@@ -112,8 +112,8 @@ def get_me(current_user):
 @app.route('/api/campaigns', methods=['GET'])
 @token_required
 def get_campaigns(current_user):
-    # Placeholder for fetching campaigns associated with the user
-    return jsonify({'campaigns': []}), 200
+    campaigns = current_user.campaigns
+    return jsonify({'campaigns': [c.to_dict() for c in campaigns]}),
 
 if __name__ == '__main__':
     app.run(debug=True, port=5889)
