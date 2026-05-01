@@ -1,0 +1,97 @@
+.campaign-form {
+  background: #1f1f2e;
+  border: 1px solid #3a3a4e;
+  border-radius: 12px;
+  padding: 40px;
+  width: 100%;
+  max-width: 700px;
+  margin: 0 auto;
+  box-shadow: 0 4px 24px rgba(0, 0, 0, 0.3);
+}
+
+.campaign-form h2 {
+  margin: 0 0 28px;
+  color: #e8e8e8;
+  font-size: 24px;
+  font-weight: 600;
+}
+
+.form-error {
+  background: #3a1f1f;
+  border: 1px solid #5a2a2a;
+  color: #ff6b6b;
+  padding: 12px 16px;
+  border-radius: 8px;
+  margin-bottom: 20px;
+  font-size: 15px;
+}
+
+.form-group {
+  margin-bottom: 24px;
+}
+
+.form-group label {
+  display: block;
+  color: #b8b8c8;
+  font-size: 15px;
+  font-weight: 500;
+  margin-bottom: 8px;
+}
+
+.form-group input,
+.form-group textarea {
+  width: 100%;
+  padding: 14px 16px;
+  background: #2a2a3e;
+  border: 1px solid #3a3a4e;
+  border-radius: 8px;
+  color: #e8e8e8;
+  font-size: 16px;
+  font-family: inherit;
+  box-sizing: border-box;
+  transition: border-color 0.2s, box-shadow 0.2s;
+}
+
+.form-group input:focus,
+.form-group textarea:focus {
+  outline: none;
+  border-color: #6c63ff;
+  box-shadow: 0 0 0 3px rgba(108, 99, 255, 0.15);
+}
+
+.form-group input::placeholder,
+.form-group textarea::placeholder {
+  color: #6a6a7e;
+}
+
+.form-group textarea {
+  resize: vertical;
+  min-height: 120px;
+}
+
+.campaign-form button {
+  width: 100%;
+  padding: 16px;
+  background: #6c63ff;
+  color: #ffffff;
+  border: none;
+  border-radius: 8px;
+  font-size: 16px;
+  font-weight: 600;
+  cursor: pointer;
+  transition: background 0.2s, transform 0.1s;
+}
+
+.campaign-form button:hover:not(:disabled) {
+  background: #5a52e0;
+  transform: translateY(-1px);
+}
+
+.campaign-form button:active:not(:disabled) {
+  transform: translateY(0);
+}
+
+.campaign-form button:disabled {
+  opacity: 0.6;
+  cursor: not-allowed;
+}

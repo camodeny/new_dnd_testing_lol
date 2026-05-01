@@ -1,4 +1,5 @@
 import { useState } from 'react'
+import { apiFetch } from './api/client'
 import './Login.css'
 
 function Login({ onLogin }) {
@@ -14,23 +15,13 @@ function Login({ onLogin }) {
     setError('')
     setLoading(true)
 
-    const endpoint = isRegistering ? '/api/register' : '/api/login'
+    const endpoint = isRegistering ? '/register' : '/login'
     const body = isRegistering
       ? { username, email, password }
       : { username, password }
 
     try {
-      const response = await fetch(`http://localhost:5889${endpoint}`, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify(body),
-      })
-
-      const data = await response.json()
-
-      if (!response.ok) {
-        throw new Error(data.error || 'Something went wrong')
-      }
+      const data = await apiFetch(endpoint, { method: 'POST', body: JSON.stringify(body) })
 
       if (data.token) {
         localStorage.setItem('token', data.token)

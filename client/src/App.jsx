@@ -1,70 +1,50 @@
-import { useState, useEffect } from 'react'
+import { BrowserRouter, Routes, Route, Navigate } from 'react-router-dom'
+import { useAuth } from './hooks/useAuth'
 import Login from './Login'
+import Header from './components/layout/Header'
+import HomePage from './pages/HomePage'
+import CharactersListPage from './pages/CharactersListPage'
+import CharacterCreatePage from './pages/CharacterCreatePage'
+import CharacterEditPage from './pages/CharacterEditPage'
+import CharacterViewPage from './pages/CharacterViewPage'
+import DevCharacterPage from './pages/DevCharacterPage'
+import NotFoundPage from './pages/NotFoundPage'
 import './App.css'
 
-function App() {
-  const [user, setUser] = useState(null)
-  const [loading, setLoading] = useState(true)
-
-  useEffect(() => {
-    const token = localStorage.getItem('token')
-    if (token) {
-      fetch('http://localhost:5889/api/me', {
-        headers: { Authorization: `Bearer ${token}` }
-      })
-        .then((res) => {
-          if (!res.ok) throw new Error('Invalid token')
-          return res.json()
-        })
-        .then((data) => setUser(data.user))
-        .catch(() => localStorage.removeItem('token'))
-        .finally(() => setLoading(false))
-    } else {
-      setLoading(false)
-    }
-  }, [])
-
-  const handleLogin = (userData) => {
-    setUser(userData)
-  }
-
-  const handleLogout = () => {
-    localStorage.removeItem('token')
-    setUser(null)
-  }
-
-  const apiFetch = (url, options = {}) => {
-    const token = localStorage.getItem('token')
-    const headers = options.headers || {}
-    if (token) {
-      headers.Authorization = `Bearer ${token}`
-    }
-    return fetch(url, { ...options, headers })
-  }
+function AppRoutes() {
+  const { user, setUser, loading, logout } = useAuth()
 
   if (loading) {
     return <div className="loading">Loading...</div>
   }
 
   if (!user) {
-    return <Login onLogin={handleLogin} />
+    return <Login onLogin={setUser} />
   }
 
   return (
     <>
-      <header className="app-header">
-        <h1>D&D Adventure</h1>
-        <div className="user-info">
-          <span>Welcome, {user.username}!</span>
-          <button onClick={handleLogout} className="logout-button">Logout</button>
-        </div>
-      </header>
-      <section id="center">
-        <div className="hero">
-          <p>Your adventure awaits...</p>
-        </div>
-      </section>
+      <Header user={user} onLogout={logout} />
+      <main className="app-main">
+        <Routes>
+          <Route path="/" element={<HomePage />} />
+          <Route path="/characters" element={<CharactersListPage />} />
+          <Route path="/characters/new" element={<CharacterCreatePage />} />
+          <Route path="/characters/:id" element={<CharacterViewPage />} />
+          <Route path="/characters/:id/edit" element={<CharacterEditPage />} />
+          <Route path="/dev/character" element={<DevCharacterPage />} />
+          <Route path="*" element={<NotFoundPage />} />
+        </Routes>
+      </main>
     </>
+  )
+}
+
+function App() {
+  return (
+    <BrowserRouter>
+      <AppRoutes />
+    </BrowserRouter>
   )
 }
 
