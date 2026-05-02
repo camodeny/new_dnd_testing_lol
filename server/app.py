@@ -1,12 +1,20 @@
 from flask import Flask, jsonify, request
 from flask_cors import CORS
 from dotenv import load_dotenv
-from datetime import datetime, timedelta, timezone
-from functools import wraps
-import jwt
+from datetime import datetime, timedelta
 import os
+from auth import auth_bp, token_required
 import random
-from models import db, User, Campaign, Character, CharacterClass, CharacterSkill, CharacterSavingThrow, CharacterProficiency, CharacterFeature, CharacterWeapon, CharacterEquipment, CharacterSpell, CharacterNote, CharacterResource, CharacterCompanion, CharacterCondition
+import json
+import string
+from models import (
+    db, User, Campaign, Character, CharacterClass, CharacterSkill,
+    CharacterSavingThrow, CharacterProficiency, CharacterFeature,
+    CharacterWeapon, CharacterEquipment, CharacterSpell, CharacterNote,
+    CharacterResource, CharacterCompanion, CharacterCondition,
+    CampaignSession, SessionMessage, CampaignMember, CampaignInvite
+)
+from openrouter import get_dm_response
 
 load_dotenv()
 
@@ -23,98 +31,92 @@ db.init_app(app)
 with app.app_context():
     db.create_all()
 
+    def _ensure_columns():
+        from sqlalchemy import text
+        engine = db.engine
+        with engine.connect() as conn:
+            result = conn.execute(text("PRAGMA table_info(campaign)"))
+            columns = {row[1] for row in result.fetchall()}
+            if 'status' not in columns:
+                conn.execute(text("ALTER TABLE campaign ADD COLUMN status VARCHAR DEFAULT 'active'"))
+            if 'last_played_at' not in columns:
+                conn.execute(text("ALTER TABLE campaign ADD COLUMN last_played_at DATETIME"))
+            if 'settings' not in columns:
+                conn.execute(text("ALTER TABLE campaign ADD COLUMN settings TEXT"))
+            if 'invite_code' not in columns:
+                conn.execute(text("ALTER TABLE campaign ADD COLUMN invite_code VARCHAR(20)"))
+            conn.commit()
 
-def generate_token(user_id):
-    payload = {
-        'user_id': user_id,
-        'exp': datetime.now(timezone.utc) + timedelta(hours=app.config['JWT_EXPIRATION_HOURS']),
-        'iat': datetime.now(timezone.utc)
-    }
-    return jwt.encode(payload, app.config['SECRET_KEY'], algorithm='HS256')
+    try:
+        _ensure_columns()
+    except Exception:
+        pass
 
 
-def token_required(f):
-    @wraps(f)
-    def decorated(*args, **kwargs):
-        token = None
-        if 'Authorization' in request.headers:
-            auth_header = request.headers['Authorization']
-            if auth_header.startswith('Bearer '):
-                token = auth_header.split(' ')[1]
-
-        if not token:
-            return jsonify({'error': 'Token is missing'}), 401
-
-        try:
-            data = jwt.decode(token, app.config['SECRET_KEY'], algorithms=['HS256'])
-            current_user = User.query.get(data['user_id'])
-            if not current_user:
-                return jsonify({'error': 'User not found'}), 401
-        except jwt.ExpiredSignatureError:
-            return jsonify({'error': 'Token has expired'}), 401
-        except jwt.InvalidTokenError:
-            return jsonify({'error': 'Token is invalid'}), 401
-
-        return f(current_user, *args, **kwargs)
-    return decorated
+app.register_blueprint(auth_bp)
 
 
 @app.route('/api/health')
 def health():
     return jsonify({'status': 'ok'})
 
-@app.route('/api/register', methods=['POST'])
-def register():
-    data = request.get_json()
-
-    if not data or not data.get('username') or not data.get('password') or not data.get('email'):
-        return jsonify({'error': 'Missing required fields'}), 400
-
-    if User.query.filter_by(username=data['username']).first():
-        return jsonify({'error': 'Username already exists'}), 400
-
-    if User.query.filter_by(email=data['email']).first():
-        return jsonify({'error': 'Email already exists'}), 400
-
-    user = User(username=data['username'], email=data['email'])
-    user.set_password(data['password'])
-
-    db.session.add(user)
-    db.session.commit()
-
-    token = generate_token(user.id)
-    return jsonify({'message': 'User created successfully', 'token': token, 'user': user.to_dict()}), 201
-
-@app.route('/api/login', methods=['POST'])
-def login():
-    data = request.get_json()
-
-    if not data or not data.get('username') or not data.get('password'):
-        return jsonify({'error': 'Missing username or password'}), 400
-
-    user = User.query.filter_by(username=data['username']).first()
-
-    if not user or not user.check_password(data['password']):
-        return jsonify({'error': 'Invalid username or password'}), 401
-
-    token = generate_token(user.id)
-    return jsonify({'message': 'Login successful', 'token': token, 'user': user.to_dict()}), 200
-
-@app.route('/api/logout', methods=['POST'])
-def logout():
-    # JWT is stateless; client discards the token
-    return jsonify({'message': 'Logged out successfully'}), 200
-
-@app.route('/api/me', methods=['GET'])
-@token_required
-def get_me(current_user):
-    return jsonify({'user': current_user.to_dict()}), 200
 
 @app.route('/api/campaigns', methods=['GET'])
 @token_required
 def get_campaigns(current_user):
     campaigns = current_user.campaigns
     return jsonify({'campaigns': [c.to_dict() for c in campaigns]}), 200
+
+@app.route('/api/campaigns/<int:campaign_id>', methods=['GET'])
+@token_required
+def get_campaign(current_user, campaign_id):
+    campaign = Campaign.query.get_or_404(campaign_id)
+    if campaign.user_id != current_user.id:
+        return jsonify({'error': 'Forbidden'}), 403
+    data = campaign.to_dict()
+    data['characters'] = [
+        _character_full_dict(c) for c in campaign.characters
+    ]
+    data['active_session'] = None
+    active = CampaignSession.query.filter_by(campaign_id=campaign_id, is_active=True).first()
+    if active:
+        data['active_session'] = active.to_dict()
+    return jsonify({'campaign': data}), 200
+
+
+@app.route('/api/campaigns/<int:campaign_id>', methods=['PUT'])
+@token_required
+def update_campaign(current_user, campaign_id):
+    campaign = Campaign.query.get_or_404(campaign_id)
+    if campaign.user_id != current_user.id:
+        return jsonify({'error': 'Forbidden'}), 403
+    data = request.get_json()
+    if 'name' in data:
+        campaign.name = data['name']
+    if 'description' in data:
+        campaign.description = data['description']
+    if 'difficulty' in data:
+        campaign.difficulty = data['difficulty']
+    if 'seed' in data:
+        campaign.seed = data['seed']
+    if 'status' in data:
+        campaign.status = data['status']
+    if 'settings' in data:
+        campaign.settings = json.dumps(data['settings'])
+    db.session.commit()
+    return jsonify({'campaign': campaign.to_dict()}), 200
+
+
+@app.route('/api/campaigns/<int:campaign_id>', methods=['DELETE'])
+@token_required
+def delete_campaign(current_user, campaign_id):
+    campaign = Campaign.query.get_or_404(campaign_id)
+    if campaign.user_id != current_user.id:
+        return jsonify({'error': 'Forbidden'}), 403
+    db.session.delete(campaign)
+    db.session.commit()
+    return jsonify({'message': 'Campaign deleted'}), 200
+
 
 @app.route('/api/campaigns', methods=['POST'])
 @token_required
@@ -1084,5 +1086,228 @@ def create_dev_character(current_user):
     return jsonify({'message': 'Dev character created', 'character': _character_full_dict(character)}), 201
 
 
+# ---------------------------------------------------------------------------
+# Campaign Dashboard API Endpoints
+# ---------------------------------------------------------------------------
+
+def _generate_invite_code():
+    import secrets
+    return ''.join(secrets.choice(string.ascii_uppercase + string.digits) for _ in range(8))
+
+
+def _ensure_member(campaign, user):
+    """Ensure user is a member of the campaign (owner auto-included)."""
+    if campaign.user_id == user.id:
+        return True
+    member = CampaignMember.query.filter_by(campaign_id=campaign.id, user_id=user.id).first()
+    return member is not None
+
+
+# -- Campaign Characters --
+
+@app.route('/api/campaigns/<int:campaign_id>/characters', methods=['GET'])
+@token_required
+def get_campaign_characters(current_user, campaign_id):
+    campaign = Campaign.query.get_or_404(campaign_id)
+    if not _ensure_member(campaign, current_user):
+        return jsonify({'error': 'Forbidden'}), 403
+    characters = Character.query.filter_by(campaign_id=campaign_id).order_by(Character.party_order).all()
+    return jsonify({'characters': [_character_full_dict(c) for c in characters]}), 200
+
+
+@app.route('/api/campaigns/<int:campaign_id>/characters', methods=['POST'])
+@token_required
+def add_campaign_character(current_user, campaign_id):
+    campaign = Campaign.query.get_or_404(campaign_id)
+    if not _ensure_member(campaign, current_user):
+        return jsonify({'error': 'Forbidden'}), 403
+    data = request.get_json()
+    if not data or not data.get('character_id'):
+        return jsonify({'error': 'Missing character_id'}), 400
+    character = Character.query.get_or_404(data['character_id'])
+    if character.user_id != current_user.id:
+        return jsonify({'error': 'Forbidden'}), 403
+    character.campaign_id = campaign_id
+    db.session.commit()
+    return jsonify({'character': _character_full_dict(character)}), 200
+
+
+# -- Sessions --
+
+@app.route('/api/campaigns/<int:campaign_id>/sessions', methods=['POST'])
+@token_required
+def start_session(current_user, campaign_id):
+    campaign = Campaign.query.get_or_404(campaign_id)
+    if not _ensure_member(campaign, current_user):
+        return jsonify({'error': 'Forbidden'}), 403
+    active = CampaignSession.query.filter_by(campaign_id=campaign_id, is_active=True).first()
+    if active:
+        return jsonify({'error': 'An active session already exists'}), 400
+    session = CampaignSession(campaign_id=campaign_id)
+    db.session.add(session)
+    campaign.last_played_at = datetime.utcnow()
+    db.session.commit()
+    return jsonify({'session': session.to_dict()}), 201
+
+
+@app.route('/api/campaigns/<int:campaign_id>/sessions', methods=['GET'])
+@token_required
+def list_sessions(current_user, campaign_id):
+    campaign = Campaign.query.get_or_404(campaign_id)
+    if not _ensure_member(campaign, current_user):
+        return jsonify({'error': 'Forbidden'}), 403
+    sessions = CampaignSession.query.filter_by(campaign_id=campaign_id).order_by(CampaignSession.started_at.desc()).all()
+    return jsonify({'sessions': [s.to_dict() for s in sessions]}), 200
+
+
+@app.route('/api/sessions/<int:session_id>', methods=['GET'])
+@token_required
+def get_session(current_user, session_id):
+    session = CampaignSession.query.get_or_404(session_id)
+    campaign = Campaign.query.get(session.campaign_id)
+    if not _ensure_member(campaign, current_user):
+        return jsonify({'error': 'Forbidden'}), 403
+    data = session.to_dict()
+    data['messages'] = [m.to_dict() for m in session.messages]
+    return jsonify({'session': data}), 200
+
+
+@app.route('/api/sessions/<int:session_id>', methods=['PUT'])
+@token_required
+def end_session(current_user, session_id):
+    session = CampaignSession.query.get_or_404(session_id)
+    campaign = Campaign.query.get(session.campaign_id)
+    if not _ensure_member(campaign, current_user):
+        return jsonify({'error': 'Forbidden'}), 403
+    data = request.get_json()
+    session.is_active = False
+    session.ended_at = datetime.utcnow()
+    if data and 'recap' in data:
+        session.recap = data['recap']
+    db.session.commit()
+    return jsonify({'session': session.to_dict()}), 200
+
+
+# -- Messages --
+
+@app.route('/api/sessions/<int:session_id>/messages', methods=['GET'])
+@token_required
+def get_messages(current_user, session_id):
+    session = CampaignSession.query.get_or_404(session_id)
+    campaign = Campaign.query.get(session.campaign_id)
+    if not _ensure_member(campaign, current_user):
+        return jsonify({'error': 'Forbidden'}), 403
+    messages = SessionMessage.query.filter_by(session_id=session_id).order_by(SessionMessage.created_at).all()
+    return jsonify({'messages': [m.to_dict() for m in messages]}), 200
+
+
+@app.route('/api/sessions/<int:session_id>/messages', methods=['POST'])
+@token_required
+def send_message(current_user, session_id):
+    session = CampaignSession.query.get_or_404(session_id)
+    campaign = Campaign.query.get(session.campaign_id)
+    if not _ensure_member(campaign, current_user):
+        return jsonify({'error': 'Forbidden'}), 403
+    data = request.get_json()
+    if not data or not data.get('content'):
+        return jsonify({'error': 'Missing content'}), 400
+    msg = SessionMessage(
+        session_id=session_id,
+        role=data.get('role', 'player'),
+        content=data['content'],
+    )
+    db.session.add(msg)
+    db.session.commit()
+    result_messages = [msg.to_dict()]
+
+    ai_text = get_dm_response(session.messages)
+    if ai_text:
+        ai_msg = SessionMessage(
+            session_id=session_id,
+            role='dm',
+            content=ai_text,
+        )
+        db.session.add(ai_msg)
+        db.session.commit()
+        result_messages.append(ai_msg.to_dict())
+
+    return jsonify({'messages': result_messages}), 201
+
+
+# -- Members & Invites --
+
+@app.route('/api/campaigns/<int:campaign_id>/members', methods=['GET'])
+@token_required
+def list_members(current_user, campaign_id):
+    campaign = Campaign.query.get_or_404(campaign_id)
+    if not _ensure_member(campaign, current_user):
+        return jsonify({'error': 'Forbidden'}), 403
+    members = CampaignMember.query.filter_by(campaign_id=campaign_id).all()
+    return jsonify({'members': [m.to_dict() for m in members]}), 200
+
+
+@app.route('/api/campaigns/<int:campaign_id>/invites', methods=['POST'])
+@token_required
+def create_invite(current_user, campaign_id):
+    campaign = Campaign.query.get_or_404(campaign_id)
+    if campaign.user_id != current_user.id:
+        return jsonify({'error': 'Only the campaign owner can create invites'}), 403
+    code = _generate_invite_code()
+    invite = CampaignInvite(
+        campaign_id=campaign_id,
+        code=code,
+        created_by=current_user.id,
+        expires_at=datetime.utcnow() + timedelta(days=7),
+    )
+    db.session.add(invite)
+    campaign.invite_code = code
+    db.session.commit()
+    return jsonify({'invite': invite.to_dict()}), 201
+
+
+@app.route('/api/campaigns/<int:campaign_id>/join', methods=['POST'])
+@token_required
+def join_campaign(current_user, campaign_id):
+    campaign = Campaign.query.get_or_404(campaign_id)
+    data = request.get_json()
+    if not data or not data.get('code'):
+        return jsonify({'error': 'Missing invite code'}), 400
+    if campaign.invite_code != data['code']:
+        return jsonify({'error': 'Invalid invite code'}), 403
+    existing = CampaignMember.query.filter_by(campaign_id=campaign_id, user_id=current_user.id).first()
+    if existing:
+        return jsonify({'error': 'Already a member'}), 400
+    member = CampaignMember(campaign_id=campaign_id, user_id=current_user.id, role='player')
+    db.session.add(member)
+    db.session.commit()
+    return jsonify({'member': member.to_dict()}), 201
+
+
+@app.route('/api/campaigns/<int:campaign_id>/members/<int:user_id>', methods=['PUT'])
+@token_required
+def update_member_role(current_user, campaign_id, user_id):
+    campaign = Campaign.query.get_or_404(campaign_id)
+    if campaign.user_id != current_user.id:
+        return jsonify({'error': 'Forbidden'}), 403
+    member = CampaignMember.query.filter_by(campaign_id=campaign_id, user_id=user_id).first_or_404()
+    data = request.get_json()
+    if data and 'role' in data:
+        member.role = data['role']
+    db.session.commit()
+    return jsonify({'member': member.to_dict()}), 200
+
+
+@app.route('/api/campaigns/<int:campaign_id>/members/<int:user_id>', methods=['DELETE'])
+@token_required
+def remove_member(current_user, campaign_id, user_id):
+    campaign = Campaign.query.get_or_404(campaign_id)
+    if campaign.user_id != current_user.id and current_user.id != user_id:
+        return jsonify({'error': 'Forbidden'}), 403
+    member = CampaignMember.query.filter_by(campaign_id=campaign_id, user_id=user_id).first_or_404()
+    db.session.delete(member)
+    db.session.commit()
+    return jsonify({'message': 'Member removed'}), 200
+
+
 if __name__ == '__main__':
-    app.run(debug=True, port=5889)
+    app.run(debug=True, host='0.0.0.0', port=5889)

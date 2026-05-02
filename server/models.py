@@ -41,9 +41,20 @@ class Campaign(db.Model):
     seed = db.Column(db.String, nullable=True)
     user_id = db.Column(db.Integer, db.ForeignKey('users.id'), nullable=False)
     created_at = db.Column(db.DateTime, default=datetime.utcnow)
+    status = db.Column(db.String, default='active')
+    last_played_at = db.Column(db.DateTime, nullable=True)
+    settings = db.Column(db.Text, nullable=True)
+    invite_code = db.Column(db.String(20), nullable=True, unique=True)
     characters = db.relationship('Character', backref='campaign', lazy=True)
+    sessions = db.relationship('CampaignSession', backref='campaign', lazy=True, cascade='all, delete-orphan')
+    members = db.relationship('CampaignMember', backref='campaign', lazy=True, cascade='all, delete-orphan')
+    invites = db.relationship('CampaignInvite', backref='campaign', lazy=True, cascade='all, delete-orphan')
+    npcs = db.relationship('NPC', backref='campaign', lazy=True, cascade='all, delete-orphan')
+    campaign_notes = db.relationship('CampaignNote', backref='campaign', lazy=True, cascade='all, delete-orphan')
+
 
     def to_dict(self):
+        import json
         return {
             'id': self.id,
             'name': self.name,
@@ -51,7 +62,11 @@ class Campaign(db.Model):
             'difficulty': self.difficulty,
             'seed': self.seed,
             'user_id': self.user_id,
-            'created_at': self.created_at.isoformat()
+            'created_at': self.created_at.isoformat() if self.created_at else None,
+            'status': self.status,
+            'last_played_at': self.last_played_at.isoformat() if self.last_played_at else None,
+            'settings': json.loads(self.settings) if self.settings else {},
+            'invite_code': self.invite_code,
         }
 
 
@@ -155,6 +170,10 @@ class Character(db.Model):
 
     # Encumbrance / Carry
     encumbrance_status = db.Column(db.String(20), default='normal')  # normal, encumbered, heavily_encumbered
+
+    # Campaign Dashboard
+    current_location = db.Column(db.String(200), nullable=True)
+    party_order = db.Column(db.Integer, default=0)
 
     # Timestamps
     created_at = db.Column(db.DateTime, default=datetime.utcnow)
@@ -546,4 +565,92 @@ class CharacterCondition(db.Model):
             'source': self.source,
             'is_permanent': self.is_permanent,
             'duration_remaining': self.duration_remaining,
+        }
+
+
+# ---------------------------------------------------------------------------
+# Campaign Dashboard Models
+# ---------------------------------------------------------------------------
+
+class CampaignSession(db.Model):
+    __tablename__ = 'campaign_sessions'
+
+    id = db.Column(db.Integer, primary_key=True)
+    campaign_id = db.Column(db.Integer, db.ForeignKey('campaign.id'), nullable=False)
+    started_at = db.Column(db.DateTime, default=datetime.utcnow)
+    ended_at = db.Column(db.DateTime, nullable=True)
+    recap = db.Column(db.Text, nullable=True)
+    is_active = db.Column(db.Boolean, default=True)
+    messages = db.relationship('SessionMessage', backref='session', lazy=True, cascade='all, delete-orphan')
+
+    def to_dict(self):
+        return {
+            'id': self.id,
+            'campaign_id': self.campaign_id,
+            'started_at': self.started_at.isoformat() if self.started_at else None,
+            'ended_at': self.ended_at.isoformat() if self.ended_at else None,
+            'recap': self.recap,
+            'is_active': self.is_active,
+        }
+
+
+class SessionMessage(db.Model):
+    __tablename__ = 'session_messages'
+
+    id = db.Column(db.Integer, primary_key=True)
+    session_id = db.Column(db.Integer, db.ForeignKey('campaign_sessions.id'), nullable=False)
+    role = db.Column(db.String(20), nullable=False)
+    content = db.Column(db.Text, nullable=False)
+    created_at = db.Column(db.DateTime, default=datetime.utcnow)
+
+    def to_dict(self):
+        return {
+            'id': self.id,
+            'session_id': self.session_id,
+            'role': self.role,
+            'content': self.content,
+            'created_at': self.created_at.isoformat() if self.created_at else None,
+        }
+
+
+class CampaignMember(db.Model):
+    __tablename__ = 'campaign_members'
+
+    id = db.Column(db.Integer, primary_key=True)
+    campaign_id = db.Column(db.Integer, db.ForeignKey('campaign.id'), nullable=False)
+    user_id = db.Column(db.Integer, db.ForeignKey('users.id'), nullable=False)
+    role = db.Column(db.String(20), default='player')
+    joined_at = db.Column(db.DateTime, default=datetime.utcnow)
+    user = db.relationship('User')
+
+    def to_dict(self):
+        return {
+            'id': self.id,
+            'campaign_id': self.campaign_id,
+            'user_id': self.user_id,
+            'username': self.user.username if self.user else None,
+            'role': self.role,
+            'joined_at': self.joined_at.isoformat() if self.joined_at else None,
+        }
+
+
+class CampaignInvite(db.Model):
+    __tablename__ = 'campaign_invites'
+
+    id = db.Column(db.Integer, primary_key=True)
+    campaign_id = db.Column(db.Integer, db.ForeignKey('campaign.id'), nullable=False)
+    code = db.Column(db.String(20), unique=True, nullable=False)
+    created_by = db.Column(db.Integer, db.ForeignKey('users.id'), nullable=False)
+    expires_at = db.Column(db.DateTime, nullable=True)
+    is_used = db.Column(db.Boolean, default=False)
+    creator = db.relationship('User')
+
+    def to_dict(self):
+        return {
+            'id': self.id,
+            'campaign_id': self.campaign_id,
+            'code': self.code,
+            'created_by': self.created_by,
+            'expires_at': self.expires_at.isoformat() if self.expires_at else None,
+            'is_used': self.is_used,
         }

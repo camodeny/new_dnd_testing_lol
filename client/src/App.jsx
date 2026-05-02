@@ -1,8 +1,9 @@
-import { BrowserRouter, Routes, Route, Navigate } from 'react-router-dom'
+import { BrowserRouter, Routes, Route, Navigate, useLocation } from 'react-router-dom'
 import { useAuth } from './hooks/useAuth'
 import Login from './Login'
 import Header from './components/layout/Header'
 import HomePage from './pages/HomePage'
+import CampaignViewPage from './pages/CampaignViewPage'
 import CharactersListPage from './pages/CharactersListPage'
 import CharacterCreatePage from './pages/CharacterCreatePage'
 import CharacterEditPage from './pages/CharacterEditPage'
@@ -13,6 +14,8 @@ import './App.css'
 
 function AppRoutes() {
   const { user, setUser, loading, logout } = useAuth()
+  const location = useLocation()
+  const isCampaignView = location.pathname.startsWith('/campaigns/')
 
   if (loading) {
     return <div className="loading">Loading...</div>
@@ -24,10 +27,11 @@ function AppRoutes() {
 
   return (
     <>
-      <Header user={user} onLogout={logout} />
-      <main className="app-main">
+      {!isCampaignView && <Header user={user} onLogout={logout} />}
+      <main className={`app-main ${isCampaignView ? 'full-bleed' : ''}`}>
         <Routes>
           <Route path="/" element={<HomePage />} />
+          <Route path="/campaigns/:id" element={<CampaignViewPage />} />
           <Route path="/characters" element={<CharactersListPage />} />
           <Route path="/characters/new" element={<CharacterCreatePage />} />
           <Route path="/characters/:id" element={<CharacterViewPage />} />
