@@ -40,27 +40,8 @@ def create_app():
 
     with app.app_context():
         db.create_all()
-        try:
-            ensure_legacy_columns()
-        except Exception:
-            pass
 
     return app
-
-
-def ensure_legacy_columns():
-    with db.engine.connect() as conn:
-        result = conn.execute(text('PRAGMA table_info(campaign)'))
-        columns = {row[1] for row in result.fetchall()}
-        if 'status' not in columns:
-            conn.execute(text("ALTER TABLE campaign ADD COLUMN status VARCHAR DEFAULT 'active'"))
-        if 'last_played_at' not in columns:
-            conn.execute(text('ALTER TABLE campaign ADD COLUMN last_played_at DATETIME'))
-        if 'settings' not in columns:
-            conn.execute(text('ALTER TABLE campaign ADD COLUMN settings TEXT'))
-        if 'invite_code' not in columns:
-            conn.execute(text('ALTER TABLE campaign ADD COLUMN invite_code VARCHAR(20)'))
-        conn.commit()
 
 
 app = create_app()
