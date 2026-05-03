@@ -36,7 +36,6 @@ export default function SessionPanel({
   onEndSession,
   onSendMessage,
   onRollDice,
-  characters,
   aiThinking,
 }) {
   const [input, setInput] = useState('')

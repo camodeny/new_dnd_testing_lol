@@ -6,6 +6,7 @@ function CampaignForm({ onCampaignCreated, onCancel, className = '' }) {
   const [description, setDescription] = useState('')
   const [difficulty, setDifficulty] = useState('')
   const [seed, setSeed] = useState('')
+  const [requiredPlayers, setRequiredPlayers] = useState(1)
   const [error, setError] = useState('')
   const [loading, setLoading] = useState(false)
 
@@ -15,7 +16,7 @@ function CampaignForm({ onCampaignCreated, onCancel, className = '' }) {
     setLoading(true)
 
     try {
-      const data = await createCampaign({ name, description, difficulty, seed })
+      const data = await createCampaign({ name, description, difficulty, seed, required_players: requiredPlayers })
       setName('')
       setDescription('')
       setDifficulty('')
@@ -57,6 +58,19 @@ function CampaignForm({ onCampaignCreated, onCancel, className = '' }) {
             <option value="Medium">Medium</option>
             <option value="Hard">Hard</option>
             <option value="Deadly">Deadly</option>
+          </select>
+        </div>
+        <div className="form-field">
+          <label htmlFor="campaign-players">Players</label>
+          <select
+            id="campaign-players"
+            value={requiredPlayers}
+            onChange={(e) => setRequiredPlayers(Number(e.target.value))}
+            className="input"
+          >
+            {[1, 2, 3, 4, 5, 6, 7, 8].map((n) => (
+              <option key={n} value={n}>{n} {n === 1 ? 'player' : 'players'}</option>
+            ))}
           </select>
         </div>
       </div>

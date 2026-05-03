@@ -1,9 +1,10 @@
-import { BrowserRouter, Routes, Route, Navigate, useLocation } from 'react-router-dom'
+import { BrowserRouter, Routes, Route, useLocation } from 'react-router-dom'
 import { useAuth } from './hooks/useAuth'
 import Login from './Login'
 import Header from './components/layout/Header'
 import HomePage from './pages/HomePage'
 import CampaignViewPage from './pages/CampaignViewPage'
+import CampaignJoinPage from './pages/CampaignJoinPage'
 import CharactersListPage from './pages/CharactersListPage'
 import CharacterCreatePage from './pages/CharacterCreatePage'
 import CharacterEditPage from './pages/CharacterEditPage'
@@ -31,7 +32,8 @@ function AppRoutes() {
       <main className={`app-main ${isCampaignView ? 'full-bleed' : ''}`}>
         <Routes>
           <Route path="/" element={<HomePage />} />
-          <Route path="/campaigns/:id" element={<CampaignViewPage />} />
+          <Route path="/campaigns/:id" element={<CampaignViewPage user={user} />} />
+          <Route path="/join/:id" element={<CampaignJoinPage />} />
           <Route path="/characters" element={<CharactersListPage />} />
           <Route path="/characters/new" element={<CharacterCreatePage />} />
           <Route path="/characters/:id" element={<CharacterViewPage />} />

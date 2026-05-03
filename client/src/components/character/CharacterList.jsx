@@ -12,21 +12,23 @@ export default function CharacterList() {
   const [error, setError] = useState('')
   const navigate = useNavigate()
 
-  const fetchCharacters = async () => {
-    setLoading(true)
-    setError('')
-    try {
-      const data = await getCharacters()
-      setCharacters(data.characters || [])
-    } catch (err) {
-      setError(err.message)
-    } finally {
-      setLoading(false)
-    }
-  }
-
   useEffect(() => {
-    fetchCharacters()
+    let isMounted = true
+
+    getCharacters()
+      .then((data) => {
+        if (isMounted) setCharacters(data.characters || [])
+      })
+      .catch((err) => {
+        if (isMounted) setError(err.message)
+      })
+      .finally(() => {
+        if (isMounted) setLoading(false)
+      })
+
+    return () => {
+      isMounted = false
+    }
   }, [])
 
   const handleDelete = async (id) => {

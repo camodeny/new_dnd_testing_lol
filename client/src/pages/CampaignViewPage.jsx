@@ -2,16 +2,16 @@ import { useEffect, useState, useCallback } from 'react'
 import { useParams, useNavigate } from 'react-router-dom'
 import {
   getCampaign, updateCampaign, getCampaignCharacters,
-  startSession, listSessions, endSession, getSession, sendMessage,
-  listNotes, createNote,
-  listNPCs, createNPC,
+  startSession, endSession, getSession, sendMessage,
   getCharacters,
   addCampaignCharacter,
+  listMembers,
 } from '../api/client'
 import Loading from '../components/common/Loading'
 import ErrorMessage from '../components/common/ErrorMessage'
 import PartyRoster from '../components/dashboard/PartyRoster'
 import SessionPanel from '../components/dashboard/SessionPanel'
+import CampaignLobby from '../components/dashboard/CampaignLobby'
 
 function formatDate(iso) {
   if (!iso) return ''
@@ -59,7 +59,28 @@ function getClassSummary(character) {
   return `Level ${character.total_level ?? '?'}`
 }
 
-export default function CampaignViewPage() {
+async function fetchCampaignPageData(id) {
+  const [campData, charData] = await Promise.all([
+    getCampaign(id),
+    getCampaignCharacters(id),
+  ])
+  const campaign = campData.campaign
+  const activeSession = campaign.active_session || null
+  const messages = activeSession
+    ? await getSession(activeSession.id)
+      .then((data) => data.session?.messages || [])
+      .catch(() => [])
+    : []
+
+  return {
+    campaign,
+    characters: charData.characters || [],
+    activeSession,
+    messages,
+  }
+}
+
+export default function CampaignViewPage({ user }) {
   const { id } = useParams()
   const navigate = useNavigate()
   const [campaign, setCampaign] = useState(null)
@@ -68,12 +89,10 @@ export default function CampaignViewPage() {
   const [error, setError] = useState('')
   const [session, setSession] = useState(null)
   const [messages, setMessages] = useState([])
-  const [notes, setNotes] = useState([])
-  const [npcs, setNPCs] = useState([])
-  const [sessions, setSessions] = useState([])
   const [showSettings, setShowSettings] = useState(false)
   const [campaignName, setCampaignName] = useState('')
   const [campaignDesc, setCampaignDesc] = useState('')
+  const [showLobby, setShowLobby] = useState(false)
 
   const [showImport, setShowImport] = useState(false)
   const [availableChars, setAvailableChars] = useState([])
@@ -82,28 +101,11 @@ export default function CampaignViewPage() {
 
   const loadData = useCallback(async () => {
     try {
-      const [campData, charData, seshData, notesData, npcsData] =
-        await Promise.all([
-          getCampaign(id),
-          getCampaignCharacters(id),
-          listSessions(id).catch(() => ({ sessions: [] })),
-          listNotes(id).catch(() => ({ notes: [] })),
-          listNPCs(id).catch(() => ({ npcs: [] })),
-        ])
-
-      setCampaign(campData.campaign)
-      setCharacters(charData.characters || [])
-      setSessions(seshData.sessions || [])
-      setSessions(seshData.sessions || [])
-      setNotes(notesData.notes || [])
-      setNPCs(npcsData.npcs || [])
-
-      const activeSession = campData.campaign.active_session
-      if (activeSession) {
-        setSession(activeSession)
-        const msgData = await getSession(activeSession.id).catch(() => ({ session: { messages: [] } }))
-        setMessages(msgData.session?.messages || [])
-      }
+      const data = await fetchCampaignPageData(id)
+      setCampaign(data.campaign)
+      setCharacters(data.characters)
+      setSession(data.activeSession)
+      setMessages(data.messages)
     } catch (err) {
       setError(err.message)
     } finally {
@@ -112,8 +114,45 @@ export default function CampaignViewPage() {
   }, [id])
 
   useEffect(() => {
-    loadData()
-  }, [loadData])
+    let isMounted = true
+
+    async function loadAll() {
+      try {
+        const data = await fetchCampaignPageData(id)
+        if (!isMounted) return
+
+        setCampaign(data.campaign)
+        setCharacters(data.characters)
+        setSession(data.activeSession)
+        setMessages(data.messages)
+
+        const required = data.campaign.settings?.required_players
+        if (required !== undefined && required > 1) {
+          try {
+            const memData = await listMembers(id)
+            if (!isMounted) return
+            const memberCount = (memData.members || []).length
+            if (memberCount < required && !data.activeSession) {
+              setShowLobby(true)
+            }
+          } catch (err) {
+            // If member fetch fails, still show dashboard
+            if (isMounted) setShowLobby(false)
+          }
+        }
+      } catch (err) {
+        if (isMounted) setError(err.message)
+      } finally {
+        if (isMounted) setLoading(false)
+      }
+    }
+
+    loadAll()
+
+    return () => {
+      isMounted = false
+    }
+  }, [id])
 
   const handleStartSession = async () => {
     try {
@@ -158,23 +197,6 @@ export default function CampaignViewPage() {
     handleSendMessage(rollMsg)
   }
 
-  const handleAddNote = async () => {
-    try {
-      const data = await createNote(id, { title: 'New Note', content: '' })
-      setNotes((prev) => [data.note, ...prev])
-    } catch (err) {
-      setError(err.message)
-    }
-  }
-
-  const handleAddNPC = async () => {
-    try {
-      const data = await createNPC(id, { name: 'New NPC', description: '' })
-      setNPCs((prev) => [data.npc, ...prev])
-    } catch (err) {
-      setError(err.message)
-    }
-  }
   const handleUpdateSettings = async () => {
     try {
       const data = await updateCampaign(id, { name: campaignName, description: campaignDesc })
@@ -215,9 +237,23 @@ export default function CampaignViewPage() {
     }
   }
 
+  const handleBeginAdventure = () => {
+    setShowLobby(false)
+  }
+
   if (loading) return <Loading />
   if (error && !campaign) return <ErrorMessage message={error} />
   if (!campaign) return <ErrorMessage message="Campaign not found." />
+
+  if (showLobby) {
+    return (
+      <CampaignLobby
+        campaign={campaign}
+        currentUser={user}
+        onBegin={handleBeginAdventure}
+      />
+    )
+  }
 
   const gradient = getGradientSeed(campaign.name + (campaign.seed || ''))
   const initials = getInitials(campaign.name)
@@ -300,7 +336,6 @@ export default function CampaignViewPage() {
             onEndSession={handleEndSession}
             onSendMessage={handleSendMessage}
             onRollDice={handleRollDice}
-            characters={characters}
             aiThinking={aiThinking}
           />
         </main>

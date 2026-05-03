@@ -49,8 +49,6 @@ class Campaign(db.Model):
     sessions = db.relationship('CampaignSession', backref='campaign', lazy=True, cascade='all, delete-orphan')
     members = db.relationship('CampaignMember', backref='campaign', lazy=True, cascade='all, delete-orphan')
     invites = db.relationship('CampaignInvite', backref='campaign', lazy=True, cascade='all, delete-orphan')
-    npcs = db.relationship('NPC', backref='campaign', lazy=True, cascade='all, delete-orphan')
-    campaign_notes = db.relationship('CampaignNote', backref='campaign', lazy=True, cascade='all, delete-orphan')
 
 
     def to_dict(self):

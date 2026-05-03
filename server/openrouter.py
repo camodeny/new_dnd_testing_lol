@@ -23,7 +23,12 @@ def get_dm_response(session_messages):
 
     messages = [{'role': 'system', 'content': SYSTEM_PROMPT}]
     for msg in session_messages:
-        role = 'assistant' if msg.role == 'dm' else msg.role
+        if msg.role == 'dm':
+            role = 'assistant'
+        elif msg.role == 'player':
+            role = 'user'
+        else:
+            role = msg.role
         messages.append({'role': role, 'content': msg.content})
 
     try:

@@ -3,18 +3,16 @@ import { apiFetch } from '../api/client'
 
 export function useAuth() {
   const [user, setUser] = useState(null)
-  const [loading, setLoading] = useState(true)
+  const [loading, setLoading] = useState(() => Boolean(localStorage.getItem('token')))
 
   useEffect(() => {
     const token = localStorage.getItem('token')
-    if (token) {
-      apiFetch('/me')
-        .then((data) => setUser(data.user))
-        .catch(() => localStorage.removeItem('token'))
-        .finally(() => setLoading(false))
-    } else {
-      setLoading(false)
-    }
+    if (!token) return
+
+    apiFetch('/me')
+      .then((data) => setUser(data.user))
+      .catch(() => localStorage.removeItem('token'))
+      .finally(() => setLoading(false))
   }, [])
 
   const logout = () => {
