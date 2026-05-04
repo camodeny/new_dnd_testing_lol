@@ -71,49 +71,138 @@ function mergeGroup(base, value) {
   return { ...(base || {}), ...(value || {}) }
 }
 
+const ITEM_LIST_FIELD_ALIASES = {
+  classes: {
+    class_name: ['name', 'class', 'className'],
+    hit_die_type: ['hit_die', 'hitDie', 'hitDieType'],
+  },
+  skills: {
+    skill_name: ['name', 'skill', 'skillName'],
+  },
+  saving_throws: {
+    ability: ['name', 'saving_throw', 'savingThrow'],
+  },
+  proficiencies: {
+    name: ['proficiency_name', 'proficiencyName'],
+    proficiency_type: ['type', 'proficiencyType'],
+  },
+  features: {
+    name: ['feature_name', 'featureName', 'title'],
+  },
+  weapons: {
+    name: ['weapon_name', 'weaponName', 'title'],
+  },
+  equipment: {
+    name: ['item_name', 'itemName', 'equipment_name', 'equipmentName', 'title'],
+    equipment_type: ['type', 'item_type', 'itemType', 'equipmentType'],
+  },
+  spells: {
+    name: ['spell_name', 'spellName', 'title'],
+    spell_level: ['level', 'spellLevel'],
+  },
+  notes: {
+    title: ['name', 'note_title', 'noteTitle'],
+    content: ['description', 'text', 'notes'],
+  },
+  resources: {
+    name: ['resource_name', 'resourceName', 'title'],
+    max: ['maximum', 'max_amount', 'maxAmount'],
+  },
+  companions: {
+    name: ['companion_name', 'companionName', 'title'],
+    companion_type: ['type', 'companionType'],
+  },
+  conditions: {
+    condition_name: ['name', 'condition', 'conditionName', 'title'],
+  },
+}
+
+const ITEM_LIST_STRING_FIELDS = {
+  proficiencies: 'name',
+}
+
+function hasUsableValue(value) {
+  return value !== undefined && value !== null && (typeof value !== 'string' || value.trim() !== '')
+}
+
+function firstUsableKey(source, keys) {
+  return keys.find((key) => hasUsableValue(source[key]))
+}
+
+export function normalizeItemList(key, items) {
+  if (!Array.isArray(items)) return items
+  const config = ITEM_LIST_CONFIGS.find((itemConfig) => itemConfig.key === key)
+  if (!config) return items
+  const aliases = ITEM_LIST_FIELD_ALIASES[key] || {}
+
+  return items.map((item) => {
+    if (typeof item === 'string') {
+      return { ...config.emptyItem, [ITEM_LIST_STRING_FIELDS[key] || config.fields[0].key]: item }
+    }
+    if (!item || typeof item !== 'object' || Array.isArray(item)) return item
+    const normalized = { ...config.emptyItem, ...item }
+    config.fields.forEach((field) => {
+      const sourceKey = firstUsableKey(item, [field.key, ...(aliases[field.key] || [])])
+      if (sourceKey) normalized[field.key] = item[sourceKey]
+    })
+    return normalized
+  })
+}
+
+export function normalizeCharacterDraft(draft) {
+  if (!draft || typeof draft !== 'object') return draft
+  const normalized = { ...draft }
+  ITEM_LIST_CONFIGS.forEach(({ key }) => {
+    if (key in normalized) normalized[key] = normalizeItemList(key, normalized[key])
+  })
+  return normalized
+}
+
 export function mergeCharacterDraft(draft) {
   const empty = makeEmptyCharacter()
-  if (!draft) return empty
+  const normalizedDraft = normalizeCharacterDraft(draft)
+  if (!normalizedDraft) return empty
   return {
     ...empty,
-    ...draft,
-    ability_scores: mergeGroup(empty.ability_scores, draft.ability_scores),
-    combat: mergeGroup(empty.combat, draft.combat),
-    general: mergeGroup(empty.general, draft.general),
+    ...normalizedDraft,
+    ability_scores: mergeGroup(empty.ability_scores, normalizedDraft.ability_scores),
+    combat: mergeGroup(empty.combat, normalizedDraft.combat),
+    general: mergeGroup(empty.general, normalizedDraft.general),
     spellcasting: {
-      ...mergeGroup(empty.spellcasting, draft.spellcasting),
-      spell_slots: mergeGroup(empty.spellcasting.spell_slots, draft.spellcasting?.spell_slots),
+      ...mergeGroup(empty.spellcasting, normalizedDraft.spellcasting),
+      spell_slots: mergeGroup(empty.spellcasting.spell_slots, normalizedDraft.spellcasting?.spell_slots),
     },
-    currency: mergeGroup(empty.currency, draft.currency),
-    personality: mergeGroup(empty.personality, draft.personality),
-    appearance: mergeGroup(empty.appearance, draft.appearance),
-    background_details: mergeGroup(empty.background_details, draft.background_details),
-    classes: draft.classes || empty.classes,
-    skills: draft.skills || empty.skills,
-    saving_throws: draft.saving_throws || empty.saving_throws,
-    proficiencies: draft.proficiencies || empty.proficiencies,
-    features: draft.features || empty.features,
-    weapons: draft.weapons || empty.weapons,
-    equipment: draft.equipment || empty.equipment,
-    spells: draft.spells || empty.spells,
-    notes: draft.notes || empty.notes,
-    resources: draft.resources || empty.resources,
-    companions: draft.companions || empty.companions,
-    conditions: draft.conditions || empty.conditions,
+    currency: mergeGroup(empty.currency, normalizedDraft.currency),
+    personality: mergeGroup(empty.personality, normalizedDraft.personality),
+    appearance: mergeGroup(empty.appearance, normalizedDraft.appearance),
+    background_details: mergeGroup(empty.background_details, normalizedDraft.background_details),
+    classes: normalizedDraft.classes || empty.classes,
+    skills: normalizedDraft.skills || empty.skills,
+    saving_throws: normalizedDraft.saving_throws || empty.saving_throws,
+    proficiencies: normalizedDraft.proficiencies || empty.proficiencies,
+    features: normalizedDraft.features || empty.features,
+    weapons: normalizedDraft.weapons || empty.weapons,
+    equipment: normalizedDraft.equipment || empty.equipment,
+    spells: normalizedDraft.spells || empty.spells,
+    notes: normalizedDraft.notes || empty.notes,
+    resources: normalizedDraft.resources || empty.resources,
+    companions: normalizedDraft.companions || empty.companions,
+    conditions: normalizedDraft.conditions || empty.conditions,
   }
 }
 
 export function flattenCharacter(character) {
+  const normalizedCharacter = normalizeCharacterDraft(character)
   return {
-    ...character,
-    ...character.ability_scores,
-    ...character.combat,
-    ...character.general,
-    ...character.spellcasting,
-    ...character.currency,
-    ...character.personality,
-    ...character.appearance,
-    ...character.background_details,
+    ...normalizedCharacter,
+    ...normalizedCharacter.ability_scores,
+    ...normalizedCharacter.combat,
+    ...normalizedCharacter.general,
+    ...normalizedCharacter.spellcasting,
+    ...normalizedCharacter.currency,
+    ...normalizedCharacter.personality,
+    ...normalizedCharacter.appearance,
+    ...normalizedCharacter.background_details,
   }
 }
 

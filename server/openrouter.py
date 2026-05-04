@@ -32,7 +32,13 @@ PLANNING_SYSTEM_PROMPT = (
 SUMMARY_SYSTEM_PROMPT = (
     "You update compact D&D campaign character-planning memory. Return only valid JSON. "
     "Preserve explicit player-stated points. Separate public facts from DM-private secrets. "
-    "Suggest bonds only when two or more specific player user IDs are involved and both should approve."
+    "Suggest bonds only when two or more specific player user IDs are involved and both should approve. "
+    "For explicit_player_points, return the complete canonical list for each user ID you include, not "
+    "a delta to append. Only include durable player-authored character choices, preferences, constraints, "
+    "boundaries, and accepted hooks. Exclude greetings, thanks, repeated wording, raw quoted messages, "
+    "and operational requests like asking the DM to create, write, generate, fill in, or help. If a "
+    "player delegates unspecified details to the DM, keep that as at most one concise durable preference "
+    "only when it should affect future character creation. Rewrite duplicates into one clear sentence."
 )
 
 DRAFT_SYSTEM_PROMPT = (
@@ -175,7 +181,7 @@ def get_planning_summary_update(context, latest_player_message, latest_dm_messag
                         'party_balance': 'short paragraph',
                         'confirmed_public_facts': ['facts visible to party'],
                         'dm_private_secrets': {'user_id': ['private facts or secrets']},
-                        'explicit_player_points': {'user_id': ['explicitly stated preferences, constraints, facts']},
+                        'explicit_player_points': {'user_id': ['complete canonical durable points for this user']},
                         'unresolved_gaps': ['party or story gaps still open'],
                         'accepted_hooks': ['confirmed hooks and approved bonds'],
                     },

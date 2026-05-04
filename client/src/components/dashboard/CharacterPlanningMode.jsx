@@ -20,6 +20,7 @@ import {
   flattenCharacter,
   makeEmptyCharacter,
   mergeCharacterDraft,
+  normalizeCharacterDraft,
 } from '../character/characterFormConfig'
 
 const VALID_PAGE_KEYS = new Set(CHARACTER_FORM_PAGES.map((page) => page.key))
@@ -219,8 +220,9 @@ export default function CharacterPlanningMode({ campaign, currentUser, onComplet
 
   const applyFormPatch = (patch) => {
     if (!patch || Object.keys(patch).length === 0) return
+    const normalizedPatch = normalizeCharacterDraft(patch)
     setDraftCharacter((prev) => {
-      const result = applySafePatch(prev, patch, touchedPaths, baselineCharacter)
+      const result = applySafePatch(prev, normalizedPatch, touchedPaths, baselineCharacter)
       setPendingSuggestions((existing) => [...existing, ...result.suggestions])
       return result.next
     })

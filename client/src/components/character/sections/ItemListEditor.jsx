@@ -41,6 +41,17 @@ export default function ItemListEditor({ title, items, onChange, fields, emptyIt
     onChange(next)
   }
 
+  const getItemLabel = (item) => {
+    if (typeof item === 'string') return item
+    if (!item || typeof item !== 'object') return 'Untitled'
+    const labelField = fields.find((field) => {
+      if (field.type === 'checkbox') return false
+      const value = item[field.key]
+      return value !== undefined && value !== null && String(value).trim() !== ''
+    })
+    return labelField ? item[labelField.key] : 'Untitled'
+  }
+
   const renderField = (field, value, onFieldChange) => {
     if (field.type === 'textarea') {
       return (
@@ -105,7 +116,7 @@ export default function ItemListEditor({ title, items, onChange, fields, emptyIt
               </div>
             ) : (
               <div className="item-display">
-                <span className="item-name">{item[fields[0].key] || 'Untitled'}</span>
+                <span className="item-name">{getItemLabel(item)}</span>
                 <div className="item-actions">
                   <Button onClick={() => startEdit(idx)} variant="secondary" className="small">Edit</Button>
                   <Button onClick={() => remove(idx)} variant="danger" className="small">Remove</Button>

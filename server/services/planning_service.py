@@ -20,7 +20,6 @@ SUMMARY_LIST_FIELDS = (
     'accepted_hooks',
 )
 
-
 def json_dumps(value):
     return json.dumps(value, ensure_ascii=False)
 
@@ -32,6 +31,37 @@ def json_loads(value, fallback):
         return json.loads(value)
     except (TypeError, ValueError):
         return fallback
+
+
+def normalize_summary_point(point):
+    return ' '.join(str(point or '').strip().split())
+
+
+def summary_point_key(point):
+    return normalize_summary_point(point).casefold()
+
+
+def clean_explicit_player_points(points_by_user):
+    if not isinstance(points_by_user, dict):
+        return {}
+
+    cleaned = {}
+    for user_id, points in points_by_user.items():
+        key = str(user_id)
+        values = points if isinstance(points, list) else [points]
+        seen = set()
+        user_points = []
+        for point in values:
+            text = normalize_summary_point(point)
+            point_key = summary_point_key(text)
+            if not text or not point_key or point_key in seen:
+                continue
+            seen.add(point_key)
+            user_points.append(text)
+        if user_points:
+            cleaned[key] = user_points
+
+    return cleaned
 
 
 def get_required_players(campaign):
@@ -116,7 +146,9 @@ def summary_dict_for_read(campaign_id, include_private=False, current_user_id=No
     summary = CampaignPlanningSummary.query.filter_by(campaign_id=campaign_id).first()
     if not summary:
         return default_summary_dict(campaign_id, include_private, current_user_id)
-    return summary.to_dict(include_private=include_private, current_user_id=current_user_id)
+    data = summary.to_dict(include_private=include_private, current_user_id=current_user_id)
+    data['explicit_player_points'] = clean_explicit_player_points(data.get('explicit_player_points', {}))
+    return data
 
 
 def clear_invalid_ready_states(members):
@@ -228,13 +260,15 @@ def merge_summary_update(summary, update):
             setattr(summary, field, json_dumps(merged))
 
     if 'explicit_player_points' in update and isinstance(update['explicit_player_points'], dict):
-        existing = json_loads(summary.explicit_player_points, {})
+        existing = clean_explicit_player_points(json_loads(summary.explicit_player_points, {}))
         for user_id, points in update['explicit_player_points'].items():
             key = str(user_id)
-            existing.setdefault(key, [])
-            for point in points if isinstance(points, list) else [points]:
-                if point and point not in existing[key]:
-                    existing[key].append(point)
+            canonical_points = clean_explicit_player_points({key: points}).get(key, [])
+            if canonical_points:
+                existing[key] = canonical_points
+            elif key in existing:
+                existing.pop(key)
+        existing = clean_explicit_player_points(existing)
         summary.explicit_player_points = json_dumps(existing)
 
     if 'dm_private_secrets' in update and isinstance(update['dm_private_secrets'], dict):

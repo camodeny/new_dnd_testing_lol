@@ -1993,12 +1993,15 @@ select.input:focus {
    ============================================================ */
 
 .lobby-page {
-  min-height: 100vh;
+  min-height: 100svh;
+  height: 100svh;
   display: flex;
   align-items: center;
   justify-content: center;
-  padding: 24px;
+  padding: 16px;
   position: relative;
+  overflow: hidden;
+  box-sizing: border-box;
 }
 
 .lobby-loading {
@@ -2040,15 +2043,20 @@ select.input:focus {
 }
 
 .lobby-container {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
   width: 100%;
-  max-width: 640px;
+  max-width: 980px;
+  max-height: 100%;
+  min-height: 0;
   animation: lobbySlideIn 0.5s cubic-bezier(0.16, 1, 0.3, 1);
 }
 
 .lobby-back-btn {
-  width: 40px;
-  height: 40px;
-  border-radius: 12px;
+  width: 36px;
+  height: 36px;
+  border-radius: 10px;
   background: #1a1a28;
   border: 1px solid #2e2e42;
   color: #b8b8c8;
@@ -2057,7 +2065,7 @@ select.input:focus {
   justify-content: center;
   cursor: pointer;
   font-size: 16px;
-  margin-bottom: 16px;
+  margin: 0;
   transition: background 0.2s, border-color 0.2s, color 0.2s;
 }
 
@@ -2073,18 +2081,33 @@ select.input:focus {
 }
 
 .lobby-card {
+  flex: 0 1 auto;
+  min-height: 0;
+  display: grid;
+  grid-template-columns: minmax(240px, 0.55fr) minmax(420px, 1fr);
+  grid-template-rows: auto auto;
+  grid-template-areas:
+    "hero party"
+    "footer invite";
+  align-items: stretch;
   background: #1a1a28;
   border: 1px solid #2e2e42;
-  border-radius: 24px;
+  border-radius: 18px;
   overflow: hidden;
   box-shadow: 0 8px 40px rgba(0, 0, 0, 0.3), 0 1px 3px rgba(0, 0, 0, 0.2);
 }
 
 .lobby-hero {
+  grid-area: hero;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
   text-align: center;
-  padding: 48px 32px 32px;
+  padding: 24px;
   position: relative;
   overflow: hidden;
+  border-right: 1px solid #2e2e42;
 }
 
 .lobby-hero::before {
@@ -2096,16 +2119,16 @@ select.input:focus {
 }
 
 .lobby-hero-avatar {
-  width: 80px;
-  height: 80px;
-  border-radius: 24px;
+  width: 64px;
+  height: 64px;
+  border-radius: 18px;
   display: flex;
   align-items: center;
   justify-content: center;
-  font-size: 28px;
+  font-size: 24px;
   font-weight: 700;
   color: #fff;
-  margin: 0 auto 20px;
+  margin: 0 auto 16px;
   text-shadow: 0 2px 4px rgba(0, 0, 0, 0.2);
   box-shadow: 0 8px 24px rgba(0, 0, 0, 0.3);
   position: relative;
@@ -2113,8 +2136,8 @@ select.input:focus {
 }
 
 .lobby-title {
-  margin: 0 0 12px;
-  font-size: 28px;
+  margin: 0 0 10px;
+  font-size: 26px;
   font-weight: 700;
   color: #e8e8e8;
   letter-spacing: -0.5px;
@@ -2127,7 +2150,7 @@ select.input:focus {
   align-items: center;
   justify-content: center;
   gap: 10px;
-  margin-bottom: 16px;
+  margin-bottom: 12px;
   flex-wrap: wrap;
   position: relative;
   z-index: 1;
@@ -2160,8 +2183,8 @@ select.input:focus {
 
 .lobby-desc {
   color: #9ca3af;
-  font-size: 15px;
-  line-height: 1.6;
+  font-size: 14px;
+  line-height: 1.45;
   margin: 0;
   max-width: 480px;
   margin: 0 auto;
@@ -2170,14 +2193,17 @@ select.input:focus {
 }
 
 .lobby-party-section {
-  padding: 0 32px 32px;
+  grid-area: party;
+  min-height: 0;
+  padding: 24px 24px 16px;
+  overflow: hidden;
 }
 
 .lobby-section-header {
   display: flex;
   justify-content: space-between;
   align-items: center;
-  margin-bottom: 20px;
+  margin-bottom: 14px;
 }
 
 .lobby-section-label {
@@ -2239,8 +2265,8 @@ select.input:focus {
 /* Players Grid */
 .lobby-players-grid {
   display: grid;
-  grid-template-columns: repeat(auto-fill, minmax(140px, 1fr));
-  gap: 16px;
+  grid-template-columns: repeat(auto-fit, minmax(124px, 1fr));
+  gap: 12px;
 }
 
 @media (max-width: 500px) {
@@ -2253,8 +2279,8 @@ select.input:focus {
   position: relative;
   background: #1f1f2e;
   border: 1px solid #2e2e42;
-  border-radius: 16px;
-  padding: 20px 12px 16px;
+  border-radius: 12px;
+  padding: 14px 10px 12px;
   text-align: center;
   transition: border-color 0.2s, background 0.2s, transform 0.2s;
 }
@@ -2279,16 +2305,16 @@ select.input:focus {
 }
 
 .lobby-slot-circle {
-  width: 56px;
-  height: 56px;
+  width: 48px;
+  height: 48px;
   border-radius: 50%;
   display: flex;
   align-items: center;
   justify-content: center;
-  font-size: 18px;
+  font-size: 16px;
   font-weight: 700;
   color: #fff;
-  margin: 0 auto 10px;
+  margin: 0 auto 8px;
   position: relative;
   text-shadow: 0 1px 2px rgba(0, 0, 0, 0.2);
   box-shadow: 0 4px 12px rgba(0, 0, 0, 0.2);
@@ -2390,7 +2416,7 @@ select.input:focus {
 
 /* Slots Progress */
 .lobby-slots-status {
-  margin-top: 20px;
+  margin-top: 14px;
   text-align: center;
 }
 
@@ -2416,8 +2442,10 @@ select.input:focus {
 
 /* Invite Section */
 .lobby-invite-section {
-  padding: 0 32px 24px;
-  margin-bottom: 8px;
+  grid-area: invite;
+  align-self: end;
+  padding: 0 24px 24px;
+  margin: 0;
 }
 
 .lobby-invite-section .lobby-section-label {
@@ -2427,15 +2455,15 @@ select.input:focus {
 .lobby-invite-card {
   background: #16171d;
   border: 1px solid #2e2e42;
-  border-radius: 14px;
-  padding: 20px;
+  border-radius: 12px;
+  padding: 14px;
 }
 
 .lobby-invite-desc {
   color: #9ca3af;
   font-size: 13px;
-  line-height: 1.5;
-  margin: 0 0 14px;
+  line-height: 1.4;
+  margin: 0 0 10px;
 }
 
 .lobby-invite-code-area {
@@ -2446,7 +2474,7 @@ select.input:focus {
   display: flex;
   align-items: center;
   gap: 10px;
-  margin-bottom: 10px;
+  margin-bottom: 8px;
 }
 
 .lobby-invite-code {
@@ -2454,10 +2482,10 @@ select.input:focus {
   display: block;
   background: #0d0d14;
   border: 2px solid #2e2e42;
-  border-radius: 10px;
-  padding: 14px 16px;
+  border-radius: 8px;
+  padding: 11px 14px;
   font-family: ui-monospace, SFMono-Regular, 'SF Mono', Menlo, monospace;
-  font-size: 18px;
+  font-size: 17px;
   font-weight: 600;
   color: #a78bfa;
   text-align: center;
@@ -2472,8 +2500,8 @@ select.input:focus {
   background: #6c63ff;
   color: #fff;
   border: none;
-  padding: 12px 18px;
-  border-radius: 10px;
+  padding: 11px 16px;
+  border-radius: 8px;
   font-size: 14px;
   font-weight: 500;
   cursor: pointer;
@@ -2536,9 +2564,12 @@ select.input:focus {
 
 /* Footer */
 .lobby-footer {
-  padding: 24px 32px 32px;
+  grid-area: footer;
+  align-self: end;
+  padding: 20px 24px 24px;
   text-align: center;
   border-top: 1px solid #2e2e42;
+  border-right: 1px solid #2e2e42;
 }
 
 .lobby-begin-btn {
@@ -2546,12 +2577,12 @@ select.input:focus {
   align-items: center;
   justify-content: center;
   gap: 10px;
-  padding: 16px 48px;
+  padding: 13px 24px;
   background: linear-gradient(135deg, #6c63ff, #a855f7);
   color: #fff;
   border: none;
-  border-radius: 14px;
-  font-size: 18px;
+  border-radius: 12px;
+  font-size: 15px;
   font-weight: 700;
   cursor: pointer;
   transition: transform 0.2s, box-shadow 0.2s, opacity 0.2s;
@@ -2589,21 +2620,57 @@ select.input:focus {
   display: flex;
   flex-direction: column;
   align-items: center;
-  gap: 12px;
+  gap: 10px;
 }
 
 .lobby-locked-msg {
   color: #6b7280;
-  font-size: 13px;
+  font-size: 12px;
   margin: 0;
   max-width: 360px;
   line-height: 1.4;
 }
 
+@media (max-width: 860px) {
+  .lobby-page {
+    height: auto;
+    min-height: 100svh;
+    align-items: flex-start;
+    overflow-y: auto;
+  }
+
+  .lobby-container {
+    max-width: 640px;
+  }
+
+  .lobby-card {
+    display: block;
+  }
+
+  .lobby-hero {
+    border-right: 0;
+    border-bottom: 1px solid #2e2e42;
+    padding: 28px 24px 22px;
+  }
+
+  .lobby-party-section {
+    padding: 22px 24px 18px;
+  }
+
+  .lobby-invite-section {
+    padding: 0 24px 22px;
+  }
+
+  .lobby-footer {
+    padding: 22px 24px 24px;
+    border-right: 0;
+  }
+}
+
 /* Character Planning */
 .planning-page {
   min-height: 100svh;
-  padding: 24px;
+  padding: 20px;
   background: #111827;
   color: #f9fafb;
   overflow-x: hidden;
@@ -2623,7 +2690,7 @@ select.input:focus {
   display: flex;
   align-items: center;
   gap: 16px;
-  margin-bottom: 20px;
+  margin-bottom: 18px;
   flex: 0 0 auto;
 }
 
@@ -2670,7 +2737,7 @@ select.input:focus {
   background: rgba(17, 24, 39, 0.9);
   border: 1px solid rgba(255, 255, 255, 0.1);
   border-radius: 8px;
-  padding: 18px;
+  padding: 16px;
   box-shadow: 0 18px 48px rgba(0, 0, 0, 0.28);
   box-sizing: border-box;
 }
@@ -2944,9 +3011,12 @@ select.input:focus {
 
 .planning-choice-layout,
 .planning-wait-layout {
-  display: flex;
-  flex-direction: column;
-  gap: 18px;
+  display: grid;
+  grid-template-columns: minmax(300px, 0.42fr) minmax(0, 0.58fr);
+  gap: 16px;
+  align-items: start;
+  max-width: 1480px;
+  margin: 0 auto;
 }
 
 .planning-create-layout {
@@ -2968,14 +3038,13 @@ select.input:focus {
 
 .planning-choice-panel,
 .planning-wait-panel {
-  min-height: 360px;
+  min-height: 0;
 }
 
 .planning-choice-panel {
-  display: grid;
-  grid-template-columns: minmax(260px, 0.75fr) minmax(360px, 1.25fr);
-  gap: 18px;
-  align-items: stretch;
+  display: flex;
+  flex-direction: column;
+  gap: 14px;
 }
 
 .planning-choice-copy,
@@ -2983,13 +3052,11 @@ select.input:focus {
   border: 1px solid rgba(255, 255, 255, 0.1);
   border-radius: 8px;
   background: rgba(17, 24, 39, 0.9);
-  padding: 24px;
+  padding: 20px;
 }
 
 .planning-choice-copy {
-  display: flex;
-  flex-direction: column;
-  justify-content: center;
+  display: block;
 }
 
 .planning-choice-copy h2,
@@ -3008,16 +3075,18 @@ select.input:focus {
 
 .planning-choice-actions {
   display: grid;
-  grid-template-columns: repeat(2, minmax(0, 1fr));
-  gap: 14px;
+  grid-template-columns: 1fr;
+  gap: 10px;
 }
 
 .planning-choice-card {
-  display: flex;
-  flex-direction: column;
+  display: grid;
+  grid-template-columns: 40px minmax(0, 1fr);
+  grid-template-areas:
+    "icon title"
+    "icon detail";
   align-items: flex-start;
-  justify-content: center;
-  min-height: 220px;
+  min-height: 112px;
   color: #f9fafb;
   text-align: left;
   cursor: pointer;
@@ -3031,18 +3100,25 @@ select.input:focus {
 }
 
 .planning-choice-card i {
-  margin-bottom: 22px;
+  grid-area: icon;
+  margin: 2px 0 0;
   color: #a78bfa;
-  font-size: 32px;
+  font-size: 28px;
+  line-height: 1;
 }
 
 .planning-choice-card span {
-  font-size: 20px;
+  grid-area: title;
+  min-width: 0;
+  font-size: 18px;
   font-weight: 900;
+  line-height: 1.2;
 }
 
 .planning-choice-card small {
-  margin-top: 8px;
+  grid-area: detail;
+  min-width: 0;
+  margin-top: 6px;
   color: rgba(255, 255, 255, 0.58);
   font-size: 13px;
   line-height: 1.45;
@@ -3051,8 +3127,8 @@ select.input:focus {
 .planning-choice-context,
 .planning-create-context {
   display: grid;
-  grid-template-columns: minmax(260px, 320px) repeat(2, minmax(0, 1fr));
-  gap: 18px;
+  grid-template-columns: minmax(260px, 340px) minmax(0, 1fr);
+  gap: 16px;
   align-items: start;
 }
 
@@ -3061,6 +3137,7 @@ select.input:focus {
   flex-direction: column;
   align-items: center;
   justify-content: center;
+  min-height: 360px;
   text-align: center;
 }
 
@@ -3243,7 +3320,7 @@ select.input:focus {
 
 .planning-party-info-grid {
   display: grid;
-  grid-template-columns: repeat(auto-fit, minmax(170px, 1fr));
+  grid-template-columns: repeat(2, minmax(0, 1fr));
   gap: 0 16px;
 }
 
@@ -3359,6 +3436,11 @@ select.input:focus {
   .planning-create-context {
     grid-template-columns: 1fr;
   }
+  .planning-choice-layout,
+  .planning-wait-layout {
+    grid-template-columns: 1fr;
+    max-width: 760px;
+  }
   .planning-create-layout {
     grid-template-columns: 1fr;
     grid-template-rows: auto;
@@ -3399,7 +3481,7 @@ select.input:focus {
     grid-template-columns: 1fr;
   }
   .planning-choice-card {
-    min-height: 150px;
+    min-height: 112px;
   }
   .planning-page-tabs {
     grid-template-columns: repeat(2, minmax(0, 1fr));
@@ -3683,5 +3765,8 @@ select.input:focus {
   .planning-chat-message.dm {
     margin-left: 0;
     margin-right: 0;
+  }
+  .planning-party-info-grid {
+    grid-template-columns: 1fr;
   }
 }

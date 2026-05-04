@@ -12,7 +12,7 @@ import BackgroundSection from './sections/BackgroundSection'
 import ItemListEditor from './sections/ItemListEditor'
 import FormGroup from '../common/FormGroup'
 import NumberInput from '../common/NumberInput'
-import { ITEM_LIST_CONFIGS, flattenCharacter, mergeCharacterDraft } from './characterFormConfig'
+import { ITEM_LIST_CONFIGS, flattenCharacter, mergeCharacterDraft, normalizeItemList } from './characterFormConfig'
 
 const ITEM_CONFIG_BY_KEY = Object.fromEntries(ITEM_LIST_CONFIGS.map((config) => [config.key, config]))
 
@@ -97,7 +97,7 @@ export function CharacterFormBody({ character, setCharacter, sections, onFieldTo
     return (
       <ItemListEditor
         key={key}
-        items={character[key]}
+        items={normalizeItemList(key, character[key] || [])}
         onChange={(items) => updateField(key, items)}
         {...editorConfig}
       />
