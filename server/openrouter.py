@@ -5,7 +5,7 @@ from dotenv import load_dotenv
 load_dotenv()
 
 OPENROUTER_API_KEY = os.environ.get('OPENROUTER_API_KEY', '')
-OPENROUTER_MODEL = os.environ.get('OPENROUTER_MODEL', 'anthropic/claude-sonnet-4-20250514')
+OPENROUTER_MODEL = os.environ.get('OPENROUTER_MODEL', '')
 API_URL = 'https://openrouter.ai/api/v1/chat/completions'
 
 SYSTEM_PROMPT = (
@@ -19,7 +19,9 @@ SYSTEM_PROMPT = (
 
 def get_dm_response(session_messages):
     if not OPENROUTER_API_KEY:
-        return None
+        raise RuntimeError('OPENROUTER_API_KEY is not set')
+    if not OPENROUTER_MODEL:
+        raise RuntimeError('OPENROUTER_MODEL is not set')
 
     messages = [{'role': 'system', 'content': SYSTEM_PROMPT}]
     for msg in session_messages:

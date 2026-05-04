@@ -103,7 +103,11 @@ def send_message(current_user, session_id):
     db.session.commit()
     result_messages = [msg.to_dict()]
 
-    ai_text = get_dm_response(session.messages)
+    try:
+        ai_text = get_dm_response(session.messages)
+    except RuntimeError as err:
+        return jsonify({'error': str(err), 'messages': result_messages}), 500
+
     if ai_text:
         ai_msg = SessionMessage(
             session_id=session_id,
