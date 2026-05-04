@@ -132,6 +132,47 @@ export function removeMember(campaignId, userId) {
   return apiFetch(`/campaigns/${campaignId}/members/${userId}`, { method: 'DELETE' })
 }
 
+// Character planning
+export function getCampaignPlanning(campaignId) {
+  return apiFetch(`/campaigns/${campaignId}/planning`)
+}
+
+export function sendPlanningMessage(campaignId, content, options = {}) {
+  return apiFetch(`/campaigns/${campaignId}/planning/messages`, {
+    method: 'POST',
+    body: JSON.stringify({
+      content,
+      draft_character: options.draftCharacter,
+      active_page: options.activePage,
+    }),
+  })
+}
+
+export function generateCharacterDraft(campaignId) {
+  return apiFetch(`/campaigns/${campaignId}/planning/draft`, { method: 'POST' })
+}
+
+export function selectPlanningCharacter(campaignId, characterId) {
+  return apiFetch(`/campaigns/${campaignId}/planning/character`, {
+    method: 'PUT',
+    body: JSON.stringify({ character_id: characterId }),
+  })
+}
+
+export function setPlanningReady(campaignId, ready) {
+  return apiFetch(`/campaigns/${campaignId}/planning/ready`, {
+    method: 'PUT',
+    body: JSON.stringify({ ready }),
+  })
+}
+
+export function updatePlanningBond(campaignId, bondId, payload) {
+  return apiFetch(`/campaigns/${campaignId}/planning/bonds/${bondId}`, {
+    method: 'PUT',
+    body: JSON.stringify(payload),
+  })
+}
+
 // Notes
 export function listNotes(campaignId) {
   return apiFetch(`/campaigns/${campaignId}/notes`)
@@ -165,6 +206,4 @@ export function updateNPC(npcId, payload) {
 export function deleteNPC(npcId) {
   return apiFetch(`/npcs/${npcId}`, { method: 'DELETE' })
 }
-
-
 

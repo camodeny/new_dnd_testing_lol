@@ -11,6 +11,7 @@ from routes.campaigns import campaigns_bp
 from routes.characters import characters_bp
 from routes.dev import dev_bp
 from routes.members import members_bp
+from routes.planning import planning_bp
 from routes.sessions import sessions_bp
 
 load_dotenv()
@@ -32,6 +33,7 @@ def create_app():
     app.register_blueprint(characters_bp)
     app.register_blueprint(dev_bp)
     app.register_blueprint(members_bp)
+    app.register_blueprint(planning_bp)
     app.register_blueprint(sessions_bp)
 
     @app.route('/api/health')
@@ -40,8 +42,22 @@ def create_app():
 
     with app.app_context():
         db.create_all()
+        ensure_lightweight_schema()
 
     return app
+
+
+def ensure_lightweight_schema():
+    """Apply additive SQLite schema updates for dev databases without Alembic."""
+    campaign_member_columns = {
+        row[1]
+        for row in db.session.execute(text('PRAGMA table_info(campaign_members)')).fetchall()
+    }
+    if 'selected_character_id' not in campaign_member_columns:
+        db.session.execute(text('ALTER TABLE campaign_members ADD COLUMN selected_character_id INTEGER'))
+    if 'character_ready_at' not in campaign_member_columns:
+        db.session.execute(text('ALTER TABLE campaign_members ADD COLUMN character_ready_at DATETIME'))
+    db.session.commit()
 
 
 app = create_app()

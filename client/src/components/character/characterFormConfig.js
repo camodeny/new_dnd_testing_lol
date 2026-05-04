@@ -34,6 +34,75 @@ export function makeEmptyCharacter() {
   }
 }
 
+export const CHARACTER_FORM_PAGES = [
+  {
+    key: 'identity',
+    label: 'Identity',
+    icon: 'bi-person-vcard',
+    sections: ['basic', 'classes'],
+  },
+  {
+    key: 'scores',
+    label: 'Scores',
+    icon: 'bi-bar-chart',
+    sections: ['ability_scores', 'skills', 'saving_throws', 'proficiencies'],
+  },
+  {
+    key: 'combat',
+    label: 'Combat',
+    icon: 'bi-shield-shaded',
+    sections: ['combat', 'general', 'weapons', 'resources'],
+  },
+  {
+    key: 'magic_gear',
+    label: 'Magic & Gear',
+    icon: 'bi-stars',
+    sections: ['spellcasting', 'spells', 'equipment', 'currency'],
+  },
+  {
+    key: 'story',
+    label: 'Story',
+    icon: 'bi-book',
+    sections: ['personality', 'appearance', 'background_details', 'features', 'notes', 'companions', 'conditions'],
+  },
+]
+
+function mergeGroup(base, value) {
+  return { ...(base || {}), ...(value || {}) }
+}
+
+export function mergeCharacterDraft(draft) {
+  const empty = makeEmptyCharacter()
+  if (!draft) return empty
+  return {
+    ...empty,
+    ...draft,
+    ability_scores: mergeGroup(empty.ability_scores, draft.ability_scores),
+    combat: mergeGroup(empty.combat, draft.combat),
+    general: mergeGroup(empty.general, draft.general),
+    spellcasting: {
+      ...mergeGroup(empty.spellcasting, draft.spellcasting),
+      spell_slots: mergeGroup(empty.spellcasting.spell_slots, draft.spellcasting?.spell_slots),
+    },
+    currency: mergeGroup(empty.currency, draft.currency),
+    personality: mergeGroup(empty.personality, draft.personality),
+    appearance: mergeGroup(empty.appearance, draft.appearance),
+    background_details: mergeGroup(empty.background_details, draft.background_details),
+    classes: draft.classes || empty.classes,
+    skills: draft.skills || empty.skills,
+    saving_throws: draft.saving_throws || empty.saving_throws,
+    proficiencies: draft.proficiencies || empty.proficiencies,
+    features: draft.features || empty.features,
+    weapons: draft.weapons || empty.weapons,
+    equipment: draft.equipment || empty.equipment,
+    spells: draft.spells || empty.spells,
+    notes: draft.notes || empty.notes,
+    resources: draft.resources || empty.resources,
+    companions: draft.companions || empty.companions,
+    conditions: draft.conditions || empty.conditions,
+  }
+}
+
 export function flattenCharacter(character) {
   return {
     ...character,

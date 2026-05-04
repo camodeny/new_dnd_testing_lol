@@ -57,7 +57,7 @@ export default function CampaignLobby({
     try {
       const data = await listMembers(campaign.id)
       setMembers(data.members || [])
-    } catch (err) {
+    } catch {
       // Silently keep current members on error
     } finally {
       setLoading(false)
@@ -68,14 +68,16 @@ export default function CampaignLobby({
     try {
       const data = await createInvite(campaign.id)
       setInvite(data.invite)
-    } catch (err) {
+    } catch {
       // Silently fail - we'll show the create button
     }
   }, [campaign.id])
 
   useEffect(() => {
-    loadMembers()
-    checkExistingInvite()
+    Promise.resolve().then(() => {
+      loadMembers()
+      checkExistingInvite()
+    })
     const interval = setInterval(loadMembers, 5000)
     return () => clearInterval(interval)
   }, [loadMembers, checkExistingInvite])
@@ -141,7 +143,6 @@ export default function CampaignLobby({
   }
 
   const filledSlots = members.length
-  const emptySlots = Math.max(0, requiredPlayers - filledSlots)
   const allSlotsFilled = filledSlots >= requiredPlayers
   const needed = requiredPlayers - filledSlots
 

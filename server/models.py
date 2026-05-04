@@ -619,7 +619,10 @@ class CampaignMember(db.Model):
     user_id = db.Column(db.Integer, db.ForeignKey('users.id'), nullable=False)
     role = db.Column(db.String(20), default='player')
     joined_at = db.Column(db.DateTime, default=datetime.utcnow)
+    selected_character_id = db.Column(db.Integer, db.ForeignKey('characters.id'), nullable=True)
+    character_ready_at = db.Column(db.DateTime, nullable=True)
     user = db.relationship('User')
+    selected_character = db.relationship('Character', foreign_keys=[selected_character_id])
 
     def to_dict(self):
         return {
@@ -629,6 +632,9 @@ class CampaignMember(db.Model):
             'username': self.user.username if self.user else None,
             'role': self.role,
             'joined_at': self.joined_at.isoformat() if self.joined_at else None,
+            'selected_character_id': self.selected_character_id,
+            'character_ready_at': self.character_ready_at.isoformat() if self.character_ready_at else None,
+            'is_character_ready': self.character_ready_at is not None and self.selected_character_id is not None,
         }
 
 
@@ -651,4 +657,108 @@ class CampaignInvite(db.Model):
             'created_by': self.created_by,
             'expires_at': self.expires_at.isoformat() if self.expires_at else None,
             'is_used': self.is_used,
+        }
+
+
+class CharacterPlanningMessage(db.Model):
+    __tablename__ = 'character_planning_messages'
+
+    id = db.Column(db.Integer, primary_key=True)
+    campaign_id = db.Column(db.Integer, db.ForeignKey('campaign.id'), nullable=False)
+    user_id = db.Column(db.Integer, db.ForeignKey('users.id'), nullable=False)
+    role = db.Column(db.String(20), nullable=False)
+    content = db.Column(db.Text, nullable=False)
+    created_at = db.Column(db.DateTime, default=datetime.utcnow)
+    campaign = db.relationship('Campaign')
+    user = db.relationship('User')
+
+    def to_dict(self):
+        return {
+            'id': self.id,
+            'campaign_id': self.campaign_id,
+            'user_id': self.user_id,
+            'role': self.role,
+            'content': self.content,
+            'created_at': self.created_at.isoformat() if self.created_at else None,
+        }
+
+
+class CampaignPlanningSummary(db.Model):
+    __tablename__ = 'campaign_planning_summaries'
+
+    id = db.Column(db.Integer, primary_key=True)
+    campaign_id = db.Column(db.Integer, db.ForeignKey('campaign.id'), nullable=False, unique=True)
+    party_balance = db.Column(db.Text, nullable=True)
+    confirmed_public_facts = db.Column(db.Text, nullable=True)
+    dm_private_secrets = db.Column(db.Text, nullable=True)
+    explicit_player_points = db.Column(db.Text, nullable=True)
+    unresolved_gaps = db.Column(db.Text, nullable=True)
+    accepted_hooks = db.Column(db.Text, nullable=True)
+    updated_at = db.Column(db.DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
+    campaign = db.relationship('Campaign')
+
+    def to_dict(self, include_private=False, current_user_id=None):
+        import json
+
+        def loads(value, fallback):
+            if not value:
+                return fallback
+            try:
+                return json.loads(value)
+            except (TypeError, ValueError):
+                return fallback
+
+        secrets = loads(self.dm_private_secrets, {})
+        if not include_private:
+            current_key = str(current_user_id) if current_user_id is not None else None
+            secrets = {current_key: secrets.get(current_key, [])} if current_key and current_key in secrets else {}
+
+        return {
+            'id': self.id,
+            'campaign_id': self.campaign_id,
+            'party_balance': loads(self.party_balance, ''),
+            'confirmed_public_facts': loads(self.confirmed_public_facts, []),
+            'dm_private_secrets': secrets,
+            'explicit_player_points': loads(self.explicit_player_points, {}),
+            'unresolved_gaps': loads(self.unresolved_gaps, []),
+            'accepted_hooks': loads(self.accepted_hooks, []),
+            'updated_at': self.updated_at.isoformat() if self.updated_at else None,
+        }
+
+
+class PlanningBondProposal(db.Model):
+    __tablename__ = 'planning_bond_proposals'
+
+    id = db.Column(db.Integer, primary_key=True)
+    campaign_id = db.Column(db.Integer, db.ForeignKey('campaign.id'), nullable=False)
+    title = db.Column(db.String(200), nullable=False)
+    description = db.Column(db.Text, nullable=False)
+    involved_user_ids = db.Column(db.Text, nullable=False)
+    approval_states = db.Column(db.Text, nullable=True)
+    status = db.Column(db.String(20), default='pending')
+    created_at = db.Column(db.DateTime, default=datetime.utcnow)
+    updated_at = db.Column(db.DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
+    campaign = db.relationship('Campaign')
+
+    def to_dict(self):
+        import json
+
+        def loads(value, fallback):
+            if not value:
+                return fallback
+            try:
+                return json.loads(value)
+            except (TypeError, ValueError):
+                return fallback
+
+        return {
+            'id': self.id,
+            'campaign_id': self.campaign_id,
+            'title': self.title,
+            'description': self.description,
+            'involved_user_ids': loads(self.involved_user_ids, []),
+            'approval_states': loads(self.approval_states, {}),
+            'status': self.status,
+            'created_at': self.created_at.isoformat() if self.created_at else None,
+            'updated_at': self.updated_at.isoformat() if self.updated_at else None,
         }

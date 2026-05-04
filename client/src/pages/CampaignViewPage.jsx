@@ -6,12 +6,14 @@ import {
   getCharacters,
   addCampaignCharacter,
   listMembers,
+  getCampaignPlanning,
 } from '../api/client'
 import Loading from '../components/common/Loading'
 import ErrorMessage from '../components/common/ErrorMessage'
 import PartyRoster from '../components/dashboard/PartyRoster'
 import SessionPanel from '../components/dashboard/SessionPanel'
 import CampaignLobby from '../components/dashboard/CampaignLobby'
+import CharacterPlanningMode from '../components/dashboard/CharacterPlanningMode'
 
 function formatDate(iso) {
   if (!iso) return ''
@@ -93,6 +95,7 @@ export default function CampaignViewPage({ user }) {
   const [campaignName, setCampaignName] = useState('')
   const [campaignDesc, setCampaignDesc] = useState('')
   const [showLobby, setShowLobby] = useState(false)
+  const [showPlanning, setShowPlanning] = useState(false)
 
   const [showImport, setShowImport] = useState(false)
   const [availableChars, setAvailableChars] = useState([])
@@ -106,6 +109,20 @@ export default function CampaignViewPage({ user }) {
       setCharacters(data.characters)
       setSession(data.activeSession)
       setMessages(data.messages)
+      const required = data.campaign.settings?.required_players || 1
+      const memData = await listMembers(id)
+      const memberCount = (memData.members || []).length
+      if (!data.activeSession && memberCount < required) {
+        setShowLobby(true)
+        setShowPlanning(false)
+      } else if (!data.activeSession) {
+        const planningData = await getCampaignPlanning(id)
+        setShowLobby(false)
+        setShowPlanning(!planningData.planning?.all_ready)
+      } else {
+        setShowLobby(false)
+        setShowPlanning(false)
+      }
     } catch (err) {
       setError(err.message)
     } finally {
@@ -126,18 +143,28 @@ export default function CampaignViewPage({ user }) {
         setSession(data.activeSession)
         setMessages(data.messages)
 
-        const required = data.campaign.settings?.required_players
-        if (required !== undefined && required > 1) {
-          try {
-            const memData = await listMembers(id)
+        const required = data.campaign.settings?.required_players || 1
+        try {
+          const memData = await listMembers(id)
+          if (!isMounted) return
+          const memberCount = (memData.members || []).length
+          if (!data.activeSession && memberCount < required) {
+            setShowLobby(true)
+            setShowPlanning(false)
+          } else if (!data.activeSession) {
+            const planningData = await getCampaignPlanning(id)
             if (!isMounted) return
-            const memberCount = (memData.members || []).length
-            if (memberCount < required && !data.activeSession) {
-              setShowLobby(true)
-            }
-          } catch (err) {
-            // If member fetch fails, still show dashboard
-            if (isMounted) setShowLobby(false)
+            setShowLobby(false)
+            setShowPlanning(!planningData.planning?.all_ready)
+          } else {
+            setShowLobby(false)
+            setShowPlanning(false)
+          }
+        } catch {
+          // If planning fetch fails, still show dashboard with the start-session backend gate.
+          if (isMounted) {
+            setShowLobby(false)
+            setShowPlanning(false)
           }
         }
       } catch (err) {
@@ -239,6 +266,7 @@ export default function CampaignViewPage({ user }) {
 
   const handleBeginAdventure = () => {
     setShowLobby(false)
+    setShowPlanning(true)
   }
 
   if (loading) return <Loading />
@@ -251,6 +279,16 @@ export default function CampaignViewPage({ user }) {
         campaign={campaign}
         currentUser={user}
         onBegin={handleBeginAdventure}
+      />
+    )
+  }
+
+  if (showPlanning && !session) {
+    return (
+      <CharacterPlanningMode
+        campaign={campaign}
+        currentUser={user}
+        onComplete={loadData}
       />
     )
   }

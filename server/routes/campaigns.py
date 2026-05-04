@@ -155,5 +155,9 @@ def add_campaign_character(current_user, campaign_id):
         return jsonify({'error': 'Forbidden'}), 403
 
     character.campaign_id = campaign_id
+    member = CampaignMember.query.filter_by(campaign_id=campaign_id, user_id=current_user.id).first()
+    if member:
+        member.selected_character_id = character.id
+        member.character_ready_at = None
     db.session.commit()
     return jsonify({'character': character_full_dict(character)}), 200

@@ -4,8 +4,9 @@ from flask import Blueprint, jsonify, request
 
 from auth import token_required
 from models import db, Campaign, CampaignSession, SessionMessage
-from openrouter import get_dm_response
+from openrouter import get_dm_response_with_context
 from services.campaign_service import ensure_member
+from services.planning_service import can_start_session, planning_context
 
 sessions_bp = Blueprint('sessions', __name__)
 
@@ -20,6 +21,14 @@ def start_session(current_user, campaign_id):
     active = CampaignSession.query.filter_by(campaign_id=campaign_id, is_active=True).first()
     if active:
         return jsonify({'error': 'An active session already exists'}), 400
+
+    ready, details = can_start_session(campaign)
+    if not ready:
+        db.session.commit()
+        return jsonify({
+            'error': 'Every party member must select and ready a character before starting a session',
+            'planning': details,
+        }), 400
 
     session = CampaignSession(campaign_id=campaign_id)
     db.session.add(session)
@@ -104,7 +113,8 @@ def send_message(current_user, session_id):
     result_messages = [msg.to_dict()]
 
     try:
-        ai_text = get_dm_response(session.messages)
+        context = planning_context(campaign, current_user)
+        ai_text = get_dm_response_with_context(session.messages, context)
     except RuntimeError as err:
         return jsonify({'error': str(err), 'messages': result_messages}), 500
 
