@@ -1,5 +1,6 @@
 import os
 import json
+from uuid import uuid4
 import requests
 from dotenv import load_dotenv
 
@@ -76,12 +77,24 @@ def _post_chat(messages, json_mode=False, audit_context=None):
     campaign_id = audit_context.get('campaign_id')
     operation = audit_context.get('operation') or 'chat_completion'
     actor = audit_context.get('actor') or 'dm'
+    trace_id = audit_context.get('trace_id') or f'{actor}:{operation}:{uuid4().hex[:10]}'
+    parent_trace_id = audit_context.get('parent_trace_id')
+    trace_label = audit_context.get('trace_label') or f'{actor}: {operation}'
 
     try:
         _require_openrouter_config()
     except Exception as err:
         if campaign_id:
-            log_model_error(campaign_id, operation, actor, err, commit=True)
+            log_model_error(
+                campaign_id,
+                operation,
+                actor,
+                err,
+                commit=True,
+                trace_id=trace_id,
+                parent_trace_id=parent_trace_id,
+                trace_label=trace_label,
+            )
         raise
 
     payload = {
@@ -98,6 +111,9 @@ def _post_chat(messages, json_mode=False, audit_context=None):
             OPENROUTER_MODEL,
             json_mode=json_mode,
             commit=True,
+            trace_id=trace_id,
+            parent_trace_id=parent_trace_id,
+            trace_label=trace_label,
         )
 
     try:
@@ -113,11 +129,29 @@ def _post_chat(messages, json_mode=False, audit_context=None):
         resp.raise_for_status()
         data = resp.json()
         if campaign_id:
-            log_model_response(campaign_id, operation, actor, data, commit=True)
+            log_model_response(
+                campaign_id,
+                operation,
+                actor,
+                data,
+                commit=True,
+                trace_id=trace_id,
+                parent_trace_id=parent_trace_id,
+                trace_label=trace_label,
+            )
         return data['choices'][0]['message']['content']
     except Exception as err:
         if campaign_id:
-            log_model_error(campaign_id, operation, actor, err, commit=True)
+            log_model_error(
+                campaign_id,
+                operation,
+                actor,
+                err,
+                commit=True,
+                trace_id=trace_id,
+                parent_trace_id=parent_trace_id,
+                trace_label=trace_label,
+            )
         raise
 
 

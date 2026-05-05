@@ -51,14 +51,27 @@ def create_app():
 
 def ensure_lightweight_schema():
     """Apply additive SQLite schema updates for dev databases without Alembic."""
-    campaign_member_columns = {
-        row[1]
-        for row in db.session.execute(text('PRAGMA table_info(campaign_members)')).fetchall()
-    }
+    def table_columns(table_name):
+        return {
+            row[1]
+            for row in db.session.execute(text(f'PRAGMA table_info({table_name})')).fetchall()
+        }
+
+    campaign_member_columns = table_columns('campaign_members')
     if 'selected_character_id' not in campaign_member_columns:
         db.session.execute(text('ALTER TABLE campaign_members ADD COLUMN selected_character_id INTEGER'))
     if 'character_ready_at' not in campaign_member_columns:
         db.session.execute(text('ALTER TABLE campaign_members ADD COLUMN character_ready_at DATETIME'))
+
+    audit_event_columns = table_columns('campaign_audit_events')
+    if 'trace_id' not in audit_event_columns:
+        db.session.execute(text('ALTER TABLE campaign_audit_events ADD COLUMN trace_id VARCHAR(160)'))
+    if 'parent_trace_id' not in audit_event_columns:
+        db.session.execute(text('ALTER TABLE campaign_audit_events ADD COLUMN parent_trace_id VARCHAR(160)'))
+    if 'trace_label' not in audit_event_columns:
+        db.session.execute(text('ALTER TABLE campaign_audit_events ADD COLUMN trace_label VARCHAR(200)'))
+    if 'audit_role' not in audit_event_columns:
+        db.session.execute(text('ALTER TABLE campaign_audit_events ADD COLUMN audit_role VARCHAR(20)'))
     db.session.commit()
 
 

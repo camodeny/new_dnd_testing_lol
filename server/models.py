@@ -922,6 +922,10 @@ class CampaignAuditEvent(db.Model):
     event_type = db.Column(db.String(80), nullable=False, index=True)
     source = db.Column(db.String(120), nullable=True)
     actor = db.Column(db.String(120), nullable=True)
+    trace_id = db.Column(db.String(160), nullable=True, index=True)
+    parent_trace_id = db.Column(db.String(160), nullable=True, index=True)
+    trace_label = db.Column(db.String(200), nullable=True)
+    audit_role = db.Column(db.String(20), nullable=True)
     summary = db.Column(db.Text, nullable=False)
     payload = db.Column(db.Text, nullable=True)
     created_at = db.Column(db.DateTime, default=datetime.utcnow, index=True)
@@ -940,6 +944,10 @@ class CampaignAuditEvent(db.Model):
             'event_type': self.event_type,
             'source': self.source,
             'actor': self.actor,
+            'trace_id': self.trace_id,
+            'parent_trace_id': self.parent_trace_id,
+            'trace_label': self.trace_label,
+            'audit_role': self.audit_role,
             'summary': self.summary,
             'payload': payload,
             'created_at': self.created_at.isoformat() if self.created_at else None,

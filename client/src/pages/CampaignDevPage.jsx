@@ -57,27 +57,150 @@ function JsonPanel({ title, value, summary, defaultOpen = false }) {
   )
 }
 
-function AuditEventCard({ event }) {
-  const payload = event.payload || {}
-  const messageCount = payload.messages?.length || payload.raw_response?.choices?.length || null
+function roleLabel(role) {
+  if (role === 'player') return 'Player'
+  if (role === 'agent') return 'Agent'
+  return 'Tools'
+}
+
+function summarizeContent(content) {
+  if (content == null) return ''
+  if (typeof content === 'string') return content
+  return stringify(content)
+}
+
+function MessageTranscript({ messages, title = 'Messages sent' }) {
+  if (!messages?.length) return null
 
   return (
-    <article className={`campaign-dev-event campaign-dev-event-${event.event_type}`}>
+    <details className="campaign-dev-details campaign-dev-transcript">
+      <summary>
+        <span>{title}</span>
+        <span className="campaign-dev-summary">{messages.length} message{messages.length === 1 ? '' : 's'}</span>
+      </summary>
+      <div className="campaign-dev-transcript-list">
+        {messages.map((message, index) => (
+          <div key={`${message.role || 'message'}-${index}`} className={`campaign-dev-transcript-message campaign-dev-transcript-${message.role || 'unknown'}`}>
+            <div className="campaign-dev-message-meta">
+              <span className={`campaign-dev-pill campaign-dev-pill-message-${message.role || 'unknown'}`}>{message.role || 'unknown'}</span>
+              <span>message {index + 1}</span>
+              {message.name && <span>name {message.name}</span>}
+              {message.tool_call_id && <span>tool call {message.tool_call_id}</span>}
+            </div>
+            <pre className="campaign-dev-transcript-content">{summarizeContent(message.content) || '(empty)'}</pre>
+            {Object.keys(message).some((key) => !['role', 'content', 'name', 'tool_call_id'].includes(key)) && (
+              <JsonPanel title="Full message object" value={message} summary="All fields on this message" />
+            )}
+          </div>
+        ))}
+      </div>
+    </details>
+  )
+}
+
+function ReasoningPanel({ reasoning }) {
+  if (!reasoning) return null
+  const usage = reasoning.usage || {}
+
+  return (
+    <details className="campaign-dev-details campaign-dev-reasoning">
+      <summary>
+        <span>Reasoning</span>
+        <span className="campaign-dev-summary">
+          {reasoning.returned ? 'returned by provider' : 'No reasoning returned'}
+          {usage.reasoning_tokens != null ? `, ${usage.reasoning_tokens} tokens` : ''}
+        </span>
+      </summary>
+      {reasoning.returned ? (
+        <div className="campaign-dev-reasoning-body">
+          {reasoning.reasoning && (
+            <pre className="campaign-dev-code">{reasoning.reasoning}</pre>
+          )}
+          {reasoning.reasoning_details && (
+            <JsonPanel title="reasoning_details" value={reasoning.reasoning_details} summary="Provider-returned reasoning blocks" defaultOpen />
+          )}
+          <JsonPanel title="Reasoning usage" value={usage} summary="Usage fields related to reasoning tokens" />
+        </div>
+      ) : (
+        <div className="campaign-dev-empty campaign-dev-empty-compact">
+          This model response did not include OpenRouter reasoning fields.
+        </div>
+      )}
+    </details>
+  )
+}
+
+function AuditStreamCard({ entry }) {
+  const payload = entry.payload || {}
+  const messageCount = entry.message_count || payload.raw_response?.choices?.length || null
+  const content = entry.content || payload.message?.content || payload.content || entry.summary
+
+  return (
+    <article className={`campaign-dev-event campaign-dev-stream-entry campaign-dev-stream-${entry.role}`}>
       <div className="campaign-dev-event-rail">
-        <span>{event.id}</span>
+        <span>{entry.id}</span>
       </div>
       <div className="campaign-dev-event-body">
         <div className="campaign-dev-message-meta">
-          <span className={`campaign-dev-pill campaign-dev-pill-${event.event_type}`}>{formatEventType(event.event_type)}</span>
-          <span>{formatDateTime(event.created_at)}</span>
-          {event.actor && <span>actor {event.actor}</span>}
-          {event.source && <span>source {event.source}</span>}
+          <span className={`campaign-dev-pill campaign-dev-pill-role-${entry.role}`}>{roleLabel(entry.role)}</span>
+          <span className={`campaign-dev-pill campaign-dev-pill-${entry.event_type}`}>{formatEventType(entry.event_type)}</span>
+          <span>{formatDateTime(entry.created_at)}</span>
+          {entry.actor && <span>actor {entry.actor}</span>}
+          {entry.source && <span>source {entry.source}</span>}
+          {entry.trace_id && <span>trace {entry.trace_id}</span>}
           {messageCount ? <span>{messageCount} item{messageCount === 1 ? '' : 's'}</span> : null}
         </div>
-        <div className="campaign-dev-message-content">{event.summary}</div>
+        <div className="campaign-dev-message-content">{content || '(empty)'}</div>
+        <MessageTranscript messages={entry.messages} />
+        <ReasoningPanel reasoning={entry.reasoning} />
         <JsonPanel title="Payload" value={payload} summary="Full captured input/output" />
       </div>
     </article>
+  )
+}
+
+function AgentRunNode({ run, depth = 0 }) {
+  const events = run.events || []
+  const modelRequests = events.filter((event) => event.event_type === 'model_request')
+  const modelResponses = events.filter((event) => event.event_type === 'model_response')
+
+  return (
+    <details className="campaign-dev-agent-run" open={depth === 0}>
+      <summary>
+        <span>{run.trace_label || run.trace_id}</span>
+        <span className="campaign-dev-summary">
+          {events.length} event{events.length === 1 ? '' : 's'}
+          {modelRequests.length ? `, ${modelRequests.length} request${modelRequests.length === 1 ? '' : 's'}` : ''}
+          {modelResponses.some((event) => event.reasoning?.returned) ? ', reasoning returned' : ''}
+        </span>
+      </summary>
+      <div className="campaign-dev-agent-run-body">
+        <div className="campaign-dev-message-meta">
+          <span>trace {run.trace_id}</span>
+          {run.parent_trace_id && <span>parent {run.parent_trace_id}</span>}
+          {run.actor && <span>actor {run.actor}</span>}
+        </div>
+        <div className="campaign-dev-agent-events">
+          {events.map((event) => (
+            <div key={event.id} className="campaign-dev-agent-event">
+              <div className="campaign-dev-message-meta">
+                <span className={`campaign-dev-pill campaign-dev-pill-role-${event.role}`}>{roleLabel(event.role)}</span>
+                <span>{formatEventType(event.event_type)}</span>
+                <span>{formatDateTime(event.created_at)}</span>
+              </div>
+              <div className="campaign-dev-message-content">{event.summary}</div>
+              <MessageTranscript messages={event.messages} title="Fed message history" />
+              <ReasoningPanel reasoning={event.reasoning} />
+            </div>
+          ))}
+        </div>
+        {run.children?.length ? (
+          <div className="campaign-dev-agent-children">
+            {run.children.map((child) => <AgentRunNode key={child.trace_id} run={child} depth={depth + 1} />)}
+          </div>
+        ) : null}
+      </div>
+    </details>
   )
 }
 
@@ -188,6 +311,8 @@ export default function CampaignDevPage() {
   const planningSummary = planning.summary || {}
   const latestSession = data.latest_session
   const auditEvents = data.audit_events || []
+  const auditStream = data.audit_stream || []
+  const agentRuns = data.agent_runs || []
   const legacyTimelineCount = timeline.length
   const streamIsLive = autoRefresh && !error
 
@@ -203,7 +328,7 @@ export default function CampaignDevPage() {
             <span className="campaign-dev-chip">Sessions {sessions.length}</span>
             <span className="campaign-dev-chip">Planning messages {planning.messages?.length || 0}</span>
             <span className="campaign-dev-chip">World {worldPublic?.is_ready ? 'ready' : 'pending'}</span>
-            <span className="campaign-dev-chip">Audit events {auditEvents.length}</span>
+            <span className="campaign-dev-chip">Audit entries {auditStream.length || auditEvents.length}</span>
           </div>
         </div>
         <div className="campaign-dev-hero-actions">
@@ -282,9 +407,40 @@ export default function CampaignDevPage() {
           <section className="campaign-dev-panel">
             <h3>Trace Limits</h3>
             <p className="campaign-dev-note">
-              Hidden provider chain-of-thought is not returned to this app. This page shows the exact app
-              inputs, system prompts, model payloads, raw model responses, graph reads and writes, and client
-              payloads that the app can persist.
+              {data.audit_notes?.message || 'This page shows the exact app inputs, system prompts, model payloads, raw model responses, graph reads and writes, and client payloads that the app can persist.'}
+            </p>
+            {data.audit_notes?.thinking && (
+              <p className="campaign-dev-note">
+                {data.audit_notes.thinking}
+              </p>
+            )}
+          </section>
+
+          <section className="campaign-dev-panel">
+            <h3>Audit Roles</h3>
+            <div className="campaign-dev-role-key">
+              <span className="campaign-dev-pill campaign-dev-pill-role-player">Player</span>
+              <span>Player-submitted planning and session messages.</span>
+              <span className="campaign-dev-pill campaign-dev-pill-role-agent">Agent</span>
+              <span>Assistant/model output and agent-authored results.</span>
+              <span className="campaign-dev-pill campaign-dev-pill-role-tools">Tools</span>
+              <span>Context reads, writes, API calls, and client payloads.</span>
+            </div>
+          </section>
+
+          <section className="campaign-dev-panel">
+            <h3>Agent Runs</h3>
+            <div className="campaign-dev-agent-tree">
+              {agentRuns.length === 0 ? (
+                <div className="campaign-dev-empty campaign-dev-empty-compact">
+                  No agent trace metadata has been captured yet.
+                </div>
+              ) : (
+                agentRuns.map((run) => <AgentRunNode key={run.trace_id} run={run} />)
+              )}
+            </div>
+            <p className="campaign-dev-note">
+              Trace groups include exact message history for model requests and any reasoning fields returned by the provider.
             </p>
           </section>
         </aside>
@@ -299,16 +455,16 @@ export default function CampaignDevPage() {
                   {lastLoadedAt ? `, last loaded ${formatDateTime(lastLoadedAt.toISOString())}` : ''}
                 </span>
               </div>
-              <span>{auditEvents.length || legacyTimelineCount} ordered entries</span>
+              <span>{auditStream.length || auditEvents.length || legacyTimelineCount} ordered entries</span>
             </div>
             <div className="campaign-dev-stream">
-              {auditEvents.length === 0 ? (
+              {auditStream.length === 0 ? (
                 <div className="campaign-dev-empty">
                   No persisted audit events yet. New planning, world, and session actions will appear here as
                   they run. Older campaigns still show the reconstructed legacy timeline below.
                 </div>
               ) : (
-                auditEvents.map((event) => <AuditEventCard key={event.id} event={event} />)
+                auditStream.map((entry) => <AuditStreamCard key={entry.id} entry={entry} />)
               )}
             </div>
           </section>

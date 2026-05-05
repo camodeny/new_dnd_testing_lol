@@ -27,6 +27,7 @@ from services.character_service import (
     character_full_dict,
     update_character_relations,
 )
+from services.audit_service import AGENT_ACTORS, infer_audit_role
 from services.planning_service import (
     get_campaign_members,
     planning_context,
@@ -56,6 +57,128 @@ def _serialize_session(session):
     data = session.to_dict()
     data['messages'] = [message.to_dict() for message in session.messages]
     return data
+
+
+def _format_event_type(event_type):
+    return (event_type or 'event').replace('_', ' ')
+
+
+def _first_choice_message(raw_response):
+    if not isinstance(raw_response, dict):
+        return {}
+    choices = raw_response.get('choices') or []
+    if not choices or not isinstance(choices[0], dict):
+        return {}
+    message = choices[0].get('message') or {}
+    return message if isinstance(message, dict) else {}
+
+
+def _reasoning_payload(payload):
+    raw_response = payload.get('raw_response') if isinstance(payload, dict) else {}
+    message = _first_choice_message(raw_response)
+    reasoning = payload.get('reasoning') or message.get('reasoning') or message.get('reasoning_content')
+    reasoning_details = payload.get('reasoning_details') or message.get('reasoning_details')
+    usage = payload.get('reasoning_usage') or {}
+    if not usage and isinstance(raw_response, dict):
+        usage_data = raw_response.get('usage') or {}
+        completion_details = usage_data.get('completion_tokens_details') or {}
+        output_details = usage_data.get('output_tokens_details') or {}
+        usage = {
+            'reasoning_tokens': completion_details.get('reasoning_tokens') or output_details.get('reasoning_tokens'),
+            'completion_tokens_details': completion_details,
+            'output_tokens_details': output_details,
+        }
+    return {
+        'returned': bool(reasoning or reasoning_details),
+        'reasoning': reasoning,
+        'reasoning_details': reasoning_details,
+        'usage': usage,
+    }
+
+
+def _fallback_trace_id(event_data):
+    actor = event_data.get('actor')
+    event_type = event_data.get('event_type')
+    if event_data.get('trace_id'):
+        return event_data.get('trace_id')
+    if actor in AGENT_ACTORS or event_type in {'model_request', 'model_response', 'model_error'}:
+        return f'actor:{actor or "model"}'
+    return None
+
+
+def _audit_stream_entry(event):
+    event_data = event.to_dict()
+    payload = event_data.get('payload') or {}
+    role = infer_audit_role(event_data.get('event_type'), actor=event_data.get('actor'), audit_role=event_data.get('audit_role'))
+    trace_id = _fallback_trace_id(event_data)
+    messages = payload.get('messages') if isinstance(payload.get('messages'), list) else []
+    reasoning = _reasoning_payload(payload) if event_data.get('event_type') == 'model_response' else None
+
+    label = event_data.get('actor') or role
+    if role == 'tools':
+        label = _format_event_type(event_data.get('event_type'))
+
+    return {
+        'id': event_data['id'],
+        'campaign_id': event_data['campaign_id'],
+        'event_type': event_data['event_type'],
+        'role': role,
+        'label': label,
+        'source': event_data.get('source'),
+        'actor': event_data.get('actor'),
+        'summary': event_data.get('summary'),
+        'content': payload.get('content') if isinstance(payload, dict) else None,
+        'payload': payload,
+        'messages': messages,
+        'message_count': len(messages),
+        'reasoning': reasoning,
+        'trace_id': trace_id,
+        'parent_trace_id': event_data.get('parent_trace_id'),
+        'trace_label': event_data.get('trace_label') or event_data.get('actor') or trace_id,
+        'created_at': event_data.get('created_at'),
+    }
+
+
+def _agent_runs_from_stream(stream):
+    nodes = {}
+    for entry in stream:
+        trace_id = entry.get('trace_id')
+        if not trace_id:
+            continue
+        node = nodes.setdefault(trace_id, {
+            'trace_id': trace_id,
+            'parent_trace_id': entry.get('parent_trace_id'),
+            'trace_label': entry.get('trace_label') or trace_id,
+            'actor': entry.get('actor'),
+            'events': [],
+            'children': [],
+        })
+        if not node.get('parent_trace_id') and entry.get('parent_trace_id'):
+            node['parent_trace_id'] = entry.get('parent_trace_id')
+        if not node.get('actor') and entry.get('actor'):
+            node['actor'] = entry.get('actor')
+        node['events'].append(entry)
+
+    for node in nodes.values():
+        node['events'].sort(key=lambda item: item.get('id') or 0)
+
+    roots = []
+    for node in nodes.values():
+        parent_id = node.get('parent_trace_id')
+        if parent_id and parent_id in nodes:
+            nodes[parent_id]['children'].append(node)
+        else:
+            roots.append(node)
+
+    def sort_node(node):
+        node['children'].sort(key=lambda child: child['events'][0]['id'] if child['events'] else 0)
+        for child in node['children']:
+            sort_node(child)
+
+    roots.sort(key=lambda node: node['events'][0]['id'] if node['events'] else 0)
+    for root in roots:
+        sort_node(root)
+    return roots
 
 
 @dev_bp.route('/api/campaigns/<int:campaign_id>/dev', methods=['GET'])
@@ -101,6 +224,9 @@ def get_campaign_dev_audit(current_user, campaign_id):
     audit_events = CampaignAuditEvent.query.filter_by(campaign_id=campaign_id).order_by(
         CampaignAuditEvent.id.asc(),
     ).all()
+    audit_events_payload = [event.to_dict() for event in audit_events]
+    audit_stream = [_audit_stream_entry(event) for event in audit_events]
+    agent_runs = _agent_runs_from_stream(audit_stream)
     latest_session = active_session or (sessions[0] if sessions else None)
 
     session_context = dict(planning_ctx)
@@ -149,10 +275,12 @@ def get_campaign_dev_audit(current_user, campaign_id):
                 ) if latest_session else [],
             },
         },
-        'audit_events': [event.to_dict() for event in audit_events],
+        'audit_events': audit_events_payload,
+        'audit_stream': audit_stream,
+        'agent_runs': agent_runs,
         'audit_notes': {
             'tool_calls': 'OpenRouter chat requests and responses are persisted as model_request/model_response events. Provider-internal tool calls are not returned unless the provider response includes them.',
-            'thinking': None,
-            'message': 'Provider-hidden chain-of-thought is not returned to or stored by this app. The audit stream shows exact app inputs, system prompts, prompt payloads, raw model responses, database reads/writes, and client response payloads in persisted order.',
+            'thinking': 'OpenRouter reasoning-capable models may return reasoning or reasoning_details fields in model responses. Some models and providers do not return reasoning, and provider-hidden reasoning is not available unless it appears in the response payload.',
+            'message': 'The audit stream shows exact app inputs, system prompts, prompt payloads, raw model responses, returned reasoning when provided, database reads/writes, and client response payloads in persisted order.',
         },
     }), 200
