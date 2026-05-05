@@ -4,9 +4,10 @@ from flask import Blueprint, jsonify, request
 
 from auth import token_required
 from models import db, Campaign, CampaignSession, SessionMessage
-from openrouter import get_dm_response_with_context
+from openrouter import get_dm_response_with_context, get_opening_scene_response
 from services.campaign_service import ensure_member
 from services.planning_service import can_start_session, planning_context
+from services.world_service import approve_world, dm_world_context, ensure_world_generated
 
 sessions_bp = Blueprint('sessions', __name__)
 
@@ -30,11 +31,31 @@ def start_session(current_user, campaign_id):
             'planning': details,
         }), 400
 
+    world, world_error = ensure_world_generated(campaign, current_user)
+    if world_error:
+        return jsonify({key: value for key, value in world_error.items() if key != 'status'}), world_error.get('status', 500)
+
     session = CampaignSession(campaign_id=campaign_id)
     db.session.add(session)
+    approve_world(world)
     campaign.last_played_at = datetime.utcnow()
+    db.session.flush()
+
+    opening_text = get_opening_scene_response(
+        planning_context(campaign, current_user),
+        dm_world_context(campaign),
+    )
+    if opening_text:
+        db.session.add(SessionMessage(
+            session_id=session.id,
+            role='dm',
+            content=opening_text,
+        ))
+
     db.session.commit()
-    return jsonify({'session': session.to_dict()}), 201
+    data = session.to_dict()
+    data['messages'] = [m.to_dict() for m in session.messages]
+    return jsonify({'session': data}), 201
 
 
 @sessions_bp.route('/api/campaigns/<int:campaign_id>/sessions', methods=['GET'])
@@ -114,6 +135,7 @@ def send_message(current_user, session_id):
 
     try:
         context = planning_context(campaign, current_user)
+        context['world'] = dm_world_context(campaign)
         ai_text = get_dm_response_with_context(session.messages, context)
     except RuntimeError as err:
         return jsonify({'error': str(err), 'messages': result_messages}), 500

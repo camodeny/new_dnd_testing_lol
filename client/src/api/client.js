@@ -94,6 +94,14 @@ export function listSessions(campaignId) {
   return apiFetch(`/campaigns/${campaignId}/sessions`)
 }
 
+export function getCampaignWorld(campaignId) {
+  return apiFetch(`/campaigns/${campaignId}/world`)
+}
+
+export function generateCampaignWorld(campaignId) {
+  return apiFetch(`/campaigns/${campaignId}/world`, { method: 'POST' })
+}
+
 export function getSession(sessionId) {
   return apiFetch(`/sessions/${sessionId}`)
 }
@@ -206,4 +214,3 @@ export function updateNPC(npcId, payload) {
 export function deleteNPC(npcId) {
   return apiFetch(`/npcs/${npcId}`, { method: 'DELETE' })
 }
-

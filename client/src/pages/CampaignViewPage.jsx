@@ -7,6 +7,7 @@ import {
   addCampaignCharacter,
   listMembers,
   getCampaignPlanning,
+  getCampaignWorld,
 } from '../api/client'
 import Loading from '../components/common/Loading'
 import ErrorMessage from '../components/common/ErrorMessage'
@@ -14,6 +15,7 @@ import PartyRoster from '../components/dashboard/PartyRoster'
 import SessionPanel from '../components/dashboard/SessionPanel'
 import CampaignLobby from '../components/dashboard/CampaignLobby'
 import CharacterPlanningMode from '../components/dashboard/CharacterPlanningMode'
+import WorldBuildingMode from '../components/dashboard/WorldBuildingMode'
 
 function formatDate(iso) {
   if (!iso) return ''
@@ -96,6 +98,7 @@ export default function CampaignViewPage({ user }) {
   const [campaignDesc, setCampaignDesc] = useState('')
   const [showLobby, setShowLobby] = useState(false)
   const [showPlanning, setShowPlanning] = useState(false)
+  const [showWorldBuilding, setShowWorldBuilding] = useState(false)
 
   const [showImport, setShowImport] = useState(false)
   const [availableChars, setAvailableChars] = useState([])
@@ -115,13 +118,22 @@ export default function CampaignViewPage({ user }) {
       if (!data.activeSession && memberCount < required) {
         setShowLobby(true)
         setShowPlanning(false)
+        setShowWorldBuilding(false)
       } else if (!data.activeSession) {
         const planningData = await getCampaignPlanning(id)
+        const allReady = Boolean(planningData.planning?.all_ready)
+        let needsWorldBuild = false
+        if (allReady) {
+          const worldData = await getCampaignWorld(id)
+          needsWorldBuild = !worldData.world?.approved_at
+        }
         setShowLobby(false)
-        setShowPlanning(!planningData.planning?.all_ready)
+        setShowPlanning(!allReady)
+        setShowWorldBuilding(allReady && needsWorldBuild)
       } else {
         setShowLobby(false)
         setShowPlanning(false)
+        setShowWorldBuilding(false)
       }
     } catch (err) {
       setError(err.message)
@@ -151,20 +163,31 @@ export default function CampaignViewPage({ user }) {
           if (!data.activeSession && memberCount < required) {
             setShowLobby(true)
             setShowPlanning(false)
+            setShowWorldBuilding(false)
           } else if (!data.activeSession) {
             const planningData = await getCampaignPlanning(id)
             if (!isMounted) return
+            const allReady = Boolean(planningData.planning?.all_ready)
+            let needsWorldBuild = false
+            if (allReady) {
+              const worldData = await getCampaignWorld(id)
+              if (!isMounted) return
+              needsWorldBuild = !worldData.world?.approved_at
+            }
             setShowLobby(false)
-            setShowPlanning(!planningData.planning?.all_ready)
+            setShowPlanning(!allReady)
+            setShowWorldBuilding(allReady && needsWorldBuild)
           } else {
             setShowLobby(false)
             setShowPlanning(false)
+            setShowWorldBuilding(false)
           }
         } catch {
           // If planning fetch fails, still show dashboard with the start-session backend gate.
           if (isMounted) {
             setShowLobby(false)
             setShowPlanning(false)
+            setShowWorldBuilding(false)
           }
         }
       } catch (err) {
@@ -186,7 +209,8 @@ export default function CampaignViewPage({ user }) {
       const data = await startSession(id)
       const newSession = data.session
       setSession(newSession)
-      setMessages([])
+      setMessages(newSession.messages || [])
+      setShowWorldBuilding(false)
       return newSession
     } catch (err) {
       setError(err.message)
@@ -267,6 +291,7 @@ export default function CampaignViewPage({ user }) {
   const handleBeginAdventure = () => {
     setShowLobby(false)
     setShowPlanning(true)
+    setShowWorldBuilding(false)
   }
 
   if (loading) return <Loading />
@@ -289,6 +314,16 @@ export default function CampaignViewPage({ user }) {
         campaign={campaign}
         currentUser={user}
         onComplete={loadData}
+      />
+    )
+  }
+
+  if (showWorldBuilding && !session) {
+    return (
+      <WorldBuildingMode
+        campaign={campaign}
+        onBegin={handleStartSession}
+        onBack={() => navigate('/')}
       />
     )
   }
@@ -335,33 +370,8 @@ export default function CampaignViewPage({ user }) {
         </div>
       </div>
 
-      {campaign.description && (
-        <div className="dashboard-desc-bar">
-          {campaign.description}
-        </div>
-      )}
-
       <div className="dashboard-layout">
         <aside className="dashboard-left">
-          <div className="dashboard-section-title">
-            Party Roster
-            <div className="roster-actions">
-              <button
-                className="btn btn-secondary small"
-                onClick={() => navigate(`/characters/new?campaign=${id}`)}
-                title="Create a new character for this campaign"
-              >
-                <i className="bi bi-plus-lg"></i> New
-              </button>
-              <button
-                className="btn btn-primary small"
-                onClick={openImport}
-                title="Import an existing character"
-              >
-                <i className="bi bi-download"></i> Import
-              </button>
-            </div>
-          </div>
           <PartyRoster characters={characters} campaignId={id} onImport={openImport} />
 
         </aside>

@@ -49,6 +49,10 @@ class Campaign(db.Model):
     sessions = db.relationship('CampaignSession', backref='campaign', lazy=True, cascade='all, delete-orphan')
     members = db.relationship('CampaignMember', backref='campaign', lazy=True, cascade='all, delete-orphan')
     invites = db.relationship('CampaignInvite', backref='campaign', lazy=True, cascade='all, delete-orphan')
+    world = db.relationship('CampaignWorld', backref='campaign', lazy=True, cascade='all, delete-orphan', uselist=False)
+    npc_actors = db.relationship('NPCActor', backref='campaign', lazy=True, cascade='all, delete-orphan')
+    clocks = db.relationship('CampaignClock', backref='campaign', lazy=True, cascade='all, delete-orphan')
+    world_events = db.relationship('WorldEvent', backref='campaign', lazy=True, cascade='all, delete-orphan')
 
 
     def to_dict(self):
@@ -761,4 +765,150 @@ class PlanningBondProposal(db.Model):
             'status': self.status,
             'created_at': self.created_at.isoformat() if self.created_at else None,
             'updated_at': self.updated_at.isoformat() if self.updated_at else None,
+        }
+
+
+class CampaignWorld(db.Model):
+    __tablename__ = 'campaign_worlds'
+
+    id = db.Column(db.Integer, primary_key=True)
+    campaign_id = db.Column(db.Integer, db.ForeignKey('campaign.id'), nullable=False, unique=True)
+    public_intro = db.Column(db.Text, nullable=False)
+    knowledge_graph = db.Column(db.Text, nullable=False)
+    world_state = db.Column(db.Text, nullable=False)
+    dm_private = db.Column(db.Text, nullable=False)
+    approved_at = db.Column(db.DateTime, nullable=True)
+    created_at = db.Column(db.DateTime, default=datetime.utcnow)
+    updated_at = db.Column(db.DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
+
+    def to_public_dict(self):
+        import json
+
+        try:
+            public_intro = json.loads(self.public_intro)
+        except (TypeError, ValueError):
+            public_intro = {}
+
+        return {
+            'id': self.id,
+            'campaign_id': self.campaign_id,
+            'public_intro': public_intro,
+            'is_ready': True,
+            'approved_at': self.approved_at.isoformat() if self.approved_at else None,
+            'created_at': self.created_at.isoformat() if self.created_at else None,
+            'updated_at': self.updated_at.isoformat() if self.updated_at else None,
+        }
+
+
+class NPCActor(db.Model):
+    __tablename__ = 'npc_actors'
+
+    id = db.Column(db.Integer, primary_key=True)
+    campaign_id = db.Column(db.Integer, db.ForeignKey('campaign.id'), nullable=False)
+    actor_id = db.Column(db.String(100), nullable=False)
+    name = db.Column(db.String(200), nullable=False)
+    role = db.Column(db.String(200), nullable=True)
+    public_summary = db.Column(db.Text, nullable=True)
+    dossier = db.Column(db.Text, nullable=False)
+    created_at = db.Column(db.DateTime, default=datetime.utcnow)
+    updated_at = db.Column(db.DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
+
+    __table_args__ = (
+        db.UniqueConstraint('campaign_id', 'actor_id', name='uq_npc_actor_campaign_actor'),
+    )
+
+    def to_dict(self, include_private=False):
+        import json
+
+        data = {
+            'id': self.id,
+            'campaign_id': self.campaign_id,
+            'actor_id': self.actor_id,
+            'name': self.name,
+            'role': self.role,
+            'public_summary': self.public_summary,
+            'created_at': self.created_at.isoformat() if self.created_at else None,
+            'updated_at': self.updated_at.isoformat() if self.updated_at else None,
+        }
+        if include_private:
+            try:
+                data['dossier'] = json.loads(self.dossier)
+            except (TypeError, ValueError):
+                data['dossier'] = {}
+        return data
+
+
+class CampaignClock(db.Model):
+    __tablename__ = 'campaign_clocks'
+
+    id = db.Column(db.Integer, primary_key=True)
+    campaign_id = db.Column(db.Integer, db.ForeignKey('campaign.id'), nullable=False)
+    clock_id = db.Column(db.String(100), nullable=False)
+    name = db.Column(db.String(200), nullable=False)
+    segments = db.Column(db.Integer, default=4)
+    filled = db.Column(db.Integer, default=0)
+    pressure_type = db.Column(db.String(80), nullable=True)
+    visibility = db.Column(db.String(30), default='dm_private')
+    summary = db.Column(db.Text, nullable=True)
+    trigger = db.Column(db.Text, nullable=True)
+    on_complete = db.Column(db.Text, nullable=True)
+    status = db.Column(db.String(30), default='active')
+    created_at = db.Column(db.DateTime, default=datetime.utcnow)
+    updated_at = db.Column(db.DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
+
+    __table_args__ = (
+        db.UniqueConstraint('campaign_id', 'clock_id', name='uq_campaign_clock_campaign_clock'),
+    )
+
+    def to_dict(self, include_private=False):
+        if self.visibility == 'dm_private' and not include_private:
+            return None
+        return {
+            'id': self.id,
+            'campaign_id': self.campaign_id,
+            'clock_id': self.clock_id,
+            'name': self.name,
+            'segments': self.segments,
+            'filled': self.filled,
+            'pressure_type': self.pressure_type,
+            'visibility': self.visibility,
+            'summary': self.summary,
+            'trigger': self.trigger if include_private else None,
+            'on_complete': self.on_complete if include_private else None,
+            'status': self.status,
+            'created_at': self.created_at.isoformat() if self.created_at else None,
+            'updated_at': self.updated_at.isoformat() if self.updated_at else None,
+        }
+
+
+class WorldEvent(db.Model):
+    __tablename__ = 'world_events'
+
+    id = db.Column(db.Integer, primary_key=True)
+    campaign_id = db.Column(db.Integer, db.ForeignKey('campaign.id'), nullable=False)
+    event_type = db.Column(db.String(80), nullable=False)
+    summary = db.Column(db.Text, nullable=False)
+    payload = db.Column(db.Text, nullable=True)
+    visibility = db.Column(db.String(30), default='dm_private')
+    created_at = db.Column(db.DateTime, default=datetime.utcnow)
+
+    def to_dict(self, include_private=False):
+        import json
+
+        if self.visibility == 'dm_private' and not include_private:
+            return None
+
+        try:
+            payload = json.loads(self.payload) if self.payload else {}
+        except (TypeError, ValueError):
+            payload = {}
+
+        return {
+            'id': self.id,
+            'campaign_id': self.campaign_id,
+            'event_type': self.event_type,
+            'summary': self.summary,
+            'payload': payload if include_private else {},
+            'visibility': self.visibility,
+            'created_at': self.created_at.isoformat() if self.created_at else None,
         }
