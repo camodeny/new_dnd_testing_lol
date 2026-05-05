@@ -601,14 +601,18 @@ class SessionMessage(db.Model):
 
     id = db.Column(db.Integer, primary_key=True)
     session_id = db.Column(db.Integer, db.ForeignKey('campaign_sessions.id'), nullable=False)
+    user_id = db.Column(db.Integer, db.ForeignKey('users.id'), nullable=True)
     role = db.Column(db.String(20), nullable=False)
     content = db.Column(db.Text, nullable=False)
     created_at = db.Column(db.DateTime, default=datetime.utcnow)
+    user = db.relationship('User')
 
     def to_dict(self):
         return {
             'id': self.id,
             'session_id': self.session_id,
+            'user_id': self.user_id,
+            'username': self.user.username if self.user else None,
             'role': self.role,
             'content': self.content,
             'created_at': self.created_at.isoformat() if self.created_at else None,

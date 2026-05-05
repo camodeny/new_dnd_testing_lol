@@ -381,6 +381,7 @@ export default function CampaignViewPage({ user }) {
           <SessionPanel
             session={session}
             messages={messages}
+            currentUser={user}
             onStartSession={handleStartSession}
             onEndSession={handleEndSession}
             onSendMessage={handleSendMessage}

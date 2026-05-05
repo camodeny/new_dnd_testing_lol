@@ -38,9 +38,23 @@ function formatRollSummary(roll) {
   return `${roll.label}: ${roll.rolls.join(', ')}${kept}${modifier} = ${roll.total}`
 }
 
+function getMessageSenderLabel(msg, currentUser) {
+  if (msg.role === 'dm') return 'DM'
+  if (msg.role === 'system') return 'System'
+  if (msg.user_id && currentUser?.id && msg.user_id === currentUser.id) return 'You'
+  return msg.username || 'Player'
+}
+
+function getMessageSenderIcon(role) {
+  if (role === 'dm') return 'bi bi-mic-fill'
+  if (role === 'system') return 'bi bi-gear-fill'
+  return 'bi bi-person-fill'
+}
+
 export default function SessionPanel({
   session,
   messages,
+  currentUser,
   onStartSession,
   onEndSession,
   onSendMessage,
@@ -159,7 +173,7 @@ export default function SessionPanel({
               <div key={msg.id} className={`session-msg session-msg-${msg.role}`}>
                 <div className="session-msg-header">
                   <span className="session-msg-role">
-                    {msg.role === 'dm' ? <><i className="bi bi-mic-fill"></i> DM</> : msg.role === 'system' ? <><i className="bi bi-gear-fill"></i> System</> : <><i className="bi bi-person-fill"></i> You</>}
+                    <i className={getMessageSenderIcon(msg.role)}></i> {getMessageSenderLabel(msg, currentUser)}
                   </span>
                   <span className="session-msg-time">{formatTime(msg.created_at)}</span>
                 </div>

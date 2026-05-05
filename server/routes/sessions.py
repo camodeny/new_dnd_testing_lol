@@ -171,6 +171,7 @@ def send_message(current_user, session_id):
 
     msg = SessionMessage(
         session_id=session_id,
+        user_id=current_user.id,
         role=data.get('role', 'player'),
         content=data['content'],
     )
