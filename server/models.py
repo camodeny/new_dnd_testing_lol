@@ -912,3 +912,35 @@ class WorldEvent(db.Model):
             'visibility': self.visibility,
             'created_at': self.created_at.isoformat() if self.created_at else None,
         }
+
+
+class CampaignAuditEvent(db.Model):
+    __tablename__ = 'campaign_audit_events'
+
+    id = db.Column(db.Integer, primary_key=True)
+    campaign_id = db.Column(db.Integer, db.ForeignKey('campaign.id'), nullable=False, index=True)
+    event_type = db.Column(db.String(80), nullable=False, index=True)
+    source = db.Column(db.String(120), nullable=True)
+    actor = db.Column(db.String(120), nullable=True)
+    summary = db.Column(db.Text, nullable=False)
+    payload = db.Column(db.Text, nullable=True)
+    created_at = db.Column(db.DateTime, default=datetime.utcnow, index=True)
+
+    def to_dict(self):
+        import json
+
+        try:
+            payload = json.loads(self.payload) if self.payload else {}
+        except (TypeError, ValueError):
+            payload = {'raw': self.payload}
+
+        return {
+            'id': self.id,
+            'campaign_id': self.campaign_id,
+            'event_type': self.event_type,
+            'source': self.source,
+            'actor': self.actor,
+            'summary': self.summary,
+            'payload': payload,
+            'created_at': self.created_at.isoformat() if self.created_at else None,
+        }

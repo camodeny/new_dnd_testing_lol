@@ -11,6 +11,7 @@ function formatDateTime(iso) {
     day: 'numeric',
     hour: '2-digit',
     minute: '2-digit',
+    second: '2-digit',
   })
 }
 
@@ -40,9 +41,13 @@ function AuditMessage({ entry }) {
   )
 }
 
-function JsonPanel({ title, value, summary }) {
+function formatEventType(type) {
+  return String(type || 'event').replace(/_/g, ' ')
+}
+
+function JsonPanel({ title, value, summary, defaultOpen = false }) {
   return (
-    <details className="campaign-dev-details" open={false}>
+    <details className="campaign-dev-details" open={defaultOpen}>
       <summary>
         <span>{title}</span>
         {summary && <span className="campaign-dev-summary">{summary}</span>}
@@ -52,35 +57,78 @@ function JsonPanel({ title, value, summary }) {
   )
 }
 
+function AuditEventCard({ event }) {
+  const payload = event.payload || {}
+  const messageCount = payload.messages?.length || payload.raw_response?.choices?.length || null
+
+  return (
+    <article className={`campaign-dev-event campaign-dev-event-${event.event_type}`}>
+      <div className="campaign-dev-event-rail">
+        <span>{event.id}</span>
+      </div>
+      <div className="campaign-dev-event-body">
+        <div className="campaign-dev-message-meta">
+          <span className={`campaign-dev-pill campaign-dev-pill-${event.event_type}`}>{formatEventType(event.event_type)}</span>
+          <span>{formatDateTime(event.created_at)}</span>
+          {event.actor && <span>actor {event.actor}</span>}
+          {event.source && <span>source {event.source}</span>}
+          {messageCount ? <span>{messageCount} item{messageCount === 1 ? '' : 's'}</span> : null}
+        </div>
+        <div className="campaign-dev-message-content">{event.summary}</div>
+        <JsonPanel title="Payload" value={payload} summary="Full captured input/output" />
+      </div>
+    </article>
+  )
+}
+
 export default function CampaignDevPage() {
   const { id } = useParams()
   const navigate = useNavigate()
   const [data, setData] = useState(null)
   const [loading, setLoading] = useState(true)
+  const [refreshing, setRefreshing] = useState(false)
+  const [autoRefresh, setAutoRefresh] = useState(true)
+  const [lastLoadedAt, setLastLoadedAt] = useState(null)
   const [error, setError] = useState('')
 
   useEffect(() => {
     let alive = true
 
-    async function load() {
-      setLoading(true)
+    async function load(background = false) {
+      if (background) {
+        setRefreshing(true)
+      } else {
+        setLoading(true)
+      }
       setError('')
       try {
         const payload = await getCampaignDevAudit(id)
-        if (alive) setData(payload)
+        if (alive) {
+          setData(payload)
+          setLastLoadedAt(new Date())
+        }
       } catch (err) {
         if (alive) setError(err.message)
       } finally {
-        if (alive) setLoading(false)
+        if (alive) {
+          setLoading(false)
+          setRefreshing(false)
+        }
       }
     }
 
-    load()
+    load(false)
+
+    let interval = null
+    if (autoRefresh) {
+      interval = window.setInterval(() => load(true), 2500)
+    }
 
     return () => {
       alive = false
+      if (interval) window.clearInterval(interval)
     }
-  }, [id])
+  }, [autoRefresh, id])
 
   const timeline = useMemo(() => {
     if (!data) return []
@@ -139,6 +187,9 @@ export default function CampaignDevPage() {
   const planningVisible = planning.visible || {}
   const planningSummary = planning.summary || {}
   const latestSession = data.latest_session
+  const auditEvents = data.audit_events || []
+  const legacyTimelineCount = timeline.length
+  const streamIsLive = autoRefresh && !error
 
   return (
     <div className="campaign-dev-page">
@@ -152,12 +203,35 @@ export default function CampaignDevPage() {
             <span className="campaign-dev-chip">Sessions {sessions.length}</span>
             <span className="campaign-dev-chip">Planning messages {planning.messages?.length || 0}</span>
             <span className="campaign-dev-chip">World {worldPublic?.is_ready ? 'ready' : 'pending'}</span>
+            <span className="campaign-dev-chip">Audit events {auditEvents.length}</span>
           </div>
         </div>
         <div className="campaign-dev-hero-actions">
           <button className="btn btn-secondary" onClick={() => navigate(`/campaigns/${id}`)}>
             Back to campaign
           </button>
+          <div className="campaign-dev-live-controls">
+            <button className="btn btn-secondary" onClick={() => setAutoRefresh((value) => !value)}>
+              {autoRefresh ? 'Pause' : 'Resume'}
+            </button>
+            <button
+              className="btn btn-secondary"
+              onClick={async () => {
+                setRefreshing(true)
+                try {
+                  const payload = await getCampaignDevAudit(id)
+                  setData(payload)
+                  setLastLoadedAt(new Date())
+                } catch (err) {
+                  setError(err.message)
+                } finally {
+                  setRefreshing(false)
+                }
+              }}
+            >
+              Refresh
+            </button>
+          </div>
           <div className="campaign-dev-route">/campaigns/{id}/dev</div>
         </div>
       </div>
@@ -208,13 +282,37 @@ export default function CampaignDevPage() {
           <section className="campaign-dev-panel">
             <h3>Trace Limits</h3>
             <p className="campaign-dev-note">
-              Hidden chain-of-thought and tool-call traces are not stored by this app. This page shows the
-              persisted messages, prompt payloads, and reconstructed model inputs that do exist.
+              Hidden provider chain-of-thought is not returned to this app. This page shows the exact app
+              inputs, system prompts, model payloads, raw model responses, graph reads and writes, and client
+              payloads that the app can persist.
             </p>
           </section>
         </aside>
 
         <main className="campaign-dev-main">
+          <section className="campaign-dev-panel campaign-dev-stream-panel">
+            <div className="campaign-dev-section-header">
+              <div>
+                <h3>Live Audit Stream</h3>
+                <span>
+                  {streamIsLive ? 'watching' : 'paused'}{refreshing ? ', refreshing' : ''}
+                  {lastLoadedAt ? `, last loaded ${formatDateTime(lastLoadedAt.toISOString())}` : ''}
+                </span>
+              </div>
+              <span>{auditEvents.length || legacyTimelineCount} ordered entries</span>
+            </div>
+            <div className="campaign-dev-stream">
+              {auditEvents.length === 0 ? (
+                <div className="campaign-dev-empty">
+                  No persisted audit events yet. New planning, world, and session actions will appear here as
+                  they run. Older campaigns still show the reconstructed legacy timeline below.
+                </div>
+              ) : (
+                auditEvents.map((event) => <AuditEventCard key={event.id} event={event} />)
+              )}
+            </div>
+          </section>
+
           <section className="campaign-dev-panel">
             <div className="campaign-dev-section-header">
               <h3>Planning Messages</h3>
@@ -326,8 +424,8 @@ export default function CampaignDevPage() {
 
           <section className="campaign-dev-panel">
             <div className="campaign-dev-section-header">
-              <h3>Audit Timeline</h3>
-              <span>{timeline.length} stored entries</span>
+              <h3>Legacy Timeline</h3>
+              <span>{timeline.length} reconstructed entries</span>
             </div>
             <div className="campaign-dev-timeline">
               {timeline.length === 0 ? (

@@ -6,6 +6,7 @@ from auth import token_required
 from dev_data import DEV_CHARACTER_TEMPLATES
 from models import (
     Campaign,
+    CampaignAuditEvent,
     CampaignClock,
     CampaignSession,
     Character,
@@ -97,6 +98,9 @@ def get_campaign_dev_audit(current_user, campaign_id):
     world_events = WorldEvent.query.filter_by(campaign_id=campaign_id).order_by(WorldEvent.created_at.asc()).all()
     npcs = NPCActor.query.filter_by(campaign_id=campaign_id).order_by(NPCActor.id.asc()).all()
     clocks = CampaignClock.query.filter_by(campaign_id=campaign_id).order_by(CampaignClock.id.asc()).all()
+    audit_events = CampaignAuditEvent.query.filter_by(campaign_id=campaign_id).order_by(
+        CampaignAuditEvent.id.asc(),
+    ).all()
     latest_session = active_session or (sessions[0] if sessions else None)
 
     session_context = dict(planning_ctx)
@@ -145,9 +149,10 @@ def get_campaign_dev_audit(current_user, campaign_id):
                 ) if latest_session else [],
             },
         },
+        'audit_events': [event.to_dict() for event in audit_events],
         'audit_notes': {
-            'tool_calls': [],
+            'tool_calls': 'OpenRouter chat requests and responses are persisted as model_request/model_response events. Provider-internal tool calls are not returned unless the provider response includes them.',
             'thinking': None,
-            'message': 'The app does not persist hidden chain-of-thought or tool-call traces. This view reconstructs the exact prompt payloads and stored messages that exist in the database.',
+            'message': 'Provider-hidden chain-of-thought is not returned to or stored by this app. The audit stream shows exact app inputs, system prompts, prompt payloads, raw model responses, database reads/writes, and client response payloads in persisted order.',
         },
     }), 200

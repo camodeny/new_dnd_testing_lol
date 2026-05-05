@@ -5,6 +5,7 @@ from flask import Blueprint, jsonify, request
 from auth import token_required
 from models import db, Campaign, CampaignSession, SessionMessage
 from openrouter import get_dm_response_with_context, get_opening_scene_response
+from services.audit_service import log_audit_event
 from services.campaign_service import ensure_member
 from services.planning_service import can_start_session, planning_context
 from services.world_service import approve_world, dm_world_context, ensure_world_generated
@@ -40,21 +41,65 @@ def start_session(current_user, campaign_id):
     approve_world(world)
     campaign.last_played_at = datetime.utcnow()
     db.session.flush()
+    log_audit_event(
+        campaign_id,
+        'session_started',
+        'Created active campaign session and approved the world package.',
+        {
+            'session': session.to_dict(),
+            'world': world.to_public_dict(),
+        },
+        source='campaign_sessions',
+        actor=current_user.username,
+        commit=True,
+    )
 
+    context = planning_context(campaign, current_user)
+    world_context = dm_world_context(campaign, audit=True, reason='opening_scene_context')
     opening_text = get_opening_scene_response(
-        planning_context(campaign, current_user),
-        dm_world_context(campaign),
+        context,
+        world_context,
+        audit_context={
+            'campaign_id': campaign_id,
+            'operation': 'opening_scene',
+            'actor': 'session_dm',
+        },
     )
     if opening_text:
-        db.session.add(SessionMessage(
+        opening_msg = SessionMessage(
             session_id=session.id,
             role='dm',
             content=opening_text,
-        ))
+        )
+        db.session.add(opening_msg)
+        log_audit_event(
+            campaign_id,
+            'dm_output_stored',
+            'Stored opening visible DM message.',
+            {
+                'session_id': session.id,
+                'message': {
+                    'role': 'dm',
+                    'content': opening_text,
+                },
+            },
+            source='session_messages',
+            actor='session_dm',
+            commit=False,
+        )
 
     db.session.commit()
     data = session.to_dict()
     data['messages'] = [m.to_dict() for m in session.messages]
+    log_audit_event(
+        campaign_id,
+        'client_response_sent',
+        'Sent started session payload to client.',
+        {'session': data},
+        source='campaign_sessions',
+        actor='server',
+        commit=True,
+    )
     return jsonify({'session': data}), 201
 
 
@@ -132,11 +177,37 @@ def send_message(current_user, session_id):
     db.session.add(msg)
     db.session.commit()
     result_messages = [msg.to_dict()]
+    log_audit_event(
+        campaign.id,
+        'player_input_stored',
+        'Stored session player message.',
+        {'session_id': session_id, 'message': msg.to_dict(), 'request_body': data},
+        source='session_messages',
+        actor=current_user.username,
+        commit=True,
+    )
 
     try:
         context = planning_context(campaign, current_user)
-        context['world'] = dm_world_context(campaign)
-        ai_text = get_dm_response_with_context(session.messages, context)
+        log_audit_event(
+            campaign.id,
+            'planning_context_read',
+            'Read planning context for session DM response.',
+            {'context': context},
+            source='planning_context',
+            actor='server',
+            commit=True,
+        )
+        context['world'] = dm_world_context(campaign, audit=True, reason='session_dm_context')
+        ai_text = get_dm_response_with_context(
+            session.messages,
+            context,
+            audit_context={
+                'campaign_id': campaign.id,
+                'operation': 'session_dm_response',
+                'actor': 'session_dm',
+            },
+        )
     except RuntimeError as err:
         return jsonify({'error': str(err), 'messages': result_messages}), 500
 
@@ -147,7 +218,31 @@ def send_message(current_user, session_id):
             content=ai_text,
         )
         db.session.add(ai_msg)
+        log_audit_event(
+            campaign.id,
+            'dm_output_stored',
+            'Stored visible session DM response.',
+            {
+                'session_id': session_id,
+                'message': {
+                    'role': 'dm',
+                    'content': ai_text,
+                },
+            },
+            source='session_messages',
+            actor='session_dm',
+            commit=False,
+        )
         db.session.commit()
         result_messages.append(ai_msg.to_dict())
 
+    log_audit_event(
+        campaign.id,
+        'client_response_sent',
+        'Sent session message response payload to client.',
+        {'session_id': session_id, 'messages': result_messages},
+        source='session_messages',
+        actor='server',
+        commit=True,
+    )
     return jsonify({'messages': result_messages}), 201

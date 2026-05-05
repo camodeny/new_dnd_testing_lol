@@ -3,6 +3,8 @@ import json
 import requests
 from dotenv import load_dotenv
 
+from services.audit_service import log_model_error, log_model_request, log_model_response
+
 load_dotenv()
 
 OPENROUTER_API_KEY = os.environ.get('OPENROUTER_API_KEY', '')
@@ -69,26 +71,54 @@ def _require_openrouter_config():
         raise RuntimeError('OPENROUTER_MODEL is not set')
 
 
-def _post_chat(messages, json_mode=False):
-    _require_openrouter_config()
+def _post_chat(messages, json_mode=False, audit_context=None):
+    audit_context = audit_context or {}
+    campaign_id = audit_context.get('campaign_id')
+    operation = audit_context.get('operation') or 'chat_completion'
+    actor = audit_context.get('actor') or 'dm'
+
+    try:
+        _require_openrouter_config()
+    except Exception as err:
+        if campaign_id:
+            log_model_error(campaign_id, operation, actor, err, commit=True)
+        raise
 
     payload = {
         'model': OPENROUTER_MODEL,
         'messages': messages,
     }
 
-    resp = requests.post(
-        API_URL,
-        headers={
-            'Authorization': f'Bearer {OPENROUTER_API_KEY}',
-            'Content-Type': 'application/json',
-        },
-        json=payload,
-        timeout=60,
-    )
-    resp.raise_for_status()
-    data = resp.json()
-    return data['choices'][0]['message']['content']
+    if campaign_id:
+        log_model_request(
+            campaign_id,
+            operation,
+            actor,
+            messages,
+            OPENROUTER_MODEL,
+            json_mode=json_mode,
+            commit=True,
+        )
+
+    try:
+        resp = requests.post(
+            API_URL,
+            headers={
+                'Authorization': f'Bearer {OPENROUTER_API_KEY}',
+                'Content-Type': 'application/json',
+            },
+            json=payload,
+            timeout=60,
+        )
+        resp.raise_for_status()
+        data = resp.json()
+        if campaign_id:
+            log_model_response(campaign_id, operation, actor, data, commit=True)
+        return data['choices'][0]['message']['content']
+    except Exception as err:
+        if campaign_id:
+            log_model_error(campaign_id, operation, actor, err, commit=True)
+        raise
 
 
 def _json_loads_or_empty(text):
@@ -324,41 +354,41 @@ def build_world_genesis_messages(context):
     ]
 
 
-def get_dm_response(session_messages):
+def get_dm_response(session_messages, audit_context=None):
     messages = build_dm_response_messages(session_messages)
 
     try:
-        return _post_chat(messages)
+        return _post_chat(messages, audit_context=audit_context)
     except Exception as e:
         print(f'[openrouter] Error: {e}')
         return None
 
 
-def get_dm_response_with_context(session_messages, planning_context=None):
+def get_dm_response_with_context(session_messages, planning_context=None, audit_context=None):
     messages = build_dm_response_messages(session_messages, planning_context)
 
     try:
-        return _post_chat(messages)
+        return _post_chat(messages, audit_context=audit_context)
     except Exception as e:
         print(f'[openrouter] Error: {e}')
         return None
 
 
-def get_opening_scene_response(context, world_context):
+def get_opening_scene_response(context, world_context, audit_context=None):
     messages = build_opening_scene_messages(context, world_context)
 
     try:
-        return _post_chat(messages)
+        return _post_chat(messages, audit_context=audit_context)
     except Exception as e:
         print(f'[openrouter] Opening scene error: {e}')
         return None
 
 
-def get_planning_dm_response(context, current_user_messages, draft_character=None, active_page=None):
+def get_planning_dm_response(context, current_user_messages, draft_character=None, active_page=None, audit_context=None):
     messages = build_planning_dm_messages(context, current_user_messages, draft_character, active_page)
 
     try:
-        text = _post_chat(messages, json_mode=True)
+        text = _post_chat(messages, json_mode=True, audit_context=audit_context)
         data = _json_loads_or_empty(text)
         if isinstance(data, dict) and data.get('message'):
             return {
@@ -372,33 +402,33 @@ def get_planning_dm_response(context, current_user_messages, draft_character=Non
         return None
 
 
-def get_planning_summary_update(context, latest_player_message, latest_dm_message):
+def get_planning_summary_update(context, latest_player_message, latest_dm_message, audit_context=None):
     messages = build_planning_summary_messages(context, latest_player_message, latest_dm_message)
 
     try:
-        data = _json_loads_or_empty(_post_chat(messages, json_mode=True))
+        data = _json_loads_or_empty(_post_chat(messages, json_mode=True, audit_context=audit_context))
         return data if isinstance(data, dict) else {}
     except Exception as e:
         print(f'[openrouter] Planning summary error: {e}')
         return {}
 
 
-def get_character_draft(context, current_user_messages):
+def get_character_draft(context, current_user_messages, audit_context=None):
     messages = build_character_draft_messages(context, current_user_messages)
 
     try:
-        data = _json_loads_or_empty(_post_chat(messages, json_mode=True))
+        data = _json_loads_or_empty(_post_chat(messages, json_mode=True, audit_context=audit_context))
         return data if isinstance(data, dict) else {}
     except Exception as e:
         print(f'[openrouter] Character draft error: {e}')
         return {}
 
 
-def get_world_genesis_package(context):
+def get_world_genesis_package(context, audit_context=None):
     messages = build_world_genesis_messages(context)
 
     try:
-        data = _json_loads_or_empty(_post_chat(messages, json_mode=True))
+        data = _json_loads_or_empty(_post_chat(messages, json_mode=True, audit_context=audit_context))
         return data if isinstance(data, dict) else {}
     except Exception as e:
         print(f'[openrouter] World genesis error: {e}')

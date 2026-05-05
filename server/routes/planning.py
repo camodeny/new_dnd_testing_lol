@@ -11,6 +11,7 @@ from openrouter import (
 )
 from services.campaign_service import ensure_member
 from services.character_service import character_full_dict
+from services.audit_service import log_audit_event
 from services.planning_service import (
     apply_bond_suggestions,
     get_campaign_members,
@@ -72,17 +73,40 @@ def send_planning_message(current_user, campaign_id):
     )
     db.session.add(player_msg)
     db.session.commit()
+    log_audit_event(
+        campaign_id,
+        'player_input_stored',
+        'Stored character-planning player message.',
+        {'message': player_msg.to_dict(), 'request_body': data or {}},
+        source='planning.messages',
+        actor=current_user.username,
+        commit=True,
+    )
 
     messages = CharacterPlanningMessage.query.filter_by(
         campaign_id=campaign_id,
         user_id=current_user.id,
     ).order_by(CharacterPlanningMessage.created_at.asc()).all()
     context = planning_context(campaign, current_user)
+    log_audit_event(
+        campaign_id,
+        'planning_context_read',
+        'Read planning context for planning DM response.',
+        {'context': context, 'message_count': len(messages)},
+        source='planning_context',
+        actor='server',
+        commit=True,
+    )
     ai_result = get_planning_dm_response(
         context,
         messages,
         draft_character=data.get('draft_character') if data else None,
         active_page=data.get('active_page') if data else None,
+        audit_context={
+            'campaign_id': campaign_id,
+            'operation': 'planning_dm_response',
+            'actor': 'planning_dm',
+        },
     )
     if not ai_result:
         return jsonify({
@@ -95,10 +119,28 @@ def send_planning_message(current_user, campaign_id):
         planning_context(campaign, current_user),
         content,
         ai_text,
+        audit_context={
+            'campaign_id': campaign_id,
+            'operation': 'planning_summary_update',
+            'actor': 'planning_memory_writer',
+        },
     )
     summary = get_or_create_summary(campaign_id)
     merge_summary_update(summary, summary_payload.get('summary_update', {}))
     apply_bond_suggestions(campaign_id, summary_payload.get('bond_suggestions', []))
+    log_audit_event(
+        campaign_id,
+        'planning_memory_write',
+        'Updated campaign planning memory from player and DM exchange.',
+        {
+            'latest_player_message': content,
+            'latest_dm_message': ai_text,
+            'summary_payload': summary_payload,
+        },
+        source='campaign_planning_summaries',
+        actor='planning_memory_writer',
+        commit=False,
+    )
 
     dm_msg = CharacterPlanningMessage(
         campaign_id=campaign_id,
@@ -107,12 +149,45 @@ def send_planning_message(current_user, campaign_id):
         content=ai_text,
     )
     db.session.add(dm_msg)
+    log_audit_event(
+        campaign_id,
+        'dm_output_stored',
+        'Stored visible planning DM response.',
+        {
+            'message': {
+                'campaign_id': campaign_id,
+                'user_id': current_user.id,
+                'role': 'dm',
+                'content': ai_text,
+            },
+            'active_page': ai_result.get('active_page'),
+            'form_patch': ai_result.get('form_patch') or {},
+        },
+        source='character_planning_messages',
+        actor='planning_dm',
+        commit=False,
+    )
 
     db.session.commit()
-    return jsonify({
-        'planning': visible_planning_payload(campaign, current_user),
+    planning_payload = visible_planning_payload(campaign, current_user)
+    response_payload = {
+        'planning': planning_payload,
         'active_page': ai_result.get('active_page'),
         'form_patch': ai_result.get('form_patch') or {},
+    }
+    log_audit_event(
+        campaign_id,
+        'client_response_sent',
+        'Sent planning response payload to client.',
+        response_payload,
+        source='planning.messages',
+        actor='server',
+        commit=True,
+    )
+    return jsonify({
+        'planning': planning_payload,
+        'active_page': response_payload['active_page'],
+        'form_patch': response_payload['form_patch'],
     }), 201
 
 
@@ -131,12 +206,39 @@ def generate_character_draft(current_user, campaign_id):
     if not messages:
         return jsonify({'error': 'Chat with the DM before generating a draft'}), 400
 
-    draft = get_character_draft(planning_context(campaign, current_user), messages)
+    context = planning_context(campaign, current_user)
+    log_audit_event(
+        campaign_id,
+        'planning_context_read',
+        'Read planning context for character draft generation.',
+        {'context': context, 'message_count': len(messages)},
+        source='planning_context',
+        actor='server',
+        commit=True,
+    )
+    draft = get_character_draft(
+        context,
+        messages,
+        audit_context={
+            'campaign_id': campaign_id,
+            'operation': 'character_draft',
+            'actor': 'character_draft_agent',
+        },
+    )
     if not draft:
         return jsonify({'error': 'The planning DM could not generate a character draft'}), 500
 
     draft['campaign_id'] = campaign_id
     draft.setdefault('player_name', current_user.username)
+    log_audit_event(
+        campaign_id,
+        'draft_output_sent',
+        'Generated character draft payload for the client.',
+        {'draft': draft},
+        source='planning.draft',
+        actor='character_draft_agent',
+        commit=True,
+    )
     return jsonify({'draft': draft}), 200
 
 

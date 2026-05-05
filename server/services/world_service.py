@@ -9,6 +9,7 @@ from models import (
     WorldEvent,
 )
 from openrouter import get_world_genesis_package
+from services.audit_service import log_audit_event
 from services.planning_service import can_start_session, planning_context
 
 
@@ -323,6 +324,21 @@ def persist_world_package(campaign, package):
     world.dm_private = json_dumps(package['dm_private'])
     world.updated_at = datetime.utcnow()
     db.session.flush()
+    log_audit_event(
+        campaign.id,
+        'knowledge_graph_write',
+        'Persisted generated world package and knowledge graph.',
+        {
+            'world_id': world.id,
+            'public_intro': package['public_intro'],
+            'knowledge_graph': package['knowledge_graph'],
+            'world_state': package['world_state'],
+            'dm_private': package['dm_private'],
+        },
+        source='campaign_worlds',
+        actor='world_architect',
+        commit=False,
+    )
 
     NPCActor.query.filter_by(campaign_id=campaign.id).delete()
     for actor in package['npc_actors']:
@@ -334,6 +350,15 @@ def persist_world_package(campaign, package):
             public_summary=actor.get('public_summary'),
             dossier=json_dumps(actor),
         ))
+    log_audit_event(
+        campaign.id,
+        'npc_actor_write',
+        'Persisted generated NPC actor dossiers.',
+        {'npc_actors': package['npc_actors']},
+        source='npc_actors',
+        actor='world_architect',
+        commit=False,
+    )
 
     CampaignClock.query.filter_by(campaign_id=campaign.id).delete()
     for clock in package['clocks']:
@@ -350,6 +375,15 @@ def persist_world_package(campaign, package):
             on_complete=clock.get('on_complete'),
             status=clock.get('status') or 'active',
         ))
+    log_audit_event(
+        campaign.id,
+        'clock_write',
+        'Persisted generated campaign clocks.',
+        {'clocks': package['clocks']},
+        source='campaign_clocks',
+        actor='world_architect',
+        commit=False,
+    )
 
     db.session.add(WorldEvent(
         campaign_id=campaign.id,
@@ -362,6 +396,18 @@ def persist_world_package(campaign, package):
         }),
         visibility='dm_private',
     ))
+    log_audit_event(
+        campaign.id,
+        'world_event_write',
+        'Persisted world_generated event.',
+        {
+            'event_type': 'world_generated',
+            'summary': f'World package generated for {campaign.name}.',
+        },
+        source='world_events',
+        actor='world_architect',
+        commit=False,
+    )
     return world
 
 
@@ -378,7 +424,24 @@ def ensure_world_generated(campaign, current_user):
             'status': 400,
         }
 
-    raw_package = get_world_genesis_package(planning_context(campaign, current_user))
+    context = planning_context(campaign, current_user)
+    log_audit_event(
+        campaign.id,
+        'planning_context_read',
+        'Read planning context for world generation.',
+        {'context': context},
+        source='planning_context',
+        actor='server',
+        commit=True,
+    )
+    raw_package = get_world_genesis_package(
+        context,
+        audit_context={
+            'campaign_id': campaign.id,
+            'operation': 'world_genesis',
+            'actor': 'world_architect',
+        },
+    )
     if not raw_package:
         return None, {
             'error': 'The DM could not build the world package',
@@ -397,9 +460,19 @@ def approve_world(world):
         world.updated_at = datetime.utcnow()
 
 
-def dm_world_context(campaign):
+def dm_world_context(campaign, audit=False, reason='dm_world_context'):
     world = get_campaign_world(campaign.id)
     if not world:
+        if audit:
+            log_audit_event(
+                campaign.id,
+                'knowledge_graph_read',
+                'Attempted to read DM world context, but no world package exists.',
+                {'reason': reason, 'world': None},
+                source='campaign_worlds',
+                actor='server',
+                commit=True,
+            )
         return None
 
     npcs = NPCActor.query.filter_by(campaign_id=campaign.id).order_by(NPCActor.id.asc()).all()
@@ -408,7 +481,7 @@ def dm_world_context(campaign):
         WorldEvent.created_at.desc(),
     ).limit(12).all()
 
-    return {
+    context = {
         'public_intro': json_loads(world.public_intro, {}),
         'knowledge_graph': json_loads(world.knowledge_graph, {}),
         'world_state': json_loads(world.world_state, {}),
@@ -417,3 +490,14 @@ def dm_world_context(campaign):
         'clocks': [clock.to_dict(include_private=True) for clock in clocks],
         'recent_events': [event.to_dict(include_private=True) for event in reversed(recent_events)],
     }
+    if audit:
+        log_audit_event(
+            campaign.id,
+            'knowledge_graph_read',
+            'Read DM world context for model input.',
+            {'reason': reason, 'context': context},
+            source='campaign_worlds',
+            actor='server',
+            commit=True,
+        )
+    return context
