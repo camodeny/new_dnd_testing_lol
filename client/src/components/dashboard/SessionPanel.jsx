@@ -1,4 +1,5 @@
 import { useState, useRef, useEffect } from 'react'
+import DiceRollStage from './DiceRollStage'
 
 function formatTime(iso) {
   if (!iso) return ''
@@ -29,21 +30,29 @@ const QUICK_SKILLS = [
 
 const DICE = [4, 6, 8, 10, 12, 20, 100]
 
+function formatRollSummary(roll) {
+  if (!roll) return ''
+  const kept = roll.rolls.length > 1 ? ` (keep ${roll.result})` : ''
+  const modifier = roll.modifier ? ` ${roll.modifier > 0 ? '+' : '-'} ${Math.abs(roll.modifier)}` : ''
+  return `${roll.label}: ${roll.rolls.join(', ')}${kept}${modifier} = ${roll.total}`
+}
+
 export default function SessionPanel({
   session,
   messages,
   onStartSession,
   onEndSession,
   onSendMessage,
-  onRollDice,
   aiThinking,
 }) {
   const [input, setInput] = useState('')
   const [modifier, setModifier] = useState(0)
   const [advantage, setAdvantage] = useState(false)
   const [showDice, setShowDice] = useState(false)
+  const [lastRoll, setLastRoll] = useState(null)
   const messagesEndRef = useRef(null)
   const inputRef = useRef(null)
+  const rollIdRef = useRef(0)
 
   useEffect(() => {
     messagesEndRef.current?.scrollIntoView({ behavior: 'smooth' })
@@ -58,8 +67,9 @@ export default function SessionPanel({
       if (match) {
         const sides = parseInt(match[1], 10)
         const mod = match[2] ? parseInt(match[2].replace(/\s/g, ''), 10) : 0
-        const { rolls, total } = rollDie(sides, mod)
-        onRollDice(sides, rolls, total, mod)
+        const { rolls, total, result } = rollDie(sides, mod)
+        recordLocalRoll({ sides, rolls, total, result, modifier: mod, label: `d${sides}` })
+        setShowDice(true)
       }
       setInput('')
       return
@@ -93,29 +103,28 @@ export default function SessionPanel({
     }
   }
 
+  const recordLocalRoll = ({ sides, rolls, total, result, modifier = 0, label }) => {
+    rollIdRef.current += 1
+    setLastRoll({
+      id: rollIdRef.current,
+      sides,
+      rolls,
+      total,
+      result,
+      modifier,
+      label,
+      rolledAt: new Date().toISOString(),
+    })
+  }
+
   const handleDieClick = (sides) => {
     const { rolls, total, result } = rollDie(sides, modifier, advantage)
-    const rollMsg = `🎲 d${sides} = ${rolls.join(', ')}${rolls.length > 1 ? ` (keep ${result})` : ''}${modifier ? ` + ${modifier} = ${total}` : ''}`
-    onRollDice(sides, rolls, total, modifier)
-    if (!session) {
-      onStartSession().then(() => {
-        setTimeout(() => onSendMessage(rollMsg), 100)
-      })
-    } else {
-      onSendMessage(rollMsg)
-    }
+    recordLocalRoll({ sides, rolls, total, result, modifier, label: `d${sides}` })
   }
 
   const handleSkillRoll = (skill) => {
     const { rolls, total, result } = rollDie(20, advantage ? 0 : 0, advantage)
-    const rollMsg = `🎲 ${skill}: d20 = ${rolls.join(', ')}${rolls.length > 1 ? ` (keep ${result})` : ''} → ${total}`
-    if (!session) {
-      onStartSession().then(() => {
-        setTimeout(() => onSendMessage(rollMsg), 100)
-      })
-    } else {
-      onSendMessage(rollMsg)
-    }
+    recordLocalRoll({ sides: 20, rolls, total, result, label: skill })
   }
 
   return (
@@ -177,7 +186,36 @@ export default function SessionPanel({
               <i className="bi bi-dice-5-fill"></i>
             </button>
             {showDice && (
-              <div className="dice-roller">
+              <>
+                <div className="dice-stage">
+                  <DiceRollStage roll={lastRoll} />
+                </div>
+                <div className="dice-roller" role="group" aria-label="Dice roller">
+                  <div className="dice-dock-top">
+                    <div className="dice-stage-readout" aria-live="polite">
+                      {lastRoll ? (
+                        <>
+                          <span className="dice-readout-label">{lastRoll.label}</span>
+                          <strong>{lastRoll.result}</strong>
+                          <span>{formatRollSummary(lastRoll)}</span>
+                        </>
+                      ) : (
+                        <>
+                          <span className="dice-readout-label">Ready</span>
+                          <strong>d20</strong>
+                          <span>Select a die.</span>
+                        </>
+                      )}
+                    </div>
+                    <button
+                      className="btn dice-dock-close"
+                      onClick={() => setShowDice(false)}
+                      title="Close dice roller"
+                      aria-label="Close dice roller"
+                    >
+                      <i className="bi bi-x-lg"></i>
+                    </button>
+                  </div>
                 <div className="dice-grid">
                   {DICE.map((sides) => (
                     <button
@@ -222,6 +260,7 @@ export default function SessionPanel({
                   ))}
                 </div>
               </div>
+              </>
             )}
           </div>
 

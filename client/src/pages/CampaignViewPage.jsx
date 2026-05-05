@@ -242,12 +242,6 @@ export default function CampaignViewPage({ user }) {
     }
   }
 
-  const handleRollDice = (sides, rolls, total, modifier) => {
-    if (!session) return
-    const rollMsg = `🎲 d${sides} = ${rolls.join(', ')}${modifier ? ` + ${modifier} = ${total}` : ` → ${total}`}`
-    handleSendMessage(rollMsg)
-  }
-
   const handleUpdateSettings = async () => {
     try {
       const data = await updateCampaign(id, { name: campaignName, description: campaignDesc })
@@ -383,7 +377,6 @@ export default function CampaignViewPage({ user }) {
             onStartSession={handleStartSession}
             onEndSession={handleEndSession}
             onSendMessage={handleSendMessage}
-            onRollDice={handleRollDice}
             aiThinking={aiThinking}
           />
         </main>
