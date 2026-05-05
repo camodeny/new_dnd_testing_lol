@@ -1,4 +1,5 @@
 import { useState, useRef, useEffect } from 'react'
+import MarkdownContent from '../common/MarkdownContent'
 import DiceRollStage from './DiceRollStage'
 
 function formatTime(iso) {
@@ -162,7 +163,9 @@ export default function SessionPanel({
                   </span>
                   <span className="session-msg-time">{formatTime(msg.created_at)}</span>
                 </div>
-                <div className="session-msg-content">{msg.content}</div>
+                <div className="session-msg-content">
+                  {msg.role === 'dm' ? <MarkdownContent content={msg.content} /> : msg.content}
+                </div>
               </div>
             ))}
             {aiThinking && (

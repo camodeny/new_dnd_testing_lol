@@ -13,7 +13,10 @@
     "bootstrap-icons": "^1.13.1",
     "react": "^19.2.5",
     "react-dom": "^19.2.5",
+    "react-markdown": "^10.1.0",
     "react-router-dom": "^7.14.2",
+    "remark-breaks": "^4.0.0",
+    "remark-gfm": "^4.0.1",
     "three": "^0.184.0"
   },
   "devDependencies": {

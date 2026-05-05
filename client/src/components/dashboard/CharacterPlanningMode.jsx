@@ -12,6 +12,7 @@ import {
 } from '../../api/client'
 import Loading from '../common/Loading'
 import ErrorMessage from '../common/ErrorMessage'
+import MarkdownContent from '../common/MarkdownContent'
 import {
   CharacterFormBody,
 } from '../character/CharacterForm'
@@ -527,7 +528,9 @@ export default function CharacterPlanningMode({ campaign, currentUser, onComplet
               <span>{message.role === 'dm' ? 'DM' : 'You'}</span>
               <time>{formatTime(message.created_at)}</time>
             </div>
-            <div>{message.content}</div>
+            <div>
+              {message.role === 'dm' ? <MarkdownContent content={message.content} /> : message.content}
+            </div>
           </div>
         ))}
         {renderPendingBondCards()}
