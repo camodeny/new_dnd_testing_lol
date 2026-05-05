@@ -55,6 +55,10 @@ export function getCampaign(id) {
   return apiFetch(`/campaigns/${id}`)
 }
 
+export function getCampaignDevAudit(id) {
+  return apiFetch(`/campaigns/${id}/dev`)
+}
+
 export function createCampaign(payload) {
   return apiFetch('/campaigns', { method: 'POST', body: JSON.stringify(payload) })
 }

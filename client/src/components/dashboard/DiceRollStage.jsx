@@ -1,10 +1,11 @@
 import { useEffect, useRef } from 'react'
 import * as THREE from 'three'
+import { ConvexGeometry } from 'three/examples/jsm/geometries/ConvexGeometry.js'
 
 const FORWARD = new THREE.Vector3(0, 0, 1)
 const CAMERA_FACE_NORMAL = new THREE.Vector3(0, 0.62, 0.78).normalize()
 const CAMERA_SCREEN_UP = new THREE.Vector3(0, 1, -0.52).normalize()
-const DIE_SCALE = 0.68
+const DIE_SCALE = 0.52
 
 const DIE_STYLES = {
   4: { base: '#374151', accent: '#f59e0b', emissive: '#312000' },
@@ -18,6 +19,11 @@ const DIE_STYLES = {
 
 function easeOutCubic(value) {
   return 1 - Math.pow(1 - value, 3)
+}
+
+function smoothstep(edge0, edge1, value) {
+  const t = THREE.MathUtils.clamp((value - edge0) / (edge1 - edge0), 0, 1)
+  return t * t * (3 - 2 * t)
 }
 
 function randomUnitVector() {
@@ -66,7 +72,13 @@ function makeStoneTexture(style) {
   return texture
 }
 
-function makeTextTexture(text, sides, highlighted = false) {
+function getTextFontSize(text, highlighted = false) {
+  if (text.length >= 3) return highlighted ? 96 : 76
+  if (text.length === 2) return highlighted ? 122 : 96
+  return highlighted ? 150 : 112
+}
+
+function makeTextTexture(text, highlighted = false) {
   const canvas = document.createElement('canvas')
   const size = 256
   canvas.width = size
@@ -76,7 +88,7 @@ function makeTextTexture(text, sides, highlighted = false) {
   context.clearRect(0, 0, size, size)
   context.textAlign = 'center'
   context.textBaseline = 'middle'
-  context.font = `900 ${highlighted ? 150 : sides === 100 ? 92 : 112}px ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif`
+  context.font = `900 ${getTextFontSize(text, highlighted)}px ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif`
   context.lineJoin = 'round'
   context.strokeStyle = highlighted ? 'rgba(0, 0, 0, 0.98)' : 'rgba(0, 0, 0, 0.9)'
   context.lineWidth = highlighted ? 30 : 20
@@ -90,17 +102,19 @@ function makeTextTexture(text, sides, highlighted = false) {
   return texture
 }
 
-function faceLabelSize(sides, highlighted = false) {
+function faceLabelSize(sides, text, highlighted = false) {
   const multiplier = highlighted ? 1.38 : 1
   if (sides === 6) return 0.42 * multiplier
-  if (sides === 4 || sides === 8 || sides === 10 || sides === 100) return 0.36 * multiplier
+  if (sides === 100) return 0.13 * (highlighted ? 1.8 : 1)
+  if (sides === 10 && text.length > 1) return 0.32 * multiplier
+  if (sides === 4 || sides === 8 || sides === 10) return 0.36 * multiplier
   if (sides === 12) return 0.3 * multiplier
   return 0.34 * multiplier
 }
 
 function createNumberLabel(text, face, sides, highlighted = false) {
-  const size = faceLabelSize(sides, highlighted)
-  const texture = makeTextTexture(text, sides, highlighted)
+  const size = faceLabelSize(sides, text, highlighted)
+  const texture = makeTextTexture(text, highlighted)
   const material = new THREE.MeshBasicMaterial({
     map: texture,
     transparent: true,
@@ -114,6 +128,25 @@ function createNumberLabel(text, face, sides, highlighted = false) {
   label.position.copy(face.center).addScaledVector(face.normal, highlighted ? 0.035 : 0.026)
   label.quaternion.setFromUnitVectors(FORWARD, face.normal)
   return label
+}
+
+function getOutwardTriangle(vertices, a, b, c) {
+  const normal = new THREE.Vector3()
+  const center = new THREE.Vector3()
+  normal.crossVectors(
+    new THREE.Vector3().subVectors(vertices[b], vertices[a]),
+    new THREE.Vector3().subVectors(vertices[c], vertices[a]),
+  ).normalize()
+  center.addVectors(vertices[a], vertices[b]).add(vertices[c]).multiplyScalar(1 / 3)
+
+  return normal.dot(center) < 0 ? [a, c, b] : [a, b, c]
+}
+
+function pushTriangle(positions, normals, vertices, vertexIndices, normal) {
+  vertexIndices.forEach((vertexIndex) => {
+    positions.push(...vertices[vertexIndex].toArray())
+    normals.push(...normal.toArray())
+  })
 }
 
 function getTriangleFace(geometry, triangleIndex, target = {}) {
@@ -172,12 +205,12 @@ function getLabelFaces(geometry, sides) {
       if (Math.abs(b.normal.y - a.normal.y) > 0.001) return b.normal.y - a.normal.y
       return Math.atan2(a.normal.z, a.normal.x) - Math.atan2(b.normal.z, b.normal.x)
     })
-    .slice(0, sides === 100 ? 10 : sides)
+    .slice(0, sides)
 }
 
 function createD10Geometry() {
-  const radius = 0.82
-  const height = 1.12
+  const radius = 0.88
+  const height = 0.72
   const vertices = [
     new THREE.Vector3(0, height, 0),
     new THREE.Vector3(0, -height, 0),
@@ -185,45 +218,88 @@ function createD10Geometry() {
 
   for (let i = 0; i < 10; i += 1) {
     const angle = (Math.PI * 2 * i) / 10
-    const y = i % 2 === 0 ? 0.18 : -0.18
+    const y = i % 2 === 0 ? 0.24 : -0.24
     vertices.push(new THREE.Vector3(Math.cos(angle) * radius, y, Math.sin(angle) * radius))
   }
 
-  const indices = []
+  const positions = []
+  const normals = []
   const labelFaces = []
+  const edgeSegments = []
+  const edgeKeys = new Set()
+
+  const addEdgeSegment = (a, b) => {
+    const key = [a, b].sort((left, right) => left - right).join(':')
+    if (edgeKeys.has(key)) return
+    edgeKeys.add(key)
+    edgeSegments.push(vertices[a].clone(), vertices[b].clone())
+  }
 
   for (let i = 0; i < 10; i += 1) {
-    const current = i + 2
-    const next = ((i + 1) % 10) + 2
+    const pole = i % 2 === 0 ? 0 : 1
+    const v1 = (i % 10) + 2
+    const v2 = ((i + 1) % 10) + 2
+    const v3 = ((i + 2) % 10) + 2
+    const triangle1 = getOutwardTriangle(vertices, pole, v1, v2)
+    const triangle2 = getOutwardTriangle(vertices, pole, v2, v3)
 
-    indices.push(0, next, 1)
-    indices.push(0, 1, current)
+    const normal1 = new THREE.Vector3().crossVectors(
+      new THREE.Vector3().subVectors(vertices[triangle1[1]], vertices[triangle1[0]]),
+      new THREE.Vector3().subVectors(vertices[triangle1[2]], vertices[triangle1[0]]),
+    ).normalize()
+    const normal2 = new THREE.Vector3().crossVectors(
+      new THREE.Vector3().subVectors(vertices[triangle2[1]], vertices[triangle2[0]]),
+      new THREE.Vector3().subVectors(vertices[triangle2[2]], vertices[triangle2[0]]),
+    ).normalize()
 
-    const center = new THREE.Vector3()
-      .add(vertices[0])
-      .add(vertices[1])
-      .add(vertices[current])
-      .add(vertices[next])
+    const kiteNormal = normal1.clone().add(normal2).normalize()
+    const kiteCenter = new THREE.Vector3()
+      .add(vertices[pole])
+      .add(vertices[v1])
+      .add(vertices[v2])
+      .add(vertices[v3])
       .multiplyScalar(0.25)
-    const normal = new THREE.Vector3()
-      .crossVectors(
-        new THREE.Vector3().subVectors(vertices[next], vertices[0]),
-        new THREE.Vector3().subVectors(vertices[1], vertices[0]),
-      )
-      .normalize()
 
-    if (normal.dot(center) < 0) {
-      normal.multiplyScalar(-1)
-    }
+    pushTriangle(positions, normals, vertices, triangle1, kiteNormal)
+    pushTriangle(positions, normals, vertices, triangle2, kiteNormal)
+    labelFaces.push({ center: kiteCenter, normal: kiteNormal })
 
-    labelFaces.push({ center, normal })
+    addEdgeSegment(pole, v1)
+    addEdgeSegment(pole, v3)
+    addEdgeSegment(v1, v2)
+    addEdgeSegment(v2, v3)
   }
 
   const geometry = new THREE.BufferGeometry()
-  geometry.setAttribute('position', new THREE.Float32BufferAttribute(vertices.flatMap((v) => v.toArray()), 3))
-  geometry.setIndex(indices)
-  geometry.computeVertexNormals()
+  geometry.setAttribute('position', new THREE.Float32BufferAttribute(positions, 3))
+  geometry.setAttribute('normal', new THREE.Float32BufferAttribute(normals, 3))
+  geometry.computeBoundingSphere()
   geometry.userData.labelFaces = labelFaces
+  geometry.userData.edgeSegments = edgeSegments
+  geometry.userData.smoothNormals = true
+  return geometry
+}
+
+function createD100Geometry() {
+  const points = []
+  const count = 52
+  const radius = 0.94
+  const goldenAngle = Math.PI * (3 - Math.sqrt(5))
+
+  for (let i = 0; i < count; i += 1) {
+    const y = 1 - (i / (count - 1)) * 2
+    const radial = Math.sqrt(Math.max(0, 1 - y * y))
+    const theta = i * goldenAngle
+    points.push(new THREE.Vector3(
+      Math.cos(theta) * radial * radius,
+      y * radius,
+      Math.sin(theta) * radial * radius,
+    ))
+  }
+
+  const geometry = new ConvexGeometry(points)
+  geometry.deleteAttribute('uv')
+  geometry.computeVertexNormals()
   return geometry
 }
 
@@ -236,8 +312,9 @@ function createDieGeometry(sides) {
     case 8:
       return new THREE.OctahedronGeometry(0.98, 0)
     case 10:
-    case 100:
       return createD10Geometry()
+    case 100:
+      return createD100Geometry()
     case 12:
       return new THREE.DodecahedronGeometry(0.92, 0)
     case 20:
@@ -246,11 +323,17 @@ function createDieGeometry(sides) {
   }
 }
 
-function createDieMesh(sides, value) {
-  const style = DIE_STYLES[sides] || DIE_STYLES[20]
+function createDieMesh(sides, value, options = {}) {
+  const style = DIE_STYLES[options.styleSides] || DIE_STYLES[sides] || DIE_STYLES[20]
   const geometry = createDieGeometry(sides)
   const labelFaces = getLabelFaces(geometry, sides)
-  const selectedFaceIndex = Math.max(0, Math.min(labelFaces.length - 1, (value - 1) % labelFaces.length))
+  const selectedFaceIndex = Math.max(
+    0,
+    Math.min(
+      labelFaces.length - 1,
+      options.selectedFaceIndex ?? ((value - 1) % labelFaces.length),
+    ),
+  )
   const material = new THREE.MeshStandardMaterial({
     color: '#f8fafc',
     map: makeStoneTexture(style),
@@ -258,13 +341,16 @@ function createDieMesh(sides, value) {
     emissiveIntensity: 0.28,
     roughness: 0.82,
     metalness: 0.06,
-    flatShading: true,
+    flatShading: !geometry.userData.smoothNormals,
   })
   const mesh = new THREE.Mesh(geometry, material)
   mesh.castShadow = true
 
+  const edgeGeometry = geometry.userData.edgeSegments
+    ? new THREE.BufferGeometry().setFromPoints(geometry.userData.edgeSegments)
+    : new THREE.EdgesGeometry(geometry, 18)
   const edges = new THREE.LineSegments(
-    new THREE.EdgesGeometry(geometry, 18),
+    edgeGeometry,
     new THREE.LineBasicMaterial({ color: '#f8fafc', transparent: true, opacity: 0.42 }),
   )
 
@@ -275,13 +361,18 @@ function createDieMesh(sides, value) {
 
   labelFaces.forEach((face, index) => {
     const highlighted = index === selectedFaceIndex
-    const faceValue = sides === 100
-      ? String(index === selectedFaceIndex ? value : (index * 10)).padStart(2, '0')
-      : String(index + 1)
+    const faceValue = options.labels?.[index] ?? String(index + 1)
     group.add(createNumberLabel(faceValue, face, sides, highlighted))
   })
 
   return { group, resultFace: labelFaces[selectedFaceIndex] || labelFaces[0] }
+}
+
+function getRollVisualSpecs(roll) {
+  const sides = roll?.sides || 20
+  const values = roll?.rolls?.length ? roll.rolls : [roll?.result || sides]
+
+  return values.map((value) => ({ sides, value }))
 }
 
 function disposeGroup(group) {
@@ -381,7 +472,10 @@ export default function DiceRollStage({ roll }) {
           const elapsed = time - activeRoll.startedAt
           const progress = Math.min(elapsed / activeRoll.duration, 1)
           const ease = easeOutCubic(progress)
-          const bounce = Math.abs(Math.sin(progress * Math.PI * 5.4)) * Math.pow(1 - progress, 1.18) * 0.78
+          const tumbleEase = easeOutCubic(Math.min(progress / 0.82, 1))
+          const settle = smoothstep(0.48, 0.96, progress)
+          const bounce = Math.abs(Math.sin(progress * Math.PI * 5.2)) * Math.pow(1 - progress, 1.35) * 0.58
+          const landingWobble = Math.sin(progress * Math.PI * 8.5) * Math.pow(1 - progress, 1.7) * smoothstep(0.62, 0.9, progress)
           const target = activeRoll.targets[index]
 
           die.position.x = THREE.MathUtils.lerp(target.startX, target.x, ease)
@@ -389,16 +483,14 @@ export default function DiceRollStage({ roll }) {
           die.position.z = THREE.MathUtils.lerp(target.startZ, 0, ease)
             + Math.sin(progress * Math.PI * 3 + index) * (1 - progress) * 0.12
 
-          if (progress < 0.78) {
-            const spin = new THREE.Quaternion().setFromAxisAngle(
-              target.spinAxis,
-              progress * target.spinTurns * Math.PI * 2,
-            )
-            die.quaternion.copy(target.startQuaternion).multiply(spin)
-          } else {
-            const settleProgress = easeOutCubic((progress - 0.78) / 0.22)
-            die.quaternion.slerpQuaternions(target.midQuaternion, target.finalQuaternion, settleProgress)
-          }
+          const spin = new THREE.Quaternion().setFromAxisAngle(
+            target.spinAxis,
+            tumbleEase * target.spinTurns * Math.PI * 2,
+          )
+          const tumblingQuaternion = target.startQuaternion.clone().multiply(spin)
+          const wobbleQuaternion = new THREE.Quaternion().setFromAxisAngle(target.wobbleAxis, landingWobble)
+          const settledQuaternion = target.finalQuaternion.clone().multiply(wobbleQuaternion)
+          die.quaternion.slerpQuaternions(tumblingQuaternion, settledQuaternion, settle)
 
           if (progress >= 1) {
             die.position.set(target.x, target.y, 0)
@@ -443,14 +535,13 @@ export default function DiceRollStage({ roll }) {
       return
     }
 
-    const sides = roll?.sides || 20
-    const count = Math.max(1, roll?.rolls?.length || 1)
+    const visualSpecs = getRollVisualSpecs(roll)
+    const count = Math.max(1, visualSpecs.length)
     const spacing = count > 1 ? 1.45 : 0
     const centerX = count === 1 ? -1.9 + Math.random() * 3.8 : 0
     const centerZ = -0.65 + Math.random() * 1.35
-    const dice = Array.from({ length: count }, (_, index) => {
-      const value = roll?.rolls?.[index] || 20
-      const { group: die, resultFace } = createDieMesh(sides, value)
+    const dice = visualSpecs.map((spec, index) => {
+      const { group: die, resultFace } = createDieMesh(spec.sides, spec.value, spec)
       die.position.set(centerX + (index - (count - 1) / 2) * spacing, -0.08, centerZ)
       die.rotation.set(0.7 + index * 0.4, 0.4 + index * 0.55, 0.25)
       die.userData.resultFace = resultFace
@@ -477,7 +568,6 @@ export default function DiceRollStage({ roll }) {
           die.userData.resultFace,
           -0.05 + index * 0.1 + Math.random() * 0.08,
         )
-        const settleSpin = new THREE.Quaternion().setFromAxisAngle(spinAxis, 0.78 * spinTurns * Math.PI * 2)
         const fromLeft = Math.random() > 0.5
 
         return {
@@ -486,9 +576,9 @@ export default function DiceRollStage({ roll }) {
           startX: x + (fromLeft ? -6.2 : 6.2) + (Math.random() - 0.5) * 0.9,
           startZ: centerZ + 1.6 + Math.random() * 1.2,
           spinAxis,
+          wobbleAxis: new THREE.Vector3(0.5 + Math.random() * 0.25, 0, 0.55 + Math.random() * 0.25).normalize(),
           spinTurns,
           startQuaternion,
-          midQuaternion: startQuaternion.clone().multiply(settleSpin),
           finalQuaternion,
         }
       }),

@@ -4,6 +4,7 @@ import Login from './Login'
 import Header from './components/layout/Header'
 import HomePage from './pages/HomePage'
 import CampaignViewPage from './pages/CampaignViewPage'
+import CampaignDevPage from './pages/CampaignDevPage'
 import CampaignJoinPage from './pages/CampaignJoinPage'
 import CharactersListPage from './pages/CharactersListPage'
 import CharacterCreatePage from './pages/CharacterCreatePage'
@@ -16,7 +17,7 @@ import './App.css'
 function AppRoutes() {
   const { user, setUser, loading, logout } = useAuth()
   const location = useLocation()
-  const isCampaignView = location.pathname.startsWith('/campaigns/')
+  const isCampaignView = /^\/campaigns\/[^/]+$/.test(location.pathname)
 
   if (loading) {
     return <div className="loading">Loading...</div>
@@ -32,6 +33,7 @@ function AppRoutes() {
       <main className={`app-main ${isCampaignView ? 'full-bleed' : ''}`}>
         <Routes>
           <Route path="/" element={<HomePage />} />
+          <Route path="/campaigns/:id/dev" element={<CampaignDevPage user={user} />} />
           <Route path="/campaigns/:id" element={<CampaignViewPage user={user} />} />
           <Route path="/join/:id" element={<CampaignJoinPage />} />
           <Route path="/characters" element={<CharactersListPage />} />

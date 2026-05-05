@@ -354,6 +354,13 @@ export default function CampaignViewPage({ user }) {
           </div>
         </div>
         <div className="dashboard-header-right">
+          <button
+            className="dashboard-settings-btn"
+            onClick={() => navigate(`/campaigns/${id}/dev`)}
+            title="Open campaign audit"
+          >
+            <i className="bi bi-bug-fill"></i>
+          </button>
           <button className="dashboard-settings-btn" onClick={() => {
             setCampaignName(campaign.name)
             setCampaignDesc(campaign.description || '')

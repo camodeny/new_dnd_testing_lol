@@ -103,29 +103,12 @@ def _json_loads_or_empty(text):
             try:
                 return json.loads(text[start:end + 1])
             except (TypeError, ValueError):
-                return {}
+                pass
+        return {}
     return {}
 
 
-def get_dm_response(session_messages):
-    messages = [{'role': 'system', 'content': SYSTEM_PROMPT}]
-    for msg in session_messages:
-        if msg.role == 'dm':
-            role = 'assistant'
-        elif msg.role == 'player':
-            role = 'user'
-        else:
-            role = msg.role
-        messages.append({'role': role, 'content': msg.content})
-
-    try:
-        return _post_chat(messages)
-    except Exception as e:
-        print(f'[openrouter] Error: {e}')
-        return None
-
-
-def get_dm_response_with_context(session_messages, planning_context=None):
+def build_dm_response_messages(session_messages, planning_context=None):
     messages = [{'role': 'system', 'content': SYSTEM_PROMPT}]
     if planning_context:
         messages.append({
@@ -142,15 +125,11 @@ def get_dm_response_with_context(session_messages, planning_context=None):
             role = msg.role
         messages.append({'role': role, 'content': msg.content})
 
-    try:
-        return _post_chat(messages)
-    except Exception as e:
-        print(f'[openrouter] Error: {e}')
-        return None
+    return messages
 
 
-def get_opening_scene_response(context, world_context):
-    messages = [
+def build_opening_scene_messages(context, world_context):
+    return [
         {'role': 'system', 'content': SYSTEM_PROMPT},
         {
             'role': 'system',
@@ -170,15 +149,9 @@ def get_opening_scene_response(context, world_context):
         },
     ]
 
-    try:
-        return _post_chat(messages)
-    except Exception as e:
-        print(f'[openrouter] Opening scene error: {e}')
-        return None
 
-
-def get_planning_dm_response(context, current_user_messages, draft_character=None, active_page=None):
-    messages = [
+def build_planning_dm_messages(context, current_user_messages, draft_character=None, active_page=None):
+    return [
         {'role': 'system', 'content': PLANNING_SYSTEM_PROMPT},
         {
             'role': 'system',
@@ -189,28 +162,18 @@ def get_planning_dm_response(context, current_user_messages, draft_character=Non
                 'valid_pages': ['identity', 'scores', 'combat', 'magic_gear', 'story'],
             }, ensure_ascii=False),
         },
-    ]
-    for msg in current_user_messages:
-        role = 'assistant' if msg.role == 'dm' else 'user'
-        messages.append({'role': role, 'content': msg.content})
-
-    try:
-        text = _post_chat(messages, json_mode=True)
-        data = _json_loads_or_empty(text)
-        if isinstance(data, dict) and data.get('message'):
-            return {
-                'message': data.get('message') or '',
-                'active_page': data.get('active_page'),
-                'form_patch': data.get('form_patch') if isinstance(data.get('form_patch'), dict) else {},
+        *[
+            {
+                'role': 'assistant' if msg.role == 'dm' else 'user',
+                'content': msg.content,
             }
-        return {'message': text, 'active_page': None, 'form_patch': {}}
-    except Exception as e:
-        print(f'[openrouter] Planning DM error: {e}')
-        return None
+            for msg in current_user_messages
+        ],
+    ]
 
 
-def get_planning_summary_update(context, latest_player_message, latest_dm_message):
-    messages = [
+def build_planning_summary_messages(context, latest_player_message, latest_dm_message):
+    return [
         {'role': 'system', 'content': SUMMARY_SYSTEM_PROMPT},
         {
             'role': 'user',
@@ -239,16 +202,9 @@ def get_planning_summary_update(context, latest_player_message, latest_dm_messag
         },
     ]
 
-    try:
-        data = _json_loads_or_empty(_post_chat(messages, json_mode=True))
-        return data if isinstance(data, dict) else {}
-    except Exception as e:
-        print(f'[openrouter] Planning summary error: {e}')
-        return {}
 
-
-def get_character_draft(context, current_user_messages):
-    messages = [
+def build_character_draft_messages(context, current_user_messages):
+    return [
         {'role': 'system', 'content': DRAFT_SYSTEM_PROMPT},
         {'role': 'system', 'content': 'Planning context:\n' + json.dumps(context, ensure_ascii=False)},
         {
@@ -264,16 +220,9 @@ def get_character_draft(context, current_user_messages):
         },
     ]
 
-    try:
-        data = _json_loads_or_empty(_post_chat(messages, json_mode=True))
-        return data if isinstance(data, dict) else {}
-    except Exception as e:
-        print(f'[openrouter] Character draft error: {e}')
-        return {}
 
-
-def get_world_genesis_package(context):
-    messages = [
+def build_world_genesis_messages(context):
+    return [
         {'role': 'system', 'content': WORLD_GENESIS_SYSTEM_PROMPT},
         {
             'role': 'user',
@@ -373,6 +322,80 @@ def get_world_genesis_package(context):
             }, ensure_ascii=False),
         },
     ]
+
+
+def get_dm_response(session_messages):
+    messages = build_dm_response_messages(session_messages)
+
+    try:
+        return _post_chat(messages)
+    except Exception as e:
+        print(f'[openrouter] Error: {e}')
+        return None
+
+
+def get_dm_response_with_context(session_messages, planning_context=None):
+    messages = build_dm_response_messages(session_messages, planning_context)
+
+    try:
+        return _post_chat(messages)
+    except Exception as e:
+        print(f'[openrouter] Error: {e}')
+        return None
+
+
+def get_opening_scene_response(context, world_context):
+    messages = build_opening_scene_messages(context, world_context)
+
+    try:
+        return _post_chat(messages)
+    except Exception as e:
+        print(f'[openrouter] Opening scene error: {e}')
+        return None
+
+
+def get_planning_dm_response(context, current_user_messages, draft_character=None, active_page=None):
+    messages = build_planning_dm_messages(context, current_user_messages, draft_character, active_page)
+
+    try:
+        text = _post_chat(messages, json_mode=True)
+        data = _json_loads_or_empty(text)
+        if isinstance(data, dict) and data.get('message'):
+            return {
+                'message': data.get('message') or '',
+                'active_page': data.get('active_page'),
+                'form_patch': data.get('form_patch') if isinstance(data.get('form_patch'), dict) else {},
+            }
+        return {'message': text, 'active_page': None, 'form_patch': {}}
+    except Exception as e:
+        print(f'[openrouter] Planning DM error: {e}')
+        return None
+
+
+def get_planning_summary_update(context, latest_player_message, latest_dm_message):
+    messages = build_planning_summary_messages(context, latest_player_message, latest_dm_message)
+
+    try:
+        data = _json_loads_or_empty(_post_chat(messages, json_mode=True))
+        return data if isinstance(data, dict) else {}
+    except Exception as e:
+        print(f'[openrouter] Planning summary error: {e}')
+        return {}
+
+
+def get_character_draft(context, current_user_messages):
+    messages = build_character_draft_messages(context, current_user_messages)
+
+    try:
+        data = _json_loads_or_empty(_post_chat(messages, json_mode=True))
+        return data if isinstance(data, dict) else {}
+    except Exception as e:
+        print(f'[openrouter] Character draft error: {e}')
+        return {}
+
+
+def get_world_genesis_package(context):
+    messages = build_world_genesis_messages(context)
 
     try:
         data = _json_loads_or_empty(_post_chat(messages, json_mode=True))
