@@ -1,6 +1,7 @@
 import { useState, useRef, useEffect } from 'react'
 import MarkdownContent from '../common/MarkdownContent'
 import DiceRollStage from './DiceRollStage'
+import { formatMessageForDm, hasIcSegment, parseQuotedMessage, parseTaggedMessage } from '../../utils/messageTags'
 
 function formatTime(iso) {
   if (!iso) return ''
@@ -51,6 +52,55 @@ function getMessageSenderIcon(role) {
   return 'bi bi-person-fill'
 }
 
+function SessionInputPreview({ value, highlightRef }) {
+  const segments = parseQuotedMessage(value, { includeQuoteMarks: true })
+
+  return (
+    <div ref={highlightRef} className="session-input-highlight" aria-hidden="true">
+      {segments.length ? segments.map((segment, index) => (
+        <span
+          key={`${segment.type}-${index}`}
+          className={segment.type === 'ic' ? 'session-input-ic-highlight' : undefined}
+        >
+          {segment.text}
+        </span>
+      )) : '\u00a0'}
+    </div>
+  )
+}
+
+function PlayerMessageContent({ content }) {
+  const segments = parseTaggedMessage(content)
+
+  return (
+    <div className="session-player-tagged-content">
+      {segments.map((segment, index) => {
+        const text = segment.text.trim()
+        if (!text) return null
+
+        if (segment.type === 'ic') {
+          return (
+            <div key={`ic-${index}`} className="session-ic-message">
+              <div className="session-ic-banner">
+                <span><i className="bi bi-chat-quote-fill"></i> PC</span>
+                <strong>In character</strong>
+              </div>
+              <div className="session-ic-text">{text}</div>
+            </div>
+          )
+        }
+
+        return (
+          <div key={`ooc-${index}`} className="session-ooc-message">
+            <span className="session-ooc-label">OOC</span>
+            <span>{text}</span>
+          </div>
+        )
+      })}
+    </div>
+  )
+}
+
 export default function SessionPanel({
   session,
   messages,
@@ -67,6 +117,7 @@ export default function SessionPanel({
   const [lastRoll, setLastRoll] = useState(null)
   const messagesEndRef = useRef(null)
   const inputRef = useRef(null)
+  const inputHighlightRef = useRef(null)
   const rollIdRef = useRef(0)
 
   useEffect(() => {
@@ -101,13 +152,13 @@ export default function SessionPanel({
 
     if (!session) {
       onStartSession().then(() => {
-        setTimeout(() => onSendMessage(text), 100)
+        setTimeout(() => onSendMessage(formatMessageForDm(text)), 100)
       })
       setInput('')
       return
     }
 
-    onSendMessage(text)
+    onSendMessage(formatMessageForDm(text))
     setInput('')
   }
 
@@ -115,6 +166,13 @@ export default function SessionPanel({
     if (e.key === 'Enter' && !e.shiftKey) {
       e.preventDefault()
       handleSend()
+    }
+  }
+
+  const handleInputScroll = (e) => {
+    if (inputHighlightRef.current) {
+      inputHighlightRef.current.scrollTop = e.currentTarget.scrollTop
+      inputHighlightRef.current.scrollLeft = e.currentTarget.scrollLeft
     }
   }
 
@@ -177,8 +235,14 @@ export default function SessionPanel({
                   </span>
                   <span className="session-msg-time">{formatTime(msg.created_at)}</span>
                 </div>
-                <div className="session-msg-content">
-                  {msg.role === 'dm' ? <MarkdownContent content={msg.content} /> : msg.content}
+                <div className={`session-msg-content ${msg.role === 'player' ? 'session-msg-content-tagged' : ''}`}>
+                  {msg.role === 'dm' ? (
+                    <MarkdownContent content={msg.content} />
+                  ) : msg.role === 'player' ? (
+                    <PlayerMessageContent content={msg.content} />
+                  ) : (
+                    msg.content
+                  )}
                 </div>
               </div>
             ))}
@@ -282,16 +346,20 @@ export default function SessionPanel({
           </div>
 
           <div className="session-input-area">
-            <textarea
-              ref={inputRef}
-              className="textarea session-input"
-              placeholder={aiThinking ? 'Waiting for DM...' : "Type your action... (use /roll d20 or /commands)"}
-              value={input}
-              onChange={(e) => setInput(e.target.value)}
-              onKeyDown={handleKeyDown}
-              rows={2}
-              disabled={aiThinking}
-            />
+            <div className={`session-input-shell ${hasIcSegment(input) ? 'has-ic' : ''}`}>
+              <SessionInputPreview value={input} highlightRef={inputHighlightRef} />
+              <textarea
+                ref={inputRef}
+                className="textarea session-input"
+                placeholder={aiThinking ? 'Waiting for DM...' : 'Type your action. Wrap speech in quotes for IC.'}
+                value={input}
+                onChange={(e) => setInput(e.target.value)}
+                onScroll={handleInputScroll}
+                onKeyDown={handleKeyDown}
+                rows={2}
+                disabled={aiThinking}
+              />
+            </div>
             <button className="btn btn-primary session-send-btn" onClick={handleSend} disabled={aiThinking}>
               {aiThinking ? '...' : 'Send'}
             </button>

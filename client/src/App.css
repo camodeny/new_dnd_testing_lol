@@ -1644,6 +1644,75 @@ select.input:focus {
   color: #e8e8e8;
 }
 
+.session-msg-player .session-msg-content-tagged {
+  padding: 0;
+  background: transparent;
+  border: none;
+}
+
+.session-player-tagged-content {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+
+.session-ooc-message {
+  display: flex;
+  align-items: flex-start;
+  gap: 8px;
+  padding: 10px 12px;
+  background: #2a1f4e;
+  border: 1px solid #3a2a6e;
+  border-radius: 8px;
+  color: #e8e8e8;
+  white-space: pre-wrap;
+}
+
+.session-ooc-label {
+  flex: 0 0 auto;
+  color: #c4b5fd;
+  font-size: 10px;
+  font-weight: 700;
+  letter-spacing: 0.4px;
+  line-height: 1.8;
+}
+
+.session-ic-message {
+  overflow: hidden;
+  background: #10252d;
+  border: 1px solid #238ca3;
+  border-radius: 8px;
+  box-shadow: 0 0 0 1px rgba(34, 211, 238, 0.08);
+}
+
+.session-ic-banner {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  gap: 12px;
+  padding: 6px 10px;
+  background: rgba(34, 211, 238, 0.14);
+  border-bottom: 1px solid rgba(34, 211, 238, 0.22);
+  color: #67e8f9;
+  font-size: 10px;
+  font-weight: 700;
+  letter-spacing: 0.4px;
+  text-transform: uppercase;
+}
+
+.session-ic-banner span {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+}
+
+.session-ic-text {
+  padding: 10px 12px 12px;
+  color: #ecfeff;
+  font-style: normal;
+  white-space: pre-wrap;
+}
+
 .session-msg-dm .session-msg-content {
   background: #1f1f2e;
   border-color: #3a3a2e;
@@ -1918,11 +1987,66 @@ select.input:focus {
   flex-shrink: 0;
 }
 
+.session-input-shell {
+  position: relative;
+  flex: 1;
+  min-width: 0;
+}
+
+.session-input-highlight {
+  position: absolute;
+  inset: 0;
+  overflow: hidden;
+  padding: 8px 12px;
+  border: 1px solid transparent;
+  border-radius: 6px;
+  background: #16171d;
+  color: transparent;
+  font-family: inherit;
+  font-size: 14px;
+  line-height: 1.5;
+  white-space: pre-wrap;
+  overflow-wrap: break-word;
+  pointer-events: none;
+  box-sizing: border-box;
+}
+
+.session-input-ic-highlight {
+  padding: 1px 3px;
+  border: 1px solid rgba(34, 211, 238, 0.6);
+  border-radius: 5px;
+  background: rgba(34, 211, 238, 0.18);
+  box-decoration-break: clone;
+  -webkit-box-decoration-break: clone;
+}
+
+.session-input-shell.has-ic::after {
+  content: 'IC';
+  position: absolute;
+  top: -7px;
+  right: 10px;
+  z-index: 2;
+  padding: 1px 6px;
+  border: 1px solid rgba(34, 211, 238, 0.5);
+  border-radius: 999px;
+  background: #10252d;
+  color: #67e8f9;
+  font-size: 9px;
+  font-weight: 800;
+  letter-spacing: 0.5px;
+  pointer-events: none;
+}
+
 .session-input {
   flex: 1;
   resize: none;
+  font-family: inherit;
   font-size: 14px;
   min-height: 40px;
+  position: relative;
+  z-index: 1;
+  background: transparent;
+  line-height: 1.5;
 }
 
 .session-send-btn {
