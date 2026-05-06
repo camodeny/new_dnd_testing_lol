@@ -4,7 +4,18 @@ from datetime import datetime
 from flask import Blueprint, jsonify, request
 
 from auth import token_required
-from models import db, Campaign, CampaignMember, CampaignInvite, Character, CampaignSession, User
+from models import (
+    db,
+    Campaign,
+    CampaignAuditEvent,
+    CampaignInvite,
+    CampaignMember,
+    CampaignPlanningSummary,
+    CampaignSession,
+    Character,
+    CharacterPlanningMessage,
+    PlanningBondProposal,
+)
 from services.campaign_service import ensure_member
 from services.character_service import character_full_dict
 
@@ -82,6 +93,15 @@ def delete_campaign(current_user, campaign_id):
     campaign = Campaign.query.get_or_404(campaign_id)
     if campaign.user_id != current_user.id:
         return jsonify({'error': 'Forbidden'}), 403
+
+    Character.query.filter_by(campaign_id=campaign_id).update(
+        {Character.campaign_id: None},
+        synchronize_session=False,
+    )
+    CharacterPlanningMessage.query.filter_by(campaign_id=campaign_id).delete(synchronize_session=False)
+    CampaignPlanningSummary.query.filter_by(campaign_id=campaign_id).delete(synchronize_session=False)
+    PlanningBondProposal.query.filter_by(campaign_id=campaign_id).delete(synchronize_session=False)
+    CampaignAuditEvent.query.filter_by(campaign_id=campaign_id).delete(synchronize_session=False)
 
     db.session.delete(campaign)
     db.session.commit()

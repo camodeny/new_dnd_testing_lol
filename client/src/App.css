@@ -868,6 +868,37 @@ select.input:focus {
   border-radius: 10px;
 }
 
+.campaign-danger-zone {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 16px;
+  margin-top: 22px;
+  padding-top: 18px;
+  border-top: 1px solid rgba(217, 48, 37, 0.28);
+}
+
+.campaign-danger-zone h3 {
+  margin: 0 0 4px;
+  color: #ff8a80;
+  font-size: 15px;
+  font-weight: 600;
+}
+
+.campaign-danger-zone p {
+  margin: 0;
+  color: #9ca3af;
+  font-size: 13px;
+  line-height: 1.4;
+}
+
+@media (max-width: 480px) {
+  .campaign-danger-zone {
+    align-items: stretch;
+    flex-direction: column;
+  }
+}
+
 /* ============================================================
    Campaign View
    ============================================================ */

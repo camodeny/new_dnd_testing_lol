@@ -1,7 +1,7 @@
 import { useEffect, useState, useCallback } from 'react'
 import { useParams, useNavigate } from 'react-router-dom'
 import {
-  getCampaign, updateCampaign, getCampaignCharacters,
+  getCampaign, updateCampaign, deleteCampaign, getCampaignCharacters,
   startSession, endSession, getSession, sendMessage,
   getCharacters,
   addCampaignCharacter,
@@ -96,6 +96,7 @@ export default function CampaignViewPage({ user }) {
   const [showSettings, setShowSettings] = useState(false)
   const [campaignName, setCampaignName] = useState('')
   const [campaignDesc, setCampaignDesc] = useState('')
+  const [deletingCampaign, setDeletingCampaign] = useState(false)
   const [showLobby, setShowLobby] = useState(false)
   const [showPlanning, setShowPlanning] = useState(false)
   const [showWorldBuilding, setShowWorldBuilding] = useState(false)
@@ -252,6 +253,24 @@ export default function CampaignViewPage({ user }) {
     }
   }
 
+  const handleDeleteCampaign = async () => {
+    if (!campaign) return
+    const confirmed = window.confirm(
+      `Delete "${campaign.name}"? This removes the campaign, sessions, invites, planning notes, and world data. Characters in the campaign will not be deleted.`
+    )
+    if (!confirmed) return
+
+    setDeletingCampaign(true)
+    setError('')
+    try {
+      await deleteCampaign(id)
+      navigate('/')
+    } catch (err) {
+      setError(err.message)
+      setDeletingCampaign(false)
+    }
+  }
+
   const openImport = async () => {
     setShowImport(true)
     setImportLoading(true)
@@ -326,6 +345,7 @@ export default function CampaignViewPage({ user }) {
   const initials = getInitials(campaign.name)
   const diffColor = getDifficultyColor(campaign.difficulty)
   const statusColor = STATUS_COLORS[campaign.status] || '#6b7280'
+  const isOwner = campaign.user_id === user?.id
 
   return (
     <div className="dashboard-page">
@@ -414,6 +434,21 @@ export default function CampaignViewPage({ user }) {
                 <button className="btn btn-secondary" onClick={() => setShowSettings(false)}>Cancel</button>
                 <button className="btn btn-primary" onClick={handleUpdateSettings}>Save</button>
               </div>
+              {isOwner && (
+                <div className="campaign-danger-zone">
+                  <div>
+                    <h3>Delete campaign</h3>
+                    <p>Remove this campaign and its dashboard history. Characters stay in your character list.</p>
+                  </div>
+                  <button
+                    className="btn btn-danger"
+                    onClick={handleDeleteCampaign}
+                    disabled={deletingCampaign}
+                  >
+                    {deletingCampaign ? 'Deleting...' : 'Delete'}
+                  </button>
+                </div>
+              )}
             </div>
           </div>
         </div>
