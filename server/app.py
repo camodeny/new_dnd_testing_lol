@@ -67,6 +67,10 @@ def ensure_lightweight_schema():
     if 'user_id' not in session_message_columns:
         db.session.execute(text('ALTER TABLE session_messages ADD COLUMN user_id INTEGER'))
 
+    campaign_session_columns = table_columns('campaign_sessions')
+    if 'running_summary' not in campaign_session_columns:
+        db.session.execute(text('ALTER TABLE campaign_sessions ADD COLUMN running_summary TEXT'))
+
     audit_event_columns = table_columns('campaign_audit_events')
     if 'trace_id' not in audit_event_columns:
         db.session.execute(text('ALTER TABLE campaign_audit_events ADD COLUMN trace_id VARCHAR(160)'))

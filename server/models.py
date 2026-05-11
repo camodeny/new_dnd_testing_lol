@@ -582,6 +582,7 @@ class CampaignSession(db.Model):
     started_at = db.Column(db.DateTime, default=datetime.utcnow)
     ended_at = db.Column(db.DateTime, nullable=True)
     recap = db.Column(db.Text, nullable=True)
+    running_summary = db.Column(db.Text, nullable=True)
     is_active = db.Column(db.Boolean, default=True)
     messages = db.relationship('SessionMessage', backref='session', lazy=True, cascade='all, delete-orphan')
 
@@ -592,6 +593,7 @@ class CampaignSession(db.Model):
             'started_at': self.started_at.isoformat() if self.started_at else None,
             'ended_at': self.ended_at.isoformat() if self.ended_at else None,
             'recap': self.recap,
+            'running_summary': self.running_summary,
             'is_active': self.is_active,
         }
 

@@ -8,10 +8,11 @@ AGENT_ACTORS = {
     'world_architect',
     'character_draft_agent',
     'planning_memory_writer',
+    'session_memory_writer',
 }
 
 PLAYER_EVENT_TYPES = {'player_input_stored'}
-AGENT_EVENT_TYPES = {'dm_output_stored', 'draft_output_sent', 'model_response'}
+AGENT_EVENT_TYPES = {'dm_output_stored', 'draft_output_sent', 'model_response', 'memory_writer_response'}
 
 
 def _json_safe(value):
@@ -86,7 +87,17 @@ def log_model_request(
     trace_id=None,
     parent_trace_id=None,
     trace_label=None,
+    tools=None,
+    tool_choice=None,
+    parallel_tool_calls=None,
+    context_manifest=None,
+    token_estimate=None,
 ):
+    tool_names = [
+        tool.get('function', {}).get('name')
+        for tool in (tools or [])
+        if isinstance(tool, dict) and tool.get('function')
+    ]
     return log_audit_event(
         campaign_id,
         'model_request',
@@ -96,6 +107,12 @@ def log_model_request(
             'model': model,
             'json_mode': json_mode,
             'messages': messages,
+            'tools': tools or [],
+            'tool_names': [name for name in tool_names if name],
+            'tool_choice': tool_choice,
+            'parallel_tool_calls': parallel_tool_calls,
+            'context_manifest': context_manifest or {},
+            'token_estimate': token_estimate or {},
             'reasoning_requested_by_app': False,
             'reasoning_note': (
                 'This app does not force reasoning for every request. OpenRouter reasoning-capable '
@@ -153,6 +170,8 @@ def log_model_response(
     trace_label=None,
 ):
     message = _first_choice_message(response)
+    choices = response.get('choices') if isinstance(response, dict) else []
+    first_choice = choices[0] if choices and isinstance(choices[0], dict) else {}
     reasoning = message.get('reasoning') or message.get('reasoning_content')
     reasoning_details = message.get('reasoning_details')
     return log_audit_event(
@@ -163,6 +182,9 @@ def log_model_response(
             'operation': operation,
             'raw_response': response,
             'content': message.get('content'),
+            'finish_reason': first_choice.get('finish_reason'),
+            'tool_calls': message.get('tool_calls') or [],
+            'usage': response.get('usage') if isinstance(response, dict) else {},
             'reasoning': reasoning,
             'reasoning_details': reasoning_details,
             'reasoning_returned': bool(reasoning or reasoning_details),

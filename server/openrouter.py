@@ -4,7 +4,7 @@ from uuid import uuid4
 import requests
 from dotenv import load_dotenv
 
-from services.audit_service import log_model_error, log_model_request, log_model_response
+from services.audit_service import log_audit_event, log_model_error, log_model_request, log_model_response
 
 load_dotenv()
 
@@ -26,6 +26,14 @@ SYSTEM_PROMPT = (
     "Never reveal DM-private memory unless it has become visible through play. "
     "Keep responses concise but vivid. Use dice rolls (via the player) when "
     "uncertainty arises. Assume standard 5e rules unless noted otherwise."
+)
+
+SESSION_TOOL_PROMPT = (
+    SYSTEM_PROMPT
+    + " You are operating with compact hot context and server tools. Use read tools for exact "
+    "character-sheet, world-memory, NPC, clock, or session facts instead of guessing. Use write tools "
+    "only when the fiction has actually changed durable world state. Do not expose DM-private tool "
+    "results in visible narration unless they became known through play."
 )
 
 PLANNING_SYSTEM_PROMPT = (
@@ -71,6 +79,20 @@ WORLD_GENESIS_SYSTEM_PROMPT = (
     "situation with active pressures, not a complete railroad."
 )
 
+SESSION_MEMORY_SYSTEM_PROMPT = (
+    "You update durable D&D campaign memory after a visible DM turn. Return only valid JSON. "
+    "Extract durable changes from the latest player message and visible DM reply. Create new clocks "
+    "when new pressure, deadlines, mysteries, faction moves, or consequences emerge, especially if all "
+    "existing active clocks are completed. Retire completed or resolved clocks instead of deleting them. "
+    "Update knowledge graph entities, relations, and facts without duplicating existing ids. Preserve "
+    "visibility as dm_private, party_known, or public. Do not invent large new lore unless it follows "
+    "from the exchange. Only write graph facts for durable truths that should remain useful after the "
+    "current scene changes. Do not write graph facts for current presence, current location, temporary "
+    "awareness, momentary posture, weather, lighting, or other scene-state details. Put current "
+    "location, occupants, and tension in scene_patch instead. If a character learns who was present, "
+    "record the durable event or encounter, not a fact that someone knows who is currently present."
+)
+
 
 def _require_openrouter_config():
     if not OPENROUTER_API_KEY:
@@ -79,7 +101,19 @@ def _require_openrouter_config():
         raise RuntimeError('OPENROUTER_MODEL is not set')
 
 
-def _post_chat(messages, json_mode=False, audit_context=None):
+def _estimate_tokens(value):
+    text = value if isinstance(value, str) else json.dumps(value, ensure_ascii=False)
+    return max(1, len(text) // 4) if text else 0
+
+
+def _post_chat_response(
+    messages,
+    json_mode=False,
+    audit_context=None,
+    tools=None,
+    tool_choice=None,
+    parallel_tool_calls=None,
+):
     audit_context = audit_context or {}
     campaign_id = audit_context.get('campaign_id')
     operation = audit_context.get('operation') or 'chat_completion'
@@ -108,6 +142,12 @@ def _post_chat(messages, json_mode=False, audit_context=None):
         'model': OPENROUTER_MODEL,
         'messages': messages,
     }
+    if tools:
+        payload['tools'] = tools
+    if tool_choice is not None:
+        payload['tool_choice'] = tool_choice
+    if parallel_tool_calls is not None:
+        payload['parallel_tool_calls'] = parallel_tool_calls
 
     if campaign_id:
         log_model_request(
@@ -121,6 +161,15 @@ def _post_chat(messages, json_mode=False, audit_context=None):
             trace_id=trace_id,
             parent_trace_id=parent_trace_id,
             trace_label=trace_label,
+            tools=tools,
+            tool_choice=tool_choice,
+            parallel_tool_calls=parallel_tool_calls,
+            context_manifest=audit_context.get('context_manifest'),
+            token_estimate=audit_context.get('token_estimate') or {
+                'estimated_message_tokens': _estimate_tokens(messages),
+                'estimated_tool_schema_tokens': _estimate_tokens(tools or []),
+                'full_world_graph_included': audit_context.get('full_world_graph_included', None),
+            },
         )
 
     try:
@@ -146,7 +195,7 @@ def _post_chat(messages, json_mode=False, audit_context=None):
                 parent_trace_id=parent_trace_id,
                 trace_label=trace_label,
             )
-        return data['choices'][0]['message']['content']
+        return data
     except Exception as err:
         if campaign_id:
             log_model_error(
@@ -160,6 +209,11 @@ def _post_chat(messages, json_mode=False, audit_context=None):
                 trace_label=trace_label,
             )
         raise
+
+
+def _post_chat(messages, json_mode=False, audit_context=None):
+    data = _post_chat_response(messages, json_mode=json_mode, audit_context=audit_context)
+    return data['choices'][0]['message']['content']
 
 
 def _json_loads_or_empty(text):
@@ -197,6 +251,17 @@ def build_dm_response_messages(session_messages, planning_context=None):
         messages.append({'role': role, 'content': msg.content})
 
     return messages
+
+
+def build_session_dm_tool_messages(hot_context):
+    return [
+        {'role': 'system', 'content': SESSION_TOOL_PROMPT},
+        {
+            'role': 'system',
+            'content': 'Compact hot context. Full campaign memory is available through tools, not preloaded:\n'
+            + json.dumps(hot_context, ensure_ascii=False),
+        },
+    ]
 
 
 def build_opening_scene_messages(context, world_context):
@@ -395,6 +460,50 @@ def build_world_genesis_messages(context):
     ]
 
 
+def build_session_memory_messages(memory_context):
+    return [
+        {'role': 'system', 'content': SESSION_MEMORY_SYSTEM_PROMPT},
+        {
+            'role': 'user',
+            'content': json.dumps({
+                'context': memory_context,
+                'return_shape': {
+                    'running_summary': 'compact updated session summary, replacing prior summary',
+                    'scene_patch': {
+                        'location_id': 'optional current scene location id; use for temporary location state',
+                        'location_name': 'optional current scene location name',
+                        'time_of_day': 'optional current scene timing',
+                        'active_npc_ids': ['npc ids currently present or active in the scene; use this instead of graph facts for occupants'],
+                        'immediate_tension': 'optional current scene tension; use for transient pressure visible right now',
+                    },
+                    'scene_reason': 'why scene changed',
+                    'upsert_graph_entities': [
+                        {'id': 'stable_id', 'type': 'npc | location | faction | item | event | threat | concept', 'name': 'display name', 'summary': 'durable summary', 'visibility': 'public | party_known | dm_private', 'tags': []}
+                    ],
+                    'upsert_graph_relations': [
+                        {'id': 'stable_id', 'source_id': 'entity id', 'target_id': 'entity id', 'type': 'relationship type', 'summary': 'durable summary', 'visibility': 'public | party_known | dm_private'}
+                    ],
+                    'upsert_graph_facts': [
+                        {'id': 'stable_id', 'entity_ids': ['all directly relevant entity ids'], 'text': 'durable fact; not current scene state, temporary presence, temporary location, or momentary character awareness', 'certainty': 'confirmed | suspected | false_rumor', 'visibility': 'public | party_known | dm_private'}
+                    ],
+                    'create_clocks': [
+                        {'id': 'stable_clock_id', 'name': 'Clock name', 'segments': 4, 'filled': 0, 'pressure_type': 'faction | danger | mystery | environment | personal | story', 'visibility': 'public | party_known | dm_private', 'summary': 'pressure summary', 'trigger': 'when it advances', 'on_complete': 'what happens', 'status': 'active', 'reason': 'why this clock now exists'}
+                    ],
+                    'retire_clocks': [
+                        {'clock_id': 'existing_clock_id', 'status': 'completed | resolved | inactive', 'reason': 'why retired'}
+                    ],
+                    'update_npc_actors': [
+                        {'id': 'npc_stable_id', 'name': 'NPC name', 'role': 'story role', 'public_summary': 'public summary', 'wants': [], 'fears': [], 'secrets': [], 'relationships': {}, 'recent_offscreen_activity': [], 'reason': 'why updated'}
+                    ],
+                    'record_events': [
+                        {'event_type': 'short_type', 'summary': 'durable event summary', 'payload': {}, 'visibility': 'public | party_known | dm_private'}
+                    ],
+                },
+            }, ensure_ascii=False),
+        },
+    ]
+
+
 def get_dm_response(session_messages, audit_context=None):
     messages = build_dm_response_messages(session_messages)
 
@@ -415,6 +524,100 @@ def get_dm_response_with_context(session_messages, planning_context=None, audit_
         return None
 
 
+def _choice_message(data):
+    choices = data.get('choices') if isinstance(data, dict) else []
+    if not choices or not isinstance(choices[0], dict):
+        return {}, None
+    message = choices[0].get('message') or {}
+    return message if isinstance(message, dict) else {}, choices[0].get('finish_reason')
+
+
+def _parse_tool_arguments(raw_arguments):
+    if isinstance(raw_arguments, dict):
+        return raw_arguments
+    if not raw_arguments:
+        return {}
+    try:
+        return json.loads(raw_arguments)
+    except (TypeError, ValueError):
+        return {}
+
+
+def _assistant_tool_message(message):
+    return {
+        'role': 'assistant',
+        'content': message.get('content'),
+        'tool_calls': message.get('tool_calls') or [],
+    }
+
+
+def get_session_dm_response_with_tools(
+    hot_context,
+    recent_messages,
+    tools,
+    execute_tool,
+    audit_context=None,
+    max_tool_rounds=4,
+):
+    base_audit = audit_context or {}
+    trace_id = base_audit.get('trace_id') or f"session_dm:session_dm_response:{uuid4().hex[:10]}"
+    trace_label = base_audit.get('trace_label') or 'session_dm: session_dm_response'
+    messages = build_session_dm_tool_messages(hot_context)
+    for msg in recent_messages:
+        if msg.role == 'dm':
+            role = 'assistant'
+        elif msg.role == 'player':
+            role = 'user'
+        else:
+            role = msg.role
+        messages.append({'role': role, 'content': msg.content})
+
+    tool_round = 0
+    while True:
+        loop_audit = {
+            **base_audit,
+            'trace_id': trace_id,
+            'trace_label': trace_label,
+            'operation': base_audit.get('operation') or 'session_dm_response',
+            'context_manifest': base_audit.get('context_manifest'),
+            'token_estimate': base_audit.get('token_estimate'),
+            'full_world_graph_included': False,
+        }
+        data = _post_chat_response(
+            messages,
+            audit_context=loop_audit,
+            tools=tools,
+            tool_choice='auto' if tool_round < max_tool_rounds else 'none',
+            parallel_tool_calls=False,
+        )
+        message, finish_reason = _choice_message(data)
+        tool_calls = message.get('tool_calls') or []
+        if not tool_calls or tool_round >= max_tool_rounds:
+            return message.get('content') or ''
+
+        messages.append(_assistant_tool_message(message))
+        for tool_call in tool_calls:
+            function = tool_call.get('function') or {}
+            tool_name = function.get('name')
+            args = _parse_tool_arguments(function.get('arguments'))
+            result = execute_tool(
+                tool_name,
+                args,
+                {
+                    **loop_audit,
+                    'parent_trace_id': trace_id,
+                    'trace_id': trace_id,
+                },
+            )
+            messages.append({
+                'role': 'tool',
+                'tool_call_id': tool_call.get('id'),
+                'name': tool_name,
+                'content': json.dumps(result, ensure_ascii=False),
+            })
+        tool_round += 1
+
+
 def get_opening_scene_response(context, world_context, audit_context=None):
     messages = build_opening_scene_messages(context, world_context)
 
@@ -423,6 +626,60 @@ def get_opening_scene_response(context, world_context, audit_context=None):
     except Exception as e:
         print(f'[openrouter] Opening scene error: {e}')
         return None
+
+
+def get_session_memory_patch(memory_context, audit_context=None):
+    messages = build_session_memory_messages(memory_context)
+    audit_context = audit_context or {}
+    campaign_id = audit_context.get('campaign_id')
+    trace_id = audit_context.get('trace_id') or f"session_memory_writer:memory_update:{uuid4().hex[:10]}"
+    trace_label = audit_context.get('trace_label') or 'session_memory_writer: memory_update'
+    if campaign_id:
+        log_audit_event(
+            campaign_id,
+            'memory_writer_request',
+            'Requested post-turn session memory update.',
+            {'context': memory_context, 'messages': messages},
+            source='openrouter',
+            actor='session_memory_writer',
+            trace_id=trace_id,
+            parent_trace_id=audit_context.get('parent_trace_id'),
+            trace_label=trace_label,
+            audit_role='tools',
+            commit=True,
+        )
+    try:
+        text = _post_chat(
+            messages,
+            json_mode=True,
+            audit_context={
+                **audit_context,
+                'trace_id': trace_id,
+                'trace_label': trace_label,
+                'operation': audit_context.get('operation') or 'session_memory_update',
+                'actor': 'session_memory_writer',
+                'full_world_graph_included': False,
+            },
+        )
+        data = _json_loads_or_empty(text)
+        if campaign_id:
+            log_audit_event(
+                campaign_id,
+                'memory_writer_response',
+                'Received post-turn session memory patch.',
+                {'patch': data},
+                source='openrouter',
+                actor='session_memory_writer',
+                trace_id=trace_id,
+                parent_trace_id=audit_context.get('parent_trace_id'),
+                trace_label=trace_label,
+                audit_role='agent',
+                commit=True,
+            )
+        return data if isinstance(data, dict) else {}
+    except Exception as e:
+        print(f'[openrouter] Session memory writer error: {e}')
+        return {}
 
 
 def get_planning_dm_response(context, current_user_messages, draft_character=None, active_page=None, audit_context=None):

@@ -4,9 +4,17 @@ from flask import Blueprint, jsonify, request
 
 from auth import token_required
 from models import db, Campaign, CampaignSession, SessionMessage
-from openrouter import get_dm_response_with_context, get_opening_scene_response
+from openrouter import get_opening_scene_response, get_session_dm_response_with_tools, get_session_memory_patch
 from services.audit_service import log_audit_event
 from services.campaign_service import ensure_member
+from services.dm_tools import (
+    DM_TOOL_DEFINITIONS,
+    apply_memory_patch,
+    build_session_hot_context,
+    build_session_memory_context,
+    context_manifest,
+    execute_dm_tool,
+)
 from services.planning_service import can_start_session, planning_context
 from services.world_service import approve_world, dm_world_context, ensure_world_generated
 
@@ -169,11 +177,12 @@ def send_message(current_user, session_id):
     if not data or not data.get('content'):
         return jsonify({'error': 'Missing content'}), 400
 
+    content = data['content']
     msg = SessionMessage(
         session_id=session_id,
         user_id=current_user.id,
         role=data.get('role', 'player'),
-        content=data['content'],
+        content=content,
     )
     db.session.add(msg)
     db.session.commit()
@@ -189,28 +198,40 @@ def send_message(current_user, session_id):
     )
 
     try:
-        context = planning_context(campaign, current_user)
+        hot_context = build_session_hot_context(campaign, session, current_user)
+        manifest = context_manifest(hot_context, DM_TOOL_DEFINITIONS)
         log_audit_event(
             campaign.id,
-            'planning_context_read',
-            'Read planning context for session DM response.',
-            {'context': context},
-            source='planning_context',
+            'session_hot_context_read',
+            'Read compact hot context for session DM response.',
+            {'context': hot_context, 'context_manifest': manifest},
+            source='session_context',
             actor='server',
             commit=True,
         )
-        context['world'] = dm_world_context(campaign, audit=True, reason='session_dm_context')
-        ai_text = get_dm_response_with_context(
-            session.messages,
-            context,
+        recent_messages = SessionMessage.query.filter_by(session_id=session_id).order_by(
+            SessionMessage.created_at.asc(),
+        ).all()[-8:]
+        trace_id = f'session_dm:session_{session_id}:message_{msg.id}'
+        ai_text = get_session_dm_response_with_tools(
+            hot_context,
+            recent_messages,
+            DM_TOOL_DEFINITIONS,
+            lambda name, args, tool_audit: execute_dm_tool(campaign, session, current_user, name, args, tool_audit),
             audit_context={
                 'campaign_id': campaign.id,
                 'operation': 'session_dm_response',
                 'actor': 'session_dm',
+                'trace_id': trace_id,
+                'trace_label': f'session_dm: session {session_id}',
+                'context_manifest': manifest,
+                'full_world_graph_included': False,
             },
         )
     except RuntimeError as err:
         return jsonify({'error': str(err), 'messages': result_messages}), 500
+    except Exception as err:
+        return jsonify({'error': repr(err), 'messages': result_messages}), 500
 
     if ai_text:
         ai_msg = SessionMessage(
@@ -219,6 +240,7 @@ def send_message(current_user, session_id):
             content=ai_text,
         )
         db.session.add(ai_msg)
+        db.session.flush()
         log_audit_event(
             campaign.id,
             'dm_output_stored',
@@ -234,8 +256,56 @@ def send_message(current_user, session_id):
             actor='session_dm',
             commit=False,
         )
+        memory_trace_id = f'session_memory_writer:session_{session_id}:message_{msg.id}'
+        try:
+            memory_context = build_session_memory_context(
+                campaign,
+                session,
+                current_user,
+                content,
+                ai_text,
+                hot_context,
+            )
+            memory_patch = get_session_memory_patch(
+                memory_context,
+                audit_context={
+                    'campaign_id': campaign.id,
+                    'operation': 'session_memory_update',
+                    'actor': 'session_memory_writer',
+                    'trace_id': memory_trace_id,
+                    'parent_trace_id': trace_id,
+                    'trace_label': f'session_memory_writer: session {session_id}',
+                },
+            )
+            if memory_patch:
+                apply_memory_patch(
+                    campaign,
+                    session,
+                    memory_patch,
+                    audit_context={
+                        'trace_id': memory_trace_id,
+                        'parent_trace_id': trace_id,
+                        'trace_label': f'session_memory_writer: session {session_id}',
+                    },
+                )
+        except Exception as err:
+            log_audit_event(
+                campaign.id,
+                'memory_update_error',
+                'Post-turn memory update failed after visible DM response.',
+                {'session_id': session_id, 'error': repr(err)},
+                source='session_memory',
+                actor='session_memory_writer',
+                trace_id=memory_trace_id,
+                parent_trace_id=trace_id,
+                trace_label=f'session_memory_writer: session {session_id}',
+                audit_role='tools',
+                commit=False,
+            )
         db.session.commit()
         result_messages.append(ai_msg.to_dict())
+    else:
+        db.session.rollback()
 
     log_audit_event(
         campaign.id,

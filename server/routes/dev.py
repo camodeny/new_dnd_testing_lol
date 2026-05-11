@@ -20,6 +20,7 @@ from openrouter import (
     build_opening_scene_messages,
     build_planning_dm_messages,
     build_planning_summary_messages,
+    build_session_dm_tool_messages,
     build_world_genesis_messages,
 )
 from services.character_service import (
@@ -28,6 +29,7 @@ from services.character_service import (
     update_character_relations,
 )
 from services.audit_service import AGENT_ACTORS, infer_audit_role
+from services.dm_tools import DM_TOOL_DEFINITIONS, build_session_hot_context, context_manifest
 from services.planning_service import (
     get_campaign_members,
     planning_context,
@@ -113,6 +115,9 @@ def _audit_stream_entry(event):
     trace_id = _fallback_trace_id(event_data)
     messages = payload.get('messages') if isinstance(payload.get('messages'), list) else []
     reasoning = _reasoning_payload(payload) if event_data.get('event_type') == 'model_response' else None
+    raw_response = payload.get('raw_response') if isinstance(payload, dict) else {}
+    first_message = _first_choice_message(raw_response)
+    tool_calls = payload.get('tool_calls') or first_message.get('tool_calls') or []
 
     label = event_data.get('actor') or role
     if role == 'tools':
@@ -132,6 +137,12 @@ def _audit_stream_entry(event):
         'messages': messages,
         'message_count': len(messages),
         'reasoning': reasoning,
+        'finish_reason': payload.get('finish_reason') if isinstance(payload, dict) else None,
+        'tool_calls': tool_calls,
+        'tool_names': payload.get('tool_names') if isinstance(payload, dict) else [],
+        'context_manifest': payload.get('context_manifest') if isinstance(payload, dict) else {},
+        'token_estimate': payload.get('token_estimate') if isinstance(payload, dict) else {},
+        'usage': payload.get('usage') if isinstance(payload, dict) else {},
         'trace_id': trace_id,
         'parent_trace_id': event_data.get('parent_trace_id'),
         'trace_label': event_data.get('trace_label') or event_data.get('actor') or trace_id,
@@ -232,6 +243,11 @@ def get_campaign_dev_audit(current_user, campaign_id):
     session_context = dict(planning_ctx)
     if world_context:
         session_context['world'] = world_context
+    latest_session_hot_context = None
+    latest_session_context_manifest = None
+    if latest_session:
+        latest_session_hot_context = build_session_hot_context(campaign, latest_session, current_user)
+        latest_session_context_manifest = context_manifest(latest_session_hot_context, DM_TOOL_DEFINITIONS)
 
     return jsonify({
         'campaign': campaign_data,
@@ -269,10 +285,19 @@ def get_campaign_dev_audit(current_user, campaign_id):
             'prompt_traces': {
                 'world_genesis': build_world_genesis_messages(planning_ctx),
                 'opening_scene': build_opening_scene_messages(planning_ctx, world_context),
-                'session_dm_response': build_dm_response_messages(
+                'legacy_full_session_dm_response': build_dm_response_messages(
                     latest_session.messages if latest_session else [],
                     session_context if latest_session else None,
                 ) if latest_session else [],
+                'session_dm_response': build_session_dm_tool_messages(
+                    latest_session_hot_context,
+                ) if latest_session_hot_context else [],
+            },
+            'context_strategy': {
+                'hot_context': latest_session_hot_context,
+                'manifest': latest_session_context_manifest,
+                'tools': DM_TOOL_DEFINITIONS,
+                'legacy_full_prompt_available': bool(latest_session),
             },
         },
         'audit_events': audit_events_payload,

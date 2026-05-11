@@ -56,6 +56,34 @@ const STATUS_COLORS = {
   archived: '#6b7280',
 }
 
+function optimisticPlayerMessage(sessionId, content, user) {
+  return {
+    id: `pending-${Date.now()}-${Math.random().toString(36).slice(2)}`,
+    session_id: sessionId,
+    user_id: user?.id || null,
+    username: user?.username || null,
+    role: 'player',
+    content,
+    created_at: new Date().toISOString(),
+    is_pending: true,
+  }
+}
+
+function reconcilePendingMessage(messages, pendingId, serverMessages = []) {
+  const hasPending = messages.some((message) => message.id === pendingId)
+  if (!hasPending) return messages
+
+  const next = []
+  messages.forEach((message) => {
+    if (message.id === pendingId) {
+      next.push(...serverMessages)
+    } else {
+      next.push(message)
+    }
+  })
+  return next
+}
+
 function getClassSummary(character) {
   if (character.classes?.length) {
     return character.classes.map((c) => `${c.class_name} ${c.level}`).join(', ')
@@ -232,11 +260,20 @@ export default function CampaignViewPage({ user }) {
 
   const handleSendMessage = async (content) => {
     if (!session) return
+    const pendingMessage = optimisticPlayerMessage(session.id, content, user)
+    setMessages((prev) => [...prev, pendingMessage])
     setAiThinking(true)
     try {
       const data = await sendMessage(session.id, content)
-      setMessages((prev) => [...prev, ...data.messages])
+      setMessages((prev) => reconcilePendingMessage(prev, pendingMessage.id, data.messages || []))
     } catch (err) {
+      const serverMessages = err.data?.messages || []
+      setMessages((prev) => {
+        if (serverMessages.length) {
+          return reconcilePendingMessage(prev, pendingMessage.id, serverMessages)
+        }
+        return prev.filter((message) => message.id !== pendingMessage.id)
+      })
       setError(err.message)
     } finally {
       setAiThinking(false)

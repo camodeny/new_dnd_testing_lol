@@ -130,6 +130,87 @@ function ReasoningPanel({ reasoning }) {
   )
 }
 
+function ContextStrategyPanel({ payload }) {
+  const manifest = payload?.context_manifest || {}
+  const tokenEstimate = payload?.token_estimate || {}
+  const toolNames = payload?.tool_names || manifest.available_tools || []
+  if (!Object.keys(manifest).length && !Object.keys(tokenEstimate).length && !toolNames.length) return null
+
+  return (
+    <details className="campaign-dev-details campaign-dev-context-strategy" open>
+      <summary>
+        <span>Context Strategy</span>
+        <span className="campaign-dev-summary">
+          {manifest.strategy || 'model request'}
+          {manifest.full_world_graph_included === false || tokenEstimate.full_world_graph_included === false ? ', full graph not fed' : ''}
+        </span>
+      </summary>
+      <div className="campaign-dev-mini-grid">
+        <div>
+          <strong>Fed directly</strong>
+          <div className="campaign-dev-muted">{(manifest.fed_sections || []).join(', ') || 'message history'}</div>
+        </div>
+        <div>
+          <strong>Tools offered</strong>
+          <div className="campaign-dev-muted">{toolNames.join(', ') || 'none'}</div>
+        </div>
+        <div>
+          <strong>Estimated tokens</strong>
+          <div className="campaign-dev-muted">
+            {manifest.estimated_total_tokens || tokenEstimate.estimated_message_tokens || 'unknown'}
+          </div>
+        </div>
+      </div>
+      <JsonPanel title="Context manifest" value={manifest} summary="Fed context and available retrieval tools" />
+      <JsonPanel title="Token estimate" value={tokenEstimate} summary="Approximate local estimate; provider usage is authoritative" />
+    </details>
+  )
+}
+
+function ToolCallsPanel({ entry, payload }) {
+  const requested = entry.tool_calls || payload?.tool_calls || []
+  const execution = payload?.tool_name ? {
+    tool_name: payload.tool_name,
+    arguments: payload.arguments,
+    result: payload.result,
+    mutated: payload.mutated,
+    affected_ids: payload.affected_ids,
+  } : null
+  if (!requested.length && !execution) return null
+
+  return (
+    <details className="campaign-dev-details campaign-dev-tool-calls" open>
+      <summary>
+        <span>Tool Calls</span>
+        <span className="campaign-dev-summary">
+          {requested.length ? `${requested.length} requested` : execution?.tool_name}
+          {execution?.mutated ? ', mutated state' : ''}
+        </span>
+      </summary>
+      {requested.length ? <JsonPanel title="Requested tool calls" value={requested} summary="Model-requested tool invocations" defaultOpen /> : null}
+      {execution ? <JsonPanel title="Tool execution" value={execution} summary="Server-side arguments, result, and affected records" defaultOpen /> : null}
+    </details>
+  )
+}
+
+function MemoryUpdatePanel({ entry, payload }) {
+  if (!['memory_writer_request', 'memory_writer_response', 'memory_patch_applied'].includes(entry.event_type)) return null
+  const summary = entry.event_type === 'memory_patch_applied'
+    ? 'Applied graph, clock, NPC, event, and summary changes'
+    : 'Post-turn memory writer model step'
+  return (
+    <details className="campaign-dev-details campaign-dev-memory-update" open>
+      <summary>
+        <span>Memory Update</span>
+        <span className="campaign-dev-summary">{summary}</span>
+      </summary>
+      {payload.patch ? <JsonPanel title="Patch" value={payload.patch} summary="Structured memory writer output" defaultOpen /> : null}
+      {payload.result ? <JsonPanel title="Applied result" value={payload.result} summary="DB mutations performed from the patch" defaultOpen /> : null}
+      {payload.context ? <JsonPanel title="Memory writer context" value={payload.context} summary="Compact input used for durable memory updates" /> : null}
+    </details>
+  )
+}
+
 function AuditStreamCard({ entry }) {
   const payload = entry.payload || {}
   const messageCount = entry.message_count || payload.raw_response?.choices?.length || null
@@ -151,6 +232,9 @@ function AuditStreamCard({ entry }) {
           {messageCount ? <span>{messageCount} item{messageCount === 1 ? '' : 's'}</span> : null}
         </div>
         <div className="campaign-dev-message-content">{content || '(empty)'}</div>
+        <ContextStrategyPanel payload={payload} />
+        <ToolCallsPanel entry={entry} payload={payload} />
+        <MemoryUpdatePanel entry={entry} payload={payload} />
         <MessageTranscript messages={entry.messages} />
         <ReasoningPanel reasoning={entry.reasoning} />
         <JsonPanel title="Payload" value={payload} summary="Full captured input/output" />
@@ -163,6 +247,8 @@ function AgentRunNode({ run, depth = 0 }) {
   const events = run.events || []
   const modelRequests = events.filter((event) => event.event_type === 'model_request')
   const modelResponses = events.filter((event) => event.event_type === 'model_response')
+  const toolEvents = events.filter((event) => event.event_type === 'dm_tool_execution')
+  const memoryEvents = events.filter((event) => String(event.event_type || '').startsWith('memory_'))
 
   return (
     <details className="campaign-dev-agent-run" open={depth === 0}>
@@ -171,6 +257,8 @@ function AgentRunNode({ run, depth = 0 }) {
         <span className="campaign-dev-summary">
           {events.length} event{events.length === 1 ? '' : 's'}
           {modelRequests.length ? `, ${modelRequests.length} request${modelRequests.length === 1 ? '' : 's'}` : ''}
+          {toolEvents.length ? `, ${toolEvents.length} tool call${toolEvents.length === 1 ? '' : 's'}` : ''}
+          {memoryEvents.length ? `, ${memoryEvents.length} memory update${memoryEvents.length === 1 ? '' : 's'}` : ''}
           {modelResponses.some((event) => event.reasoning?.returned) ? ', reasoning returned' : ''}
         </span>
       </summary>
@@ -189,6 +277,9 @@ function AgentRunNode({ run, depth = 0 }) {
                 <span>{formatDateTime(event.created_at)}</span>
               </div>
               <div className="campaign-dev-message-content">{event.summary}</div>
+              <ContextStrategyPanel payload={event.payload || {}} />
+              <ToolCallsPanel entry={event} payload={event.payload || {}} />
+              <MemoryUpdatePanel entry={event} payload={event.payload || {}} />
               <MessageTranscript messages={event.messages} title="Fed message history" />
               <ReasoningPanel reasoning={event.reasoning} />
             </div>
@@ -313,6 +404,7 @@ export default function CampaignDevPage() {
   const auditEvents = data.audit_events || []
   const auditStream = data.audit_stream || []
   const agentRuns = data.agent_runs || []
+  const contextStrategy = data.world?.context_strategy || {}
   const legacyTimelineCount = timeline.length
   const streamIsLive = autoRefresh && !error
 
@@ -517,6 +609,12 @@ export default function CampaignDevPage() {
             <JsonPanel title="World public payload" value={worldPublic} summary="Campaign-facing world state" />
             <JsonPanel title="World context" value={worldContext} summary="DM-visible world memory" />
             <JsonPanel
+              title="Session context strategy"
+              value={contextStrategy}
+              summary="What live session DM turns feed directly versus retrieve through tools"
+              defaultOpen
+            />
+            <JsonPanel
               title="World genesis prompt"
               value={data.world?.prompt_traces?.world_genesis}
               summary="Prompt used to generate the world package"
@@ -572,9 +670,14 @@ export default function CampaignDevPage() {
               ))}
             </div>
             <JsonPanel
-              title="Session DM prompt"
+              title="Session DM prompt + tools"
               value={data.world?.prompt_traces?.session_dm_response}
-              summary={`Reconstructed from ${latestSession ? `session ${latestSession.id}` : 'no session'}`}
+              summary={`Compact hot prompt reconstructed from ${latestSession ? `session ${latestSession.id}` : 'no session'}`}
+            />
+            <JsonPanel
+              title="Legacy full session DM prompt"
+              value={data.world?.prompt_traces?.legacy_full_session_dm_response}
+              summary="Old full-context prompt kept here for comparison"
             />
           </section>
 
