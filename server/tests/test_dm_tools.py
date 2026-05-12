@@ -280,6 +280,25 @@ class DmToolsTest(unittest.TestCase):
         )
         log_audit_event(
             self.campaign.id,
+            'dm_tool_execution',
+            'DM tool executed: get_current_scene',
+            {
+                'session_id': self.session.id,
+                'tool_name': 'get_current_scene',
+                'arguments': {'include_private': True},
+                'result': {'current_scene': {'location_name': 'Dock Ward'}},
+                'mutated': False,
+                'affected_ids': {},
+            },
+            actor='session_dm',
+            trace_id=session_trace_id,
+            parent_trace_id=session_trace_id,
+            trace_label=f'session_dm: session {self.session.id}',
+            audit_role='tools',
+            commit=False,
+        )
+        log_audit_event(
+            self.campaign.id,
             'memory_writer_request',
             'Requested post-turn session memory update.',
             {'messages': [{'role': 'user', 'content': 'memory input'}]},
@@ -317,6 +336,11 @@ class DmToolsTest(unittest.TestCase):
         session_message = next(message for message in session_lane['messages'] if message['id'] == session_player.id)
         self.assertEqual(session_message['branches'][0]['trace_id'], session_trace_id)
         self.assertEqual(session_message['branches'][0]['children'][0]['trace_id'], memory_trace_id)
+        branch_steps = session_message['branches'][0]['steps']
+        self.assertEqual([step['kind'] for step in branch_steps], ['model_response', 'tool_call', 'tool_result'])
+        self.assertEqual([step['category'] for step in branch_steps], ['agents', 'tools', 'tools'])
+        self.assertEqual(branch_steps[1]['title'], 'get_current_scene')
+        self.assertEqual(branch_steps[2]['result']['current_scene']['location_name'], 'Dock Ward')
         self.assertEqual(flow['unlinked_branches'][0]['summary'], 'Legacy unlinked write.')
         planning_lane = next(lane for lane in flow['lanes'] if lane['type'] == 'planning')
         self.assertEqual([message['content'] for message in planning_lane['messages']], [

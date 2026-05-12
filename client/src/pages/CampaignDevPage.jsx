@@ -76,10 +76,50 @@ function branchCategory(branch) {
   return 'agents'
 }
 
+function branchHasStepCategory(branch, category) {
+  if ((branch.steps || []).some((step) => step.category === category)) return true
+  return (branch.children || []).some((child) => branchHasStepCategory(child, category))
+}
+
 function branchVisible(branch, filters) {
-  if (branch.tool_events?.length && filters.tools) return true
-  if (branch.memory_events?.length && filters.memory) return true
+  if (branchHasStepCategory(branch, 'tools') && filters.tools) return true
+  if (branchHasStepCategory(branch, 'memory') && filters.memory) return true
   return filters[branchCategory(branch)]
+}
+
+function stepVisible(step, filters) {
+  const category = step.category || 'agents'
+  if (category === 'tools') return filters.tools
+  if (category === 'memory') return filters.memory
+  return filters.agents
+}
+
+function isSessionDmBranch(branch) {
+  return branch.actor === 'session_dm' && branch.operation === 'session_dm_response'
+}
+
+function isMemoryBranch(branch) {
+  return branchCategory(branch) === 'memory' || branchHasStepCategory(branch, 'memory')
+}
+
+function mainThreadSteps(branches, filters) {
+  return (branches || [])
+    .filter(isSessionDmBranch)
+    .flatMap((branch) => branch.steps || [])
+    .filter((step) => stepVisible(step, filters))
+    .filter((step) => !['model_response', 'dm_output_stored'].includes(step.kind))
+}
+
+function sideBranchesForMessage(message, previousMessage) {
+  const ownBranches = (message.branches || []).filter((branch) => !isSessionDmBranch(branch))
+  if (message.role !== 'dm' || !previousMessage) return ownBranches
+
+  const priorDmChildren = (previousMessage.branches || [])
+    .filter(isSessionDmBranch)
+    .flatMap((branch) => branch.children || [])
+    .filter(isMemoryBranch)
+
+  return [...ownBranches, ...priorDmChildren]
 }
 
 function laneVisible(lane, filters) {
@@ -102,6 +142,7 @@ function matchesSearch(branch, query) {
   if (branch.messages?.some((m) => m.content && String(m.content).toLowerCase().includes(q))) return true
   if (branch.tool_events?.some((e) => stringify(e).toLowerCase().includes(q))) return true
   if (branch.memory_events?.some((e) => stringify(e).toLowerCase().includes(q))) return true
+  if ((branch.steps || []).some((step) => stringify(step).toLowerCase().includes(q))) return true
   return false
 }
 
@@ -203,21 +244,6 @@ function TruncatedContent({ content, maxLength = 500 }) {
   )
 }
 
-function TokenBadge({ usage }) {
-  if (!usage) return null
-  const total = usage.total_tokens || usage.completion_tokens || null
-  const reasoning = usage.reasoning_tokens || null
-  if (!total && !reasoning) return null
-
-  return (
-    <span className="dev-token-badge">
-      <i className="bi bi-cpu" />
-      {formatTokens(total) && <span>{formatTokens(total)} tokens</span>}
-      {reasoning && <span className="dev-token-reasoning">+{formatTokens(reasoning)} reasoning</span>}
-    </span>
-  )
-}
-
 function MessageTranscript({ messages, title = 'Message history' }) {
   if (!messages?.length) return null
 
@@ -282,110 +308,133 @@ function ReasoningPanel({ reasoning }) {
   )
 }
 
-function BranchToolPanel({ branch }) {
-  if (!branch.tool_events?.length) return null
+function stepIcon(kind, category) {
+  if (category === 'tools') return 'bi-wrench'
+  if (category === 'memory') return 'bi-database'
+  if (kind === 'model_request') return 'bi-send'
+  if (kind === 'model_response') return 'bi-chat-square-text'
+  if (kind === 'dm_output_stored') return 'bi-arrow-return-right'
+  return 'bi-activity'
+}
 
+function BranchStepCard({ step, inline = false }) {
+  const category = step.category || 'agents'
+  const hasUsage = step.usage && Object.keys(step.usage).length > 0
+  const hasPayload = step.payload && Object.keys(step.payload).length > 0
+  const showRawPayload = hasPayload && !['model_request', 'model_response', 'dm_tool_execution'].includes(step.kind)
+  const contentMax = step.kind === 'dm_output_stored' ? 360 : 520
   return (
-    <details className="dev-details dev-tool-calls" open>
-      <summary>
-        <span className="dev-details-title">
-          <i className="bi bi-wrench" /> Tool Calls
+    <article className={`dev-step-card dev-step-${category} ${inline ? 'dev-step-inline' : ''}`}>
+      <div className="dev-step-header">
+        <span className={`dev-step-icon dev-step-icon-${category}`}>
+          <i className={`bi ${stepIcon(step.kind, category)}`} />
         </span>
-        <span className="dev-details-summary">{branch.tool_events.length}</span>
-      </summary>
-      <div className="dev-flow-list">
-        {branch.tool_events.map((event, index) => (
-          <JsonPanel
-            key={`${event.event_id || 'tool'}-${index}`}
-            title={event.tool_name || formatEventType(event.event_type)}
-            value={event}
-            summary={event.mutated ? 'mutated state' : 'captured'}
-          />
-        ))}
+        <div className="dev-step-heading">
+          <div className="dev-step-title-row">
+            <strong>{step.title || formatEventType(step.kind)}</strong>
+            <span className={`dev-pill dev-pill-cat-${category}`}>{category}</span>
+          </div>
+          <div className="dev-step-meta">
+            {step.actor && <span>{step.actor}</span>}
+            {step.summary && <span>{step.summary}</span>}
+            {step.event_id && <span>event {step.event_id}</span>}
+            {step.created_at && <span>{formatDateTime(step.created_at)}</span>}
+          </div>
+        </div>
       </div>
-    </details>
+
+      {step.content != null && (
+        <div className="dev-step-content">
+          <TruncatedContent content={step.content} maxLength={contentMax} />
+        </div>
+      )}
+
+      <MessageTranscript messages={step.messages} title="Messages sent" />
+
+      {step.tool_calls?.length > 0 && (
+        <JsonPanel title="Requested tool calls" value={step.tool_calls} summary={`${step.tool_calls.length} call${step.tool_calls.length === 1 ? '' : 's'}`} />
+      )}
+      {step.tool_call && (
+        <JsonPanel title="Tool call payload" value={step.tool_call} summary="Provider request" />
+      )}
+      {step.arguments != null && (
+        <JsonPanel title="Arguments" value={step.arguments} summary={step.tool_name || step.title} defaultOpen={category === 'tools'} />
+      )}
+      {step.result != null && (
+        <JsonPanel title="Result" value={step.result} summary={step.mutated ? 'mutated state' : 'read result'} />
+      )}
+      {step.affected_ids && (
+        <JsonPanel title="Affected records" value={step.affected_ids} summary="Database ids" />
+      )}
+      <ReasoningPanel reasoning={step.reasoning} />
+      {hasUsage && <JsonPanel title="Usage" value={step.usage} summary="Provider usage" />}
+      {showRawPayload && <JsonPanel title="Payload" value={step.payload} summary="Raw event payload" />}
+    </article>
   )
 }
 
-function BranchMemoryPanel({ branch }) {
-  if (!branch.memory_events?.length) return null
-
+function MainThreadSteps({ steps }) {
+  if (!steps.length) return null
   return (
-    <details className="dev-details dev-memory-update" open>
-      <summary>
-        <span className="dev-details-title">
-          <i className="bi bi-database" /> Memory Updates
-        </span>
-        <span className="dev-details-summary">{branch.memory_events.length}</span>
-      </summary>
-      <div className="dev-flow-list">
-        {branch.memory_events.map((event) => (
-          <JsonPanel
-            key={event.event_id}
-            title={formatEventType(event.event_type)}
-            value={event.payload}
-            summary={event.summary}
-          />
-        ))}
-      </div>
-    </details>
+    <div className="dev-main-step-list">
+      {steps.map((step) => (
+        <BranchStepCard key={step.id || `${step.event_id}-${step.kind}`} step={step} inline />
+      ))}
+    </div>
   )
 }
 
-function BranchCard({ branch, filters, compact = false }) {
+function BranchTimeline({ branch, filters }) {
+  const steps = (branch.steps || []).filter((step) => stepVisible(step, filters))
+  if (!steps.length) {
+    return <div className="dev-empty-compact">No branch steps match the active filters.</div>
+  }
+
+  return (
+    <div className="dev-branch-timeline">
+      {steps.map((step) => (
+        <BranchStepCard key={step.id || `${step.event_id}-${step.kind}`} step={step} />
+      ))}
+    </div>
+  )
+}
+
+function BranchRun({ branch, filters, compact = false }) {
   if (!branchVisible(branch, filters)) return null
 
   const category = branchCategory(branch)
   const isError = isBranchError(branch)
   const eventCount = branch.event_ids?.length || branch.events?.length || 0
   const toolNames = [...new Set((branch.tool_events || []).map((event) => event.tool_name || formatEventType(event.event_type)).filter(Boolean))]
+  const stepCount = (branch.steps || []).length
   const branchClassName = [
-    'dev-graph-node',
-    'dev-graph-branch',
-    `dev-branch-${category}`,
-    compact ? 'dev-graph-branch-compact' : '',
-    isError ? 'dev-branch-error' : '',
+    'dev-branch-run',
+    `dev-branch-run-${category}`,
+    compact ? 'dev-branch-run-compact' : '',
+    isError ? 'dev-branch-run-error' : '',
   ].filter(Boolean).join(' ')
 
   return (
-    <details className={branchClassName}>
-      <summary>
+    <div className={branchClassName}>
+      <div className="dev-branch-run-header">
         <span className={`dev-pill dev-pill-cat-${category}`}>{category}</span>
-        <span className="dev-branch-label">{branch.trace_label || branch.actor || branch.summary || 'Agent branch'}</span>
+        <span className="dev-branch-label">{branch.trace_label || branch.actor || branch.summary || 'Branch'}</span>
         {branch.operation && <span className="dev-branch-op">{formatEventType(branch.operation)}</span>}
+        <span className="dev-branch-op">{stepCount} step{stepCount === 1 ? '' : 's'}</span>
         {toolNames.length > 0 && (
           <span className="dev-branch-op">
             <i className="bi bi-wrench" /> {toolNames.join(', ')}
           </span>
         )}
-      </summary>
-      <div className="dev-graph-node-body">
-        <div className="dev-message-meta">
-          {branch.actor && <span className="dev-meta-tag">{branch.actor}</span>}
-          <span className="dev-meta-tag">{formatDateTime(branch.created_at)}</span>
-          <TokenBadge usage={branch.reasoning?.usage} />
-        </div>
-        {branch.summary && <p className="dev-branch-summary">{branch.summary}</p>}
-        {branch.response && (
-          <div className="dev-flow-response">
-            <div className="dev-response-header">
-              <strong>Response</strong>
-              <CopyButton value={branch.response} label="Copy response" />
-            </div>
-            <TruncatedContent content={branch.response} maxLength={800} />
-          </div>
-        )}
-        <MessageTranscript messages={branch.messages} />
-        {filters.tools && <BranchToolPanel branch={branch} />}
-        {filters.memory && <BranchMemoryPanel branch={branch} />}
-        <ReasoningPanel reasoning={branch.reasoning} />
-        <JsonPanel
-          title="Raw events"
-          value={branch.events || []}
-          summary={`${eventCount} event${eventCount === 1 ? '' : 's'}`}
-        />
       </div>
-    </details>
+      {branch.summary && <p className="dev-branch-summary">{branch.summary}</p>}
+      <BranchTimeline branch={branch} filters={filters} />
+      <JsonPanel
+        title="Raw events"
+        value={branch.events || []}
+        summary={`${eventCount} event${eventCount === 1 ? '' : 's'}`}
+      />
+    </div>
   )
 }
 
@@ -401,6 +450,19 @@ function splitBranches(branches) {
   }, { left: [], right: [] })
 }
 
+function BranchStack({ branch, filters, compact = false }) {
+  return (
+    <div className="dev-graph-branch-stack">
+      <BranchRun branch={branch} filters={filters} compact={compact} />
+      {(branch.children || []).filter((child) => branchVisible(child, filters)).map((child) => (
+        <div key={child.id} className="dev-graph-child">
+          <BranchStack branch={child} filters={filters} compact />
+        </div>
+      ))}
+    </div>
+  )
+}
+
 function BranchColumn({ branches, filters, side }) {
   const branchClassName = [
     'dev-graph-branches',
@@ -413,21 +475,16 @@ function BranchColumn({ branches, filters, side }) {
   return (
     <div className={branchClassName}>
       {branches.map((branch) => (
-        <div key={branch.id} className="dev-graph-branch-stack">
-          <BranchCard branch={branch} filters={filters} />
-          {(branch.children || []).filter((child) => branchVisible(child, filters)).map((child) => (
-            <div key={child.id} className="dev-graph-child">
-              <BranchCard branch={child} filters={filters} compact />
-            </div>
-          ))}
-        </div>
+        <BranchStack key={branch.id} branch={branch} filters={filters} />
       ))}
     </div>
   )
 }
 
-function FlowGraphNode({ message, filters, isLast, searchQuery }) {
-  const branches = (message.branches || []).filter((branch) => branchVisible(branch, filters) && matchesSearch(branch, searchQuery))
+function FlowGraphNode({ message, previousMessage, filters, isLast, searchQuery }) {
+  const sideBranches = sideBranchesForMessage(message, previousMessage)
+  const branches = sideBranches.filter((branch) => branchVisible(branch, filters) && matchesSearch(branch, searchQuery))
+  const steps = mainThreadSteps(message.branches || [], filters)
   const { left, right } = splitBranches(branches)
   const role = message.role === 'dm' ? 'dm' : message.role === 'system' ? 'system' : 'player'
   const rowClassName = [
@@ -438,20 +495,23 @@ function FlowGraphNode({ message, filters, isLast, searchQuery }) {
     isLast ? 'is-last' : '',
   ].filter(Boolean).join(' ')
 
-  if (searchQuery && !messageMatchesSearch(message, searchQuery) && branches.length === 0) return null
+  if (searchQuery && !messageMatchesSearch(message, searchQuery) && branches.length === 0 && !steps.some((step) => stringify(step).toLowerCase().includes(searchQuery.toLowerCase()))) return null
 
   return (
     <div className={rowClassName}>
       <BranchColumn branches={left} filters={filters} side="left" />
-      <article className={`dev-graph-node dev-graph-message dev-graph-message-${role}`}>
-        <div className="dev-message-meta">
-          <span className={`dev-pill dev-pill-${message.source}-${message.role}`}>{roleLabel(message.role)}</span>
-          {message.username && <span className="dev-meta-tag">{message.username}</span>}
-          <span className="dev-meta-time">{formatTime(message.created_at)}</span>
-          {branches.length > 0 && <span className="dev-branch-count">{branches.length} branch{branches.length === 1 ? '' : 'es'}</span>}
-        </div>
-        <div className="dev-message-content">{message.content || '(empty)'}</div>
-      </article>
+      <div className="dev-main-thread-stack">
+        <article className={`dev-graph-node dev-graph-message dev-graph-message-${role}`}>
+          <div className="dev-message-meta">
+            <span className={`dev-pill dev-pill-${message.source}-${message.role}`}>{roleLabel(message.role)}</span>
+            {message.username && <span className="dev-meta-tag">{message.username}</span>}
+            <span className="dev-meta-time">{formatTime(message.created_at)}</span>
+            {branches.length > 0 && <span className="dev-branch-count">{branches.length} branch{branches.length === 1 ? '' : 'es'}</span>}
+          </div>
+          <div className="dev-message-content">{message.content || '(empty)'}</div>
+        </article>
+        <MainThreadSteps steps={steps} />
+      </div>
       <BranchColumn branches={right} filters={filters} side="right" />
     </div>
   )
@@ -495,6 +555,7 @@ function FlowLane({ lane, filters, searchQuery }) {
           <FlowGraphNode
             key={message.key}
             message={message}
+            previousMessage={filteredMessages[index - 1]}
             filters={filters}
             searchQuery={searchQuery}
             isLast={index === filteredMessages.length - 1 && branches.length === 0}
@@ -617,7 +678,7 @@ function FilterPanel({ filters, setFilters, chatFlow, data, searchQuery, setSear
 
       <section className="dev-panel dev-panel-note">
         <p>
-          Chat messages appear in the center. Agent, tool, memory, and reasoning details branch off to the sides when linked to a message.
+          The center thread shows player messages, DM reasoning, tool calls, tool responses, and visible DM replies in order. Side branches are for work that does not feed back into that main thread, such as memory updates.
         </p>
         {data.audit_notes?.thinking && (
           <p className="dev-note-extra">{data.audit_notes.thinking}</p>

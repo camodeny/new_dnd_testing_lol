@@ -1,3 +1,4 @@
+import json
 import random
 import re
 
@@ -269,6 +270,207 @@ def _branch_response(events):
     return None
 
 
+def _json_loads_or_value(value):
+    if isinstance(value, str):
+        try:
+            return json.loads(value)
+        except (TypeError, ValueError):
+            return value
+    return value
+
+
+def _event_step_category(event):
+    event_type = event.get('event_type') or ''
+    actor = event.get('actor') or ''
+    if event_type == 'dm_tool_execution':
+        return 'tools'
+    if 'memory' in actor or event_type.startswith('memory_') or event_type in {'planning_memory_write', 'memory_patch_applied'}:
+        return 'memory'
+    if event_type in {'model_request', 'model_response', 'dm_output_stored', 'draft_output_sent'}:
+        return 'agents'
+    if event.get('role') == 'tools':
+        return 'tools'
+    return 'agents'
+
+
+def _reasoning_step(event):
+    reasoning = event.get('reasoning') or {}
+    if not reasoning.get('returned'):
+        return None
+    content = reasoning.get('reasoning') or reasoning.get('reasoning_details')
+    if not content:
+        return None
+    return {
+        'id': f"{event.get('id')}-reasoning",
+        'event_id': event.get('id'),
+        'kind': 'model_reasoning',
+        'category': _event_step_category(event),
+        'title': 'Model reasoning',
+        'summary': 'returned by provider',
+        'actor': event.get('actor'),
+        'created_at': event.get('created_at'),
+        'content': content,
+        'usage': reasoning.get('usage') or {},
+    }
+
+
+def _model_tool_request_step(event):
+    tool_calls = event.get('tool_calls') or []
+    if not tool_calls:
+        return None
+    names = []
+    for tool_call in tool_calls:
+        function = tool_call.get('function') if isinstance(tool_call, dict) else {}
+        name = function.get('name') if isinstance(function, dict) else None
+        if name:
+            names.append(name)
+    return {
+        'id': f"{event.get('id')}-model-tool-request",
+        'event_id': event.get('id'),
+        'kind': 'model_tool_request',
+        'category': 'agents',
+        'title': 'Model tool request',
+        'summary': ', '.join(names) if names else f"{len(tool_calls)} tool request{'s' if len(tool_calls) != 1 else ''}",
+        'actor': event.get('actor'),
+        'created_at': event.get('created_at'),
+        'tool_calls': tool_calls,
+    }
+
+
+def _tool_call_step(event):
+    payload = event.get('payload') or {}
+    return {
+        'id': f"{event.get('id')}-tool-call",
+        'event_id': event.get('id'),
+        'kind': 'tool_call',
+        'category': 'tools',
+        'title': payload.get('tool_name') or 'Tool call',
+        'summary': 'called by server',
+        'actor': event.get('actor'),
+        'created_at': event.get('created_at'),
+        'tool_name': payload.get('tool_name'),
+        'arguments': payload.get('arguments'),
+        'payload': payload,
+    }
+
+
+def _tool_result_step(event):
+    payload = event.get('payload') or {}
+    return {
+        'id': f"{event.get('id')}-tool-result",
+        'event_id': event.get('id'),
+        'kind': 'tool_result',
+        'category': 'tools',
+        'title': f"{payload.get('tool_name') or 'Tool'} result",
+        'summary': 'mutated state' if payload.get('mutated') else 'read result',
+        'actor': event.get('actor'),
+        'created_at': event.get('created_at'),
+        'tool_name': payload.get('tool_name'),
+        'result': payload.get('result'),
+        'mutated': payload.get('mutated'),
+        'affected_ids': payload.get('affected_ids'),
+        'payload': payload,
+    }
+
+
+def _event_step_title(event):
+    event_type = event.get('event_type')
+    payload = event.get('payload') or {}
+    if event_type == 'dm_tool_execution':
+        return payload.get('tool_name') or 'Tool execution'
+    if event_type == 'model_request':
+        return 'Model request'
+    if event_type == 'model_response':
+        return 'Model response'
+    if event_type == 'dm_output_stored':
+        return 'Visible chat message'
+    if event_type == 'memory_patch_applied':
+        return 'Memory patch applied'
+    if event_type == 'memory_writer_request':
+        return 'Memory writer request'
+    if event_type == 'memory_writer_response':
+        return 'Memory writer response'
+    return _format_event_type(event_type)
+
+
+def _event_step_summary(event):
+    event_type = event.get('event_type')
+    payload = event.get('payload') or {}
+    if event_type == 'dm_tool_execution':
+        return 'mutated state' if payload.get('mutated') else 'executed'
+    if event.get('tool_calls'):
+        return f"{len(event.get('tool_calls') or [])} tool request{'s' if len(event.get('tool_calls') or []) != 1 else ''}"
+    operation = payload.get('operation')
+    if operation:
+        return _format_event_type(operation)
+    return event.get('summary')
+
+
+def _event_step_content(event):
+    payload = event.get('payload') or {}
+    content = event.get('content') or payload.get('content')
+    if content:
+        return content
+    message = payload.get('message') if isinstance(payload.get('message'), dict) else {}
+    if message.get('content'):
+        return message.get('content')
+    if payload.get('patch'):
+        return payload.get('patch')
+    if payload.get('draft'):
+        return payload.get('draft')
+    return None
+
+
+def _branch_steps(events):
+    steps = []
+    for event in events:
+        reasoning = _reasoning_step(event)
+        if reasoning:
+            steps.append(reasoning)
+
+        if event.get('event_type') == 'model_response' and event.get('tool_calls'):
+            tool_request = _model_tool_request_step(event)
+            if tool_request:
+                steps.append(tool_request)
+            if not _event_step_content(event):
+                continue
+
+        if event.get('event_type') == 'model_request':
+            continue
+
+        if event.get('event_type') == 'dm_tool_execution':
+            steps.append(_tool_call_step(event))
+            steps.append(_tool_result_step(event))
+            continue
+
+        payload = event.get('payload') or {}
+        category = _event_step_category(event)
+        step = {
+            'id': f"event-{event.get('id')}",
+            'event_id': event.get('id'),
+            'kind': event.get('event_type'),
+            'category': category,
+            'title': _event_step_title(event),
+            'summary': _event_step_summary(event),
+            'actor': event.get('actor'),
+            'created_at': event.get('created_at'),
+            'content': _event_step_content(event),
+            'messages': event.get('messages') or [],
+            'usage': event.get('usage') or {},
+            'reasoning': event.get('reasoning'),
+            'finish_reason': event.get('finish_reason'),
+            'tool_calls': event.get('tool_calls') or [],
+            'tool_name': payload.get('tool_name'),
+            'arguments': payload.get('arguments'),
+            'result': payload.get('result'),
+            'mutated': payload.get('mutated'),
+            'affected_ids': payload.get('affected_ids'),
+            'payload': payload,
+        }
+        steps.append(step)
+    return steps
+
+
 def _branch_tool_events(events):
     result = []
     for event in events:
@@ -330,6 +532,7 @@ def _branch_from_run(run):
         'created_at': first_event.get('created_at'),
         'event_ids': [event.get('id') for event in events],
         'events': events,
+        'steps': _branch_steps(events),
         'messages': _branch_messages(events),
         'response': _branch_response(events),
         'tool_events': _branch_tool_events(events),
@@ -353,6 +556,7 @@ def _branch_from_event(event):
         'created_at': event.get('created_at'),
         'event_ids': [event.get('id')],
         'events': [event],
+        'steps': _branch_steps([event]),
         'messages': event.get('messages') or [],
         'response': event.get('content'),
         'tool_events': _branch_tool_events([event]),

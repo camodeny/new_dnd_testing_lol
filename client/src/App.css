@@ -5010,6 +5010,173 @@ select.input:focus {
   padding: 12px;
 }
 
+/* ── Branch Timeline ── */
+
+.dev-branch-timeline {
+  position: relative;
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+  margin-top: 12px;
+  padding-left: 14px;
+}
+
+.dev-branch-timeline::before {
+  content: '';
+  position: absolute;
+  top: 8px;
+  bottom: 8px;
+  left: 5px;
+  width: 2px;
+  background: rgba(148, 163, 184, 0.24);
+}
+
+.dev-step-card {
+  position: relative;
+  border: 1px solid #2e303a;
+  border-radius: 8px;
+  background: #0f1017;
+  padding: 10px;
+  overflow: hidden;
+}
+
+.dev-step-card::before {
+  content: '';
+  position: absolute;
+  top: 17px;
+  left: -14px;
+  width: 14px;
+  height: 2px;
+  background: rgba(148, 163, 184, 0.28);
+}
+
+.dev-step-agents {
+  border-color: rgba(132, 204, 22, 0.34);
+}
+
+.dev-step-tools {
+  border-color: rgba(148, 163, 184, 0.45);
+}
+
+.dev-step-memory {
+  border-color: rgba(251, 191, 36, 0.38);
+}
+
+.dev-step-header {
+  display: grid;
+  grid-template-columns: 24px minmax(0, 1fr);
+  gap: 8px;
+  align-items: start;
+}
+
+.dev-step-icon {
+  width: 24px;
+  height: 24px;
+  border-radius: 6px;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  font-size: 13px;
+  background: #1f1f2e;
+  color: #b8b8c8;
+}
+
+.dev-step-icon-agents {
+  background: rgba(132, 204, 22, 0.14);
+  color: #bef264;
+}
+
+.dev-step-icon-tools {
+  background: rgba(148, 163, 184, 0.16);
+  color: #cbd5e1;
+}
+
+.dev-step-icon-memory {
+  background: rgba(251, 191, 36, 0.14);
+  color: #fcd34d;
+}
+
+.dev-step-heading {
+  min-width: 0;
+}
+
+.dev-step-title-row {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 6px;
+}
+
+.dev-step-title-row strong {
+  color: #e8e8e8;
+  font-size: 12px;
+  line-height: 1.35;
+  overflow-wrap: anywhere;
+}
+
+.dev-step-meta {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 7px;
+  margin-top: 4px;
+  color: #6b7280;
+  font-size: 11px;
+  font-family: var(--mono);
+}
+
+.dev-step-content {
+  margin-top: 10px;
+  border-top: 1px solid #252733;
+  padding-top: 10px;
+}
+
+.dev-step-card .dev-details {
+  border-radius: 8px;
+  margin-top: 8px;
+}
+
+.dev-step-card .dev-details summary {
+  padding: 9px 10px;
+}
+
+.dev-step-card .dev-code {
+  max-height: 260px;
+  font-size: 11px;
+}
+
+.dev-step-inline {
+  background: #14151d;
+  border-color: rgba(94, 94, 255, 0.28);
+}
+
+.dev-main-thread-stack {
+  position: relative;
+  z-index: 2;
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+  min-width: 0;
+}
+
+.dev-main-step-list {
+  position: relative;
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+  padding-top: 2px;
+}
+
+.dev-main-step-list::before {
+  content: '';
+  position: absolute;
+  top: -12px;
+  left: 50%;
+  width: 2px;
+  height: 12px;
+  background: rgba(94, 94, 255, 0.35);
+  transform: translateX(-50%);
+}
+
 /* ── Graph ── */
 
 .dev-graph {
@@ -5150,6 +5317,32 @@ select.input:focus {
 .dev-graph-branch {
   width: 100%;
   border-radius: 14px;
+}
+
+.dev-branch-run {
+  width: 100%;
+  min-width: 0;
+}
+
+.dev-branch-run-header {
+  display: flex;
+  gap: 8px;
+  align-items: center;
+  flex-wrap: wrap;
+  padding: 0 0 8px 0;
+  border-bottom: 1px solid rgba(148, 163, 184, 0.16);
+}
+
+.dev-branch-run-compact {
+  padding-top: 2px;
+}
+
+.dev-branch-run-error .dev-branch-label {
+  color: #f87171;
+}
+
+.dev-branch-run > .dev-details {
+  margin-left: 14px;
 }
 
 .dev-graph-branch-compact {
