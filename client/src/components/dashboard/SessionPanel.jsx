@@ -101,6 +101,39 @@ function PlayerMessageContent({ content }) {
   )
 }
 
+function DMMessageContent({ content }) {
+  const segments = parseTaggedMessage(content)
+
+  return (
+    <div className="session-dm-tagged-content">
+      {segments.map((segment, index) => {
+        const text = segment.text.trim()
+        if (!text) return null
+
+        if (segment.type === 'npc') {
+          return (
+            <div key={`npc-${index}`} className="session-npc-message">
+              <div className="session-npc-banner">
+                <span><i className="bi bi-person-badge-fill"></i> NPC</span>
+                <strong>{segment.target}</strong>
+              </div>
+              <div className="session-npc-text">
+                <MarkdownContent content={text} />
+              </div>
+            </div>
+          )
+        }
+
+        return (
+          <div key={`dm-${index}`} className="session-dm-narration">
+            <MarkdownContent content={text} />
+          </div>
+        )
+      })}
+    </div>
+  )
+}
+
 export default function SessionPanel({
   session,
   messages,
@@ -237,7 +270,7 @@ export default function SessionPanel({
                 </div>
                 <div className={`session-msg-content ${msg.role === 'player' ? 'session-msg-content-tagged' : ''}`}>
                   {msg.role === 'dm' ? (
-                    <MarkdownContent content={msg.content} />
+                    <DMMessageContent content={msg.content} />
                   ) : msg.role === 'player' ? (
                     <PlayerMessageContent content={msg.content} />
                   ) : (
