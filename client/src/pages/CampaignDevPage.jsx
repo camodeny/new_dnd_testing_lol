@@ -1,8 +1,22 @@
-import { useEffect, useMemo, useState } from 'react'
+import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import { useNavigate, useParams } from 'react-router-dom'
 import { getCampaignDevAudit } from '../api/client'
 import Loading from '../components/common/Loading'
 import ErrorMessage from '../components/common/ErrorMessage'
+
+const FLOW_FILTERS = [
+  { key: 'planning', label: 'Planning', icon: 'bi-journal-text' },
+  { key: 'sessions', label: 'Sessions', icon: 'bi-chat-dots' },
+  { key: 'agents', label: 'Agents', icon: 'bi-robot' },
+  { key: 'tools', label: 'Tools', icon: 'bi-wrench' },
+  { key: 'memory', label: 'Memory', icon: 'bi-database' },
+  { key: 'raw', label: 'Raw', icon: 'bi-code-slash' },
+]
+
+const DEFAULT_FILTERS = FLOW_FILTERS.reduce((acc, filter) => {
+  acc[filter.key] = filter.key !== 'raw'
+  return acc
+}, {})
 
 function formatDateTime(iso) {
   if (!iso) return 'Unknown'
@@ -15,6 +29,14 @@ function formatDateTime(iso) {
   })
 }
 
+function formatTime(iso) {
+  if (!iso) return ''
+  return new Date(iso).toLocaleTimeString(undefined, {
+    hour: '2-digit',
+    minute: '2-digit',
+  })
+}
+
 function stringify(value) {
   if (value == null) return 'null'
   try {
@@ -24,43 +46,8 @@ function stringify(value) {
   }
 }
 
-function joinNames(items, key = 'name') {
-  return (items || []).map((item) => item?.[key]).filter(Boolean).join(', ')
-}
-
-function AuditMessage({ entry }) {
-  return (
-    <div className="campaign-dev-message">
-      <div className="campaign-dev-message-meta">
-        <span className={`campaign-dev-pill campaign-dev-pill-${entry.kind}`}>{entry.label}</span>
-        <span>{formatDateTime(entry.created_at)}</span>
-        {entry.context && <span>{entry.context}</span>}
-      </div>
-      <div className="campaign-dev-message-content">{entry.content || '(empty)'}</div>
-    </div>
-  )
-}
-
 function formatEventType(type) {
   return String(type || 'event').replace(/_/g, ' ')
-}
-
-function JsonPanel({ title, value, summary, defaultOpen = false }) {
-  return (
-    <details className="campaign-dev-details" open={defaultOpen}>
-      <summary>
-        <span>{title}</span>
-        {summary && <span className="campaign-dev-summary">{summary}</span>}
-      </summary>
-      <pre className="campaign-dev-code">{stringify(value)}</pre>
-    </details>
-  )
-}
-
-function roleLabel(role) {
-  if (role === 'player') return 'Player'
-  if (role === 'agent') return 'Agent'
-  return 'Tools'
 }
 
 function summarizeContent(content) {
@@ -69,28 +56,187 @@ function summarizeContent(content) {
   return stringify(content)
 }
 
-function MessageTranscript({ messages, title = 'Messages sent' }) {
+function roleLabel(role) {
+  if (role === 'dm') return 'DM'
+  if (role === 'player') return 'Player'
+  if (role === 'assistant') return 'Assistant'
+  if (role === 'system') return 'System'
+  if (role === 'tool') return 'Tool'
+  return role || 'Message'
+}
+
+function branchCategory(branch) {
+  const actor = String(branch.actor || '')
+  const hasMemory = actor.includes('memory') || branch.memory_events?.length
+  const hasTools = branch.tool_events?.length || branch.role === 'tools'
+  const hasAgentShape = actor.includes('dm') || actor.includes('architect') || actor.includes('draft') || branch.response || branch.messages?.length
+  if (hasMemory) return 'memory'
+  if (hasAgentShape) return 'agents'
+  if (hasTools) return 'tools'
+  return 'agents'
+}
+
+function branchVisible(branch, filters) {
+  if (branch.tool_events?.length && filters.tools) return true
+  if (branch.memory_events?.length && filters.memory) return true
+  return filters[branchCategory(branch)]
+}
+
+function laneVisible(lane, filters) {
+  if (lane.type === 'planning') return filters.planning
+  if (lane.type === 'session') return filters.sessions
+  return filters.agents || filters.tools || filters.memory
+}
+
+function matchesSearch(branch, query) {
+  if (!query) return true
+  const q = query.toLowerCase()
+  const fields = [
+    branch.trace_label,
+    branch.actor,
+    branch.summary,
+    branch.response,
+    branch.operation,
+  ]
+  if (fields.some((f) => f && String(f).toLowerCase().includes(q))) return true
+  if (branch.messages?.some((m) => m.content && String(m.content).toLowerCase().includes(q))) return true
+  if (branch.tool_events?.some((e) => stringify(e).toLowerCase().includes(q))) return true
+  if (branch.memory_events?.some((e) => stringify(e).toLowerCase().includes(q))) return true
+  return false
+}
+
+function messageMatchesSearch(message, query) {
+  if (!query) return true
+  const q = query.toLowerCase()
+  if (message.content && String(message.content).toLowerCase().includes(q)) return true
+  if (message.username && String(message.username).toLowerCase().includes(q)) return true
+  if (message.role && String(message.role).toLowerCase().includes(q)) return true
+  return false
+}
+
+function extractActors(chatFlow) {
+  const actors = new Set()
+  for (const lane of chatFlow.lanes || []) {
+    for (const msg of lane.messages || []) {
+      for (const branch of msg.branches || []) {
+        if (branch.actor) actors.add(branch.actor)
+      }
+    }
+    for (const branch of lane.branches || []) {
+      if (branch.actor) actors.add(branch.actor)
+    }
+  }
+  return [...actors].sort()
+}
+
+function isBranchError(branch) {
+  return branch.event_ids?.some((id) => String(id).includes('error')) ||
+    String(branch.actor || '').includes('error') ||
+    String(branch.summary || '').toLowerCase().includes('error')
+}
+
+function formatTokens(n) {
+  if (n == null) return null
+  if (n >= 1000) return `${(n / 1000).toFixed(1)}k`
+  return String(n)
+}
+
+async function copyToClipboard(text) {
+  try {
+    await navigator.clipboard.writeText(text)
+    return true
+  } catch {
+    return false
+  }
+}
+
+function CopyButton({ value, label = 'Copy' }) {
+  const [copied, setCopied] = useState(false)
+
+  const handleCopy = async (e) => {
+    e.stopPropagation()
+    const text = typeof value === 'string' ? value : stringify(value)
+    const ok = await copyToClipboard(text)
+    if (ok) {
+      setCopied(true)
+      setTimeout(() => setCopied(false), 1500)
+    }
+  }
+
+  return (
+    <button className={`dev-copy-btn ${copied ? 'dev-copy-btn-copied' : ''}`} onClick={handleCopy} title={label}>
+      <i className={copied ? 'bi bi-check' : 'bi bi-clipboard'} />
+    </button>
+  )
+}
+
+function JsonPanel({ title, value, summary, defaultOpen = false }) {
+  return (
+    <details className="dev-details" open={defaultOpen}>
+      <summary>
+        <span className="dev-details-title">{title}</span>
+        {summary && <span className="dev-details-summary">{summary}</span>}
+      </summary>
+      <div className="dev-code-wrapper">
+        <CopyButton value={value} label={`Copy ${title}`} />
+        <pre className="dev-code">{stringify(value)}</pre>
+      </div>
+    </details>
+  )
+}
+
+function TruncatedContent({ content, maxLength = 500 }) {
+  const text = summarizeContent(content)
+  const [expanded, setExpanded] = useState(false)
+
+  if (!text || text.length <= maxLength) {
+    return <pre className="dev-transcript-content">{text || '(empty)'}</pre>
+  }
+
+  return (
+    <div className="dev-truncated">
+      <pre className="dev-transcript-content">{expanded ? text : text.slice(0, maxLength) + '...'}</pre>
+      <button className="dev-expand-btn" onClick={() => setExpanded(!expanded)}>
+        {expanded ? 'Show less' : `Show all ${text.length.toLocaleString()} chars`}
+      </button>
+    </div>
+  )
+}
+
+function TokenBadge({ usage }) {
+  if (!usage) return null
+  const total = usage.total_tokens || usage.completion_tokens || null
+  const reasoning = usage.reasoning_tokens || null
+  if (!total && !reasoning) return null
+
+  return (
+    <span className="dev-token-badge">
+      <i className="bi bi-cpu" />
+      {formatTokens(total) && <span>{formatTokens(total)} tokens</span>}
+      {reasoning && <span className="dev-token-reasoning">+{formatTokens(reasoning)} reasoning</span>}
+    </span>
+  )
+}
+
+function MessageTranscript({ messages, title = 'Message history' }) {
   if (!messages?.length) return null
 
   return (
-    <details className="campaign-dev-details campaign-dev-transcript">
+    <details className="dev-details dev-transcript">
       <summary>
-        <span>{title}</span>
-        <span className="campaign-dev-summary">{messages.length} message{messages.length === 1 ? '' : 's'}</span>
+        <span className="dev-details-title">{title}</span>
+        <span className="dev-details-summary">{messages.length} msg{messages.length === 1 ? '' : 's'}</span>
       </summary>
-      <div className="campaign-dev-transcript-list">
+      <div className="dev-transcript-list">
         {messages.map((message, index) => (
-          <div key={`${message.role || 'message'}-${index}`} className={`campaign-dev-transcript-message campaign-dev-transcript-${message.role || 'unknown'}`}>
-            <div className="campaign-dev-message-meta">
-              <span className={`campaign-dev-pill campaign-dev-pill-message-${message.role || 'unknown'}`}>{message.role || 'unknown'}</span>
-              <span>message {index + 1}</span>
-              {message.name && <span>name {message.name}</span>}
-              {message.tool_call_id && <span>tool call {message.tool_call_id}</span>}
+          <div key={`${message.role || 'message'}-${index}`} className={`dev-transcript-message dev-transcript-${message.role || 'unknown'}`}>
+            <div className="dev-message-meta">
+              <span className={`dev-pill dev-pill-msg-${message.role || 'unknown'}`}>{message.role || '?'}</span>
+              <span>#{index + 1}</span>
+              {message.name && <span className="dev-meta-tag">{message.name}</span>}
+              {message.tool_call_id && <span className="dev-meta-tag">tool: {message.tool_call_id}</span>}
             </div>
-            <pre className="campaign-dev-transcript-content">{summarizeContent(message.content) || '(empty)'}</pre>
-            {Object.keys(message).some((key) => !['role', 'content', 'name', 'tool_call_id'].includes(key)) && (
-              <JsonPanel title="Full message object" value={message} summary="All fields on this message" />
-            )}
+            <TruncatedContent content={message.content} />
           </div>
         ))}
       </div>
@@ -101,198 +247,404 @@ function MessageTranscript({ messages, title = 'Messages sent' }) {
 function ReasoningPanel({ reasoning }) {
   if (!reasoning) return null
   const usage = reasoning.usage || {}
+  const hasContent = reasoning.reasoning || reasoning.reasoning_details
 
   return (
-    <details className="campaign-dev-details campaign-dev-reasoning">
+    <details className="dev-details dev-reasoning">
       <summary>
-        <span>Reasoning</span>
-        <span className="campaign-dev-summary">
-          {reasoning.returned ? 'returned by provider' : 'No reasoning returned'}
-          {usage.reasoning_tokens != null ? `, ${usage.reasoning_tokens} tokens` : ''}
+        <span className="dev-details-title">
+          <i className="bi bi-lightbulb" /> Reasoning
+        </span>
+        <span className="dev-details-summary">
+          {reasoning.returned ? 'returned' : 'not returned'}
+          {usage.reasoning_tokens != null ? ` · ${formatTokens(usage.reasoning_tokens)} tok` : ''}
         </span>
       </summary>
-      {reasoning.returned ? (
-        <div className="campaign-dev-reasoning-body">
+      {hasContent ? (
+        <div className="dev-reasoning-body">
           {reasoning.reasoning && (
-            <pre className="campaign-dev-code">{reasoning.reasoning}</pre>
+            <div className="dev-code-wrapper">
+              <CopyButton value={reasoning.reasoning} label="Copy reasoning" />
+              <pre className="dev-code dev-code-reasoning">{reasoning.reasoning}</pre>
+            </div>
           )}
           {reasoning.reasoning_details && (
-            <JsonPanel title="reasoning_details" value={reasoning.reasoning_details} summary="Provider-returned reasoning blocks" defaultOpen />
+            <JsonPanel title="reasoning_details" value={reasoning.reasoning_details} summary="Provider blocks" defaultOpen />
           )}
-          <JsonPanel title="Reasoning usage" value={usage} summary="Usage fields related to reasoning tokens" />
+          {Object.keys(usage).length > 0 && (
+            <JsonPanel title="Usage" value={usage} summary="Token usage fields" />
+          )}
         </div>
       ) : (
-        <div className="campaign-dev-empty campaign-dev-empty-compact">
-          This model response did not include OpenRouter reasoning fields.
-        </div>
+        <div className="dev-empty-compact">No reasoning content was returned by the provider.</div>
       )}
     </details>
   )
 }
 
-function ContextStrategyPanel({ payload }) {
-  const manifest = payload?.context_manifest || {}
-  const tokenEstimate = payload?.token_estimate || {}
-  const toolNames = payload?.tool_names || manifest.available_tools || []
-  if (!Object.keys(manifest).length && !Object.keys(tokenEstimate).length && !toolNames.length) return null
+function BranchToolPanel({ branch }) {
+  if (!branch.tool_events?.length) return null
 
   return (
-    <details className="campaign-dev-details campaign-dev-context-strategy" open>
+    <details className="dev-details dev-tool-calls" open>
       <summary>
-        <span>Context Strategy</span>
-        <span className="campaign-dev-summary">
-          {manifest.strategy || 'model request'}
-          {manifest.full_world_graph_included === false || tokenEstimate.full_world_graph_included === false ? ', full graph not fed' : ''}
+        <span className="dev-details-title">
+          <i className="bi bi-wrench" /> Tool Calls
         </span>
+        <span className="dev-details-summary">{branch.tool_events.length}</span>
       </summary>
-      <div className="campaign-dev-mini-grid">
-        <div>
-          <strong>Fed directly</strong>
-          <div className="campaign-dev-muted">{(manifest.fed_sections || []).join(', ') || 'message history'}</div>
+      <div className="dev-flow-list">
+        {branch.tool_events.map((event, index) => (
+          <JsonPanel
+            key={`${event.event_id || 'tool'}-${index}`}
+            title={event.tool_name || formatEventType(event.event_type)}
+            value={event}
+            summary={event.mutated ? 'mutated state' : 'captured'}
+          />
+        ))}
+      </div>
+    </details>
+  )
+}
+
+function BranchMemoryPanel({ branch }) {
+  if (!branch.memory_events?.length) return null
+
+  return (
+    <details className="dev-details dev-memory-update" open>
+      <summary>
+        <span className="dev-details-title">
+          <i className="bi bi-database" /> Memory Updates
+        </span>
+        <span className="dev-details-summary">{branch.memory_events.length}</span>
+      </summary>
+      <div className="dev-flow-list">
+        {branch.memory_events.map((event) => (
+          <JsonPanel
+            key={event.event_id}
+            title={formatEventType(event.event_type)}
+            value={event.payload}
+            summary={event.summary}
+          />
+        ))}
+      </div>
+    </details>
+  )
+}
+
+function BranchCard({ branch, filters, compact = false }) {
+  if (!branchVisible(branch, filters)) return null
+
+  const category = branchCategory(branch)
+  const isError = isBranchError(branch)
+  const eventCount = branch.event_ids?.length || branch.events?.length || 0
+  const toolNames = [...new Set((branch.tool_events || []).map((event) => event.tool_name || formatEventType(event.event_type)).filter(Boolean))]
+  const branchClassName = [
+    'dev-graph-node',
+    'dev-graph-branch',
+    `dev-branch-${category}`,
+    compact ? 'dev-graph-branch-compact' : '',
+    isError ? 'dev-branch-error' : '',
+  ].filter(Boolean).join(' ')
+
+  return (
+    <details className={branchClassName}>
+      <summary>
+        <span className={`dev-pill dev-pill-cat-${category}`}>{category}</span>
+        <span className="dev-branch-label">{branch.trace_label || branch.actor || branch.summary || 'Agent branch'}</span>
+        {branch.operation && <span className="dev-branch-op">{formatEventType(branch.operation)}</span>}
+        {toolNames.length > 0 && (
+          <span className="dev-branch-op">
+            <i className="bi bi-wrench" /> {toolNames.join(', ')}
+          </span>
+        )}
+      </summary>
+      <div className="dev-graph-node-body">
+        <div className="dev-message-meta">
+          {branch.actor && <span className="dev-meta-tag">{branch.actor}</span>}
+          <span className="dev-meta-tag">{formatDateTime(branch.created_at)}</span>
+          <TokenBadge usage={branch.reasoning?.usage} />
         </div>
-        <div>
-          <strong>Tools offered</strong>
-          <div className="campaign-dev-muted">{toolNames.join(', ') || 'none'}</div>
-        </div>
-        <div>
-          <strong>Estimated tokens</strong>
-          <div className="campaign-dev-muted">
-            {manifest.estimated_total_tokens || tokenEstimate.estimated_message_tokens || 'unknown'}
+        {branch.summary && <p className="dev-branch-summary">{branch.summary}</p>}
+        {branch.response && (
+          <div className="dev-flow-response">
+            <div className="dev-response-header">
+              <strong>Response</strong>
+              <CopyButton value={branch.response} label="Copy response" />
+            </div>
+            <TruncatedContent content={branch.response} maxLength={800} />
           </div>
-        </div>
+        )}
+        <MessageTranscript messages={branch.messages} />
+        {filters.tools && <BranchToolPanel branch={branch} />}
+        {filters.memory && <BranchMemoryPanel branch={branch} />}
+        <ReasoningPanel reasoning={branch.reasoning} />
+        <JsonPanel
+          title="Raw events"
+          value={branch.events || []}
+          summary={`${eventCount} event${eventCount === 1 ? '' : 's'}`}
+        />
       </div>
-      <JsonPanel title="Context manifest" value={manifest} summary="Fed context and available retrieval tools" />
-      <JsonPanel title="Token estimate" value={tokenEstimate} summary="Approximate local estimate; provider usage is authoritative" />
     </details>
   )
 }
 
-function ToolCallsPanel({ entry, payload }) {
-  const requested = entry.tool_calls || payload?.tool_calls || []
-  const execution = payload?.tool_name ? {
-    tool_name: payload.tool_name,
-    arguments: payload.arguments,
-    result: payload.result,
-    mutated: payload.mutated,
-    affected_ids: payload.affected_ids,
-  } : null
-  if (!requested.length && !execution) return null
-
-  return (
-    <details className="campaign-dev-details campaign-dev-tool-calls" open>
-      <summary>
-        <span>Tool Calls</span>
-        <span className="campaign-dev-summary">
-          {requested.length ? `${requested.length} requested` : execution?.tool_name}
-          {execution?.mutated ? ', mutated state' : ''}
-        </span>
-      </summary>
-      {requested.length ? <JsonPanel title="Requested tool calls" value={requested} summary="Model-requested tool invocations" defaultOpen /> : null}
-      {execution ? <JsonPanel title="Tool execution" value={execution} summary="Server-side arguments, result, and affected records" defaultOpen /> : null}
-    </details>
-  )
+function splitBranches(branches) {
+  return branches.reduce((groups, branch, index) => {
+    const category = branchCategory(branch)
+    if (category === 'memory' || index % 2 === 1) {
+      groups.right.push(branch)
+    } else {
+      groups.left.push(branch)
+    }
+    return groups
+  }, { left: [], right: [] })
 }
 
-function MemoryUpdatePanel({ entry, payload }) {
-  if (!['memory_writer_request', 'memory_writer_response', 'memory_patch_applied'].includes(entry.event_type)) return null
-  const summary = entry.event_type === 'memory_patch_applied'
-    ? 'Applied graph, clock, NPC, event, and summary changes'
-    : 'Post-turn memory writer model step'
-  return (
-    <details className="campaign-dev-details campaign-dev-memory-update" open>
-      <summary>
-        <span>Memory Update</span>
-        <span className="campaign-dev-summary">{summary}</span>
-      </summary>
-      {payload.patch ? <JsonPanel title="Patch" value={payload.patch} summary="Structured memory writer output" defaultOpen /> : null}
-      {payload.result ? <JsonPanel title="Applied result" value={payload.result} summary="DB mutations performed from the patch" defaultOpen /> : null}
-      {payload.context ? <JsonPanel title="Memory writer context" value={payload.context} summary="Compact input used for durable memory updates" /> : null}
-    </details>
-  )
-}
+function BranchColumn({ branches, filters, side }) {
+  const branchClassName = [
+    'dev-graph-branches',
+    `dev-graph-branches-${side}`,
+    branches.length ? 'dev-graph-branches-has-branches' : '',
+  ].filter(Boolean).join(' ')
 
-function AuditStreamCard({ entry }) {
-  const payload = entry.payload || {}
-  const messageCount = entry.message_count || payload.raw_response?.choices?.length || null
-  const content = entry.content || payload.message?.content || payload.content || entry.summary
+  if (!branches.length) return <div className={branchClassName} />
 
   return (
-    <article className={`campaign-dev-event campaign-dev-stream-entry campaign-dev-stream-${entry.role}`}>
-      <div className="campaign-dev-event-rail">
-        <span>{entry.id}</span>
-      </div>
-      <div className="campaign-dev-event-body">
-        <div className="campaign-dev-message-meta">
-          <span className={`campaign-dev-pill campaign-dev-pill-role-${entry.role}`}>{roleLabel(entry.role)}</span>
-          <span className={`campaign-dev-pill campaign-dev-pill-${entry.event_type}`}>{formatEventType(entry.event_type)}</span>
-          <span>{formatDateTime(entry.created_at)}</span>
-          {entry.actor && <span>actor {entry.actor}</span>}
-          {entry.source && <span>source {entry.source}</span>}
-          {entry.trace_id && <span>trace {entry.trace_id}</span>}
-          {messageCount ? <span>{messageCount} item{messageCount === 1 ? '' : 's'}</span> : null}
-        </div>
-        <div className="campaign-dev-message-content">{content || '(empty)'}</div>
-        <ContextStrategyPanel payload={payload} />
-        <ToolCallsPanel entry={entry} payload={payload} />
-        <MemoryUpdatePanel entry={entry} payload={payload} />
-        <MessageTranscript messages={entry.messages} />
-        <ReasoningPanel reasoning={entry.reasoning} />
-        <JsonPanel title="Payload" value={payload} summary="Full captured input/output" />
-      </div>
-    </article>
-  )
-}
-
-function AgentRunNode({ run, depth = 0 }) {
-  const events = run.events || []
-  const modelRequests = events.filter((event) => event.event_type === 'model_request')
-  const modelResponses = events.filter((event) => event.event_type === 'model_response')
-  const toolEvents = events.filter((event) => event.event_type === 'dm_tool_execution')
-  const memoryEvents = events.filter((event) => String(event.event_type || '').startsWith('memory_'))
-
-  return (
-    <details className="campaign-dev-agent-run" open={depth === 0}>
-      <summary>
-        <span>{run.trace_label || run.trace_id}</span>
-        <span className="campaign-dev-summary">
-          {events.length} event{events.length === 1 ? '' : 's'}
-          {modelRequests.length ? `, ${modelRequests.length} request${modelRequests.length === 1 ? '' : 's'}` : ''}
-          {toolEvents.length ? `, ${toolEvents.length} tool call${toolEvents.length === 1 ? '' : 's'}` : ''}
-          {memoryEvents.length ? `, ${memoryEvents.length} memory update${memoryEvents.length === 1 ? '' : 's'}` : ''}
-          {modelResponses.some((event) => event.reasoning?.returned) ? ', reasoning returned' : ''}
-        </span>
-      </summary>
-      <div className="campaign-dev-agent-run-body">
-        <div className="campaign-dev-message-meta">
-          <span>trace {run.trace_id}</span>
-          {run.parent_trace_id && <span>parent {run.parent_trace_id}</span>}
-          {run.actor && <span>actor {run.actor}</span>}
-        </div>
-        <div className="campaign-dev-agent-events">
-          {events.map((event) => (
-            <div key={event.id} className="campaign-dev-agent-event">
-              <div className="campaign-dev-message-meta">
-                <span className={`campaign-dev-pill campaign-dev-pill-role-${event.role}`}>{roleLabel(event.role)}</span>
-                <span>{formatEventType(event.event_type)}</span>
-                <span>{formatDateTime(event.created_at)}</span>
-              </div>
-              <div className="campaign-dev-message-content">{event.summary}</div>
-              <ContextStrategyPanel payload={event.payload || {}} />
-              <ToolCallsPanel entry={event} payload={event.payload || {}} />
-              <MemoryUpdatePanel entry={event} payload={event.payload || {}} />
-              <MessageTranscript messages={event.messages} title="Fed message history" />
-              <ReasoningPanel reasoning={event.reasoning} />
+    <div className={branchClassName}>
+      {branches.map((branch) => (
+        <div key={branch.id} className="dev-graph-branch-stack">
+          <BranchCard branch={branch} filters={filters} />
+          {(branch.children || []).filter((child) => branchVisible(child, filters)).map((child) => (
+            <div key={child.id} className="dev-graph-child">
+              <BranchCard branch={child} filters={filters} compact />
             </div>
           ))}
         </div>
-        {run.children?.length ? (
-          <div className="campaign-dev-agent-children">
-            {run.children.map((child) => <AgentRunNode key={child.trace_id} run={child} depth={depth + 1} />)}
-          </div>
-        ) : null}
-      </div>
-    </details>
+      ))}
+    </div>
   )
+}
+
+function FlowGraphNode({ message, filters, isLast, searchQuery }) {
+  const branches = (message.branches || []).filter((branch) => branchVisible(branch, filters) && matchesSearch(branch, searchQuery))
+  const { left, right } = splitBranches(branches)
+  const role = message.role === 'dm' ? 'dm' : message.role === 'system' ? 'system' : 'player'
+  const rowClassName = [
+    'dev-graph-row',
+    branches.length ? 'has-branches' : '',
+    left.length ? 'has-left-branches' : '',
+    right.length ? 'has-right-branches' : '',
+    isLast ? 'is-last' : '',
+  ].filter(Boolean).join(' ')
+
+  if (searchQuery && !messageMatchesSearch(message, searchQuery) && branches.length === 0) return null
+
+  return (
+    <div className={rowClassName}>
+      <BranchColumn branches={left} filters={filters} side="left" />
+      <article className={`dev-graph-node dev-graph-message dev-graph-message-${role}`}>
+        <div className="dev-message-meta">
+          <span className={`dev-pill dev-pill-${message.source}-${message.role}`}>{roleLabel(message.role)}</span>
+          {message.username && <span className="dev-meta-tag">{message.username}</span>}
+          <span className="dev-meta-time">{formatTime(message.created_at)}</span>
+          {branches.length > 0 && <span className="dev-branch-count">{branches.length} branch{branches.length === 1 ? '' : 'es'}</span>}
+        </div>
+        <div className="dev-message-content">{message.content || '(empty)'}</div>
+      </article>
+      <BranchColumn branches={right} filters={filters} side="right" />
+    </div>
+  )
+}
+
+function FlowLane({ lane, filters, searchQuery }) {
+  const branches = (lane.branches || []).filter((branch) => branchVisible(branch, filters) && matchesSearch(branch, searchQuery))
+  const messages = lane.messages || []
+
+  const filteredMessages = searchQuery
+    ? messages.filter((m) => messageMatchesSearch(m, searchQuery) || (m.branches || []).some((b) => matchesSearch(b, searchQuery)))
+    : messages
+  const unlinkedLeft = branches.filter((_, index) => index % 2 === 0)
+  const unlinkedRight = branches.filter((_, index) => index % 2 === 1)
+  const unlinkedRowClassName = [
+    'dev-graph-row',
+    'dev-graph-row-unlinked',
+    'is-last',
+    branches.length ? 'has-branches' : '',
+    unlinkedLeft.length ? 'has-left-branches' : '',
+    unlinkedRight.length ? 'has-right-branches' : '',
+  ].filter(Boolean).join(' ')
+
+  if (searchQuery && filteredMessages.length === 0 && branches.length === 0) return null
+
+  return (
+    <section className={`dev-panel dev-flow-lane dev-flow-lane-${lane.type}`}>
+      <div className="dev-section-header">
+        <div>
+          <h3>{lane.title}</h3>
+          <span className="dev-section-subtitle">{lane.subtitle}</span>
+        </div>
+        <span className="dev-section-count">
+          {filteredMessages.length} msg{filteredMessages.length === 1 ? '' : 's'}
+          {branches.length ? ` · ${branches.length} unlinked` : ''}
+        </span>
+      </div>
+
+      <div className="dev-graph">
+        {filteredMessages.map((message, index) => (
+          <FlowGraphNode
+            key={message.key}
+            message={message}
+            filters={filters}
+            searchQuery={searchQuery}
+            isLast={index === filteredMessages.length - 1 && branches.length === 0}
+          />
+        ))}
+        {branches.length > 0 && (
+          <div className={unlinkedRowClassName}>
+            <BranchColumn branches={unlinkedLeft} filters={filters} side="left" />
+            <div className="dev-graph-node dev-graph-message dev-graph-message-system">
+              <div className="dev-message-meta">
+                <span className="dev-pill dev-pill-cat-tools">Unlinked</span>
+                <span>{branches.length} branch{branches.length === 1 ? '' : 'es'}</span>
+              </div>
+              <div className="dev-message-content">Agent activity not tied to a visible chat message.</div>
+            </div>
+            <BranchColumn branches={unlinkedRight} filters={filters} side="right" />
+          </div>
+        )}
+        {(!filteredMessages.length && !branches.length) && (
+          <div className="dev-empty">No matching entries for the active filters.</div>
+        )}
+      </div>
+    </section>
+  )
+}
+
+function FilterPanel({ filters, setFilters, chatFlow, data, searchQuery, setSearchQuery, actors, actorFilter, setActorFilter, onExpandAll, onCollapseAll }) {
+  const stats = chatFlow?.stats || {}
+  const auditCount = data.audit_stream?.length || data.audit_events?.length || 0
+
+  return (
+    <aside className="dev-aside">
+      <div className="dev-search-wrapper">
+        <i className="bi bi-search dev-search-icon" />
+        <input
+          type="text"
+          className="dev-search-input"
+          placeholder="Search content, actors, labels..."
+          value={searchQuery}
+          onChange={(e) => setSearchQuery(e.target.value)}
+        />
+        {searchQuery && (
+          <button className="dev-search-clear" onClick={() => setSearchQuery('')}>
+            <i className="bi bi-x" />
+          </button>
+        )}
+      </div>
+
+      <section className="dev-panel">
+        <div className="dev-panel-header">
+          <h3>Filters</h3>
+          <div className="dev-panel-actions">
+            <button className="dev-link-btn" onClick={onExpandAll}>Expand all</button>
+            <span className="dev-panel-sep">·</span>
+            <button className="dev-link-btn" onClick={onCollapseAll}>Collapse</button>
+          </div>
+        </div>
+        <div className="dev-filter-pills">
+          {FLOW_FILTERS.map((filter) => (
+            <button
+              key={filter.key}
+              className={`dev-filter-pill ${filters[filter.key] ? 'dev-filter-pill-active' : ''}`}
+              onClick={() => setFilters((current) => ({ ...current, [filter.key]: !current[filter.key] }))}
+            >
+              <i className={`bi ${filter.icon}`} />
+              {filter.label}
+            </button>
+          ))}
+        </div>
+      </section>
+
+      {actors.length > 0 && (
+        <section className="dev-panel">
+          <h3>Actors</h3>
+          <div className="dev-actor-chips">
+            <button
+              className={`dev-actor-chip ${actorFilter.length === 0 ? 'dev-actor-chip-active' : ''}`}
+              onClick={() => setActorFilter([])}
+            >
+              All
+            </button>
+            {actors.map((actor) => (
+              <button
+                key={actor}
+                className={`dev-actor-chip ${actorFilter.includes(actor) ? 'dev-actor-chip-active' : ''}`}
+                onClick={() => {
+                  setActorFilter((current) =>
+                    current.includes(actor) ? current.filter((a) => a !== actor) : [...current, actor]
+                  )
+                }}
+              >
+                {actor.replace(/_/g, ' ')}
+              </button>
+            ))}
+          </div>
+        </section>
+      )}
+
+      <section className="dev-panel">
+        <h3>Summary</h3>
+        <div className="dev-stats-grid">
+          <div className="dev-stat">
+            <span className="dev-stat-value">{stats.visible_message_count || 0}</span>
+            <span className="dev-stat-label">Messages</span>
+          </div>
+          <div className="dev-stat">
+            <span className="dev-stat-value">{stats.linked_branch_count || 0}</span>
+            <span className="dev-stat-label">Branches</span>
+          </div>
+          <div className="dev-stat">
+            <span className="dev-stat-value">{stats.unlinked_branch_count || 0}</span>
+            <span className="dev-stat-label">Unlinked</span>
+          </div>
+          <div className="dev-stat">
+            <span className="dev-stat-value">{auditCount}</span>
+            <span className="dev-stat-label">Events</span>
+          </div>
+        </div>
+      </section>
+
+      <section className="dev-panel dev-panel-note">
+        <p>
+          Chat messages appear in the center. Agent, tool, memory, and reasoning details branch off to the sides when linked to a message.
+        </p>
+        {data.audit_notes?.thinking && (
+          <p className="dev-note-extra">{data.audit_notes.thinking}</p>
+        )}
+      </section>
+    </aside>
+  )
+}
+
+function useExpandCollapse() {
+  const [expandKey, setExpandKey] = useState(0)
+
+  const expandAll = useCallback(() => {
+    document.querySelectorAll('.dev-graph-branch, .dev-details').forEach((el) => {
+      if (el.tagName === 'DETAILS') el.open = true
+    })
+    setExpandKey((k) => k + 1)
+  }, [])
+
+  const collapseAll = useCallback(() => {
+    document.querySelectorAll('.dev-graph-branch, .dev-details').forEach((el) => {
+      if (el.tagName === 'DETAILS') el.open = false
+    })
+    setExpandKey((k) => k + 1)
+  }, [])
+
+  return { expandKey, expandAll, collapseAll }
 }
 
 export default function CampaignDevPage() {
@@ -304,6 +656,11 @@ export default function CampaignDevPage() {
   const [autoRefresh, setAutoRefresh] = useState(true)
   const [lastLoadedAt, setLastLoadedAt] = useState(null)
   const [error, setError] = useState('')
+  const [filters, setFilters] = useState(DEFAULT_FILTERS)
+  const [searchQuery, setSearchQuery] = useState('')
+  const [actorFilter, setActorFilter] = useState([])
+  const { expandKey, expandAll, collapseAll } = useExpandCollapse()
+  const pulseRef = useRef(false)
 
   useEffect(() => {
     let alive = true
@@ -320,6 +677,10 @@ export default function CampaignDevPage() {
         if (alive) {
           setData(payload)
           setLastLoadedAt(new Date())
+          if (background) {
+            pulseRef.current = true
+            setTimeout(() => { pulseRef.current = false }, 600)
+          }
         }
       } catch (err) {
         if (alive) setError(err.message)
@@ -344,366 +705,122 @@ export default function CampaignDevPage() {
     }
   }, [autoRefresh, id])
 
-  const timeline = useMemo(() => {
-    if (!data) return []
+  const chatFlow = useMemo(() => data?.chat_flow || { lanes: [], stats: {} }, [data])
+  const actors = useMemo(() => extractActors(chatFlow), [chatFlow])
 
-    const entries = []
-    const planningMessages = data.planning?.messages || []
-    const sessions = data.sessions || []
-    const worldEvents = data.world?.events || []
-
-    planningMessages.forEach((message) => {
-      entries.push({
-        kind: `planning-${message.role}`,
-        label: `Planning ${message.role}`,
-        created_at: message.created_at,
-        content: message.content,
-        context: `Campaign ${id}`,
+  const visibleLanes = useMemo(() => {
+    const lanes = chatFlow.lanes || []
+    return lanes
+      .filter((lane) => laneVisible(lane, filters))
+      .map((lane) => {
+        if (actorFilter.length === 0) return lane
+        const filteredMessages = (lane.messages || []).map((msg) => ({
+          ...msg,
+          branches: (msg.branches || []).filter((b) => actorFilter.includes(b.actor)),
+        }))
+        const filteredBranches = (lane.branches || []).filter((b) => actorFilter.includes(b.actor))
+        return { ...lane, messages: filteredMessages, branches: filteredBranches }
       })
-    })
+  }, [chatFlow, filters, actorFilter])
 
-    sessions.forEach((session) => {
-      session.messages?.forEach((message) => {
-        entries.push({
-          kind: `session-${message.role}`,
-          label: `Session ${session.id} ${message.role}`,
-          created_at: message.created_at,
-          content: message.content,
-          context: session.is_active ? 'active session' : `session ${session.id}`,
-        })
-      })
-    })
-
-    worldEvents.forEach((event) => {
-      entries.push({
-        kind: `world-${event.visibility || 'unknown'}`,
-        label: `World event ${event.event_type}`,
-        created_at: event.created_at,
-        content: event.summary,
-        context: event.visibility || 'unknown',
-      })
-    })
-
-    return entries.sort((a, b) => new Date(a.created_at) - new Date(b.created_at))
-  }, [data, id])
-
-  if (loading) return <Loading message="Loading campaign audit..." />
+  if (loading) return <Loading message="Loading audit data..." />
   if (error) return <ErrorMessage message={error} />
-  if (!data) return <ErrorMessage message="Campaign audit not found." />
+  if (!data) return <ErrorMessage message="Campaign audit data not found." />
 
-  const campaign = data.campaign
+  const campaign = data.campaign || {}
   const members = data.members || []
   const sessions = data.sessions || []
-  const activeSession = data.active_session
-  const worldPublic = data.world?.public || null
-  const worldContext = data.world?.context || null
-  const planning = data.planning || {}
-  const planningVisible = planning.visible || {}
-  const planningSummary = planning.summary || {}
-  const latestSession = data.latest_session
-  const auditEvents = data.audit_events || []
-  const auditStream = data.audit_stream || []
-  const agentRuns = data.agent_runs || []
-  const contextStrategy = data.world?.context_strategy || {}
-  const legacyTimelineCount = timeline.length
+  const planningCount = data.planning?.messages?.length || 0
   const streamIsLive = autoRefresh && !error
 
+  const handleManualRefresh = async () => {
+    setRefreshing(true)
+    try {
+      const payload = await getCampaignDevAudit(id)
+      setData(payload)
+      setLastLoadedAt(new Date())
+      setError('')
+    } catch (err) {
+      setError(err.message)
+    } finally {
+      setRefreshing(false)
+    }
+  }
+
   return (
-    <div className="campaign-dev-page">
-      <div className="campaign-dev-hero">
-        <div className="campaign-dev-hero-copy">
-          <div className="campaign-dev-kicker">Campaign audit</div>
-          <h2>{campaign.name}</h2>
-          <p>{campaign.description || 'No campaign description is set.'}</p>
-          <div className="campaign-dev-chips">
-            <span className="campaign-dev-chip">Members {members.length}</span>
-            <span className="campaign-dev-chip">Sessions {sessions.length}</span>
-            <span className="campaign-dev-chip">Planning messages {planning.messages?.length || 0}</span>
-            <span className="campaign-dev-chip">World {worldPublic?.is_ready ? 'ready' : 'pending'}</span>
-            <span className="campaign-dev-chip">Audit entries {auditStream.length || auditEvents.length}</span>
-          </div>
-        </div>
-        <div className="campaign-dev-hero-actions">
-          <button className="btn btn-secondary" onClick={() => navigate(`/campaigns/${id}`)}>
-            Back to campaign
+    <div className="dev-page">
+      <header className="dev-header">
+        <div className="dev-breadcrumb">
+          <button className="dev-breadcrumb-link" onClick={() => navigate(`/campaigns/${id}`)}>
+            <i className="bi bi-arrow-left" />
+            {campaign.name}
           </button>
-          <div className="campaign-dev-live-controls">
-            <button className="btn btn-secondary" onClick={() => setAutoRefresh((value) => !value)}>
-              {autoRefresh ? 'Pause' : 'Resume'}
+          <span className="dev-breadcrumb-sep">/</span>
+          <span className="dev-breadcrumb-current">Developer Audit</span>
+        </div>
+
+        <div className="dev-header-right">
+          <div className="dev-chips-row">
+            <span className="dev-chip">{members.length} members</span>
+            <span className="dev-chip">{sessions.length} sessions</span>
+            <span className="dev-chip">{planningCount} planning</span>
+          </div>
+
+          <div className="dev-controls">
+            <button className={`dev-live-toggle ${streamIsLive ? 'dev-live-active' : ''}`} onClick={() => setAutoRefresh((v) => !v)}>
+              <span className={`dev-live-dot ${streamIsLive ? 'dev-live-dot-on' : ''}`} />
+              {streamIsLive ? 'Live' : 'Paused'}
             </button>
-            <button
-              className="btn btn-secondary"
-              onClick={async () => {
-                setRefreshing(true)
-                try {
-                  const payload = await getCampaignDevAudit(id)
-                  setData(payload)
-                  setLastLoadedAt(new Date())
-                } catch (err) {
-                  setError(err.message)
-                } finally {
-                  setRefreshing(false)
-                }
-              }}
-            >
+            <button className="btn btn-secondary btn-small" onClick={handleManualRefresh} disabled={refreshing}>
+              <i className={`bi bi-arrow-clockwise ${refreshing ? 'dev-spin' : ''}`} />
               Refresh
             </button>
-          </div>
-          <div className="campaign-dev-route">/campaigns/{id}/dev</div>
-        </div>
-      </div>
-
-      <div className="campaign-dev-layout">
-        <aside className="campaign-dev-aside">
-          <section className="campaign-dev-panel">
-            <h3>Setup Snapshot</h3>
-            <dl className="campaign-dev-stats">
-              <div>
-                <dt>Owner</dt>
-                <dd>{data.campaign.owner_username || campaign.user_id}</dd>
-              </div>
-              <div>
-                <dt>Status</dt>
-                <dd>{campaign.status || 'unknown'}</dd>
-              </div>
-              <div>
-                <dt>Active session</dt>
-                <dd>{activeSession ? `#${activeSession.id}` : 'none'}</dd>
-              </div>
-              <div>
-                <dt>World approved</dt>
-                <dd>{worldPublic?.world?.approved_at ? 'yes' : 'no'}</dd>
-              </div>
-            </dl>
-          </section>
-
-          <section className="campaign-dev-panel">
-            <h3>Members</h3>
-            <div className="campaign-dev-list">
-              {members.map((member) => (
-                <div key={member.id} className="campaign-dev-list-row">
-                  <div>
-                    <strong>{member.username || `User ${member.user_id}`}</strong>
-                    <div className="campaign-dev-muted">
-                      {member.role} {member.is_character_ready ? 'ready' : 'not ready'}
-                    </div>
-                  </div>
-                  <div className="campaign-dev-muted">
-                    {member.selected_character_id ? `Character ${member.selected_character_id}` : 'No character'}
-                  </div>
-                </div>
-              ))}
-            </div>
-          </section>
-
-          <section className="campaign-dev-panel">
-            <h3>Trace Limits</h3>
-            <p className="campaign-dev-note">
-              {data.audit_notes?.message || 'This page shows the exact app inputs, system prompts, model payloads, raw model responses, graph reads and writes, and client payloads that the app can persist.'}
-            </p>
-            {data.audit_notes?.thinking && (
-              <p className="campaign-dev-note">
-                {data.audit_notes.thinking}
-              </p>
+            {lastLoadedAt && (
+              <span className="dev-last-updated">{formatTime(lastLoadedAt.toISOString())}</span>
             )}
-          </section>
+          </div>
+        </div>
+      </header>
 
-          <section className="campaign-dev-panel">
-            <h3>Audit Roles</h3>
-            <div className="campaign-dev-role-key">
-              <span className="campaign-dev-pill campaign-dev-pill-role-player">Player</span>
-              <span>Player-submitted planning and session messages.</span>
-              <span className="campaign-dev-pill campaign-dev-pill-role-agent">Agent</span>
-              <span>Assistant/model output and agent-authored results.</span>
-              <span className="campaign-dev-pill campaign-dev-pill-role-tools">Tools</span>
-              <span>Context reads, writes, API calls, and client payloads.</span>
-            </div>
-          </section>
+      <div className="dev-layout">
+        <FilterPanel
+          filters={filters}
+          setFilters={setFilters}
+          chatFlow={chatFlow}
+          data={data}
+          searchQuery={searchQuery}
+          setSearchQuery={setSearchQuery}
+          actors={actors}
+          actorFilter={actorFilter}
+          setActorFilter={setActorFilter}
+          onExpandAll={expandAll}
+          onCollapseAll={collapseAll}
+        />
 
-          <section className="campaign-dev-panel">
-            <h3>Agent Runs</h3>
-            <div className="campaign-dev-agent-tree">
-              {agentRuns.length === 0 ? (
-                <div className="campaign-dev-empty campaign-dev-empty-compact">
-                  No agent trace metadata has been captured yet.
+        <main className="dev-main" key={expandKey}>
+          {visibleLanes.length === 0 ? (
+            <section className="dev-panel">
+              <div className="dev-empty">No lanes match the active filters{searchQuery ? ` or search "${searchQuery}"` : ''}.</div>
+            </section>
+          ) : (
+            visibleLanes.map((lane) => (
+              <FlowLane key={lane.id} lane={lane} filters={filters} searchQuery={searchQuery} />
+            ))
+          )}
+
+          {filters.raw && (
+            <section className="dev-panel">
+              <div className="dev-section-header">
+                <div>
+                  <h3>Raw Payloads</h3>
+                  <span className="dev-section-subtitle">Original audit data for debugging</span>
                 </div>
-              ) : (
-                agentRuns.map((run) => <AgentRunNode key={run.trace_id} run={run} />)
-              )}
-            </div>
-            <p className="campaign-dev-note">
-              Trace groups include exact message history for model requests and any reasoning fields returned by the provider.
-            </p>
-          </section>
-        </aside>
-
-        <main className="campaign-dev-main">
-          <section className="campaign-dev-panel campaign-dev-stream-panel">
-            <div className="campaign-dev-section-header">
-              <div>
-                <h3>Live Audit Stream</h3>
-                <span>
-                  {streamIsLive ? 'watching' : 'paused'}{refreshing ? ', refreshing' : ''}
-                  {lastLoadedAt ? `, last loaded ${formatDateTime(lastLoadedAt.toISOString())}` : ''}
-                </span>
               </div>
-              <span>{auditStream.length || auditEvents.length || legacyTimelineCount} ordered entries</span>
-            </div>
-            <div className="campaign-dev-stream">
-              {auditStream.length === 0 ? (
-                <div className="campaign-dev-empty">
-                  No persisted audit events yet. New planning, world, and session actions will appear here as
-                  they run. Older campaigns still show the reconstructed legacy timeline below.
-                </div>
-              ) : (
-                auditStream.map((entry) => <AuditStreamCard key={entry.id} entry={entry} />)
-              )}
-            </div>
-          </section>
-
-          <section className="campaign-dev-panel">
-            <div className="campaign-dev-section-header">
-              <h3>Planning Messages</h3>
-              <span>{planning.messages?.length || 0} stored</span>
-            </div>
-            <div className="campaign-dev-message-list">
-              {(planning.messages || []).map((message) => (
-                <AuditMessage
-                  key={message.id}
-                  entry={{
-                    kind: `planning-${message.role}`,
-                    label: message.role === 'dm' ? 'DM' : 'Player',
-                    created_at: message.created_at,
-                    content: message.content,
-                    context: `user ${message.user_id}`,
-                  }}
-                />
-              ))}
-            </div>
-          </section>
-
-          <section className="campaign-dev-panel">
-            <div className="campaign-dev-section-header">
-              <h3>Planning Setup</h3>
-              <span>State and prompts</span>
-            </div>
-            <JsonPanel title="Visible planning state" value={planningVisible} summary="What the current user can see" />
-            <JsonPanel title="Planning summary" value={planningSummary} summary="Includes private planning memory" />
-            <JsonPanel
-              title="Planning DM prompt"
-              value={planning.prompt_traces?.dm_response}
-              summary="Reconstructed prompt sent to the planning DM"
-            />
-            <JsonPanel
-              title="Planning summary update prompt"
-              value={planning.prompt_traces?.summary_update}
-              summary="Prompt used to update planning memory"
-            />
-          </section>
-
-          <section className="campaign-dev-panel">
-            <div className="campaign-dev-section-header">
-              <h3>World Package</h3>
-              <span>{worldPublic?.is_ready ? 'ready' : 'pending'}</span>
-            </div>
-            <JsonPanel title="World public payload" value={worldPublic} summary="Campaign-facing world state" />
-            <JsonPanel title="World context" value={worldContext} summary="DM-visible world memory" />
-            <JsonPanel
-              title="Session context strategy"
-              value={contextStrategy}
-              summary="What live session DM turns feed directly versus retrieve through tools"
-              defaultOpen
-            />
-            <JsonPanel
-              title="World genesis prompt"
-              value={data.world?.prompt_traces?.world_genesis}
-              summary="Prompt used to generate the world package"
-            />
-            <JsonPanel
-              title="Opening scene prompt"
-              value={data.world?.prompt_traces?.opening_scene}
-              summary="Prompt used for the first visible DM message"
-            />
-          </section>
-
-          <section className="campaign-dev-panel">
-            <div className="campaign-dev-section-header">
-              <h3>World Details</h3>
-              <span>{joinNames(data.world?.npc_actors || [], 'name')} </span>
-            </div>
-            <JsonPanel title="NPC actors" value={data.world?.npc_actors || []} summary="Full actor dossiers" />
-            <JsonPanel title="Clocks" value={data.world?.clocks || []} summary="Visible and private pressure clocks" />
-            <JsonPanel title="World events" value={data.world?.events || []} summary="Persisted world events" />
-          </section>
-
-          <section className="campaign-dev-panel">
-            <div className="campaign-dev-section-header">
-              <h3>Session Transcripts</h3>
-              <span>{sessions.length} sessions</span>
-            </div>
-            <div className="campaign-dev-session-list">
-              {sessions.map((session) => (
-                <details key={session.id} className="campaign-dev-details" open={session.is_active}>
-                  <summary>
-                    <span>
-                      Session #{session.id}{session.is_active ? ' active' : ''}
-                    </span>
-                    <span className="campaign-dev-summary">
-                      {session.messages?.length || 0} messages, started {formatDateTime(session.started_at)}
-                    </span>
-                  </summary>
-                  <div className="campaign-dev-message-list">
-                    {(session.messages || []).map((message) => (
-                      <AuditMessage
-                        key={message.id}
-                        entry={{
-                          kind: `session-${message.role}`,
-                          label: message.role === 'dm' ? 'DM' : message.role === 'system' ? 'System' : 'Player',
-                          created_at: message.created_at,
-                          content: message.content,
-                          context: `session ${session.id}`,
-                        }}
-                      />
-                    ))}
-                  </div>
-                </details>
-              ))}
-            </div>
-            <JsonPanel
-              title="Session DM prompt + tools"
-              value={data.world?.prompt_traces?.session_dm_response}
-              summary={`Compact hot prompt reconstructed from ${latestSession ? `session ${latestSession.id}` : 'no session'}`}
-            />
-            <JsonPanel
-              title="Legacy full session DM prompt"
-              value={data.world?.prompt_traces?.legacy_full_session_dm_response}
-              summary="Old full-context prompt kept here for comparison"
-            />
-          </section>
-
-          <section className="campaign-dev-panel">
-            <div className="campaign-dev-section-header">
-              <h3>Legacy Timeline</h3>
-              <span>{timeline.length} reconstructed entries</span>
-            </div>
-            <div className="campaign-dev-timeline">
-              {timeline.length === 0 ? (
-                <div className="campaign-dev-empty">No planning, session, or world events were found.</div>
-              ) : (
-                timeline.map((entry, index) => <AuditMessage key={`${entry.kind}-${index}-${entry.created_at}`} entry={entry} />)
-              )}
-            </div>
-          </section>
-
-          <section className="campaign-dev-panel">
-            <div className="campaign-dev-section-header">
-              <h3>Raw Payloads</h3>
-              <span>Useful for debugging</span>
-            </div>
-            <JsonPanel title="Campaign" value={campaign} summary="Campaign record" />
-            <JsonPanel title="Members" value={members} summary="Campaign membership records" />
-            <JsonPanel title="Characters" value={data.characters || []} summary="Campaign-linked characters" />
-          </section>
+              <JsonPanel title="Audit stream" value={data.audit_stream || []} summary="Normalized events" />
+              <JsonPanel title="Agent runs" value={data.agent_runs || []} summary="Trace tree" />
+              <JsonPanel title="Raw audit events" value={data.audit_events || []} summary="DB records" />
+            </section>
+          )}
         </main>
       </div>
     </div>

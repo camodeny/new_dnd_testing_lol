@@ -17,10 +17,13 @@ from models import (
     CampaignSession,
     CampaignWorld,
     Character,
+    CharacterPlanningMessage,
     SessionMessage,
     User,
 )
+from routes.dev import _agent_runs_from_stream, _audit_stream_entry, _chat_flow_payload
 from routes.sessions import sessions_bp
+from services.audit_service import log_audit_event
 from services.dm_tools import DM_TOOL_DEFINITIONS, apply_memory_patch, build_session_hot_context, context_manifest, execute_dm_tool
 
 
@@ -108,6 +111,31 @@ class DmToolsTest(unittest.TestCase):
         self.assertIn('get_character_context', manifest['available_tools'])
         self.assertIn('recent_messages', manifest['estimated_tokens_by_section'])
 
+    def test_agent_runs_ignore_self_parent_trace(self):
+        stream = [
+            {
+                'id': 1,
+                'trace_id': 'session_dm:session_2:message_15',
+                'parent_trace_id': None,
+                'trace_label': 'session_dm: session 2',
+                'actor': 'session_dm',
+            },
+            {
+                'id': 2,
+                'trace_id': 'session_dm:session_2:message_15',
+                'parent_trace_id': 'session_dm:session_2:message_15',
+                'trace_label': 'session_dm: session 2',
+                'actor': 'session_dm',
+            },
+        ]
+
+        runs = _agent_runs_from_stream(stream)
+
+        self.assertEqual(len(runs), 1)
+        self.assertEqual(runs[0]['trace_id'], 'session_dm:session_2:message_15')
+        self.assertEqual(runs[0]['events'], stream)
+        self.assertEqual(runs[0]['children'], [])
+
     def test_memory_patch_creates_clock_and_graph_fact(self):
         result = apply_memory_patch(
             self.campaign,
@@ -168,8 +196,15 @@ class DmToolsTest(unittest.TestCase):
         token = generate_token(self.user.id)
         client = self.app.test_client()
 
+        def memory_patch_side_effect(_memory_context, audit_context=None):
+            dm_event = CampaignAuditEvent.query.filter_by(event_type='dm_output_stored').first()
+            self.assertIsNotNone(dm_event)
+            self.assertEqual(audit_context['trace_id'].split(':')[0], 'session_memory_writer')
+            self.assertEqual(audit_context['parent_trace_id'].split(':')[0], 'session_dm')
+            return {}
+
         with patch('routes.sessions.get_session_dm_response_with_tools', return_value='Yes, you are in a party.') as dm_response, \
-                patch('routes.sessions.get_session_memory_patch', return_value={}) as memory_patch:
+                patch('routes.sessions.get_session_memory_patch', side_effect=memory_patch_side_effect) as memory_patch:
             response = client.post(
                 f'/api/sessions/{self.session.id}/messages',
                 json={'content': '<ooc>Am I in a party?</ooc>', 'role': 'player'},
@@ -184,6 +219,110 @@ class DmToolsTest(unittest.TestCase):
         self.assertIsNotNone(CampaignAuditEvent.query.filter_by(event_type='dm_output_stored').first())
         self.assertTrue(dm_response.called)
         self.assertEqual(memory_patch.call_args.args[0]['latest_player_message'], '<ooc>Am I in a party?</ooc>')
+        player_msg = SessionMessage.query.filter_by(session_id=self.session.id, role='player').first()
+        expected_dm_trace_id = f'session_dm:session_{self.session.id}:message_{player_msg.id}'
+        expected_memory_trace_id = f'session_memory_writer:session_{self.session.id}:message_{player_msg.id}'
+        self.assertEqual(memory_patch.call_args.kwargs['audit_context']['parent_trace_id'], expected_dm_trace_id)
+        self.assertEqual(memory_patch.call_args.kwargs['audit_context']['trace_id'], expected_memory_trace_id)
+
+    def test_chat_flow_groups_visible_messages_and_nested_branches(self):
+        planning_player = CharacterPlanningMessage(
+            campaign_id=self.campaign.id,
+            user_id=self.user.id,
+            role='player',
+            content='I want to be a dockside wizard.',
+        )
+        planning_dm = CharacterPlanningMessage(
+            campaign_id=self.campaign.id,
+            user_id=self.user.id,
+            role='dm',
+            content='Tie your wizard to the warning bell.',
+        )
+        session_player = SessionMessage(
+            session_id=self.session.id,
+            user_id=self.user.id,
+            role='player',
+            content='<ooc>What do I see?</ooc>',
+        )
+        db.session.add_all([planning_player, planning_dm, session_player])
+        db.session.commit()
+
+        session_trace_id = f'session_dm:session_{self.session.id}:message_{session_player.id}'
+        memory_trace_id = f'session_memory_writer:session_{self.session.id}:message_{session_player.id}'
+        log_audit_event(
+            self.campaign.id,
+            'model_request',
+            'session_dm request: session_dm_response',
+            {
+                'operation': 'session_dm_response',
+                'messages': [{'role': 'user', 'content': '<ooc>What do I see?</ooc>'}],
+            },
+            actor='session_dm',
+            trace_id=session_trace_id,
+            trace_label=f'session_dm: session {self.session.id}',
+            audit_role='tools',
+            commit=False,
+        )
+        log_audit_event(
+            self.campaign.id,
+            'model_response',
+            'session_dm response: session_dm_response',
+            {
+                'operation': 'session_dm_response',
+                'content': 'You see lanterns swinging in the mist.',
+                'raw_response': {'choices': [{'message': {'content': 'You see lanterns swinging in the mist.'}}]},
+            },
+            actor='session_dm',
+            trace_id=session_trace_id,
+            trace_label=f'session_dm: session {self.session.id}',
+            audit_role='agent',
+            commit=False,
+        )
+        log_audit_event(
+            self.campaign.id,
+            'memory_writer_request',
+            'Requested post-turn session memory update.',
+            {'messages': [{'role': 'user', 'content': 'memory input'}]},
+            actor='session_memory_writer',
+            trace_id=memory_trace_id,
+            parent_trace_id=session_trace_id,
+            trace_label=f'session_memory_writer: session {self.session.id}',
+            audit_role='tools',
+            commit=False,
+        )
+        log_audit_event(
+            self.campaign.id,
+            'knowledge_graph_write',
+            'Legacy unlinked write.',
+            {'fact': 'The bell rang.'},
+            actor='world_architect',
+            audit_role='tools',
+            commit=False,
+        )
+        db.session.commit()
+
+        audit_events = CampaignAuditEvent.query.filter_by(campaign_id=self.campaign.id).order_by(CampaignAuditEvent.id.asc()).all()
+        audit_stream = [_audit_stream_entry(event) for event in audit_events]
+        agent_runs = _agent_runs_from_stream(audit_stream)
+        flow = _chat_flow_payload(
+            self.campaign.id,
+            CharacterPlanningMessage.query.filter_by(campaign_id=self.campaign.id).order_by(CharacterPlanningMessage.created_at.asc()).all(),
+            [self.session],
+            list(self.campaign.members),
+            audit_stream,
+            agent_runs,
+        )
+
+        session_lane = next(lane for lane in flow['lanes'] if lane['id'] == f'session-{self.session.id}')
+        session_message = next(message for message in session_lane['messages'] if message['id'] == session_player.id)
+        self.assertEqual(session_message['branches'][0]['trace_id'], session_trace_id)
+        self.assertEqual(session_message['branches'][0]['children'][0]['trace_id'], memory_trace_id)
+        self.assertEqual(flow['unlinked_branches'][0]['summary'], 'Legacy unlinked write.')
+        planning_lane = next(lane for lane in flow['lanes'] if lane['type'] == 'planning')
+        self.assertEqual([message['content'] for message in planning_lane['messages']], [
+            'I want to be a dockside wizard.',
+            'Tie your wizard to the warning bell.',
+        ])
 
 
 if __name__ == '__main__':

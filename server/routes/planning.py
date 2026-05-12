@@ -73,6 +73,8 @@ def send_planning_message(current_user, campaign_id):
     )
     db.session.add(player_msg)
     db.session.commit()
+    dm_trace_id = f'planning_dm:campaign_{campaign_id}:message_{player_msg.id}'
+    memory_trace_id = f'planning_memory_writer:campaign_{campaign_id}:message_{player_msg.id}'
     log_audit_event(
         campaign_id,
         'player_input_stored',
@@ -106,6 +108,8 @@ def send_planning_message(current_user, campaign_id):
             'campaign_id': campaign_id,
             'operation': 'planning_dm_response',
             'actor': 'planning_dm',
+            'trace_id': dm_trace_id,
+            'trace_label': f'planning_dm: campaign {campaign_id}',
         },
     )
     if not ai_result:
@@ -123,6 +127,9 @@ def send_planning_message(current_user, campaign_id):
             'campaign_id': campaign_id,
             'operation': 'planning_summary_update',
             'actor': 'planning_memory_writer',
+            'trace_id': memory_trace_id,
+            'parent_trace_id': dm_trace_id,
+            'trace_label': f'planning_memory_writer: campaign {campaign_id}',
         },
     )
     summary = get_or_create_summary(campaign_id)
@@ -139,6 +146,9 @@ def send_planning_message(current_user, campaign_id):
         },
         source='campaign_planning_summaries',
         actor='planning_memory_writer',
+        trace_id=memory_trace_id,
+        parent_trace_id=dm_trace_id,
+        trace_label=f'planning_memory_writer: campaign {campaign_id}',
         commit=False,
     )
 
@@ -165,6 +175,8 @@ def send_planning_message(current_user, campaign_id):
         },
         source='character_planning_messages',
         actor='planning_dm',
+        trace_id=dm_trace_id,
+        trace_label=f'planning_dm: campaign {campaign_id}',
         commit=False,
     )
 
@@ -207,6 +219,8 @@ def generate_character_draft(current_user, campaign_id):
         return jsonify({'error': 'Chat with the DM before generating a draft'}), 400
 
     context = planning_context(campaign, current_user)
+    latest_player_message = next((message for message in reversed(messages) if message.role == 'player'), messages[-1])
+    draft_trace_id = f'character_draft_agent:campaign_{campaign_id}:message_{latest_player_message.id}'
     log_audit_event(
         campaign_id,
         'planning_context_read',
@@ -223,6 +237,8 @@ def generate_character_draft(current_user, campaign_id):
             'campaign_id': campaign_id,
             'operation': 'character_draft',
             'actor': 'character_draft_agent',
+            'trace_id': draft_trace_id,
+            'trace_label': f'character_draft_agent: campaign {campaign_id}',
         },
     )
     if not draft:
@@ -237,6 +253,8 @@ def generate_character_draft(current_user, campaign_id):
         {'draft': draft},
         source='planning.draft',
         actor='character_draft_agent',
+        trace_id=draft_trace_id,
+        trace_label=f'character_draft_agent: campaign {campaign_id}',
         commit=True,
     )
     return jsonify({'draft': draft}), 200

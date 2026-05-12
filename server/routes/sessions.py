@@ -64,6 +64,7 @@ def start_session(current_user, campaign_id):
 
     context = planning_context(campaign, current_user)
     world_context = dm_world_context(campaign, audit=True, reason='opening_scene_context')
+    opening_trace_id = f'session_dm:session_{session.id}:opening'
     opening_text = get_opening_scene_response(
         context,
         world_context,
@@ -71,6 +72,8 @@ def start_session(current_user, campaign_id):
             'campaign_id': campaign_id,
             'operation': 'opening_scene',
             'actor': 'session_dm',
+            'trace_id': opening_trace_id,
+            'trace_label': f'session_dm: session {session.id} opening',
         },
     )
     if opening_text:
@@ -93,6 +96,8 @@ def start_session(current_user, campaign_id):
             },
             source='session_messages',
             actor='session_dm',
+            trace_id=opening_trace_id,
+            trace_label=f'session_dm: session {session.id} opening',
             commit=False,
         )
 
@@ -254,6 +259,8 @@ def send_message(current_user, session_id):
             },
             source='session_messages',
             actor='session_dm',
+            trace_id=trace_id,
+            trace_label=f'session_dm: session {session_id}',
             commit=False,
         )
         memory_trace_id = f'session_memory_writer:session_{session_id}:message_{msg.id}'

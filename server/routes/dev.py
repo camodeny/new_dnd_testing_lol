@@ -1,4 +1,5 @@
 import random
+import re
 
 from flask import Blueprint, jsonify
 
@@ -164,7 +165,11 @@ def _agent_runs_from_stream(stream):
             'events': [],
             'children': [],
         })
-        if not node.get('parent_trace_id') and entry.get('parent_trace_id'):
+        if (
+            not node.get('parent_trace_id')
+            and entry.get('parent_trace_id')
+            and entry.get('parent_trace_id') != trace_id
+        ):
             node['parent_trace_id'] = entry.get('parent_trace_id')
         if not node.get('actor') and entry.get('actor'):
             node['actor'] = entry.get('actor')
@@ -176,7 +181,7 @@ def _agent_runs_from_stream(stream):
     roots = []
     for node in nodes.values():
         parent_id = node.get('parent_trace_id')
-        if parent_id and parent_id in nodes:
+        if parent_id and parent_id in nodes and parent_id != node.get('trace_id'):
             nodes[parent_id]['children'].append(node)
         else:
             roots.append(node)
@@ -190,6 +195,290 @@ def _agent_runs_from_stream(stream):
     for root in roots:
         sort_node(root)
     return roots
+
+
+def _message_link_from_trace(trace_id):
+    if not trace_id:
+        return None
+
+    session_match = re.search(r'(?:^|:)session_(\d+):message_(\d+)', trace_id)
+    if session_match:
+        return {
+            'lane_id': f'session-{session_match.group(1)}',
+            'message_key': f'session-message-{session_match.group(2)}',
+        }
+
+    planning_match = re.search(r'(?:^|:)campaign_(\d+):message_(\d+)', trace_id)
+    if planning_match:
+        return {
+            'lane_id': f'planning-user-message-{planning_match.group(2)}',
+            'message_key': f'planning-message-{planning_match.group(2)}',
+        }
+
+    return None
+
+
+def _normalize_visible_message(source, message, lane_id, username=None):
+    return {
+        'key': f'{source}-message-{message.id}',
+        'id': message.id,
+        'source': source,
+        'lane_id': lane_id,
+        'role': message.role,
+        'user_id': getattr(message, 'user_id', None),
+        'username': username,
+        'content': message.content,
+        'created_at': message.created_at.isoformat() if message.created_at else None,
+        'branches': [],
+    }
+
+
+def _branch_operation(events):
+    for event in events:
+        payload = event.get('payload') or {}
+        operation = payload.get('operation')
+        if operation:
+            return operation
+    return None
+
+
+def _branch_messages(events):
+    for event in events:
+        if event.get('messages'):
+            return event.get('messages') or []
+        payload = event.get('payload') or {}
+        if isinstance(payload.get('messages'), list):
+            return payload.get('messages') or []
+    return []
+
+
+def _branch_response(events):
+    for event in events:
+        if event.get('event_type') in {'model_response', 'memory_writer_response', 'draft_output_sent', 'dm_output_stored'}:
+            payload = event.get('payload') or {}
+            content = event.get('content') or payload.get('content')
+            if content:
+                return content
+            message = payload.get('message') if isinstance(payload.get('message'), dict) else {}
+            if message.get('content'):
+                return message.get('content')
+            if payload.get('patch'):
+                return payload.get('patch')
+            if payload.get('draft'):
+                return payload.get('draft')
+    return None
+
+
+def _branch_tool_events(events):
+    result = []
+    for event in events:
+        payload = event.get('payload') or {}
+        if event.get('tool_calls'):
+            result.append({
+                'event_id': event.get('id'),
+                'event_type': event.get('event_type'),
+                'tool_calls': event.get('tool_calls'),
+            })
+        if payload.get('tool_name'):
+            result.append({
+                'event_id': event.get('id'),
+                'event_type': event.get('event_type'),
+                'tool_name': payload.get('tool_name'),
+                'arguments': payload.get('arguments'),
+                'result': payload.get('result'),
+                'mutated': payload.get('mutated'),
+                'affected_ids': payload.get('affected_ids'),
+            })
+    return result
+
+
+def _branch_memory_events(events):
+    return [
+        {
+            'event_id': event.get('id'),
+            'event_type': event.get('event_type'),
+            'summary': event.get('summary'),
+            'payload': event.get('payload') or {},
+        }
+        for event in events
+        if str(event.get('event_type') or '').startswith('memory_')
+        or event.get('event_type') in {'planning_memory_write', 'memory_patch_applied'}
+    ]
+
+
+def _branch_reasoning(events):
+    for event in events:
+        reasoning = event.get('reasoning')
+        if reasoning and reasoning.get('returned'):
+            return reasoning
+    return None
+
+
+def _branch_from_run(run):
+    events = run.get('events') or []
+    first_event = events[0] if events else {}
+    trace_id = run.get('trace_id')
+    return {
+        'id': trace_id or f'audit-run-{first_event.get("id")}',
+        'trace_id': trace_id,
+        'parent_trace_id': run.get('parent_trace_id'),
+        'trace_label': run.get('trace_label') or trace_id,
+        'actor': run.get('actor') or first_event.get('actor'),
+        'operation': _branch_operation(events),
+        'role': first_event.get('role') or 'tools',
+        'summary': first_event.get('summary') or run.get('trace_label') or trace_id,
+        'created_at': first_event.get('created_at'),
+        'event_ids': [event.get('id') for event in events],
+        'events': events,
+        'messages': _branch_messages(events),
+        'response': _branch_response(events),
+        'tool_events': _branch_tool_events(events),
+        'memory_events': _branch_memory_events(events),
+        'reasoning': _branch_reasoning(events),
+        'link': _message_link_from_trace(trace_id),
+        'children': [_branch_from_run(child) for child in (run.get('children') or [])],
+    }
+
+
+def _branch_from_event(event):
+    return {
+        'id': f'audit-event-{event.get("id")}',
+        'trace_id': event.get('trace_id'),
+        'parent_trace_id': event.get('parent_trace_id'),
+        'trace_label': event.get('trace_label') or event.get('label'),
+        'actor': event.get('actor'),
+        'operation': (event.get('payload') or {}).get('operation'),
+        'role': event.get('role') or 'tools',
+        'summary': event.get('summary'),
+        'created_at': event.get('created_at'),
+        'event_ids': [event.get('id')],
+        'events': [event],
+        'messages': event.get('messages') or [],
+        'response': event.get('content'),
+        'tool_events': _branch_tool_events([event]),
+        'memory_events': _branch_memory_events([event]),
+        'reasoning': event.get('reasoning'),
+        'link': _message_link_from_trace(event.get('trace_id')),
+        'children': [],
+    }
+
+
+def _attach_branch(lanes_by_id, branch):
+    link = branch.get('link') or {}
+    lane = lanes_by_id.get(link.get('lane_id'))
+    if not lane:
+        return False
+    for message in lane.get('messages') or []:
+        if message.get('key') == link.get('message_key'):
+            message.setdefault('branches', []).append(branch)
+            return True
+    return False
+
+
+def _branch_count(branches):
+    return sum(1 + _branch_count(branch.get('children') or []) for branch in branches)
+
+
+def _chat_flow_payload(campaign_id, planning_messages, sessions, members, audit_stream, agent_runs):
+    user_names = {member.user_id: member.user.username if member.user else None for member in members}
+    lanes = []
+    lanes_by_id = {}
+
+    planning_lane_by_user = {}
+    planning_message_lane_ids = {}
+    for message in planning_messages:
+        username = user_names.get(message.user_id) or f'User {message.user_id}'
+        lane_id = f'planning-user-{message.user_id}'
+        lane = planning_lane_by_user.get(message.user_id)
+        if not lane:
+            lane = {
+                'id': lane_id,
+                'type': 'planning',
+                'title': f'Planning chat - {username}',
+                'subtitle': f'Campaign {campaign_id} character planning',
+                'messages': [],
+                'branches': [],
+            }
+            planning_lane_by_user[message.user_id] = lane
+            lanes.append(lane)
+            lanes_by_id[lane_id] = lane
+        normalized = _normalize_visible_message('planning', message, lane_id, username=username)
+        lane['messages'].append(normalized)
+        planning_message_lane_ids[str(message.id)] = lane_id
+
+    for message_id, lane_id in planning_message_lane_ids.items():
+        lanes_by_id[f'planning-user-message-{message_id}'] = lanes_by_id[lane_id]
+
+    for session in sessions:
+        lane_id = f'session-{session.id}'
+        lane = {
+            'id': lane_id,
+            'type': 'session',
+            'title': f'Session #{session.id}',
+            'subtitle': 'Active session' if session.is_active else 'Past session',
+            'messages': [],
+            'branches': [],
+        }
+        session_messages = sorted(session.messages or [], key=lambda item: item.created_at or item.id)
+        for message in session_messages:
+            username = message.user.username if message.user else None
+            lane['messages'].append(_normalize_visible_message('session', message, lane_id, username=username))
+        lanes.append(lane)
+        lanes_by_id[lane_id] = lane
+
+    system_lane = {
+        'id': 'system-unlinked',
+        'type': 'system',
+        'title': 'Unlinked agent runs',
+        'subtitle': 'World generation, legacy traces, and audit events that cannot be tied to one visible message',
+        'messages': [],
+        'branches': [],
+    }
+
+    linked_event_ids = set()
+    unlinked_branches = []
+    for run in agent_runs:
+        branch = _branch_from_run(run)
+        linked_event_ids.update(branch.get('event_ids') or [])
+        if _attach_branch(lanes_by_id, branch):
+            continue
+        unlinked_branches.append(branch)
+
+    standalone_event_types = {'player_input_stored', 'dm_output_stored'}
+    for event in audit_stream:
+        if event.get('id') in linked_event_ids:
+            continue
+        if event.get('trace_id'):
+            continue
+        if event.get('event_type') in standalone_event_types:
+            continue
+        unlinked_branches.append(_branch_from_event(event))
+
+    unlinked_branches.sort(key=lambda branch: branch.get('created_at') or '')
+    system_lane['branches'] = unlinked_branches
+    if unlinked_branches:
+        lanes.append(system_lane)
+        lanes_by_id[system_lane['id']] = system_lane
+
+    for lane in lanes:
+        for message in lane.get('messages') or []:
+            message.get('branches', []).sort(key=lambda branch: branch.get('created_at') or '')
+        lane.get('branches', []).sort(key=lambda branch: branch.get('created_at') or '')
+
+    return {
+        'lanes': lanes,
+        'unlinked_branches': unlinked_branches,
+        'stats': {
+            'lane_count': len(lanes),
+            'visible_message_count': sum(len(lane.get('messages') or []) for lane in lanes),
+            'linked_branch_count': sum(
+                _branch_count(message.get('branches') or [])
+                for lane in lanes
+                for message in (lane.get('messages') or [])
+            ),
+            'unlinked_branch_count': _branch_count(unlinked_branches),
+        },
+    }
 
 
 @dev_bp.route('/api/campaigns/<int:campaign_id>/dev', methods=['GET'])
@@ -238,6 +527,7 @@ def get_campaign_dev_audit(current_user, campaign_id):
     audit_events_payload = [event.to_dict() for event in audit_events]
     audit_stream = [_audit_stream_entry(event) for event in audit_events]
     agent_runs = _agent_runs_from_stream(audit_stream)
+    chat_flow = _chat_flow_payload(campaign_id, planning_messages, sessions, members, audit_stream, agent_runs)
     latest_session = active_session or (sessions[0] if sessions else None)
 
     session_context = dict(planning_ctx)
@@ -303,6 +593,7 @@ def get_campaign_dev_audit(current_user, campaign_id):
         'audit_events': audit_events_payload,
         'audit_stream': audit_stream,
         'agent_runs': agent_runs,
+        'chat_flow': chat_flow,
         'audit_notes': {
             'tool_calls': 'OpenRouter chat requests and responses are persisted as model_request/model_response events. Provider-internal tool calls are not returned unless the provider response includes them.',
             'thinking': 'OpenRouter reasoning-capable models may return reasoning or reasoning_details fields in model responses. Some models and providers do not return reasoning, and provider-hidden reasoning is not available unless it appears in the response payload.',
