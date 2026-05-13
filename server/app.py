@@ -1,7 +1,7 @@
 import os
 
 from dotenv import load_dotenv
-from flask import Flask, jsonify
+from flask import Flask, jsonify, send_from_directory
 from flask_cors import CORS
 from sqlalchemy import text
 
@@ -19,10 +19,17 @@ load_dotenv()
 
 
 def create_app():
-    app = Flask(__name__)
-    CORS(app, resources={r'/api/*': {'origins': '*'}})
+    app = Flask(__name__, static_folder='static', static_url_path='')
 
-    app.config['SQLALCHEMY_DATABASE_URI'] = 'sqlite:///dnd.db'
+    frontend_origins = os.environ.get('FRONTEND_ORIGINS', '*')
+    cors_origins = '*' if frontend_origins == '*' else [
+        origin.strip()
+        for origin in frontend_origins.split(',')
+        if origin.strip()
+    ]
+    CORS(app, resources={r'/api/*': {'origins': cors_origins}})
+
+    app.config['SQLALCHEMY_DATABASE_URI'] = os.environ.get('DATABASE_URL', 'sqlite:///dnd.db')
     app.config['SQLALCHEMY_TRACK_MODIFICATIONS'] = False
     app.config['SECRET_KEY'] = os.environ.get('SECRET_KEY', 'dev-secret-key')
     app.config['JWT_EXPIRATION_HOURS'] = int(os.environ.get('JWT_EXPIRATION_HOURS', 24))
@@ -41,6 +48,23 @@ def create_app():
     @app.route('/api/health')
     def health():
         return jsonify({'status': 'ok'})
+
+    @app.route('/', defaults={'path': ''})
+    @app.route('/<path:path>')
+    def serve_frontend(path):
+        if path.startswith('api/'):
+            return jsonify({'error': 'Not found'}), 404
+
+        static_dir = app.static_folder
+        requested_path = os.path.join(static_dir, path) if path else ''
+        if path and os.path.exists(requested_path):
+            return send_from_directory(static_dir, path)
+
+        index_path = os.path.join(static_dir, 'index.html')
+        if os.path.exists(index_path):
+            return send_from_directory(static_dir, 'index.html')
+
+        return jsonify({'status': 'ok', 'message': 'API server is running'}), 200
 
     with app.app_context():
         db.create_all()
@@ -87,4 +111,6 @@ app = create_app()
 
 
 if __name__ == '__main__':
-    app.run(debug=True, host='0.0.0.0', port=5889)
+    port = int(os.environ.get('PORT', 5889))
+    debug = os.environ.get('FLASK_DEBUG', 'true').lower() == 'true'
+    app.run(debug=debug, host='0.0.0.0', port=port)

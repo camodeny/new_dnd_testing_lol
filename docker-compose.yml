@@ -1,0 +1,19 @@
+services:
+  app:
+    build: .
+    image: dnd-app:latest
+    ports:
+      - "${APP_PORT:-5889}:5001"
+    environment:
+      FLASK_ENV: production
+      FLASK_DEBUG: "false"
+      PORT: 5001
+      DATABASE_URL: ${DATABASE_URL:-sqlite:////app/data/dnd.db}
+      FRONTEND_ORIGINS: ${FRONTEND_ORIGINS:-http://localhost:5889}
+      SECRET_KEY: ${SECRET_KEY:-dev-secret-key}
+      JWT_EXPIRATION_HOURS: ${JWT_EXPIRATION_HOURS:-24}
+      OPENROUTER_API_KEY: ${OPENROUTER_API_KEY:-}
+      OPENROUTER_MODEL: ${OPENROUTER_MODEL:-}
+    volumes:
+      - ./data:/app/data
+    restart: unless-stopped

@@ -1,0 +1,13 @@
+.git
+.github
+.env
+*.env
+**/__pycache__/
+**/*.pyc
+**/node_modules/
+client/dist/
+server/instance/
+venv/
+.venv/
+.DS_Store
+*.log

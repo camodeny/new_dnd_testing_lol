@@ -1,7 +1,8 @@
 import { useState, useRef, useEffect } from 'react'
 import MarkdownContent from '../common/MarkdownContent'
 import DiceRollStage from './DiceRollStage'
-import { formatMessageForDm, hasIcSegment, parseQuotedMessage, parseTaggedMessage } from '../../utils/messageTags'
+import SessionInput from './SessionInput'
+import { formatMessageForDm, hasIcSegment, parseTaggedMessage } from '../../utils/messageTags'
 
 function formatTime(iso) {
   if (!iso) return ''
@@ -50,23 +51,6 @@ function getMessageSenderIcon(role) {
   if (role === 'dm') return 'bi bi-mic-fill'
   if (role === 'system') return 'bi bi-gear-fill'
   return 'bi bi-person-fill'
-}
-
-function SessionInputPreview({ value, highlightRef }) {
-  const segments = parseQuotedMessage(value, { includeQuoteMarks: true })
-
-  return (
-    <div ref={highlightRef} className="session-input-highlight" aria-hidden="true">
-      {segments.length ? segments.map((segment, index) => (
-        <span
-          key={`${segment.type}-${index}`}
-          className={segment.type === 'ic' ? 'session-input-ic-highlight' : undefined}
-        >
-          {segment.text}
-        </span>
-      )) : '\u00a0'}
-    </div>
-  )
 }
 
 function PlayerMessageContent({ content }) {
@@ -149,8 +133,6 @@ export default function SessionPanel({
   const [showDice, setShowDice] = useState(false)
   const [lastRoll, setLastRoll] = useState(null)
   const messagesEndRef = useRef(null)
-  const inputRef = useRef(null)
-  const inputHighlightRef = useRef(null)
   const rollIdRef = useRef(0)
 
   useEffect(() => {
@@ -193,20 +175,6 @@ export default function SessionPanel({
 
     onSendMessage(formatMessageForDm(text))
     setInput('')
-  }
-
-  const handleKeyDown = (e) => {
-    if (e.key === 'Enter' && !e.shiftKey) {
-      e.preventDefault()
-      handleSend()
-    }
-  }
-
-  const handleInputScroll = (e) => {
-    if (inputHighlightRef.current) {
-      inputHighlightRef.current.scrollTop = e.currentTarget.scrollTop
-      inputHighlightRef.current.scrollLeft = e.currentTarget.scrollLeft
-    }
   }
 
   const recordLocalRoll = ({ sides, rolls, total, result, modifier = 0, label }) => {
@@ -380,17 +348,12 @@ export default function SessionPanel({
 
           <div className="session-input-area">
             <div className={`session-input-shell ${hasIcSegment(input) ? 'has-ic' : ''}`}>
-              <SessionInputPreview value={input} highlightRef={inputHighlightRef} />
-              <textarea
-                ref={inputRef}
-                className="textarea session-input"
-                placeholder={aiThinking ? 'Waiting for DM...' : 'Type your action. Wrap speech in quotes for IC.'}
+              <SessionInput
                 value={input}
-                onChange={(e) => setInput(e.target.value)}
-                onScroll={handleInputScroll}
-                onKeyDown={handleKeyDown}
-                rows={2}
+                onChange={setInput}
+                onSubmit={handleSend}
                 disabled={aiThinking}
+                placeholder={aiThinking ? 'Waiting for DM...' : 'Type your action. Wrap speech in quotes for IC.'}
               />
             </div>
             <button className="btn btn-primary session-send-btn" onClick={handleSend} disabled={aiThinking}>
