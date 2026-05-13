@@ -182,6 +182,16 @@ jobs:
             docker build -t dnd-app:${IMAGE_TAG} . && \
             sed -i 's|image:[[:space:]]*dnd-app:.*|image: dnd-app:${IMAGE_TAG}|g' docker-compose.yml && \
             docker compose --env-file .deploy.env up -d && \
-            docker compose --env-file .deploy.env exec -T app python -c \"import urllib.request; print(urllib.request.urlopen('http://127.0.0.1:5001/api/health', timeout=10).read().decode())\" && \
+            for attempt in \$(seq 1 30); do \
+              if docker compose --env-file .deploy.env exec -T app python -c \"import urllib.request; print(urllib.request.urlopen('http://127.0.0.1:5001/api/health', timeout=5).read().decode())\"; then \
+                break; \
+              fi; \
+              if [ \"\$attempt\" -eq 30 ]; then \
+                docker compose --env-file .deploy.env ps; \
+                docker compose --env-file .deploy.env logs --tail=200 app; \
+                exit 1; \
+              fi; \
+              sleep 2; \
+            done && \
             docker image prune -af \
           "
