@@ -135,6 +135,7 @@ jobs:
             --exclude-vcs \
             --exclude='.env' \
             --exclude='*.env' \
+            --exclude='data' \
             --exclude='node_modules' \
             --exclude='client/node_modules' \
             --exclude='client/dist' \

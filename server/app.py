@@ -4,6 +4,7 @@ from dotenv import load_dotenv
 from flask import Flask, jsonify, send_from_directory
 from flask_cors import CORS
 from sqlalchemy import text
+from werkzeug.utils import safe_join
 
 from auth import auth_bp
 from models import db
@@ -19,7 +20,7 @@ load_dotenv()
 
 
 def create_app():
-    app = Flask(__name__, static_folder='static', static_url_path='')
+    app = Flask(__name__, static_folder=None)
 
     frontend_origins = os.environ.get('FRONTEND_ORIGINS', '*')
     cors_origins = '*' if frontend_origins == '*' else [
@@ -55,9 +56,9 @@ def create_app():
         if path.startswith('api/'):
             return jsonify({'error': 'Not found'}), 404
 
-        static_dir = app.static_folder
-        requested_path = os.path.join(static_dir, path) if path else ''
-        if path and os.path.exists(requested_path):
+        static_dir = os.path.join(app.root_path, 'static')
+        requested_path = safe_join(static_dir, path) if path else None
+        if requested_path and os.path.isfile(requested_path):
             return send_from_directory(static_dir, path)
 
         index_path = os.path.join(static_dir, 'index.html')
