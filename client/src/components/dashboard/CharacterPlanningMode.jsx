@@ -2,7 +2,7 @@ import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import { useNavigate } from 'react-router-dom'
 import {
   createCharacter,
-  generateCharacterDraft,
+
   getCampaignPlanning,
   getCharacters,
   selectPlanningCharacter,
@@ -138,7 +138,6 @@ export default function CharacterPlanningMode({ campaign, currentUser, onComplet
   const [input, setInput] = useState('')
   const [sending, setSending] = useState(false)
   const [savingCharacter, setSavingCharacter] = useState(false)
-  const [drafting, setDrafting] = useState(false)
   const [showImport, setShowImport] = useState(false)
   const [availableChars, setAvailableChars] = useState([])
   const [importLoading, setImportLoading] = useState(false)
@@ -304,20 +303,6 @@ export default function CharacterPlanningMode({ campaign, currentUser, onComplet
     }
   }
 
-  const handleDraft = async () => {
-    setDrafting(true)
-    setError('')
-    try {
-      const data = await generateCharacterDraft(campaign.id)
-      applyFormPatch(data.draft)
-      setActivePage('identity')
-    } catch (err) {
-      setError(err.message)
-    } finally {
-      setDrafting(false)
-    }
-  }
-
   const handleSaveCharacter = async (event) => {
     event.preventDefault()
     if (!draftCharacter.name?.trim() || !draftCharacter.race?.trim()) {
@@ -457,10 +442,19 @@ export default function CharacterPlanningMode({ campaign, currentUser, onComplet
 
   const renderPendingBondCards = () => pendingBonds.map((bond) => {
     const editing = bondEdits[bond.id]
+    const currentApproval = bond.approval_states?.[String(currentUser?.id)]
+    const acceptedByCurrentUser = currentApproval === 'accepted'
+    const waitingForCount = (bond.involved_user_ids || []).filter((userId) => (
+      String(userId) !== String(currentUser?.id)
+        && bond.approval_states?.[String(userId)] !== 'accepted'
+    )).length
+    const waitingLabel = waitingForCount === 1 ? 'Waiting for the other player' : 'Waiting for other players'
+
     return (
       <div className="planning-chat-bond" key={`bond-${bond.id}`}>
         <div className="planning-chat-meta">
           <span>Bond Proposal</span>
+          {acceptedByCurrentUser && <span className="planning-bond-status">Accepted by you</span>}
         </div>
         {editing ? (
           <>
@@ -482,6 +476,12 @@ export default function CharacterPlanningMode({ campaign, currentUser, onComplet
             <p>{bond.description}</p>
           </>
         )}
+        {!editing && acceptedByCurrentUser && (
+          <div className="planning-bond-waiting" role="status" aria-live="polite">
+            <i className="bi bi-hourglass-split"></i>
+            <span>{waitingLabel}</span>
+          </div>
+        )}
         <div className="planning-bond-actions">
           {editing ? (
             <>
@@ -490,7 +490,9 @@ export default function CharacterPlanningMode({ campaign, currentUser, onComplet
             </>
           ) : (
             <>
-              <button className="btn btn-primary small" onClick={() => handleBondAction(bond, 'accept')}>Accept</button>
+              {!acceptedByCurrentUser && (
+                <button className="btn btn-primary small" onClick={() => handleBondAction(bond, 'accept')}>Accept</button>
+              )}
               <button
                 className="btn btn-secondary small"
                 onClick={() => setBondEdits((prev) => ({ ...prev, [bond.id]: { title: bond.title, description: bond.description } }))}
@@ -557,9 +559,6 @@ export default function CharacterPlanningMode({ campaign, currentUser, onComplet
           rows={2}
         />
         <div className="planning-chat-actions">
-          <button className="btn btn-secondary" onClick={handleDraft} disabled={drafting || planning.messages.length === 0}>
-            <i className="bi bi-magic"></i> {drafting ? 'Drafting...' : 'Generate Draft'}
-          </button>
           <button className="btn btn-primary" onClick={handleSend} disabled={sending || !input.trim()}>
             Send
           </button>

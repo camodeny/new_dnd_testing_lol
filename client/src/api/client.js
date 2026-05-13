@@ -164,10 +164,6 @@ export function sendPlanningMessage(campaignId, content, options = {}) {
   })
 }
 
-export function generateCharacterDraft(campaignId) {
-  return apiFetch(`/campaigns/${campaignId}/planning/draft`, { method: 'POST' })
-}
-
 export function selectPlanningCharacter(campaignId, characterId) {
   return apiFetch(`/campaigns/${campaignId}/planning/character`, {
     method: 'PUT',

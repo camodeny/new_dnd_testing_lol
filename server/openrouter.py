@@ -64,12 +64,6 @@ SUMMARY_SYSTEM_PROMPT = (
     "only when it should affect future character creation. Rewrite duplicates into one clear sentence."
 )
 
-DRAFT_SYSTEM_PROMPT = (
-    "You convert a D&D character planning conversation into a JSON character draft compatible with "
-    "the app's character form. Return only valid JSON. Keep the draft playable at level 1 unless the "
-    "campaign context clearly says otherwise. Include concise backstory hooks that fit the campaign."
-)
-
 WORLD_GENESIS_SYSTEM_PROMPT = (
     "You are a D&D campaign architect creating the first persistent world package after all player "
     "characters are ready. Return only valid JSON. The public_intro must be a spoiler-free elevator "
@@ -337,24 +331,6 @@ def build_planning_summary_messages(context, latest_player_message, latest_dm_me
                     ],
                 },
             }, ensure_ascii=False),
-        },
-    ]
-
-
-def build_character_draft_messages(context, current_user_messages):
-    return [
-        {'role': 'system', 'content': DRAFT_SYSTEM_PROMPT},
-        {'role': 'system', 'content': 'Planning context:\n' + json.dumps(context, ensure_ascii=False)},
-        {
-            'role': 'user',
-            'content': (
-                "Create a JSON character draft with top-level fields accepted by the app: name, "
-                "player_name, race, subrace, alignment, background, total_level, ability_scores, combat, "
-                "general, spellcasting, currency, personality, appearance, background_details, classes, "
-                "skills, saving_throws, proficiencies, features, weapons, equipment, spells, notes, "
-                "resources, companions, conditions. Conversation:\n"
-                + json.dumps([msg.to_dict() for msg in current_user_messages], ensure_ascii=False)
-            ),
         },
     ]
 
@@ -710,17 +686,6 @@ def get_planning_summary_update(context, latest_player_message, latest_dm_messag
         return data if isinstance(data, dict) else {}
     except Exception as e:
         print(f'[openrouter] Planning summary error: {e}')
-        return {}
-
-
-def get_character_draft(context, current_user_messages, audit_context=None):
-    messages = build_character_draft_messages(context, current_user_messages)
-
-    try:
-        data = _json_loads_or_empty(_post_chat(messages, json_mode=True, audit_context=audit_context))
-        return data if isinstance(data, dict) else {}
-    except Exception as e:
-        print(f'[openrouter] Character draft error: {e}')
         return {}
 
 

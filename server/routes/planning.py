@@ -5,7 +5,6 @@ from flask import Blueprint, jsonify, request
 from auth import token_required
 from models import db, Campaign, Character, CharacterPlanningMessage, PlanningBondProposal
 from openrouter import (
-    get_character_draft,
     get_planning_dm_response,
     get_planning_summary_update,
 )
@@ -202,62 +201,6 @@ def send_planning_message(current_user, campaign_id):
         'form_patch': response_payload['form_patch'],
     }), 201
 
-
-@planning_bp.route('/api/campaigns/<int:campaign_id>/planning/draft', methods=['POST'])
-@token_required
-def generate_character_draft(current_user, campaign_id):
-    result, error = require_planning_member(current_user, campaign_id)
-    if error:
-        return error
-
-    campaign, _member = result
-    messages = CharacterPlanningMessage.query.filter_by(
-        campaign_id=campaign_id,
-        user_id=current_user.id,
-    ).order_by(CharacterPlanningMessage.created_at.asc()).all()
-    if not messages:
-        return jsonify({'error': 'Chat with the DM before generating a draft'}), 400
-
-    context = planning_context(campaign, current_user)
-    latest_player_message = next((message for message in reversed(messages) if message.role == 'player'), messages[-1])
-    draft_trace_id = f'character_draft_agent:campaign_{campaign_id}:message_{latest_player_message.id}'
-    log_audit_event(
-        campaign_id,
-        'planning_context_read',
-        'Read planning context for character draft generation.',
-        {'context': context, 'message_count': len(messages)},
-        source='planning_context',
-        actor='server',
-        commit=True,
-    )
-    draft = get_character_draft(
-        context,
-        messages,
-        audit_context={
-            'campaign_id': campaign_id,
-            'operation': 'character_draft',
-            'actor': 'character_draft_agent',
-            'trace_id': draft_trace_id,
-            'trace_label': f'character_draft_agent: campaign {campaign_id}',
-        },
-    )
-    if not draft:
-        return jsonify({'error': 'The planning DM could not generate a character draft'}), 500
-
-    draft['campaign_id'] = campaign_id
-    draft.setdefault('player_name', current_user.username)
-    log_audit_event(
-        campaign_id,
-        'draft_output_sent',
-        'Generated character draft payload for the client.',
-        {'draft': draft},
-        source='planning.draft',
-        actor='character_draft_agent',
-        trace_id=draft_trace_id,
-        trace_label=f'character_draft_agent: campaign {campaign_id}',
-        commit=True,
-    )
-    return jsonify({'draft': draft}), 200
 
 
 @planning_bp.route('/api/campaigns/<int:campaign_id>/planning/character', methods=['PUT'])
