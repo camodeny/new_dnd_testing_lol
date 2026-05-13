@@ -3,6 +3,7 @@ import { useNavigate } from 'react-router-dom'
 import {
   listMembers,
   createInvite,
+  getInvite,
   updateCampaign,
   removeMember,
 } from '../../api/client'
@@ -66,7 +67,7 @@ export default function CampaignLobby({
 
   const checkExistingInvite = useCallback(async () => {
     try {
-      const data = await createInvite(campaign.id)
+      const data = await getInvite(campaign.id)
       setInvite(data.invite)
     } catch {
       // Silently fail - we'll show the create button
@@ -308,7 +309,7 @@ export default function CampaignLobby({
                       </button>
                     </div>
                     <p className="lobby-invite-hint">
-                      <i className="bi bi-info-circle"></i> This code expires in 7 days
+                      <i className="bi bi-info-circle"></i> This code stays active for this campaign
                     </p>
                   </div>
                 ) : (

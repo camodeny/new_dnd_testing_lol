@@ -112,6 +112,51 @@ class AppRouteTest(unittest.TestCase):
         self.assertEqual(response.status_code, 201)
         self.assertEqual(response.get_json()['member']['campaign_id'], campaign_id)
 
+    def test_campaign_preview_accepts_stored_invite_code_after_current_code_changes(self):
+        campaign_id, token = self.create_campaign_with_invite('COWJVBID')
+        with app.app_context():
+            campaign = Campaign.query.get(campaign_id)
+            campaign.invite_code = 'KI9FIV1K'
+            db.session.add(CampaignInvite(
+                campaign_id=campaign_id,
+                code='KI9FIV1K',
+                created_by=campaign.user_id,
+                is_used=False,
+            ))
+            db.session.commit()
+
+        response = self.client.get(
+            f'/api/campaigns/{campaign_id}?code=COWJVBID',
+            headers={'Authorization': f'Bearer {token}'},
+        )
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.get_json()['campaign']['id'], campaign_id)
+
+    def test_get_invite_returns_current_invite_without_creating_a_new_one(self):
+        campaign_id, token = self.create_campaign_with_invite('COWJVBID')
+
+        response = self.client.get(
+            f'/api/campaigns/{campaign_id}/invites',
+            headers={'Authorization': f'Bearer {token}'},
+        )
+
+        self.assertEqual(response.status_code, 403)
+
+        with app.app_context():
+            owner_id = Campaign.query.get(campaign_id).user_id
+            owner_token = generate_token(owner_id)
+
+        response = self.client.get(
+            f'/api/campaigns/{campaign_id}/invites',
+            headers={'Authorization': f'Bearer {owner_token}'},
+        )
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.get_json()['invite']['code'], 'COWJVBID')
+        with app.app_context():
+            self.assertEqual(CampaignInvite.query.filter_by(campaign_id=campaign_id).count(), 1)
+
 
 if __name__ == '__main__':
     unittest.main()

@@ -132,6 +132,10 @@ export function createInvite(campaignId) {
   return apiFetch(`/campaigns/${campaignId}/invites`, { method: 'POST' })
 }
 
+export function getInvite(campaignId) {
+  return apiFetch(`/campaigns/${campaignId}/invites`)
+}
+
 export function joinCampaign(campaignId, code) {
   return apiFetch(`/campaigns/${campaignId}/join`, { method: 'POST', body: JSON.stringify({ code }) })
 }

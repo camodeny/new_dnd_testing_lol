@@ -1,7 +1,7 @@
 import secrets
 import string
 
-from models import CampaignMember
+from models import CampaignInvite, CampaignMember
 
 
 def generate_invite_code():
@@ -21,6 +21,32 @@ def ensure_member(campaign, user):
 
 def invite_code_matches(campaign, code):
     if not campaign.invite_code or not code:
-        return False
+        return find_invite_by_code(campaign, code) is not None
 
-    return campaign.invite_code.strip().upper() == code.strip().upper()
+    normalized = code.strip().upper()
+    if campaign.invite_code.strip().upper() == normalized:
+        return True
+
+    return find_invite_by_code(campaign, normalized) is not None
+
+
+def find_invite_by_code(campaign, code):
+    if not code:
+        return None
+
+    return CampaignInvite.query.filter_by(
+        campaign_id=campaign.id,
+        code=code.strip().upper(),
+        is_used=False,
+    ).first()
+
+
+def current_invite_for_campaign(campaign):
+    if not campaign.invite_code:
+        return None
+
+    invite = find_invite_by_code(campaign, campaign.invite_code)
+    if invite:
+        return invite
+
+    return None

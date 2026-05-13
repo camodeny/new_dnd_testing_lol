@@ -4,7 +4,12 @@ from flask import Blueprint, jsonify, request
 
 from auth import token_required
 from models import db, Campaign, CampaignInvite, CampaignMember
-from services.campaign_service import ensure_member, generate_invite_code, invite_code_matches
+from services.campaign_service import (
+    current_invite_for_campaign,
+    ensure_member,
+    generate_invite_code,
+    invite_code_matches,
+)
 
 members_bp = Blueprint('members', __name__)
 
@@ -33,6 +38,20 @@ def list_members(current_user, campaign_id):
             })
 
     return jsonify({'members': result}), 200
+
+
+@members_bp.route('/api/campaigns/<int:campaign_id>/invites', methods=['GET'])
+@token_required
+def get_current_invite(current_user, campaign_id):
+    campaign = Campaign.query.get_or_404(campaign_id)
+    if campaign.user_id != current_user.id:
+        return jsonify({'error': 'Only the campaign owner can view invites'}), 403
+
+    invite = current_invite_for_campaign(campaign)
+    if not invite:
+        return jsonify({'invite': None}), 200
+
+    return jsonify({'invite': invite.to_dict()}), 200
 
 
 @members_bp.route('/api/campaigns/<int:campaign_id>/invites', methods=['POST'])
