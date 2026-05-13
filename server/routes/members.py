@@ -4,7 +4,7 @@ from flask import Blueprint, jsonify, request
 
 from auth import token_required
 from models import db, Campaign, CampaignInvite, CampaignMember
-from services.campaign_service import ensure_member, generate_invite_code
+from services.campaign_service import ensure_member, generate_invite_code, invite_code_matches
 
 members_bp = Blueprint('members', __name__)
 
@@ -62,7 +62,7 @@ def join_campaign(current_user, campaign_id):
     data = request.get_json()
     if not data or not data.get('code'):
         return jsonify({'error': 'Missing invite code'}), 400
-    if campaign.invite_code != data['code']:
+    if not invite_code_matches(campaign, data['code']):
         return jsonify({'error': 'Invalid invite code'}), 403
 
     existing = CampaignMember.query.filter_by(campaign_id=campaign_id, user_id=current_user.id).first()

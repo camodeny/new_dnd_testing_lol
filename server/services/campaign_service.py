@@ -17,3 +17,10 @@ def ensure_member(campaign, user):
         campaign_id=campaign.id,
         user_id=user.id,
     ).first() is not None
+
+
+def invite_code_matches(campaign, code):
+    if not campaign.invite_code or not code:
+        return False
+
+    return campaign.invite_code.strip().upper() == code.strip().upper()

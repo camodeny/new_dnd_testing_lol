@@ -1,6 +1,4 @@
 import json
-from datetime import datetime
-
 from flask import Blueprint, jsonify, request
 
 from auth import token_required
@@ -8,7 +6,6 @@ from models import (
     db,
     Campaign,
     CampaignAuditEvent,
-    CampaignInvite,
     CampaignMember,
     CampaignPlanningSummary,
     CampaignSession,
@@ -16,7 +13,7 @@ from models import (
     CharacterPlanningMessage,
     PlanningBondProposal,
 )
-from services.campaign_service import ensure_member
+from services.campaign_service import ensure_member, invite_code_matches
 from services.character_service import character_full_dict
 
 campaigns_bp = Blueprint('campaigns', __name__)
@@ -40,12 +37,8 @@ def get_campaign(current_user, campaign_id):
 
     has_invite = False
     invite_code = request.args.get('code')
-    if invite_code:
-        valid = CampaignInvite.query.filter_by(
-            campaign_id=campaign_id, code=invite_code, is_used=False
-        ).first()
-        if valid and (valid.expires_at is None or valid.expires_at > datetime.utcnow()):
-            has_invite = True
+    if invite_code and invite_code_matches(campaign, invite_code):
+        has_invite = True
 
     if not ensure_member(campaign, current_user) and not has_invite:
         return jsonify({'error': 'Forbidden'}), 403
