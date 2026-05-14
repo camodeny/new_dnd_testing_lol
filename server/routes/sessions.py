@@ -4,7 +4,12 @@ from flask import Blueprint, jsonify, request
 
 from auth import token_required
 from models import db, Campaign, CampaignSession, SessionMessage
-from openrouter import get_opening_scene_response, get_session_dm_response_with_tools, get_session_memory_patch
+from openrouter import (
+    get_opening_scene_response,
+    get_session_dm_response_with_tools,
+    get_session_memory_patch,
+    normalize_session_dm_turn_decision,
+)
 from services.audit_service import log_audit_event
 from services.campaign_service import ensure_member, get_or_404
 from services.dm_tools import (
@@ -19,6 +24,20 @@ from services.planning_service import can_start_session, planning_context
 from services.world_service import approve_world, dm_world_context, ensure_world_generated
 
 sessions_bp = Blueprint('sessions', __name__)
+
+
+def _session_dm_turn_decision(raw_result):
+    decision = normalize_session_dm_turn_decision(raw_result)
+    if decision.get('mode') == 'silent':
+        return {
+            'mode': 'silent',
+            'content': '',
+            'reason': decision.get('reason') or 'The DM intentionally stayed silent.',
+        }
+    return {
+        'mode': 'speak',
+        'content': decision.get('content') or '',
+    }
 
 
 @sessions_bp.route('/api/campaigns/<int:campaign_id>/sessions', methods=['POST'])
@@ -218,7 +237,7 @@ def send_message(current_user, session_id):
             SessionMessage.created_at.asc(),
         ).all()[-8:]
         trace_id = f'session_dm:session_{session_id}:message_{msg.id}'
-        ai_text = get_session_dm_response_with_tools(
+        ai_result = get_session_dm_response_with_tools(
             hot_context,
             recent_messages,
             DM_TOOL_DEFINITIONS,
@@ -238,7 +257,10 @@ def send_message(current_user, session_id):
     except Exception as err:
         return jsonify({'error': repr(err), 'messages': result_messages}), 500
 
-    if ai_text:
+    ai_turn = _session_dm_turn_decision(ai_result)
+    ai_text = ai_turn.get('content') or ''
+
+    if ai_turn.get('mode') == 'speak' and ai_text:
         ai_msg = SessionMessage(
             session_id=session_id,
             role='dm',
@@ -311,8 +333,45 @@ def send_message(current_user, session_id):
             )
         db.session.commit()
         result_messages.append(ai_msg.to_dict())
+    elif ai_turn.get('mode') == 'silent':
+        log_audit_event(
+            campaign.id,
+            'dm_silence_chosen',
+            'Session DM intentionally sent no visible response.',
+            {
+                'session_id': session_id,
+                'player_message_id': msg.id,
+                'decision': {
+                    'mode': 'silent',
+                    'reason': ai_turn.get('reason') or '',
+                },
+            },
+            source='session_messages',
+            actor='session_dm',
+            trace_id=trace_id,
+            trace_label=f'session_dm: session {session_id}',
+            audit_role='agent',
+            commit=False,
+        )
+        db.session.commit()
     else:
-        db.session.rollback()
+        log_audit_event(
+            campaign.id,
+            'dm_output_empty',
+            'Session DM returned no visible content; no DM message was stored.',
+            {
+                'session_id': session_id,
+                'player_message_id': msg.id,
+                'decision': ai_turn,
+            },
+            source='session_messages',
+            actor='session_dm',
+            trace_id=trace_id,
+            trace_label=f'session_dm: session {session_id}',
+            audit_role='agent',
+            commit=False,
+        )
+        db.session.commit()
 
     log_audit_event(
         campaign.id,

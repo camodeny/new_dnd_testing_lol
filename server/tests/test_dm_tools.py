@@ -21,7 +21,7 @@ from models import (
     SessionMessage,
     User,
 )
-from openrouter import _pc_control_violation
+from openrouter import _pc_control_violation, normalize_session_dm_turn_decision
 from routes.dev import _agent_runs_from_stream, _audit_stream_entry, _chat_flow_payload
 from routes.sessions import sessions_bp
 from services.audit_service import log_audit_event
@@ -148,6 +148,23 @@ class DmToolsTest(unittest.TestCase):
             hot_context,
         ))
 
+    def test_session_dm_turn_decision_normalizes_silence_contract(self):
+        self.assertEqual(
+            normalize_session_dm_turn_decision('{"mode":"silent","reason":"PC-to-PC exchange."}'),
+            {
+                'mode': 'silent',
+                'content': '',
+                'reason': 'PC-to-PC exchange.',
+            },
+        )
+        self.assertEqual(
+            normalize_session_dm_turn_decision('The lock clicks open.'),
+            {
+                'mode': 'speak',
+                'content': 'The lock clicks open.',
+            },
+        )
+
     def test_agent_runs_ignore_self_parent_trace(self):
         stream = [
             {
@@ -261,6 +278,30 @@ class DmToolsTest(unittest.TestCase):
         expected_memory_trace_id = f'session_memory_writer:session_{self.session.id}:message_{player_msg.id}'
         self.assertEqual(memory_patch.call_args.kwargs['audit_context']['parent_trace_id'], expected_dm_trace_id)
         self.assertEqual(memory_patch.call_args.kwargs['audit_context']['trace_id'], expected_memory_trace_id)
+
+    def test_session_message_route_persists_player_message_when_dm_is_silent(self):
+        token = generate_token(self.user.id)
+        client = self.app.test_client()
+
+        with patch('routes.sessions.get_session_dm_response_with_tools', return_value={
+            'mode': 'silent',
+            'reason': 'PC-to-PC exchange.',
+        }) as dm_response, patch('routes.sessions.get_session_memory_patch') as memory_patch:
+            response = client.post(
+                f'/api/sessions/{self.session.id}/messages',
+                json={'content': '<ic>Raven, what do you think?</ic>', 'role': 'player'},
+                headers={'Authorization': f'Bearer {token}'},
+            )
+
+        self.assertEqual(response.status_code, 201)
+        payload = response.get_json()
+        self.assertEqual([message['role'] for message in payload['messages']], ['player'])
+        self.assertEqual(SessionMessage.query.filter_by(session_id=self.session.id).count(), 1)
+        self.assertIsNotNone(SessionMessage.query.filter_by(session_id=self.session.id, role='player').first())
+        silence_event = CampaignAuditEvent.query.filter_by(event_type='dm_silence_chosen').first()
+        self.assertIsNotNone(silence_event)
+        self.assertTrue(dm_response.called)
+        self.assertFalse(memory_patch.called)
 
     def test_chat_flow_groups_visible_messages_and_nested_branches(self):
         planning_player = CharacterPlanningMessage(

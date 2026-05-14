@@ -20,8 +20,8 @@ PC_CONTROL_POLICY = (
     "Do not write exact dialogue for any player character unless that player supplied the exact words. "
     "Do not narrate another player's PC actions, gestures, thoughts, emotions, decisions, or answers. "
     "For the current player's PC, resolve only the action or words they declared; prefer second person "
-    "and do not add unprovided intent, emotion, or quoted speech. If one PC addresses another PC, stop "
-    "at the prompt for that player, e.g. 'Raven, how do you respond?'"
+    "and do not add unprovided intent, emotion, or quoted speech. If one PC addresses another PC and "
+    "no DM adjudication, NPC response, environmental consequence, or clarification is needed, stay silent."
 )
 
 SYSTEM_PROMPT = (
@@ -49,7 +49,11 @@ SESSION_TOOL_PROMPT = (
     "character-sheet, world-memory, NPC, clock, or session facts instead of guessing. Use write tools "
     "only when the fiction has actually changed durable world state. Do not expose DM-private tool "
     "results in visible narration unless they became known through play. The hot context contains "
-    "protected_player_characters and current_player_character; obey those boundaries exactly."
+    "protected_player_characters and current_player_character; obey those boundaries exactly. "
+    "For the final turn decision, return only valid JSON. Use {\"mode\":\"speak\",\"content\":\"...\"} "
+    "when the DM should send a visible reply. Use {\"mode\":\"silent\",\"reason\":\"...\"} when the latest "
+    "message is only PC-to-PC conversation or waiting on another PC and the DM should not send anything. "
+    "Do not send handoff prompts such as 'How do you respond?' for ordinary PC-to-PC conversation."
 )
 
 PLANNING_SYSTEM_PROMPT = (
@@ -281,6 +285,35 @@ def _json_loads_or_empty(text):
                 pass
         return {}
     return {}
+
+
+def normalize_session_dm_turn_decision(raw_decision):
+    if isinstance(raw_decision, dict):
+        data = raw_decision
+    elif isinstance(raw_decision, str):
+        data = _json_loads_or_empty(raw_decision)
+        if not isinstance(data, dict) or not data:
+            return {'mode': 'speak', 'content': raw_decision.strip()}
+    else:
+        return {'mode': 'speak', 'content': ''}
+
+    mode = str(data.get('mode') or data.get('action') or '').strip().lower()
+    if mode in {'silent', 'no_response', 'no_dm_response', 'none'}:
+        return {
+            'mode': 'silent',
+            'content': '',
+            'reason': str(data.get('reason') or 'The DM intentionally stayed silent.').strip(),
+        }
+
+    content = data.get('content')
+    if content is None:
+        content = data.get('message')
+    if content is None:
+        content = data.get('visible_message')
+    return {
+        'mode': 'speak',
+        'content': str(content or '').strip(),
+    }
 
 
 def build_session_dm_tool_messages(hot_context):
@@ -634,8 +667,10 @@ def get_session_dm_response_with_tools(
         message, finish_reason = _choice_message(data)
         tool_calls = message.get('tool_calls') or []
         if not tool_calls or tool_round >= max_tool_rounds:
-            content = message.get('content') or ''
-            violation = _pc_control_violation(content, hot_context)
+            raw_content = message.get('content') or ''
+            decision = normalize_session_dm_turn_decision(raw_content)
+            content = decision.get('content') or ''
+            violation = _pc_control_violation(content, hot_context) if decision.get('mode') == 'speak' else None
             if violation and not pc_control_retried:
                 if base_audit.get('campaign_id'):
                     log_audit_event(
@@ -644,7 +679,7 @@ def get_session_dm_response_with_tools(
                         'Session DM response controlled a protected player character; requesting rewrite.',
                         {
                             'violation': violation,
-                            'draft_response': content,
+                            'draft_response': raw_content,
                         },
                         source='session_dm.guard',
                         actor='server',
@@ -653,13 +688,15 @@ def get_session_dm_response_with_tools(
                         audit_role='guard',
                         commit=True,
                     )
-                messages.append({'role': 'assistant', 'content': content})
+                messages.append({'role': 'assistant', 'content': raw_content})
                 messages.append({
                     'role': 'user',
                     'content': (
                         'Rewrite the previous response. It controlled a protected player character. '
                         'Do not write dialogue, actions, gestures, thoughts, emotions, or decisions for any PC. '
-                        'If a player character addresses another player character, prompt that player to respond.'
+                        'If a player character addresses another player character and no DM adjudication is needed, '
+                        'return {"mode":"silent","reason":"PC-to-PC exchange."}. Otherwise return the same JSON '
+                        'contract with mode="speak" and safe DM-visible content.'
                     ),
                 })
                 pc_control_retried = True
@@ -673,7 +710,7 @@ def get_session_dm_response_with_tools(
                         'Session DM response still controlled a protected player character after retry.',
                         {
                             'violation': violation,
-                            'draft_response': content,
+                            'draft_response': raw_content,
                         },
                         source='session_dm.guard',
                         actor='server',
@@ -682,11 +719,11 @@ def get_session_dm_response_with_tools(
                         audit_role='guard',
                         commit=True,
                     )
-                return (
-                    "You carry out your declared action, then the moment hangs open for the other "
-                    "player character to answer. How do they respond?"
-                )
-            return content
+                return {
+                    'mode': 'silent',
+                    'reason': 'The DM response would have controlled a protected player character.',
+                }
+            return decision
 
         messages.append(_assistant_tool_message(message))
         for tool_call in tool_calls:

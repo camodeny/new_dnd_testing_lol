@@ -286,7 +286,14 @@ def _branch_messages(events):
 
 def _branch_response(events):
     for event in events:
-        if event.get('event_type') in {'model_response', 'memory_writer_response', 'draft_output_sent', 'dm_output_stored'}:
+        if event.get('event_type') in {
+            'model_response',
+            'memory_writer_response',
+            'draft_output_sent',
+            'dm_output_stored',
+            'dm_silence_chosen',
+            'dm_output_empty',
+        }:
             payload = event.get('payload') or {}
             content = event.get('content') or payload.get('content')
             if content:
@@ -294,6 +301,9 @@ def _branch_response(events):
             message = payload.get('message') if isinstance(payload.get('message'), dict) else {}
             if message.get('content'):
                 return message.get('content')
+            decision = payload.get('decision') if isinstance(payload.get('decision'), dict) else {}
+            if decision.get('reason'):
+                return decision.get('reason')
             if payload.get('patch'):
                 return payload.get('patch')
             if payload.get('draft'):
@@ -317,7 +327,14 @@ def _event_step_category(event):
         return 'tools'
     if 'memory' in actor or event_type.startswith('memory_') or event_type in {'planning_memory_write', 'memory_patch_applied'}:
         return 'memory'
-    if event_type in {'model_request', 'model_response', 'dm_output_stored', 'draft_output_sent'}:
+    if event_type in {
+        'model_request',
+        'model_response',
+        'dm_output_stored',
+        'dm_silence_chosen',
+        'dm_output_empty',
+        'draft_output_sent',
+    }:
         return 'agents'
     if event.get('role') == 'tools':
         return 'tools'
@@ -415,6 +432,10 @@ def _event_step_title(event):
         return 'Model response'
     if event_type == 'dm_output_stored':
         return 'Visible chat message'
+    if event_type == 'dm_silence_chosen':
+        return 'DM stayed silent'
+    if event_type == 'dm_output_empty':
+        return 'Empty DM output'
     if event_type == 'memory_patch_applied':
         return 'Memory patch applied'
     if event_type == 'memory_writer_request':
@@ -482,6 +503,9 @@ def _event_step_content(event):
     message = payload.get('message') if isinstance(payload.get('message'), dict) else {}
     if message.get('content'):
         return message.get('content')
+    decision = payload.get('decision') if isinstance(payload.get('decision'), dict) else {}
+    if decision.get('reason'):
+        return decision.get('reason')
     if payload.get('patch'):
         return payload.get('patch')
     if payload.get('draft'):
@@ -716,7 +740,12 @@ def _chat_flow_payload(campaign_id, planning_messages, sessions, members, audit_
             continue
         unlinked_branches.append(branch)
 
-    standalone_event_types = {'player_input_stored', 'dm_output_stored'}
+    standalone_event_types = {
+        'player_input_stored',
+        'dm_output_stored',
+        'dm_silence_chosen',
+        'dm_output_empty',
+    }
     for event in audit_stream:
         if event.get('id') in linked_event_ids:
             continue

@@ -12,7 +12,14 @@ AGENT_ACTORS = {
 }
 
 PLAYER_EVENT_TYPES = {'player_input_stored'}
-AGENT_EVENT_TYPES = {'dm_output_stored', 'draft_output_sent', 'model_response', 'memory_writer_response'}
+AGENT_EVENT_TYPES = {
+    'dm_output_stored',
+    'dm_output_empty',
+    'dm_silence_chosen',
+    'draft_output_sent',
+    'model_response',
+    'memory_writer_response',
+}
 
 
 def _json_safe(value):
