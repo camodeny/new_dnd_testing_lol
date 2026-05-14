@@ -2,6 +2,7 @@ from flask import Blueprint, jsonify, request
 
 from auth import token_required
 from models import db, Character, CampaignMember
+from services.campaign_service import get_or_404
 from services.character_service import (
     build_character_from_data,
     character_full_dict,
@@ -21,7 +22,7 @@ def get_characters(current_user):
 @characters_bp.route('/api/characters/<int:character_id>', methods=['GET'])
 @token_required
 def get_character(current_user, character_id):
-    character = Character.query.get_or_404(character_id)
+    character = get_or_404(Character, character_id)
     if character.user_id != current_user.id:
         return jsonify({'error': 'Forbidden'}), 403
 
@@ -58,7 +59,7 @@ def create_character(current_user):
 @characters_bp.route('/api/characters/<int:character_id>', methods=['PUT'])
 @token_required
 def update_character(current_user, character_id):
-    character = Character.query.get_or_404(character_id)
+    character = get_or_404(Character, character_id)
     if character.user_id != current_user.id:
         return jsonify({'error': 'Forbidden'}), 403
 
@@ -79,7 +80,7 @@ def update_character(current_user, character_id):
 @characters_bp.route('/api/characters/<int:character_id>', methods=['DELETE'])
 @token_required
 def delete_character(current_user, character_id):
-    character = Character.query.get_or_404(character_id)
+    character = get_or_404(Character, character_id)
     if character.user_id != current_user.id:
         return jsonify({'error': 'Forbidden'}), 403
 

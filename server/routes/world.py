@@ -3,7 +3,7 @@ from flask import Blueprint, jsonify
 from auth import token_required
 from models import Campaign
 from services.audit_service import log_audit_event
-from services.campaign_service import ensure_member
+from services.campaign_service import ensure_member, get_or_404
 from services.world_service import ensure_world_generated, world_public_payload
 
 world_bp = Blueprint('world', __name__)
@@ -12,7 +12,7 @@ world_bp = Blueprint('world', __name__)
 @world_bp.route('/api/campaigns/<int:campaign_id>/world', methods=['GET'])
 @token_required
 def get_world(current_user, campaign_id):
-    campaign = Campaign.query.get_or_404(campaign_id)
+    campaign = get_or_404(Campaign, campaign_id)
     if not ensure_member(campaign, current_user):
         return jsonify({'error': 'Forbidden'}), 403
 
@@ -22,7 +22,7 @@ def get_world(current_user, campaign_id):
 @world_bp.route('/api/campaigns/<int:campaign_id>/world', methods=['POST'])
 @token_required
 def generate_world(current_user, campaign_id):
-    campaign = Campaign.query.get_or_404(campaign_id)
+    campaign = get_or_404(Campaign, campaign_id)
     if not ensure_member(campaign, current_user):
         return jsonify({'error': 'Forbidden'}), 403
     log_audit_event(

@@ -13,7 +13,7 @@ from models import (
     CharacterPlanningMessage,
     PlanningBondProposal,
 )
-from services.campaign_service import ensure_member, invite_code_matches
+from services.campaign_service import ensure_member, get_or_404, invite_code_matches
 from services.character_service import character_full_dict
 
 campaigns_bp = Blueprint('campaigns', __name__)
@@ -33,7 +33,7 @@ def get_campaigns(current_user):
 @campaigns_bp.route('/api/campaigns/<int:campaign_id>', methods=['GET'])
 @token_required
 def get_campaign(current_user, campaign_id):
-    campaign = Campaign.query.get_or_404(campaign_id)
+    campaign = get_or_404(Campaign, campaign_id)
 
     has_invite = False
     invite_code = request.args.get('code')
@@ -58,7 +58,7 @@ def get_campaign(current_user, campaign_id):
 @campaigns_bp.route('/api/campaigns/<int:campaign_id>', methods=['PUT'])
 @token_required
 def update_campaign(current_user, campaign_id):
-    campaign = Campaign.query.get_or_404(campaign_id)
+    campaign = get_or_404(Campaign, campaign_id)
     if campaign.user_id != current_user.id:
         return jsonify({'error': 'Forbidden'}), 403
 
@@ -83,7 +83,7 @@ def update_campaign(current_user, campaign_id):
 @campaigns_bp.route('/api/campaigns/<int:campaign_id>', methods=['DELETE'])
 @token_required
 def delete_campaign(current_user, campaign_id):
-    campaign = Campaign.query.get_or_404(campaign_id)
+    campaign = get_or_404(Campaign, campaign_id)
     if campaign.user_id != current_user.id:
         return jsonify({'error': 'Forbidden'}), 403
 
@@ -144,7 +144,7 @@ def create_campaign(current_user):
 @campaigns_bp.route('/api/campaigns/<int:campaign_id>/characters', methods=['GET'])
 @token_required
 def get_campaign_characters(current_user, campaign_id):
-    campaign = Campaign.query.get_or_404(campaign_id)
+    campaign = get_or_404(Campaign, campaign_id)
     if not ensure_member(campaign, current_user):
         return jsonify({'error': 'Forbidden'}), 403
 
@@ -155,7 +155,7 @@ def get_campaign_characters(current_user, campaign_id):
 @campaigns_bp.route('/api/campaigns/<int:campaign_id>/characters', methods=['POST'])
 @token_required
 def add_campaign_character(current_user, campaign_id):
-    campaign = Campaign.query.get_or_404(campaign_id)
+    campaign = get_or_404(Campaign, campaign_id)
     if not ensure_member(campaign, current_user):
         return jsonify({'error': 'Forbidden'}), 403
 
@@ -163,7 +163,7 @@ def add_campaign_character(current_user, campaign_id):
     if not data or not data.get('character_id'):
         return jsonify({'error': 'Missing character_id'}), 400
 
-    character = Character.query.get_or_404(data['character_id'])
+    character = get_or_404(Character, data['character_id'])
     if character.user_id != current_user.id:
         return jsonify({'error': 'Forbidden'}), 403
 

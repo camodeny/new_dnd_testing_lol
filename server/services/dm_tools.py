@@ -58,7 +58,7 @@ def _compact_character(character):
 def _current_character(campaign, current_user):
     member = _selected_member(campaign.id, current_user.id)
     if member and member.selected_character_id:
-        return Character.query.get(member.selected_character_id)
+        return db.session.get(Character, member.selected_character_id)
     return Character.query.filter_by(campaign_id=campaign.id, user_id=current_user.id).first()
 
 
@@ -313,7 +313,7 @@ def _tool_get_character_context(campaign, current_user, args):
         members = CampaignMember.query.filter_by(campaign_id=campaign.id).order_by(CampaignMember.id.asc()).all()
         characters = []
         for member in members:
-            character = Character.query.get(member.selected_character_id) if member.selected_character_id else None
+            character = db.session.get(Character, member.selected_character_id) if member.selected_character_id else None
             if character:
                 raw = character_full_dict(character) if full else _compact_character(character)
                 characters.append({

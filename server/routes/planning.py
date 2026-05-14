@@ -8,7 +8,7 @@ from openrouter import (
     get_planning_dm_response,
     get_planning_summary_update,
 )
-from services.campaign_service import ensure_member
+from services.campaign_service import ensure_member, get_or_404
 from services.character_service import character_full_dict
 from services.audit_service import log_audit_event
 from services.planning_service import (
@@ -27,7 +27,7 @@ planning_bp = Blueprint('planning', __name__)
 
 
 def require_planning_member(current_user, campaign_id):
-    campaign = Campaign.query.get_or_404(campaign_id)
+    campaign = get_or_404(Campaign, campaign_id)
     if not ensure_member(campaign, current_user):
         return None, (jsonify({'error': 'Forbidden'}), 403)
 
@@ -219,7 +219,7 @@ def select_planning_character(current_user, campaign_id):
         db.session.commit()
         return jsonify({'planning': visible_planning_payload(campaign, current_user)}), 200
 
-    character = Character.query.get_or_404(character_id)
+    character = get_or_404(Character, character_id)
     if character.user_id != current_user.id:
         return jsonify({'error': 'Forbidden'}), 403
 
@@ -247,7 +247,7 @@ def update_planning_ready(current_user, campaign_id):
         return jsonify({'error': 'Select a character before marking ready'}), 400
 
     if ready:
-        character = Character.query.get_or_404(member.selected_character_id)
+        character = get_or_404(Character, member.selected_character_id)
         if character.user_id != current_user.id or character.campaign_id != campaign_id:
             member.selected_character_id = None
             member.character_ready_at = None

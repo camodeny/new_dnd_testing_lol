@@ -311,6 +311,7 @@ function ReasoningPanel({ reasoning }) {
 function stepIcon(kind, category) {
   if (category === 'tools') return 'bi-wrench'
   if (category === 'memory') return 'bi-database'
+  if (kind === 'prompt_message') return 'bi-chat-left-text'
   if (kind === 'model_request') return 'bi-send'
   if (kind === 'model_response') return 'bi-chat-square-text'
   if (kind === 'dm_output_stored') return 'bi-arrow-return-right'
@@ -322,7 +323,7 @@ function BranchStepCard({ step, inline = false }) {
   const hasUsage = step.usage && Object.keys(step.usage).length > 0
   const hasPayload = step.payload && Object.keys(step.payload).length > 0
   const showRawPayload = hasPayload && !['model_request', 'model_response', 'dm_tool_execution'].includes(step.kind)
-  const contentMax = step.kind === 'dm_output_stored' ? 360 : 520
+  const contentMax = step.kind === 'prompt_message' && step.prompt_role === 'system' ? 900 : step.kind === 'dm_output_stored' ? 360 : 520
   return (
     <article className={`dev-step-card dev-step-${category} ${inline ? 'dev-step-inline' : ''}`}>
       <div className="dev-step-header">
@@ -333,11 +334,14 @@ function BranchStepCard({ step, inline = false }) {
           <div className="dev-step-title-row">
             <strong>{step.title || formatEventType(step.kind)}</strong>
             <span className={`dev-pill dev-pill-cat-${category}`}>{category}</span>
+            {step.prompt_role && <span className={`dev-pill dev-pill-msg-${step.prompt_role}`}>{step.prompt_role}</span>}
           </div>
           <div className="dev-step-meta">
             {step.actor && <span>{step.actor}</span>}
             {step.summary && <span>{step.summary}</span>}
             {step.event_id && <span>event {step.event_id}</span>}
+            {step.name && <span>{step.name}</span>}
+            {step.tool_call_id && <span>tool {step.tool_call_id}</span>}
             {step.created_at && <span>{formatDateTime(step.created_at)}</span>}
           </div>
         </div>

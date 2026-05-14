@@ -272,26 +272,6 @@ def _json_loads_or_empty(text):
     return {}
 
 
-def build_dm_response_messages(session_messages, planning_context=None):
-    messages = [{'role': 'system', 'content': SYSTEM_PROMPT}]
-    if planning_context:
-        messages.append({
-            'role': 'system',
-            'content': 'Campaign context, including private DM-only world memory when present:\n' + json.dumps(planning_context, ensure_ascii=False),
-        })
-
-    for msg in session_messages:
-        if msg.role == 'dm':
-            role = 'assistant'
-        elif msg.role == 'player':
-            role = 'user'
-        else:
-            role = msg.role
-        messages.append({'role': role, 'content': msg.content})
-
-    return messages
-
-
 def build_session_dm_tool_messages(hot_context):
     return [
         {'role': 'system', 'content': SESSION_TOOL_PROMPT},
@@ -523,26 +503,6 @@ def build_session_memory_messages(memory_context):
             }, ensure_ascii=False),
         },
     ]
-
-
-def get_dm_response(session_messages, audit_context=None):
-    messages = build_dm_response_messages(session_messages)
-
-    try:
-        return _post_chat(messages, audit_context=audit_context)
-    except Exception as e:
-        print(f'[openrouter] Error: {e}')
-        return None
-
-
-def get_dm_response_with_context(session_messages, planning_context=None, audit_context=None):
-    messages = build_dm_response_messages(session_messages, planning_context)
-
-    try:
-        return _post_chat(messages, audit_context=audit_context)
-    except Exception as e:
-        print(f'[openrouter] Error: {e}')
-        return None
 
 
 def _choice_message(data):

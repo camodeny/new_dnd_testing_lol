@@ -160,7 +160,7 @@ def clear_invalid_ready_states(members):
                 changed = True
             continue
 
-        character = Character.query.get(member.selected_character_id)
+        character = db.session.get(Character, member.selected_character_id)
         invalid = (
             character is None
             or character.user_id != member.user_id

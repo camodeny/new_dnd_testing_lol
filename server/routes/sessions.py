@@ -6,7 +6,7 @@ from auth import token_required
 from models import db, Campaign, CampaignSession, SessionMessage
 from openrouter import get_opening_scene_response, get_session_dm_response_with_tools, get_session_memory_patch
 from services.audit_service import log_audit_event
-from services.campaign_service import ensure_member
+from services.campaign_service import ensure_member, get_or_404
 from services.dm_tools import (
     DM_TOOL_DEFINITIONS,
     apply_memory_patch,
@@ -24,7 +24,7 @@ sessions_bp = Blueprint('sessions', __name__)
 @sessions_bp.route('/api/campaigns/<int:campaign_id>/sessions', methods=['POST'])
 @token_required
 def start_session(current_user, campaign_id):
-    campaign = Campaign.query.get_or_404(campaign_id)
+    campaign = get_or_404(Campaign, campaign_id)
     if not ensure_member(campaign, current_user):
         return jsonify({'error': 'Forbidden'}), 403
 
@@ -119,7 +119,7 @@ def start_session(current_user, campaign_id):
 @sessions_bp.route('/api/campaigns/<int:campaign_id>/sessions', methods=['GET'])
 @token_required
 def list_sessions(current_user, campaign_id):
-    campaign = Campaign.query.get_or_404(campaign_id)
+    campaign = get_or_404(Campaign, campaign_id)
     if not ensure_member(campaign, current_user):
         return jsonify({'error': 'Forbidden'}), 403
 
@@ -130,8 +130,8 @@ def list_sessions(current_user, campaign_id):
 @sessions_bp.route('/api/sessions/<int:session_id>', methods=['GET'])
 @token_required
 def get_session(current_user, session_id):
-    session = CampaignSession.query.get_or_404(session_id)
-    campaign = Campaign.query.get(session.campaign_id)
+    session = get_or_404(CampaignSession, session_id)
+    campaign = db.session.get(Campaign, session.campaign_id)
     if not ensure_member(campaign, current_user):
         return jsonify({'error': 'Forbidden'}), 403
 
@@ -143,8 +143,8 @@ def get_session(current_user, session_id):
 @sessions_bp.route('/api/sessions/<int:session_id>', methods=['PUT'])
 @token_required
 def end_session(current_user, session_id):
-    session = CampaignSession.query.get_or_404(session_id)
-    campaign = Campaign.query.get(session.campaign_id)
+    session = get_or_404(CampaignSession, session_id)
+    campaign = db.session.get(Campaign, session.campaign_id)
     if not ensure_member(campaign, current_user):
         return jsonify({'error': 'Forbidden'}), 403
 
@@ -161,8 +161,8 @@ def end_session(current_user, session_id):
 @sessions_bp.route('/api/sessions/<int:session_id>/messages', methods=['GET'])
 @token_required
 def get_messages(current_user, session_id):
-    session = CampaignSession.query.get_or_404(session_id)
-    campaign = Campaign.query.get(session.campaign_id)
+    session = get_or_404(CampaignSession, session_id)
+    campaign = db.session.get(Campaign, session.campaign_id)
     if not ensure_member(campaign, current_user):
         return jsonify({'error': 'Forbidden'}), 403
 
@@ -173,8 +173,8 @@ def get_messages(current_user, session_id):
 @sessions_bp.route('/api/sessions/<int:session_id>/messages', methods=['POST'])
 @token_required
 def send_message(current_user, session_id):
-    session = CampaignSession.query.get_or_404(session_id)
-    campaign = Campaign.query.get(session.campaign_id)
+    session = get_or_404(CampaignSession, session_id)
+    campaign = db.session.get(Campaign, session.campaign_id)
     if not ensure_member(campaign, current_user):
         return jsonify({'error': 'Forbidden'}), 403
 

@@ -1,7 +1,16 @@
 import secrets
 import string
 
-from models import CampaignInvite, CampaignMember
+from flask import abort
+
+from models import db, CampaignInvite, CampaignMember
+
+
+def get_or_404(model, ident):
+    item = db.session.get(model, ident)
+    if item is None:
+        abort(404)
+    return item
 
 
 def generate_invite_code():

@@ -8,6 +8,7 @@ from services.campaign_service import (
     current_invite_for_campaign,
     ensure_member,
     generate_invite_code,
+    get_or_404,
     invite_code_matches,
 )
 
@@ -17,7 +18,7 @@ members_bp = Blueprint('members', __name__)
 @members_bp.route('/api/campaigns/<int:campaign_id>/members', methods=['GET'])
 @token_required
 def list_members(current_user, campaign_id):
-    campaign = Campaign.query.get_or_404(campaign_id)
+    campaign = get_or_404(Campaign, campaign_id)
     if not ensure_member(campaign, current_user):
         return jsonify({'error': 'Forbidden'}), 403
 
@@ -43,7 +44,7 @@ def list_members(current_user, campaign_id):
 @members_bp.route('/api/campaigns/<int:campaign_id>/invites', methods=['GET'])
 @token_required
 def get_current_invite(current_user, campaign_id):
-    campaign = Campaign.query.get_or_404(campaign_id)
+    campaign = get_or_404(Campaign, campaign_id)
     if campaign.user_id != current_user.id:
         return jsonify({'error': 'Only the campaign owner can view invites'}), 403
 
@@ -57,7 +58,7 @@ def get_current_invite(current_user, campaign_id):
 @members_bp.route('/api/campaigns/<int:campaign_id>/invites', methods=['POST'])
 @token_required
 def create_invite(current_user, campaign_id):
-    campaign = Campaign.query.get_or_404(campaign_id)
+    campaign = get_or_404(Campaign, campaign_id)
     if campaign.user_id != current_user.id:
         return jsonify({'error': 'Only the campaign owner can create invites'}), 403
 
@@ -77,7 +78,7 @@ def create_invite(current_user, campaign_id):
 @members_bp.route('/api/campaigns/<int:campaign_id>/join', methods=['POST'])
 @token_required
 def join_campaign(current_user, campaign_id):
-    campaign = Campaign.query.get_or_404(campaign_id)
+    campaign = get_or_404(Campaign, campaign_id)
     data = request.get_json()
     if not data or not data.get('code'):
         return jsonify({'error': 'Missing invite code'}), 400
@@ -97,7 +98,7 @@ def join_campaign(current_user, campaign_id):
 @members_bp.route('/api/campaigns/<int:campaign_id>/members/<int:user_id>', methods=['PUT'])
 @token_required
 def update_member_role(current_user, campaign_id, user_id):
-    campaign = Campaign.query.get_or_404(campaign_id)
+    campaign = get_or_404(Campaign, campaign_id)
     if campaign.user_id != current_user.id:
         return jsonify({'error': 'Forbidden'}), 403
 
@@ -113,7 +114,7 @@ def update_member_role(current_user, campaign_id, user_id):
 @members_bp.route('/api/campaigns/<int:campaign_id>/members/<int:user_id>', methods=['DELETE'])
 @token_required
 def remove_member(current_user, campaign_id, user_id):
-    campaign = Campaign.query.get_or_404(campaign_id)
+    campaign = get_or_404(Campaign, campaign_id)
     if campaign.user_id != current_user.id and current_user.id != user_id:
         return jsonify({'error': 'Forbidden'}), 403
 

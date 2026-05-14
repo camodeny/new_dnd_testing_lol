@@ -125,7 +125,7 @@ class AppRouteTest(unittest.TestCase):
     def test_campaign_preview_accepts_stored_invite_code_after_current_code_changes(self):
         campaign_id, token = self.create_campaign_with_invite('COWJVBID')
         with app.app_context():
-            campaign = Campaign.query.get(campaign_id)
+            campaign = db.session.get(Campaign, campaign_id)
             campaign.invite_code = 'KI9FIV1K'
             db.session.add(CampaignInvite(
                 campaign_id=campaign_id,
@@ -154,7 +154,7 @@ class AppRouteTest(unittest.TestCase):
         self.assertEqual(response.status_code, 403)
 
         with app.app_context():
-            owner_id = Campaign.query.get(campaign_id).user_id
+            owner_id = db.session.get(Campaign, campaign_id).user_id
             owner_token = generate_token(owner_id)
 
         response = self.client.get(

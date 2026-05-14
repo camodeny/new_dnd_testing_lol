@@ -18,7 +18,6 @@ from models import (
     db,
 )
 from openrouter import (
-    build_dm_response_messages,
     build_opening_scene_messages,
     build_planning_dm_messages,
     build_planning_summary_messages,
@@ -34,6 +33,7 @@ from services.character_service import (
     update_character_relations,
 )
 from services.audit_service import AGENT_ACTORS, infer_audit_role
+from services.campaign_service import get_or_404
 from services.dm_tools import DM_TOOL_DEFINITIONS, build_session_hot_context, context_manifest
 from services.planning_service import (
     get_campaign_members,
@@ -424,6 +424,43 @@ def _event_step_title(event):
     return _format_event_type(event_type)
 
 
+def _prompt_message_title(message):
+    role = message.get('role') if isinstance(message, dict) else None
+    if role == 'system':
+        return 'System prompt'
+    if role == 'assistant':
+        return 'Assistant context'
+    if role == 'user':
+        return 'User message'
+    if role == 'tool':
+        return 'Tool message'
+    return 'Prompt message'
+
+
+def _prompt_message_steps(event):
+    steps = []
+    for index, message in enumerate(event.get('messages') or []):
+        if not isinstance(message, dict):
+            continue
+        role = message.get('role') or 'message'
+        steps.append({
+            'id': f"{event.get('id')}-prompt-message-{index}",
+            'event_id': event.get('id'),
+            'kind': 'prompt_message',
+            'category': 'agents',
+            'title': _prompt_message_title(message),
+            'summary': f"#{index + 1} sent to model",
+            'actor': event.get('actor'),
+            'created_at': event.get('created_at'),
+            'content': message.get('content'),
+            'prompt_role': role,
+            'name': message.get('name'),
+            'tool_call_id': message.get('tool_call_id'),
+            'tool_calls': message.get('tool_calls') or [],
+        })
+    return steps
+
+
 def _event_step_summary(event):
     event_type = event.get('event_type')
     payload = event.get('payload') or {}
@@ -459,6 +496,9 @@ def _branch_steps(events):
         if reasoning:
             steps.append(reasoning)
 
+        if event.get('event_type') == 'model_request':
+            steps.extend(_prompt_message_steps(event))
+
         if event.get('event_type') == 'model_response' and event.get('tool_calls'):
             tool_request = _model_tool_request_step(event)
             if tool_request:
@@ -483,7 +523,7 @@ def _branch_steps(events):
             'actor': event.get('actor'),
             'created_at': event.get('created_at'),
             'content': _event_step_content(event),
-            'messages': event.get('messages') or [],
+            'messages': [] if event.get('event_type') == 'model_request' else event.get('messages') or [],
             'usage': event.get('usage') or {},
             'reasoning': event.get('reasoning'),
             'finish_reason': event.get('finish_reason'),
@@ -662,7 +702,7 @@ def _chat_flow_payload(campaign_id, planning_messages, sessions, members, audit_
         'id': 'system-unlinked',
         'type': 'system',
         'title': 'Unlinked agent runs',
-        'subtitle': 'World generation, legacy traces, and audit events that cannot be tied to one visible message',
+        'subtitle': 'World generation and audit events that cannot be tied to one visible message',
         'messages': [],
         'branches': [],
     }
@@ -716,7 +756,7 @@ def _chat_flow_payload(campaign_id, planning_messages, sessions, members, audit_
 @dev_bp.route('/api/campaigns/<int:campaign_id>/dev', methods=['GET'])
 @token_required
 def get_campaign_dev_audit(current_user, campaign_id):
-    campaign = Campaign.query.get_or_404(campaign_id)
+    campaign = get_or_404(Campaign, campaign_id)
     members = get_campaign_members(campaign)
     member_user_ids = {member.user_id for member in members}
     if current_user.id not in member_user_ids and campaign.user_id != current_user.id:
@@ -762,9 +802,6 @@ def get_campaign_dev_audit(current_user, campaign_id):
     chat_flow = _chat_flow_payload(campaign_id, planning_messages, sessions, members, audit_stream, agent_runs)
     latest_session = active_session or (sessions[0] if sessions else None)
 
-    session_context = dict(planning_ctx)
-    if world_context:
-        session_context['world'] = world_context
     latest_session_hot_context = None
     latest_session_context_manifest = None
     if latest_session:
@@ -807,10 +844,6 @@ def get_campaign_dev_audit(current_user, campaign_id):
             'prompt_traces': {
                 'world_genesis': build_world_genesis_messages(planning_ctx),
                 'opening_scene': build_opening_scene_messages(planning_ctx, world_context),
-                'legacy_full_session_dm_response': build_dm_response_messages(
-                    latest_session.messages if latest_session else [],
-                    session_context if latest_session else None,
-                ) if latest_session else [],
                 'session_dm_response': build_session_dm_tool_messages(
                     latest_session_hot_context,
                 ) if latest_session_hot_context else [],
@@ -819,7 +852,7 @@ def get_campaign_dev_audit(current_user, campaign_id):
                 'hot_context': latest_session_hot_context,
                 'manifest': latest_session_context_manifest,
                 'tools': DM_TOOL_DEFINITIONS,
-                'legacy_full_prompt_available': bool(latest_session),
+                'session_prompt_available': bool(latest_session_hot_context),
             },
         },
         'audit_events': audit_events_payload,

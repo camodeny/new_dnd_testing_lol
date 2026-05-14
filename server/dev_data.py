@@ -323,7 +323,7 @@ DEV_CHARACTER_TEMPLATES = [
         "currency": {"cp": 0, "sp": 10, "ep": 0, "gp": 50, "pp": 2},
         "personality": {"personality_traits": "My eloquent flattery makes everyone feel special.", "ideals": "It is my duty to respect the authority of my superiors.", "bonds": "I will face any challenge to win the approval of my family.", "flaws": "I have an insatiable desire for decadent luxury."},
         "appearance": {"age": "28", "height": "6'2\"", "weight": "220", "eyes": "Azure", "skin": "Scales", "hair": "None", "character_appearance": "Proud bearing with bronze scales and a commanding presence."},
-        "background_details": {"backstory": "Born into a noble house with a legacy of dragon riders.", "allies_organizations": "The Order of the Gauntlet", "additional_features_traits": "Position of Privilege", "treasure": ""},
+        "background_details": {"backstory": "Born into a noble house with a tradition of dragon riders.", "allies_organizations": "The Order of the Gauntlet", "additional_features_traits": "Position of Privilege", "treasure": ""},
         "classes": [{"class_name": "Paladin", "subclass": "Oath of Devotion", "level": 5, "hit_die_type": "d10"}],
         "skills": [
             {"skill_name": "Athletics", "is_proficient": True, "is_expertise": False, "bonus_override": None},
