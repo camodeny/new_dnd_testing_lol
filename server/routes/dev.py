@@ -466,9 +466,6 @@ def _branch_steps(events):
             if not _event_step_content(event):
                 continue
 
-        if event.get('event_type') == 'model_request':
-            continue
-
         if event.get('event_type') == 'dm_tool_execution':
             steps.append(_tool_call_step(event))
             steps.append(_tool_result_step(event))

@@ -244,11 +244,11 @@ function TruncatedContent({ content, maxLength = 500 }) {
   )
 }
 
-function MessageTranscript({ messages, title = 'Message history' }) {
+function MessageTranscript({ messages, title = 'Message history', defaultOpen = false }) {
   if (!messages?.length) return null
 
   return (
-    <details className="dev-details dev-transcript">
+    <details className="dev-details dev-transcript" open={defaultOpen}>
       <summary>
         <span className="dev-details-title">{title}</span>
         <span className="dev-details-summary">{messages.length} msg{messages.length === 1 ? '' : 's'}</span>
@@ -349,7 +349,7 @@ function BranchStepCard({ step, inline = false }) {
         </div>
       )}
 
-      <MessageTranscript messages={step.messages} title="Messages sent" />
+      <MessageTranscript messages={step.messages} title="Messages sent" defaultOpen={step.kind === 'model_request'} />
 
       {step.tool_calls?.length > 0 && (
         <JsonPanel title="Requested tool calls" value={step.tool_calls} summary={`${step.tool_calls.length} call${step.tool_calls.length === 1 ? '' : 's'}`} />
