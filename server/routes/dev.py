@@ -458,27 +458,48 @@ def _prompt_message_title(message):
     return 'Prompt message'
 
 
+def _prompt_message_step(event, message, index, summary=None):
+    role = message.get('role') or 'message'
+    return {
+        'id': f"{event.get('id')}-prompt-message-{index}",
+        'event_id': event.get('id'),
+        'kind': 'prompt_message',
+        'category': 'agents',
+        'title': _prompt_message_title(message),
+        'summary': summary or f"#{index + 1} sent to model",
+        'actor': event.get('actor'),
+        'created_at': event.get('created_at'),
+        'content': message.get('content'),
+        'prompt_role': role,
+        'name': message.get('name'),
+        'tool_call_id': message.get('tool_call_id'),
+        'tool_calls': message.get('tool_calls') or [],
+        'source_message_index': index,
+    }
+
+
 def _prompt_message_steps(event):
     steps = []
     for index, message in enumerate(event.get('messages') or []):
         if not isinstance(message, dict):
             continue
-        role = message.get('role') or 'message'
-        steps.append({
-            'id': f"{event.get('id')}-prompt-message-{index}",
-            'event_id': event.get('id'),
-            'kind': 'prompt_message',
-            'category': 'agents',
-            'title': _prompt_message_title(message),
-            'summary': f"#{index + 1} sent to model",
-            'actor': event.get('actor'),
-            'created_at': event.get('created_at'),
-            'content': message.get('content'),
-            'prompt_role': role,
-            'name': message.get('name'),
-            'tool_call_id': message.get('tool_call_id'),
-            'tool_calls': message.get('tool_calls') or [],
-        })
+        steps.append(_prompt_message_step(event, message, index))
+    return steps
+
+
+def _agent_setup_prompt_steps(event):
+    steps = []
+    for index, message in enumerate(event.get('messages') or []):
+        if not isinstance(message, dict):
+            continue
+        if message.get('role') != 'system':
+            break
+        steps.append(_prompt_message_step(
+            event,
+            message,
+            index,
+            summary=f"agent setup from message #{index + 1}",
+        ))
     return steps
 
 
@@ -515,13 +536,16 @@ def _event_step_content(event):
 
 def _branch_steps(events):
     steps = []
+    setup_prompts_added = False
     for event in events:
         reasoning = _reasoning_step(event)
         if reasoning:
             steps.append(reasoning)
 
         if event.get('event_type') == 'model_request':
-            steps.extend(_prompt_message_steps(event))
+            if not setup_prompts_added:
+                steps.extend(_agent_setup_prompt_steps(event))
+                setup_prompts_added = True
 
         if event.get('event_type') == 'model_response' and event.get('tool_calls'):
             tool_request = _model_tool_request_step(event)
@@ -547,7 +571,7 @@ def _branch_steps(events):
             'actor': event.get('actor'),
             'created_at': event.get('created_at'),
             'content': _event_step_content(event),
-            'messages': [] if event.get('event_type') == 'model_request' else event.get('messages') or [],
+            'messages': event.get('messages') or [],
             'usage': event.get('usage') or {},
             'reasoning': event.get('reasoning'),
             'finish_reason': event.get('finish_reason'),
@@ -662,12 +686,29 @@ def _branch_from_event(event):
 def _attach_branch(lanes_by_id, branch):
     link = branch.get('link') or {}
     lane = lanes_by_id.get(link.get('lane_id'))
-    if not lane:
-        return False
-    for message in lane.get('messages') or []:
-        if message.get('key') == link.get('message_key'):
-            message.setdefault('branches', []).append(branch)
-            return True
+    if lane:
+        for message in lane.get('messages') or []:
+            if message.get('key') == link.get('message_key'):
+                message.setdefault('branches', []).append(branch)
+                return True
+
+    for event in branch.get('events') or []:
+        if event.get('event_type') != 'dm_output_stored':
+            continue
+        payload = event.get('payload') or {}
+        session_id = payload.get('session_id')
+        message_payload = payload.get('message') if isinstance(payload.get('message'), dict) else {}
+        content = message_payload.get('content')
+        role = message_payload.get('role') or 'dm'
+        if not session_id or not content:
+            continue
+        lane = lanes_by_id.get(f'session-{session_id}')
+        if not lane:
+            continue
+        for message in lane.get('messages') or []:
+            if message.get('role') == role and message.get('content') == content:
+                message.setdefault('branches', []).append(branch)
+                return True
     return False
 
 

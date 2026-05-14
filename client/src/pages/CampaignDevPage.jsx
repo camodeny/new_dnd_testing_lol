@@ -117,7 +117,7 @@ function mainThreadSteps(branches, filters) {
     .filter(isSessionDmBranch)
     .flatMap((branch) => branch.steps || [])
     .filter((step) => stepVisible(step, filters))
-    .filter((step) => !['model_response', 'dm_output_stored'].includes(step.kind))
+    .filter((step) => step.kind !== 'dm_output_stored')
 }
 
 function sideBranchesForMessage(message, previousMessage) {
@@ -365,7 +365,10 @@ function BranchStepCard({ step, inline = false }) {
         </div>
       )}
 
-      <MessageTranscript messages={step.messages} title="Messages sent" defaultOpen={step.kind === 'model_request'} />
+      <MessageTranscript
+        messages={step.messages}
+        title={step.kind === 'model_request' ? 'Prompt payload sent to provider' : 'Messages sent'}
+      />
 
       {step.tool_calls?.length > 0 && (
         <JsonPanel title="Requested tool calls" value={step.tool_calls} summary={`${step.tool_calls.length} call${step.tool_calls.length === 1 ? '' : 's'}`} />
@@ -694,7 +697,7 @@ function FilterPanel({ filters, setFilters, chatFlow, data, searchQuery, setSear
 
       <section className="dev-panel dev-panel-note">
         <p>
-          The center thread shows visible player and DM messages. Each model request expands into the exact prompt messages sent to the provider; the Agents filter means the request came from an app agent, not that every prompt message has the assistant role.
+          The center thread shows the causal DM chain: visible messages, agent setup prompts, model requests, returned reasoning, tool calls, tool results, and model responses. Full provider prompt payloads stay collapsed on each model request.
         </p>
         {data.audit_notes?.thinking && (
           <p className="dev-note-extra">{data.audit_notes.thinking}</p>
