@@ -11,6 +11,7 @@ os.environ['DATABASE_URL'] = 'sqlite:///:memory:'
 from app import app
 from auth import generate_token
 from models import db, Campaign, CampaignInvite, CampaignMember, User
+from openrouter import get_openrouter_model, reset_openrouter_model
 
 
 class AppRouteTest(unittest.TestCase):
@@ -31,10 +32,19 @@ class AppRouteTest(unittest.TestCase):
         self.client = app.test_client()
 
     def tearDown(self):
+        reset_openrouter_model()
         app.root_path = self.old_root_path
         with app.app_context():
             db.session.remove()
         self.temp_dir.cleanup()
+
+    def create_user_token(self):
+        with app.app_context():
+            user = User(username='dev', email='dev@example.com')
+            user.set_password('password')
+            db.session.add(user)
+            db.session.commit()
+            return generate_token(user.id)
 
     def create_campaign_with_invite(self, code, expires_at=None):
         with app.app_context():
@@ -156,6 +166,34 @@ class AppRouteTest(unittest.TestCase):
         self.assertEqual(response.get_json()['invite']['code'], 'COWJVBID')
         with app.app_context():
             self.assertEqual(CampaignInvite.query.filter_by(campaign_id=campaign_id).count(), 1)
+
+    def test_dev_model_settings_can_override_openrouter_model(self):
+        token = self.create_user_token()
+
+        response = self.client.put(
+            '/api/dev/model',
+            json={'model': 'anthropic/claude-sonnet-4.5'},
+            headers={'Authorization': f'Bearer {token}'},
+        )
+
+        self.assertEqual(response.status_code, 200)
+        settings = response.get_json()['settings']
+        self.assertEqual(settings['model'], 'anthropic/claude-sonnet-4.5')
+        self.assertEqual(settings['source'], 'runtime')
+        self.assertTrue(settings['is_overridden'])
+        self.assertEqual(get_openrouter_model(), 'anthropic/claude-sonnet-4.5')
+
+    def test_dev_model_settings_reject_blank_model(self):
+        token = self.create_user_token()
+
+        response = self.client.put(
+            '/api/dev/model',
+            json={'model': '   '},
+            headers={'Authorization': f'Bearer {token}'},
+        )
+
+        self.assertEqual(response.status_code, 400)
+        self.assertEqual(response.get_json(), {'error': 'Model is required'})
 
 
 if __name__ == '__main__':

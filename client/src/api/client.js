@@ -67,6 +67,18 @@ export function createDevCharacter() {
   return apiFetch('/dev/character', { method: 'POST' })
 }
 
+export function getDevModelSettings() {
+  return apiFetch('/dev/model')
+}
+
+export function updateDevModel(model) {
+  return apiFetch('/dev/model', { method: 'PUT', body: JSON.stringify({ model }) })
+}
+
+export function resetDevModel() {
+  return apiFetch('/dev/model', { method: 'PUT', body: JSON.stringify({ reset: true }) })
+}
+
 // -- Campaign Dashboard API --
 
 export function updateCampaign(id, payload) {

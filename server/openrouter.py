@@ -1,5 +1,6 @@
 import os
 import json
+from threading import Lock
 from uuid import uuid4
 import requests
 from dotenv import load_dotenv
@@ -10,6 +11,8 @@ load_dotenv()
 
 OPENROUTER_API_KEY = os.environ.get('OPENROUTER_API_KEY', '')
 OPENROUTER_MODEL = os.environ.get('OPENROUTER_MODEL', '')
+_OPENROUTER_MODEL_LOCK = Lock()
+_OPENROUTER_MODEL_OVERRIDE = None
 API_URL = 'https://openrouter.ai/api/v1/chat/completions'
 
 SYSTEM_PROMPT = (
@@ -90,10 +93,49 @@ SESSION_MEMORY_SYSTEM_PROMPT = (
 )
 
 
-def _require_openrouter_config():
+def get_openrouter_model():
+    with _OPENROUTER_MODEL_LOCK:
+        return _OPENROUTER_MODEL_OVERRIDE or OPENROUTER_MODEL
+
+
+def get_openrouter_settings():
+    model = get_openrouter_model()
+    with _OPENROUTER_MODEL_LOCK:
+        is_overridden = _OPENROUTER_MODEL_OVERRIDE is not None
+    return {
+        'model': model,
+        'env_model': OPENROUTER_MODEL,
+        'source': 'runtime' if is_overridden else 'env',
+        'is_overridden': is_overridden,
+        'api_key_configured': bool(OPENROUTER_API_KEY),
+    }
+
+
+def set_openrouter_model(model):
+    global _OPENROUTER_MODEL_OVERRIDE
+
+    next_model = (model or '').strip()
+    if not next_model:
+        raise ValueError('Model is required')
+    if len(next_model) > 200:
+        raise ValueError('Model must be 200 characters or fewer')
+    with _OPENROUTER_MODEL_LOCK:
+        _OPENROUTER_MODEL_OVERRIDE = next_model
+    return get_openrouter_settings()
+
+
+def reset_openrouter_model():
+    global _OPENROUTER_MODEL_OVERRIDE
+
+    with _OPENROUTER_MODEL_LOCK:
+        _OPENROUTER_MODEL_OVERRIDE = None
+    return get_openrouter_settings()
+
+
+def _require_openrouter_config(model=None):
     if not OPENROUTER_API_KEY:
         raise RuntimeError('OPENROUTER_API_KEY is not set')
-    if not OPENROUTER_MODEL:
+    if not (model if model is not None else get_openrouter_model()):
         raise RuntimeError('OPENROUTER_MODEL is not set')
 
 
@@ -118,8 +160,9 @@ def _post_chat_response(
     parent_trace_id = audit_context.get('parent_trace_id')
     trace_label = audit_context.get('trace_label') or f'{actor}: {operation}'
 
+    model = get_openrouter_model()
     try:
-        _require_openrouter_config()
+        _require_openrouter_config(model)
     except Exception as err:
         if campaign_id:
             log_model_error(
@@ -135,7 +178,7 @@ def _post_chat_response(
         raise
 
     payload = {
-        'model': OPENROUTER_MODEL,
+        'model': model,
         'messages': messages,
     }
     if tools:
@@ -151,7 +194,7 @@ def _post_chat_response(
             operation,
             actor,
             messages,
-            OPENROUTER_MODEL,
+            model,
             json_mode=json_mode,
             commit=True,
             trace_id=trace_id,

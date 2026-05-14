@@ -9,6 +9,134 @@
   flex-wrap: wrap;
 }
 
+.success-message {
+  background: rgba(57, 168, 92, 0.15);
+  color: #82e6a3;
+  padding: 12px 16px;
+  border-radius: 6px;
+  margin-bottom: 16px;
+  font-size: 14px;
+}
+
+.dev-model-page {
+  max-width: 920px;
+}
+
+.dev-model-header {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 16px;
+  margin-bottom: 20px;
+}
+
+.dev-model-header h2 {
+  margin-bottom: 6px;
+}
+
+.dev-model-header p {
+  margin: 0;
+  color: #b8b8c8;
+  font-size: 14px;
+  line-height: 1.5;
+}
+
+.dev-model-source {
+  border: 1px solid #3a3a4e;
+  border-radius: 999px;
+  color: #e8e8e8;
+  font-size: 12px;
+  line-height: 1;
+  padding: 7px 10px;
+  white-space: nowrap;
+}
+
+.dev-model-source-runtime {
+  border-color: rgba(130, 230, 163, 0.45);
+  color: #82e6a3;
+}
+
+.dev-model-panel {
+  background: #1f1f2e;
+  border: 1px solid #3a3a4e;
+  border-radius: 8px;
+  padding: 20px;
+}
+
+.dev-model-panel label {
+  color: #b8b8c8;
+  display: block;
+  font-size: 13px;
+  margin-bottom: 8px;
+}
+
+.dev-model-control-row {
+  display: flex;
+  align-items: stretch;
+  gap: 12px;
+}
+
+.dev-model-input {
+  font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, 'Liberation Mono', monospace;
+}
+
+.dev-model-meta {
+  display: grid;
+  gap: 12px;
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+  margin-top: 18px;
+}
+
+.dev-model-meta div {
+  background: #16171d;
+  border: 1px solid #303044;
+  border-radius: 6px;
+  min-width: 0;
+  padding: 12px;
+}
+
+.dev-model-meta span,
+.dev-model-meta strong {
+  display: block;
+}
+
+.dev-model-meta span {
+  color: #8f8fa3;
+  font-size: 12px;
+  margin-bottom: 6px;
+}
+
+.dev-model-meta strong {
+  color: #e8e8e8;
+  font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, 'Liberation Mono', monospace;
+  font-size: 13px;
+  overflow-wrap: anywhere;
+}
+
+.dev-model-actions {
+  border-top: 1px solid #303044;
+  display: flex;
+  justify-content: flex-end;
+  margin-top: 18px;
+  padding-top: 18px;
+}
+
+@media (max-width: 680px) {
+  .dev-model-header,
+  .dev-model-control-row {
+    flex-direction: column;
+  }
+
+  .dev-model-meta {
+    grid-template-columns: 1fr;
+  }
+
+  .dev-model-control-row .btn,
+  .dev-model-actions .btn {
+    width: 100%;
+  }
+}
+
 .app-header h1 {
   color: #e8e8e8;
   margin: 0;

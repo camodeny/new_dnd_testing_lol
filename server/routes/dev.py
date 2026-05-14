@@ -2,7 +2,7 @@ import json
 import random
 import re
 
-from flask import Blueprint, jsonify
+from flask import Blueprint, jsonify, request
 
 from auth import token_required
 from dev_data import DEV_CHARACTER_TEMPLATES
@@ -24,6 +24,9 @@ from openrouter import (
     build_planning_summary_messages,
     build_session_dm_tool_messages,
     build_world_genesis_messages,
+    get_openrouter_settings,
+    reset_openrouter_model,
+    set_openrouter_model,
 )
 from services.character_service import (
     build_character_from_data,
@@ -56,6 +59,34 @@ def create_dev_character(current_user):
     db.session.commit()
 
     return jsonify({'message': 'Dev character created', 'character': character_full_dict(character)}), 201
+
+
+@dev_bp.route('/api/dev/model', methods=['GET'])
+@token_required
+def get_dev_model_settings(current_user):
+    return jsonify({'settings': get_openrouter_settings()}), 200
+
+
+@dev_bp.route('/api/dev/model', methods=['PUT'])
+@token_required
+def update_dev_model_settings(current_user):
+    data = request.get_json() or {}
+    if data.get('reset'):
+        return jsonify({
+            'message': 'OpenRouter model reset to environment value',
+            'settings': reset_openrouter_model(),
+        }), 200
+
+    try:
+        settings = set_openrouter_model(data.get('model'))
+    except ValueError as err:
+        return jsonify({'error': str(err)}), 400
+
+    return jsonify({
+        'message': 'OpenRouter model updated',
+        'settings': settings,
+    }), 200
+
 
 def _serialize_session(session):
     data = session.to_dict()

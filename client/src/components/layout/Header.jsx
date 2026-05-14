@@ -7,6 +7,7 @@ export default function Header({ user, onLogout }) {
       <nav className="app-nav">
         <Link to="/" className="nav-link">Campaigns</Link>
         <Link to="/characters" className="nav-link">Characters</Link>
+        <Link to="/dev/model" className="nav-link">Model</Link>
       </nav>
       <div className="user-info">
         <span>Welcome, {user?.username}!</span>

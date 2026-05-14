@@ -11,6 +11,7 @@ import CharacterCreatePage from './pages/CharacterCreatePage'
 import CharacterEditPage from './pages/CharacterEditPage'
 import CharacterViewPage from './pages/CharacterViewPage'
 import DevCharacterPage from './pages/DevCharacterPage'
+import DevModelPage from './pages/DevModelPage'
 import NotFoundPage from './pages/NotFoundPage'
 import './App.css'
 
@@ -41,6 +42,7 @@ function AppRoutes() {
           <Route path="/characters/:id" element={<CharacterViewPage />} />
           <Route path="/characters/:id/edit" element={<CharacterEditPage />} />
           <Route path="/dev/character" element={<DevCharacterPage />} />
+          <Route path="/dev/model" element={<DevModelPage />} />
           <Route path="*" element={<NotFoundPage />} />
         </Routes>
       </main>
