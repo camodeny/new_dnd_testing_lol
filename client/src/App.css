@@ -5114,7 +5114,7 @@ select.input:focus {
   padding: 3px 8px;
   font-size: 11px;
   text-transform: uppercase;
-  letter-spacing: 0.06em;
+  letter-spacing: 0;
   background: #2e303a;
   color: #b8b8c8;
   font-weight: 500;
@@ -5156,6 +5156,11 @@ select.input:focus {
 .dev-pill-cat-memory {
   background: rgba(251, 191, 36, 0.2);
   color: #fcd34d;
+}
+
+.dev-pill-cat-prompt {
+  background: rgba(59, 130, 246, 0.18);
+  color: #bfdbfe;
 }
 
 .dev-pill-session-dm,

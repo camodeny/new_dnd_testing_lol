@@ -65,6 +65,16 @@ function roleLabel(role) {
   return role || 'Message'
 }
 
+function stepCategoryLabel(step, category) {
+  if (step.kind === 'prompt_message') return 'model input'
+  return category
+}
+
+function stepCategoryPillClass(step, category) {
+  if (step.kind === 'prompt_message') return 'dev-pill-cat-prompt'
+  return `dev-pill-cat-${category}`
+}
+
 function branchCategory(branch) {
   const actor = String(branch.actor || '')
   const hasMemory = actor.includes('memory') || branch.memory_events?.length
@@ -320,6 +330,8 @@ function stepIcon(kind, category) {
 
 function BranchStepCard({ step, inline = false }) {
   const category = step.category || 'agents'
+  const categoryLabel = stepCategoryLabel(step, category)
+  const categoryPillClass = stepCategoryPillClass(step, category)
   const hasUsage = step.usage && Object.keys(step.usage).length > 0
   const hasPayload = step.payload && Object.keys(step.payload).length > 0
   const showRawPayload = hasPayload && !['model_request', 'model_response', 'dm_tool_execution'].includes(step.kind)
@@ -333,8 +345,8 @@ function BranchStepCard({ step, inline = false }) {
         <div className="dev-step-heading">
           <div className="dev-step-title-row">
             <strong>{step.title || formatEventType(step.kind)}</strong>
-            <span className={`dev-pill dev-pill-cat-${category}`}>{category}</span>
-            {step.prompt_role && <span className={`dev-pill dev-pill-msg-${step.prompt_role}`}>{step.prompt_role}</span>}
+            {step.prompt_role && <span className={`dev-pill dev-pill-msg-${step.prompt_role}`}>{roleLabel(step.prompt_role)}</span>}
+            <span className={`dev-pill ${categoryPillClass}`}>{categoryLabel}</span>
           </div>
           <div className="dev-step-meta">
             {step.actor && <span>{step.actor}</span>}
@@ -682,7 +694,7 @@ function FilterPanel({ filters, setFilters, chatFlow, data, searchQuery, setSear
 
       <section className="dev-panel dev-panel-note">
         <p>
-          The center thread shows player messages, DM reasoning, tool calls, tool responses, and visible DM replies in order. Side branches are for work that does not feed back into that main thread, such as memory updates.
+          The center thread shows visible player and DM messages. Each model request expands into the exact prompt messages sent to the provider; the Agents filter means the request came from an app agent, not that every prompt message has the assistant role.
         </p>
         {data.audit_notes?.thinking && (
           <p className="dev-note-extra">{data.audit_notes.thinking}</p>
