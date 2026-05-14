@@ -129,6 +129,47 @@ function pathLabel(path) {
     .join(' / ')
 }
 
+function planningDraftStorageKey(campaignId, userId) {
+  return `campaign-planning-draft:${campaignId}:${userId || 'anonymous'}`
+}
+
+function loadStoredDraft(campaignId, user) {
+  const fallback = { player_name: user?.username || '' }
+  if (typeof window === 'undefined') return fallback
+
+  try {
+    const stored = window.localStorage.getItem(planningDraftStorageKey(campaignId, user?.id))
+    return stored ? { ...JSON.parse(stored), player_name: user?.username || fallback.player_name } : fallback
+  } catch {
+    return fallback
+  }
+}
+
+function saveStoredDraft(campaignId, userId, draft) {
+  if (typeof window === 'undefined') return
+  try {
+    window.localStorage.setItem(planningDraftStorageKey(campaignId, userId), JSON.stringify(draft))
+  } catch {
+    // Local storage is best-effort; saving the character still uses the API.
+  }
+}
+
+function clearStoredDraft(campaignId, userId) {
+  if (typeof window === 'undefined') return
+  try {
+    window.localStorage.removeItem(planningDraftStorageKey(campaignId, userId))
+  } catch {
+    // Ignore unavailable local storage.
+  }
+}
+
+function pendingBondsForUser(bonds, userId) {
+  return (bonds || []).filter((bond) => (
+    bond.status === 'pending'
+      && (bond.involved_user_ids || []).some((involvedId) => String(involvedId) === String(userId))
+  ))
+}
+
 export default function CharacterPlanningMode({ campaign, currentUser, onComplete }) {
   const navigate = useNavigate()
   const [planning, setPlanning] = useState(null)
@@ -142,9 +183,9 @@ export default function CharacterPlanningMode({ campaign, currentUser, onComplet
   const [availableChars, setAvailableChars] = useState([])
   const [importLoading, setImportLoading] = useState(false)
   const [bondEdits, setBondEdits] = useState({})
-  const [draftCharacter, setDraftCharacter] = useState(() => mergeCharacterDraft({
-    player_name: currentUser?.username || '',
-  }))
+  const [draftCharacter, setDraftCharacter] = useState(() => mergeCharacterDraft(
+    loadStoredDraft(campaign.id, currentUser)
+  ))
   const [activePage, setActivePage] = useState('identity')
   const [touchedPaths, setTouchedPaths] = useState(() => new Set())
   const [pendingSuggestions, setPendingSuggestions] = useState([])
@@ -173,9 +214,19 @@ export default function CharacterPlanningMode({ campaign, currentUser, onComplet
     return () => clearInterval(interval)
   }, [loadPlanning])
 
+  useEffect(() => {
+    saveStoredDraft(campaign.id, currentUser?.id, draftCharacter)
+  }, [campaign.id, currentUser?.id, draftCharacter])
+
   const currentMember = planning?.members?.find((member) => member.user_id === currentUser?.id)
   const selectedCharacter = currentMember?.selected_character
   const isReady = Boolean(currentMember?.is_character_ready)
+
+  useEffect(() => {
+    if (selectedCharacter && isReady) {
+      clearStoredDraft(campaign.id, currentUser?.id)
+    }
+  }, [campaign.id, currentUser?.id, selectedCharacter, isReady])
 
   useEffect(() => {
     const messages = planning?.messages || []
@@ -253,6 +304,11 @@ export default function CharacterPlanningMode({ campaign, currentUser, onComplet
   }
 
   const handleSelectCharacter = async (characterId) => {
+    if (blockingPendingBonds.length > 0) {
+      setError('Resolve pending bond proposals before marking ready.')
+      return
+    }
+
     setImportLoading(true)
     setError('')
     try {
@@ -261,6 +317,7 @@ export default function CharacterPlanningMode({ campaign, currentUser, onComplet
       const readyData = await setPlanningReady(campaign.id, true)
       setPlanning(readyData.planning)
       setShowImport(false)
+      clearStoredDraft(campaign.id, currentUser?.id)
       setFlowMode('waiting')
     } catch (err) {
       setError(err.message)
@@ -305,6 +362,10 @@ export default function CharacterPlanningMode({ campaign, currentUser, onComplet
 
   const handleSaveCharacter = async (event) => {
     event.preventDefault()
+    if (blockingPendingBonds.length > 0) {
+      setError('Resolve pending bond proposals before marking ready.')
+      return
+    }
     if (!draftCharacter.name?.trim() || !draftCharacter.race?.trim()) {
       setActivePage('identity')
       setError('Character name and race are required before saving.')
@@ -318,6 +379,7 @@ export default function CharacterPlanningMode({ campaign, currentUser, onComplet
         ...flattenCharacter(draftCharacter),
         campaign_id: campaign.id,
       })
+      clearStoredDraft(campaign.id, currentUser?.id)
       const readyData = await setPlanningReady(campaign.id, true)
       setPlanning(readyData.planning)
       setFlowMode('waiting')
@@ -350,6 +412,7 @@ export default function CharacterPlanningMode({ campaign, currentUser, onComplet
   const explicitPoints = summary.explicit_player_points || {}
   const ownSecrets = summary.dm_private_secrets?.[String(currentUser?.id)] || []
   const pendingBonds = (planning.bonds || []).filter((bond) => bond.status === 'pending')
+  const blockingPendingBonds = pendingBondsForUser(pendingBonds, currentUser?.id)
   const confirmedBonds = (planning.bonds || []).filter((bond) => bond.status === 'confirmed')
   const effectiveFlowMode = flowMode || (selectedCharacter && isReady ? 'waiting' : 'choice')
   const currentPageIndex = Math.max(0, CHARACTER_FORM_PAGES.findIndex((page) => page.key === activePage))
@@ -577,6 +640,10 @@ export default function CharacterPlanningMode({ campaign, currentUser, onComplet
         <div className="import-modal-body">
           {importLoading && availableChars.length === 0 ? (
             <div className="loading" style={{ padding: 24 }}>Loading characters...</div>
+          ) : blockingPendingBonds.length > 0 ? (
+            <div className="empty-state-v2" style={{ padding: 24 }}>
+              <p>Resolve pending bond proposals before marking ready.</p>
+            </div>
           ) : availableChars.length === 0 ? (
             <div className="empty-state-v2" style={{ padding: 24 }}>
               <p>No characters are available.</p>
@@ -722,6 +789,15 @@ export default function CharacterPlanningMode({ campaign, currentUser, onComplet
           </div>
         )}
 
+        {blockingPendingBonds.length > 0 && (
+          <div className="planning-suggestions">
+            <div className="planning-section-title">
+              <i className="bi bi-link-45deg"></i> Pending Bonds
+            </div>
+            <p className="planning-muted">Resolve pending bond proposals before marking ready.</p>
+          </div>
+        )}
+
         <CharacterFormBody
           character={draftCharacter}
           setCharacter={setDraftCharacter}
@@ -747,7 +823,7 @@ export default function CharacterPlanningMode({ campaign, currentUser, onComplet
               Next <i className="bi bi-chevron-right"></i>
             </button>
           ) : (
-            <button type="submit" className="btn btn-primary" disabled={savingCharacter}>
+            <button type="submit" className="btn btn-primary" disabled={savingCharacter || blockingPendingBonds.length > 0}>
               {savingCharacter ? 'Saving...' : 'Save Character'}
             </button>
           )}

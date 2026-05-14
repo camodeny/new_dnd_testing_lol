@@ -15,6 +15,15 @@ _OPENROUTER_MODEL_LOCK = Lock()
 _OPENROUTER_MODEL_OVERRIDE = None
 API_URL = 'https://openrouter.ai/api/v1/chat/completions'
 
+PC_CONTROL_POLICY = (
+    "Player-character control policy: NPCs may speak and act. Player characters are protected. "
+    "Do not write exact dialogue for any player character unless that player supplied the exact words. "
+    "Do not narrate another player's PC actions, gestures, thoughts, emotions, decisions, or answers. "
+    "For the current player's PC, resolve only the action or words they declared; prefer second person "
+    "and do not add unprovided intent, emotion, or quoted speech. If one PC addresses another PC, stop "
+    "at the prompt for that player, e.g. 'Raven, how do you respond?'"
+)
+
 SYSTEM_PROMPT = (
     "You are a Dungeon Master for a Dungeons & Dragons campaign. "
     "For each response, determine from the current context whether the reply should be "
@@ -26,6 +35,7 @@ SYSTEM_PROMPT = (
     "player actions. When speaking as a specific NPC, wrap only that NPC's spoken line "
     "or performance in <npc target=\"NPC name\">...</npc>; leave narration outside the "
     "NPC tag. "
+    + PC_CONTROL_POLICY + " "
     "When campaign world memory includes NPC actor dossiers, silently coordinate the NPC's goals, "
     "secrets, recent offscreen activity, and relationship to the party before speaking for them. "
     "Never reveal DM-private memory unless it has become visible through play. "
@@ -38,7 +48,8 @@ SESSION_TOOL_PROMPT = (
     + " You are operating with compact hot context and server tools. Use read tools for exact "
     "character-sheet, world-memory, NPC, clock, or session facts instead of guessing. Use write tools "
     "only when the fiction has actually changed durable world state. Do not expose DM-private tool "
-    "results in visible narration unless they became known through play."
+    "results in visible narration unless they became known through play. The hot context contains "
+    "protected_player_characters and current_player_character; obey those boundaries exactly."
 )
 
 PLANNING_SYSTEM_PROMPT = (
@@ -281,6 +292,54 @@ def build_session_dm_tool_messages(hot_context):
             + json.dumps(hot_context, ensure_ascii=False),
         },
     ]
+
+
+def _strip_npc_blocks(text):
+    import re
+
+    return re.sub(r'<npc\b[^>]*>.*?</npc>', '', text or '', flags=re.IGNORECASE | re.DOTALL)
+
+
+def _pc_control_violation(response_text, hot_context):
+    import re
+
+    visible = _strip_npc_blocks(response_text)
+    protected = hot_context.get('protected_player_characters') or []
+    action_verbs = (
+        'nods', 'nod', 'glances', 'glance', 'looks', 'look', 'turns', 'turn', 'steps', 'step',
+        'moves', 'move', 'smiles', 'smile', 'frowns', 'frown', 'laughs', 'laugh', 'sighs',
+        'sigh', 'shrugs', 'shrug', 'reaches', 'reach', 'draws', 'draw', 'takes', 'take',
+        'gives', 'give', 'straightens', 'straighten', 'waits', 'wait',
+    )
+    speech_verbs = (
+        'says', 'say', 'asks', 'ask', 'replies', 'reply', 'responds', 'respond', 'whispers',
+        'whisper', 'mutters', 'mutter', 'shouts', 'shout', 'calls', 'call', 'answers', 'answer',
+    )
+
+    for character in protected:
+        name = (character.get('name') or '').strip()
+        if not name:
+            continue
+        escaped = re.escape(name)
+        first = re.escape(name.split()[0])
+        name_pattern = f'(?:{escaped}|{first})'
+        handoff_pattern = rf'\b{name_pattern}\s*,\s+how do you respond\?'
+        visible_for_character = re.sub(handoff_pattern, '', visible, flags=re.IGNORECASE)
+        checks = [
+            rf'\*\*{name_pattern}\b[^*]*:\*\*',
+            rf'<npc\s+target=["\']{escaped}["\']',
+            rf'\b{name_pattern}\b[^.!?\n]{{0,80}}\b(?:{"|".join(speech_verbs)})\b',
+            rf'\b{name_pattern}(?:[’\']s)?\b[^.!?\n]{{0,80}}\b(?:{"|".join(action_verbs)})\b',
+            rf'\b{name_pattern}[’\']s\s+(?:eyes|expression|face|voice|smirk|smile|shoulders|hands)\b',
+        ]
+        for pattern in checks:
+            if re.search(pattern, visible_for_character, flags=re.IGNORECASE):
+                return {
+                    'character': character,
+                    'pattern': pattern,
+                }
+
+    return None
 
 
 def build_opening_scene_messages(context, world_context):
@@ -554,6 +613,7 @@ def get_session_dm_response_with_tools(
         messages.append({'role': role, 'content': msg.content})
 
     tool_round = 0
+    pc_control_retried = False
     while True:
         loop_audit = {
             **base_audit,
@@ -574,7 +634,59 @@ def get_session_dm_response_with_tools(
         message, finish_reason = _choice_message(data)
         tool_calls = message.get('tool_calls') or []
         if not tool_calls or tool_round >= max_tool_rounds:
-            return message.get('content') or ''
+            content = message.get('content') or ''
+            violation = _pc_control_violation(content, hot_context)
+            if violation and not pc_control_retried:
+                if base_audit.get('campaign_id'):
+                    log_audit_event(
+                        base_audit.get('campaign_id'),
+                        'pc_control_guard_retry',
+                        'Session DM response controlled a protected player character; requesting rewrite.',
+                        {
+                            'violation': violation,
+                            'draft_response': content,
+                        },
+                        source='session_dm.guard',
+                        actor='server',
+                        trace_id=trace_id,
+                        trace_label=trace_label,
+                        audit_role='guard',
+                        commit=True,
+                    )
+                messages.append({'role': 'assistant', 'content': content})
+                messages.append({
+                    'role': 'user',
+                    'content': (
+                        'Rewrite the previous response. It controlled a protected player character. '
+                        'Do not write dialogue, actions, gestures, thoughts, emotions, or decisions for any PC. '
+                        'If a player character addresses another player character, prompt that player to respond.'
+                    ),
+                })
+                pc_control_retried = True
+                tool_round = max_tool_rounds
+                continue
+            if violation:
+                if base_audit.get('campaign_id'):
+                    log_audit_event(
+                        base_audit.get('campaign_id'),
+                        'pc_control_guard_blocked',
+                        'Session DM response still controlled a protected player character after retry.',
+                        {
+                            'violation': violation,
+                            'draft_response': content,
+                        },
+                        source='session_dm.guard',
+                        actor='server',
+                        trace_id=trace_id,
+                        trace_label=trace_label,
+                        audit_role='guard',
+                        commit=True,
+                    )
+                return (
+                    "You carry out your declared action, then the moment hangs open for the other "
+                    "player character to answer. How do they respond?"
+                )
+            return content
 
         messages.append(_assistant_tool_message(message))
         for tool_call in tool_calls:

@@ -288,6 +288,10 @@ def apply_bond_suggestions(campaign_id, suggestions):
     if not isinstance(suggestions, list):
         return []
 
+    existing_keys = {
+        _bond_suggestion_key(bond.to_dict())
+        for bond in PlanningBondProposal.query.filter_by(campaign_id=campaign_id).all()
+    }
     created = []
     for suggestion in suggestions:
         if not isinstance(suggestion, dict):
@@ -296,6 +300,14 @@ def apply_bond_suggestions(campaign_id, suggestions):
         title = (suggestion.get('title') or '').strip()
         description = (suggestion.get('description') or '').strip()
         if len(involved) < 2 or not title or not description:
+            continue
+
+        suggestion_key = _bond_suggestion_key({
+            'title': title,
+            'description': description,
+            'involved_user_ids': involved,
+        })
+        if suggestion_key in existing_keys:
             continue
 
         approvals = {str(user_id): 'pending' for user_id in involved}
@@ -309,8 +321,16 @@ def apply_bond_suggestions(campaign_id, suggestions):
         )
         db.session.add(proposal)
         created.append(proposal)
+        existing_keys.add(suggestion_key)
 
     return created
+
+
+def _bond_suggestion_key(suggestion):
+    involved = tuple(sorted(int(user_id) for user_id in suggestion.get('involved_user_ids', [])))
+    title = ' '.join((suggestion.get('title') or '').casefold().split())
+    description = ' '.join((suggestion.get('description') or '').casefold().split())
+    return involved, title, description
 
 
 def visible_planning_payload(campaign, current_user):

@@ -21,6 +21,7 @@ from models import (
     SessionMessage,
     User,
 )
+from openrouter import _pc_control_violation
 from routes.dev import _agent_runs_from_stream, _audit_stream_entry, _chat_flow_payload
 from routes.sessions import sessions_bp
 from services.audit_service import log_audit_event
@@ -110,6 +111,42 @@ class DmToolsTest(unittest.TestCase):
         self.assertFalse(manifest['full_world_graph_included'])
         self.assertIn('get_character_context', manifest['available_tools'])
         self.assertIn('recent_messages', manifest['estimated_tokens_by_section'])
+
+    def test_hot_context_includes_protected_player_characters(self):
+        hot_context = build_session_hot_context(self.campaign, self.session, self.user)
+
+        self.assertEqual(hot_context['current_player_character']['name'], 'Aria')
+        self.assertEqual(hot_context['protected_player_characters'][0]['name'], 'Aria')
+
+    def test_pc_control_guard_detects_pc_dialogue_and_action(self):
+        hot_context = {
+            'protected_player_characters': [
+                {'id': 1, 'name': 'Borin Stonefist', 'user_id': 1},
+                {'id': 2, 'name': 'Raven Nightshade', 'user_id': 2},
+            ],
+        }
+
+        self.assertIsNotNone(_pc_control_violation(
+            '**Raven (quietly):** "She is fine."\n\nRaven nods.',
+            hot_context,
+        ))
+        self.assertIsNotNone(_pc_control_violation(
+            '**Borin:** "How is your mother?"',
+            hot_context,
+        ))
+
+    def test_pc_control_guard_allows_npc_addressing_pcs(self):
+        hot_context = {
+            'protected_player_characters': [
+                {'id': 1, 'name': 'Borin Stonefist', 'user_id': 1},
+                {'id': 2, 'name': 'Raven Nightshade', 'user_id': 2},
+            ],
+        }
+
+        self.assertIsNone(_pc_control_violation(
+            '<npc target="Mayor Elara Voss">Thank you for coming, Borin, Raven.</npc>\n\nRaven, how do you respond?',
+            hot_context,
+        ))
 
     def test_agent_runs_ignore_self_parent_trace(self):
         stream = [

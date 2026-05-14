@@ -62,6 +62,20 @@ def _current_character(campaign, current_user):
     return Character.query.filter_by(campaign_id=campaign.id, user_id=current_user.id).first()
 
 
+def _protected_player_characters(members):
+    protected = []
+    for member in members:
+        character = db.session.get(Character, member.selected_character_id) if member.selected_character_id else None
+        if character:
+            protected.append({
+                'id': character.id,
+                'name': character.name,
+                'user_id': member.user_id,
+                'username': member.user.username if member.user else None,
+            })
+    return protected
+
+
 def _world_json(campaign):
     world = get_campaign_world(campaign.id)
     if not world:
@@ -87,6 +101,7 @@ def build_session_hot_context(campaign, session, current_user):
     active_clocks = _active_clocks(campaign)
     current_scene = world_state.get('current_scene', {}) if isinstance(world_state, dict) else {}
     members = CampaignMember.query.filter_by(campaign_id=campaign.id).order_by(CampaignMember.id.asc()).all()
+    protected_player_characters = _protected_player_characters(members)
 
     context = {
         'strategy': 'compact_hot_context_with_dm_tools',
@@ -105,11 +120,24 @@ def build_session_hot_context(campaign, session, current_user):
         },
         'current_user': current_user.to_dict(),
         'current_character': _compact_character(character),
+        'current_player_character': (
+            {
+                'id': character.id,
+                'name': character.name,
+                'user_id': character.user_id,
+            }
+            if character else None
+        ),
+        'protected_player_characters': protected_player_characters,
         'party': [
             {
                 'user_id': member.user_id,
                 'username': member.user.username if member.user else None,
                 'selected_character_id': member.selected_character_id,
+                'selected_character': next((
+                    pc for pc in protected_player_characters
+                    if pc['id'] == member.selected_character_id
+                ), None),
                 'ready': bool(member.character_ready_at and member.selected_character_id),
             }
             for member in members

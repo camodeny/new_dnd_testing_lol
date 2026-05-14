@@ -39,6 +39,17 @@ def require_planning_member(current_user, campaign_id):
     return (campaign, member), None
 
 
+def pending_bonds_for_user(campaign_id, user_id):
+    pending_bonds = PlanningBondProposal.query.filter_by(
+        campaign_id=campaign_id,
+        status='pending',
+    ).all()
+    return [
+        bond for bond in pending_bonds
+        if user_id in json_loads(bond.involved_user_ids, [])
+    ]
+
+
 @planning_bp.route('/api/campaigns/<int:campaign_id>/planning', methods=['GET'])
 @token_required
 def get_planning(current_user, campaign_id):
@@ -245,6 +256,8 @@ def update_planning_ready(current_user, campaign_id):
     ready = bool(data.get('ready'))
     if ready and not member.selected_character_id:
         return jsonify({'error': 'Select a character before marking ready'}), 400
+    if ready and pending_bonds_for_user(campaign_id, current_user.id):
+        return jsonify({'error': 'Resolve pending bond proposals before marking ready'}), 400
 
     if ready:
         character = get_or_404(Character, member.selected_character_id)

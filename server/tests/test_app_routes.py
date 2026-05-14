@@ -10,8 +10,9 @@ os.environ['DATABASE_URL'] = 'sqlite:///:memory:'
 
 from app import app
 from auth import generate_token
-from models import db, Campaign, CampaignInvite, CampaignMember, User
+from models import db, Campaign, CampaignInvite, CampaignMember, Character, PlanningBondProposal, User
 from openrouter import get_openrouter_model, reset_openrouter_model
+from services.planning_service import apply_bond_suggestions
 
 
 class AppRouteTest(unittest.TestCase):
@@ -194,6 +195,111 @@ class AppRouteTest(unittest.TestCase):
 
         self.assertEqual(response.status_code, 400)
         self.assertEqual(response.get_json(), {'error': 'Model is required'})
+
+    def test_create_character_normalizes_nested_model_output(self):
+        token = self.create_user_token()
+
+        response = self.client.post(
+            '/api/characters',
+            json={
+                'name': 'Raven Nightshade',
+                'player_name': 'dev',
+                'race': 'Human Variant',
+                'background': 'Charlatan',
+                'classes': [{'class_name': 'Rogue', 'level': 1}],
+                'skills': ['Deception', 'Stealth'],
+                'saving_throws': ['Dexterity'],
+                'proficiencies': ['Thieves tools'],
+                'weapons': [{'name': 'Rapier', 'damage': '1d8 piercing', 'properties': ['finesse']}],
+                'equipment': [{'name': 'Studded Leather', 'type': 'armor', 'properties': ['light']}],
+            },
+            headers={'Authorization': f'Bearer {token}'},
+        )
+
+        self.assertEqual(response.status_code, 201)
+        character = response.get_json()['character']
+        self.assertEqual(character['skills'][0]['skill_name'], 'Deception')
+        self.assertEqual(character['saving_throws'][0]['ability'], 'Dexterity')
+        self.assertEqual(character['proficiencies'][0]['name'], 'Thieves tools')
+        self.assertEqual(character['weapons'][0]['properties'], 'finesse')
+        self.assertEqual(character['equipment'][0]['equipment_type'], 'armor')
+        self.assertEqual(character['equipment'][0]['properties'], 'light')
+
+        with app.app_context():
+            self.assertEqual(Character.query.filter_by(name='Raven Nightshade').count(), 1)
+
+    def test_bond_suggestions_are_deduplicated(self):
+        with app.app_context():
+            owner = User(username='owner', email='owner@example.com')
+            owner.set_password('password')
+            player = User(username='player', email='player@example.com')
+            player.set_password('password')
+            db.session.add_all([owner, player])
+            db.session.commit()
+
+            campaign = Campaign(name='Lost Stones', user_id=owner.id)
+            db.session.add(campaign)
+            db.session.commit()
+
+            suggestion = {
+                'title': 'Inverse Former Lover Bond',
+                'description': "Former lover of Phazedrl's mother.",
+                'involved_user_ids': [owner.id, player.id],
+            }
+
+            self.assertEqual(len(apply_bond_suggestions(campaign.id, [suggestion])), 1)
+            self.assertEqual(len(apply_bond_suggestions(campaign.id, [suggestion])), 0)
+            db.session.commit()
+
+            self.assertEqual(PlanningBondProposal.query.filter_by(campaign_id=campaign.id).count(), 1)
+
+    def test_pending_bond_blocks_character_ready(self):
+        with app.app_context():
+            owner = User(username='owner', email='owner@example.com')
+            owner.set_password('password')
+            player = User(username='player', email='player@example.com')
+            player.set_password('password')
+            db.session.add_all([owner, player])
+            db.session.commit()
+
+            campaign = Campaign(name='Lost Stones', user_id=owner.id)
+            db.session.add(campaign)
+            db.session.flush()
+            character = Character(
+                user_id=player.id,
+                campaign_id=campaign.id,
+                name='Raven Nightshade',
+                race='Human',
+            )
+            db.session.add(character)
+            db.session.flush()
+            db.session.add(CampaignMember(campaign_id=campaign.id, user_id=owner.id, role='player'))
+            db.session.add(CampaignMember(
+                campaign_id=campaign.id,
+                user_id=player.id,
+                role='player',
+                selected_character_id=character.id,
+            ))
+            db.session.add(PlanningBondProposal(
+                campaign_id=campaign.id,
+                title='Former Lover Bond',
+                description='A proposed connection that needs approval.',
+                involved_user_ids=f'[{owner.id}, {player.id}]',
+                approval_states=f'{{"{owner.id}": "accepted", "{player.id}": "pending"}}',
+                status='pending',
+            ))
+            db.session.commit()
+            token = generate_token(player.id)
+            campaign_id = campaign.id
+
+        response = self.client.put(
+            f'/api/campaigns/{campaign_id}/planning/ready',
+            json={'ready': True},
+            headers={'Authorization': f'Bearer {token}'},
+        )
+
+        self.assertEqual(response.status_code, 400)
+        self.assertEqual(response.get_json(), {'error': 'Resolve pending bond proposals before marking ready'})
 
 
 if __name__ == '__main__':

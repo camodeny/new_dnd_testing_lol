@@ -1,3 +1,5 @@
+import json
+
 from models import (
     db, CharacterClass, CharacterSkill, CharacterSavingThrow,
     CharacterProficiency, CharacterFeature, CharacterWeapon,
@@ -185,6 +187,87 @@ CHARACTER_RELATION_CONFIGS = {
     },
 }
 
+CHARACTER_RELATION_ALIASES = {
+    'classes': {
+        'class_name': ('name', 'class', 'className'),
+        'hit_die_type': ('hit_die', 'hitDie', 'hitDieType'),
+    },
+    'skills': {
+        'skill_name': ('name', 'skill', 'skillName'),
+    },
+    'saving_throws': {
+        'ability': ('name', 'saving_throw', 'savingThrow'),
+    },
+    'proficiencies': {
+        'proficiency_type': ('type', 'proficiencyType'),
+        'name': ('proficiency_name', 'proficiencyName'),
+    },
+    'features': {
+        'name': ('feature_name', 'featureName', 'title'),
+    },
+    'weapons': {
+        'name': ('weapon_name', 'weaponName', 'title'),
+    },
+    'equipment': {
+        'equipment_type': ('type', 'item_type', 'itemType', 'equipmentType'),
+        'name': ('item_name', 'itemName', 'equipment_name', 'equipmentName', 'title'),
+    },
+    'spells': {
+        'name': ('spell_name', 'spellName', 'title'),
+        'spell_level': ('level', 'spellLevel'),
+    },
+    'notes': {
+        'title': ('name', 'note_title', 'noteTitle'),
+        'content': ('description', 'text', 'notes'),
+    },
+    'resources': {
+        'name': ('resource_name', 'resourceName', 'title'),
+        'max': ('maximum', 'max_amount', 'maxAmount'),
+    },
+    'companions': {
+        'name': ('companion_name', 'companionName', 'title'),
+        'companion_type': ('type', 'companionType'),
+    },
+    'conditions': {
+        'condition_name': ('name', 'condition', 'conditionName', 'title'),
+    },
+}
+
+CHARACTER_RELATION_STRING_LIST_FIELDS = {
+    'proficiencies': 'name',
+}
+
+
+def _first_present_value(item, field_name, aliases):
+    for key in (field_name, *aliases.get(field_name, ())):
+        if key in item:
+            return item[key]
+    return None
+
+
+def _coerce_scalar(value):
+    if isinstance(value, list):
+        return ', '.join(str(item) for item in value if item is not None)
+    if isinstance(value, dict):
+        return json.dumps(value, ensure_ascii=False)
+    return value
+
+
+def _normalize_relation_item(relation_name, item, config):
+    first_input_field = config['fields'][0][0]
+    if isinstance(item, str):
+        input_field = CHARACTER_RELATION_STRING_LIST_FIELDS.get(relation_name, first_input_field)
+        item = {input_field: item}
+    elif not isinstance(item, dict) or item is None:
+        item = {}
+
+    aliases = CHARACTER_RELATION_ALIASES.get(relation_name, {})
+    values = {}
+    for input_field, model_field, default in config['fields']:
+        value = _first_present_value(item, input_field, aliases)
+        values[model_field] = _coerce_scalar(default if value is None else value)
+    return values
+
 
 def character_full_dict(character):
     """Return a character dict with all nested relations."""
@@ -221,8 +304,5 @@ def update_character_relations(character, data):
 
         model = config['model']
         for item in data[relation_name]:
-            values = {
-                model_field: item.get(input_field, default)
-                for input_field, model_field, default in config['fields']
-            }
+            values = _normalize_relation_item(relation_name, item, config)
             db.session.add(model(character=character, **values))
