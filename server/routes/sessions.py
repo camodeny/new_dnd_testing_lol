@@ -81,9 +81,18 @@ def start_session(current_user, campaign_id):
         commit=True,
     )
 
-    context = planning_context(campaign, current_user)
-    world_context = dm_world_context(campaign, audit=True, reason='opening_scene_context')
     opening_trace_id = f'session_dm:session_{session.id}:opening'
+    opening_trace_label = f'session_dm: session {session.id} opening'
+    context = planning_context(campaign, current_user)
+    world_context = dm_world_context(
+        campaign,
+        audit=True,
+        reason='opening_scene_context',
+        audit_context={
+            'trace_id': opening_trace_id,
+            'trace_label': opening_trace_label,
+        },
+    )
     opening_text = get_opening_scene_response(
         context,
         world_context,
@@ -92,7 +101,7 @@ def start_session(current_user, campaign_id):
             'operation': 'opening_scene',
             'actor': 'session_dm',
             'trace_id': opening_trace_id,
-            'trace_label': f'session_dm: session {session.id} opening',
+            'trace_label': opening_trace_label,
         },
     )
     if opening_text:
@@ -116,7 +125,7 @@ def start_session(current_user, campaign_id):
             source='session_messages',
             actor='session_dm',
             trace_id=opening_trace_id,
-            trace_label=f'session_dm: session {session.id} opening',
+            trace_label=opening_trace_label,
             commit=False,
         )
 
@@ -130,6 +139,8 @@ def start_session(current_user, campaign_id):
         {'session': data},
         source='campaign_sessions',
         actor='server',
+        trace_id=opening_trace_id,
+        trace_label=opening_trace_label,
         commit=True,
     )
     return jsonify({'session': data}), 201
@@ -211,6 +222,8 @@ def send_message(current_user, session_id):
     db.session.add(msg)
     db.session.commit()
     result_messages = [msg.to_dict()]
+    trace_id = f'session_dm:session_{session_id}:message_{msg.id}'
+    trace_label = f'session_dm: session {session_id}'
     log_audit_event(
         campaign.id,
         'player_input_stored',
@@ -231,12 +244,13 @@ def send_message(current_user, session_id):
             {'context': hot_context, 'context_manifest': manifest},
             source='session_context',
             actor='server',
+            trace_id=trace_id,
+            trace_label=trace_label,
             commit=True,
         )
         recent_messages = SessionMessage.query.filter_by(session_id=session_id).order_by(
             SessionMessage.created_at.asc(),
         ).all()[-8:]
-        trace_id = f'session_dm:session_{session_id}:message_{msg.id}'
         ai_result = get_session_dm_response_with_tools(
             hot_context,
             recent_messages,
@@ -247,7 +261,7 @@ def send_message(current_user, session_id):
                 'operation': 'session_dm_response',
                 'actor': 'session_dm',
                 'trace_id': trace_id,
-                'trace_label': f'session_dm: session {session_id}',
+                'trace_label': trace_label,
                 'context_manifest': manifest,
                 'full_world_graph_included': False,
             },
@@ -282,7 +296,7 @@ def send_message(current_user, session_id):
             source='session_messages',
             actor='session_dm',
             trace_id=trace_id,
-            trace_label=f'session_dm: session {session_id}',
+            trace_label=trace_label,
             commit=False,
         )
         memory_trace_id = f'session_memory_writer:session_{session_id}:message_{msg.id}'
@@ -349,7 +363,7 @@ def send_message(current_user, session_id):
             source='session_messages',
             actor='session_dm',
             trace_id=trace_id,
-            trace_label=f'session_dm: session {session_id}',
+            trace_label=trace_label,
             audit_role='agent',
             commit=False,
         )
@@ -367,7 +381,7 @@ def send_message(current_user, session_id):
             source='session_messages',
             actor='session_dm',
             trace_id=trace_id,
-            trace_label=f'session_dm: session {session_id}',
+            trace_label=trace_label,
             audit_role='agent',
             commit=False,
         )
@@ -380,6 +394,8 @@ def send_message(current_user, session_id):
         {'session_id': session_id, 'messages': result_messages},
         source='session_messages',
         actor='server',
+        trace_id=trace_id,
+        trace_label=trace_label,
         commit=True,
     )
     return jsonify({'messages': result_messages}), 201

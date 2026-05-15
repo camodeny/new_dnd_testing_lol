@@ -460,7 +460,8 @@ def approve_world(world):
         world.updated_at = datetime.utcnow()
 
 
-def dm_world_context(campaign, audit=False, reason='dm_world_context'):
+def dm_world_context(campaign, audit=False, reason='dm_world_context', audit_context=None):
+    audit_context = audit_context or {}
     world = get_campaign_world(campaign.id)
     if not world:
         if audit:
@@ -471,6 +472,9 @@ def dm_world_context(campaign, audit=False, reason='dm_world_context'):
                 {'reason': reason, 'world': None},
                 source='campaign_worlds',
                 actor='server',
+                trace_id=audit_context.get('trace_id'),
+                parent_trace_id=audit_context.get('parent_trace_id'),
+                trace_label=audit_context.get('trace_label'),
                 commit=True,
             )
         return None
@@ -498,6 +502,9 @@ def dm_world_context(campaign, audit=False, reason='dm_world_context'):
             {'reason': reason, 'context': context},
             source='campaign_worlds',
             actor='server',
+            trace_id=audit_context.get('trace_id'),
+            parent_trace_id=audit_context.get('parent_trace_id'),
+            trace_label=audit_context.get('trace_label'),
             commit=True,
         )
     return context

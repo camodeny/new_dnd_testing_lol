@@ -203,7 +203,9 @@ def _agent_runs_from_stream(stream):
             and entry.get('parent_trace_id') != trace_id
         ):
             node['parent_trace_id'] = entry.get('parent_trace_id')
-        if not node.get('actor') and entry.get('actor'):
+        if entry.get('actor') in AGENT_ACTORS and node.get('actor') not in AGENT_ACTORS:
+            node['actor'] = entry.get('actor')
+        elif not node.get('actor') and entry.get('actor'):
             node['actor'] = entry.get('actor')
         node['events'].append(entry)
 
@@ -227,6 +229,52 @@ def _agent_runs_from_stream(stream):
     for root in roots:
         sort_node(root)
     return roots
+
+
+def _with_inferred_session_trace_links(stream):
+    linked = [dict(entry) for entry in (stream or [])]
+    pending = []
+    active_session_trace = None
+    active_session_label = None
+
+    def is_session_trace(trace_id):
+        return bool(trace_id and re.search(r'(?:^|:)session_\d+:(?:message_\d+|opening)', trace_id))
+
+    def is_session_support_event(entry):
+        event_type = entry.get('event_type')
+        source = entry.get('source')
+        if event_type in {'session_hot_context_read', 'knowledge_graph_read'}:
+            return True
+        if event_type == 'client_response_sent' and source in {'session_messages', 'campaign_sessions'}:
+            return True
+        return False
+
+    def apply_trace(entry, trace_id, trace_label):
+        entry['trace_id'] = trace_id
+        entry['trace_label'] = trace_label or entry.get('trace_label')
+
+    for entry in linked:
+        trace_id = entry.get('trace_id')
+        if is_session_trace(trace_id):
+            active_session_trace = trace_id
+            active_session_label = entry.get('trace_label')
+            for pending_entry in pending:
+                apply_trace(pending_entry, active_session_trace, active_session_label)
+            pending = []
+            continue
+
+        if trace_id:
+            continue
+
+        if not is_session_support_event(entry):
+            continue
+
+        if active_session_trace and entry.get('event_type') == 'client_response_sent':
+            apply_trace(entry, active_session_trace, active_session_label)
+        else:
+            pending.append(entry)
+
+    return linked
 
 
 def _message_link_from_trace(trace_id):
@@ -442,12 +490,23 @@ def _event_step_title(event):
         return 'Memory writer request'
     if event_type == 'memory_writer_response':
         return 'Memory writer response'
+    if event_type == 'session_hot_context_read':
+        return 'Session context read'
+    if event_type == 'knowledge_graph_read':
+        return 'World context read'
+    if event_type == 'client_response_sent':
+        return 'Client response sent'
     return _format_event_type(event_type)
 
 
 def _prompt_message_title(message):
     role = message.get('role') if isinstance(message, dict) else None
+    content = str(message.get('content') or '') if isinstance(message, dict) else ''
     if role == 'system':
+        if content.startswith('Compact hot context.'):
+            return 'Session context'
+        if content.startswith('Use the private campaign world memory'):
+            return 'Opening instruction'
         return 'System prompt'
     if role == 'assistant':
         return 'Assistant context'
@@ -867,7 +926,7 @@ def get_campaign_dev_audit(current_user, campaign_id):
         CampaignAuditEvent.id.asc(),
     ).all()
     audit_events_payload = [event.to_dict() for event in audit_events]
-    audit_stream = [_audit_stream_entry(event) for event in audit_events]
+    audit_stream = _with_inferred_session_trace_links([_audit_stream_entry(event) for event in audit_events])
     agent_runs = _agent_runs_from_stream(audit_stream)
     chat_flow = _chat_flow_payload(campaign_id, planning_messages, sessions, members, audit_stream, agent_runs)
     latest_session = active_session or (sessions[0] if sessions else None)

@@ -105,18 +105,21 @@ function stepVisible(step, filters) {
 }
 
 function isSessionDmBranch(branch) {
-  return branch.actor === 'session_dm' && branch.operation === 'session_dm_response'
+  if (branch.actor !== 'session_dm') return false
+  if (['opening_scene', 'session_dm_response'].includes(branch.operation)) return true
+  return (branch.steps || []).some((step) => ['dm_output_stored', 'dm_silence_chosen', 'dm_output_empty'].includes(step.kind))
 }
 
 function isMemoryBranch(branch) {
   return branchCategory(branch) === 'memory' || branchHasStepCategory(branch, 'memory')
 }
 
-function mainThreadSteps(branches, filters) {
+function mainThreadSteps(branches, filters, { includeSetup = false } = {}) {
   return (branches || [])
     .filter(isSessionDmBranch)
     .flatMap((branch) => branch.steps || [])
     .filter((step) => stepVisible(step, filters))
+    .filter((step) => includeSetup || step.kind !== 'prompt_message')
     .filter((step) => step.kind !== 'dm_output_stored')
 }
 
@@ -503,7 +506,10 @@ function BranchColumn({ branches, filters, side }) {
 function FlowGraphNode({ message, previousMessage, filters, isLast, searchQuery }) {
   const sideBranches = sideBranchesForMessage(message, previousMessage)
   const branches = sideBranches.filter((branch) => branchVisible(branch, filters) && matchesSearch(branch, searchQuery))
-  const steps = mainThreadSteps(message.branches || [], filters)
+  const includeSetup = message.role === 'dm' && (message.branches || []).some((branch) => branch.actor === 'session_dm' && branch.operation === 'opening_scene')
+  const steps = mainThreadSteps(message.branches || [], filters, { includeSetup })
+  const stepsBeforeMessage = message.role === 'dm' ? steps : []
+  const stepsAfterMessage = message.role === 'dm' ? [] : steps
   const { left, right } = splitBranches(branches)
   const role = message.role === 'dm' ? 'dm' : message.role === 'system' ? 'system' : 'player'
   const rowClassName = [
@@ -520,6 +526,7 @@ function FlowGraphNode({ message, previousMessage, filters, isLast, searchQuery 
     <div className={rowClassName}>
       <BranchColumn branches={left} filters={filters} side="left" />
       <div className="dev-main-thread-stack">
+        <MainThreadSteps steps={stepsBeforeMessage} />
         <article className={`dev-graph-node dev-graph-message dev-graph-message-${role}`}>
           <div className="dev-message-meta">
             <span className={`dev-pill dev-pill-${message.source}-${message.role}`}>{roleLabel(message.role)}</span>
@@ -529,7 +536,7 @@ function FlowGraphNode({ message, previousMessage, filters, isLast, searchQuery 
           </div>
           <div className="dev-message-content">{message.content || '(empty)'}</div>
         </article>
-        <MainThreadSteps steps={steps} />
+        <MainThreadSteps steps={stepsAfterMessage} />
       </div>
       <BranchColumn branches={right} filters={filters} side="right" />
     </div>
