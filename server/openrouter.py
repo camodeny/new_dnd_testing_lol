@@ -112,6 +112,12 @@ SESSION_MEMORY_SYSTEM_PROMPT = (
     "record the durable event or encounter, not a fact that someone knows who is currently present."
 )
 
+JSON_REPAIR_SYSTEM_PROMPT = (
+    "You repair malformed JSON. Return only valid JSON with the same intended data and structure as "
+    "the original. Make the smallest changes needed to fix syntax errors. Do not add commentary, "
+    "markdown fences, or new facts."
+)
+
 
 def get_openrouter_model():
     with _OPENROUTER_MODEL_LOCK:
@@ -291,21 +297,94 @@ def _post_chat(messages, json_mode=False, audit_context=None):
     return data['choices'][0]['message']['content']
 
 
-def _json_loads_or_empty(text):
+def _json_candidate(text):
+    if not isinstance(text, str):
+        return text
+    start = text.find('{')
+    end = text.rfind('}')
+    if start >= 0 and end > start:
+        return text[start:end + 1]
+    return text
+
+
+def _json_loads_with_error(text):
     if not text:
-        return {}
+        return {}, None, text
     try:
-        return json.loads(text)
-    except (TypeError, ValueError):
-        start = text.find('{')
-        end = text.rfind('}')
-        if start >= 0 and end > start:
+        return json.loads(text), None, text
+    except (TypeError, ValueError) as raw_error:
+        candidate = _json_candidate(text)
+        if candidate != text:
             try:
-                return json.loads(text[start:end + 1])
-            except (TypeError, ValueError):
-                pass
-        return {}
-    return {}
+                return json.loads(candidate), None, candidate
+            except (TypeError, ValueError) as candidate_error:
+                return {}, candidate_error, candidate
+        return {}, raw_error, candidate
+
+
+def _json_loads_or_empty(text):
+    data, _error, _candidate = _json_loads_with_error(text)
+    return data
+
+
+def _json_error_excerpt(candidate, error, context_lines=2):
+    if not isinstance(candidate, str) or not isinstance(error, json.JSONDecodeError):
+        return ''
+
+    lines = candidate.splitlines()
+    if not lines:
+        return ''
+
+    line_index = max(error.lineno - 1, 0)
+    start = max(line_index - context_lines, 0)
+    end = min(line_index + context_lines + 1, len(lines))
+    excerpt_lines = []
+    for index in range(start, end):
+        prefix = '>>' if index == line_index else '  '
+        excerpt_lines.append(f'{prefix} {index + 1}: {lines[index]}')
+        if index == line_index:
+            excerpt_lines.append(f'   {" " * (len(str(index + 1)) + 2 + max(error.colno - 1, 0))}^')
+    return '\n'.join(excerpt_lines)
+
+
+def _build_json_repair_messages(candidate, error):
+    excerpt = _json_error_excerpt(candidate, error)
+    return [
+        {
+            'role': 'system',
+            'content': JSON_REPAIR_SYSTEM_PROMPT,
+        },
+        {
+            'role': 'user',
+            'content': (
+                'Repair this malformed JSON and return the complete corrected JSON document.\n\n'
+                f'Parser error: {error.msg} at line {error.lineno}, column {error.colno} '
+                f'(character {error.pos}).\n\n'
+                f'Problem area:\n{excerpt}\n\n'
+                f'Original malformed JSON:\n{candidate}'
+            ),
+        },
+    ]
+
+
+def _json_loads_with_repair(text, audit_context=None):
+    data, error, candidate = _json_loads_with_error(text)
+    if error is None or not isinstance(error, json.JSONDecodeError):
+        return data
+
+    audit_context = audit_context or {}
+    operation = audit_context.get('operation') or 'json_response'
+    repair_context = {
+        **audit_context,
+        'operation': f'{operation}_json_repair',
+    }
+    repaired_text = _post_chat(
+        _build_json_repair_messages(candidate, error),
+        json_mode=True,
+        audit_context=repair_context,
+    )
+    repaired_data, _repair_error, _repaired_candidate = _json_loads_with_error(repaired_text)
+    return repaired_data
 
 
 def normalize_session_dm_turn_decision(raw_decision):
@@ -800,19 +879,20 @@ def get_session_memory_patch(memory_context, audit_context=None):
             commit=True,
         )
     try:
+        request_audit_context = {
+            **audit_context,
+            'trace_id': trace_id,
+            'trace_label': trace_label,
+            'operation': audit_context.get('operation') or 'session_memory_update',
+            'actor': 'session_memory_writer',
+            'full_world_graph_included': False,
+        }
         text = _post_chat(
             messages,
             json_mode=True,
-            audit_context={
-                **audit_context,
-                'trace_id': trace_id,
-                'trace_label': trace_label,
-                'operation': audit_context.get('operation') or 'session_memory_update',
-                'actor': 'session_memory_writer',
-                'full_world_graph_included': False,
-            },
+            audit_context=request_audit_context,
         )
-        data = _json_loads_or_empty(text)
+        data = _json_loads_with_repair(text, audit_context=request_audit_context)
         if campaign_id:
             log_audit_event(
                 campaign_id,
@@ -838,7 +918,7 @@ def get_planning_dm_response(context, current_user_messages, draft_character=Non
 
     try:
         text = _post_chat(messages, json_mode=True, audit_context=audit_context)
-        data = _json_loads_or_empty(text)
+        data = _json_loads_with_repair(text, audit_context=audit_context)
         if isinstance(data, dict) and data.get('message'):
             return {
                 'message': data.get('message') or '',
@@ -855,7 +935,10 @@ def get_planning_summary_update(context, latest_player_message, latest_dm_messag
     messages = build_planning_summary_messages(context, latest_player_message, latest_dm_message)
 
     try:
-        data = _json_loads_or_empty(_post_chat(messages, json_mode=True, audit_context=audit_context))
+        data = _json_loads_with_repair(
+            _post_chat(messages, json_mode=True, audit_context=audit_context),
+            audit_context=audit_context,
+        )
         return data if isinstance(data, dict) else {}
     except Exception as e:
         print(f'[openrouter] Planning summary error: {e}')
@@ -866,7 +949,10 @@ def get_world_genesis_package(context, audit_context=None):
     messages = build_world_genesis_messages(context)
 
     try:
-        data = _json_loads_or_empty(_post_chat(messages, json_mode=True, audit_context=audit_context))
+        data = _json_loads_with_repair(
+            _post_chat(messages, json_mode=True, audit_context=audit_context),
+            audit_context=audit_context,
+        )
         return data if isinstance(data, dict) else {}
     except Exception as e:
         print(f'[openrouter] World genesis error: {e}')
