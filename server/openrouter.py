@@ -1,6 +1,8 @@
 import os
 import json
+import tempfile
 from threading import Lock
+from pathlib import Path
 from uuid import uuid4
 import requests
 from dotenv import load_dotenv
@@ -12,7 +14,10 @@ load_dotenv()
 OPENROUTER_API_KEY = os.environ.get('OPENROUTER_API_KEY', '')
 OPENROUTER_MODEL = os.environ.get('OPENROUTER_MODEL', '')
 _OPENROUTER_MODEL_LOCK = Lock()
-_OPENROUTER_MODEL_OVERRIDE = None
+OPENROUTER_RUNTIME_MODEL_FILE = Path(os.environ.get(
+    'OPENROUTER_RUNTIME_MODEL_FILE',
+    os.path.join(tempfile.gettempdir(), 'new_dnd_testing_lol_openrouter_model'),
+))
 API_URL = 'https://openrouter.ai/api/v1/chat/completions'
 
 PC_CONTROL_POLICY = (
@@ -110,41 +115,57 @@ SESSION_MEMORY_SYSTEM_PROMPT = (
 
 def get_openrouter_model():
     with _OPENROUTER_MODEL_LOCK:
-        return _OPENROUTER_MODEL_OVERRIDE or OPENROUTER_MODEL
+        return _read_runtime_model_override() or OPENROUTER_MODEL
 
 
 def get_openrouter_settings():
-    model = get_openrouter_model()
     with _OPENROUTER_MODEL_LOCK:
-        is_overridden = _OPENROUTER_MODEL_OVERRIDE is not None
+        override = _read_runtime_model_override()
+    model = override or OPENROUTER_MODEL
     return {
         'model': model,
         'env_model': OPENROUTER_MODEL,
-        'source': 'runtime' if is_overridden else 'env',
-        'is_overridden': is_overridden,
+        'source': 'runtime' if override else 'env',
+        'is_overridden': bool(override),
         'api_key_configured': bool(OPENROUTER_API_KEY),
     }
 
 
 def set_openrouter_model(model):
-    global _OPENROUTER_MODEL_OVERRIDE
-
     next_model = (model or '').strip()
     if not next_model:
         raise ValueError('Model is required')
     if len(next_model) > 200:
         raise ValueError('Model must be 200 characters or fewer')
     with _OPENROUTER_MODEL_LOCK:
-        _OPENROUTER_MODEL_OVERRIDE = next_model
+        _write_runtime_model_override(next_model)
     return get_openrouter_settings()
 
 
 def reset_openrouter_model():
-    global _OPENROUTER_MODEL_OVERRIDE
-
     with _OPENROUTER_MODEL_LOCK:
-        _OPENROUTER_MODEL_OVERRIDE = None
+        OPENROUTER_RUNTIME_MODEL_FILE.unlink(missing_ok=True)
     return get_openrouter_settings()
+
+
+def _read_runtime_model_override():
+    try:
+        return OPENROUTER_RUNTIME_MODEL_FILE.read_text(encoding='utf-8').strip() or None
+    except FileNotFoundError:
+        return None
+
+
+def _write_runtime_model_override(model):
+    OPENROUTER_RUNTIME_MODEL_FILE.parent.mkdir(parents=True, exist_ok=True)
+    with tempfile.NamedTemporaryFile(
+        'w',
+        encoding='utf-8',
+        dir=OPENROUTER_RUNTIME_MODEL_FILE.parent,
+        delete=False,
+    ) as temp_file:
+        temp_file.write(model)
+        temp_path = Path(temp_file.name)
+    temp_path.replace(OPENROUTER_RUNTIME_MODEL_FILE)
 
 
 def _require_openrouter_config(model=None):

@@ -7,6 +7,10 @@ from pathlib import Path
 
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), '..')))
 os.environ['DATABASE_URL'] = 'sqlite:///:memory:'
+os.environ['OPENROUTER_RUNTIME_MODEL_FILE'] = os.path.join(
+    tempfile.gettempdir(),
+    f'new_dnd_testing_lol_openrouter_model_test_{os.getpid()}',
+)
 
 from app import app
 from auth import generate_token
@@ -183,6 +187,16 @@ class AppRouteTest(unittest.TestCase):
         self.assertEqual(settings['source'], 'runtime')
         self.assertTrue(settings['is_overridden'])
         self.assertEqual(get_openrouter_model(), 'anthropic/claude-sonnet-4.5')
+
+        refreshed_response = self.client.get(
+            '/api/dev/model',
+            headers={'Authorization': f'Bearer {token}'},
+        )
+
+        self.assertEqual(refreshed_response.status_code, 200)
+        refreshed_settings = refreshed_response.get_json()['settings']
+        self.assertEqual(refreshed_settings['model'], 'anthropic/claude-sonnet-4.5')
+        self.assertEqual(refreshed_settings['source'], 'runtime')
 
     def test_dev_model_settings_reject_blank_model(self):
         token = self.create_user_token()
