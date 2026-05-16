@@ -99,6 +99,9 @@ def log_model_request(
     parallel_tool_calls=None,
     context_manifest=None,
     token_estimate=None,
+    provider='openrouter',
+    reasoning_requested_by_app=False,
+    reasoning_note=None,
 ):
     tool_names = [
         tool.get('function', {}).get('name')
@@ -120,13 +123,13 @@ def log_model_request(
             'parallel_tool_calls': parallel_tool_calls,
             'context_manifest': context_manifest or {},
             'token_estimate': token_estimate or {},
-            'reasoning_requested_by_app': False,
-            'reasoning_note': (
-                'This app does not force reasoning for every request. OpenRouter reasoning-capable '
+            'reasoning_requested_by_app': reasoning_requested_by_app,
+            'reasoning_note': reasoning_note or (
+                'This app does not force reasoning for every request. Reasoning-capable '
                 'models may still return reasoning fields in the model response.'
             ),
         },
-        source='openrouter',
+        source=provider,
         actor=actor,
         trace_id=trace_id,
         parent_trace_id=parent_trace_id,
@@ -175,6 +178,7 @@ def log_model_response(
     trace_id=None,
     parent_trace_id=None,
     trace_label=None,
+    provider='openrouter',
 ):
     message = _first_choice_message(response)
     choices = response.get('choices') if isinstance(response, dict) else []
@@ -197,7 +201,7 @@ def log_model_response(
             'reasoning_returned': bool(reasoning or reasoning_details),
             'reasoning_usage': _reasoning_usage(response),
         },
-        source='openrouter',
+        source=provider,
         actor=actor,
         trace_id=trace_id,
         parent_trace_id=parent_trace_id,
@@ -216,6 +220,7 @@ def log_model_error(
     trace_id=None,
     parent_trace_id=None,
     trace_label=None,
+    provider='openrouter',
 ):
     return log_audit_event(
         campaign_id,
@@ -225,7 +230,7 @@ def log_model_error(
             'operation': operation,
             'error': repr(error),
         },
-        source='openrouter',
+        source=provider,
         actor=actor,
         trace_id=trace_id,
         parent_trace_id=parent_trace_id,

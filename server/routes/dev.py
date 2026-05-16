@@ -73,7 +73,7 @@ def update_dev_model_settings(current_user):
     data = request.get_json() or {}
     if data.get('reset'):
         return jsonify({
-            'message': 'OpenRouter model reset to environment value',
+            'message': 'LLM model reset to environment value',
             'settings': reset_openrouter_model(),
         }), 200
 
@@ -83,7 +83,7 @@ def update_dev_model_settings(current_user):
         return jsonify({'error': str(err)}), 400
 
     return jsonify({
-        'message': 'OpenRouter model updated',
+        'message': 'LLM model updated',
         'settings': settings,
     }), 200
 
@@ -989,8 +989,8 @@ def get_campaign_dev_audit(current_user, campaign_id):
         'agent_runs': agent_runs,
         'chat_flow': chat_flow,
         'audit_notes': {
-            'tool_calls': 'OpenRouter chat requests and responses are persisted as model_request/model_response events. Provider-internal tool calls are not returned unless the provider response includes them.',
-            'thinking': 'OpenRouter reasoning-capable models may return reasoning or reasoning_details fields in model responses. Some models and providers do not return reasoning, and provider-hidden reasoning is not available unless it appears in the response payload.',
+            'tool_calls': 'Chat requests and responses are persisted as model_request/model_response events. Provider-internal tool calls are not returned unless the provider response includes them.',
+            'thinking': 'Reasoning-capable models may return reasoning or reasoning_details fields in model responses. Some models and providers do not return reasoning, and provider-hidden reasoning is not available unless it appears in the response payload.',
             'message': 'The audit stream shows exact app inputs, system prompts, prompt payloads, raw model responses, returned reasoning when provided, database reads/writes, and client response payloads in persisted order.',
         },
     }), 200

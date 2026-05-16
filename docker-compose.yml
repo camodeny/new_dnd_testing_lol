@@ -12,8 +12,13 @@ services:
       FRONTEND_ORIGINS: ${FRONTEND_ORIGINS:-http://localhost:5889}
       SECRET_KEY: ${SECRET_KEY:-dev-secret-key}
       JWT_EXPIRATION_HOURS: ${JWT_EXPIRATION_HOURS:-24}
+      LLM_PROVIDER: ${LLM_PROVIDER:-openrouter}
       OPENROUTER_API_KEY: ${OPENROUTER_API_KEY:-}
       OPENROUTER_MODEL: ${OPENROUTER_MODEL:-}
+      OPENCODE_GO_API_KEY: ${OPENCODE_GO_API_KEY:-}
+      OPENCODE_GO_MODEL: ${OPENCODE_GO_MODEL:-}
+      OPENCODE_GO_THINKING: ${OPENCODE_GO_THINKING:-disabled}
+      OPENCODE_GO_REASONING_EFFORT: ${OPENCODE_GO_REASONING_EFFORT:-high}
     volumes:
       - ./data:/app/data
     restart: unless-stopped

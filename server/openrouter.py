@@ -14,17 +14,35 @@ load_dotenv()
 
 OPENROUTER_API_KEY = os.environ.get('OPENROUTER_API_KEY', '')
 OPENROUTER_MODEL = os.environ.get('OPENROUTER_MODEL', '')
-_OPENROUTER_MODEL_LOCK = Lock()
-OPENROUTER_RUNTIME_MODEL_FILE = Path(os.environ.get(
-    'OPENROUTER_RUNTIME_MODEL_FILE',
-    os.path.join(tempfile.gettempdir(), 'new_dnd_testing_lol_openrouter_model'),
+OPENROUTER_BASE_URL = os.environ.get('OPENROUTER_BASE_URL', 'https://openrouter.ai/api/v1/chat/completions')
+
+OPENCODE_GO_API_KEY = os.environ.get('OPENCODE_GO_API_KEY', '')
+OPENCODE_GO_MODEL = os.environ.get('OPENCODE_GO_MODEL', '')
+OPENCODE_GO_BASE_URL = os.environ.get(
+    'OPENCODE_GO_BASE_URL',
+    'https://opencode.ai/zen/go/v1/chat/completions',
+)
+OPENCODE_GO_THINKING = os.environ.get('OPENCODE_GO_THINKING', 'disabled')
+OPENCODE_GO_REASONING_EFFORT = os.environ.get('OPENCODE_GO_REASONING_EFFORT', 'high')
+
+LLM_PROVIDER = os.environ.get('LLM_PROVIDER', 'openrouter').strip().lower() or 'openrouter'
+SUPPORTED_LLM_PROVIDERS = {'openrouter', 'opencode_go'}
+_LLM_MODEL_LOCK = Lock()
+LLM_RUNTIME_MODEL_FILE = Path(os.environ.get(
+    'LLM_RUNTIME_MODEL_FILE',
+    os.environ.get(
+        'OPENROUTER_RUNTIME_MODEL_FILE',
+        os.path.join(tempfile.gettempdir(), 'new_dnd_testing_lol_llm_model'),
+    ),
 ))
-API_URL = 'https://openrouter.ai/api/v1/chat/completions'
-OPENROUTER_MAX_ATTEMPTS = max(1, int(os.environ.get('OPENROUTER_MAX_ATTEMPTS', '4')))
-OPENROUTER_RETRY_BASE_DELAY_SECONDS = max(0.0, float(os.environ.get('OPENROUTER_RETRY_BASE_DELAY_SECONDS', '1')))
-OPENROUTER_RETRY_MAX_DELAY_SECONDS = max(
-    OPENROUTER_RETRY_BASE_DELAY_SECONDS,
-    float(os.environ.get('OPENROUTER_RETRY_MAX_DELAY_SECONDS', '8')),
+LLM_MAX_ATTEMPTS = max(1, int(os.environ.get('LLM_MAX_ATTEMPTS', os.environ.get('OPENROUTER_MAX_ATTEMPTS', '4'))))
+LLM_RETRY_BASE_DELAY_SECONDS = max(
+    0.0,
+    float(os.environ.get('LLM_RETRY_BASE_DELAY_SECONDS', os.environ.get('OPENROUTER_RETRY_BASE_DELAY_SECONDS', '1'))),
+)
+LLM_RETRY_MAX_DELAY_SECONDS = max(
+    LLM_RETRY_BASE_DELAY_SECONDS,
+    float(os.environ.get('LLM_RETRY_MAX_DELAY_SECONDS', os.environ.get('OPENROUTER_RETRY_MAX_DELAY_SECONDS', '8'))),
 )
 
 PC_CONTROL_POLICY = (
@@ -138,66 +156,109 @@ JSON_REPAIR_SYSTEM_PROMPT = (
 )
 
 
-def get_openrouter_model():
-    with _OPENROUTER_MODEL_LOCK:
-        return _read_runtime_model_override() or OPENROUTER_MODEL
+def _env_model_for_provider(provider):
+    return OPENCODE_GO_MODEL if provider == 'opencode_go' else OPENROUTER_MODEL
 
 
-def get_openrouter_settings():
-    with _OPENROUTER_MODEL_LOCK:
+def _api_key_for_provider(provider):
+    return OPENCODE_GO_API_KEY if provider == 'opencode_go' else OPENROUTER_API_KEY
+
+
+def _api_url_for_provider(provider):
+    return OPENCODE_GO_BASE_URL if provider == 'opencode_go' else OPENROUTER_BASE_URL
+
+
+def get_llm_provider():
+    if LLM_PROVIDER not in SUPPORTED_LLM_PROVIDERS:
+        supported = ', '.join(sorted(SUPPORTED_LLM_PROVIDERS))
+        raise RuntimeError(f'LLM_PROVIDER must be one of: {supported}')
+    return LLM_PROVIDER
+
+
+def get_llm_model():
+    provider = get_llm_provider()
+    with _LLM_MODEL_LOCK:
+        return _read_runtime_model_override() or _env_model_for_provider(provider)
+
+
+def get_llm_settings():
+    provider = get_llm_provider()
+    with _LLM_MODEL_LOCK:
         override = _read_runtime_model_override()
-    model = override or OPENROUTER_MODEL
+    env_model = _env_model_for_provider(provider)
+    model = override or env_model
     return {
+        'provider': provider,
         'model': model,
-        'env_model': OPENROUTER_MODEL,
+        'env_model': env_model,
         'source': 'runtime' if override else 'env',
         'is_overridden': bool(override),
-        'api_key_configured': bool(OPENROUTER_API_KEY),
+        'api_key_configured': bool(_api_key_for_provider(provider)),
+        'thinking_enabled': _deepseek_thinking_enabled(provider, model),
+        'reasoning_effort': OPENCODE_GO_REASONING_EFFORT if provider == 'opencode_go' else None,
     }
 
 
-def set_openrouter_model(model):
+def set_llm_model(model):
     next_model = (model or '').strip()
     if not next_model:
         raise ValueError('Model is required')
     if len(next_model) > 200:
         raise ValueError('Model must be 200 characters or fewer')
-    with _OPENROUTER_MODEL_LOCK:
+    with _LLM_MODEL_LOCK:
         _write_runtime_model_override(next_model)
-    return get_openrouter_settings()
+    return get_llm_settings()
+
+
+def reset_llm_model():
+    with _LLM_MODEL_LOCK:
+        LLM_RUNTIME_MODEL_FILE.unlink(missing_ok=True)
+    return get_llm_settings()
+
+
+def get_openrouter_model():
+    return get_llm_model()
+
+
+def get_openrouter_settings():
+    return get_llm_settings()
+
+
+def set_openrouter_model(model):
+    return set_llm_model(model)
 
 
 def reset_openrouter_model():
-    with _OPENROUTER_MODEL_LOCK:
-        OPENROUTER_RUNTIME_MODEL_FILE.unlink(missing_ok=True)
-    return get_openrouter_settings()
+    return reset_llm_model()
 
 
 def _read_runtime_model_override():
     try:
-        return OPENROUTER_RUNTIME_MODEL_FILE.read_text(encoding='utf-8').strip() or None
+        return LLM_RUNTIME_MODEL_FILE.read_text(encoding='utf-8').strip() or None
     except FileNotFoundError:
         return None
 
 
 def _write_runtime_model_override(model):
-    OPENROUTER_RUNTIME_MODEL_FILE.parent.mkdir(parents=True, exist_ok=True)
+    LLM_RUNTIME_MODEL_FILE.parent.mkdir(parents=True, exist_ok=True)
     with tempfile.NamedTemporaryFile(
         'w',
         encoding='utf-8',
-        dir=OPENROUTER_RUNTIME_MODEL_FILE.parent,
+        dir=LLM_RUNTIME_MODEL_FILE.parent,
         delete=False,
     ) as temp_file:
         temp_file.write(model)
         temp_path = Path(temp_file.name)
-    temp_path.replace(OPENROUTER_RUNTIME_MODEL_FILE)
+    temp_path.replace(LLM_RUNTIME_MODEL_FILE)
 
 
-def _require_openrouter_config(model=None):
-    if not OPENROUTER_API_KEY:
-        raise RuntimeError('OPENROUTER_API_KEY is not set')
-    if not (model if model is not None else get_openrouter_model()):
-        raise RuntimeError('OPENROUTER_MODEL is not set')
+def _require_llm_config(provider=None, model=None):
+    provider = provider or get_llm_provider()
+    env_prefix = 'OPENCODE_GO' if provider == 'opencode_go' else 'OPENROUTER'
+    if not _api_key_for_provider(provider):
+        raise RuntimeError(f'{env_prefix}_API_KEY is not set')
+    if not (model if model is not None else get_llm_model()):
+        raise RuntimeError(f'{env_prefix}_MODEL is not set')
 
 
 def _estimate_tokens(value):
@@ -207,17 +268,47 @@ def _estimate_tokens(value):
 
 def _retry_delay_seconds(failed_attempt):
     return min(
-        OPENROUTER_RETRY_BASE_DELAY_SECONDS * (2 ** max(failed_attempt - 1, 0)),
-        OPENROUTER_RETRY_MAX_DELAY_SECONDS,
+        LLM_RETRY_BASE_DELAY_SECONDS * (2 ** max(failed_attempt - 1, 0)),
+        LLM_RETRY_MAX_DELAY_SECONDS,
     )
 
 
-def _is_retriable_openrouter_error(error):
+def _is_retriable_llm_error(error):
     if isinstance(error, requests.HTTPError):
         response = getattr(error, 'response', None)
         status_code = getattr(response, 'status_code', None)
         return status_code in {404, 408, 409, 425, 429} or (status_code is not None and status_code >= 500)
     return isinstance(error, (requests.ConnectionError, requests.Timeout))
+
+
+def _enabled(value):
+    return str(value or '').strip().lower() in {'1', 'true', 'yes', 'on', 'enabled'}
+
+
+def _deepseek_thinking_enabled(provider, model):
+    return (
+        provider == 'opencode_go'
+        and str(model or '').strip().lower().startswith('deepseek-v4-')
+        and _enabled(OPENCODE_GO_THINKING)
+    )
+
+
+def _provider_request_payload_options(provider, model, tools, tool_choice, parallel_tool_calls):
+    thinking_enabled = _deepseek_thinking_enabled(provider, model)
+    options = {
+        'thinking_enabled': thinking_enabled,
+        'tool_choice': tool_choice,
+        'parallel_tool_calls': parallel_tool_calls,
+    }
+    if thinking_enabled:
+        options['thinking'] = {'type': 'enabled'}
+        effort = (OPENCODE_GO_REASONING_EFFORT or 'high').strip().lower()
+        options['reasoning_effort'] = effort if effort in {'high', 'max'} else 'high'
+        if tools:
+            # DeepSeek thinking mode rejects tool_choice and does not document parallel_tool_calls.
+            options['tool_choice'] = None
+            options['parallel_tool_calls'] = None
+    return options
 
 
 def _post_chat_response(
@@ -236,9 +327,10 @@ def _post_chat_response(
     parent_trace_id = audit_context.get('parent_trace_id')
     trace_label = audit_context.get('trace_label') or f'{actor}: {operation}'
 
-    model = get_openrouter_model()
+    provider = get_llm_provider()
+    model = get_llm_model()
     try:
-        _require_openrouter_config(model)
+        _require_llm_config(provider, model)
     except Exception as err:
         if campaign_id:
             log_model_error(
@@ -250,19 +342,30 @@ def _post_chat_response(
                 trace_id=trace_id,
                 parent_trace_id=parent_trace_id,
                 trace_label=trace_label,
+                provider=provider,
             )
         raise
 
+    provider_options = _provider_request_payload_options(
+        provider,
+        model,
+        tools,
+        tool_choice,
+        parallel_tool_calls,
+    )
     payload = {
         'model': model,
         'messages': messages,
     }
     if tools:
         payload['tools'] = tools
-    if tool_choice is not None:
-        payload['tool_choice'] = tool_choice
-    if parallel_tool_calls is not None:
-        payload['parallel_tool_calls'] = parallel_tool_calls
+    if provider_options.get('tool_choice') is not None:
+        payload['tool_choice'] = provider_options['tool_choice']
+    if provider_options.get('parallel_tool_calls') is not None:
+        payload['parallel_tool_calls'] = provider_options['parallel_tool_calls']
+    if provider_options.get('thinking_enabled'):
+        payload['thinking'] = provider_options['thinking']
+        payload['reasoning_effort'] = provider_options['reasoning_effort']
 
     if campaign_id:
         log_model_request(
@@ -276,23 +379,30 @@ def _post_chat_response(
             trace_id=trace_id,
             parent_trace_id=parent_trace_id,
             trace_label=trace_label,
+            provider=provider,
             tools=tools,
-            tool_choice=tool_choice,
-            parallel_tool_calls=parallel_tool_calls,
+            tool_choice=provider_options.get('tool_choice'),
+            parallel_tool_calls=provider_options.get('parallel_tool_calls'),
             context_manifest=audit_context.get('context_manifest'),
             token_estimate=audit_context.get('token_estimate') or {
                 'estimated_message_tokens': _estimate_tokens(messages),
                 'estimated_tool_schema_tokens': _estimate_tokens(tools or []),
                 'full_world_graph_included': audit_context.get('full_world_graph_included', None),
             },
+            reasoning_requested_by_app=provider_options.get('thinking_enabled', False),
+            reasoning_note=(
+                'DeepSeek V4 thinking mode is enabled by app configuration.'
+                if provider_options.get('thinking_enabled')
+                else None
+            ),
         )
 
-    for attempt in range(1, OPENROUTER_MAX_ATTEMPTS + 1):
+    for attempt in range(1, LLM_MAX_ATTEMPTS + 1):
         try:
             resp = requests.post(
-                API_URL,
+                _api_url_for_provider(provider),
                 headers={
-                    'Authorization': f'Bearer {OPENROUTER_API_KEY}',
+                    'Authorization': f'Bearer {_api_key_for_provider(provider)}',
                     'Content-Type': 'application/json',
                 },
                 json=payload,
@@ -310,10 +420,11 @@ def _post_chat_response(
                     trace_id=trace_id,
                     parent_trace_id=parent_trace_id,
                     trace_label=trace_label,
+                    provider=provider,
                 )
             return data
         except Exception as err:
-            can_retry = attempt < OPENROUTER_MAX_ATTEMPTS and _is_retriable_openrouter_error(err)
+            can_retry = attempt < LLM_MAX_ATTEMPTS and _is_retriable_llm_error(err)
             if can_retry:
                 delay_seconds = _retry_delay_seconds(attempt)
                 if campaign_id:
@@ -325,11 +436,11 @@ def _post_chat_response(
                             'operation': operation,
                             'attempt': attempt,
                             'next_attempt': attempt + 1,
-                            'max_attempts': OPENROUTER_MAX_ATTEMPTS,
+                            'max_attempts': LLM_MAX_ATTEMPTS,
                             'delay_seconds': delay_seconds,
                             'error': repr(err),
                         },
-                        source='openrouter',
+                        source=provider,
                         actor=actor,
                         trace_id=trace_id,
                         parent_trace_id=parent_trace_id,
@@ -350,6 +461,7 @@ def _post_chat_response(
                     trace_id=trace_id,
                     parent_trace_id=parent_trace_id,
                     trace_label=trace_label,
+                    provider=provider,
                 )
             raise
 
@@ -884,11 +996,15 @@ def _parse_tool_arguments(raw_arguments):
 
 
 def _assistant_tool_message(message):
-    return {
+    assistant_message = {
         'role': 'assistant',
-        'content': message.get('content'),
+        'content': message.get('content') or '',
         'tool_calls': message.get('tool_calls') or [],
     }
+    for field in ('reasoning_content', 'reasoning', 'reasoning_details'):
+        if message.get(field) is not None:
+            assistant_message[field] = message.get(field)
+    return assistant_message
 
 
 def get_session_dm_response_with_tools(
@@ -1142,6 +1258,7 @@ def get_opening_scene_response(context, world_context, audit_context=None):
 def get_session_memory_patch(memory_context, audit_context=None):
     messages = build_session_memory_messages(memory_context)
     audit_context = audit_context or {}
+    provider = get_llm_provider()
     campaign_id = audit_context.get('campaign_id')
     trace_id = audit_context.get('trace_id') or f"session_memory_writer:memory_update:{uuid4().hex[:10]}"
     trace_label = audit_context.get('trace_label') or 'session_memory_writer: memory_update'
@@ -1151,7 +1268,7 @@ def get_session_memory_patch(memory_context, audit_context=None):
             'memory_writer_request',
             'Requested post-turn session memory update.',
             {'context': memory_context, 'messages': messages},
-            source='openrouter',
+            source=provider,
             actor='session_memory_writer',
             trace_id=trace_id,
             parent_trace_id=audit_context.get('parent_trace_id'),
@@ -1180,7 +1297,7 @@ def get_session_memory_patch(memory_context, audit_context=None):
                 'memory_writer_response',
                 'Received post-turn session memory patch.',
                 {'patch': data},
-                source='openrouter',
+                source=provider,
                 actor='session_memory_writer',
                 trace_id=trace_id,
                 parent_trace_id=audit_context.get('parent_trace_id'),

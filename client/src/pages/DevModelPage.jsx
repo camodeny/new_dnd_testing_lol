@@ -78,7 +78,7 @@ export default function DevModelPage() {
       <div className="dev-model-header">
         <div>
           <h2>Dev Model</h2>
-          <p>Change the OpenRouter model used for new DM responses without restarting the server.</p>
+          <p>Change the configured model used for new DM responses without restarting the server.</p>
         </div>
         <div className={`dev-model-source dev-model-source-${settings?.source || 'env'}`}>
           {settings?.source === 'runtime' ? 'Runtime override' : 'Environment default'}
@@ -89,7 +89,7 @@ export default function DevModelPage() {
       {message && <div className="success-message">{message}</div>}
 
       <form className="dev-model-panel" onSubmit={handleSubmit}>
-        <label htmlFor="dev-model-input">OpenRouter model id</label>
+        <label htmlFor="dev-model-input">Model id</label>
         <div className="dev-model-control-row">
           <input
             id="dev-model-input"
@@ -108,6 +108,10 @@ export default function DevModelPage() {
 
         <div className="dev-model-meta">
           <div>
+            <span>Provider</span>
+            <strong>{settings?.provider || 'Not set'}</strong>
+          </div>
+          <div>
             <span>Current</span>
             <strong>{settings?.model || 'Not set'}</strong>
           </div>
@@ -118,6 +122,10 @@ export default function DevModelPage() {
           <div>
             <span>API key</span>
             <strong>{settings?.api_key_configured ? 'Configured' : 'Missing'}</strong>
+          </div>
+          <div>
+            <span>Thinking</span>
+            <strong>{settings?.thinking_enabled ? settings?.reasoning_effort || 'Enabled' : 'Disabled'}</strong>
           </div>
         </div>
 

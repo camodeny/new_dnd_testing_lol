@@ -8,6 +8,8 @@ import requests
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), '..')))
 
 from openrouter import (
+    _assistant_tool_message,
+    _provider_request_payload_options,
     _json_error_excerpt,
     _json_loads_with_error,
     _json_loads_with_repair,
@@ -94,7 +96,8 @@ class OpenRouterRetryTest(unittest.TestCase):
         }
 
         with patch('openrouter.OPENROUTER_API_KEY', 'test-key'), \
-                patch('openrouter.get_openrouter_model', return_value='test-model'), \
+                patch('openrouter.get_llm_provider', return_value='openrouter'), \
+                patch('openrouter.get_llm_model', return_value='test-model'), \
                 patch('openrouter.requests.post', side_effect=[
                     FakeResponse(404),
                     FakeResponse(200, success),
@@ -107,7 +110,8 @@ class OpenRouterRetryTest(unittest.TestCase):
 
     def test_post_chat_response_does_not_retry_permanent_400(self):
         with patch('openrouter.OPENROUTER_API_KEY', 'test-key'), \
-                patch('openrouter.get_openrouter_model', return_value='test-model'), \
+                patch('openrouter.get_llm_provider', return_value='openrouter'), \
+                patch('openrouter.get_llm_model', return_value='test-model'), \
                 patch('openrouter.requests.post', return_value=FakeResponse(400)) as post, \
                 patch('openrouter.time.sleep') as sleep:
             with self.assertRaises(requests.HTTPError):
@@ -115,6 +119,67 @@ class OpenRouterRetryTest(unittest.TestCase):
 
         self.assertEqual(post.call_count, 1)
         sleep.assert_not_called()
+
+
+class ProviderCompatibilityTest(unittest.TestCase):
+    def test_deepseek_thinking_mode_omits_unsupported_tool_controls(self):
+        with patch('openrouter.OPENCODE_GO_THINKING', 'enabled'), \
+                patch('openrouter.OPENCODE_GO_REASONING_EFFORT', 'max'):
+            options = _provider_request_payload_options(
+                'opencode_go',
+                'deepseek-v4-flash',
+                [{'type': 'function', 'function': {'name': 'get_clock'}}],
+                'auto',
+                False,
+            )
+
+        self.assertTrue(options['thinking_enabled'])
+        self.assertEqual(options['thinking'], {'type': 'enabled'})
+        self.assertEqual(options['reasoning_effort'], 'max')
+        self.assertIsNone(options['tool_choice'])
+        self.assertIsNone(options['parallel_tool_calls'])
+
+    def test_assistant_tool_message_preserves_deepseek_reasoning_content(self):
+        self.assertEqual(
+            _assistant_tool_message({
+                'content': None,
+                'reasoning_content': 'Check the clock before answering.',
+                'tool_calls': [{'id': 'call_1'}],
+            }),
+            {
+                'role': 'assistant',
+                'content': '',
+                'tool_calls': [{'id': 'call_1'}],
+                'reasoning_content': 'Check the clock before answering.',
+            },
+        )
+
+    def test_opencode_go_deepseek_thinking_request_uses_provider_specific_payload(self):
+        success = {
+            'choices': [{'message': {'content': 'ok'}}],
+        }
+
+        with patch('openrouter.OPENCODE_GO_API_KEY', 'go-key'), \
+                patch('openrouter.OPENCODE_GO_THINKING', 'enabled'), \
+                patch('openrouter.OPENCODE_GO_REASONING_EFFORT', 'high'), \
+                patch('openrouter.get_llm_provider', return_value='opencode_go'), \
+                patch('openrouter.get_llm_model', return_value='deepseek-v4-flash'), \
+                patch('openrouter.requests.post', return_value=FakeResponse(200, success)) as post:
+            result = _post_chat_response(
+                [{'role': 'user', 'content': 'hello'}],
+                tools=[{'type': 'function', 'function': {'name': 'get_clock'}}],
+                tool_choice='auto',
+                parallel_tool_calls=False,
+            )
+
+        self.assertEqual(result, success)
+        request = post.call_args
+        self.assertEqual(request.args[0], 'https://opencode.ai/zen/go/v1/chat/completions')
+        self.assertEqual(request.kwargs['headers']['Authorization'], 'Bearer go-key')
+        self.assertEqual(request.kwargs['json']['thinking'], {'type': 'enabled'})
+        self.assertEqual(request.kwargs['json']['reasoning_effort'], 'high')
+        self.assertNotIn('tool_choice', request.kwargs['json'])
+        self.assertNotIn('parallel_tool_calls', request.kwargs['json'])
 
 
 class SessionSpoilerCheckTest(unittest.TestCase):

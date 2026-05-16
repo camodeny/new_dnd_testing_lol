@@ -18,8 +18,9 @@ Set these repository or environment secrets:
 - `TS_OAUTH_CLIENT_ID`
 - `TS_OAUTH_SECRET`
 - `SECRET_KEY`
-- `OPENROUTER_API_KEY`
-- `OPENROUTER_MODEL`
+- Provider credentials for the selected provider:
+  - OpenRouter: `OPENROUTER_API_KEY`, `OPENROUTER_MODEL`
+  - OpenCode Go: `OPENCODE_GO_API_KEY`
 
 Optional secrets:
 
@@ -36,6 +37,30 @@ Optional variables:
 - `FRONTEND_ORIGINS`: defaults to `http://localhost:$APP_PORT`.
 - `PUBLIC_APP_BASE_URL`: defaults to `http://localhost:$APP_PORT`.
 - `JWT_EXPIRATION_HOURS`: defaults to `24`.
+- `LLM_PROVIDER`: `openrouter` or `opencode_go`; defaults to `openrouter`.
+- `OPENCODE_GO_MODEL`: required when `LLM_PROVIDER=opencode_go`.
+- `OPENCODE_GO_THINKING`: set to `enabled` to request DeepSeek V4 thinking mode through OpenCode Go; defaults to `disabled`.
+- `OPENCODE_GO_REASONING_EFFORT`: `high` or `max`; defaults to `high`.
+
+## Provider examples
+
+Use OpenRouter:
+
+```bash
+LLM_PROVIDER=openrouter
+OPENROUTER_API_KEY=...
+OPENROUTER_MODEL=deepseek/deepseek-v4-flash
+```
+
+Use OpenCode Go with DeepSeek V4 Flash thinking mode:
+
+```bash
+LLM_PROVIDER=opencode_go
+OPENCODE_GO_API_KEY=...
+OPENCODE_GO_MODEL=deepseek-v4-flash
+OPENCODE_GO_THINKING=enabled
+OPENCODE_GO_REASONING_EFFORT=high
+```
 
 ## Trigger
 
