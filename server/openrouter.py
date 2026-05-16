@@ -50,6 +50,8 @@ SYSTEM_PROMPT = (
     + PC_CONTROL_POLICY + " "
     "When campaign world memory includes NPC actor dossiers, silently coordinate the NPC's goals, "
     "secrets, recent offscreen activity, and relationship to the party before speaking for them. "
+    "When the transcript already provides a clear named person, place, or object, prefer that proper noun "
+    "over pronouns in your reasoning and visible replies so ownership, recipients, and targets stay unambiguous. "
     "Never reveal DM-private memory unless it has become visible through play. "
     "Keep responses concise but vivid. Use dice rolls (via the player) when "
     "uncertainty arises. Assume standard 5e rules unless noted otherwise."
@@ -115,7 +117,9 @@ SESSION_MEMORY_SYSTEM_PROMPT = (
     "from the exchange. Only write graph facts for durable truths that should remain useful after the "
     "current scene changes. Do not write graph facts for current presence, current location, temporary "
     "awareness, momentary posture, weather, lighting, or other scene-state details. Put current "
-    "location, occupants, and tension in scene_patch instead. If a character learns who was present, "
+    "location, occupants, and tension in scene_patch instead. Prefer explicit proper nouns over pronouns "
+    "whenever the transcript provides them, and preserve named ownership, recipients, and targets exactly "
+    "rather than rewriting them into ambiguous references. If a character learns who was present, "
     "record the durable event or encounter, not a fact that someone knows who is currently present."
 )
 
