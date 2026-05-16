@@ -92,10 +92,12 @@ class OpenRouterRetryTest(unittest.TestCase):
             'choices': [{'message': {'content': 'ok'}}],
         }
 
-        with patch('openrouter.requests.post', side_effect=[
-            FakeResponse(404),
-            FakeResponse(200, success),
-        ]) as post, patch('openrouter.time.sleep') as sleep:
+        with patch('openrouter.OPENROUTER_API_KEY', 'test-key'), \
+                patch('openrouter.get_openrouter_model', return_value='test-model'), \
+                patch('openrouter.requests.post', side_effect=[
+                    FakeResponse(404),
+                    FakeResponse(200, success),
+                ]) as post, patch('openrouter.time.sleep') as sleep:
             result = _post_chat_response([{'role': 'user', 'content': 'hello'}])
 
         self.assertEqual(result, success)
@@ -103,7 +105,10 @@ class OpenRouterRetryTest(unittest.TestCase):
         sleep.assert_called_once_with(1)
 
     def test_post_chat_response_does_not_retry_permanent_400(self):
-        with patch('openrouter.requests.post', return_value=FakeResponse(400)) as post, patch('openrouter.time.sleep') as sleep:
+        with patch('openrouter.OPENROUTER_API_KEY', 'test-key'), \
+                patch('openrouter.get_openrouter_model', return_value='test-model'), \
+                patch('openrouter.requests.post', return_value=FakeResponse(400)) as post, \
+                patch('openrouter.time.sleep') as sleep:
             with self.assertRaises(requests.HTTPError):
                 _post_chat_response([{'role': 'user', 'content': 'hello'}])
 
