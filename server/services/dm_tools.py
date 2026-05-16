@@ -133,6 +133,61 @@ def _private_output_terms(campaign):
     return sorted(terms, key=lambda value: value.lower())
 
 
+def _private_spoiler_items(campaign):
+    _world, graph, _world_state, dm_private = _world_json(campaign)
+    items = []
+    seen = set()
+
+    def add(item_id, kind, text):
+        clean = clean_text(text, 700)
+        if not clean:
+            return
+        dedupe_key = clean.lower()
+        if dedupe_key in seen:
+            return
+        seen.add(dedupe_key)
+        items.append({
+            'id': clean_id(item_id, f'private_item_{len(items) + 1}'),
+            'kind': kind,
+            'text': clean,
+        })
+
+    for entity in graph.get('entities', []) if isinstance(graph, dict) else []:
+        if entity.get('visibility') == 'dm_private':
+            add(entity.get('id'), 'entity', ' - '.join(
+                part for part in [entity.get('name'), entity.get('summary')] if part
+            ))
+    for relation in graph.get('relations', []) if isinstance(graph, dict) else []:
+        if relation.get('visibility') == 'dm_private':
+            add(relation.get('id'), 'relation', relation.get('summary'))
+    for fact in graph.get('facts', []) if isinstance(graph, dict) else []:
+        if fact.get('visibility') == 'dm_private':
+            add(fact.get('id'), 'fact', fact.get('text'))
+
+    for clock in CampaignClock.query.filter_by(campaign_id=campaign.id).all():
+        if (clock.visibility or 'dm_private') == 'dm_private':
+            add(
+                f'clock_{clock.clock_id}',
+                'clock',
+                ' - '.join(part for part in [clock.name, clock.summary, clock.trigger, clock.on_complete] if part),
+            )
+
+    for npc in NPCActor.query.filter_by(campaign_id=campaign.id).all():
+        dossier = json_loads(npc.dossier, {})
+        for index, secret in enumerate(dossier.get('secrets', []) if isinstance(dossier, dict) else []):
+            add(f'npc_secret_{npc.actor_id}_{index + 1}', 'npc_secret', secret)
+
+    if isinstance(dm_private, dict):
+        for key in ('true_inciting_incident', 'villain_plan'):
+            add(f'dm_private_{key}', key, dm_private.get(key))
+        for index, value in enumerate(dm_private.get('hidden_factions', []) if isinstance(dm_private.get('hidden_factions'), list) else []):
+            add(f'dm_private_hidden_faction_{index + 1}', 'hidden_faction', value)
+        for index, value in enumerate(dm_private.get('npc_secrets', []) if isinstance(dm_private.get('npc_secrets'), list) else []):
+            add(f'dm_private_npc_secret_{index + 1}', 'npc_secret', value)
+
+    return items
+
+
 def build_session_hot_context(campaign, session, current_user):
     character = _current_character(campaign, current_user)
     world, _graph, world_state, _private = _world_json(campaign)
@@ -184,6 +239,7 @@ def build_session_hot_context(campaign, session, current_user):
         'current_scene': current_scene,
         'active_clocks': [clock.to_dict(include_private=True) for clock in active_clocks],
         'private_output_terms': _private_output_terms(campaign),
+        'private_spoiler_items': _private_spoiler_items(campaign),
         'recent_messages': [message.to_dict() for message in recent_messages],
         'tool_policy': (
             'Use tools for character-sheet facts, campaign memory, NPC dossiers, clocks, and durable state writes. '

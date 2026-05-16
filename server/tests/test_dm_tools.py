@@ -21,8 +21,12 @@ from models import (
     SessionMessage,
     User,
 )
-from openrouter import _pc_control_violation, normalize_session_dm_turn_decision
-from openrouter import _private_output_violation
+from openrouter import (
+    _pc_control_violation,
+    _private_output_violation,
+    get_session_dm_response_with_tools,
+    normalize_session_dm_turn_decision,
+)
 from routes.dev import _agent_runs_from_stream, _audit_stream_entry, _chat_flow_payload
 from routes.sessions import sessions_bp
 from services.audit_service import log_audit_event
@@ -119,6 +123,7 @@ class DmToolsTest(unittest.TestCase):
         self.assertEqual(hot_context['current_player_character']['name'], 'Aria')
         self.assertEqual(hot_context['protected_player_characters'][0]['name'], 'Aria')
         self.assertIn('Crimson Veil', hot_context['private_output_terms'])
+        self.assertEqual(hot_context['private_spoiler_items'][0]['text'], 'Crimson Veil')
 
     def test_pc_control_guard_detects_pc_dialogue_and_action(self):
         hot_context = {
@@ -160,6 +165,65 @@ class DmToolsTest(unittest.TestCase):
         self.assertIsNone(
             _private_output_violation('A hidden scheme moves another step ahead.', hot_context),
         )
+
+    def test_spoiler_checker_allows_safe_reply(self):
+        hot_context = {
+            'protected_player_characters': [],
+            'private_output_terms': [],
+            'private_spoiler_items': [{'id': 'fact_trap', 'kind': 'fact', 'text': 'The note is a trap.'}],
+        }
+
+        with patch('openrouter._post_chat_response', return_value={
+            'choices': [{'message': {'content': '{"mode":"speak","content":"Jara watches the door."}'}}],
+        }), patch('openrouter.check_session_spoilers_with_llm', return_value={
+            'safe': True,
+            'leaked_item_ids': [],
+            'evidence': [],
+            'reason': '',
+        }) as checker:
+            result = get_session_dm_response_with_tools(hot_context, [], [], lambda *_args, **_kwargs: {}, max_tool_rounds=0)
+
+        self.assertEqual(result, {'mode': 'speak', 'content': 'Jara watches the door.'})
+        checker.assert_called_once()
+
+    def test_spoiler_checker_rewrites_semantic_leak(self):
+        hot_context = {
+            'protected_player_characters': [],
+            'private_output_terms': [],
+            'private_spoiler_items': [{'id': 'fact_trap', 'kind': 'fact', 'text': 'The note is a trap.'}],
+        }
+
+        with patch('openrouter._post_chat_response', side_effect=[
+            {'choices': [{'message': {'content': '{"mode":"speak","content":"The trap closes around you."}'}}]},
+            {'choices': [{'message': {'content': '{"mode":"speak","content":"The air feels tense as you leave."}'}}]},
+        ]), patch('openrouter.check_session_spoilers_with_llm', side_effect=[
+            {'safe': False, 'leaked_item_ids': ['fact_trap'], 'evidence': ['The trap closes'], 'reason': 'Directly implies the hidden truth.'},
+            {'safe': True, 'leaked_item_ids': [], 'evidence': [], 'reason': ''},
+        ]):
+            result = get_session_dm_response_with_tools(hot_context, [], [], lambda *_args, **_kwargs: {}, max_tool_rounds=0)
+
+        self.assertEqual(result, {'mode': 'speak', 'content': 'The air feels tense as you leave.'})
+
+    def test_spoiler_checker_blocks_repeated_semantic_leak(self):
+        hot_context = {
+            'protected_player_characters': [],
+            'private_output_terms': [],
+            'private_spoiler_items': [{'id': 'fact_trap', 'kind': 'fact', 'text': 'The note is a trap.'}],
+        }
+
+        with patch('openrouter._post_chat_response', side_effect=[
+            {'choices': [{'message': {'content': '{"mode":"speak","content":"The trap closes around you."}'}}]},
+            {'choices': [{'message': {'content': '{"mode":"speak","content":"A hidden trap closes around you."}'}}]},
+        ]), patch('openrouter.check_session_spoilers_with_llm', side_effect=[
+            {'safe': False, 'leaked_item_ids': ['fact_trap'], 'evidence': ['The trap closes'], 'reason': 'Directly implies the hidden truth.'},
+            {'safe': False, 'leaked_item_ids': ['fact_trap'], 'evidence': ['hidden trap'], 'reason': 'Still implies the hidden truth.'},
+        ]):
+            result = get_session_dm_response_with_tools(hot_context, [], [], lambda *_args, **_kwargs: {}, max_tool_rounds=0)
+
+        self.assertEqual(result, {
+            'mode': 'silent',
+            'reason': 'The DM response would have semantically exposed DM-private information.',
+        })
 
     def test_session_dm_turn_decision_normalizes_silence_contract(self):
         self.assertEqual(

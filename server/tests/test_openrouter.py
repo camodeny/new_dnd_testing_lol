@@ -13,6 +13,7 @@ from openrouter import (
     _json_loads_with_repair,
     _post_chat_response,
     get_world_genesis_package,
+    normalize_session_spoiler_check,
 )
 
 
@@ -114,6 +115,24 @@ class OpenRouterRetryTest(unittest.TestCase):
 
         self.assertEqual(post.call_count, 1)
         sleep.assert_not_called()
+
+
+class SessionSpoilerCheckTest(unittest.TestCase):
+    def test_normalize_session_spoiler_check_marks_leaked_ids_unsafe(self):
+        self.assertEqual(
+            normalize_session_spoiler_check({
+                'safe': True,
+                'leaked_item_ids': ['fact_trap'],
+                'evidence': ['trap'],
+                'reason': 'Leaked hidden truth.',
+            }),
+            {
+                'safe': False,
+                'leaked_item_ids': ['fact_trap'],
+                'evidence': ['trap'],
+                'reason': 'Leaked hidden truth.',
+            },
+        )
 
 
 if __name__ == '__main__':

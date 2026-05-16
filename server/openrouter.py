@@ -119,6 +119,14 @@ SESSION_MEMORY_SYSTEM_PROMPT = (
     "record the durable event or encounter, not a fact that someone knows who is currently present."
 )
 
+SESSION_SPOILER_CHECK_SYSTEM_PROMPT = (
+    "You are a spoiler-safety checker for visible Dungeon Master replies. "
+    "Return only valid JSON. Decide whether the candidate visible DM reply directly reveals or strongly implies "
+    "any unrevealed private item. A reply is unsafe when a reasonable player could learn the hidden truth from "
+    "the reply itself. Ordinary foreshadowing, mood, uncertainty, and clues that do not effectively answer the "
+    "hidden truth are safe. Do not mark a reply unsafe merely because it is thematically related to a private item."
+)
+
 JSON_REPAIR_SYSTEM_PROMPT = (
     "You repair malformed JSON. Return only valid JSON with the same intended data and structure as "
     "the original. Make the smallest changes needed to fix syntax errors. Do not add commentary, "
@@ -541,6 +549,95 @@ def _private_output_violation(response_text, hot_context):
     return None
 
 
+def normalize_session_spoiler_check(raw_check):
+    data = raw_check if isinstance(raw_check, dict) else _json_loads_or_empty(raw_check)
+    if not isinstance(data, dict) or not data:
+        return {
+            'safe': True,
+            'leaked_item_ids': [],
+            'evidence': [],
+            'reason': 'Checker returned no usable decision.',
+        }
+
+    leaked_item_ids = data.get('leaked_item_ids')
+    if not isinstance(leaked_item_ids, list):
+        leaked_item_ids = []
+    leaked_item_ids = [str(item).strip() for item in leaked_item_ids if str(item).strip()]
+
+    evidence = data.get('evidence')
+    if not isinstance(evidence, list):
+        evidence = []
+    evidence = [str(item).strip() for item in evidence if str(item).strip()]
+
+    safe = bool(data.get('safe')) and not leaked_item_ids
+    return {
+        'safe': safe,
+        'leaked_item_ids': leaked_item_ids,
+        'evidence': evidence,
+        'reason': str(data.get('reason') or '').strip(),
+    }
+
+
+def build_session_spoiler_check_messages(response_text, hot_context):
+    return [
+        {'role': 'system', 'content': SESSION_SPOILER_CHECK_SYSTEM_PROMPT},
+        {
+            'role': 'user',
+            'content': json.dumps({
+                'candidate_visible_dm_reply': response_text,
+                'unrevealed_private_items': hot_context.get('private_spoiler_items') or [],
+                'return_shape': {
+                    'safe': 'boolean',
+                    'leaked_item_ids': ['ids of unrevealed private items leaked or strongly implied'],
+                    'evidence': ['short exact snippets from the candidate reply that caused the decision'],
+                    'reason': 'one short explanation',
+                },
+            }, ensure_ascii=False),
+        },
+    ]
+
+
+def check_session_spoilers_with_llm(response_text, hot_context, audit_context=None):
+    if not (response_text or '').strip() or not hot_context.get('private_spoiler_items'):
+        return {'safe': True, 'leaked_item_ids': [], 'evidence': [], 'reason': ''}
+
+    base_audit = audit_context or {}
+    checker_audit = {
+        **base_audit,
+        'operation': 'session_spoiler_check',
+        'actor': 'session_spoiler_checker',
+        'parent_trace_id': base_audit.get('trace_id'),
+    }
+    try:
+        raw_check = _post_chat(
+            build_session_spoiler_check_messages(response_text, hot_context),
+            json_mode=True,
+            audit_context=checker_audit,
+        )
+        return normalize_session_spoiler_check(raw_check)
+    except Exception as err:
+        campaign_id = base_audit.get('campaign_id')
+        if campaign_id:
+            log_audit_event(
+                campaign_id,
+                'spoiler_checker_error',
+                'Session spoiler checker failed open.',
+                {'error': repr(err)},
+                source='session_dm.guard',
+                actor='server',
+                trace_id=base_audit.get('trace_id'),
+                trace_label=base_audit.get('trace_label'),
+                audit_role='guard',
+                commit=True,
+            )
+        return {
+            'safe': True,
+            'leaked_item_ids': [],
+            'evidence': [],
+            'reason': 'Checker failed open.',
+        }
+
+
 def build_opening_scene_messages(context, world_context):
     return [
         {'role': 'system', 'content': SYSTEM_PROMPT},
@@ -814,6 +911,7 @@ def get_session_dm_response_with_tools(
     tool_round = 0
     pc_control_retried = False
     private_output_retried = False
+    spoiler_checker_retried = False
     while True:
         loop_audit = {
             **base_audit,
@@ -842,6 +940,11 @@ def get_session_dm_response_with_tools(
                 _private_output_violation(content, hot_context)
                 if decision.get('mode') == 'speak'
                 else None
+            )
+            spoiler_check = (
+                check_session_spoilers_with_llm(content, hot_context, loop_audit)
+                if decision.get('mode') == 'speak' and not private_violation
+                else {'safe': True, 'leaked_item_ids': [], 'evidence': [], 'reason': ''}
             )
             if violation and not pc_control_retried:
                 if base_audit.get('campaign_id'):
@@ -904,6 +1007,36 @@ def get_session_dm_response_with_tools(
                 private_output_retried = True
                 tool_round = max_tool_rounds
                 continue
+            if not spoiler_check.get('safe', True) and not spoiler_checker_retried:
+                if base_audit.get('campaign_id'):
+                    log_audit_event(
+                        base_audit.get('campaign_id'),
+                        'spoiler_checker_guard_retry',
+                        'Session spoiler checker flagged a semantic leak; requesting rewrite.',
+                        {
+                            'checker_result': spoiler_check,
+                            'draft_response': raw_content,
+                        },
+                        source='session_dm.guard',
+                        actor='server',
+                        trace_id=trace_id,
+                        trace_label=trace_label,
+                        audit_role='guard',
+                        commit=True,
+                    )
+                messages.append({'role': 'assistant', 'content': raw_content})
+                messages.append({
+                    'role': 'user',
+                    'content': (
+                        'Rewrite the previous response. A spoiler-safety checker determined it directly revealed '
+                        'or strongly implied unrevealed DM-private information. Keep only what the players could '
+                        'currently observe or reasonably know in-world. Return the same JSON contract with '
+                        'mode="speak" and spoiler-safe visible content.'
+                    ),
+                })
+                spoiler_checker_retried = True
+                tool_round = max_tool_rounds
+                continue
             if violation:
                 if base_audit.get('campaign_id'):
                     log_audit_event(
@@ -945,6 +1078,27 @@ def get_session_dm_response_with_tools(
                 return {
                     'mode': 'silent',
                     'reason': 'The DM response would have exposed DM-private information.',
+                }
+            if not spoiler_check.get('safe', True):
+                if base_audit.get('campaign_id'):
+                    log_audit_event(
+                        base_audit.get('campaign_id'),
+                        'spoiler_checker_guard_blocked',
+                        'Session spoiler checker still flagged a semantic leak after retry.',
+                        {
+                            'checker_result': spoiler_check,
+                            'draft_response': raw_content,
+                        },
+                        source='session_dm.guard',
+                        actor='server',
+                        trace_id=trace_id,
+                        trace_label=trace_label,
+                        audit_role='guard',
+                        commit=True,
+                    )
+                return {
+                    'mode': 'silent',
+                    'reason': 'The DM response would have semantically exposed DM-private information.',
                 }
             return decision
 
