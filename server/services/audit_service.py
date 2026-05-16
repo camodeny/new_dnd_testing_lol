@@ -5,6 +5,7 @@ from models import CampaignAuditEvent, db
 AGENT_ACTORS = {
     'planning_dm',
     'session_dm',
+    'session_dm_guard',
     'world_architect',
     'character_draft_agent',
     'planning_memory_writer',

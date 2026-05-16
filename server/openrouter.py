@@ -713,17 +713,29 @@ def build_session_spoiler_check_messages(response_text, hot_context):
     ]
 
 
+def _child_audit_context(base_audit, operation, actor, trace_label):
+    parent_trace_id = base_audit.get('trace_id')
+    return {
+        **base_audit,
+        'operation': operation,
+        'actor': actor,
+        'trace_id': f'{parent_trace_id or actor}:{operation}:{uuid4().hex[:10]}',
+        'parent_trace_id': parent_trace_id,
+        'trace_label': trace_label,
+    }
+
+
 def check_session_spoilers_with_llm(response_text, hot_context, audit_context=None):
     if not (response_text or '').strip() or not hot_context.get('private_spoiler_items'):
         return {'safe': True, 'leaked_item_ids': [], 'evidence': [], 'reason': ''}
 
     base_audit = audit_context or {}
-    checker_audit = {
-        **base_audit,
-        'operation': 'session_spoiler_check',
-        'actor': 'session_spoiler_checker',
-        'parent_trace_id': base_audit.get('trace_id'),
-    }
+    checker_audit = _child_audit_context(
+        base_audit,
+        'session_spoiler_check',
+        'session_spoiler_checker',
+        'session_spoiler_checker: spoiler check',
+    )
     try:
         raw_check = _post_chat(
             build_session_spoiler_check_messages(response_text, hot_context),
@@ -1032,6 +1044,18 @@ def get_session_dm_response_with_tools(
     pc_control_retried = False
     private_output_retried = False
     spoiler_checker_retried = False
+    guard_audits = {}
+
+    def guard_audit(guard_name):
+        if guard_name not in guard_audits:
+            guard_audits[guard_name] = _child_audit_context(
+                base_audit,
+                guard_name,
+                'session_dm_guard',
+                f'session_dm_guard: {guard_name}',
+            )
+        return guard_audits[guard_name]
+
     while True:
         loop_audit = {
             **base_audit,
@@ -1068,18 +1092,21 @@ def get_session_dm_response_with_tools(
             )
             if violation and not pc_control_retried:
                 if base_audit.get('campaign_id'):
+                    audit = guard_audit('pc_control_guard')
                     log_audit_event(
                         base_audit.get('campaign_id'),
                         'pc_control_guard_retry',
                         'Session DM response controlled a protected player character; requesting rewrite.',
                         {
+                            'operation': 'pc_control_guard',
                             'violation': violation,
                             'draft_response': raw_content,
                         },
                         source='session_dm.guard',
-                        actor='server',
-                        trace_id=trace_id,
-                        trace_label=trace_label,
+                        actor=audit.get('actor'),
+                        trace_id=audit.get('trace_id'),
+                        parent_trace_id=audit.get('parent_trace_id'),
+                        trace_label=audit.get('trace_label'),
                         audit_role='guard',
                         commit=True,
                     )
@@ -1095,22 +1122,24 @@ def get_session_dm_response_with_tools(
                     ),
                 })
                 pc_control_retried = True
-                tool_round = max_tool_rounds
                 continue
             if private_violation and not private_output_retried:
                 if base_audit.get('campaign_id'):
+                    audit = guard_audit('private_output_guard')
                     log_audit_event(
                         base_audit.get('campaign_id'),
                         'private_output_guard_retry',
                         'Session DM response exposed DM-private output terms; requesting rewrite.',
                         {
+                            'operation': 'private_output_guard',
                             'violation': private_violation,
                             'draft_response': raw_content,
                         },
                         source='session_dm.guard',
-                        actor='server',
-                        trace_id=trace_id,
-                        trace_label=trace_label,
+                        actor=audit.get('actor'),
+                        trace_id=audit.get('trace_id'),
+                        parent_trace_id=audit.get('parent_trace_id'),
+                        trace_label=audit.get('trace_label'),
                         audit_role='guard',
                         commit=True,
                     )
@@ -1125,22 +1154,24 @@ def get_session_dm_response_with_tools(
                     ),
                 })
                 private_output_retried = True
-                tool_round = max_tool_rounds
                 continue
             if not spoiler_check.get('safe', True) and not spoiler_checker_retried:
                 if base_audit.get('campaign_id'):
+                    audit = guard_audit('spoiler_checker_guard')
                     log_audit_event(
                         base_audit.get('campaign_id'),
                         'spoiler_checker_guard_retry',
                         'Session spoiler checker flagged a semantic leak; requesting rewrite.',
                         {
+                            'operation': 'spoiler_checker_guard',
                             'checker_result': spoiler_check,
                             'draft_response': raw_content,
                         },
                         source='session_dm.guard',
-                        actor='server',
-                        trace_id=trace_id,
-                        trace_label=trace_label,
+                        actor=audit.get('actor'),
+                        trace_id=audit.get('trace_id'),
+                        parent_trace_id=audit.get('parent_trace_id'),
+                        trace_label=audit.get('trace_label'),
                         audit_role='guard',
                         commit=True,
                     )
@@ -1155,22 +1186,24 @@ def get_session_dm_response_with_tools(
                     ),
                 })
                 spoiler_checker_retried = True
-                tool_round = max_tool_rounds
                 continue
             if violation:
                 if base_audit.get('campaign_id'):
+                    audit = guard_audit('pc_control_guard')
                     log_audit_event(
                         base_audit.get('campaign_id'),
                         'pc_control_guard_blocked',
                         'Session DM response still controlled a protected player character after retry.',
                         {
+                            'operation': 'pc_control_guard',
                             'violation': violation,
                             'draft_response': raw_content,
                         },
                         source='session_dm.guard',
-                        actor='server',
-                        trace_id=trace_id,
-                        trace_label=trace_label,
+                        actor=audit.get('actor'),
+                        trace_id=audit.get('trace_id'),
+                        parent_trace_id=audit.get('parent_trace_id'),
+                        trace_label=audit.get('trace_label'),
                         audit_role='guard',
                         commit=True,
                     )
@@ -1180,18 +1213,21 @@ def get_session_dm_response_with_tools(
                 }
             if private_violation:
                 if base_audit.get('campaign_id'):
+                    audit = guard_audit('private_output_guard')
                     log_audit_event(
                         base_audit.get('campaign_id'),
                         'private_output_guard_blocked',
                         'Session DM response still exposed DM-private output terms after retry.',
                         {
+                            'operation': 'private_output_guard',
                             'violation': private_violation,
                             'draft_response': raw_content,
                         },
                         source='session_dm.guard',
-                        actor='server',
-                        trace_id=trace_id,
-                        trace_label=trace_label,
+                        actor=audit.get('actor'),
+                        trace_id=audit.get('trace_id'),
+                        parent_trace_id=audit.get('parent_trace_id'),
+                        trace_label=audit.get('trace_label'),
                         audit_role='guard',
                         commit=True,
                     )
@@ -1201,18 +1237,21 @@ def get_session_dm_response_with_tools(
                 }
             if not spoiler_check.get('safe', True):
                 if base_audit.get('campaign_id'):
+                    audit = guard_audit('spoiler_checker_guard')
                     log_audit_event(
                         base_audit.get('campaign_id'),
                         'spoiler_checker_guard_blocked',
                         'Session spoiler checker still flagged a semantic leak after retry.',
                         {
+                            'operation': 'spoiler_checker_guard',
                             'checker_result': spoiler_check,
                             'draft_response': raw_content,
                         },
                         source='session_dm.guard',
-                        actor='server',
-                        trace_id=trace_id,
-                        trace_label=trace_label,
+                        actor=audit.get('actor'),
+                        trace_id=audit.get('trace_id'),
+                        parent_trace_id=audit.get('parent_trace_id'),
+                        trace_label=audit.get('trace_label'),
                         audit_role='guard',
                         commit=True,
                     )

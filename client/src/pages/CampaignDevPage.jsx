@@ -125,14 +125,18 @@ function mainThreadSteps(branches, filters, { includeSetup = false } = {}) {
 
 function sideBranchesForMessage(message, previousMessage) {
   const ownBranches = (message.branches || []).filter((branch) => !isSessionDmBranch(branch))
-  if (message.role !== 'dm' || !previousMessage) return ownBranches
+  const ownSessionChildren = (message.branches || [])
+    .filter(isSessionDmBranch)
+    .flatMap((branch) => branch.children || [])
+    .filter((branch) => !isMemoryBranch(branch))
+  if (message.role !== 'dm' || !previousMessage) return [...ownBranches, ...ownSessionChildren]
 
   const priorDmChildren = (previousMessage.branches || [])
     .filter(isSessionDmBranch)
     .flatMap((branch) => branch.children || [])
     .filter(isMemoryBranch)
 
-  return [...ownBranches, ...priorDmChildren]
+  return [...ownBranches, ...ownSessionChildren, ...priorDmChildren]
 }
 
 function laneVisible(lane, filters) {

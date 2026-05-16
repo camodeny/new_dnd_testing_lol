@@ -204,6 +204,78 @@ class DmToolsTest(unittest.TestCase):
 
         self.assertEqual(result, {'mode': 'speak', 'content': 'The air feels tense as you leave.'})
 
+    def test_private_output_guard_retry_uses_child_trace(self):
+        hot_context = {
+            'protected_player_characters': [],
+            'private_output_terms': ['Crimson Veil'],
+            'private_spoiler_items': [],
+        }
+        trace_id = 'session_dm:session_2:message_15'
+
+        with patch('openrouter._post_chat_response', side_effect=[
+            {'choices': [{'message': {'content': '{"mode":"speak","content":"The Crimson Veil watches you."}'}}]},
+            {'choices': [{'message': {'content': '{"mode":"speak","content":"Someone watches from the dark."}'}}]},
+        ]):
+            result = get_session_dm_response_with_tools(
+                hot_context,
+                [],
+                [],
+                lambda *_args, **_kwargs: {},
+                audit_context={
+                    'campaign_id': self.campaign.id,
+                    'trace_id': trace_id,
+                    'trace_label': 'session_dm: session 2',
+                },
+                max_tool_rounds=0,
+            )
+
+        self.assertEqual(result, {'mode': 'speak', 'content': 'Someone watches from the dark.'})
+        retry_event = CampaignAuditEvent.query.filter_by(event_type='private_output_guard_retry').one()
+        self.assertEqual(retry_event.actor, 'session_dm_guard')
+        self.assertEqual(retry_event.parent_trace_id, trace_id)
+        self.assertNotEqual(retry_event.trace_id, trace_id)
+        self.assertIn(':private_output_guard:', retry_event.trace_id)
+
+    def test_private_output_guard_retry_can_finish_after_tool_call(self):
+        hot_context = {
+            'protected_player_characters': [],
+            'private_output_terms': ['Fiendish Patron'],
+            'private_spoiler_items': [],
+        }
+        executed = []
+
+        def execute_tool(name, args, _audit):
+            executed.append((name, args))
+            return {'matches': [{'text': 'The symbol appears infernal.'}]}
+
+        with patch('openrouter._post_chat_response', side_effect=[
+            {'choices': [{'message': {'content': '{"mode":"speak","content":"Your Fiendish Patron stirs."}'}}]},
+            {'choices': [{'message': {
+                'content': '',
+                'tool_calls': [{
+                    'id': 'call_retry_search',
+                    'function': {
+                        'name': 'search_campaign_memory',
+                        'arguments': '{"query":"burned symbol infernal"}',
+                    },
+                }],
+            }}]},
+            {'choices': [{'message': {'content': '{"mode":"speak","content":"The symbol appears infernal, but you do not know who left it."}'}}]},
+        ]):
+            result = get_session_dm_response_with_tools(
+                hot_context,
+                [],
+                [],
+                execute_tool,
+                max_tool_rounds=1,
+            )
+
+        self.assertEqual(
+            result,
+            {'mode': 'speak', 'content': 'The symbol appears infernal, but you do not know who left it.'},
+        )
+        self.assertEqual(executed, [('search_campaign_memory', {'query': 'burned symbol infernal'})])
+
     def test_spoiler_checker_blocks_repeated_semantic_leak(self):
         hot_context = {
             'protected_player_characters': [],
@@ -403,6 +475,7 @@ class DmToolsTest(unittest.TestCase):
         db.session.commit()
 
         session_trace_id = f'session_dm:session_{self.session.id}:message_{session_player.id}'
+        guard_trace_id = f'{session_trace_id}:private_output_guard:abc123'
         memory_trace_id = f'session_memory_writer:session_{self.session.id}:message_{session_player.id}'
         log_audit_event(
             self.campaign.id,
@@ -461,6 +534,22 @@ class DmToolsTest(unittest.TestCase):
         )
         log_audit_event(
             self.campaign.id,
+            'private_output_guard_retry',
+            'Session DM response exposed DM-private output terms; requesting rewrite.',
+            {
+                'operation': 'private_output_guard',
+                'violation': {'matched_terms': ['Crimson Veil']},
+                'draft_response': 'The Crimson Veil waits nearby.',
+            },
+            actor='session_dm_guard',
+            trace_id=guard_trace_id,
+            parent_trace_id=session_trace_id,
+            trace_label='session_dm_guard: private_output_guard',
+            audit_role='guard',
+            commit=False,
+        )
+        log_audit_event(
+            self.campaign.id,
             'memory_writer_request',
             'Requested post-turn session memory update.',
             {'messages': [{'role': 'user', 'content': 'memory input'}]},
@@ -499,7 +588,10 @@ class DmToolsTest(unittest.TestCase):
         self.assertEqual(session_message['branches'][0]['trace_id'], session_trace_id)
         self.assertEqual(session_message['branches'][0]['provider'], 'opencode_go')
         self.assertEqual(session_message['branches'][0]['model'], 'deepseek-v4-flash')
-        self.assertEqual(session_message['branches'][0]['children'][0]['trace_id'], memory_trace_id)
+        self.assertEqual(
+            [child['trace_id'] for child in session_message['branches'][0]['children']],
+            [guard_trace_id, memory_trace_id],
+        )
         branch_steps = session_message['branches'][0]['steps']
         self.assertEqual([step['kind'] for step in branch_steps], ['prompt_message', 'model_request', 'model_response', 'tool_call', 'tool_result'])
         self.assertEqual([step['category'] for step in branch_steps], ['agents', 'agents', 'agents', 'tools', 'tools'])
