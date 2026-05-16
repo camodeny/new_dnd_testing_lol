@@ -410,6 +410,8 @@ class DmToolsTest(unittest.TestCase):
             'session_dm request: session_dm_response',
             {
                 'operation': 'session_dm_response',
+                'provider': 'opencode_go',
+                'model': 'deepseek-v4-flash',
                 'messages': [
                     {'role': 'system', 'content': 'You are the test DM.'},
                     {'role': 'user', 'content': '<ooc>What do I see?</ooc>'},
@@ -427,6 +429,8 @@ class DmToolsTest(unittest.TestCase):
             'session_dm response: session_dm_response',
             {
                 'operation': 'session_dm_response',
+                'provider': 'opencode_go',
+                'model': 'deepseek-v4-flash',
                 'content': 'You see lanterns swinging in the mist.',
                 'raw_response': {'choices': [{'message': {'content': 'You see lanterns swinging in the mist.'}}]},
             },
@@ -493,6 +497,8 @@ class DmToolsTest(unittest.TestCase):
         session_lane = next(lane for lane in flow['lanes'] if lane['id'] == f'session-{self.session.id}')
         session_message = next(message for message in session_lane['messages'] if message['id'] == session_player.id)
         self.assertEqual(session_message['branches'][0]['trace_id'], session_trace_id)
+        self.assertEqual(session_message['branches'][0]['provider'], 'opencode_go')
+        self.assertEqual(session_message['branches'][0]['model'], 'deepseek-v4-flash')
         self.assertEqual(session_message['branches'][0]['children'][0]['trace_id'], memory_trace_id)
         branch_steps = session_message['branches'][0]['steps']
         self.assertEqual([step['kind'] for step in branch_steps], ['prompt_message', 'model_request', 'model_response', 'tool_call', 'tool_result'])
@@ -500,6 +506,8 @@ class DmToolsTest(unittest.TestCase):
         self.assertEqual(branch_steps[0]['prompt_role'], 'system')
         self.assertEqual(branch_steps[0]['content'], 'You are the test DM.')
         self.assertEqual([message['role'] for message in branch_steps[1]['messages']], ['system', 'user'])
+        self.assertEqual(branch_steps[1]['provider'], 'opencode_go')
+        self.assertEqual(branch_steps[1]['model'], 'deepseek-v4-flash')
         self.assertEqual(branch_steps[3]['title'], 'get_current_scene')
         self.assertEqual(branch_steps[4]['result']['current_scene']['location_name'], 'Dock Ward')
         self.assertEqual(flow['unlinked_branches'][0]['summary'], 'Unlinked write.')

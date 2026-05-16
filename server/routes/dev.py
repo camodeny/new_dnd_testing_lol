@@ -151,6 +151,10 @@ def _audit_stream_entry(event):
     raw_response = payload.get('raw_response') if isinstance(payload, dict) else {}
     first_message = _first_choice_message(raw_response)
     tool_calls = payload.get('tool_calls') or first_message.get('tool_calls') or []
+    provider = payload.get('provider') or event_data.get('source')
+    model = payload.get('model')
+    if not model and isinstance(raw_response, dict):
+        model = raw_response.get('model')
 
     label = event_data.get('actor') or role
     if role == 'tools':
@@ -165,6 +169,8 @@ def _audit_stream_entry(event):
         'source': event_data.get('source'),
         'actor': event_data.get('actor'),
         'summary': event_data.get('summary'),
+        'provider': provider,
+        'model': model,
         'content': payload.get('content') if isinstance(payload, dict) else None,
         'payload': payload,
         'messages': messages,
@@ -404,6 +410,8 @@ def _reasoning_step(event):
         'title': 'Model reasoning',
         'summary': 'returned by provider',
         'actor': event.get('actor'),
+        'provider': event.get('provider'),
+        'model': event.get('model'),
         'created_at': event.get('created_at'),
         'content': content,
         'usage': reasoning.get('usage') or {},
@@ -428,6 +436,8 @@ def _model_tool_request_step(event):
         'title': 'Model tool request',
         'summary': ', '.join(names) if names else f"{len(tool_calls)} tool request{'s' if len(tool_calls) != 1 else ''}",
         'actor': event.get('actor'),
+        'provider': event.get('provider'),
+        'model': event.get('model'),
         'created_at': event.get('created_at'),
         'tool_calls': tool_calls,
     }
@@ -628,6 +638,8 @@ def _branch_steps(events):
             'title': _event_step_title(event),
             'summary': _event_step_summary(event),
             'actor': event.get('actor'),
+            'provider': event.get('provider'),
+            'model': event.get('model'),
             'created_at': event.get('created_at'),
             'content': _event_step_content(event),
             'messages': event.get('messages') or [],
@@ -691,16 +703,29 @@ def _branch_reasoning(events):
     return None
 
 
+def _branch_model_metadata(events):
+    for event in events:
+        if event.get('model') or event.get('provider'):
+            return {
+                'provider': event.get('provider'),
+                'model': event.get('model'),
+            }
+    return {'provider': None, 'model': None}
+
+
 def _branch_from_run(run):
     events = run.get('events') or []
     first_event = events[0] if events else {}
     trace_id = run.get('trace_id')
+    model_metadata = _branch_model_metadata(events)
     return {
         'id': trace_id or f'audit-run-{first_event.get("id")}',
         'trace_id': trace_id,
         'parent_trace_id': run.get('parent_trace_id'),
         'trace_label': run.get('trace_label') or trace_id,
         'actor': run.get('actor') or first_event.get('actor'),
+        'provider': model_metadata.get('provider'),
+        'model': model_metadata.get('model'),
         'operation': _branch_operation(events),
         'role': first_event.get('role') or 'tools',
         'summary': first_event.get('summary') or run.get('trace_label') or trace_id,
@@ -725,6 +750,8 @@ def _branch_from_event(event):
         'parent_trace_id': event.get('parent_trace_id'),
         'trace_label': event.get('trace_label') or event.get('label'),
         'actor': event.get('actor'),
+        'provider': event.get('provider'),
+        'model': event.get('model'),
         'operation': (event.get('payload') or {}).get('operation'),
         'role': event.get('role') or 'tools',
         'summary': event.get('summary'),

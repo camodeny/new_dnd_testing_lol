@@ -350,6 +350,8 @@ function BranchStepCard({ step, inline = false }) {
             <strong>{step.title || formatEventType(step.kind)}</strong>
             {step.prompt_role && <span className={`dev-pill dev-pill-msg-${step.prompt_role}`}>{roleLabel(step.prompt_role)}</span>}
             <span className={`dev-pill ${categoryPillClass}`}>{categoryLabel}</span>
+            {step.provider && <span className="dev-pill dev-pill-cat-tools">{step.provider}</span>}
+            {step.model && <span className="dev-pill dev-pill-cat-prompt">{step.model}</span>}
           </div>
           <div className="dev-step-meta">
             {step.actor && <span>{step.actor}</span>}
@@ -442,6 +444,8 @@ function BranchRun({ branch, filters, compact = false }) {
         <span className={`dev-pill dev-pill-cat-${category}`}>{category}</span>
         <span className="dev-branch-label">{branch.trace_label || branch.actor || branch.summary || 'Branch'}</span>
         {branch.operation && <span className="dev-branch-op">{formatEventType(branch.operation)}</span>}
+        {branch.provider && <span className="dev-branch-op">{branch.provider}</span>}
+        {branch.model && <span className="dev-branch-op">{branch.model}</span>}
         <span className="dev-branch-op">{stepCount} step{stepCount === 1 ? '' : 's'}</span>
         {toolNames.length > 0 && (
           <span className="dev-branch-op">

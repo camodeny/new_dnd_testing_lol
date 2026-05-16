@@ -114,6 +114,7 @@ def log_model_request(
         f'{actor} request: {operation}',
         {
             'operation': operation,
+            'provider': provider,
             'model': model,
             'json_mode': json_mode,
             'messages': messages,
@@ -191,6 +192,8 @@ def log_model_response(
         f'{actor} response: {operation}',
         {
             'operation': operation,
+            'provider': provider,
+            'model': response.get('model') if isinstance(response, dict) else None,
             'raw_response': response,
             'content': message.get('content'),
             'finish_reason': first_choice.get('finish_reason'),
@@ -228,6 +231,7 @@ def log_model_error(
         f'{actor} error: {operation}',
         {
             'operation': operation,
+            'provider': provider,
             'error': repr(error),
         },
         source=provider,
