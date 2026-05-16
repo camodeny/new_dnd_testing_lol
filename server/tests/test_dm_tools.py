@@ -22,6 +22,7 @@ from models import (
     User,
 )
 from openrouter import _pc_control_violation, normalize_session_dm_turn_decision
+from openrouter import _private_output_violation
 from routes.dev import _agent_runs_from_stream, _audit_stream_entry, _chat_flow_payload
 from routes.sessions import sessions_bp
 from services.audit_service import log_audit_event
@@ -70,9 +71,9 @@ class DmToolsTest(unittest.TestCase):
         db.session.add(CampaignWorld(
             campaign_id=self.campaign.id,
             public_intro='{}',
-            knowledge_graph='{"entities":[],"relations":[],"facts":[]}',
+            knowledge_graph='{"entities":[{"id":"fac_crimson_veil","type":"faction","name":"Crimson Veil","visibility":"dm_private"}],"relations":[],"facts":[]}',
             world_state='{"current_scene":{"location_name":"Dock Ward","immediate_tension":"A bell rings."}}',
-            dm_private='{}',
+            dm_private='{"hidden_factions":["Crimson Veil"]}',
         ))
         db.session.commit()
 
@@ -117,6 +118,7 @@ class DmToolsTest(unittest.TestCase):
 
         self.assertEqual(hot_context['current_player_character']['name'], 'Aria')
         self.assertEqual(hot_context['protected_player_characters'][0]['name'], 'Aria')
+        self.assertIn('Crimson Veil', hot_context['private_output_terms'])
 
     def test_pc_control_guard_detects_pc_dialogue_and_action(self):
         hot_context = {
@@ -147,6 +149,17 @@ class DmToolsTest(unittest.TestCase):
             '<npc target="Mayor Elara Voss">Thank you for coming, Borin, Raven.</npc>\n\nRaven, how do you respond?',
             hot_context,
         ))
+
+    def test_private_output_guard_detects_hidden_terms(self):
+        hot_context = {'private_output_terms': ['Crimson Veil']}
+
+        self.assertEqual(
+            _private_output_violation('The Crimson Veil moves another step ahead.', hot_context),
+            {'matched_terms': ['Crimson Veil']},
+        )
+        self.assertIsNone(
+            _private_output_violation('A hidden scheme moves another step ahead.', hot_context),
+        )
 
     def test_session_dm_turn_decision_normalizes_silence_contract(self):
         self.assertEqual(

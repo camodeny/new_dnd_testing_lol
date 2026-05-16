@@ -94,6 +94,45 @@ def _active_clocks(campaign, limit=8):
     return (active or clocks)[:limit]
 
 
+def _private_output_terms(campaign):
+    _world, graph, _world_state, dm_private = _world_json(campaign)
+    terms = set()
+
+    def add(value):
+        text = clean_text(value, 240)
+        if len(text) >= 4:
+            terms.add(text)
+
+    for entity in graph.get('entities', []) if isinstance(graph, dict) else []:
+        if entity.get('visibility') == 'dm_private':
+            add(entity.get('name'))
+    for relation in graph.get('relations', []) if isinstance(graph, dict) else []:
+        if relation.get('visibility') == 'dm_private':
+            add(relation.get('summary'))
+    for fact in graph.get('facts', []) if isinstance(graph, dict) else []:
+        if fact.get('visibility') == 'dm_private':
+            add(fact.get('text'))
+
+    for clock in CampaignClock.query.filter_by(campaign_id=campaign.id).all():
+        if (clock.visibility or 'dm_private') == 'dm_private':
+            add(clock.name)
+
+    for npc in NPCActor.query.filter_by(campaign_id=campaign.id).all():
+        dossier = json_loads(npc.dossier, {})
+        for secret in dossier.get('secrets', []) if isinstance(dossier, dict) else []:
+            add(secret)
+
+    if isinstance(dm_private, dict):
+        for key in ('true_inciting_incident', 'villain_plan'):
+            add(dm_private.get(key))
+        for value in dm_private.get('hidden_factions', []) if isinstance(dm_private.get('hidden_factions'), list) else []:
+            add(value)
+        for value in dm_private.get('npc_secrets', []) if isinstance(dm_private.get('npc_secrets'), list) else []:
+            add(value)
+
+    return sorted(terms, key=lambda value: value.lower())
+
+
 def build_session_hot_context(campaign, session, current_user):
     character = _current_character(campaign, current_user)
     world, _graph, world_state, _private = _world_json(campaign)
@@ -144,11 +183,13 @@ def build_session_hot_context(campaign, session, current_user):
         ],
         'current_scene': current_scene,
         'active_clocks': [clock.to_dict(include_private=True) for clock in active_clocks],
+        'private_output_terms': _private_output_terms(campaign),
         'recent_messages': [message.to_dict() for message in recent_messages],
         'tool_policy': (
             'Use tools for character-sheet facts, campaign memory, NPC dossiers, clocks, and durable state writes. '
             'Do not claim to update world state unless a write tool succeeds. Never reveal DM-private tool results '
-            'unless they have become visible through play.'
+            'unless they have become visible through play. private_output_terms are reasoning-only strings that must '
+            'not appear in visible narration unless they are first revealed through play.'
         ),
     }
     return context

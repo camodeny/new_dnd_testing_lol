@@ -3,12 +3,15 @@ import sys
 import unittest
 from unittest.mock import patch
 
+import requests
+
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), '..')))
 
 from openrouter import (
     _json_error_excerpt,
     _json_loads_with_error,
     _json_loads_with_repair,
+    _post_chat_response,
     get_world_genesis_package,
 )
 
@@ -65,6 +68,47 @@ class OpenRouterJsonRepairTest(unittest.TestCase):
         self.assertEqual(data['public_intro']['title'], 'Test')
         self.assertEqual(data['knowledge_graph'], [])
         self.assertEqual(post_chat.call_count, 2)
+
+
+class FakeResponse:
+    def __init__(self, status_code, payload=None):
+        self.status_code = status_code
+        self._payload = payload or {}
+
+    def raise_for_status(self):
+        if self.status_code >= 400:
+            raise requests.HTTPError(
+                f'{self.status_code} error',
+                response=self,
+            )
+
+    def json(self):
+        return self._payload
+
+
+class OpenRouterRetryTest(unittest.TestCase):
+    def test_post_chat_response_retries_transient_404_then_succeeds(self):
+        success = {
+            'choices': [{'message': {'content': 'ok'}}],
+        }
+
+        with patch('openrouter.requests.post', side_effect=[
+            FakeResponse(404),
+            FakeResponse(200, success),
+        ]) as post, patch('openrouter.time.sleep') as sleep:
+            result = _post_chat_response([{'role': 'user', 'content': 'hello'}])
+
+        self.assertEqual(result, success)
+        self.assertEqual(post.call_count, 2)
+        sleep.assert_called_once_with(1)
+
+    def test_post_chat_response_does_not_retry_permanent_400(self):
+        with patch('openrouter.requests.post', return_value=FakeResponse(400)) as post, patch('openrouter.time.sleep') as sleep:
+            with self.assertRaises(requests.HTTPError):
+                _post_chat_response([{'role': 'user', 'content': 'hello'}])
+
+        self.assertEqual(post.call_count, 1)
+        sleep.assert_not_called()
 
 
 if __name__ == '__main__':

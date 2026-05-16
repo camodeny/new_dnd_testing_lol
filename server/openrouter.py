@@ -1,6 +1,7 @@
 import os
 import json
 import tempfile
+import time
 from threading import Lock
 from pathlib import Path
 from uuid import uuid4
@@ -19,6 +20,12 @@ OPENROUTER_RUNTIME_MODEL_FILE = Path(os.environ.get(
     os.path.join(tempfile.gettempdir(), 'new_dnd_testing_lol_openrouter_model'),
 ))
 API_URL = 'https://openrouter.ai/api/v1/chat/completions'
+OPENROUTER_MAX_ATTEMPTS = max(1, int(os.environ.get('OPENROUTER_MAX_ATTEMPTS', '4')))
+OPENROUTER_RETRY_BASE_DELAY_SECONDS = max(0.0, float(os.environ.get('OPENROUTER_RETRY_BASE_DELAY_SECONDS', '1')))
+OPENROUTER_RETRY_MAX_DELAY_SECONDS = max(
+    OPENROUTER_RETRY_BASE_DELAY_SECONDS,
+    float(os.environ.get('OPENROUTER_RETRY_MAX_DELAY_SECONDS', '8')),
+)
 
 PC_CONTROL_POLICY = (
     "Player-character control policy: NPCs may speak and act. Player characters are protected. "
@@ -186,6 +193,21 @@ def _estimate_tokens(value):
     return max(1, len(text) // 4) if text else 0
 
 
+def _retry_delay_seconds(failed_attempt):
+    return min(
+        OPENROUTER_RETRY_BASE_DELAY_SECONDS * (2 ** max(failed_attempt - 1, 0)),
+        OPENROUTER_RETRY_MAX_DELAY_SECONDS,
+    )
+
+
+def _is_retriable_openrouter_error(error):
+    if isinstance(error, requests.HTTPError):
+        response = getattr(error, 'response', None)
+        status_code = getattr(response, 'status_code', None)
+        return status_code in {404, 408, 409, 425, 429} or (status_code is not None and status_code >= 500)
+    return isinstance(error, (requests.ConnectionError, requests.Timeout))
+
+
 def _post_chat_response(
     messages,
     json_mode=False,
@@ -253,43 +275,71 @@ def _post_chat_response(
             },
         )
 
-    try:
-        resp = requests.post(
-            API_URL,
-            headers={
-                'Authorization': f'Bearer {OPENROUTER_API_KEY}',
-                'Content-Type': 'application/json',
-            },
-            json=payload,
-            timeout=60,
-        )
-        resp.raise_for_status()
-        data = resp.json()
-        if campaign_id:
-            log_model_response(
-                campaign_id,
-                operation,
-                actor,
-                data,
-                commit=True,
-                trace_id=trace_id,
-                parent_trace_id=parent_trace_id,
-                trace_label=trace_label,
+    for attempt in range(1, OPENROUTER_MAX_ATTEMPTS + 1):
+        try:
+            resp = requests.post(
+                API_URL,
+                headers={
+                    'Authorization': f'Bearer {OPENROUTER_API_KEY}',
+                    'Content-Type': 'application/json',
+                },
+                json=payload,
+                timeout=60,
             )
-        return data
-    except Exception as err:
-        if campaign_id:
-            log_model_error(
-                campaign_id,
-                operation,
-                actor,
-                err,
-                commit=True,
-                trace_id=trace_id,
-                parent_trace_id=parent_trace_id,
-                trace_label=trace_label,
-            )
-        raise
+            resp.raise_for_status()
+            data = resp.json()
+            if campaign_id:
+                log_model_response(
+                    campaign_id,
+                    operation,
+                    actor,
+                    data,
+                    commit=True,
+                    trace_id=trace_id,
+                    parent_trace_id=parent_trace_id,
+                    trace_label=trace_label,
+                )
+            return data
+        except Exception as err:
+            can_retry = attempt < OPENROUTER_MAX_ATTEMPTS and _is_retriable_openrouter_error(err)
+            if can_retry:
+                delay_seconds = _retry_delay_seconds(attempt)
+                if campaign_id:
+                    log_audit_event(
+                        campaign_id,
+                        'model_retry',
+                        f'{actor} retrying: {operation}',
+                        {
+                            'operation': operation,
+                            'attempt': attempt,
+                            'next_attempt': attempt + 1,
+                            'max_attempts': OPENROUTER_MAX_ATTEMPTS,
+                            'delay_seconds': delay_seconds,
+                            'error': repr(err),
+                        },
+                        source='openrouter',
+                        actor=actor,
+                        trace_id=trace_id,
+                        parent_trace_id=parent_trace_id,
+                        trace_label=trace_label,
+                        audit_role='tools',
+                        commit=True,
+                    )
+                time.sleep(delay_seconds)
+                continue
+
+            if campaign_id:
+                log_model_error(
+                    campaign_id,
+                    operation,
+                    actor,
+                    err,
+                    commit=True,
+                    trace_id=trace_id,
+                    parent_trace_id=parent_trace_id,
+                    trace_label=trace_label,
+                )
+            raise
 
 
 def _post_chat(messages, json_mode=False, audit_context=None):
@@ -472,6 +522,22 @@ def _pc_control_violation(response_text, hot_context):
                     'pattern': pattern,
                 }
 
+    return None
+
+
+def _private_output_violation(response_text, hot_context):
+    import re
+
+    visible = _strip_npc_blocks(response_text)
+    matched_terms = []
+    for term in hot_context.get('private_output_terms') or []:
+        candidate = str(term or '').strip()
+        if len(candidate) < 4:
+            continue
+        if re.search(re.escape(candidate), visible, flags=re.IGNORECASE):
+            matched_terms.append(candidate)
+    if matched_terms:
+        return {'matched_terms': matched_terms}
     return None
 
 
@@ -747,6 +813,7 @@ def get_session_dm_response_with_tools(
 
     tool_round = 0
     pc_control_retried = False
+    private_output_retried = False
     while True:
         loop_audit = {
             **base_audit,
@@ -771,6 +838,11 @@ def get_session_dm_response_with_tools(
             decision = normalize_session_dm_turn_decision(raw_content)
             content = decision.get('content') or ''
             violation = _pc_control_violation(content, hot_context) if decision.get('mode') == 'speak' else None
+            private_violation = (
+                _private_output_violation(content, hot_context)
+                if decision.get('mode') == 'speak'
+                else None
+            )
             if violation and not pc_control_retried:
                 if base_audit.get('campaign_id'):
                     log_audit_event(
@@ -802,6 +874,36 @@ def get_session_dm_response_with_tools(
                 pc_control_retried = True
                 tool_round = max_tool_rounds
                 continue
+            if private_violation and not private_output_retried:
+                if base_audit.get('campaign_id'):
+                    log_audit_event(
+                        base_audit.get('campaign_id'),
+                        'private_output_guard_retry',
+                        'Session DM response exposed DM-private output terms; requesting rewrite.',
+                        {
+                            'violation': private_violation,
+                            'draft_response': raw_content,
+                        },
+                        source='session_dm.guard',
+                        actor='server',
+                        trace_id=trace_id,
+                        trace_label=trace_label,
+                        audit_role='guard',
+                        commit=True,
+                    )
+                messages.append({'role': 'assistant', 'content': raw_content})
+                messages.append({
+                    'role': 'user',
+                    'content': (
+                        'Rewrite the previous response. It exposed DM-private information that has not become '
+                        'visible through play. Do not mention any of these reasoning-only private terms in the '
+                        f'visible reply: {", ".join(private_violation["matched_terms"])}. Return the same JSON '
+                        'contract with mode="speak" and spoiler-safe visible content.'
+                    ),
+                })
+                private_output_retried = True
+                tool_round = max_tool_rounds
+                continue
             if violation:
                 if base_audit.get('campaign_id'):
                     log_audit_event(
@@ -822,6 +924,27 @@ def get_session_dm_response_with_tools(
                 return {
                     'mode': 'silent',
                     'reason': 'The DM response would have controlled a protected player character.',
+                }
+            if private_violation:
+                if base_audit.get('campaign_id'):
+                    log_audit_event(
+                        base_audit.get('campaign_id'),
+                        'private_output_guard_blocked',
+                        'Session DM response still exposed DM-private output terms after retry.',
+                        {
+                            'violation': private_violation,
+                            'draft_response': raw_content,
+                        },
+                        source='session_dm.guard',
+                        actor='server',
+                        trace_id=trace_id,
+                        trace_label=trace_label,
+                        audit_role='guard',
+                        commit=True,
+                    )
+                return {
+                    'mode': 'silent',
+                    'reason': 'The DM response would have exposed DM-private information.',
                 }
             return decision
 
