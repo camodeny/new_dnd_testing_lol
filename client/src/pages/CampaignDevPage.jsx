@@ -199,6 +199,49 @@ function formatTokens(n) {
   return String(n)
 }
 
+function requestTokenEstimate(entry) {
+  const estimate = entry?.token_estimate || {}
+  const messageTokens = Number(estimate.estimated_message_tokens) || 0
+  const toolSchemaTokens = Number(estimate.estimated_tool_schema_tokens) || 0
+  return messageTokens + toolSchemaTokens
+}
+
+function tokenStats(auditStream = []) {
+  const stats = {
+    estimatedSentTotal: 0,
+    latestRequestSent: null,
+    latestSessionDmSent: null,
+    providerPromptTotal: 0,
+    providerTotal: 0,
+    hasProviderUsage: false,
+  }
+
+  for (const entry of auditStream) {
+    if (entry.event_type === 'model_request') {
+      const estimate = requestTokenEstimate(entry)
+      stats.estimatedSentTotal += estimate
+      stats.latestRequestSent = estimate
+      if (entry.actor === 'session_dm') stats.latestSessionDmSent = estimate
+    }
+
+    if (entry.event_type === 'model_response') {
+      const usage = entry.usage || {}
+      const promptTokens = Number(usage.prompt_tokens)
+      const totalTokens = Number(usage.total_tokens)
+      if (Number.isFinite(promptTokens)) {
+        stats.providerPromptTotal += promptTokens
+        stats.hasProviderUsage = true
+      }
+      if (Number.isFinite(totalTokens)) {
+        stats.providerTotal += totalTokens
+        stats.hasProviderUsage = true
+      }
+    }
+  }
+
+  return stats
+}
+
 async function copyToClipboard(text) {
   try {
     await navigator.clipboard.writeText(text)
@@ -619,6 +662,7 @@ function FlowLane({ lane, filters, searchQuery }) {
 function FilterPanel({ filters, setFilters, chatFlow, data, searchQuery, setSearchQuery, actors, actorFilter, setActorFilter, onExpandAll, onCollapseAll }) {
   const stats = chatFlow?.stats || {}
   const auditCount = data.audit_stream?.length || data.audit_events?.length || 0
+  const tokens = tokenStats(data.audit_stream || [])
 
   return (
     <aside className="dev-aside">
@@ -706,6 +750,36 @@ function FilterPanel({ filters, setFilters, chatFlow, data, searchQuery, setSear
           <div className="dev-stat">
             <span className="dev-stat-value">{auditCount}</span>
             <span className="dev-stat-label">Events</span>
+          </div>
+        </div>
+      </section>
+
+      <section className="dev-panel">
+        <h3>Tokens</h3>
+        <div className="dev-stats-grid">
+          <div className="dev-stat">
+            <span className="dev-stat-value">{formatTokens(tokens.estimatedSentTotal)}</span>
+            <span className="dev-stat-label">Estimated Sent</span>
+          </div>
+          <div className="dev-stat">
+            <span className="dev-stat-value">{formatTokens(tokens.latestRequestSent) || '—'}</span>
+            <span className="dev-stat-label">Latest Request</span>
+          </div>
+          <div className="dev-stat">
+            <span className="dev-stat-value">{formatTokens(tokens.latestSessionDmSent) || '—'}</span>
+            <span className="dev-stat-label">Latest Main DM</span>
+          </div>
+          <div className="dev-stat">
+            <span className="dev-stat-value">
+              {tokens.hasProviderUsage ? formatTokens(tokens.providerPromptTotal) : '—'}
+            </span>
+            <span className="dev-stat-label">Provider Prompt</span>
+          </div>
+          <div className="dev-stat">
+            <span className="dev-stat-value">
+              {tokens.hasProviderUsage ? formatTokens(tokens.providerTotal) : '—'}
+            </span>
+            <span className="dev-stat-label">Provider Total</span>
           </div>
         </div>
       </section>

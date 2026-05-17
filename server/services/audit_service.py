@@ -8,6 +8,7 @@ AGENT_ACTORS = {
     'session_dm_guard',
     'world_architect',
     'character_draft_agent',
+    'character_sheet_agent',
     'planning_memory_writer',
     'session_memory_writer',
 }

@@ -14,6 +14,7 @@ from services.audit_service import log_audit_event
 from services.character_service import character_full_dict
 from services.planning_service import summary_dict_for_read
 from services.world_service import clean_id, clean_text, get_campaign_world, json_dumps, json_loads
+from openrouter import get_character_sheet_answer
 
 
 VALID_VISIBILITIES = {'public', 'party_known', 'dm_private'}
@@ -242,7 +243,7 @@ def build_session_hot_context(campaign, session, current_user):
         'private_spoiler_items': _private_spoiler_items(campaign),
         'recent_messages': [message.to_dict() for message in recent_messages],
         'tool_policy': (
-            'Use tools for character-sheet facts, campaign memory, NPC dossiers, clocks, and durable state writes. '
+            'Use tools for character-sheet answers, campaign memory, NPC dossiers, clocks, and durable state writes. '
             'Do not claim to update world state unless a write tool succeeds. Never reveal DM-private tool results '
             'unless they have become visible through play. private_output_terms are reasoning-only strings that must '
             'not appear in visible narration unless they are first revealed through play.'
@@ -303,10 +304,11 @@ DM_TOOL_DEFINITIONS = [
     {
         'type': 'function',
         'function': {
-            'name': 'get_character_context',
-            'description': 'Fetch compact or full character-sheet context for the current player, party, or a specific character.',
+            'name': 'ask_character_sheet',
+            'description': 'Ask a focused question about the current player, party, or a specific character sheet and receive only the concise answer needed.',
             'parameters': {
                 'type': 'object',
+                'required': ['question'],
                 'properties': {
                     'scope': {
                         'type': 'string',
@@ -314,12 +316,7 @@ DM_TOOL_DEFINITIONS = [
                         'default': 'current_player',
                     },
                     'character_id': {'type': 'integer'},
-                    'fields': {
-                        'type': 'array',
-                        'items': {'type': 'string'},
-                        'description': 'Optional top-level fields to return, such as combat, general, ability_scores, spells, equipment.',
-                    },
-                    'full': {'type': 'boolean', 'default': False},
+                    'question': {'type': 'string'},
                 },
             },
         },
@@ -421,39 +418,41 @@ DM_TOOL_DEFINITIONS = [
 ]
 
 
-def _filter_fields(data, fields):
-    if not fields:
-        return data
-    allowed = {'id', 'user_id', 'campaign_id', 'name', 'player_name', 'race', 'subrace', 'background', 'total_level'}
-    allowed.update(str(field) for field in fields)
-    return {key: value for key, value in data.items() if key in allowed}
-
-
-def _tool_get_character_context(campaign, current_user, args):
+def _tool_ask_character_sheet(campaign, current_user, args, audit_context=None):
     scope = args.get('scope') or 'current_player'
-    fields = args.get('fields') if isinstance(args.get('fields'), list) else []
-    full = bool(args.get('full'))
+    question = clean_text(args.get('question'), 600)
+    if not question:
+        return {
+            'scope': scope,
+            'answer': 'A character-sheet question is required.',
+            'character_ids': [],
+            'missing': True,
+        }
 
     if scope == 'party':
         members = CampaignMember.query.filter_by(campaign_id=campaign.id).order_by(CampaignMember.id.asc()).all()
-        characters = []
+        character_sheets = []
         for member in members:
             character = db.session.get(Character, member.selected_character_id) if member.selected_character_id else None
             if character:
-                raw = character_full_dict(character) if full else _compact_character(character)
-                characters.append({
+                character_sheets.append({
                     'user_id': member.user_id,
                     'username': member.user.username if member.user else None,
-                    'character': _filter_fields(raw, fields),
+                    'character': character_full_dict(character),
                 })
-        return {'scope': scope, 'characters': characters}
-
-    if scope == 'character_id':
-        character = Character.query.filter_by(id=args.get('character_id'), campaign_id=campaign.id).first()
     else:
-        character = _current_character(campaign, current_user)
-    raw = character_full_dict(character) if full and character else _compact_character(character)
-    return {'scope': scope, 'character': _filter_fields(raw or {}, fields)}
+        if scope == 'character_id':
+            character = Character.query.filter_by(id=args.get('character_id'), campaign_id=campaign.id).first()
+        else:
+            character = _current_character(campaign, current_user)
+        character_sheets = [{
+            'user_id': character.user_id,
+            'username': current_user.username if current_user and character.user_id == current_user.id else None,
+            'character': character_full_dict(character),
+        }] if character else []
+
+    result = get_character_sheet_answer(question, scope, character_sheets, audit_context=audit_context)
+    return {'scope': scope, **result}
 
 
 def _tool_get_current_scene(campaign, _current_user, args):
@@ -617,7 +616,7 @@ def _tool_reveal_fact(campaign, _current_user, args):
 
 
 TOOL_HANDLERS = {
-    'get_character_context': _tool_get_character_context,
+    'ask_character_sheet': _tool_ask_character_sheet,
     'get_current_scene': _tool_get_current_scene,
     'search_campaign_memory': _tool_search_campaign_memory,
     'record_world_event': _tool_record_world_event,
@@ -636,7 +635,11 @@ def execute_dm_tool(campaign, session, current_user, name, args, audit_context=N
         mutated = False
     else:
         before_new = len(db.session.new)
-        result = handler(campaign, current_user, args)
+        result = (
+            handler(campaign, current_user, args, audit_context)
+            if name == 'ask_character_sheet'
+            else handler(campaign, current_user, args)
+        )
         mutated = name in {'record_world_event', 'update_current_scene', 'advance_clock', 'reveal_fact'}
         mutated = mutated or len(db.session.new) > before_new
     log_audit_event(

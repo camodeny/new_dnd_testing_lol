@@ -88,7 +88,7 @@ class DmToolsTest(unittest.TestCase):
 
     def test_tool_definitions_are_function_schemas(self):
         names = {tool['function']['name'] for tool in DM_TOOL_DEFINITIONS}
-        self.assertIn('get_character_context', names)
+        self.assertIn('ask_character_sheet', names)
         self.assertIn('search_campaign_memory', names)
         self.assertIn('advance_clock', names)
         for tool in DM_TOOL_DEFINITIONS:
@@ -96,25 +96,35 @@ class DmToolsTest(unittest.TestCase):
             self.assertIn('parameters', tool['function'])
             self.assertEqual(tool['function']['parameters']['type'], 'object')
 
-    def test_character_context_fetches_selected_character(self):
-        result = execute_dm_tool(
-            self.campaign,
-            self.session,
-            self.user,
-            'get_character_context',
-            {'scope': 'current_player', 'fields': ['combat', 'general']},
-            {},
-        )
-        self.assertEqual(result['character']['name'], 'Aria')
-        self.assertEqual(result['character']['combat']['armor_class'], 15)
-        self.assertEqual(result['character']['general']['passive_perception'], 13)
+    def test_character_sheet_agent_answers_from_selected_character(self):
+        with patch('services.dm_tools.get_character_sheet_answer', return_value={
+            'answer': 'Aria has AC 15 and passive Perception 13.',
+            'character_ids': [self.character.id],
+            'missing': False,
+        }) as answer:
+            result = execute_dm_tool(
+                self.campaign,
+                self.session,
+                self.user,
+                'ask_character_sheet',
+                {'scope': 'current_player', 'question': "What are Aria's AC and passive Perception?"},
+                {},
+            )
+
+        self.assertEqual(result['answer'], 'Aria has AC 15 and passive Perception 13.')
+        self.assertEqual(result['character_ids'], [self.character.id])
+        answer.assert_called_once()
+        sheets = answer.call_args.args[2]
+        self.assertEqual(sheets[0]['character']['name'], 'Aria')
+        self.assertEqual(sheets[0]['character']['combat']['armor_class'], 15)
+        self.assertEqual(sheets[0]['character']['general']['passive_perception'], 13)
 
     def test_context_manifest_reports_compact_strategy(self):
         hot_context = build_session_hot_context(self.campaign, self.session, self.user)
         manifest = context_manifest(hot_context, DM_TOOL_DEFINITIONS)
         self.assertEqual(manifest['strategy'], 'compact_hot_context_with_dm_tools')
         self.assertFalse(manifest['full_world_graph_included'])
-        self.assertIn('get_character_context', manifest['available_tools'])
+        self.assertIn('ask_character_sheet', manifest['available_tools'])
         self.assertIn('recent_messages', manifest['estimated_tokens_by_section'])
 
     def test_hot_context_includes_protected_player_characters(self):

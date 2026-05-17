@@ -149,6 +149,15 @@ SESSION_SPOILER_CHECK_SYSTEM_PROMPT = (
     "hidden truth are safe. Do not mark a reply unsafe merely because it is thematically related to a private item."
 )
 
+CHARACTER_SHEET_SYSTEM_PROMPT = (
+    "You answer focused questions about D&D character sheets for the session DM. "
+    "Use only the provided character-sheet data. Return only valid JSON with keys: "
+    "answer, character_ids, missing. Keep answer concise and include only the facts needed "
+    "to answer the question; do not dump the full sheet, infer unstated facts, or add advice. "
+    "If the sheet data does not contain the answer, set missing to true and say exactly what "
+    "is unavailable."
+)
+
 JSON_REPAIR_SYSTEM_PROMPT = (
     "You repair malformed JSON. Return only valid JSON with the same intended data and structure as "
     "the original. Make the smallest changes needed to fix syntax errors. Do not add commentary, "
@@ -1008,6 +1017,25 @@ def build_session_memory_messages(memory_context):
     ]
 
 
+def build_character_sheet_agent_messages(question, scope, character_sheets):
+    return [
+        {'role': 'system', 'content': CHARACTER_SHEET_SYSTEM_PROMPT},
+        {
+            'role': 'user',
+            'content': json.dumps({
+                'question': question,
+                'scope': scope,
+                'character_sheets': character_sheets,
+                'return_shape': {
+                    'answer': 'concise answer for the DM',
+                    'character_ids': [1],
+                    'missing': False,
+                },
+            }, ensure_ascii=False),
+        },
+    ]
+
+
 def _choice_message(data):
     choices = data.get('choices') if isinstance(data, dict) else []
     if not choices or not isinstance(choices[0], dict):
@@ -1369,6 +1397,53 @@ def get_session_memory_patch(memory_context, audit_context=None):
     except Exception as e:
         print(f'[openrouter] Session memory writer error: {e}')
         return {}
+
+
+def get_character_sheet_answer(question, scope, character_sheets, audit_context=None):
+    if not character_sheets:
+        return {
+            'answer': 'No matching character sheet was found.',
+            'character_ids': [],
+            'missing': True,
+        }
+
+    base_audit = audit_context or {}
+    agent_audit = _child_audit_context(
+        base_audit,
+        'character_sheet_answer',
+        'character_sheet_agent',
+        'character_sheet_agent: sheet answer',
+    )
+    messages = build_character_sheet_agent_messages(question, scope, character_sheets)
+
+    try:
+        data = _json_loads_with_repair(
+            _post_chat(messages, json_mode=True, audit_context=agent_audit),
+            audit_context=agent_audit,
+        )
+    except Exception as err:
+        print(f'[openrouter] Character sheet agent error: {err}')
+        return {
+            'answer': 'Character sheet lookup failed.',
+            'character_ids': [],
+            'missing': True,
+        }
+
+    if not isinstance(data, dict):
+        return {
+            'answer': 'Character sheet lookup returned an invalid response.',
+            'character_ids': [],
+            'missing': True,
+        }
+
+    ids = data.get('character_ids')
+    if not isinstance(ids, list):
+        ids = []
+    return {
+        'answer': str(data.get('answer') or '').strip() or 'No answer was returned from the character sheet.',
+        'character_ids': [item for item in ids if isinstance(item, int)],
+        'missing': bool(data.get('missing')),
+    }
 
 
 def get_planning_dm_response(context, current_user_messages, draft_character=None, active_page=None, audit_context=None):

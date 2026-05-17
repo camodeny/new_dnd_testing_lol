@@ -14,6 +14,7 @@ from openrouter import (
     _json_loads_with_error,
     _json_loads_with_repair,
     _post_chat_response,
+    get_character_sheet_answer,
     get_world_genesis_package,
     normalize_session_spoiler_check,
 )
@@ -198,6 +199,23 @@ class SessionSpoilerCheckTest(unittest.TestCase):
                 'reason': 'Leaked hidden truth.',
             },
         )
+
+
+class CharacterSheetAgentTest(unittest.TestCase):
+    def test_character_sheet_agent_returns_compact_answer(self):
+        with patch('openrouter._post_chat', return_value='{"answer":"AC 15.","character_ids":[7],"missing":false}'):
+            result = get_character_sheet_answer(
+                'What is the AC?',
+                'current_player',
+                [{'id': 7, 'name': 'Aria', 'combat': {'armor_class': 15}}],
+                audit_context={'trace_id': 'session_dm:test'},
+            )
+
+        self.assertEqual(result, {
+            'answer': 'AC 15.',
+            'character_ids': [7],
+            'missing': False,
+        })
 
 
 if __name__ == '__main__':
