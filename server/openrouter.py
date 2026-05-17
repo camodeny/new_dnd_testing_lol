@@ -713,6 +713,26 @@ def build_session_spoiler_check_messages(response_text, hot_context):
     ]
 
 
+def _spoiler_rewrite_feedback(spoiler_check):
+    evidence = spoiler_check.get('evidence') if isinstance(spoiler_check, dict) else []
+    snippets = [str(item).strip() for item in evidence or [] if str(item).strip()]
+    if snippets:
+        quoted = '\n'.join(f'- "{snippet}"' for snippet in snippets)
+        reason = str(spoiler_check.get('reason') or '').strip()
+        reason_line = f'\nChecker reason: {reason}' if reason else ''
+        return (
+            'The checker flagged these visible spoiler-bearing snippets:\n'
+            f'{quoted}'
+            f'{reason_line}\n'
+            'Remove or generalize those claims while preserving the rest of the safe answer where possible. '
+            'Do not restate or paraphrase the hidden explanation behind them.'
+        )
+    return (
+        'Remove or generalize any claims that directly reveal or strongly imply unrevealed DM-private '
+        'information while preserving the rest of the safe answer where possible.'
+    )
+
+
 def _child_audit_context(base_audit, operation, actor, trace_label):
     parent_trace_id = base_audit.get('trace_id')
     return {
@@ -1180,9 +1200,10 @@ def get_session_dm_response_with_tools(
                     'role': 'user',
                     'content': (
                         'Rewrite the previous response. A spoiler-safety checker determined it directly revealed '
-                        'or strongly implied unrevealed DM-private information. Keep only what the players could '
-                        'currently observe or reasonably know in-world. Return the same JSON contract with '
-                        'mode="speak" and spoiler-safe visible content.'
+                        'or strongly implied unrevealed DM-private information. '
+                        f'{_spoiler_rewrite_feedback(spoiler_check)} '
+                        'Keep only what the players could currently observe or reasonably know in-world. '
+                        'Return the same JSON contract with mode="speak" and spoiler-safe visible content.'
                     ),
                 })
                 spoiler_checker_retried = True

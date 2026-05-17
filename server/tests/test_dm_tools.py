@@ -196,13 +196,17 @@ class DmToolsTest(unittest.TestCase):
         with patch('openrouter._post_chat_response', side_effect=[
             {'choices': [{'message': {'content': '{"mode":"speak","content":"The trap closes around you."}'}}]},
             {'choices': [{'message': {'content': '{"mode":"speak","content":"The air feels tense as you leave."}'}}]},
-        ]), patch('openrouter.check_session_spoilers_with_llm', side_effect=[
+        ]) as post_chat, patch('openrouter.check_session_spoilers_with_llm', side_effect=[
             {'safe': False, 'leaked_item_ids': ['fact_trap'], 'evidence': ['The trap closes'], 'reason': 'Directly implies the hidden truth.'},
             {'safe': True, 'leaked_item_ids': [], 'evidence': [], 'reason': ''},
         ]):
             result = get_session_dm_response_with_tools(hot_context, [], [], lambda *_args, **_kwargs: {}, max_tool_rounds=0)
 
         self.assertEqual(result, {'mode': 'speak', 'content': 'The air feels tense as you leave.'})
+        retry_prompt = post_chat.call_args_list[1].args[0][-1]['content']
+        self.assertIn('"The trap closes"', retry_prompt)
+        self.assertIn('Directly implies the hidden truth.', retry_prompt)
+        self.assertIn('Remove or generalize those claims', retry_prompt)
 
     def test_private_output_guard_retry_uses_child_trace(self):
         hot_context = {
