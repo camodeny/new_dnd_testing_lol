@@ -2171,6 +2171,7 @@ select.input:focus {
 
 .session-input-shell {
   position: relative;
+  display: grid;
   flex: 1;
   min-width: 0;
   border-radius: 8px;
@@ -2178,6 +2179,7 @@ select.input:focus {
 }
 
 .session-input-editable {
+  grid-area: 1 / 1;
   flex: 1;
   width: 100%;
   min-height: 40px;
@@ -2205,8 +2207,7 @@ select.input:focus {
 }
 
 .session-input-placeholder {
-  position: absolute;
-  inset: 0;
+  grid-area: 1 / 1;
   padding: 8px 12px;
   color: #5a5a7a;
   pointer-events: none;
