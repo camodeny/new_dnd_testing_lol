@@ -73,7 +73,8 @@ export default function PartyRoster({ characters, campaignId, onImport }) {
       {characters.map((c) => {
         const gradient = getGradient(c.name)
         const initials = getInitials(c.name)
-        const hpPct = getHpPercent(c.current_hp, c.max_hp)
+        const combat = c.combat || {}
+        const hpPct = getHpPercent(combat.current_hp, combat.max_hp)
         const hpColor = getHpColor(hpPct)
         const levels = c.classes?.map((cl) => `${cl.class_name} ${cl.level}`).join(', ') || `Level ${c.total_level}`
 
@@ -92,28 +93,28 @@ export default function PartyRoster({ characters, campaignId, onImport }) {
                 <div className="roster-subtitle">{c.race} &mdash; {levels}</div>
               </div>
               <div className="roster-ac-badge" title="Armor Class">
-                AC {c.armor_class}
+                AC {combat.armor_class}
               </div>
             </div>
 
-            <div className="roster-hp-bar-container" title={`${c.current_hp} / ${c.max_hp} HP`}>
+            <div className="roster-hp-bar-container" title={`${combat.current_hp} / ${combat.max_hp} HP`}>
               <div className="roster-hp-bar-bg">
                 <div
                   className="roster-hp-bar-fill"
                   style={{ width: `${hpPct}%`, background: hpColor }}
                 />
-                {c.temp_hp > 0 && (
+                {combat.temp_hp > 0 && (
                   <div
                     className="roster-hp-bar-temp"
                     style={{
-                      width: `${Math.min(100, ((c.current_hp + c.temp_hp) / c.max_hp) * 100)}%`,
+                      width: `${Math.min(100, ((combat.current_hp + combat.temp_hp) / combat.max_hp) * 100)}%`,
                       left: `${hpPct}%`,
                     }}
                   />
                 )}
               </div>
               <span className="roster-hp-text">
-                {c.current_hp}{c.temp_hp > 0 ? `+${c.temp_hp}` : ''} / {c.max_hp}
+                {combat.current_hp}{combat.temp_hp > 0 ? `+${combat.temp_hp}` : ''} / {combat.max_hp}
               </span>
             </div>
 
