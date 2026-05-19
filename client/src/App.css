@@ -909,6 +909,125 @@ select.input:focus {
   background: #2a2a3e;
 }
 
+/* Sheet Proposal Popup */
+.sheet-proposal-panel {
+  max-width: 520px;
+}
+
+.sheet-proposal-body {
+  padding: 0 28px 20px;
+  display: flex;
+  flex-direction: column;
+  gap: 16px;
+}
+
+.sheet-proposal-card {
+  background: #1a1a2e;
+  border: 1px solid #3a3a4e;
+  border-radius: 12px;
+  padding: 16px;
+}
+
+.sheet-proposal-reason {
+  margin: 0 0 12px;
+  font-size: 14px;
+  color: #c0c0d0;
+  line-height: 1.4;
+}
+
+.sheet-proposal-changes {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  margin-bottom: 12px;
+}
+
+.sheet-proposal-change {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  padding: 6px 10px;
+  background: #12121e;
+  border-radius: 8px;
+  font-size: 13px;
+}
+
+.sp-change-label {
+  color: #a0a0b8;
+  font-weight: 500;
+}
+
+.sp-change-arrow {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  font-variant-numeric: tabular-nums;
+}
+
+.sp-op {
+  color: #6b7280;
+  font-size: 12px;
+}
+
+.sheet-proposal-actions {
+  display: flex;
+  gap: 8px;
+}
+
+.sheet-proposal-bulk-actions {
+  padding: 0 28px 20px;
+}
+
+/* Sheet Proposal Inline (in session feed) */
+.sheet-proposal-inline {
+  background: #1a1a2e;
+  border: 1px solid #3a3a4e;
+  border-radius: 12px;
+  padding: 12px 16px;
+  margin: 4px 0;
+}
+
+.sheet-proposal-inline .session-msg-header {
+  margin-bottom: 8px;
+}
+
+.sheet-proposal-inline .sheet-proposal-reason {
+  margin: 0 0 10px;
+  font-size: 13px;
+  color: #c0c0d0;
+  line-height: 1.4;
+}
+
+.sheet-proposal-inline .sheet-proposal-changes {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  margin-bottom: 10px;
+}
+
+.sheet-proposal-inline .sheet-proposal-change {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  padding: 5px 8px;
+  background: #12121e;
+  border-radius: 6px;
+  font-size: 12px;
+}
+
+.sheet-proposal-inline .sheet-proposal-actions {
+  display: flex;
+  gap: 6px;
+}
+
+.sheet-proposal-done {
+  opacity: 0.6;
+}
+
+.sheet-proposal-done .btn {
+  display: none;
+}
+
 /* Compact Form (used inside modal) */
 .campaign-form-compact {
   padding: 20px 28px 28px;

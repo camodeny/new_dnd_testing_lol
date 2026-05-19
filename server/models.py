@@ -920,6 +920,35 @@ class WorldEvent(db.Model):
         }
 
 
+class SheetProposal(db.Model):
+    __tablename__ = 'sheet_proposals'
+
+    id = db.Column(db.Integer, primary_key=True)
+    session_id = db.Column(db.Integer, db.ForeignKey('campaign_sessions.id'), nullable=False)
+    character_id = db.Column(db.Integer, db.ForeignKey('characters.id'), nullable=False)
+    dm_user_id = db.Column(db.Integer, db.ForeignKey('users.id'), nullable=True)
+    message_id = db.Column(db.Integer, db.ForeignKey('session_messages.id'), nullable=True)
+    reason = db.Column(db.String(500), nullable=False)
+    changes = db.Column(db.JSON, nullable=False)
+    status = db.Column(db.String(20), default='pending')
+    created_at = db.Column(db.DateTime, default=datetime.utcnow)
+    applied_at = db.Column(db.DateTime, nullable=True)
+
+    def to_dict(self):
+        return {
+            'id': self.id,
+            'session_id': self.session_id,
+            'character_id': self.character_id,
+            'dm_user_id': self.dm_user_id,
+            'message_id': self.message_id,
+            'reason': self.reason,
+            'changes': self.changes,
+            'status': self.status,
+            'created_at': self.created_at.isoformat() if self.created_at else None,
+            'applied_at': self.applied_at.isoformat() if self.applied_at else None,
+        }
+
+
 class CampaignAuditEvent(db.Model):
     __tablename__ = 'campaign_audit_events'
 

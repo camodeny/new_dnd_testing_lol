@@ -8,6 +8,7 @@ import {
   listMembers,
   getCampaignPlanning,
   getCampaignWorld,
+  getSheetProposals,
 } from '../api/client'
 import Loading from '../components/common/Loading'
 import ErrorMessage from '../components/common/ErrorMessage'
@@ -34,26 +35,6 @@ function getGradientSeed(str) {
   const h1 = hues[Math.abs(hash) % hues.length]
   const h2 = (h1 + 40) % 360
   return `linear-gradient(135deg, hsl(${h1}, 60%, 55%), hsl(${h2}, 55%, 45%))`
-}
-
-const DIFFICULTY_COLORS = {
-  easy: '#4ade80',
-  medium: '#facc15',
-  hard: '#fb923c',
-  deadly: '#f87171',
-}
-
-function getDifficultyColor(difficulty) {
-  if (!difficulty) return null
-  const key = difficulty.toLowerCase().trim()
-  return DIFFICULTY_COLORS[key] || '#a78bfa'
-}
-
-const STATUS_COLORS = {
-  active: '#4ade80',
-  paused: '#facc15',
-  completed: '#6b7280',
-  archived: '#6b7280',
 }
 
 function optimisticPlayerMessage(sessionId, content, user) {
@@ -84,6 +65,20 @@ function reconcilePendingMessage(messages, pendingId, serverMessages = []) {
   return next
 }
 
+function proposalsToMessages(sessionId, proposals) {
+  return (proposals || [])
+    .filter((p) => p.status === 'pending')
+    .map((p) => ({
+      id: `proposal-${p.id}`,
+      session_id: sessionId,
+      role: 'system',
+      content: '',
+      is_proposal: true,
+      proposal: p,
+      created_at: p.created_at,
+    }))
+}
+
 function getClassSummary(character) {
   if (character.classes?.length) {
     return character.classes.map((c) => `${c.class_name} ${c.level}`).join(', ')
@@ -98,17 +93,21 @@ async function fetchCampaignPageData(id) {
   ])
   const campaign = campData.campaign
   const activeSession = campaign.active_session || null
-  const messages = activeSession
-    ? await getSession(activeSession.id)
-      .then((data) => data.session?.messages || [])
-      .catch(() => [])
-    : []
+  let messages = []
+  let sheetProposals = []
+  if (activeSession) {
+    const data = await getSession(activeSession.id).catch(() => ({ session: { messages: [] } }))
+    messages = data.session?.messages || []
+    const propData = await getSheetProposals(activeSession.id).catch(() => ({ sheet_proposals: [] }))
+    sheetProposals = propData.sheet_proposals || []
+  }
 
   return {
     campaign,
     characters: charData.characters || [],
     activeSession,
     messages,
+    sheetProposals,
   }
 }
 
@@ -133,6 +132,7 @@ export default function CampaignViewPage({ user }) {
   const [availableChars, setAvailableChars] = useState([])
   const [importLoading, setImportLoading] = useState(false)
   const [aiThinking, setAiThinking] = useState(false)
+  const [sheetProposals, setSheetProposals] = useState([])
 
   const loadData = useCallback(async () => {
     try {
@@ -141,6 +141,15 @@ export default function CampaignViewPage({ user }) {
       setCharacters(data.characters)
       setSession(data.activeSession)
       setMessages(data.messages)
+      const loadedProposals = data.sheetProposals || []
+      setSheetProposals(loadedProposals)
+      if (data.activeSession && loadedProposals.length) {
+        setMessages((prev) => {
+          const existing = new Set(prev.map((m) => m.id))
+          const newOnes = proposalsToMessages(data.activeSession.id, loadedProposals).filter((m) => !existing.has(m.id))
+          return [...prev, ...newOnes]
+        })
+      }
       const required = data.campaign.settings?.required_players || 1
       const memData = await listMembers(id)
       const memberCount = (memData.members || []).length
@@ -183,6 +192,15 @@ export default function CampaignViewPage({ user }) {
         setCharacters(data.characters)
         setSession(data.activeSession)
         setMessages(data.messages)
+        const loadedProposals = data.sheetProposals || []
+        setSheetProposals(loadedProposals)
+        if (data.activeSession && loadedProposals.length) {
+          setMessages((prev) => {
+            const existing = new Set(prev.map((m) => m.id))
+            const newOnes = proposalsToMessages(data.activeSession.id, loadedProposals).filter((m) => !existing.has(m.id))
+            return [...prev, ...newOnes]
+          })
+        }
 
         const required = data.campaign.settings?.required_players || 1
         try {
@@ -240,6 +258,8 @@ export default function CampaignViewPage({ user }) {
       setSession(newSession)
       setMessages(newSession.messages || [])
       setShowWorldBuilding(false)
+      const propData = await getSheetProposals(newSession.id).catch(() => ({ sheet_proposals: [] }))
+      setSheetProposals(propData.sheet_proposals || [])
       return newSession
     } catch (err) {
       setError(err.message)
@@ -265,7 +285,29 @@ export default function CampaignViewPage({ user }) {
     setAiThinking(true)
     try {
       const data = await sendMessage(session.id, content)
-      setMessages((prev) => reconcilePendingMessage(prev, pendingMessage.id, data.messages || []))
+      const newMessages = data.messages || []
+      setMessages((prev) => reconcilePendingMessage(prev, pendingMessage.id, newMessages))
+      if (data.sheet_proposals?.length) {
+        setSheetProposals((prev) => {
+          const existing = new Set(prev.map((p) => p.id))
+          const newOnes = data.sheet_proposals.filter((p) => !existing.has(p.id))
+          return [...prev, ...newOnes]
+        })
+        const proposalMessages = data.sheet_proposals.map((p) => ({
+          id: `proposal-${p.id}`,
+          session_id: session.id,
+          role: 'system',
+          content: '',
+          is_proposal: true,
+          proposal: p,
+          created_at: p.created_at,
+        }))
+        setMessages((prev) => {
+          const existing = new Set(prev.map((m) => m.id))
+          const newOnes = proposalMessages.filter((m) => !existing.has(m.id))
+          return [...prev, ...newOnes]
+        })
+      }
     } catch (err) {
       const serverMessages = err.data?.messages || []
       setMessages((prev) => {
@@ -338,6 +380,33 @@ export default function CampaignViewPage({ user }) {
     }
   }
 
+  const currentCharacter = characters.find((c) => c.user_id === user?.id)
+
+  const handleProposalApplied = (appliedProposal, updatedCharacter) => {
+    setSheetProposals((prev) => prev.filter((p) => p.id !== appliedProposal.id))
+    setMessages((prev) =>
+      prev.map((m) =>
+        m.id === `proposal-${appliedProposal.id}`
+          ? { ...m, proposal: { ...m.proposal, status: 'applied' } }
+          : m
+      )
+    )
+    setCharacters((prev) =>
+      prev.map((c) => (c.id === updatedCharacter?.id ? updatedCharacter : c))
+    )
+  }
+
+  const handleProposalDismissed = (dismissedProposal) => {
+    setSheetProposals((prev) => prev.filter((p) => p.id !== dismissedProposal.id))
+    setMessages((prev) =>
+      prev.map((m) =>
+        m.id === `proposal-${dismissedProposal.id}`
+          ? { ...m, proposal: { ...m.proposal, status: 'dismissed' } }
+          : m
+      )
+    )
+  }
+
   const handleBeginAdventure = () => {
     setShowLobby(false)
     setShowPlanning(true)
@@ -378,56 +447,10 @@ export default function CampaignViewPage({ user }) {
     )
   }
 
-  const gradient = getGradientSeed(campaign.name + (campaign.seed || ''))
-  const initials = getInitials(campaign.name)
-  const diffColor = getDifficultyColor(campaign.difficulty)
-  const statusColor = STATUS_COLORS[campaign.status] || '#6b7280'
   const isOwner = campaign.user_id === user?.id
 
   return (
     <div className="dashboard-page">
-      <div className="dashboard-header">
-        <div className="dashboard-header-left">
-          <button className="dashboard-back" onClick={() => navigate('/')} title="Back to campaigns">
-            <i className="bi bi-arrow-left"></i>
-          </button>
-          <div className="dashboard-avatar" style={{ background: gradient }}>
-            {initials}
-          </div>
-          <div className="dashboard-header-meta">
-            <h2>{campaign.name}</h2>
-            <div className="dashboard-header-tags">
-              {campaign.difficulty && (
-                <span className="campaign-badge" style={{ '--badge-color': diffColor }}>
-                  {campaign.difficulty}
-                </span>
-              )}
-              <span className="dashboard-status-dot" style={{ background: statusColor }} />
-              <span style={{ color: statusColor, fontSize: 13, textTransform: 'capitalize' }}>
-                {campaign.status}
-              </span>
-              <span className="dashboard-date">Created {formatDate(campaign.created_at)}</span>
-            </div>
-          </div>
-        </div>
-        <div className="dashboard-header-right">
-          <button
-            className="dashboard-settings-btn"
-            onClick={() => navigate(`/campaigns/${id}/dev`)}
-            title="Open campaign audit"
-          >
-            <i className="bi bi-bug-fill"></i>
-          </button>
-          <button className="dashboard-settings-btn" onClick={() => {
-            setCampaignName(campaign.name)
-            setCampaignDesc(campaign.description || '')
-            setShowSettings(true)
-          }} title="Campaign settings">
-            <i className="bi bi-gear-fill"></i>
-          </button>
-        </div>
-      </div>
-
       <div className="dashboard-layout">
         <aside className="dashboard-left">
           <PartyRoster characters={characters} campaignId={id} onImport={openImport} />
@@ -443,6 +466,9 @@ export default function CampaignViewPage({ user }) {
             onEndSession={handleEndSession}
             onSendMessage={handleSendMessage}
             aiThinking={aiThinking}
+            sheetProposals={sheetProposals}
+            onProposalApplied={handleProposalApplied}
+            onProposalDismissed={handleProposalDismissed}
           />
         </main>
 

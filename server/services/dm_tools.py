@@ -8,6 +8,7 @@ from models import (
     CampaignWorld,
     Character,
     NPCActor,
+    SheetProposal,
     WorldEvent,
 )
 from services.audit_service import log_audit_event
@@ -300,6 +301,168 @@ def build_session_memory_context(campaign, session, current_user, player_message
     }
 
 
+SHEET_SCALAR_FIELDS = {
+    'max_hp': {'type': 'int', 'min': 0},
+    'current_hp': {'type': 'int', 'min': 0},
+    'temp_hp': {'type': 'int', 'min': 0},
+    'armor_class': {'type': 'int', 'min': 0},
+    'initiative_bonus': {'type': 'int'},
+    'speed': {'type': 'int', 'min': 0},
+    'death_save_successes': {'type': 'int', 'min': 0, 'max': 3},
+    'death_save_failures': {'type': 'int', 'min': 0, 'max': 3},
+    'inspiration': {'type': 'bool'},
+    'proficiency_bonus': {'type': 'int', 'min': 0},
+    'passive_perception': {'type': 'int', 'min': 0},
+    'exhaustion_level': {'type': 'int', 'min': 0, 'max': 6},
+    'experience_points': {'type': 'int', 'min': 0},
+    'cp': {'type': 'int', 'min': 0},
+    'sp': {'type': 'int', 'min': 0},
+    'ep': {'type': 'int', 'min': 0},
+    'gp': {'type': 'int', 'min': 0},
+    'pp': {'type': 'int', 'min': 0},
+    'spell_slots_used_1': {'type': 'int', 'min': 0},
+    'spell_slots_used_2': {'type': 'int', 'min': 0},
+    'spell_slots_used_3': {'type': 'int', 'min': 0},
+    'spell_slots_used_4': {'type': 'int', 'min': 0},
+    'spell_slots_used_5': {'type': 'int', 'min': 0},
+    'spell_slots_used_6': {'type': 'int', 'min': 0},
+    'spell_slots_used_7': {'type': 'int', 'min': 0},
+    'spell_slots_used_8': {'type': 'int', 'min': 0},
+    'spell_slots_used_9': {'type': 'int', 'min': 0},
+}
+
+SHEET_LIST_OPERATIONS = ('condition', 'equipment')
+
+FIELD_LABELS = {
+    'max_hp': 'Max HP',
+    'current_hp': 'Current HP',
+    'temp_hp': 'Temp HP',
+    'armor_class': 'Armor Class',
+    'initiative_bonus': 'Initiative Bonus',
+    'speed': 'Speed',
+    'death_save_successes': 'Death Save Successes',
+    'death_save_failures': 'Death Save Failures',
+    'inspiration': 'Inspiration',
+    'proficiency_bonus': 'Proficiency Bonus',
+    'passive_perception': 'Passive Perception',
+    'exhaustion_level': 'Exhaustion Level',
+    'experience_points': 'Experience Points',
+    'cp': 'CP',
+    'sp': 'SP',
+    'ep': 'EP',
+    'gp': 'GP',
+    'pp': 'PP',
+    'spell_slots_used_1': 'Level 1 Spell Slots Used',
+    'spell_slots_used_2': 'Level 2 Spell Slots Used',
+    'spell_slots_used_3': 'Level 3 Spell Slots Used',
+    'spell_slots_used_4': 'Level 4 Spell Slots Used',
+    'spell_slots_used_5': 'Level 5 Spell Slots Used',
+    'spell_slots_used_6': 'Level 6 Spell Slots Used',
+    'spell_slots_used_7': 'Level 7 Spell Slots Used',
+    'spell_slots_used_8': 'Level 8 Spell Slots Used',
+    'spell_slots_used_9': 'Level 9 Spell Slots Used',
+}
+
+
+def _sheet_field_label(field):
+    clean = field.split(':', 1)[0]
+    return FIELD_LABELS.get(clean, clean.replace('_', ' ').title())
+
+
+def _current_list_item_count(character, relation_name, item_name):
+    items = getattr(character, relation_name, [])
+    return sum(
+        1 for item in items
+        if (getattr(item, 'condition_name', None) or getattr(item, 'name', None) or '').lower() == item_name.lower()
+    )
+
+
+def _compute_change(character, change):
+    field = change.get('field', '')
+    operation = change.get('operation', '')
+    raw_value = change.get('value', 0)
+
+    if ':' in field:
+        prefix, item_name = field.split(':', 1)
+        prefix = prefix.strip().lower()
+        if prefix not in SHEET_LIST_OPERATIONS:
+            return None
+        item_name = item_name.strip()
+        label_prefix = prefix.capitalize()
+        count = _current_list_item_count(character, f'{prefix}s' if prefix != 'equipment' else prefix, item_name)
+        if operation == 'add' or (operation == 'set' and raw_value):
+            return {
+                'field': field,
+                'operation': operation,
+                'value': {'name': item_name},
+                'before': {'count': count},
+                'after': {'count': count + 1},
+                'label': f'{label_prefix}: {item_name}',
+            }
+        elif operation in ('subtract', 'remove') or (operation == 'set' and not raw_value):
+            return {
+                'field': field,
+                'operation': operation,
+                'value': {'name': item_name},
+                'before': {'count': count},
+                'after': {'count': max(0, count - 1)},
+                'label': f'{label_prefix}: {item_name}',
+            }
+        return None
+
+    config = SHEET_SCALAR_FIELDS.get(field)
+    if not config:
+        return None
+
+    try:
+        current = getattr(character, field, 0)
+    except (TypeError, AttributeError):
+        return None
+
+    if config['type'] == 'bool':
+        current = bool(current)
+        new = bool(raw_value)
+        if operation == 'set':
+            new = bool(raw_value)
+        elif operation == 'add':
+            new = True
+        elif operation == 'subtract':
+            new = False
+        else:
+            return None
+    else:
+        try:
+            current = int(current) if current is not None else 0
+            delta = int(raw_value)
+        except (TypeError, ValueError):
+            return None
+
+        if operation == 'set':
+            new = delta
+        elif operation == 'add':
+            new = current + delta
+        elif operation == 'subtract':
+            new = current - delta
+        else:
+            return None
+
+        min_val = config.get('min')
+        max_val = config.get('max')
+        if min_val is not None:
+            new = max(min_val, new)
+        if max_val is not None:
+            new = min(max_val, new)
+
+    return {
+        'field': field,
+        'operation': operation,
+        'value': raw_value,
+        'before': current,
+        'after': new,
+        'label': _sheet_field_label(field),
+    }
+
+
 DM_TOOL_DEFINITIONS = [
     {
         'type': 'function',
@@ -415,6 +578,43 @@ DM_TOOL_DEFINITIONS = [
             },
         },
     },
+    {
+        'type': 'function',
+        'function': {
+            'name': 'propose_sheet_update',
+            'description': 'Propose a mechanical update to a character sheet based on visible events in play. Use ask_character_sheet first to check current values. The player must approve the change unless the character is DM-controlled.',
+            'parameters': {
+                'type': 'object',
+                'required': ['character_id', 'reason', 'changes'],
+                'properties': {
+                    'character_id': {'type': 'integer', 'description': 'ID of the character to update.'},
+                    'reason': {'type': 'string', 'description': 'Brief player-visible explanation of why this change is happening.'},
+                    'changes': {
+                        'type': 'array',
+                        'items': {
+                            'type': 'object',
+                            'required': ['field', 'operation', 'value'],
+                            'properties': {
+                                'field': {
+                                    'type': 'string',
+                                    'description': 'Scalar field (current_hp, gp, inspiration, spell_slots_used_1, exhaustion_level, etc.) or list field (condition:Poisoned, equipment:Potion of Healing).',
+                                },
+                                'operation': {
+                                    'type': 'string',
+                                    'enum': ['add', 'subtract', 'set'],
+                                    'description': 'add, subtract, or set the value.',
+                                },
+                                'value': {
+                                    'type': 'number',
+                                    'description': 'Numeric value to add/subtract/set. For boolean fields use 1 (true) or 0 (false).',
+                                },
+                            },
+                        },
+                    },
+                },
+            },
+        },
+    },
 ]
 
 
@@ -453,6 +653,47 @@ def _tool_ask_character_sheet(campaign, current_user, args, audit_context=None):
 
     result = get_character_sheet_answer(question, scope, character_sheets, audit_context=audit_context)
     return {'scope': scope, **result}
+
+
+def _tool_propose_sheet_update(campaign, current_user, args, session, audit_context=None):
+    character_id = args.get('character_id')
+    reason = clean_text(args.get('reason', ''), 500)
+    raw_changes = args.get('changes', [])
+
+    if not character_id or not reason or not raw_changes:
+        return {'error': 'character_id, reason, and changes are required.'}
+
+    character = Character.query.filter_by(id=character_id, campaign_id=campaign.id).first()
+    if not character:
+        return {'error': 'Character not found in this campaign.'}
+
+    computed_changes = []
+    for change in raw_changes:
+        result = _compute_change(character, change)
+        if result:
+            computed_changes.append(result)
+
+    if not computed_changes:
+        return {'error': 'No valid changes could be computed from the provided data.'}
+
+    proposal = SheetProposal(
+        session_id=session.id,
+        character_id=character_id,
+        dm_user_id=current_user.id,
+        reason=reason,
+        changes=computed_changes,
+        status='pending',
+    )
+    db.session.add(proposal)
+    db.session.commit()
+
+    return {
+        'proposal_id': proposal.id,
+        'character_id': character_id,
+        'reason': reason,
+        'changes': computed_changes,
+        'status': 'pending',
+    }
 
 
 def _tool_get_current_scene(campaign, _current_user, args):
@@ -623,6 +864,7 @@ TOOL_HANDLERS = {
     'update_current_scene': _tool_update_current_scene,
     'advance_clock': _tool_advance_clock,
     'reveal_fact': _tool_reveal_fact,
+    'propose_sheet_update': _tool_propose_sheet_update,
 }
 
 
@@ -636,7 +878,9 @@ def execute_dm_tool(campaign, session, current_user, name, args, audit_context=N
     else:
         before_new = len(db.session.new)
         result = (
-            handler(campaign, current_user, args, audit_context)
+            handler(campaign, current_user, args, session, audit_context)
+            if name == 'propose_sheet_update'
+            else handler(campaign, current_user, args, audit_context)
             if name == 'ask_character_sheet'
             else handler(campaign, current_user, args)
         )

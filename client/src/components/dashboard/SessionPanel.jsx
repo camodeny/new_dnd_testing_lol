@@ -2,6 +2,7 @@ import { useState, useRef, useEffect } from 'react'
 import MarkdownContent from '../common/MarkdownContent'
 import DiceRollStage from './DiceRollStage'
 import SessionInput from './SessionInput'
+import SheetProposalInline from '../session/SheetProposalInline'
 import { formatMessageForDm, hasIcSegment, parseTaggedMessage } from '../../utils/messageTags'
 
 function formatTime(iso) {
@@ -126,6 +127,9 @@ export default function SessionPanel({
   onEndSession,
   onSendMessage,
   aiThinking,
+  sheetProposals,
+  onProposalApplied,
+  onProposalDismissed,
 }) {
   const [input, setInput] = useState('')
   const [modifier, setModifier] = useState(0)
@@ -230,21 +234,33 @@ export default function SessionPanel({
             )}
             {messages.map((msg) => (
               <div key={msg.id} className={`session-msg session-msg-${msg.role}`}>
-                <div className="session-msg-header">
-                  <span className="session-msg-role">
-                    <i className={getMessageSenderIcon(msg.role)}></i> {getMessageSenderLabel(msg, currentUser)}
-                  </span>
-                  <span className="session-msg-time">{formatTime(msg.created_at)}</span>
-                </div>
-                <div className={`session-msg-content ${msg.role === 'player' ? 'session-msg-content-tagged' : ''}`}>
-                  {msg.role === 'dm' ? (
-                    <DMMessageContent content={msg.content} />
-                  ) : msg.role === 'player' ? (
-                    <PlayerMessageContent content={msg.content} />
-                  ) : (
-                    msg.content
-                  )}
-                </div>
+                {msg.is_proposal ? (
+                  <SheetProposalInline
+                    proposal={msg.proposal}
+                    sessionId={session?.id}
+                    currentUser={currentUser}
+                    onApplied={onProposalApplied}
+                    onDismissed={onProposalDismissed}
+                  />
+                ) : (
+                  <>
+                    <div className="session-msg-header">
+                      <span className="session-msg-role">
+                        <i className={getMessageSenderIcon(msg.role)}></i> {getMessageSenderLabel(msg, currentUser)}
+                      </span>
+                      <span className="session-msg-time">{formatTime(msg.created_at)}</span>
+                    </div>
+                    <div className={`session-msg-content ${msg.role === 'player' ? 'session-msg-content-tagged' : ''}`}>
+                      {msg.role === 'dm' ? (
+                        <DMMessageContent content={msg.content} />
+                      ) : msg.role === 'player' ? (
+                        <PlayerMessageContent content={msg.content} />
+                      ) : (
+                        msg.content
+                      )}
+                    </div>
+                  </>
+                )}
               </div>
             ))}
             {aiThinking && (

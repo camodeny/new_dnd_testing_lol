@@ -3,7 +3,7 @@ from datetime import datetime
 from flask import Blueprint, jsonify, request
 
 from auth import token_required
-from models import db, Campaign, CampaignSession, SessionMessage
+from models import db, Campaign, CampaignSession, SessionMessage, SheetProposal, Character
 from openrouter import (
     get_opening_scene_response,
     get_session_dm_response_with_tools,
@@ -12,8 +12,10 @@ from openrouter import (
 )
 from services.audit_service import log_audit_event
 from services.campaign_service import ensure_member, get_or_404
+from services.character_service import character_full_dict
 from services.dm_tools import (
     DM_TOOL_DEFINITIONS,
+    SHEET_SCALAR_FIELDS,
     apply_memory_patch,
     build_session_hot_context,
     build_session_memory_context,
@@ -274,6 +276,7 @@ def send_message(current_user, session_id):
     ai_turn = _session_dm_turn_decision(ai_result)
     ai_text = ai_turn.get('content') or ''
 
+    sheet_proposals = []
     if ai_turn.get('mode') == 'speak' and ai_text:
         ai_msg = SessionMessage(
             session_id=session_id,
@@ -347,7 +350,29 @@ def send_message(current_user, session_id):
             )
         db.session.commit()
         result_messages.append(ai_msg.to_dict())
-    elif ai_turn.get('mode') == 'silent':
+
+        pending_proposals = SheetProposal.query.filter_by(
+            session_id=session_id, message_id=None, status='pending',
+        ).all()
+        for proposal in pending_proposals:
+            proposal.message_id = ai_msg.id
+        db.session.commit()
+        sheet_proposals = [p.to_dict() for p in pending_proposals]
+
+        log_audit_event(
+            campaign.id,
+            'client_response_sent',
+            'Sent session message response payload to client.',
+            {'session_id': session_id, 'messages': result_messages, 'sheet_proposals': sheet_proposals},
+            source='session_messages',
+            actor='server',
+            trace_id=trace_id,
+            trace_label=trace_label,
+            commit=True,
+        )
+        return jsonify({'messages': result_messages, 'sheet_proposals': sheet_proposals}), 201
+
+    if ai_turn.get('mode') == 'silent':
         log_audit_event(
             campaign.id,
             'dm_silence_chosen',
@@ -367,7 +392,6 @@ def send_message(current_user, session_id):
             audit_role='agent',
             commit=False,
         )
-        db.session.commit()
     else:
         log_audit_event(
             campaign.id,
@@ -385,8 +409,8 @@ def send_message(current_user, session_id):
             audit_role='agent',
             commit=False,
         )
-        db.session.commit()
 
+    db.session.commit()
     log_audit_event(
         campaign.id,
         'client_response_sent',
@@ -399,3 +423,152 @@ def send_message(current_user, session_id):
         commit=True,
     )
     return jsonify({'messages': result_messages}), 201
+
+
+@token_required
+def _get_session_proposals(current_user, session_id):
+    session = get_or_404(CampaignSession, session_id)
+    campaign = db.session.get(Campaign, session.campaign_id)
+    if not ensure_member(campaign, current_user):
+        return jsonify({'error': 'Forbidden'}), 403
+
+    is_dm = campaign.user_id == current_user.id
+    proposals = SheetProposal.query.filter_by(session_id=session_id, status='pending').all()
+
+    if is_dm:
+        result = [p.to_dict() for p in proposals]
+    else:
+        user_char_ids = {c.id for c in Character.query.filter_by(user_id=current_user.id).all()}
+        result = [p.to_dict() for p in proposals if p.character_id in user_char_ids]
+
+    return jsonify({'sheet_proposals': result}), 200
+
+
+@token_required
+def _apply_sheet_proposal(current_user, session_id, proposal_id):
+    session = get_or_404(CampaignSession, session_id)
+    campaign = db.session.get(Campaign, session.campaign_id)
+    proposal = get_or_404(SheetProposal, proposal_id)
+
+    if proposal.status != 'pending':
+        return jsonify({'error': 'Proposal is not pending.'}), 400
+
+    character = db.session.get(Character, proposal.character_id)
+    if not character:
+        return jsonify({'error': 'Character not found.'}), 404
+
+    is_dm = campaign.user_id == current_user.id
+    is_owner = character.user_id == current_user.id
+    is_npc = character.user_id is None
+
+    if not is_owner and not (is_dm and is_npc):
+        return jsonify({'error': 'Forbidden'}), 403
+
+    from models import CharacterCondition, CharacterEquipment
+
+    for change in proposal.changes:
+        field = change['field']
+        after = change['after']
+
+        if ':' in field:
+            prefix, item_name = field.split(':', 1)
+            prefix = prefix.strip().lower()
+            item_name = item_name.strip()
+
+            if prefix == 'condition':
+                existing = CharacterCondition.query.filter_by(
+                    character_id=character.id, condition_name=item_name,
+                ).first()
+                if isinstance(after, dict) and after.get('count', 0) > 0:
+                    if not existing:
+                        db.session.add(CharacterCondition(
+                            character=character, condition_name=item_name,
+                        ))
+                elif existing:
+                    db.session.delete(existing)
+
+            elif prefix == 'equipment':
+                if isinstance(after, dict) and after.get('count', 0) > 0:
+                    existing_equip = CharacterEquipment.query.filter_by(
+                        character_id=character.id, name=item_name,
+                    ).first()
+                    if existing_equip:
+                        existing_equip.quantity = (existing_equip.quantity or 0) + 1
+                    else:
+                        db.session.add(CharacterEquipment(
+                            character=character, name=item_name, quantity=1,
+                        ))
+        else:
+            config = SHEET_SCALAR_FIELDS.get(field)
+            if not config:
+                continue
+            if config['type'] == 'bool':
+                setattr(character, field, bool(after))
+            else:
+                setattr(character, field, int(after))
+
+    character.updated_at = datetime.utcnow()
+    proposal.status = 'applied'
+    proposal.applied_at = datetime.utcnow()
+    db.session.commit()
+
+    log_audit_event(
+        campaign.id,
+        'sheet_proposal_applied',
+        f'Sheet proposal {proposal_id} applied.',
+        {'session_id': session_id, 'proposal_id': proposal_id, 'changes': proposal.changes},
+        source='session_messages',
+        actor=current_user.username,
+        commit=True,
+    )
+
+    return jsonify({'proposal': proposal.to_dict(), 'character': character_full_dict(character)}), 200
+
+
+@token_required
+def _dismiss_sheet_proposal(current_user, session_id, proposal_id):
+    session = get_or_404(CampaignSession, session_id)
+    campaign = db.session.get(Campaign, session.campaign_id)
+    proposal = get_or_404(SheetProposal, proposal_id)
+
+    if proposal.status != 'pending':
+        return jsonify({'error': 'Proposal is not pending.'}), 400
+
+    character = db.session.get(Character, proposal.character_id)
+    is_dm = campaign.user_id == current_user.id
+    is_owner = character and character.user_id == current_user.id
+
+    if not is_owner and not is_dm:
+        return jsonify({'error': 'Forbidden'}), 403
+
+    proposal.status = 'dismissed'
+    db.session.commit()
+
+    log_audit_event(
+        campaign.id,
+        'sheet_proposal_dismissed',
+        f'Sheet proposal {proposal_id} dismissed.',
+        {'session_id': session_id, 'proposal_id': proposal_id},
+        source='session_messages',
+        actor=current_user.username,
+        commit=True,
+    )
+
+    return jsonify({'proposal': proposal.to_dict()}), 200
+
+
+sessions_bp.add_url_rule(
+    '/api/sessions/<int:session_id>/proposals',
+    view_func=_get_session_proposals,
+    methods=['GET'],
+)
+sessions_bp.add_url_rule(
+    '/api/sessions/<int:session_id>/proposals/<int:proposal_id>/apply',
+    view_func=_apply_sheet_proposal,
+    methods=['POST'],
+)
+sessions_bp.add_url_rule(
+    '/api/sessions/<int:session_id>/proposals/<int:proposal_id>/dismiss',
+    view_func=_dismiss_sheet_proposal,
+    methods=['POST'],
+)

@@ -135,6 +135,19 @@ export function sendMessage(sessionId, content, role = 'player') {
   return apiFetch(`/sessions/${sessionId}/messages`, { method: 'POST', body: JSON.stringify({ content, role }) })
 }
 
+// Sheet Proposals
+export function getSheetProposals(sessionId) {
+  return apiFetch(`/sessions/${sessionId}/proposals`)
+}
+
+export function applySheetProposal(sessionId, proposalId) {
+  return apiFetch(`/sessions/${sessionId}/proposals/${proposalId}/apply`, { method: 'POST' })
+}
+
+export function dismissSheetProposal(sessionId, proposalId) {
+  return apiFetch(`/sessions/${sessionId}/proposals/${proposalId}/dismiss`, { method: 'POST' })
+}
+
 // Members & Invites
 export function listMembers(campaignId) {
   return apiFetch(`/campaigns/${campaignId}/members`)
