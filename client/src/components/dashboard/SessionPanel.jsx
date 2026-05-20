@@ -993,71 +993,77 @@ export default function SessionPanel({
             <div className={`session-input-shell ${hasIcSegment(input) ? 'has-ic' : ''} ${activeSlashCommand ? 'has-command' : ''}`}>
               {activeSlashCommand === 'roll' ? (
                 <div className="session-slash-inline" onKeyDown={handleSlashKeyDown}>
-                  <span className="slash-inline-command">/roll</span>
-                  <label className="slash-inline-field slash-inline-label-field">
-                    <span>label</span>
-                    <input
-                      type="text"
-                      placeholder="Physical Roll"
-                      value={physicalLabel}
-                      onChange={(e) => setPhysicalLabel(e.target.value)}
-                      aria-label="Roll label"
-                    />
-                  </label>
-                  <label className="slash-inline-field slash-inline-die-field">
-                    <span>die</span>
-                    <select
-                      value={physicalSides}
-                      onChange={(e) => setPhysicalSides(parseInt(e.target.value, 10))}
-                      aria-label="Die type"
+                  <div className="slash-inline-top-row">
+                    <span className="slash-inline-command"><i className="bi bi-dice-5-fill"></i> /roll</span>
+                    <span className="slash-inline-hint">Log a physical dice roll</span>
+                    <button
+                      type="button"
+                      className="btn slash-inline-close"
+                      onClick={cancelSlashCommand}
+                      aria-label="Cancel slash command"
+                      title="Cancel (Esc)"
                     >
-                      <option value="20">d20</option>
-                      <option value="12">d12</option>
-                      <option value="10">d10</option>
-                      <option value="8">d8</option>
-                      <option value="6">d6</option>
-                      <option value="4">d4</option>
-                      <option value="100">d100</option>
-                    </select>
-                  </label>
-                  <label className="slash-inline-field slash-inline-rolls-field">
-                    <span>rolls</span>
-                    <input
-                      type="text"
-                      placeholder="14"
-                      value={physicalRolls}
-                      onChange={(e) => updatePhysicalRolls(e.target.value)}
-                      autoFocus
-                      aria-label="Natural rolls"
-                    />
-                  </label>
-                  <label className="slash-inline-field slash-inline-number-field">
-                    <span>mod</span>
-                    <input
-                      type="number"
-                      value={physicalModifier}
-                      onChange={(e) => updatePhysicalModifier(e.target.value)}
-                      aria-label="Roll modifier"
-                    />
-                  </label>
-                  <label className="slash-inline-field slash-inline-number-field">
-                    <span>total</span>
-                    <input
-                      type="number"
-                      value={physicalTotal}
-                      onChange={(e) => setPhysicalTotal(parseInt(e.target.value, 10) || 0)}
-                      aria-label="Roll total"
-                    />
-                  </label>
-                  <button
-                    type="button"
-                    className="btn slash-inline-close"
-                    onClick={cancelSlashCommand}
-                    aria-label="Cancel slash command"
-                    title="Cancel"
-                  >
-                    <i className="bi bi-x-lg"></i>
-                  </button>
+                      <i className="bi bi-x-lg"></i>
+                    </button>
+                  </div>
+                  <div className="slash-inline-fields">
+                    <label className="slash-inline-field slash-inline-label-field">
+                      <span>Label</span>
+                      <input
+                        type="text"
+                        placeholder="Physical Roll"
+                        value={physicalLabel}
+                        onChange={(e) => setPhysicalLabel(e.target.value)}
+                        aria-label="Roll label"
+                      />
+                    </label>
+                    <label className="slash-inline-field slash-inline-die-field">
+                      <span>Die</span>
+                      <select
+                        value={physicalSides}
+                        onChange={(e) => setPhysicalSides(parseInt(e.target.value, 10))}
+                        aria-label="Die type"
+                      >
+                        <option value="20">d20</option>
+                        <option value="12">d12</option>
+                        <option value="10">d10</option>
+                        <option value="8">d8</option>
+                        <option value="6">d6</option>
+                        <option value="4">d4</option>
+                        <option value="100">d100</option>
+                      </select>
+                    </label>
+                    <label className="slash-inline-field slash-inline-rolls-field">
+                      <span>Result</span>
+                      <input
+                        type="text"
+                        placeholder="e.g. 14"
+                        value={physicalRolls}
+                        onChange={(e) => updatePhysicalRolls(e.target.value)}
+                        autoFocus
+                        aria-label="Natural rolls"
+                      />
+                    </label>
+                    <label className="slash-inline-field slash-inline-number-field">
+                      <span>Mod</span>
+                      <input
+                        type="number"
+                        value={physicalModifier}
+                        onChange={(e) => updatePhysicalModifier(e.target.value)}
+                        aria-label="Roll modifier"
+                      />
+                    </label>
+                    <label className="slash-inline-field slash-inline-total-field">
+                      <span>Total</span>
+                      <input
+                        type="number"
+                        value={physicalTotal}
+                        onChange={(e) => setPhysicalTotal(parseInt(e.target.value, 10) || 0)}
+                        aria-label="Roll total"
+                        readOnly
+                      />
+                    </label>
+                  </div>
                 </div>
               ) : (
                 <SessionInput
