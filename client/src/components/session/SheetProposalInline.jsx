@@ -18,7 +18,7 @@ function changeDescription(change) {
   return { label, opSymbol, beforeStr: formatValue(before), afterStr: formatValue(after) }
 }
 
-export default function SheetProposalInline({ proposal, sessionId, currentUser, onApplied, onDismissed }) {
+export default function SheetProposalInline({ proposal, sessionId, onApplied, onDismissed }) {
   const [applying, setApplying] = useState(false)
   const [dismissed, setDismissed] = useState(false)
 
@@ -39,7 +39,7 @@ export default function SheetProposalInline({ proposal, sessionId, currentUser, 
     try {
       const data = await applySheetProposal(sessionId, proposal.id)
       onApplied?.(data.proposal, data.character)
-    } catch (err) {
+    } catch {
       setApplying(false)
     }
   }

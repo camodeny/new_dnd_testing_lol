@@ -18,12 +18,6 @@ import CampaignLobby from '../components/dashboard/CampaignLobby'
 import CharacterPlanningMode from '../components/dashboard/CharacterPlanningMode'
 import WorldBuildingMode from '../components/dashboard/WorldBuildingMode'
 
-function formatDate(iso) {
-  if (!iso) return ''
-  const d = new Date(iso)
-  return d.toLocaleDateString(undefined, { month: 'short', day: 'numeric', year: 'numeric' })
-}
-
 function getInitials(name) {
   return name.split(' ').map((w) => w[0]).join('').slice(0, 2).toUpperCase()
 }
@@ -462,6 +456,7 @@ export default function CampaignViewPage({ user }) {
             session={session}
             messages={messages}
             currentUser={user}
+            currentCharacter={currentCharacter}
             onStartSession={handleStartSession}
             onEndSession={handleEndSession}
             onSendMessage={handleSendMessage}

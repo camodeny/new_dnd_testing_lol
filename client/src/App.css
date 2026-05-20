@@ -1278,6 +1278,7 @@ select.input:focus {
 .session-panel {
   display: flex;
   flex-direction: column;
+  position: relative;
   height: 100%;
 }
 
@@ -2875,4 +2876,445 @@ select.input:focus {
 @keyframes rotateClockwise {
   from { transform: rotate(0deg); }
   to { transform: rotate(360deg); }
+}
+
+/* ==========================================================================
+   ROLL CARD & DICE ROLLER TABS UX STYLES
+   ========================================================================== */
+
+/* Roll Card Styling */
+.roll-card {
+  background: linear-gradient(135deg, rgba(22, 23, 29, 0.9), rgba(31, 32, 43, 0.8));
+  border: 1px solid rgba(255, 255, 255, 0.1);
+  border-radius: var(--radius-md);
+  padding: 14px 18px;
+  margin: 6px 0;
+  box-shadow: var(--shadow-sm), inset 0 0 10px rgba(0, 0, 0, 0.3);
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  min-width: 260px;
+  max-width: 100%;
+  animation: rollCardFadeIn 0.35s cubic-bezier(0.34, 1.56, 0.64, 1);
+  box-sizing: border-box;
+}
+
+@keyframes rollCardFadeIn {
+  from { opacity: 0; transform: translateY(8px) scale(0.96); }
+  to { opacity: 1; transform: translateY(0) scale(1); }
+}
+
+.roll-card-header {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  border-bottom: 1px solid rgba(255, 255, 255, 0.05);
+  padding-bottom: 6px;
+}
+
+.roll-card-icon {
+  color: var(--text-gold);
+  font-size: 0.95rem;
+  display: flex;
+  align-items: center;
+}
+
+.roll-card-title {
+  font-size: 0.85rem;
+  font-weight: 700;
+  text-transform: uppercase;
+  color: var(--text-muted);
+  letter-spacing: 0.5px;
+}
+
+.roll-card-body {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  gap: 16px;
+}
+
+.roll-card-result {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+}
+
+.roll-card-total {
+  font-size: 2.2rem;
+  font-weight: 500;
+  font-family: var(--heading);
+  color: var(--text-bright);
+  line-height: 1;
+  text-shadow: 0 0 10px rgba(255, 255, 255, 0.1);
+}
+
+.roll-card-badge {
+  font-size: 0.65rem;
+  font-weight: 800;
+  padding: 2px 6px;
+  border-radius: 4px;
+  letter-spacing: 0.5px;
+  text-transform: uppercase;
+}
+
+.crit-hit-badge {
+  background: var(--color-accent);
+  color: #000;
+  box-shadow: 0 0 10px var(--color-accent-glow);
+}
+
+.crit-miss-badge {
+  background: var(--color-danger);
+  color: #fff;
+  box-shadow: 0 0 10px var(--color-danger-border);
+}
+
+/* Glow effects for crits */
+.roll-card.crit-hit {
+  border-color: rgba(245, 158, 11, 0.45);
+  box-shadow: var(--shadow-sm), 0 0 15px rgba(245, 158, 11, 0.25), inset 0 0 10px rgba(245, 158, 11, 0.05);
+}
+
+.roll-card.crit-hit .roll-card-total {
+  color: var(--text-gold);
+  text-shadow: 0 0 15px var(--color-accent-glow);
+}
+
+.roll-card.crit-miss {
+  border-color: rgba(220, 38, 38, 0.45);
+  box-shadow: var(--shadow-sm), 0 0 15px rgba(220, 38, 38, 0.25), inset 0 0 10px rgba(220, 38, 38, 0.05);
+}
+
+.roll-card.crit-miss .roll-card-total {
+  color: var(--color-danger);
+  text-shadow: 0 0 15px var(--color-danger-border);
+}
+
+.roll-card-breakdown {
+  display: flex;
+  flex-direction: column;
+  align-items: flex-end;
+  font-size: 0.75rem;
+  color: var(--text-dim);
+  gap: 2px;
+}
+
+.roll-card-formula {
+  font-weight: 600;
+  color: var(--text-muted);
+}
+
+.roll-card-rolls {
+  font-family: var(--mono);
+}
+
+/* Tabs in Dice Roller */
+.dice-tabs {
+  display: flex;
+  gap: 6px;
+  border-bottom: 1px solid var(--border-color);
+  padding-bottom: 10px;
+  margin-bottom: 4px;
+}
+
+.btn-tab {
+  background: transparent;
+  border: 1px solid transparent;
+  color: var(--text-muted);
+  transition: var(--transition-smooth);
+}
+
+.btn-tab:hover {
+  color: var(--text-bright);
+  background: rgba(255, 255, 255, 0.02);
+}
+
+.btn-tab.active {
+  background: rgba(139, 92, 246, 0.1);
+  border-color: rgba(139, 92, 246, 0.3);
+  color: var(--color-primary-hover);
+}
+
+/* Grids in Dice Roller tabs */
+.dice-skills-grid,
+.dice-saves-grid {
+  display: grid;
+  grid-template-columns: repeat(3, 1fr);
+  gap: 6px;
+  max-height: 180px;
+  overflow-y: auto;
+  padding-right: 4px;
+}
+
+@media (max-width: 600px) {
+  .dice-skills-grid,
+  .dice-saves-grid {
+    grid-template-columns: repeat(2, 1fr);
+  }
+}
+
+.btn-skill-roll,
+.btn-save-roll {
+  background: rgba(255, 255, 255, 0.02);
+  border: 1px solid var(--border-color);
+  color: var(--text-main);
+  font-size: 0.8rem;
+  padding: 8px 10px;
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  transition: var(--transition-bounce);
+}
+
+.btn-skill-roll:hover,
+.btn-save-roll:hover {
+  background: var(--bg-panel-elevated);
+  border-color: var(--color-accent);
+  color: var(--text-gold);
+  box-shadow: 0 0 8px var(--color-accent-glow);
+}
+
+.btn-skill-roll span.mod-val,
+.btn-save-roll span.mod-val {
+  font-weight: 700;
+  color: var(--text-gold);
+}
+
+/* Combat tab styling */
+.dice-combat-tab {
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+  max-height: 180px;
+  overflow-y: auto;
+}
+
+.combat-roll-row {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  background: rgba(255, 255, 255, 0.01);
+  border: 1px solid var(--border-color);
+  border-radius: var(--radius-sm);
+  padding: 8px 12px;
+  gap: 12px;
+}
+
+.combat-item-name {
+  font-weight: 600;
+  font-size: 0.85rem;
+  color: var(--text-bright);
+}
+
+.combat-item-meta {
+  font-size: 0.75rem;
+  color: var(--text-dim);
+}
+
+.combat-roll-buttons {
+  display: flex;
+  gap: 6px;
+}
+
+/* Post roll button */
+.btn-post-roll {
+  margin-left: 12px;
+  padding: 4px 8px;
+  font-size: 0.75rem;
+  border-radius: 4px;
+}
+
+/* Auto-post toggle */
+.dice-auto-post {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  font-size: 0.8rem;
+  color: var(--text-muted);
+  cursor: pointer;
+}
+
+
+/* Command Suggestions Box */
+.session-command-suggestions {
+  position: absolute;
+  bottom: 84px;
+  left: 24px;
+  right: 24px;
+  background: rgba(18, 19, 24, 0.95);
+  backdrop-filter: blur(12px);
+  border: 1px solid rgba(255, 255, 255, 0.1);
+  border-radius: var(--radius-md);
+  padding: 12px;
+  box-shadow: var(--shadow-lg), 0 0 20px rgba(0, 0, 0, 0.4);
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  z-index: 100;
+  animation: slideUp 0.2s cubic-bezier(0.34, 1.56, 0.64, 1);
+}
+
+.suggestion-header {
+  font-size: 0.75rem;
+  font-weight: 700;
+  text-transform: uppercase;
+  letter-spacing: 0.05em;
+  color: var(--text-muted);
+  padding: 4px 8px 8px 8px;
+  border-bottom: 1px solid rgba(255, 255, 255, 0.05);
+}
+
+.suggestion-item {
+  border: 0;
+  width: 100%;
+  background: transparent;
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  padding: 8px 12px;
+  border-radius: var(--radius-sm);
+  cursor: pointer;
+  transition: all 0.2s ease;
+}
+
+.suggestion-item:hover {
+  background: rgba(255, 255, 255, 0.05);
+  transform: translateX(4px);
+}
+
+.suggestion-trigger {
+  font-family: var(--font-mono, monospace);
+  font-weight: 600;
+  color: var(--text-gold);
+}
+
+.suggestion-desc {
+  font-size: 0.85rem;
+  color: var(--text-muted);
+}
+
+.session-input-shell.has-command {
+  display: flex;
+  align-items: center;
+  min-height: 50px;
+  border-color: var(--color-primary);
+  box-shadow: 0 0 12px var(--color-primary-glow);
+}
+
+.session-slash-inline {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 7px;
+  width: 100%;
+  padding: 8px 10px;
+}
+
+.slash-inline-command {
+  flex: 0 0 auto;
+  padding: 4px 2px;
+  font-family: var(--font-mono, monospace);
+  font-size: 1rem;
+  font-weight: 700;
+  color: var(--text-bright);
+}
+
+.slash-inline-field {
+  display: inline-flex;
+  align-items: center;
+  min-height: 34px;
+  min-width: 0;
+  overflow: hidden;
+  border: 1px solid rgba(96, 165, 250, 0.75);
+  border-radius: var(--radius-sm);
+  background: rgba(37, 99, 235, 0.12);
+}
+
+.slash-inline-field:focus-within {
+  border-color: var(--color-primary-hover);
+  box-shadow: 0 0 0 2px rgba(139, 92, 246, 0.25);
+}
+
+.slash-inline-field span {
+  align-self: stretch;
+  display: flex;
+  align-items: center;
+  padding: 0 9px;
+  border-right: 1px solid rgba(96, 165, 250, 0.35);
+  background: rgba(255, 255, 255, 0.04);
+  color: var(--text-muted);
+  font-size: 0.82rem;
+  font-weight: 700;
+  white-space: nowrap;
+}
+
+.slash-inline-field input,
+.slash-inline-field select {
+  width: 100%;
+  min-width: 0;
+  height: 32px;
+  border: 0;
+  outline: none;
+  background: transparent;
+  color: var(--text-bright);
+  font: inherit;
+  font-size: 0.92rem;
+  padding: 0 9px;
+}
+
+.slash-inline-field input::placeholder {
+  color: var(--text-dim);
+}
+
+.slash-inline-field select {
+  appearance: none;
+  cursor: pointer;
+}
+
+.slash-inline-label-field {
+  flex: 1 1 180px;
+}
+
+.slash-inline-rolls-field {
+  flex: 1 1 120px;
+}
+
+.slash-inline-die-field {
+  flex: 0 0 96px;
+}
+
+.slash-inline-number-field {
+  flex: 0 0 92px;
+}
+
+.slash-inline-close {
+  flex: 0 0 auto;
+  width: 30px;
+  height: 30px;
+  margin-left: auto;
+  padding: 0;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  color: var(--text-muted);
+  background: transparent;
+  border-color: transparent;
+}
+
+.slash-inline-close:hover {
+  color: var(--text-bright);
+  background: rgba(255, 255, 255, 0.05);
+}
+
+@media (max-width: 760px) {
+  .session-command-suggestions {
+    left: 12px;
+    right: 12px;
+  }
+
+  .slash-inline-label-field,
+  .slash-inline-rolls-field {
+    flex-basis: 100%;
+  }
 }

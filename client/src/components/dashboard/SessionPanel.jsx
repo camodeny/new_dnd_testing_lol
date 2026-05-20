@@ -1,4 +1,4 @@
-import { useState, useRef, useEffect } from 'react'
+import { useState, useRef, useEffect, useMemo } from 'react'
 import { createPortal } from 'react-dom'
 import MarkdownContent from '../common/MarkdownContent'
 import DiceRollStage from './DiceRollStage'
@@ -12,26 +12,123 @@ function formatTime(iso) {
   return d.toLocaleTimeString(undefined, { hour: '2-digit', minute: '2-digit' })
 }
 
-function rollDie(sides, modifier = 0, advantage = false) {
-  if (advantage) {
+function rollDie(sides, modifier = 0, rollMode = 'normal') {
+  if (rollMode === 'advantage') {
     const r1 = Math.floor(Math.random() * sides) + 1
     const r2 = Math.floor(Math.random() * sides) + 1
-    return { result: Math.max(r1, r2), rolls: [r1, r2], total: Math.max(r1, r2) + modifier }
+    const result = Math.max(r1, r2)
+    return { result, rolls: [r1, r2], total: result + modifier }
+  }
+  if (rollMode === 'disadvantage') {
+    const r1 = Math.floor(Math.random() * sides) + 1
+    const r2 = Math.floor(Math.random() * sides) + 1
+    const result = Math.min(r1, r2)
+    return { result, rolls: [r1, r2], total: result + modifier }
   }
   const r = Math.floor(Math.random() * sides) + 1
   return { result: r, rolls: [r], total: r + modifier }
 }
 
-const QUICK_SKILLS = [
-  { label: 'Initiative', skill: 'Dexterity' },
-  { label: 'Perception', skill: 'Wisdom' },
-  { label: 'Stealth', skill: 'Dexterity' },
-  { label: 'Investigation', skill: 'Intelligence' },
-  { label: 'Insight', skill: 'Wisdom' },
-  { label: 'Persuasion', skill: 'Charisma' },
-  { label: 'Arcana', skill: 'Intelligence' },
-  { label: 'History', skill: 'Intelligence' },
+const SKILL_ABILITIES = {
+  Athletics: 'strength',
+  Acrobatics: 'dexterity',
+  'Sleight of Hand': 'dexterity',
+  Stealth: 'dexterity',
+  Arcana: 'intelligence',
+  History: 'intelligence',
+  Investigation: 'intelligence',
+  Nature: 'intelligence',
+  Religion: 'intelligence',
+  'Animal Handling': 'wisdom',
+  Insight: 'wisdom',
+  Medicine: 'wisdom',
+  Perception: 'wisdom',
+  Survival: 'wisdom',
+  Deception: 'charisma',
+  Intimidation: 'charisma',
+  Performance: 'charisma',
+  Persuasion: 'charisma',
+}
+
+const STANDARD_SKILLS = [
+  'Acrobatics', 'Animal Handling', 'Arcana', 'Athletics', 'Deception',
+  'History', 'Insight', 'Intimidation', 'Investigation', 'Medicine',
+  'Nature', 'Perception', 'Performance', 'Persuasion', 'Religion',
+  'Sleight of Hand', 'Stealth', 'Survival'
 ]
+
+function getAbilityModifier(score) {
+  if (score === undefined || score === null) return 0
+  return Math.floor((score - 10) / 2)
+}
+
+function getSavingThrowModifier(character, ability) {
+  const save = (character.saving_throws || []).find(
+    (s) => s.ability?.toLowerCase() === ability.toLowerCase()
+  )
+  if (save && save.bonus_override !== null && save.bonus_override !== undefined && save.bonus_override !== '') {
+    return parseInt(save.bonus_override, 10)
+  }
+  const score = character.ability_scores?.[ability.toLowerCase()] ?? 10
+  const baseMod = getAbilityModifier(score)
+  const isProf = save ? save.is_proficient : false
+  const profBonus = character.general?.proficiency_bonus ?? 2
+  return baseMod + (isProf ? profBonus : 0)
+}
+
+function getSkillModifier(character, skillName) {
+  const skill = (character.skills || []).find(
+    (s) => s.skill_name?.toLowerCase() === skillName.toLowerCase()
+  )
+  if (skill && skill.bonus_override !== null && skill.bonus_override !== undefined && skill.bonus_override !== '') {
+    return parseInt(skill.bonus_override, 10)
+  }
+  const ability = SKILL_ABILITIES[skillName] || 'wisdom'
+  const score = character.ability_scores?.[ability] ?? 10
+  const baseMod = getAbilityModifier(score)
+  const isProf = skill ? skill.is_proficient : false
+  const isExp = skill ? skill.is_expertise : false
+  const profBonus = character.general?.proficiency_bonus ?? 2
+  let mod = baseMod
+  if (isExp) {
+    mod += profBonus * 2
+  } else if (isProf) {
+    mod += profBonus
+  }
+  return mod
+}
+
+function getInitiativeModifier(character) {
+  return character.combat?.initiative_bonus ?? 0
+}
+
+function parseDiceString(str) {
+  const clean = str.replace(/\s+/g, '')
+  const match = clean.match(/^(\d+)d(\d+)(?:([+-])(\d+))?$/i)
+  if (!match) {
+    return { num: 1, sides: 6, mod: 0 }
+  }
+  const num = parseInt(match[1], 10)
+  const sides = parseInt(match[2], 10)
+  let mod = 0
+  if (match[3] && match[4]) {
+    const sign = match[3] === '+' ? 1 : -1
+    mod = sign * parseInt(match[4], 10)
+  }
+  return { num, sides, mod }
+}
+
+function rollDiceString(str) {
+  const { num, sides, mod } = parseDiceString(str)
+  let total = 0
+  const rolls = []
+  for (let i = 0; i < num; i++) {
+    const r = Math.floor(Math.random() * sides) + 1
+    rolls.push(r)
+    total += r
+  }
+  return { rolls, result: total, total: total + mod, modifier: mod, sides }
+}
 
 const DICE = [4, 6, 8, 10, 12, 20, 100]
 
@@ -55,6 +152,54 @@ function getMessageSenderIcon(role) {
   return 'bi bi-person-fill'
 }
 
+const rollRegex = /^\[Roll:\s*([^\]]+)\]\s*total:\s*(-?\d+)\s*\|\s*rolls:\s*([\d,\s]+)\s*\|\s*mod:\s*(-?\d+)\s*\|\s*sides:\s*(\d+)/i
+
+function RollCard({ label, total, rolls, modifier, sides }) {
+  const isD20 = sides === 20
+  let isCritHit = false
+  let isCritMiss = false
+
+  if (isD20) {
+    const chosenRoll = total - modifier
+    if (chosenRoll === 20) isCritHit = true
+    if (chosenRoll === 1) isCritMiss = true
+  }
+
+  const statusClass = isCritHit ? 'crit-hit' : isCritMiss ? 'crit-miss' : ''
+  const displayMod = modifier > 0 ? `+${modifier}` : modifier < 0 ? `${modifier}` : ''
+
+  const rollDetails = rolls.join(', ')
+  const isAdv = label.includes('(Advantage)')
+  const isDis = label.includes('(Disadvantage)')
+
+  let modeStr = ''
+  if (isAdv) modeStr = ' (Adv)'
+  if (isDis) modeStr = ' (Dis)'
+
+  const formula = `${isD20 ? (rolls.length > 1 ? '2' : '1') : rolls.length}d${sides}${modeStr}`
+
+  return (
+    <div className={`roll-card ${statusClass}`}>
+      <div className="roll-card-header">
+        <span className="roll-card-icon"><i className="bi bi-dice-5-fill"></i></span>
+        <span className="roll-card-title">{label}</span>
+      </div>
+      <div className="roll-card-body">
+        <div className="roll-card-result">
+          <span className="roll-card-total">{total}</span>
+          {isCritHit && <span className="roll-card-badge crit-hit-badge">CRIT!</span>}
+          {isCritMiss && <span className="roll-card-badge crit-miss-badge">FAIL!</span>}
+        </div>
+        <div className="roll-card-breakdown">
+          <span className="roll-card-formula">{formula}</span>
+          <span className="roll-card-rolls">[{rollDetails}]</span>
+          {displayMod && <span className="roll-card-mod">{displayMod} modifier</span>}
+        </div>
+      </div>
+    </div>
+  )
+}
+
 function PlayerMessageContent({ content }) {
   const segments = parseTaggedMessage(content)
 
@@ -73,6 +218,26 @@ function PlayerMessageContent({ content }) {
               </div>
               <div className="session-ic-text">{text}</div>
             </div>
+          )
+        }
+
+        const match = text.match(rollRegex)
+        if (segment.type === 'ooc' && match) {
+          const label = match[1]
+          const total = parseInt(match[2], 10)
+          const rolls = match[3].split(',').map((r) => parseInt(r.trim(), 10))
+          const modifier = parseInt(match[4], 10)
+          const sides = parseInt(match[5], 10)
+
+          return (
+            <RollCard
+              key={`roll-${index}`}
+              label={label}
+              total={total}
+              rolls={rolls}
+              modifier={modifier}
+              sides={sides}
+            />
           )
         }
 
@@ -124,36 +289,138 @@ export default function SessionPanel({
   session,
   messages,
   currentUser,
+  currentCharacter,
   onStartSession,
   onEndSession,
   onSendMessage,
   aiThinking,
-  sheetProposals,
   onProposalApplied,
   onProposalDismissed,
 }) {
   const [input, setInput] = useState('')
   const [modifier, setModifier] = useState(0)
-  const [advantage, setAdvantage] = useState(false)
+  const [rollMode, setRollMode] = useState('normal')
+  const [customLabel, setCustomLabel] = useState('')
+  const [autoPost, setAutoPost] = useState(false)
+  const [activeTab, setActiveTab] = useState('custom')
   const [showDice, setShowDice] = useState(false)
   const [lastRoll, setLastRoll] = useState(null)
   const messagesEndRef = useRef(null)
   const rollIdRef = useRef(0)
 
+  const [activeSlashCommand, setActiveSlashCommand] = useState(null)
+  const [physicalLabel, setPhysicalLabel] = useState('')
+  const [physicalSides, setPhysicalSides] = useState(20)
+  const [physicalRolls, setPhysicalRolls] = useState('')
+  const [physicalModifier, setPhysicalModifier] = useState(0)
+  const [physicalTotal, setPhysicalTotal] = useState(0)
+
+  const cancelSlashCommand = () => {
+    setActiveSlashCommand(null)
+    setPhysicalLabel('')
+    setPhysicalSides(20)
+    setPhysicalRolls('')
+    setPhysicalModifier(0)
+    setPhysicalTotal(0)
+  }
+
+  const submitPhysicalRoll = () => {
+    const rolls = physicalRolls
+      .split(',')
+      .map((s) => parseInt(s.trim(), 10))
+      .filter((n) => !Number.isNaN(n))
+
+    if (rolls.length === 0) return
+
+    const totalVal = parseInt(physicalTotal, 10) || 0
+    const sidesVal = parseInt(physicalSides, 10) || 20
+    const modifierVal = parseInt(physicalModifier, 10) || 0
+    const msg = `[Roll: ${physicalLabel || 'Physical Roll'}] total: ${totalVal} | rolls: ${rolls.join(',')} | mod: ${modifierVal} | sides: ${sidesVal}`
+
+    onSendMessage(formatMessageForDm(msg))
+    cancelSlashCommand()
+  }
+
+  const updatePhysicalRolls = (value) => {
+    setPhysicalRolls(value)
+    const rolls = value
+      .split(',')
+      .map((s) => parseInt(s.trim(), 10))
+      .filter((n) => !Number.isNaN(n))
+    const sum = rolls.reduce((a, b) => a + b, 0)
+    setPhysicalTotal(sum + (parseInt(physicalModifier, 10) || 0))
+  }
+
+  const updatePhysicalModifier = (value) => {
+    const modifierValue = parseInt(value, 10) || 0
+    setPhysicalModifier(modifierValue)
+    const rolls = physicalRolls
+      .split(',')
+      .map((s) => parseInt(s.trim(), 10))
+      .filter((n) => !Number.isNaN(n))
+    const sum = rolls.reduce((a, b) => a + b, 0)
+    setPhysicalTotal(sum + modifierValue)
+  }
+
+  const handleSlashKeyDown = (e) => {
+    if (!activeSlashCommand) return
+
+    if (e.key === 'Escape') {
+      cancelSlashCommand()
+      e.preventDefault()
+    } else if (e.key === 'Enter') {
+      if (e.target.closest?.('button')) return
+      submitPhysicalRoll()
+      e.preventDefault()
+    }
+  }
+
+
+  const uniqueSkills = useMemo(() => {
+    if (!currentCharacter) return []
+    return Array.from(new Set([
+      ...STANDARD_SKILLS,
+      ...(currentCharacter.skills || []).map(s => s.skill_name).filter(Boolean)
+    ]))
+  }, [currentCharacter])
+
   useEffect(() => {
     messagesEndRef.current?.scrollIntoView({ behavior: 'smooth' })
   }, [messages])
 
+  const postRollToChat = (roll) => {
+    if (!roll) return
+    const msg = `[Roll: ${roll.label}] total: ${roll.total} | rolls: ${roll.rolls.join(',')} | mod: ${roll.modifier} | sides: ${roll.sides}`
+    onSendMessage(formatMessageForDm(msg))
+  }
+
   const handleSend = () => {
-    const text = input.trim()
+    if (activeSlashCommand === 'roll') {
+      submitPhysicalRoll()
+      return
+    }
+
+    // Clean zero-width space characters and convert non-breaking space to standard space
+    const text = input
+      .replace(/\u200b|\u200c|\u200d|\ufeff/g, '')
+      .replace(/\u00a0/g, ' ')
+      .trim()
     if (!text) return
 
-    if (text.startsWith('/roll ')) {
-      const match = text.match(/\/roll\s*d(\d+)(?:\s*([+-]\s*\d+))?/)
+    const lowerText = text.toLowerCase()
+
+    if (lowerText === '/roll') {
+      setActiveSlashCommand('roll')
+      setInput('')
+      return
+    }
+
+    if (lowerText.startsWith('/roll ')) {
+      const match = text.match(/\/roll\s*d(\d+)(?:\s*([+-]\s*\d+))?/i)
       if (match) {
         const sides = parseInt(match[1], 10)
         const mod = match[2] ? parseInt(match[2].replace(/\s/g, ''), 10) : 0
-        const { rolls, total, result } = rollDie(sides, mod)
+        const { rolls, total, result } = rollDie(sides, mod, rollMode)
         recordLocalRoll({ sides, rolls, total, result, modifier: mod, label: `d${sides}` })
         setShowDice(true)
       }
@@ -161,7 +428,7 @@ export default function SessionPanel({
       return
     }
 
-    if (text.startsWith('/')) {
+    if (lowerText.startsWith('/')) {
       const parts = text.slice(1).split(' ')
       const cmd = parts[0].toLowerCase()
       if (cmd === 'sheet' && parts[1]) {
@@ -182,29 +449,132 @@ export default function SessionPanel({
     setInput('')
   }
 
-  const recordLocalRoll = ({ sides, rolls, total, result, modifier = 0, label }) => {
+  const recordLocalRoll = (rollData) => {
     rollIdRef.current += 1
-    setLastRoll({
+    const roll = {
       id: rollIdRef.current,
+      sides: rollData.sides,
+      rolls: rollData.rolls,
+      total: rollData.total,
+      result: rollData.result,
+      modifier: rollData.modifier,
+      label: rollData.label,
+      rolledAt: new Date().toISOString(),
+    }
+    setLastRoll(roll)
+    if (autoPost) {
+      postRollToChat(roll)
+    }
+  }
+
+  const handleCustomDieClick = (sides) => {
+    const { rolls, total, result } = rollDie(sides, modifier, rollMode)
+    const label = customLabel.trim() || `d${sides}`
+    recordLocalRoll({ sides, rolls, total, result, modifier, label })
+  }
+
+  const handleSkillRoll = (skillName, mod) => {
+    const { rolls, total, result } = rollDie(20, mod, rollMode)
+    const suffix = rollMode === 'advantage' ? ' (Advantage)' : rollMode === 'disadvantage' ? ' (Disadvantage)' : ''
+    recordLocalRoll({
+      sides: 20,
+      rolls,
+      total,
+      result,
+      modifier: mod,
+      label: `${skillName} check${suffix}`
+    })
+  }
+
+  const handleSaveRoll = (ability, mod) => {
+    const { rolls, total, result } = rollDie(20, mod, rollMode)
+    const suffix = rollMode === 'advantage' ? ' (Advantage)' : rollMode === 'disadvantage' ? ' (Disadvantage)' : ''
+    recordLocalRoll({
+      sides: 20,
+      rolls,
+      total,
+      result,
+      modifier: mod,
+      label: `${ability.charAt(0).toUpperCase() + ability.slice(1)} Save${suffix}`
+    })
+  }
+
+  const handleInitiativeRoll = (mod) => {
+    const { rolls, total, result } = rollDie(20, mod, rollMode)
+    const suffix = rollMode === 'advantage' ? ' (Advantage)' : rollMode === 'disadvantage' ? ' (Disadvantage)' : ''
+    recordLocalRoll({
+      sides: 20,
+      rolls,
+      total,
+      result,
+      modifier: mod,
+      label: `Initiative${suffix}`
+    })
+  }
+
+  const handleWeaponAttackRoll = (weaponName, attackBonus) => {
+    const { rolls, total, result } = rollDie(20, attackBonus, rollMode)
+    const suffix = rollMode === 'advantage' ? ' (Advantage)' : rollMode === 'disadvantage' ? ' (Disadvantage)' : ''
+    recordLocalRoll({
+      sides: 20,
+      rolls,
+      total,
+      result,
+      modifier: attackBonus,
+      label: `${weaponName} Attack${suffix}`
+    })
+  }
+
+  const handleWeaponDamageRoll = (weaponName, damageStr) => {
+    const { rolls, result, total, modifier, sides } = rollDiceString(damageStr)
+    recordLocalRoll({
       sides,
       rolls,
       total,
       result,
       modifier,
-      label,
-      rolledAt: new Date().toISOString(),
+      label: `${weaponName} Damage`
     })
   }
 
-  const handleDieClick = (sides) => {
-    const { rolls, total, result } = rollDie(sides, modifier, advantage)
-    recordLocalRoll({ sides, rolls, total, result, modifier, label: `d${sides}` })
+  const handleSpellAttackRoll = (attackBonus) => {
+    const { rolls, total, result } = rollDie(20, attackBonus, rollMode)
+    const suffix = rollMode === 'advantage' ? ' (Advantage)' : rollMode === 'disadvantage' ? ' (Disadvantage)' : ''
+    recordLocalRoll({
+      sides: 20,
+      rolls,
+      total,
+      result,
+      modifier: attackBonus,
+      label: `Spell Attack${suffix}`
+    })
   }
 
-  const handleSkillRoll = (skill) => {
-    const { rolls, total, result } = rollDie(20, advantage ? 0 : 0, advantage)
-    recordLocalRoll({ sides: 20, rolls, total, result, label: skill })
-  }
+  const cleanedInput = input
+    .replace(/\u200b|\u200c|\u200d|\ufeff/g, '')
+    .replace(/\u00a0/g, ' ')
+    .trim()
+
+  const filteredSuggestions = [
+    {
+      trigger: '/roll',
+      desc: 'Log a physical dice roll to chat',
+      onClick: () => { setActiveSlashCommand('roll'); setInput(''); }
+    },
+    {
+      trigger: '/roll d[sides] [+/- mod]',
+      desc: 'Direct roll (e.g., /roll d20 + 5)',
+      onClick: () => { setInput('/roll d20 + 5'); }
+    },
+    {
+      trigger: '/sheet [request]',
+      desc: 'Request character sheet update (e.g., add 10 gold)',
+      onClick: () => { setInput('/sheet '); }
+    }
+  ].filter(item => item.trigger.startsWith(cleanedInput.toLowerCase()) || cleanedInput === '/')
+
+  const showCommandsHelp = cleanedInput.startsWith('/') && !activeSlashCommand && !showDice && filteredSuggestions.length > 0
+  const canSubmitPhysicalRoll = activeSlashCommand !== 'roll' || physicalRolls.trim().length > 0
 
   return (
     <div className="session-panel">
@@ -281,6 +651,8 @@ export default function SessionPanel({
             <button
               className={`btn btn-roll-toggle ${showDice ? 'active' : ''}`}
               onClick={() => setShowDice(!showDice)}
+              title="Toggle dice roller"
+              aria-label="Toggle dice roller"
             >
               <i className="bi bi-dice-5-fill"></i>
             </button>
@@ -300,6 +672,13 @@ export default function SessionPanel({
                           <span className="dice-readout-label">{lastRoll.label}</span>
                           <strong>{lastRoll.result}</strong>
                           <span>{formatRollSummary(lastRoll)}</span>
+                          <button
+                            className="btn btn-secondary small btn-post-roll"
+                            onClick={() => postRollToChat(lastRoll)}
+                            title="Post roll to chat feed"
+                          >
+                            <i className="bi bi-chat-text-fill"></i> Post
+                          </button>
                         </>
                       ) : (
                         <>
@@ -318,66 +697,385 @@ export default function SessionPanel({
                       <i className="bi bi-x-lg"></i>
                     </button>
                   </div>
-                <div className="dice-grid">
-                  {DICE.map((sides) => (
-                    <button
-                      key={sides}
-                      className="btn btn-die"
-                      onClick={() => handleDieClick(sides)}
-                      title={`d${sides}`}
-                    >
-                      d{sides}
-                    </button>
-                  ))}
+
+                  {currentCharacter && (
+                    <div className="dice-tabs">
+                      <button
+                        className={`btn btn-tab small ${activeTab === 'custom' ? 'active' : ''}`}
+                        onClick={() => setActiveTab('custom')}
+                      >
+                        Custom
+                      </button>
+                      <button
+                        className={`btn btn-tab small ${activeTab === 'skills' ? 'active' : ''}`}
+                        onClick={() => setActiveTab('skills')}
+                      >
+                        Skills
+                      </button>
+                      <button
+                        className={`btn btn-tab small ${activeTab === 'saves' ? 'active' : ''}`}
+                        onClick={() => setActiveTab('saves')}
+                      >
+                        Saves
+                      </button>
+                      <button
+                        className={`btn btn-tab small ${activeTab === 'combat' ? 'active' : ''}`}
+                        onClick={() => setActiveTab('combat')}
+                      >
+                        Combat
+                      </button>
+                    </div>
+                  )}
+
+                  {activeTab === 'custom' || !currentCharacter ? (
+                    <>
+                      <div className="dice-grid">
+                        {DICE.map((sides) => (
+                          <button
+                            key={sides}
+                            className="btn btn-die"
+                            onClick={() => handleCustomDieClick(sides)}
+                            title={`d${sides}`}
+                          >
+                            d{sides}
+                          </button>
+                        ))}
+                      </div>
+                      <div className="dice-controls">
+                        <label className="dice-modifier">
+                          Label:
+                          <input
+                            type="text"
+                            className="input dice-label-input"
+                            value={customLabel}
+                            onChange={(e) => setCustomLabel(e.target.value)}
+                            placeholder="e.g. Athletics jump"
+                            style={{ width: '130px', padding: '6px 10px' }}
+                          />
+                        </label>
+                        <label className="dice-modifier">
+                          Mod:
+                          <input
+                            type="number"
+                            className="input dice-mod-input"
+                            value={modifier}
+                            onChange={(e) => setModifier(parseInt(e.target.value, 10) || 0)}
+                          />
+                        </label>
+                        <label className="dice-modifier">
+                          Mode:
+                          <select
+                            className="input dice-select"
+                            value={rollMode}
+                            onChange={(e) => setRollMode(e.target.value)}
+                            style={{ padding: '5px 10px', background: 'var(--bg-input)', border: '1px solid var(--border-color)', borderRadius: 'var(--radius-sm)', color: 'var(--text-bright)' }}
+                          >
+                            <option value="normal">Normal</option>
+                            <option value="advantage">Advantage</option>
+                            <option value="disadvantage">Disadvantage</option>
+                          </select>
+                        </label>
+                        <label className="dice-auto-post">
+                          <input
+                            type="checkbox"
+                            checked={autoPost}
+                            onChange={(e) => setAutoPost(e.target.checked)}
+                          />
+                          Auto-post
+                        </label>
+                      </div>
+                    </>
+                  ) : activeTab === 'skills' ? (
+                    <>
+                      <div className="dice-skills-grid">
+                        {uniqueSkills.map((skillName) => {
+                          const mod = getSkillModifier(currentCharacter, skillName);
+                          const skillRec = (currentCharacter.skills || []).find(
+                            s => s.skill_name?.toLowerCase() === skillName.toLowerCase()
+                          );
+                          const typeLabel = skillRec?.is_expertise ? ' (E)' : skillRec?.is_proficient ? ' (P)' : '';
+                          const displayMod = mod >= 0 ? `+${mod}` : mod;
+                          return (
+                            <button
+                              key={skillName}
+                              className="btn btn-skill-roll"
+                              onClick={() => handleSkillRoll(skillName, mod)}
+                              title={`Roll ${skillName} (${SKILL_ABILITIES[skillName] || 'custom'})`}
+                            >
+                              <span>{skillName}{typeLabel}</span>
+                              <span className="mod-val">{displayMod}</span>
+                            </button>
+                          );
+                        })}
+                      </div>
+                      <div className="dice-controls">
+                        <label className="dice-modifier">
+                          Mode:
+                          <select
+                            className="input dice-select"
+                            value={rollMode}
+                            onChange={(e) => setRollMode(e.target.value)}
+                            style={{ padding: '5px 10px', background: 'var(--bg-input)', border: '1px solid var(--border-color)', borderRadius: 'var(--radius-sm)', color: 'var(--text-bright)' }}
+                          >
+                            <option value="normal">Normal</option>
+                            <option value="advantage">Advantage</option>
+                            <option value="disadvantage">Disadvantage</option>
+                          </select>
+                        </label>
+                        <label className="dice-auto-post">
+                          <input
+                            type="checkbox"
+                            checked={autoPost}
+                            onChange={(e) => setAutoPost(e.target.checked)}
+                          />
+                          Auto-post
+                        </label>
+                      </div>
+                    </>
+                  ) : activeTab === 'saves' ? (
+                    <>
+                      <div className="dice-saves-grid">
+                        {['strength', 'dexterity', 'constitution', 'intelligence', 'wisdom', 'charisma'].map((ability) => {
+                          const mod = getSavingThrowModifier(currentCharacter, ability);
+                          const saveRec = (currentCharacter.saving_throws || []).find(
+                            s => s.ability?.toLowerCase() === ability.toLowerCase()
+                          );
+                          const typeLabel = saveRec?.is_proficient ? ' (P)' : '';
+                          const displayMod = mod >= 0 ? `+${mod}` : mod;
+                          const abilityName = ability.toUpperCase().slice(0, 3);
+                          return (
+                            <button
+                              key={ability}
+                              className="btn btn-save-roll"
+                              onClick={() => handleSaveRoll(ability, mod)}
+                              title={`Roll ${ability} saving throw`}
+                            >
+                              <span>{abilityName} Save{typeLabel}</span>
+                              <span className="mod-val">{displayMod}</span>
+                            </button>
+                          );
+                        })}
+                      </div>
+                      <div className="dice-controls">
+                        <label className="dice-modifier">
+                          Mode:
+                          <select
+                            className="input dice-select"
+                            value={rollMode}
+                            onChange={(e) => setRollMode(e.target.value)}
+                            style={{ padding: '5px 10px', background: 'var(--bg-input)', border: '1px solid var(--border-color)', borderRadius: 'var(--radius-sm)', color: 'var(--text-bright)' }}
+                          >
+                            <option value="normal">Normal</option>
+                            <option value="advantage">Advantage</option>
+                            <option value="disadvantage">Disadvantage</option>
+                          </select>
+                        </label>
+                        <label className="dice-auto-post">
+                          <input
+                            type="checkbox"
+                            checked={autoPost}
+                            onChange={(e) => setAutoPost(e.target.checked)}
+                          />
+                          Auto-post
+                        </label>
+                      </div>
+                    </>
+                  ) : (
+                    <>
+                      <div className="dice-combat-tab">
+                        <div className="combat-roll-row">
+                          <div>
+                            <div className="combat-item-name">Initiative</div>
+                            <div className="combat-item-meta">Dexterity-based turn order</div>
+                          </div>
+                          <div className="combat-roll-buttons">
+                            <button
+                              className="btn btn-primary small"
+                              onClick={() => handleInitiativeRoll(getInitiativeModifier(currentCharacter))}
+                            >
+                              Roll Initiative ({getInitiativeModifier(currentCharacter) >= 0 ? `+${getInitiativeModifier(currentCharacter)}` : getInitiativeModifier(currentCharacter)})
+                            </button>
+                          </div>
+                        </div>
+
+                        {currentCharacter.weapons && currentCharacter.weapons.length > 0 ? (
+                          currentCharacter.weapons.map((w, i) => (
+                            <div key={i} className="combat-roll-row">
+                              <div>
+                                <div className="combat-item-name">{w.name} {w.is_equipped ? '⚔️' : ''}</div>
+                                <div className="combat-item-meta">{w.damage} {w.damage_type} &bull; {w.properties}</div>
+                              </div>
+                              <div className="combat-roll-buttons">
+                                <button
+                                  className="btn btn-secondary small"
+                                  onClick={() => handleWeaponAttackRoll(w.name, w.attack_bonus || 0)}
+                                >
+                                  Attack ({w.attack_bonus >= 0 ? `+${w.attack_bonus}` : w.attack_bonus})
+                                </button>
+                                {w.damage && (
+                                  <button
+                                    className="btn small"
+                                    style={{ background: 'rgba(245, 158, 11, 0.15)', borderColor: 'rgba(245, 158, 11, 0.3)', color: 'var(--text-gold)' }}
+                                    onClick={() => handleWeaponDamageRoll(w.name, w.damage)}
+                                  >
+                                    Damage ({w.damage})
+                                  </button>
+                                )}
+                              </div>
+                            </div>
+                          ))
+                        ) : (
+                          <div className="empty-combat" style={{ padding: '8px 0', fontSize: '0.8rem', color: 'var(--text-dim)' }}>
+                            No weapons defined on character sheet.
+                          </div>
+                        )}
+
+                        {currentCharacter.spellcasting && (
+                          <div className="combat-roll-row">
+                            <div>
+                              <div className="combat-item-name">Spellcasting Magic</div>
+                              <div className="combat-item-meta">Save DC: {currentCharacter.spellcasting.spell_save_dc || 10}</div>
+                            </div>
+                            <div className="combat-roll-buttons">
+                              <button
+                                className="btn btn-primary small"
+                                onClick={() => handleSpellAttackRoll(currentCharacter.spellcasting.spell_attack_bonus || 0)}
+                              >
+                                Spell Attack ({currentCharacter.spellcasting.spell_attack_bonus >= 0 ? `+${currentCharacter.spellcasting.spell_attack_bonus}` : currentCharacter.spellcasting.spell_attack_bonus || 0})
+                              </button>
+                            </div>
+                          </div>
+                        )}
+                      </div>
+                      <div className="dice-controls">
+                        <label className="dice-modifier">
+                          Mode:
+                          <select
+                            className="input dice-select"
+                            value={rollMode}
+                            onChange={(e) => setRollMode(e.target.value)}
+                            style={{ padding: '5px 10px', background: 'var(--bg-input)', border: '1px solid var(--border-color)', borderRadius: 'var(--radius-sm)', color: 'var(--text-bright)' }}
+                          >
+                            <option value="normal">Normal</option>
+                            <option value="advantage">Advantage</option>
+                            <option value="disadvantage">Disadvantage</option>
+                          </select>
+                        </label>
+                        <label className="dice-auto-post">
+                          <input
+                            type="checkbox"
+                            checked={autoPost}
+                            onChange={(e) => setAutoPost(e.target.checked)}
+                          />
+                          Auto-post
+                        </label>
+                      </div>
+                    </>
+                  )}
                 </div>
-                <div className="dice-controls">
-                  <label className="dice-modifier">
-                    Mod:
-                    <input
-                      type="number"
-                      className="input dice-mod-input"
-                      value={modifier}
-                      onChange={(e) => setModifier(parseInt(e.target.value, 10) || 0)}
-                    />
-                  </label>
-                  <label className="checkbox-label">
-                    <input
-                      type="checkbox"
-                      checked={advantage}
-                      onChange={(e) => setAdvantage(e.target.checked)}
-                    />
-                    Advantage
-                  </label>
-                </div>
-                <div className="dice-skills">
-                  {QUICK_SKILLS.map((s) => (
-                    <button
-                      key={s.label}
-                      className="btn btn-skill small"
-                      onClick={() => handleSkillRoll(s.label)}
-                      title={`Roll ${s.label} (${s.skill})`}
-                    >
-                      {s.label}
-                    </button>
-                  ))}
-                </div>
-              </div>
               </>
             )}
           </div>
 
-          <div className="session-input-area">
-            <div className={`session-input-shell ${hasIcSegment(input) ? 'has-ic' : ''}`}>
-              <SessionInput
-                value={input}
-                onChange={setInput}
-                onSubmit={handleSend}
-                disabled={aiThinking}
-                placeholder={aiThinking ? 'Waiting for DM...' : 'Type your action. Wrap speech in quotes for IC.'}
-              />
+          {showCommandsHelp && (
+            <div className="session-command-suggestions">
+              <div className="suggestion-header">Commands</div>
+              {filteredSuggestions.map((suggestion) => (
+                <button key={suggestion.trigger} type="button" className="suggestion-item" onClick={suggestion.onClick}>
+                  <span className="suggestion-trigger">{suggestion.trigger}</span>
+                  <span className="suggestion-desc">{suggestion.desc}</span>
+                </button>
+              ))}
             </div>
-            <button className="btn btn-primary session-send-btn" onClick={handleSend} disabled={aiThinking}>
-              {aiThinking ? '...' : 'Send'}
+          )}
+
+          <div className="session-input-area">
+            <div className={`session-input-shell ${hasIcSegment(input) ? 'has-ic' : ''} ${activeSlashCommand ? 'has-command' : ''}`}>
+              {activeSlashCommand === 'roll' ? (
+                <div className="session-slash-inline" onKeyDown={handleSlashKeyDown}>
+                  <span className="slash-inline-command">/roll</span>
+                  <label className="slash-inline-field slash-inline-label-field">
+                    <span>label</span>
+                    <input
+                      type="text"
+                      placeholder="Physical Roll"
+                      value={physicalLabel}
+                      onChange={(e) => setPhysicalLabel(e.target.value)}
+                      aria-label="Roll label"
+                    />
+                  </label>
+                  <label className="slash-inline-field slash-inline-die-field">
+                    <span>die</span>
+                    <select
+                      value={physicalSides}
+                      onChange={(e) => setPhysicalSides(parseInt(e.target.value, 10))}
+                      aria-label="Die type"
+                    >
+                      <option value="20">d20</option>
+                      <option value="12">d12</option>
+                      <option value="10">d10</option>
+                      <option value="8">d8</option>
+                      <option value="6">d6</option>
+                      <option value="4">d4</option>
+                      <option value="100">d100</option>
+                    </select>
+                  </label>
+                  <label className="slash-inline-field slash-inline-rolls-field">
+                    <span>rolls</span>
+                    <input
+                      type="text"
+                      placeholder="14"
+                      value={physicalRolls}
+                      onChange={(e) => updatePhysicalRolls(e.target.value)}
+                      autoFocus
+                      aria-label="Natural rolls"
+                    />
+                  </label>
+                  <label className="slash-inline-field slash-inline-number-field">
+                    <span>mod</span>
+                    <input
+                      type="number"
+                      value={physicalModifier}
+                      onChange={(e) => updatePhysicalModifier(e.target.value)}
+                      aria-label="Roll modifier"
+                    />
+                  </label>
+                  <label className="slash-inline-field slash-inline-number-field">
+                    <span>total</span>
+                    <input
+                      type="number"
+                      value={physicalTotal}
+                      onChange={(e) => setPhysicalTotal(parseInt(e.target.value, 10) || 0)}
+                      aria-label="Roll total"
+                    />
+                  </label>
+                  <button
+                    type="button"
+                    className="btn slash-inline-close"
+                    onClick={cancelSlashCommand}
+                    aria-label="Cancel slash command"
+                    title="Cancel"
+                  >
+                    <i className="bi bi-x-lg"></i>
+                  </button>
+                </div>
+              ) : (
+                <SessionInput
+                  value={input}
+                  onChange={setInput}
+                  onSubmit={handleSend}
+                  onKeyDown={handleSlashKeyDown}
+                  disabled={aiThinking}
+                  placeholder={aiThinking ? 'Waiting for DM...' : 'Type your action. Wrap speech in quotes for IC.'}
+                />
+              )}
+            </div>
+            <button
+              className="btn btn-primary session-send-btn"
+              onClick={handleSend}
+              disabled={aiThinking || !canSubmitPhysicalRoll}
+            >
+              {aiThinking ? '...' : activeSlashCommand ? 'Post' : 'Send'}
             </button>
           </div>
         </>

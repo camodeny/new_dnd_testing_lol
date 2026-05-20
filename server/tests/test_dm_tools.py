@@ -24,6 +24,7 @@ from models import (
 from openrouter import (
     _pc_control_violation,
     _private_output_violation,
+    _session_dm_format_violation,
     get_session_dm_response_with_tools,
     normalize_session_dm_turn_decision,
 )
@@ -175,6 +176,54 @@ class DmToolsTest(unittest.TestCase):
         self.assertIsNone(
             _private_output_violation('A hidden scheme moves another step ahead.', hot_context),
         )
+
+    def test_session_dm_format_guard_detects_malformed_tags(self):
+        self.assertIsNone(_session_dm_format_violation(
+            'Bram smiles.\n\n<npc target="Bram Truewood">"Careful now."</npc>',
+        ))
+
+        mismatched = _session_dm_format_violation(
+            '<npc target="Bram Truewood">"The candle is always lit."</p>'
+        )
+        self.assertEqual(mismatched['errors'][0]['kind'], 'disallowed_tag')
+        self.assertIn('</p>', mismatched['errors'][0]['snippet'])
+        self.assertEqual(mismatched['errors'][1]['kind'], 'unclosed_npc_tag')
+
+        unclosed = _session_dm_format_violation(
+            '<npc target="Greta">"I will save you stew."'
+        )
+        self.assertEqual(unclosed['errors'][0]['kind'], 'unclosed_npc_tag')
+
+        ooc = _session_dm_format_violation('<ooc>Make an Investigation check.</ooc>')
+        self.assertEqual(ooc['errors'][0]['kind'], 'disallowed_tag')
+
+    def test_session_dm_format_guard_rewrites_malformed_reply(self):
+        hot_context = {
+            'protected_player_characters': [],
+            'private_output_terms': [],
+            'private_spoiler_items': [],
+        }
+
+        with patch('openrouter._post_chat_response', side_effect=[
+            {'choices': [{'message': {'content': '{"mode":"speak","content":"<npc target=\\"Bram Truewood\\">\\"The candle is always lit.\\"</p>"}'}}]},
+            {'choices': [{'message': {'content': '{"mode":"speak","content":"<npc target=\\"Bram Truewood\\">\\"The candle is always lit.\\"</npc>"}'}}]},
+        ]) as post_chat:
+            result = get_session_dm_response_with_tools(
+                hot_context,
+                [],
+                [],
+                lambda *_args, **_kwargs: {},
+                max_tool_rounds=0,
+            )
+
+        self.assertEqual(result, {
+            'mode': 'speak',
+            'content': '<npc target="Bram Truewood">"The candle is always lit."</npc>',
+        })
+        retry_prompt = post_chat.call_args_list[1].args[0][-1]['content']
+        self.assertIn('visible-message syntax checker rejected it', retry_prompt)
+        self.assertIn('</p>', retry_prompt)
+        self.assertIn('only allowed angle-bracket tag', retry_prompt)
 
     def test_spoiler_checker_allows_safe_reply(self):
         hot_context = {

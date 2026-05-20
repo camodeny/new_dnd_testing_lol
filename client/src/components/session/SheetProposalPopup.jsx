@@ -13,20 +13,18 @@ function formatValue(val) {
 }
 
 function changeDescription(change) {
-  const { field, operation, before, after, label } = change
+  const { operation, before, after, label } = change
   const opSymbol = operation === 'add' ? '+' : operation === 'subtract' ? '−' : '→'
   const beforeStr = formatValue(before)
   const afterStr = formatValue(after)
   return { label, opSymbol, beforeStr, afterStr }
 }
 
-export default function SheetProposalPopup({ proposals, sessionId, currentUser, campaign, onApplied, onDismissed }) {
+export default function SheetProposalPopup({ proposals, sessionId, onApplied, onDismissed }) {
   const [applying, setApplying] = useState({})
   const [error, setError] = useState(null)
 
   if (!proposals || proposals.length === 0) return null
-
-  const isDm = campaign?.user_id === currentUser?.id
 
   const handleApply = async (proposal) => {
     setApplying((prev) => ({ ...prev, [proposal.id]: true }))

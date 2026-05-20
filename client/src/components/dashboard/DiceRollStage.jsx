@@ -17,10 +17,6 @@ const DIE_STYLES = {
   100: { base: '#403a34', accent: '#fb923c', emissive: '#351505' },
 }
 
-function easeOutCubic(value) {
-  return 1 - Math.pow(1 - value, 3)
-}
-
 function smoothstep(edge0, edge1, value) {
   const t = THREE.MathUtils.clamp((value - edge0) / (edge1 - edge0), 0, 1)
   return t * t * (3 - 2 * t)

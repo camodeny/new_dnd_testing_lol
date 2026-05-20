@@ -139,7 +139,7 @@ function restoreCursorOffset(element, targetOffset) {
   sel.addRange(range)
 }
 
-export default function SessionInput({ value, onChange, onSubmit, disabled, placeholder }) {
+export default function SessionInput({ value, onChange, onSubmit, onKeyDown, disabled, placeholder }) {
   const ref = useRef(null)
   const isComposing = useRef(false)
 
@@ -174,6 +174,9 @@ export default function SessionInput({ value, onChange, onSubmit, disabled, plac
 
   const handleKeyDown = useCallback(
     (e) => {
+      onKeyDown?.(e)
+      if (e.defaultPrevented) return
+
       // Block rich-text formatting shortcuts
       if ((e.ctrlKey || e.metaKey) && ['b', 'i', 'u'].includes(e.key.toLowerCase())) {
         e.preventDefault()
@@ -192,7 +195,7 @@ export default function SessionInput({ value, onChange, onSubmit, disabled, plac
         return
       }
     },
-    [onSubmit]
+    [onKeyDown, onSubmit]
   )
 
   const handlePaste = useCallback((e) => {

@@ -64,7 +64,8 @@ SYSTEM_PROMPT = (
     "When in character, narrate the story, describe scenes, play NPCs, and adjudicate "
     "player actions. When speaking as a specific NPC, wrap only that NPC's spoken line "
     "or performance in <npc target=\"NPC name\">...</npc>; leave narration outside the "
-    "NPC tag. "
+    "NPC tag. Every <npc> tag must include target and must close with </npc>. Do not use "
+    "<ic>, <ooc>, HTML, XML, or any other angle-bracket tags in visible DM replies. "
     + PC_CONTROL_POLICY + " "
     "When campaign world memory includes NPC actor dossiers, silently coordinate the NPC's goals, "
     "secrets, recent offscreen activity, and relationship to the party before speaking for them. "
@@ -674,6 +675,85 @@ def _private_output_violation(response_text, hot_context):
     return None
 
 
+def _session_dm_format_violation(response_text):
+    import re
+
+    text = response_text or ''
+    tag_pattern = re.compile(r'</?\s*([A-Za-z][\w:-]*)\b[^>]*>', flags=re.DOTALL)
+    attr_pattern = re.compile(
+        r'([a-zA-Z_][\w:-]*)\s*=\s*(?:"([^"]*)"|\'([^\']*)\'|([^\s"\'>/]+))'
+    )
+    errors = []
+    open_npc_tags = []
+
+    def add_error(kind, snippet, detail):
+        errors.append({
+            'kind': kind,
+            'snippet': ' '.join(str(snippet or '').split())[:160],
+            'detail': detail,
+        })
+
+    for match in tag_pattern.finditer(text):
+        raw_tag = match.group(0)
+        tag_name = match.group(1).lower()
+        is_closing = raw_tag.lstrip().startswith('</')
+        is_self_closing = raw_tag.rstrip().endswith('/>')
+
+        if tag_name != 'npc':
+            add_error(
+                'disallowed_tag',
+                raw_tag,
+                'Visible DM replies may only use <npc target="NPC name">...</npc> tags.',
+            )
+            continue
+
+        if is_closing:
+            if not open_npc_tags:
+                add_error('unmatched_close_tag', raw_tag, 'Found </npc> without a matching open <npc> tag.')
+                continue
+            open_npc_tags.pop()
+            continue
+
+        attrs = {
+            attr_match.group(1).lower(): (
+                attr_match.group(2)
+                if attr_match.group(2) is not None
+                else attr_match.group(3)
+                if attr_match.group(3) is not None
+                else attr_match.group(4)
+                or ''
+            )
+            for attr_match in attr_pattern.finditer(raw_tag)
+        }
+        target = str(attrs.get('target') or '').strip()
+        if not target:
+            add_error('missing_npc_target', raw_tag, 'NPC tags must include a non-empty target attribute.')
+        if is_self_closing:
+            add_error('self_closing_npc_tag', raw_tag, 'NPC speech tags must wrap spoken text and close with </npc>.')
+        else:
+            open_npc_tags.append(raw_tag)
+
+    for raw_tag in open_npc_tags:
+        add_error('unclosed_npc_tag', raw_tag, 'Found an open <npc> tag without a matching </npc> close tag.')
+
+    return {'errors': errors} if errors else None
+
+
+def _session_dm_format_feedback(format_violation):
+    errors = format_violation.get('errors') if isinstance(format_violation, dict) else []
+    lines = []
+    for error in errors[:6]:
+        snippet = str(error.get('snippet') or '').strip()
+        detail = str(error.get('detail') or '').strip()
+        if snippet and detail:
+            lines.append(f'- {detail} Problem tag: {snippet}')
+        elif detail:
+            lines.append(f'- {detail}')
+    if not lines:
+        lines.append('- The visible reply contains malformed or disallowed angle-bracket tags.')
+    return '\n'.join(lines)
+
+
 def normalize_session_spoiler_check(raw_check):
     data = raw_check if isinstance(raw_check, dict) else _json_loads_or_empty(raw_check)
     if not isinstance(data, dict) or not data:
@@ -1089,6 +1169,7 @@ def get_session_dm_response_with_tools(
         messages.append({'role': role, 'content': msg.content})
 
     tool_round = 0
+    format_retried = False
     pc_control_retried = False
     private_output_retried = False
     spoiler_checker_retried = False
@@ -1127,17 +1208,60 @@ def get_session_dm_response_with_tools(
             raw_content = message.get('content') or ''
             decision = normalize_session_dm_turn_decision(raw_content)
             content = decision.get('content') or ''
-            violation = _pc_control_violation(content, hot_context) if decision.get('mode') == 'speak' else None
+            format_violation = (
+                _session_dm_format_violation(content)
+                if decision.get('mode') == 'speak'
+                else None
+            )
+            violation = (
+                _pc_control_violation(content, hot_context)
+                if decision.get('mode') == 'speak' and not format_violation
+                else None
+            )
             private_violation = (
                 _private_output_violation(content, hot_context)
-                if decision.get('mode') == 'speak'
+                if decision.get('mode') == 'speak' and not format_violation
                 else None
             )
             spoiler_check = (
                 check_session_spoilers_with_llm(content, hot_context, loop_audit)
-                if decision.get('mode') == 'speak' and not private_violation
+                if decision.get('mode') == 'speak' and not format_violation and not private_violation
                 else {'safe': True, 'leaked_item_ids': [], 'evidence': [], 'reason': ''}
             )
+            if format_violation and not format_retried:
+                if base_audit.get('campaign_id'):
+                    audit = guard_audit('format_guard')
+                    log_audit_event(
+                        base_audit.get('campaign_id'),
+                        'format_guard_retry',
+                        'Session DM response used malformed visible-message syntax; requesting rewrite.',
+                        {
+                            'operation': 'format_guard',
+                            'violation': format_violation,
+                            'draft_response': raw_content,
+                        },
+                        source='session_dm.guard',
+                        actor=audit.get('actor'),
+                        trace_id=audit.get('trace_id'),
+                        parent_trace_id=audit.get('parent_trace_id'),
+                        trace_label=audit.get('trace_label'),
+                        audit_role='guard',
+                        commit=True,
+                    )
+                messages.append({'role': 'assistant', 'content': raw_content})
+                messages.append({
+                    'role': 'user',
+                    'content': (
+                        'Rewrite the previous response. A visible-message syntax checker rejected it:\n'
+                        f'{_session_dm_format_feedback(format_violation)}\n'
+                        'Return the same JSON contract. If mode="speak", the content may use Markdown and plain text. '
+                        'The only allowed angle-bracket tag is <npc target="NPC name">...</npc>, and every NPC tag '
+                        'must have a target and a matching </npc>. Do not use <ic>, <ooc>, HTML, XML, or closing tags '
+                        'such as </p> in visible DM replies.'
+                    ),
+                })
+                format_retried = True
+                continue
             if violation and not pc_control_retried:
                 if base_audit.get('campaign_id'):
                     audit = guard_audit('pc_control_guard')
@@ -1283,6 +1407,30 @@ def get_session_dm_response_with_tools(
                 return {
                     'mode': 'silent',
                     'reason': 'The DM response would have exposed DM-private information.',
+                }
+            if format_violation:
+                if base_audit.get('campaign_id'):
+                    audit = guard_audit('format_guard')
+                    log_audit_event(
+                        base_audit.get('campaign_id'),
+                        'format_guard_blocked',
+                        'Session DM response still used malformed visible-message syntax after retry.',
+                        {
+                            'operation': 'format_guard',
+                            'violation': format_violation,
+                            'draft_response': raw_content,
+                        },
+                        source='session_dm.guard',
+                        actor=audit.get('actor'),
+                        trace_id=audit.get('trace_id'),
+                        parent_trace_id=audit.get('parent_trace_id'),
+                        trace_label=audit.get('trace_label'),
+                        audit_role='guard',
+                        commit=True,
+                    )
+                return {
+                    'mode': 'silent',
+                    'reason': 'The DM response used malformed visible-message syntax.',
                 }
             if not spoiler_check.get('safe', True):
                 if base_audit.get('campaign_id'):
