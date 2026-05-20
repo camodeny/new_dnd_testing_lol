@@ -5,7 +5,7 @@ import { ConvexGeometry } from 'three/examples/jsm/geometries/ConvexGeometry.js'
 const FORWARD = new THREE.Vector3(0, 0, 1)
 const CAMERA_FACE_NORMAL = new THREE.Vector3(0, 0.62, 0.78).normalize()
 const CAMERA_SCREEN_UP = new THREE.Vector3(0, 1, -0.52).normalize()
-const DIE_SCALE = 0.52
+const DIE_SCALE = 0.36
 
 const DIE_STYLES = {
   4: { base: '#374151', accent: '#f59e0b', emissive: '#312000' },
@@ -209,8 +209,8 @@ function getLabelFaces(geometry, sides) {
 }
 
 function createD10Geometry() {
-  const radius = 0.88
-  const height = 0.72
+  const radius = 0.85
+  const height = 0.96
   const vertices = [
     new THREE.Vector3(0, height, 0),
     new THREE.Vector3(0, -height, 0),
@@ -218,7 +218,7 @@ function createD10Geometry() {
 
   for (let i = 0; i < 10; i += 1) {
     const angle = (Math.PI * 2 * i) / 10
-    const y = i % 2 === 0 ? 0.24 : -0.24
+    const y = i % 2 === 0 ? 0.1014 : -0.1014
     vertices.push(new THREE.Vector3(Math.cos(angle) * radius, y, Math.sin(angle) * radius))
   }
 
@@ -444,7 +444,7 @@ export default function DiceRollStage({ roll }) {
       new THREE.ShadowMaterial({ opacity: 0.28 }),
     )
     shadowPlane.rotation.x = -Math.PI / 2
-    shadowPlane.position.y = -0.78
+    shadowPlane.position.y = -0.50
     shadowPlane.receiveShadow = true
     scene.add(shadowPlane)
 
@@ -471,23 +471,51 @@ export default function DiceRollStage({ roll }) {
         if (activeRoll) {
           const elapsed = time - activeRoll.startedAt
           const progress = Math.min(elapsed / activeRoll.duration, 1)
-          const ease = easeOutCubic(progress)
-          const tumbleEase = easeOutCubic(Math.min(progress / 0.82, 1))
-          const settle = smoothstep(0.48, 0.96, progress)
-          const bounce = Math.abs(Math.sin(progress * Math.PI * 5.2)) * Math.pow(1 - progress, 1.35) * 0.58
-          const landingWobble = Math.sin(progress * Math.PI * 8.5) * Math.pow(1 - progress, 1.7) * smoothstep(0.62, 0.9, progress)
           const target = activeRoll.targets[index]
 
-          die.position.x = THREE.MathUtils.lerp(target.startX, target.x, ease)
-          die.position.y = target.y + bounce + (1 - progress) * 0.3
-          die.position.z = THREE.MathUtils.lerp(target.startZ, 0, ease)
-            + Math.sin(progress * Math.PI * 3 + index) * (1 - progress) * 0.12
+          // Phase-based horizontal movement (constant speed in air, decelerates after hitting floor at 0.65)
+          const ease = progress < 0.65
+            ? (progress / 0.65) * 0.65
+            : 0.65 + (1 - 0.65) * Math.sin(((progress - 0.65) / (1 - 0.65)) * (Math.PI / 2))
 
-          const spin = new THREE.Quaternion().setFromAxisAngle(
-            target.spinAxis,
-            tumbleEase * target.spinTurns * Math.PI * 2,
-          )
+          // 3-phase bouncing trajectory
+          let bounce = 0
+          if (progress < 0.65) {
+            // First flight arc (falls to the ground)
+            const p = progress / 0.65
+            bounce = 0.7 * (1 - p * p) // starts at 0.7 units above floor
+          } else if (progress < 0.82) {
+            // First bounce
+            const p = (progress - 0.65) / (0.82 - 0.65)
+            bounce = 0.18 * 4 * p * (1 - p)
+          } else if (progress < 0.93) {
+            // Second bounce
+            const p = (progress - 0.82) / (0.93 - 0.82)
+            bounce = 0.05 * 4 * p * (1 - p)
+          }
+
+          die.position.x = THREE.MathUtils.lerp(target.startX, target.x, ease)
+          die.position.y = target.y + bounce
+          die.position.z = THREE.MathUtils.lerp(target.startZ, 0, ease)
+            + Math.sin(progress * Math.PI * 3 + index) * (1 - progress) * 0.08
+
+          // Spin speed slows down significantly after first impact
+          let spinAngle
+          if (progress < 0.65) {
+            spinAngle = progress * target.spinTurns * Math.PI * 2
+          } else {
+            const p = (progress - 0.65) / (1 - 0.65)
+            spinAngle = 0.65 * target.spinTurns * Math.PI * 2
+              + Math.sin(p * Math.PI / 2) * (target.spinTurns * 0.35) * Math.PI * 2
+          }
+
+          const spin = new THREE.Quaternion().setFromAxisAngle(target.spinAxis, spinAngle)
           const tumblingQuaternion = target.startQuaternion.clone().multiply(spin)
+
+          // Alignment/settling only starts after first impact is done, finalizing near the end
+          const settle = smoothstep(0.76, 0.93, progress)
+          const landingWobble = Math.sin((progress - 0.76) * Math.PI * 8) * Math.pow(1 - settle, 2.0) * 0.22
+
           const wobbleQuaternion = new THREE.Quaternion().setFromAxisAngle(target.wobbleAxis, landingWobble)
           const settledQuaternion = target.finalQuaternion.clone().multiply(wobbleQuaternion)
           die.quaternion.slerpQuaternions(tumblingQuaternion, settledQuaternion, settle)
@@ -537,12 +565,12 @@ export default function DiceRollStage({ roll }) {
 
     const visualSpecs = getRollVisualSpecs(roll)
     const count = Math.max(1, visualSpecs.length)
-    const spacing = count > 1 ? 1.45 : 0
-    const centerX = count === 1 ? -1.9 + Math.random() * 3.8 : 0
+    const spacing = count > 1 ? 0.8 : 0
+    const centerX = count === 1 ? -2.2 + Math.random() * 4.4 : 0
     const centerZ = -0.65 + Math.random() * 1.35
     const dice = visualSpecs.map((spec, index) => {
       const { group: die, resultFace } = createDieMesh(spec.sides, spec.value, spec)
-      die.position.set(centerX + (index - (count - 1) / 2) * spacing, -0.08, centerZ)
+      die.position.set(centerX + (index - (count - 1) / 2) * spacing, -0.14, centerZ)
       die.rotation.set(0.7 + index * 0.4, 0.4 + index * 0.55, 0.25)
       die.userData.resultFace = resultFace
       die.userData.idleSpin = false
@@ -572,9 +600,9 @@ export default function DiceRollStage({ roll }) {
 
         return {
           x,
-          y: -0.08,
-          startX: x + (fromLeft ? -6.2 : 6.2) + (Math.random() - 0.5) * 0.9,
-          startZ: centerZ + 1.6 + Math.random() * 1.2,
+          y: -0.14,
+          startX: x + (fromLeft ? -5.5 : 5.5) + (Math.random() - 0.5) * 0.7,
+          startZ: centerZ + 1.2 + Math.random() * 0.9,
           spinAxis,
           wobbleAxis: new THREE.Vector3(0.5 + Math.random() * 0.25, 0, 0.55 + Math.random() * 0.25).normalize(),
           spinTurns,

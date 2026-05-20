@@ -1,4 +1,5 @@
 import { useState, useRef, useEffect } from 'react'
+import { createPortal } from 'react-dom'
 import MarkdownContent from '../common/MarkdownContent'
 import DiceRollStage from './DiceRollStage'
 import SessionInput from './SessionInput'
@@ -285,9 +286,12 @@ export default function SessionPanel({
             </button>
             {showDice && (
               <>
-                <div className="dice-stage">
-                  <DiceRollStage roll={lastRoll} />
-                </div>
+                {createPortal(
+                  <div className="dice-stage">
+                    <DiceRollStage roll={lastRoll} />
+                  </div>,
+                  document.body
+                )}
                 <div className="dice-roller" role="group" aria-label="Dice roller">
                   <div className="dice-dock-top">
                     <div className="dice-stage-readout" aria-live="polite">
