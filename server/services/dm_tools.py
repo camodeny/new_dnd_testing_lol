@@ -19,6 +19,7 @@ from services.embedding_service import (
     search_weight,
     upsert_memory_embedding,
 )
+from services.lootbox_service import generate_loot_box as do_generate_loot_box
 from services.planning_service import summary_dict_for_read
 from services.world_service import clean_id, clean_text, get_campaign_world, json_dumps, json_loads
 from openrouter import get_character_sheet_answer
@@ -196,6 +197,39 @@ def _private_spoiler_items(campaign):
     return items
 
 
+def _campaign_loot_mode_policy(campaign):
+    import json
+    try:
+        settings = json.loads(campaign.settings) if isinstance(campaign.settings, str) else (campaign.settings or {})
+    except (TypeError, ValueError):
+        settings = {}
+    loot_mode = settings.get('loot_mode', 'frequent_gamble')
+
+    if loot_mode == 'rare_quality':
+        return (
+            'Loot policy: The party is in "Rare Quality" mode. '
+            'Use the generate_loot_box tool sparingly — only after major boss fights, '
+            'significant story milestones, or truly exceptional achievements. '
+            'When you do generate loot, the items should feel meaningful and memorable. '
+            'Make each drop count.'
+        )
+    return (
+        'Loot policy: The party is in "Frequent Gamble" mode. '
+        'Use the generate_loot_box tool often — after combat encounters, exploration '
+        'discoveries, social victories, or any notable achievement. '
+        'The fun is in the frequency — keep the rewards coming regularly.'
+    )
+
+
+def _campaign_loot_mode(campaign):
+    import json
+    try:
+        settings = json.loads(campaign.settings) if isinstance(campaign.settings, str) else (campaign.settings or {})
+    except (TypeError, ValueError):
+        settings = {}
+    return settings.get('loot_mode', 'frequent_gamble')
+
+
 def build_session_hot_context(campaign, session, current_user):
     character = _current_character(campaign, current_user)
     world, _graph, world_state, _private = _world_json(campaign)
@@ -204,6 +238,7 @@ def build_session_hot_context(campaign, session, current_user):
     current_scene = world_state.get('current_scene', {}) if isinstance(world_state, dict) else {}
     members = CampaignMember.query.filter_by(campaign_id=campaign.id).order_by(CampaignMember.id.asc()).all()
     protected_player_characters = _protected_player_characters(members)
+    loot_mode = _campaign_loot_mode(campaign)
 
     context = {
         'strategy': 'compact_hot_context_with_dm_tools',
@@ -214,6 +249,7 @@ def build_session_hot_context(campaign, session, current_user):
             'description': campaign.description,
             'difficulty': campaign.difficulty,
             'seed': campaign.seed,
+            'loot_mode': loot_mode,
         },
         'session': {
             'id': session.id,
@@ -253,7 +289,8 @@ def build_session_hot_context(campaign, session, current_user):
             'Use tools for character-sheet answers, campaign memory, NPC dossiers, clocks, and durable state writes. '
             'Do not claim to update world state unless a write tool succeeds. Never reveal DM-private tool results '
             'unless they have become visible through play. private_output_terms are reasoning-only strings that must '
-            'not appear in visible narration unless they are first revealed through play.'
+            'not appear in visible narration unless they are first revealed through play. '
+            + _campaign_loot_mode_policy(campaign)
         ),
     }
     return context
@@ -621,6 +658,27 @@ DM_TOOL_DEFINITIONS = [
             },
         },
     },
+    {
+        'type': 'function',
+        'function': {
+            'name': 'generate_loot_box',
+            'description': 'Generate a loot box for the party after a notable achievement like a combat victory, discovery, or reward scene. Call this when the party earns treasure through their actions. The generated loot box will appear in the campaign stash for players to inspect and open.',
+            'parameters': {
+                'type': 'object',
+                'required': ['name'],
+                'properties': {
+                    'name': {
+                        'type': 'string',
+                        'description': 'Thematic name for this loot box, e.g. "Goblin Chieftain\'s Hoard" or "Crypt of the Forgotten Knight".',
+                    },
+                    'description': {
+                        'type': 'string',
+                        'description': 'Flavor text describing where this loot came from and what it looks like. Will be visible to players.',
+                    },
+                },
+            },
+        },
+    },
 ]
 
 
@@ -881,6 +939,51 @@ def _tool_reveal_fact(campaign, _current_user, args):
     return {'item': target, 'affected_ids': {'world_id': world.id, 'world_event_ids': [event.id]}}
 
 
+def _tool_generate_loot_box(campaign, current_user, args, session=None, audit_context=None):
+    from models import SessionMessage
+
+    name = clean_text(args.get('name', ''), 200)
+    description = clean_text(args.get('description', ''), 1000)
+    if not name:
+        return {'error': 'A loot box name is required.'}
+
+    try:
+        loot_box = do_generate_loot_box(campaign, session, current_user, name, description)
+    except Exception as err:
+        return {'error': f'Failed to generate loot box: {repr(err)}'}
+
+    if session:
+        announcement = (
+            f'A loot box has appeared: **{loot_box.name}**. '
+            f'The party can inspect and open it from the campaign stash.'
+        )
+        announcement_msg = SessionMessage(
+            session_id=session.id,
+            role='dm',
+            content=announcement,
+        )
+        db.session.add(announcement_msg)
+        db.session.flush()
+
+    event = _record_event(
+        campaign,
+        'loot_box_generated',
+        f'Loot box "{loot_box.name}" generated.',
+        {'loot_box_id': loot_box.id, 'name': loot_box.name, 'description': loot_box.description},
+        visibility='party_known',
+    )
+
+    return {
+        'loot_box': {
+            'id': loot_box.id,
+            'name': loot_box.name,
+            'description': loot_box.description,
+            'status': loot_box.status,
+        },
+        'affected_ids': {'loot_box_ids': [loot_box.id], 'world_event_ids': [event.id]},
+    }
+
+
 TOOL_HANDLERS = {
     'ask_character_sheet': _tool_ask_character_sheet,
     'get_current_scene': _tool_get_current_scene,
@@ -890,6 +993,7 @@ TOOL_HANDLERS = {
     'advance_clock': _tool_advance_clock,
     'reveal_fact': _tool_reveal_fact,
     'propose_sheet_update': _tool_propose_sheet_update,
+    'generate_loot_box': _tool_generate_loot_box,
 }
 
 
@@ -904,12 +1008,12 @@ def execute_dm_tool(campaign, session, current_user, name, args, audit_context=N
         before_new = len(db.session.new)
         result = (
             handler(campaign, current_user, args, session, audit_context)
-            if name == 'propose_sheet_update'
+            if name in {'propose_sheet_update', 'generate_loot_box'}
             else handler(campaign, current_user, args, audit_context)
             if name in {'ask_character_sheet', 'search_campaign_memory'}
             else handler(campaign, current_user, args)
         )
-        mutated = name in {'record_world_event', 'update_current_scene', 'advance_clock', 'reveal_fact'}
+        mutated = name in {'record_world_event', 'update_current_scene', 'advance_clock', 'reveal_fact', 'generate_loot_box'}
         mutated = mutated or len(db.session.new) > before_new
     log_audit_event(
         campaign.id,

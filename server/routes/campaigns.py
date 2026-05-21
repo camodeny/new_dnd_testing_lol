@@ -122,6 +122,10 @@ def create_campaign(current_user):
         except (ValueError, TypeError):
             pass
 
+    loot_mode = data.get('loot_mode')
+    if loot_mode in ('frequent_gamble', 'rare_quality'):
+        settings['loot_mode'] = loot_mode
+
     campaign = Campaign(
         name=data['name'],
         description=data.get('description', ''),

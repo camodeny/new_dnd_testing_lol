@@ -7,6 +7,7 @@ function CampaignForm({ onCampaignCreated, onCancel, className = '' }) {
   const [difficulty, setDifficulty] = useState('')
   const [seed, setSeed] = useState('')
   const [requiredPlayers, setRequiredPlayers] = useState(1)
+  const [lootMode, setLootMode] = useState('frequent_gamble')
   const [error, setError] = useState('')
   const [loading, setLoading] = useState(false)
 
@@ -16,7 +17,7 @@ function CampaignForm({ onCampaignCreated, onCancel, className = '' }) {
     setLoading(true)
 
     try {
-      const data = await createCampaign({ name, description, difficulty, seed, required_players: requiredPlayers })
+      const data = await createCampaign({ name, description, difficulty, seed, required_players: requiredPlayers, loot_mode: lootMode })
       setName('')
       setDescription('')
       setDifficulty('')
@@ -71,6 +72,18 @@ function CampaignForm({ onCampaignCreated, onCancel, className = '' }) {
             {[1, 2, 3, 4, 5, 6, 7, 8].map((n) => (
               <option key={n} value={n}>{n} {n === 1 ? 'player' : 'players'}</option>
             ))}
+          </select>
+        </div>
+        <div className="form-field">
+          <label htmlFor="campaign-loot">Loot Mode</label>
+          <select
+            id="campaign-loot"
+            value={lootMode}
+            onChange={(e) => setLootMode(e.target.value)}
+            className="input"
+          >
+            <option value="frequent_gamble">Frequent Gamble — Lots of drops, mostly okay, sometimes amazing</option>
+            <option value="rare_quality">Rare Quality — Few drops, always good, sometimes amazing</option>
           </select>
         </div>
       </div>

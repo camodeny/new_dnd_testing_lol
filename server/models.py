@@ -993,6 +993,72 @@ class SheetProposal(db.Model):
         }
 
 
+class LootBox(db.Model):
+    __tablename__ = 'loot_boxes'
+
+    id = db.Column(db.Integer, primary_key=True)
+    campaign_id = db.Column(db.Integer, db.ForeignKey('campaign.id'), nullable=False)
+    session_id = db.Column(db.Integer, db.ForeignKey('campaign_sessions.id'), nullable=True)
+    name = db.Column(db.String(200), nullable=False)
+    description = db.Column(db.Text, nullable=True)
+    items_json = db.Column(db.Text, nullable=False)
+    currency_json = db.Column(db.Text, nullable=False)
+    draw_results_json = db.Column(db.Text, nullable=True)
+    status = db.Column(db.String(20), default='unopened')
+    created_by_session_tool = db.Column(db.Boolean, default=False)
+    created_at = db.Column(db.DateTime, default=datetime.utcnow)
+    opened_at = db.Column(db.DateTime, nullable=True)
+    campaign = db.relationship('Campaign')
+    session = db.relationship('CampaignSession')
+
+    def to_dict(self, current_user=None, is_dm=False):
+        import json
+        items = json.loads(self.items_json) if isinstance(self.items_json, str) else self.items_json or {}
+        currency = json.loads(self.currency_json) if isinstance(self.currency_json, str) else self.currency_json or {}
+        draws = json.loads(self.draw_results_json) if isinstance(self.draw_results_json, str) else self.draw_results_json or {}
+
+        result = {
+            'id': self.id,
+            'campaign_id': self.campaign_id,
+            'session_id': self.session_id,
+            'name': self.name,
+            'description': self.description,
+            'currency': currency,
+            'status': self.status,
+            'created_at': self.created_at.isoformat() if self.created_at else None,
+            'opened_at': self.opened_at.isoformat() if self.opened_at else None,
+        }
+
+        if self.status == 'unopened':
+            result['item_count'] = sum(len(v) for v in items.values()) if isinstance(items, dict) else 0
+            result['player_count'] = len(items) if isinstance(items, dict) else 0
+            result['pools'] = {} if not is_dm else items
+            result['draws'] = None
+        else:
+            result['pools'] = {} if not is_dm else items
+            result['draws'] = draws
+
+        if current_user and hasattr(current_user, 'id'):
+            user_char_ids = {
+                c.id for c in Character.query.filter_by(user_id=current_user.id).all()
+            }
+            if draws:
+                user_draws = {
+                    str(k): v for k, v in draws.items()
+                    if int(k) in user_char_ids or is_dm
+                }
+                result['draws'] = user_draws
+            if is_dm:
+                result['pools'] = items
+            elif isinstance(items, dict):
+                result['pools'] = {
+                    str(k): v for k, v in items.items()
+                    if int(k) in user_char_ids
+                }
+
+        return result
+
+
 class CampaignAuditEvent(db.Model):
     __tablename__ = 'campaign_audit_events'
 

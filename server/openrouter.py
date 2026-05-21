@@ -165,6 +165,13 @@ JSON_REPAIR_SYSTEM_PROMPT = (
     "markdown fences, or new facts."
 )
 
+LOOT_GENERATION_SYSTEM_PROMPT = (
+    "You generate thematic D&D loot boxes for a party of adventurers. "
+    "Each character gets their own personal pool of items tailored to their class, level, and identity. "
+    "Items should be fun, thematic, and feel earned. Include a mix of consumables, gear, trinkets, "
+    "and situational items. Return only valid JSON with no commentary or markdown fences."
+)
+
 
 def _env_model_for_provider(provider):
     return OPENCODE_GO_MODEL if provider == 'opencode_go' else OPENROUTER_MODEL
@@ -1629,6 +1636,17 @@ def get_character_sheet_answer(question, scope, character_sheets, audit_context=
         'character_ids': [item for item in ids if isinstance(item, int)],
         'missing': bool(data.get('missing')),
     }
+
+
+def get_loot_generation_response(generation_context):
+    from services.lootbox_service import _build_loot_generation_messages
+
+    messages = _build_loot_generation_messages(generation_context)
+    try:
+        data = _json_loads_with_repair(_post_chat(messages, json_mode=True))
+        return data if isinstance(data, dict) else {}
+    except Exception:
+        return {}
 
 
 def get_planning_dm_response(context, current_user_messages, draft_character=None, active_page=None, audit_context=None):

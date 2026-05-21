@@ -3,6 +3,7 @@ import { useNavigate, useParams } from 'react-router-dom'
 import { getCampaignDevAudit } from '../api/client'
 import Loading from '../components/common/Loading'
 import ErrorMessage from '../components/common/ErrorMessage'
+import './CampaignDevPage.css'
 
 const FLOW_FILTERS = [
   { key: 'planning', label: 'Planning', icon: 'bi-journal-text' },

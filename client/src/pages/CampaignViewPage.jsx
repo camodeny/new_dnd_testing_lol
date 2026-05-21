@@ -14,6 +14,7 @@ import Loading from '../components/common/Loading'
 import ErrorMessage from '../components/common/ErrorMessage'
 import PartyRoster from '../components/dashboard/PartyRoster'
 import SessionPanel from '../components/dashboard/SessionPanel'
+import LootBoxStash from '../components/lootbox/LootBoxStash'
 import CampaignLobby from '../components/dashboard/CampaignLobby'
 import CharacterPlanningMode from '../components/dashboard/CharacterPlanningMode'
 import WorldBuildingMode from '../components/dashboard/WorldBuildingMode'
@@ -121,6 +122,7 @@ export default function CampaignViewPage({ user }) {
   const [showLobby, setShowLobby] = useState(false)
   const [showPlanning, setShowPlanning] = useState(false)
   const [showWorldBuilding, setShowWorldBuilding] = useState(false)
+  const [showLootStash, setShowLootStash] = useState(false)
 
   const [showImport, setShowImport] = useState(false)
   const [availableChars, setAvailableChars] = useState([])
@@ -390,6 +392,36 @@ export default function CampaignViewPage({ user }) {
     )
   }
 
+  const handleLootBoxOpened = async () => {
+    loadData() // Always reload campaign data (characters, etc.)
+
+    if (!session) return
+    const propData = await getSheetProposals(session.id).catch(() => ({ sheet_proposals: [] }))
+    const newProposals = propData.sheet_proposals || []
+    setSheetProposals((prev) => {
+      const existing = new Set(prev.map((p) => p.id))
+      const fresh = newProposals.filter((p) => !existing.has(p.id))
+      return [...prev, ...fresh]
+    })
+    if (newProposals.length) {
+      setMessages((prev) => {
+        const existing = new Set(prev.map((m) => m.id))
+        const proposalMessages = newProposals
+          .filter((p) => !existing.has(`proposal-${p.id}`))
+          .map((p) => ({
+            id: `proposal-${p.id}`,
+            session_id: session.id,
+            role: 'system',
+            content: '',
+            is_proposal: true,
+            proposal: p,
+            created_at: p.created_at,
+          }))
+        return [...prev, ...proposalMessages]
+      })
+    }
+  }
+
   const handleProposalDismissed = (dismissedProposal) => {
     setSheetProposals((prev) => prev.filter((p) => p.id !== dismissedProposal.id))
     setMessages((prev) =>
@@ -464,11 +496,12 @@ export default function CampaignViewPage({ user }) {
             sheetProposals={sheetProposals}
             onProposalApplied={handleProposalApplied}
             onProposalDismissed={handleProposalDismissed}
+            onToggleLootStash={() => setShowLootStash(true)}
           />
         </main>
 
         <aside className="dashboard-right">
-          <div className="dashboard-sidebar-panel"></div>
+          <LootBoxStash campaignId={id} isOwner={isOwner} characters={characters} onLootBoxOpened={handleLootBoxOpened} />
         </aside>
       </div>
 
@@ -552,6 +585,20 @@ export default function CampaignViewPage({ user }) {
                   })}
                 </div>
               )}
+            </div>
+          </div>
+        </div>
+      )}
+
+      {showLootStash && (
+        <div className="modal-overlay" onClick={() => setShowLootStash(false)}>
+          <div className="modal-panel lootbox-stash-modal" onClick={(e) => e.stopPropagation()}>
+            <div className="modal-header">
+              <h2>Loot Stash</h2>
+              <button className="modal-close" onClick={() => setShowLootStash(false)}><i className="bi bi-x-lg"></i></button>
+            </div>
+            <div style={{ padding: '24px', overflowY: 'auto', maxHeight: '70vh' }}>
+              <LootBoxStash campaignId={id} isOwner={isOwner} characters={characters} onLootBoxOpened={handleLootBoxOpened} />
             </div>
           </div>
         </div>

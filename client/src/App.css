@@ -3517,3 +3517,122 @@ select.input:focus {
   }
 }
 
+/* ==========================================================================
+   LOOT BOX STASH
+   ========================================================================== */
+
+.loot-box-stash-title {
+  font-size: 13px;
+  font-weight: 600;
+  text-transform: uppercase;
+  letter-spacing: 0.05em;
+  color: var(--text-muted, #888);
+  margin-bottom: 10px;
+  display: flex;
+  align-items: center;
+  gap: 6px;
+}
+
+.loot-box-stash-empty-text {
+  font-size: 12px;
+  color: var(--text-muted, #666);
+  padding: 8px 0;
+}
+
+.loot-box-stash-list {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+
+/* ── Loot Box Card ── */
+.loot-box-card {
+  background: var(--surface-alt, #1e1e1e);
+  border: 1px solid var(--border, #333);
+  border-radius: 8px;
+  padding: 10px 12px;
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+
+.loot-box-card-header {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  font-size: 14px;
+  font-weight: 600;
+  color: var(--text, #e0e0e0);
+}
+
+.loot-box-card-header .bi {
+  font-size: 18px;
+  color: var(--accent, #d4a017);
+}
+
+.loot-box-card-desc {
+  font-size: 12px;
+  color: var(--text-muted, #999);
+  line-height: 1.4;
+}
+
+.loot-box-card-meta {
+  font-size: 11px;
+  color: var(--text-muted, #666);
+  display: flex;
+  gap: 12px;
+}
+
+.loot-box-open-btn {
+  align-self: flex-start;
+  margin-top: 4px;
+}
+
+/* ── Loot Box Draws ── */
+.loot-box-draws {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  padding-top: 4px;
+  border-top: 1px solid var(--border, #333);
+}
+
+.loot-box-draw-item {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  font-size: 13px;
+  color: var(--text, #ddd);
+}
+
+.loot-box-draw-dot {
+  width: 8px;
+  height: 8px;
+  border-radius: 50%;
+  flex-shrink: 0;
+}
+
+.loot-box-draw-name {
+  font-weight: 500;
+}
+
+/* Mobile loot stash button and modal overrides */
+.btn-mobile-loot {
+  display: none;
+}
+
+@media (max-width: 1024px) {
+  .btn-mobile-loot {
+    display: inline-flex !important;
+    align-items: center;
+    gap: 8px;
+  }
+}
+
+.lootbox-stash-modal {
+  max-width: 480px;
+}
+
+.lootbox-stash-modal .loot-box-stash-title {
+  display: none;
+}

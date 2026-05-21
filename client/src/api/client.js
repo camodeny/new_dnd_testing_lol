@@ -227,6 +227,19 @@ export function deleteNote(noteId) {
   return apiFetch(`/notes/${noteId}`, { method: 'DELETE' })
 }
 
+// Loot Boxes
+export function getLootBoxes(campaignId) {
+  return apiFetch(`/campaigns/${campaignId}/lootboxes`)
+}
+
+export function getLootBox(lootBoxId) {
+  return apiFetch(`/lootboxes/${lootBoxId}`)
+}
+
+export function openLootBox(lootBoxId) {
+  return apiFetch(`/lootboxes/${lootBoxId}/open`, { method: 'POST' })
+}
+
 // NPCs
 export function listNPCs(campaignId) {
   return apiFetch(`/campaigns/${campaignId}/npcs`)

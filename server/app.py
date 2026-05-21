@@ -14,6 +14,7 @@ from routes.dev import dev_bp
 from routes.members import members_bp
 from routes.planning import planning_bp
 from routes.sessions import sessions_bp
+from routes.lootboxes import lootboxes_bp
 from routes.world import world_bp
 
 load_dotenv()
@@ -44,6 +45,7 @@ def create_app():
     app.register_blueprint(members_bp)
     app.register_blueprint(planning_bp)
     app.register_blueprint(sessions_bp)
+    app.register_blueprint(lootboxes_bp)
     app.register_blueprint(world_bp)
 
     @app.route('/api/health')
