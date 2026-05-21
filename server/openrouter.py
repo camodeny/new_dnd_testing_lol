@@ -481,6 +481,30 @@ def _post_chat(messages, json_mode=False, audit_context=None):
     return data['choices'][0]['message']['content']
 
 
+def _opening_scene_text_from_response(data):
+    message, _finish_reason = _choice_message(data)
+    content = message.get('content') or ''
+    if str(content).strip():
+        return str(content).strip()
+
+    return None
+
+
+def _opening_scene_format_retry_messages(messages):
+    return [
+        *messages,
+        {
+            'role': 'user',
+            'content': (
+                'Your previous response had no visible assistant content. Return the opening scene again, '
+                'but put the full player-visible DM message in the assistant content field only. Do not put '
+                'the scene in reasoning, thinking, hidden notes, JSON, or a markdown code fence. End with a '
+                'clear prompt for player action.'
+            ),
+        },
+    ]
+
+
 def _json_candidate(text):
     if not isinstance(text, str):
         return text
@@ -1485,7 +1509,20 @@ def get_opening_scene_response(context, world_context, audit_context=None):
     messages = build_opening_scene_messages(context, world_context)
 
     try:
-        return _post_chat(messages, audit_context=audit_context)
+        data = _post_chat_response(messages, audit_context=audit_context)
+        opening_text = _opening_scene_text_from_response(data)
+        if opening_text:
+            return opening_text
+
+        retry_audit_context = {
+            **(audit_context or {}),
+            'operation': 'opening_scene_format_retry',
+        }
+        data = _post_chat_response(
+            _opening_scene_format_retry_messages(messages),
+            audit_context=retry_audit_context,
+        )
+        return _opening_scene_text_from_response(data)
     except Exception as e:
         print(f'[openrouter] Opening scene error: {e}')
         return None

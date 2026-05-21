@@ -21,12 +21,14 @@ Set these repository or environment secrets:
 - Provider credentials for the selected provider:
   - OpenRouter: `OPENROUTER_API_KEY`, `OPENROUTER_MODEL`
   - OpenCode Go: `OPENCODE_GO_API_KEY`
+- Embeddings: `GEMINI_API_KEY`
 
 Optional secrets:
 
 - `DATABASE_URL`
 
 If `DATABASE_URL` is not set, the app uses a SQLite database stored in the remote `data/` volume.
+Local `.env` files are intentionally excluded from the deploy archive. Values that need to reach the server must be configured as GitHub secrets or variables and are written to the remote `.deploy.env` during deployment.
 
 ## GitHub environment variables
 
@@ -41,6 +43,11 @@ Optional variables:
 - `OPENCODE_GO_MODEL`: required when `LLM_PROVIDER=opencode_go`.
 - `OPENCODE_GO_THINKING`: set to `enabled` to request DeepSeek V4 thinking mode through OpenCode Go; defaults to `disabled`.
 - `OPENCODE_GO_REASONING_EFFORT`: `high` or `max`; defaults to `high`.
+- `GEMINI_EMBEDDINGS_ENABLED`: `true` or `false`; defaults to `true` but fails open when `GEMINI_API_KEY` is unset.
+- `GEMINI_EMBEDDING_MODEL`: defaults to `gemini-embedding-001`.
+- `GEMINI_EMBEDDING_DIMENSIONS`: defaults to `768`.
+- `MEMORY_EMBEDDING_DEDUPE_THRESHOLD`: defaults to `0.90`.
+- `MEMORY_EMBEDDING_SEARCH_WEIGHT`: defaults to `0.70`.
 
 ## Provider examples
 

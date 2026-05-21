@@ -53,6 +53,7 @@ class Campaign(db.Model):
     npc_actors = db.relationship('NPCActor', backref='campaign', lazy=True, cascade='all, delete-orphan')
     clocks = db.relationship('CampaignClock', backref='campaign', lazy=True, cascade='all, delete-orphan')
     world_events = db.relationship('WorldEvent', backref='campaign', lazy=True, cascade='all, delete-orphan')
+    memory_embeddings = db.relationship('CampaignMemoryEmbedding', backref='campaign', lazy=True, cascade='all, delete-orphan')
 
 
     def to_dict(self):
@@ -918,6 +919,49 @@ class WorldEvent(db.Model):
             'visibility': self.visibility,
             'created_at': self.created_at.isoformat() if self.created_at else None,
         }
+
+
+class CampaignMemoryEmbedding(db.Model):
+    __tablename__ = 'campaign_memory_embeddings'
+
+    id = db.Column(db.Integer, primary_key=True)
+    campaign_id = db.Column(db.Integer, db.ForeignKey('campaign.id'), nullable=False, index=True)
+    item_type = db.Column(db.String(40), nullable=False)
+    item_id = db.Column(db.String(160), nullable=False)
+    visibility = db.Column(db.String(30), default='dm_private')
+    canonical_text = db.Column(db.Text, nullable=False)
+    text_hash = db.Column(db.String(64), nullable=False)
+    embedding_model = db.Column(db.String(120), nullable=False)
+    embedding_dimensions = db.Column(db.Integer, nullable=False)
+    embedding_json = db.Column(db.Text, nullable=False)
+    created_at = db.Column(db.DateTime, default=datetime.utcnow)
+    updated_at = db.Column(db.DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
+
+    __table_args__ = (
+        db.UniqueConstraint('campaign_id', 'item_type', 'item_id', name='uq_campaign_memory_embedding_item'),
+    )
+
+    def to_dict(self, include_vector=False):
+        data = {
+            'id': self.id,
+            'campaign_id': self.campaign_id,
+            'item_type': self.item_type,
+            'item_id': self.item_id,
+            'visibility': self.visibility,
+            'canonical_text': self.canonical_text,
+            'text_hash': self.text_hash,
+            'embedding_model': self.embedding_model,
+            'embedding_dimensions': self.embedding_dimensions,
+            'created_at': self.created_at.isoformat() if self.created_at else None,
+            'updated_at': self.updated_at.isoformat() if self.updated_at else None,
+        }
+        if include_vector:
+            import json
+            try:
+                data['embedding'] = json.loads(self.embedding_json)
+            except (TypeError, ValueError):
+                data['embedding'] = []
+        return data
 
 
 class SheetProposal(db.Model):

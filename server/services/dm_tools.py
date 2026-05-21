@@ -13,6 +13,12 @@ from models import (
 )
 from services.audit_service import log_audit_event
 from services.character_service import character_full_dict
+from services.embedding_service import (
+    find_duplicate_graph_item,
+    search_memory_embeddings,
+    search_weight,
+    upsert_memory_embedding,
+)
 from services.planning_service import summary_dict_for_read
 from services.world_service import clean_id, clean_text, get_campaign_world, json_dumps, json_loads
 from openrouter import get_character_sheet_answer
@@ -727,7 +733,11 @@ def _match_score(query_terms, value):
     return sum(1 for term in query_terms if term and term in text)
 
 
-def _tool_search_campaign_memory(campaign, _current_user, args):
+def _candidate_key(item):
+    return (str(item.get('kind')), str(item.get('item_id')))
+
+
+def _tool_search_campaign_memory(campaign, _current_user, args, audit_context=None):
     query = clean_text(args.get('query'), 240).lower()
     terms = [term for term in query.replace('_', ' ').split() if len(term) > 2]
     limit = min(max(int(args.get('limit') or 8), 1), 20)
@@ -736,22 +746,33 @@ def _tool_search_campaign_memory(campaign, _current_user, args):
 
     for kind in ('entities', 'relations', 'facts'):
         for item in graph.get(kind, []) if isinstance(graph, dict) else []:
-            candidates.append({'kind': kind[:-1], 'value': item})
+            candidates.append({'kind': kind[:-1], 'item_id': item.get('id'), 'value': item})
     for npc in NPCActor.query.filter_by(campaign_id=campaign.id).all():
-        candidates.append({'kind': 'npc_actor', 'value': npc.to_dict(include_private=True)})
+        candidates.append({'kind': 'npc_actor', 'item_id': npc.actor_id, 'value': npc.to_dict(include_private=True)})
     for clock in CampaignClock.query.filter_by(campaign_id=campaign.id).all():
-        candidates.append({'kind': 'clock', 'value': clock.to_dict(include_private=True)})
+        candidates.append({'kind': 'clock', 'item_id': clock.clock_id, 'value': clock.to_dict(include_private=True)})
     for event in WorldEvent.query.filter_by(campaign_id=campaign.id).order_by(WorldEvent.created_at.desc()).limit(30).all():
-        candidates.append({'kind': 'world_event', 'value': event.to_dict(include_private=True)})
-    candidates.append({'kind': 'world_state', 'value': world_state})
-    candidates.append({'kind': 'dm_private', 'value': dm_private})
-    candidates.append({'kind': 'planning_summary', 'value': summary_dict_for_read(campaign.id, include_private=True)})
+        candidates.append({'kind': 'world_event', 'item_id': str(event.id), 'value': event.to_dict(include_private=True)})
+    candidates.append({'kind': 'world_state', 'item_id': 'current', 'value': world_state})
+    candidates.append({'kind': 'dm_private', 'item_id': 'current', 'value': dm_private})
+    candidates.append({'kind': 'planning_summary', 'item_id': 'current', 'value': summary_dict_for_read(campaign.id, include_private=True)})
+
+    semantic = search_memory_embeddings(campaign, query, candidates, limit, audit_context=audit_context)
+    semantic_scores = semantic.get('scores') if semantic.get('ok') else {}
+    weight = search_weight()
 
     scored = []
     for item in candidates:
-        score = _match_score(terms, item['value'])
+        keyword_score = _match_score(terms, item['value'])
+        semantic_score = semantic_scores.get(_candidate_key(item), 0.0)
+        score = keyword_score + (semantic_score * weight)
         if score:
-            scored.append({**item, 'score': score})
+            scored.append({
+                **item,
+                'score': score,
+                'keyword_score': keyword_score,
+                'embedding_score': semantic_score,
+            })
     scored.sort(key=lambda item: item['score'], reverse=True)
     return {'query': query, 'matches': scored[:limit]}
 
@@ -766,6 +787,7 @@ def _record_event(campaign, event_type, summary, payload=None, visibility='dm_pr
     )
     db.session.add(event)
     db.session.flush()
+    upsert_memory_embedding(campaign, 'world_event', str(event.id), event.to_dict(include_private=True))
     return event
 
 
@@ -790,6 +812,7 @@ def _tool_update_current_scene(campaign, _current_user, args):
     world_state['current_scene'] = current_scene
     world.world_state = json_dumps(world_state)
     world.updated_at = datetime.utcnow()
+    upsert_memory_embedding(campaign, 'world_state', 'current', world_state)
     event = _record_event(
         campaign,
         'scene_updated',
@@ -815,6 +838,7 @@ def _tool_advance_clock(campaign, _current_user, args):
     elif clock.filled >= (clock.segments or 4):
         clock.status = 'completed'
     clock.updated_at = datetime.utcnow()
+    upsert_memory_embedding(campaign, 'clock', clock.clock_id, clock.to_dict(include_private=True))
     event = _record_event(
         campaign,
         'clock_advanced',
@@ -846,6 +870,7 @@ def _tool_reveal_fact(campaign, _current_user, args):
     target['visibility'] = visibility
     world.knowledge_graph = json_dumps(graph)
     world.updated_at = datetime.utcnow()
+    upsert_memory_embedding(campaign, item_type, item_id, target)
     event = _record_event(
         campaign,
         'fact_revealed',
@@ -881,7 +906,7 @@ def execute_dm_tool(campaign, session, current_user, name, args, audit_context=N
             handler(campaign, current_user, args, session, audit_context)
             if name == 'propose_sheet_update'
             else handler(campaign, current_user, args, audit_context)
-            if name == 'ask_character_sheet'
+            if name in {'ask_character_sheet', 'search_campaign_memory'}
             else handler(campaign, current_user, args)
         )
         mutated = name in {'record_world_event', 'update_current_scene', 'advance_clock', 'reveal_fact'}
@@ -924,6 +949,53 @@ def _upsert_by_id(items, item, fallback_id):
     return clean_item, 'created'
 
 
+def _upsert_graph_item(campaign, item_type, items, item, fallback_id, audit_context=None):
+    item = item if isinstance(item, dict) else {}
+    requested_id = clean_id(item.get('id'), fallback_id)
+    exact_exists = any(existing.get('id') == requested_id for existing in items)
+    dedupe = {'duplicate_id': None}
+    if not exact_exists:
+        dedupe = find_duplicate_graph_item(campaign, item_type, item, audit_context=audit_context)
+        duplicate_id = dedupe.get('duplicate_id')
+        if duplicate_id and any(existing.get('id') == duplicate_id for existing in items):
+            item = dict(item)
+            item['id'] = duplicate_id
+
+    merged, action = _upsert_by_id(items, item, fallback_id)
+    upsert_memory_embedding(
+        campaign,
+        item_type,
+        merged.get('id'),
+        merged,
+        audit_context=audit_context,
+        embedding_result=dedupe.get('embedding'),
+    )
+    return merged, action, {
+        'requested_id': requested_id,
+        'dedupe_match_id': dedupe.get('duplicate_id'),
+        'dedupe_similarity': (
+            round(dedupe.get('best', {}).get('similarity'), 4)
+            if isinstance(dedupe.get('best'), dict) and dedupe.get('best', {}).get('similarity') is not None
+            else None
+        ),
+    }
+
+
+def _apply_entity_id_remaps(kind, item, id_remaps):
+    if not id_remaps or not isinstance(item, dict):
+        return item
+    item = dict(item)
+    if kind == 'relation':
+        for field in ('source_id', 'target_id'):
+            if item.get(field) in id_remaps:
+                item[field] = id_remaps[item[field]]
+    elif kind == 'fact':
+        entity_ids = item.get('entity_ids', [])
+        if isinstance(entity_ids, list):
+            item['entity_ids'] = [id_remaps.get(entity_id, entity_id) for entity_id in entity_ids]
+    return item
+
+
 def _create_clock_from_patch(campaign, patch):
     clock_id = clean_id(patch.get('id') or patch.get('clock_id'), f'clock_{datetime.utcnow().strftime("%Y%m%d%H%M%S")}')
     existing = CampaignClock.query.filter_by(campaign_id=campaign.id, clock_id=clock_id).first()
@@ -949,6 +1021,7 @@ def _create_clock_from_patch(campaign, patch):
     if not existing:
         db.session.add(clock)
     db.session.flush()
+    upsert_memory_embedding(campaign, 'clock', clock.clock_id, clock.to_dict(include_private=True))
     event = _record_event(
         campaign,
         'clock_created' if not existing else 'clock_updated',
@@ -966,6 +1039,7 @@ def _retire_clock_from_patch(campaign, patch):
         return {'error': f'Clock not found: {clock_id}'}
     clock.status = clean_text(patch.get('status'), 30) or 'resolved'
     clock.updated_at = datetime.utcnow()
+    upsert_memory_embedding(campaign, 'clock', clock.clock_id, clock.to_dict(include_private=True))
     event = _record_event(
         campaign,
         'clock_retired',
@@ -994,6 +1068,7 @@ def _update_npc_actor(campaign, patch):
     actor.dossier = json_dumps(dossier)
     actor.updated_at = datetime.utcnow()
     db.session.flush()
+    upsert_memory_embedding(campaign, 'npc_actor', actor.actor_id, actor.to_dict(include_private=True))
     event = _record_event(
         campaign,
         'npc_actor_upserted',
@@ -1016,6 +1091,7 @@ def apply_memory_patch(campaign, session, patch, audit_context=None):
     }
 
     if world:
+        entity_id_remaps = {}
         for kind, key, fallback in (
             ('entity', 'upsert_graph_entities', 'entity'),
             ('relation', 'upsert_graph_relations', 'relation'),
@@ -1025,8 +1101,27 @@ def apply_memory_patch(campaign, session, patch, audit_context=None):
             graph.setdefault(plural, [])
             items = patch.get(key) if isinstance(patch.get(key), list) else []
             for index, item in enumerate(items):
-                item, action = _upsert_by_id(graph[plural], item, f'{fallback}_{index + 1}')
-                result['graph_changes'].append({'kind': kind, 'action': action, 'id': item.get('id')})
+                item = _apply_entity_id_remaps(kind, item, entity_id_remaps)
+                item, action, embedding_dedupe = _upsert_graph_item(
+                    campaign,
+                    kind,
+                    graph[plural],
+                    item,
+                    f'{fallback}_{index + 1}',
+                    audit_context=audit_context,
+                )
+                result['graph_changes'].append({
+                    'kind': kind,
+                    'action': action,
+                    'id': item.get('id'),
+                    'embedding_dedupe': embedding_dedupe,
+                })
+                if (
+                    kind == 'entity'
+                    and embedding_dedupe.get('dedupe_match_id')
+                    and embedding_dedupe.get('requested_id') != item.get('id')
+                ):
+                    entity_id_remaps[embedding_dedupe['requested_id']] = item.get('id')
 
         scene_patch = patch.get('scene_patch') if isinstance(patch.get('scene_patch'), dict) else {}
         if scene_patch:
@@ -1039,6 +1134,8 @@ def apply_memory_patch(campaign, session, patch, audit_context=None):
         world.knowledge_graph = json_dumps(graph)
         world.world_state = json_dumps(world_state)
         world.updated_at = datetime.utcnow()
+        if scene_patch:
+            upsert_memory_embedding(campaign, 'world_state', 'current', world_state, audit_context=audit_context)
 
     for item in patch.get('create_clocks', []) if isinstance(patch.get('create_clocks'), list) else []:
         change = _create_clock_from_patch(campaign, item)

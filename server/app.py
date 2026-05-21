@@ -105,6 +105,13 @@ def ensure_lightweight_schema():
         db.session.execute(text('ALTER TABLE campaign_audit_events ADD COLUMN trace_label VARCHAR(200)'))
     if 'audit_role' not in audit_event_columns:
         db.session.execute(text('ALTER TABLE campaign_audit_events ADD COLUMN audit_role VARCHAR(20)'))
+
+    embedding_columns = table_columns('campaign_memory_embeddings')
+    if embedding_columns:
+        if 'visibility' not in embedding_columns:
+            db.session.execute(text('ALTER TABLE campaign_memory_embeddings ADD COLUMN visibility VARCHAR(30) DEFAULT "dm_private"'))
+        if 'embedding_dimensions' not in embedding_columns:
+            db.session.execute(text('ALTER TABLE campaign_memory_embeddings ADD COLUMN embedding_dimensions INTEGER DEFAULT 0'))
     db.session.commit()
 
 

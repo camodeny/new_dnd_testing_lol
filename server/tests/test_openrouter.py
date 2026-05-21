@@ -15,6 +15,7 @@ from openrouter import (
     _json_loads_with_repair,
     _post_chat_response,
     get_character_sheet_answer,
+    get_opening_scene_response,
     get_world_genesis_package,
     normalize_session_spoiler_check,
 )
@@ -181,6 +182,53 @@ class ProviderCompatibilityTest(unittest.TestCase):
         self.assertEqual(request.kwargs['json']['reasoning_effort'], 'high')
         self.assertNotIn('tool_choice', request.kwargs['json'])
         self.assertNotIn('parallel_tool_calls', request.kwargs['json'])
+
+    def test_opening_scene_reprompts_when_visible_content_is_empty(self):
+        empty_response = {
+            'choices': [{
+                'message': {
+                    'content': '',
+                    'reasoning_content': 'The town square waits in uneasy silence.\n\nWhat do you do?',
+                },
+                'finish_reason': 'stop',
+            }],
+        }
+        retry_response = {
+            'choices': [{
+                'message': {
+                    'content': 'The town square waits in uneasy silence.\n\nWhat do you do?',
+                },
+                'finish_reason': 'stop',
+            }],
+        }
+
+        with patch('openrouter._post_chat_response', side_effect=[empty_response, retry_response]) as post_chat:
+            result = get_opening_scene_response({}, {})
+
+        self.assertEqual(result, 'The town square waits in uneasy silence.\n\nWhat do you do?')
+        self.assertEqual(post_chat.call_count, 2)
+        retry_messages = post_chat.call_args.args[0]
+        self.assertIn('no visible assistant content', retry_messages[-1]['content'])
+        self.assertEqual(
+            post_chat.call_args.kwargs['audit_context']['operation'],
+            'opening_scene_format_retry',
+        )
+
+    def test_opening_scene_returns_none_when_retry_has_no_visible_content(self):
+        response = {
+            'choices': [{
+                'message': {
+                    'content': '',
+                },
+                'finish_reason': 'stop',
+            }],
+        }
+
+        with patch('openrouter._post_chat_response', return_value=response) as post_chat:
+            result = get_opening_scene_response({}, {})
+
+        self.assertIsNone(result)
+        self.assertEqual(post_chat.call_count, 2)
 
 
 class SessionSpoilerCheckTest(unittest.TestCase):

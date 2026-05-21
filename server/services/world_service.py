@@ -10,6 +10,7 @@ from models import (
 )
 from openrouter import get_world_genesis_package
 from services.audit_service import log_audit_event
+from services.embedding_service import upsert_memory_embedding
 from services.planning_service import can_start_session, planning_context
 
 
@@ -324,6 +325,14 @@ def persist_world_package(campaign, package):
     world.dm_private = json_dumps(package['dm_private'])
     world.updated_at = datetime.utcnow()
     db.session.flush()
+    for entity in package['knowledge_graph'].get('entities', []):
+        upsert_memory_embedding(campaign, 'entity', entity.get('id'), entity)
+    for relation in package['knowledge_graph'].get('relations', []):
+        upsert_memory_embedding(campaign, 'relation', relation.get('id'), relation)
+    for fact in package['knowledge_graph'].get('facts', []):
+        upsert_memory_embedding(campaign, 'fact', fact.get('id'), fact)
+    upsert_memory_embedding(campaign, 'world_state', 'current', package['world_state'])
+    upsert_memory_embedding(campaign, 'dm_private', 'current', package['dm_private'])
     log_audit_event(
         campaign.id,
         'knowledge_graph_write',
@@ -350,6 +359,7 @@ def persist_world_package(campaign, package):
             public_summary=actor.get('public_summary'),
             dossier=json_dumps(actor),
         ))
+        upsert_memory_embedding(campaign, 'npc_actor', actor['id'], actor)
     log_audit_event(
         campaign.id,
         'npc_actor_write',
@@ -375,6 +385,7 @@ def persist_world_package(campaign, package):
             on_complete=clock.get('on_complete'),
             status=clock.get('status') or 'active',
         ))
+        upsert_memory_embedding(campaign, 'clock', clock['id'], clock)
     log_audit_event(
         campaign.id,
         'clock_write',
@@ -385,7 +396,7 @@ def persist_world_package(campaign, package):
         commit=False,
     )
 
-    db.session.add(WorldEvent(
+    world_event = WorldEvent(
         campaign_id=campaign.id,
         event_type='world_generated',
         summary=f'World package generated for {campaign.name}.',
@@ -395,7 +406,10 @@ def persist_world_package(campaign, package):
             'clock_ids': [clock['id'] for clock in package['clocks']],
         }),
         visibility='dm_private',
-    ))
+    )
+    db.session.add(world_event)
+    db.session.flush()
+    upsert_memory_embedding(campaign, 'world_event', str(world_event.id), world_event.to_dict(include_private=True))
     log_audit_event(
         campaign.id,
         'world_event_write',

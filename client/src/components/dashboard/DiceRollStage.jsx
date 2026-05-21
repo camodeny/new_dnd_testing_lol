@@ -6,6 +6,11 @@ const FORWARD = new THREE.Vector3(0, 0, 1)
 const CAMERA_FACE_NORMAL = new THREE.Vector3(0, 0.62, 0.78).normalize()
 const CAMERA_SCREEN_UP = new THREE.Vector3(0, 1, -0.52).normalize()
 const DIE_SCALE = 0.36
+const DIE_LANDING_Y = -0.14
+const DIE_LANDING_Z = 0
+const DICE_STAGE_MARGIN = 0.78
+const DICE_SPACING = 0.8
+const MOBILE_DIE_SCALE = 0.27
 
 const DIE_STYLES = {
   4: { base: '#374151', accent: '#f59e0b', emissive: '#312000' },
@@ -24,6 +29,17 @@ function smoothstep(edge0, edge1, value) {
 
 function randomUnitVector() {
   return new THREE.Vector3(Math.random() - 0.5, Math.random() - 0.5, Math.random() - 0.5).normalize()
+}
+
+function randomBetween(min, max) {
+  return min + Math.random() * (max - min)
+}
+
+function getResponsiveDieScale(camera) {
+  if (camera.aspect >= 1) return DIE_SCALE
+
+  const portraitT = THREE.MathUtils.clamp((camera.aspect - 0.45) / 0.55, 0, 1)
+  return THREE.MathUtils.lerp(MOBILE_DIE_SCALE, DIE_SCALE, portraitT)
 }
 
 function makeStoneTexture(style) {
@@ -353,7 +369,7 @@ function createDieMesh(sides, value, options = {}) {
   const group = new THREE.Group()
   group.add(mesh)
   group.add(edges)
-  group.scale.setScalar(DIE_SCALE)
+  group.scale.setScalar(options.dieScale || DIE_SCALE)
 
   labelFaces.forEach((face, index) => {
     const highlighted = index === selectedFaceIndex
@@ -395,6 +411,34 @@ function getLandingQuaternion(face, yaw = 0) {
   )
   const faceYaw = new THREE.Quaternion().setFromAxisAngle(CAMERA_FACE_NORMAL, correction + yaw)
   return faceYaw.multiply(alignToCamera)
+}
+
+function getResponsiveRollBounds(camera, count, dieScale = DIE_SCALE) {
+  camera.updateMatrixWorld()
+
+  const forward = new THREE.Vector3()
+  camera.getWorldDirection(forward)
+
+  const landingPoint = new THREE.Vector3(0, DIE_LANDING_Y, DIE_LANDING_Z)
+  const distance = Math.max(0.1, landingPoint.sub(camera.position).dot(forward))
+  const visibleHeight = 2 * Math.tan(THREE.MathUtils.degToRad(camera.fov) / 2) * distance
+  const visibleHalfWidth = (visibleHeight * camera.aspect) / 2
+  const stageMargin = Math.min(DICE_STAGE_MARGIN, dieScale * 1.55 + 0.24)
+  const landingHalfWidth = Math.max(dieScale * 1.3, visibleHalfWidth - stageMargin)
+  const spacing = count > 1
+    ? Math.min(DICE_SPACING, (landingHalfWidth * 2) / Math.max(1, count - 1))
+    : 0
+  const spreadHalfWidth = ((count - 1) * spacing) / 2
+  const centerHalfWidth = Math.max(0, landingHalfWidth - spreadHalfWidth)
+  const offscreenOffset = Math.max(stageMargin + dieScale * 1.6, 0.78)
+
+  return {
+    spacing,
+    centerHalfWidth,
+    minX: -landingHalfWidth,
+    maxX: landingHalfWidth,
+    offscreenOffset,
+  }
 }
 
 export default function DiceRollStage({ roll }) {
@@ -492,7 +536,7 @@ export default function DiceRollStage({ roll }) {
 
           die.position.x = THREE.MathUtils.lerp(target.startX, target.x, ease)
           die.position.y = target.y + bounce
-          die.position.z = THREE.MathUtils.lerp(target.startZ, 0, ease)
+          die.position.z = THREE.MathUtils.lerp(target.startZ, DIE_LANDING_Z, ease)
             + Math.sin(progress * Math.PI * 3 + index) * (1 - progress) * 0.08
 
           // Spin speed slows down significantly after first impact
@@ -517,7 +561,7 @@ export default function DiceRollStage({ roll }) {
           die.quaternion.slerpQuaternions(tumblingQuaternion, settledQuaternion, settle)
 
           if (progress >= 1) {
-            die.position.set(target.x, target.y, 0)
+            die.position.set(target.x, target.y, DIE_LANDING_Z)
             die.quaternion.copy(target.finalQuaternion)
             die.userData.idleSpin = false
           }
@@ -561,12 +605,23 @@ export default function DiceRollStage({ roll }) {
 
     const visualSpecs = getRollVisualSpecs(roll)
     const count = Math.max(1, visualSpecs.length)
-    const spacing = count > 1 ? 0.8 : 0
-    const centerX = count === 1 ? -2.2 + Math.random() * 4.4 : 0
+    const dieScale = getResponsiveDieScale(context.camera)
+    const rollBounds = getResponsiveRollBounds(context.camera, count, dieScale)
+    const spacing = rollBounds.spacing
+    const centerX = count === 1
+      ? randomBetween(-rollBounds.centerHalfWidth, rollBounds.centerHalfWidth)
+      : 0
     const centerZ = -0.65 + Math.random() * 1.35
+    const targetXs = visualSpecs.map((_, index) => (
+      THREE.MathUtils.clamp(
+        centerX + (index - (count - 1) / 2) * spacing,
+        rollBounds.minX,
+        rollBounds.maxX,
+      )
+    ))
     const dice = visualSpecs.map((spec, index) => {
-      const { group: die, resultFace } = createDieMesh(spec.sides, spec.value, spec)
-      die.position.set(centerX + (index - (count - 1) / 2) * spacing, -0.14, centerZ)
+      const { group: die, resultFace } = createDieMesh(spec.sides, spec.value, { ...spec, dieScale })
+      die.position.set(targetXs[index], DIE_LANDING_Y, centerZ)
       die.rotation.set(0.7 + index * 0.4, 0.4 + index * 0.55, 0.25)
       die.userData.resultFace = resultFace
       die.userData.idleSpin = false
@@ -580,7 +635,7 @@ export default function DiceRollStage({ roll }) {
       startedAt: performance.now(),
       duration: 1725,
       targets: dice.map((die, index) => {
-        const x = centerX + (index - (count - 1) / 2) * spacing
+        const x = targetXs[index]
         const spinAxis = randomUnitVector()
         const spinTurns = 5.25 + Math.random() * 2.25
         const startQuaternion = new THREE.Quaternion().setFromEuler(new THREE.Euler(
@@ -596,8 +651,10 @@ export default function DiceRollStage({ roll }) {
 
         return {
           x,
-          y: -0.14,
-          startX: x + (fromLeft ? -5.5 : 5.5) + (Math.random() - 0.5) * 0.7,
+          y: DIE_LANDING_Y,
+          startX: fromLeft
+            ? rollBounds.minX - rollBounds.offscreenOffset - Math.random() * 0.24
+            : rollBounds.maxX + rollBounds.offscreenOffset + Math.random() * 0.24,
           startZ: centerZ + 1.2 + Math.random() * 0.9,
           spinAxis,
           wobbleAxis: new THREE.Vector3(0.5 + Math.random() * 0.25, 0, 0.55 + Math.random() * 0.25).normalize(),

@@ -1,4 +1,5 @@
 import os
+import json
 import sys
 import unittest
 from unittest.mock import patch
@@ -13,6 +14,7 @@ from models import (
     Campaign,
     CampaignAuditEvent,
     CampaignClock,
+    CampaignMemoryEmbedding,
     CampaignMember,
     CampaignSession,
     CampaignWorld,
@@ -32,10 +34,13 @@ from routes.dev import _agent_runs_from_stream, _audit_stream_entry, _chat_flow_
 from routes.sessions import sessions_bp
 from services.audit_service import log_audit_event
 from services.dm_tools import DM_TOOL_DEFINITIONS, apply_memory_patch, build_session_hot_context, context_manifest, execute_dm_tool
+from services.embedding_service import canonical_text_for_item, cosine_similarity
 
 
 class DmToolsTest(unittest.TestCase):
     def setUp(self):
+        self.env_patch = patch.dict(os.environ, {'GEMINI_EMBEDDINGS_ENABLED': 'false'}, clear=False)
+        self.env_patch.start()
         self.app = Flask(__name__)
         self.app.config['SQLALCHEMY_DATABASE_URI'] = 'sqlite:///:memory:'
         self.app.config['SQLALCHEMY_TRACK_MODIFICATIONS'] = False
@@ -86,6 +91,7 @@ class DmToolsTest(unittest.TestCase):
         db.session.remove()
         db.drop_all()
         self.ctx.pop()
+        self.env_patch.stop()
 
     def test_tool_definitions_are_function_schemas(self):
         names = {tool['function']['name'] for tool in DM_TOOL_DEFINITIONS}
@@ -135,6 +141,42 @@ class DmToolsTest(unittest.TestCase):
         self.assertEqual(hot_context['protected_player_characters'][0]['name'], 'Aria')
         self.assertIn('Crimson Veil', hot_context['private_output_terms'])
         self.assertEqual(hot_context['private_spoiler_items'][0]['text'], 'Crimson Veil')
+
+    def test_embedding_canonical_text_includes_graph_context(self):
+        entity_text = canonical_text_for_item('entity', {
+            'id': 'bram_truewood',
+            'type': 'npc',
+            'name': 'Bram Truewood',
+            'summary': 'Bookshop owner on Silver Street.',
+            'visibility': 'party_known',
+            'tags': ['books', 'infernal lore'],
+        })
+        relation_text = canonical_text_for_item('relation', {
+            'id': 'bram_requested_scroll_help',
+            'source_id': 'bram_truewood',
+            'target_id': 'seraphina',
+            'type': 'requested_help',
+            'summary': 'Bram asked Seraphina to watch for missing scrolls.',
+        })
+        fact_text = canonical_text_for_item('fact', {
+            'id': 'fact_symbol',
+            'entity_ids': ['seraphina', 'burned_symbol'],
+            'text': 'The door symbol is an Infernal seal of scrutiny.',
+            'certainty': 'confirmed',
+            'visibility': 'party_known',
+        })
+
+        self.assertIn('Bram Truewood', entity_text)
+        self.assertIn('Bookshop owner', entity_text)
+        self.assertIn('infernal lore', entity_text)
+        self.assertIn('bram_truewood -> seraphina', relation_text)
+        self.assertIn('requested_help', relation_text)
+        self.assertIn('burned_symbol', fact_text)
+        self.assertIn('confirmed', fact_text)
+
+    def test_cosine_similarity_handles_matching_vectors(self):
+        self.assertAlmostEqual(cosine_similarity([1, 0], [1, 0]), 1.0)
+        self.assertAlmostEqual(cosine_similarity([1, 0], [0, 1]), 0.0)
 
     def test_pc_control_guard_detects_pc_dialogue_and_action(self):
         hot_context = {
@@ -437,6 +479,230 @@ class DmToolsTest(unittest.TestCase):
         self.assertTrue(result['running_summary_updated'])
         self.assertEqual(self.session.running_summary, 'The party heard a warning bell at the docks.')
 
+    def test_memory_patch_embedding_dedupe_updates_similar_entity(self):
+        world = CampaignWorld.query.filter_by(campaign_id=self.campaign.id).first()
+        world.knowledge_graph = json.dumps({
+            'entities': [
+                {
+                    'id': 'silver_street_bookshop',
+                    'type': 'location',
+                    'name': "Bram Truewood's Bookshop",
+                    'summary': 'A bookshop on Silver Street.',
+                    'visibility': 'party_known',
+                }
+            ],
+            'relations': [],
+            'facts': [],
+        })
+        db.session.add(CampaignMemoryEmbedding(
+            campaign_id=self.campaign.id,
+            item_type='entity',
+            item_id='silver_street_bookshop',
+            visibility='party_known',
+            canonical_text="Entity: Bram Truewood's Bookshop",
+            text_hash='old',
+            embedding_model='gemini-embedding-001',
+            embedding_dimensions=2,
+            embedding_json='[1.0, 0.0]',
+        ))
+        db.session.commit()
+
+        with patch.dict(os.environ, {
+            'GEMINI_EMBEDDINGS_ENABLED': 'true',
+            'GEMINI_EMBEDDING_DIMENSIONS': '2',
+        }, clear=False), patch('services.embedding_service.embedding_from_text', return_value={
+            'ok': True,
+            'vector': [1.0, 0.0],
+            'model': 'gemini-embedding-001',
+            'dimensions': 2,
+        }):
+            result = apply_memory_patch(
+                self.campaign,
+                self.session,
+                {
+                    'upsert_graph_entities': [
+                        {
+                            'id': 'bram_truewood_bookshop',
+                            'type': 'location',
+                            'name': "Bram Truewood's Bookshop",
+                            'summary': 'A cluttered bookshop on Silver Street run by Bram.',
+                            'visibility': 'party_known',
+                        }
+                    ],
+                    'upsert_graph_facts': [
+                        {
+                            'id': 'fact_bookshop_visit',
+                            'entity_ids': ['bram_truewood_bookshop'],
+                            'text': 'Seraphina visited Bram Truewood\'s bookshop.',
+                            'certainty': 'confirmed',
+                            'visibility': 'party_known',
+                        }
+                    ],
+                },
+                {},
+            )
+
+        graph = json.loads(world.knowledge_graph)
+        self.assertEqual(len(graph['entities']), 1)
+        self.assertEqual(graph['entities'][0]['id'], 'silver_street_bookshop')
+        self.assertIn('cluttered bookshop', graph['entities'][0]['summary'])
+        self.assertEqual(graph['facts'][0]['entity_ids'], ['silver_street_bookshop'])
+        self.assertEqual(result['graph_changes'][0]['action'], 'updated')
+        self.assertEqual(
+            result['graph_changes'][0]['embedding_dedupe']['dedupe_match_id'],
+            'silver_street_bookshop',
+        )
+
+    def test_memory_patch_embedding_low_similarity_creates_entity(self):
+        db.session.add(CampaignMemoryEmbedding(
+            campaign_id=self.campaign.id,
+            item_type='entity',
+            item_id='fac_crimson_veil',
+            visibility='dm_private',
+            canonical_text='Entity: Crimson Veil',
+            text_hash='old',
+            embedding_model='gemini-embedding-001',
+            embedding_dimensions=2,
+            embedding_json='[1.0, 0.0]',
+        ))
+        db.session.commit()
+
+        with patch.dict(os.environ, {
+            'GEMINI_EMBEDDINGS_ENABLED': 'true',
+            'GEMINI_EMBEDDING_DIMENSIONS': '2',
+        }, clear=False), patch('services.embedding_service.embedding_from_text', return_value={
+            'ok': True,
+            'vector': [0.0, 1.0],
+            'model': 'gemini-embedding-001',
+            'dimensions': 2,
+        }):
+            result = apply_memory_patch(
+                self.campaign,
+                self.session,
+                {
+                    'upsert_graph_entities': [
+                        {
+                            'id': 'dock_ward',
+                            'type': 'location',
+                            'name': 'Dock Ward',
+                            'summary': 'A busy waterfront district.',
+                            'visibility': 'party_known',
+                        }
+                    ],
+                },
+                {},
+            )
+
+        world = CampaignWorld.query.filter_by(campaign_id=self.campaign.id).first()
+        graph = json.loads(world.knowledge_graph)
+        self.assertTrue(any(entity['id'] == 'dock_ward' for entity in graph['entities']))
+        self.assertEqual(result['graph_changes'][0]['action'], 'created')
+        self.assertIsNone(result['graph_changes'][0]['embedding_dedupe']['dedupe_match_id'])
+
+    def test_memory_patch_embedding_failure_falls_back_and_audits(self):
+        with patch.dict(os.environ, {
+            'GEMINI_EMBEDDINGS_ENABLED': 'true',
+            'GEMINI_API_KEY': '',
+        }, clear=False):
+            result = apply_memory_patch(
+                self.campaign,
+                self.session,
+                {
+                    'upsert_graph_entities': [
+                        {
+                            'id': 'dock_ward',
+                            'type': 'location',
+                            'name': 'Dock Ward',
+                            'summary': 'A busy waterfront district.',
+                            'visibility': 'party_known',
+                        }
+                    ],
+                },
+                {},
+            )
+
+        self.assertEqual(result['graph_changes'][0]['id'], 'dock_ward')
+        self.assertIsNotNone(CampaignAuditEvent.query.filter_by(event_type='embedding_fallback').first())
+
+    def test_search_campaign_memory_uses_embedding_similarity_without_keyword_overlap(self):
+        world = CampaignWorld.query.filter_by(campaign_id=self.campaign.id).first()
+        world.knowledge_graph = json.dumps({
+            'entities': [],
+            'relations': [],
+            'facts': [
+                {
+                    'id': 'fact_symbol',
+                    'entity_ids': ['burned_symbol'],
+                    'text': 'The door mark is an Infernal seal of scrutiny.',
+                    'certainty': 'confirmed',
+                    'visibility': 'party_known',
+                }
+            ],
+        })
+        db.session.add(CampaignMemoryEmbedding(
+            campaign_id=self.campaign.id,
+            item_type='fact',
+            item_id='fact_symbol',
+            visibility='party_known',
+            canonical_text='Fact: The door mark is an Infernal seal of scrutiny.',
+            text_hash='fact',
+            embedding_model='gemini-embedding-001',
+            embedding_dimensions=2,
+            embedding_json='[1.0, 0.0]',
+        ))
+        db.session.commit()
+
+        with patch.dict(os.environ, {
+            'GEMINI_EMBEDDINGS_ENABLED': 'true',
+            'GEMINI_EMBEDDING_DIMENSIONS': '2',
+        }, clear=False), patch('services.embedding_service.embedding_from_text', return_value={
+            'ok': True,
+            'vector': [1.0, 0.0],
+            'model': 'gemini-embedding-001',
+            'dimensions': 2,
+        }):
+            result = execute_dm_tool(
+                self.campaign,
+                self.session,
+                self.user,
+                'search_campaign_memory',
+                {'query': 'ominous personal brand', 'limit': 3},
+                {},
+            )
+
+        self.assertEqual(result['matches'][0]['item_id'], 'fact_symbol')
+        self.assertEqual(result['matches'][0]['keyword_score'], 0)
+        self.assertGreater(result['matches'][0]['embedding_score'], 0.9)
+
+    def test_search_campaign_memory_keyword_fallback_when_embeddings_disabled(self):
+        world = CampaignWorld.query.filter_by(campaign_id=self.campaign.id).first()
+        world.knowledge_graph = json.dumps({
+            'entities': [],
+            'relations': [],
+            'facts': [
+                {
+                    'id': 'dock_warning_bell',
+                    'entity_ids': ['dock_ward'],
+                    'text': 'A warning bell rang in the Dock Ward.',
+                    'certainty': 'confirmed',
+                    'visibility': 'party_known',
+                }
+            ],
+        })
+        db.session.commit()
+
+        result = execute_dm_tool(
+            self.campaign,
+            self.session,
+            self.user,
+            'search_campaign_memory',
+            {'query': 'bell', 'limit': 3},
+            {},
+        )
+
+        self.assertEqual(result['matches'][0]['item_id'], 'dock_warning_bell')
+        self.assertGreater(result['matches'][0]['keyword_score'], 0)
+
     def test_advance_clock_mutates_existing_clock(self):
         db.session.add(CampaignClock(
             campaign_id=self.campaign.id,
@@ -490,6 +756,39 @@ class DmToolsTest(unittest.TestCase):
         expected_memory_trace_id = f'session_memory_writer:session_{self.session.id}:message_{player_msg.id}'
         self.assertEqual(memory_patch.call_args.kwargs['audit_context']['parent_trace_id'], expected_dm_trace_id)
         self.assertEqual(memory_patch.call_args.kwargs['audit_context']['trace_id'], expected_memory_trace_id)
+
+    def test_session_message_route_continues_when_embedding_request_fails(self):
+        token = generate_token(self.user.id)
+        client = self.app.test_client()
+
+        with patch.dict(os.environ, {
+            'GEMINI_EMBEDDINGS_ENABLED': 'true',
+            'GEMINI_API_KEY': 'test-key',
+        }, clear=False), patch('services.embedding_service._post_embedding', side_effect=RuntimeError('timeout')), \
+                patch('routes.sessions.get_session_dm_response_with_tools', return_value='A bell rings across the docks.'), \
+                patch('routes.sessions.get_session_memory_patch', return_value={
+                    'running_summary': 'A bell rang across the docks.',
+                    'upsert_graph_facts': [
+                        {
+                            'id': 'dock_warning_bell',
+                            'entity_ids': ['dock_ward'],
+                            'text': 'A warning bell rang in the Dock Ward.',
+                            'certainty': 'confirmed',
+                            'visibility': 'party_known',
+                        }
+                    ],
+                }):
+            response = client.post(
+                f'/api/sessions/{self.session.id}/messages',
+                json={'content': '<ooc>What happens?</ooc>', 'role': 'player'},
+                headers={'Authorization': f'Bearer {token}'},
+            )
+
+        self.assertEqual(response.status_code, 201)
+        payload = response.get_json()
+        self.assertEqual([message['role'] for message in payload['messages']], ['player', 'dm'])
+        self.assertEqual(self.session.running_summary, 'A bell rang across the docks.')
+        self.assertIsNotNone(CampaignAuditEvent.query.filter_by(event_type='embedding_fallback').first())
 
     def test_session_message_route_persists_player_message_when_dm_is_silent(self):
         token = generate_token(self.user.id)
