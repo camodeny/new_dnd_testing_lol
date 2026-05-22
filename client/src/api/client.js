@@ -154,6 +154,19 @@ export function moveEncounterMapToken(encounterMapId, col, row) {
   })
 }
 
+export function rollPlayerInitiative(encounterMapId, actorType, actorId, initiative) {
+  return apiFetch(`/encounter-maps/${encounterMapId}/encounter/roll-initiative`, {
+    method: 'POST',
+    body: JSON.stringify({ actor_type: actorType, actor_id: actorId, initiative }),
+  })
+}
+
+export function advanceEncounterTurn(encounterMapId) {
+  return apiFetch(`/encounter-maps/${encounterMapId}/encounter/next-turn`, {
+    method: 'POST',
+  })
+}
+
 export function generateCampaignWorld(campaignId) {
   return apiFetch(`/campaigns/${campaignId}/world`, { method: 'POST' })
 }

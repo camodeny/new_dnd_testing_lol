@@ -244,6 +244,7 @@ def _compact_encounter_map(encounter_map):
         'grid': data.get('grid'),
         'vtt_setup': data.get('vtt_setup'),
         'placements': data.get('placements', []),
+        'encounter_state': data.get('encounter_state'),
         'setup_status': data.get('setup_status'),
         'setup_error': data.get('setup_error'),
     }
@@ -316,6 +317,8 @@ def build_session_hot_context(campaign, session, current_user):
             'friendly starts, enemy starts, obstacles, objectives, or terrain calls for the playable setup JSON. '
             'After a map exists and combat positioning matters, use place_encounter_map_actors to place '
             'players, NPCs, and monsters on grid coordinates. '
+            'When combat or initiative starts, use toggle_encounter_mode(active=True) to start Encounter Mode. '
+            'During combat, track turns: use next_combat_turn() to advance turns, update_combatant_actions() to deduct actions/movement, and set_combat_turn() to skip/set turns. '
             'Do not generate maps for every ordinary scene. '
             + _campaign_loot_mode_policy(campaign)
         ),
@@ -796,7 +799,110 @@ DM_TOOL_DEFINITIONS = [
             },
         },
     },
+    {
+        'type': 'function',
+        'function': {
+            'name': 'toggle_encounter_mode',
+            'description': 'Start or stop Encounter Mode (combat tracker) on the latest map. Starts initiative rolling for monsters/NPCs and prompts players to roll initiative.',
+            'parameters': {
+                'type': 'object',
+                'required': ['active'],
+                'properties': {
+                    'active': {
+                        'type': 'boolean',
+                        'description': 'True to start Encounter Mode, False to stop/clear it.'
+                    }
+                }
+            }
+        }
+    },
+    {
+        'type': 'function',
+        'function': {
+            'name': 'next_combat_turn',
+            'description': 'Advance combat tracker to the next combatant, resetting their actions/movement and potentially advancing the round counter.',
+            'parameters': {
+                'type': 'object',
+                'properties': {}
+            }
+        }
+    },
+    {
+        'type': 'function',
+        'function': {
+            'name': 'set_combat_turn',
+            'description': 'Directly jump to a specific combatant in the turn order list by index.',
+            'parameters': {
+                'type': 'object',
+                'required': ['active_turn_index'],
+                'properties': {
+                    'active_turn_index': {
+                        'type': 'integer',
+                        'description': 'Index in the turn order list to jump to.'
+                    }
+                }
+            }
+        }
+    },
+    {
+        'type': 'function',
+        'function': {
+            'name': 'update_combatant_actions',
+            'description': 'Manually update a combatant action resources (action, bonus_action, reaction, movement_remaining).',
+            'parameters': {
+                'type': 'object',
+                'properties': {
+                    'placement_id': {
+                        'type': 'integer',
+                        'description': 'Find combatant by placement ID.'
+                    },
+                    'actor_type': {
+                        'type': 'string',
+                        'enum': ['player', 'npc', 'monster']
+                    },
+                    'actor_id': {
+                        'type': 'string'
+                    },
+                    'actions': {
+                        'type': 'object',
+                        'description': 'Map of action flags/movement to update.',
+                        'properties': {
+                            'action': {'type': 'boolean'},
+                            'bonus_action': {'type': 'boolean'},
+                            'reaction': {'type': 'boolean'},
+                            'movement_remaining': {'type': 'integer'}
+                        }
+                    }
+                }
+            }
+        }
+    }
 ]
+
+
+def get_dm_tool_definitions(campaign):
+    if not campaign:
+        return DM_TOOL_DEFINITIONS
+
+    try:
+        settings = json.loads(campaign.settings) if isinstance(campaign.settings, str) else (campaign.settings or {})
+    except (TypeError, ValueError):
+        settings = {}
+
+    encounter_active = bool(settings.get('encounter_active', False))
+
+    if encounter_active:
+        return DM_TOOL_DEFINITIONS
+
+    exclude_names = {
+        'create_encounter_map',
+        'place_encounter_map_actors',
+        'next_combat_turn',
+        'set_combat_turn',
+        'update_combatant_actions',
+    }
+    return [tool for tool in DM_TOOL_DEFINITIONS if tool['function']['name'] not in exclude_names]
+
 
 
 def _tool_ask_character_sheet(campaign, current_user, args, audit_context=None):
@@ -1391,6 +1497,188 @@ def _tool_place_encounter_map_actors(campaign, current_user, args, session=None,
     }
 
 
+def _tool_toggle_encounter_mode(campaign, current_user, args):
+    _ = current_user
+    active = bool(args.get('active', False))
+
+    try:
+        settings = json.loads(campaign.settings) if isinstance(campaign.settings, str) else (campaign.settings or {})
+    except (TypeError, ValueError):
+        settings = {}
+    settings['encounter_active'] = active
+    campaign.settings = json.dumps(settings)
+
+    encounter_map = latest_encounter_map(campaign.id)
+    encounter_state = {}
+    if encounter_map:
+        from routes.encounter_maps import build_initial_encounter_state, check_and_start_turns
+        if active:
+            encounter_state = build_initial_encounter_state(encounter_map, campaign)
+            check_and_start_turns(encounter_state)
+            encounter_map.encounter_state_json = json.dumps(encounter_state)
+        else:
+            state = EncounterMap._json_value(encounter_map.encounter_state_json, {})
+            if state:
+                state['active'] = False
+                state['active_turn_index'] = None
+                encounter_map.encounter_state_json = json.dumps(state)
+            else:
+                encounter_map.encounter_state_json = None
+            encounter_state = state or {}
+
+    db.session.commit()
+    return {
+        'message': f"Encounter mode {'started' if active else 'stopped'}.",
+        'encounter_state': encounter_state,
+        'affected_ids': {
+            'encounter_map_ids': [encounter_map.id] if encounter_map else [],
+        }
+    }
+
+
+def _tool_next_combat_turn(campaign, current_user, args):
+    _ = current_user, args
+    encounter_map = latest_encounter_map(campaign.id)
+    if not encounter_map:
+        return {'error': 'No encounter map is active for this campaign.'}
+
+    state = EncounterMap._json_value(encounter_map.encounter_state_json, {})
+    if not state or not state.get('active'):
+        return {'error': 'Combat is not active.'}
+
+    active_turn_index = state.get('active_turn_index')
+    if active_turn_index is None:
+        return {'error': 'Initiative is not fully rolled yet.'}
+
+    turn_order = state.get('turn_order', [])
+    if not turn_order:
+        return {'error': 'Turn order is empty.'}
+
+    next_index = (active_turn_index + 1) % len(turn_order)
+    if next_index == 0:
+        state['round'] = state.get('round', 1) + 1
+
+    state['active_turn_index'] = next_index
+
+    next_combatant = turn_order[next_index]
+    speed = next_combatant.get('speed', 30)
+    next_combatant['actions'] = {
+        'action': True,
+        'bonus_action': True,
+        'reaction': True,
+        'movement_remaining': speed
+    }
+
+    encounter_map.encounter_state_json = json.dumps(state)
+    db.session.commit()
+
+    return {
+        'message': f"Turn advanced to {next_combatant.get('label')}.",
+        'encounter_state': state,
+        'affected_ids': {
+            'encounter_map_ids': [encounter_map.id],
+        }
+    }
+
+
+def _tool_set_combat_turn(campaign, current_user, args):
+    _ = current_user
+    try:
+        new_index = int(args.get('active_turn_index'))
+    except (TypeError, ValueError):
+        return {'error': 'active_turn_index must be an integer.'}
+
+    encounter_map = latest_encounter_map(campaign.id)
+    if not encounter_map:
+        return {'error': 'No encounter map is active for this campaign.'}
+
+    state = EncounterMap._json_value(encounter_map.encounter_state_json, {})
+    if not state or not state.get('active'):
+        return {'error': 'Combat is not active.'}
+
+    turn_order = state.get('turn_order', [])
+    if not turn_order:
+        return {'error': 'Turn order is empty.'}
+
+    if new_index < 0 or new_index >= len(turn_order):
+        return {'error': f'Turn index must be between 0 and {len(turn_order) - 1}.'}
+
+    state['active_turn_index'] = new_index
+
+    new_combatant = turn_order[new_index]
+    speed = new_combatant.get('speed', 30)
+    new_combatant['actions'] = {
+        'action': True,
+        'bonus_action': True,
+        'reaction': True,
+        'movement_remaining': speed
+    }
+
+    encounter_map.encounter_state_json = json.dumps(state)
+    db.session.commit()
+
+    return {
+        'message': f"Turn set to {new_combatant.get('label')}.",
+        'encounter_state': state,
+        'affected_ids': {
+            'encounter_map_ids': [encounter_map.id],
+        }
+    }
+
+
+def _tool_update_combatant_actions(campaign, current_user, args):
+    _ = current_user
+    actor_type = args.get('actor_type')
+    actor_id = args.get('actor_id')
+    placement_id = args.get('placement_id')
+    actions_updates = args.get('actions', {})
+
+    encounter_map = latest_encounter_map(campaign.id)
+    if not encounter_map:
+        return {'error': 'No encounter map is active for this campaign.'}
+
+    state = EncounterMap._json_value(encounter_map.encounter_state_json, {})
+    if not state or not state.get('active'):
+        return {'error': 'Combat is not active.'}
+
+    turn_order = state.get('turn_order', [])
+    target = None
+    for combatant in turn_order:
+        if placement_id is not None and combatant.get('placement_id') == placement_id:
+            target = combatant
+            break
+        if actor_type is not None and actor_id is not None:
+            if combatant.get('actor_type') == actor_type and str(combatant.get('actor_id')) == str(actor_id):
+                target = combatant
+                break
+
+    if not target:
+        return {'error': 'Combatant not found in turn order.'}
+
+    if 'actions' not in target:
+        target['actions'] = {}
+
+    for key in ('action', 'bonus_action', 'reaction'):
+        if key in actions_updates:
+            target['actions'][key] = bool(actions_updates[key])
+    if 'movement_remaining' in actions_updates:
+        try:
+            target['actions']['movement_remaining'] = max(0, int(actions_updates['movement_remaining']))
+        except (TypeError, ValueError):
+            pass
+
+    encounter_map.encounter_state_json = json.dumps(state)
+    db.session.commit()
+
+    return {
+        'message': f"Actions updated for {target.get('label')}.",
+        'encounter_state': state,
+        'affected_ids': {
+            'encounter_map_ids': [encounter_map.id],
+        }
+    }
+
+
 TOOL_HANDLERS = {
     'ask_character_sheet': _tool_ask_character_sheet,
     'get_current_scene': _tool_get_current_scene,
@@ -1403,6 +1691,10 @@ TOOL_HANDLERS = {
     'generate_loot_box': _tool_generate_loot_box,
     'create_encounter_map': _tool_create_encounter_map,
     'place_encounter_map_actors': _tool_place_encounter_map_actors,
+    'toggle_encounter_mode': _tool_toggle_encounter_mode,
+    'next_combat_turn': _tool_next_combat_turn,
+    'set_combat_turn': _tool_set_combat_turn,
+    'update_combatant_actions': _tool_update_combatant_actions,
 }
 
 
@@ -1430,6 +1722,10 @@ def execute_dm_tool(campaign, session, current_user, name, args, audit_context=N
             'generate_loot_box',
             'create_encounter_map',
             'place_encounter_map_actors',
+            'toggle_encounter_mode',
+            'next_combat_turn',
+            'set_combat_turn',
+            'update_combatant_actions',
         }
         mutated = mutated or len(db.session.new) > before_new
     log_audit_event(

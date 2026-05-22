@@ -10,6 +10,7 @@ import {
   getCampaignWorld,
   getCurrentEncounterMap,
   getSheetProposals,
+  rollPlayerInitiative,
 } from '../api/client'
 import Loading from '../components/common/Loading'
 import ErrorMessage from '../components/common/ErrorMessage'
@@ -262,6 +263,22 @@ export default function CampaignViewPage({ user }) {
     }
   }, [id])
 
+  // Background polling for encounter map when a session is active
+  useEffect(() => {
+    if (!session) return
+
+    const interval = setInterval(async () => {
+      try {
+        const mapData = await getCurrentEncounterMap(id)
+        setEncounterMap(mapData.encounter_map || null)
+      } catch (err) {
+        // Silently ignore polling errors to avoid disrupting play
+      }
+    }, 4000)
+
+    return () => clearInterval(interval)
+  }, [id, session])
+
   const handleStartSession = async () => {
     try {
       const data = await startSession(id)
@@ -298,6 +315,21 @@ export default function CampaignViewPage({ user }) {
       const data = await sendMessage(session.id, content)
       const newMessages = data.messages || []
       setMessages((prev) => reconcilePendingMessage(prev, pendingMessage.id, newMessages))
+
+      // Check for initiative roll in content
+      const match = content.match(/\[Roll:\s*([^\]]+)\]\s*total:\s*(-?\d+)/i)
+      if (match && encounterMap?.id && user?.id) {
+        const label = match[1]
+        const total = parseInt(match[2], 10)
+        if (label.toLowerCase().includes('initiative')) {
+          try {
+            await rollPlayerInitiative(encounterMap.id, 'player', String(user.id), total)
+          } catch (err) {
+            console.error('Failed to submit initiative roll:', err)
+          }
+        }
+      }
+
       setEncounterMapLoading(true)
       getCurrentEncounterMap(id)
         .then((mapData) => setEncounterMap(mapData.encounter_map || null))
@@ -514,6 +546,7 @@ export default function CampaignViewPage({ user }) {
               onEncounterMapChange={setEncounterMap}
               isMapExpanded={isMapExpanded}
               setIsMapExpanded={setIsMapExpanded}
+              onSendMessage={handleSendMessage}
             />
           )}
           <SessionPanel

@@ -971,6 +971,7 @@ class EncounterMap(db.Model):
     quality = db.Column(db.String(40), nullable=False)
     grid_json = db.Column(db.Text, nullable=True)
     vtt_setup_json = db.Column(db.Text, nullable=True)
+    encounter_state_json = db.Column(db.Text, nullable=True)
     setup_status = db.Column(db.String(20), default='pending')
     setup_error = db.Column(db.String(500), nullable=True)
     created_by_tool = db.Column(db.Boolean, default=True)
@@ -1020,6 +1021,7 @@ class EncounterMap(db.Model):
             'quality': self.quality,
             'grid': self._json_value(self.grid_json),
             'vtt_setup': vtt_setup if include_private else self._public_vtt_setup(vtt_setup),
+            'encounter_state': self._json_value(self.encounter_state_json),
             'placements': [
                 placement.to_dict()
                 for placement in sorted(self.placements, key=lambda item: (item.grid_row, item.grid_col, item.id))

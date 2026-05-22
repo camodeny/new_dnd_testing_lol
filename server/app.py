@@ -54,8 +54,8 @@ def create_app():
     def health():
         return jsonify({'status': 'ok'})
 
-    @app.route('/', defaults={'path': ''})
-    @app.route('/<path:path>')
+    @app.route('/', defaults={'path': ''}, methods=['GET', 'POST', 'PUT', 'DELETE', 'PATCH'])
+    @app.route('/<path:path>', methods=['GET', 'POST', 'PUT', 'DELETE', 'PATCH'])
     def serve_frontend(path):
         if path.startswith('api/'):
             return jsonify({'error': 'Not found'}), 404
@@ -125,6 +125,8 @@ def ensure_lightweight_schema():
             db.session.execute(text('ALTER TABLE encounter_maps ADD COLUMN grid_json TEXT'))
         if 'vtt_setup_json' not in encounter_map_columns:
             db.session.execute(text('ALTER TABLE encounter_maps ADD COLUMN vtt_setup_json TEXT'))
+        if 'encounter_state_json' not in encounter_map_columns:
+            db.session.execute(text('ALTER TABLE encounter_maps ADD COLUMN encounter_state_json TEXT'))
         if 'setup_status' not in encounter_map_columns:
             db.session.execute(text('ALTER TABLE encounter_maps ADD COLUMN setup_status VARCHAR(20) DEFAULT "pending"'))
         if 'setup_error' not in encounter_map_columns:

@@ -1,5 +1,11 @@
 import { useEffect, useMemo, useRef, useState } from 'react'
-import { getEncounterMapImage, getEncounterMapLabeledImage, moveEncounterMapToken } from '../../api/client'
+import {
+  getEncounterMapImage,
+  getEncounterMapLabeledImage,
+  moveEncounterMapToken,
+  rollPlayerInitiative,
+  advanceEncounterTurn,
+} from '../../api/client'
 
 // Convert row/col to chess-style algebraic coordinates, e.g. A-1, B-5, etc.
 function getGridCoordinate(col, row) {
@@ -23,13 +29,115 @@ function getGridMoveDistance(fromCol, fromRow, toCol, toRow) {
   return Math.max(Math.abs(toCol - fromCol), Math.abs(toRow - fromRow))
 }
 
-function clampDestinationToMovement(fromCol, fromRow, toCol, toRow, maxSquares, columns, rows) {
-  const limitedCol = fromCol + clamp(toCol - fromCol, -maxSquares, maxSquares)
-  const limitedRow = fromRow + clamp(toRow - fromRow, -maxSquares, maxSquares)
-  return {
-    col: clamp(limitedCol, 0, columns - 1),
-    row: clamp(limitedRow, 0, rows - 1),
+function pointInPolygon(points, x, y) {
+  if (!Array.isArray(points) || points.length < 3) return false
+  let inside = false
+  let previous = points[points.length - 1]
+  points.forEach((current) => {
+    const x1 = Number(previous?.col)
+    const y1 = Number(previous?.row)
+    const x2 = Number(current?.col)
+    const y2 = Number(current?.row)
+    if ([x1, y1, x2, y2].every(Number.isFinite) && ((y1 > y) !== (y2 > y))) {
+      const xIntersection = ((x2 - x1) * (y - y1)) / ((y2 - y1) || 1e-9) + x1
+      if (x < xIntersection) inside = !inside
+    }
+    previous = current
+  })
+  return inside
+}
+
+function rectContainsCell(rect, col, row) {
+  const rectCol = Number(rect?.col)
+  const rectRow = Number(rect?.row)
+  const width = Number(rect?.width)
+  const height = Number(rect?.height)
+  if (![rectCol, rectRow, width, height].every(Number.isFinite)) return false
+  return rectCol <= col && col < rectCol + width && rectRow <= row && row < rectRow + height
+}
+
+function areaContainsCell(area, col, row) {
+  if (Array.isArray(area?.polygon) && area.polygon.length >= 3) {
+    return pointInPolygon(area.polygon, col + 0.5, row + 0.5)
   }
+  return rectContainsCell(area?.rect, col, row)
+}
+
+function getCellMovementProfile(vttSetup, col, row) {
+  const profile = { blocked: false, cost: 1 }
+  const movementAreaGroups = ['terrain_zones', 'obstacles']
+  movementAreaGroups.forEach((group) => {
+    const areas = Array.isArray(vttSetup?.[group]) ? vttSetup[group] : []
+    areas.forEach((area) => {
+      if (!area || !areaContainsCell(area, col, row)) return
+
+      const kind = String(area.kind || '').toLowerCase()
+      const movementEffect = String(area.movement_effect || '').toLowerCase()
+      if (kind === 'blocked' || kind === 'wall' || movementEffect === 'blocks_movement') {
+        profile.blocked = true
+      }
+      if (kind === 'difficult' || kind === 'water' || movementEffect === 'costs_extra_movement') {
+        profile.cost = Math.max(profile.cost, 2)
+      }
+    })
+  })
+  return profile
+}
+
+function buildMovementGrid(vttSetup, columns, rows) {
+  return Array.from({ length: rows }, (_, row) => (
+    Array.from({ length: columns }, (_, col) => getCellMovementProfile(vttSetup, col, row))
+  ))
+}
+
+function getReachableMovementCells(vttSetup, columns, rows, fromCol, fromRow, maxSquares) {
+  if (!columns || !rows || maxSquares < 0) return []
+  const movementGrid = buildMovementGrid(vttSetup, columns, rows)
+  const bestCosts = new Map([[`${fromCol},${fromRow}`, 0]])
+  const queue = [{ col: fromCol, row: fromRow, cost: 0 }]
+  const directions = [
+    [-1, -1], [0, -1], [1, -1],
+    [-1, 0], [1, 0],
+    [-1, 1], [0, 1], [1, 1],
+  ]
+
+  for (let index = 0; index < queue.length; index += 1) {
+    const current = queue[index]
+    directions.forEach(([dc, dr]) => {
+      const col = current.col + dc
+      const row = current.row + dr
+      if (col < 0 || row < 0 || col >= columns || row >= rows) return
+      if (movementGrid[row][col].blocked) return
+      if (dc && dr && (movementGrid[current.row][col].blocked || movementGrid[row][current.col].blocked)) return
+
+      const cost = current.cost + movementGrid[row][col].cost
+      const key = `${col},${row}`
+      if (cost > maxSquares || cost >= (bestCosts.get(key) ?? Infinity)) return
+      bestCosts.set(key, cost)
+      queue.push({ col, row, cost })
+    })
+  }
+
+  return Array.from(bestCosts, ([key, cost]) => {
+    const [col, row] = key.split(',').map(Number)
+    return {
+      col,
+      row,
+      cost,
+      isDifficult: movementGrid[row]?.[col]?.cost > 1,
+    }
+  })
+}
+
+function getNearestReachableCell(target, reachableCells) {
+  if (!target || !reachableCells.length) return null
+  return reachableCells.reduce((best, cell) => {
+    const distance = getGridMoveDistance(target.col, target.row, cell.col, cell.row)
+    const tiebreaker = Math.abs(target.col - cell.col) + Math.abs(target.row - cell.row)
+    const score = distance * 1000 + tiebreaker * 10 + cell.cost
+    if (!best || score < best.score) return { ...cell, score }
+    return best
+  }, null)
 }
 
 export default function EncounterMapPanel({
@@ -41,6 +149,7 @@ export default function EncounterMapPanel({
   onEncounterMapChange,
   isMapExpanded,
   setIsMapExpanded,
+  onSendMessage,
 }) {
   const [imageState, setImageState] = useState({ mapId: null, url: '', error: '' })
   const [labeledImageState, setLabeledImageState] = useState({ mapId: null, url: '', error: '' })
@@ -61,6 +170,7 @@ export default function EncounterMapPanel({
   const [moveError, setMoveError] = useState('')
   const [movementMessage, setMovementMessage] = useState('')
   const [isMovingToken, setIsMovingToken] = useState(false)
+  const [manualInitValues, setManualInitValues] = useState({})
 
   // Adjust state when map ID changes (during render phase to avoid effect cascades)
   const currentMapId = encounterMap?.id || null
@@ -73,8 +183,79 @@ export default function EncounterMapPanel({
     setMoveError('')
     setMovementMessage('')
     setIsMovingToken(false)
+    setManualInitValues({})
     if (isCollapsed) {
       setHasNotification(true)
+    }
+  }
+
+  const encounterState = useMemo(() => {
+    if (!encounterMap?.encounter_state_json) return null
+    try {
+      return typeof encounterMap.encounter_state_json === 'string'
+        ? JSON.parse(encounterMap.encounter_state_json)
+        : encounterMap.encounter_state_json
+    } catch (err) {
+      return null
+    }
+  }, [encounterMap?.encounter_state_json])
+
+  const isEncounterActive = Boolean(encounterState?.active)
+  const turnOrder = encounterState?.turn_order || []
+  const activeTurnIndex = encounterState?.active_turn_index
+  const activeCombatant = (activeTurnIndex !== null && activeTurnIndex !== undefined) ? turnOrder[activeTurnIndex] : null
+
+  const placements = useMemo(() => encounterMap?.placements || [], [encounterMap?.placements])
+  const currentUserActorId = currentUser?.id != null ? String(currentUser.id) : ''
+  const playerPlacement = useMemo(
+    () => placements.find((placement) => (
+      placement.actor_type === 'player' && String(placement.actor_id) === currentUserActorId
+    )),
+    [placements, currentUserActorId],
+  )
+  const isUserActiveTurn = activeCombatant && activeCombatant.placement_id === playerPlacement?.id
+
+  const handleRollInitiative = async (combatant) => {
+    if (!encounterMap?.id) return
+    const bonus = combatant.initiative_bonus || 0
+    const d20 = Math.floor(Math.random() * 20) + 1
+    const total = d20 + bonus
+    try {
+      const data = await rollPlayerInitiative(encounterMap.id, combatant.actor_type, combatant.actor_id, total)
+      onEncounterMapChange?.(data.encounter_map)
+      setMoveError('')
+      if (onSendMessage) {
+        await onSendMessage(`rolls initiative for ${combatant.label}: [Roll: Initiative] total: ${total} (rolled ${d20} + ${bonus})`)
+      }
+    } catch (err) {
+      setMoveError(err.message)
+    }
+  }
+
+  const handleManualInitiativeSubmit = async (combatant, val) => {
+    if (!encounterMap?.id) return
+    const initVal = parseInt(val, 10)
+    if (isNaN(initVal)) return
+    try {
+      const data = await rollPlayerInitiative(encounterMap.id, combatant.actor_type, combatant.actor_id, initVal)
+      onEncounterMapChange?.(data.encounter_map)
+      setMoveError('')
+      if (onSendMessage) {
+        await onSendMessage(`sets initiative for ${combatant.label} to ${initVal}`)
+      }
+    } catch (err) {
+      setMoveError(err.message)
+    }
+  }
+
+  const handleNextTurn = async () => {
+    if (!encounterMap?.id) return
+    try {
+      const data = await advanceEncounterTurn(encounterMap.id)
+      onEncounterMapChange?.(data.encounter_map)
+      setMoveError('')
+    } catch (err) {
+      setMoveError(err.message)
     }
   }
 
@@ -83,22 +264,54 @@ export default function EncounterMapPanel({
   const columns = Number.isInteger(grid.columns) ? grid.columns : null
   const rows = Number.isInteger(grid.rows) ? grid.rows : null
   const canOverlayPlacements = Boolean(columns && rows)
-  const placements = useMemo(() => encounterMap?.placements || [], [encounterMap?.placements])
-  const currentUserActorId = currentUser?.id != null ? String(currentUser.id) : ''
-  const movementSquares = getMovementSquares(currentCharacter)
-  const playerPlacement = useMemo(
-    () => placements.find((placement) => (
-      placement.actor_type === 'player' && String(placement.actor_id) === currentUserActorId
-    )),
-    [placements, currentUserActorId],
-  )
   const canMovePlayerToken = Boolean(
     encounterMap?.id &&
     canOverlayPlacements &&
     playerPlacement &&
-    currentCharacter
+    currentCharacter &&
+    (!isEncounterActive || (
+      encounterState?.active_turn_index !== null &&
+      encounterState?.active_turn_index !== undefined &&
+      encounterState?.turn_order?.[encounterState.active_turn_index]?.placement_id === playerPlacement.id
+    ))
   )
+
+  const movementSquares = useMemo(() => {
+    if (!currentCharacter) return 0
+    if (isEncounterActive) {
+      const activeIdx = encounterState?.active_turn_index
+      if (activeIdx !== null && activeIdx !== undefined) {
+        const activeCbt = encounterState?.turn_order?.[activeIdx]
+        if (activeCbt && activeCbt.placement_id === playerPlacement?.id) {
+          const remaining = activeCbt.actions?.movement_remaining ?? activeCbt.speed ?? 30
+          return Math.floor(remaining / 5)
+        }
+      }
+      return 0
+    }
+    const speed = Number(currentCharacter.speed || currentCharacter.combat?.speed)
+    return Number.isFinite(speed) && speed > 0 ? Math.floor(speed / 5) : 6
+  }, [currentCharacter, isEncounterActive, encounterState, playerPlacement])
+
   const canDragPlayerToken = canMovePlayerToken && !isMovingToken
+  const reachableMovementCells = useMemo(() => {
+    if (!canMovePlayerToken || !columns || !rows || !playerPlacement) return []
+    return getReachableMovementCells(
+      encounterMap?.vtt_setup,
+      columns,
+      rows,
+      playerPlacement.col,
+      playerPlacement.row,
+      movementSquares,
+    )
+  }, [canMovePlayerToken, columns, rows, playerPlacement, encounterMap?.vtt_setup, movementSquares])
+  const reachableMovementCellMap = useMemo(() => {
+    const map = new Map()
+    reachableMovementCells.forEach((cell) => {
+      map.set(`${cell.col},${cell.row}`, cell)
+    })
+    return map
+  }, [reachableMovementCells])
   const displayPlacements = useMemo(() => (
     placements.map((placement) => {
       if (dragState?.placementId === placement.id) {
@@ -265,16 +478,15 @@ export default function EncounterMapPanel({
 
   const getLimitedDestinationFromPointer = (event, state) => {
     const cell = getGridCellFromPointer(event)
-    if (!cell || !state || !columns || !rows) return null
-    return clampDestinationToMovement(
-      state.fromCol,
-      state.fromRow,
-      cell.col,
-      cell.row,
-      state.maxSquares,
-      columns,
-      rows,
-    )
+    if (!cell || !state) return null
+    const reachableCell = reachableMovementCellMap.get(`${cell.col},${cell.row}`)
+      || getNearestReachableCell(cell, reachableMovementCells)
+    if (!reachableCell) return null
+    return {
+      col: reachableCell.col,
+      row: reachableCell.row,
+      cost: reachableCell.cost,
+    }
   }
 
   const canDragPlacement = (placement) => (
@@ -301,6 +513,7 @@ export default function EncounterMapPanel({
       row: placement.row,
       maxSquares: movementSquares,
       distance: 0,
+      cost: 0,
     })
   }
 
@@ -317,6 +530,7 @@ export default function EncounterMapPanel({
         ...current,
         ...destination,
         distance: getGridMoveDistance(current.fromCol, current.fromRow, destination.col, destination.row),
+        cost: destination.cost ?? getGridMoveDistance(current.fromCol, current.fromRow, destination.col, destination.row),
       }
     })
   }
@@ -331,8 +545,9 @@ export default function EncounterMapPanel({
     const destination = getLimitedDestinationFromPointer(event, dragState) || {
       col: dragState.col,
       row: dragState.row,
+      cost: dragState.cost,
     }
-    const distance = getGridMoveDistance(dragState.fromCol, dragState.fromRow, destination.col, destination.row)
+    const distance = destination.cost ?? getGridMoveDistance(dragState.fromCol, dragState.fromRow, destination.col, destination.row)
     const placementId = dragState.placementId
     setDragState(null)
 
@@ -480,6 +695,125 @@ export default function EncounterMapPanel({
         </div>
       </div>
 
+      {isEncounterActive && (
+        <div className="encounter-combat-tracker">
+          <div className="encounter-combat-tracker-left">
+            <span className="encounter-combat-tracker-round">
+              Round {encounterState?.round ?? 1}
+            </span>
+          </div>
+
+          <div className="encounter-tracker-list-container">
+            <div className="encounter-tracker-list">
+              {turnOrder.map((combatant, idx) => {
+                const canRollOrInput = combatant.actor_type === 'player' && String(combatant.actor_id) === currentUserActorId
+                const hasInitiative = combatant.initiative !== null && combatant.initiative !== undefined
+                const isActiveItem = idx === activeTurnIndex
+
+                return (
+                  <div
+                    key={`${combatant.actor_type}-${combatant.actor_id}-${combatant.placement_id || idx}`}
+                    className={`encounter-tracker-item ${combatant.actor_type} ${isActiveItem ? 'active' : ''}`}
+                  >
+                    <span className="tracker-avatar">
+                      {combatant.label?.slice(0, 2).toUpperCase() || '?'}
+                    </span>
+                    <span className="tracker-label">{combatant.label}</span>
+                    
+                    {hasInitiative ? (
+                      <span className="tracker-init-badge">{combatant.initiative}</span>
+                    ) : canRollOrInput ? (
+                      <div className="tracker-roll-action">
+                        <button
+                          type="button"
+                          className="btn btn-primary btn-roll-init"
+                          onClick={(e) => {
+                            e.stopPropagation()
+                            handleRollInitiative(combatant)
+                          }}
+                        >
+                          🎲 Roll
+                        </button>
+                        <input
+                          type="number"
+                          className="initiative-manual-input"
+                          placeholder="or type..."
+                          value={manualInitValues[`${combatant.actor_type}-${combatant.actor_id}`] ?? ''}
+                          onClick={(e) => e.stopPropagation()}
+                          onChange={(e) => {
+                            const val = e.target.value
+                            setManualInitValues(prev => ({
+                              ...prev,
+                              [`${combatant.actor_type}-${combatant.actor_id}`]: val
+                            }))
+                          }}
+                          onKeyDown={(e) => {
+                            if (e.key === 'Enter') {
+                              handleManualInitiativeSubmit(combatant, e.target.value)
+                            }
+                          }}
+                        />
+                      </div>
+                    ) : (
+                      <span className="tracker-init-badge" title="Waiting for initiative roll">⏳</span>
+                    )}
+                  </div>
+                )
+              })}
+            </div>
+          </div>
+
+          <div className="encounter-combat-tracker-right">
+            {activeCombatant ? (
+              <div className="active-combatant-details">
+                <span className="active-combatant-name" title={activeCombatant.label}>
+                  ⚔️ {activeCombatant.label}
+                </span>
+                <span
+                  className={`action-pill ${activeCombatant.actions?.action ? 'active action' : ''}`}
+                  title="Action"
+                >
+                  A
+                </span>
+                <span
+                  className={`action-pill ${activeCombatant.actions?.bonus_action ? 'active bonus_action' : ''}`}
+                  title="Bonus Action"
+                >
+                  B
+                </span>
+                <span
+                  className={`action-pill ${activeCombatant.actions?.reaction ? 'active reaction' : ''}`}
+                  title="Reaction"
+                >
+                  R
+                </span>
+                <span
+                  className={`action-pill ${activeCombatant.actions?.movement_remaining > 0 ? 'active movement' : ''}`}
+                  title="Movement"
+                >
+                  {activeCombatant.actions?.movement_remaining ?? 0} ft
+                </span>
+              </div>
+            ) : (
+              <span className="active-combatant-name">Waiting for Initiative...</span>
+            )}
+            
+            <div className="encounter-combat-controls">
+              {isUserActiveTurn && (
+                <button
+                  type="button"
+                  className="btn btn-primary btn-end-turn"
+                  onClick={handleNextTurn}
+                  disabled={activeTurnIndex === null || activeTurnIndex === undefined}
+                >
+                  End Turn <i className="bi bi-chevron-right"></i>
+                </button>
+              )}
+            </div>
+          </div>
+        </div>
+      )}
+
       <div className="encounter-map-body-layout">
         <div className={`encounter-map-stage ${!encounterMap ? 'empty' : ''}`}>
         {loading ? (
@@ -524,14 +858,35 @@ export default function EncounterMapPanel({
                     aria-label="Placed combatants"
                     style={gridLayout}
                   >
+                    {canMovePlayerToken && dragState && reachableMovementCells.map((cell) => {
+                      const isOrigin = cell.col === playerPlacement.col && cell.row === playerPlacement.row
+                      const isSelected = dragState?.col === cell.col && dragState?.row === cell.row
+                      return (
+                        <div
+                          key={`${cell.col},${cell.row}`}
+                          className={`encounter-map-move-cell ${cell.isDifficult ? 'difficult' : ''} ${isOrigin ? 'origin' : ''} ${isSelected ? 'selected' : ''}`}
+                          style={{
+                            left: `${(cell.col / columns) * 100}%`,
+                            top: `${(cell.row / rows) * 100}%`,
+                            width: `${100 / columns}%`,
+                            height: `${100 / rows}%`,
+                          }}
+                        />
+                      )
+                    })}
                     {displayPlacements.map((placement) => {
                       const isHighlighted = activeHoverId === placement.id
                       const isDraggable = canDragPlacement(placement)
                       const isDragging = dragState?.placementId === placement.id
+                      const isActiveTurn = isEncounterActive && 
+                        encounterState?.active_turn_index !== null &&
+                        encounterState?.active_turn_index !== undefined &&
+                        encounterState?.turn_order?.[encounterState.active_turn_index]?.placement_id === placement.id
+
                       return (
                         <div
                           key={placement.id}
-                          className={`encounter-map-token ${placement.actor_type} ${isHighlighted ? 'highlighted' : ''} ${isDraggable ? 'draggable' : ''} ${isDragging ? 'dragging' : ''}`}
+                          className={`encounter-map-token ${placement.actor_type} ${isHighlighted ? 'highlighted' : ''} ${isDraggable ? 'draggable' : ''} ${isDragging ? 'dragging' : ''} ${isActiveTurn ? 'active-turn' : ''}`}
                           style={{
                             left: `${((placement.col + 0.5) / columns) * 100}%`,
                             top: `${((placement.row + 0.5) / rows) * 100}%`,
@@ -555,7 +910,7 @@ export default function EncounterMapPanel({
                             </span>
                             {isDraggable && (
                               <span className="tooltip-coord">
-                                Move: {dragState?.placementId === placement.id ? dragState.distance : 0}/{movementSquares} sq
+                                Move: {dragState?.placementId === placement.id ? dragState.cost : 0}/{movementSquares} sq
                               </span>
                             )}
                             <span className="tooltip-alliance">{placement.actor_type}</span>
@@ -570,7 +925,7 @@ export default function EncounterMapPanel({
                     <i className={isMovingToken ? 'bi bi-arrow-repeat' : 'bi bi-arrows-move'}></i>
                     <span>
                       {dragState
-                        ? `${dragState.distance}/${dragState.maxSquares} sq`
+                        ? `${dragState.cost}/${dragState.maxSquares} sq`
                         : isMovingToken
                           ? 'Saving move...'
                           : `Move ${movementSquares} sq`}

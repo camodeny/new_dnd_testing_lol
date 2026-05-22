@@ -43,7 +43,14 @@ from openrouter import (
 from routes.dev import _agent_runs_from_stream, _audit_stream_entry, _chat_flow_payload
 from routes.sessions import sessions_bp
 from services.audit_service import log_audit_event
-from services.dm_tools import DM_TOOL_DEFINITIONS, apply_memory_patch, build_session_hot_context, context_manifest, execute_dm_tool
+from services.dm_tools import (
+    DM_TOOL_DEFINITIONS,
+    get_dm_tool_definitions,
+    apply_memory_patch,
+    build_session_hot_context,
+    context_manifest,
+    execute_dm_tool,
+)
 from services.embedding_service import canonical_text_for_item, cosine_similarity
 from services.encounter_map_service import create_labeled_grid_image, detect_grid_from_image
 
@@ -1675,6 +1682,169 @@ class DmToolsTest(unittest.TestCase):
             'I want to be a dockside wizard.',
             'Tie your wizard to the warning bell.',
         ])
+
+    def test_combat_encounter_dm_tools(self):
+        encounter_map = EncounterMap(
+            campaign_id=self.campaign.id,
+            session_id=self.session.id,
+            title='Skirmish Area',
+            prompt='A small tactical area.',
+            image_filename='skirmish.png',
+            model='gpt-image-2',
+            size='1024x1024',
+            quality='high',
+            grid_json=json.dumps({'columns': 10, 'rows': 10}),
+            setup_status='ready',
+        )
+        db.session.add(encounter_map)
+        db.session.commit()
+
+        player_placement = EncounterMapPlacement(
+            encounter_map_id=encounter_map.id,
+            actor_type='player',
+            actor_id=str(self.user.id),
+            label='Aria',
+            grid_col=1,
+            grid_row=1,
+        )
+        monster_placement = EncounterMapPlacement(
+            encounter_map_id=encounter_map.id,
+            actor_type='monster',
+            actor_id='goblin_1',
+            label='Goblin',
+            grid_col=5,
+            grid_row=5,
+        )
+        db.session.add_all([player_placement, monster_placement])
+        db.session.commit()
+
+        # 1. Toggle Encounter Mode ON
+        result = execute_dm_tool(
+            self.campaign,
+            self.session,
+            self.user,
+            'toggle_encounter_mode',
+            {'active': True},
+        )
+        self.assertNotIn('error', result)
+        state = result['encounter_state']
+        self.assertTrue(state['active'])
+        self.assertEqual(state['round'], 1)
+        self.assertIsNone(state['active_turn_index'])
+
+        # 2. Simulate initiative rolling completed
+        encounter_map = db.session.get(EncounterMap, encounter_map.id)
+        current_state = json.loads(encounter_map.encounter_state_json)
+        for c in current_state['turn_order']:
+            if c['actor_type'] == 'player':
+                c['initiative'] = 15
+            else:
+                c['initiative'] = 10
+        current_state['turn_order'].sort(key=lambda x: x['initiative'], reverse=True)
+        current_state['active_turn_index'] = 0
+        encounter_map.encounter_state_json = json.dumps(current_state)
+        db.session.commit()
+
+        # 3. Next Turn
+        result_next = execute_dm_tool(
+            self.campaign,
+            self.session,
+            self.user,
+            'next_combat_turn',
+            {},
+        )
+        self.assertNotIn('error', result_next)
+        self.assertEqual(result_next['encounter_state']['active_turn_index'], 1)
+
+        # 4. Set Combat Turn directly
+        result_set = execute_dm_tool(
+            self.campaign,
+            self.session,
+            self.user,
+            'set_combat_turn',
+            {'active_turn_index': 0},
+        )
+        self.assertNotIn('error', result_set)
+        self.assertEqual(result_set['encounter_state']['active_turn_index'], 0)
+
+        # 5. Update Actions
+        result_update = execute_dm_tool(
+            self.campaign,
+            self.session,
+            self.user,
+            'update_combatant_actions',
+            {
+                'actor_type': 'player',
+                'actor_id': str(self.user.id),
+                'actions': {'action': False, 'movement_remaining': 10},
+            },
+        )
+        self.assertNotIn('error', result_update)
+        aria_combatant = next(x for x in result_update['encounter_state']['turn_order'] if x['actor_type'] == 'player')
+        self.assertFalse(aria_combatant['actions']['action'])
+        self.assertEqual(aria_combatant['actions']['movement_remaining'], 10)
+
+        # 6. Toggle Encounter Mode OFF
+        result_off = execute_dm_tool(
+            self.campaign,
+            self.session,
+            self.user,
+            'toggle_encounter_mode',
+            {'active': False},
+        )
+        self.assertNotIn('error', result_off)
+        self.assertFalse(result_off['encounter_state']['active'])
+
+    def test_dm_tools_filtered_by_encounter_mode(self):
+        # 1. Active Campaign, encounter_active is not set in campaign.settings by default
+        tools = get_dm_tool_definitions(self.campaign)
+        tool_names = {t['function']['name'] for t in tools}
+
+        exclude_names = {
+            'create_encounter_map',
+            'place_encounter_map_actors',
+            'next_combat_turn',
+            'set_combat_turn',
+            'update_combatant_actions',
+        }
+        for name in exclude_names:
+            self.assertNotIn(name, tool_names)
+        self.assertIn('toggle_encounter_mode', tool_names)
+        self.assertIn('ask_character_sheet', tool_names)
+
+        # 2. Toggle encounter mode ON
+        result_on = execute_dm_tool(
+            self.campaign,
+            self.session,
+            self.user,
+            'toggle_encounter_mode',
+            {'active': True},
+        )
+        self.assertNotIn('error', result_on)
+
+        # 3. Check that encounter_active is True and all tools are now present
+        tools_on = get_dm_tool_definitions(self.campaign)
+        tool_names_on = {t['function']['name'] for t in tools_on}
+        for name in exclude_names:
+            self.assertIn(name, tool_names_on)
+        self.assertIn('toggle_encounter_mode', tool_names_on)
+
+        # 4. Toggle encounter mode OFF
+        result_off = execute_dm_tool(
+            self.campaign,
+            self.session,
+            self.user,
+            'toggle_encounter_mode',
+            {'active': False},
+        )
+        self.assertNotIn('error', result_off)
+
+        # 5. Check that tools are filtered again
+        tools_off = get_dm_tool_definitions(self.campaign)
+        tool_names_off = {t['function']['name'] for t in tools_off}
+        for name in exclude_names:
+            self.assertNotIn(name, tool_names_off)
+        self.assertIn('toggle_encounter_mode', tool_names_off)
 
 
 if __name__ == '__main__':

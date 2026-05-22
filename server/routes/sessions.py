@@ -14,7 +14,7 @@ from services.audit_service import log_audit_event
 from services.campaign_service import ensure_member, get_or_404
 from services.character_service import character_full_dict
 from services.dm_tools import (
-    DM_TOOL_DEFINITIONS,
+    get_dm_tool_definitions,
     SHEET_SCALAR_FIELDS,
     apply_memory_patch,
     build_session_hot_context,
@@ -238,7 +238,8 @@ def send_message(current_user, session_id):
 
     try:
         hot_context = build_session_hot_context(campaign, session, current_user)
-        manifest = context_manifest(hot_context, DM_TOOL_DEFINITIONS)
+        dm_tools_filtered = get_dm_tool_definitions(campaign)
+        manifest = context_manifest(hot_context, dm_tools_filtered)
         log_audit_event(
             campaign.id,
             'session_hot_context_read',
@@ -256,7 +257,7 @@ def send_message(current_user, session_id):
         ai_result = get_session_dm_response_with_tools(
             hot_context,
             recent_messages,
-            DM_TOOL_DEFINITIONS,
+            dm_tools_filtered,
             lambda name, args, tool_audit: execute_dm_tool(campaign, session, current_user, name, args, tool_audit),
             audit_context={
                 'campaign_id': campaign.id,

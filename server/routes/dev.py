@@ -34,7 +34,7 @@ from services.character_service import (
 )
 from services.audit_service import AGENT_ACTORS, infer_audit_role
 from services.campaign_service import get_or_404
-from services.dm_tools import DM_TOOL_DEFINITIONS, build_session_hot_context, context_manifest
+from services.dm_tools import get_dm_tool_definitions, build_session_hot_context, context_manifest
 from services.planning_service import (
     get_campaign_members,
     planning_context,
@@ -960,9 +960,10 @@ def get_campaign_dev_audit(current_user, campaign_id):
 
     latest_session_hot_context = None
     latest_session_context_manifest = None
+    dm_tools_filtered = get_dm_tool_definitions(campaign)
     if latest_session:
         latest_session_hot_context = build_session_hot_context(campaign, latest_session, current_user)
-        latest_session_context_manifest = context_manifest(latest_session_hot_context, DM_TOOL_DEFINITIONS)
+        latest_session_context_manifest = context_manifest(latest_session_hot_context, dm_tools_filtered)
 
     return jsonify({
         'campaign': campaign_data,
@@ -1007,7 +1008,7 @@ def get_campaign_dev_audit(current_user, campaign_id):
             'context_strategy': {
                 'hot_context': latest_session_hot_context,
                 'manifest': latest_session_context_manifest,
-                'tools': DM_TOOL_DEFINITIONS,
+                'tools': dm_tools_filtered,
                 'session_prompt_available': bool(latest_session_hot_context),
             },
         },

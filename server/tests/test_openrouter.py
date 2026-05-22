@@ -63,16 +63,53 @@ class OpenRouterJsonRepairTest(unittest.TestCase):
             'world_genesis_json_repair',
         )
 
-    def test_world_genesis_uses_json_repair_once_after_parse_failure(self):
-        malformed = '{"public_intro": {"title": "Test"}, "knowledge_graph": [}'
-        repaired = '{"public_intro": {"title": "Test"}, "knowledge_graph": []}'
+    def test_world_genesis_builds_sections_with_retained_history_and_repair(self):
+        malformed_intro = '{"public_intro": {"title": "Test"}'
+        repaired_intro = '{"public_intro": {"title": "Test"}}'
+        section_responses = [
+            malformed_intro,
+            repaired_intro,
+            '{"knowledge_graph": {"entities": [{"id": "stonehaven", "type": "location"}], "relations": [], "facts": []}}',
+            '{"world_state": {"current_arc": "Opening", "current_scene": {"location_id": "stonehaven"}}}',
+            '{"dm_private": {"true_inciting_incident": "A hidden forge curse."}}',
+            '{"npc_actors": [{"id": "elder_mara", "name": "Elder Mara"}]}',
+            '{"clocks": [{"id": "curse_wakes", "name": "The Curse Wakes"}]}',
+        ]
 
-        with patch('openrouter._post_chat', side_effect=[malformed, repaired]) as post_chat:
-            data = get_world_genesis_package({}, audit_context={'operation': 'world_genesis'})
+        with patch('openrouter._post_chat', side_effect=section_responses) as post_chat:
+            data = get_world_genesis_package(
+                {'campaign': {'name': 'Test'}},
+                audit_context={'operation': 'world_genesis'},
+            )
 
         self.assertEqual(data['public_intro']['title'], 'Test')
-        self.assertEqual(data['knowledge_graph'], [])
-        self.assertEqual(post_chat.call_count, 2)
+        self.assertEqual(data['knowledge_graph']['entities'][0]['id'], 'stonehaven')
+        self.assertEqual(data['world_state']['current_arc'], 'Opening')
+        self.assertEqual(data['dm_private']['true_inciting_incident'], 'A hidden forge curse.')
+        self.assertEqual(data['npc_actors'][0]['id'], 'elder_mara')
+        self.assertEqual(data['clocks'][0]['id'], 'curse_wakes')
+        self.assertEqual(post_chat.call_count, 7)
+
+        operations = [
+            call.kwargs['audit_context']['operation']
+            for call in post_chat.call_args_list
+        ]
+        self.assertEqual(
+            operations,
+            [
+                'world_genesis_public_intro',
+                'world_genesis_public_intro_json_repair',
+                'world_genesis_knowledge_graph',
+                'world_genesis_world_state',
+                'world_genesis_dm_private',
+                'world_genesis_npc_actors',
+                'world_genesis_clocks',
+            ],
+        )
+
+        knowledge_graph_messages = post_chat.call_args_list[2].args[0]
+        self.assertIn('"public_intro": {"title": "Test"}', knowledge_graph_messages[-2]['content'])
+        self.assertIn('"section": "knowledge_graph"', knowledge_graph_messages[-1]['content'])
 
 
 class FakeResponse:

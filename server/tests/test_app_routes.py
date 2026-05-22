@@ -391,6 +391,155 @@ class AppRouteTest(unittest.TestCase):
             self.assertEqual(placement.grid_col, 1)
             self.assertEqual(placement.grid_row, 1)
 
+    def test_player_cannot_move_map_token_through_blocking_terrain(self):
+        with app.app_context():
+            player = User(username='wallblocked', email='wallblocked@example.com')
+            player.set_password('password')
+            db.session.add(player)
+            db.session.flush()
+            campaign = Campaign(name='Blocked Movement Campaign', user_id=player.id)
+            db.session.add(campaign)
+            db.session.flush()
+            character = Character(
+                user_id=player.id,
+                campaign_id=campaign.id,
+                name='Wall Tester',
+                race='Human',
+                speed=30,
+            )
+            db.session.add(character)
+            db.session.flush()
+            db.session.add(CampaignMember(
+                campaign_id=campaign.id,
+                user_id=player.id,
+                role='player',
+                selected_character_id=character.id,
+            ))
+            encounter_map = EncounterMap(
+                campaign_id=campaign.id,
+                title='Wall Hall',
+                prompt='A hall split by a wall.',
+                image_filename='map.png',
+                model='gpt-image-2',
+                size='1024x1024',
+                quality='high',
+                grid_json=json.dumps({'columns': 5, 'rows': 3}),
+                vtt_setup_json=json.dumps({
+                    'terrain_zones': [],
+                    'obstacles': [{
+                        'label': 'Stone Wall',
+                        'kind': 'wall',
+                        'movement_effect': 'blocks_movement',
+                        'shape_type': 'rect',
+                        'rect': {'col': 2, 'row': 0, 'width': 1, 'height': 3},
+                        'polygon': [],
+                    }],
+                }),
+                setup_status='ready',
+            )
+            db.session.add(encounter_map)
+            db.session.flush()
+            placement = EncounterMapPlacement(
+                encounter_map_id=encounter_map.id,
+                actor_type='player',
+                actor_id=str(player.id),
+                label=character.name,
+                grid_col=1,
+                grid_row=1,
+            )
+            db.session.add(placement)
+            db.session.commit()
+            map_id = encounter_map.id
+            placement_id = placement.id
+            token = generate_token(player.id)
+
+        response = self.client.patch(
+            f'/api/encounter-maps/{map_id}/placements/me',
+            json={'col': 3, 'row': 1},
+            headers={'Authorization': f'Bearer {token}'},
+        )
+
+        self.assertEqual(response.status_code, 400)
+        self.assertIn('not reachable', response.get_json()['error'])
+        with app.app_context():
+            placement = db.session.get(EncounterMapPlacement, placement_id)
+            self.assertEqual(placement.grid_col, 1)
+            self.assertEqual(placement.grid_row, 1)
+
+    def test_player_move_counts_difficult_terrain_extra_cost(self):
+        with app.app_context():
+            player = User(username='mudrunner', email='mudrunner@example.com')
+            player.set_password('password')
+            db.session.add(player)
+            db.session.flush()
+            campaign = Campaign(name='Difficult Movement Campaign', user_id=player.id)
+            db.session.add(campaign)
+            db.session.flush()
+            character = Character(
+                user_id=player.id,
+                campaign_id=campaign.id,
+                name='Mud Runner',
+                race='Elf',
+                speed=30,
+            )
+            db.session.add(character)
+            db.session.flush()
+            db.session.add(CampaignMember(
+                campaign_id=campaign.id,
+                user_id=player.id,
+                role='player',
+                selected_character_id=character.id,
+            ))
+            encounter_map = EncounterMap(
+                campaign_id=campaign.id,
+                title='Mud Hall',
+                prompt='A hall covered in mud.',
+                image_filename='map.png',
+                model='gpt-image-2',
+                size='1024x1024',
+                quality='high',
+                grid_json=json.dumps({'columns': 7, 'rows': 3}),
+                vtt_setup_json=json.dumps({
+                    'terrain_zones': [{
+                        'label': 'Deep Mud',
+                        'kind': 'difficult',
+                        'shape_type': 'rect',
+                        'rect': {'col': 2, 'row': 0, 'width': 3, 'height': 3},
+                        'polygon': [],
+                    }],
+                    'obstacles': [],
+                }),
+                setup_status='ready',
+            )
+            db.session.add(encounter_map)
+            db.session.flush()
+            placement = EncounterMapPlacement(
+                encounter_map_id=encounter_map.id,
+                actor_type='player',
+                actor_id=str(player.id),
+                label=character.name,
+                grid_col=1,
+                grid_row=1,
+            )
+            db.session.add(placement)
+            db.session.commit()
+            map_id = encounter_map.id
+            placement_id = placement.id
+            token = generate_token(player.id)
+
+        response = self.client.patch(
+            f'/api/encounter-maps/{map_id}/placements/me',
+            json={'col': 5, 'row': 1},
+            headers={'Authorization': f'Bearer {token}'},
+        )
+
+        self.assertEqual(response.status_code, 400)
+        self.assertEqual(response.get_json()['movement']['max_squares'], 6)
+        with app.app_context():
+            placement = db.session.get(EncounterMapPlacement, placement_id)
+            self.assertEqual(placement.grid_col, 1)
+            self.assertEqual(placement.grid_row, 1)
+
     def test_missing_api_routes_stay_json_404s(self):
         response = self.client.get('/api/not-real')
 
@@ -691,6 +840,204 @@ class AppRouteTest(unittest.TestCase):
 
         self.assertEqual(response.status_code, 400)
         self.assertEqual(response.get_json(), {'error': 'Resolve pending bond proposals before marking ready'})
+
+    def test_encounter_combat_flow_and_movement_restrictions(self):
+        from routes.encounter_maps import build_initial_encounter_state, check_and_start_turns
+        with app.app_context():
+            owner = User(username='dm_user', email='dm@example.com')
+            owner.set_password('password')
+            player = User(username='player_user', email='player@example.com')
+            player.set_password('password')
+            db.session.add_all([owner, player])
+            db.session.commit()
+
+            campaign = Campaign(name='Combat Campaign', user_id=owner.id)
+            db.session.add(campaign)
+            db.session.commit()
+
+            character = Character(
+                user_id=player.id,
+                campaign_id=campaign.id,
+                name='Fighter Hero',
+                race='Dwarf',
+                speed=30,
+            )
+            db.session.add(character)
+            db.session.commit()
+
+            db.session.add(CampaignMember(
+                campaign_id=campaign.id,
+                user_id=owner.id,
+                role='player',
+            ))
+            db.session.add(CampaignMember(
+                campaign_id=campaign.id,
+                user_id=player.id,
+                role='player',
+                selected_character_id=character.id,
+            ))
+            
+            encounter_map = EncounterMap(
+                campaign_id=campaign.id,
+                title='Arena',
+                prompt='A flat sandy arena.',
+                image_filename='arena.png',
+                model='gpt-image-2',
+                size='1024x1024',
+                quality='high',
+                grid_json=json.dumps({'columns': 10, 'rows': 10}),
+                vtt_setup_json=json.dumps({
+                    'terrain_zones': [],
+                    'obstacles': [],
+                }),
+                setup_status='ready',
+            )
+            db.session.add(encounter_map)
+            db.session.commit()
+
+            player_placement = EncounterMapPlacement(
+                encounter_map_id=encounter_map.id,
+                actor_type='player',
+                actor_id=str(player.id),
+                label=character.name,
+                grid_col=0,
+                grid_row=0,
+            )
+            monster_placement = EncounterMapPlacement(
+                encounter_map_id=encounter_map.id,
+                actor_type='monster',
+                actor_id='goblin-1',
+                label='Goblin',
+                grid_col=5,
+                grid_row=5,
+            )
+            db.session.add_all([player_placement, monster_placement])
+            db.session.commit()
+
+            campaign_id = campaign.id
+            map_id = encounter_map.id
+            player_placement_id = player_placement.id
+            dm_token = generate_token(owner.id)
+            player_token = generate_token(player.id)
+
+        # 1. Assert that deleted endpoints return 404
+        for endpoint in ('toggle', 'prev-turn', 'set-turn', 'update-actions'):
+            response = self.client.post(
+                f'/api/encounter-maps/{map_id}/encounter/{endpoint}',
+                json={},
+                headers={'Authorization': f'Bearer {dm_token}'},
+            )
+            self.assertEqual(response.status_code, 404)
+
+        # 2. Set up initial combat state directly in database
+        with app.app_context():
+            encounter_map = db.session.get(EncounterMap, map_id)
+            campaign = db.session.get(Campaign, encounter_map.campaign_id)
+            encounter_state = build_initial_encounter_state(encounter_map, campaign)
+            # Give the monster a low initiative (e.g. 5) so player init 10 will go first
+            monster_combatant = next(x for x in encounter_state['turn_order'] if x['actor_type'] == 'monster')
+            monster_combatant['initiative'] = 5
+            encounter_map.encounter_state_json = json.dumps(encounter_state)
+            db.session.commit()
+
+        # 3. Roll initiative for player (fails for others)
+        response = self.client.post(
+            f'/api/encounter-maps/{map_id}/encounter/roll-initiative',
+            json={'actor_type': 'monster', 'actor_id': 'goblin-1', 'initiative': 15},
+            headers={'Authorization': f'Bearer {player_token}'},
+        )
+        self.assertEqual(response.status_code, 403)
+
+        # Player rolls initiative for themselves
+        response = self.client.post(
+            f'/api/encounter-maps/{map_id}/encounter/roll-initiative',
+            json={'actor_type': 'player', 'actor_id': str(player.id), 'initiative': 10},
+            headers={'Authorization': f'Bearer {player_token}'},
+        )
+        self.assertEqual(response.status_code, 200)
+        data = response.get_json()['encounter_map']
+        state = data['encounter_state']
+        # Active turn should be player (index 0) because player initiative (10) > monster initiative (5)
+        self.assertEqual(state['active_turn_index'], 0)
+        active_combatant = state['turn_order'][0]
+        self.assertEqual(active_combatant['actor_type'], 'player')
+
+        # 4. End Turn restriction: DM cannot end player's turn via next-turn API
+        response = self.client.post(
+            f'/api/encounter-maps/{map_id}/encounter/next-turn',
+            headers={'Authorization': f'Bearer {dm_token}'},
+        )
+        self.assertEqual(response.status_code, 403)
+        self.assertIn('Only the active player', response.get_json()['error'])
+
+        # Player can end their own turn
+        response = self.client.post(
+            f'/api/encounter-maps/{map_id}/encounter/next-turn',
+            headers={'Authorization': f'Bearer {player_token}'},
+        )
+        self.assertEqual(response.status_code, 200)
+        state = response.get_json()['encounter_map']['encounter_state']
+        self.assertEqual(state['active_turn_index'], 1)
+        active_combatant = state['turn_order'][1]
+        self.assertEqual(active_combatant['actor_type'], 'monster')
+
+        # Since it is now the monster's turn, player cannot move
+        response = self.client.patch(
+            f'/api/encounter-maps/{map_id}/placements/me',
+            json={'col': 1, 'row': 1},
+            headers={'Authorization': f'Bearer {player_token}'},
+        )
+        self.assertEqual(response.status_code, 400)
+        self.assertIn('not your turn', response.get_json()['error'])
+
+        # Player cannot call next-turn when it is not their turn
+        response = self.client.post(
+            f'/api/encounter-maps/{map_id}/encounter/next-turn',
+            headers={'Authorization': f'Bearer {player_token}'},
+        )
+        self.assertEqual(response.status_code, 403)
+        self.assertIn('Only the active player', response.get_json()['error'])
+
+        # Directly set turn back to player (index 0) in DB to test player movement
+        with app.app_context():
+            encounter_map = db.session.get(EncounterMap, map_id)
+            state = json.loads(encounter_map.encounter_state_json)
+            state['active_turn_index'] = 0
+            encounter_map.encounter_state_json = json.dumps(state)
+            db.session.commit()
+
+        # Now it is player's turn, move the player token by 2 squares (col: 0->2, row: 0->0)
+        response = self.client.patch(
+            f'/api/encounter-maps/{map_id}/placements/me',
+            json={'col': 2, 'row': 0},
+            headers={'Authorization': f'Bearer {player_token}'},
+        )
+        self.assertEqual(response.status_code, 200)
+        data = response.get_json()['encounter_map']
+        state = data['encounter_state']
+        player_combatant = next(x for x in state['turn_order'] if x['actor_type'] == 'player')
+        self.assertEqual(player_combatant['actions']['movement_remaining'], 20)
+
+        # Mutate action budget directly in DB (e.g. update actions for next movement test)
+        with app.app_context():
+            encounter_map = db.session.get(EncounterMap, map_id)
+            state = json.loads(encounter_map.encounter_state_json)
+            player_combatant = next(x for x in state['turn_order'] if x['actor_type'] == 'player')
+            player_combatant['actions']['action'] = False
+            player_combatant['actions']['movement_remaining'] = 15
+            encounter_map.encounter_state_json = json.dumps(state)
+            db.session.commit()
+
+        # Verify mutated values are returned properly
+        response = self.client.get(
+            f'/api/campaigns/{campaign_id}/encounter-maps/current',
+            headers={'Authorization': f'Bearer {player_token}'},
+        )
+        self.assertEqual(response.status_code, 200)
+        state = response.get_json()['encounter_map']['encounter_state']
+        player_combatant = next(x for x in state['turn_order'] if x['actor_type'] == 'player')
+        self.assertFalse(player_combatant['actions']['action'])
+        self.assertEqual(player_combatant['actions']['movement_remaining'], 15)
 
 
 if __name__ == '__main__':

@@ -1084,6 +1084,175 @@ def build_world_genesis_messages(context):
     ]
 
 
+WORLD_GENESIS_SECTION_SPECS = (
+    (
+        'public_intro',
+        {
+            'public_intro': {
+                'title': 'short campaign-facing title',
+                'elevator_pitch': '2-3 spoiler-free sentences for players',
+                'starting_location': 'public starting place name',
+                'campaign_tone': ['3-5 spoiler-free tone tags'],
+                'party_hook': 'why the party is together at the opening moment without revealing secrets',
+            },
+        },
+    ),
+    (
+        'knowledge_graph',
+        {
+            'knowledge_graph': {
+                'entities': [
+                    {
+                        'id': 'stable_snake_case_id',
+                        'type': 'npc | location | faction | item | event | threat | concept',
+                        'name': 'display name',
+                        'summary': 'durable fact summary',
+                        'visibility': 'public | party_known | dm_private',
+                        'tags': ['short tags'],
+                    },
+                ],
+                'relations': [
+                    {
+                        'id': 'stable_snake_case_id',
+                        'source_id': 'entity id',
+                        'target_id': 'entity id',
+                        'type': 'relationship type',
+                        'summary': 'relationship summary',
+                        'visibility': 'public | party_known | dm_private',
+                    },
+                ],
+                'facts': [
+                    {
+                        'id': 'stable_snake_case_id',
+                        'entity_ids': ['entity ids'],
+                        'text': 'durable fact text',
+                        'certainty': 'confirmed | suspected | false_rumor',
+                        'visibility': 'public | party_known | dm_private',
+                    },
+                ],
+            },
+        },
+    ),
+    (
+        'world_state',
+        {
+            'world_state': {
+                'current_arc': 'opening arc name',
+                'current_scene': {
+                    'location_id': 'entity id for starting location',
+                    'location_name': 'display name',
+                    'time_of_day': 'opening scene timing',
+                    'active_npc_ids': ['npc actor ids present or relevant'],
+                    'immediate_tension': 'what is visibly pressing right now',
+                },
+                'party': {
+                    'known_location_id': 'entity id',
+                    'public_reputation': 'how locals currently read the party',
+                },
+                'open_threads': ['non-spoiler and private thread summaries as appropriate'],
+            },
+        },
+    ),
+    (
+        'dm_private',
+        {
+            'dm_private': {
+                'true_inciting_incident': 'private truth behind the opening problem',
+                'villain_plan': 'private antagonist or pressure plan if applicable',
+                'hidden_factions': ['private faction notes'],
+                'npc_secrets': ['private NPC secrets'],
+                'opening_scene_private_notes': 'DM-only guidance for the first exchange',
+            },
+        },
+    ),
+    (
+        'npc_actors',
+        {
+            'npc_actors': [
+                {
+                    'id': 'npc_stable_id',
+                    'name': 'NPC name',
+                    'role': 'story role',
+                    'public_summary': 'safe public-facing summary',
+                    'voice': 'how they speak',
+                    'background': 'private background',
+                    'wants': ['motivations'],
+                    'fears': ['fears'],
+                    'secrets': ['private secrets'],
+                    'relationships': {'party': 'initial relationship'},
+                    'recent_offscreen_activity': ['what they did before the opening'],
+                },
+            ],
+        },
+    ),
+    (
+        'clocks',
+        {
+            'clocks': [
+                {
+                    'id': 'clock_stable_id',
+                    'name': 'Clock name',
+                    'segments': 4,
+                    'filled': 0,
+                    'pressure_type': 'faction | danger | mystery | environment | personal',
+                    'visibility': 'public | party_known | dm_private',
+                    'summary': 'what this pressure represents',
+                    'trigger': 'when it advances',
+                    'on_complete': 'what happens when filled',
+                    'status': 'active',
+                },
+            ],
+        },
+    ),
+)
+
+
+def build_world_genesis_section_seed_messages(context):
+    return [
+        {'role': 'system', 'content': WORLD_GENESIS_SYSTEM_PROMPT},
+        {
+            'role': 'user',
+            'content': json.dumps({
+                'context': context,
+                'task': (
+                    'Build the campaign world package in sections. I will ask for one JSON section at a time. '
+                    'Keep each new section consistent with the campaign context and with any prior sections in '
+                    'this conversation. Return only the requested JSON object for each section.'
+                ),
+                'final_package_keys': [
+                    section_name
+                    for section_name, _shape in WORLD_GENESIS_SECTION_SPECS
+                ],
+            }, ensure_ascii=False),
+        },
+    ]
+
+
+def build_world_genesis_section_prompt(section_name, return_shape):
+    return {
+        'role': 'user',
+        'content': json.dumps({
+            'section': section_name,
+            'instructions': (
+                f'Generate only the {section_name} section now. Return valid JSON with exactly one top-level '
+                f'key named "{section_name}". Do not repeat previous sections. Keep spoiler-sensitive facts '
+                'out of public-facing fields and mark hidden facts dm_private where the schema supports visibility.'
+            ),
+            'return_shape': return_shape,
+        }, ensure_ascii=False),
+    }
+
+
+def _coerce_world_genesis_section(section_name, data):
+    if isinstance(data, dict) and section_name in data:
+        return {section_name: data[section_name]}
+    if section_name in {'npc_actors', 'clocks'} and isinstance(data, list):
+        return {section_name: data}
+    if isinstance(data, dict):
+        return {section_name: data}
+    raise ValueError(f'World genesis section {section_name} returned invalid JSON')
+
+
 def build_session_memory_messages(memory_context):
     return [
         {'role': 'system', 'content': SESSION_MEMORY_SYSTEM_PROMPT},
@@ -1682,14 +1851,37 @@ def get_planning_summary_update(context, latest_player_message, latest_dm_messag
 
 
 def get_world_genesis_package(context, audit_context=None):
-    messages = build_world_genesis_messages(context)
+    base_audit = audit_context or {}
+    trace_id = base_audit.get('trace_id') or f"world_architect:world_genesis:{uuid4().hex[:10]}"
+    trace_label = base_audit.get('trace_label') or 'world_architect: world_genesis'
+    messages = build_world_genesis_section_seed_messages(context)
+    package = {}
 
     try:
-        data = _json_loads_with_repair(
-            _post_chat(messages, json_mode=True, audit_context=audit_context),
-            audit_context=audit_context,
-        )
-        return data if isinstance(data, dict) else {}
+        for section_name, return_shape in WORLD_GENESIS_SECTION_SPECS:
+            section_audit_context = {
+                **base_audit,
+                'operation': f'world_genesis_{section_name}',
+                'actor': base_audit.get('actor') or 'world_architect',
+                'trace_id': f'{trace_id}:{section_name}',
+                'parent_trace_id': trace_id,
+                'trace_label': f'{trace_label}: {section_name}',
+            }
+            messages.append(build_world_genesis_section_prompt(section_name, return_shape))
+            text = _post_chat(
+                list(messages),
+                json_mode=True,
+                audit_context=section_audit_context,
+            )
+            data = _json_loads_with_repair(text, audit_context=section_audit_context)
+            section_payload = _coerce_world_genesis_section(section_name, data)
+            package.update(section_payload)
+            messages.append({
+                'role': 'assistant',
+                'content': json.dumps(section_payload, ensure_ascii=False),
+            })
+
+        return package
     except Exception as e:
         print(f'[openrouter] World genesis error: {e}')
         return {}
