@@ -925,8 +925,8 @@ def get_campaign_dev_audit(current_user, campaign_id):
     sessions = CampaignSession.query.filter_by(campaign_id=campaign_id).order_by(CampaignSession.started_at.desc()).all()
     active_session = CampaignSession.query.filter_by(campaign_id=campaign_id, is_active=True).first()
 
-    planning_ctx = planning_context(campaign, current_user)
-    visible_planning = visible_planning_payload(campaign, current_user)
+    planning_ctx = planning_context(campaign, current_user, clean_ready_states=False)
+    visible_planning = visible_planning_payload(campaign, current_user, clean_ready_states=False)
     planning_summary = summary_dict_for_read(campaign.id, include_private=True, current_user_id=current_user.id)
     planning_messages = CharacterPlanningMessage.query.filter_by(campaign_id=campaign_id).order_by(
         CharacterPlanningMessage.created_at.asc(),
@@ -944,7 +944,7 @@ def get_campaign_dev_audit(current_user, campaign_id):
         '',
     )
 
-    world_public = world_public_payload(campaign)
+    world_public = world_public_payload(campaign, clean_ready_states=False)
     world_context = dm_world_context(campaign)
     world_events = WorldEvent.query.filter_by(campaign_id=campaign_id).order_by(WorldEvent.created_at.asc()).all()
     npcs = NPCActor.query.filter_by(campaign_id=campaign_id).order_by(NPCActor.id.asc()).all()

@@ -11,6 +11,7 @@ from models import db
 from routes.campaigns import campaigns_bp
 from routes.characters import characters_bp
 from routes.dev import dev_bp
+from routes.encounter_maps import encounter_maps_bp
 from routes.members import members_bp
 from routes.planning import planning_bp
 from routes.sessions import sessions_bp
@@ -42,6 +43,7 @@ def create_app():
     app.register_blueprint(campaigns_bp)
     app.register_blueprint(characters_bp)
     app.register_blueprint(dev_bp)
+    app.register_blueprint(encounter_maps_bp)
     app.register_blueprint(members_bp)
     app.register_blueprint(planning_bp)
     app.register_blueprint(sessions_bp)
@@ -114,6 +116,19 @@ def ensure_lightweight_schema():
             db.session.execute(text('ALTER TABLE campaign_memory_embeddings ADD COLUMN visibility VARCHAR(30) DEFAULT "dm_private"'))
         if 'embedding_dimensions' not in embedding_columns:
             db.session.execute(text('ALTER TABLE campaign_memory_embeddings ADD COLUMN embedding_dimensions INTEGER DEFAULT 0'))
+
+    encounter_map_columns = table_columns('encounter_maps')
+    if encounter_map_columns:
+        if 'labeled_image_filename' not in encounter_map_columns:
+            db.session.execute(text('ALTER TABLE encounter_maps ADD COLUMN labeled_image_filename VARCHAR(260)'))
+        if 'grid_json' not in encounter_map_columns:
+            db.session.execute(text('ALTER TABLE encounter_maps ADD COLUMN grid_json TEXT'))
+        if 'vtt_setup_json' not in encounter_map_columns:
+            db.session.execute(text('ALTER TABLE encounter_maps ADD COLUMN vtt_setup_json TEXT'))
+        if 'setup_status' not in encounter_map_columns:
+            db.session.execute(text('ALTER TABLE encounter_maps ADD COLUMN setup_status VARCHAR(20) DEFAULT "pending"'))
+        if 'setup_error' not in encounter_map_columns:
+            db.session.execute(text('ALTER TABLE encounter_maps ADD COLUMN setup_error VARCHAR(500)'))
     db.session.commit()
 
 

@@ -8,6 +8,7 @@ import {
   listMembers,
   getCampaignPlanning,
   getCampaignWorld,
+  getCurrentEncounterMap,
   getSheetProposals,
 } from '../api/client'
 import Loading from '../components/common/Loading'
@@ -17,6 +18,7 @@ import SessionPanel from '../components/dashboard/SessionPanel'
 import LootBoxStash from '../components/lootbox/LootBoxStash'
 import CampaignLobby from '../components/dashboard/CampaignLobby'
 import CharacterPlanningMode from '../components/dashboard/CharacterPlanningMode'
+import EncounterMapPanel from '../components/dashboard/EncounterMapPanel'
 import WorldBuildingMode from '../components/dashboard/WorldBuildingMode'
 
 function getInitials(name) {
@@ -90,11 +92,16 @@ async function fetchCampaignPageData(id) {
   const activeSession = campaign.active_session || null
   let messages = []
   let sheetProposals = []
+  let encounterMap = null
   if (activeSession) {
-    const data = await getSession(activeSession.id).catch(() => ({ session: { messages: [] } }))
+    const [data, propData, mapData] = await Promise.all([
+      getSession(activeSession.id).catch(() => ({ session: { messages: [] } })),
+      getSheetProposals(activeSession.id).catch(() => ({ sheet_proposals: [] })),
+      getCurrentEncounterMap(id).catch(() => ({ encounter_map: null })),
+    ])
     messages = data.session?.messages || []
-    const propData = await getSheetProposals(activeSession.id).catch(() => ({ sheet_proposals: [] }))
     sheetProposals = propData.sheet_proposals || []
+    encounterMap = mapData.encounter_map || null
   }
 
   return {
@@ -103,6 +110,7 @@ async function fetchCampaignPageData(id) {
     activeSession,
     messages,
     sheetProposals,
+    encounterMap,
   }
 }
 
@@ -129,6 +137,11 @@ export default function CampaignViewPage({ user }) {
   const [importLoading, setImportLoading] = useState(false)
   const [aiThinking, setAiThinking] = useState(false)
   const [sheetProposals, setSheetProposals] = useState([])
+  const [encounterMap, setEncounterMap] = useState(null)
+  const [encounterMapLoading, setEncounterMapLoading] = useState(false)
+  const [isMapExpanded, setIsMapExpanded] = useState(() => {
+    return localStorage.getItem('encounter_map_collapsed') === 'false'
+  })
 
   const loadData = useCallback(async () => {
     try {
@@ -137,6 +150,7 @@ export default function CampaignViewPage({ user }) {
       setCharacters(data.characters)
       setSession(data.activeSession)
       setMessages(data.messages)
+      setEncounterMap(data.encounterMap || null)
       const loadedProposals = data.sheetProposals || []
       setSheetProposals(loadedProposals)
       if (data.activeSession && loadedProposals.length) {
@@ -188,6 +202,7 @@ export default function CampaignViewPage({ user }) {
         setCharacters(data.characters)
         setSession(data.activeSession)
         setMessages(data.messages)
+        setEncounterMap(data.encounterMap || null)
         const loadedProposals = data.sheetProposals || []
         setSheetProposals(loadedProposals)
         if (data.activeSession && loadedProposals.length) {
@@ -283,6 +298,11 @@ export default function CampaignViewPage({ user }) {
       const data = await sendMessage(session.id, content)
       const newMessages = data.messages || []
       setMessages((prev) => reconcilePendingMessage(prev, pendingMessage.id, newMessages))
+      setEncounterMapLoading(true)
+      getCurrentEncounterMap(id)
+        .then((mapData) => setEncounterMap(mapData.encounter_map || null))
+        .catch(() => {})
+        .finally(() => setEncounterMapLoading(false))
       if (data.sheet_proposals?.length) {
         setSheetProposals((prev) => {
           const existing = new Set(prev.map((p) => p.id))
@@ -474,16 +494,25 @@ export default function CampaignViewPage({ user }) {
   }
 
   const isOwner = campaign.user_id === user?.id
+  const hasActiveMap = Boolean(encounterMap)
 
   return (
-    <div className="dashboard-page">
-      <div className="dashboard-layout">
+    <div className={`dashboard-page ${isMapExpanded && hasActiveMap ? 'map-expanded' : ''}`}>
+      <div className={`dashboard-layout ${isMapExpanded && hasActiveMap ? 'map-expanded' : ''}`}>
         <aside className="dashboard-left">
           <PartyRoster characters={characters} campaignId={id} onImport={openImport} />
-
         </aside>
 
-        <main className="dashboard-center">
+        <main className={`dashboard-center ${isMapExpanded && hasActiveMap ? 'map-expanded' : ''}`}>
+          {(session || encounterMap) && (
+            <EncounterMapPanel
+              encounterMap={encounterMap}
+              loading={encounterMapLoading}
+              isOwner={isOwner}
+              isMapExpanded={isMapExpanded}
+              setIsMapExpanded={setIsMapExpanded}
+            />
+          )}
           <SessionPanel
             session={session}
             messages={messages}

@@ -294,10 +294,10 @@ def get_campaign_world(campaign_id):
     return CampaignWorld.query.filter_by(campaign_id=campaign_id).first()
 
 
-def world_public_payload(campaign):
+def world_public_payload(campaign, clean_ready_states=True):
     world = get_campaign_world(campaign.id)
     if not world:
-        ready, details = can_start_session(campaign)
+        ready, details = can_start_session(campaign, clean_ready_states=clean_ready_states)
         return {
             'world': None,
             'is_ready': False,

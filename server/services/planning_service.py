@@ -151,8 +151,36 @@ def summary_dict_for_read(campaign_id, include_private=False, current_user_id=No
     return data
 
 
+def invalid_ready_member_ids(members):
+    selected_ids = {
+        member.selected_character_id
+        for member in members
+        if member.selected_character_id
+    }
+    if not selected_ids:
+        return set()
+
+    with db.session.no_autoflush:
+        characters = Character.query.filter(Character.id.in_(selected_ids)).all()
+    characters_by_id = {character.id: character for character in characters}
+    invalid_ids = set()
+    for member in members:
+        if not member.selected_character_id:
+            continue
+
+        character = characters_by_id.get(member.selected_character_id)
+        if (
+            character is None
+            or character.user_id != member.user_id
+            or character.campaign_id != member.campaign_id
+        ):
+            invalid_ids.add(member.id)
+    return invalid_ids
+
+
 def clear_invalid_ready_states(members):
     changed = False
+    invalid_ids = invalid_ready_member_ids(members)
     for member in members:
         if not member.selected_character_id:
             if member.character_ready_at is not None:
@@ -160,26 +188,34 @@ def clear_invalid_ready_states(members):
                 changed = True
             continue
 
-        character = db.session.get(Character, member.selected_character_id)
-        invalid = (
-            character is None
-            or character.user_id != member.user_id
-            or character.campaign_id != member.campaign_id
-        )
-        if invalid:
+        if member.id in invalid_ids:
             member.selected_character_id = None
             member.character_ready_at = None
             changed = True
     return changed
 
 
-def member_planning_dict(member):
+def member_is_ready(member, invalid_member_ids=None):
+    if invalid_member_ids and member.id in invalid_member_ids:
+        return False
+    return bool(member.selected_character_id and member.character_ready_at)
+
+
+def member_planning_dict(member, invalid_member_ids=None):
+    invalid = bool(invalid_member_ids and member.id in invalid_member_ids)
+    stale_ready = not member.selected_character_id and member.character_ready_at is not None
     data = member.to_dict()
-    data['selected_character'] = (
-        character_full_dict(member.selected_character)
-        if member.selected_character is not None
-        else None
-    )
+    if invalid or stale_ready:
+        data['selected_character_id'] = None
+        data['character_ready_at'] = None
+        data['is_character_ready'] = False
+        data['selected_character'] = None
+    else:
+        data['selected_character'] = (
+            character_full_dict(member.selected_character)
+            if member.selected_character is not None
+            else None
+        )
     return data
 
 
@@ -187,23 +223,31 @@ def party_is_full(campaign, members):
     return len(members) >= get_required_players(campaign)
 
 
-def all_members_ready(campaign, members):
+def all_members_ready(campaign, members, invalid_member_ids=None):
     required = get_required_players(campaign)
     relevant_members = members[:required]
     return len(relevant_members) >= required and all(
-        member.selected_character_id and member.character_ready_at
+        member_is_ready(member, invalid_member_ids)
         for member in relevant_members
     )
 
 
-def can_start_session(campaign):
+def can_start_session(campaign, clean_ready_states=True):
     members = get_campaign_members(campaign)
-    clear_invalid_ready_states(members)
+    invalid_member_ids = set()
+    if clean_ready_states:
+        clear_invalid_ready_states(members)
+    else:
+        invalid_member_ids = invalid_ready_member_ids(members)
     required = get_required_players(campaign)
-    return all_members_ready(campaign, members), {
+    return all_members_ready(campaign, members, invalid_member_ids), {
         'required_players': required,
-        'ready_players': sum(1 for member in members[:required] if member.selected_character_id and member.character_ready_at),
-        'members': [member_planning_dict(member) for member in members],
+        'ready_players': sum(
+            1
+            for member in members[:required]
+            if member_is_ready(member, invalid_member_ids)
+        ),
+        'members': [member_planning_dict(member, invalid_member_ids) for member in members],
     }
 
 
@@ -220,9 +264,13 @@ def recent_planning_messages(campaign_id, per_user=8):
     return result
 
 
-def planning_context(campaign, current_user=None):
+def planning_context(campaign, current_user=None, clean_ready_states=True):
     members = get_campaign_members(campaign)
-    clear_invalid_ready_states(members)
+    invalid_member_ids = set()
+    if clean_ready_states:
+        clear_invalid_ready_states(members)
+    else:
+        invalid_member_ids = invalid_ready_member_ids(members)
     characters = Character.query.filter_by(campaign_id=campaign.id).all()
     bonds = PlanningBondProposal.query.filter_by(campaign_id=campaign.id).order_by(
         PlanningBondProposal.created_at.asc(),
@@ -231,7 +279,7 @@ def planning_context(campaign, current_user=None):
     context = {
         'campaign': campaign.to_dict(),
         'required_players': get_required_players(campaign),
-        'members': [member_planning_dict(member) for member in members],
+        'members': [member_planning_dict(member, invalid_member_ids) for member in members],
         'characters': [character_full_dict(character) for character in characters],
         'summary': summary_dict_for_read(campaign.id, include_private=True),
         'pending_bonds': [bond.to_dict() for bond in bonds if bond.status == 'pending'],
@@ -333,9 +381,13 @@ def _bond_suggestion_key(suggestion):
     return involved, title, description
 
 
-def visible_planning_payload(campaign, current_user):
+def visible_planning_payload(campaign, current_user, clean_ready_states=True):
     members = get_campaign_members(campaign)
-    clear_invalid_ready_states(members)
+    invalid_member_ids = set()
+    if clean_ready_states:
+        clear_invalid_ready_states(members)
+    else:
+        invalid_member_ids = invalid_ready_member_ids(members)
     messages = CharacterPlanningMessage.query.filter_by(
         campaign_id=campaign.id,
         user_id=current_user.id,
@@ -353,8 +405,8 @@ def visible_planning_payload(campaign, current_user):
     return {
         'required_players': required,
         'party_full': party_is_full(campaign, members),
-        'all_ready': all_members_ready(campaign, members),
-        'members': [member_planning_dict(member) for member in members],
+        'all_ready': all_members_ready(campaign, members, invalid_member_ids),
+        'members': [member_planning_dict(member, invalid_member_ids) for member in members],
         'summary': summary_dict_for_read(campaign.id, include_private=False, current_user_id=current_user.id),
         'messages': [message.to_dict() for message in messages],
         'bonds': user_bonds,

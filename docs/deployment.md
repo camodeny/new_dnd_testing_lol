@@ -18,6 +18,7 @@ Set these repository or environment secrets:
 - `TS_OAUTH_CLIENT_ID`
 - `TS_OAUTH_SECRET`
 - `SECRET_KEY`
+- `OPENAI_API_KEY` for encounter map image generation
 - Provider credentials for the selected provider:
   - OpenRouter: `OPENROUTER_API_KEY`, `OPENROUTER_MODEL`
   - OpenCode Go: `OPENCODE_GO_API_KEY`
@@ -38,11 +39,24 @@ Optional variables:
 - `APP_PORT`: defaults to `5889`.
 - `FRONTEND_ORIGINS`: defaults to `http://localhost:$APP_PORT`.
 - `PUBLIC_APP_BASE_URL`: defaults to `http://localhost:$APP_PORT`.
+- `GUNICORN_TIMEOUT`: defaults to `420` in Docker Compose to allow slower image generation requests.
 - `JWT_EXPIRATION_HOURS`: defaults to `24`.
 - `LLM_PROVIDER`: `openrouter` or `opencode_go`; defaults to `openrouter`.
 - `OPENCODE_GO_MODEL`: required when `LLM_PROVIDER=opencode_go`.
 - `OPENCODE_GO_THINKING`: set to `enabled` to request DeepSeek V4 thinking mode through OpenCode Go; defaults to `disabled`.
 - `OPENCODE_GO_REASONING_EFFORT`: `high` or `max`; defaults to `high`.
+- `OPENAI_IMAGE_QUALITY`: `low`, `medium`, or `high`; defaults to `low` for cheaper map iteration.
+- `OPENAI_IMAGE_TIMEOUT_SECONDS`: defaults to `240`.
+- `OPENAI_IMAGE_QA_ENABLED`: `true` or `false`; defaults to `true` to review generated maps before saving.
+- `OPENAI_IMAGE_QA_MODEL`: defaults to `gpt-5.4-mini`.
+- `OPENAI_IMAGE_QA_THRESHOLD`: 1-10 review score required to accept the first map; defaults to `8`.
+- `OPENAI_IMAGE_QA_MAX_RETRIES`: number of review-guided regeneration attempts; defaults to `1`.
+- `OPENAI_IMAGE_QA_TIMEOUT_SECONDS`: defaults to `90`.
+- `OPENAI_IMAGE_GRID_VALIDATION_ENABLED`: `true` or `false`; defaults to `true` to reject generated maps whose baked-in grid cannot be detected.
+- `OPENAI_IMAGE_GRID_MAX_RETRIES`: number of grid-guided regeneration attempts before saving the final candidate; defaults to `2`.
+- `OPENAI_IMAGE_SETUP_MODEL`: defaults to `gpt-5.4-mini` for VTT setup analysis.
+- `OPENAI_IMAGE_SETUP_TIMEOUT_SECONDS`: defaults to `90`.
+- `ENCOUNTER_MAP_STORAGE_DIR`: defaults to `/app/data/encounter_maps`.
 - `GEMINI_EMBEDDINGS_ENABLED`: `true` or `false`; defaults to `true` but fails open when `GEMINI_API_KEY` is unset.
 - `GEMINI_EMBEDDING_MODEL`: defaults to `gemini-embedding-001`.
 - `GEMINI_EMBEDDING_DIMENSIONS`: defaults to `768`.

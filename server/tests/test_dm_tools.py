@@ -1,10 +1,16 @@
 import os
+import base64
 import json
 import sys
+import tempfile
 import unittest
+from io import BytesIO
+from pathlib import Path
 from unittest.mock import patch
 
+import requests
 from flask import Flask
+from PIL import Image, ImageDraw
 
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), '..')))
 
@@ -16,10 +22,14 @@ from models import (
     CampaignClock,
     CampaignMemoryEmbedding,
     CampaignMember,
+    CampaignMonster,
     CampaignSession,
     CampaignWorld,
     Character,
     CharacterPlanningMessage,
+    EncounterMap,
+    EncounterMapPlacement,
+    NPCActor,
     SessionMessage,
     User,
 )
@@ -35,6 +45,22 @@ from routes.sessions import sessions_bp
 from services.audit_service import log_audit_event
 from services.dm_tools import DM_TOOL_DEFINITIONS, apply_memory_patch, build_session_hot_context, context_manifest, execute_dm_tool
 from services.embedding_service import canonical_text_for_item, cosine_similarity
+from services.encounter_map_service import create_labeled_grid_image, detect_grid_from_image
+
+
+def synthetic_grid_png(size=256, cell=32, offset=0, blank=False):
+    image = Image.new('RGB', (size, size), 'white')
+    if not blank:
+        draw = ImageDraw.Draw(image)
+        for position in range(offset, size, cell):
+            draw.line([(position, 0), (position, size - 1)], fill=(20, 20, 20), width=2)
+            draw.line([(0, position), (size - 1, position)], fill=(20, 20, 20), width=2)
+        if offset == 0:
+            draw.line([(size - 1, 0), (size - 1, size - 1)], fill=(20, 20, 20), width=2)
+            draw.line([(0, size - 1), (size - 1, size - 1)], fill=(20, 20, 20), width=2)
+    buffer = BytesIO()
+    image.save(buffer, format='PNG')
+    return buffer.getvalue()
 
 
 class DmToolsTest(unittest.TestCase):
@@ -51,6 +77,7 @@ class DmToolsTest(unittest.TestCase):
         self.ctx = self.app.app_context()
         self.ctx.push()
         db.create_all()
+        self.client = self.app.test_client()
 
         self.user = User(username='player', email='player@example.com')
         self.user.set_password('password')
@@ -98,10 +125,211 @@ class DmToolsTest(unittest.TestCase):
         self.assertIn('ask_character_sheet', names)
         self.assertIn('search_campaign_memory', names)
         self.assertIn('advance_clock', names)
+        self.assertIn('create_encounter_map', names)
+        self.assertIn('place_encounter_map_actors', names)
         for tool in DM_TOOL_DEFINITIONS:
             self.assertEqual(tool['type'], 'function')
             self.assertIn('parameters', tool['function'])
             self.assertEqual(tool['function']['parameters']['type'], 'object')
+
+    def test_ai_dm_tool_places_encounter_map_actors_and_creates_monsters(self):
+        npc = NPCActor(
+            campaign_id=self.campaign.id,
+            actor_id='bram_truewood',
+            name='Bram Truewood',
+            dossier='{}',
+        )
+        encounter_map = EncounterMap(
+            campaign_id=self.campaign.id,
+            session_id=self.session.id,
+            title='Ruined Hall',
+            prompt='A ruined hall.',
+            image_filename='map.png',
+            model='gpt-image-2',
+            size='1024x1024',
+            quality='high',
+            grid_json=json.dumps({'columns': 12, 'rows': 10}),
+            setup_status='ready',
+        )
+        db.session.add_all([npc, encounter_map])
+        db.session.commit()
+
+        result = execute_dm_tool(
+            self.campaign,
+            self.session,
+            self.user,
+            'place_encounter_map_actors',
+            {
+                'encounter_map_id': encounter_map.id,
+                'placements': [
+                    {'actor_type': 'player', 'actor_id': str(self.user.id), 'col': 2, 'row': 3},
+                    {'actor_type': 'npc', 'actor_id': 'bram_truewood', 'col': 4, 'row': 5},
+                    {'actor_type': 'monster', 'actor_id': 'goblin_1', 'monster_name': 'Goblin', 'col': 8, 'row': 4},
+                ],
+            },
+        )
+        db.session.commit()
+
+        self.assertNotIn('error', result)
+        self.assertEqual(len(result['placements']), 3)
+        self.assertEqual(CampaignMonster.query.filter_by(campaign_id=self.campaign.id).count(), 1)
+        self.assertEqual(EncounterMapPlacement.query.filter_by(encounter_map_id=encounter_map.id).count(), 3)
+        monster = CampaignMonster.query.filter_by(campaign_id=self.campaign.id, monster_id='goblin_1').one()
+        self.assertEqual(monster.name, 'Goblin')
+
+        move_result = execute_dm_tool(
+            self.campaign,
+            self.session,
+            self.user,
+            'place_encounter_map_actors',
+            {
+                'encounter_map_id': encounter_map.id,
+                'placements': [{'actor_type': 'monster', 'actor_id': 'goblin_1', 'col': 9, 'row': 4}],
+            },
+        )
+        db.session.commit()
+
+        self.assertNotIn('error', move_result)
+        self.assertEqual(EncounterMapPlacement.query.filter_by(encounter_map_id=encounter_map.id).count(), 3)
+        moved = EncounterMapPlacement.query.filter_by(
+            encounter_map_id=encounter_map.id,
+            actor_type='monster',
+            actor_id='goblin_1',
+        ).one()
+        self.assertEqual(moved.grid_col, 9)
+
+    def test_ai_dm_tool_rejects_out_of_bounds_map_placements(self):
+        encounter_map = EncounterMap(
+            campaign_id=self.campaign.id,
+            session_id=self.session.id,
+            title='Small Room',
+            prompt='A small room.',
+            image_filename='map.png',
+            model='gpt-image-2',
+            size='1024x1024',
+            quality='high',
+            grid_json=json.dumps({'columns': 4, 'rows': 4}),
+            setup_status='ready',
+        )
+        db.session.add(encounter_map)
+        db.session.commit()
+
+        result = execute_dm_tool(
+            self.campaign,
+            self.session,
+            self.user,
+            'place_encounter_map_actors',
+            {
+                'encounter_map_id': encounter_map.id,
+                'placements': [{'actor_type': 'player', 'actor_id': str(self.user.id), 'col': 4, 'row': 0}],
+            },
+        )
+
+        self.assertEqual(result['error'], 'No placements were saved.')
+        self.assertEqual(EncounterMapPlacement.query.filter_by(encounter_map_id=encounter_map.id).count(), 0)
+
+    def test_ai_dm_tool_warns_before_illegal_map_placements(self):
+        encounter_map = EncounterMap(
+            campaign_id=self.campaign.id,
+            session_id=self.session.id,
+            title='Wreck Room',
+            prompt='A wrecked ship chamber.',
+            image_filename='map.png',
+            model='gpt-image-2',
+            size='1024x1024',
+            quality='high',
+            grid_json=json.dumps({'columns': 12, 'rows': 10}),
+            vtt_setup_json=json.dumps({
+                'obstacles': [{
+                    'label': 'Crashed Ship Hull',
+                    'kind': 'blocked',
+                    'movement_effect': 'blocks_movement',
+                    'description': 'Splintered ship timbers block movement through this square.',
+                    'shape_type': 'rect',
+                    'rect': {'col': 5, 'row': 4, 'width': 3, 'height': 2},
+                    'polygon': [],
+                }],
+                'terrain_zones': [],
+            }),
+            setup_status='ready',
+        )
+        db.session.add(encounter_map)
+        db.session.flush()
+        db.session.add(EncounterMapPlacement(
+            encounter_map_id=encounter_map.id,
+            actor_type='player',
+            actor_id=str(self.user.id),
+            label='Aria',
+            grid_col=1,
+            grid_row=1,
+        ))
+        db.session.commit()
+
+        result = execute_dm_tool(
+            self.campaign,
+            self.session,
+            self.user,
+            'place_encounter_map_actors',
+            {
+                'encounter_map_id': encounter_map.id,
+                'clear_existing': True,
+                'placements': [{'actor_type': 'monster', 'actor_id': 'shark_1', 'monster_name': 'Reef Shark', 'col': 6, 'row': 4}],
+            },
+        )
+        db.session.commit()
+
+        self.assertIn('warning', result)
+        self.assertEqual(result['placement_warnings'][0]['area_label'], 'Crashed Ship Hull')
+        self.assertIn('blocks movement', result['placement_warnings'][0]['reason'])
+        self.assertEqual(EncounterMapPlacement.query.filter_by(encounter_map_id=encounter_map.id).count(), 1)
+        self.assertEqual(CampaignMonster.query.filter_by(campaign_id=self.campaign.id).count(), 0)
+
+    def test_ai_dm_tool_can_override_illegal_map_placement_warning(self):
+        encounter_map = EncounterMap(
+            campaign_id=self.campaign.id,
+            session_id=self.session.id,
+            title='Hazard Room',
+            prompt='A room with a deep fissure.',
+            image_filename='map.png',
+            model='gpt-image-2',
+            size='1024x1024',
+            quality='high',
+            grid_json=json.dumps({'columns': 12, 'rows': 10}),
+            vtt_setup_json=json.dumps({
+                'terrain_zones': [{
+                    'label': 'Deep Fissure',
+                    'kind': 'hazard',
+                    'description': 'A dangerous drop cuts across the floor.',
+                    'shape_type': 'rect',
+                    'rect': {'col': 2, 'row': 2, 'width': 2, 'height': 2},
+                    'polygon': [],
+                }],
+                'obstacles': [],
+            }),
+            setup_status='ready',
+        )
+        db.session.add(encounter_map)
+        db.session.commit()
+
+        result = execute_dm_tool(
+            self.campaign,
+            self.session,
+            self.user,
+            'place_encounter_map_actors',
+            {
+                'encounter_map_id': encounter_map.id,
+                'allow_illegal_placements': True,
+                'placements': [{'actor_type': 'player', 'actor_id': str(self.user.id), 'col': 2, 'row': 2}],
+            },
+        )
+        db.session.commit()
+
+        self.assertNotIn('error', result)
+        self.assertEqual(result['placement_warnings'][0]['area_label'], 'Deep Fissure')
+        self.assertEqual(len(result['placements']), 1)
+        placement = EncounterMapPlacement.query.filter_by(encounter_map_id=encounter_map.id).one()
+        self.assertEqual(placement.grid_col, 2)
+        self.assertEqual(placement.grid_row, 2)
 
     def test_character_sheet_agent_answers_from_selected_character(self):
         with patch('services.dm_tools.get_character_sheet_answer', return_value={
@@ -132,7 +360,484 @@ class DmToolsTest(unittest.TestCase):
         self.assertEqual(manifest['strategy'], 'compact_hot_context_with_dm_tools')
         self.assertFalse(manifest['full_world_graph_included'])
         self.assertIn('ask_character_sheet', manifest['available_tools'])
+        self.assertIn('create_encounter_map', manifest['available_tools'])
         self.assertIn('recent_messages', manifest['estimated_tokens_by_section'])
+
+    def test_grid_detector_finds_synthetic_grid_and_writes_labeled_copy(self):
+        image_bytes = synthetic_grid_png(size=256, cell=32)
+        grid = detect_grid_from_image(image_bytes)
+
+        self.assertLessEqual(abs(grid['origin_px']['x']), 2)
+        self.assertLessEqual(abs(grid['origin_px']['y']), 2)
+        self.assertLessEqual(abs(grid['cell_size_px']['average'] - 32), 2)
+        self.assertEqual(grid['columns'], 8)
+        self.assertEqual(grid['rows'], 8)
+        self.assertGreaterEqual(grid['confidence'], 0.45)
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            original_path = os.path.join(temp_dir, 'original.png')
+            labeled_path = os.path.join(temp_dir, 'labeled.png')
+            with open(original_path, 'wb') as file:
+                file.write(image_bytes)
+
+            labeled_bytes = create_labeled_grid_image(image_bytes, grid, Path(labeled_path))
+
+            self.assertTrue(os.path.exists(labeled_path))
+            with open(original_path, 'rb') as file:
+                self.assertEqual(file.read(), image_bytes)
+            self.assertNotEqual(labeled_bytes, image_bytes)
+
+    def test_grid_detector_finds_offset_grid_phase(self):
+        image_bytes = synthetic_grid_png(size=256, cell=32, offset=11)
+        grid = detect_grid_from_image(image_bytes)
+
+        self.assertLessEqual(abs(grid['origin_px']['x'] - 11), 4)
+        self.assertLessEqual(abs(grid['origin_px']['y'] - 11), 4)
+        self.assertLessEqual(abs(grid['cell_size_px']['average'] - 32), 2)
+        self.assertEqual(grid['columns'], 7)
+        self.assertEqual(grid['rows'], 7)
+        self.assertGreaterEqual(grid['confidence'], 0.45)
+
+    def test_grid_detector_preserves_near_cell_offset_phase(self):
+        image_bytes = synthetic_grid_png(size=256, cell=32, offset=31)
+        grid = detect_grid_from_image(image_bytes)
+
+        self.assertLessEqual(abs(grid['origin_px']['x'] - 31), 4)
+        self.assertLessEqual(abs(grid['origin_px']['y'] - 31), 4)
+        self.assertLessEqual(abs(grid['cell_size_px']['average'] - 32), 2)
+        self.assertEqual(grid['columns'], 7)
+        self.assertEqual(grid['rows'], 7)
+        self.assertGreaterEqual(grid['confidence'], 0.45)
+
+    def test_create_encounter_map_persists_vtt_setup_json(self):
+        image_bytes = synthetic_grid_png(size=256, cell=32)
+        setup_json = {
+            'map_summary': 'Compact arena with cover and northern ruins.',
+            'dm_setup_context': 'Friendlies enter from the south; enemies hold the ruins.',
+            'friendly_spawn_boxes': [{
+                'label': 'Friendly Entry',
+                'rect': {'col': 1, 'row': 6, 'width': 2, 'height': 1},
+                'description': 'Players enter from the lower path.',
+                'confidence': 0.9,
+            }],
+            'enemy_spawn_boxes': [{
+                'label': 'North Ruins',
+                'rect': {'col': 5, 'row': 1, 'width': 2, 'height': 2},
+                'description': 'Enemies hold the upper cover.',
+                'confidence': 0.8,
+            }],
+            'terrain_zones': [{
+                'kind': 'cover',
+                'label': 'Crates',
+                'shape_type': 'rect',
+                'rect': {'col': 3, 'row': 3, 'width': 2, 'height': 1},
+                'polygon': [],
+                'description': 'Half cover from stacked crates.',
+                'confidence': 0.85,
+            }],
+            'obstacles': [{
+                'label': 'Crate Stack',
+                'kind': 'cover',
+                'shape_type': 'rect',
+                'rect': {'col': 3, 'row': 3, 'width': 2, 'height': 1},
+                'polygon': [],
+                'movement_effect': 'provides_cover',
+                'cover_type': 'half',
+                'description': 'Stacked crates provide half cover.',
+                'confidence': 0.86,
+            }],
+            'tactical_notes': ['South side has the safest load-in lane.'],
+        }
+
+        class FakeImageResponse:
+            def raise_for_status(self):
+                return None
+
+            def json(self):
+                return {'data': [{'b64_json': base64.b64encode(image_bytes).decode('ascii')}]}
+
+        class FakeSetupResponse:
+            def raise_for_status(self):
+                return None
+
+            def json(self):
+                return {'output_text': json.dumps(setup_json)}
+
+        with tempfile.TemporaryDirectory() as temp_dir, \
+                patch.dict(os.environ, {
+                    'OPENAI_API_KEY': 'test-key',
+                    'ENCOUNTER_MAP_STORAGE_DIR': temp_dir,
+                    'OPENAI_IMAGE_QA_ENABLED': 'false',
+                }, clear=False), \
+                patch('services.encounter_map_service.requests.post', side_effect=[
+                    FakeImageResponse(),
+                    FakeSetupResponse(),
+                ]) as post:
+            result = execute_dm_tool(
+                self.campaign,
+                self.session,
+                self.user,
+                'create_encounter_map',
+                {
+                    'title': 'Setup Map',
+                    'map_prompt': 'A compact tactical arena with cover.',
+                    'vtt_setup_notes': 'Friendlies enter from the south; enemies hold the northern ruins.',
+                },
+                {},
+            )
+
+            encounter_map = EncounterMap.query.filter_by(campaign_id=self.campaign.id).one()
+            self.assertEqual(encounter_map.setup_status, 'ready')
+            self.assertTrue(os.path.exists(os.path.join(temp_dir, encounter_map.image_filename)))
+            self.assertTrue(os.path.exists(os.path.join(temp_dir, encounter_map.labeled_image_filename)))
+            self.assertLessEqual(abs(json.loads(encounter_map.grid_json)['cell_size_px']['average'] - 32), 2)
+            persisted_setup = json.loads(encounter_map.vtt_setup_json)
+
+        self.assertEqual(persisted_setup['friendly_spawn_boxes'][0]['label'], 'Friendly Entry')
+        self.assertEqual(persisted_setup['player_start_areas'][0]['label'], 'Friendly Entry')
+        self.assertEqual(persisted_setup['obstacles'][0]['movement_effect'], 'provides_cover')
+        self.assertEqual(persisted_setup['terrain_zones'][0]['kind'], 'cover')
+        self.assertEqual(result['encounter_map']['setup_status'], 'ready')
+        self.assertLessEqual(abs(result['encounter_map']['grid']['cell_size_px']['average'] - 32), 2)
+        self.assertEqual(result['encounter_map']['vtt_setup']['enemy_spawn_boxes'][0]['label'], 'North Ruins')
+        self.assertEqual(result['encounter_map']['vtt_setup']['enemy_start_areas'][0]['label'], 'North Ruins')
+        setup_call = post.call_args_list[1]
+        self.assertEqual(setup_call.kwargs['json']['model'], 'gpt-5.4-mini')
+        setup_text = setup_call.kwargs['json']['input'][0]['content'][0]['text']
+        self.assertIn('DM setup and placement instructions', setup_text)
+        self.assertIn('Friendlies enter from the south', setup_text)
+        setup_schema = setup_call.kwargs['json']['text']['format']['schema']
+        self.assertIn('friendly_spawn_boxes', setup_schema['required'])
+        self.assertIn('enemy_spawn_boxes', setup_schema['required'])
+        self.assertIn('obstacles', setup_schema['required'])
+        image_parts = [
+            part for part in setup_call.kwargs['json']['input'][0]['content']
+            if part.get('type') == 'input_image'
+        ]
+        self.assertEqual(len(image_parts), 2)
+        self.assertEqual(image_parts[0]['detail'], 'low')
+        self.assertEqual(image_parts[1]['detail'], 'high')
+
+    def test_low_confidence_grid_setup_fails_without_blocking_map(self):
+        image_bytes = synthetic_grid_png(size=256, cell=32, blank=True)
+
+        class FakeImageResponse:
+            def raise_for_status(self):
+                return None
+
+            def json(self):
+                return {'data': [{'b64_json': base64.b64encode(image_bytes).decode('ascii')}]}
+
+        with tempfile.TemporaryDirectory() as temp_dir, \
+                patch.dict(os.environ, {
+                    'OPENAI_API_KEY': 'test-key',
+                    'ENCOUNTER_MAP_STORAGE_DIR': temp_dir,
+                    'OPENAI_IMAGE_QA_ENABLED': 'false',
+                    'OPENAI_IMAGE_GRID_MAX_RETRIES': '0',
+                }, clear=False), \
+                patch('services.encounter_map_service.requests.post', return_value=FakeImageResponse()) as post:
+            result = execute_dm_tool(
+                self.campaign,
+                self.session,
+                self.user,
+                'create_encounter_map',
+                {'title': 'Blank Map', 'map_prompt': 'A blank field.'},
+                {},
+            )
+
+            encounter_map = EncounterMap.query.filter_by(campaign_id=self.campaign.id).one()
+            self.assertTrue(os.path.exists(os.path.join(temp_dir, encounter_map.image_filename)))
+
+        self.assertEqual(post.call_count, 1)
+        self.assertEqual(encounter_map.setup_status, 'failed')
+        self.assertIsNone(encounter_map.vtt_setup_json)
+        self.assertIn('grid', encounter_map.setup_error.lower())
+        self.assertEqual(result['encounter_map']['setup_status'], 'failed')
+
+    def test_grid_validation_retries_generation_before_saving_map(self):
+        bad_image_bytes = synthetic_grid_png(size=256, cell=32, blank=True)
+        good_image_bytes = synthetic_grid_png(size=256, cell=32)
+        setup_json = {
+            'player_start_areas': [],
+            'enemy_start_areas': [],
+            'terrain_zones': [],
+        }
+
+        class FakeImageResponse:
+            def __init__(self, image_bytes):
+                self.image_bytes = image_bytes
+
+            def raise_for_status(self):
+                return None
+
+            def json(self):
+                return {'data': [{'b64_json': base64.b64encode(self.image_bytes).decode('ascii')}]}
+
+        class FakeSetupResponse:
+            def raise_for_status(self):
+                return None
+
+            def json(self):
+                return {'output_text': json.dumps(setup_json)}
+
+        with tempfile.TemporaryDirectory() as temp_dir, \
+                patch.dict(os.environ, {
+                    'OPENAI_API_KEY': 'test-key',
+                    'ENCOUNTER_MAP_STORAGE_DIR': temp_dir,
+                    'OPENAI_IMAGE_QA_ENABLED': 'false',
+                    'OPENAI_IMAGE_GRID_MAX_RETRIES': '1',
+                }, clear=False), \
+                patch('services.encounter_map_service.requests.post', side_effect=[
+                    FakeImageResponse(bad_image_bytes),
+                    FakeImageResponse(good_image_bytes),
+                    FakeSetupResponse(),
+                ]) as post:
+            result = execute_dm_tool(
+                self.campaign,
+                self.session,
+                self.user,
+                'create_encounter_map',
+                {'title': 'Retry Grid Map', 'map_prompt': 'A map with a clear machine-readable grid.'},
+                {},
+            )
+
+            encounter_map = EncounterMap.query.filter_by(campaign_id=self.campaign.id).one()
+            saved_path = os.path.join(temp_dir, encounter_map.image_filename)
+            with open(saved_path, 'rb') as file:
+                self.assertEqual(file.read(), good_image_bytes)
+
+        self.assertEqual(post.call_count, 3)
+        self.assertEqual(encounter_map.setup_status, 'ready')
+        self.assertLessEqual(abs(result['encounter_map']['grid']['cell_size_px']['average'] - 32), 2)
+        self.assertIn('Machine grid-detection corrections', post.call_args_list[1].kwargs['json']['prompt'])
+
+    def test_create_encounter_map_tool_persists_generated_png(self):
+        image_bytes = synthetic_grid_png(size=128, cell=32, blank=True)
+
+        class FakeImageResponse:
+            def raise_for_status(self):
+                return None
+
+            def json(self):
+                return {
+                    'data': [{'b64_json': base64.b64encode(image_bytes).decode('ascii')}],
+                    'usage': {'total_tokens': 12},
+                }
+
+        class FakeQaResponse:
+            def raise_for_status(self):
+                return None
+
+            def json(self):
+                return {
+                    'output_text': json.dumps({
+                        'pass': True,
+                        'score': 9,
+                        'issues': [],
+                        'retry_prompt_patch': '',
+                    })
+                }
+
+        with tempfile.TemporaryDirectory() as temp_dir, \
+                patch.dict(os.environ, {
+                    'OPENAI_API_KEY': 'test-key',
+                    'ENCOUNTER_MAP_STORAGE_DIR': temp_dir,
+                    'OPENAI_IMAGE_TIMEOUT_SECONDS': '240',
+                    'OPENAI_IMAGE_GRID_VALIDATION_ENABLED': 'false',
+                }, clear=False), \
+                patch('services.encounter_map_service.requests.post', side_effect=[
+                    FakeImageResponse(),
+                    FakeQaResponse(),
+                ]) as post:
+            result = execute_dm_tool(
+                self.campaign,
+                self.session,
+                self.user,
+                'create_encounter_map',
+                {
+                    'title': 'Dock Ward Ambush',
+                    'map_prompt': 'A rain-slick dock with crates, alleys, and a moored skiff.',
+                    'terrain': 'urban waterfront',
+                    'tactical_features': 'crates for cover and two narrow gangplanks',
+                    'mood': 'night rain',
+                },
+                {'trace_id': 'session_dm:test'},
+            )
+
+            encounter_map = EncounterMap.query.filter_by(campaign_id=self.campaign.id).one()
+            saved_path = os.path.join(temp_dir, encounter_map.image_filename)
+            self.assertTrue(os.path.exists(saved_path))
+            with open(saved_path, 'rb') as file:
+                self.assertEqual(file.read(), image_bytes)
+
+        self.assertIn('encounter_map', result)
+        self.assertEqual(result['encounter_map']['title'], 'Dock Ward Ambush')
+        self.assertEqual(result['encounter_map']['image_url'], f'/api/encounter-maps/{encounter_map.id}/image')
+        image_call = post.call_args_list[0]
+        qa_call = post.call_args_list[1]
+        self.assertEqual(image_call.kwargs['json']['model'], 'gpt-image-2')
+        self.assertEqual(image_call.kwargs['json']['quality'], 'medium')
+        self.assertEqual(image_call.kwargs['timeout'], 240)
+        self.assertEqual(qa_call.kwargs['json']['model'], 'gpt-5.4-mini')
+        self.assertEqual(qa_call.kwargs['json']['input'][0]['content'][1]['detail'], 'low')
+        prompt = image_call.kwargs['json']['prompt']
+        self.assertIn('VTT-ready', prompt)
+        self.assertIn('battlemap/cartography style', prompt)
+        self.assertIn('no cinematic perspective', prompt)
+        self.assertIn('Design the map around the grid', prompt)
+        self.assertIn('Each grid cell should have an obvious gameplay meaning', prompt)
+        self.assertIn('align to grid squares', prompt)
+        self.assertIn('snap cleanly to grid lines', prompt)
+        self.assertIn('obvious open squares', prompt)
+        self.assertIn('tactical contrast high', prompt)
+        self.assertIn('Do not let canopy texture obscure grid intersections', prompt)
+        self.assertIn('Do not include people', prompt)
+        self.assertIn('tokens can be placed on top', prompt)
+        self.assertIn('straight evenly spaced grid lines', prompt)
+
+    def test_create_encounter_map_retries_once_when_quality_review_fails(self):
+        image_bytes = synthetic_grid_png(size=128, cell=32, blank=True)
+
+        class FakeImageResponse:
+            def raise_for_status(self):
+                return None
+
+            def json(self):
+                return {'data': [{'b64_json': base64.b64encode(image_bytes).decode('ascii')}]}
+
+        class FakeQaResponse:
+            def __init__(self, passed, score, patch_text):
+                self.passed = passed
+                self.score = score
+                self.patch_text = patch_text
+
+            def raise_for_status(self):
+                return None
+
+            def json(self):
+                return {
+                    'output_text': json.dumps({
+                        'pass': self.passed,
+                        'score': self.score,
+                        'issues': ['Grid is pasted over scenery'],
+                        'retry_prompt_patch': self.patch_text,
+                    })
+                }
+
+        retry_patch = 'Make every wall and obstacle snap to grid squares.'
+        with tempfile.TemporaryDirectory() as temp_dir, \
+                patch.dict(os.environ, {
+                    'OPENAI_API_KEY': 'test-key',
+                    'ENCOUNTER_MAP_STORAGE_DIR': temp_dir,
+                    'OPENAI_IMAGE_QA_MAX_RETRIES': '1',
+                    'OPENAI_IMAGE_GRID_VALIDATION_ENABLED': 'false',
+                }, clear=False), \
+                patch('services.encounter_map_service.requests.post', side_effect=[
+                    FakeImageResponse(),
+                    FakeQaResponse(False, 5, retry_patch),
+                    FakeImageResponse(),
+                    FakeQaResponse(True, 9, ''),
+                ]) as post:
+            result = execute_dm_tool(
+                self.campaign,
+                self.session,
+                self.user,
+                'create_encounter_map',
+                {'title': 'Retry Map', 'map_prompt': 'A narrow dungeon junction.'},
+                {},
+            )
+
+            encounter_map = EncounterMap.query.filter_by(campaign_id=self.campaign.id).one()
+
+        image_calls = [
+            call for call in post.call_args_list
+            if call.kwargs['json'].get('model') == 'gpt-image-2'
+        ]
+        self.assertEqual(len(image_calls), 2)
+        self.assertIn(retry_patch, image_calls[1].kwargs['json']['prompt'])
+        self.assertIn(retry_patch, encounter_map.prompt)
+        self.assertEqual(result['encounter_map']['id'], encounter_map.id)
+
+    def test_create_encounter_map_tool_returns_clear_error_without_openai_key(self):
+        with patch.dict(os.environ, {'OPENAI_API_KEY': ''}, clear=False):
+            result = execute_dm_tool(
+                self.campaign,
+                self.session,
+                self.user,
+                'create_encounter_map',
+                {'title': 'No Key Map', 'map_prompt': 'A small cave.'},
+                {},
+            )
+
+        self.assertIn('OPENAI_API_KEY is required', result['error'])
+        self.assertEqual(EncounterMap.query.count(), 0)
+
+    def test_create_encounter_map_tool_reports_timeout_with_configured_limit(self):
+        with tempfile.TemporaryDirectory() as temp_dir, \
+                patch.dict(os.environ, {
+                    'OPENAI_API_KEY': 'test-key',
+                    'ENCOUNTER_MAP_STORAGE_DIR': temp_dir,
+                    'OPENAI_IMAGE_TIMEOUT_SECONDS': '180',
+                }, clear=False), \
+                patch('services.encounter_map_service.requests.post', side_effect=requests.Timeout('too slow')):
+            result = execute_dm_tool(
+                self.campaign,
+                self.session,
+                self.user,
+                'create_encounter_map',
+                {'title': 'Slow Map', 'map_prompt': 'A large ruin.'},
+                {},
+            )
+
+        self.assertIn('Failed to generate encounter map', result['error'])
+        self.assertIn('timed out after 180 seconds', result['error'])
+        self.assertEqual(EncounterMap.query.count(), 0)
+
+    def test_session_message_route_completes_when_dm_tool_creates_map(self):
+        image_bytes = synthetic_grid_png(size=128, cell=32, blank=True)
+
+        class FakeResponse:
+            def raise_for_status(self):
+                return None
+
+            def json(self):
+                return {'data': [{'b64_json': base64.b64encode(image_bytes).decode('ascii')}]}
+
+        def dm_response(_hot_context, _recent_messages, _tools, execute_tool, audit_context=None):
+            execute_tool(
+                'create_encounter_map',
+                {
+                    'title': 'Warehouse Fight',
+                    'map_prompt': 'A warehouse with stacked crates and loading doors.',
+                },
+                audit_context or {},
+            )
+            return {'mode': 'speak', 'content': 'A gridded map appears on the table.'}
+
+        token = generate_token(self.user.id)
+        with tempfile.TemporaryDirectory() as temp_dir, \
+                patch.dict(os.environ, {
+                    'OPENAI_API_KEY': 'test-key',
+                    'ENCOUNTER_MAP_STORAGE_DIR': temp_dir,
+                    'OPENAI_IMAGE_QA_ENABLED': 'false',
+                    'OPENAI_IMAGE_GRID_VALIDATION_ENABLED': 'false',
+                }, clear=False), \
+                patch('services.encounter_map_service.requests.post', return_value=FakeResponse()), \
+                patch('routes.sessions.get_session_dm_response_with_tools', side_effect=dm_response), \
+                patch('routes.sessions.get_session_memory_patch', return_value={}):
+            response = self.client.post(
+                f'/api/sessions/{self.session.id}/messages',
+                json={'content': '<ooc>Please make a map.</ooc>'},
+                headers={'Authorization': f'Bearer {token}'},
+            )
+
+            self.assertEqual(response.status_code, 201)
+            self.assertEqual(EncounterMap.query.filter_by(campaign_id=self.campaign.id).count(), 1)
+            encounter_map = EncounterMap.query.filter_by(campaign_id=self.campaign.id).one()
+            self.assertTrue(os.path.exists(os.path.join(temp_dir, encounter_map.image_filename)))
+
+        messages = response.get_json()['messages']
+        self.assertEqual(messages[-1]['content'], 'A gridded map appears on the table.')
 
     def test_hot_context_includes_protected_player_characters(self):
         hot_context = build_session_hot_context(self.campaign, self.session, self.user)

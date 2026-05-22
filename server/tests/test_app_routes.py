@@ -2,8 +2,10 @@ import os
 import sys
 import tempfile
 import unittest
+import json
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
+from unittest.mock import patch
 
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), '..')))
 os.environ['DATABASE_URL'] = 'sqlite:///:memory:'
@@ -14,9 +16,18 @@ os.environ['OPENROUTER_RUNTIME_MODEL_FILE'] = os.path.join(
 
 from app import app
 from auth import generate_token
-from models import db, Campaign, CampaignInvite, CampaignMember, Character, PlanningBondProposal, User
+from models import (
+    db,
+    Campaign,
+    CampaignInvite,
+    CampaignMember,
+    Character,
+    EncounterMap,
+    PlanningBondProposal,
+    User,
+)
 from openrouter import get_openrouter_model, reset_openrouter_model
-from services.planning_service import apply_bond_suggestions
+from services.planning_service import apply_bond_suggestions, planning_context
 
 
 class AppRouteTest(unittest.TestCase):
@@ -94,6 +105,164 @@ class AppRouteTest(unittest.TestCase):
         self.assertEqual(response.status_code, 200)
         self.assertIn('text/javascript', response.content_type)
         self.assertEqual(response.data, b'console.log("ok")')
+
+    def test_encounter_map_routes_require_campaign_membership(self):
+        maps_dir = Path(self.temp_dir.name) / 'maps'
+        maps_dir.mkdir()
+        (maps_dir / 'map.png').write_bytes(b'\x89PNG\r\n\x1a\nfake')
+        (maps_dir / 'map_labeled.png').write_bytes(b'\x89PNG\r\n\x1a\nlabeled')
+
+        with app.app_context():
+            owner = User(username='owner2', email='owner2@example.com')
+            owner.set_password('password')
+            member = User(username='member2', email='member2@example.com')
+            member.set_password('password')
+            outsider = User(username='outsider', email='outsider@example.com')
+            outsider.set_password('password')
+            db.session.add_all([owner, member, outsider])
+            db.session.commit()
+
+            campaign = Campaign(name='Map Campaign', user_id=owner.id)
+            db.session.add(campaign)
+            db.session.commit()
+            db.session.add(CampaignMember(campaign_id=campaign.id, user_id=owner.id, role='player'))
+            db.session.add(CampaignMember(campaign_id=campaign.id, user_id=member.id, role='player'))
+            encounter_map = EncounterMap(
+                campaign_id=campaign.id,
+                title='Bridge Fight',
+                prompt='A bridge over a chasm.',
+                image_filename='map.png',
+                labeled_image_filename='map_labeled.png',
+                model='gpt-image-2',
+                size='1024x1024',
+                quality='high',
+                grid_json=json.dumps({
+                    'origin_px': {'x': 0, 'y': 0},
+                    'cell_size_px': {'x': 64.0, 'y': 64.0, 'average': 64.0},
+                    'columns': 16,
+                    'rows': 16,
+                    'rotation_degrees': 0,
+                    'confidence': 0.9,
+                    'warnings': [],
+                }),
+                vtt_setup_json=json.dumps({
+                    'map_summary': 'Bridge over a chasm.',
+                    'dm_setup_context': 'Enemies start hidden on the far ridge.',
+                    'friendly_spawn_boxes': [],
+                    'player_start_areas': [],
+                    'enemy_spawn_boxes': [{
+                        'label': 'Hidden Ridge',
+                        'rect': {'col': 12, 'row': 2, 'width': 2, 'height': 2},
+                        'description': 'Enemy start.',
+                        'confidence': 0.8,
+                    }],
+                    'enemy_start_areas': [],
+                    'terrain_zones': [],
+                    'obstacles': [],
+                    'tactical_notes': ['Do not reveal enemy start until initiative.'],
+                }),
+                setup_status='ready',
+            )
+            db.session.add(encounter_map)
+            db.session.commit()
+            campaign_id = campaign.id
+            map_id = encounter_map.id
+            owner_token = generate_token(owner.id)
+            member_token = generate_token(member.id)
+            outsider_token = generate_token(outsider.id)
+
+        with patch.dict(os.environ, {'ENCOUNTER_MAP_STORAGE_DIR': str(maps_dir)}, clear=False):
+            owner_response = self.client.get(
+                f'/api/campaigns/{campaign_id}/encounter-maps/current',
+                headers={'Authorization': f'Bearer {owner_token}'},
+            )
+            member_response = self.client.get(
+                f'/api/campaigns/{campaign_id}/encounter-maps/current',
+                headers={'Authorization': f'Bearer {member_token}'},
+            )
+            outsider_response = self.client.get(
+                f'/api/campaigns/{campaign_id}/encounter-maps/current',
+                headers={'Authorization': f'Bearer {outsider_token}'},
+            )
+            outsider_image = self.client.get(
+                f'/api/encounter-maps/{map_id}/image',
+                headers={'Authorization': f'Bearer {outsider_token}'},
+            )
+            owner_labeled_image = self.client.get(
+                f'/api/encounter-maps/{map_id}/labeled-image',
+                headers={'Authorization': f'Bearer {owner_token}'},
+            )
+            outsider_labeled_image = self.client.get(
+                f'/api/encounter-maps/{map_id}/labeled-image',
+                headers={'Authorization': f'Bearer {outsider_token}'},
+            )
+
+        self.assertEqual(owner_response.status_code, 200)
+        owner_map = owner_response.get_json()['encounter_map']
+        self.assertEqual(owner_map['title'], 'Bridge Fight')
+        self.assertEqual(owner_map['setup_status'], 'ready')
+        self.assertEqual(owner_map['grid']['cell_size_px']['average'], 64.0)
+        self.assertEqual(owner_map['labeled_image_url'], f'/api/encounter-maps/{map_id}/labeled-image')
+        self.assertIn('enemy_spawn_boxes', owner_map['vtt_setup'])
+        self.assertIn('dm_setup_context', owner_map['vtt_setup'])
+        self.assertEqual(member_response.status_code, 200)
+        member_map = member_response.get_json()['encounter_map']
+        self.assertIn('friendly_spawn_boxes', member_map['vtt_setup'])
+        self.assertIn('terrain_zones', member_map['vtt_setup'])
+        self.assertNotIn('enemy_spawn_boxes', member_map['vtt_setup'])
+        self.assertNotIn('dm_setup_context', member_map['vtt_setup'])
+        self.assertEqual(outsider_response.status_code, 403)
+        self.assertEqual(outsider_image.status_code, 403)
+        self.assertEqual(owner_labeled_image.status_code, 200)
+        self.assertEqual(outsider_labeled_image.status_code, 403)
+
+    def test_human_users_do_not_have_map_placement_routes(self):
+        with app.app_context():
+            owner = User(username='mapowner', email='mapowner@example.com')
+            owner.set_password('password')
+            db.session.add(owner)
+            db.session.commit()
+
+            campaign = Campaign(name='Placement Routes Campaign', user_id=owner.id)
+            db.session.add(campaign)
+            db.session.commit()
+            db.session.add(CampaignMember(campaign_id=campaign.id, user_id=owner.id, role='player'))
+            encounter_map = EncounterMap(
+                campaign_id=campaign.id,
+                title='Ruined Hall',
+                prompt='A ruined hall.',
+                image_filename='map.png',
+                model='gpt-image-2',
+                size='1024x1024',
+                quality='high',
+                grid_json=json.dumps({'columns': 12, 'rows': 10}),
+                setup_status='ready',
+            )
+            db.session.add(encounter_map)
+            db.session.commit()
+            campaign_id = campaign.id
+            map_id = encounter_map.id
+            owner_token = generate_token(owner.id)
+
+        create_monster = self.client.post(
+            f'/api/campaigns/{campaign_id}/monsters',
+            json={'monster_id': 'goblin_1', 'name': 'Goblin'},
+            headers={'Authorization': f'Bearer {owner_token}'},
+        )
+        place_actor = self.client.post(
+            f'/api/encounter-maps/{map_id}/placements',
+            json={'actor_type': 'monster', 'actor_id': 'goblin_1', 'col': 1, 'row': 1},
+            headers={'Authorization': f'Bearer {owner_token}'},
+        )
+        current_map = self.client.get(
+            f'/api/campaigns/{campaign_id}/encounter-maps/current',
+            headers={'Authorization': f'Bearer {owner_token}'},
+        )
+
+        self.assertIn(create_monster.status_code, {404, 405})
+        self.assertIn(place_actor.status_code, {404, 405})
+        self.assertEqual(current_map.status_code, 200)
+        self.assertEqual(current_map.get_json()['encounter_map']['placements'], [])
 
     def test_missing_api_routes_stay_json_404s(self):
         response = self.client.get('/api/not-real')
@@ -266,6 +435,87 @@ class AppRouteTest(unittest.TestCase):
             db.session.commit()
 
             self.assertEqual(PlanningBondProposal.query.filter_by(campaign_id=campaign.id).count(), 1)
+
+    def test_planning_context_read_only_mode_sanitizes_invalid_ready_state_without_dirtying_session(self):
+        with app.app_context():
+            owner = User(username='owner', email='owner@example.com')
+            owner.set_password('password')
+            player = User(username='player', email='player@example.com')
+            player.set_password('password')
+            db.session.add_all([owner, player])
+            db.session.commit()
+
+            campaign = Campaign(name='Lost Stones', user_id=owner.id)
+            db.session.add(campaign)
+            db.session.flush()
+            member = CampaignMember(
+                campaign_id=campaign.id,
+                user_id=player.id,
+                role='player',
+                selected_character_id=9999,
+                character_ready_at=datetime(2026, 1, 1, 12, 0, 0),
+            )
+            db.session.add_all([
+                CampaignMember(campaign_id=campaign.id, user_id=owner.id, role='player'),
+                member,
+            ])
+            db.session.commit()
+
+            context = planning_context(campaign, player, clean_ready_states=False)
+            player_member = next(item for item in context['members'] if item['user_id'] == player.id)
+
+            self.assertIsNone(player_member['selected_character_id'])
+            self.assertIsNone(player_member['character_ready_at'])
+            self.assertFalse(player_member['is_character_ready'])
+            self.assertFalse(db.session.dirty)
+            persisted_member = db.session.get(CampaignMember, member.id)
+            self.assertEqual(persisted_member.selected_character_id, 9999)
+            self.assertIsNotNone(persisted_member.character_ready_at)
+
+    def test_dev_audit_does_not_flush_invalid_ready_state_cleanup(self):
+        with app.app_context():
+            owner = User(username='owner', email='owner@example.com')
+            owner.set_password('password')
+            player = User(username='player', email='player@example.com')
+            player.set_password('password')
+            db.session.add_all([owner, player])
+            db.session.commit()
+
+            campaign = Campaign(name='Lost Stones', user_id=owner.id)
+            db.session.add(campaign)
+            db.session.flush()
+            member = CampaignMember(
+                campaign_id=campaign.id,
+                user_id=player.id,
+                role='player',
+                selected_character_id=9999,
+                character_ready_at=datetime(2026, 1, 1, 12, 0, 0),
+            )
+            db.session.add_all([
+                CampaignMember(campaign_id=campaign.id, user_id=owner.id, role='player'),
+                member,
+            ])
+            db.session.commit()
+            campaign_id = campaign.id
+            member_id = member.id
+            player_id = player.id
+            token = generate_token(player.id)
+
+        response = self.client.get(
+            f'/api/campaigns/{campaign_id}/dev',
+            headers={'Authorization': f'Bearer {token}'},
+        )
+
+        self.assertEqual(response.status_code, 200)
+        planning_member = next(
+            item for item in response.get_json()['planning']['context']['members']
+            if item['user_id'] == player_id
+        )
+        self.assertIsNone(planning_member['selected_character_id'])
+        with app.app_context():
+            persisted_member = db.session.get(CampaignMember, member_id)
+            self.assertEqual(persisted_member.selected_character_id, 9999)
+            self.assertIsNotNone(persisted_member.character_ready_at)
 
     def test_pending_bond_blocks_character_ready(self):
         with app.app_context():

@@ -27,6 +27,27 @@ export async function apiFetch(path, options = {}) {
   return data
 }
 
+export async function apiBlob(path, options = {}) {
+  const url = `${API_BASE}${path}`
+  const headers = {
+    ...(options.headers || {}),
+  }
+  const token = getToken()
+  if (token) {
+    headers.Authorization = `Bearer ${token}`
+  }
+
+  const res = await fetch(url, { ...options, headers })
+  if (!res.ok) {
+    const data = await res.json().catch(() => ({}))
+    const err = new Error(data.error || `HTTP ${res.status}`)
+    err.status = res.status
+    err.data = data
+    throw err
+  }
+  return res.blob()
+}
+
 export function getCharacters() {
   return apiFetch('/characters')
 }
@@ -112,6 +133,18 @@ export function listSessions(campaignId) {
 
 export function getCampaignWorld(campaignId) {
   return apiFetch(`/campaigns/${campaignId}/world`)
+}
+
+export function getCurrentEncounterMap(campaignId) {
+  return apiFetch(`/campaigns/${campaignId}/encounter-maps/current`)
+}
+
+export function getEncounterMapImage(encounterMapId) {
+  return apiBlob(`/encounter-maps/${encounterMapId}/image`)
+}
+
+export function getEncounterMapLabeledImage(encounterMapId) {
+  return apiBlob(`/encounter-maps/${encounterMapId}/labeled-image`)
 }
 
 export function generateCampaignWorld(campaignId) {

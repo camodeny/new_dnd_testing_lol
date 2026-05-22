@@ -1,6 +1,8 @@
+from datetime import datetime
+import json
+
 from flask_sqlalchemy import SQLAlchemy
 from werkzeug.security import generate_password_hash, check_password_hash
-from datetime import datetime
 
 db = SQLAlchemy()
 
@@ -54,6 +56,8 @@ class Campaign(db.Model):
     clocks = db.relationship('CampaignClock', backref='campaign', lazy=True, cascade='all, delete-orphan')
     world_events = db.relationship('WorldEvent', backref='campaign', lazy=True, cascade='all, delete-orphan')
     memory_embeddings = db.relationship('CampaignMemoryEmbedding', backref='campaign', lazy=True, cascade='all, delete-orphan')
+    encounter_maps = db.relationship('EncounterMap', backref='campaign', lazy=True, cascade='all, delete-orphan')
+    monsters = db.relationship('CampaignMonster', backref='campaign', lazy=True, cascade='all, delete-orphan')
 
 
     def to_dict(self):
@@ -918,6 +922,145 @@ class WorldEvent(db.Model):
             'payload': payload if include_private else {},
             'visibility': self.visibility,
             'created_at': self.created_at.isoformat() if self.created_at else None,
+        }
+
+
+class CampaignMonster(db.Model):
+    __tablename__ = 'campaign_monsters'
+
+    id = db.Column(db.Integer, primary_key=True)
+    campaign_id = db.Column(db.Integer, db.ForeignKey('campaign.id'), nullable=False, index=True)
+    monster_id = db.Column(db.String(100), nullable=False)
+    name = db.Column(db.String(200), nullable=False)
+    stat_block = db.Column(db.Text, nullable=True)
+    created_at = db.Column(db.DateTime, default=datetime.utcnow)
+    updated_at = db.Column(db.DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
+
+    __table_args__ = (
+        db.UniqueConstraint('campaign_id', 'monster_id', name='uq_campaign_monster_campaign_monster'),
+    )
+
+    def to_dict(self):
+        try:
+            stat_block = json.loads(self.stat_block) if self.stat_block else {}
+        except (TypeError, ValueError):
+            stat_block = {}
+        return {
+            'id': self.id,
+            'campaign_id': self.campaign_id,
+            'monster_id': self.monster_id,
+            'name': self.name,
+            'stat_block': stat_block,
+            'created_at': self.created_at.isoformat() if self.created_at else None,
+            'updated_at': self.updated_at.isoformat() if self.updated_at else None,
+        }
+
+
+class EncounterMap(db.Model):
+    __tablename__ = 'encounter_maps'
+
+    id = db.Column(db.Integer, primary_key=True)
+    campaign_id = db.Column(db.Integer, db.ForeignKey('campaign.id'), nullable=False, index=True)
+    session_id = db.Column(db.Integer, db.ForeignKey('campaign_sessions.id'), nullable=True, index=True)
+    title = db.Column(db.String(200), nullable=False)
+    prompt = db.Column(db.Text, nullable=False)
+    image_filename = db.Column(db.String(260), nullable=False)
+    labeled_image_filename = db.Column(db.String(260), nullable=True)
+    model = db.Column(db.String(120), nullable=False)
+    size = db.Column(db.String(40), nullable=False)
+    quality = db.Column(db.String(40), nullable=False)
+    grid_json = db.Column(db.Text, nullable=True)
+    vtt_setup_json = db.Column(db.Text, nullable=True)
+    setup_status = db.Column(db.String(20), default='pending')
+    setup_error = db.Column(db.String(500), nullable=True)
+    created_by_tool = db.Column(db.Boolean, default=True)
+    created_at = db.Column(db.DateTime, default=datetime.utcnow)
+    updated_at = db.Column(db.DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
+    session = db.relationship('CampaignSession')
+    placements = db.relationship(
+        'EncounterMapPlacement',
+        backref='encounter_map',
+        lazy=True,
+        cascade='all, delete-orphan',
+    )
+
+    @staticmethod
+    def _json_value(raw_value, default=None):
+        if not raw_value:
+            return default
+        try:
+            return json.loads(raw_value)
+        except (TypeError, ValueError):
+            return default
+
+    @staticmethod
+    def _public_vtt_setup(setup):
+        if not isinstance(setup, dict):
+            return setup
+        return {
+            'map_summary': setup.get('map_summary'),
+            'friendly_spawn_boxes': setup.get('friendly_spawn_boxes', []),
+            'player_start_areas': setup.get('player_start_areas', setup.get('friendly_spawn_boxes', [])),
+            'terrain_zones': setup.get('terrain_zones', []),
+            'obstacles': setup.get('obstacles', []),
+        }
+
+    def to_dict(self, include_private=False):
+        vtt_setup = self._json_value(self.vtt_setup_json)
+        return {
+            'id': self.id,
+            'campaign_id': self.campaign_id,
+            'session_id': self.session_id,
+            'title': self.title,
+            'prompt': self.prompt,
+            'image_url': f'/api/encounter-maps/{self.id}/image',
+            'labeled_image_url': f'/api/encounter-maps/{self.id}/labeled-image' if self.labeled_image_filename else None,
+            'model': self.model,
+            'size': self.size,
+            'quality': self.quality,
+            'grid': self._json_value(self.grid_json),
+            'vtt_setup': vtt_setup if include_private else self._public_vtt_setup(vtt_setup),
+            'placements': [
+                placement.to_dict()
+                for placement in sorted(self.placements, key=lambda item: (item.grid_row, item.grid_col, item.id))
+            ],
+            'setup_status': self.setup_status or 'pending',
+            'setup_error': self.setup_error,
+            'created_by_tool': self.created_by_tool,
+            'created_at': self.created_at.isoformat() if self.created_at else None,
+            'updated_at': self.updated_at.isoformat() if self.updated_at else None,
+        }
+
+
+class EncounterMapPlacement(db.Model):
+    __tablename__ = 'encounter_map_placements'
+
+    id = db.Column(db.Integer, primary_key=True)
+    encounter_map_id = db.Column(db.Integer, db.ForeignKey('encounter_maps.id'), nullable=False, index=True)
+    actor_type = db.Column(db.String(20), nullable=False)
+    actor_id = db.Column(db.String(100), nullable=False)
+    label = db.Column(db.String(200), nullable=False)
+    grid_col = db.Column(db.Integer, nullable=False)
+    grid_row = db.Column(db.Integer, nullable=False)
+    created_at = db.Column(db.DateTime, default=datetime.utcnow)
+    updated_at = db.Column(db.DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
+
+    __table_args__ = (
+        db.UniqueConstraint('encounter_map_id', 'actor_type', 'actor_id', name='uq_encounter_map_actor_placement'),
+        db.CheckConstraint("actor_type in ('player', 'npc', 'monster')", name='ck_encounter_map_actor_type'),
+    )
+
+    def to_dict(self):
+        return {
+            'id': self.id,
+            'encounter_map_id': self.encounter_map_id,
+            'actor_type': self.actor_type,
+            'actor_id': self.actor_id,
+            'label': self.label,
+            'col': self.grid_col,
+            'row': self.grid_row,
+            'created_at': self.created_at.isoformat() if self.created_at else None,
+            'updated_at': self.updated_at.isoformat() if self.updated_at else None,
         }
 
 

@@ -1,8 +1,8 @@
 # Player Experience Feature Ideas
 
-These are player-facing features that would make the app feel richer without exposing DM-private world state. The shared rule across all of them is:
+These are player-facing features that would make the app feel richer without exposing AI-DM-private world state. In this product, the AI is the only Dungeon Master/DM; documentation should not imply a separate human DM or non-AI moderator. The shared rule across all of these ideas is:
 
-> A player-facing feature may reflect what happened to the character, what was explicitly revealed in play, or what the DM intentionally grants. It should not surface hidden motives, unrevealed facts, secret clocks, or behind-the-screen campaign structure.
+> A player-facing feature may reflect what happened to the character, what was explicitly revealed in play, or what the AI DM intentionally grants. It should not surface hidden motives, unrevealed facts, secret clocks, or behind-the-screen campaign structure.
 
 ## 1. Apply to Character Sheet Popup
 
@@ -21,25 +21,25 @@ Examples:
 
 ### Desired experience
 
-After the DM response, the player sees a small review popup or side tray with the proposed changes:
+After the AI DM response, the player sees a small review popup or side tray with the proposed changes:
 
 - what changed
 - why it changed
 - the before and after values
 - actions for `Apply`, `Edit`, or `Dismiss`
 
-This should feel like the app is helping with bookkeeping, not like the DM is silently editing the sheet behind the player's back.
+This should feel like the app is helping with bookkeeping, not like the AI DM is silently editing the sheet behind the player's back.
 
 ### Spoiler-safety rules
 
 - Only propose changes that are directly supported by visible play.
-- Never use hidden DM knowledge to mutate a sheet.
+- Never use hidden AI DM knowledge to mutate a sheet.
 - Keep approval with the player unless a future campaign setting explicitly enables auto-apply.
 
 ### Good first version
 
 - Support currency, HP, temp HP, inspiration, conditions, spell slots, resources, and equipment.
-- Generate proposals from structured DM output rather than parsing prose alone.
+- Generate proposals from structured AI DM output rather than parsing prose alone.
 - Reuse the existing review-before-apply behavior already used during character planning.
 
 ## 2. Sheet-Aware Rolls
@@ -83,11 +83,11 @@ The app fills in the correct bonus and shows enough roll detail to be trustworth
 
 ### Core idea
 
-When treasure is awarded, the DM can create a loot box that contains currency and items for the party to claim or distribute.
+When treasure is awarded, the AI DM can create a loot box that contains currency and items for the party to claim or distribute.
 
 ### Desired experience
 
-The DM produces a reward bundle such as:
+The AI DM produces a reward bundle such as:
 
 - mundane supplies
 - coin
@@ -99,7 +99,7 @@ Players can inspect what has been revealed, claim items, assign them to another 
 
 ### Loot box angle
 
-This could be more fun than a plain inventory transfer if the DM can shape the box by rarity or reward profile:
+This could be more fun than a plain inventory transfer if the AI DM can shape the box by rarity or reward profile:
 
 - `Common Cache`
 - `Adventurer's Satchel`
@@ -114,21 +114,21 @@ Possible rarity bands:
 - rare
 - very rare
 
-The DM could either:
+The AI DM could:
 
-- hand-author the contents
-- ask the AI to suggest a box from a theme and rarity budget
+- author the contents directly from the current adventure context
+- generate a box from a theme and rarity budget
 - mix fixed rewards with a small number of revealable unknown slots
 
 ### Spoiler-safety rules
 
-- Players only see items once the DM reveals the loot box or a slot inside it.
+- Players only see items once the AI DM reveals the loot box or a slot inside it.
 - No hidden future rewards should be exposed ahead of time.
 - If mystery slots exist, they should be revealed intentionally, not inferred from backend state.
 
 ### Good first version
 
-- DM creates a named loot box with revealed items and coin.
+- AI DM creates a named loot box with revealed items and coin.
 - Players can claim or assign each item.
 - Claimed items become pending sheet updates.
 - Add rarity styling later after the basic claim flow works.
@@ -178,7 +178,7 @@ Useful upgrades:
 - clearer in-character versus out-of-character treatment
 - speaker accents through layout and color, not unreadable fonts
 - optional scene title or location banner when the scene changes
-- richer treatment for dramatic DM narration
+- richer treatment for dramatic AI DM narration
 
 The current tagged message handling is already a good base. This feature is about making the presentation feel more intentional and theatrical.
 
@@ -191,13 +191,13 @@ The current tagged message handling is already a good base. This feature is abou
 
 - Improve NPC message blocks with stronger visual identity.
 - Add better hierarchy between narration, NPC speech, player IC speech, and OOC text.
-- Add lightweight scene-change banners when the DM explicitly changes the visible scene.
+- Add lightweight scene-change banners when the AI DM explicitly changes the visible scene.
 
-## 6. DM-Approved Handouts
+## 6. AI-DM-Revealed Handouts
 
 ### Core idea
 
-Let the DM create or reveal player-facing artifacts during play.
+Let the AI DM create or reveal player-facing artifacts during play.
 
 Examples:
 
@@ -212,15 +212,15 @@ Examples:
 
 ### Desired experience
 
-The DM reveals a handout in the session, and players can open it in a focused viewer, revisit it later, and optionally attach it to their notes.
+The AI DM reveals a handout in the session, and players can open it in a focused viewer, revisit it later, and optionally attach it to their notes.
 
 This adds atmosphere because the party gets objects from the world, not just descriptions of objects.
 
 ### Spoiler-safety rules
 
-- Handouts must be explicitly revealed by the DM.
+- Handouts must be explicitly revealed by the AI DM.
 - Draft or hidden handouts should never appear in player views.
-- If AI generates a handout, the DM should approve the final visible version before release.
+- Generated handouts should only become visible when the AI DM intentionally releases the final player-facing version.
 
 ### Good first version
 
@@ -266,6 +266,6 @@ Examples:
 4. Private character notes
 5. Loot claim and loot boxes
 6. Better in-character presentation
-7. DM-approved handouts
+7. AI-DM-revealed handouts
 
 The first three are the best value because they directly improve moment-to-moment play and reuse data the app already has. The later items add more atmosphere and campaign texture once the core play loop feels responsive.

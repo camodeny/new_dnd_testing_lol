@@ -5,8 +5,11 @@ from models import (
     db,
     CampaignClock,
     CampaignMember,
+    CampaignMonster,
     CampaignWorld,
     Character,
+    EncounterMap,
+    EncounterMapPlacement,
     NPCActor,
     SheetProposal,
     WorldEvent,
@@ -19,6 +22,7 @@ from services.embedding_service import (
     search_weight,
     upsert_memory_embedding,
 )
+from services.encounter_map_service import create_encounter_map as do_create_encounter_map, latest_encounter_map
 from services.lootbox_service import generate_loot_box as do_generate_loot_box
 from services.planning_service import summary_dict_for_read
 from services.world_service import clean_id, clean_text, get_campaign_world, json_dumps, json_loads
@@ -230,6 +234,21 @@ def _campaign_loot_mode(campaign):
     return settings.get('loot_mode', 'frequent_gamble')
 
 
+def _compact_encounter_map(encounter_map):
+    if not encounter_map:
+        return None
+    data = encounter_map.to_dict(include_private=True)
+    return {
+        'id': data.get('id'),
+        'title': data.get('title'),
+        'grid': data.get('grid'),
+        'vtt_setup': data.get('vtt_setup'),
+        'placements': data.get('placements', []),
+        'setup_status': data.get('setup_status'),
+        'setup_error': data.get('setup_error'),
+    }
+
+
 def build_session_hot_context(campaign, session, current_user):
     character = _current_character(campaign, current_user)
     world, _graph, world_state, _private = _world_json(campaign)
@@ -239,6 +258,7 @@ def build_session_hot_context(campaign, session, current_user):
     members = CampaignMember.query.filter_by(campaign_id=campaign.id).order_by(CampaignMember.id.asc()).all()
     protected_player_characters = _protected_player_characters(members)
     loot_mode = _campaign_loot_mode(campaign)
+    encounter_map = latest_encounter_map(campaign.id)
 
     context = {
         'strategy': 'compact_hot_context_with_dm_tools',
@@ -281,6 +301,7 @@ def build_session_hot_context(campaign, session, current_user):
             for member in members
         ],
         'current_scene': current_scene,
+        'current_encounter_map': _compact_encounter_map(encounter_map),
         'active_clocks': [clock.to_dict(include_private=True) for clock in active_clocks],
         'private_output_terms': _private_output_terms(campaign),
         'private_spoiler_items': _private_spoiler_items(campaign),
@@ -290,6 +311,12 @@ def build_session_hot_context(campaign, session, current_user):
             'Do not claim to update world state unless a write tool succeeds. Never reveal DM-private tool results '
             'unless they have become visible through play. private_output_terms are reasoning-only strings that must '
             'not appear in visible narration unless they are first revealed through play. '
+            'Use create_encounter_map when the party enters a tactical area where spatial positioning matters, '
+            'or when a player explicitly asks for a map; include vtt_setup_notes when the DM has intended '
+            'friendly starts, enemy starts, obstacles, objectives, or terrain calls for the playable setup JSON. '
+            'After a map exists and combat positioning matters, use place_encounter_map_actors to place '
+            'players, NPCs, and monsters on grid coordinates. '
+            'Do not generate maps for every ordinary scene. '
             + _campaign_loot_mode_policy(campaign)
         ),
     }
@@ -679,6 +706,96 @@ DM_TOOL_DEFINITIONS = [
             },
         },
     },
+    {
+        'type': 'function',
+        'function': {
+            'name': 'create_encounter_map',
+            'description': 'Generate a party-visible gridded D&D battle map for a tactical encounter area, then create structured VTT setup JSON with friendly/enemy spawn boxes, terrain labels, obstacles, and tactical notes. Use this when spatial positioning matters or when players ask for a map.',
+            'parameters': {
+                'type': 'object',
+                'required': ['title', 'map_prompt'],
+                'properties': {
+                    'title': {
+                        'type': 'string',
+                        'description': 'Short player-visible title for the map, e.g. "Ruined Chapel Ambush".',
+                    },
+                    'map_prompt': {
+                        'type': 'string',
+                        'description': 'Concrete visual description of the battle map layout and important zones.',
+                    },
+                    'terrain': {
+                        'type': 'string',
+                        'description': 'Optional terrain notes such as forest, cavern, city street, ship deck, or dungeon room.',
+                    },
+                    'tactical_features': {
+                        'type': 'string',
+                        'description': 'Optional tactical details such as cover, choke points, elevation, hazards, doors, water, bridges, or obstacles.',
+                    },
+                    'vtt_setup_notes': {
+                        'type': 'string',
+                        'description': 'Optional DM-only setup instructions for the VTT JSON, such as where friendly PCs should start, where enemies should spawn, which obstacles or terrain matter, and any intended tactical objective. This guides metadata only and is not shown as map text.',
+                    },
+                    'mood': {
+                        'type': 'string',
+                        'description': 'Optional mood and lighting notes.',
+                    },
+                },
+            },
+        },
+    },
+    {
+        'type': 'function',
+        'function': {
+            'name': 'place_encounter_map_actors',
+            'description': 'Place or move players, NPCs, and monsters on the current encounter map grid. Use this after a map exists and combat or tactical positioning matters. Monster ids are created automatically if missing. If a placement is on blocked or hazardous terrain, the tool returns placement_warnings and saves nothing unless allow_illegal_placements is explicitly true.',
+            'parameters': {
+                'type': 'object',
+                'required': ['placements'],
+                'properties': {
+                    'encounter_map_id': {
+                        'type': 'integer',
+                        'description': 'Optional explicit encounter map id. Defaults to the latest campaign encounter map.',
+                    },
+                    'clear_existing': {
+                        'type': 'boolean',
+                        'default': False,
+                        'description': 'When true, remove existing placements on this map before applying the supplied placements.',
+                    },
+                    'allow_illegal_placements': {
+                        'type': 'boolean',
+                        'default': False,
+                        'description': 'Set true only after reviewing placement_warnings from a previous call and intentionally placing actors on blocked or hazardous map cells.',
+                    },
+                    'placements': {
+                        'type': 'array',
+                        'minItems': 1,
+                        'items': {
+                            'type': 'object',
+                            'required': ['actor_type', 'actor_id', 'col', 'row'],
+                            'properties': {
+                                'actor_type': {'type': 'string', 'enum': ['player', 'npc', 'monster']},
+                                'actor_id': {
+                                    'type': 'string',
+                                    'description': 'Player user id or selected character id, NPC actor_id, or monster_id.',
+                                },
+                                'col': {'type': 'integer', 'minimum': 0},
+                                'row': {'type': 'integer', 'minimum': 0},
+                                'label': {'type': 'string'},
+                                'monster_name': {
+                                    'type': 'string',
+                                    'description': 'Optional name to use when actor_type is monster and the monster id is new.',
+                                },
+                                'stat_block': {
+                                    'type': 'object',
+                                    'description': 'Optional structured monster stats for newly created monster ids.',
+                                },
+                            },
+                        },
+                    },
+                },
+            },
+        },
+    },
 ]
 
 
@@ -984,6 +1101,296 @@ def _tool_generate_loot_box(campaign, current_user, args, session=None, audit_co
     }
 
 
+def _tool_create_encounter_map(campaign, current_user, args, session=None, audit_context=None):
+    title = clean_text(args.get('title', ''), 200)
+    map_prompt = clean_text(args.get('map_prompt', ''), 2000)
+    if not title:
+        return {'error': 'A map title is required.'}
+    if not map_prompt:
+        return {'error': 'A map prompt is required.'}
+
+    try:
+        encounter_map = do_create_encounter_map(
+            campaign,
+            session,
+            title,
+            map_prompt,
+            terrain=args.get('terrain', ''),
+            tactical_features=args.get('tactical_features', ''),
+            mood=args.get('mood', ''),
+            vtt_setup_notes=args.get('vtt_setup_notes', ''),
+            audit_context=audit_context,
+        )
+    except Exception as err:
+        return {'error': f'Failed to generate encounter map: {repr(err)}'}
+
+    event = _record_event(
+        campaign,
+        'encounter_map_generated',
+        f'Encounter map "{encounter_map.title}" generated.',
+        {'encounter_map_id': encounter_map.id, 'title': encounter_map.title},
+        visibility='party_known',
+    )
+    return {
+        'encounter_map': encounter_map.to_dict(include_private=True),
+        'affected_ids': {'encounter_map_ids': [encounter_map.id], 'world_event_ids': [event.id]},
+    }
+
+
+def _encounter_map_grid_dimensions(encounter_map):
+    grid = EncounterMap._json_value(encounter_map.grid_json, {})
+    if not isinstance(grid, dict):
+        return None, None
+    columns = grid.get('columns')
+    rows = grid.get('rows')
+    return columns if isinstance(columns, int) else None, rows if isinstance(rows, int) else None
+
+
+def _resolve_map_player(campaign, actor_id):
+    try:
+        numeric_id = int(actor_id)
+    except (TypeError, ValueError):
+        return None, 'Player actor_id must be a user id or selected character id.'
+
+    member = CampaignMember.query.filter_by(campaign_id=campaign.id, user_id=numeric_id).first()
+    if not member:
+        member = CampaignMember.query.filter_by(campaign_id=campaign.id, selected_character_id=numeric_id).first()
+    if not member:
+        return None, 'No campaign player exists with that user id or selected character id.'
+
+    character = member.selected_character
+    label = character.name if character else (member.user.username if member.user else f'Player {member.user_id}')
+    return {'actor_id': str(member.user_id), 'label': label}, None
+
+
+def _resolve_map_npc(campaign, actor_id):
+    actor = NPCActor.query.filter_by(campaign_id=campaign.id, actor_id=actor_id).first()
+    if not actor and str(actor_id).isdigit():
+        actor = NPCActor.query.filter_by(campaign_id=campaign.id, id=int(actor_id)).first()
+    if not actor:
+        return None, 'No campaign NPC exists with that id.'
+    return {'actor_id': actor.actor_id, 'label': actor.name}, None
+
+
+def _resolve_map_monster(campaign, placement):
+    monster_id = clean_id(placement.get('actor_id'), '')
+    if not monster_id:
+        return None, 'Monster actor_id is required.'
+    monster = CampaignMonster.query.filter_by(campaign_id=campaign.id, monster_id=monster_id).first()
+    if not monster:
+        monster = CampaignMonster(
+            campaign_id=campaign.id,
+            monster_id=monster_id,
+            name=clean_text(placement.get('monster_name') or placement.get('label'), 200) or monster_id.replace('_', ' ').title(),
+            stat_block=json_dumps(placement.get('stat_block') if isinstance(placement.get('stat_block'), dict) else {}),
+        )
+        db.session.add(monster)
+        db.session.flush()
+    return {'actor_id': monster.monster_id, 'label': monster.name, 'monster_id': monster.id}, None
+
+
+def _resolve_map_actor(campaign, placement):
+    actor_type = clean_text(placement.get('actor_type'), 20).lower()
+    actor_id = clean_text(placement.get('actor_id'), 100)
+    if actor_type == 'player':
+        return _resolve_map_player(campaign, actor_id)
+    if actor_type == 'npc':
+        return _resolve_map_npc(campaign, actor_id)
+    if actor_type == 'monster':
+        return _resolve_map_monster(campaign, placement)
+    return None, 'actor_type must be player, npc, or monster.'
+
+
+def _point_in_polygon(points, x, y):
+    if len(points) < 3:
+        return False
+
+    inside = False
+    previous = points[-1]
+    for current in points:
+        current_x = current.get('col')
+        current_y = current.get('row')
+        previous_x = previous.get('col')
+        previous_y = previous.get('row')
+        if not all(isinstance(value, (int, float)) for value in (current_x, current_y, previous_x, previous_y)):
+            previous = current
+            continue
+        if (current_y > y) != (previous_y > y):
+            x_intersection = (previous_x - current_x) * (y - current_y) / (previous_y - current_y) + current_x
+            if x < x_intersection:
+                inside = not inside
+        previous = current
+    return inside
+
+
+def _rect_contains_cell(rect, grid_col, grid_row):
+    rect = rect if isinstance(rect, dict) else {}
+    try:
+        col = int(rect.get('col'))
+        row = int(rect.get('row'))
+        width = int(rect.get('width'))
+        height = int(rect.get('height'))
+    except (TypeError, ValueError):
+        return False
+    return col <= grid_col < col + width and row <= grid_row < row + height
+
+
+def _map_area_contains_cell(area, grid_col, grid_row):
+    polygon = area.get('polygon') if isinstance(area.get('polygon'), list) else []
+    if polygon:
+        return _point_in_polygon(polygon, grid_col + 0.5, grid_row + 0.5)
+    return _rect_contains_cell(area.get('rect'), grid_col, grid_row)
+
+
+def _illegal_area_reason(area):
+    kind = clean_text(area.get('kind'), 40).lower()
+    movement_effect = clean_text(area.get('movement_effect'), 60).lower()
+    if kind in {'blocked', 'wall'} or movement_effect == 'blocks_movement':
+        return 'blocks movement'
+    if kind == 'hazard':
+        return 'is hazardous terrain'
+    return ''
+
+
+def _placement_illegal_warnings(encounter_map, placement, index, grid_col, grid_row):
+    setup = EncounterMap._json_value(encounter_map.vtt_setup_json, {})
+    if not isinstance(setup, dict):
+        return []
+
+    label = clean_text(placement.get('label'), 200) or clean_text(placement.get('monster_name'), 200) or clean_text(placement.get('actor_id'), 100)
+    warnings = []
+    for group in ('terrain_zones', 'obstacles'):
+        areas = setup.get(group) if isinstance(setup.get(group), list) else []
+        for area in areas:
+            if not isinstance(area, dict) or not _map_area_contains_cell(area, grid_col, grid_row):
+                continue
+            reason = _illegal_area_reason(area)
+            if not reason:
+                continue
+            area_label = clean_text(area.get('label'), 200) or 'Unnamed map area'
+            description = clean_text(area.get('description'), 300)
+            warning = {
+                'index': index,
+                'actor_type': clean_text(placement.get('actor_type'), 20).lower(),
+                'actor_id': clean_text(placement.get('actor_id'), 100),
+                'label': label,
+                'col': grid_col,
+                'row': grid_row,
+                'area_label': area_label,
+                'area_type': clean_text(area.get('kind'), 40) or group,
+                'reason': f'{area_label} {reason}.',
+            }
+            if description:
+                warning['description'] = description
+                warning['reason'] = f'{warning["reason"]} {description}'
+            warnings.append(warning)
+    return warnings
+
+
+def _tool_place_encounter_map_actors(campaign, current_user, args, session=None, audit_context=None):
+    _ = current_user, session, audit_context
+    encounter_map_id = args.get('encounter_map_id')
+    encounter_map = db.session.get(EncounterMap, encounter_map_id) if encounter_map_id else latest_encounter_map(campaign.id)
+    if not encounter_map or encounter_map.campaign_id != campaign.id:
+        return {'error': 'No encounter map is available for this campaign.'}
+
+    placements = args.get('placements') if isinstance(args.get('placements'), list) else []
+    if not placements:
+        return {'error': 'At least one placement is required.'}
+
+    columns, rows = _encounter_map_grid_dimensions(encounter_map)
+    errors = []
+    validated_placements = []
+    placement_warnings = []
+    saved = []
+    monster_ids = []
+
+    for index, raw_placement in enumerate(placements):
+        placement = raw_placement if isinstance(raw_placement, dict) else {}
+        try:
+            grid_col = int(placement.get('col'))
+            grid_row = int(placement.get('row'))
+        except (TypeError, ValueError):
+            errors.append({'index': index, 'error': 'Placement requires integer col and row values.'})
+            continue
+
+        if grid_col < 0 or grid_row < 0:
+            errors.append({'index': index, 'error': 'Placement col and row must be 0 or greater.'})
+            continue
+        if columns is not None and grid_col >= columns:
+            errors.append({'index': index, 'error': f'Placement col must be less than map columns ({columns}).'})
+            continue
+        if rows is not None and grid_row >= rows:
+            errors.append({'index': index, 'error': f'Placement row must be less than map rows ({rows}).'})
+            continue
+
+        placement_warnings.extend(_placement_illegal_warnings(encounter_map, placement, index, grid_col, grid_row))
+        validated_placements.append((index, placement, grid_col, grid_row))
+
+    if placement_warnings and not args.get('allow_illegal_placements'):
+        return {
+            'warning': 'One or more placements are on blocked or hazardous map cells. No placements were saved. Review placement_warnings, then choose legal cells or call again with allow_illegal_placements=true if this is intentional.',
+            'encounter_map_id': encounter_map.id,
+            'placement_warnings': placement_warnings,
+            'placement_errors': errors,
+        }
+
+    if args.get('clear_existing'):
+        EncounterMapPlacement.query.filter_by(encounter_map_id=encounter_map.id).delete(synchronize_session=False)
+
+    for index, placement, grid_col, grid_row in validated_placements:
+        actor_type = clean_text(placement.get('actor_type'), 20).lower()
+        resolved, error = _resolve_map_actor(campaign, placement)
+        if error:
+            errors.append({'index': index, 'error': error})
+            continue
+
+        if resolved.get('monster_id'):
+            monster_ids.append(resolved['monster_id'])
+
+        existing = EncounterMapPlacement.query.filter_by(
+            encounter_map_id=encounter_map.id,
+            actor_type=actor_type,
+            actor_id=resolved['actor_id'],
+        ).first()
+        row = existing or EncounterMapPlacement(
+            encounter_map_id=encounter_map.id,
+            actor_type=actor_type,
+            actor_id=resolved['actor_id'],
+            label=resolved['label'],
+        )
+        if not existing:
+            db.session.add(row)
+        row.grid_col = grid_col
+        row.grid_row = grid_row
+        row.label = clean_text(placement.get('label'), 200) or resolved['label']
+        db.session.flush()
+        saved.append(row.to_dict())
+
+    if not saved and errors:
+        return {'error': 'No placements were saved.', 'placement_errors': errors, 'placement_warnings': placement_warnings}
+
+    event = _record_event(
+        campaign,
+        'encounter_map_actors_placed',
+        f'{len(saved)} actor placement{"s" if len(saved) != 1 else ""} updated on "{encounter_map.title}".',
+        {'encounter_map_id': encounter_map.id, 'placements': saved, 'errors': errors, 'warnings': placement_warnings},
+        visibility='party_known',
+    )
+    return {
+        'encounter_map': encounter_map.to_dict(include_private=True),
+        'placements': saved,
+        'placement_warnings': placement_warnings,
+        'placement_errors': errors,
+        'affected_ids': {
+            'encounter_map_ids': [encounter_map.id],
+            'placement_ids': [placement['id'] for placement in saved],
+            'monster_ids': sorted(set(monster_ids)),
+            'world_event_ids': [event.id],
+        },
+    }
+
+
 TOOL_HANDLERS = {
     'ask_character_sheet': _tool_ask_character_sheet,
     'get_current_scene': _tool_get_current_scene,
@@ -994,6 +1401,8 @@ TOOL_HANDLERS = {
     'reveal_fact': _tool_reveal_fact,
     'propose_sheet_update': _tool_propose_sheet_update,
     'generate_loot_box': _tool_generate_loot_box,
+    'create_encounter_map': _tool_create_encounter_map,
+    'place_encounter_map_actors': _tool_place_encounter_map_actors,
 }
 
 
@@ -1008,12 +1417,20 @@ def execute_dm_tool(campaign, session, current_user, name, args, audit_context=N
         before_new = len(db.session.new)
         result = (
             handler(campaign, current_user, args, session, audit_context)
-            if name in {'propose_sheet_update', 'generate_loot_box'}
+            if name in {'propose_sheet_update', 'generate_loot_box', 'create_encounter_map', 'place_encounter_map_actors'}
             else handler(campaign, current_user, args, audit_context)
             if name in {'ask_character_sheet', 'search_campaign_memory'}
             else handler(campaign, current_user, args)
         )
-        mutated = name in {'record_world_event', 'update_current_scene', 'advance_clock', 'reveal_fact', 'generate_loot_box'}
+        mutated = name in {
+            'record_world_event',
+            'update_current_scene',
+            'advance_clock',
+            'reveal_fact',
+            'generate_loot_box',
+            'create_encounter_map',
+            'place_encounter_map_actors',
+        }
         mutated = mutated or len(db.session.new) > before_new
     log_audit_event(
         campaign.id,
