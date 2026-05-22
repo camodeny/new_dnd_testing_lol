@@ -23,6 +23,7 @@ from models import (
     CampaignMember,
     Character,
     EncounterMap,
+    EncounterMapPlacement,
     PlanningBondProposal,
     User,
 )
@@ -263,6 +264,132 @@ class AppRouteTest(unittest.TestCase):
         self.assertIn(place_actor.status_code, {404, 405})
         self.assertEqual(current_map.status_code, 200)
         self.assertEqual(current_map.get_json()['encounter_map']['placements'], [])
+
+    def test_player_can_move_own_map_token_within_character_speed(self):
+        with app.app_context():
+            player = User(username='mover', email='mover@example.com')
+            player.set_password('password')
+            db.session.add(player)
+            db.session.flush()
+            campaign = Campaign(name='Movement Campaign', user_id=player.id)
+            db.session.add(campaign)
+            db.session.flush()
+            character = Character(
+                user_id=player.id,
+                campaign_id=campaign.id,
+                name='Fast Boots',
+                race='Human',
+                speed=30,
+            )
+            db.session.add(character)
+            db.session.flush()
+            db.session.add(CampaignMember(
+                campaign_id=campaign.id,
+                user_id=player.id,
+                role='player',
+                selected_character_id=character.id,
+            ))
+            encounter_map = EncounterMap(
+                campaign_id=campaign.id,
+                title='Training Grid',
+                prompt='A training grid.',
+                image_filename='map.png',
+                model='gpt-image-2',
+                size='1024x1024',
+                quality='high',
+                grid_json=json.dumps({'columns': 12, 'rows': 10}),
+                setup_status='ready',
+            )
+            db.session.add(encounter_map)
+            db.session.flush()
+            db.session.add(EncounterMapPlacement(
+                encounter_map_id=encounter_map.id,
+                actor_type='player',
+                actor_id=str(player.id),
+                label=character.name,
+                grid_col=1,
+                grid_row=1,
+            ))
+            db.session.commit()
+            map_id = encounter_map.id
+            token = generate_token(player.id)
+
+        response = self.client.patch(
+            f'/api/encounter-maps/{map_id}/placements/me',
+            json={'col': 7, 'row': 1},
+            headers={'Authorization': f'Bearer {token}'},
+        )
+
+        self.assertEqual(response.status_code, 200)
+        data = response.get_json()
+        self.assertEqual(data['movement']['max_squares'], 6)
+        self.assertEqual(data['placement']['col'], 7)
+        self.assertEqual(data['placement']['row'], 1)
+        self.assertEqual(data['encounter_map']['placements'][0]['col'], 7)
+
+    def test_player_cannot_move_map_token_beyond_character_speed(self):
+        with app.app_context():
+            player = User(username='slowmover', email='slowmover@example.com')
+            player.set_password('password')
+            db.session.add(player)
+            db.session.flush()
+            campaign = Campaign(name='Limited Movement Campaign', user_id=player.id)
+            db.session.add(campaign)
+            db.session.flush()
+            character = Character(
+                user_id=player.id,
+                campaign_id=campaign.id,
+                name='Measured Step',
+                race='Dwarf',
+                speed=25,
+            )
+            db.session.add(character)
+            db.session.flush()
+            db.session.add(CampaignMember(
+                campaign_id=campaign.id,
+                user_id=player.id,
+                role='player',
+                selected_character_id=character.id,
+            ))
+            encounter_map = EncounterMap(
+                campaign_id=campaign.id,
+                title='Long Hall',
+                prompt='A long hall.',
+                image_filename='map.png',
+                model='gpt-image-2',
+                size='1024x1024',
+                quality='high',
+                grid_json=json.dumps({'columns': 12, 'rows': 10}),
+                setup_status='ready',
+            )
+            db.session.add(encounter_map)
+            db.session.flush()
+            placement = EncounterMapPlacement(
+                encounter_map_id=encounter_map.id,
+                actor_type='player',
+                actor_id=str(player.id),
+                label=character.name,
+                grid_col=1,
+                grid_row=1,
+            )
+            db.session.add(placement)
+            db.session.commit()
+            map_id = encounter_map.id
+            placement_id = placement.id
+            token = generate_token(player.id)
+
+        response = self.client.patch(
+            f'/api/encounter-maps/{map_id}/placements/me',
+            json={'col': 7, 'row': 1},
+            headers={'Authorization': f'Bearer {token}'},
+        )
+
+        self.assertEqual(response.status_code, 400)
+        self.assertEqual(response.get_json()['movement']['max_squares'], 5)
+        with app.app_context():
+            placement = db.session.get(EncounterMapPlacement, placement_id)
+            self.assertEqual(placement.grid_col, 1)
+            self.assertEqual(placement.grid_row, 1)
 
     def test_missing_api_routes_stay_json_404s(self):
         response = self.client.get('/api/not-real')

@@ -147,6 +147,13 @@ export function getEncounterMapLabeledImage(encounterMapId) {
   return apiBlob(`/encounter-maps/${encounterMapId}/labeled-image`)
 }
 
+export function moveEncounterMapToken(encounterMapId, col, row) {
+  return apiFetch(`/encounter-maps/${encounterMapId}/placements/me`, {
+    method: 'PATCH',
+    body: JSON.stringify({ col, row }),
+  })
+}
+
 export function generateCampaignWorld(campaignId) {
   return apiFetch(`/campaigns/${campaignId}/world`, { method: 'POST' })
 }

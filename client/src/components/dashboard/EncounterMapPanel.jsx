@@ -1,5 +1,5 @@
-import { useEffect, useMemo, useState } from 'react'
-import { getEncounterMapImage, getEncounterMapLabeledImage } from '../../api/client'
+import { useEffect, useMemo, useRef, useState } from 'react'
+import { getEncounterMapImage, getEncounterMapLabeledImage, moveEncounterMapToken } from '../../api/client'
 
 // Convert row/col to chess-style algebraic coordinates, e.g. A-1, B-5, etc.
 function getGridCoordinate(col, row) {
@@ -9,9 +9,42 @@ function getGridCoordinate(col, row) {
   return `${prefix}${letter}-${row + 1}`
 }
 
-export default function EncounterMapPanel({ encounterMap, loading, isOwner, isMapExpanded, setIsMapExpanded }) {
+function clamp(value, min, max) {
+  return Math.min(Math.max(value, min), max)
+}
+
+function getMovementSquares(character) {
+  const speed = Number(character?.combat?.speed)
+  if (!Number.isFinite(speed) || speed <= 0) return 0
+  return Math.floor(speed / 5)
+}
+
+function getGridMoveDistance(fromCol, fromRow, toCol, toRow) {
+  return Math.max(Math.abs(toCol - fromCol), Math.abs(toRow - fromRow))
+}
+
+function clampDestinationToMovement(fromCol, fromRow, toCol, toRow, maxSquares, columns, rows) {
+  const limitedCol = fromCol + clamp(toCol - fromCol, -maxSquares, maxSquares)
+  const limitedRow = fromRow + clamp(toRow - fromRow, -maxSquares, maxSquares)
+  return {
+    col: clamp(limitedCol, 0, columns - 1),
+    row: clamp(limitedRow, 0, rows - 1),
+  }
+}
+
+export default function EncounterMapPanel({
+  encounterMap,
+  loading,
+  isOwner,
+  currentUser,
+  currentCharacter,
+  onEncounterMapChange,
+  isMapExpanded,
+  setIsMapExpanded,
+}) {
   const [imageState, setImageState] = useState({ mapId: null, url: '', error: '' })
   const [labeledImageState, setLabeledImageState] = useState({ mapId: null, url: '', error: '' })
+  const tokenLayerRef = useRef(null)
   
   // UX UI states
   const isCollapsed = !isMapExpanded
@@ -23,6 +56,11 @@ export default function EncounterMapPanel({ encounterMap, loading, isOwner, isMa
   const [prevMapId, setPrevMapId] = useState(encounterMap?.id || null)
   const [aspectRatio, setAspectRatio] = useState(null)
   const [imageDimensions, setImageDimensions] = useState({ width: 0, height: 0 })
+  const [dragState, setDragState] = useState(null)
+  const [pendingPlacementOverrides, setPendingPlacementOverrides] = useState({})
+  const [moveError, setMoveError] = useState('')
+  const [movementMessage, setMovementMessage] = useState('')
+  const [isMovingToken, setIsMovingToken] = useState(false)
 
   // Adjust state when map ID changes (during render phase to avoid effect cascades)
   const currentMapId = encounterMap?.id || null
@@ -30,6 +68,11 @@ export default function EncounterMapPanel({ encounterMap, loading, isOwner, isMa
     setPrevMapId(currentMapId)
     setAspectRatio(null)
     setImageDimensions({ width: 0, height: 0 })
+    setDragState(null)
+    setPendingPlacementOverrides({})
+    setMoveError('')
+    setMovementMessage('')
+    setIsMovingToken(false)
     if (isCollapsed) {
       setHasNotification(true)
     }
@@ -41,6 +84,33 @@ export default function EncounterMapPanel({ encounterMap, loading, isOwner, isMa
   const rows = Number.isInteger(grid.rows) ? grid.rows : null
   const canOverlayPlacements = Boolean(columns && rows)
   const placements = useMemo(() => encounterMap?.placements || [], [encounterMap?.placements])
+  const currentUserActorId = currentUser?.id != null ? String(currentUser.id) : ''
+  const movementSquares = getMovementSquares(currentCharacter)
+  const playerPlacement = useMemo(
+    () => placements.find((placement) => (
+      placement.actor_type === 'player' && String(placement.actor_id) === currentUserActorId
+    )),
+    [placements, currentUserActorId],
+  )
+  const canMovePlayerToken = Boolean(
+    encounterMap?.id &&
+    canOverlayPlacements &&
+    playerPlacement &&
+    currentCharacter
+  )
+  const canDragPlayerToken = canMovePlayerToken && !isMovingToken
+  const displayPlacements = useMemo(() => (
+    placements.map((placement) => {
+      if (dragState?.placementId === placement.id) {
+        return { ...placement, col: dragState.col, row: dragState.row }
+      }
+      const pending = pendingPlacementOverrides[placement.id]
+      if (pending) {
+        return { ...placement, ...pending }
+      }
+      return placement
+    })
+  ), [placements, dragState, pendingPlacementOverrides])
   
   const gridLayout = useMemo(() => {
     if (!grid || !grid.origin_px || !grid.cell_size_px || !imageDimensions.width || !imageDimensions.height) {
@@ -106,13 +176,13 @@ export default function EncounterMapPanel({ encounterMap, loading, isOwner, isMa
   // Group placements by actor type
   const groupedPlacements = useMemo(() => {
     const groups = { player: [], npc: [], monster: [] }
-    placements.forEach((p) => {
+    displayPlacements.forEach((p) => {
       if (groups[p.actor_type]) {
         groups[p.actor_type].push(p)
       }
     })
     return groups
-  }, [placements])
+  }, [displayPlacements])
 
   // Sync state changes with localStorage
   const handleToggleCollapse = () => {
@@ -178,6 +248,134 @@ export default function EncounterMapPanel({ encounterMap, loading, isOwner, isMa
       objectUrls.forEach((objectUrl) => URL.revokeObjectURL(objectUrl))
     }
   }, [encounterMap?.id, encounterMap?.labeled_image_url])
+
+  const getGridCellFromPointer = (event) => {
+    const layer = tokenLayerRef.current
+    if (!layer || !columns || !rows) return null
+    const rect = layer.getBoundingClientRect()
+    if (!rect.width || !rect.height) return null
+
+    const x = clamp((event.clientX - rect.left) / rect.width, 0, 0.999999)
+    const y = clamp((event.clientY - rect.top) / rect.height, 0, 0.999999)
+    return {
+      col: clamp(Math.floor(x * columns), 0, columns - 1),
+      row: clamp(Math.floor(y * rows), 0, rows - 1),
+    }
+  }
+
+  const getLimitedDestinationFromPointer = (event, state) => {
+    const cell = getGridCellFromPointer(event)
+    if (!cell || !state || !columns || !rows) return null
+    return clampDestinationToMovement(
+      state.fromCol,
+      state.fromRow,
+      cell.col,
+      cell.row,
+      state.maxSquares,
+      columns,
+      rows,
+    )
+  }
+
+  const canDragPlacement = (placement) => (
+    canDragPlayerToken &&
+    placement.actor_type === 'player' &&
+    String(placement.actor_id) === currentUserActorId
+  )
+
+  const handleTokenPointerDown = (event, placement) => {
+    if (!canDragPlacement(placement)) return
+
+    event.preventDefault()
+    event.stopPropagation()
+    event.currentTarget.setPointerCapture?.(event.pointerId)
+    setActiveHoverId(placement.id)
+    setMoveError('')
+    setMovementMessage('')
+    setDragState({
+      placementId: placement.id,
+      pointerId: event.pointerId,
+      fromCol: placement.col,
+      fromRow: placement.row,
+      col: placement.col,
+      row: placement.row,
+      maxSquares: movementSquares,
+      distance: 0,
+    })
+  }
+
+  const handleTokenPointerMove = (event) => {
+    if (!dragState || dragState.pointerId !== event.pointerId) return
+
+    event.preventDefault()
+    const destination = getLimitedDestinationFromPointer(event, dragState)
+    if (!destination) return
+
+    setDragState((current) => {
+      if (!current || current.pointerId !== event.pointerId) return current
+      return {
+        ...current,
+        ...destination,
+        distance: getGridMoveDistance(current.fromCol, current.fromRow, destination.col, destination.row),
+      }
+    })
+  }
+
+  const handleTokenPointerUp = async (event) => {
+    if (!dragState || dragState.pointerId !== event.pointerId || !encounterMap?.id) return
+
+    event.preventDefault()
+    event.stopPropagation()
+    event.currentTarget.releasePointerCapture?.(event.pointerId)
+
+    const destination = getLimitedDestinationFromPointer(event, dragState) || {
+      col: dragState.col,
+      row: dragState.row,
+    }
+    const distance = getGridMoveDistance(dragState.fromCol, dragState.fromRow, destination.col, destination.row)
+    const placementId = dragState.placementId
+    setDragState(null)
+
+    if (!distance) {
+      setActiveHoverId(null)
+      return
+    }
+
+    setPendingPlacementOverrides((current) => ({
+      ...current,
+      [placementId]: destination,
+    }))
+    setIsMovingToken(true)
+
+    try {
+      const data = await moveEncounterMapToken(encounterMap.id, destination.col, destination.row)
+      onEncounterMapChange?.(data.encounter_map)
+      setPendingPlacementOverrides((current) => {
+        const next = { ...current }
+        delete next[placementId]
+        return next
+      })
+      setMovementMessage(`Moved ${data.movement?.moved_squares ?? distance}/${data.movement?.max_squares ?? movementSquares} sq to ${getGridCoordinate(destination.col, destination.row)}.`)
+      setMoveError('')
+    } catch (err) {
+      setPendingPlacementOverrides((current) => {
+        const next = { ...current }
+        delete next[placementId]
+        return next
+      })
+      setMoveError(err.message)
+    } finally {
+      setIsMovingToken(false)
+      setActiveHoverId(null)
+    }
+  }
+
+  const handleTokenPointerCancel = (event) => {
+    if (!dragState || dragState.pointerId !== event.pointerId) return
+    event.currentTarget.releasePointerCapture?.(event.pointerId)
+    setDragState(null)
+    setActiveHoverId(null)
+  }
 
   // Helper renderer for lists
   const renderCombatantCard = (placement) => {
@@ -321,20 +519,27 @@ export default function EncounterMapPanel({ encounterMap, loading, isOwner, isMa
                 {/* Tokens Layer */}
                 {canOverlayPlacements && (
                   <div
+                    ref={tokenLayerRef}
                     className="encounter-map-token-layer"
                     aria-label="Placed combatants"
                     style={gridLayout}
                   >
-                    {placements.map((placement) => {
+                    {displayPlacements.map((placement) => {
                       const isHighlighted = activeHoverId === placement.id
+                      const isDraggable = canDragPlacement(placement)
+                      const isDragging = dragState?.placementId === placement.id
                       return (
                         <div
                           key={placement.id}
-                          className={`encounter-map-token ${placement.actor_type} ${isHighlighted ? 'highlighted' : ''}`}
+                          className={`encounter-map-token ${placement.actor_type} ${isHighlighted ? 'highlighted' : ''} ${isDraggable ? 'draggable' : ''} ${isDragging ? 'dragging' : ''}`}
                           style={{
                             left: `${((placement.col + 0.5) / columns) * 100}%`,
                             top: `${((placement.row + 0.5) / rows) * 100}%`,
                           }}
+                          onPointerDown={(event) => handleTokenPointerDown(event, placement)}
+                          onPointerMove={handleTokenPointerMove}
+                          onPointerUp={handleTokenPointerUp}
+                          onPointerCancel={handleTokenPointerCancel}
                           onMouseEnter={() => setActiveHoverId(placement.id)}
                           onMouseLeave={() => setActiveHoverId(null)}
                         >
@@ -348,11 +553,31 @@ export default function EncounterMapPanel({ encounterMap, loading, isOwner, isMa
                             <span className="tooltip-coord">
                               Coordinate: {getGridCoordinate(placement.col, placement.row)}
                             </span>
+                            {isDraggable && (
+                              <span className="tooltip-coord">
+                                Move: {dragState?.placementId === placement.id ? dragState.distance : 0}/{movementSquares} sq
+                              </span>
+                            )}
                             <span className="tooltip-alliance">{placement.actor_type}</span>
                           </div>
                         </div>
                       )
                     })}
+                  </div>
+                )}
+                {canMovePlayerToken && (
+                  <div className={`encounter-map-movement-hud ${moveError ? 'has-error' : ''}`}>
+                    <i className={isMovingToken ? 'bi bi-arrow-repeat' : 'bi bi-arrows-move'}></i>
+                    <span>
+                      {dragState
+                        ? `${dragState.distance}/${dragState.maxSquares} sq`
+                        : isMovingToken
+                          ? 'Saving move...'
+                          : `Move ${movementSquares} sq`}
+                    </span>
+                    {(moveError || movementMessage) && (
+                      <small>{moveError || movementMessage}</small>
+                    )}
                   </div>
                 )}
               </div>

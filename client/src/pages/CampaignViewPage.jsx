@@ -509,6 +509,9 @@ export default function CampaignViewPage({ user }) {
               encounterMap={encounterMap}
               loading={encounterMapLoading}
               isOwner={isOwner}
+              currentUser={user}
+              currentCharacter={currentCharacter}
+              onEncounterMapChange={setEncounterMap}
               isMapExpanded={isMapExpanded}
               setIsMapExpanded={setIsMapExpanded}
             />
