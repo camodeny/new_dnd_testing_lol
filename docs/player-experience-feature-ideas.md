@@ -164,35 +164,6 @@ This should feel closer to a real player's notebook than a shared campaign wiki.
 - Optional note pinning.
 - Optional "save selected session text to note" action later.
 
-## 5. Better In-Character Presentation
-
-### Core idea
-
-Make the session transcript feel more like a scene and less like a generic chat log while preserving clarity.
-
-### Desired experience
-
-Useful upgrades:
-
-- stronger NPC speech styling
-- clearer in-character versus out-of-character treatment
-- speaker accents through layout and color, not unreadable fonts
-- optional scene title or location banner when the scene changes
-- richer treatment for dramatic AI DM narration
-
-The current tagged message handling is already a good base. This feature is about making the presentation feel more intentional and theatrical.
-
-### Spoiler-safety rules
-
-- Presentation can emphasize what has already been spoken or narrated.
-- It should not imply hidden NPC motives, affiliations, or undiscovered importance.
-
-### Good first version
-
-- Improve NPC message blocks with stronger visual identity.
-- Add better hierarchy between narration, NPC speech, player IC speech, and OOC text.
-- Add lightweight scene-change banners when the AI DM explicitly changes the visible scene.
-
 ## 6. AI-DM-Revealed Handouts
 
 ### Core idea

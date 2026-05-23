@@ -229,6 +229,10 @@ export function getInvite(campaignId) {
   return apiFetch(`/campaigns/${campaignId}/invites`)
 }
 
+export function lookupInvite(code) {
+  return apiFetch(`/invites/lookup?code=${encodeURIComponent(code)}`)
+}
+
 export function joinCampaign(campaignId, code) {
   return apiFetch(`/campaigns/${campaignId}/join`, { method: 'POST', body: JSON.stringify({ code }) })
 }

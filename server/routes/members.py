@@ -15,6 +15,29 @@ from services.campaign_service import (
 members_bp = Blueprint('members', __name__)
 
 
+@members_bp.route('/api/invites/lookup', methods=['GET'])
+@token_required
+def lookup_invite_code(current_user):
+    code = request.args.get('code')
+    if not code:
+        return jsonify({'error': 'Missing invite code'}), 400
+
+    normalized = code.strip().upper()
+    campaign = Campaign.query.filter(Campaign.invite_code == normalized).first()
+    if not campaign:
+        invite = CampaignInvite.query.filter_by(code=normalized, is_used=False).first()
+        if invite:
+            campaign = Campaign.query.get(invite.campaign_id)
+
+    if not campaign:
+        return jsonify({'error': 'Invalid invite code'}), 404
+
+    return jsonify({
+        'campaign_id': campaign.id,
+        'campaign_name': campaign.name
+    }), 200
+
+
 @members_bp.route('/api/campaigns/<int:campaign_id>/members', methods=['GET'])
 @token_required
 def list_members(current_user, campaign_id):

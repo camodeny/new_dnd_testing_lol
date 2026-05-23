@@ -1039,6 +1039,35 @@ class AppRouteTest(unittest.TestCase):
         self.assertFalse(player_combatant['actions']['action'])
         self.assertEqual(player_combatant['actions']['movement_remaining'], 15)
 
+    def test_lookup_invite_code_success(self):
+        campaign_id, token = self.create_campaign_with_invite('MYCODE12')
+        response = self.client.get(
+            '/api/invites/lookup?code=mycode12',
+            headers={'Authorization': f'Bearer {token}'},
+        )
+        self.assertEqual(response.status_code, 200)
+        data = response.get_json()
+        self.assertEqual(data['campaign_id'], campaign_id)
+        self.assertEqual(data['campaign_name'], 'Ashes Under Alderfen')
+
+    def test_lookup_invite_code_missing(self):
+        token = self.create_user_token()
+        response = self.client.get(
+            '/api/invites/lookup',
+            headers={'Authorization': f'Bearer {token}'},
+        )
+        self.assertEqual(response.status_code, 400)
+        self.assertEqual(response.get_json()['error'], 'Missing invite code')
+
+    def test_lookup_invite_code_not_found(self):
+        token = self.create_user_token()
+        response = self.client.get(
+            '/api/invites/lookup?code=NONEXISTENT',
+            headers={'Authorization': f'Bearer {token}'},
+        )
+        self.assertEqual(response.status_code, 404)
+        self.assertEqual(response.get_json()['error'], 'Invalid invite code')
+
 
 if __name__ == '__main__':
     unittest.main()

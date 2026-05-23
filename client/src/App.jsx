@@ -33,7 +33,7 @@ function AppRoutes() {
       {!isCampaignView && <Header user={user} onLogout={logout} />}
       <main className={`app-main ${isCampaignView ? 'full-bleed' : ''}`}>
         <Routes>
-          <Route path="/" element={<HomePage />} />
+          <Route path="/" element={<HomePage user={user} />} />
           <Route path="/campaigns/:id/dev" element={<CampaignDevPage user={user} />} />
           <Route path="/campaigns/:id" element={<CampaignViewPage user={user} />} />
           <Route path="/join/:id" element={<CampaignJoinPage />} />

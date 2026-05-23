@@ -37,13 +37,25 @@ function getGradientSeed(str) {
   return `linear-gradient(135deg, hsl(${h1}, 60%, 55%), hsl(${h2}, 55%, 45%))`
 }
 
-export default function CampaignCard({ campaign, onClick }) {
+export default function CampaignCard({ campaign, onClick, onDelete }) {
   const diffColor = useMemo(() => getDifficultyColor(campaign.difficulty), [campaign.difficulty])
   const initials = useMemo(() => getInitials(campaign.name), [campaign.name])
   const gradient = useMemo(() => getGradientSeed(campaign.name + (campaign.seed || '')), [campaign.name, campaign.seed])
 
   return (
     <div className="campaign-card-v2" onClick={onClick}>
+      {onDelete && (
+        <button
+          className="campaign-card-delete-btn"
+          onClick={(e) => {
+            e.stopPropagation()
+            onDelete()
+          }}
+          aria-label="Delete campaign"
+        >
+          <i className="bi bi-trash"></i>
+        </button>
+      )}
       <div className="campaign-card-inner">
         <div className="campaign-card-header">
           <div className="campaign-avatar" style={{ background: gradient }}>
