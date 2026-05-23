@@ -205,6 +205,43 @@ class DmToolsTest(unittest.TestCase):
         ).one()
         self.assertEqual(moved.grid_col, 9)
 
+    def test_place_map_actors_initializes_state_when_encounter_mode_already_active(self):
+        self.campaign.settings = json.dumps({'encounter_active': True})
+        encounter_map = EncounterMap(
+            campaign_id=self.campaign.id,
+            session_id=self.session.id,
+            title='Ruined Hall',
+            prompt='A ruined hall.',
+            image_filename='map.png',
+            model='gpt-image-2',
+            size='1024x1024',
+            quality='high',
+            grid_json=json.dumps({'columns': 12, 'rows': 10}),
+            setup_status='ready',
+        )
+        db.session.add(encounter_map)
+        db.session.commit()
+
+        result = execute_dm_tool(
+            self.campaign,
+            self.session,
+            self.user,
+            'place_encounter_map_actors',
+            {
+                'encounter_map_id': encounter_map.id,
+                'placements': [
+                    {'actor_type': 'player', 'actor_id': str(self.user.id), 'col': 2, 'row': 3},
+                    {'actor_type': 'monster', 'actor_id': 'goblin_1', 'monster_name': 'Goblin', 'col': 8, 'row': 4},
+                ],
+            },
+        )
+        db.session.commit()
+
+        self.assertNotIn('error', result)
+        state = result['encounter_map']['encounter_state']
+        self.assertTrue(state['active'])
+        self.assertEqual(len(state['turn_order']), 2)
+
     def test_ai_dm_tool_rejects_out_of_bounds_map_placements(self):
         encounter_map = EncounterMap(
             campaign_id=self.campaign.id,
@@ -846,6 +883,44 @@ class DmToolsTest(unittest.TestCase):
         messages = response.get_json()['messages']
         self.assertEqual(messages[-1]['content'], 'A gridded map appears on the table.')
 
+    def test_session_messages_can_page_older_history(self):
+        token = generate_token(self.user.id)
+        db.session.add_all([
+            SessionMessage(
+                session_id=self.session.id,
+                user_id=self.user.id,
+                role='player',
+                content=f'Message {index}',
+            )
+            for index in range(55)
+        ])
+        db.session.commit()
+
+        latest_response = self.client.get(
+            f'/api/sessions/{self.session.id}/messages?limit=10',
+            headers={'Authorization': f'Bearer {token}'},
+        )
+
+        self.assertEqual(latest_response.status_code, 200)
+        latest_payload = latest_response.get_json()
+        self.assertTrue(latest_payload['has_more_messages'])
+        self.assertEqual([message['content'] for message in latest_payload['messages']], [
+            f'Message {index}' for index in range(45, 55)
+        ])
+
+        before_id = latest_payload['messages'][0]['id']
+        older_response = self.client.get(
+            f'/api/sessions/{self.session.id}/messages?limit=10&before_id={before_id}',
+            headers={'Authorization': f'Bearer {token}'},
+        )
+
+        self.assertEqual(older_response.status_code, 200)
+        older_payload = older_response.get_json()
+        self.assertTrue(older_payload['has_more_messages'])
+        self.assertEqual([message['content'] for message in older_payload['messages']], [
+            f'Message {index}' for index in range(35, 45)
+        ])
+
     def test_hot_context_includes_protected_player_characters(self):
         hot_context = build_session_hot_context(self.campaign, self.session, self.user)
 
@@ -853,6 +928,89 @@ class DmToolsTest(unittest.TestCase):
         self.assertEqual(hot_context['protected_player_characters'][0]['name'], 'Aria')
         self.assertIn('Crimson Veil', hot_context['private_output_terms'])
         self.assertEqual(hot_context['private_spoiler_items'][0]['text'], 'Crimson Veil')
+
+    def test_hot_context_includes_combat_coordinates_when_encounter_active(self):
+        self.campaign.settings = json.dumps({'encounter_active': True})
+        encounter_map = EncounterMap(
+            campaign_id=self.campaign.id,
+            session_id=self.session.id,
+            title='Ruined Hall',
+            prompt='A ruined hall.',
+            image_filename='map.png',
+            model='gpt-image-2',
+            size='1024x1024',
+            quality='high',
+            grid_json=json.dumps({'columns': 12, 'rows': 10}),
+            setup_status='ready',
+        )
+        db.session.add(encounter_map)
+        db.session.flush()
+        player_placement = EncounterMapPlacement(
+            encounter_map_id=encounter_map.id,
+            actor_type='player',
+            actor_id=str(self.user.id),
+            label='Aria',
+            grid_col=2,
+            grid_row=3,
+        )
+        npc_placement = EncounterMapPlacement(
+            encounter_map_id=encounter_map.id,
+            actor_type='npc',
+            actor_id='bram_truewood',
+            label='Bram Truewood',
+            grid_col=4,
+            grid_row=5,
+        )
+        monster_placement = EncounterMapPlacement(
+            encounter_map_id=encounter_map.id,
+            actor_type='monster',
+            actor_id='goblin_1',
+            label='Goblin',
+            grid_col=8,
+            grid_row=4,
+        )
+        db.session.add_all([player_placement, npc_placement, monster_placement])
+        db.session.flush()
+        encounter_map.encounter_state_json = json.dumps({
+            'active': True,
+            'round': 2,
+            'active_turn_index': 0,
+            'turn_order': [
+                {
+                    'placement_id': player_placement.id,
+                    'actor_type': 'player',
+                    'actor_id': str(self.user.id),
+                    'label': 'Aria',
+                    'initiative': 18,
+                },
+                {
+                    'placement_id': monster_placement.id,
+                    'actor_type': 'monster',
+                    'actor_id': 'goblin_1',
+                    'label': 'Goblin',
+                    'initiative': 12,
+                },
+            ],
+        })
+        db.session.commit()
+
+        hot_context = build_session_hot_context(self.campaign, self.session, self.user)
+        combat_coordinates = hot_context['combat_coordinates']
+
+        self.assertTrue(combat_coordinates['active'])
+        self.assertEqual(combat_coordinates['encounter_map_id'], encounter_map.id)
+        self.assertEqual(combat_coordinates['round'], 2)
+        self.assertEqual(combat_coordinates['grid'], {'columns': 12, 'rows': 10})
+        by_label = {
+            combatant['label']: combatant
+            for combatant in combat_coordinates['combatants']
+        }
+        self.assertEqual(by_label['Aria']['coordinates'], {'col': 2, 'row': 3})
+        self.assertTrue(by_label['Aria']['is_active_turn'])
+        self.assertEqual(by_label['Bram Truewood']['combatant_type'], 'npc')
+        self.assertEqual(by_label['Goblin']['combatant_type'], 'enemy')
+        self.assertEqual(by_label['Goblin']['coordinates'], {'col': 8, 'row': 4})
+        self.assertIn('combat_coordinates', hot_context['tool_policy'])
 
     def test_embedding_canonical_text_includes_graph_context(self):
         entity_text = canonical_text_for_item('entity', {
@@ -1845,6 +2003,55 @@ class DmToolsTest(unittest.TestCase):
         for name in exclude_names:
             self.assertNotIn(name, tool_names_off)
         self.assertIn('toggle_encounter_mode', tool_names_off)
+
+    def test_toggle_encounter_mode_archives_and_prompts(self):
+        from services.encounter_map_service import latest_encounter_map
+        # Create an encounter map
+        encounter_map = EncounterMap(
+            campaign_id=self.campaign.id,
+            title="Archiving Test Map",
+            prompt="A test map prompt",
+            image_filename="test_archiving.png",
+            model="gpt-image-2",
+            size="1024x1024",
+            quality="medium",
+        )
+        db.session.add(encounter_map)
+        db.session.commit()
+
+        # Check it is returned by latest_encounter_map
+        self.assertEqual(latest_encounter_map(self.campaign.id).id, encounter_map.id)
+
+        # 1. Toggle Encounter Mode ON
+        result_on = execute_dm_tool(
+            self.campaign,
+            self.session,
+            self.user,
+            'toggle_encounter_mode',
+            {'active': True},
+        )
+        self.assertIn("You MUST now run the create_encounter_map tool", result_on['message'])
+        self.assertIn('"title":"Short player-visible map title"', result_on['message'])
+        self.assertIn('"map_prompt":"Concrete top-down battle map layout and important zones"', result_on['message'])
+        self.assertIn('Do not use name, description, width, height, grid_size', result_on['message'])
+        self.assertIn('place_encounter_map_actors', result_on['message'])
+
+        # 2. Toggle Encounter Mode OFF
+        result_off = execute_dm_tool(
+            self.campaign,
+            self.session,
+            self.user,
+            'toggle_encounter_mode',
+            {'active': False},
+        )
+        self.assertIn("stopped", result_off['message'])
+
+        # 3. Check that the map is archived
+        db.session.refresh(encounter_map)
+        self.assertTrue(encounter_map.is_archived)
+
+        # 4. Check that latest_encounter_map now returns None
+        self.assertIsNone(latest_encounter_map(self.campaign.id))
 
 
 if __name__ == '__main__':

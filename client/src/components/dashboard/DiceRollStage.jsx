@@ -117,12 +117,13 @@ function makeTextTexture(text, highlighted = false) {
 function faceLabelSize(sides, text, highlighted = false) {
   const multiplier = highlighted ? 1.38 : 1
   if (sides === 6) return 0.42 * multiplier
-  if (sides === 100) return 0.13 * (highlighted ? 1.8 : 1)
+  if (sides === 100) return 0.18 * (highlighted ? 1.85 : 1.05)
   if (sides === 10 && text.length > 1) return 0.32 * multiplier
   if (sides === 4 || sides === 8 || sides === 10) return 0.36 * multiplier
   if (sides === 12) return 0.3 * multiplier
   return 0.34 * multiplier
 }
+
 
 function createNumberLabel(text, face, sides, highlighted = false) {
   const size = faceLabelSize(sides, text, highlighted)
@@ -605,7 +606,14 @@ export default function DiceRollStage({ roll }) {
 
     const visualSpecs = getRollVisualSpecs(roll)
     const count = Math.max(1, visualSpecs.length)
-    const dieScale = getResponsiveDieScale(context.camera)
+    let dieScale = getResponsiveDieScale(context.camera)
+    
+    // Scale up specifically for d100 to make it more legible
+    const hasD100 = visualSpecs.some(spec => spec.sides === 100)
+    if (hasD100) {
+      dieScale *= 1.45
+    }
+
     const rollBounds = getResponsiveRollBounds(context.camera, count, dieScale)
     const spacing = rollBounds.spacing
     const centerX = count === 1
@@ -619,9 +627,13 @@ export default function DiceRollStage({ roll }) {
         rollBounds.maxX,
       )
     ))
+
+    // Dynamically calculate landing height to prevent clipping through the floor shadow plane
+    const landingY = hasD100 ? -0.50 + (0.94 * dieScale) : DIE_LANDING_Y
+
     const dice = visualSpecs.map((spec, index) => {
       const { group: die, resultFace } = createDieMesh(spec.sides, spec.value, { ...spec, dieScale })
-      die.position.set(targetXs[index], DIE_LANDING_Y, centerZ)
+      die.position.set(targetXs[index], landingY, centerZ)
       die.rotation.set(0.7 + index * 0.4, 0.4 + index * 0.55, 0.25)
       die.userData.resultFace = resultFace
       die.userData.idleSpin = false
@@ -651,7 +663,7 @@ export default function DiceRollStage({ roll }) {
 
         return {
           x,
-          y: DIE_LANDING_Y,
+          y: landingY,
           startX: fromLeft
             ? rollBounds.minX - rollBounds.offscreenOffset - Math.random() * 0.24
             : rollBounds.maxX + rollBounds.offscreenOffset + Math.random() * 0.24,

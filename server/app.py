@@ -131,6 +131,8 @@ def ensure_lightweight_schema():
             db.session.execute(text('ALTER TABLE encounter_maps ADD COLUMN setup_status VARCHAR(20) DEFAULT "pending"'))
         if 'setup_error' not in encounter_map_columns:
             db.session.execute(text('ALTER TABLE encounter_maps ADD COLUMN setup_error VARCHAR(500)'))
+        if 'is_archived' not in encounter_map_columns:
+            db.session.execute(text('ALTER TABLE encounter_maps ADD COLUMN is_archived BOOLEAN DEFAULT 0 NOT NULL'))
     db.session.commit()
 
 

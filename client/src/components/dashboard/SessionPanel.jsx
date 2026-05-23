@@ -1,4 +1,4 @@
-import { useState, useRef, useEffect, useMemo } from 'react'
+import { useState, useRef, useLayoutEffect, useMemo } from 'react'
 import { createPortal } from 'react-dom'
 import MarkdownContent from '../common/MarkdownContent'
 import DiceRollStage from './DiceRollStage'
@@ -200,6 +200,22 @@ function RollCard({ label, total, rolls, modifier, sides }) {
   )
 }
 
+function TurnEndedCard({ characterName }) {
+  return (
+    <div className="turn-ended-card">
+      <div className="turn-ended-card-icon">
+        <i className="bi bi-hourglass-bottom"></i>
+      </div>
+      <div className="turn-ended-card-content">
+        <div className="turn-ended-card-title">Turn Status</div>
+        <div className="turn-ended-card-body">
+          <strong>{characterName}</strong> ended their turn.
+        </div>
+      </div>
+    </div>
+  )
+}
+
 function PlayerMessageContent({ content }) {
   const segments = parseTaggedMessage(content)
 
@@ -218,6 +234,16 @@ function PlayerMessageContent({ content }) {
               </div>
               <div className="session-ic-text">{text}</div>
             </div>
+          )
+        }
+
+        if (segment.type === 'ooc' && text.startsWith('[Turn Ended]')) {
+          const name = text.replace('[Turn Ended]', '').trim() || 'Player'
+          return (
+            <TurnEndedCard
+              key={`turn-ended-${index}`}
+              characterName={name}
+            />
           )
         }
 
@@ -293,6 +319,9 @@ export default function SessionPanel({
   onStartSession,
   onEndSession,
   onSendMessage,
+  hasOlderMessages = false,
+  loadingOlderMessages = false,
+  onLoadOlderMessages,
   aiThinking,
   onProposalApplied,
   onProposalDismissed,
@@ -306,7 +335,10 @@ export default function SessionPanel({
   const [activeTab, setActiveTab] = useState('custom')
   const [showDice, setShowDice] = useState(false)
   const [lastRoll, setLastRoll] = useState(null)
+  const messagesContainerRef = useRef(null)
   const messagesEndRef = useRef(null)
+  const olderLoadScrollRef = useRef(null)
+  const previousMessageCountRef = useRef(0)
   const rollIdRef = useRef(0)
 
   const [activeSlashCommand, setActiveSlashCommand] = useState(null)
@@ -385,9 +417,44 @@ export default function SessionPanel({
     ]))
   }, [currentCharacter])
 
-  useEffect(() => {
-    messagesEndRef.current?.scrollIntoView({ behavior: 'smooth' })
+  useLayoutEffect(() => {
+    const container = messagesContainerRef.current
+    const olderLoadScroll = olderLoadScrollRef.current
+    if (container && olderLoadScroll) {
+      container.scrollTop = container.scrollHeight - olderLoadScroll.previousScrollHeight + olderLoadScroll.previousScrollTop
+      olderLoadScrollRef.current = null
+      previousMessageCountRef.current = messages.length
+      return
+    }
+
+    const previousCount = previousMessageCountRef.current
+    previousMessageCountRef.current = messages.length
+    if (!container || messages.length === previousCount) return
+
+    if (messages.length > previousCount) {
+      messagesEndRef.current?.scrollIntoView({ behavior: 'smooth' })
+    }
   }, [messages])
+
+  const loadOlderFromTop = (force = false) => {
+    const container = messagesContainerRef.current
+    if (!container || !hasOlderMessages || loadingOlderMessages || !onLoadOlderMessages) return
+    if (!force && container.scrollTop > 80) return
+
+    olderLoadScrollRef.current = {
+      previousScrollHeight: container.scrollHeight,
+      previousScrollTop: container.scrollTop,
+    }
+    Promise.resolve(onLoadOlderMessages())
+      .then((loadedCount) => {
+        if (!loadedCount) olderLoadScrollRef.current = null
+      })
+      .catch(() => {
+        olderLoadScrollRef.current = null
+      })
+  }
+
+  const handleMessagesScroll = () => loadOlderFromTop(false)
 
   const postRollToChat = (roll) => {
     if (!roll) return
@@ -610,7 +677,19 @@ export default function SessionPanel({
             </button>
           </div>
 
-          <div className="session-messages">
+          <div className="session-messages" ref={messagesContainerRef} onScroll={handleMessagesScroll}>
+            {(hasOlderMessages || loadingOlderMessages) && (
+              <div className="session-load-history">
+                <button
+                  type="button"
+                  className="btn btn-secondary small"
+                  onClick={() => loadOlderFromTop(true)}
+                  disabled={loadingOlderMessages}
+                >
+                  {loadingOlderMessages ? 'Loading older messages...' : 'Load older messages'}
+                </button>
+              </div>
+            )}
             {messages.length === 0 && (
               <div className="session-empty-msg">
                 The session has begun. Type an action or speak to the DM.

@@ -975,6 +975,7 @@ class EncounterMap(db.Model):
     setup_status = db.Column(db.String(20), default='pending')
     setup_error = db.Column(db.String(500), nullable=True)
     created_by_tool = db.Column(db.Boolean, default=True)
+    is_archived = db.Column(db.Boolean, default=False, nullable=False)
     created_at = db.Column(db.DateTime, default=datetime.utcnow)
     updated_at = db.Column(db.DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
     session = db.relationship('CampaignSession')
@@ -1029,6 +1030,7 @@ class EncounterMap(db.Model):
             'setup_status': self.setup_status or 'pending',
             'setup_error': self.setup_error,
             'created_by_tool': self.created_by_tool,
+            'is_archived': self.is_archived,
             'created_at': self.created_at.isoformat() if self.created_at else None,
             'updated_at': self.updated_at.isoformat() if self.updated_at else None,
         }

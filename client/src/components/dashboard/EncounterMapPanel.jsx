@@ -171,6 +171,9 @@ export default function EncounterMapPanel({
   const [movementMessage, setMovementMessage] = useState('')
   const [isMovingToken, setIsMovingToken] = useState(false)
   const [manualInitValues, setManualInitValues] = useState({})
+  const [isNarrativeCollapsed, setIsNarrativeCollapsed] = useState(() => {
+    return localStorage.getItem('encounter_narrative_collapsed') === 'true'
+  })
 
   // Adjust state when map ID changes (during render phase to avoid effect cascades)
   const currentMapId = encounterMap?.id || null
@@ -184,21 +187,23 @@ export default function EncounterMapPanel({
     setMovementMessage('')
     setIsMovingToken(false)
     setManualInitValues({})
+    setIsNarrativeCollapsed(false)
     if (isCollapsed) {
       setHasNotification(true)
     }
   }
 
   const encounterState = useMemo(() => {
-    if (!encounterMap?.encounter_state_json) return null
+    const rawState = encounterMap?.encounter_state || encounterMap?.encounter_state_json
+    if (!rawState) return null
     try {
-      return typeof encounterMap.encounter_state_json === 'string'
-        ? JSON.parse(encounterMap.encounter_state_json)
-        : encounterMap.encounter_state_json
+      return typeof rawState === 'string'
+        ? JSON.parse(rawState)
+        : rawState
     } catch (err) {
       return null
     }
-  }, [encounterMap?.encounter_state_json])
+  }, [encounterMap?.encounter_state, encounterMap?.encounter_state_json])
 
   const isEncounterActive = Boolean(encounterState?.active)
   const turnOrder = encounterState?.turn_order || []
@@ -254,6 +259,10 @@ export default function EncounterMapPanel({
       const data = await advanceEncounterTurn(encounterMap.id)
       onEncounterMapChange?.(data.encounter_map)
       setMoveError('')
+      if (onSendMessage) {
+        const name = activeCombatant?.label || currentCharacter?.name || playerPlacement?.label || 'Player'
+        await onSendMessage(`[Turn Ended] ${name}`)
+      }
     } catch (err) {
       setMoveError(err.message)
     }
@@ -995,9 +1004,25 @@ export default function EncounterMapPanel({
         {(encounterMap?.vtt_setup?.map_summary || (isOwner && encounterMap)) && (
           <div className="encounter-vtt-overlays-bottom-left">
             {encounterMap?.vtt_setup?.map_summary && (
-              <div className="encounter-narrative">
-                <i className="bi bi-blockquote-left narrative-icon"></i>
-                <p className="encounter-map-summary">{encounterMap.vtt_setup.map_summary}</p>
+              <div className={`encounter-narrative ${isNarrativeCollapsed ? 'collapsed' : 'expanded'}`}>
+                <div 
+                  className="encounter-narrative-header"
+                  onClick={() => {
+                    const nextVal = !isNarrativeCollapsed
+                    setIsNarrativeCollapsed(nextVal)
+                    localStorage.setItem('encounter_narrative_collapsed', String(nextVal))
+                  }}
+                  title={isNarrativeCollapsed ? "Expand Narrative" : "Collapse Narrative"}
+                >
+                  <div className="narrative-header-left">
+                    <i className="bi bi-blockquote-left narrative-icon"></i>
+                    <span className="narrative-header-title">Narrative</span>
+                  </div>
+                  <i className={`bi bi-chevron-${isNarrativeCollapsed ? 'up' : 'down'} narrative-chevron`}></i>
+                </div>
+                {!isNarrativeCollapsed && (
+                  <p className="encounter-map-summary">{encounterMap.vtt_setup.map_summary}</p>
+                )}
               </div>
             )}
 

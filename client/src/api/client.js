@@ -171,8 +171,20 @@ export function generateCampaignWorld(campaignId) {
   return apiFetch(`/campaigns/${campaignId}/world`, { method: 'POST' })
 }
 
-export function getSession(sessionId) {
-  return apiFetch(`/sessions/${sessionId}`)
+function queryString(params = {}) {
+  const search = new URLSearchParams()
+  Object.entries(params).forEach(([key, value]) => {
+    if (value !== undefined && value !== null && value !== '') search.set(key, value)
+  })
+  const query = search.toString()
+  return query ? `?${query}` : ''
+}
+
+export function getSession(sessionId, options = {}) {
+  return apiFetch(`/sessions/${sessionId}${queryString({
+    limit: options.limit,
+    before_id: options.beforeId,
+  })}`)
 }
 
 export function endSession(sessionId, recap) {
@@ -180,8 +192,11 @@ export function endSession(sessionId, recap) {
 }
 
 // Messages
-export function getMessages(sessionId) {
-  return apiFetch(`/sessions/${sessionId}/messages`)
+export function getMessages(sessionId, options = {}) {
+  return apiFetch(`/sessions/${sessionId}/messages${queryString({
+    limit: options.limit,
+    before_id: options.beforeId,
+  })}`)
 }
 
 export function sendMessage(sessionId, content, role = 'player') {

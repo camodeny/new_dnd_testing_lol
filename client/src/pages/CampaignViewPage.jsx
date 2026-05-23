@@ -1,8 +1,8 @@
-import { useEffect, useState, useCallback } from 'react'
+import { useEffect, useState, useCallback, useMemo } from 'react'
 import { useParams, useNavigate } from 'react-router-dom'
 import {
   getCampaign, updateCampaign, deleteCampaign, getCampaignCharacters,
-  startSession, endSession, getSession, sendMessage,
+  startSession, endSession, getSession, getMessages, sendMessage,
   getCharacters,
   addCampaignCharacter,
   listMembers,
@@ -21,6 +21,8 @@ import CampaignLobby from '../components/dashboard/CampaignLobby'
 import CharacterPlanningMode from '../components/dashboard/CharacterPlanningMode'
 import EncounterMapPanel from '../components/dashboard/EncounterMapPanel'
 import WorldBuildingMode from '../components/dashboard/WorldBuildingMode'
+
+const SESSION_MESSAGE_PAGE_SIZE = 50
 
 function getInitials(name) {
   return name.split(' ').map((w) => w[0]).join('').slice(0, 2).toUpperCase()
@@ -96,13 +98,23 @@ async function fetchCampaignPageData(id) {
   let encounterMap = null
   if (activeSession) {
     const [data, propData, mapData] = await Promise.all([
-      getSession(activeSession.id).catch(() => ({ session: { messages: [] } })),
+      getSession(activeSession.id, { limit: SESSION_MESSAGE_PAGE_SIZE }).catch(() => ({ session: { messages: [], has_more_messages: false } })),
       getSheetProposals(activeSession.id).catch(() => ({ sheet_proposals: [] })),
       getCurrentEncounterMap(id).catch(() => ({ encounter_map: null })),
     ])
     messages = data.session?.messages || []
+    const hasOlderMessages = Boolean(data.session?.has_more_messages)
     sheetProposals = propData.sheet_proposals || []
     encounterMap = mapData.encounter_map || null
+    return {
+      campaign,
+      characters: charData.characters || [],
+      activeSession,
+      messages,
+      hasOlderMessages,
+      sheetProposals,
+      encounterMap,
+    }
   }
 
   return {
@@ -110,6 +122,7 @@ async function fetchCampaignPageData(id) {
     characters: charData.characters || [],
     activeSession,
     messages,
+    hasOlderMessages: false,
     sheetProposals,
     encounterMap,
   }
@@ -124,6 +137,8 @@ export default function CampaignViewPage({ user }) {
   const [error, setError] = useState('')
   const [session, setSession] = useState(null)
   const [messages, setMessages] = useState([])
+  const [hasOlderMessages, setHasOlderMessages] = useState(false)
+  const [loadingOlderMessages, setLoadingOlderMessages] = useState(false)
   const [showSettings, setShowSettings] = useState(false)
   const [campaignName, setCampaignName] = useState('')
   const [campaignDesc, setCampaignDesc] = useState('')
@@ -143,6 +158,29 @@ export default function CampaignViewPage({ user }) {
   const [isMapExpanded, setIsMapExpanded] = useState(() => {
     return localStorage.getItem('encounter_map_collapsed') === 'false'
   })
+  const isEncounterActive = useMemo(() => {
+    if (campaign?.settings?.encounter_active) return true
+    if (!encounterMap) return false
+    const rawState = encounterMap.encounter_state || encounterMap.encounter_state_json
+    if (!rawState) return false
+    try {
+      const parsed = typeof rawState === 'string' ? JSON.parse(rawState) : rawState
+      return Boolean(parsed?.active)
+    } catch {
+      return false
+    }
+  }, [campaign?.settings?.encounter_active, encounterMap])
+
+  const hasPlacements = useMemo(() => {
+    return Boolean(encounterMap?.placements && encounterMap.placements.length > 0)
+  }, [encounterMap])
+
+  useEffect(() => {
+    if (isEncounterActive && hasPlacements) {
+      setIsMapExpanded(true)
+      localStorage.setItem('encounter_map_collapsed', 'false')
+    }
+  }, [isEncounterActive, hasPlacements])
 
   const loadData = useCallback(async () => {
     try {
@@ -151,6 +189,7 @@ export default function CampaignViewPage({ user }) {
       setCharacters(data.characters)
       setSession(data.activeSession)
       setMessages(data.messages)
+      setHasOlderMessages(data.hasOlderMessages)
       setEncounterMap(data.encounterMap || null)
       const loadedProposals = data.sheetProposals || []
       setSheetProposals(loadedProposals)
@@ -203,6 +242,7 @@ export default function CampaignViewPage({ user }) {
         setCharacters(data.characters)
         setSession(data.activeSession)
         setMessages(data.messages)
+        setHasOlderMessages(data.hasOlderMessages)
         setEncounterMap(data.encounterMap || null)
         const loadedProposals = data.sheetProposals || []
         setSheetProposals(loadedProposals)
@@ -271,7 +311,7 @@ export default function CampaignViewPage({ user }) {
       try {
         const mapData = await getCurrentEncounterMap(id)
         setEncounterMap(mapData.encounter_map || null)
-      } catch (err) {
+      } catch {
         // Silently ignore polling errors to avoid disrupting play
       }
     }, 4000)
@@ -285,6 +325,7 @@ export default function CampaignViewPage({ user }) {
       const newSession = data.session
       setSession(newSession)
       setMessages(newSession.messages || [])
+      setHasOlderMessages(false)
       setShowWorldBuilding(false)
       const propData = await getSheetProposals(newSession.id).catch(() => ({ sheet_proposals: [] }))
       setSheetProposals(propData.sheet_proposals || [])
@@ -300,6 +341,7 @@ export default function CampaignViewPage({ user }) {
       await endSession(session.id, '')
       setSession(null)
       setMessages([])
+      setHasOlderMessages(false)
       loadData()
     } catch (err) {
       setError(err.message)
@@ -430,6 +472,40 @@ export default function CampaignViewPage({ user }) {
 
   const currentCharacter = characters.find((c) => c.user_id === user?.id)
 
+  const loadOlderMessages = useCallback(async () => {
+    if (!session || loadingOlderMessages || !hasOlderMessages) return 0
+    const oldestMessage = messages.find((message) => Number.isInteger(message.id))
+    if (!oldestMessage) {
+      setHasOlderMessages(false)
+      return 0
+    }
+
+    setLoadingOlderMessages(true)
+    try {
+      const data = await getMessages(session.id, {
+        beforeId: oldestMessage.id,
+        limit: SESSION_MESSAGE_PAGE_SIZE,
+      })
+      const olderMessages = data.messages || []
+      setHasOlderMessages(Boolean(data.has_more_messages))
+      if (olderMessages.length) {
+        setMessages((prev) => {
+          const existing = new Set(prev.map((message) => message.id))
+          return [
+            ...olderMessages.filter((message) => !existing.has(message.id)),
+            ...prev,
+          ]
+        })
+      }
+      return olderMessages.length
+    } catch (err) {
+      setError(err.message)
+      return 0
+    } finally {
+      setLoadingOlderMessages(false)
+    }
+  }, [hasOlderMessages, loadingOlderMessages, messages, session])
+
   const handleProposalApplied = (appliedProposal, updatedCharacter) => {
     setSheetProposals((prev) => prev.filter((p) => p.id !== appliedProposal.id))
     setMessages((prev) =>
@@ -524,9 +600,8 @@ export default function CampaignViewPage({ user }) {
       />
     )
   }
-
   const isOwner = campaign.user_id === user?.id
-  const hasActiveMap = Boolean(encounterMap)
+  const hasActiveMap = isEncounterActive || Boolean(encounterMap)
 
   return (
     <div className={`dashboard-page ${isMapExpanded && hasActiveMap ? 'map-expanded' : ''}`}>
@@ -536,7 +611,7 @@ export default function CampaignViewPage({ user }) {
         </aside>
 
         <main className={`dashboard-center ${isMapExpanded && hasActiveMap ? 'map-expanded' : ''}`}>
-          {(session || encounterMap) && (
+          {hasActiveMap && (
             <EncounterMapPanel
               encounterMap={encounterMap}
               loading={encounterMapLoading}
@@ -557,6 +632,9 @@ export default function CampaignViewPage({ user }) {
             onStartSession={handleStartSession}
             onEndSession={handleEndSession}
             onSendMessage={handleSendMessage}
+            hasOlderMessages={hasOlderMessages}
+            loadingOlderMessages={loadingOlderMessages}
+            onLoadOlderMessages={loadOlderMessages}
             aiThinking={aiThinking}
             sheetProposals={sheetProposals}
             onProposalApplied={handleProposalApplied}

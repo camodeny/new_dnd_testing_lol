@@ -27,6 +27,34 @@ from services.world_service import approve_world, dm_world_context, ensure_world
 
 sessions_bp = Blueprint('sessions', __name__)
 
+DEFAULT_MESSAGE_PAGE_SIZE = 50
+MAX_MESSAGE_PAGE_SIZE = 100
+
+
+def _message_page(session_id, before_id=None, limit=DEFAULT_MESSAGE_PAGE_SIZE):
+    try:
+        limit = int(limit)
+    except (TypeError, ValueError):
+        limit = DEFAULT_MESSAGE_PAGE_SIZE
+    limit = max(1, min(limit, MAX_MESSAGE_PAGE_SIZE))
+
+    query = SessionMessage.query.filter_by(session_id=session_id)
+    if before_id:
+        try:
+            before_id = int(before_id)
+        except (TypeError, ValueError):
+            before_id = None
+        if before_id:
+            query = query.filter(SessionMessage.id < before_id)
+
+    rows = query.order_by(SessionMessage.id.desc()).limit(limit + 1).all()
+    has_more = len(rows) > limit
+    messages = list(reversed(rows[:limit]))
+    return {
+        'messages': [message.to_dict() for message in messages],
+        'has_more_messages': has_more,
+    }
+
 
 def _session_dm_turn_decision(raw_result):
     decision = normalize_session_dm_turn_decision(raw_result)
@@ -168,7 +196,11 @@ def get_session(current_user, session_id):
         return jsonify({'error': 'Forbidden'}), 403
 
     data = session.to_dict()
-    data['messages'] = [m.to_dict() for m in session.messages]
+    data.update(_message_page(
+        session_id,
+        before_id=request.args.get('before_id'),
+        limit=request.args.get('limit'),
+    ))
     return jsonify({'session': data}), 200
 
 
@@ -198,8 +230,11 @@ def get_messages(current_user, session_id):
     if not ensure_member(campaign, current_user):
         return jsonify({'error': 'Forbidden'}), 403
 
-    messages = SessionMessage.query.filter_by(session_id=session_id).order_by(SessionMessage.created_at).all()
-    return jsonify({'messages': [m.to_dict() for m in messages]}), 200
+    return jsonify(_message_page(
+        session_id,
+        before_id=request.args.get('before_id'),
+        limit=request.args.get('limit'),
+    )), 200
 
 
 @sessions_bp.route('/api/sessions/<int:session_id>/messages', methods=['POST'])

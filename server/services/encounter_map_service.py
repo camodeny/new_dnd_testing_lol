@@ -48,7 +48,7 @@ def encounter_map_labeled_path(encounter_map):
 
 def latest_encounter_map(campaign_id):
     return (
-        EncounterMap.query.filter_by(campaign_id=campaign_id)
+        EncounterMap.query.filter_by(campaign_id=campaign_id, is_archived=False)
         .order_by(EncounterMap.created_at.desc(), EncounterMap.id.desc())
         .first()
     )

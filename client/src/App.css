@@ -1287,8 +1287,8 @@ select.input:focus {
 
 .dashboard-center.map-expanded .session-panel {
   order: -1;
-  flex: 0 0 clamp(250px, 15vw, 320px);
-  width: clamp(250px, 15vw, 320px);
+  flex: 0 0 clamp(320px, 20vw, 380px);
+  width: clamp(320px, 20vw, 380px);
   border-right: 1px solid var(--border-color);
   border-left: none;
   background: rgba(15, 16, 22, 0.45);
@@ -2291,16 +2291,56 @@ select.input:focus {
   padding: 12px 16px;
   border-radius: 0 var(--radius-sm) var(--radius-sm) 0;
   display: flex;
-  gap: 12px;
-  align-items: flex-start;
+  flex-direction: column;
+  gap: 8px;
   box-shadow: var(--shadow-sm);
+  transition: all 0.3s cubic-bezier(0.4, 0, 0.2, 1);
+}
+
+.encounter-narrative.collapsed {
+  padding: 8px 12px;
+}
+
+.encounter-narrative-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  cursor: pointer;
+  user-select: none;
+  width: 100%;
+  gap: 12px;
+}
+
+.narrative-header-left {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
+.narrative-header-title {
+  font-size: 0.72rem;
+  font-weight: 800;
+  text-transform: uppercase;
+  letter-spacing: 0.08em;
+  color: var(--text-gold);
 }
 
 .narrative-icon {
   font-size: 1.1rem;
   color: var(--text-gold);
-  margin-top: 2px;
   flex-shrink: 0;
+}
+
+.narrative-chevron {
+  color: var(--text-muted);
+  font-size: 0.85rem;
+  transition: transform 0.25s cubic-bezier(0.4, 0, 0.2, 1), color 0.2s ease;
+  flex-shrink: 0;
+}
+
+.encounter-narrative-header:hover .narrative-chevron {
+  color: var(--text-bright);
+  transform: scale(1.15);
 }
 
 .encounter-map-summary {
@@ -2308,6 +2348,7 @@ select.input:focus {
   color: var(--text-muted);
   font-size: 0.85rem;
   line-height: 1.5;
+  padding-left: 26px;
 }
 
 /* Styled Combatants Roster list */
@@ -2889,6 +2930,12 @@ select.input:focus {
   color: var(--text-dim);
   font-style: italic;
   font-size: 0.95rem;
+}
+
+.session-load-history {
+  display: flex;
+  justify-content: center;
+  padding: 4px 0 8px;
 }
 
 /* Chat Messages */
@@ -5817,3 +5864,68 @@ select.input:focus {
 .lootbox-stash-modal .loot-box-stash-title {
   display: none;
 }
+
+/* ==========================================================================
+   TURN ENDED CARD
+   ========================================================================== */
+.turn-ended-card {
+  background: linear-gradient(135deg, rgba(31, 41, 55, 0.9), rgba(17, 24, 39, 0.95));
+  border: 1px solid rgba(139, 92, 246, 0.25);
+  border-left: 4px solid var(--color-primary, #8b5cf6);
+  border-radius: var(--radius-md, 8px);
+  padding: 12px 16px;
+  margin: 8px 0;
+  box-shadow: var(--shadow-md), 0 4px 12px rgba(0, 0, 0, 0.3), inset 0 0 10px rgba(139, 92, 246, 0.05);
+  display: flex;
+  align-items: center;
+  gap: 14px;
+  max-width: 100%;
+  animation: turnCardSlideIn 0.35s cubic-bezier(0.34, 1.56, 0.64, 1);
+  box-sizing: border-box;
+}
+
+@keyframes turnCardSlideIn {
+  from { opacity: 0; transform: translateX(-12px) scale(0.98); }
+  to { opacity: 1; transform: translateX(0) scale(1); }
+}
+
+.turn-ended-card-icon {
+  width: 36px;
+  height: 36px;
+  border-radius: 50%;
+  background: rgba(139, 92, 246, 0.15);
+  border: 1px solid rgba(139, 92, 246, 0.3);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  color: var(--color-primary-hover, #a78bfa);
+  font-size: 1.1rem;
+  flex-shrink: 0;
+  box-shadow: 0 0 10px rgba(139, 92, 246, 0.2);
+}
+
+.turn-ended-card-content {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  flex-grow: 1;
+}
+
+.turn-ended-card-title {
+  font-size: 0.8rem;
+  font-weight: 700;
+  text-transform: uppercase;
+  color: var(--text-muted, #9ca3af);
+  letter-spacing: 1px;
+}
+
+.turn-ended-card-body {
+  font-size: 0.95rem;
+  color: var(--text-bright, #f3f4f6);
+  font-weight: 500;
+}
+
+.turn-ended-card-body strong {
+  color: var(--text-gold, #f59e0b);
+}
+

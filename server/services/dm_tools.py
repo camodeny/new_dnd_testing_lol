@@ -250,6 +250,72 @@ def _compact_encounter_map(encounter_map):
     }
 
 
+def _campaign_settings(campaign):
+    try:
+        return json.loads(campaign.settings) if isinstance(campaign.settings, str) else (campaign.settings or {})
+    except (TypeError, ValueError):
+        return {}
+
+
+def _combat_coordinate_context(campaign, encounter_map):
+    if not encounter_map:
+        return None
+
+    settings = _campaign_settings(campaign)
+    state = EncounterMap._json_value(encounter_map.encounter_state_json, {})
+    state_active = state.get('active', False) if isinstance(state, dict) else False
+    if not settings.get('encounter_active') and not state_active:
+        return None
+
+    grid = EncounterMap._json_value(encounter_map.grid_json, {})
+    turn_order = state.get('turn_order', []) if isinstance(state, dict) else []
+    turn_by_placement_id = {
+        item.get('placement_id'): item
+        for item in turn_order
+        if isinstance(item, dict) and item.get('placement_id') is not None
+    }
+    active_turn_index = state.get('active_turn_index') if isinstance(state, dict) else None
+    active_placement_id = None
+    if isinstance(active_turn_index, int) and 0 <= active_turn_index < len(turn_order):
+        active_item = turn_order[active_turn_index]
+        if isinstance(active_item, dict):
+            active_placement_id = active_item.get('placement_id')
+
+    combatants = []
+    for placement in sorted(encounter_map.placements, key=lambda item: (item.grid_row, item.grid_col, item.id)):
+        turn_item = turn_by_placement_id.get(placement.id, {})
+        combatants.append({
+            'placement_id': placement.id,
+            'actor_type': placement.actor_type,
+            'combatant_type': 'enemy' if placement.actor_type == 'monster' else placement.actor_type,
+            'actor_id': placement.actor_id,
+            'label': placement.label,
+            'coordinates': {
+                'col': placement.grid_col,
+                'row': placement.grid_row,
+            },
+            'initiative': turn_item.get('initiative') if isinstance(turn_item, dict) else None,
+            'is_active_turn': placement.id == active_placement_id,
+        })
+
+    return {
+        'active': True,
+        'encounter_map_id': encounter_map.id,
+        'encounter_map_title': encounter_map.title,
+        'grid': {
+            'columns': grid.get('columns') if isinstance(grid, dict) else None,
+            'rows': grid.get('rows') if isinstance(grid, dict) else None,
+        },
+        'round': state.get('round') if isinstance(state, dict) else None,
+        'active_turn_index': active_turn_index,
+        'combatants': combatants,
+        'instruction': (
+            'Use these exact grid coordinates as the current combat positions for every player character, '
+            'NPC, and enemy before adjudicating the latest message.'
+        ),
+    }
+
+
 def build_session_hot_context(campaign, session, current_user):
     character = _current_character(campaign, current_user)
     world, _graph, world_state, _private = _world_json(campaign)
@@ -303,6 +369,7 @@ def build_session_hot_context(campaign, session, current_user):
         ],
         'current_scene': current_scene,
         'current_encounter_map': _compact_encounter_map(encounter_map),
+        'combat_coordinates': _combat_coordinate_context(campaign, encounter_map),
         'active_clocks': [clock.to_dict(include_private=True) for clock in active_clocks],
         'private_output_terms': _private_output_terms(campaign),
         'private_spoiler_items': _private_spoiler_items(campaign),
@@ -318,7 +385,10 @@ def build_session_hot_context(campaign, session, current_user):
             'After a map exists and combat positioning matters, use place_encounter_map_actors to place '
             'players, NPCs, and monsters on grid coordinates. '
             'When combat or initiative starts, use toggle_encounter_mode(active=True) to start Encounter Mode. '
+            'This will return an instruction prompt. You must then immediately call create_encounter_map to generate '
+            'a brand new combat map, and then place_encounter_map_actors to place everyone onto it. Do not re-use old maps. '
             'During combat, track turns: use next_combat_turn() to advance turns, update_combatant_actions() to deduct actions/movement, and set_combat_turn() to skip/set turns. '
+            'When combat_coordinates is present, treat it as the latest exact grid location list for every PC, NPC, and enemy after the latest message. '
             'Do not generate maps for every ordinary scene. '
             + _campaign_loot_mode_policy(campaign)
         ),
@@ -803,7 +873,7 @@ DM_TOOL_DEFINITIONS = [
         'type': 'function',
         'function': {
             'name': 'toggle_encounter_mode',
-            'description': 'Start or stop Encounter Mode (combat tracker) on the latest map. Starts initiative rolling for monsters/NPCs and prompts players to roll initiative.',
+            'description': 'Start or stop Encounter Mode (combat tracker). Starting it will return instructions to generate a new map and place actors. Stopping it will archive the current map.',
             'parameters': {
                 'type': 'object',
                 'required': ['active'],
@@ -1476,6 +1546,17 @@ def _tool_place_encounter_map_actors(campaign, current_user, args, session=None,
     if not saved and errors:
         return {'error': 'No placements were saved.', 'placement_errors': errors, 'placement_warnings': placement_warnings}
 
+    try:
+        settings = json.loads(campaign.settings) if isinstance(campaign.settings, str) else (campaign.settings or {})
+    except (TypeError, ValueError):
+        settings = {}
+    state = EncounterMap._json_value(encounter_map.encounter_state_json, {})
+    if settings.get('encounter_active') and not state:
+        from routes.encounter_maps import build_initial_encounter_state, check_and_start_turns
+        state = build_initial_encounter_state(encounter_map, campaign)
+        check_and_start_turns(state)
+        encounter_map.encounter_state_json = json.dumps(state)
+
     event = _record_event(
         campaign,
         'encounter_map_actors_placed',
@@ -1526,9 +1607,29 @@ def _tool_toggle_encounter_mode(campaign, current_user, args):
                 encounter_map.encounter_state_json = None
             encounter_state = state or {}
 
+            # Archive the map when combat is ended
+            encounter_map.is_archived = True
+
     db.session.commit()
+
+    message = f"Encounter mode {'started' if active else 'stopped'}."
+    if active:
+        message += (
+            " You MUST now run the create_encounter_map tool to generate a brand new map "
+            "for this combat encounter, and then run the place_encounter_map_actors tool "
+            "to place all players, NPCs, and monsters onto the newly generated map. Do not re-use old maps. "
+            "Use this exact create_encounter_map argument shape: "
+            '{"title":"Short player-visible map title","map_prompt":"Concrete top-down battle map layout and important zones",'
+            '"terrain":"Optional terrain/environment notes","tactical_features":"Optional cover, choke points, elevation, hazards, doors, obstacles, objectives",'
+            '"vtt_setup_notes":"Optional setup notes for friendly starts, enemy starts, obstacles, objectives, and terrain calls",'
+            '"mood":"Optional mood and lighting notes"}. '
+            "Do not use name, description, width, height, grid_size, environment_type, lighting_conditions, or terrain_features. "
+            "After the map is created, use place_encounter_map_actors with this argument shape: "
+            '{"encounter_map_id":123,"clear_existing":true,"placements":[{"actor_type":"player|npc|monster","actor_id":"user id, selected character id, NPC actor_id, or monster_id","col":0,"row":0,"label":"Optional label","monster_name":"Optional monster name","stat_block":{}}]}.'
+        )
+
     return {
-        'message': f"Encounter mode {'started' if active else 'stopped'}.",
+        'message': message,
         'encounter_state': encounter_state,
         'affected_ids': {
             'encounter_map_ids': [encounter_map.id] if encounter_map else [],
