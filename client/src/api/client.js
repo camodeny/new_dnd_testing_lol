@@ -328,3 +328,16 @@ export function updateNPC(npcId, payload) {
 export function deleteNPC(npcId) {
   return apiFetch(`/npcs/${npcId}`, { method: 'DELETE' })
 }
+
+// Shops
+export function getShops(campaignId) {
+  return apiFetch(`/campaigns/${campaignId}/shops`)
+}
+
+export function buyShopItem(shopId, characterId, itemName) {
+  return apiFetch(`/shops/${shopId}/buy`, {
+    method: 'POST',
+    body: JSON.stringify({ character_id: characterId, item_name: itemName }),
+  })
+}
+

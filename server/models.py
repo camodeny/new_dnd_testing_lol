@@ -1244,3 +1244,39 @@ class CampaignAuditEvent(db.Model):
             'payload': payload,
             'created_at': self.created_at.isoformat() if self.created_at else None,
         }
+
+
+class CampaignShop(db.Model):
+    __tablename__ = 'campaign_shops'
+
+    id = db.Column(db.Integer, primary_key=True)
+    campaign_id = db.Column(db.Integer, db.ForeignKey('campaign.id'), nullable=False)
+    location_id = db.Column(db.String(160), nullable=True)
+    location_name = db.Column(db.String(200), nullable=True)
+    name = db.Column(db.String(200), nullable=False)
+    description = db.Column(db.Text, nullable=True)
+    items_json = db.Column(db.Text, nullable=False)  # JSON array of shop items
+    is_open = db.Column(db.Boolean, default=True, nullable=False)
+    created_at = db.Column(db.DateTime, default=datetime.utcnow)
+    updated_at = db.Column(db.DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
+
+    campaign = db.relationship('Campaign')
+
+    def to_dict(self):
+        import json
+        try:
+            items = json.loads(self.items_json) if self.items_json else []
+        except (TypeError, ValueError):
+            items = []
+        return {
+            'id': self.id,
+            'campaign_id': self.campaign_id,
+            'location_id': self.location_id,
+            'location_name': self.location_name,
+            'name': self.name,
+            'description': self.description,
+            'items': items,
+            'is_open': bool(self.is_open),
+            'created_at': self.created_at.isoformat() if self.created_at else None,
+            'updated_at': self.updated_at.isoformat() if self.updated_at else None,
+        }

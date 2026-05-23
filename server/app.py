@@ -17,6 +17,7 @@ from routes.planning import planning_bp
 from routes.sessions import sessions_bp
 from routes.lootboxes import lootboxes_bp
 from routes.world import world_bp
+from routes.shops import shops_bp
 
 load_dotenv()
 
@@ -49,6 +50,7 @@ def create_app():
     app.register_blueprint(sessions_bp)
     app.register_blueprint(lootboxes_bp)
     app.register_blueprint(world_bp)
+    app.register_blueprint(shops_bp)
 
     @app.route('/api/health')
     def health():
@@ -133,6 +135,15 @@ def ensure_lightweight_schema():
             db.session.execute(text('ALTER TABLE encounter_maps ADD COLUMN setup_error VARCHAR(500)'))
         if 'is_archived' not in encounter_map_columns:
             db.session.execute(text('ALTER TABLE encounter_maps ADD COLUMN is_archived BOOLEAN DEFAULT 0 NOT NULL'))
+
+    campaign_shop_columns = table_columns('campaign_shops')
+    if campaign_shop_columns:
+        if 'location_id' not in campaign_shop_columns:
+            db.session.execute(text('ALTER TABLE campaign_shops ADD COLUMN location_id VARCHAR(160)'))
+        if 'location_name' not in campaign_shop_columns:
+            db.session.execute(text('ALTER TABLE campaign_shops ADD COLUMN location_name VARCHAR(200)'))
+        if 'is_open' not in campaign_shop_columns:
+            db.session.execute(text('ALTER TABLE campaign_shops ADD COLUMN is_open BOOLEAN DEFAULT 1 NOT NULL'))
     db.session.commit()
 
 

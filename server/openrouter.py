@@ -172,6 +172,13 @@ LOOT_GENERATION_SYSTEM_PROMPT = (
     "and situational items. Return only valid JSON with no commentary or markdown fences."
 )
 
+SHOP_MENU_GENERATION_SYSTEM_PROMPT = (
+    "You generate one D&D shop inventory from a merchant summary and current scene context. "
+    "Return only valid JSON. Keep prices plausible for standard 5e gold-piece economy unless campaign "
+    "context clearly says otherwise. Include mundane goods, useful adventuring supplies, and a few flavorful "
+    "local items that fit the merchant. Do not include secret spoilers or player-facing narration."
+)
+
 
 def _env_model_for_provider(provider):
     return OPENCODE_GO_MODEL if provider == 'opencode_go' else OPENROUTER_MODEL
@@ -1813,6 +1820,41 @@ def get_loot_generation_response(generation_context):
     messages = _build_loot_generation_messages(generation_context)
     try:
         data = _json_loads_with_repair(_post_chat(messages, json_mode=True))
+        return data if isinstance(data, dict) else {}
+    except Exception:
+        return {}
+
+
+def get_shop_menu_generation_response(generation_context, audit_context=None):
+    shop = generation_context.get('shop') or {}
+    scene = generation_context.get('current_scene') or {}
+    campaign = generation_context.get('campaign') or {}
+    item_count = shop.get('item_count') or 6
+    messages = [
+        {
+            'role': 'system',
+            'content': SHOP_MENU_GENERATION_SYSTEM_PROMPT,
+        },
+        {
+            'role': 'user',
+            'content': (
+                'Create the item list for this single shop.\n\n'
+                f'Campaign: {json.dumps(campaign, ensure_ascii=False)}\n'
+                f'Current scene: {json.dumps(scene, ensure_ascii=False)}\n'
+                f'Shop summary: {json.dumps(shop, ensure_ascii=False)}\n\n'
+                f'Return exactly {item_count} items unless the shop concept clearly needs fewer.\n'
+                'Return only JSON matching this shape:\n'
+                '{\n'
+                '  "items": [\n'
+                '    {"name": "Item Name", "description": "1 concise sentence", "cost_gp": 5, "quantity": 3}\n'
+                '  ]\n'
+                '}\n'
+                'Use quantity null for common unlimited goods. Use integer quantities for limited stock.'
+            ),
+        },
+    ]
+    try:
+        data = _json_loads_with_repair(_post_chat(messages, json_mode=True, audit_context=audit_context))
         return data if isinstance(data, dict) else {}
     except Exception:
         return {}

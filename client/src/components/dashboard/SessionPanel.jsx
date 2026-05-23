@@ -326,6 +326,7 @@ export default function SessionPanel({
   onProposalApplied,
   onProposalDismissed,
   onToggleLootStash,
+  onToggleShops,
 }) {
   const [input, setInput] = useState('')
   const [modifier, setModifier] = useState(0)
@@ -651,7 +652,7 @@ export default function SessionPanel({
           <div className="session-idle-icon"><i className="bi bi-dice-5-fill"></i></div>
           <h3>No Active Session</h3>
           <p>Start a new session to begin playing with the AI Dungeon Master.</p>
-          <div className="session-idle-actions" style={{ display: 'flex', gap: '12px', justifyContent: 'center', marginTop: '12px' }}>
+          <div className="session-idle-actions" style={{ display: 'flex', gap: '12px', justifyContent: 'center', marginTop: '12px', flexWrap: 'wrap' }}>
             <button className="btn btn-primary" onClick={onStartSession}>
               Start Session
             </button>
@@ -667,12 +668,17 @@ export default function SessionPanel({
           <div className="session-header">
             <span className="session-active-indicator" />
             <span className="session-status">Session Active</span>
+            {onToggleShops && (
+              <button className="btn btn-secondary small" onClick={onToggleShops} style={{ marginLeft: 'auto', marginRight: '8px' }}>
+                <i className="bi bi-shop"></i> Local Shops
+              </button>
+            )}
             {onToggleLootStash && (
-              <button className="btn btn-secondary small btn-mobile-loot" onClick={onToggleLootStash} style={{ marginLeft: 'auto', marginRight: '8px' }}>
+              <button className="btn btn-secondary small btn-mobile-loot" onClick={onToggleLootStash} style={{ marginLeft: onToggleShops ? '0' : 'auto', marginRight: '8px' }}>
                 <i className="bi bi-box-seam"></i> Loot Stash
               </button>
             )}
-            <button className="btn btn-secondary small" onClick={onEndSession} style={{ marginLeft: onToggleLootStash ? '0' : 'auto' }}>
+            <button className="btn btn-secondary small" onClick={onEndSession} style={{ marginLeft: !onToggleShops && !onToggleLootStash ? 'auto' : '0' }}>
               End Session
             </button>
           </div>

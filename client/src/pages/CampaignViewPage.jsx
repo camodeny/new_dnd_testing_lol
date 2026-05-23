@@ -18,6 +18,7 @@ import PartyRoster from '../components/dashboard/PartyRoster'
 import SessionPanel from '../components/dashboard/SessionPanel'
 import LootBoxStash from '../components/lootbox/LootBoxStash'
 import CampaignLobby from '../components/dashboard/CampaignLobby'
+import CampaignShops from '../components/shop/CampaignShops'
 import CharacterPlanningMode from '../components/dashboard/CharacterPlanningMode'
 import EncounterMapPanel from '../components/dashboard/EncounterMapPanel'
 import WorldBuildingMode from '../components/dashboard/WorldBuildingMode'
@@ -147,6 +148,7 @@ export default function CampaignViewPage({ user }) {
   const [showPlanning, setShowPlanning] = useState(false)
   const [showWorldBuilding, setShowWorldBuilding] = useState(false)
   const [showLootStash, setShowLootStash] = useState(false)
+  const [showShops, setShowShops] = useState(false)
 
   const [showImport, setShowImport] = useState(false)
   const [availableChars, setAvailableChars] = useState([])
@@ -550,6 +552,13 @@ export default function CampaignViewPage({ user }) {
     }
   }
 
+  const handlePurchaseSuccess = (updatedCharacter) => {
+    setCharacters((prev) =>
+      prev.map((c) => (c.id === updatedCharacter?.id ? updatedCharacter : c))
+    )
+    loadData()
+  }
+
   const handleProposalDismissed = (dismissedProposal) => {
     setSheetProposals((prev) => prev.filter((p) => p.id !== dismissedProposal.id))
     setMessages((prev) =>
@@ -640,6 +649,7 @@ export default function CampaignViewPage({ user }) {
             onProposalApplied={handleProposalApplied}
             onProposalDismissed={handleProposalDismissed}
             onToggleLootStash={() => setShowLootStash(true)}
+            onToggleShops={() => setShowShops(true)}
           />
         </main>
 
@@ -742,6 +752,24 @@ export default function CampaignViewPage({ user }) {
             </div>
             <div style={{ padding: '24px', overflowY: 'auto', maxHeight: '70vh' }}>
               <LootBoxStash campaignId={id} isOwner={isOwner} characters={characters} onLootBoxOpened={handleLootBoxOpened} />
+            </div>
+          </div>
+        </div>
+      )}
+
+      {showShops && (
+        <div className="modal-overlay" onClick={() => setShowShops(false)}>
+          <div className="modal-panel" style={{ maxWidth: '900px' }} onClick={(e) => e.stopPropagation()}>
+            <div className="modal-header">
+              <h2>Local Shops</h2>
+              <button className="modal-close" onClick={() => setShowShops(false)}><i className="bi bi-x-lg"></i></button>
+            </div>
+            <div style={{ padding: '24px', overflowY: 'auto', maxHeight: '78vh' }}>
+              <CampaignShops
+                campaignId={id}
+                currentCharacter={currentCharacter}
+                onPurchaseSuccess={handlePurchaseSuccess}
+              />
             </div>
           </div>
         </div>

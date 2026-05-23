@@ -134,6 +134,8 @@ class DmToolsTest(unittest.TestCase):
         self.assertIn('advance_clock', names)
         self.assertIn('create_encounter_map', names)
         self.assertIn('place_encounter_map_actors', names)
+        self.assertIn('create_shop_list', names)
+        self.assertNotIn('create_shop_menu', names)
         for tool in DM_TOOL_DEFINITIONS:
             self.assertEqual(tool['type'], 'function')
             self.assertIn('parameters', tool['function'])

@@ -25,6 +25,7 @@ from services.embedding_service import (
 from services.encounter_map_service import create_encounter_map as do_create_encounter_map, latest_encounter_map
 from services.lootbox_service import generate_loot_box as do_generate_loot_box
 from services.planning_service import summary_dict_for_read
+from services.shop_generation_service import clean_shop_items, generate_scene_shops, upsert_shop
 from services.world_service import clean_id, clean_text, get_campaign_world, json_dumps, json_loads
 from openrouter import get_character_sheet_answer
 
@@ -946,6 +947,59 @@ DM_TOOL_DEFINITIONS = [
                 }
             }
         }
+    },
+    {
+        'type': 'function',
+        'function': {
+            'name': 'create_shop_list',
+            'description': 'Create or update all local merchants for the current scene. Provide concise shop summaries only; a separate shop generator will expand each merchant into a priced item menu and save the shop records.',
+            'parameters': {
+                'type': 'object',
+                'required': ['shops'],
+                'properties': {
+                    'scene_note': {
+                        'type': 'string',
+                        'description': 'Optional brief note about the market, street, district, or trade scene these shops belong to.'
+                    },
+                    'shops': {
+                        'type': 'array',
+                        'description': 'Concise list of merchants or storefronts available in this current scene.',
+                        'minItems': 1,
+                        'maxItems': 12,
+                        'items': {
+                            'type': 'object',
+                            'required': ['name', 'description', 'specialties'],
+                            'properties': {
+                                'name': {
+                                    'type': 'string',
+                                    'description': 'Thematic merchant or shop name, e.g. "Grom\'s Armory" or "The Whispering Elixir".'
+                                },
+                                'description': {
+                                    'type': 'string',
+                                    'description': 'Concise flavor text describing the merchant, storefront, and atmosphere.'
+                                },
+                                'specialties': {
+                                    'type': 'array',
+                                    'description': 'What this merchant sells, such as weapons, armor, potions, maps, mounts, rations, tools, books, or luxury goods.',
+                                    'items': {'type': 'string'}
+                                },
+                                'price_level': {
+                                    'type': 'string',
+                                    'enum': ['budget', 'standard', 'premium', 'luxury'],
+                                    'description': 'General price band for this merchant.'
+                                },
+                                'item_count': {
+                                    'type': 'integer',
+                                    'minimum': 1,
+                                    'maximum': 12,
+                                    'description': 'Approximate number of menu items the shop generator should create.'
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
     }
 ]
 
@@ -1780,6 +1834,122 @@ def _tool_update_combatant_actions(campaign, current_user, args):
     }
 
 
+def _current_scene_for_shop(campaign):
+    _world, _graph, world_state, _private = _world_json(campaign)
+    current_scene = world_state.get('current_scene', {}) if isinstance(world_state, dict) else {}
+    return current_scene if isinstance(current_scene, dict) else {}
+
+
+def _tool_create_shop_menu(campaign, current_user, args, session=None, audit_context=None):
+    from models import SessionMessage
+    _ = current_user
+    _ = audit_context
+
+    current_scene = _current_scene_for_shop(campaign)
+    location_name = clean_text(current_scene.get('location_name', ''), 200) or None
+
+    name = clean_text(args.get('name', ''), 200)
+    description = clean_text(args.get('description', ''), 1000)
+    if not name:
+        return {'error': 'A shop name is required.'}
+
+    cleaned_items = clean_shop_items(args.get('items', []))
+    shop = upsert_shop(campaign, current_scene, {'name': name, 'description': description}, cleaned_items)
+    action_text = f'Shop "{name}" upserted.'
+
+    if session:
+        location_text = f' in {location_name}' if location_name else ''
+        announcement = (
+            f'A local merchant is available{location_text}: **{shop.name}**. '
+            f'The party can browse and purchase items while they remain here.'
+        )
+        announcement_msg = SessionMessage(
+            session_id=session.id,
+            role='dm',
+            content=announcement,
+        )
+        db.session.add(announcement_msg)
+        db.session.flush()
+
+    event = _record_event(
+        campaign,
+        'shop_menu_created',
+        action_text,
+        {
+            'shop_id': shop.id,
+            'name': shop.name,
+            'description': shop.description,
+            'location_id': shop.location_id,
+            'location_name': shop.location_name,
+        },
+        visibility='party_known',
+    )
+
+    return {
+        'shop': shop.to_dict(),
+        'affected_ids': {'shop_ids': [shop.id], 'world_event_ids': [event.id]}
+    }
+
+
+def _tool_create_shop_list(campaign, current_user, args, session=None, audit_context=None):
+    from models import SessionMessage
+    _ = current_user
+
+    shop_requests = args.get('shops', [])
+    if not isinstance(shop_requests, list) or not shop_requests:
+        return {'error': 'At least one shop is required.'}
+
+    current_scene = _current_scene_for_shop(campaign)
+    location_name = clean_text(current_scene.get('location_name', ''), 200) or None
+    shops = generate_scene_shops(
+        campaign,
+        current_scene,
+        shop_requests[:12],
+        audit_context=audit_context,
+    )
+    if not shops:
+        return {'error': 'No valid shops were provided.'}
+
+    if session:
+        location_text = f' in {location_name}' if location_name else ''
+        shop_names = ', '.join(f'**{shop.name}**' for shop in shops[:6])
+        if len(shops) > 6:
+            shop_names = f'{shop_names}, and {len(shops) - 6} more'
+        announcement = (
+            f'Local merchants are available{location_text}: {shop_names}. '
+            f'The party can browse and purchase items while they remain here.'
+        )
+        announcement_msg = SessionMessage(
+            session_id=session.id,
+            role='dm',
+            content=announcement,
+        )
+        db.session.add(announcement_msg)
+        db.session.flush()
+
+    event = _record_event(
+        campaign,
+        'shop_list_created',
+        f'{len(shops)} local shops prepared for the current scene.',
+        {
+            'shop_ids': [shop.id for shop in shops],
+            'names': [shop.name for shop in shops],
+            'location_id': clean_text(current_scene.get('location_id', ''), 160) or None,
+            'location_name': location_name,
+            'scene_note': clean_text(args.get('scene_note', ''), 500),
+        },
+        visibility='party_known',
+    )
+
+    return {
+        'shops': [shop.to_dict() for shop in shops],
+        'affected_ids': {
+            'shop_ids': [shop.id for shop in shops],
+            'world_event_ids': [event.id],
+        }
+    }
+
+
 TOOL_HANDLERS = {
     'ask_character_sheet': _tool_ask_character_sheet,
     'get_current_scene': _tool_get_current_scene,
@@ -1796,6 +1966,8 @@ TOOL_HANDLERS = {
     'next_combat_turn': _tool_next_combat_turn,
     'set_combat_turn': _tool_set_combat_turn,
     'update_combatant_actions': _tool_update_combatant_actions,
+    'create_shop_list': _tool_create_shop_list,
+    'create_shop_menu': _tool_create_shop_menu,
 }
 
 
@@ -1810,7 +1982,7 @@ def execute_dm_tool(campaign, session, current_user, name, args, audit_context=N
         before_new = len(db.session.new)
         result = (
             handler(campaign, current_user, args, session, audit_context)
-            if name in {'propose_sheet_update', 'generate_loot_box', 'create_encounter_map', 'place_encounter_map_actors'}
+            if name in {'propose_sheet_update', 'generate_loot_box', 'create_encounter_map', 'place_encounter_map_actors', 'create_shop_list', 'create_shop_menu'}
             else handler(campaign, current_user, args, audit_context)
             if name in {'ask_character_sheet', 'search_campaign_memory'}
             else handler(campaign, current_user, args)
@@ -1827,6 +1999,8 @@ def execute_dm_tool(campaign, session, current_user, name, args, audit_context=N
             'next_combat_turn',
             'set_combat_turn',
             'update_combatant_actions',
+            'create_shop_list',
+            'create_shop_menu',
         }
         mutated = mutated or len(db.session.new) > before_new
     log_audit_event(
