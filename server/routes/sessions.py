@@ -1,9 +1,10 @@
 from datetime import datetime
+from threading import Thread
 
-from flask import Blueprint, jsonify, request
+from flask import Blueprint, current_app, jsonify, request
 
 from auth import token_required
-from models import db, Campaign, CampaignSession, SessionMessage, SheetProposal, Character
+from models import db, Campaign, CampaignSession, SessionMessage, SheetProposal, Character, User
 from openrouter import (
     get_opening_scene_response,
     get_session_dm_response_with_tools,
@@ -68,6 +69,125 @@ def _session_dm_turn_decision(raw_result):
         'mode': 'speak',
         'content': decision.get('content') or '',
     }
+
+
+def _run_session_memory_update(
+    campaign_id,
+    session_id,
+    user_id,
+    player_message_id,
+    player_content,
+    ai_text,
+    hot_context,
+    parent_trace_id,
+):
+    memory_trace_id = f'session_memory_writer:session_{session_id}:message_{player_message_id}'
+    trace_label = f'session_memory_writer: session {session_id}'
+    try:
+        campaign = db.session.get(Campaign, campaign_id)
+        session = db.session.get(CampaignSession, session_id)
+        current_user = db.session.get(User, user_id)
+        if not campaign or not session or not current_user:
+            return
+
+        memory_context = build_session_memory_context(
+            campaign,
+            session,
+            current_user,
+            player_content,
+            ai_text,
+            hot_context,
+        )
+        memory_patch = get_session_memory_patch(
+            memory_context,
+            audit_context={
+                'campaign_id': campaign.id,
+                'operation': 'session_memory_update',
+                'actor': 'session_memory_writer',
+                'trace_id': memory_trace_id,
+                'parent_trace_id': parent_trace_id,
+                'trace_label': trace_label,
+            },
+        )
+        if memory_patch:
+            apply_memory_patch(
+                campaign,
+                session,
+                memory_patch,
+                audit_context={
+                    'trace_id': memory_trace_id,
+                    'parent_trace_id': parent_trace_id,
+                    'trace_label': trace_label,
+                },
+            )
+        db.session.commit()
+    except Exception as err:
+        db.session.rollback()
+        log_audit_event(
+            campaign_id,
+            'memory_update_error',
+            'Post-turn memory update failed after visible DM response.',
+            {'session_id': session_id, 'error': repr(err)},
+            source='session_memory',
+            actor='session_memory_writer',
+            trace_id=memory_trace_id,
+            parent_trace_id=parent_trace_id,
+            trace_label=trace_label,
+            audit_role='tools',
+            commit=True,
+        )
+
+
+def _schedule_session_memory_update(
+    campaign_id,
+    session_id,
+    user_id,
+    player_message_id,
+    player_content,
+    ai_text,
+    hot_context,
+    parent_trace_id,
+):
+    app = current_app._get_current_object()
+
+    def run_with_app_context():
+        with app.app_context():
+            try:
+                _run_session_memory_update(
+                    campaign_id,
+                    session_id,
+                    user_id,
+                    player_message_id,
+                    player_content,
+                    ai_text,
+                    hot_context,
+                    parent_trace_id,
+                )
+            finally:
+                db.session.remove()
+
+    if (
+        app.config.get('TESTING')
+        or app.testing
+        or app.config.get('SQLALCHEMY_DATABASE_URI') == 'sqlite:///:memory:'
+    ):
+        _run_session_memory_update(
+            campaign_id,
+            session_id,
+            user_id,
+            player_message_id,
+            player_content,
+            ai_text,
+            hot_context,
+            parent_trace_id,
+        )
+        return
+
+    Thread(
+        target=run_with_app_context,
+        name=f'session-memory-{session_id}',
+        daemon=True,
+    ).start()
 
 
 @sessions_bp.route('/api/campaigns/<int:campaign_id>/sessions', methods=['POST'])
@@ -338,61 +458,13 @@ def send_message(current_user, session_id):
             trace_label=trace_label,
             commit=False,
         )
-        memory_trace_id = f'session_memory_writer:session_{session_id}:message_{msg.id}'
-        try:
-            memory_context = build_session_memory_context(
-                campaign,
-                session,
-                current_user,
-                content,
-                ai_text,
-                hot_context,
-            )
-            memory_patch = get_session_memory_patch(
-                memory_context,
-                audit_context={
-                    'campaign_id': campaign.id,
-                    'operation': 'session_memory_update',
-                    'actor': 'session_memory_writer',
-                    'trace_id': memory_trace_id,
-                    'parent_trace_id': trace_id,
-                    'trace_label': f'session_memory_writer: session {session_id}',
-                },
-            )
-            if memory_patch:
-                apply_memory_patch(
-                    campaign,
-                    session,
-                    memory_patch,
-                    audit_context={
-                        'trace_id': memory_trace_id,
-                        'parent_trace_id': trace_id,
-                        'trace_label': f'session_memory_writer: session {session_id}',
-                    },
-                )
-        except Exception as err:
-            log_audit_event(
-                campaign.id,
-                'memory_update_error',
-                'Post-turn memory update failed after visible DM response.',
-                {'session_id': session_id, 'error': repr(err)},
-                source='session_memory',
-                actor='session_memory_writer',
-                trace_id=memory_trace_id,
-                parent_trace_id=trace_id,
-                trace_label=f'session_memory_writer: session {session_id}',
-                audit_role='tools',
-                commit=False,
-            )
-        db.session.commit()
-        result_messages.append(ai_msg.to_dict())
-
         pending_proposals = SheetProposal.query.filter_by(
             session_id=session_id, message_id=None, status='pending',
         ).all()
         for proposal in pending_proposals:
             proposal.message_id = ai_msg.id
         db.session.commit()
+        result_messages.append(ai_msg.to_dict())
         sheet_proposals = [p.to_dict() for p in pending_proposals]
 
         log_audit_event(
@@ -405,6 +477,16 @@ def send_message(current_user, session_id):
             trace_id=trace_id,
             trace_label=trace_label,
             commit=True,
+        )
+        _schedule_session_memory_update(
+            campaign.id,
+            session_id,
+            current_user.id,
+            msg.id,
+            content,
+            ai_text,
+            hot_context,
+            trace_id,
         )
         return jsonify({'messages': result_messages, 'sheet_proposals': sheet_proposals}), 201
 

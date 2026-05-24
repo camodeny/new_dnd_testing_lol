@@ -44,6 +44,10 @@ LLM_RETRY_MAX_DELAY_SECONDS = max(
     LLM_RETRY_BASE_DELAY_SECONDS,
     float(os.environ.get('LLM_RETRY_MAX_DELAY_SECONDS', os.environ.get('OPENROUTER_RETRY_MAX_DELAY_SECONDS', '8'))),
 )
+SESSION_PREFLIGHT_TIMEOUT_SECONDS = max(
+    1.0,
+    float(os.environ.get('SESSION_PREFLIGHT_TIMEOUT_SECONDS', '6')),
+)
 
 PC_CONTROL_POLICY = (
     "Player-character control policy: NPCs may speak and act. Player characters are protected. "
@@ -148,6 +152,17 @@ SESSION_SPOILER_CHECK_SYSTEM_PROMPT = (
     "any unrevealed private item. A reply is unsafe when a reasonable player could learn the hidden truth from "
     "the reply itself. Ordinary foreshadowing, mood, uncertainty, and clues that do not effectively answer the "
     "hidden truth are safe. Do not mark a reply unsafe merely because it is thematically related to a private item."
+)
+
+SESSION_PREFLIGHT_SYSTEM_PROMPT = (
+    "You are a fast routing classifier for an AI Dungeon Master turn. "
+    "Return only valid JSON. Be extremely conservative about skipping spoiler checks. "
+    "Set skip_spoiler_check=true only when it is excruciatingly obvious the final visible reply, if any, "
+    "will be silent, purely out-of-character operational help, purely mechanical/rules bookkeeping, "
+    "or a clarification with no narrative facts, NPC claims, object ownership, location state, motives, "
+    "relations, reveals, clues, or world-state assertions. For any narrative reply, uncertain case, "
+    "NPC interaction, scene description, lore answer, object/person/location claim, or likely tool use, "
+    "set skip_spoiler_check=false."
 )
 
 CHARACTER_SHEET_SYSTEM_PROMPT = (
@@ -317,8 +332,8 @@ def _deepseek_thinking_enabled(provider, model):
     )
 
 
-def _provider_request_payload_options(provider, model, tools, tool_choice, parallel_tool_calls):
-    thinking_enabled = _deepseek_thinking_enabled(provider, model)
+def _provider_request_payload_options(provider, model, tools, tool_choice, parallel_tool_calls, allow_thinking=True):
+    thinking_enabled = bool(allow_thinking) and _deepseek_thinking_enabled(provider, model)
     options = {
         'thinking_enabled': thinking_enabled,
         'tool_choice': tool_choice,
@@ -342,6 +357,9 @@ def _post_chat_response(
     tools=None,
     tool_choice=None,
     parallel_tool_calls=None,
+    allow_thinking=True,
+    timeout_seconds=60,
+    max_attempts=None,
 ):
     audit_context = audit_context or {}
     campaign_id = audit_context.get('campaign_id')
@@ -376,6 +394,7 @@ def _post_chat_response(
         tools,
         tool_choice,
         parallel_tool_calls,
+        allow_thinking=allow_thinking,
     )
     payload = {
         'model': model,
@@ -421,7 +440,8 @@ def _post_chat_response(
             ),
         )
 
-    for attempt in range(1, LLM_MAX_ATTEMPTS + 1):
+    attempt_limit = max(1, int(max_attempts or LLM_MAX_ATTEMPTS))
+    for attempt in range(1, attempt_limit + 1):
         try:
             resp = requests.post(
                 _api_url_for_provider(provider),
@@ -430,7 +450,7 @@ def _post_chat_response(
                     'Content-Type': 'application/json',
                 },
                 json=payload,
-                timeout=60,
+                timeout=timeout_seconds,
             )
             resp.raise_for_status()
             data = resp.json()
@@ -448,7 +468,7 @@ def _post_chat_response(
                 )
             return data
         except Exception as err:
-            can_retry = attempt < LLM_MAX_ATTEMPTS and _is_retriable_llm_error(err)
+            can_retry = attempt < attempt_limit and _is_retriable_llm_error(err)
             if can_retry:
                 delay_seconds = _retry_delay_seconds(attempt)
                 if campaign_id:
@@ -460,7 +480,7 @@ def _post_chat_response(
                             'operation': operation,
                             'attempt': attempt,
                             'next_attempt': attempt + 1,
-                            'max_attempts': LLM_MAX_ATTEMPTS,
+                            'max_attempts': attempt_limit,
                             'delay_seconds': delay_seconds,
                             'error': repr(err),
                         },
@@ -490,8 +510,22 @@ def _post_chat_response(
             raise
 
 
-def _post_chat(messages, json_mode=False, audit_context=None):
-    data = _post_chat_response(messages, json_mode=json_mode, audit_context=audit_context)
+def _post_chat(
+    messages,
+    json_mode=False,
+    audit_context=None,
+    allow_thinking=True,
+    timeout_seconds=60,
+    max_attempts=None,
+):
+    data = _post_chat_response(
+        messages,
+        json_mode=json_mode,
+        audit_context=audit_context,
+        allow_thinking=allow_thinking,
+        timeout_seconds=timeout_seconds,
+        max_attempts=max_attempts,
+    )
     return data['choices'][0]['message']['content']
 
 
@@ -638,15 +672,147 @@ def normalize_session_dm_turn_decision(raw_decision):
     }
 
 
+SESSION_DM_GUARD_ONLY_CONTEXT_KEYS = {'private_output_terms', 'private_spoiler_items'}
+
+
+def _session_dm_prompt_context(hot_context):
+    return {
+        key: value
+        for key, value in (hot_context or {}).items()
+        if key not in SESSION_DM_GUARD_ONLY_CONTEXT_KEYS
+    }
+
+
 def build_session_dm_tool_messages(hot_context):
+    prompt_context = _session_dm_prompt_context(hot_context)
     return [
         {'role': 'system', 'content': SESSION_TOOL_PROMPT},
         {
             'role': 'system',
             'content': 'Compact hot context. Full campaign memory is available through tools, not preloaded:\n'
-            + json.dumps(hot_context, ensure_ascii=False),
+            + json.dumps(prompt_context, ensure_ascii=False),
         },
     ]
+
+
+SAFE_SPOILER_SKIP_PREFLIGHT_MODES = {'silent', 'ooc_only', 'mechanics_only', 'clarification_only'}
+
+
+def _preflight_message_dict(message):
+    if isinstance(message, dict):
+        role = message.get('role')
+        content = message.get('content')
+    else:
+        role = getattr(message, 'role', None)
+        content = getattr(message, 'content', None)
+    return {
+        'role': role or 'user',
+        'content': str(content or '')[:1000],
+    }
+
+
+def build_session_preflight_messages(hot_context, recent_messages, tools):
+    prompt_context = _session_dm_prompt_context(hot_context)
+    tool_names = [
+        tool.get('function', {}).get('name')
+        for tool in (tools or [])
+        if isinstance(tool, dict) and tool.get('function')
+    ]
+    payload = {
+        'latest_messages': [_preflight_message_dict(message) for message in recent_messages[-4:]],
+        'current_character': prompt_context.get('current_player_character'),
+        'has_active_combat': bool(prompt_context.get('combat_coordinates')),
+        'has_current_encounter_map': bool(prompt_context.get('current_encounter_map')),
+        'has_unrevealed_private_items': bool((hot_context or {}).get('private_spoiler_items')),
+        'available_tool_names': [name for name in tool_names if name],
+        'decision_policy': (
+            'skip_spoiler_check may be true only for silent, ooc_only, mechanics_only, or '
+            'clarification_only turns with high confidence. Set it false for narrative, unknown, '
+            'tool-likely, NPC, lore, object ownership, relationship, location, clue, reveal, or world-state turns.'
+        ),
+        'return_shape': {
+            'dm_reply_mode': 'silent | ooc_only | mechanics_only | clarification_only | narrative | unknown',
+            'skip_spoiler_check': False,
+            'confidence': 'high | medium | low',
+            'reason': 'short explanation',
+        },
+    }
+    return [
+        {'role': 'system', 'content': SESSION_PREFLIGHT_SYSTEM_PROMPT},
+        {'role': 'user', 'content': json.dumps(payload, ensure_ascii=False)},
+    ]
+
+
+def normalize_session_preflight_decision(raw_decision):
+    data = raw_decision if isinstance(raw_decision, dict) else _json_loads_or_empty(raw_decision)
+    if not isinstance(data, dict) or not data:
+        return {
+            'dm_reply_mode': 'unknown',
+            'skip_spoiler_check': False,
+            'confidence': 'low',
+            'reason': 'Preflight returned no usable decision.',
+        }
+
+    mode = str(data.get('dm_reply_mode') or data.get('reply_mode') or 'unknown').strip().lower()
+    if mode not in SAFE_SPOILER_SKIP_PREFLIGHT_MODES | {'narrative', 'unknown'}:
+        mode = 'unknown'
+    confidence = str(data.get('confidence') or 'low').strip().lower()
+    if confidence not in {'high', 'medium', 'low'}:
+        confidence = 'low'
+    skip_spoiler_check = (
+        data.get('skip_spoiler_check') is True
+        and mode in SAFE_SPOILER_SKIP_PREFLIGHT_MODES
+        and confidence == 'high'
+    )
+
+    return {
+        'dm_reply_mode': mode,
+        'skip_spoiler_check': skip_spoiler_check,
+        'confidence': confidence,
+        'reason': str(data.get('reason') or '').strip(),
+    }
+
+
+def get_session_preflight_decision(hot_context, recent_messages, tools, audit_context=None):
+    base_audit = audit_context or {}
+    preflight_audit = _child_audit_context(
+        base_audit,
+        'session_preflight',
+        'session_preflight_router',
+        'session_preflight_router: routing',
+    )
+    try:
+        raw_decision = _post_chat(
+            build_session_preflight_messages(hot_context, recent_messages, tools),
+            json_mode=True,
+            audit_context=preflight_audit,
+            allow_thinking=False,
+            timeout_seconds=SESSION_PREFLIGHT_TIMEOUT_SECONDS,
+            max_attempts=1,
+        )
+        return normalize_session_preflight_decision(raw_decision)
+    except Exception as err:
+        campaign_id = base_audit.get('campaign_id')
+        if campaign_id:
+            log_audit_event(
+                campaign_id,
+                'session_preflight_error',
+                'Session preflight failed closed.',
+                {'error': repr(err)},
+                source='session_dm.preflight',
+                actor='session_preflight_router',
+                trace_id=preflight_audit.get('trace_id'),
+                parent_trace_id=preflight_audit.get('parent_trace_id'),
+                trace_label=preflight_audit.get('trace_label'),
+                audit_role='tools',
+                commit=True,
+            )
+        return {
+            'dm_reply_mode': 'unknown',
+            'skip_spoiler_check': False,
+            'confidence': 'low',
+            'reason': 'Preflight failed closed.',
+        }
 
 
 def _strip_npc_blocks(text):
@@ -872,9 +1038,16 @@ def _child_audit_context(base_audit, operation, actor, trace_label):
     }
 
 
-def check_session_spoilers_with_llm(response_text, hot_context, audit_context=None):
+def check_session_spoilers_with_llm(response_text, hot_context, audit_context=None, skip_spoiler_check=False):
     if not (response_text or '').strip() or not hot_context.get('private_spoiler_items'):
         return {'safe': True, 'leaked_item_ids': [], 'evidence': [], 'reason': ''}
+    if skip_spoiler_check is True:
+        return {
+            'safe': True,
+            'leaked_item_ids': [],
+            'evidence': [],
+            'reason': 'Conservative preflight classified this turn as safe to skip spoiler checking.',
+        }
 
     base_audit = audit_context or {}
     checker_audit = _child_audit_context(
@@ -888,6 +1061,7 @@ def check_session_spoilers_with_llm(response_text, hot_context, audit_context=No
             build_session_spoiler_check_messages(response_text, hot_context),
             json_mode=True,
             audit_context=checker_audit,
+            allow_thinking=False,
         )
         return normalize_session_spoiler_check(raw_check)
     except Exception as err:
@@ -1374,6 +1548,25 @@ def get_session_dm_response_with_tools(
         else:
             role = msg.role
         messages.append({'role': role, 'content': msg.content})
+    preflight_decision = {
+        'dm_reply_mode': 'unknown',
+        'skip_spoiler_check': False,
+        'confidence': 'low',
+        'reason': 'Preflight not run.',
+    }
+    if base_audit.get('operation') == 'session_dm_response':
+        preflight_decision = get_session_preflight_decision(
+            hot_context,
+            recent_messages,
+            tools,
+            audit_context={
+                **base_audit,
+                'trace_id': trace_id,
+                'trace_label': trace_label,
+                'operation': 'session_preflight',
+                'actor': 'session_preflight_router',
+            },
+        )
 
     tool_round = 0
     format_retried = False
@@ -1431,7 +1624,12 @@ def get_session_dm_response_with_tools(
                 else None
             )
             spoiler_check = (
-                check_session_spoilers_with_llm(content, hot_context, loop_audit)
+                check_session_spoilers_with_llm(
+                    content,
+                    hot_context,
+                    loop_audit,
+                    skip_spoiler_check=preflight_decision.get('skip_spoiler_check') is True,
+                )
                 if decision.get('mode') == 'speak' and not format_violation and not private_violation
                 else {'safe': True, 'leaked_item_ids': [], 'evidence': [], 'reason': ''}
             )

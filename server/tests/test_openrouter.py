@@ -14,9 +14,15 @@ from openrouter import (
     _json_loads_with_error,
     _json_loads_with_repair,
     _post_chat_response,
+    SESSION_PREFLIGHT_TIMEOUT_SECONDS,
+    build_session_dm_tool_messages,
+    build_session_preflight_messages,
+    check_session_spoilers_with_llm,
     get_character_sheet_answer,
     get_opening_scene_response,
+    get_session_preflight_decision,
     get_world_genesis_package,
+    normalize_session_preflight_decision,
     normalize_session_spoiler_check,
 )
 
@@ -220,6 +226,25 @@ class ProviderCompatibilityTest(unittest.TestCase):
         self.assertNotIn('tool_choice', request.kwargs['json'])
         self.assertNotIn('parallel_tool_calls', request.kwargs['json'])
 
+    def test_post_chat_response_can_disable_thinking_for_lightweight_calls(self):
+        success = {
+            'choices': [{'message': {'content': 'ok'}}],
+        }
+
+        with patch('openrouter.OPENCODE_GO_API_KEY', 'go-key'), \
+                patch('openrouter.OPENCODE_GO_THINKING', 'enabled'), \
+                patch('openrouter.get_llm_provider', return_value='opencode_go'), \
+                patch('openrouter.get_llm_model', return_value='deepseek-v4-flash'), \
+                patch('openrouter.requests.post', return_value=FakeResponse(200, success)) as post:
+            result = _post_chat_response(
+                [{'role': 'user', 'content': 'hello'}],
+                allow_thinking=False,
+            )
+
+        self.assertEqual(result, success)
+        self.assertNotIn('thinking', post.call_args.kwargs['json'])
+        self.assertNotIn('reasoning_effort', post.call_args.kwargs['json'])
+
     def test_opening_scene_reprompts_when_visible_content_is_empty(self):
         empty_response = {
             'choices': [{
@@ -284,6 +309,114 @@ class SessionSpoilerCheckTest(unittest.TestCase):
                 'reason': 'Leaked hidden truth.',
             },
         )
+
+    def test_session_dm_prompt_omits_guard_only_private_corpus(self):
+        messages = build_session_dm_tool_messages({
+            'campaign': {'name': 'Test'},
+            'private_output_terms': ['Crimson Veil'],
+            'private_spoiler_items': [
+                {'id': 'villain', 'text': 'Lord Ember secretly funds the crimson cult.'},
+            ],
+        })
+
+        prompt_context = messages[1]['content']
+        self.assertIn('"campaign"', prompt_context)
+        self.assertNotIn('private_output_terms', prompt_context)
+        self.assertNotIn('private_spoiler_items', prompt_context)
+        self.assertNotIn('Crimson Veil', prompt_context)
+        self.assertNotIn('crimson cult', prompt_context)
+
+    def test_preflight_normalizer_only_allows_high_confidence_safe_modes_to_skip(self):
+        self.assertEqual(
+            normalize_session_preflight_decision({
+                'dm_reply_mode': 'mechanics_only',
+                'skip_spoiler_check': True,
+                'confidence': 'high',
+                'reason': 'Only reports a roll total.',
+            }),
+            {
+                'dm_reply_mode': 'mechanics_only',
+                'skip_spoiler_check': True,
+                'confidence': 'high',
+                'reason': 'Only reports a roll total.',
+            },
+        )
+        self.assertFalse(normalize_session_preflight_decision({
+            'dm_reply_mode': 'narrative',
+            'skip_spoiler_check': True,
+            'confidence': 'high',
+        })['skip_spoiler_check'])
+        self.assertFalse(normalize_session_preflight_decision({
+            'dm_reply_mode': 'ooc_only',
+            'skip_spoiler_check': True,
+            'confidence': 'medium',
+        })['skip_spoiler_check'])
+
+    def test_session_preflight_prompt_uses_policy_and_not_private_spoiler_corpus(self):
+        messages = build_session_preflight_messages(
+            {
+                'current_player_character': {'id': 1, 'name': 'Aria'},
+                'private_spoiler_items': [
+                    {'id': 'villain', 'text': 'Lord Ember secretly funds the crimson cult.'},
+                ],
+            },
+            [{'role': 'player', 'content': '<ooc>What is my AC?</ooc>'}],
+            [{'type': 'function', 'function': {'name': 'ask_character_sheet'}}],
+        )
+
+        payload = messages[1]['content']
+        self.assertIn('excruciatingly obvious', messages[0]['content'])
+        self.assertIn('has_unrevealed_private_items', payload)
+        self.assertIn('ask_character_sheet', payload)
+        self.assertNotIn('Lord Ember', payload)
+        self.assertNotIn('crimson cult', payload)
+
+    def test_session_preflight_uses_single_fast_non_thinking_call(self):
+        with patch('openrouter._post_chat', return_value='{"dm_reply_mode":"ooc_only","skip_spoiler_check":true,"confidence":"high","reason":"OOC help."}') as post_chat:
+            result = get_session_preflight_decision(
+                {},
+                [{'role': 'player', 'content': '<ooc>How do I roll?</ooc>'}],
+                [],
+            )
+
+        self.assertTrue(result['skip_spoiler_check'])
+        self.assertFalse(post_chat.call_args.kwargs['allow_thinking'])
+        self.assertEqual(post_chat.call_args.kwargs['max_attempts'], 1)
+        self.assertEqual(post_chat.call_args.kwargs['timeout_seconds'], SESSION_PREFLIGHT_TIMEOUT_SECONDS)
+
+    def test_spoiler_checker_skips_llm_when_preflight_explicitly_allows_skip(self):
+        hot_context = {
+            'private_spoiler_items': [
+                {'id': 'villain', 'text': 'Lord Ember secretly funds the crimson cult.'},
+            ],
+        }
+
+        with patch('openrouter._post_chat') as post_chat:
+            result = check_session_spoilers_with_llm(
+                'Lord Ember watches the crimson cult from a balcony.',
+                hot_context,
+                skip_spoiler_check=True,
+            )
+
+        self.assertTrue(result['safe'])
+        post_chat.assert_not_called()
+
+    def test_spoiler_checker_disables_thinking_when_preflight_does_not_skip(self):
+        hot_context = {
+            'private_spoiler_items': [
+                {'id': 'villain', 'text': 'Lord Ember secretly funds the crimson cult.'},
+            ],
+        }
+
+        with patch('openrouter._post_chat', return_value='{"safe": true, "leaked_item_ids": [], "evidence": [], "reason": ""}') as post_chat:
+            result = check_session_spoilers_with_llm(
+                'Lord Ember watches the crimson cult from a balcony.',
+                hot_context,
+                skip_spoiler_check=False,
+            )
+
+        self.assertTrue(result['safe'])
+        self.assertFalse(post_chat.call_args.kwargs['allow_thinking'])
 
 
 class CharacterSheetAgentTest(unittest.TestCase):
