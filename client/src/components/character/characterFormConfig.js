@@ -74,6 +74,7 @@ function mergeGroup(base, value) {
 const ITEM_LIST_FIELD_ALIASES = {
   classes: {
     class_name: ['name', 'class', 'className'],
+    subclass: ['archetype', 'subclassName'],
     hit_die_type: ['hit_die', 'hitDie', 'hitDieType'],
   },
   skills: {
@@ -121,6 +122,11 @@ const ITEM_LIST_STRING_FIELDS = {
   proficiencies: 'name',
 }
 
+const ITEM_LIST_STRING_DEFAULTS = {
+  skills: { is_proficient: true },
+  saving_throws: { is_proficient: true },
+}
+
 function hasUsableValue(value) {
   return value !== undefined && value !== null && (typeof value !== 'string' || value.trim() !== '')
 }
@@ -137,7 +143,11 @@ export function normalizeItemList(key, items) {
 
   return items.map((item) => {
     if (typeof item === 'string') {
-      return { ...config.emptyItem, [ITEM_LIST_STRING_FIELDS[key] || config.fields[0].key]: item }
+      return {
+        ...config.emptyItem,
+        ...(ITEM_LIST_STRING_DEFAULTS[key] || {}),
+        [ITEM_LIST_STRING_FIELDS[key] || config.fields[0].key]: item,
+      }
     }
     if (!item || typeof item !== 'object' || Array.isArray(item)) return item
     const normalized = { ...config.emptyItem, ...item }
@@ -149,9 +159,48 @@ export function normalizeItemList(key, items) {
   })
 }
 
+function setExpandedPath(target, path, value) {
+  const parts = path.split('.').filter(Boolean)
+  if (parts.length < 2) {
+    target[path] = value
+    return
+  }
+
+  let cursor = target
+  for (let index = 0; index < parts.length - 1; index += 1) {
+    const part = parts[index]
+    if (!cursor[part] || typeof cursor[part] !== 'object' || Array.isArray(cursor[part])) {
+      cursor[part] = {}
+    }
+    cursor = cursor[part]
+  }
+  cursor[parts[parts.length - 1]] = value
+}
+
+function expandDottedKeys(source) {
+  const expanded = {}
+  Object.entries(source).forEach(([key, value]) => {
+    if (key.includes('.')) {
+      setExpandedPath(expanded, key, value)
+    } else if (
+      value
+      && typeof value === 'object'
+      && !Array.isArray(value)
+      && expanded[key]
+      && typeof expanded[key] === 'object'
+      && !Array.isArray(expanded[key])
+    ) {
+      expanded[key] = { ...expanded[key], ...value }
+    } else {
+      expanded[key] = value
+    }
+  })
+  return expanded
+}
+
 export function normalizeCharacterDraft(draft) {
   if (!draft || typeof draft !== 'object') return draft
-  const normalized = { ...draft }
+  const normalized = expandDottedKeys(draft)
   ITEM_LIST_CONFIGS.forEach(({ key }) => {
     if (key in normalized) normalized[key] = normalizeItemList(key, normalized[key])
   })

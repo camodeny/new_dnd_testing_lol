@@ -19,6 +19,7 @@ from auth import generate_token
 from models import (
     db,
     Campaign,
+    CampaignAuditEvent,
     CampaignInvite,
     CampaignMember,
     Character,
@@ -665,7 +666,7 @@ class AppRouteTest(unittest.TestCase):
                 'player_name': 'dev',
                 'race': 'Human Variant',
                 'background': 'Charlatan',
-                'classes': [{'class_name': 'Rogue', 'level': 1}],
+                'classes': [{'name': 'Scout', 'archetype': 'Ace Pilot', 'level': 1}],
                 'skills': ['Deception', 'Stealth'],
                 'saving_throws': ['Dexterity'],
                 'proficiencies': ['Thieves tools'],
@@ -677,8 +678,12 @@ class AppRouteTest(unittest.TestCase):
 
         self.assertEqual(response.status_code, 201)
         character = response.get_json()['character']
+        self.assertEqual(character['classes'][0]['class_name'], 'Scout')
+        self.assertEqual(character['classes'][0]['subclass'], 'Ace Pilot')
         self.assertEqual(character['skills'][0]['skill_name'], 'Deception')
+        self.assertTrue(character['skills'][0]['is_proficient'])
         self.assertEqual(character['saving_throws'][0]['ability'], 'Dexterity')
+        self.assertTrue(character['saving_throws'][0]['is_proficient'])
         self.assertEqual(character['proficiencies'][0]['name'], 'Thieves tools')
         self.assertEqual(character['weapons'][0]['properties'], 'finesse')
         self.assertEqual(character['equipment'][0]['equipment_type'], 'armor')
@@ -747,6 +752,74 @@ class AppRouteTest(unittest.TestCase):
             persisted_member = db.session.get(CampaignMember, member.id)
             self.assertEqual(persisted_member.selected_character_id, 9999)
             self.assertIsNotNone(persisted_member.character_ready_at)
+
+    def test_planning_payload_replays_latest_draft_patch_for_user(self):
+        with app.app_context():
+            owner = User(username='owner', email='owner@example.com')
+            owner.set_password('password')
+            player = User(username='player', email='player@example.com')
+            player.set_password('password')
+            other = User(username='other', email='other@example.com')
+            other.set_password('password')
+            db.session.add_all([owner, player, other])
+            db.session.commit()
+
+            campaign = Campaign(name='Lost Stones', user_id=owner.id)
+            db.session.add(campaign)
+            db.session.flush()
+            db.session.add_all([
+                CampaignMember(campaign_id=campaign.id, user_id=owner.id, role='player'),
+                CampaignMember(campaign_id=campaign.id, user_id=player.id, role='player'),
+                CampaignMember(campaign_id=campaign.id, user_id=other.id, role='player'),
+                CampaignAuditEvent(
+                    campaign_id=campaign.id,
+                    event_type='dm_output_stored',
+                    source='character_planning_messages',
+                    actor='planning_dm',
+                    summary='Stored visible planning response.',
+                    payload=json.dumps({
+                        'message': {'campaign_id': campaign.id, 'user_id': player.id, 'role': 'dm', 'content': 'Updated.'},
+                        'form_patch': {'skills': ['Piloting'], 'combat.max_hp': 10},
+                    }),
+                ),
+                CampaignAuditEvent(
+                    campaign_id=campaign.id,
+                    event_type='dm_output_stored',
+                    source='character_planning_messages',
+                    actor='planning_dm',
+                    summary='Stored visible planning response.',
+                    payload=json.dumps({
+                        'message': {'campaign_id': campaign.id, 'user_id': other.id, 'role': 'dm', 'content': 'Other.'},
+                        'form_patch': {'skills': ['Stealth']},
+                    }),
+                ),
+                CampaignAuditEvent(
+                    campaign_id=campaign.id,
+                    event_type='dm_output_stored',
+                    source='character_planning_messages',
+                    actor='planning_dm',
+                    summary='Stored visible planning response.',
+                    payload=json.dumps({
+                        'message': {'campaign_id': campaign.id, 'user_id': player.id, 'role': 'dm', 'content': 'Updated again.'},
+                        'form_patch': {'skills': ['Piloting', 'Perception'], 'general.passive_perception': 14},
+                    }),
+                ),
+            ])
+            db.session.commit()
+            token = generate_token(player.id)
+            campaign_id = campaign.id
+
+        response = self.client.get(
+            f'/api/campaigns/{campaign_id}/planning',
+            headers={'Authorization': f'Bearer {token}'},
+        )
+
+        self.assertEqual(response.status_code, 200)
+        planning = response.get_json()['planning']
+        self.assertEqual(planning['draft_patch']['skills'], ['Piloting', 'Perception'])
+        self.assertEqual(planning['draft_patch']['combat.max_hp'], 10)
+        self.assertEqual(planning['draft_patch']['general.passive_perception'], 14)
+        self.assertIsNotNone(planning['draft_patch_event_id'])
 
     def test_dev_audit_does_not_flush_invalid_ready_state_cleanup(self):
         with app.app_context():

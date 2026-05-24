@@ -190,6 +190,7 @@ CHARACTER_RELATION_CONFIGS = {
 CHARACTER_RELATION_ALIASES = {
     'classes': {
         'class_name': ('name', 'class', 'className'),
+        'subclass': ('archetype', 'subclassName'),
         'hit_die_type': ('hit_die', 'hitDie', 'hitDieType'),
     },
     'skills': {
@@ -237,6 +238,11 @@ CHARACTER_RELATION_STRING_LIST_FIELDS = {
     'proficiencies': 'name',
 }
 
+CHARACTER_RELATION_STRING_LIST_DEFAULTS = {
+    'skills': {'is_proficient': True},
+    'saving_throws': {'is_proficient': True},
+}
+
 
 def _first_present_value(item, field_name, aliases):
     for key in (field_name, *aliases.get(field_name, ())):
@@ -257,7 +263,10 @@ def _normalize_relation_item(relation_name, item, config):
     first_input_field = config['fields'][0][0]
     if isinstance(item, str):
         input_field = CHARACTER_RELATION_STRING_LIST_FIELDS.get(relation_name, first_input_field)
-        item = {input_field: item}
+        item = {
+            **CHARACTER_RELATION_STRING_LIST_DEFAULTS.get(relation_name, {}),
+            input_field: item,
+        }
     elif not isinstance(item, dict) or item is None:
         item = {}
 

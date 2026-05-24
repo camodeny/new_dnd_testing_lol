@@ -19,6 +19,7 @@ import {
 } from '../character/CharacterForm'
 import {
   CHARACTER_FORM_PAGES,
+  ITEM_LIST_CONFIGS,
   flattenCharacter,
   makeEmptyCharacter,
   mergeCharacterDraft,
@@ -26,6 +27,15 @@ import {
 } from '../character/characterFormConfig'
 
 const VALID_PAGE_KEYS = new Set(CHARACTER_FORM_PAGES.map((page) => page.key))
+const ITEM_LIST_IDENTITY_KEYS = {
+  proficiencies: 'name',
+}
+const ITEM_LIST_MERGE_KEYS = Object.fromEntries(
+  ITEM_LIST_CONFIGS.map((config) => {
+    const labelField = config.fields.find((field) => field.type !== 'checkbox') || config.fields[0]
+    return [config.key, ITEM_LIST_IDENTITY_KEYS[config.key] || labelField.key]
+  })
+)
 
 function getInitials(name) {
   if (!name) return '?'
@@ -95,6 +105,39 @@ function setAtPath(source, path, value) {
   return next
 }
 
+function listItemMergeKey(path, item) {
+  const listKey = path.split('.')[0]
+  const fieldKey = ITEM_LIST_MERGE_KEYS[listKey]
+  if (!fieldKey || !item || typeof item !== 'object' || Array.isArray(item)) return null
+  const value = item[fieldKey]
+  if (value === undefined || value === null || String(value).trim() === '') return null
+  return String(value).trim().toLowerCase()
+}
+
+function mergeItemListPatch(currentValue, patchValue, path) {
+  if (!Array.isArray(currentValue) || !Array.isArray(patchValue)) return null
+  if (!ITEM_LIST_MERGE_KEYS[path]) return null
+
+  const next = [...currentValue]
+  const byKey = new Map()
+  next.forEach((item, index) => {
+    const key = listItemMergeKey(path, item)
+    if (key) byKey.set(key, index)
+  })
+
+  patchValue.forEach((item) => {
+    const key = listItemMergeKey(path, item)
+    if (key && byKey.has(key)) {
+      next[byKey.get(key)] = item
+    } else {
+      if (key) byKey.set(key, next.length)
+      next.push(item)
+    }
+  })
+
+  return next
+}
+
 function applySafePatch(current, patch, touchedPaths, baseline, prefix = '') {
   if (!isPlainObject(patch)) return { next: current, suggestions: [] }
   let next = Array.isArray(current) ? [...current] : { ...current }
@@ -108,6 +151,14 @@ function applySafePatch(current, patch, touchedPaths, baseline, prefix = '') {
       const result = applySafePatch(currentValue, patchValue, touchedPaths, baselineValue || {}, path)
       next[key] = result.next
       suggestions.push(...result.suggestions)
+      return
+    }
+
+    const mergedList = !isPathTouched(touchedPaths, path)
+      ? mergeItemListPatch(currentValue, patchValue, path)
+      : null
+    if (mergedList) {
+      next[key] = mergedList
       return
     }
 
@@ -195,26 +246,105 @@ export default function CharacterPlanningMode({ campaign, currentUser, onComplet
   const chatMessagesRef = useRef(null)
   const lastSeenMessageIdRef = useRef(null)
   const pendingAutoScrollRef = useRef(false)
+  const lastAppliedDraftPatchEventIdRef = useRef(null)
   const baselineCharacter = useMemo(() => makeEmptyCharacter(), [])
+
+  const applyFormPatch = useCallback((patch) => {
+    if (!patch || Object.keys(patch).length === 0) return
+    const normalizedPatch = normalizeCharacterDraft(patch)
+    setDraftCharacter((prev) => {
+      const result = applySafePatch(prev, normalizedPatch, touchedPaths, baselineCharacter)
+      setPendingSuggestions((existing) => [...existing, ...result.suggestions])
+      return result.next
+    })
+  }, [baselineCharacter, touchedPaths])
 
   const loadPlanning = useCallback(async ({ quiet = false } = {}) => {
     if (!quiet) setLoading(true)
     try {
       const data = await getCampaignPlanning(campaign.id)
       setPlanning(data.planning)
+      const draftPatchEventId = data.planning?.draft_patch_event_id
+      if (draftPatchEventId && lastAppliedDraftPatchEventIdRef.current !== draftPatchEventId) {
+        lastAppliedDraftPatchEventIdRef.current = draftPatchEventId
+        applyFormPatch(data.planning?.draft_patch)
+      }
       setError('')
     } catch (err) {
       setError(err.message)
     } finally {
       if (!quiet) setLoading(false)
     }
-  }, [campaign.id])
+  }, [campaign.id, applyFormPatch])
 
   useEffect(() => {
     Promise.resolve().then(() => loadPlanning())
     const interval = setInterval(() => loadPlanning({ quiet: true }), 5000)
     return () => clearInterval(interval)
   }, [loadPlanning])
+
+  // Resilient planning stream listener on mount/refresh
+  useEffect(() => {
+    if (!campaign?.id) return
+
+    let eventSource = null
+    let isMounted = true
+
+    const connectStream = () => {
+      if (!isMounted) return
+      const streamUrl = getPlanningStreamUrl(campaign.id)
+      eventSource = new EventSource(streamUrl)
+
+      eventSource.onmessage = (event) => {
+        try {
+          const payload = JSON.parse(event.data)
+          if (payload.type === 'token') {
+            setSending(true)
+            setStreamingContent((prev) => prev + payload.token)
+            const container = chatMessagesRef.current
+            if (container) {
+              window.requestAnimationFrame(() => {
+                container.scrollTo({ top: container.scrollHeight, behavior: 'smooth' })
+              })
+            }
+          } else if (payload.type === 'done') {
+            if (VALID_PAGE_KEYS.has(payload.active_page)) setActivePage(payload.active_page)
+            applyFormPatch(payload.form_patch)
+            setStreamingContent('')
+            setSending(false)
+            eventSource.close()
+            loadPlanning({ quiet: true })
+          } else if (payload.type === 'error') {
+            setError(payload.error)
+            setStreamingContent('')
+            setSending(false)
+            eventSource.close()
+          } else if (payload.type === 'idle') {
+            eventSource.close()
+          }
+        } catch (e) {
+          console.error('Planning SSE parse error', e)
+        }
+      }
+
+      eventSource.onerror = () => {
+        if (eventSource) eventSource.close()
+        // If we were actively receiving content, clean up
+        setSending(false)
+        setStreamingContent('')
+        loadPlanning({ quiet: true })
+      }
+    }
+
+    connectStream()
+
+    return () => {
+      isMounted = false
+      if (eventSource) {
+        eventSource.close()
+      }
+    }
+  }, [campaign.id, loadPlanning, applyFormPatch])
 
   useEffect(() => {
     saveStoredDraft(campaign.id, currentUser?.id, draftCharacter)
@@ -268,16 +398,6 @@ export default function CharacterPlanningMode({ campaign, currentUser, onComplet
       const next = new Set(prev)
       next.add(path)
       return next
-    })
-  }
-
-  const applyFormPatch = (patch) => {
-    if (!patch || Object.keys(patch).length === 0) return
-    const normalizedPatch = normalizeCharacterDraft(patch)
-    setDraftCharacter((prev) => {
-      const result = applySafePatch(prev, normalizedPatch, touchedPaths, baselineCharacter)
-      setPendingSuggestions((existing) => [...existing, ...result.suggestions])
-      return result.next
     })
   }
 

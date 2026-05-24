@@ -5,6 +5,7 @@ from sqlalchemy.exc import IntegrityError
 
 from models import (
     db,
+    CampaignAuditEvent,
     CampaignMember,
     Character,
     CharacterPlanningMessage,
@@ -381,6 +382,42 @@ def _bond_suggestion_key(suggestion):
     return involved, title, description
 
 
+def _merge_draft_patch(base, patch):
+    if not isinstance(patch, dict):
+        return base
+
+    for key, value in patch.items():
+        if isinstance(value, dict) and isinstance(base.get(key), dict):
+            base[key] = _merge_draft_patch(dict(base[key]), value)
+        else:
+            base[key] = value
+    return base
+
+
+def accumulated_planning_draft_patch(campaign_id, user_id):
+    events = CampaignAuditEvent.query.filter_by(
+        campaign_id=campaign_id,
+        event_type='dm_output_stored',
+        source='character_planning_messages',
+        actor='planning_dm',
+    ).order_by(CampaignAuditEvent.id.asc()).all()
+
+    patch = {}
+    latest_event_id = None
+    for event in events:
+        payload = json_loads(event.payload, {})
+        message = payload.get('message') if isinstance(payload, dict) else None
+        if not isinstance(message, dict) or message.get('user_id') != user_id:
+            continue
+        form_patch = payload.get('form_patch')
+        if not isinstance(form_patch, dict) or not form_patch:
+            continue
+        _merge_draft_patch(patch, form_patch)
+        latest_event_id = event.id
+
+    return patch, latest_event_id
+
+
 def visible_planning_payload(campaign, current_user, clean_ready_states=True):
     members = get_campaign_members(campaign)
     invalid_member_ids = set()
@@ -402,6 +439,7 @@ def visible_planning_payload(campaign, current_user, clean_ready_states=True):
             user_bonds.append(data)
 
     required = get_required_players(campaign)
+    draft_patch, draft_patch_event_id = accumulated_planning_draft_patch(campaign.id, current_user.id)
     return {
         'required_players': required,
         'party_full': party_is_full(campaign, members),
@@ -410,4 +448,6 @@ def visible_planning_payload(campaign, current_user, clean_ready_states=True):
         'summary': summary_dict_for_read(campaign.id, include_private=False, current_user_id=current_user.id),
         'messages': [message.to_dict() for message in messages],
         'bonds': user_bonds,
+        'draft_patch': draft_patch,
+        'draft_patch_event_id': draft_patch_event_id,
     }
