@@ -1,5 +1,7 @@
 import json
-from datetime import datetime
+from datetime import datetime, timedelta
+
+from sqlalchemy.exc import IntegrityError
 
 from models import (
     db,
@@ -12,6 +14,9 @@ from openrouter import get_world_genesis_package
 from services.audit_service import log_audit_event
 from services.embedding_service import upsert_memory_embedding
 from services.planning_service import can_start_session, planning_context
+
+
+WORLD_GENERATION_STALE_AFTER = timedelta(minutes=20)
 
 
 PUBLIC_INTRO_FIELDS = (
@@ -294,14 +299,46 @@ def get_campaign_world(campaign_id):
     return CampaignWorld.query.filter_by(campaign_id=campaign_id).first()
 
 
+def world_generation_status(world):
+    if not world:
+        return None
+    public_intro = json_loads(world.public_intro, {})
+    if not isinstance(public_intro, dict):
+        return None
+    return public_intro.get('generation_status')
+
+
+def world_generation_in_progress(world):
+    return world_generation_status(world) == 'building'
+
+
+def world_generation_is_stale(world):
+    if not world_generation_in_progress(world):
+        return False
+    updated_at = world.updated_at or world.created_at
+    if not updated_at:
+        return False
+    return datetime.utcnow() - updated_at > WORLD_GENERATION_STALE_AFTER
+
+
 def world_public_payload(campaign, clean_ready_states=True):
     world = get_campaign_world(campaign.id)
+    if world_generation_in_progress(world):
+        return {
+            'world': None,
+            'is_ready': False,
+            'can_generate': False,
+            'generation_in_progress': True,
+            'planning': None,
+        }
+
     if not world:
         ready, details = can_start_session(campaign, clean_ready_states=clean_ready_states)
         return {
             'world': None,
             'is_ready': False,
             'can_generate': ready,
+            'generation_in_progress': False,
             'planning': details,
         }
 
@@ -309,6 +346,7 @@ def world_public_payload(campaign, clean_ready_states=True):
         'world': world.to_public_dict(),
         'is_ready': True,
         'can_generate': False,
+        'generation_in_progress': False,
         'planning': None,
     }
 
@@ -425,13 +463,77 @@ def persist_world_package(campaign, package):
     return world
 
 
+def claim_world_generation(campaign):
+    existing = get_campaign_world(campaign.id)
+    if existing and not world_generation_in_progress(existing):
+        return existing, None
+    if existing and world_generation_is_stale(existing):
+        db.session.delete(existing)
+        db.session.flush()
+    elif existing:
+        return None, {
+            'error': 'Campaign world generation is already in progress',
+            'generation_in_progress': True,
+            'status': 409,
+        }
+
+    world = CampaignWorld(
+        campaign_id=campaign.id,
+        public_intro=json_dumps({
+            'generation_status': 'building',
+            'title': campaign.name,
+        }),
+        knowledge_graph='{}',
+        world_state='{}',
+        dm_private='{}',
+    )
+    db.session.add(world)
+    try:
+        db.session.commit()
+        return None, None
+    except IntegrityError:
+        db.session.rollback()
+        existing = get_campaign_world(campaign.id)
+        if existing and not world_generation_in_progress(existing):
+            return existing, None
+        return None, {
+            'error': 'Campaign world generation is already in progress',
+            'generation_in_progress': True,
+            'status': 409,
+        }
+
+
 def ensure_world_generated(campaign, current_user):
     existing = get_campaign_world(campaign.id)
     if existing:
+        if world_generation_in_progress(existing):
+            if world_generation_is_stale(existing):
+                db.session.delete(existing)
+                db.session.commit()
+            else:
+                return None, {
+                    'error': 'Campaign world generation is already in progress',
+                    'generation_in_progress': True,
+                    'status': 409,
+                }
+        else:
+            return existing, None
+
+    claimed_world, claim_error = claim_world_generation(campaign)
+    if claimed_world or claim_error:
+        return claimed_world, claim_error
+
+    campaign = db.session.get(type(campaign), campaign.id)
+    existing = get_campaign_world(campaign.id)
+    if existing and not world_generation_in_progress(existing):
         return existing, None
 
     ready, details = can_start_session(campaign)
     if not ready:
+        placeholder = get_campaign_world(campaign.id)
+        if world_generation_in_progress(placeholder):
+            db.session.delete(placeholder)
+            db.session.commit()
         return None, {
             'error': 'Every party member must select and ready a character before building the world',
             'planning': details,
@@ -457,6 +559,10 @@ def ensure_world_generated(campaign, current_user):
         },
     )
     if not raw_package:
+        placeholder = get_campaign_world(campaign.id)
+        if world_generation_in_progress(placeholder):
+            db.session.delete(placeholder)
+            db.session.commit()
         return None, {
             'error': 'The DM could not build the world package',
             'status': 500,

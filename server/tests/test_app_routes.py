@@ -22,6 +22,7 @@ from models import (
     CampaignAuditEvent,
     CampaignInvite,
     CampaignMember,
+    CampaignWorld,
     Character,
     EncounterMap,
     EncounterMapPlacement,
@@ -30,6 +31,7 @@ from models import (
 )
 from openrouter import get_openrouter_model, reset_openrouter_model
 from services.planning_service import apply_bond_suggestions, planning_context
+from services.world_service import ensure_world_generated, json_dumps, world_public_payload
 
 
 class AppRouteTest(unittest.TestCase):
@@ -865,6 +867,34 @@ class AppRouteTest(unittest.TestCase):
             persisted_member = db.session.get(CampaignMember, member_id)
             self.assertEqual(persisted_member.selected_character_id, 9999)
             self.assertIsNotNone(persisted_member.character_ready_at)
+
+    def test_world_generation_placeholder_blocks_duplicate_generation(self):
+        with app.app_context():
+            owner = User(username='owner', email='owner@example.com')
+            owner.set_password('password')
+            db.session.add(owner)
+            db.session.commit()
+
+            campaign = Campaign(name='Lost Stones', user_id=owner.id)
+            db.session.add(campaign)
+            db.session.flush()
+            db.session.add(CampaignWorld(
+                campaign_id=campaign.id,
+                public_intro=json_dumps({'generation_status': 'building', 'title': campaign.name}),
+                knowledge_graph='{}',
+                world_state='{}',
+                dm_private='{}',
+            ))
+            db.session.commit()
+
+            payload = world_public_payload(campaign)
+            _world, error = ensure_world_generated(campaign, owner)
+
+            self.assertIsNone(payload['world'])
+            self.assertTrue(payload['generation_in_progress'])
+            self.assertFalse(payload['can_generate'])
+            self.assertEqual(error['status'], 409)
+            self.assertTrue(error['generation_in_progress'])
 
     def test_pending_bond_blocks_character_ready(self):
         with app.app_context():

@@ -21,6 +21,8 @@ from openrouter import (
     check_session_spoilers_with_llm,
     get_character_sheet_answer,
     get_opening_scene_response,
+    get_planning_dm_response,
+    get_planning_dm_response_streaming,
     get_session_preflight_decision,
     get_world_genesis_package,
     normalize_session_preflight_decision,
@@ -117,6 +119,46 @@ class OpenRouterJsonRepairTest(unittest.TestCase):
         knowledge_graph_messages = post_chat.call_args_list[2].args[0]
         self.assertIn('"public_intro": {"title": "Test"}', knowledge_graph_messages[-2]['content'])
         self.assertIn('"section": "knowledge_graph"', knowledge_graph_messages[-1]['content'])
+
+
+class PlanningDmResponseTest(unittest.TestCase):
+    def test_planning_response_retries_blank_json_output(self):
+        class Message:
+            role = 'player'
+            content = 'What age fits my character?'
+
+        with patch('openrouter._post_chat', side_effect=[
+            '      ',
+            '{"message":"Barrow could plausibly be in his late 30s.","active_page":"story","form_patch":{}}',
+        ]) as post_chat:
+            result = get_planning_dm_response(
+                {'campaign': {'name': 'Test'}},
+                [Message()],
+                audit_context={'operation': 'planning_dm_response', 'actor': 'planning_dm'},
+            )
+
+        self.assertEqual(result['message'], 'Barrow could plausibly be in his late 30s.')
+        self.assertEqual(result['active_page'], 'story')
+        self.assertEqual(post_chat.call_count, 2)
+        self.assertEqual(
+            post_chat.call_args_list[1].kwargs['audit_context']['operation'],
+            'planning_dm_response_blank_retry',
+        )
+
+    def test_streaming_planning_response_does_not_return_blank_message(self):
+        class Message:
+            role = 'player'
+            content = 'What height fits my character?'
+
+        with patch('openrouter._post_chat_stream', return_value='     '), \
+                patch('openrouter._post_chat', return_value='{}'):
+            result = get_planning_dm_response_streaming(
+                {'campaign': {'name': 'Test'}},
+                [Message()],
+                audit_context={'operation': 'planning_dm_response', 'actor': 'planning_dm'},
+            )
+
+        self.assertIsNone(result)
 
 
 class FakeResponse:

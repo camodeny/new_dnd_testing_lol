@@ -748,6 +748,41 @@ def _json_loads_with_repair(text, audit_context=None):
     return repaired_data
 
 
+def _planning_blank_retry_messages(messages):
+    return [
+        *messages,
+        {
+            'role': 'user',
+            'content': (
+                'Your previous response was blank or invalid. Return only valid JSON now with a non-empty '
+                'player-visible message string, an active_page value from identity, scores, combat, '
+                'magic_gear, story, or null, and a form_patch object. Do not return whitespace, an empty '
+                'JSON object, markdown fences, hidden reasoning, or commentary outside the JSON object.'
+            ),
+        },
+    ]
+
+
+def _planning_result_from_text(text, audit_context=None):
+    if not isinstance(text, str) or not text.strip():
+        return None
+
+    data = _json_loads_with_repair(text, audit_context=audit_context)
+    if isinstance(data, dict):
+        message = data.get('message')
+        if isinstance(message, str) and message.strip():
+            return {
+                'message': message.strip(),
+                'active_page': data.get('active_page'),
+                'form_patch': data.get('form_patch') if isinstance(data.get('form_patch'), dict) else {},
+            }
+
+    if not text.lstrip().startswith('{'):
+        return {'message': text.strip(), 'active_page': None, 'form_patch': {}}
+
+    return None
+
+
 def normalize_session_dm_turn_decision(raw_decision):
     if isinstance(raw_decision, dict):
         data = raw_decision
@@ -2295,14 +2330,20 @@ def get_planning_dm_response(context, current_user_messages, draft_character=Non
 
     try:
         text = _post_chat(messages, json_mode=True, audit_context=audit_context)
-        data = _json_loads_with_repair(text, audit_context=audit_context)
-        if isinstance(data, dict) and data.get('message'):
-            return {
-                'message': data.get('message') or '',
-                'active_page': data.get('active_page'),
-                'form_patch': data.get('form_patch') if isinstance(data.get('form_patch'), dict) else {},
-            }
-        return {'message': text, 'active_page': None, 'form_patch': {}}
+        result = _planning_result_from_text(text, audit_context=audit_context)
+        if result:
+            return result
+
+        retry_text = _post_chat(
+            _planning_blank_retry_messages(messages),
+            json_mode=True,
+            audit_context={
+                **(audit_context or {}),
+                'operation': f"{(audit_context or {}).get('operation') or 'planning_dm_response'}_blank_retry",
+            },
+            allow_thinking=False,
+        )
+        return _planning_result_from_text(retry_text, audit_context=audit_context)
     except Exception as e:
         print(f'[openrouter] Planning DM error: {e}')
         return None
@@ -2327,14 +2368,20 @@ def get_planning_dm_response_streaming(context, current_user_messages, draft_cha
             audit_context=audit_context,
             on_token=on_token,
         )
-        data = _json_loads_with_repair(text, audit_context=audit_context)
-        if isinstance(data, dict) and data.get('message'):
-            return {
-                'message': data.get('message') or '',
-                'active_page': data.get('active_page'),
-                'form_patch': data.get('form_patch') if isinstance(data.get('form_patch'), dict) else {},
-            }
-        return {'message': text, 'active_page': None, 'form_patch': {}}
+        result = _planning_result_from_text(text, audit_context=audit_context)
+        if result:
+            return result
+
+        retry_text = _post_chat(
+            _planning_blank_retry_messages(messages),
+            json_mode=True,
+            audit_context={
+                **(audit_context or {}),
+                'operation': f"{(audit_context or {}).get('operation') or 'planning_dm_response'}_blank_retry",
+            },
+            allow_thinking=False,
+        )
+        return _planning_result_from_text(retry_text, audit_context=audit_context)
     except Exception as e:
         print(f'[openrouter] Planning DM streaming error: {e}')
         return None

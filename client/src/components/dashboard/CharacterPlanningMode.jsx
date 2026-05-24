@@ -230,6 +230,11 @@ export default function CharacterPlanningMode({ campaign, currentUser, onComplet
   const [error, setError] = useState('')
   const [input, setInput] = useState('')
   const [sending, setSending] = useState(false)
+  const sendingRef = useRef(false)
+  const changeSending = useCallback((value) => {
+    setSending(value)
+    sendingRef.current = value
+  }, [])
   const [savingCharacter, setSavingCharacter] = useState(false)
   const [showImport, setShowImport] = useState(false)
   const [availableChars, setAvailableChars] = useState([])
@@ -250,7 +255,16 @@ export default function CharacterPlanningMode({ campaign, currentUser, onComplet
   const chatMessagesRef = useRef(null)
   const lastSeenMessageIdRef = useRef(null)
   const pendingAutoScrollRef = useRef(false)
+  const isAutoScrollEnabledRef = useRef(true)
   const lastAppliedDraftPatchEventIdRef = useRef(null)
+
+  const handleScroll = useCallback(() => {
+    const container = chatMessagesRef.current
+    if (!container) return
+    const distanceFromBottom = container.scrollHeight - container.scrollTop - container.clientHeight
+    // Re-enable auto-scroll if scrolled to the bottom (within 20px threshold)
+    isAutoScrollEnabledRef.current = distanceFromBottom < 20
+  }, [])
   const baselineCharacter = useMemo(() => makeEmptyCharacter(), [])
 
   const applyFormPatch = useCallback((patch) => {
@@ -263,10 +277,12 @@ export default function CharacterPlanningMode({ campaign, currentUser, onComplet
     })
   }, [baselineCharacter])
 
-  const loadPlanning = useCallback(async ({ quiet = false } = {}) => {
+  const loadPlanning = useCallback(async ({ quiet = false, onComplete } = {}) => {
+    if (quiet && sendingRef.current && !onComplete) return
     if (!quiet) setLoading(true)
     try {
       const data = await getCampaignPlanning(campaign.id)
+      if (quiet && sendingRef.current && !onComplete) return
       setPlanning(data.planning)
       const draftPatchEventId = data.planning?.draft_patch_event_id
       if (draftPatchEventId && lastAppliedDraftPatchEventIdRef.current !== draftPatchEventId) {
@@ -274,12 +290,13 @@ export default function CharacterPlanningMode({ campaign, currentUser, onComplet
         applyFormPatch(data.planning?.draft_patch)
       }
       setError('')
+      if (onComplete) onComplete()
     } catch (err) {
       setError(err.message)
     } finally {
       if (!quiet) setLoading(false)
     }
-  }, [campaign.id, applyFormPatch])
+  }, [campaign.id, applyFormPatch, sendingRef])
 
   useEffect(() => {
     Promise.resolve().then(() => loadPlanning())
@@ -303,25 +320,29 @@ export default function CharacterPlanningMode({ campaign, currentUser, onComplet
         try {
           const payload = JSON.parse(event.data)
           if (payload.type === 'token') {
-            setSending(true)
+            changeSending(true)
             setStreamingContent((prev) => prev + payload.token)
             const container = chatMessagesRef.current
-            if (container) {
+            if (container && isAutoScrollEnabledRef.current) {
               window.requestAnimationFrame(() => {
-                container.scrollTo({ top: container.scrollHeight, behavior: 'smooth' })
+                container.scrollTop = container.scrollHeight
               })
             }
           } else if (payload.type === 'done') {
             if (VALID_PAGE_KEYS.has(payload.active_page)) setActivePage(payload.active_page)
             applyFormPatch(payload.form_patch)
-            setStreamingContent('')
-            setSending(false)
             eventSource.close()
-            loadPlanning({ quiet: true })
+            loadPlanning({
+              quiet: true,
+              onComplete: () => {
+                setStreamingContent('')
+                changeSending(false)
+              },
+            })
           } else if (payload.type === 'error') {
             setError(payload.error)
             setStreamingContent('')
-            setSending(false)
+            changeSending(false)
             eventSource.close()
           } else if (payload.type === 'idle') {
             eventSource.close()
@@ -334,7 +355,7 @@ export default function CharacterPlanningMode({ campaign, currentUser, onComplet
       eventSource.onerror = () => {
         if (eventSource) eventSource.close()
         // If we were actively receiving content, clean up
-        setSending(false)
+        changeSending(false)
         setStreamingContent('')
         loadPlanning({ quiet: true })
       }
@@ -348,7 +369,7 @@ export default function CharacterPlanningMode({ campaign, currentUser, onComplet
         eventSource.close()
       }
     }
-  }, [campaign.id, loadPlanning, applyFormPatch])
+  }, [campaign.id, loadPlanning, applyFormPatch, changeSending])
 
   useEffect(() => {
     saveStoredDraft(campaign.id, currentUser?.id, draftCharacter)
@@ -382,10 +403,7 @@ export default function CharacterPlanningMode({ campaign, currentUser, onComplet
     if (lastSeenMessageIdRef.current === lastMessageId) return
 
     const container = chatMessagesRef.current
-    const distanceFromBottom = container
-      ? container.scrollHeight - container.scrollTop - container.clientHeight
-      : 0
-    const shouldAutoScroll = pendingAutoScrollRef.current || distanceFromBottom < 96
+    const shouldAutoScroll = pendingAutoScrollRef.current || isAutoScrollEnabledRef.current
 
     lastSeenMessageIdRef.current = lastMessageId
     pendingAutoScrollRef.current = false
@@ -467,10 +485,27 @@ export default function CharacterPlanningMode({ campaign, currentUser, onComplet
   const handleSend = async () => {
     const content = input.trim()
     if (!content) return
-    setSending(true)
+    changeSending(true)
     setInput('')
     setStreamingContent('')
     pendingAutoScrollRef.current = true
+    isAutoScrollEnabledRef.current = true
+
+    // Optimistically add the player's message to the local chat feed
+    const tempMessage = {
+      id: `temp-${Date.now()}`,
+      role: 'player',
+      content: content,
+      created_at: new Date().toISOString(),
+    }
+    setPlanning((prev) => {
+      if (!prev) return prev
+      return {
+        ...prev,
+        messages: [...(prev.messages || []), tempMessage],
+      }
+    })
+
     try {
       const data = await sendPlanningMessage(campaign.id, content, {
         draftCharacter,
@@ -482,7 +517,7 @@ export default function CharacterPlanningMode({ campaign, currentUser, onComplet
         setPlanning(data.planning)
         if (VALID_PAGE_KEYS.has(data.active_page)) setActivePage(data.active_page)
         applyFormPatch(data.form_patch)
-        setSending(false)
+        changeSending(false)
         return
       }
 
@@ -494,31 +529,36 @@ export default function CharacterPlanningMode({ campaign, currentUser, onComplet
         try {
           const payload = JSON.parse(event.data)
           if (payload.type === 'token') {
+            changeSending(true)
             setStreamingContent((prev) => prev + payload.token)
             // Auto-scroll as content streams in
             const container = chatMessagesRef.current
-            if (container) {
+            if (container && isAutoScrollEnabledRef.current) {
               window.requestAnimationFrame(() => {
-                container.scrollTo({ top: container.scrollHeight, behavior: 'smooth' })
+                container.scrollTop = container.scrollHeight
               })
             }
           } else if (payload.type === 'done') {
             if (VALID_PAGE_KEYS.has(payload.active_page)) setActivePage(payload.active_page)
             applyFormPatch(payload.form_patch)
-            setStreamingContent('')
-            setSending(false)
             eventSource.close()
             // Refresh planning data to pick up the persisted DM message
-            loadPlanning({ quiet: true })
+            loadPlanning({
+              quiet: true,
+              onComplete: () => {
+                setStreamingContent('')
+                changeSending(false)
+              },
+            })
           } else if (payload.type === 'error') {
             setError(payload.error)
             setStreamingContent('')
-            setSending(false)
+            changeSending(false)
             eventSource.close()
           } else if (payload.type === 'idle') {
             // No active generation, close and refresh
             eventSource.close()
-            setSending(false)
+            changeSending(false)
             setStreamingContent('')
             loadPlanning({ quiet: true })
           }
@@ -530,14 +570,22 @@ export default function CharacterPlanningMode({ campaign, currentUser, onComplet
       eventSource.onerror = () => {
         eventSource.close()
         setStreamingContent('')
-        setSending(false)
+        changeSending(false)
         loadPlanning({ quiet: true })
       }
     } catch (err) {
       pendingAutoScrollRef.current = false
       setStreamingContent('')
       setError(err.message)
-      setSending(false)
+      changeSending(false)
+      setInput(content) // Restore input so they don't lose their message
+      setPlanning((prev) => {
+        if (!prev) return prev
+        return {
+          ...prev,
+          messages: (prev.messages || []).filter((msg) => msg.id !== tempMessage.id),
+        }
+      })
     }
   }
 
@@ -762,7 +810,7 @@ export default function CharacterPlanningMode({ campaign, currentUser, onComplet
       <div className="planning-section-title">
         <i className="bi bi-stars"></i> DM Character Workshop
       </div>
-      <div className="planning-chat-messages" ref={chatMessagesRef}>
+      <div className="planning-chat-messages" ref={chatMessagesRef} onScroll={handleScroll}>
         {planning.messages.length === 0 && pendingBonds.length === 0 && (
           <div className="planning-empty-chat">
             Start with your concept, class ideas, tone, secrets, or what you want tied into the story.

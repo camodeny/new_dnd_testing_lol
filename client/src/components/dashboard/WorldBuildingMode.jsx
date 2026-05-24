@@ -14,6 +14,12 @@ function getToneList(intro) {
   return Array.isArray(intro?.campaign_tone) ? intro.campaign_tone.filter(Boolean) : []
 }
 
+function wait(ms) {
+  return new Promise((resolve) => {
+    window.setTimeout(resolve, ms)
+  })
+}
+
 export default function WorldBuildingMode({ campaign, onBegin, onBack }) {
   const [world, setWorld] = useState(null)
   const [status, setStatus] = useState('loading')
@@ -24,6 +30,16 @@ export default function WorldBuildingMode({ campaign, onBegin, onBack }) {
   useEffect(() => {
     let cancelled = false
 
+    async function waitForGeneratedWorld() {
+      while (!cancelled) {
+        const latest = await getCampaignWorld(campaign.id)
+        if (cancelled) return null
+        if (latest.world?.public_intro) return latest.world
+        await wait(3000)
+      }
+      return null
+    }
+
     async function loadOrBuildWorld() {
       setStatus('loading')
       setError('')
@@ -32,6 +48,14 @@ export default function WorldBuildingMode({ campaign, onBegin, onBack }) {
         if (cancelled) return
         if (existing.world?.public_intro) {
           setWorld(existing.world)
+          setStatus('ready')
+          return
+        }
+        if (existing.generation_in_progress) {
+          setStatus('building')
+          const generatedWorld = await waitForGeneratedWorld()
+          if (cancelled || !generatedWorld) return
+          setWorld(generatedWorld)
           setStatus('ready')
           return
         }
@@ -48,6 +72,21 @@ export default function WorldBuildingMode({ campaign, onBegin, onBack }) {
         setStatus('ready')
       } catch (err) {
         if (cancelled) return
+        if (err.status === 409 || err.data?.generation_in_progress) {
+          setStatus('building')
+          try {
+            const generatedWorld = await waitForGeneratedWorld()
+            if (cancelled || !generatedWorld) return
+            setWorld(generatedWorld)
+            setStatus('ready')
+            return
+          } catch (pollErr) {
+            if (cancelled) return
+            setError(pollErr.message || 'The DM could not build the world.')
+            setStatus('error')
+            return
+          }
+        }
         setError(err.message || 'The DM could not build the world.')
         setStatus('error')
       }
@@ -80,6 +119,22 @@ export default function WorldBuildingMode({ campaign, onBegin, onBack }) {
       setWorld(generated.world)
       setStatus('ready')
     } catch (err) {
+      if (err.status === 409 || err.data?.generation_in_progress) {
+        try {
+          let latest = await getCampaignWorld(campaign.id)
+          while (!latest.world?.public_intro) {
+            await wait(3000)
+            latest = await getCampaignWorld(campaign.id)
+          }
+          setWorld(latest.world)
+          setStatus('ready')
+          return
+        } catch (pollErr) {
+          setError(pollErr.message || 'The DM could not build the world.')
+          setStatus('error')
+          return
+        }
+      }
       setError(err.message || 'The DM could not build the world.')
       setStatus('error')
     }
