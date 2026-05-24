@@ -1425,6 +1425,113 @@ class DmToolsTest(unittest.TestCase):
             'silver_street_bookshop',
         )
 
+    def test_memory_patch_keeps_distinct_companion_relations(self):
+        world = CampaignWorld.query.filter_by(campaign_id=self.campaign.id).first()
+        world.knowledge_graph = json.dumps({
+            'entities': [
+                {'id': 'kai_swiftstrike', 'type': 'pc', 'name': 'Kai Swiftstrike'},
+                {'id': 'acolyte_mariko', 'type': 'npc', 'name': 'Acolyte Mariko'},
+                {'id': 'acolyte_tobin', 'type': 'npc', 'name': 'Acolyte Tobin'},
+            ],
+            'relations': [],
+            'facts': [],
+        })
+        db.session.commit()
+
+        with patch('services.dm_tools.find_duplicate_graph_item') as relation_dedupe:
+            result = apply_memory_patch(
+                self.campaign,
+                self.session,
+                {
+                    'upsert_graph_relations': [
+                        {
+                            'id': 'kai_mariko_travel',
+                            'source_id': 'kai_swiftstrike',
+                            'target_id': 'acolyte_mariko',
+                            'type': 'traveling_with',
+                            'summary': 'Kai Swiftstrike is traveling with Acolyte Mariko.',
+                            'visibility': 'public',
+                        },
+                        {
+                            'id': 'kai_tobin_travel',
+                            'source_id': 'kai_swiftstrike',
+                            'target_id': 'acolyte_tobin',
+                            'type': 'traveling_with',
+                            'summary': 'Kai Swiftstrike is traveling with Acolyte Tobin.',
+                            'visibility': 'public',
+                        },
+                    ],
+                },
+                {},
+            )
+
+        graph = json.loads(world.knowledge_graph)
+        self.assertFalse(relation_dedupe.called)
+        self.assertEqual(len(graph['relations']), 2)
+        self.assertEqual(
+            {
+                (relation['type'], relation['source_id'], relation['target_id'])
+                for relation in graph['relations']
+            },
+            {
+                ('traveling_with', 'acolyte_mariko', 'kai_swiftstrike'),
+                ('traveling_with', 'acolyte_tobin', 'kai_swiftstrike'),
+            },
+        )
+        self.assertEqual([change['action'] for change in result['graph_changes']], ['created', 'created'])
+
+    def test_memory_patch_dedupes_reverse_symmetric_relation(self):
+        world = CampaignWorld.query.filter_by(campaign_id=self.campaign.id).first()
+        world.knowledge_graph = json.dumps({
+            'entities': [
+                {'id': 'kai_swiftstrike', 'type': 'pc', 'name': 'Kai Swiftstrike'},
+                {'id': 'acolyte_mariko', 'type': 'npc', 'name': 'Acolyte Mariko'},
+            ],
+            'relations': [
+                {
+                    'id': 'kai_mariko_travel',
+                    'source_id': 'kai_swiftstrike',
+                    'target_id': 'acolyte_mariko',
+                    'type': 'traveling_with',
+                    'summary': 'Kai Swiftstrike is traveling with Acolyte Mariko.',
+                    'visibility': 'public',
+                },
+            ],
+            'facts': [],
+        })
+        db.session.commit()
+
+        result = apply_memory_patch(
+            self.campaign,
+            self.session,
+            {
+                'upsert_graph_relations': [
+                    {
+                        'id': 'mariko_kai_travel',
+                        'source_id': 'acolyte_mariko',
+                        'target_id': 'kai_swiftstrike',
+                        'type': 'traveling_with',
+                        'summary': 'Acolyte Mariko is traveling with Kai Swiftstrike.',
+                        'visibility': 'public',
+                    },
+                ],
+            },
+            {},
+        )
+
+        graph = json.loads(world.knowledge_graph)
+        self.assertEqual(len(graph['relations']), 1)
+        relation = graph['relations'][0]
+        self.assertEqual(relation['id'], 'kai_mariko_travel')
+        self.assertEqual(relation['source_id'], 'acolyte_mariko')
+        self.assertEqual(relation['target_id'], 'kai_swiftstrike')
+        self.assertIn('Mariko is traveling with Kai', relation['summary'])
+        self.assertEqual(result['graph_changes'][0]['action'], 'updated')
+        self.assertEqual(
+            result['graph_changes'][0]['embedding_dedupe']['dedupe_strategy'],
+            'relation_identity',
+        )
+
     def test_memory_patch_embedding_low_similarity_creates_entity(self):
         db.session.add(CampaignMemoryEmbedding(
             campaign_id=self.campaign.id,

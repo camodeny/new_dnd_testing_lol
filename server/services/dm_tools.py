@@ -32,6 +32,15 @@ from openrouter import get_character_sheet_answer
 
 VALID_VISIBILITIES = {'public', 'party_known', 'dm_private'}
 ACTIVE_CLOCK_STATUSES = {'active', 'ticking', 'pending'}
+SYMMETRIC_RELATION_TYPES = {
+    'allied_with',
+    'associated_with',
+    'connected_to',
+    'companion_of',
+    'friends_with',
+    'sibling_of',
+    'traveling_with',
+}
 
 
 def estimate_tokens(value):
@@ -2041,14 +2050,52 @@ def _upsert_by_id(items, item, fallback_id):
     return clean_item, 'created'
 
 
+def _normalize_graph_relation(item):
+    item = dict(item if isinstance(item, dict) else {})
+    relation_type = clean_id(item.get('type'), '')
+    source_id = clean_id(item.get('source_id'), '')
+    target_id = clean_id(item.get('target_id'), '')
+    item['type'] = relation_type
+    item['source_id'] = source_id
+    item['target_id'] = target_id
+    if relation_type in SYMMETRIC_RELATION_TYPES and source_id and target_id:
+        item['source_id'], item['target_id'] = sorted((source_id, target_id))
+    return item
+
+
+def _relation_identity(item):
+    item = _normalize_graph_relation(item)
+    return (
+        clean_id(item.get('type'), ''),
+        clean_id(item.get('source_id'), ''),
+        clean_id(item.get('target_id'), ''),
+    )
+
+
+def _find_existing_relation_id(items, item):
+    identity = _relation_identity(item)
+    if not all(identity):
+        return None
+    for existing in items:
+        if _relation_identity(existing) == identity:
+            return existing.get('id')
+    return None
+
+
 def _upsert_graph_item(campaign, item_type, items, item, fallback_id, audit_context=None):
     item = item if isinstance(item, dict) else {}
+    if item_type == 'relation':
+        item = _normalize_graph_relation(item)
     requested_id = clean_id(item.get('id'), fallback_id)
     exact_exists = any(existing.get('id') == requested_id for existing in items)
     dedupe = {'duplicate_id': None}
     if not exact_exists:
-        dedupe = find_duplicate_graph_item(campaign, item_type, item, audit_context=audit_context)
-        duplicate_id = dedupe.get('duplicate_id')
+        duplicate_id = _find_existing_relation_id(items, item) if item_type == 'relation' else None
+        if duplicate_id:
+            dedupe = {'duplicate_id': duplicate_id, 'strategy': 'relation_identity'}
+        elif item_type != 'relation':
+            dedupe = find_duplicate_graph_item(campaign, item_type, item, audit_context=audit_context)
+            duplicate_id = dedupe.get('duplicate_id')
         if duplicate_id and any(existing.get('id') == duplicate_id for existing in items):
             item = dict(item)
             item['id'] = duplicate_id
@@ -2065,6 +2112,7 @@ def _upsert_graph_item(campaign, item_type, items, item, fallback_id, audit_cont
     return merged, action, {
         'requested_id': requested_id,
         'dedupe_match_id': dedupe.get('duplicate_id'),
+        'dedupe_strategy': dedupe.get('strategy') or ('embedding' if dedupe.get('duplicate_id') else None),
         'dedupe_similarity': (
             round(dedupe.get('best', {}).get('similarity'), 4)
             if isinstance(dedupe.get('best'), dict) and dedupe.get('best', {}).get('similarity') is not None
