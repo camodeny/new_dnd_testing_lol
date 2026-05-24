@@ -3136,27 +3136,49 @@ select.input:focus {
   color: var(--text-bright);
 }
 
-/* DM Thinking dot animation */
+/* DM Thinking indicator styling */
 .session-msg-thinking {
-  padding: 12px 20px;
-}
-
-.thinking-dot {
-  font-size: 1.5rem;
-  font-weight: 700;
-  color: var(--color-primary);
-  animation: pulseDot 1.4s infinite;
+  padding: 14px 20px;
+  background: rgba(168, 85, 247, 0.05);
+  border-left: 2px solid var(--color-primary);
+  border-radius: var(--radius-sm);
   display: inline-block;
-  line-height: 1;
+  max-width: 100%;
 }
 
-.thinking-dot:nth-child(2) { animation-delay: 0.2s; }
-.thinking-dot:nth-child(3) { animation-delay: 0.4s; }
+.thinking-indicator-wrapper {
+  display: flex;
+  align-items: center;
+  gap: 14px;
+}
 
-@keyframes pulseDot {
-  0% { transform: translateY(0); opacity: 0.3; }
-  50% { transform: translateY(-4px); opacity: 1; }
-  100% { transform: translateY(0); opacity: 0.3; }
+.thinking-spinner {
+  width: 18px;
+  height: 18px;
+  border: 2px solid rgba(168, 85, 247, 0.15);
+  border-top-color: var(--color-primary);
+  border-radius: 50%;
+  animation: spinThinking 0.8s linear infinite;
+  flex-shrink: 0;
+}
+
+.thinking-status-text {
+  font-family: var(--heading);
+  font-size: 0.95rem;
+  font-weight: 500;
+  color: var(--text-bright);
+  letter-spacing: 0.3px;
+  text-shadow: 0 0 10px rgba(168, 85, 247, 0.2);
+  animation: fadeInTrace 0.5s ease-out forwards;
+}
+
+@keyframes spinThinking {
+  to { transform: rotate(360deg); }
+}
+
+@keyframes fadeInTrace {
+  from { opacity: 0; transform: translateX(-4px); }
+  to { opacity: 1; transform: translateX(0); }
 }
 
 /* Dice Roller Panel */
@@ -4237,6 +4259,35 @@ select.input:focus {
 .planning-chat-actions {
   display: flex;
   justify-content: flex-end;
+}
+
+.planning-chat-body {
+  line-height: 1.55;
+  font-size: 0.93rem;
+}
+
+.planning-streaming-indicator {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  color: var(--text-muted);
+  font-style: italic;
+  font-size: 0.9rem;
+}
+
+.planning-dot-pulse {
+  display: inline-block;
+  width: 8px;
+  height: 8px;
+  border-radius: 50%;
+  background: var(--text-gold);
+  animation: planningDotPulse 1.2s ease-in-out infinite;
+  flex-shrink: 0;
+}
+
+@keyframes planningDotPulse {
+  0%, 100% { opacity: 0.3; transform: scale(0.8); }
+  50% { opacity: 1; transform: scale(1.2); box-shadow: 0 0 8px rgba(245, 158, 11, 0.5); }
 }
 
 .planning-draft-form {

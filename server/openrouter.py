@@ -46,7 +46,11 @@ LLM_RETRY_MAX_DELAY_SECONDS = max(
 )
 SESSION_PREFLIGHT_TIMEOUT_SECONDS = max(
     1.0,
-    float(os.environ.get('SESSION_PREFLIGHT_TIMEOUT_SECONDS', '6')),
+    float(os.environ.get('SESSION_PREFLIGHT_TIMEOUT_SECONDS', '12')),
+)
+SESSION_PREFLIGHT_MAX_TOKENS = max(
+    64,
+    int(os.environ.get('SESSION_PREFLIGHT_MAX_TOKENS', '160')),
 )
 
 PC_CONTROL_POLICY = (
@@ -162,7 +166,10 @@ SESSION_PREFLIGHT_SYSTEM_PROMPT = (
     "or a clarification with no narrative facts, NPC claims, object ownership, location state, motives, "
     "relations, reveals, clues, or world-state assertions. For any narrative reply, uncertain case, "
     "NPC interaction, scene description, lore answer, object/person/location claim, or likely tool use, "
-    "set skip_spoiler_check=false."
+    "set skip_spoiler_check=false. Set main_call_thinking=false only for high-confidence simple turns "
+    "that do not require hidden-state reasoning, rules ambiguity, tool planning, combat adjudication, "
+    "or major consequences. Set main_call_thinking=true for uncertain, complex, tool-likely, combat, "
+    "private-context, lore-heavy, or consequence-heavy turns."
 )
 
 CHARACTER_SHEET_SYSTEM_PROMPT = (
@@ -360,6 +367,7 @@ def _post_chat_response(
     allow_thinking=True,
     timeout_seconds=60,
     max_attempts=None,
+    max_tokens=None,
 ):
     audit_context = audit_context or {}
     campaign_id = audit_context.get('campaign_id')
@@ -400,6 +408,8 @@ def _post_chat_response(
         'model': model,
         'messages': messages,
     }
+    if max_tokens is not None:
+        payload['max_tokens'] = max_tokens
     if tools:
         payload['tools'] = tools
     if provider_options.get('tool_choice') is not None:
@@ -409,6 +419,8 @@ def _post_chat_response(
     if provider_options.get('thinking_enabled'):
         payload['thinking'] = provider_options['thinking']
         payload['reasoning_effort'] = provider_options['reasoning_effort']
+    if json_mode:
+        payload['response_format'] = {'type': 'json_object'}
 
     if campaign_id:
         log_model_request(
@@ -517,6 +529,7 @@ def _post_chat(
     allow_thinking=True,
     timeout_seconds=60,
     max_attempts=None,
+    max_tokens=None,
 ):
     data = _post_chat_response(
         messages,
@@ -525,8 +538,100 @@ def _post_chat(
         allow_thinking=allow_thinking,
         timeout_seconds=timeout_seconds,
         max_attempts=max_attempts,
+        max_tokens=max_tokens,
     )
     return data['choices'][0]['message']['content']
+
+
+def _post_chat_stream(
+    messages,
+    json_mode=False,
+    audit_context=None,
+    allow_thinking=False,
+    timeout_seconds=90,
+    on_token=None,
+):
+    """Stream an LLM chat completion, calling on_token(delta_text) for each content chunk.
+
+    Returns the fully accumulated content string when the stream finishes.
+    """
+    audit_context = audit_context or {}
+    campaign_id = audit_context.get('campaign_id')
+    operation = audit_context.get('operation') or 'chat_completion_stream'
+    actor = audit_context.get('actor') or 'dm'
+    trace_id = audit_context.get('trace_id') or f'{actor}:{operation}:{uuid4().hex[:10]}'
+    parent_trace_id = audit_context.get('parent_trace_id')
+    trace_label = audit_context.get('trace_label') or f'{actor}: {operation}'
+
+    provider = get_llm_provider()
+    model = get_llm_model()
+    _require_llm_config(provider, model)
+
+    provider_options = _provider_request_payload_options(
+        provider, model, None, None, None, allow_thinking=allow_thinking,
+    )
+    payload = {
+        'model': model,
+        'messages': messages,
+        'stream': True,
+    }
+    if provider_options.get('thinking_enabled'):
+        payload['thinking'] = provider_options['thinking']
+        payload['reasoning_effort'] = provider_options['reasoning_effort']
+    if json_mode:
+        payload['response_format'] = {'type': 'json_object'}
+
+    if campaign_id:
+        log_model_request(
+            campaign_id, operation, actor, messages, model,
+            json_mode=json_mode, commit=True,
+            trace_id=trace_id, parent_trace_id=parent_trace_id,
+            trace_label=trace_label, provider=provider,
+        )
+
+    resp = requests.post(
+        _api_url_for_provider(provider),
+        headers={
+            'Authorization': f'Bearer {_api_key_for_provider(provider)}',
+            'Content-Type': 'application/json',
+        },
+        json=payload,
+        timeout=timeout_seconds,
+        stream=True,
+    )
+    resp.raise_for_status()
+
+    accumulated = []
+    for line in resp.iter_lines(decode_unicode=True):
+        if not line:
+            continue
+        if line.startswith('data: '):
+            data_str = line[6:]
+            if data_str.strip() == '[DONE]':
+                break
+            try:
+                chunk = json.loads(data_str)
+                delta = (chunk.get('choices') or [{}])[0].get('delta') or {}
+                content = delta.get('content') or ''
+                if content:
+                    accumulated.append(content)
+                    if on_token:
+                        on_token(content)
+            except (json.JSONDecodeError, IndexError, KeyError):
+                continue
+
+    full_text = ''.join(accumulated)
+
+    if campaign_id:
+        log_model_response(
+            campaign_id, operation, actor,
+            {'choices': [{'message': {'content': full_text}}]},
+            commit=True, trace_id=trace_id,
+            parent_trace_id=parent_trace_id,
+            trace_label=trace_label, provider=provider,
+        )
+
+    return full_text
 
 
 def _opening_scene_text_from_response(data):
@@ -672,6 +777,31 @@ def normalize_session_dm_turn_decision(raw_decision):
     }
 
 
+def _session_dm_json_contract_violation(raw_content):
+    data = _json_loads_or_empty(raw_content)
+    if not isinstance(data, dict) or not data:
+        return {
+            'kind': 'non_json_response',
+            'detail': 'Session DM final answer must be a JSON object with mode/content or mode/reason.',
+        }
+
+    mode = str(data.get('mode') or data.get('action') or '').strip().lower()
+    if mode in {'silent', 'no_response', 'no_dm_response', 'none'}:
+        return None
+    if mode and mode != 'speak':
+        return {
+            'kind': 'invalid_mode',
+            'detail': 'Session DM mode must be "speak" or "silent".',
+            'mode': mode,
+        }
+    if data.get('content') is None and data.get('message') is None and data.get('visible_message') is None:
+        return {
+            'kind': 'missing_content',
+            'detail': 'Session DM speak decisions must include content, message, or visible_message.',
+        }
+    return None
+
+
 SESSION_DM_GUARD_ONLY_CONTEXT_KEYS = {'private_output_terms', 'private_spoiler_items'}
 
 
@@ -696,6 +826,7 @@ def build_session_dm_tool_messages(hot_context):
 
 
 SAFE_SPOILER_SKIP_PREFLIGHT_MODES = {'silent', 'ooc_only', 'mechanics_only', 'clarification_only'}
+THINKING_OFF_PREFLIGHT_MODES = SAFE_SPOILER_SKIP_PREFLIGHT_MODES | {'simple_narrative'}
 
 
 def _preflight_message_dict(message):
@@ -728,11 +859,14 @@ def build_session_preflight_messages(hot_context, recent_messages, tools):
         'decision_policy': (
             'skip_spoiler_check may be true only for silent, ooc_only, mechanics_only, or '
             'clarification_only turns with high confidence. Set it false for narrative, unknown, '
-            'tool-likely, NPC, lore, object ownership, relationship, location, clue, reveal, or world-state turns.'
+            'tool-likely, NPC, lore, object ownership, relationship, location, clue, reveal, or world-state turns. '
+            'main_call_thinking may be false only for high-confidence simple turns. Use true for any uncertainty, '
+            'combat, complex rules, likely tool use, hidden/private context, lore-heavy reasoning, or major consequences.'
         ),
         'return_shape': {
-            'dm_reply_mode': 'silent | ooc_only | mechanics_only | clarification_only | narrative | unknown',
+            'dm_reply_mode': 'silent | ooc_only | mechanics_only | clarification_only | simple_narrative | narrative | unknown',
             'skip_spoiler_check': False,
+            'main_call_thinking': True,
             'confidence': 'high | medium | low',
             'reason': 'short explanation',
         },
@@ -749,12 +883,13 @@ def normalize_session_preflight_decision(raw_decision):
         return {
             'dm_reply_mode': 'unknown',
             'skip_spoiler_check': False,
+            'main_call_thinking': True,
             'confidence': 'low',
             'reason': 'Preflight returned no usable decision.',
         }
 
     mode = str(data.get('dm_reply_mode') or data.get('reply_mode') or 'unknown').strip().lower()
-    if mode not in SAFE_SPOILER_SKIP_PREFLIGHT_MODES | {'narrative', 'unknown'}:
+    if mode not in THINKING_OFF_PREFLIGHT_MODES | {'narrative', 'unknown'}:
         mode = 'unknown'
     confidence = str(data.get('confidence') or 'low').strip().lower()
     if confidence not in {'high', 'medium', 'low'}:
@@ -764,10 +899,16 @@ def normalize_session_preflight_decision(raw_decision):
         and mode in SAFE_SPOILER_SKIP_PREFLIGHT_MODES
         and confidence == 'high'
     )
+    main_call_thinking = not (
+        data.get('main_call_thinking') is False
+        and mode in THINKING_OFF_PREFLIGHT_MODES
+        and confidence == 'high'
+    )
 
     return {
         'dm_reply_mode': mode,
         'skip_spoiler_check': skip_spoiler_check,
+        'main_call_thinking': main_call_thinking,
         'confidence': confidence,
         'reason': str(data.get('reason') or '').strip(),
     }
@@ -789,6 +930,7 @@ def get_session_preflight_decision(hot_context, recent_messages, tools, audit_co
             allow_thinking=False,
             timeout_seconds=SESSION_PREFLIGHT_TIMEOUT_SECONDS,
             max_attempts=1,
+            max_tokens=SESSION_PREFLIGHT_MAX_TOKENS,
         )
         return normalize_session_preflight_decision(raw_decision)
     except Exception as err:
@@ -810,6 +952,7 @@ def get_session_preflight_decision(hot_context, recent_messages, tools, audit_co
         return {
             'dm_reply_mode': 'unknown',
             'skip_spoiler_check': False,
+            'main_call_thinking': True,
             'confidence': 'low',
             'reason': 'Preflight failed closed.',
         }
@@ -1535,6 +1678,7 @@ def get_session_dm_response_with_tools(
     execute_tool,
     audit_context=None,
     max_tool_rounds=4,
+    on_status_change=None,
 ):
     base_audit = audit_context or {}
     trace_id = base_audit.get('trace_id') or f"session_dm:session_dm_response:{uuid4().hex[:10]}"
@@ -1551,6 +1695,7 @@ def get_session_dm_response_with_tools(
     preflight_decision = {
         'dm_reply_mode': 'unknown',
         'skip_spoiler_check': False,
+        'main_call_thinking': True,
         'confidence': 'low',
         'reason': 'Preflight not run.',
     }
@@ -1568,7 +1713,11 @@ def get_session_dm_response_with_tools(
             },
         )
 
+    if on_status_change:
+        on_status_change({"step": "preflight"})
+
     tool_round = 0
+    json_contract_retried = False
     format_retried = False
     pc_control_retried = False
     private_output_retried = False
@@ -1586,6 +1735,25 @@ def get_session_dm_response_with_tools(
         return guard_audits[guard_name]
 
     while True:
+        if on_status_change:
+            on_status_change({"step": "thinking", "reasoning": "Determining best actions or phrasing narration"})
+
+        retrying_visible_answer = any((
+            json_contract_retried,
+            format_retried,
+            pc_control_retried,
+            private_output_retried,
+            spoiler_checker_retried,
+        ))
+        active_tools = None if retrying_visible_answer else tools
+        active_tool_choice = (
+            'auto'
+            if active_tools and tool_round < max_tool_rounds
+            else 'none'
+            if active_tools
+            else None
+        )
+
         loop_audit = {
             **base_audit,
             'trace_id': trace_id,
@@ -1597,15 +1765,65 @@ def get_session_dm_response_with_tools(
         }
         data = _post_chat_response(
             messages,
+            json_mode=retrying_visible_answer,
             audit_context=loop_audit,
-            tools=tools,
-            tool_choice='auto' if tool_round < max_tool_rounds else 'none',
-            parallel_tool_calls=False,
+            tools=active_tools,
+            tool_choice=active_tool_choice,
+            parallel_tool_calls=False if active_tools else None,
+            allow_thinking=(
+                False
+                if retrying_visible_answer
+                else preflight_decision.get('main_call_thinking') is not False or tool_round > 0
+            ),
         )
         message, finish_reason = _choice_message(data)
+
+        # If the LLM returned a reasoning field, let's extract it and feed it to status
+        reasoning_val = message.get("reasoning_content") or message.get("reasoning")
+        if on_status_change and reasoning_val:
+            on_status_change({"step": "thinking", "reasoning": reasoning_val})
+
         tool_calls = message.get('tool_calls') or []
         if not tool_calls or tool_round >= max_tool_rounds:
+            if on_status_change:
+                on_status_change({"step": "guard_check"})
             raw_content = message.get('content') or ''
+            json_contract_violation = _session_dm_json_contract_violation(raw_content)
+            if json_contract_violation and not json_contract_retried:
+                if on_status_change:
+                    on_status_change({"step": "revising", "violations": {"type": "json_contract", "details": json_contract_violation}})
+                if base_audit.get('campaign_id'):
+                    audit = guard_audit('json_contract_guard')
+                    log_audit_event(
+                        base_audit.get('campaign_id'),
+                        'json_contract_guard_retry',
+                        'Session DM response did not follow the final JSON contract; requesting rewrite.',
+                        {
+                            'operation': 'json_contract_guard',
+                            'violation': json_contract_violation,
+                            'draft_response': raw_content,
+                        },
+                        source='session_dm.guard',
+                        actor=audit.get('actor'),
+                        trace_id=audit.get('trace_id'),
+                        parent_trace_id=audit.get('parent_trace_id'),
+                        trace_label=audit.get('trace_label'),
+                        audit_role='guard',
+                        commit=True,
+                    )
+                messages.append({'role': 'assistant', 'content': raw_content})
+                messages.append({
+                    'role': 'user',
+                    'content': (
+                        'Your previous answer did not follow the required final JSON contract. '
+                        'Discard any meta-commentary about rewriting, correction, tags, or instructions. '
+                        'Return only one valid JSON object. Use {"mode":"speak","content":"..."} with only '
+                        'the player-visible in-world answer in content, or {"mode":"silent","reason":"..."} '
+                        'only if no visible DM response is needed.'
+                    ),
+                })
+                json_contract_retried = True
+                continue
             decision = normalize_session_dm_turn_decision(raw_content)
             content = decision.get('content') or ''
             format_violation = (
@@ -1634,6 +1852,8 @@ def get_session_dm_response_with_tools(
                 else {'safe': True, 'leaked_item_ids': [], 'evidence': [], 'reason': ''}
             )
             if format_violation and not format_retried:
+                if on_status_change:
+                    on_status_change({"step": "revising", "violations": {"type": "format", "details": format_violation}})
                 if base_audit.get('campaign_id'):
                     audit = guard_audit('format_guard')
                     log_audit_event(
@@ -1668,6 +1888,8 @@ def get_session_dm_response_with_tools(
                 format_retried = True
                 continue
             if violation and not pc_control_retried:
+                if on_status_change:
+                    on_status_change({"step": "revising", "violations": {"type": "pc_control", "details": violation}})
                 if base_audit.get('campaign_id'):
                     audit = guard_audit('pc_control_guard')
                     log_audit_event(
@@ -1701,6 +1923,8 @@ def get_session_dm_response_with_tools(
                 pc_control_retried = True
                 continue
             if private_violation and not private_output_retried:
+                if on_status_change:
+                    on_status_change({"step": "revising", "violations": {"type": "private_output", "details": private_violation}})
                 if base_audit.get('campaign_id'):
                     audit = guard_audit('private_output_guard')
                     log_audit_event(
@@ -1733,6 +1957,8 @@ def get_session_dm_response_with_tools(
                 private_output_retried = True
                 continue
             if not spoiler_check.get('safe', True) and not spoiler_checker_retried:
+                if on_status_change:
+                    on_status_change({"step": "revising", "violations": {"type": "spoiler", "details": spoiler_check}})
                 if base_audit.get('campaign_id'):
                     audit = guard_audit('spoiler_checker_guard')
                     log_audit_event(
@@ -1868,6 +2094,12 @@ def get_session_dm_response_with_tools(
             function = tool_call.get('function') or {}
             tool_name = function.get('name')
             args = _parse_tool_arguments(function.get('arguments'))
+            if on_status_change:
+                on_status_change({
+                    "step": "tool_call",
+                    "tool_name": tool_name,
+                    "arguments": args
+                })
             result = execute_tool(
                 tool_name,
                 args,
@@ -2073,6 +2305,38 @@ def get_planning_dm_response(context, current_user_messages, draft_character=Non
         return {'message': text, 'active_page': None, 'form_patch': {}}
     except Exception as e:
         print(f'[openrouter] Planning DM error: {e}')
+        return None
+
+
+def get_planning_dm_response_streaming(context, current_user_messages, draft_character=None, active_page=None, audit_context=None, on_token=None):
+    """Streaming variant of get_planning_dm_response.
+
+    Calls on_token(delta_text) for each text chunk from the LLM.
+    The stream contains raw JSON text including the 'message' value —
+    the caller is responsible for extracting visible content from the
+    streaming tokens (the planning_stream worker handles this).
+
+    Returns the final parsed result dict (same shape as get_planning_dm_response).
+    """
+    messages = build_planning_dm_messages(context, current_user_messages, draft_character, active_page)
+
+    try:
+        text = _post_chat_stream(
+            messages,
+            json_mode=True,
+            audit_context=audit_context,
+            on_token=on_token,
+        )
+        data = _json_loads_with_repair(text, audit_context=audit_context)
+        if isinstance(data, dict) and data.get('message'):
+            return {
+                'message': data.get('message') or '',
+                'active_page': data.get('active_page'),
+                'form_patch': data.get('form_patch') if isinstance(data.get('form_patch'), dict) else {},
+            }
+        return {'message': text, 'active_page': None, 'form_patch': {}}
+    except Exception as e:
+        print(f'[openrouter] Planning DM streaming error: {e}')
         return None
 
 

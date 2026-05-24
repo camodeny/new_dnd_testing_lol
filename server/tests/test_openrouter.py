@@ -14,6 +14,7 @@ from openrouter import (
     _json_loads_with_error,
     _json_loads_with_repair,
     _post_chat_response,
+    SESSION_PREFLIGHT_MAX_TOKENS,
     SESSION_PREFLIGHT_TIMEOUT_SECONDS,
     build_session_dm_tool_messages,
     build_session_preflight_messages,
@@ -331,12 +332,14 @@ class SessionSpoilerCheckTest(unittest.TestCase):
             normalize_session_preflight_decision({
                 'dm_reply_mode': 'mechanics_only',
                 'skip_spoiler_check': True,
+                'main_call_thinking': False,
                 'confidence': 'high',
                 'reason': 'Only reports a roll total.',
             }),
             {
                 'dm_reply_mode': 'mechanics_only',
                 'skip_spoiler_check': True,
+                'main_call_thinking': False,
                 'confidence': 'high',
                 'reason': 'Only reports a roll total.',
             },
@@ -351,6 +354,31 @@ class SessionSpoilerCheckTest(unittest.TestCase):
             'skip_spoiler_check': True,
             'confidence': 'medium',
         })['skip_spoiler_check'])
+
+    def test_preflight_normalizer_allows_thinking_off_for_simple_narrative_but_not_spoiler_skip(self):
+        result = normalize_session_preflight_decision({
+            'dm_reply_mode': 'simple_narrative',
+            'skip_spoiler_check': True,
+            'main_call_thinking': False,
+            'confidence': 'high',
+            'reason': 'Simple public scene color.',
+        })
+
+        self.assertEqual(result['dm_reply_mode'], 'simple_narrative')
+        self.assertFalse(result['skip_spoiler_check'])
+        self.assertFalse(result['main_call_thinking'])
+
+    def test_preflight_normalizer_keeps_thinking_on_when_uncertain_or_complex(self):
+        self.assertTrue(normalize_session_preflight_decision({
+            'dm_reply_mode': 'narrative',
+            'main_call_thinking': False,
+            'confidence': 'high',
+        })['main_call_thinking'])
+        self.assertTrue(normalize_session_preflight_decision({
+            'dm_reply_mode': 'ooc_only',
+            'main_call_thinking': False,
+            'confidence': 'medium',
+        })['main_call_thinking'])
 
     def test_session_preflight_prompt_uses_policy_and_not_private_spoiler_corpus(self):
         messages = build_session_preflight_messages(
@@ -367,12 +395,13 @@ class SessionSpoilerCheckTest(unittest.TestCase):
         payload = messages[1]['content']
         self.assertIn('excruciatingly obvious', messages[0]['content'])
         self.assertIn('has_unrevealed_private_items', payload)
+        self.assertIn('main_call_thinking', payload)
         self.assertIn('ask_character_sheet', payload)
         self.assertNotIn('Lord Ember', payload)
         self.assertNotIn('crimson cult', payload)
 
     def test_session_preflight_uses_single_fast_non_thinking_call(self):
-        with patch('openrouter._post_chat', return_value='{"dm_reply_mode":"ooc_only","skip_spoiler_check":true,"confidence":"high","reason":"OOC help."}') as post_chat:
+        with patch('openrouter._post_chat', return_value='{"dm_reply_mode":"ooc_only","skip_spoiler_check":true,"main_call_thinking":false,"confidence":"high","reason":"OOC help."}') as post_chat:
             result = get_session_preflight_decision(
                 {},
                 [{'role': 'player', 'content': '<ooc>How do I roll?</ooc>'}],
@@ -380,9 +409,11 @@ class SessionSpoilerCheckTest(unittest.TestCase):
             )
 
         self.assertTrue(result['skip_spoiler_check'])
+        self.assertFalse(result['main_call_thinking'])
         self.assertFalse(post_chat.call_args.kwargs['allow_thinking'])
         self.assertEqual(post_chat.call_args.kwargs['max_attempts'], 1)
         self.assertEqual(post_chat.call_args.kwargs['timeout_seconds'], SESSION_PREFLIGHT_TIMEOUT_SECONDS)
+        self.assertEqual(post_chat.call_args.kwargs['max_tokens'], SESSION_PREFLIGHT_MAX_TOKENS)
 
     def test_spoiler_checker_skips_llm_when_preflight_explicitly_allows_skip(self):
         hot_context = {

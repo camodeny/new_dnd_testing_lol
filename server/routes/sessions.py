@@ -1,5 +1,7 @@
 from datetime import datetime
 from threading import Thread
+import json
+import queue
 
 from flask import Blueprint, current_app, jsonify, request
 
@@ -11,6 +13,7 @@ from openrouter import (
     get_session_memory_patch,
     normalize_session_dm_turn_decision,
 )
+from services.stream_manager import stream_manager
 from services.audit_service import log_audit_event
 from services.campaign_service import ensure_member, get_or_404
 from services.character_service import character_full_dict
@@ -379,8 +382,6 @@ def send_message(current_user, session_id):
     db.session.add(msg)
     db.session.commit()
     result_messages = [msg.to_dict()]
-    trace_id = f'session_dm:session_{session_id}:message_{msg.id}'
-    trace_label = f'session_dm: session {session_id}'
     log_audit_event(
         campaign.id,
         'player_input_stored',
@@ -391,7 +392,18 @@ def send_message(current_user, session_id):
         commit=True,
     )
 
-    try:
+    # Start generation asynchronously
+    if (
+        current_app.config.get('TESTING')
+        or current_app.testing
+        or current_app.config.get('SQLALCHEMY_DATABASE_URI') == 'sqlite:///:memory:'
+    ):
+        recent_messages = SessionMessage.query.filter_by(session_id=session_id).order_by(
+            SessionMessage.created_at.asc(),
+        ).all()[-8:]
+        trace_id = f'session_dm:session_{session_id}:message_{msg.id}'
+        trace_label = f'session_dm: session {session_id}'
+
         hot_context = build_session_hot_context(campaign, session, current_user)
         dm_tools_filtered = get_dm_tool_definitions(campaign)
         manifest = context_manifest(hot_context, dm_tools_filtered)
@@ -406,141 +418,182 @@ def send_message(current_user, session_id):
             trace_label=trace_label,
             commit=True,
         )
-        recent_messages = SessionMessage.query.filter_by(session_id=session_id).order_by(
-            SessionMessage.created_at.asc(),
-        ).all()[-8:]
-        ai_result = get_session_dm_response_with_tools(
-            hot_context,
-            recent_messages,
-            dm_tools_filtered,
-            lambda name, args, tool_audit: execute_dm_tool(campaign, session, current_user, name, args, tool_audit),
-            audit_context={
-                'campaign_id': campaign.id,
-                'operation': 'session_dm_response',
-                'actor': 'session_dm',
-                'trace_id': trace_id,
-                'trace_label': trace_label,
-                'context_manifest': manifest,
-                'full_world_graph_included': False,
-            },
-        )
-    except RuntimeError as err:
-        return jsonify({'error': str(err), 'messages': result_messages}), 500
-    except Exception as err:
-        return jsonify({'error': repr(err), 'messages': result_messages}), 500
 
-    ai_turn = _session_dm_turn_decision(ai_result)
-    ai_text = ai_turn.get('content') or ''
-
-    sheet_proposals = []
-    if ai_turn.get('mode') == 'speak' and ai_text:
-        ai_msg = SessionMessage(
-            session_id=session_id,
-            role='dm',
-            content=ai_text,
-        )
-        db.session.add(ai_msg)
-        db.session.flush()
-        log_audit_event(
-            campaign.id,
-            'dm_output_stored',
-            'Stored visible session DM response.',
-            {
-                'session_id': session_id,
-                'message': {
-                    'role': 'dm',
-                    'content': ai_text,
+        try:
+            ai_result = get_session_dm_response_with_tools(
+                hot_context,
+                recent_messages,
+                dm_tools_filtered,
+                lambda name, args, tool_audit: execute_dm_tool(campaign, session, current_user, name, args, tool_audit),
+                audit_context={
+                    'campaign_id': campaign.id,
+                    'operation': 'session_dm_response',
+                    'actor': 'session_dm',
+                    'trace_id': trace_id,
+                    'trace_label': trace_label,
+                    'context_manifest': manifest,
+                    'full_world_graph_included': False,
                 },
-            },
-            source='session_messages',
-            actor='session_dm',
-            trace_id=trace_id,
-            trace_label=trace_label,
-            commit=False,
-        )
-        pending_proposals = SheetProposal.query.filter_by(
-            session_id=session_id, message_id=None, status='pending',
-        ).all()
-        for proposal in pending_proposals:
-            proposal.message_id = ai_msg.id
-        db.session.commit()
-        result_messages.append(ai_msg.to_dict())
-        sheet_proposals = [p.to_dict() for p in pending_proposals]
+            )
+        except Exception as err:
+            return jsonify({'error': repr(err), 'messages': result_messages}), 500
+
+        ai_turn = _session_dm_turn_decision(ai_result)
+        ai_text = ai_turn.get('content') or ''
+
+        if ai_turn.get('mode') == 'speak' and ai_text:
+            ai_msg = SessionMessage(
+                session_id=session_id,
+                role='dm',
+                content=ai_text,
+            )
+            db.session.add(ai_msg)
+            db.session.flush()
+            log_audit_event(
+                campaign.id,
+                'dm_output_stored',
+                'Stored visible session DM response.',
+                {
+                    'session_id': session_id,
+                    'message': {
+                        'role': 'dm',
+                        'content': ai_text,
+                    },
+                },
+                source='session_messages',
+                actor='session_dm',
+                trace_id=trace_id,
+                trace_label=trace_label,
+                commit=False,
+            )
+            pending_proposals = SheetProposal.query.filter_by(
+                session_id=session_id, message_id=None, status='pending',
+            ).all()
+            for proposal in pending_proposals:
+                proposal.message_id = ai_msg.id
+            db.session.commit()
+            result_messages.append(ai_msg.to_dict())
+
+            # Synchronous memory update
+            _run_session_memory_update(
+                campaign.id,
+                session_id,
+                current_user.id,
+                msg.id,
+                content,
+                ai_text,
+                hot_context,
+                trace_id,
+            )
+        elif ai_turn.get('mode') == 'silent':
+            log_audit_event(
+                campaign.id,
+                'dm_silence_chosen',
+                'Session DM intentionally sent no visible response.',
+                {
+                    'session_id': session_id,
+                    'player_message_id': msg.id,
+                    'decision': {
+                        'mode': 'silent',
+                        'reason': ai_turn.get('reason') or '',
+                    },
+                },
+                source='session_messages',
+                actor='session_dm',
+                trace_id=trace_id,
+                trace_label=trace_label,
+                audit_role='agent',
+                commit=False,
+            )
+            db.session.commit()
+        else:
+            log_audit_event(
+                campaign.id,
+                'dm_output_empty',
+                'Session DM returned no visible content; no DM message was stored.',
+                {
+                    'session_id': session_id,
+                    'player_message_id': msg.id,
+                    'decision': ai_turn,
+                },
+                source='session_messages',
+                actor='session_dm',
+                trace_id=trace_id,
+                trace_label=trace_label,
+                audit_role='agent',
+                commit=False,
+            )
+            db.session.commit()
 
         log_audit_event(
             campaign.id,
             'client_response_sent',
-            'Sent session message response payload to client.',
-            {'session_id': session_id, 'messages': result_messages, 'sheet_proposals': sheet_proposals},
+            'Sent session turn messages payload to client.',
+            {'messages': result_messages},
             source='session_messages',
             actor='server',
             trace_id=trace_id,
             trace_label=trace_label,
             commit=True,
         )
-        _schedule_session_memory_update(
-            campaign.id,
-            session_id,
-            current_user.id,
-            msg.id,
-            content,
-            ai_text,
-            hot_context,
-            trace_id,
-        )
-        return jsonify({'messages': result_messages, 'sheet_proposals': sheet_proposals}), 201
-
-    if ai_turn.get('mode') == 'silent':
-        log_audit_event(
-            campaign.id,
-            'dm_silence_chosen',
-            'Session DM intentionally sent no visible response.',
-            {
-                'session_id': session_id,
-                'player_message_id': msg.id,
-                'decision': {
-                    'mode': 'silent',
-                    'reason': ai_turn.get('reason') or '',
-                },
-            },
-            source='session_messages',
-            actor='session_dm',
-            trace_id=trace_id,
-            trace_label=trace_label,
-            audit_role='agent',
-            commit=False,
-        )
     else:
-        log_audit_event(
-            campaign.id,
-            'dm_output_empty',
-            'Session DM returned no visible content; no DM message was stored.',
-            {
-                'session_id': session_id,
-                'player_message_id': msg.id,
-                'decision': ai_turn,
-            },
-            source='session_messages',
-            actor='session_dm',
-            trace_id=trace_id,
-            trace_label=trace_label,
-            audit_role='agent',
-            commit=False,
-        )
-
-    db.session.commit()
-    log_audit_event(
-        campaign.id,
-        'client_response_sent',
-        'Sent session message response payload to client.',
-        {'session_id': session_id, 'messages': result_messages},
-        source='session_messages',
-        actor='server',
-        trace_id=trace_id,
-        trace_label=trace_label,
-        commit=True,
-    )
+        stream_manager.start_generation(campaign.id, session_id, current_user.id, content, msg.id)
     return jsonify({'messages': result_messages}), 201
+
+
+@sessions_bp.route('/api/sessions/<int:session_id>/stream', methods=['GET'])
+def stream_session(session_id):
+    # Retrieve token from query params since EventSource doesn't support headers natively
+    token_str = request.args.get('token')
+    if not token_str:
+        return jsonify({'error': 'Unauthorized'}), 401
+
+    import jwt
+    try:
+        data = jwt.decode(token_str, current_app.config['SECRET_KEY'], algorithms=['HS256'])
+        token_user_id = data.get('user_id')
+    except Exception:
+        return jsonify({'error': 'Unauthorized'}), 401
+
+    if not token_user_id:
+        return jsonify({'error': 'Unauthorized'}), 401
+
+    current_user = db.session.get(User, token_user_id)
+    if not current_user:
+        return jsonify({'error': 'Unauthorized'}), 401
+
+    session = get_or_404(CampaignSession, session_id)
+    campaign = db.session.get(Campaign, session.campaign_id)
+    if not ensure_member(campaign, current_user):
+        return jsonify({'error': 'Forbidden'}), 403
+
+    worker = stream_manager.get_worker(session_id)
+    if not worker:
+        # If no generation is running, return a brief EventStream indicating idle
+        def idle_stream():
+            yield "data: " + json.dumps({"type": "status", "status": "idle"}) + "\n\n"
+        return current_app.response_class(idle_stream(), mimetype='text/event-stream')
+
+    q = worker.add_listener()
+
+    def event_stream():
+        try:
+            while True:
+                try:
+                    event = q.get(timeout=20) # Keep-alive ping / timeout
+                    yield f"data: {json.dumps(event)}\n\n"
+                    if event.get("type") in ("done", "error"):
+                        break
+                except queue.Empty:
+                    # Keep-alive comment
+                    yield ": ping\n\n"
+        finally:
+            worker.remove_listener(q)
+
+    response = current_app.response_class(event_stream(), mimetype='text/event-stream')
+    response.headers['Cache-Control'] = 'no-cache'
+    response.headers['X-Accel-Buffering'] = 'no'
+    return response
 
 
 @token_required

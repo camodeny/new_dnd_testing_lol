@@ -1138,6 +1138,38 @@ class DmToolsTest(unittest.TestCase):
         self.assertIn('visible-message syntax checker rejected it', retry_prompt)
         self.assertIn('</p>', retry_prompt)
         self.assertIn('only allowed angle-bracket tag', retry_prompt)
+        self.assertTrue(post_chat.call_args_list[1].kwargs.get('json_mode'))
+        self.assertIsNone(post_chat.call_args_list[1].kwargs.get('tools'))
+        self.assertFalse(post_chat.call_args_list[1].kwargs.get('allow_thinking'))
+
+    def test_session_dm_format_retry_repairs_non_json_meta_response(self):
+        hot_context = {
+            'protected_player_characters': [],
+            'private_output_terms': [],
+            'private_spoiler_items': [],
+        }
+
+        with patch('openrouter._post_chat_response', side_effect=[
+            {'choices': [{'message': {'content': '{"mode":"speak","content":"<ic>\\"Green lights.\\"</ic>"}'}}]},
+            {'choices': [{'message': {'content': 'Understood. No `<ic>` tags.\n\n<npc target="Brenn">"Green lights by the old willow."</npc>'}}]},
+            {'choices': [{'message': {'content': '{"mode":"speak","content":"<npc target=\\"Brenn\\">\\"Green lights by the old willow.\\"</npc>"}'}}]},
+        ]) as post_chat:
+            result = get_session_dm_response_with_tools(
+                hot_context,
+                [],
+                [],
+                lambda *_args, **_kwargs: {},
+                max_tool_rounds=0,
+            )
+
+        self.assertEqual(result, {
+            'mode': 'speak',
+            'content': '<npc target="Brenn">"Green lights by the old willow."</npc>',
+        })
+        self.assertEqual(post_chat.call_count, 3)
+        contract_retry_prompt = post_chat.call_args_list[2].args[0][-1]['content']
+        self.assertIn('final JSON contract', contract_retry_prompt)
+        self.assertIn('Discard any meta-commentary', contract_retry_prompt)
 
     def test_spoiler_checker_allows_safe_reply(self):
         hot_context = {
@@ -1158,6 +1190,74 @@ class DmToolsTest(unittest.TestCase):
 
         self.assertEqual(result, {'mode': 'speak', 'content': 'Jara watches the door.'})
         checker.assert_called_once()
+
+    def test_session_preflight_can_disable_main_dm_thinking(self):
+        hot_context = {
+            'protected_player_characters': [],
+            'private_output_terms': [],
+            'private_spoiler_items': [],
+        }
+
+        with patch('openrouter.get_session_preflight_decision', return_value={
+            'dm_reply_mode': 'simple_narrative',
+            'skip_spoiler_check': False,
+            'main_call_thinking': False,
+            'confidence': 'high',
+            'reason': 'Simple public narration.',
+        }), patch('openrouter._post_chat_response', return_value={
+            'choices': [{'message': {'content': '{"mode":"speak","content":"Rain slicks the old stones."}'}}],
+        }) as post_chat:
+            result = get_session_dm_response_with_tools(
+                hot_context,
+                [],
+                [],
+                lambda *_args, **_kwargs: {},
+                audit_context={'operation': 'session_dm_response'},
+                max_tool_rounds=0,
+            )
+
+        self.assertEqual(result, {'mode': 'speak', 'content': 'Rain slicks the old stones.'})
+        self.assertFalse(post_chat.call_args.kwargs['allow_thinking'])
+
+    def test_session_preflight_thinking_off_upgrades_after_tool_call(self):
+        hot_context = {
+            'protected_player_characters': [],
+            'private_output_terms': [],
+            'private_spoiler_items': [],
+        }
+        tool_result = {'answer': 'AC 15.', 'missing': False}
+
+        with patch('openrouter.get_session_preflight_decision', return_value={
+            'dm_reply_mode': 'mechanics_only',
+            'skip_spoiler_check': True,
+            'main_call_thinking': False,
+            'confidence': 'high',
+            'reason': 'Simple mechanics lookup.',
+        }), patch('openrouter._post_chat_response', side_effect=[
+            {'choices': [{'message': {
+                'content': '',
+                'tool_calls': [{
+                    'id': 'call_sheet',
+                    'function': {
+                        'name': 'ask_character_sheet',
+                        'arguments': '{"question":"What is my AC?"}',
+                    },
+                }],
+            }}]},
+            {'choices': [{'message': {'content': '{"mode":"speak","content":"Your AC is 15."}'}}]},
+        ]) as post_chat:
+            result = get_session_dm_response_with_tools(
+                hot_context,
+                [],
+                [{'type': 'function', 'function': {'name': 'ask_character_sheet'}}],
+                lambda *_args, **_kwargs: tool_result,
+                audit_context={'operation': 'session_dm_response'},
+                max_tool_rounds=1,
+            )
+
+        self.assertEqual(result, {'mode': 'speak', 'content': 'Your AC is 15.'})
+        self.assertFalse(post_chat.call_args_list[0].kwargs['allow_thinking'])
+        self.assertTrue(post_chat.call_args_list[1].kwargs['allow_thinking'])
 
     def test_spoiler_checker_rewrites_semantic_leak(self):
         hot_context = {

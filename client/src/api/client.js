@@ -203,6 +203,11 @@ export function sendMessage(sessionId, content, role = 'player') {
   return apiFetch(`/sessions/${sessionId}/messages`, { method: 'POST', body: JSON.stringify({ content, role }) })
 }
 
+export function getSessionStreamUrl(sessionId) {
+  const token = getToken()
+  return `${API_BASE}/sessions/${sessionId}/stream?token=${encodeURIComponent(token || '')}`
+}
+
 // Sheet Proposals
 export function getSheetProposals(sessionId) {
   return apiFetch(`/sessions/${sessionId}/proposals`)
@@ -259,6 +264,11 @@ export function sendPlanningMessage(campaignId, content, options = {}) {
       active_page: options.activePage,
     }),
   })
+}
+
+export function getPlanningStreamUrl(campaignId) {
+  const token = getToken()
+  return `${API_BASE}/campaigns/${campaignId}/planning/stream?token=${encodeURIComponent(token || '')}`
 }
 
 export function selectPlanningCharacter(campaignId, characterId) {

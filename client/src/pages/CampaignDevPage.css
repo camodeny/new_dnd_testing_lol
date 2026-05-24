@@ -1,5 +1,6 @@
 /* ==========================================================================
    CAMPAIGN DEV PAGE (DEVELOPER AUDIT) STYLES
+   Chat-centric branching timeline layout
    ========================================================================== */
 
 .dev-page {
@@ -156,7 +157,7 @@
 /* ── Layout Grid ── */
 .dev-layout {
   display: grid;
-  grid-template-columns: 300px 1fr;
+  grid-template-columns: 280px 1fr;
   gap: 24px;
   align-items: start;
   width: 100%;
@@ -409,6 +410,7 @@
   flex-direction: column;
   gap: 24px;
   width: 100%;
+  min-width: 0;
 }
 
 /* ── Flow Lanes ── */
@@ -446,150 +448,157 @@
   font-family: var(--mono);
 }
 
-/* ── Flow Graph 3-Column Tree Layout ── */
-.dev-graph {
+/* ==========================================================================
+   TIMELINE LAYOUT — Chat-centric branching view
+   ========================================================================== */
+
+.dev-timeline {
   display: flex;
   flex-direction: column;
-  gap: 24px;
   position: relative;
   width: 100%;
+  padding: 8px 0;
 }
 
-/* Vertical line down the graph center */
-.dev-graph::before {
+/* Subtle center spine */
+.dev-timeline::before {
   content: '';
   position: absolute;
-  top: 16px;
-  bottom: 16px;
+  top: 0;
+  bottom: 0;
   left: 50%;
   width: 2px;
-  background: linear-gradient(to bottom, var(--border-color), rgba(255, 255, 255, 0.01));
+  background: linear-gradient(
+    to bottom,
+    transparent 0%,
+    rgba(255, 255, 255, 0.06) 5%,
+    rgba(255, 255, 255, 0.06) 95%,
+    transparent 100%
+  );
   transform: translateX(-50%);
+  z-index: 0;
+  pointer-events: none;
+}
+
+/* ── Timeline Node (one message + its branches) ── */
+.dev-timeline-node {
+  position: relative;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  padding: 12px 0;
   z-index: 1;
 }
 
-.dev-graph-row {
-  display: grid;
-  grid-template-columns: 1fr 480px 1fr;
-  gap: 24px;
-  position: relative;
-  align-items: center;
-  width: 100%;
-}
-
-/* Horizontal connection lines from branches to center */
-.dev-graph-row.has-left-branches::before {
+/* Dot on the spine at each message */
+.dev-timeline-node::before {
   content: '';
   position: absolute;
   top: 50%;
-  left: 0;
-  width: calc(50% - 240px);
-  height: 2px;
-  background: rgba(255, 255, 255, 0.08);
-  transform: translateY(-50%);
-  z-index: 1;
-}
-
-.dev-graph-row.has-right-branches::after {
-  content: '';
-  position: absolute;
-  top: 50%;
-  right: 0;
-  width: calc(50% - 240px);
-  height: 2px;
-  background: rgba(255, 255, 255, 0.08);
-  transform: translateY(-50%);
-  z-index: 1;
-}
-
-@media (max-width: 1200px) {
-  .dev-graph::before,
-  .dev-graph-row.has-left-branches::before,
-  .dev-graph-row.has-right-branches::after {
-    display: none;
-  }
-  
-  .dev-graph-row {
-    grid-template-columns: 1fr;
-    gap: 16px;
-  }
-}
-
-/* ── Columns ── */
-.dev-graph-branches {
-  display: flex;
-  flex-direction: column;
-  gap: 16px;
-  height: 100%;
-  justify-content: center;
-}
-
-.dev-graph-branches-left {
-  align-items: flex-end;
-}
-
-.dev-graph-branches-right {
-  align-items: flex-start;
-}
-
-.dev-main-thread-stack {
-  display: flex;
-  flex-direction: column;
-  gap: 16px;
-  align-items: center;
-  justify-content: center;
-  z-index: 2;
-  position: relative;
-  width: 100%;
-}
-
-.dev-graph-branch-stack {
-  display: flex;
-  flex-direction: column;
-  gap: 12px;
-  width: 100%;
-}
-
-.dev-graph-child {
-  padding-left: 16px;
-  border-left: 1px dashed rgba(255, 255, 255, 0.1);
-  margin-left: 12px;
-  margin-top: 8px;
-  position: relative;
-}
-
-/* ── Messages & Nodes ── */
-.dev-graph-node {
-  width: 100%;
-  box-sizing: border-box;
-}
-
-.dev-graph-message {
-  background: linear-gradient(135deg, var(--bg-panel-elevated), var(--bg-panel));
-  border: 1px solid var(--border-color);
-  border-radius: var(--radius-md);
-  padding: 16px 20px;
-  box-shadow: var(--shadow-md);
-  max-width: 480px;
-  width: 100%;
+  left: 50%;
+  width: 10px;
+  height: 10px;
+  border-radius: 50%;
+  background: var(--bg-panel-elevated);
+  border: 2px solid rgba(255, 255, 255, 0.15);
+  transform: translate(-50%, -50%);
+  z-index: 3;
+  pointer-events: none;
   transition: var(--transition-smooth);
 }
 
-.dev-graph-message:hover {
-  border-color: var(--color-primary-glow);
-  transform: translateY(-2px);
-  box-shadow: var(--shadow-lg), 0 0 15px rgba(139, 92, 246, 0.05);
+.dev-timeline-node:hover::before {
+  border-color: var(--color-primary);
+  box-shadow: 0 0 8px var(--color-primary-glow);
 }
 
-.dev-graph-message-dm {
+.dev-timeline-node.has-branches::before {
+  width: 12px;
+  height: 12px;
+  border-color: rgba(139, 92, 246, 0.4);
+  background: rgba(139, 92, 246, 0.15);
+}
+
+/* The row that holds center message + side branches */
+.dev-timeline-row {
+  display: grid;
+  grid-template-columns: 1fr auto 1fr;
+  gap: 0;
+  width: 100%;
+  align-items: start;
+  position: relative;
+}
+
+/* ── Center message column ── */
+.dev-timeline-center {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 8px;
+  padding: 0 24px;
+  z-index: 2;
+  position: relative;
+  min-width: 340px;
+  max-width: 520px;
+  justify-self: center;
+}
+
+/* ── Side branch columns ── */
+.dev-timeline-branches-left,
+.dev-timeline-branches-right {
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+  padding: 0 12px;
+  min-width: 0;
+}
+
+.dev-timeline-branches-left {
+  align-items: flex-end;
+  justify-self: end;
+}
+
+.dev-timeline-branches-right {
+  align-items: flex-start;
+  justify-self: start;
+}
+
+/* Empty columns take no space */
+.dev-timeline-branches-left:empty,
+.dev-timeline-branches-right:empty {
+  padding: 0;
+  min-width: 0;
+}
+
+/* ── Message Bubble ── */
+.dev-msg-bubble {
+  background: linear-gradient(135deg, var(--bg-panel-elevated), var(--bg-panel));
+  border: 1px solid var(--border-color);
+  border-radius: var(--radius-md);
+  padding: 14px 18px;
+  box-shadow: var(--shadow-md);
+  width: 100%;
+  max-width: 480px;
+  box-sizing: border-box;
+  transition: var(--transition-smooth);
+  position: relative;
+}
+
+.dev-msg-bubble:hover {
+  border-color: var(--color-primary-glow);
+  transform: translateY(-1px);
+  box-shadow: var(--shadow-lg), 0 0 12px rgba(139, 92, 246, 0.06);
+}
+
+.dev-msg-bubble-dm {
   border-left: 4px solid var(--color-primary);
 }
 
-.dev-graph-message-player {
+.dev-msg-bubble-player {
   border-left: 4px solid var(--color-accent);
 }
 
-.dev-graph-message-system {
+.dev-msg-bubble-system {
   border-left: 4px solid var(--text-dim);
 }
 
@@ -597,7 +606,7 @@
   display: flex;
   align-items: center;
   gap: 8px;
-  margin-bottom: 8px;
+  margin-bottom: 6px;
   font-size: 0.72rem;
   color: var(--text-muted);
   flex-wrap: wrap;
@@ -625,25 +634,202 @@
 }
 
 .dev-message-content {
-  font-size: 0.92rem;
+  font-size: 0.9rem;
   line-height: 1.5;
   color: var(--text-main);
   word-break: break-word;
   white-space: pre-wrap;
 }
 
-/* ── Branch / Action Run Container ── */
+/* ── Main Thread Steps (inline in center) ── */
+.dev-main-step-list {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  width: 100%;
+  max-width: 480px;
+}
+
+/* ==========================================================================
+   BRANCH FORK — Collapsible side branch cards
+   ========================================================================== */
+
+.dev-branch-fork {
+  position: relative;
+  width: 100%;
+  max-width: 360px;
+  min-width: 200px;
+}
+
+/* ── Fork connector arm ── */
+.dev-branch-fork::before {
+  content: '';
+  position: absolute;
+  top: 18px;
+  width: 20px;
+  height: 2px;
+  z-index: 0;
+}
+
+.dev-timeline-branches-left .dev-branch-fork::before {
+  right: -12px;
+  background: linear-gradient(to right, transparent, rgba(255, 255, 255, 0.1));
+}
+
+.dev-timeline-branches-right .dev-branch-fork::before {
+  left: -12px;
+  background: linear-gradient(to left, transparent, rgba(255, 255, 255, 0.1));
+}
+
+/* ── Fork header (always visible, clickable) ── */
+.dev-fork-header {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 8px 12px;
+  background: rgba(255, 255, 255, 0.02);
+  border: 1px solid var(--border-color);
+  border-radius: var(--radius-md);
+  cursor: pointer;
+  transition: var(--transition-smooth);
+  user-select: none;
+  position: relative;
+  z-index: 1;
+}
+
+.dev-fork-header:hover {
+  background: rgba(255, 255, 255, 0.05);
+  border-color: var(--border-color-hover);
+}
+
+.dev-fork-header-expanded {
+  border-radius: var(--radius-md) var(--radius-md) 0 0;
+  border-bottom-color: transparent;
+}
+
+.dev-fork-icon {
+  width: 26px;
+  height: 26px;
+  border-radius: 6px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  font-size: 0.8rem;
+  flex-shrink: 0;
+}
+
+.dev-fork-icon-agents {
+  background: rgba(59, 130, 246, 0.12);
+  color: hsl(217, 91%, 60%);
+  border: 1px solid rgba(59, 130, 246, 0.2);
+}
+
+.dev-fork-icon-tools {
+  background: rgba(245, 158, 11, 0.12);
+  color: var(--color-accent);
+  border: 1px solid rgba(245, 158, 11, 0.2);
+}
+
+.dev-fork-icon-memory {
+  background: rgba(34, 197, 94, 0.12);
+  color: var(--color-success);
+  border: 1px solid rgba(34, 197, 94, 0.2);
+}
+
+.dev-fork-label {
+  font-size: 0.78rem;
+  font-weight: 600;
+  color: var(--text-bright);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  flex: 1;
+  min-width: 0;
+}
+
+.dev-fork-meta {
+  font-size: 0.68rem;
+  color: var(--text-dim);
+  font-family: var(--mono);
+  white-space: nowrap;
+  flex-shrink: 0;
+}
+
+.dev-fork-chevron {
+  color: var(--text-dim);
+  font-size: 0.7rem;
+  transition: transform 0.2s ease;
+  flex-shrink: 0;
+}
+
+.dev-fork-chevron-open {
+  transform: rotate(90deg);
+}
+
+/* ── Fork body (expandable) ── */
+.dev-fork-body {
+  overflow: hidden;
+  max-height: 0;
+  opacity: 0;
+  transition: max-height 0.35s cubic-bezier(0.4, 0, 0.2, 1),
+              opacity 0.25s ease;
+}
+
+.dev-fork-body-open {
+  max-height: 4000px;
+  opacity: 1;
+}
+
+.dev-fork-body-inner {
+  background: rgba(255, 255, 255, 0.015);
+  border: 1px solid var(--border-color);
+  border-top: none;
+  border-radius: 0 0 var(--radius-md) var(--radius-md);
+  padding: 12px;
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+}
+
+/* Color accent on expanded fork */
+.dev-fork-body-inner-agents {
+  border-left: 3px solid hsl(217, 91%, 60%);
+}
+
+.dev-fork-body-inner-tools {
+  border-left: 3px solid var(--color-accent);
+}
+
+.dev-fork-body-inner-memory {
+  border-left: 3px solid var(--color-success);
+}
+
+/* ── Nested children inside a fork ── */
+.dev-fork-children {
+  padding-left: 14px;
+  border-left: 1px dashed rgba(255, 255, 255, 0.08);
+  margin-left: 10px;
+  margin-top: 6px;
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+}
+
+/* ==========================================================================
+   BRANCH / ACTION RUN (inside fork body)
+   ========================================================================== */
+
 .dev-branch-run {
   background: rgba(255, 255, 255, 0.015);
   border: 1px solid var(--border-color);
   border-radius: var(--radius-md);
-  padding: 16px;
+  padding: 14px;
   width: 100%;
   box-sizing: border-box;
   transition: var(--transition-smooth);
   display: flex;
   flex-direction: column;
-  gap: 12px;
+  gap: 10px;
 }
 
 .dev-branch-run:hover {
@@ -652,7 +838,7 @@
 }
 
 .dev-branch-run-compact {
-  padding: 12px;
+  padding: 10px;
 }
 
 .dev-branch-run-agents {
@@ -677,11 +863,11 @@
   display: flex;
   flex-wrap: wrap;
   align-items: center;
-  gap: 8px;
+  gap: 6px;
 }
 
 .dev-branch-label {
-  font-size: 0.9rem;
+  font-size: 0.82rem;
   font-weight: 600;
   color: var(--text-bright);
   max-width: 100%;
@@ -691,17 +877,17 @@
 }
 
 .dev-branch-op {
-  font-size: 0.72rem;
+  font-size: 0.68rem;
   color: var(--text-muted);
   background: rgba(255, 255, 255, 0.03);
   border: 1px solid var(--border-color);
-  padding: 1px 6px;
+  padding: 1px 5px;
   border-radius: 4px;
   font-family: var(--mono);
 }
 
 .dev-branch-summary {
-  font-size: 0.82rem;
+  font-size: 0.78rem;
   color: var(--text-main);
   margin: 0;
   font-style: italic;
@@ -711,7 +897,7 @@
 .dev-branch-timeline {
   display: flex;
   flex-direction: column;
-  gap: 10px;
+  gap: 8px;
 }
 
 /* ── Branch Step Cards ── */
@@ -719,10 +905,10 @@
   background: rgba(0, 0, 0, 0.12);
   border: 1px solid var(--border-color);
   border-radius: var(--radius-md);
-  padding: 14px;
+  padding: 12px;
   display: flex;
   flex-direction: column;
-  gap: 12px;
+  gap: 10px;
   width: 100%;
   box-sizing: border-box;
   transition: var(--transition-smooth);
@@ -755,7 +941,7 @@
 
 .dev-step-header {
   display: flex;
-  gap: 10px;
+  gap: 8px;
   align-items: flex-start;
 }
 
@@ -763,11 +949,11 @@
   display: flex;
   align-items: center;
   justify-content: center;
-  width: 30px;
-  height: 30px;
+  width: 26px;
+  height: 26px;
   border-radius: 6px;
   flex-shrink: 0;
-  font-size: 0.9rem;
+  font-size: 0.8rem;
 }
 
 .dev-step-icon-agents {
@@ -791,27 +977,28 @@
 .dev-step-heading {
   display: flex;
   flex-direction: column;
-  gap: 3px;
+  gap: 2px;
   flex: 1;
+  min-width: 0;
 }
 
 .dev-step-title-row {
   display: flex;
   flex-wrap: wrap;
   align-items: center;
-  gap: 6px;
+  gap: 5px;
 }
 
 .dev-step-title-row strong {
-  font-size: 0.88rem;
+  font-size: 0.82rem;
   color: var(--text-bright);
 }
 
 .dev-step-meta {
   display: flex;
   flex-wrap: wrap;
-  gap: 2px 10px;
-  font-size: 0.72rem;
+  gap: 2px 8px;
+  font-size: 0.68rem;
   color: var(--text-muted);
 }
 
@@ -820,11 +1007,11 @@
 }
 
 .dev-step-content {
-  font-size: 0.85rem;
+  font-size: 0.82rem;
   line-height: 1.5;
   color: var(--text-main);
   background: rgba(0, 0, 0, 0.2);
-  padding: 10px 12px;
+  padding: 8px 10px;
   border-radius: var(--radius-sm);
   border: 1px solid var(--border-color);
   overflow: hidden;
@@ -837,7 +1024,7 @@
   justify-content: center;
   padding: 1px 6px;
   border-radius: var(--radius-xl);
-  font-size: 0.65rem;
+  font-size: 0.62rem;
   font-weight: 700;
   text-transform: uppercase;
   letter-spacing: 0.5px;
@@ -907,13 +1094,13 @@
 }
 
 .dev-details summary {
-  padding: 8px 12px;
+  padding: 6px 10px;
   cursor: pointer;
   user-select: none;
   display: flex;
   align-items: center;
   justify-content: space-between;
-  font-size: 0.8rem;
+  font-size: 0.76rem;
   font-weight: 500;
   color: var(--text-muted);
   background: rgba(255, 255, 255, 0.01);
@@ -944,7 +1131,7 @@
 
 .dev-details-summary {
   font-family: var(--mono);
-  font-size: 0.72rem;
+  font-size: 0.68rem;
   color: var(--text-dim);
 }
 
@@ -956,15 +1143,15 @@
 
 .dev-code {
   margin: 0;
-  padding: 12px 40px 12px 12px;
+  padding: 10px 36px 10px 10px;
   background: var(--bg-input);
   border-top: 1px solid var(--border-color);
   font-family: var(--mono);
-  font-size: 0.78rem;
+  font-size: 0.74rem;
   line-height: 1.5;
   color: hsl(142, 60%, 75%);
   overflow-x: auto;
-  max-height: 300px;
+  max-height: 280px;
   white-space: pre-wrap;
   word-break: break-all;
   box-sizing: border-box;
@@ -973,10 +1160,10 @@
 /* Copy Button */
 .dev-copy-btn {
   position: absolute;
-  top: 8px;
-  right: 8px;
-  width: 26px;
-  height: 26px;
+  top: 6px;
+  right: 6px;
+  width: 24px;
+  height: 24px;
   border-radius: 4px;
   background: rgba(255, 255, 255, 0.04);
   border: 1px solid var(--border-color);
@@ -1034,22 +1221,22 @@
 .dev-transcript-list {
   display: flex;
   flex-direction: column;
-  gap: 8px;
-  padding: 10px;
+  gap: 6px;
+  padding: 8px;
   background: rgba(0, 0, 0, 0.2);
   border-top: 1px solid var(--border-color);
-  max-height: 250px;
+  max-height: 220px;
   overflow-y: auto;
 }
 
 .dev-transcript-message {
-  padding: 8px 10px;
+  padding: 6px 8px;
   border-radius: var(--radius-sm);
   background: rgba(255, 255, 255, 0.01);
   border: 1px solid rgba(255, 255, 255, 0.03);
   display: flex;
   flex-direction: column;
-  gap: 4px;
+  gap: 3px;
 }
 
 .dev-transcript-system,
@@ -1073,7 +1260,7 @@
   margin: 0;
   white-space: pre-wrap;
   font-family: var(--mono);
-  font-size: 0.76rem;
+  font-size: 0.72rem;
   color: var(--text-main);
   word-break: break-all;
 }
@@ -1081,7 +1268,7 @@
 .dev-truncated {
   display: flex;
   flex-direction: column;
-  gap: 4px;
+  gap: 3px;
 }
 
 .dev-expand-btn {
@@ -1089,7 +1276,7 @@
   background: transparent;
   border: none;
   color: var(--color-primary);
-  font-size: 0.72rem;
+  font-size: 0.7rem;
   cursor: pointer;
   padding: 2px 0;
   font-family: var(--sans);
@@ -1100,6 +1287,74 @@
 .dev-expand-btn:hover {
   color: var(--color-primary-hover);
   text-decoration: underline;
+}
+
+/* ── SVG Connector Lines ── */
+.dev-connector-svg {
+  position: absolute;
+  top: 0;
+  left: 0;
+  width: 100%;
+  height: 100%;
+  pointer-events: none;
+  z-index: 0;
+  overflow: visible;
+}
+
+.dev-connector-path {
+  fill: none;
+  stroke-width: 1.5;
+  opacity: 0.4;
+  transition: opacity 0.3s ease;
+}
+
+.dev-connector-path-agents {
+  stroke: hsl(217, 91%, 60%);
+}
+
+.dev-connector-path-tools {
+  stroke: var(--color-accent);
+}
+
+.dev-connector-path-memory {
+  stroke: var(--color-success);
+}
+
+.dev-timeline-node:hover .dev-connector-path {
+  opacity: 0.7;
+}
+
+/* ── Unlinked row ── */
+.dev-timeline-unlinked {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  padding: 16px 0;
+  gap: 12px;
+}
+
+.dev-timeline-unlinked-label {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 8px 16px;
+  background: rgba(255, 255, 255, 0.02);
+  border: 1px dashed var(--border-color);
+  border-radius: var(--radius-md);
+  font-size: 0.8rem;
+  color: var(--text-muted);
+}
+
+.dev-timeline-unlinked-branches {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 12px;
+  justify-content: center;
+  max-width: 100%;
+}
+
+.dev-timeline-unlinked-branches .dev-branch-fork {
+  max-width: 320px;
 }
 
 /* ── Empty states ── */
@@ -1117,4 +1372,54 @@
   color: var(--text-dim);
   font-size: 0.75rem;
   font-style: italic;
+}
+
+/* ==========================================================================
+   RESPONSIVE
+   ========================================================================== */
+
+@media (max-width: 1400px) {
+  .dev-branch-fork {
+    max-width: 300px;
+  }
+}
+
+@media (max-width: 1200px) {
+  .dev-timeline::before {
+    display: none;
+  }
+  
+  .dev-timeline-node::before {
+    display: none;
+  }
+
+  .dev-timeline-row {
+    grid-template-columns: 1fr;
+    gap: 12px;
+  }
+
+  .dev-timeline-center {
+    max-width: 100%;
+    min-width: 0;
+    padding: 0;
+  }
+
+  .dev-timeline-branches-left,
+  .dev-timeline-branches-right {
+    align-items: stretch;
+    padding: 0;
+  }
+
+  .dev-branch-fork {
+    max-width: 100%;
+  }
+
+  .dev-branch-fork::before {
+    display: none;
+  }
+
+  .dev-timeline-branches-left .dev-branch-fork,
+  .dev-timeline-branches-right .dev-branch-fork {
+    max-width: 100%;
+  }
 }

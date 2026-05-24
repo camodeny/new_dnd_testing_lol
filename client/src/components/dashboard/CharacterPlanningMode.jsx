@@ -5,6 +5,7 @@ import {
 
   getCampaignPlanning,
   getCharacters,
+  getPlanningStreamUrl,
   selectPlanningCharacter,
   sendPlanningMessage,
   setPlanningReady,
@@ -190,6 +191,7 @@ export default function CharacterPlanningMode({ campaign, currentUser, onComplet
   const [touchedPaths, setTouchedPaths] = useState(() => new Set())
   const [pendingSuggestions, setPendingSuggestions] = useState([])
   const [partyInfoCollapsed, setPartyInfoCollapsed] = useState(false)
+  const [streamingContent, setStreamingContent] = useState('')
   const chatMessagesRef = useRef(null)
   const lastSeenMessageIdRef = useRef(null)
   const pendingAutoScrollRef = useRef(false)
@@ -343,19 +345,74 @@ export default function CharacterPlanningMode({ campaign, currentUser, onComplet
     if (!content) return
     setSending(true)
     setInput('')
+    setStreamingContent('')
     pendingAutoScrollRef.current = true
     try {
       const data = await sendPlanningMessage(campaign.id, content, {
         draftCharacter,
         activePage,
       })
-      setPlanning(data.planning)
-      if (VALID_PAGE_KEYS.has(data.active_page)) setActivePage(data.active_page)
-      applyFormPatch(data.form_patch)
+
+      // If the server returned a synchronous response (test mode), apply it directly
+      if (data.planning) {
+        setPlanning(data.planning)
+        if (VALID_PAGE_KEYS.has(data.active_page)) setActivePage(data.active_page)
+        applyFormPatch(data.form_patch)
+        setSending(false)
+        return
+      }
+
+      // Production: connect to the planning SSE stream
+      const streamUrl = getPlanningStreamUrl(campaign.id)
+      const eventSource = new EventSource(streamUrl)
+
+      eventSource.onmessage = (event) => {
+        try {
+          const payload = JSON.parse(event.data)
+          if (payload.type === 'token') {
+            setStreamingContent((prev) => prev + payload.token)
+            // Auto-scroll as content streams in
+            const container = chatMessagesRef.current
+            if (container) {
+              window.requestAnimationFrame(() => {
+                container.scrollTo({ top: container.scrollHeight, behavior: 'smooth' })
+              })
+            }
+          } else if (payload.type === 'done') {
+            if (VALID_PAGE_KEYS.has(payload.active_page)) setActivePage(payload.active_page)
+            applyFormPatch(payload.form_patch)
+            setStreamingContent('')
+            setSending(false)
+            eventSource.close()
+            // Refresh planning data to pick up the persisted DM message
+            loadPlanning({ quiet: true })
+          } else if (payload.type === 'error') {
+            setError(payload.error)
+            setStreamingContent('')
+            setSending(false)
+            eventSource.close()
+          } else if (payload.type === 'idle') {
+            // No active generation, close and refresh
+            eventSource.close()
+            setSending(false)
+            setStreamingContent('')
+            loadPlanning({ quiet: true })
+          }
+        } catch (e) {
+          console.error('Planning SSE parse error', e)
+        }
+      }
+
+      eventSource.onerror = () => {
+        eventSource.close()
+        setStreamingContent('')
+        setSending(false)
+        loadPlanning({ quiet: true })
+      }
     } catch (err) {
       pendingAutoScrollRef.current = false
+      setStreamingContent('')
       setError(err.message)
-    } finally {
       setSending(false)
     }
   }
@@ -593,7 +650,7 @@ export default function CharacterPlanningMode({ campaign, currentUser, onComplet
               <span>{message.role === 'dm' ? 'DM' : 'You'}</span>
               <time>{formatTime(message.created_at)}</time>
             </div>
-            <div>
+            <div className="planning-chat-body">
               {message.role === 'dm' ? <MarkdownContent content={message.content} /> : message.content}
             </div>
           </div>
@@ -602,7 +659,16 @@ export default function CharacterPlanningMode({ campaign, currentUser, onComplet
         {sending && (
           <div className="planning-chat-message dm">
             <div className="planning-chat-meta"><span>DM</span></div>
-            <div>Thinking...</div>
+            <div className="planning-chat-body">
+              {streamingContent ? (
+                <MarkdownContent content={streamingContent} />
+              ) : (
+                <div className="planning-streaming-indicator">
+                  <span className="planning-dot-pulse" />
+                  <span>Thinking...</span>
+                </div>
+              )}
+            </div>
           </div>
         )}
       </div>

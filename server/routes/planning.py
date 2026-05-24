@@ -1,9 +1,11 @@
 from datetime import datetime
+import json
+import queue
 
-from flask import Blueprint, jsonify, request
+from flask import Blueprint, current_app, jsonify, request
 
 from auth import token_required
-from models import db, Campaign, Character, CharacterPlanningMessage, PlanningBondProposal
+from models import db, Campaign, Character, CharacterPlanningMessage, PlanningBondProposal, User
 from openrouter import (
     get_planning_dm_response,
     get_planning_summary_update,
@@ -11,6 +13,7 @@ from openrouter import (
 from services.campaign_service import ensure_member, get_or_404
 from services.character_service import character_full_dict
 from services.audit_service import log_audit_event
+from services.planning_stream import planning_stream_manager
 from services.planning_service import (
     apply_bond_suggestions,
     get_campaign_members,
@@ -83,8 +86,6 @@ def send_planning_message(current_user, campaign_id):
     )
     db.session.add(player_msg)
     db.session.commit()
-    dm_trace_id = f'planning_dm:campaign_{campaign_id}:message_{player_msg.id}'
-    memory_trace_id = f'planning_memory_writer:campaign_{campaign_id}:message_{player_msg.id}'
     log_audit_event(
         campaign_id,
         'player_input_stored',
@@ -95,123 +96,180 @@ def send_planning_message(current_user, campaign_id):
         commit=True,
     )
 
-    messages = CharacterPlanningMessage.query.filter_by(
-        campaign_id=campaign_id,
-        user_id=current_user.id,
-    ).order_by(CharacterPlanningMessage.created_at.asc()).all()
-    context = planning_context(campaign, current_user)
-    log_audit_event(
-        campaign_id,
-        'planning_context_read',
-        'Read planning context for planning DM response.',
-        {'context': context, 'message_count': len(messages)},
-        source='planning_context',
-        actor='server',
-        commit=True,
-    )
-    ai_result = get_planning_dm_response(
-        context,
-        messages,
-        draft_character=data.get('draft_character') if data else None,
-        active_page=data.get('active_page') if data else None,
-        audit_context={
-            'campaign_id': campaign_id,
-            'operation': 'planning_dm_response',
-            'actor': 'planning_dm',
-            'trace_id': dm_trace_id,
-            'trace_label': f'planning_dm: campaign {campaign_id}',
-        },
-    )
-    if not ai_result:
-        return jsonify({
-            'error': 'The planning DM could not respond',
-            'planning': visible_planning_payload(campaign, current_user),
-        }), 500
-    ai_text = ai_result.get('message') or ''
-
-    summary_payload = get_planning_summary_update(
-        planning_context(campaign, current_user),
-        content,
-        ai_text,
-        audit_context={
-            'campaign_id': campaign_id,
-            'operation': 'planning_summary_update',
-            'actor': 'planning_memory_writer',
-            'trace_id': memory_trace_id,
-            'parent_trace_id': dm_trace_id,
-            'trace_label': f'planning_memory_writer: campaign {campaign_id}',
-        },
-    )
-    summary = get_or_create_summary(campaign_id)
-    merge_summary_update(summary, summary_payload.get('summary_update', {}))
-    apply_bond_suggestions(campaign_id, summary_payload.get('bond_suggestions', []))
-    log_audit_event(
-        campaign_id,
-        'planning_memory_write',
-        'Updated campaign planning memory from player and DM exchange.',
-        {
-            'latest_player_message': content,
-            'latest_dm_message': ai_text,
-            'summary_payload': summary_payload,
-        },
-        source='campaign_planning_summaries',
-        actor='planning_memory_writer',
-        trace_id=memory_trace_id,
-        parent_trace_id=dm_trace_id,
-        trace_label=f'planning_memory_writer: campaign {campaign_id}',
-        commit=False,
-    )
-
-    dm_msg = CharacterPlanningMessage(
-        campaign_id=campaign_id,
-        user_id=current_user.id,
-        role='dm',
-        content=ai_text,
-    )
-    db.session.add(dm_msg)
-    log_audit_event(
-        campaign_id,
-        'dm_output_stored',
-        'Stored visible planning DM response.',
-        {
-            'message': {
+    # In test mode, run synchronously (same as before)
+    if (
+        current_app.config.get('TESTING')
+        or current_app.testing
+        or current_app.config.get('SQLALCHEMY_DATABASE_URI') == 'sqlite:///:memory:'
+    ):
+        dm_trace_id = f'planning_dm:campaign_{campaign_id}:message_{player_msg.id}'
+        memory_trace_id = f'planning_memory_writer:campaign_{campaign_id}:message_{player_msg.id}'
+        messages = CharacterPlanningMessage.query.filter_by(
+            campaign_id=campaign_id,
+            user_id=current_user.id,
+        ).order_by(CharacterPlanningMessage.created_at.asc()).all()
+        context = planning_context(campaign, current_user)
+        log_audit_event(
+            campaign_id,
+            'planning_context_read',
+            'Read planning context for planning DM response.',
+            {'context': context, 'message_count': len(messages)},
+            source='planning_context',
+            actor='server',
+            commit=True,
+        )
+        ai_result = get_planning_dm_response(
+            context,
+            messages,
+            draft_character=data.get('draft_character') if data else None,
+            active_page=data.get('active_page') if data else None,
+            audit_context={
                 'campaign_id': campaign_id,
-                'user_id': current_user.id,
-                'role': 'dm',
-                'content': ai_text,
+                'operation': 'planning_dm_response',
+                'actor': 'planning_dm',
+                'trace_id': dm_trace_id,
+                'trace_label': f'planning_dm: campaign {campaign_id}',
             },
+        )
+        if not ai_result:
+            return jsonify({
+                'error': 'The planning DM could not respond',
+                'planning': visible_planning_payload(campaign, current_user),
+            }), 500
+        ai_text = ai_result.get('message') or ''
+
+        summary_payload = get_planning_summary_update(
+            planning_context(campaign, current_user),
+            content,
+            ai_text,
+            audit_context={
+                'campaign_id': campaign_id,
+                'operation': 'planning_summary_update',
+                'actor': 'planning_memory_writer',
+                'trace_id': memory_trace_id,
+                'parent_trace_id': dm_trace_id,
+                'trace_label': f'planning_memory_writer: campaign {campaign_id}',
+            },
+        )
+        summary = get_or_create_summary(campaign_id)
+        merge_summary_update(summary, summary_payload.get('summary_update', {}))
+        apply_bond_suggestions(campaign_id, summary_payload.get('bond_suggestions', []))
+        log_audit_event(
+            campaign_id,
+            'planning_memory_write',
+            'Updated campaign planning memory from player and DM exchange.',
+            {
+                'latest_player_message': content,
+                'latest_dm_message': ai_text,
+                'summary_payload': summary_payload,
+            },
+            source='campaign_planning_summaries',
+            actor='planning_memory_writer',
+            trace_id=memory_trace_id,
+            parent_trace_id=dm_trace_id,
+            trace_label=f'planning_memory_writer: campaign {campaign_id}',
+            commit=False,
+        )
+
+        dm_msg = CharacterPlanningMessage(
+            campaign_id=campaign_id,
+            user_id=current_user.id,
+            role='dm',
+            content=ai_text,
+        )
+        db.session.add(dm_msg)
+        log_audit_event(
+            campaign_id,
+            'dm_output_stored',
+            'Stored visible planning DM response.',
+            {
+                'message': {
+                    'campaign_id': campaign_id,
+                    'user_id': current_user.id,
+                    'role': 'dm',
+                    'content': ai_text,
+                },
+                'active_page': ai_result.get('active_page'),
+                'form_patch': ai_result.get('form_patch') or {},
+            },
+            source='character_planning_messages',
+            actor='planning_dm',
+            trace_id=dm_trace_id,
+            trace_label=f'planning_dm: campaign {campaign_id}',
+            commit=False,
+        )
+
+        db.session.commit()
+        planning_payload = visible_planning_payload(campaign, current_user)
+        return jsonify({
+            'planning': planning_payload,
             'active_page': ai_result.get('active_page'),
             'form_patch': ai_result.get('form_patch') or {},
-        },
-        source='character_planning_messages',
-        actor='planning_dm',
-        trace_id=dm_trace_id,
-        trace_label=f'planning_dm: campaign {campaign_id}',
-        commit=False,
-    )
+        }), 201
 
-    db.session.commit()
-    planning_payload = visible_planning_payload(campaign, current_user)
-    response_payload = {
-        'planning': planning_payload,
-        'active_page': ai_result.get('active_page'),
-        'form_patch': ai_result.get('form_patch') or {},
-    }
-    log_audit_event(
+    # Production: kick off async streaming generation
+    planning_stream_manager.start_generation(
         campaign_id,
-        'client_response_sent',
-        'Sent planning response payload to client.',
-        response_payload,
-        source='planning.messages',
-        actor='server',
-        commit=True,
+        current_user.id,
+        player_msg.id,
+        content,
+        draft_character=data.get('draft_character') if data else None,
+        active_page=data.get('active_page') if data else None,
     )
-    return jsonify({
-        'planning': planning_payload,
-        'active_page': response_payload['active_page'],
-        'form_patch': response_payload['form_patch'],
-    }), 201
+    return jsonify({'streaming': True}), 202
 
+
+@planning_bp.route('/api/campaigns/<int:campaign_id>/planning/stream', methods=['GET'])
+def stream_planning(campaign_id):
+    """SSE endpoint for streaming planning DM responses."""
+    import jwt
+
+    token_str = request.args.get('token')
+    if not token_str:
+        return jsonify({'error': 'Unauthorized'}), 401
+
+    try:
+        token_data = jwt.decode(token_str, current_app.config['SECRET_KEY'], algorithms=['HS256'])
+        token_user_id = token_data.get('user_id')
+    except Exception:
+        return jsonify({'error': 'Unauthorized'}), 401
+
+    if not token_user_id:
+        return jsonify({'error': 'Unauthorized'}), 401
+
+    current_user = db.session.get(User, token_user_id)
+    if not current_user:
+        return jsonify({'error': 'Unauthorized'}), 401
+
+    campaign = db.session.get(Campaign, campaign_id)
+    if not campaign or not ensure_member(campaign, current_user):
+        return jsonify({'error': 'Forbidden'}), 403
+
+    worker = planning_stream_manager.get_worker(campaign_id, current_user.id)
+    if not worker:
+        def idle_stream():
+            yield 'data: ' + json.dumps({'type': 'idle'}) + '\n\n'
+        return current_app.response_class(idle_stream(), mimetype='text/event-stream')
+
+    q = worker.add_listener()
+
+    def event_stream():
+        try:
+            while True:
+                try:
+                    event = q.get(timeout=30)
+                    yield f'data: {json.dumps(event)}\n\n'
+                    if event.get('type') in ('done', 'error'):
+                        break
+                except queue.Empty:
+                    yield ': ping\n\n'
+        finally:
+            worker.remove_listener(q)
+
+    response = current_app.response_class(event_stream(), mimetype='text/event-stream')
+    response.headers['Cache-Control'] = 'no-cache'
+    response.headers['X-Accel-Buffering'] = 'no'
+    return response
 
 
 @planning_bp.route('/api/campaigns/<int:campaign_id>/planning/character', methods=['PUT'])

@@ -323,6 +323,7 @@ export default function SessionPanel({
   loadingOlderMessages = false,
   onLoadOlderMessages,
   aiThinking,
+  aiThinkingStatus,
   onProposalApplied,
   onProposalDismissed,
   onToggleLootStash,
@@ -738,7 +739,10 @@ export default function SessionPanel({
                   <span className="session-msg-role"><i className="bi bi-mic-fill"></i> DM</span>
                 </div>
                 <div className="session-msg-content session-msg-thinking">
-                  <span className="thinking-dot">.</span><span className="thinking-dot">.</span><span className="thinking-dot">.</span>
+                  <div className="thinking-indicator-wrapper">
+                    <span className="thinking-spinner"></span>
+                    <span className="thinking-status-text">{aiThinkingStatus || "Thinking..."}</span>
+                  </div>
                 </div>
               </div>
             )}

@@ -11,6 +11,7 @@ import {
   getCurrentEncounterMap,
   getSheetProposals,
   rollPlayerInitiative,
+  getSessionStreamUrl,
 } from '../api/client'
 import Loading from '../components/common/Loading'
 import ErrorMessage from '../components/common/ErrorMessage'
@@ -53,14 +54,46 @@ function optimisticPlayerMessage(sessionId, content, user) {
 
 function reconcilePendingMessage(messages, pendingId, serverMessages = []) {
   const hasPending = messages.some((message) => message.id === pendingId)
-  if (!hasPending) return messages
+  if (!hasPending) return mergeUniqueMessages(messages, serverMessages)
 
+  const serverIds = new Set(serverMessages.map((message) => message.id))
+  const insertedIds = new Set()
   const next = []
   messages.forEach((message) => {
     if (message.id === pendingId) {
-      next.push(...serverMessages)
-    } else {
+      serverMessages.forEach((serverMessage) => {
+        if (!insertedIds.has(serverMessage.id)) {
+          next.push(serverMessage)
+          insertedIds.add(serverMessage.id)
+        }
+      })
+    } else if (!serverIds.has(message.id)) {
       next.push(message)
+    }
+  })
+  return next
+}
+
+function mergeUniqueMessages(messages, additions = []) {
+  if (!additions.length) return messages
+  const existing = new Set(messages.map((message) => message.id))
+  const next = [...messages]
+  additions.forEach((message) => {
+    if (!existing.has(message.id)) {
+      next.push(message)
+      existing.add(message.id)
+    }
+  })
+  return next
+}
+
+function uniqueMessages(messages = []) {
+  const existing = new Set()
+  const next = []
+  messages.forEach((message) => {
+    if (!existing.has(message.id)) {
+      next.push(message)
+      existing.add(message.id)
     }
   })
   return next
@@ -154,6 +187,7 @@ export default function CampaignViewPage({ user }) {
   const [availableChars, setAvailableChars] = useState([])
   const [importLoading, setImportLoading] = useState(false)
   const [aiThinking, setAiThinking] = useState(false)
+  const [aiThinkingStatus, setAiThinkingStatus] = useState('')
   const [sheetProposals, setSheetProposals] = useState([])
   const [encounterMap, setEncounterMap] = useState(null)
   const [encounterMapLoading, setEncounterMapLoading] = useState(false)
@@ -321,6 +355,75 @@ export default function CampaignViewPage({ user }) {
     return () => clearInterval(interval)
   }, [id, session])
 
+  // Resilient stream listener on mount/refresh
+  useEffect(() => {
+    if (!session?.id) return
+
+    let eventSource = null
+    let isMounted = true
+
+    const connectStream = () => {
+      if (!isMounted) return
+      const streamUrl = getSessionStreamUrl(session.id)
+      eventSource = new EventSource(streamUrl)
+
+      eventSource.onmessage = (event) => {
+        try {
+          const payload = JSON.parse(event.data)
+          if (payload.type === 'status') {
+            if (payload.status !== 'idle') {
+              setAiThinking(true)
+              setAiThinkingStatus(payload.status)
+            } else {
+              setAiThinking(false)
+              setAiThinkingStatus('')
+            }
+          } else if (payload.type === 'error') {
+            setError(payload.error)
+            setAiThinking(false)
+            setAiThinkingStatus('')
+            eventSource.close()
+          } else if (payload.type === 'done') {
+            const serverMessages = payload.messages || []
+            if (serverMessages.length) {
+              setMessages((prev) => mergeUniqueMessages(prev, serverMessages))
+            }
+            if (payload.sheet_proposals?.length) {
+              setSheetProposals((prev) => {
+                const existing = new Set(prev.map((p) => p.id))
+                const newOnes = payload.sheet_proposals.filter((p) => !existing.has(p.id))
+                return [...prev, ...newOnes]
+              })
+            }
+            setAiThinking(false)
+            setAiThinkingStatus('')
+            eventSource.close()
+          }
+        } catch (e) {
+          console.error("SSE parse error on reconnect", e)
+        }
+      }
+
+      eventSource.onerror = () => {
+        eventSource.close()
+        // If it's idle, we stop reconnecting
+        setAiThinking(false)
+        setAiThinkingStatus('')
+      }
+    }
+
+    // Delay connection slightly to make sure page load calls complete
+    const timer = setTimeout(connectStream, 500)
+
+    return () => {
+      isMounted = false
+      clearTimeout(timer)
+      if (eventSource) {
+        eventSource.close()
+      }
+    }
+  }, [session?.id])
+
   const handleStartSession = async () => {
     try {
       const data = await startSession(id)
@@ -355,10 +458,78 @@ export default function CampaignViewPage({ user }) {
     const pendingMessage = optimisticPlayerMessage(session.id, content, user)
     setMessages((prev) => [...prev, pendingMessage])
     setAiThinking(true)
+    setAiThinkingStatus("Checking safety...")
+
+    let eventSource = null
+    const cleanupStream = () => {
+      if (eventSource) {
+        eventSource.close()
+        eventSource = null
+      }
+      setAiThinking(false)
+      setAiThinkingStatus('')
+    }
+
     try {
       const data = await sendMessage(session.id, content)
-      const newMessages = data.messages || []
-      setMessages((prev) => reconcilePendingMessage(prev, pendingMessage.id, newMessages))
+
+      // Connect to EventSource to stream updates
+      const streamUrl = getSessionStreamUrl(session.id)
+      eventSource = new EventSource(streamUrl)
+
+      eventSource.onmessage = (event) => {
+        try {
+          const payload = JSON.parse(event.data)
+          if (payload.type === 'status') {
+            if (payload.status === 'idle') {
+              cleanupStream()
+            } else {
+              setAiThinkingStatus(payload.status)
+            }
+          } else if (payload.type === 'error') {
+            setError(payload.error)
+            cleanupStream()
+            setMessages((prev) => reconcilePendingMessage(prev, pendingMessage.id, data.messages || []))
+          } else if (payload.type === 'done') {
+            const serverMessages = uniqueMessages([
+              ...(data.messages || []),
+              ...(payload.messages || []),
+            ])
+            setMessages((prev) => reconcilePendingMessage(prev, pendingMessage.id, serverMessages))
+            if (payload.sheet_proposals?.length) {
+              setSheetProposals((prev) => {
+                const existing = new Set(prev.map((p) => p.id))
+                const newOnes = payload.sheet_proposals.filter((p) => !existing.has(p.id))
+                return [...prev, ...newOnes]
+              })
+              const proposalMessages = payload.sheet_proposals.map((p) => ({
+                id: `proposal-${p.id}`,
+                session_id: session.id,
+                role: 'system',
+                content: '',
+                is_proposal: true,
+                proposal: p,
+                created_at: p.created_at,
+              }))
+              setMessages((prev) => {
+                const existing = new Set(prev.map((m) => m.id))
+                const newOnes = proposalMessages.filter((m) => !existing.has(m.id))
+                return [...prev, ...newOnes]
+              })
+            }
+            cleanupStream()
+          }
+        } catch (e) {
+          console.error("SSE parse error", e)
+        }
+      }
+
+      eventSource.onerror = (e) => {
+        console.error("SSE error", e)
+        cleanupStream()
+        // If stream fails, load page data to ensure we didn't lose state
+        loadData()
+      }
 
       // Check for initiative roll in content
       const match = content.match(/\[Roll:\s*([^\]]+)\]\s*total:\s*(-?\d+)/i)
@@ -379,28 +550,9 @@ export default function CampaignViewPage({ user }) {
         .then((mapData) => setEncounterMap(mapData.encounter_map || null))
         .catch(() => {})
         .finally(() => setEncounterMapLoading(false))
-      if (data.sheet_proposals?.length) {
-        setSheetProposals((prev) => {
-          const existing = new Set(prev.map((p) => p.id))
-          const newOnes = data.sheet_proposals.filter((p) => !existing.has(p.id))
-          return [...prev, ...newOnes]
-        })
-        const proposalMessages = data.sheet_proposals.map((p) => ({
-          id: `proposal-${p.id}`,
-          session_id: session.id,
-          role: 'system',
-          content: '',
-          is_proposal: true,
-          proposal: p,
-          created_at: p.created_at,
-        }))
-        setMessages((prev) => {
-          const existing = new Set(prev.map((m) => m.id))
-          const newOnes = proposalMessages.filter((m) => !existing.has(m.id))
-          return [...prev, ...newOnes]
-        })
-      }
+
     } catch (err) {
+      cleanupStream()
       const serverMessages = err.data?.messages || []
       setMessages((prev) => {
         if (serverMessages.length) {
@@ -409,8 +561,6 @@ export default function CampaignViewPage({ user }) {
         return prev.filter((message) => message.id !== pendingMessage.id)
       })
       setError(err.message)
-    } finally {
-      setAiThinking(false)
     }
   }
 
@@ -645,6 +795,7 @@ export default function CampaignViewPage({ user }) {
             loadingOlderMessages={loadingOlderMessages}
             onLoadOlderMessages={loadOlderMessages}
             aiThinking={aiThinking}
+            aiThinkingStatus={aiThinkingStatus}
             sheetProposals={sheetProposals}
             onProposalApplied={handleProposalApplied}
             onProposalDismissed={handleProposalDismissed}
