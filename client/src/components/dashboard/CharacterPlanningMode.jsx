@@ -240,6 +240,10 @@ export default function CharacterPlanningMode({ campaign, currentUser, onComplet
   ))
   const [activePage, setActivePage] = useState('identity')
   const [touchedPaths, setTouchedPaths] = useState(() => new Set())
+  const touchedPathsRef = useRef(touchedPaths)
+  useEffect(() => {
+    touchedPathsRef.current = touchedPaths
+  }, [touchedPaths])
   const [pendingSuggestions, setPendingSuggestions] = useState([])
   const [partyInfoCollapsed, setPartyInfoCollapsed] = useState(false)
   const [streamingContent, setStreamingContent] = useState('')
@@ -253,11 +257,11 @@ export default function CharacterPlanningMode({ campaign, currentUser, onComplet
     if (!patch || Object.keys(patch).length === 0) return
     const normalizedPatch = normalizeCharacterDraft(patch)
     setDraftCharacter((prev) => {
-      const result = applySafePatch(prev, normalizedPatch, touchedPaths, baselineCharacter)
+      const result = applySafePatch(prev, normalizedPatch, touchedPathsRef.current, baselineCharacter)
       setPendingSuggestions((existing) => [...existing, ...result.suggestions])
       return result.next
     })
-  }, [baselineCharacter, touchedPaths])
+  }, [baselineCharacter])
 
   const loadPlanning = useCallback(async ({ quiet = false } = {}) => {
     if (!quiet) setLoading(true)
