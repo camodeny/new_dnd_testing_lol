@@ -1112,6 +1112,9 @@ class DmToolsTest(unittest.TestCase):
         ooc = _session_dm_format_violation('<ooc>Make an Investigation check.</ooc>')
         self.assertEqual(ooc['errors'][0]['kind'], 'disallowed_tag')
 
+        ooc_label = _session_dm_format_violation('*OOC*: Make an Investigation check.')
+        self.assertEqual(ooc_label['errors'][0]['kind'], 'disallowed_mode_label')
+
     def test_mechanical_guard_uses_llm_when_preflight_flags_mechanics(self):
         preflight = {
             'latest_player_intent_requires_mechanics': True,
@@ -1272,6 +1275,31 @@ class DmToolsTest(unittest.TestCase):
         contract_retry_prompt = post_chat.call_args_list[1].args[0][-1]['content']
         self.assertIn('Convert that same visible answer into JSON', contract_retry_prompt)
         self.assertIn('do not return mode="silent"', contract_retry_prompt)
+
+    def test_json_contract_fallback_still_rewrites_ooc_label(self):
+        hot_context = {
+            'protected_player_characters': [],
+            'private_output_terms': [],
+            'private_spoiler_items': [],
+        }
+        draft = '*OOC*: Make a Technology check.'
+
+        with patch('openrouter._post_chat_response', side_effect=[
+            {'choices': [{'message': {'content': draft}}]},
+            {'choices': [{'message': {'content': '{"mode":"silent","reason":"Awaiting player response."}'}}]},
+            {'choices': [{'message': {'content': '{"mode":"speak","content":"Make a Technology check."}'}}]},
+        ]) as post_chat:
+            result = get_session_dm_response_with_tools(
+                hot_context,
+                [],
+                [],
+                lambda *_args, **_kwargs: {},
+                max_tool_rounds=0,
+            )
+
+        self.assertEqual(result, {'mode': 'speak', 'content': 'Make a Technology check.'})
+        format_retry_prompt = post_chat.call_args_list[2].args[0][-1]['content']
+        self.assertIn('OOC/IC mode labels', format_retry_prompt)
 
     def test_spoiler_checker_allows_safe_reply(self):
         hot_context = {

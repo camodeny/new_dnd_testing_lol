@@ -1130,6 +1130,13 @@ def _session_dm_format_violation(response_text):
             'detail': detail,
         })
 
+    for match in re.finditer(r'(?im)^\s*(?:[*_]{1,3}\s*)?(?:ooc|out\s+of\s+character|ic|in\s+character)(?:\s*[*_]{1,3})?\s*:?', text):
+        add_error(
+            'disallowed_mode_label',
+            match.group(0),
+            'Visible DM replies should not prefix content with OOC/IC mode labels.',
+        )
+
     for match in tag_pattern.finditer(text):
         raw_tag = match.group(0)
         tag_name = match.group(1).lower()
@@ -1187,7 +1194,7 @@ def _session_dm_format_feedback(format_violation):
         elif detail:
             lines.append(f'- {detail}')
     if not lines:
-        lines.append('- The visible reply contains malformed or disallowed angle-bracket tags.')
+        lines.append('- The visible reply contains malformed or disallowed visible-message syntax.')
     return '\n'.join(lines)
 
 
