@@ -245,13 +245,7 @@ def stream_planning(campaign_id):
     if not campaign or not ensure_member(campaign, current_user):
         return jsonify({'error': 'Forbidden'}), 403
 
-    worker = planning_stream_manager.get_worker(campaign_id, current_user.id)
-    if not worker:
-        def idle_stream():
-            yield 'data: ' + json.dumps({'type': 'idle'}) + '\n\n'
-        return current_app.response_class(idle_stream(), mimetype='text/event-stream')
-
-    q = worker.add_listener()
+    q = planning_stream_manager.add_listener(campaign_id, current_user.id)
 
     def event_stream():
         try:
@@ -259,12 +253,10 @@ def stream_planning(campaign_id):
                 try:
                     event = q.get(timeout=30)
                     yield f'data: {json.dumps(event)}\n\n'
-                    if event.get('type') in ('done', 'error'):
-                        break
                 except queue.Empty:
                     yield ': ping\n\n'
         finally:
-            worker.remove_listener(q)
+            planning_stream_manager.remove_listener(campaign_id, current_user.id, q)
 
     response = current_app.response_class(event_stream(), mimetype='text/event-stream')
     response.headers['Cache-Control'] = 'no-cache'
@@ -286,6 +278,7 @@ def select_planning_character(current_user, campaign_id):
         member.selected_character_id = None
         member.character_ready_at = None
         db.session.commit()
+        planning_stream_manager.broadcast_campaign_event(campaign_id, {"type": "planning_refresh"})
         return jsonify({'planning': visible_planning_payload(campaign, current_user)}), 200
 
     character = get_or_404(Character, character_id)
@@ -296,6 +289,7 @@ def select_planning_character(current_user, campaign_id):
     member.selected_character_id = character.id
     member.character_ready_at = None
     db.session.commit()
+    planning_stream_manager.broadcast_campaign_event(campaign_id, {"type": "planning_refresh"})
     return jsonify({
         'character': character_full_dict(character),
         'planning': visible_planning_payload(campaign, current_user),
@@ -329,6 +323,7 @@ def update_planning_ready(current_user, campaign_id):
         member.character_ready_at = None
 
     db.session.commit()
+    planning_stream_manager.broadcast_campaign_event(campaign_id, {"type": "planning_refresh"})
     return jsonify({'planning': visible_planning_payload(campaign, current_user)}), 200
 
 
@@ -377,4 +372,5 @@ def update_planning_bond(current_user, campaign_id, bond_id):
 
     bond.approval_states = json_dumps(approvals)
     db.session.commit()
+    planning_stream_manager.broadcast_campaign_event(campaign_id, {"type": "planning_refresh"})
     return jsonify({'planning': visible_planning_payload(campaign, current_user)}), 200

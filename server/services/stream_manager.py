@@ -62,6 +62,7 @@ class SessionGeneratorWorker:
         with self.listener_lock:
             for q in self.listeners:
                 q.put(payload)
+        stream_manager.broadcast_event(self.session_id, payload)
 
     def finish_success(self, messages, sheet_proposals):
         self.messages_result = messages
@@ -350,6 +351,7 @@ class SessionStreamManager:
 
     def __init__(self):
         self.workers = {}
+        self.listeners = {}  # session_id -> list of queue.Queue
         self.lock = threading.Lock()
 
     def start_generation(self, campaign_id, session_id, user_id, content, player_message_id=None):
@@ -375,5 +377,32 @@ class SessionStreamManager:
                     del self.workers[session_id]
                     return None
             return worker
+
+    def add_listener(self, session_id):
+        q = queue.Queue()
+        with self.lock:
+            if session_id not in self.listeners:
+                self.listeners[session_id] = []
+            self.listeners[session_id].append(q)
+
+            # Catch up new listener with current status of active worker if it exists
+            worker = self.workers.get(session_id)
+            if worker and not worker.is_done:
+                q.put({"type": "status", "status": worker.status})
+        return q
+
+    def remove_listener(self, session_id, q):
+        with self.lock:
+            if session_id in self.listeners:
+                if q in self.listeners[session_id]:
+                    self.listeners[session_id].remove(q)
+                if not self.listeners[session_id]:
+                    del self.listeners[session_id]
+
+    def broadcast_event(self, session_id, payload):
+        with self.lock:
+            listeners = list(self.listeners.get(session_id, []))
+        for q in listeners:
+            q.put(payload)
 
 stream_manager = SessionStreamManager()

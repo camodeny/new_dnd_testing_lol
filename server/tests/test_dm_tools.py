@@ -34,6 +34,7 @@ from models import (
     User,
 )
 from openrouter import (
+    check_session_mechanics_with_llm,
     _pc_control_violation,
     _private_output_violation,
     _session_dm_format_violation,
@@ -1111,6 +1112,79 @@ class DmToolsTest(unittest.TestCase):
         ooc = _session_dm_format_violation('<ooc>Make an Investigation check.</ooc>')
         self.assertEqual(ooc['errors'][0]['kind'], 'disallowed_tag')
 
+    def test_mechanical_guard_uses_llm_when_preflight_flags_mechanics(self):
+        preflight = {
+            'latest_player_intent_requires_mechanics': True,
+            'required_mechanic': 'initiative',
+        }
+
+        with patch('openrouter._post_chat', return_value=json.dumps({
+            'safe': False,
+            'violations': ['Her truncheon catches you across the ribs and knocks you down.'],
+            'required_mechanic': 'initiative',
+            'reason': 'The reply resolves a combat exchange before initiative.',
+        })) as post_chat:
+            result = check_session_mechanics_with_llm(
+                'You charge at the constable. Her truncheon catches you across the ribs and knocks you down.',
+                preflight,
+                {'combat_coordinates': None},
+                {'operation': 'session_dm_response'},
+            )
+
+        self.assertFalse(result['safe'])
+        self.assertEqual(result['required_mechanic'], 'initiative')
+        self.assertIn('truncheon catches you', result['violations'][0])
+        prompt_payload = json.loads(post_chat.call_args.args[0][1]['content'])
+        self.assertEqual(prompt_payload['preflight_decision']['required_mechanic'], 'initiative')
+
+    def test_mechanical_guard_rewrites_attack_resolution_into_roll_request(self):
+        hot_context = {
+            'protected_player_characters': [],
+            'private_output_terms': [],
+            'private_spoiler_items': [],
+            'combat_coordinates': None,
+        }
+        recent_messages = [
+            SessionMessage(role='player', content='<ooc>I punch the constable</ooc>'),
+        ]
+
+        with patch('openrouter.get_session_preflight_decision', return_value={
+            'dm_reply_mode': 'narrative',
+            'skip_spoiler_check': False,
+            'main_call_thinking': True,
+            'latest_player_intent_requires_mechanics': True,
+            'required_mechanic': 'initiative',
+            'confidence': 'high',
+            'reason': 'The player is starting a fight.',
+        }), patch('openrouter._post_chat_response', side_effect=[
+            {'choices': [{'message': {'content': '{"mode":"speak","content":"The blow catches you across the ribs and knocks you down."}'}}]},
+            {'choices': [{'message': {'content': '{"mode":"speak","content":"The constable snaps her truncheon up as you rush in. Roll initiative."}'}}]},
+        ]) as post_chat, patch('openrouter._post_chat', side_effect=[
+            json.dumps({
+                'safe': False,
+                'violations': ['The blow catches you across the ribs and knocks you down.'],
+                'required_mechanic': 'initiative',
+                'reason': 'The reply resolved combat before initiative.',
+            }),
+            json.dumps({'safe': True, 'violations': [], 'required_mechanic': '', 'reason': ''}),
+        ]):
+            result = get_session_dm_response_with_tools(
+                hot_context,
+                recent_messages,
+                [],
+                lambda *_args, **_kwargs: {},
+                audit_context={'operation': 'session_dm_response'},
+                max_tool_rounds=0,
+            )
+
+        self.assertEqual(result, {
+            'mode': 'speak',
+            'content': 'The constable snaps her truncheon up as you rush in. Roll initiative.',
+        })
+        retry_prompt = post_chat.call_args_list[1].args[0][-1]['content']
+        self.assertIn('resolved a violent or combat action without', retry_prompt)
+        self.assertIn('ask for the appropriate attack roll', retry_prompt)
+
     def test_session_dm_format_guard_rewrites_malformed_reply(self):
         hot_context = {
             'protected_player_characters': [],
@@ -1170,6 +1244,34 @@ class DmToolsTest(unittest.TestCase):
         contract_retry_prompt = post_chat.call_args_list[2].args[0][-1]['content']
         self.assertIn('final JSON contract', contract_retry_prompt)
         self.assertIn('Discard any meta-commentary', contract_retry_prompt)
+
+    def test_json_contract_retry_does_not_turn_visible_draft_silent(self):
+        hot_context = {
+            'protected_player_characters': [],
+            'private_output_terms': [],
+            'private_spoiler_items': [],
+        }
+        draft = (
+            'The engine panel lights flicker as you key in the hot-wire bypass. '
+            'The startup sequence now reads **70 seconds**.'
+        )
+
+        with patch('openrouter._post_chat_response', side_effect=[
+            {'choices': [{'message': {'content': draft}}]},
+            {'choices': [{'message': {'content': '{"mode":"silent","reason":"Awaiting player response."}'}}]},
+        ]) as post_chat:
+            result = get_session_dm_response_with_tools(
+                hot_context,
+                [],
+                [],
+                lambda *_args, **_kwargs: {},
+                max_tool_rounds=0,
+            )
+
+        self.assertEqual(result, {'mode': 'speak', 'content': draft})
+        contract_retry_prompt = post_chat.call_args_list[1].args[0][-1]['content']
+        self.assertIn('Convert that same visible answer into JSON', contract_retry_prompt)
+        self.assertIn('do not return mode="silent"', contract_retry_prompt)
 
     def test_spoiler_checker_allows_safe_reply(self):
         hot_context = {
@@ -2163,7 +2265,6 @@ class DmToolsTest(unittest.TestCase):
         self.assertFalse(result_off['encounter_state']['active'])
 
     def test_dm_tools_filtered_by_encounter_mode(self):
-        # 1. Active Campaign, encounter_active is not set in campaign.settings by default
         tools = get_dm_tool_definitions(self.campaign)
         tool_names = {t['function']['name'] for t in tools}
 
@@ -2179,7 +2280,6 @@ class DmToolsTest(unittest.TestCase):
         self.assertIn('toggle_encounter_mode', tool_names)
         self.assertIn('ask_character_sheet', tool_names)
 
-        # 2. Toggle encounter mode ON
         result_on = execute_dm_tool(
             self.campaign,
             self.session,
@@ -2196,7 +2296,6 @@ class DmToolsTest(unittest.TestCase):
             self.assertIn(name, tool_names_on)
         self.assertIn('toggle_encounter_mode', tool_names_on)
 
-        # 4. Toggle encounter mode OFF
         result_off = execute_dm_tool(
             self.campaign,
             self.session,

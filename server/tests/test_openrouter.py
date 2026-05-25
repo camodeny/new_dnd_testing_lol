@@ -382,6 +382,8 @@ class SessionSpoilerCheckTest(unittest.TestCase):
                 'dm_reply_mode': 'mechanics_only',
                 'skip_spoiler_check': True,
                 'main_call_thinking': False,
+                'latest_player_intent_requires_mechanics': False,
+                'required_mechanic': '',
                 'confidence': 'high',
                 'reason': 'Only reports a roll total.',
             },

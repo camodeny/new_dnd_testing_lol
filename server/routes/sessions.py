@@ -14,6 +14,7 @@ from openrouter import (
     normalize_session_dm_turn_decision,
 )
 from services.stream_manager import stream_manager
+from services.planning_stream import planning_stream_manager
 from services.audit_service import log_audit_event
 from services.campaign_service import ensure_member, get_or_404
 from services.character_service import character_full_dict
@@ -283,6 +284,8 @@ def start_session(current_user, campaign_id):
         )
 
     db.session.commit()
+    stream_manager.broadcast_event(session.id, {"type": "refresh"})
+    planning_stream_manager.broadcast_campaign_event(campaign_id, {"type": "session_started"})
     data = session.to_dict()
     data['messages'] = [m.to_dict() for m in session.messages]
     log_audit_event(
@@ -342,6 +345,7 @@ def end_session(current_user, session_id):
         session.recap = data['recap']
 
     db.session.commit()
+    stream_manager.broadcast_event(session_id, {"type": "refresh"})
     return jsonify({'session': session.to_dict()}), 200
 
 
@@ -381,6 +385,7 @@ def send_message(current_user, session_id):
     )
     db.session.add(msg)
     db.session.commit()
+    stream_manager.broadcast_event(session_id, {"type": "message", "message": msg.to_dict()})
     result_messages = [msg.to_dict()]
     log_audit_event(
         campaign.id,
@@ -567,14 +572,7 @@ def stream_session(session_id):
     if not ensure_member(campaign, current_user):
         return jsonify({'error': 'Forbidden'}), 403
 
-    worker = stream_manager.get_worker(session_id)
-    if not worker:
-        # If no generation is running, return a brief EventStream indicating idle
-        def idle_stream():
-            yield "data: " + json.dumps({"type": "status", "status": "idle"}) + "\n\n"
-        return current_app.response_class(idle_stream(), mimetype='text/event-stream')
-
-    q = worker.add_listener()
+    q = stream_manager.add_listener(session_id)
 
     def event_stream():
         try:
@@ -582,13 +580,11 @@ def stream_session(session_id):
                 try:
                     event = q.get(timeout=20) # Keep-alive ping / timeout
                     yield f"data: {json.dumps(event)}\n\n"
-                    if event.get("type") in ("done", "error"):
-                        break
                 except queue.Empty:
                     # Keep-alive comment
                     yield ": ping\n\n"
         finally:
-            worker.remove_listener(q)
+            stream_manager.remove_listener(session_id, q)
 
     response = current_app.response_class(event_stream(), mimetype='text/event-stream')
     response.headers['Cache-Control'] = 'no-cache'
@@ -683,6 +679,12 @@ def _apply_sheet_proposal(current_user, session_id, proposal_id):
     proposal.applied_at = datetime.utcnow()
     db.session.commit()
 
+    stream_manager.broadcast_event(session_id, {
+        "type": "proposal_applied",
+        "proposal": proposal.to_dict(),
+        "character": character_full_dict(character)
+    })
+
     log_audit_event(
         campaign.id,
         'sheet_proposal_applied',
@@ -714,6 +716,11 @@ def _dismiss_sheet_proposal(current_user, session_id, proposal_id):
 
     proposal.status = 'dismissed'
     db.session.commit()
+
+    stream_manager.broadcast_event(session_id, {
+        "type": "proposal_dismissed",
+        "proposal": proposal.to_dict()
+    })
 
     log_audit_event(
         campaign.id,

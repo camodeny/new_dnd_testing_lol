@@ -257,6 +257,7 @@ export default function CharacterPlanningMode({ campaign, currentUser, onComplet
   const pendingAutoScrollRef = useRef(false)
   const isAutoScrollEnabledRef = useRef(true)
   const lastAppliedDraftPatchEventIdRef = useRef(null)
+  const pendingMessageIdsRef = useRef(new Set())
 
   const handleScroll = useCallback(() => {
     const container = chatMessagesRef.current
@@ -331,21 +332,32 @@ export default function CharacterPlanningMode({ campaign, currentUser, onComplet
           } else if (payload.type === 'done') {
             if (VALID_PAGE_KEYS.has(payload.active_page)) setActivePage(payload.active_page)
             applyFormPatch(payload.form_patch)
-            eventSource.close()
             loadPlanning({
               quiet: true,
               onComplete: () => {
                 setStreamingContent('')
                 changeSending(false)
+
+                // Clear the optimistic temp message
+                setPlanning((prev) => {
+                  if (!prev) return prev
+                  const filtered = (prev.messages || []).filter((msg) => !pendingMessageIdsRef.current.has(msg.id))
+                  pendingMessageIdsRef.current.clear()
+                  return {
+                    ...prev,
+                    messages: filtered
+                  }
+                })
               },
             })
           } else if (payload.type === 'error') {
             setError(payload.error)
             setStreamingContent('')
             changeSending(false)
-            eventSource.close()
-          } else if (payload.type === 'idle') {
-            eventSource.close()
+          } else if (payload.type === 'planning_refresh') {
+            loadPlanning({ quiet: true })
+          } else if (payload.type === 'session_started') {
+            onComplete()
           }
         } catch (e) {
           console.error('Planning SSE parse error', e)
@@ -353,7 +365,6 @@ export default function CharacterPlanningMode({ campaign, currentUser, onComplet
       }
 
       eventSource.onerror = () => {
-        if (eventSource) eventSource.close()
         // If we were actively receiving content, clean up
         changeSending(false)
         setStreamingContent('')
@@ -369,7 +380,7 @@ export default function CharacterPlanningMode({ campaign, currentUser, onComplet
         eventSource.close()
       }
     }
-  }, [campaign.id, loadPlanning, applyFormPatch, changeSending])
+  }, [campaign.id, loadPlanning, applyFormPatch, changeSending, onComplete])
 
   useEffect(() => {
     saveStoredDraft(campaign.id, currentUser?.id, draftCharacter)
@@ -505,6 +516,7 @@ export default function CharacterPlanningMode({ campaign, currentUser, onComplet
         messages: [...(prev.messages || []), tempMessage],
       }
     })
+    pendingMessageIdsRef.current.add(tempMessage.id)
 
     try {
       const data = await sendPlanningMessage(campaign.id, content, {
@@ -514,65 +526,22 @@ export default function CharacterPlanningMode({ campaign, currentUser, onComplet
 
       // If the server returned a synchronous response (test mode), apply it directly
       if (data.planning) {
-        setPlanning(data.planning)
+        setPlanning((prev) => {
+          if (!prev) return data.planning
+          const filteredMessages = (prev.messages || []).filter((msg) => msg.id !== tempMessage.id)
+          pendingMessageIdsRef.current.delete(tempMessage.id)
+          return {
+            ...data.planning,
+            messages: [...filteredMessages, ...(data.planning.messages || [])]
+          }
+        })
         if (VALID_PAGE_KEYS.has(data.active_page)) setActivePage(data.active_page)
         applyFormPatch(data.form_patch)
         changeSending(false)
         return
       }
 
-      // Production: connect to the planning SSE stream
-      const streamUrl = getPlanningStreamUrl(campaign.id)
-      const eventSource = new EventSource(streamUrl)
-
-      eventSource.onmessage = (event) => {
-        try {
-          const payload = JSON.parse(event.data)
-          if (payload.type === 'token') {
-            changeSending(true)
-            setStreamingContent((prev) => prev + payload.token)
-            // Auto-scroll as content streams in
-            const container = chatMessagesRef.current
-            if (container && isAutoScrollEnabledRef.current) {
-              window.requestAnimationFrame(() => {
-                container.scrollTop = container.scrollHeight
-              })
-            }
-          } else if (payload.type === 'done') {
-            if (VALID_PAGE_KEYS.has(payload.active_page)) setActivePage(payload.active_page)
-            applyFormPatch(payload.form_patch)
-            eventSource.close()
-            // Refresh planning data to pick up the persisted DM message
-            loadPlanning({
-              quiet: true,
-              onComplete: () => {
-                setStreamingContent('')
-                changeSending(false)
-              },
-            })
-          } else if (payload.type === 'error') {
-            setError(payload.error)
-            setStreamingContent('')
-            changeSending(false)
-            eventSource.close()
-          } else if (payload.type === 'idle') {
-            // No active generation, close and refresh
-            eventSource.close()
-            changeSending(false)
-            setStreamingContent('')
-            loadPlanning({ quiet: true })
-          }
-        } catch (e) {
-          console.error('Planning SSE parse error', e)
-        }
-      }
-
-      eventSource.onerror = () => {
-        eventSource.close()
-        setStreamingContent('')
-        changeSending(false)
-        loadPlanning({ quiet: true })
-      }
+      // Production: wait for updates to stream into the persistent SSE listener!
     } catch (err) {
       pendingAutoScrollRef.current = false
       setStreamingContent('')
@@ -586,6 +555,7 @@ export default function CharacterPlanningMode({ campaign, currentUser, onComplet
           messages: (prev.messages || []).filter((msg) => msg.id !== tempMessage.id),
         }
       })
+      pendingMessageIdsRef.current.delete(tempMessage.id)
     }
   }
 

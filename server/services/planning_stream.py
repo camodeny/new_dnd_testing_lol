@@ -153,6 +153,7 @@ class PlanningGeneratorWorker:
         with self.listener_lock:
             for q in self.listeners:
                 q.put(payload)
+        planning_stream_manager.broadcast_event(self.campaign_id, self.user_id, payload)
 
     def finish_success(self, result):
         self.is_done = True
@@ -317,6 +318,7 @@ class PlanningStreamManager:
 
     def __init__(self):
         self.workers = {}
+        self.listeners = {}  # (campaign_id, user_id) -> list of queue.Queue
         self.lock = threading.Lock()
 
     def _key(self, campaign_id, user_id):
@@ -348,6 +350,40 @@ class PlanningStreamManager:
                     del self.workers[key]
                     return None
             return worker
+
+    def add_listener(self, campaign_id, user_id):
+        key = self._key(campaign_id, user_id)
+        q = queue.Queue()
+        with self.lock:
+            if key not in self.listeners:
+                self.listeners[key] = []
+            self.listeners[key].append(q)
+        return q
+
+    def remove_listener(self, campaign_id, user_id, q):
+        key = self._key(campaign_id, user_id)
+        with self.lock:
+            if key in self.listeners:
+                if q in self.listeners[key]:
+                    self.listeners[key].remove(q)
+                if not self.listeners[key]:
+                    del self.listeners[key]
+
+    def broadcast_event(self, campaign_id, user_id, payload):
+        key = self._key(campaign_id, user_id)
+        with self.lock:
+            listeners = list(self.listeners.get(key, []))
+        for q in listeners:
+            q.put(payload)
+
+    def broadcast_campaign_event(self, campaign_id, payload):
+        with self.lock:
+            queues = []
+            for (c_id, u_id), listeners in self.listeners.items():
+                if c_id == campaign_id:
+                    queues.extend(listeners)
+        for q in queues:
+            q.put(payload)
 
 
 planning_stream_manager = PlanningStreamManager()

@@ -1,4 +1,4 @@
-import { useEffect, useState, useCallback, useMemo } from 'react'
+import { useEffect, useState, useCallback, useMemo, useRef } from 'react'
 import { useParams, useNavigate } from 'react-router-dom'
 import {
   getCampaign, updateCampaign, deleteCampaign, getCampaignCharacters,
@@ -182,6 +182,7 @@ export default function CampaignViewPage({ user }) {
   const [showWorldBuilding, setShowWorldBuilding] = useState(false)
   const [showLootStash, setShowLootStash] = useState(false)
   const [showShops, setShowShops] = useState(false)
+  const pendingMessageIdsRef = useRef(new Set())
 
   const [showImport, setShowImport] = useState(false)
   const [availableChars, setAvailableChars] = useState([])
@@ -382,11 +383,46 @@ export default function CampaignViewPage({ user }) {
             setError(payload.error)
             setAiThinking(false)
             setAiThinkingStatus('')
-            eventSource.close()
+          } else if (payload.type === 'message') {
+            if (payload.message) {
+              setMessages((prev) => mergeUniqueMessages(prev, [payload.message]))
+            }
+          } else if (payload.type === 'proposal_applied') {
+            setSheetProposals((prev) => prev.filter((p) => p.id !== payload.proposal.id))
+            setMessages((prev) =>
+              prev.map((m) =>
+                m.id === `proposal-${payload.proposal.id}`
+                  ? { ...m, proposal: { ...m.proposal, status: 'applied' } }
+                  : m
+              )
+            )
+            if (payload.character) {
+              setCharacters((prev) =>
+                prev.map((c) => (c.id === payload.character.id ? payload.character : c))
+              )
+            }
+          } else if (payload.type === 'proposal_dismissed') {
+            setSheetProposals((prev) => prev.filter((p) => p.id !== payload.proposal.id))
+            setMessages((prev) =>
+              prev.map((m) =>
+                m.id === `proposal-${payload.proposal.id}`
+                  ? { ...m, proposal: { ...m.proposal, status: 'dismissed' } }
+                  : m
+              )
+            )
+          } else if (payload.type === 'refresh') {
+            loadData()
           } else if (payload.type === 'done') {
             const serverMessages = payload.messages || []
             if (serverMessages.length) {
-              setMessages((prev) => mergeUniqueMessages(prev, serverMessages))
+              setMessages((prev) => {
+                let next = prev
+                for (const pendingId of pendingMessageIdsRef.current) {
+                  next = reconcilePendingMessage(next, pendingId, serverMessages)
+                }
+                pendingMessageIdsRef.current.clear()
+                return mergeUniqueMessages(next, serverMessages)
+              })
             }
             if (payload.sheet_proposals?.length) {
               setSheetProposals((prev) => {
@@ -394,10 +430,23 @@ export default function CampaignViewPage({ user }) {
                 const newOnes = payload.sheet_proposals.filter((p) => !existing.has(p.id))
                 return [...prev, ...newOnes]
               })
+              const proposalMessages = payload.sheet_proposals.map((p) => ({
+                id: `proposal-${p.id}`,
+                session_id: session.id,
+                role: 'system',
+                content: '',
+                is_proposal: true,
+                proposal: p,
+                created_at: p.created_at,
+              }))
+              setMessages((prev) => {
+                const existing = new Set(prev.map((m) => m.id))
+                const newOnes = proposalMessages.filter((m) => !existing.has(m.id))
+                return [...prev, ...newOnes]
+              })
             }
             setAiThinking(false)
             setAiThinkingStatus('')
-            eventSource.close()
           }
         } catch (e) {
           console.error("SSE parse error on reconnect", e)
@@ -405,8 +454,6 @@ export default function CampaignViewPage({ user }) {
       }
 
       eventSource.onerror = () => {
-        eventSource.close()
-        // If it's idle, we stop reconnecting
         setAiThinking(false)
         setAiThinkingStatus('')
       }
@@ -457,79 +504,17 @@ export default function CampaignViewPage({ user }) {
     if (!session) return
     const pendingMessage = optimisticPlayerMessage(session.id, content, user)
     setMessages((prev) => [...prev, pendingMessage])
+    pendingMessageIdsRef.current.add(pendingMessage.id)
     setAiThinking(true)
     setAiThinkingStatus("Checking safety...")
 
-    let eventSource = null
-    const cleanupStream = () => {
-      if (eventSource) {
-        eventSource.close()
-        eventSource = null
-      }
-      setAiThinking(false)
-      setAiThinkingStatus('')
-    }
-
     try {
       const data = await sendMessage(session.id, content)
-
-      // Connect to EventSource to stream updates
-      const streamUrl = getSessionStreamUrl(session.id)
-      eventSource = new EventSource(streamUrl)
-
-      eventSource.onmessage = (event) => {
-        try {
-          const payload = JSON.parse(event.data)
-          if (payload.type === 'status') {
-            if (payload.status === 'idle') {
-              cleanupStream()
-            } else {
-              setAiThinkingStatus(payload.status)
-            }
-          } else if (payload.type === 'error') {
-            setError(payload.error)
-            cleanupStream()
-            setMessages((prev) => reconcilePendingMessage(prev, pendingMessage.id, data.messages || []))
-          } else if (payload.type === 'done') {
-            const serverMessages = uniqueMessages([
-              ...(data.messages || []),
-              ...(payload.messages || []),
-            ])
-            setMessages((prev) => reconcilePendingMessage(prev, pendingMessage.id, serverMessages))
-            if (payload.sheet_proposals?.length) {
-              setSheetProposals((prev) => {
-                const existing = new Set(prev.map((p) => p.id))
-                const newOnes = payload.sheet_proposals.filter((p) => !existing.has(p.id))
-                return [...prev, ...newOnes]
-              })
-              const proposalMessages = payload.sheet_proposals.map((p) => ({
-                id: `proposal-${p.id}`,
-                session_id: session.id,
-                role: 'system',
-                content: '',
-                is_proposal: true,
-                proposal: p,
-                created_at: p.created_at,
-              }))
-              setMessages((prev) => {
-                const existing = new Set(prev.map((m) => m.id))
-                const newOnes = proposalMessages.filter((m) => !existing.has(m.id))
-                return [...prev, ...newOnes]
-              })
-            }
-            cleanupStream()
-          }
-        } catch (e) {
-          console.error("SSE parse error", e)
-        }
-      }
-
-      eventSource.onerror = (e) => {
-        console.error("SSE error", e)
-        cleanupStream()
-        // If stream fails, load page data to ensure we didn't lose state
-        loadData()
-      }
+      setMessages((prev) => {
+        const next = reconcilePendingMessage(prev, pendingMessage.id, data.messages || [])
+        pendingMessageIdsRef.current.delete(pendingMessage.id)
+        return next
+      })
 
       // Check for initiative roll in content
       const match = content.match(/\[Roll:\s*([^\]]+)\]\s*total:\s*(-?\d+)/i)
@@ -552,12 +537,16 @@ export default function CampaignViewPage({ user }) {
         .finally(() => setEncounterMapLoading(false))
 
     } catch (err) {
-      cleanupStream()
+      setAiThinking(false)
+      setAiThinkingStatus('')
       const serverMessages = err.data?.messages || []
       setMessages((prev) => {
         if (serverMessages.length) {
-          return reconcilePendingMessage(prev, pendingMessage.id, serverMessages)
+          const next = reconcilePendingMessage(prev, pendingMessage.id, serverMessages)
+          pendingMessageIdsRef.current.delete(pendingMessage.id)
+          return next
         }
+        pendingMessageIdsRef.current.delete(pendingMessage.id)
         return prev.filter((message) => message.id !== pendingMessage.id)
       })
       setError(err.message)

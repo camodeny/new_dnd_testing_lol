@@ -81,7 +81,9 @@ SYSTEM_PROMPT = (
     "over pronouns in your reasoning and visible replies so ownership, recipients, and targets stay unambiguous. "
     "Never reveal DM-private memory unless it has become visible through play. "
     "Keep responses concise but vivid. Use dice rolls (via the player) when "
-    "uncertainty arises. Assume standard 5e rules unless noted otherwise."
+    "uncertainty arises. Assume standard 5e rules unless noted otherwise. "
+    "Do not narrate attack hits, misses, damage, grapples, restraints, or combat defeat "
+    "until the needed D&D roll or initiative step has happened."
 )
 
 SESSION_TOOL_PROMPT = (
@@ -158,6 +160,17 @@ SESSION_SPOILER_CHECK_SYSTEM_PROMPT = (
     "hidden truth are safe. Do not mark a reply unsafe merely because it is thematically related to a private item."
 )
 
+SESSION_MECHANICS_CHECK_SYSTEM_PROMPT = (
+    "You are a D&D 5e mechanical-adjudication guard for visible Dungeon Master replies. "
+    "Return only valid JSON. The preflight router has already decided that the latest player intent likely "
+    "requires a roll, initiative, or other D&D mechanical step before the outcome is known. Decide whether "
+    "the candidate visible reply improperly resolves that uncertain mechanical outcome before the roll/step "
+    "happens. Unsafe replies narrate hits, misses, damage, restraint, capture, knockdown, forced movement, "
+    "combat defeat, or success/failure of a contested or risky action without requesting or reporting the "
+    "needed mechanic. Safe replies ask for a roll, call for initiative, clarify intent, or describe only setup "
+    "and immediate reactions without deciding the mechanical outcome."
+)
+
 SESSION_PREFLIGHT_SYSTEM_PROMPT = (
     "You are a fast routing classifier for an AI Dungeon Master turn. "
     "Return only valid JSON. Be extremely conservative about skipping spoiler checks. "
@@ -169,7 +182,10 @@ SESSION_PREFLIGHT_SYSTEM_PROMPT = (
     "set skip_spoiler_check=false. Set main_call_thinking=false only for high-confidence simple turns "
     "that do not require hidden-state reasoning, rules ambiguity, tool planning, combat adjudication, "
     "or major consequences. Set main_call_thinking=true for uncertain, complex, tool-likely, combat, "
-    "private-context, lore-heavy, or consequence-heavy turns."
+    "private-context, lore-heavy, or consequence-heavy turns. Set latest_player_intent_requires_mechanics=true "
+    "when the latest player intent attempts violence, starts a fight, makes an attack, grapples, shoves, "
+    "restrains, flees pursuit, performs a contested action, risks injury, or otherwise needs a D&D roll or "
+    "initiative before success/failure is known."
 )
 
 CHARACTER_SHEET_SYSTEM_PROMPT = (
@@ -837,6 +853,36 @@ def _session_dm_json_contract_violation(raw_content):
     return None
 
 
+def _json_contract_retry_visible_draft(raw_content, violation):
+    if not isinstance(violation, dict) or violation.get('kind') != 'non_json_response':
+        return None
+    draft = str(raw_content or '').strip()
+    if not draft:
+        return None
+    return draft
+
+
+def _json_contract_retry_prompt(raw_content, violation):
+    visible_draft = _json_contract_retry_visible_draft(raw_content, violation)
+    if visible_draft:
+        return (
+            'Your previous answer included player-visible DM content but did not follow the required final JSON contract. '
+            'Convert that same visible answer into JSON. Keep the player-visible story, adjudication, NPC dialogue, '
+            'and immediate consequences unless a guard instruction explicitly requires removing malformed tags or '
+            'meta-commentary. Do not reinterpret the turn as silent, and do not return mode="silent"; the previous '
+            'draft already chose to speak. Discard any meta-commentary about rewriting, correction, tags, or '
+            'instructions. Return only one valid JSON object using {"mode":"speak","content":"..."} with only the '
+            'player-visible answer in content.'
+        )
+    return (
+        'Your previous answer did not follow the required final JSON contract. '
+        'Discard any meta-commentary about rewriting, correction, tags, or instructions. '
+        'Return only one valid JSON object. Use {"mode":"speak","content":"..."} with only '
+        'the player-visible in-world answer in content, or {"mode":"silent","reason":"..."} '
+        'only if no visible DM response is needed.'
+    )
+
+
 SESSION_DM_GUARD_ONLY_CONTEXT_KEYS = {'private_output_terms', 'private_spoiler_items'}
 
 
@@ -896,12 +942,17 @@ def build_session_preflight_messages(hot_context, recent_messages, tools):
             'clarification_only turns with high confidence. Set it false for narrative, unknown, '
             'tool-likely, NPC, lore, object ownership, relationship, location, clue, reveal, or world-state turns. '
             'main_call_thinking may be false only for high-confidence simple turns. Use true for any uncertainty, '
-            'combat, complex rules, likely tool use, hidden/private context, lore-heavy reasoning, or major consequences.'
+            'combat, complex rules, likely tool use, hidden/private context, lore-heavy reasoning, or major consequences. '
+            'Set latest_player_intent_requires_mechanics true when the latest player is trying to attack, harm, '
+            'grapple, shove, restrain, flee pursuit, start a fight, or attempt any risky/contested action whose '
+            'outcome should not be narrated until a D&D roll or initiative step happens.'
         ),
         'return_shape': {
             'dm_reply_mode': 'silent | ooc_only | mechanics_only | clarification_only | simple_narrative | narrative | unknown',
             'skip_spoiler_check': False,
             'main_call_thinking': True,
+            'latest_player_intent_requires_mechanics': False,
+            'required_mechanic': 'short label such as attack roll, initiative, contested check, saving throw, or empty string',
             'confidence': 'high | medium | low',
             'reason': 'short explanation',
         },
@@ -919,6 +970,8 @@ def normalize_session_preflight_decision(raw_decision):
             'dm_reply_mode': 'unknown',
             'skip_spoiler_check': False,
             'main_call_thinking': True,
+            'latest_player_intent_requires_mechanics': False,
+            'required_mechanic': '',
             'confidence': 'low',
             'reason': 'Preflight returned no usable decision.',
         }
@@ -944,6 +997,8 @@ def normalize_session_preflight_decision(raw_decision):
         'dm_reply_mode': mode,
         'skip_spoiler_check': skip_spoiler_check,
         'main_call_thinking': main_call_thinking,
+        'latest_player_intent_requires_mechanics': data.get('latest_player_intent_requires_mechanics') is True,
+        'required_mechanic': str(data.get('required_mechanic') or '').strip()[:80],
         'confidence': confidence,
         'reason': str(data.get('reason') or '').strip(),
     }
@@ -1165,6 +1220,50 @@ def normalize_session_spoiler_check(raw_check):
     }
 
 
+def normalize_session_mechanics_check(raw_check):
+    data = raw_check if isinstance(raw_check, dict) else _json_loads_or_empty(raw_check)
+    if not isinstance(data, dict) or not data:
+        return {
+            'safe': True,
+            'violations': [],
+            'required_mechanic': '',
+            'reason': 'Checker returned no usable decision.',
+        }
+
+    violations = data.get('violations')
+    if not isinstance(violations, list):
+        violations = []
+    violations = [str(item).strip() for item in violations if str(item).strip()]
+    safe = bool(data.get('safe')) and not violations
+    return {
+        'safe': safe,
+        'violations': violations,
+        'required_mechanic': str(data.get('required_mechanic') or '').strip()[:80],
+        'reason': str(data.get('reason') or '').strip(),
+    }
+
+
+def build_session_mechanics_check_messages(response_text, preflight_decision, hot_context):
+    return [
+        {'role': 'system', 'content': SESSION_MECHANICS_CHECK_SYSTEM_PROMPT},
+        {
+            'role': 'user',
+            'content': json.dumps({
+                'candidate_visible_dm_reply': response_text,
+                'preflight_decision': preflight_decision or {},
+                'has_active_combat': bool((hot_context or {}).get('combat_coordinates')),
+                'has_current_encounter_map': bool((hot_context or {}).get('current_encounter_map')),
+                'return_shape': {
+                    'safe': 'boolean',
+                    'violations': ['short exact snippets or paraphrases of resolved outcomes before mechanics'],
+                    'required_mechanic': 'attack roll | initiative | contested check | saving throw | other | empty string',
+                    'reason': 'one short explanation',
+                },
+            }, ensure_ascii=False),
+        },
+    ]
+
+
 def build_session_spoiler_check_messages(response_text, hot_context):
     return [
         {'role': 'system', 'content': SESSION_SPOILER_CHECK_SYSTEM_PROMPT},
@@ -1204,6 +1303,24 @@ def _spoiler_rewrite_feedback(spoiler_check):
     )
 
 
+def _mechanics_rewrite_feedback(mechanics_check):
+    violations = mechanics_check.get('violations') if isinstance(mechanics_check, dict) else []
+    snippets = [str(item).strip() for item in violations or [] if str(item).strip()]
+    required = str((mechanics_check or {}).get('required_mechanic') or '').strip()
+    reason = str((mechanics_check or {}).get('reason') or '').strip()
+    lines = []
+    if snippets:
+        lines.append('The mechanics checker flagged these premature outcome decisions:')
+        lines.extend(f'- "{snippet}"' for snippet in snippets[:6])
+    if required:
+        lines.append(f'Required mechanic: {required}.')
+    if reason:
+        lines.append(f'Checker reason: {reason}')
+    if not lines:
+        lines.append('The response resolved an uncertain mechanical outcome before the required D&D step.')
+    return '\n'.join(lines)
+
+
 def _child_audit_context(base_audit, operation, actor, trace_label):
     parent_trace_id = base_audit.get('trace_id')
     return {
@@ -1214,6 +1331,50 @@ def _child_audit_context(base_audit, operation, actor, trace_label):
         'parent_trace_id': parent_trace_id,
         'trace_label': trace_label,
     }
+
+
+def check_session_mechanics_with_llm(response_text, preflight_decision, hot_context, audit_context=None):
+    if not (response_text or '').strip():
+        return {'safe': True, 'violations': [], 'required_mechanic': '', 'reason': ''}
+    if not (preflight_decision or {}).get('latest_player_intent_requires_mechanics'):
+        return {'safe': True, 'violations': [], 'required_mechanic': '', 'reason': ''}
+
+    base_audit = audit_context or {}
+    checker_audit = _child_audit_context(
+        base_audit,
+        'session_mechanics_check',
+        'session_mechanics_checker',
+        'session_mechanics_checker: mechanics check',
+    )
+    try:
+        raw_check = _post_chat(
+            build_session_mechanics_check_messages(response_text, preflight_decision, hot_context),
+            json_mode=True,
+            audit_context=checker_audit,
+            allow_thinking=False,
+        )
+        return normalize_session_mechanics_check(raw_check)
+    except Exception as err:
+        campaign_id = base_audit.get('campaign_id')
+        if campaign_id:
+            log_audit_event(
+                campaign_id,
+                'mechanics_checker_error',
+                'Session mechanics checker failed open.',
+                {'error': repr(err)},
+                source='session_dm.guard',
+                actor='server',
+                trace_id=base_audit.get('trace_id'),
+                trace_label=base_audit.get('trace_label'),
+                audit_role='guard',
+                commit=True,
+            )
+        return {
+            'safe': True,
+            'violations': [],
+            'required_mechanic': '',
+            'reason': 'Checker failed open.',
+        }
 
 
 def check_session_spoilers_with_llm(response_text, hot_context, audit_context=None, skip_spoiler_check=False):
@@ -1754,9 +1915,11 @@ def get_session_dm_response_with_tools(
     tool_round = 0
     json_contract_retried = False
     format_retried = False
+    mechanical_retried = False
     pc_control_retried = False
     private_output_retried = False
     spoiler_checker_retried = False
+    json_contract_retry_visible_draft = None
     guard_audits = {}
 
     def guard_audit(guard_name):
@@ -1776,6 +1939,7 @@ def get_session_dm_response_with_tools(
         retrying_visible_answer = any((
             json_contract_retried,
             format_retried,
+            mechanical_retried,
             pc_control_retried,
             private_output_retried,
             spoiler_checker_retried,
@@ -1847,23 +2011,41 @@ def get_session_dm_response_with_tools(
                         commit=True,
                     )
                 messages.append({'role': 'assistant', 'content': raw_content})
+                json_contract_retry_visible_draft = _json_contract_retry_visible_draft(
+                    raw_content,
+                    json_contract_violation,
+                )
                 messages.append({
                     'role': 'user',
-                    'content': (
-                        'Your previous answer did not follow the required final JSON contract. '
-                        'Discard any meta-commentary about rewriting, correction, tags, or instructions. '
-                        'Return only one valid JSON object. Use {"mode":"speak","content":"..."} with only '
-                        'the player-visible in-world answer in content, or {"mode":"silent","reason":"..."} '
-                        'only if no visible DM response is needed.'
-                    ),
+                    'content': _json_contract_retry_prompt(raw_content, json_contract_violation),
                 })
                 json_contract_retried = True
                 continue
             decision = normalize_session_dm_turn_decision(raw_content)
+            if json_contract_retry_visible_draft is not None:
+                if decision.get('mode') == 'silent':
+                    decision = {
+                        'mode': 'speak',
+                        'content': json_contract_retry_visible_draft,
+                    }
+                json_contract_retry_visible_draft = None
             content = decision.get('content') or ''
             format_violation = (
                 _session_dm_format_violation(content)
                 if decision.get('mode') == 'speak'
+                else None
+            )
+            mechanics_check = (
+                check_session_mechanics_with_llm(content, preflight_decision, hot_context, loop_audit)
+                if decision.get('mode') == 'speak' and not format_violation
+                else {'safe': True, 'violations': [], 'required_mechanic': '', 'reason': ''}
+            )
+            mechanical_violation = (
+                {
+                    'kind': 'mechanics_resolved_without_required_step',
+                    **mechanics_check,
+                }
+                if not mechanics_check.get('safe', True)
                 else None
             )
             violation = (
@@ -1884,6 +2066,7 @@ def get_session_dm_response_with_tools(
                     skip_spoiler_check=preflight_decision.get('skip_spoiler_check') is True,
                 )
                 if decision.get('mode') == 'speak' and not format_violation and not private_violation
+                and not mechanical_violation
                 else {'safe': True, 'leaked_item_ids': [], 'evidence': [], 'reason': ''}
             )
             if format_violation and not format_retried:
@@ -1921,6 +2104,43 @@ def get_session_dm_response_with_tools(
                     ),
                 })
                 format_retried = True
+                continue
+            if mechanical_violation and not mechanical_retried:
+                if on_status_change:
+                    on_status_change({"step": "revising", "violations": {"type": "mechanical_resolution", "details": mechanical_violation}})
+                if base_audit.get('campaign_id'):
+                    audit = guard_audit('mechanical_resolution_guard')
+                    log_audit_event(
+                        base_audit.get('campaign_id'),
+                        'mechanical_resolution_guard_retry',
+                        'Session DM response resolved combat without required D&D mechanics; requesting rewrite.',
+                        {
+                            'operation': 'mechanical_resolution_guard',
+                            'violation': mechanical_violation,
+                            'draft_response': raw_content,
+                        },
+                        source='session_dm.guard',
+                        actor=audit.get('actor'),
+                        trace_id=audit.get('trace_id'),
+                        parent_trace_id=audit.get('parent_trace_id'),
+                        trace_label=audit.get('trace_label'),
+                        audit_role='guard',
+                        commit=True,
+                    )
+                messages.append({'role': 'assistant', 'content': raw_content})
+                messages.append({
+                    'role': 'user',
+                    'content': (
+                        'Rewrite the previous response. It resolved a violent or combat action without '
+                        'the required D&D mechanics. Do not narrate whether an attack hits, misses, deals '
+                        'damage, restrains, pins, knocks down, or defeats anyone until the needed roll has '
+                        'happened. If the player initiated an attack, ask for the appropriate attack roll '
+                        'or initiative roll instead. If combat is beginning, say that initiative is needed. '
+                        f'{_mechanics_rewrite_feedback(mechanical_violation)} '
+                        'Return only the same JSON contract with mode="speak" and player-visible content.'
+                    ),
+                })
+                mechanical_retried = True
                 continue
             if violation and not pc_control_retried:
                 if on_status_change:
@@ -2049,6 +2269,30 @@ def get_session_dm_response_with_tools(
                 return {
                     'mode': 'silent',
                     'reason': 'The DM response would have controlled a protected player character.',
+                }
+            if mechanical_violation:
+                if base_audit.get('campaign_id'):
+                    audit = guard_audit('mechanical_resolution_guard')
+                    log_audit_event(
+                        base_audit.get('campaign_id'),
+                        'mechanical_resolution_guard_blocked',
+                        'Session DM response still resolved combat without required D&D mechanics after retry.',
+                        {
+                            'operation': 'mechanical_resolution_guard',
+                            'violation': mechanical_violation,
+                            'draft_response': raw_content,
+                        },
+                        source='session_dm.guard',
+                        actor=audit.get('actor'),
+                        trace_id=audit.get('trace_id'),
+                        parent_trace_id=audit.get('parent_trace_id'),
+                        trace_label=audit.get('trace_label'),
+                        audit_role='guard',
+                        commit=True,
+                    )
+                return {
+                    'mode': 'silent',
+                    'reason': 'The DM response would have resolved combat without required D&D mechanics.',
                 }
             if private_violation:
                 if base_audit.get('campaign_id'):
