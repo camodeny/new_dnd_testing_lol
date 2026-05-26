@@ -40,6 +40,9 @@ Optional variables:
 - `FRONTEND_ORIGINS`: defaults to `http://localhost:$APP_PORT`.
 - `PUBLIC_APP_BASE_URL`: defaults to `http://localhost:$APP_PORT`.
 - `GUNICORN_TIMEOUT`: defaults to `420` in Docker Compose to allow slower image generation requests.
+- `GUNICORN_WORKER_CLASS`: defaults to `gthread` for better handling of long-lived streaming requests.
+- `WEB_CONCURRENCY`: defaults to `3` Gunicorn workers.
+- `WEB_THREADS`: defaults to `12` threads per worker when using `gthread`.
 - `JWT_EXPIRATION_HOURS`: defaults to `24`.
 - `LLM_PROVIDER`: `openrouter` or `opencode_go`; defaults to `openrouter`.
 - `OPENCODE_GO_MODEL`: required when `LLM_PROVIDER=opencode_go`.

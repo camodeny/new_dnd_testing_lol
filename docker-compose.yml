@@ -9,6 +9,9 @@ services:
       FLASK_DEBUG: "false"
       PORT: 5001
       GUNICORN_TIMEOUT: ${GUNICORN_TIMEOUT:-420}
+      GUNICORN_WORKER_CLASS: ${GUNICORN_WORKER_CLASS:-gthread}
+      WEB_CONCURRENCY: ${WEB_CONCURRENCY:-3}
+      WEB_THREADS: ${WEB_THREADS:-12}
       DATABASE_URL: ${DATABASE_URL:-sqlite:////app/data/dnd.db}
       FRONTEND_ORIGINS: ${FRONTEND_ORIGINS:-http://localhost:5889}
       SECRET_KEY: ${SECRET_KEY:-dev-secret-key}
