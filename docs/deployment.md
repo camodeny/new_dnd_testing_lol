@@ -43,6 +43,8 @@ Optional variables:
 - `GUNICORN_WORKER_CLASS`: defaults to `gthread` for better handling of long-lived streaming requests.
 - `WEB_CONCURRENCY`: defaults to `3` Gunicorn workers.
 - `WEB_THREADS`: defaults to `12` threads per worker when using `gthread`.
+- `REDIS_URL`: defaults to `redis://redis:6379/0` for cross-worker and cross-instance session stream fanout.
+- `SESSION_STREAM_REDIS_CHANNEL`: optional pub/sub channel name; defaults to `dnd:session_stream`.
 - `JWT_EXPIRATION_HOURS`: defaults to `24`.
 - `LLM_PROVIDER`: `openrouter` or `opencode_go`; defaults to `openrouter`.
 - `OPENCODE_GO_MODEL`: required when `LLM_PROVIDER=opencode_go`.

@@ -1,4 +1,5 @@
 import json
+import os
 import queue
 import threading
 import time
@@ -19,6 +20,11 @@ from services.dm_tools import (
     execute_dm_tool,
 )
 from services.audit_service import log_audit_event
+
+try:
+    import redis
+except Exception:  # pragma: no cover - redis package may be omitted in some environments
+    redis = None
 
 class SessionGeneratorWorker:
     def __init__(self, campaign_id, session_id, user_id, content, player_message_id=None):
@@ -348,14 +354,97 @@ def _session_dm_turn_decision(raw_result):
 
 class SessionStreamManager:
     DONE_WORKER_TTL_SECONDS = 60
+    REDIS_RETRY_SECONDS = 10
 
     def __init__(self):
         self.workers = {}
         self.listeners = {}  # session_id -> list of queue.Queue
         self.lock = threading.Lock()
+        self.instance_id = str(uuid4())
+        self.redis_url = os.environ.get('REDIS_URL', '').strip()
+        self.redis_channel = os.environ.get('SESSION_STREAM_REDIS_CHANNEL', 'dnd:session_stream')
+        self.redis_client = None
+        self.redis_pubsub = None
+        self.redis_thread = None
+        self.redis_disabled_until = 0.0
+
+    def _redis_enabled(self):
+        return bool(self.redis_url and redis is not None)
+
+    def _close_redis_locked(self):
+        if self.redis_thread:
+            try:
+                self.redis_thread.stop()
+            except Exception:
+                pass
+        if self.redis_pubsub:
+            try:
+                self.redis_pubsub.close()
+            except Exception:
+                pass
+        if self.redis_client:
+            try:
+                self.redis_client.close()
+            except Exception:
+                pass
+        self.redis_thread = None
+        self.redis_pubsub = None
+        self.redis_client = None
+
+    def _on_redis_message(self, message):
+        try:
+            data = message.get('data') if isinstance(message, dict) else None
+            if not data:
+                return
+            if isinstance(data, bytes):
+                data = data.decode('utf-8', errors='replace')
+            envelope = json.loads(data)
+            if envelope.get('source') == self.instance_id:
+                return
+            session_id = envelope.get('session_id')
+            payload = envelope.get('payload')
+            if session_id is None or payload is None:
+                return
+        except Exception:
+            return
+
+        with self.lock:
+            listeners = list(self.listeners.get(session_id, []))
+        for q in listeners:
+            q.put(payload)
+
+    def _ensure_redis_subscription_locked(self):
+        if not self._redis_enabled():
+            return False
+        if self.redis_thread and self.redis_thread.is_alive():
+            return True
+        if time.monotonic() < self.redis_disabled_until:
+            return False
+
+        try:
+            self.redis_client = redis.Redis.from_url(
+                self.redis_url,
+                decode_responses=True,
+                socket_connect_timeout=1,
+                socket_timeout=1,
+                health_check_interval=30,
+            )
+            self.redis_pubsub = self.redis_client.pubsub(ignore_subscribe_messages=True)
+            self.redis_pubsub.subscribe(**{self.redis_channel: self._on_redis_message})
+            self.redis_thread = self.redis_pubsub.run_in_thread(sleep_time=0.05, daemon=True)
+            return True
+        except Exception:
+            self._close_redis_locked()
+            self.redis_disabled_until = time.monotonic() + self.REDIS_RETRY_SECONDS
+            return False
+
+    def _ensure_redis_subscription(self):
+        with self.lock:
+            return self._ensure_redis_subscription_locked()
 
     def start_generation(self, campaign_id, session_id, user_id, content, player_message_id=None):
         with self.lock:
+            self._ensure_redis_subscription_locked()
             # If there's already a worker running for this session, don't spawn a new one.
             if session_id in self.workers and not self.workers[session_id].is_done:
                 return self.workers[session_id]
@@ -381,6 +470,7 @@ class SessionStreamManager:
     def add_listener(self, session_id):
         q = queue.Queue()
         with self.lock:
+            self._ensure_redis_subscription_locked()
             if session_id not in self.listeners:
                 self.listeners[session_id] = []
             self.listeners[session_id].append(q)
@@ -400,9 +490,23 @@ class SessionStreamManager:
                     del self.listeners[session_id]
 
     def broadcast_event(self, session_id, payload):
+        self._ensure_redis_subscription()
         with self.lock:
             listeners = list(self.listeners.get(session_id, []))
         for q in listeners:
             q.put(payload)
+        if not self._redis_enabled():
+            return
+        try:
+            envelope = json.dumps({
+                'source': self.instance_id,
+                'session_id': session_id,
+                'payload': payload,
+            })
+            self.redis_client.publish(self.redis_channel, envelope)
+        except Exception:
+            with self.lock:
+                self._close_redis_locked()
+                self.redis_disabled_until = time.monotonic() + self.REDIS_RETRY_SECONDS
 
 stream_manager = SessionStreamManager()

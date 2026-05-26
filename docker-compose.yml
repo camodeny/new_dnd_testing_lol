@@ -12,6 +12,7 @@ services:
       GUNICORN_WORKER_CLASS: ${GUNICORN_WORKER_CLASS:-gthread}
       WEB_CONCURRENCY: ${WEB_CONCURRENCY:-3}
       WEB_THREADS: ${WEB_THREADS:-12}
+      REDIS_URL: ${REDIS_URL:-redis://redis:6379/0}
       DATABASE_URL: ${DATABASE_URL:-sqlite:////app/data/dnd.db}
       FRONTEND_ORIGINS: ${FRONTEND_ORIGINS:-http://localhost:5889}
       SECRET_KEY: ${SECRET_KEY:-dev-secret-key}
@@ -44,4 +45,10 @@ services:
       MEMORY_EMBEDDING_SEARCH_WEIGHT: ${MEMORY_EMBEDDING_SEARCH_WEIGHT:-0.70}
     volumes:
       - ./data:/app/data
+    depends_on:
+      - redis
+    restart: unless-stopped
+
+  redis:
+    image: redis:7-alpine
     restart: unless-stopped
