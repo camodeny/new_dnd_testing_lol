@@ -1,4 +1,4 @@
-import { useState, useRef, useLayoutEffect, useMemo } from 'react'
+import { memo, useState, useRef, useLayoutEffect, useMemo } from 'react'
 import { createPortal } from 'react-dom'
 import MarkdownContent from '../common/MarkdownContent'
 import DiceRollStage from './DiceRollStage'
@@ -310,6 +310,46 @@ function DMMessageContent({ content }) {
     </div>
   )
 }
+
+const SessionMessageItem = memo(function SessionMessageItem({
+  msg,
+  currentUser,
+  sessionId,
+  onProposalApplied,
+  onProposalDismissed,
+}) {
+  return (
+    <div className={`session-msg session-msg-${msg.role}`}>
+      {msg.is_proposal ? (
+        <SheetProposalInline
+          proposal={msg.proposal}
+          sessionId={sessionId}
+          currentUser={currentUser}
+          onApplied={onProposalApplied}
+          onDismissed={onProposalDismissed}
+        />
+      ) : (
+        <>
+          <div className="session-msg-header">
+            <span className="session-msg-role">
+              <i className={getMessageSenderIcon(msg.role)}></i> {getMessageSenderLabel(msg, currentUser)}
+            </span>
+            <span className="session-msg-time">{formatTime(msg.created_at)}</span>
+          </div>
+          <div className={`session-msg-content ${msg.role === 'player' ? 'session-msg-content-tagged' : ''}`}>
+            {msg.role === 'dm' ? (
+              <DMMessageContent content={msg.content} />
+            ) : msg.role === 'player' ? (
+              <PlayerMessageContent content={msg.content} />
+            ) : (
+              msg.content
+            )}
+          </div>
+        </>
+      )}
+    </div>
+  )
+})
 
 export default function SessionPanel({
   session,
@@ -703,35 +743,14 @@ export default function SessionPanel({
               </div>
             )}
             {messages.map((msg) => (
-              <div key={msg.id} className={`session-msg session-msg-${msg.role}`}>
-                {msg.is_proposal ? (
-                  <SheetProposalInline
-                    proposal={msg.proposal}
-                    sessionId={session?.id}
-                    currentUser={currentUser}
-                    onApplied={onProposalApplied}
-                    onDismissed={onProposalDismissed}
-                  />
-                ) : (
-                  <>
-                    <div className="session-msg-header">
-                      <span className="session-msg-role">
-                        <i className={getMessageSenderIcon(msg.role)}></i> {getMessageSenderLabel(msg, currentUser)}
-                      </span>
-                      <span className="session-msg-time">{formatTime(msg.created_at)}</span>
-                    </div>
-                    <div className={`session-msg-content ${msg.role === 'player' ? 'session-msg-content-tagged' : ''}`}>
-                      {msg.role === 'dm' ? (
-                        <DMMessageContent content={msg.content} />
-                      ) : msg.role === 'player' ? (
-                        <PlayerMessageContent content={msg.content} />
-                      ) : (
-                        msg.content
-                      )}
-                    </div>
-                  </>
-                )}
-              </div>
+              <SessionMessageItem
+                key={msg.id}
+                msg={msg}
+                currentUser={currentUser}
+                sessionId={session?.id}
+                onProposalApplied={onProposalApplied}
+                onProposalDismissed={onProposalDismissed}
+              />
             ))}
             {aiThinking && (
               <div className="session-msg session-msg-dm">

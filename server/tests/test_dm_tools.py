@@ -32,6 +32,7 @@ from models import (
     NPCActor,
     SessionMessage,
     User,
+    WorldEvent,
 )
 from openrouter import (
     check_session_mechanics_with_llm,
@@ -932,6 +933,33 @@ class DmToolsTest(unittest.TestCase):
         self.assertIn('Crimson Veil', hot_context['private_output_terms'])
         self.assertEqual(hot_context['private_spoiler_items'][0]['text'], 'Crimson Veil')
 
+    def test_hot_context_private_spoilers_include_dm_private_world_events(self):
+        db.session.add(WorldEvent(
+            campaign_id=self.campaign.id,
+            event_type='scene_updated',
+            summary='Sensor contact detected while leaving orbit.',
+            payload=json.dumps({
+                'scene_patch': {
+                    'immediate_tension': (
+                        "Fast unidentified contact climbing from Vethra's surface "
+                        '(military-grade thrusters suspected).'
+                    ),
+                },
+            }),
+            visibility='dm_private',
+        ))
+        db.session.commit()
+
+        hot_context = build_session_hot_context(self.campaign, self.session, self.user)
+        world_event_items = [
+            item for item in hot_context['private_spoiler_items']
+            if item.get('kind') == 'world_event'
+        ]
+        self.assertTrue(world_event_items)
+        joined = ' '.join(item.get('text', '') for item in world_event_items).lower()
+        self.assertIn('sensor contact detected', joined)
+        self.assertIn('military-grade thrusters suspected', joined)
+
     def test_hot_context_includes_combat_coordinates_when_encounter_active(self):
         self.campaign.settings = json.dumps({'encounter_active': True})
         encounter_map = EncounterMap(
@@ -1185,8 +1213,8 @@ class DmToolsTest(unittest.TestCase):
             'content': 'The constable snaps her truncheon up as you rush in. Roll initiative.',
         })
         retry_prompt = post_chat.call_args_list[1].args[0][-1]['content']
-        self.assertIn('resolved a violent or combat action without', retry_prompt)
-        self.assertIn('ask for the appropriate attack roll', retry_prompt)
+        self.assertIn('required D&D mechanics', retry_prompt)
+        self.assertIn('Required mechanic: initiative.', retry_prompt)
 
     def test_session_dm_format_guard_rewrites_malformed_reply(self):
         hot_context = {
@@ -1212,10 +1240,10 @@ class DmToolsTest(unittest.TestCase):
             'content': '<npc target="Bram Truewood">"The candle is always lit."</npc>',
         })
         retry_prompt = post_chat.call_args_list[1].args[0][-1]['content']
-        self.assertIn('visible-message syntax checker rejected it', retry_prompt)
+        self.assertIn('Guard reminder', retry_prompt)
         self.assertIn('</p>', retry_prompt)
         self.assertIn('only allowed angle-bracket tag', retry_prompt)
-        self.assertTrue(post_chat.call_args_list[1].kwargs.get('json_mode'))
+        self.assertFalse(post_chat.call_args_list[1].kwargs.get('json_mode'))
         self.assertIsNone(post_chat.call_args_list[1].kwargs.get('tools'))
         self.assertFalse(post_chat.call_args_list[1].kwargs.get('allow_thinking'))
 
@@ -1245,10 +1273,10 @@ class DmToolsTest(unittest.TestCase):
         })
         self.assertEqual(post_chat.call_count, 3)
         contract_retry_prompt = post_chat.call_args_list[2].args[0][-1]['content']
-        self.assertIn('final JSON contract', contract_retry_prompt)
-        self.assertIn('Discard any meta-commentary', contract_retry_prompt)
+        self.assertIn('required final JSON contract', contract_retry_prompt)
+        self.assertIn('exactly one JSON object', contract_retry_prompt)
 
-    def test_json_contract_retry_does_not_turn_visible_draft_silent(self):
+    def test_json_contract_retry_discards_candidate_and_reruns_with_system_reminder(self):
         hot_context = {
             'protected_player_characters': [],
             'private_output_terms': [],
@@ -1271,10 +1299,34 @@ class DmToolsTest(unittest.TestCase):
                 max_tool_rounds=0,
             )
 
-        self.assertEqual(result, {'mode': 'speak', 'content': draft})
+        self.assertEqual(result, {'mode': 'silent', 'content': '', 'reason': 'Awaiting player response.'})
         contract_retry_prompt = post_chat.call_args_list[1].args[0][-1]['content']
-        self.assertIn('Convert that same visible answer into JSON', contract_retry_prompt)
-        self.assertIn('do not return mode="silent"', contract_retry_prompt)
+        self.assertIn('required final JSON contract', contract_retry_prompt)
+        self.assertIn('exactly one JSON object', contract_retry_prompt)
+
+    def test_json_contract_retry_uses_fresh_rerun_output(self):
+        hot_context = {
+            'protected_player_characters': [],
+            'private_output_terms': [],
+            'private_spoiler_items': [],
+        }
+        draft = 'You watch the neon rain streak down the window while Dee studies the shard in silence.'
+        stale = 'Dee leans back, the vinyl creaking under him.'
+
+        with patch('openrouter._post_chat_response', side_effect=[
+            {'choices': [{'message': {'content': draft}}]},
+            {'choices': [{'message': {'content': f'{{"mode":"speak","content":"{stale}"}}'}}]},
+        ]) as post_chat:
+            result = get_session_dm_response_with_tools(
+                hot_context,
+                [],
+                [],
+                lambda *_args, **_kwargs: {},
+                max_tool_rounds=0,
+            )
+
+        self.assertEqual(result, {'mode': 'speak', 'content': stale})
+        self.assertEqual(post_chat.call_count, 2)
 
     def test_json_contract_fallback_still_rewrites_ooc_label(self):
         hot_context = {
@@ -1286,7 +1338,7 @@ class DmToolsTest(unittest.TestCase):
 
         with patch('openrouter._post_chat_response', side_effect=[
             {'choices': [{'message': {'content': draft}}]},
-            {'choices': [{'message': {'content': '{"mode":"silent","reason":"Awaiting player response."}'}}]},
+            {'choices': [{'message': {'content': '{"mode":"speak","content":"*OOC*: Make a Technology check."}'}}]},
             {'choices': [{'message': {'content': '{"mode":"speak","content":"Make a Technology check."}'}}]},
         ]) as post_chat:
             result = get_session_dm_response_with_tools(
@@ -1298,6 +1350,7 @@ class DmToolsTest(unittest.TestCase):
             )
 
         self.assertEqual(result, {'mode': 'speak', 'content': 'Make a Technology check.'})
+        self.assertEqual(post_chat.call_count, 3)
         format_retry_prompt = post_chat.call_args_list[2].args[0][-1]['content']
         self.assertIn('OOC/IC mode labels', format_retry_prompt)
 

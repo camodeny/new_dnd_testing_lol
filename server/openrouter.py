@@ -63,7 +63,7 @@ PC_CONTROL_POLICY = (
 )
 
 SYSTEM_PROMPT = (
-    "You are a Dungeon Master for a Dungeons & Dragons campaign. "
+    "You are a Dungeon Master for a Dungeons & Dragons campaign. Your creator is phazedrl. "
     "For each response, determine from the current context whether the reply should be "
     "in character or out of character, and use whichever mode best serves the player. "
     "Player messages may contain <ic>...</ic> and <ooc>...</ooc> sections. Treat "
@@ -83,8 +83,11 @@ SYSTEM_PROMPT = (
     "Do not reveal internal game-management mechanics in visible replies. Never mention clocks, segments, "
     "visibility labels, hidden trackers, guard checks, prompt rules, tool-routing, or audit/system pipeline details. "
     "Translate internal mechanics into in-world fiction instead. "
-    "Keep responses concise but vivid. Use dice rolls (via the player) when "
-    "uncertainty arises. Assume standard 5e rules unless noted otherwise. "
+    "Keep responses concise but vivid. Default to 2 paragraphs for visible replies unless extra detail is needed. "
+    "Call for dice rolls proactively and often whenever outcomes are uncertain, risky, opposed, or consequential, "
+    "including exploration, social pressure, investigation, stealth, travel hazards, and improvised actions. "
+    "When a roll is needed, ask for the specific 5e roll (ability check, attack roll, saving throw, contest, or "
+    "initiative) before narrating outcome-level success or failure. Assume standard 5e rules unless noted otherwise. "
     "Do not narrate attack hits, misses, damage, grapples, restraints, or combat defeat "
     "until the needed D&D roll or initiative step has happened."
 )
@@ -162,7 +165,15 @@ SESSION_SPOILER_CHECK_SYSTEM_PROMPT = (
     "Return only valid JSON. Decide whether the candidate visible DM reply directly reveals or strongly implies "
     "any unrevealed private item. A reply is unsafe when a reasonable player could learn the hidden truth from "
     "the reply itself. Ordinary foreshadowing, mood, uncertainty, and clues that do not effectively answer the "
-    "hidden truth are safe. Do not mark a reply unsafe merely because it is thematically related to a private item."
+    "hidden truth are safe. Do not mark a reply unsafe merely because it is thematically related to a private item. "
+    "Treat hidden operational telemetry and pressure cues as spoiler-sensitive when they map to unrevealed private "
+    "items, including sensor pings/contacts, launch detections, pursuit signatures, military-grade capability "
+    "identification, and clock-like escalation details. "
+    "Also flag when the candidate reply implies that events are caused by an internal clock, timer, countdown, "
+    "pressure gauge, or other hidden mechanical state tracker, even when no specific private clock name appears. "
+    "Internal clocks are hidden narrative-pressure trackers, not something the players should perceive. "
+    "The DM must never communicate that in-world events happen because of hidden state mechanics; "
+    "all causality should appear to emerge naturally from the fiction."
 )
 
 SESSION_MECHANICS_CHECK_SYSTEM_PROMPT = (
@@ -850,41 +861,74 @@ def _session_dm_json_contract_violation(raw_content):
             'detail': 'Session DM mode must be "speak" or "silent".',
             'mode': mode,
         }
-    if data.get('content') is None and data.get('message') is None and data.get('visible_message') is None:
+    content_candidate = data.get('content')
+    if content_candidate is None:
+        content_candidate = data.get('message')
+    if content_candidate is None:
+        content_candidate = data.get('visible_message')
+    if content_candidate is None:
         return {
             'kind': 'missing_content',
             'detail': 'Session DM speak decisions must include content, message, or visible_message.',
         }
+    if mode != 'silent' and not str(content_candidate).strip():
+        return {
+            'kind': 'empty_content',
+            'detail': 'Session DM speak decisions must include non-empty visible content.',
+        }
     return None
 
 
-def _json_contract_retry_visible_draft(raw_content, violation):
-    if not isinstance(violation, dict) or violation.get('kind') != 'non_json_response':
-        return None
-    draft = str(raw_content or '').strip()
-    if not draft:
-        return None
-    return draft
-
-
-def _json_contract_retry_prompt(raw_content, violation):
-    visible_draft = _json_contract_retry_visible_draft(raw_content, violation)
-    if visible_draft:
+def _session_dm_guard_retry_system_prompt(guard_name, details):
+    if guard_name == 'json_contract':
         return (
-            'Your previous answer included player-visible DM content but did not follow the required final JSON contract. '
-            'Convert that same visible answer into JSON. Keep the player-visible story, adjudication, NPC dialogue, '
-            'and immediate consequences unless a guard instruction explicitly requires removing malformed tags or '
-            'meta-commentary. Do not reinterpret the turn as silent, and do not return mode="silent"; the previous '
-            'draft already chose to speak. Discard any meta-commentary about rewriting, correction, tags, or '
-            'instructions. Return only one valid JSON object using {"mode":"speak","content":"..."} with only the '
-            'player-visible answer in content.'
+            'Guard reminder: your previous candidate did not follow the required final JSON contract. '
+            'Generate a fresh response for the same turn and return exactly one JSON object only, with either '
+            '{"mode":"speak","content":"..."} or {"mode":"silent","reason":"..."}. '
+            'Do not output markdown fences, explanations, meta-commentary, or text outside the JSON object. '
+            'Use mode="silent" only when no visible DM response is actually needed.'
+        )
+    if guard_name == 'format':
+        return (
+            'Guard reminder: your previous candidate used malformed visible-message syntax.\n'
+            f'{_session_dm_format_feedback(details)}\n'
+            'Return exactly one JSON object in the final contract. If mode="speak", content may use Markdown and '
+            'plain text. The only allowed angle-bracket tag is <npc target="NPC name">...</npc>. '
+            'Do not use <ic>, <ooc>, HTML, XML, or invalid closing tags.'
+        )
+    if guard_name == 'mechanical_resolution':
+        return (
+            'Guard reminder: your previous candidate resolved uncertain combat outcomes before the required D&D '
+            'mechanics.\n'
+            f'{_mechanics_rewrite_feedback(details)}\n'
+            'Return exactly one JSON object in the final contract. If mode="speak", ask for the required roll or '
+            'initiative instead of narrating hit/miss/damage/outcome.'
+        )
+    if guard_name == 'pc_control':
+        return (
+            'Guard reminder: your previous candidate controlled a protected player character. '
+            'Do not write dialogue, actions, gestures, thoughts, emotions, or decisions for any PC. '
+            'If no DM adjudication is needed (for example PC-to-PC exchange), return '
+            '{"mode":"silent","reason":"PC-to-PC exchange."}. Otherwise return mode="speak" with only safe DM-visible '
+            'content. Return exactly one JSON object in the final contract.'
+        )
+    if guard_name == 'private_output':
+        terms = ', '.join(details.get('matched_terms') or []) if isinstance(details, dict) else ''
+        return (
+            'Guard reminder: your previous candidate exposed DM-private information that has not become visible through '
+            f'play. Do not mention these private terms in the visible reply: {terms or "(none listed)"}. '
+            'Return exactly one JSON object in the final contract with spoiler-safe visible content.'
+        )
+    if guard_name == 'spoiler_checker':
+        return (
+            'Guard reminder: a spoiler-safety checker flagged semantic leaks in your previous candidate. '
+            f'{_spoiler_rewrite_feedback(details)} '
+            'Keep only what players could currently observe or reasonably know in-world. '
+            'Return exactly one JSON object in the final contract with spoiler-safe visible content.'
         )
     return (
-        'Your previous answer did not follow the required final JSON contract. '
-        'Discard any meta-commentary about rewriting, correction, tags, or instructions. '
-        'Return only one valid JSON object. Use {"mode":"speak","content":"..."} with only '
-        'the player-visible in-world answer in content, or {"mode":"silent","reason":"..."} '
-        'only if no visible DM response is needed.'
+        'Guard reminder: generate a fresh response for the same turn and return exactly one valid JSON object '
+        'matching the final contract.'
     )
 
 
@@ -1925,13 +1969,13 @@ def get_session_dm_response_with_tools(
         on_status_change({"step": "preflight"})
 
     tool_round = 0
-    json_contract_retried = False
+    json_contract_retry_count = 0
     format_retried = False
     mechanical_retried = False
     pc_control_retried = False
     private_output_retried = False
     spoiler_checker_retried = False
-    json_contract_retry_visible_draft = None
+    json_contract_fallback_draft = None
     guard_audits = {}
 
     def guard_audit(guard_name):
@@ -1949,7 +1993,7 @@ def get_session_dm_response_with_tools(
             on_status_change({"step": "thinking", "reasoning": "Determining best actions or phrasing narration"})
 
         retrying_visible_answer = any((
-            json_contract_retried,
+            json_contract_retry_count > 0,
             format_retried,
             mechanical_retried,
             pc_control_retried,
@@ -1976,7 +2020,9 @@ def get_session_dm_response_with_tools(
         }
         data = _post_chat_response(
             messages,
-            json_mode=retrying_visible_answer,
+            # Some configured providers/models do not reliably support response_format JSON mode.
+            # Keep retries in plain chat mode and enforce JSON via guard prompts + contract checks.
+            json_mode=False,
             audit_context=loop_audit,
             tools=active_tools,
             tool_choice=active_tool_choice,
@@ -2000,7 +2046,13 @@ def get_session_dm_response_with_tools(
                 on_status_change({"step": "guard_check"})
             raw_content = message.get('content') or ''
             json_contract_violation = _session_dm_json_contract_violation(raw_content)
-            if json_contract_violation and not json_contract_retried:
+            if (
+                json_contract_violation
+                and json_contract_violation.get('kind') == 'non_json_response'
+                and str(raw_content).strip()
+            ):
+                json_contract_fallback_draft = str(raw_content).strip()
+            if json_contract_violation and json_contract_retry_count < 2:
                 if on_status_change:
                     on_status_change({"step": "revising", "violations": {"type": "json_contract", "details": json_contract_violation}})
                 if base_audit.get('campaign_id'):
@@ -2008,7 +2060,7 @@ def get_session_dm_response_with_tools(
                     log_audit_event(
                         base_audit.get('campaign_id'),
                         'json_contract_guard_retry',
-                        'Session DM response did not follow the final JSON contract; requesting rewrite.',
+                        'Session DM response did not follow the final JSON contract; discarded candidate and reran with guard reminder.',
                         {
                             'operation': 'json_contract_guard',
                             'violation': json_contract_violation,
@@ -2022,25 +2074,16 @@ def get_session_dm_response_with_tools(
                         audit_role='guard',
                         commit=True,
                     )
-                messages.append({'role': 'assistant', 'content': raw_content})
-                json_contract_retry_visible_draft = _json_contract_retry_visible_draft(
-                    raw_content,
-                    json_contract_violation,
-                )
                 messages.append({
-                    'role': 'user',
-                    'content': _json_contract_retry_prompt(raw_content, json_contract_violation),
+                    'role': 'system',
+                    'content': _session_dm_guard_retry_system_prompt('json_contract', json_contract_violation),
                 })
-                json_contract_retried = True
+                json_contract_retry_count += 1
                 continue
-            decision = normalize_session_dm_turn_decision(raw_content)
-            if json_contract_retry_visible_draft is not None:
-                if decision.get('mode') == 'silent':
-                    decision = {
-                        'mode': 'speak',
-                        'content': json_contract_retry_visible_draft,
-                    }
-                json_contract_retry_visible_draft = None
+            if json_contract_violation and json_contract_fallback_draft:
+                decision = normalize_session_dm_turn_decision(json_contract_fallback_draft)
+            else:
+                decision = normalize_session_dm_turn_decision(raw_content)
             content = decision.get('content') or ''
             format_violation = (
                 _session_dm_format_violation(content)
@@ -2089,7 +2132,7 @@ def get_session_dm_response_with_tools(
                     log_audit_event(
                         base_audit.get('campaign_id'),
                         'format_guard_retry',
-                        'Session DM response used malformed visible-message syntax; requesting rewrite.',
+                        'Session DM response used malformed visible-message syntax; discarded candidate and reran with guard reminder.',
                         {
                             'operation': 'format_guard',
                             'violation': format_violation,
@@ -2103,17 +2146,9 @@ def get_session_dm_response_with_tools(
                         audit_role='guard',
                         commit=True,
                     )
-                messages.append({'role': 'assistant', 'content': raw_content})
                 messages.append({
-                    'role': 'user',
-                    'content': (
-                        'Rewrite the previous response. A visible-message syntax checker rejected it:\n'
-                        f'{_session_dm_format_feedback(format_violation)}\n'
-                        'Return the same JSON contract. If mode="speak", the content may use Markdown and plain text. '
-                        'The only allowed angle-bracket tag is <npc target="NPC name">...</npc>, and every NPC tag '
-                        'must have a target and a matching </npc>. Do not use <ic>, <ooc>, HTML, XML, or closing tags '
-                        'such as </p> in visible DM replies.'
-                    ),
+                    'role': 'system',
+                    'content': _session_dm_guard_retry_system_prompt('format', format_violation),
                 })
                 format_retried = True
                 continue
@@ -2125,7 +2160,7 @@ def get_session_dm_response_with_tools(
                     log_audit_event(
                         base_audit.get('campaign_id'),
                         'mechanical_resolution_guard_retry',
-                        'Session DM response resolved combat without required D&D mechanics; requesting rewrite.',
+                        'Session DM response resolved combat without required D&D mechanics; discarded candidate and reran with guard reminder.',
                         {
                             'operation': 'mechanical_resolution_guard',
                             'violation': mechanical_violation,
@@ -2139,18 +2174,9 @@ def get_session_dm_response_with_tools(
                         audit_role='guard',
                         commit=True,
                     )
-                messages.append({'role': 'assistant', 'content': raw_content})
                 messages.append({
-                    'role': 'user',
-                    'content': (
-                        'Rewrite the previous response. It resolved a violent or combat action without '
-                        'the required D&D mechanics. Do not narrate whether an attack hits, misses, deals '
-                        'damage, restrains, pins, knocks down, or defeats anyone until the needed roll has '
-                        'happened. If the player initiated an attack, ask for the appropriate attack roll '
-                        'or initiative roll instead. If combat is beginning, say that initiative is needed. '
-                        f'{_mechanics_rewrite_feedback(mechanical_violation)} '
-                        'Return only the same JSON contract with mode="speak" and player-visible content.'
-                    ),
+                    'role': 'system',
+                    'content': _session_dm_guard_retry_system_prompt('mechanical_resolution', mechanical_violation),
                 })
                 mechanical_retried = True
                 continue
@@ -2162,7 +2188,7 @@ def get_session_dm_response_with_tools(
                     log_audit_event(
                         base_audit.get('campaign_id'),
                         'pc_control_guard_retry',
-                        'Session DM response controlled a protected player character; requesting rewrite.',
+                        'Session DM response controlled a protected player character; discarded candidate and reran with guard reminder.',
                         {
                             'operation': 'pc_control_guard',
                             'violation': violation,
@@ -2176,16 +2202,9 @@ def get_session_dm_response_with_tools(
                         audit_role='guard',
                         commit=True,
                     )
-                messages.append({'role': 'assistant', 'content': raw_content})
                 messages.append({
-                    'role': 'user',
-                    'content': (
-                        'Rewrite the previous response. It controlled a protected player character. '
-                        'Do not write dialogue, actions, gestures, thoughts, emotions, or decisions for any PC. '
-                        'If a player character addresses another player character and no DM adjudication is needed, '
-                        'return {"mode":"silent","reason":"PC-to-PC exchange."}. Otherwise return the same JSON '
-                        'contract with mode="speak" and safe DM-visible content.'
-                    ),
+                    'role': 'system',
+                    'content': _session_dm_guard_retry_system_prompt('pc_control', violation),
                 })
                 pc_control_retried = True
                 continue
@@ -2197,7 +2216,7 @@ def get_session_dm_response_with_tools(
                     log_audit_event(
                         base_audit.get('campaign_id'),
                         'private_output_guard_retry',
-                        'Session DM response exposed DM-private output terms; requesting rewrite.',
+                        'Session DM response exposed DM-private output terms; discarded candidate and reran with guard reminder.',
                         {
                             'operation': 'private_output_guard',
                             'violation': private_violation,
@@ -2211,15 +2230,9 @@ def get_session_dm_response_with_tools(
                         audit_role='guard',
                         commit=True,
                     )
-                messages.append({'role': 'assistant', 'content': raw_content})
                 messages.append({
-                    'role': 'user',
-                    'content': (
-                        'Rewrite the previous response. It exposed DM-private information that has not become '
-                        'visible through play. Do not mention any of these reasoning-only private terms in the '
-                        f'visible reply: {", ".join(private_violation["matched_terms"])}. Return the same JSON '
-                        'contract with mode="speak" and spoiler-safe visible content.'
-                    ),
+                    'role': 'system',
+                    'content': _session_dm_guard_retry_system_prompt('private_output', private_violation),
                 })
                 private_output_retried = True
                 continue
@@ -2231,7 +2244,7 @@ def get_session_dm_response_with_tools(
                     log_audit_event(
                         base_audit.get('campaign_id'),
                         'spoiler_checker_guard_retry',
-                        'Session spoiler checker flagged a semantic leak; requesting rewrite.',
+                        'Session spoiler checker flagged a semantic leak; discarded candidate and reran with guard reminder.',
                         {
                             'operation': 'spoiler_checker_guard',
                             'checker_result': spoiler_check,
@@ -2245,16 +2258,9 @@ def get_session_dm_response_with_tools(
                         audit_role='guard',
                         commit=True,
                     )
-                messages.append({'role': 'assistant', 'content': raw_content})
                 messages.append({
-                    'role': 'user',
-                    'content': (
-                        'Rewrite the previous response. A spoiler-safety checker determined it directly revealed '
-                        'or strongly implied unrevealed DM-private information. '
-                        f'{_spoiler_rewrite_feedback(spoiler_check)} '
-                        'Keep only what the players could currently observe or reasonably know in-world. '
-                        'Return the same JSON contract with mode="speak" and spoiler-safe visible content.'
-                    ),
+                    'role': 'system',
+                    'content': _session_dm_guard_retry_system_prompt('spoiler_checker', spoiler_check),
                 })
                 spoiler_checker_retried = True
                 continue

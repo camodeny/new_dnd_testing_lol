@@ -1,4 +1,5 @@
 import ReactMarkdown from 'react-markdown'
+import { memo } from 'react'
 import remarkBreaks from 'remark-breaks'
 import remarkGfm from 'remark-gfm'
 
@@ -12,7 +13,7 @@ const components = {
   },
 }
 
-export default function MarkdownContent({ content }) {
+function MarkdownContent({ content }) {
   return (
     <div className="markdown-content">
       <ReactMarkdown remarkPlugins={[remarkGfm, remarkBreaks]} components={components}>
@@ -21,3 +22,5 @@ export default function MarkdownContent({ content }) {
     </div>
   )
 }
+
+export default memo(MarkdownContent)

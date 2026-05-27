@@ -208,6 +208,30 @@ def _private_spoiler_items(campaign):
         for index, value in enumerate(dm_private.get('npc_secrets', []) if isinstance(dm_private.get('npc_secrets'), list) else []):
             add(f'dm_private_npc_secret_{index + 1}', 'npc_secret', value)
 
+    # Include recent DM-private world events so operational clues from hidden state
+    # are available to the spoiler checker as unrevealed private items.
+    private_events = (
+        WorldEvent.query
+        .filter_by(campaign_id=campaign.id, visibility='dm_private')
+        .order_by(WorldEvent.created_at.desc())
+        .limit(24)
+        .all()
+    )
+    for event in reversed(private_events):
+        payload = json_loads(event.payload, {})
+        payload_scene = payload.get('scene_patch', {}) if isinstance(payload, dict) else {}
+        payload_current_scene = payload.get('current_scene', {}) if isinstance(payload, dict) else {}
+        scene_tension = payload_scene.get('immediate_tension') if isinstance(payload_scene, dict) else None
+        current_tension = payload_current_scene.get('immediate_tension') if isinstance(payload_current_scene, dict) else None
+        text = ' - '.join(
+            part for part in [
+                event.summary,
+                scene_tension,
+                current_tension,
+            ] if part
+        )
+        add(f'world_event_{event.id}', 'world_event', text)
+
     return items
 
 

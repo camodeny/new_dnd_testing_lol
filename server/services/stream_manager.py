@@ -41,6 +41,8 @@ class SessionGeneratorWorker:
         self.error = None
         self.messages_result = []
         self.sheet_proposals_result = []
+        self.dynamic_summary_lock = threading.Lock()
+        self.last_dynamic_summary_at = 0.0
 
     def add_listener(self):
         q = queue.Queue()
@@ -121,54 +123,66 @@ class SessionGeneratorWorker:
 
         self.broadcast({"type": "status", "status": self.status})
 
-        # Run dynamic dynamic summarization asynchronously
+        # Keep status text responsive without letting rapid status changes pile up
+        # overlapping low-value summary calls.
+        now = time.monotonic()
+        if now - self.last_dynamic_summary_at < 3:
+            return
+        if not self.dynamic_summary_lock.acquire(blocking=False):
+            return
+        self.last_dynamic_summary_at = now
+
+        # Run dynamic summarization asynchronously
         threading.Thread(
             target=self._run_dynamic_summarization,
-            args=(action_desc,),
+            args=(action_desc, True),
             daemon=True
         ).start()
 
-    def _run_dynamic_summarization(self, action_desc):
-        # Setup context and system prompt
-        provider = get_llm_provider()
-        model = get_openrouter_model()
-
-        # Let's check if the provider/API is configured. If not, don't run.
-        from openrouter import _api_key_for_provider
-        if not _api_key_for_provider(provider):
-            return
-
-        system_prompt = (
-            "You are a D&D DM thinking trace generator. Generate a 2-3 word summary of what the DM is currently doing in-game based on the provided rich operational data.\n"
-            "The trace must be highly specific to the context provided (e.g. mention character names, items, locations, or actions if present in the data), organic, mysterious, and D&D thematic (e.g., 'Amending Gildor's gold...', 'Reading Gildor's spells...', 'Consulting local shop...', 'Foretelling dragon's move...').\n"
-            "Return ONLY the 2-3 word summary, capitalizing only the first word. Do not include quotes, preamble, or formatting."
-        )
-
-        messages = [
-            {"role": "system", "content": system_prompt},
-            {"role": "user", "content": f"Rich context data: {action_desc}"}
-        ]
-
+    def _run_dynamic_summarization(self, action_desc, release_lock=False):
         try:
-            # Fast, cheap call to the LLM (using 1 attempt, short timeout)
-            res = _post_chat(
-                messages,
-                allow_thinking=False,
-                timeout_seconds=8,
-                max_attempts=1,
-                audit_context={
-                    "campaign_id": self.campaign_id,
-                    "operation": "dynamic_thinking_trace",
-                    "actor": "thinking_trace_agent"
-                }
+            # Setup context and system prompt
+            provider = get_llm_provider()
+
+            # Check if the provider/API is configured. If not, don't run.
+            from openrouter import _api_key_for_provider
+            if not _api_key_for_provider(provider):
+                return
+
+            system_prompt = (
+                "You are a D&D DM thinking trace generator. Generate a 2-3 word summary of what the DM is currently doing in-game based on the provided rich operational data.\n"
+                "The trace must be highly specific to the context provided (e.g. mention character names, items, locations, or actions if present in the data), organic, mysterious, and D&D thematic (e.g., 'Amending Gildor's gold...', 'Reading Gildor's spells...', 'Consulting local shop...', 'Foretelling dragon's move...').\n"
+                "Return ONLY the 2-3 word summary, capitalizing only the first word. Do not include quotes, preamble, or formatting."
             )
-            summary = res.strip().strip('"').strip("'").rstrip(".")
-            if summary and len(summary.split()) <= 4:
-                self.status = summary + "..."
-                self.broadcast({"type": "status", "status": self.status})
-        except Exception:
-            # Fallback is already broadcasted, so fail silently
-            pass
+
+            messages = [
+                {"role": "system", "content": system_prompt},
+                {"role": "user", "content": f"Rich context data: {action_desc}"}
+            ]
+
+            try:
+                # Fast, cheap call to the LLM (using 1 attempt, short timeout)
+                res = _post_chat(
+                    messages,
+                    allow_thinking=False,
+                    timeout_seconds=8,
+                    max_attempts=1,
+                    audit_context={
+                        "campaign_id": self.campaign_id,
+                        "operation": "dynamic_thinking_trace",
+                        "actor": "thinking_trace_agent"
+                    }
+                )
+                summary = res.strip().strip('"').strip("'").rstrip(".")
+                if summary and len(summary.split()) <= 4:
+                    self.status = summary + "..."
+                    self.broadcast({"type": "status", "status": self.status})
+            except Exception:
+                # Fallback is already broadcasted, so fail silently
+                pass
+        finally:
+            if release_lock:
+                self.dynamic_summary_lock.release()
 
     def run(self, app):
         with app.app_context():
