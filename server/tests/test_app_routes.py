@@ -1445,6 +1445,104 @@ class AppRouteTest(unittest.TestCase):
             self.assertIn('memory_runs.json', manifest['files'])
             self.assertIn('memory_logs.json', manifest['files'])
 
+    def test_export_campaign_includes_reasoning_data(self):
+        import io
+        import zipfile
+        from models import CampaignAuditEvent, CampaignSession, SessionMessage
+
+        with app.app_context():
+            owner = User.query.filter_by(username='export_owner').first()
+            if not owner:
+                owner = User(username='export_owner', email='export_owner@example.com')
+                owner.set_password('password')
+                db.session.add(owner)
+                db.session.commit()
+
+            campaign = Campaign(name='Reasoning export campaign', user_id=owner.id)
+            db.session.add(campaign)
+            db.session.flush()
+
+            session = CampaignSession(campaign_id=campaign.id, is_active=True)
+            db.session.add(session)
+            db.session.flush()
+
+            # Create DM message to link to
+            dm_msg = SessionMessage(
+                session_id=session.id,
+                role='dm',
+                content='Hello D&D player!'
+            )
+            db.session.add(dm_msg)
+            db.session.flush()
+
+            # Create stored output audit event
+            stored_event = CampaignAuditEvent(
+                campaign_id=campaign.id,
+                event_type='dm_output_stored',
+                trace_id='trace_test_reasoning_1',
+                summary='Stored visible DM response.',
+                payload=json.dumps({
+                    'session_id': session.id,
+                    'message': {'role': 'dm', 'content': 'Hello D&D player!'}
+                })
+            )
+
+            # Create model response event with reasoning
+            model_event = CampaignAuditEvent(
+                campaign_id=campaign.id,
+                event_type='model_response',
+                trace_id='trace_test_reasoning_1',
+                actor='session_dm',
+                summary='Model response.',
+                payload=json.dumps({
+                    'model': 'google/gemini-2.5-pro',
+                    'provider': 'openrouter',
+                    'reasoning': 'Let us greet the player warmly.',
+                    'raw_response': {
+                        'choices': [{
+                            'message': {'role': 'assistant', 'content': 'Hello D&D player!'}
+                        }]
+                    }
+                })
+            )
+
+            db.session.add_all([stored_event, model_event])
+            db.session.commit()
+
+            campaign_id = campaign.id
+            token = generate_token(owner.id)
+            msg_id = dm_msg.id
+            session_id = session.id
+
+        response = self.client.get(
+            f'/api/campaigns/{campaign_id}/export',
+            headers={'Authorization': f'Bearer {token}'},
+        )
+        self.assertEqual(response.status_code, 200)
+
+        zip_data = io.BytesIO(response.data)
+        with zipfile.ZipFile(zip_data, 'r') as zf:
+            file_list = zf.namelist()
+            self.assertIn('reasonings.json', file_list)
+            self.assertIn('manifest.json', file_list)
+
+            reasonings = json.loads(zf.read('reasonings.json').decode('utf-8'))
+            self.assertEqual(len(reasonings), 1)
+            self.assertEqual(reasonings[0]['reasoning'], 'Let us greet the player warmly.')
+            self.assertEqual(reasonings[0]['model'], 'google/gemini-2.5-pro')
+            self.assertEqual(reasonings[0]['provider'], 'openrouter')
+            self.assertEqual(reasonings[0]['actor'], 'session_dm')
+
+            self.assertIsNotNone(reasonings[0]['link'])
+            self.assertEqual(reasonings[0]['link']['type'], 'session_message')
+            self.assertEqual(reasonings[0]['link']['message_id'], msg_id)
+            self.assertEqual(reasonings[0]['link']['session_id'], session_id)
+            self.assertEqual(reasonings[0]['link']['content'], 'Hello D&D player!')
+
+            manifest = json.loads(zf.read('manifest.json').decode('utf-8'))
+            self.assertIn('reasonings.json', manifest['files'])
+
 
 if __name__ == '__main__':
     unittest.main()
+

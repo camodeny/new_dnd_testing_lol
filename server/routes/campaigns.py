@@ -298,6 +298,103 @@ def export_campaign(current_user, campaign_id):
     memory_logs = CampaignMemoryLog.query.filter_by(campaign_id=campaign_id).order_by(CampaignMemoryLog.created_at).all()
     memory_logs_data = [l.to_dict() for l in memory_logs]
 
+    # Model reasonings extraction and linking
+    reasonings_data = []
+
+    # 1. Fetch DM response messages to construct maps for quick linking
+    session_messages = SessionMessage.query.join(CampaignSession).filter(CampaignSession.campaign_id == campaign_id).all()
+    planning_messages = CharacterPlanningMessage.query.filter_by(campaign_id=campaign_id).all()
+
+    session_msg_map = {}
+    for sm in session_messages:
+        if sm.role == 'dm' and sm.content:
+            session_msg_map[(sm.session_id, sm.content.strip())] = sm.id
+
+    planning_msg_map = {}
+    for pm in planning_messages:
+        if pm.role == 'dm' and pm.content:
+            planning_msg_map[pm.content.strip()] = pm.id
+
+    # 2. Map dm_output_stored events by trace_id to link to model responses
+    dm_stored_events = CampaignAuditEvent.query.filter_by(
+        campaign_id=campaign_id,
+        event_type='dm_output_stored'
+    ).all()
+
+    dm_events_by_trace = {}
+    for de in dm_stored_events:
+        if de.trace_id:
+            dm_events_by_trace[de.trace_id] = de
+
+    # 3. Process model_response events that have reasoning
+    for event in audit_events:
+        if event.event_type != 'model_response':
+            continue
+        try:
+            payload = json.loads(event.payload) if event.payload else {}
+        except (TypeError, ValueError):
+            payload = {}
+
+        if not isinstance(payload, dict):
+            continue
+
+        raw_resp = payload.get('raw_response')
+        message = raw_resp.get('choices', [{}])[0].get('message', {}) if isinstance(raw_resp, dict) and raw_resp.get('choices') else {}
+        reasoning = payload.get('reasoning') or message.get('reasoning') or message.get('reasoning_content')
+        reasoning_details = payload.get('reasoning_details') or message.get('reasoning_details')
+
+        if not reasoning and not reasoning_details:
+            continue
+
+        reasoning_item = {
+            'audit_event_id': event.id,
+            'created_at': event.created_at.isoformat() if event.created_at else None,
+            'model': payload.get('model'),
+            'provider': payload.get('provider'),
+            'actor': event.actor,
+            'operation': payload.get('operation'),
+            'reasoning': reasoning,
+            'reasoning_details': reasoning_details,
+            'link': None
+        }
+
+        # Link reasoning to DM response
+        if event.trace_id and event.trace_id in dm_events_by_trace:
+            de = dm_events_by_trace[event.trace_id]
+            try:
+                de_payload = json.loads(de.payload) if de.payload else {}
+            except (TypeError, ValueError):
+                de_payload = {}
+
+            if isinstance(de_payload, dict):
+                content = de_payload.get('message', {}).get('content', '').strip()
+                if content:
+                    if event.actor == 'session_dm' or de.source == 'session_messages':
+                        session_id = de_payload.get('session_id')
+                        if not session_id and de.trace_id:
+                            m = re.search(r'session_(\d+)', de.trace_id)
+                            if m:
+                                session_id = int(m.group(1))
+                        if session_id:
+                            msg_id = session_msg_map.get((session_id, content))
+                            if msg_id:
+                                reasoning_item['link'] = {
+                                    'type': 'session_message',
+                                    'session_id': session_id,
+                                    'message_id': msg_id,
+                                    'content': content
+                                }
+                    elif event.actor == 'planning_dm' or de.source == 'character_planning_messages':
+                        msg_id = planning_msg_map.get(content)
+                        if msg_id:
+                            reasoning_item['link'] = {
+                                'type': 'planning_message',
+                                'campaign_id': campaign_id,
+                                'message_id': msg_id,
+                                'content': content
+                            }
+        reasonings_data.append(reasoning_item)
+
     # --- Build ZIP in memory ---
     buf = io.BytesIO()
     with zipfile.ZipFile(buf, 'w', zipfile.ZIP_DEFLATED) as zf:
@@ -320,6 +417,7 @@ def export_campaign(current_user, campaign_id):
         add_json('audit_log.json', audit_data)
         add_json('memory_runs.json', memory_runs_data)
         add_json('memory_logs.json', memory_logs_data)
+        add_json('reasonings.json', reasonings_data)
 
         # Manifest
         manifest = {
@@ -344,6 +442,7 @@ def export_campaign(current_user, campaign_id):
                 'audit_log.json',
                 'memory_runs.json',
                 'memory_logs.json',
+                'reasonings.json',
             ],
         }
         add_json('manifest.json', manifest)
