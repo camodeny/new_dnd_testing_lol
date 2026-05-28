@@ -1,8 +1,10 @@
-from flask import Blueprint, jsonify, request, current_app
+from flask import Blueprint, jsonify, request, current_app, g
 from datetime import datetime, timedelta, timezone
 from functools import wraps
 import jwt
-from models import db, User
+from werkzeug.security import check_password_hash
+
+from models import db, LLMPlayer, User
 
 auth_bp = Blueprint('auth', __name__)
 
@@ -19,27 +21,79 @@ def generate_token(user_id):
 def token_required(f):
     @wraps(f)
     def decorated(*args, **kwargs):
-        token = None
-        if 'Authorization' in request.headers:
-            auth_header = request.headers['Authorization']
-            if auth_header.startswith('Bearer '):
-                token = auth_header.split(' ')[1]
-
-        if not token:
-            return jsonify({'error': 'Token is missing'}), 401
-
-        try:
-            data = jwt.decode(token, current_app.config['SECRET_KEY'], algorithms=['HS256'])
-            current_user = db.session.get(User, data['user_id'])
-            if not current_user:
-                return jsonify({'error': 'User not found'}), 401
-        except jwt.ExpiredSignatureError:
-            return jsonify({'error': 'Token has expired'}), 401
-        except jwt.InvalidTokenError:
-            return jsonify({'error': 'Token is invalid'}), 401
+        current_user, error_response = authenticate_request()
+        if error_response is not None:
+            return error_response
 
         return f(current_user, *args, **kwargs)
     return decorated
+
+
+def _extract_bearer_token():
+    auth_header = request.headers.get('Authorization', '')
+    if auth_header.startswith('Bearer '):
+        return auth_header.split(' ', 1)[1].strip()
+    return None
+
+
+def _authenticate_jwt(token):
+    try:
+        data = jwt.decode(token, current_app.config['SECRET_KEY'], algorithms=['HS256'])
+        current_user = db.session.get(User, data['user_id'])
+        if not current_user:
+            return None, jsonify({'error': 'User not found'}), 401
+        g.auth_mode = 'jwt'
+        g.llm_player = None
+        return current_user, None, None
+    except jwt.ExpiredSignatureError:
+        return None, jsonify({'error': 'Token has expired'}), 401
+    except jwt.InvalidTokenError:
+        return None, jsonify({'error': 'Token is invalid'}), 401
+
+
+def _authenticate_api_key(api_key):
+    if not api_key:
+        return None, jsonify({'error': 'API key is missing'}), 401
+
+    prefix = api_key[:24]
+    candidates = LLMPlayer.query.filter_by(api_key_prefix=prefix).all()
+    for llm_player in candidates:
+        if check_password_hash(llm_player.api_key_hash, api_key):
+            current_user = llm_player.user
+            if not current_user:
+                return None, jsonify({'error': 'User not found'}), 401
+            llm_player.last_used_at = datetime.utcnow()
+            db.session.commit()
+            g.auth_mode = 'api_key'
+            g.llm_player = llm_player
+            return current_user, None, None
+
+    return None, jsonify({'error': 'API key is invalid'}), 401
+
+
+def authenticate_request(token=None, api_key=None):
+    provided_api_key = api_key or request.headers.get('X-API-Key')
+    bearer_token = token or _extract_bearer_token()
+
+    if provided_api_key:
+        current_user, response, status = _authenticate_api_key(provided_api_key)
+        if response is not None:
+            return None, (response, status)
+        return current_user, None
+
+    if bearer_token:
+        if bearer_token.startswith('dndllm_'):
+            current_user, response, status = _authenticate_api_key(bearer_token)
+            if response is not None:
+                return None, (response, status)
+            return current_user, None
+
+        current_user, response, status = _authenticate_jwt(bearer_token)
+        if response is not None:
+            return None, (response, status)
+        return current_user, None
+
+    return None, (jsonify({'error': 'Token is missing'}), 401)
 
 
 @auth_bp.route('/api/register', methods=['POST'])

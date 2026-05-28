@@ -152,12 +152,15 @@ SESSION_MEMORY_SYSTEM_PROMPT = (
     "Update knowledge graph entities, relations, and facts without duplicating existing ids. Preserve "
     "visibility as dm_private, party_known, or public. Do not invent large new lore unless it follows "
     "from the exchange. Only write graph facts for durable truths that should remain useful after the "
-    "current scene changes. Do not write graph facts for current presence, current location, temporary "
-    "awareness, momentary posture, weather, lighting, or other scene-state details. Put current "
-    "location, occupants, and tension in scene_patch instead. Prefer explicit proper nouns over pronouns "
-    "whenever the transcript provides them, and preserve named ownership, recipients, and targets exactly "
-    "rather than rewriting them into ambiguous references. If a character learns who was present, "
-    "record the durable event or encounter, not a fact that someone knows who is currently present."
+    "current scene changes. Put current location, occupants, and tension in scene_patch instead. "
+    "Prefer explicit proper nouns over pronouns, and preserve named ownership. "
+    "For every memory item created, updated, or retired (in graph entities, relations, facts, clocks, "
+    "NPC actors, or events), you must include these metadata fields: "
+    "1. 'certainty': 'confirmed | suspected | inferred | false | retconned' "
+    "2. 'importance': 1-5 (where 5 is campaign-defining and 1 is a minor detail) "
+    "3. 'expires_or_retire_condition': concise description of when this memory expires or should be retired, or null "
+    "4. 'reason': concise 1-sentence reason why this change or new memory is warranted "
+    "5. 'memory_type': 'npc | fact | relation | clock | location | quest | inventory | money'"
 )
 
 SESSION_SPOILER_CHECK_SYSTEM_PROMPT = (
@@ -844,7 +847,26 @@ def normalize_session_dm_turn_decision(raw_decision):
     }
 
 
+def _looks_like_provider_tool_markup(raw_content):
+    if not isinstance(raw_content, str):
+        return False
+    text = raw_content.strip()
+    if not text:
+        return False
+    return (
+        '<｜｜DSML｜｜tool_calls>' in text
+        or '<｜｜DSML｜｜invoke ' in text
+        or '</｜｜DSML｜｜tool_calls>' in text
+    )
+
+
 def _session_dm_json_contract_violation(raw_content):
+    if _looks_like_provider_tool_markup(raw_content):
+        return {
+            'kind': 'provider_tool_markup',
+            'detail': 'Session DM final answer contained provider tool-call markup instead of a visible JSON reply.',
+        }
+
     data = _json_loads_or_empty(raw_content)
     if not isinstance(data, dict) or not data:
         return {
@@ -881,6 +903,15 @@ def _session_dm_json_contract_violation(raw_content):
 
 def _session_dm_guard_retry_system_prompt(guard_name, details):
     if guard_name == 'json_contract':
+        if isinstance(details, dict) and details.get('kind') == 'provider_tool_markup':
+            return (
+                'Guard reminder: your previous candidate exposed raw provider tool-call markup instead of a player-visible '
+                'DM reply. Discard that candidate completely and generate a fresh response for the same turn. '
+                'Do not output DSML, <｜｜DSML｜｜tool_calls>, invoke tags, XML, or any tool-call markup in visible content. '
+                'The final answer must be exactly one JSON object only, with either '
+                '{"mode":"speak","content":"..."} or {"mode":"silent","reason":"..."}. '
+                'If you need to narrate what the player learns, write only the player-facing result in content.'
+            )
         return (
             'Guard reminder: your previous candidate did not follow the required final JSON contract. '
             'Generate a fresh response for the same turn and return exactly one JSON object only, with either '
@@ -1847,25 +1878,108 @@ def build_session_memory_messages(memory_context):
                     },
                     'scene_reason': 'why scene changed',
                     'upsert_graph_entities': [
-                        {'id': 'stable_id', 'type': 'npc | location | faction | item | event | threat | concept', 'name': 'display name', 'summary': 'durable summary', 'visibility': 'public | party_known | dm_private', 'tags': []}
+                        {
+                            'id': 'stable_id',
+                            'type': 'npc | location | faction | item | event | threat | concept',
+                            'name': 'display name',
+                            'summary': 'durable summary',
+                            'visibility': 'public | party_known | dm_private',
+                            'tags': [],
+                            'certainty': 'confirmed | suspected | inferred | false | retconned',
+                            'importance': 3,
+                            'expires_or_retire_condition': 'optional description or null',
+                            'reason': 'why created/updated',
+                            'memory_type': 'npc | location | fact'
+                        }
                     ],
                     'upsert_graph_relations': [
-                        {'id': 'stable_id', 'source_id': 'entity id', 'target_id': 'entity id', 'type': 'relationship type', 'summary': 'durable summary', 'visibility': 'public | party_known | dm_private'}
+                        {
+                            'id': 'stable_id',
+                            'source_id': 'entity id',
+                            'target_id': 'entity id',
+                            'type': 'relationship type',
+                            'summary': 'durable summary',
+                            'visibility': 'public | party_known | dm_private',
+                            'certainty': 'confirmed | suspected | inferred | false | retconned',
+                            'importance': 3,
+                            'expires_or_retire_condition': 'optional description or null',
+                            'reason': 'why created/updated',
+                            'memory_type': 'relation'
+                        }
                     ],
                     'upsert_graph_facts': [
-                        {'id': 'stable_id', 'entity_ids': ['all directly relevant entity ids'], 'text': 'durable fact; not current scene state, temporary presence, temporary location, or momentary character awareness', 'certainty': 'confirmed | suspected | false_rumor', 'visibility': 'public | party_known | dm_private'}
+                        {
+                            'id': 'stable_id',
+                            'entity_ids': ['all directly relevant entity ids'],
+                            'text': 'durable fact',
+                            'certainty': 'confirmed | suspected | inferred | false | retconned',
+                            'visibility': 'public | party_known | dm_private',
+                            'importance': 3,
+                            'expires_or_retire_condition': 'optional description or null',
+                            'reason': 'why created/updated',
+                            'memory_type': 'fact | quest | inventory | money'
+                        }
                     ],
                     'create_clocks': [
-                        {'id': 'stable_clock_id', 'name': 'Clock name', 'segments': 4, 'filled': 0, 'pressure_type': 'faction | danger | mystery | environment | personal | story', 'visibility': 'public | party_known | dm_private', 'summary': 'pressure summary', 'trigger': 'when it advances', 'on_complete': 'what happens', 'status': 'active', 'reason': 'why this clock now exists'}
+                        {
+                            'id': 'stable_clock_id',
+                            'name': 'Clock name',
+                            'segments': 4,
+                            'filled': 0,
+                            'pressure_type': 'faction | danger | mystery | environment | personal | story',
+                            'visibility': 'public | party_known | dm_private',
+                            'summary': 'pressure summary',
+                            'trigger': 'when it advances',
+                            'on_complete': 'what happens',
+                            'status': 'active',
+                            'reason': 'why this clock now exists',
+                            'certainty': 'confirmed | suspected | inferred | false | retconned',
+                            'importance': 3,
+                            'expires_or_retire_condition': 'optional description or null',
+                            'memory_type': 'clock'
+                        }
                     ],
                     'retire_clocks': [
-                        {'clock_id': 'existing_clock_id', 'status': 'completed | resolved | inactive', 'reason': 'why retired'}
+                        {
+                            'clock_id': 'existing_clock_id',
+                            'status': 'completed | resolved | inactive',
+                            'reason': 'why retired',
+                            'certainty': 'confirmed | suspected | inferred | false | retconned',
+                            'importance': 3,
+                            'expires_or_retire_condition': 'optional description or null',
+                            'memory_type': 'clock'
+                        }
                     ],
                     'update_npc_actors': [
-                        {'id': 'npc_stable_id', 'name': 'NPC name', 'role': 'story role', 'public_summary': 'public summary', 'wants': [], 'fears': [], 'secrets': [], 'relationships': {}, 'recent_offscreen_activity': [], 'reason': 'why updated'}
+                        {
+                            'id': 'npc_stable_id',
+                            'name': 'NPC name',
+                            'role': 'story role',
+                            'public_summary': 'public summary',
+                            'wants': [],
+                            'fears': [],
+                            'secrets': [],
+                            'relationships': {},
+                            'recent_offscreen_activity': [],
+                            'reason': 'why updated',
+                            'certainty': 'confirmed | suspected | inferred | false | retconned',
+                            'importance': 3,
+                            'expires_or_retire_condition': 'optional description or null',
+                            'memory_type': 'npc'
+                        }
                     ],
                     'record_events': [
-                        {'event_type': 'short_type', 'summary': 'durable event summary', 'payload': {}, 'visibility': 'public | party_known | dm_private'}
+                        {
+                            'event_type': 'short_type',
+                            'summary': 'durable event summary',
+                            'payload': {},
+                            'visibility': 'public | party_known | dm_private',
+                            'certainty': 'confirmed | suspected | inferred | false | retconned',
+                            'importance': 3,
+                            'expires_or_retire_condition': 'optional description or null',
+                            'reason': 'why created',
+                            'memory_type': 'fact'
+                        }
                     ],
                 },
             }, ensure_ascii=False),
@@ -2080,8 +2194,14 @@ def get_session_dm_response_with_tools(
                 })
                 json_contract_retry_count += 1
                 continue
-            if json_contract_violation and json_contract_fallback_draft:
-                decision = normalize_session_dm_turn_decision(json_contract_fallback_draft)
+            if json_contract_violation:
+                if json_contract_fallback_draft:
+                    decision = normalize_session_dm_turn_decision(json_contract_fallback_draft)
+                else:
+                    return {
+                        'mode': 'silent',
+                        'reason': 'The DM response did not produce a valid visible reply.',
+                    }
             else:
                 decision = normalize_session_dm_turn_decision(raw_content)
             content = decision.get('content') or ''
@@ -2445,6 +2565,19 @@ def get_session_memory_patch(memory_context, audit_context=None):
     campaign_id = audit_context.get('campaign_id')
     trace_id = audit_context.get('trace_id') or f"session_memory_writer:memory_update:{uuid4().hex[:10]}"
     trace_label = audit_context.get('trace_label') or 'session_memory_writer: memory_update'
+
+    prompt_str = json.dumps(messages, ensure_ascii=False)
+    prompt_chars = len(prompt_str)
+    prompt_tokens_estimate = prompt_chars // 4
+
+    context_breakdown = {}
+    if isinstance(memory_context, dict):
+        for k, v in memory_context.items():
+            try:
+                context_breakdown[k] = len(json.dumps(v, ensure_ascii=False))
+            except Exception:
+                context_breakdown[k] = 0
+
     if campaign_id:
         log_audit_event(
             campaign_id,
@@ -2473,7 +2606,18 @@ def get_session_memory_patch(memory_context, audit_context=None):
             json_mode=True,
             audit_context=request_audit_context,
         )
+        response_chars = len(text) if text else 0
         data = _json_loads_with_repair(text, audit_context=request_audit_context)
+        if not isinstance(data, dict):
+            data = {}
+
+        data['_telemetry'] = {
+            'prompt_chars': prompt_chars,
+            'prompt_tokens_estimate': prompt_tokens_estimate,
+            'response_chars': response_chars,
+            'context_breakdown': context_breakdown,
+        }
+
         if campaign_id:
             log_audit_event(
                 campaign_id,
@@ -2488,10 +2632,18 @@ def get_session_memory_patch(memory_context, audit_context=None):
                 audit_role='agent',
                 commit=True,
             )
-        return data if isinstance(data, dict) else {}
+        return data
     except Exception as e:
         print(f'[openrouter] Session memory writer error: {e}')
-        return {}
+        return {
+            '_telemetry': {
+                'prompt_chars': prompt_chars,
+                'prompt_tokens_estimate': prompt_tokens_estimate,
+                'response_chars': 0,
+                'context_breakdown': context_breakdown,
+                'error': str(e)
+            }
+        }
 
 
 def get_character_sheet_answer(question, scope, character_sheets, audit_context=None):

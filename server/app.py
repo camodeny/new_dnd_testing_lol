@@ -16,6 +16,7 @@ from routes.members import members_bp
 from routes.planning import planning_bp
 from routes.sessions import sessions_bp
 from routes.lootboxes import lootboxes_bp
+from routes.llm_players import llm_players_bp
 from routes.world import world_bp
 from routes.shops import shops_bp
 
@@ -23,7 +24,13 @@ load_dotenv()
 
 
 def create_app():
-    app = Flask(__name__, static_folder=None)
+    # Ensure consistent absolute instance path relative to project root
+    server_dir = os.path.dirname(os.path.abspath(__file__))
+    project_root = os.path.dirname(server_dir)
+    instance_dir = os.path.join(project_root, 'instance')
+    os.makedirs(instance_dir, exist_ok=True)
+
+    app = Flask(__name__, static_folder=None, instance_path=instance_dir)
 
     frontend_origins = os.environ.get('FRONTEND_ORIGINS', '*')
     cors_origins = '*' if frontend_origins == '*' else [
@@ -33,7 +40,8 @@ def create_app():
     ]
     CORS(app, resources={r'/api/*': {'origins': cors_origins}})
 
-    app.config['SQLALCHEMY_DATABASE_URI'] = os.environ.get('DATABASE_URL', 'sqlite:///dnd.db')
+    default_db_path = f"sqlite:///{os.path.join(instance_dir, 'dnd.db')}"
+    app.config['SQLALCHEMY_DATABASE_URI'] = os.environ.get('DATABASE_URL', default_db_path)
     app.config['SQLALCHEMY_TRACK_MODIFICATIONS'] = False
     app.config['SECRET_KEY'] = os.environ.get('SECRET_KEY', 'dev-secret-key')
     app.config['JWT_EXPIRATION_HOURS'] = int(os.environ.get('JWT_EXPIRATION_HOURS', 24))
@@ -49,6 +57,7 @@ def create_app():
     app.register_blueprint(planning_bp)
     app.register_blueprint(sessions_bp)
     app.register_blueprint(lootboxes_bp)
+    app.register_blueprint(llm_players_bp)
     app.register_blueprint(world_bp)
     app.register_blueprint(shops_bp)
 

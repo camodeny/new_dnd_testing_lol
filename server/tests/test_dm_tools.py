@@ -1354,6 +1354,40 @@ class DmToolsTest(unittest.TestCase):
         format_retry_prompt = post_chat.call_args_list[2].args[0][-1]['content']
         self.assertIn('OOC/IC mode labels', format_retry_prompt)
 
+    def test_json_contract_retry_reprompts_provider_tool_markup_with_specific_reminder(self):
+        hot_context = {
+            'protected_player_characters': [],
+            'private_output_terms': [],
+            'private_spoiler_items': [],
+        }
+        dsml = (
+            '<｜｜DSML｜｜tool_calls>\n'
+            '<｜｜DSML｜｜invoke name="search_campaign_memory">\n'
+            '</｜｜DSML｜｜invoke>\n'
+            '</｜｜DSML｜｜tool_calls>'
+        )
+
+        with patch('openrouter._post_chat_response', side_effect=[
+            {'choices': [{'message': {'content': dsml}}]},
+            {'choices': [{'message': {'content': "{\"mode\":\"speak\",\"content\":\"The Broker's instructions are clear: keep the crate sealed and deliver it intact.\"}"}}]},
+        ]) as post_chat:
+            result = get_session_dm_response_with_tools(
+                hot_context,
+                [],
+                [],
+                lambda *_args, **_kwargs: {},
+                max_tool_rounds=0,
+            )
+
+        self.assertEqual(result, {
+            'mode': 'speak',
+            'content': "The Broker's instructions are clear: keep the crate sealed and deliver it intact.",
+        })
+        self.assertEqual(post_chat.call_count, 2)
+        retry_prompt = post_chat.call_args_list[1].args[0][-1]['content']
+        self.assertIn('raw provider tool-call markup', retry_prompt)
+        self.assertIn('Do not output DSML', retry_prompt)
+
     def test_spoiler_checker_allows_safe_reply(self):
         hot_context = {
             'protected_player_characters': [],
@@ -1633,6 +1667,88 @@ class DmToolsTest(unittest.TestCase):
         self.assertEqual(clock.filled, 1)
         self.assertTrue(result['running_summary_updated'])
         self.assertEqual(self.session.running_summary, 'The party heard a warning bell at the docks.')
+
+    def test_memory_patch_logs_runs_and_changes(self):
+        from models import CampaignMemoryRun, CampaignMemoryLog
+        CampaignMemoryRun.query.delete()
+        CampaignMemoryLog.query.delete()
+        db.session.commit()
+
+        result = apply_memory_patch(
+            self.campaign,
+            self.session,
+            {
+                '_telemetry': {
+                    'prompt_chars': 1000,
+                    'prompt_tokens_estimate': 250,
+                    'response_chars': 500,
+                    'context_breakdown': {'entities': 400}
+                },
+                'running_summary': 'The party heard a warning bell at the docks.',
+                'upsert_graph_facts': [
+                    {
+                        'id': 'dock_warning_bell',
+                        'entity_ids': ['dock_ward'],
+                        'text': 'A warning bell rang in the Dock Ward.',
+                        'certainty': 'confirmed',
+                        'visibility': 'party_known',
+                        'importance': 4,
+                        'reason': 'A bell rang to warn of guards.',
+                        'memory_type': 'fact'
+                    }
+                ]
+            },
+            {
+                'trace_id': 'test_trace_123',
+                'player_message_id': 42,
+                'dm_message_id': 43
+            },
+        )
+
+        run = CampaignMemoryRun.query.one()
+        self.assertEqual(run.campaign_id, self.campaign.id)
+        self.assertEqual(run.session_id, self.session.id)
+        self.assertEqual(run.source_player_message_id, 42)
+        self.assertEqual(run.source_dm_message_id, 43)
+        self.assertEqual(run.prompt_chars, 1000)
+        self.assertEqual(run.prompt_tokens_estimate, 250)
+        self.assertEqual(run.response_chars, 500)
+
+        logs = CampaignMemoryLog.query.all()
+        self.assertEqual(len(logs), 2)
+        
+        fact_log = next(l for l in logs if l.memory_id == 'dock_warning_bell')
+        self.assertEqual(fact_log.operation, 'create')
+        self.assertEqual(fact_log.memory_type, 'fact')
+        self.assertEqual(fact_log.importance, 4)
+        self.assertEqual(fact_log.certainty, 'confirmed')
+        self.assertEqual(fact_log.reason, 'A bell rang to warn of guards.')
+        self.assertEqual(fact_log.source_player_message_id, 42)
+        self.assertEqual(fact_log.source_dm_message_id, 43)
+
+    def test_memory_patch_no_op_logging(self):
+        from models import CampaignMemoryRun, CampaignMemoryLog
+        CampaignMemoryRun.query.delete()
+        CampaignMemoryLog.query.delete()
+        db.session.commit()
+
+        result = apply_memory_patch(
+            self.campaign,
+            self.session,
+            {},
+            {
+                'trace_id': 'test_trace_noop',
+                'player_message_id': 50,
+                'dm_message_id': 51
+            },
+        )
+
+        logs = CampaignMemoryLog.query.all()
+        self.assertEqual(len(logs), 1)
+        self.assertEqual(logs[0].operation, 'no-op')
+        self.assertEqual(logs[0].status, 'no_op')
+        self.assertEqual(logs[0].source_player_message_id, 50)
+        self.assertEqual(logs[0].source_dm_message_id, 51)
 
     def test_memory_patch_embedding_dedupe_updates_similar_entity(self):
         world = CampaignWorld.query.filter_by(campaign_id=self.campaign.id).first()

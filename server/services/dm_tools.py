@@ -2243,8 +2243,103 @@ def _update_npc_actor(campaign, patch):
 
 
 def apply_memory_patch(campaign, session, patch, audit_context=None):
+    from models import CampaignMemoryRun, CampaignMemoryLog, CampaignClock, NPCActor, db
+    import uuid
+
     audit_context = audit_context or {}
     patch = patch if isinstance(patch, dict) else {}
+    telemetry = patch.pop('_telemetry', None)
+
+    # Initialize memory run ID and turn ID tracking
+    memory_run_id = audit_context.get('memory_run_id') or f"memrun_{uuid.uuid4().hex[:12]}"
+    trace_id = audit_context.get('trace_id')
+    player_message_id = audit_context.get('source_player_message_id') or audit_context.get('player_message_id')
+    dm_message_id = audit_context.get('source_dm_message_id') or audit_context.get('dm_message_id')
+
+    turn_id = audit_context.get('turn_id')
+    if not turn_id and session:
+        turn_id = f"session_{session.id}_msg_{player_message_id or 'none'}"
+
+    # Extract telemetry
+    prompt_chars = None
+    prompt_tokens_estimate = None
+    response_chars = None
+    context_breakdown = None
+    if telemetry:
+        prompt_chars = telemetry.get('prompt_chars')
+        prompt_tokens_estimate = telemetry.get('prompt_tokens_estimate')
+        response_chars = telemetry.get('response_chars')
+        context_breakdown = telemetry.get('context_breakdown')
+
+    # Record the overall memory run context
+    run_record = CampaignMemoryRun(
+        memory_run_id=memory_run_id,
+        campaign_id=campaign.id,
+        session_id=session.id if session else None,
+        source_player_message_id=player_message_id,
+        source_dm_message_id=dm_message_id,
+        trace_id=trace_id,
+        prompt_chars=prompt_chars,
+        prompt_tokens_estimate=prompt_tokens_estimate,
+        response_chars=response_chars,
+        context_breakdown_json=context_breakdown
+    )
+    db.session.add(run_record)
+
+    logs_written = 0
+
+    def log_change(memory_id, target_table, target_id, operation, status='applied',
+                   memory_type=None, visibility=None, certainty=None, importance=None,
+                   reason=None, expires_or_retire_condition=None,
+                   before_json=None, after_json=None, patch_json=None, error=None):
+        nonlocal logs_written
+        # Normalize certainty
+        cert_val = certainty
+        if cert_val not in ('confirmed', 'suspected', 'inferred', 'false', 'retconned'):
+            if cert_val == 'false_rumor':
+                cert_val = 'false'
+            else:
+                cert_val = 'confirmed'
+
+        # Normalize importance
+        imp_val = 3
+        if importance is not None:
+            try:
+                imp_val = int(importance)
+                if imp_val < 1:
+                    imp_val = 1
+                elif imp_val > 5:
+                    imp_val = 5
+            except (ValueError, TypeError):
+                pass
+
+        log_entry = CampaignMemoryLog(
+            campaign_id=campaign.id,
+            session_id=session.id if session else None,
+            memory_run_id=memory_run_id,
+            trace_id=trace_id,
+            turn_id=turn_id,
+            source_player_message_id=player_message_id,
+            source_dm_message_id=dm_message_id,
+            memory_id=memory_id,
+            target_table=target_table,
+            target_id=target_id,
+            operation=operation,
+            status=status,
+            memory_type=memory_type or 'fact',
+            visibility=visibility or 'dm_private',
+            certainty=cert_val,
+            importance=imp_val,
+            reason=reason,
+            expires_or_retire_condition=expires_or_retire_condition,
+            before_json=before_json,
+            after_json=after_json,
+            patch_json=patch_json,
+            error=error
+        )
+        db.session.add(log_entry)
+        logs_written += 1
+
     world, graph, world_state, _private = _world_json(campaign)
     result = {
         'graph_changes': [],
@@ -2253,6 +2348,14 @@ def apply_memory_patch(campaign, session, patch, audit_context=None):
         'world_event_ids': [],
         'running_summary_updated': False,
     }
+
+    before_entities = {}
+    before_relations = {}
+    before_facts = {}
+    if graph:
+        before_entities = {e.get('id'): dict(e) for e in graph.get('entities', []) if isinstance(e, dict) and e.get('id')}
+        before_relations = {r.get('id'): dict(r) for r in graph.get('relations', []) if isinstance(r, dict) and r.get('id')}
+        before_facts = {f.get('id'): dict(f) for f in graph.get('facts', []) if isinstance(f, dict) and f.get('id')}
 
     if world:
         entity_id_remaps = {}
@@ -2266,6 +2369,17 @@ def apply_memory_patch(campaign, session, patch, audit_context=None):
             items = patch.get(key) if isinstance(patch.get(key), list) else []
             for index, item in enumerate(items):
                 item = _apply_entity_id_remaps(kind, item, entity_id_remaps)
+                item_id = item.get('id')
+
+                # Fetch before snapshot
+                before_val = None
+                if kind == 'entity':
+                    before_val = before_entities.get(item_id)
+                elif kind == 'relation':
+                    before_val = before_relations.get(item_id)
+                elif kind == 'fact':
+                    before_val = before_facts.get(item_id)
+
                 item, action, embedding_dedupe = _upsert_graph_item(
                     campaign,
                     kind,
@@ -2280,6 +2394,37 @@ def apply_memory_patch(campaign, session, patch, audit_context=None):
                     'id': item.get('id'),
                     'embedding_dedupe': embedding_dedupe,
                 })
+
+                # Fetch after snapshot
+                after_val = next((x for x in graph[plural] if x.get('id') == item.get('id')), None)
+
+                # Determine memory type
+                mtype = kind
+                if kind == 'entity':
+                    if item.get('type') == 'location':
+                        mtype = 'location'
+                    elif item.get('type') == 'npc':
+                        mtype = 'npc'
+                    else:
+                        mtype = item.get('memory_type') or 'fact'
+
+                log_change(
+                    memory_id=item.get('id'),
+                    target_table='campaign_worlds',
+                    target_id=str(world.id),
+                    operation='update' if action == 'updated' else 'create',
+                    status='applied',
+                    memory_type=mtype,
+                    visibility=item.get('visibility'),
+                    certainty=item.get('certainty'),
+                    importance=item.get('importance'),
+                    reason=item.get('reason'),
+                    expires_or_retire_condition=item.get('expires_or_retire_condition'),
+                    before_json=before_val,
+                    after_json=after_val,
+                    patch_json=item
+                )
+
                 if (
                     kind == 'entity'
                     and embedding_dedupe.get('dedupe_match_id')
@@ -2290,10 +2435,27 @@ def apply_memory_patch(campaign, session, patch, audit_context=None):
         scene_patch = patch.get('scene_patch') if isinstance(patch.get('scene_patch'), dict) else {}
         if scene_patch:
             current_scene = world_state.get('current_scene', {}) if isinstance(world_state, dict) else {}
+            before_scene = dict(current_scene)
             current_scene.update(scene_patch)
             world_state['current_scene'] = current_scene
             event = _record_event(campaign, 'scene_updated', patch.get('scene_reason') or 'Scene updated by memory writer.', {'scene_patch': scene_patch})
             result['world_event_ids'].append(event.id)
+
+            log_change(
+                memory_id='current_scene',
+                target_table='campaign_worlds',
+                target_id=str(world.id),
+                operation='update',
+                status='applied',
+                memory_type='location',
+                visibility='party_known',
+                certainty='confirmed',
+                importance=3,
+                reason=patch.get('scene_reason') or 'Scene transition/patch',
+                before_json={'current_scene': before_scene},
+                after_json={'current_scene': current_scene},
+                patch_json={'scene_patch': scene_patch}
+            )
 
         world.knowledge_graph = json_dumps(graph)
         world.world_state = json_dumps(world_state)
@@ -2302,20 +2464,94 @@ def apply_memory_patch(campaign, session, patch, audit_context=None):
             upsert_memory_embedding(campaign, 'world_state', 'current', world_state, audit_context=audit_context)
 
     for item in patch.get('create_clocks', []) if isinstance(patch.get('create_clocks'), list) else []:
+        clock_id = clean_id(item.get('id') or item.get('clock_id'), '')
+        existing = CampaignClock.query.filter_by(campaign_id=campaign.id, clock_id=clock_id).first() if clock_id else None
+        before_val = existing.to_dict(include_private=True) if existing else None
+
         change = _create_clock_from_patch(campaign, item)
         result['clock_changes'].append(change)
         if change.get('event_id'):
             result['world_event_ids'].append(change['event_id'])
+
+        after_val = change.get('clock')
+        action = change.get('action')
+
+        log_change(
+            memory_id=clock_id,
+            target_table='campaign_clocks',
+            target_id=str(after_val.get('id')) if after_val else None,
+            operation='update' if action == 'updated' else 'create',
+            status='applied',
+            memory_type='clock',
+            visibility=item.get('visibility') or (after_val.get('visibility') if after_val else None),
+            certainty=item.get('certainty'),
+            importance=item.get('importance'),
+            reason=item.get('reason'),
+            expires_or_retire_condition=item.get('expires_or_retire_condition'),
+            before_json=before_val,
+            after_json=after_val,
+            patch_json=item
+        )
+
     for item in patch.get('retire_clocks', []) if isinstance(patch.get('retire_clocks'), list) else []:
+        clock_id = clean_id(item.get('clock_id') or item.get('id'), '')
+        existing = CampaignClock.query.filter_by(campaign_id=campaign.id, clock_id=clock_id).first() if clock_id else None
+        before_val = existing.to_dict(include_private=True) if existing else None
+
         change = _retire_clock_from_patch(campaign, item)
         result['clock_changes'].append(change)
         if change.get('event_id'):
             result['world_event_ids'].append(change['event_id'])
+
+        after_val = change.get('clock')
+
+        log_change(
+            memory_id=clock_id,
+            target_table='campaign_clocks',
+            target_id=str(after_val.get('id')) if after_val else None,
+            operation='retire',
+            status='applied',
+            memory_type='clock',
+            visibility=item.get('visibility') or (after_val.get('visibility') if after_val else None),
+            certainty=item.get('certainty'),
+            importance=item.get('importance'),
+            reason=item.get('reason'),
+            expires_or_retire_condition=item.get('expires_or_retire_condition'),
+            before_json=before_val,
+            after_json=after_val,
+            patch_json=item
+        )
+
     for item in patch.get('update_npc_actors', []) if isinstance(patch.get('update_npc_actors'), list) else []:
+        actor_id = clean_id(item.get('id') or item.get('actor_id'), '')
+        existing = NPCActor.query.filter_by(campaign_id=campaign.id, actor_id=actor_id).first() if actor_id else None
+        before_val = existing.to_dict(include_private=True) if existing else None
+
         change = _update_npc_actor(campaign, item)
         result['npc_changes'].append(change)
         if change.get('event_id'):
             result['world_event_ids'].append(change['event_id'])
+
+        after_val = change.get('npc_actor')
+        action = change.get('action')
+
+        log_change(
+            memory_id=actor_id,
+            target_table='npc_actors',
+            target_id=str(after_val.get('id')) if after_val else None,
+            operation='update' if action == 'updated' else 'create',
+            status='applied',
+            memory_type='npc',
+            visibility=item.get('visibility') or (after_val.get('visibility') if after_val else None),
+            certainty=item.get('certainty'),
+            importance=item.get('importance'),
+            reason=item.get('reason'),
+            expires_or_retire_condition=item.get('expires_or_retire_condition'),
+            before_json=before_val,
+            after_json=after_val,
+            patch_json=item
+        )
+
     for event_patch in patch.get('record_events', []) if isinstance(patch.get('record_events'), list) else []:
         event = _record_event(
             campaign,
@@ -2326,10 +2562,63 @@ def apply_memory_patch(campaign, session, patch, audit_context=None):
         )
         result['world_event_ids'].append(event.id)
 
+        log_change(
+            memory_id=f"event_{event.id}",
+            target_table='world_events',
+            target_id=str(event.id),
+            operation='create',
+            status='applied',
+            memory_type='fact',
+            visibility=event_patch.get('visibility'),
+            certainty=event_patch.get('certainty'),
+            importance=event_patch.get('importance'),
+            reason=event_patch.get('reason'),
+            expires_or_retire_condition=event_patch.get('expires_or_retire_condition'),
+            before_json=None,
+            after_json=event.to_dict(include_private=True),
+            patch_json=event_patch
+        )
+
     summary = clean_text(patch.get('running_summary'), 4000)
     if summary:
-        session.running_summary = summary
+        before_summary = session.running_summary if session else None
+        if session:
+            session.running_summary = summary
         result['running_summary_updated'] = True
+
+        log_change(
+            memory_id='running_summary',
+            target_table='campaign_sessions',
+            target_id=str(session.id) if session else None,
+            operation='update',
+            status='applied',
+            memory_type='fact',
+            visibility='dm_private',
+            certainty='confirmed',
+            importance=4,
+            reason='Running summary revised by LLM memory pass',
+            before_json={'running_summary': before_summary},
+            after_json={'running_summary': summary},
+            patch_json={'running_summary': summary}
+        )
+
+    # Log fallback no-op if no logs were written
+    if logs_written == 0:
+        log_change(
+            memory_id=None,
+            target_table=None,
+            target_id=None,
+            operation='no-op',
+            status='no_op',
+            memory_type=None,
+            visibility=None,
+            certainty=None,
+            importance=None,
+            reason='No memory write operations were requested or applied by the memory writer.',
+            before_json=None,
+            after_json=None,
+            patch_json=None
+        )
 
     log_audit_event(
         campaign.id,
@@ -2338,7 +2627,7 @@ def apply_memory_patch(campaign, session, patch, audit_context=None):
         {'session_id': session.id, 'patch': patch, 'result': result},
         source='dm_tools.memory',
         actor='session_memory_writer',
-        trace_id=audit_context.get('trace_id'),
+        trace_id=trace_id,
         parent_trace_id=audit_context.get('parent_trace_id'),
         trace_label=audit_context.get('trace_label'),
         audit_role='tools',

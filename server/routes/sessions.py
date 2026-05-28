@@ -5,7 +5,7 @@ import queue
 
 from flask import Blueprint, current_app, jsonify, request
 
-from auth import token_required
+from auth import authenticate_request, token_required
 from models import db, Campaign, CampaignSession, SessionMessage, SheetProposal, Character, User
 from openrouter import (
     get_opening_scene_response,
@@ -84,7 +84,10 @@ def _run_session_memory_update(
     ai_text,
     hot_context,
     parent_trace_id,
+    dm_message_id=None,
 ):
+    from uuid import uuid4
+    memory_run_id = f"memrun_{uuid4().hex[:12]}"
     memory_trace_id = f'session_memory_writer:session_{session_id}:message_{player_message_id}'
     trace_label = f'session_memory_writer: session {session_id}'
     try:
@@ -111,6 +114,7 @@ def _run_session_memory_update(
                 'trace_id': memory_trace_id,
                 'parent_trace_id': parent_trace_id,
                 'trace_label': trace_label,
+                'memory_run_id': memory_run_id,
             },
         )
         if memory_patch:
@@ -122,6 +126,9 @@ def _run_session_memory_update(
                     'trace_id': memory_trace_id,
                     'parent_trace_id': parent_trace_id,
                     'trace_label': trace_label,
+                    'memory_run_id': memory_run_id,
+                    'source_player_message_id': player_message_id,
+                    'source_dm_message_id': dm_message_id,
                 },
             )
         db.session.commit()
@@ -151,6 +158,7 @@ def _schedule_session_memory_update(
     ai_text,
     hot_context,
     parent_trace_id,
+    dm_message_id=None,
 ):
     app = current_app._get_current_object()
 
@@ -166,6 +174,7 @@ def _schedule_session_memory_update(
                     ai_text,
                     hot_context,
                     parent_trace_id,
+                    dm_message_id=dm_message_id,
                 )
             finally:
                 db.session.remove()
@@ -184,6 +193,7 @@ def _schedule_session_memory_update(
             ai_text,
             hot_context,
             parent_trace_id,
+            dm_message_id=dm_message_id,
         )
         return
 
@@ -489,6 +499,7 @@ def send_message(current_user, session_id):
                 ai_text,
                 hot_context,
                 trace_id,
+                dm_message_id=ai_msg.id,
             )
         elif ai_turn.get('mode') == 'silent':
             log_audit_event(
@@ -548,24 +559,14 @@ def send_message(current_user, session_id):
 
 @sessions_bp.route('/api/sessions/<int:session_id>/stream', methods=['GET'])
 def stream_session(session_id):
-    # Retrieve token from query params since EventSource doesn't support headers natively
     token_str = request.args.get('token')
-    if not token_str:
+    api_key = request.args.get('api_key')
+    if not token_str and not api_key:
         return jsonify({'error': 'Unauthorized'}), 401
 
-    import jwt
-    try:
-        data = jwt.decode(token_str, current_app.config['SECRET_KEY'], algorithms=['HS256'])
-        token_user_id = data.get('user_id')
-    except Exception:
-        return jsonify({'error': 'Unauthorized'}), 401
-
-    if not token_user_id:
-        return jsonify({'error': 'Unauthorized'}), 401
-
-    current_user = db.session.get(User, token_user_id)
-    if not current_user:
-        return jsonify({'error': 'Unauthorized'}), 401
+    current_user, error_response = authenticate_request(token=token_str, api_key=api_key)
+    if error_response is not None:
+        return error_response
 
     session = get_or_404(CampaignSession, session_id)
     campaign = db.session.get(Campaign, session.campaign_id)

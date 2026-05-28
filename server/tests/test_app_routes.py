@@ -22,10 +22,12 @@ from models import (
     CampaignAuditEvent,
     CampaignInvite,
     CampaignMember,
+    CampaignSession,
     CampaignWorld,
     Character,
     EncounterMap,
     EncounterMapPlacement,
+    LLMPlayer,
     PlanningBondProposal,
     User,
 )
@@ -219,6 +221,215 @@ class AppRouteTest(unittest.TestCase):
         self.assertEqual(outsider_image.status_code, 403)
         self.assertEqual(owner_labeled_image.status_code, 200)
         self.assertEqual(outsider_labeled_image.status_code, 403)
+
+    def test_owner_can_create_llm_player_and_use_api_key_for_session_messages(self):
+        with app.app_context():
+            owner = User(username='owner-llm', email='owner-llm@example.com')
+            owner.set_password('password')
+            db.session.add(owner)
+            db.session.commit()
+
+            campaign = Campaign(name='LLM Table', user_id=owner.id)
+            db.session.add(campaign)
+            db.session.commit()
+
+            owner_member = CampaignMember(campaign_id=campaign.id, user_id=owner.id, role='player')
+            db.session.add(owner_member)
+
+            session = CampaignSession(campaign_id=campaign.id, is_active=True)
+            db.session.add(session)
+            db.session.commit()
+
+            campaign_id = campaign.id
+            session_id = session.id
+            owner_token = generate_token(owner.id)
+
+        create_response = self.client.post(
+            f'/api/campaigns/{campaign_id}/llm-players',
+            headers={'Authorization': f'Bearer {owner_token}'},
+            json={},
+        )
+
+        self.assertEqual(create_response.status_code, 201)
+        create_data = create_response.get_json()
+        self.assertTrue(create_data['api_key'].startswith('dndllm_'))
+        self.assertEqual(create_data['member']['campaign_id'], campaign_id)
+        self.assertTrue(create_data['member']['is_character_ready'])
+        self.assertTrue(create_data['member']['is_llm_player'])
+        self.assertEqual(create_data['character']['campaign_id'], campaign_id)
+
+        llm_api_key = create_data['api_key']
+        llm_label = create_data['llm_player']['label']
+
+        with app.app_context():
+            llm_player = LLMPlayer.query.filter_by(campaign_id=campaign_id).first()
+            self.assertIsNotNone(llm_player)
+            self.assertEqual(llm_player.label, llm_label)
+
+        me_response = self.client.get(
+            '/api/me',
+            headers={'X-API-Key': llm_api_key},
+        )
+        self.assertEqual(me_response.status_code, 200)
+        self.assertEqual(me_response.get_json()['user']['llm_player']['label'], llm_label)
+
+        with patch('routes.sessions.get_session_dm_response_with_tools', return_value={'mode': 'silent', 'reason': 'No reply'}):
+            message_response = self.client.post(
+                f'/api/sessions/{session_id}/messages',
+                headers={'X-API-Key': llm_api_key},
+                json={'content': '"I take the lantern and check the door."', 'role': 'player'},
+            )
+
+        self.assertEqual(message_response.status_code, 201)
+        message_data = message_response.get_json()['messages']
+        self.assertEqual(len(message_data), 1)
+        self.assertEqual(message_data[0]['username'], llm_label)
+        self.assertEqual(message_data[0]['role'], 'player')
+
+    def test_owner_can_rotate_llm_player_key(self):
+        with app.app_context():
+            owner = User(username='owner-rotate', email='owner-rotate@example.com')
+            owner.set_password('password')
+            db.session.add(owner)
+            db.session.commit()
+
+            campaign = Campaign(name='Rotate Campaign', user_id=owner.id)
+            db.session.add(campaign)
+            db.session.commit()
+            db.session.add(CampaignMember(campaign_id=campaign.id, user_id=owner.id, role='player'))
+            db.session.commit()
+
+            campaign_id = campaign.id
+            owner_token = generate_token(owner.id)
+
+        create_response = self.client.post(
+            f'/api/campaigns/{campaign_id}/llm-players',
+            headers={'Authorization': f'Bearer {owner_token}'},
+            json={},
+        )
+        self.assertEqual(create_response.status_code, 201)
+        create_data = create_response.get_json()
+        old_key = create_data['api_key']
+        llm_player_id = create_data['llm_player']['id']
+
+        rotate_response = self.client.post(
+            f'/api/campaigns/{campaign_id}/llm-players/{llm_player_id}/rotate-key',
+            headers={'Authorization': f'Bearer {owner_token}'},
+        )
+        self.assertEqual(rotate_response.status_code, 200)
+        rotate_data = rotate_response.get_json()
+        new_key = rotate_data['api_key']
+
+        self.assertTrue(new_key.startswith('dndllm_'))
+        self.assertNotEqual(new_key, old_key)
+        self.assertEqual(rotate_data['llm_player']['id'], llm_player_id)
+
+        old_me_response = self.client.get('/api/me', headers={'X-API-Key': old_key})
+        self.assertEqual(old_me_response.status_code, 401)
+
+        new_me_response = self.client.get('/api/me', headers={'X-API-Key': new_key})
+        self.assertEqual(new_me_response.status_code, 200)
+        self.assertEqual(
+            new_me_response.get_json()['user']['llm_player']['id'],
+            llm_player_id,
+        )
+
+    def test_owner_can_assign_existing_llm_player_to_another_campaign(self):
+        with app.app_context():
+            owner = User(username='owner-assign', email='owner-assign@example.com')
+            owner.set_password('password')
+            db.session.add(owner)
+            db.session.commit()
+
+            campaign_one = Campaign(name='Campaign One', user_id=owner.id)
+            campaign_two = Campaign(name='Campaign Two', user_id=owner.id)
+            db.session.add_all([campaign_one, campaign_two])
+            db.session.commit()
+            db.session.add_all([
+                CampaignMember(campaign_id=campaign_one.id, user_id=owner.id, role='player'),
+                CampaignMember(campaign_id=campaign_two.id, user_id=owner.id, role='player'),
+            ])
+            db.session.commit()
+
+            owner_token = generate_token(owner.id)
+            campaign_one_id = campaign_one.id
+            campaign_two_id = campaign_two.id
+
+        create_response = self.client.post(
+            f'/api/campaigns/{campaign_one_id}/llm-players',
+            headers={'Authorization': f'Bearer {owner_token}'},
+            json={},
+        )
+        self.assertEqual(create_response.status_code, 201)
+        llm_player_id = create_response.get_json()['llm_player']['id']
+
+        list_response = self.client.get(
+            f'/api/campaigns/{campaign_two_id}/llm-players',
+            headers={'Authorization': f'Bearer {owner_token}'},
+        )
+        self.assertEqual(list_response.status_code, 200)
+        list_data = list_response.get_json()
+        self.assertEqual(list_data['llm_players'], [])
+        self.assertEqual(len(list_data['available_llm_players']), 1)
+        self.assertEqual(list_data['available_llm_players'][0]['llm_player']['id'], llm_player_id)
+
+        assign_response = self.client.post(
+            f'/api/campaigns/{campaign_two_id}/llm-players/assign',
+            headers={'Authorization': f'Bearer {owner_token}'},
+            json={'llm_player_id': llm_player_id},
+        )
+        self.assertEqual(assign_response.status_code, 200)
+        assign_data = assign_response.get_json()
+        self.assertEqual(assign_data['llm_player']['campaign_id'], campaign_two_id)
+        self.assertEqual(assign_data['member']['campaign_id'], campaign_two_id)
+        self.assertEqual(assign_data['character']['campaign_id'], campaign_two_id)
+
+        with app.app_context():
+            llm_player = db.session.get(LLMPlayer, llm_player_id)
+            self.assertEqual(llm_player.campaign_id, campaign_two_id)
+
+    def test_owner_can_delete_llm_player(self):
+        with app.app_context():
+            owner = User(username='owner-delete', email='owner-delete@example.com')
+            owner.set_password('password')
+            db.session.add(owner)
+            db.session.commit()
+
+            campaign = Campaign(name='Delete Campaign', user_id=owner.id)
+            db.session.add(campaign)
+            db.session.commit()
+            db.session.add(CampaignMember(campaign_id=campaign.id, user_id=owner.id, role='player'))
+            db.session.commit()
+
+            campaign_id = campaign.id
+            owner_token = generate_token(owner.id)
+
+        create_response = self.client.post(
+            f'/api/campaigns/{campaign_id}/llm-players',
+            headers={'Authorization': f'Bearer {owner_token}'},
+            json={},
+        )
+        self.assertEqual(create_response.status_code, 201)
+        create_data = create_response.get_json()
+        llm_player_id = create_data['llm_player']['id']
+        llm_user_id = create_data['llm_player']['user_id']
+        character_id = create_data['character']['id']
+        api_key = create_data['api_key']
+
+        delete_response = self.client.delete(
+            f'/api/campaigns/{campaign_id}/llm-players/{llm_player_id}',
+            headers={'Authorization': f'Bearer {owner_token}'},
+        )
+        self.assertEqual(delete_response.status_code, 200)
+        self.assertEqual(delete_response.get_json()['message'], 'LLM player deleted')
+
+        me_response = self.client.get('/api/me', headers={'X-API-Key': api_key})
+        self.assertEqual(me_response.status_code, 401)
+
+        with app.app_context():
+            self.assertIsNone(db.session.get(LLMPlayer, llm_player_id))
+            self.assertIsNone(Character.query.filter_by(id=character_id).first())
+            self.assertIsNone(CampaignMember.query.filter_by(campaign_id=campaign_id, user_id=llm_user_id).first())
 
     def test_human_users_do_not_have_map_placement_routes(self):
         with app.app_context():
@@ -1170,6 +1381,69 @@ class AppRouteTest(unittest.TestCase):
         )
         self.assertEqual(response.status_code, 404)
         self.assertEqual(response.get_json()['error'], 'Invalid invite code')
+
+
+    def test_export_campaign_includes_memory_runs_and_logs(self):
+        import io
+        import zipfile
+        from models import CampaignMemoryRun, CampaignMemoryLog
+
+        with app.app_context():
+            owner = User.query.filter_by(username='export_owner').first()
+            if not owner:
+                owner = User(username='export_owner', email='export_owner@example.com')
+                owner.set_password('password')
+                db.session.add(owner)
+                db.session.commit()
+            
+            campaign = Campaign(name='Export test campaign', user_id=owner.id)
+            db.session.add(campaign)
+            db.session.commit()
+
+            run = CampaignMemoryRun(
+                memory_run_id='run_export_1',
+                campaign_id=campaign.id,
+                prompt_chars=100
+            )
+            log = CampaignMemoryLog(
+                memory_run_id='run_export_1',
+                campaign_id=campaign.id,
+                operation='create',
+                memory_type='fact'
+            )
+            db.session.add_all([run, log])
+            db.session.commit()
+
+            campaign_id = campaign.id
+            token = generate_token(owner.id)
+
+        response = self.client.get(
+            f'/api/campaigns/{campaign_id}/export',
+            headers={'Authorization': f'Bearer {token}'},
+        )
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.content_type, 'application/zip')
+
+        zip_data = io.BytesIO(response.data)
+        with zipfile.ZipFile(zip_data, 'r') as zf:
+            file_list = zf.namelist()
+            self.assertIn('memory_runs.json', file_list)
+            self.assertIn('memory_logs.json', file_list)
+            self.assertIn('manifest.json', file_list)
+
+            runs_content = json.loads(zf.read('memory_runs.json').decode('utf-8'))
+            self.assertEqual(len(runs_content), 1)
+            self.assertEqual(runs_content[0]['memory_run_id'], 'run_export_1')
+            self.assertEqual(runs_content[0]['prompt_chars'], 100)
+
+            logs_content = json.loads(zf.read('memory_logs.json').decode('utf-8'))
+            self.assertEqual(len(logs_content), 1)
+            self.assertEqual(logs_content[0]['memory_run_id'], 'run_export_1')
+            self.assertEqual(logs_content[0]['operation'], 'create')
+
+            manifest = json.loads(zf.read('manifest.json').decode('utf-8'))
+            self.assertIn('memory_runs.json', manifest['files'])
+            self.assertIn('memory_logs.json', manifest['files'])
 
 
 if __name__ == '__main__':

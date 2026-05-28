@@ -7,6 +7,7 @@ import {
   updateCampaign,
   removeMember,
 } from '../../api/client'
+import LlmPlayerManager from './LlmPlayerManager'
 
 function getInitials(name) {
   if (!name) return '?'
@@ -39,6 +40,8 @@ export default function CampaignLobby({
   campaign,
   currentUser,
   onBegin,
+  showLlmTools = false,
+  onLlmPlayerAdded,
 }) {
   const navigate = useNavigate()
   const [members, setMembers] = useState([])
@@ -328,6 +331,13 @@ export default function CampaignLobby({
               </div>
             </div>
           )}
+
+          <LlmPlayerManager
+            campaignId={campaign.id}
+            enabled={showLlmTools}
+            isOwner={isOwner}
+            onAdded={onLlmPlayerAdded}
+          />
 
           <div className="lobby-footer">
             {allSlotsFilled ? (

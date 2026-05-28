@@ -1,7 +1,7 @@
 import { useEffect, useState, useCallback, useMemo, useRef } from 'react'
-import { useParams, useNavigate } from 'react-router-dom'
+import { useParams, useNavigate, useSearchParams } from 'react-router-dom'
 import {
-  getCampaign, updateCampaign, deleteCampaign, getCampaignCharacters,
+  getCampaign, updateCampaign, deleteCampaign, exportCampaign, getCampaignCharacters,
   startSession, endSession, getSession, getMessages, sendMessage,
   getCharacters,
   addCampaignCharacter,
@@ -23,6 +23,7 @@ import CampaignShops from '../components/shop/CampaignShops'
 import CharacterPlanningMode from '../components/dashboard/CharacterPlanningMode'
 import EncounterMapPanel from '../components/dashboard/EncounterMapPanel'
 import WorldBuildingMode from '../components/dashboard/WorldBuildingMode'
+import LlmPlayerManager from '../components/dashboard/LlmPlayerManager'
 
 const SESSION_MESSAGE_PAGE_SIZE = 50
 
@@ -165,6 +166,7 @@ async function fetchCampaignPageData(id) {
 export default function CampaignViewPage({ user }) {
   const { id } = useParams()
   const navigate = useNavigate()
+  const [searchParams] = useSearchParams()
   const [campaign, setCampaign] = useState(null)
   const [characters, setCharacters] = useState([])
   const [loading, setLoading] = useState(true)
@@ -177,6 +179,7 @@ export default function CampaignViewPage({ user }) {
   const [campaignName, setCampaignName] = useState('')
   const [campaignDesc, setCampaignDesc] = useState('')
   const [deletingCampaign, setDeletingCampaign] = useState(false)
+  const [exportingCampaign, setExportingCampaign] = useState(false)
   const [showLobby, setShowLobby] = useState(false)
   const [showPlanning, setShowPlanning] = useState(false)
   const [showWorldBuilding, setShowWorldBuilding] = useState(false)
@@ -207,6 +210,7 @@ export default function CampaignViewPage({ user }) {
       return false
     }
   }, [campaign?.settings?.encounter_active, encounterMap])
+  const showLlmTools = searchParams.get('llm') === 'true'
 
   const hasPlacements = useMemo(() => {
     return Boolean(encounterMap?.placements && encounterMap.placements.length > 0)
@@ -581,6 +585,27 @@ export default function CampaignViewPage({ user }) {
     }
   }
 
+  const handleExportCampaign = async () => {
+    if (!campaign) return
+    setExportingCampaign(true)
+    setError('')
+    try {
+      const blob = await exportCampaign(id)
+      const url = URL.createObjectURL(blob)
+      const a = document.createElement('a')
+      a.href = url
+      a.download = `${campaign.name.replace(/[^\w\-]/g, '_')}_export.zip`
+      document.body.appendChild(a)
+      a.click()
+      document.body.removeChild(a)
+      URL.revokeObjectURL(url)
+    } catch (err) {
+      setError(err.message || 'Export failed.')
+    } finally {
+      setExportingCampaign(false)
+    }
+  }
+
   const openImport = async () => {
     setShowImport(true)
     setImportLoading(true)
@@ -715,40 +740,71 @@ export default function CampaignViewPage({ user }) {
     setShowWorldBuilding(false)
   }
 
+  const handleLlmPlayerAdded = () => {
+    loadData()
+  }
+
   if (loading) return <Loading />
   if (error && !campaign) return <ErrorMessage message={error} />
   if (!campaign) return <ErrorMessage message="Campaign not found." />
 
+  const isOwner = campaign.user_id === user?.id
+
+  const exportBtn = isOwner && (
+    <button
+      id="export-campaign-btn"
+      className="btn btn-secondary campaign-export-fab"
+      onClick={handleExportCampaign}
+      disabled={exportingCampaign}
+      title="Export campaign data as ZIP"
+    >
+      <i className="bi bi-download"></i>
+      {exportingCampaign ? 'Exporting…' : 'Export'}
+    </button>
+  )
+
   if (showLobby) {
     return (
-      <CampaignLobby
-        campaign={campaign}
-        currentUser={user}
-        onBegin={handleBeginAdventure}
-      />
+      <>
+        <CampaignLobby
+          campaign={campaign}
+          currentUser={user}
+          onBegin={handleBeginAdventure}
+          showLlmTools={showLlmTools}
+          onLlmPlayerAdded={handleLlmPlayerAdded}
+        />
+        {exportBtn}
+      </>
     )
   }
 
   if (showPlanning && !session) {
     return (
-      <CharacterPlanningMode
-        campaign={campaign}
-        currentUser={user}
-        onComplete={loadData}
-      />
+      <>
+        <CharacterPlanningMode
+          campaign={campaign}
+          currentUser={user}
+          onComplete={loadData}
+          showLlmTools={showLlmTools}
+          onLlmPlayerAdded={handleLlmPlayerAdded}
+        />
+        {exportBtn}
+      </>
     )
   }
 
   if (showWorldBuilding && !session) {
     return (
-      <WorldBuildingMode
-        campaign={campaign}
-        onBegin={handleStartSession}
-        onBack={() => navigate('/')}
-      />
+      <>
+        <WorldBuildingMode
+          campaign={campaign}
+          onBegin={handleStartSession}
+          onBack={() => navigate('/')}
+        />
+        {exportBtn}
+      </>
     )
   }
-  const isOwner = campaign.user_id === user?.id
   const hasActiveMap = isEncounterActive || Boolean(encounterMap)
 
   return (
@@ -794,9 +850,16 @@ export default function CampaignViewPage({ user }) {
         </main>
 
         <aside className="dashboard-right">
+          <LlmPlayerManager
+            campaignId={id}
+            enabled={showLlmTools}
+            isOwner={isOwner}
+            onAdded={handleLlmPlayerAdded}
+          />
           <LootBoxStash campaignId={id} isOwner={isOwner} characters={characters} onLootBoxOpened={handleLootBoxOpened} />
         </aside>
       </div>
+      {exportBtn}
 
       {showSettings && (
         <div className="modal-overlay" onClick={() => setShowSettings(false)}>
@@ -816,6 +879,17 @@ export default function CampaignViewPage({ user }) {
               </div>
               <div className="form-actions-compact">
                 <button className="btn btn-secondary" onClick={() => setShowSettings(false)}>Cancel</button>
+                {isOwner && (
+                  <button
+                    className="btn btn-secondary"
+                    onClick={handleExportCampaign}
+                    disabled={exportingCampaign}
+                    title="Download all campaign data as a ZIP archive"
+                  >
+                    <i className="bi bi-download"></i>
+                    {exportingCampaign ? 'Exporting...' : 'Export'}
+                  </button>
+                )}
                 <button className="btn btn-primary" onClick={handleUpdateSettings}>Save</button>
               </div>
               {isOwner && (

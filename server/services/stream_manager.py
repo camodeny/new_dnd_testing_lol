@@ -308,6 +308,7 @@ class SessionGeneratorWorker:
                 ai_text,
                 hot_context,
                 trace_id,
+                dm_message_id=ai_msg.id,
             )
             return
         elif ai_turn.get('mode') == 'silent':

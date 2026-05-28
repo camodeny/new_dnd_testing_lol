@@ -1,0 +1,234 @@
+import { useEffect, useState } from 'react'
+import { assignLlmPlayer, createLlmPlayer, deleteLlmPlayer, listLlmPlayers, rotateLlmPlayerKey } from '../../api/client'
+
+function classSummary(character) {
+  if (!character) return 'No character assigned'
+  if (character.classes?.length) {
+    return character.classes.map((c) => `${c.class_name} ${c.level}`).join(', ')
+  }
+  return `Level ${character.total_level ?? 1}`
+}
+
+export default function LlmPlayerManager({ campaignId, enabled, isOwner, onAdded }) {
+  const [llmPlayers, setLlmPlayers] = useState([])
+  const [availableLlmPlayers, setAvailableLlmPlayers] = useState([])
+  const [loading, setLoading] = useState(false)
+  const [creating, setCreating] = useState(false)
+  const [rotatingId, setRotatingId] = useState(null)
+  const [assigningId, setAssigningId] = useState(null)
+  const [deletingId, setDeletingId] = useState(null)
+  const [error, setError] = useState('')
+  const [latestKey, setLatestKey] = useState('')
+
+  const loadLlmPlayers = async (active = true) => {
+    const data = await listLlmPlayers(campaignId)
+    if (!active) return
+    setLlmPlayers(data.llm_players || [])
+    setAvailableLlmPlayers(data.available_llm_players || [])
+  }
+
+  useEffect(() => {
+    if (!enabled || !isOwner) return
+    let active = true
+    setLoading(true)
+    loadLlmPlayers(active)
+      .catch((err) => {
+        if (active) setError(err.message)
+      })
+      .finally(() => {
+        if (active) setLoading(false)
+      })
+    return () => {
+      active = false
+    }
+  }, [campaignId, enabled, isOwner])
+
+  if (!enabled || !isOwner) return null
+
+  const handleCreate = async () => {
+    setCreating(true)
+    setError('')
+    try {
+      const data = await createLlmPlayer(campaignId)
+      setLatestKey(data.api_key || '')
+      await loadLlmPlayers(true)
+      onAdded?.(data)
+    } catch (err) {
+      setError(err.message)
+    } finally {
+      setCreating(false)
+    }
+  }
+
+  const handleCopy = async () => {
+    if (!latestKey) return
+    const text = [
+      `X-API-Key: ${latestKey}`,
+      `GET /api/campaigns`,
+      `GET /api/campaigns/${campaignId}`,
+      `POST /api/sessions/{sessionId}/messages {"content":"...","role":"player"}`,
+    ].join('\n')
+    try {
+      await navigator.clipboard.writeText(text)
+    } catch {
+      // Ignore clipboard failures.
+    }
+  }
+
+  const handleRotate = async (llmPlayerId) => {
+    setRotatingId(llmPlayerId)
+    setError('')
+    try {
+      const data = await rotateLlmPlayerKey(campaignId, llmPlayerId)
+      setLatestKey(data.api_key || '')
+      await loadLlmPlayers(true)
+      onAdded?.(data)
+    } catch (err) {
+      setError(err.message)
+    } finally {
+      setRotatingId(null)
+    }
+  }
+
+  const handleAssign = async (llmPlayerId) => {
+    setAssigningId(llmPlayerId)
+    setError('')
+    try {
+      const data = await assignLlmPlayer(campaignId, llmPlayerId)
+      await loadLlmPlayers(true)
+      onAdded?.(data)
+    } catch (err) {
+      setError(err.message)
+    } finally {
+      setAssigningId(null)
+    }
+  }
+
+  const handleDelete = async (llmPlayerId, label) => {
+    const confirmed = window.confirm(`Delete "${label}"? This removes the LLM seat, its assigned character, and its pending sheet proposals.`)
+    if (!confirmed) return
+
+    setDeletingId(llmPlayerId)
+    setError('')
+    try {
+      await deleteLlmPlayer(campaignId, llmPlayerId)
+      await loadLlmPlayers(true)
+      if (latestKey) setLatestKey('')
+      onAdded?.()
+    } catch (err) {
+      setError(err.message)
+    } finally {
+      setDeletingId(null)
+    }
+  }
+
+  const assignedCount = llmPlayers.length
+  const availableCount = availableLlmPlayers.length
+
+  return (
+    <section className="llm-manager-card">
+      <div className="llm-manager-header">
+        <div>
+          <h3>LLM Players</h3>
+          <p>LLM players listed here are already assigned to this campaign. Creating a new one also assigns it here immediately.</p>
+        </div>
+        <button className="btn btn-primary small" onClick={handleCreate} disabled={creating}>
+          {creating ? 'Creating...' : 'Create And Assign LLM'}
+        </button>
+      </div>
+
+      {error && <div className="lobby-error">{error}</div>}
+      {loading && <div className="lobby-loading">Loading LLM players...</div>}
+
+      {latestKey && (
+        <div className="llm-manager-keybox">
+          <div className="llm-manager-keyline">
+            <strong>New API key</strong>
+            <button className="btn btn-secondary small" onClick={handleCopy}>Copy</button>
+          </div>
+          <code>{latestKey}</code>
+          <p>Pass it as `X-API-Key` or `Authorization: Bearer ...`.</p>
+        </div>
+      )}
+
+      <div className="llm-manager-summary">
+        <span>{assignedCount} in this campaign</span>
+        <span>{availableCount} available to assign from your other campaigns</span>
+      </div>
+
+      {availableCount > 0 && (
+        <div className="llm-manager-section">
+          <div className="llm-manager-subhead">
+            <strong>Available To Assign</strong>
+          </div>
+          <div className="llm-manager-list">
+            {availableLlmPlayers.map((entry) => (
+              <article key={`available-${entry.llm_player.id}`} className="llm-manager-player">
+                <div className="llm-manager-player-title">
+                  <strong>{entry.llm_player.label}</strong>
+                  <span>{entry.assigned_campaign?.name || 'Unassigned'}</span>
+                </div>
+                <div className="llm-manager-player-body">
+                  <span>{entry.character?.name || 'Unknown character'}</span>
+                  <span>{classSummary(entry.character)}</span>
+                </div>
+                {entry.assigned_campaign?.has_active_session ? (
+                  <div className="llm-manager-note">Locked: source campaign has an active session.</div>
+                ) : (
+                  <div className="llm-manager-player-actions">
+                    <button
+                      className="btn btn-secondary small"
+                      onClick={() => handleAssign(entry.llm_player.id)}
+                      disabled={assigningId === entry.llm_player.id}
+                    >
+                      {assigningId === entry.llm_player.id ? 'Assigning...' : 'Assign To This Campaign'}
+                    </button>
+                  </div>
+                )}
+              </article>
+            ))}
+          </div>
+        </div>
+      )}
+
+      <div className="llm-manager-section">
+        <div className="llm-manager-subhead">
+          <strong>Assigned Here</strong>
+        </div>
+        <div className="llm-manager-list">
+        {llmPlayers.map((entry) => (
+          <article key={entry.llm_player.id} className="llm-manager-player">
+            <div className="llm-manager-player-title">
+              <strong>{entry.llm_player.label}</strong>
+              <span>{entry.llm_player.api_key_prefix}...</span>
+            </div>
+            <div className="llm-manager-player-body">
+              <span>{entry.character?.name || 'Unknown character'}</span>
+              <span>{classSummary(entry.character)}</span>
+            </div>
+            <div className="llm-manager-player-actions">
+              <button
+                className="btn btn-secondary small"
+                onClick={() => handleRotate(entry.llm_player.id)}
+                disabled={rotatingId === entry.llm_player.id || deletingId === entry.llm_player.id}
+              >
+                {rotatingId === entry.llm_player.id ? 'Rotating...' : 'Rotate Key'}
+              </button>
+              <button
+                className="btn btn-danger small"
+                onClick={() => handleDelete(entry.llm_player.id, entry.llm_player.label)}
+                disabled={deletingId === entry.llm_player.id || rotatingId === entry.llm_player.id}
+              >
+                {deletingId === entry.llm_player.id ? 'Deleting...' : 'Delete'}
+              </button>
+            </div>
+          </article>
+        ))}
+        {!loading && llmPlayers.length === 0 && (
+          <div className="llm-manager-empty">No LLM players are assigned to this campaign yet.</div>
+        )}
+        </div>
+      </div>
+    </section>
+  )
+}

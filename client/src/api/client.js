@@ -110,6 +110,10 @@ export function deleteCampaign(id) {
   return apiFetch(`/campaigns/${id}`, { method: 'DELETE' })
 }
 
+export function exportCampaign(id) {
+  return apiBlob(`/campaigns/${id}/export`)
+}
+
 // Characters in a campaign
 export function getCampaignCharacters(campaignId) {
   return apiFetch(`/campaigns/${campaignId}/characters`)
@@ -206,6 +210,36 @@ export function sendMessage(sessionId, content, role = 'player') {
 export function getSessionStreamUrl(sessionId) {
   const token = getToken()
   return `${API_BASE}/sessions/${sessionId}/stream?token=${encodeURIComponent(token || '')}`
+}
+
+export function listLlmPlayers(campaignId) {
+  return apiFetch(`/campaigns/${campaignId}/llm-players`)
+}
+
+export function createLlmPlayer(campaignId, payload = {}) {
+  return apiFetch(`/campaigns/${campaignId}/llm-players`, {
+    method: 'POST',
+    body: JSON.stringify(payload),
+  })
+}
+
+export function assignLlmPlayer(campaignId, llmPlayerId) {
+  return apiFetch(`/campaigns/${campaignId}/llm-players/assign`, {
+    method: 'POST',
+    body: JSON.stringify({ llm_player_id: llmPlayerId }),
+  })
+}
+
+export function rotateLlmPlayerKey(campaignId, llmPlayerId) {
+  return apiFetch(`/campaigns/${campaignId}/llm-players/${llmPlayerId}/rotate-key`, {
+    method: 'POST',
+  })
+}
+
+export function deleteLlmPlayer(campaignId, llmPlayerId) {
+  return apiFetch(`/campaigns/${campaignId}/llm-players/${llmPlayerId}`, {
+    method: 'DELETE',
+  })
 }
 
 // Sheet Proposals
@@ -350,4 +384,3 @@ export function buyShopItem(shopId, characterId, itemName) {
     body: JSON.stringify({ character_id: characterId, item_name: itemName }),
   })
 }
-

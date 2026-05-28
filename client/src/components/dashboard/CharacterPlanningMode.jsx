@@ -14,6 +14,7 @@ import {
 import Loading from '../common/Loading'
 import ErrorMessage from '../common/ErrorMessage'
 import MarkdownContent from '../common/MarkdownContent'
+import LlmPlayerManager from './LlmPlayerManager'
 import {
   CharacterFormBody,
 } from '../character/CharacterForm'
@@ -222,7 +223,13 @@ function pendingBondsForUser(bonds, userId) {
   ))
 }
 
-export default function CharacterPlanningMode({ campaign, currentUser, onComplete }) {
+export default function CharacterPlanningMode({
+  campaign,
+  currentUser,
+  onComplete,
+  showLlmTools = false,
+  onLlmPlayerAdded,
+}) {
   const navigate = useNavigate()
   const [planning, setPlanning] = useState(null)
   const [flowMode, setFlowMode] = useState(null)
@@ -1065,6 +1072,13 @@ export default function CharacterPlanningMode({ campaign, currentUser, onComplet
           </button>
         )}
       </header>
+
+      <LlmPlayerManager
+        campaignId={campaign.id}
+        enabled={showLlmTools}
+        isOwner={campaign.user_id === currentUser?.id}
+        onAdded={onLlmPlayerAdded}
+      />
 
       {effectiveFlowMode === 'create' ? renderCreate() : effectiveFlowMode === 'waiting' ? renderWaiting() : renderChoice()}
       {renderImportModal()}

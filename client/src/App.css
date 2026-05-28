@@ -1082,6 +1082,244 @@ select.input:focus {
   font-size: 0.85rem;
 }
 
+.llm-manager-card {
+  margin-top: 24px;
+  padding: 22px 24px;
+  border-radius: 18px;
+  border: 1px solid rgba(255, 255, 255, 0.08);
+  background: rgba(15, 23, 42, 0.7);
+  backdrop-filter: blur(12px);
+  color: #e5eefc;
+  max-width: 800px;
+  margin-left: auto;
+  margin-right: auto;
+  flex-shrink: 0;
+  position: relative;
+  overflow: hidden;
+  box-shadow: 0 4px 20px rgba(0, 0, 0, 0.25);
+}
+
+/* Subtle gradient accent line at the top */
+.llm-manager-card::before {
+  content: '';
+  position: absolute;
+  top: 0;
+  left: 0;
+  right: 0;
+  height: 3px;
+  background: linear-gradient(90deg, var(--color-primary, #a855f7), var(--color-accent, #6366f1));
+  opacity: 0.6;
+}
+
+.llm-manager-header {
+  display: flex;
+  gap: 16px;
+  justify-content: space-between;
+  align-items: flex-start;
+  margin-bottom: 14px;
+}
+
+.llm-manager-header h3 {
+  margin: 0;
+  font-size: 1.1rem;
+  letter-spacing: 0.01em;
+}
+
+.llm-manager-header p {
+  margin: 4px 0 0;
+  font-size: 0.85rem;
+  line-height: 1.45;
+}
+
+.llm-manager-header p,
+.llm-manager-keybox p,
+.llm-manager-player-body span:last-child,
+.llm-manager-empty {
+  color: rgba(229, 238, 252, 0.65);
+}
+
+.llm-manager-keybox {
+  margin-bottom: 14px;
+  padding: 14px;
+  border-radius: 14px;
+  background: rgba(8, 15, 28, 0.65);
+  border: 1px solid rgba(255, 255, 255, 0.04);
+}
+
+.llm-manager-keyline {
+  display: flex;
+  justify-content: space-between;
+  gap: 12px;
+  align-items: center;
+  margin-bottom: 8px;
+}
+
+.llm-manager-keybox code {
+  display: block;
+  overflow-wrap: anywhere;
+  font-size: 0.82rem;
+  padding: 8px 10px;
+  background: rgba(0, 0, 0, 0.25);
+  border-radius: 8px;
+  margin-top: 6px;
+  color: rgba(229, 238, 252, 0.85);
+}
+
+.llm-manager-list {
+  display: grid;
+  gap: 10px;
+}
+
+.llm-manager-summary,
+.llm-manager-subhead {
+  display: flex;
+  justify-content: space-between;
+  gap: 12px;
+  flex-wrap: wrap;
+}
+
+.llm-manager-summary {
+  margin-bottom: 14px;
+  color: rgba(229, 238, 252, 0.65);
+  font-size: 0.9rem;
+}
+
+.llm-manager-section + .llm-manager-section {
+  margin-top: 18px;
+  padding-top: 18px;
+  border-top: 1px solid rgba(255, 255, 255, 0.05);
+}
+
+.llm-manager-subhead {
+  margin-bottom: 10px;
+}
+
+.llm-manager-subhead strong {
+  font-size: 0.9rem;
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+  color: rgba(229, 238, 252, 0.85);
+}
+
+.llm-manager-player {
+  padding: 14px;
+  border-radius: 14px;
+  background: rgba(255, 255, 255, 0.035);
+  border: 1px solid rgba(255, 255, 255, 0.04);
+  transition: background 0.2s ease, border-color 0.2s ease;
+}
+
+.llm-manager-player:hover {
+  background: rgba(255, 255, 255, 0.06);
+  border-color: rgba(255, 255, 255, 0.08);
+}
+
+.llm-manager-player-title,
+.llm-manager-player-body {
+  display: flex;
+  justify-content: space-between;
+  gap: 12px;
+  align-items: baseline;
+}
+
+.llm-manager-player-title strong {
+  font-size: 0.95rem;
+}
+
+.llm-manager-player-title span {
+  font-size: 0.8rem;
+  color: rgba(229, 238, 252, 0.5);
+  font-family: var(--mono, monospace);
+}
+
+.llm-manager-player-body {
+  margin-top: 6px;
+  font-size: 0.9rem;
+}
+
+.llm-manager-player-actions {
+  margin-top: 10px;
+  display: flex;
+  justify-content: flex-end;
+  gap: 8px;
+}
+
+.llm-manager-note {
+  margin-top: 10px;
+  color: rgba(229, 238, 252, 0.65);
+  font-size: 0.85rem;
+  font-style: italic;
+}
+
+/* ── Context: Planning page ── */
+.planning-page > .llm-manager-card {
+  margin: 0;
+  margin-top: 0;
+  border-radius: 0;
+  border-left: none;
+  border-right: none;
+  max-width: none;
+  padding: 16px 24px;
+}
+
+.planning-page > .llm-manager-card::before {
+  display: none;
+}
+
+/* ── Context: Dashboard right sidebar (280px) ── */
+.dashboard-right .llm-manager-card {
+  margin-top: 0;
+  margin-bottom: 20px;
+  padding: 16px;
+  max-width: none;
+  border-radius: 14px;
+}
+
+.dashboard-right .llm-manager-header {
+  flex-direction: column;
+  gap: 10px;
+}
+
+.dashboard-right .llm-manager-header .btn {
+  align-self: flex-start;
+}
+
+.dashboard-right .llm-manager-summary {
+  flex-direction: column;
+  gap: 4px;
+}
+
+.dashboard-right .llm-manager-player-title,
+.dashboard-right .llm-manager-player-body {
+  flex-direction: column;
+  gap: 4px;
+}
+
+.dashboard-right .llm-manager-player-actions {
+  justify-content: flex-start;
+}
+
+@media (max-width: 720px) {
+  .llm-manager-card {
+    margin-top: 16px;
+    padding: 16px;
+    border-radius: 14px;
+  }
+
+  .llm-manager-header,
+  .llm-manager-keyline,
+  .llm-manager-summary,
+  .llm-manager-subhead,
+  .llm-manager-player-title,
+  .llm-manager-player-body {
+    flex-direction: column;
+  }
+
+  .llm-manager-player-actions {
+    justify-content: flex-start;
+  }
+}
+
 /* ==========================================================================
    PARTY ROSTER SIDEBAR
    ========================================================================== */
@@ -1281,6 +1519,26 @@ select.input:focus {
   border-left: 1px solid var(--border-color);
   padding: 24px;
   overflow-y: auto;
+}
+
+.campaign-export-fab {
+  position: fixed;
+  bottom: 24px;
+  right: 24px;
+  z-index: 200;
+  gap: 8px;
+  font-size: 0.85rem;
+  padding: 10px 18px;
+  box-shadow: 0 4px 20px rgba(0, 0, 0, 0.4);
+  backdrop-filter: blur(8px);
+  opacity: 0.88;
+  transition: opacity 0.2s ease, transform 0.2s ease, box-shadow 0.2s ease;
+}
+
+.campaign-export-fab:hover:not(:disabled) {
+  opacity: 1;
+  transform: translateY(-2px);
+  box-shadow: 0 6px 28px rgba(0, 0, 0, 0.5);
 }
 
 /* Dashboard Full-screen VTT Layout (Map Expanded) */
@@ -6483,6 +6741,3 @@ select.input:focus {
   font-size: 0.85rem;
   margin-top: 4px;
 }
-
-
-

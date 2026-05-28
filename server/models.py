@@ -17,6 +17,7 @@ class User(db.Model):
     created_at = db.Column(db.DateTime, default=datetime.utcnow)
     campaigns = db.relationship('Campaign', backref='owner', lazy=True)
     characters = db.relationship('Character', backref='player', lazy=True)
+    llm_player_profile = db.relationship('LLMPlayer', backref='user', uselist=False, lazy=True, cascade='all, delete-orphan')
 
     def set_password(self, password):
         self.password_hash = generate_password_hash(password)
@@ -25,11 +26,13 @@ class User(db.Model):
         return check_password_hash(self.password_hash, password)
 
     def to_dict(self):
+        llm_profile = self.llm_player_profile
         return {
             'id': self.id,
             'username': self.username,
             'email': self.email,
-            'created_at': self.created_at.isoformat()
+            'created_at': self.created_at.isoformat(),
+            'llm_player': llm_profile.to_dict() if llm_profile else None,
         }
 
 
@@ -615,11 +618,12 @@ class SessionMessage(db.Model):
     user = db.relationship('User')
 
     def to_dict(self):
+        llm_profile = self.user.llm_player_profile if self.user else None
         return {
             'id': self.id,
             'session_id': self.session_id,
             'user_id': self.user_id,
-            'username': self.user.username if self.user else None,
+            'username': llm_profile.label if llm_profile else (self.user.username if self.user else None),
             'role': self.role,
             'content': self.content,
             'created_at': self.created_at.isoformat() if self.created_at else None,
@@ -640,16 +644,44 @@ class CampaignMember(db.Model):
     selected_character = db.relationship('Character', foreign_keys=[selected_character_id])
 
     def to_dict(self):
+        llm_profile = self.user.llm_player_profile if self.user else None
         return {
             'id': self.id,
             'campaign_id': self.campaign_id,
             'user_id': self.user_id,
-            'username': self.user.username if self.user else None,
+            'username': llm_profile.label if llm_profile else (self.user.username if self.user else None),
             'role': self.role,
             'joined_at': self.joined_at.isoformat() if self.joined_at else None,
             'selected_character_id': self.selected_character_id,
             'character_ready_at': self.character_ready_at.isoformat() if self.character_ready_at else None,
             'is_character_ready': self.character_ready_at is not None and self.selected_character_id is not None,
+            'is_llm_player': bool(llm_profile),
+            'llm_player_id': llm_profile.id if llm_profile else None,
+        }
+
+
+class LLMPlayer(db.Model):
+    __tablename__ = 'llm_players'
+
+    id = db.Column(db.Integer, primary_key=True)
+    campaign_id = db.Column(db.Integer, db.ForeignKey('campaign.id'), nullable=False)
+    user_id = db.Column(db.Integer, db.ForeignKey('users.id'), nullable=False, unique=True)
+    label = db.Column(db.String(120), nullable=False)
+    api_key_hash = db.Column(db.String(256), nullable=False)
+    api_key_prefix = db.Column(db.String(24), nullable=False, index=True)
+    created_at = db.Column(db.DateTime, default=datetime.utcnow)
+    last_used_at = db.Column(db.DateTime, nullable=True)
+    campaign = db.relationship('Campaign')
+
+    def to_dict(self):
+        return {
+            'id': self.id,
+            'campaign_id': self.campaign_id,
+            'user_id': self.user_id,
+            'label': self.label,
+            'api_key_prefix': self.api_key_prefix,
+            'created_at': self.created_at.isoformat() if self.created_at else None,
+            'last_used_at': self.last_used_at.isoformat() if self.last_used_at else None,
         }
 
 
@@ -1280,3 +1312,112 @@ class CampaignShop(db.Model):
             'created_at': self.created_at.isoformat() if self.created_at else None,
             'updated_at': self.updated_at.isoformat() if self.updated_at else None,
         }
+
+
+class CampaignMemoryRun(db.Model):
+    __tablename__ = 'campaign_memory_runs'
+
+    id = db.Column(db.Integer, primary_key=True)
+    memory_run_id = db.Column(db.String(100), nullable=False, unique=True, index=True)
+    campaign_id = db.Column(db.Integer, db.ForeignKey('campaign.id'), nullable=False, index=True)
+    session_id = db.Column(db.Integer, db.ForeignKey('campaign_sessions.id'), nullable=True, index=True)
+    source_player_message_id = db.Column(db.Integer, nullable=True)
+    source_dm_message_id = db.Column(db.Integer, nullable=True)
+    trace_id = db.Column(db.String(100), nullable=True, index=True)
+
+    prompt_chars = db.Column(db.Integer, nullable=True)
+    prompt_tokens_estimate = db.Column(db.Integer, nullable=True)
+    response_chars = db.Column(db.Integer, nullable=True)
+    context_breakdown_json = db.Column(db.JSON, nullable=True)
+
+    created_at = db.Column(db.DateTime, default=datetime.utcnow, index=True)
+
+    def to_dict(self):
+        return {
+            'id': self.id,
+            'memory_run_id': self.memory_run_id,
+            'campaign_id': self.campaign_id,
+            'session_id': self.session_id,
+            'source_player_message_id': self.source_player_message_id,
+            'source_dm_message_id': self.source_dm_message_id,
+            'trace_id': self.trace_id,
+            'prompt_chars': self.prompt_chars,
+            'prompt_tokens_estimate': self.prompt_tokens_estimate,
+            'response_chars': self.response_chars,
+            'context_breakdown': self.context_breakdown_json,
+            'created_at': self.created_at.isoformat() if self.created_at else None,
+        }
+
+
+class CampaignMemoryLog(db.Model):
+    __tablename__ = 'campaign_memory_logs'
+
+    id = db.Column(db.Integer, primary_key=True)
+
+    campaign_id = db.Column(db.Integer, db.ForeignKey('campaign.id'), nullable=False, index=True)
+    session_id = db.Column(db.Integer, db.ForeignKey('campaign_sessions.id'), nullable=True, index=True)
+
+    memory_run_id = db.Column(db.String(100), nullable=False, index=True)
+    trace_id = db.Column(db.String(100), nullable=True, index=True)
+    turn_id = db.Column(db.String(100), nullable=True, index=True)
+
+    source_player_message_id = db.Column(db.Integer, nullable=True)
+    source_dm_message_id = db.Column(db.Integer, nullable=True)
+
+    memory_id = db.Column(db.String(200), nullable=True, index=True)
+    target_table = db.Column(db.String(100), nullable=True)
+    target_id = db.Column(db.String(200), nullable=True)
+
+    operation = db.Column(db.String(50), nullable=False)  # create | update | retire | no-op
+    status = db.Column(db.String(50), nullable=False, default='applied')  # applied | skipped | failed | validation_failed | no_op
+
+    memory_type = db.Column(db.String(50), nullable=True)  # npc | fact | relation | clock | location | quest | inventory | money
+    visibility = db.Column(db.String(50), nullable=True)
+    certainty = db.Column(db.String(50), nullable=True)
+    importance = db.Column(db.Integer, nullable=True)
+
+    reason = db.Column(db.Text, nullable=True)
+    expires_or_retire_condition = db.Column(db.Text, nullable=True)
+
+    before_json = db.Column(db.JSON, nullable=True)
+    after_json = db.Column(db.JSON, nullable=True)
+    patch_json = db.Column(db.JSON, nullable=True)
+
+    error = db.Column(db.Text, nullable=True)
+
+    created_at = db.Column(db.DateTime, default=datetime.utcnow, index=True)
+
+    __table_args__ = (
+        db.Index('ix_campaign_memory_logs_campaign_created', 'campaign_id', 'created_at'),
+        db.Index('ix_campaign_memory_logs_run', 'memory_run_id'),
+        db.Index('ix_campaign_memory_logs_memory', 'campaign_id', 'memory_id'),
+    )
+
+    def to_dict(self):
+        return {
+            'id': self.id,
+            'campaign_id': self.campaign_id,
+            'session_id': self.session_id,
+            'memory_run_id': self.memory_run_id,
+            'trace_id': self.trace_id,
+            'turn_id': self.turn_id,
+            'source_player_message_id': self.source_player_message_id,
+            'source_dm_message_id': self.source_dm_message_id,
+            'memory_id': self.memory_id,
+            'target_table': self.target_table,
+            'target_id': self.target_id,
+            'operation': self.operation,
+            'status': self.status,
+            'memory_type': self.memory_type,
+            'visibility': self.visibility,
+            'certainty': self.certainty,
+            'importance': self.importance,
+            'reason': self.reason,
+            'expires_or_retire_condition': self.expires_or_retire_condition,
+            'before_json': self.before_json,
+            'after_json': self.after_json,
+            'patch_json': self.patch_json,
+            'error': self.error,
+            'created_at': self.created_at.isoformat() if self.created_at else None,
+        }
+
