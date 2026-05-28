@@ -67,9 +67,11 @@ function listFrom(value) {
   return []
 }
 
+import { parseDate } from '../../utils/date'
+
 function formatTime(iso) {
   if (!iso) return ''
-  return new Date(iso).toLocaleTimeString(undefined, { hour: '2-digit', minute: '2-digit' })
+  return parseDate(iso).toLocaleTimeString(undefined, { hour: '2-digit', minute: '2-digit' })
 }
 
 function valuesEqual(a, b) {

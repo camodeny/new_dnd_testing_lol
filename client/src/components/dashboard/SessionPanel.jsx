@@ -6,9 +6,11 @@ import SessionInput from './SessionInput'
 import SheetProposalInline from '../session/SheetProposalInline'
 import { formatMessageForDm, hasIcSegment, parseTaggedMessage } from '../../utils/messageTags'
 
+import { parseDate } from '../../utils/date'
+
 function formatTime(iso) {
   if (!iso) return ''
-  const d = new Date(iso)
+  const d = parseDate(iso)
   return d.toLocaleTimeString(undefined, { hour: '2-digit', minute: '2-digit' })
 }
 
@@ -471,7 +473,17 @@ export default function SessionPanel({
 
     const previousCount = previousMessageCountRef.current
     previousMessageCountRef.current = messages.length
-    if (!container || messages.length === previousCount) return
+    if (!container) return
+
+    if (previousCount === 0 && messages.length > 0) {
+      container.scrollTop = container.scrollHeight
+      setTimeout(() => {
+        if (messagesContainerRef.current) {
+          messagesContainerRef.current.scrollTop = messagesContainerRef.current.scrollHeight
+        }
+      }, 50)
+      return
+    }
 
     if (messages.length > previousCount) {
       messagesEndRef.current?.scrollIntoView({ behavior: 'smooth' })

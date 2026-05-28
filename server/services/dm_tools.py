@@ -409,10 +409,13 @@ def build_session_hot_context(campaign, session, current_user):
         'private_spoiler_items': _private_spoiler_items(campaign),
         'recent_messages': [message.to_dict() for message in recent_messages],
         'tool_policy': (
-            'Use tools for character-sheet answers, campaign memory, NPC dossiers, clocks, and durable state writes. '
-            'Do not claim to update world state unless a write tool succeeds. Never reveal DM-private tool results '
-            'unless they have become visible through play. private_output_terms are reasoning-only strings that must '
-            'not appear in visible narration unless they are first revealed through play. '
+            'Treat hot-context memory as authoritative state for lore, continuity, NPC motivations, active pressure, '
+            'and world consequences. Use tools for character-sheet answers, campaign memory, NPC dossiers, clocks, '
+            'scene state, and durable state writes instead of guessing. If a question or action touches remembered '
+            'facts, unresolved clocks, recent world events, or stored NPC agendas, inspect and follow that state '
+            'before improvising. Do not claim to update world state unless a write tool succeeds. Never reveal '
+            'DM-private tool results unless they have become visible through play. private_output_terms are '
+            'reasoning-only strings that must not appear in visible narration unless they are first revealed through play. '
             'Use create_encounter_map when the party enters a tactical area where spatial positioning matters, '
             'or when a player explicitly asks for a map; include vtt_setup_notes when the DM has intended '
             'friendly starts, enemy starts, obstacles, objectives, or terrain calls for the playable setup JSON. '

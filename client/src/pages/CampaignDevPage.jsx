@@ -21,9 +21,11 @@ const DEFAULT_FILTERS = FLOW_FILTERS.reduce((acc, filter) => {
 
 /* ── Formatters & Helpers ── */
 
+import { parseDate } from '../utils/date'
+
 function formatDateTime(iso) {
   if (!iso) return 'Unknown'
-  return new Date(iso).toLocaleString(undefined, {
+  return parseDate(iso).toLocaleString(undefined, {
     month: 'short',
     day: 'numeric',
     hour: '2-digit',
@@ -34,7 +36,7 @@ function formatDateTime(iso) {
 
 function formatTime(iso) {
   if (!iso) return ''
-  return new Date(iso).toLocaleTimeString(undefined, {
+  return parseDate(iso).toLocaleTimeString(undefined, {
     hour: '2-digit',
     minute: '2-digit',
   })

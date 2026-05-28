@@ -13,9 +13,11 @@ function getDifficultyColor(difficulty) {
   return DIFFICULTY_COLORS[key] || '#a78bfa'
 }
 
+import { parseDate } from '../../utils/date'
+
 function formatDate(iso) {
   if (!iso) return ''
-  const d = new Date(iso)
+  const d = parseDate(iso)
   return d.toLocaleDateString(undefined, { month: 'short', day: 'numeric', year: 'numeric' })
 }
 
