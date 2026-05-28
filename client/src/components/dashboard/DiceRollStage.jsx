@@ -1,4 +1,4 @@
-import { useEffect, useRef } from 'react'
+import { useEffect, useRef, useState } from 'react'
 import * as THREE from 'three'
 import { ConvexGeometry } from 'three/examples/jsm/geometries/ConvexGeometry.js'
 
@@ -448,10 +448,21 @@ export default function DiceRollStage({ roll }) {
   const diceRef = useRef([])
   const animationRef = useRef(null)
   const rollRef = useRef(null)
+  const [webglUnavailable, setWebglUnavailable] = useState(false)
 
   useEffect(() => {
     const canvas = canvasRef.current
-    const renderer = new THREE.WebGLRenderer({ canvas, antialias: true, alpha: true })
+    if (!canvas) return undefined
+
+    let renderer
+    try {
+      renderer = new THREE.WebGLRenderer({ canvas, antialias: true, alpha: true })
+    } catch {
+      setWebglUnavailable(true)
+      return undefined
+    }
+
+    setWebglUnavailable(false)
     renderer.setPixelRatio(Math.min(window.devicePixelRatio || 1, 2))
     renderer.setClearColor(0x000000, 0)
     renderer.shadowMap.enabled = true
@@ -586,6 +597,9 @@ export default function DiceRollStage({ roll }) {
       observer.disconnect()
       cancelAnimationFrame(animationRef.current)
       diceRef.current.forEach(disposeGroup)
+      diceRef.current = []
+      sceneRef.current = null
+      rollRef.current = null
       renderer.dispose()
     }
   }, [])
@@ -677,6 +691,14 @@ export default function DiceRollStage({ roll }) {
       }),
     }
   }, [roll])
+
+  if (webglUnavailable) {
+    return (
+      <div className="dice-roll-fallback" aria-hidden="true">
+        <span>3D dice preview unavailable in this browser.</span>
+      </div>
+    )
+  }
 
   return <canvas ref={canvasRef} className="dice-roll-canvas" aria-hidden="true" />
 }
