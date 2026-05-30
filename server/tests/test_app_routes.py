@@ -1,3 +1,4 @@
+import hashlib
 import os
 import sys
 import tempfile
@@ -17,6 +18,7 @@ os.environ['OPENROUTER_RUNTIME_MODEL_FILE'] = os.path.join(
 from app import app
 from auth import generate_token
 from models import (
+    AuthSession,
     db,
     Campaign,
     CampaignAuditEvent,
@@ -29,6 +31,8 @@ from models import (
     EncounterMapPlacement,
     LLMPlayer,
     PlanningBondProposal,
+    SessionMessage,
+    SheetProposal,
     User,
 )
 from openrouter import get_openrouter_model, reset_openrouter_model
@@ -97,6 +101,118 @@ class AppRouteTest(unittest.TestCase):
 
             token = generate_token(player.id)
             return campaign.id, token
+
+    def test_sso_callback_creates_cookie_backed_session(self):
+        class FakeSSOClient:
+            def get_login_url(self, state):
+                return f'https://sso.example.test/oauth/authorize?state={state}'
+
+            def exchange_code(self, code):
+                self.last_code = code
+                return {
+                    'access_token': 'access-123',
+                    'refresh_token': 'refresh-123',
+                    'id_token': 'id-123',
+                    'scope': 'openid profile email',
+                    'expires_in': 3600,
+                    'token_type': 'Bearer',
+                }
+
+            def get_user_info(self, access_token):
+                self.last_access_token = access_token
+                return {
+                    'sub': 'sso-user-42',
+                    'email': 'sso@example.com',
+                    'username': 'ssohero',
+                    'name': 'SSO Hero',
+                }
+
+        fake_sso = FakeSSOClient()
+        with (
+            patch.dict(os.environ, {
+                'SSO_URL': 'https://sso.example.test',
+                'CLIENT_ID': 'client-id',
+                'CLIENT_SECRET': 'client-secret',
+                'REDIRECT_URI': 'http://localhost/api/auth/callback',
+            }, clear=False),
+            patch('auth.get_pendergrass_sso_client', return_value=fake_sso),
+        ):
+            login_response = self.client.get('/api/auth/login?next=/campaigns/7')
+
+            self.assertEqual(login_response.status_code, 302)
+            self.assertIn('https://sso.example.test/oauth/authorize', login_response.location)
+            self.assertIn('dnd_session=', login_response.headers.get('Set-Cookie', ''))
+
+            with app.app_context():
+                auth_session = AuthSession.query.one()
+                state = auth_session.pending_oauth_state
+
+            callback_response = self.client.get(f'/api/auth/callback?code=demo-code&state={state}')
+            self.assertEqual(callback_response.status_code, 302)
+            self.assertTrue(callback_response.location.endswith('/campaigns/7'))
+
+            me_response = self.client.get('/api/me')
+            self.assertEqual(me_response.status_code, 200)
+            me_data = me_response.get_json()
+            self.assertEqual(me_data['user']['username'], 'ssohero')
+            self.assertEqual(me_data['user']['email'], 'sso@example.com')
+            self.assertEqual(fake_sso.last_code, 'demo-code')
+            self.assertEqual(fake_sso.last_access_token, 'access-123')
+
+            with app.app_context():
+                auth_session = AuthSession.query.one()
+                user = User.query.one()
+                self.assertEqual(user.sso_subject, 'sso-user-42')
+                self.assertEqual(auth_session.user_id, user.id)
+                self.assertEqual(auth_session.provider, 'pendergrass_sso')
+                self.assertEqual(auth_session.refresh_token, 'refresh-123')
+                self.assertIsNone(auth_session.pending_oauth_state)
+
+    def test_logout_revokes_sso_refresh_token_and_clears_cookie_session(self):
+        class FakeSSOClient:
+            def __init__(self):
+                self.revoked = []
+
+            def revoke_token(self, refresh_token):
+                self.revoked.append(refresh_token)
+
+        fake_sso = FakeSSOClient()
+
+        with app.app_context():
+            user = User(username='logout-user', email='logout@example.com', sso_subject='logout-subject')
+            user.set_password('password')
+            db.session.add(user)
+            db.session.commit()
+
+            auth_session = AuthSession(
+                session_token_hash=hashlib.sha256(b'cookie-session-token').hexdigest(),
+                user_id=user.id,
+                provider='pendergrass_sso',
+                provider_subject='logout-subject',
+                refresh_token='refresh-to-revoke',
+            )
+            db.session.add(auth_session)
+            db.session.commit()
+
+        self.client.set_cookie('dnd_session', 'cookie-session-token')
+
+        with (
+            patch.dict(os.environ, {
+                'SSO_URL': 'https://sso.example.test',
+                'CLIENT_ID': 'client-id',
+                'CLIENT_SECRET': 'client-secret',
+                'REDIRECT_URI': 'http://localhost/api/auth/callback',
+            }, clear=False),
+            patch('auth.get_pendergrass_sso_client', return_value=fake_sso),
+        ):
+            response = self.client.post('/api/logout')
+
+        self.assertEqual(response.status_code, 200)
+        self.assertIn('dnd_session=;', response.headers.get('Set-Cookie', ''))
+        self.assertEqual(fake_sso.revoked, ['refresh-to-revoke'])
+
+        with app.app_context():
+            self.assertEqual(AuthSession.query.count(), 0)
 
     def test_spa_routes_fall_back_to_index(self):
         response = self.client.get('/join/1?code=COWJVBID')
@@ -1155,6 +1271,81 @@ class AppRouteTest(unittest.TestCase):
         self.assertEqual(response.status_code, 400)
         self.assertEqual(response.get_json(), {'error': 'Resolve pending bond proposals before marking ready'})
 
+    def test_session_proposals_exclude_orphaned_pending_rows(self):
+        with app.app_context():
+            owner = User(username='proposal_dm', email='proposal_dm@example.com')
+            owner.set_password('password')
+            player = User(username='proposal_player', email='proposal_player@example.com')
+            player.set_password('password')
+            db.session.add_all([owner, player])
+            db.session.commit()
+
+            campaign = Campaign(name='Proposal Campaign', user_id=owner.id)
+            db.session.add(campaign)
+            db.session.commit()
+
+            character = Character(
+                user_id=player.id,
+                campaign_id=campaign.id,
+                name='Pippin',
+                race='Halfling',
+            )
+            db.session.add(character)
+            db.session.flush()
+
+            db.session.add(CampaignMember(campaign_id=campaign.id, user_id=owner.id, role='player'))
+            db.session.add(CampaignMember(
+                campaign_id=campaign.id,
+                user_id=player.id,
+                role='player',
+                selected_character_id=character.id,
+            ))
+            session = CampaignSession(campaign_id=campaign.id, is_active=True)
+            db.session.add(session)
+            db.session.flush()
+
+            dm_message = SessionMessage(
+                session_id=session.id,
+                role='dm',
+                content='A real proposal source message.',
+            )
+            db.session.add(dm_message)
+            db.session.flush()
+
+            valid_proposal = SheetProposal(
+                session_id=session.id,
+                character_id=character.id,
+                dm_user_id=owner.id,
+                reason='Valid pending proposal.',
+                changes=[{'field': 'inspiration', 'operation': 'set', 'value': 1, 'before': False, 'after': True}],
+                status='pending',
+                message_id=dm_message.id,
+            )
+            orphaned_proposal = SheetProposal(
+                session_id=session.id,
+                character_id=character.id,
+                dm_user_id=owner.id,
+                reason='Orphaned stale proposal.',
+                changes=[{'field': 'inspiration', 'operation': 'set', 'value': 0, 'before': True, 'after': False}],
+                status='pending',
+                message_id=999999,
+            )
+            db.session.add_all([valid_proposal, orphaned_proposal])
+            db.session.commit()
+
+            token = generate_token(player.id)
+            session_id = session.id
+
+        response = self.client.get(
+            f'/api/sessions/{session_id}/proposals',
+            headers={'Authorization': f'Bearer {token}'},
+        )
+
+        self.assertEqual(response.status_code, 200)
+        proposals = response.get_json()['sheet_proposals']
+        self.assertEqual(len(proposals), 1)
+        self.assertEqual(proposals[0]['reason'], 'Valid pending proposal.')
+
     def test_encounter_combat_flow_and_movement_restrictions(self):
         from routes.encounter_maps import build_initial_encounter_state, check_and_start_turns
         with app.app_context():
@@ -1545,4 +1736,3 @@ class AppRouteTest(unittest.TestCase):
 
 if __name__ == '__main__':
     unittest.main()
-

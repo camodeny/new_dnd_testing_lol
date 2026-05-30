@@ -45,6 +45,10 @@ def create_app():
     app.config['SQLALCHEMY_TRACK_MODIFICATIONS'] = False
     app.config['SECRET_KEY'] = os.environ.get('SECRET_KEY', 'dev-secret-key')
     app.config['JWT_EXPIRATION_HOURS'] = int(os.environ.get('JWT_EXPIRATION_HOURS', 24))
+    app.config['AUTH_SESSION_COOKIE_NAME'] = os.environ.get('AUTH_SESSION_COOKIE_NAME', 'dnd_session')
+    app.config['AUTH_SESSION_LIFETIME_DAYS'] = int(os.environ.get('AUTH_SESSION_LIFETIME_DAYS', 30))
+    app.config['OAUTH_STATE_LIFETIME_MINUTES'] = int(os.environ.get('OAUTH_STATE_LIFETIME_MINUTES', 10))
+    app.config['AUTH_COOKIE_SECURE'] = os.environ.get('AUTH_COOKIE_SECURE', 'false').lower() == 'true'
 
     db.init_app(app)
 
@@ -153,6 +157,10 @@ def ensure_lightweight_schema():
             db.session.execute(text('ALTER TABLE campaign_shops ADD COLUMN location_name VARCHAR(200)'))
         if 'is_open' not in campaign_shop_columns:
             db.session.execute(text('ALTER TABLE campaign_shops ADD COLUMN is_open BOOLEAN DEFAULT 1 NOT NULL'))
+
+    user_columns = table_columns('users')
+    if 'sso_subject' not in user_columns:
+        db.session.execute(text('ALTER TABLE users ADD COLUMN sso_subject VARCHAR(160)'))
     db.session.commit()
 
 

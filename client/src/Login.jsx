@@ -1,4 +1,4 @@
-import { useState } from 'react'
+import { useEffect, useState } from 'react'
 import { apiFetch } from './api/client'
 import './Login.css'
 
@@ -9,6 +9,42 @@ function Login({ onLogin }) {
   const [password, setPassword] = useState('')
   const [error, setError] = useState('')
   const [loading, setLoading] = useState(false)
+  const [ssoEnabled, setSsoEnabled] = useState(false)
+
+  useEffect(() => {
+    let ignore = false
+
+    apiFetch('/auth/config')
+      .then((data) => {
+        if (!ignore) {
+          setSsoEnabled(Boolean(data.sso_enabled))
+        }
+      })
+      .catch(() => {
+        if (!ignore) {
+          setSsoEnabled(false)
+        }
+      })
+
+    const params = new URLSearchParams(window.location.search)
+    const authError = params.get('auth_error')
+    if (authError) {
+      setError(authError)
+      params.delete('auth_error')
+      const nextSearch = params.toString()
+      const nextUrl = `${window.location.pathname}${nextSearch ? `?${nextSearch}` : ''}${window.location.hash}`
+      window.history.replaceState({}, '', nextUrl)
+    }
+
+    return () => {
+      ignore = true
+    }
+  }, [])
+
+  const handleSsoLogin = () => {
+    const next = `${window.location.pathname}${window.location.search}${window.location.hash}`
+    window.location.assign(`/api/auth/login?next=${encodeURIComponent(next || '/')}`)
+  }
 
   const handleSubmit = async (e) => {
     e.preventDefault()
@@ -44,6 +80,20 @@ function Login({ onLogin }) {
         <p className="login-subtitle">
           {isRegistering ? 'Start your D&D adventure' : 'Sign in to continue'}
         </p>
+
+        {ssoEnabled && (
+          <>
+            <button
+              type="button"
+              className="login-button sso-button"
+              onClick={handleSsoLogin}
+              disabled={loading}
+            >
+              Continue with Pendergrass SSO
+            </button>
+            <div className="login-divider">or use a local account</div>
+          </>
+        )}
 
         <form onSubmit={handleSubmit}>
           {error && <div className="error-message">{error}</div>}

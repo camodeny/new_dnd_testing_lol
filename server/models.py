@@ -14,10 +14,12 @@ class User(db.Model):
     username = db.Column(db.String(80), unique=True, nullable=False)
     email = db.Column(db.String(120), unique=True, nullable=False)
     password_hash = db.Column(db.String(256), nullable=False)
+    sso_subject = db.Column(db.String(160), unique=True, nullable=True)
     created_at = db.Column(db.DateTime, default=datetime.utcnow)
     campaigns = db.relationship('Campaign', backref='owner', lazy=True)
     characters = db.relationship('Character', backref='player', lazy=True)
     llm_player_profile = db.relationship('LLMPlayer', backref='user', uselist=False, lazy=True, cascade='all, delete-orphan')
+    auth_sessions = db.relationship('AuthSession', backref='user', lazy=True, cascade='all, delete-orphan')
 
     def set_password(self, password):
         self.password_hash = generate_password_hash(password)
@@ -31,9 +33,32 @@ class User(db.Model):
             'id': self.id,
             'username': self.username,
             'email': self.email,
+            'sso_subject': self.sso_subject,
             'created_at': self.created_at.isoformat(),
             'llm_player': llm_profile.to_dict() if llm_profile else None,
         }
+
+
+class AuthSession(db.Model):
+    __tablename__ = 'auth_sessions'
+
+    id = db.Column(db.Integer, primary_key=True)
+    session_token_hash = db.Column(db.String(64), unique=True, nullable=False, index=True)
+    user_id = db.Column(db.Integer, db.ForeignKey('users.id'), nullable=True, index=True)
+    provider = db.Column(db.String(40), nullable=True)
+    provider_subject = db.Column(db.String(160), nullable=True, index=True)
+    access_token = db.Column(db.Text, nullable=True)
+    refresh_token = db.Column(db.Text, nullable=True)
+    id_token = db.Column(db.Text, nullable=True)
+    scope = db.Column(db.String(200), nullable=True)
+    provider_user_json = db.Column(db.Text, nullable=True)
+    access_token_expires_at = db.Column(db.DateTime, nullable=True)
+    pending_oauth_state = db.Column(db.String(120), nullable=True, index=True)
+    pending_oauth_state_expires_at = db.Column(db.DateTime, nullable=True)
+    post_login_redirect = db.Column(db.String(500), nullable=True)
+    created_at = db.Column(db.DateTime, default=datetime.utcnow, index=True)
+    updated_at = db.Column(db.DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
+    last_seen_at = db.Column(db.DateTime, default=datetime.utcnow, nullable=False)
 
 
 class Campaign(db.Model):
@@ -1420,4 +1445,3 @@ class CampaignMemoryLog(db.Model):
             'error': self.error,
             'created_at': self.created_at.isoformat() if self.created_at else None,
         }
-

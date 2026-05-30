@@ -35,7 +35,9 @@ from models import (
     WorldEvent,
 )
 from openrouter import (
+    check_session_missing_npc_tags_with_llm,
     check_session_mechanics_with_llm,
+    _possible_missing_npc_tag_signal,
     _pc_control_violation,
     _private_output_violation,
     _session_dm_format_violation,
@@ -1143,6 +1145,42 @@ class DmToolsTest(unittest.TestCase):
         ooc_label = _session_dm_format_violation('*OOC*: Make an Investigation check.')
         self.assertEqual(ooc_label['errors'][0]['kind'], 'disallowed_mode_label')
 
+        self.assertIsNone(_session_dm_format_violation(
+            'Dee watches you for a long moment, reading your resolve. He does not argue. '
+            'Instead, he gives a single, slow nod. **"Alright. Lock the creds down first."**'
+        ))
+
+    def test_possible_missing_npc_tag_signal_detects_attributed_quote(self):
+        signal = _possible_missing_npc_tag_signal(
+            'Dee watches you for a long moment, reading your resolve. He does not argue. '
+            'Instead, he gives a single, slow nod. **"Alright. Lock the creds down first."**'
+        )
+        self.assertEqual(signal['speaker'], 'Dee')
+        self.assertIn('Alright.', signal['quote'])
+
+    def test_missing_npc_tag_checker_uses_llm_only_when_signaled(self):
+        signal = {
+            'speaker': 'Dee',
+            'quote': '**"Alright. Lock the creds down first."**',
+            'context': 'Dee gives a single, slow nod.',
+        }
+
+        with patch('openrouter._post_chat', return_value=json.dumps({
+            'requires_npc_tag': True,
+            'speaker': 'Dee',
+            'evidence': ['**"Alright. Lock the creds down first."**'],
+            'reason': 'This is clearly Dee speaking in the current scene.',
+        })) as post_chat:
+            result = check_session_missing_npc_tags_with_llm(
+                'Dee watches you for a long moment. **"Alright. Lock the creds down first."**',
+                signal,
+                {'operation': 'session_dm_response'},
+            )
+
+        self.assertTrue(result['requires_npc_tag'])
+        self.assertEqual(result['speaker'], 'Dee')
+        self.assertFalse(post_chat.call_args.kwargs['allow_thinking'])
+
     def test_mechanical_guard_uses_llm_when_preflight_flags_mechanics(self):
         preflight = {
             'latest_player_intent_requires_mechanics': True,
@@ -1214,7 +1252,8 @@ class DmToolsTest(unittest.TestCase):
         })
         retry_prompt = post_chat.call_args_list[1].args[0][-1]['content']
         self.assertIn('required D&D mechanics', retry_prompt)
-        self.assertIn('Required mechanic: initiative.', retry_prompt)
+        self.assertIn('do not resolve uncertain combat outcomes', retry_prompt)
+        self.assertNotIn('Required mechanic:', retry_prompt)
 
     def test_session_dm_format_guard_rewrites_malformed_reply(self):
         hot_context = {
@@ -1241,11 +1280,56 @@ class DmToolsTest(unittest.TestCase):
         })
         retry_prompt = post_chat.call_args_list[1].args[0][-1]['content']
         self.assertIn('Guard reminder', retry_prompt)
-        self.assertIn('</p>', retry_prompt)
         self.assertIn('only allowed angle-bracket tag', retry_prompt)
+        self.assertNotIn('</p>', retry_prompt)
         self.assertFalse(post_chat.call_args_list[1].kwargs.get('json_mode'))
         self.assertIsNone(post_chat.call_args_list[1].kwargs.get('tools'))
         self.assertFalse(post_chat.call_args_list[1].kwargs.get('allow_thinking'))
+
+    def test_session_dm_format_guard_rewrites_missing_npc_tag_reply_with_special_prompt(self):
+        hot_context = {
+            'protected_player_characters': [],
+            'private_output_terms': [],
+            'private_spoiler_items': [],
+        }
+
+        with patch('openrouter._post_chat_response', side_effect=[
+            {'choices': [{'message': {'content': json.dumps({
+                'mode': 'speak',
+                'content': 'Dee watches you for a long moment, reading your resolve. He does not argue. '
+                           'Instead, he gives a single, slow nod. **"Alright. Lock the creds down first."**',
+            })}}]},
+            {'choices': [{'message': {'content': json.dumps({
+                'mode': 'speak',
+                'content': 'Dee watches you for a long moment, reading your resolve. He does not argue. '
+                           'Instead, he gives a single, slow nod.\n\n'
+                           '<npc target="Dee">"Alright. Lock the creds down first."</npc>',
+            })}}]},
+        ]) as post_chat, patch('openrouter._post_chat', return_value=json.dumps({
+            'requires_npc_tag': True,
+            'speaker': 'Dee',
+            'evidence': ['**"Alright. Lock the creds down first."**'],
+            'reason': 'This is clearly Dee speaking in the current scene.',
+        })):
+            result = get_session_dm_response_with_tools(
+                hot_context,
+                [],
+                [],
+                lambda *_args, **_kwargs: {},
+                max_tool_rounds=0,
+            )
+
+        self.assertEqual(result, {
+            'mode': 'speak',
+            'content': 'Dee watches you for a long moment, reading your resolve. He does not argue. '
+                       'Instead, he gives a single, slow nod.\n\n'
+                       '<npc target="Dee">"Alright. Lock the creds down first."</npc>',
+        })
+        retry_prompt = post_chat.call_args_list[1].args[0][-1]['content']
+        self.assertIn('clearly attributed NPC speech', retry_prompt)
+        self.assertIn('use the required <npc> wrapper', retry_prompt)
+        self.assertNotIn('Rewrite the same reply', retry_prompt)
+        self.assertNotIn('Preserve the narration', retry_prompt)
 
     def test_session_dm_format_retry_repairs_non_json_meta_response(self):
         hot_context = {
@@ -1273,7 +1357,7 @@ class DmToolsTest(unittest.TestCase):
         })
         self.assertEqual(post_chat.call_count, 3)
         contract_retry_prompt = post_chat.call_args_list[2].args[0][-1]['content']
-        self.assertIn('required final JSON contract', contract_retry_prompt)
+        self.assertIn('return exactly one JSON object only', contract_retry_prompt)
         self.assertIn('exactly one JSON object', contract_retry_prompt)
 
     def test_json_contract_retry_discards_candidate_and_reruns_with_system_reminder(self):
@@ -1301,7 +1385,7 @@ class DmToolsTest(unittest.TestCase):
 
         self.assertEqual(result, {'mode': 'silent', 'content': '', 'reason': 'Awaiting player response.'})
         contract_retry_prompt = post_chat.call_args_list[1].args[0][-1]['content']
-        self.assertIn('required final JSON contract', contract_retry_prompt)
+        self.assertIn('return exactly one JSON object only', contract_retry_prompt)
         self.assertIn('exactly one JSON object', contract_retry_prompt)
 
     def test_json_contract_retry_uses_fresh_rerun_output(self):
@@ -1352,7 +1436,8 @@ class DmToolsTest(unittest.TestCase):
         self.assertEqual(result, {'mode': 'speak', 'content': 'Make a Technology check.'})
         self.assertEqual(post_chat.call_count, 3)
         format_retry_prompt = post_chat.call_args_list[2].args[0][-1]['content']
-        self.assertIn('OOC/IC mode labels', format_retry_prompt)
+        self.assertIn('use valid visible-message syntax', format_retry_prompt)
+        self.assertNotIn('OOC/IC mode labels', format_retry_prompt)
 
     def test_json_contract_retry_reprompts_provider_tool_markup_with_specific_reminder(self):
         hot_context = {
@@ -1385,7 +1470,7 @@ class DmToolsTest(unittest.TestCase):
         })
         self.assertEqual(post_chat.call_count, 2)
         retry_prompt = post_chat.call_args_list[1].args[0][-1]['content']
-        self.assertIn('raw provider tool-call markup', retry_prompt)
+        self.assertIn('player-visible DM reply only', retry_prompt)
         self.assertIn('Do not output DSML', retry_prompt)
 
     def test_spoiler_checker_allows_safe_reply(self):
@@ -1494,9 +1579,9 @@ class DmToolsTest(unittest.TestCase):
 
         self.assertEqual(result, {'mode': 'speak', 'content': 'The air feels tense as you leave.'})
         retry_prompt = post_chat.call_args_list[1].args[0][-1]['content']
-        self.assertIn('"The trap closes"', retry_prompt)
-        self.assertIn('Directly implies the hidden truth.', retry_prompt)
-        self.assertIn('Remove or generalize those claims', retry_prompt)
+        self.assertIn('keep the visible reply spoiler-safe', retry_prompt)
+        self.assertIn('keep the visible reply spoiler-safe', retry_prompt)
+        self.assertNotIn('The trap closes', retry_prompt)
 
     def test_private_output_guard_retry_uses_child_trace(self):
         hot_context = {

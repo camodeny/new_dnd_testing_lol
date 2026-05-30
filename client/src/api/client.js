@@ -15,7 +15,7 @@ export async function apiFetch(path, options = {}) {
     headers.Authorization = `Bearer ${token}`
   }
 
-  const res = await fetch(url, { ...options, headers })
+  const res = await fetch(url, { ...options, headers, credentials: 'include' })
   const data = await res.json().catch(() => ({}))
 
   if (!res.ok) {
@@ -37,7 +37,7 @@ export async function apiBlob(path, options = {}) {
     headers.Authorization = `Bearer ${token}`
   }
 
-  const res = await fetch(url, { ...options, headers })
+  const res = await fetch(url, { ...options, headers, credentials: 'include' })
   if (!res.ok) {
     const data = await res.json().catch(() => ({}))
     const err = new Error(data.error || `HTTP ${res.status}`)
@@ -209,7 +209,9 @@ export function sendMessage(sessionId, content, role = 'player') {
 
 export function getSessionStreamUrl(sessionId) {
   const token = getToken()
-  return `${API_BASE}/sessions/${sessionId}/stream?token=${encodeURIComponent(token || '')}`
+  return token
+    ? `${API_BASE}/sessions/${sessionId}/stream?token=${encodeURIComponent(token)}`
+    : `${API_BASE}/sessions/${sessionId}/stream`
 }
 
 export function listLlmPlayers(campaignId) {

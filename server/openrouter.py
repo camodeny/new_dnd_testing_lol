@@ -202,6 +202,16 @@ SESSION_MECHANICS_CHECK_SYSTEM_PROMPT = (
     "and immediate reactions without deciding the mechanical outcome."
 )
 
+SESSION_NPC_TAG_CHECK_SYSTEM_PROMPT = (
+    "You are a formatting checker for visible Dungeon Master replies. "
+    "Return only valid JSON. Decide whether the candidate visible DM reply contains quoted NPC-performed "
+    "speech or performance that should be wrapped in <npc target=\"NPC name\">...</npc> but is currently "
+    "plain text. Be conservative. Safe replies include plain narration, unattributed quoted text, signage, "
+    "interface text, remembered phrases, ambient sounds, or stylized prose that is not clearly an NPC's "
+    "current performed line. Unsafe replies clearly attribute a current spoken line or performed utterance "
+    "to a specific NPC or named non-player speaker without the required <npc> wrapper."
+)
+
 SESSION_PREFLIGHT_SYSTEM_PROMPT = (
     "You are a fast routing classifier for an AI Dungeon Master turn. "
     "Return only valid JSON. Be extremely conservative about skipping spoiler checks. "
@@ -914,64 +924,76 @@ def _session_dm_json_contract_violation(raw_content):
 
 
 def _session_dm_guard_retry_system_prompt(guard_name, details):
+    silent_ack = ' Acknowledge these instructions silently and follow them. Do not output an acknowledgement.'
     if guard_name == 'json_contract':
         if isinstance(details, dict) and details.get('kind') == 'provider_tool_markup':
             return (
-                'Guard reminder: your previous candidate exposed raw provider tool-call markup instead of a player-visible '
-                'DM reply. Discard that candidate completely and generate a fresh response for the same turn. '
+                'Guard reminder: generate a player-visible DM reply only. '
                 'Do not output DSML, <｜｜DSML｜｜tool_calls>, invoke tags, XML, or any tool-call markup in visible content. '
                 'The final answer must be exactly one JSON object only, with either '
                 '{"mode":"speak","content":"..."} or {"mode":"silent","reason":"..."}. '
                 'If you need to narrate what the player learns, write only the player-facing result in content.'
+                + silent_ack
             )
         return (
-            'Guard reminder: your previous candidate did not follow the required final JSON contract. '
-            'Generate a fresh response for the same turn and return exactly one JSON object only, with either '
+            'Guard reminder: return exactly one JSON object only, with either '
             '{"mode":"speak","content":"..."} or {"mode":"silent","reason":"..."}. '
             'Do not output markdown fences, explanations, meta-commentary, or text outside the JSON object. '
             'Use mode="silent" only when no visible DM response is actually needed.'
+            + silent_ack
         )
     if guard_name == 'format':
         return (
-            'Guard reminder: your previous candidate used malformed visible-message syntax.\n'
-            f'{_session_dm_format_feedback(details)}\n'
+            'Guard reminder: use valid visible-message syntax. '
             'Return exactly one JSON object in the final contract. If mode="speak", content may use Markdown and '
             'plain text. The only allowed angle-bracket tag is <npc target="NPC name">...</npc>. '
             'Do not use <ic>, <ooc>, HTML, XML, or invalid closing tags.'
+            + silent_ack
+        )
+    if guard_name == 'missing_npc_tag':
+        return (
+            'Guard reminder: if you include clearly attributed NPC speech or performed utterances, use the required '
+            '<npc> wrapper. '
+            'If you include clearly attributed current NPC spoken lines or performed utterances, wrap them in '
+            '<npc target="NPC name">...</npc>, and leave narration outside the tag. '
+            'Do not use any other angle-bracket tags. Return exactly one JSON object in the final contract.'
+            + silent_ack
         )
     if guard_name == 'mechanical_resolution':
         return (
-            'Guard reminder: your previous candidate resolved uncertain combat outcomes before the required D&D '
-            'mechanics.\n'
-            f'{_mechanics_rewrite_feedback(details)}\n'
+            'Guard reminder: do not resolve uncertain combat outcomes before the required D&D mechanics. '
             'Return exactly one JSON object in the final contract. If mode="speak", ask for the required roll or '
             'initiative instead of narrating hit/miss/damage/outcome.'
+            + silent_ack
         )
     if guard_name == 'pc_control':
         return (
-            'Guard reminder: your previous candidate controlled a protected player character. '
+            'Guard reminder: do not control a protected player character. '
             'Do not write dialogue, actions, gestures, thoughts, emotions, or decisions for any PC. '
             'If no DM adjudication is needed (for example PC-to-PC exchange), return '
             '{"mode":"silent","reason":"PC-to-PC exchange."}. Otherwise return mode="speak" with only safe DM-visible '
             'content. Return exactly one JSON object in the final contract.'
+            + silent_ack
         )
     if guard_name == 'private_output':
         terms = ', '.join(details.get('matched_terms') or []) if isinstance(details, dict) else ''
         return (
-            'Guard reminder: your previous candidate exposed DM-private information that has not become visible through '
+            'Guard reminder: do not expose DM-private information that has not become visible through '
             f'play. Do not mention these private terms in the visible reply: {terms or "(none listed)"}. '
             'Return exactly one JSON object in the final contract with spoiler-safe visible content.'
+            + silent_ack
         )
     if guard_name == 'spoiler_checker':
         return (
-            'Guard reminder: a spoiler-safety checker flagged semantic leaks in your previous candidate. '
-            f'{_spoiler_rewrite_feedback(details)} '
+            'Guard reminder: keep the visible reply spoiler-safe. '
             'Keep only what players could currently observe or reasonably know in-world. '
             'Return exactly one JSON object in the final contract with spoiler-safe visible content.'
+            + silent_ack
         )
     return (
-        'Guard reminder: generate a fresh response for the same turn and return exactly one valid JSON object '
+        'Guard reminder: return exactly one valid JSON object '
         'matching the final contract.'
+        + silent_ack
     )
 
 
@@ -1290,6 +1312,45 @@ def _session_dm_format_feedback(format_violation):
     return '\n'.join(lines)
 
 
+def _possible_missing_npc_tag_signal(response_text):
+    import re
+
+    text = response_text or ''
+    if '<npc' in text.lower():
+        return None
+
+    quoted_dialogue_pattern = re.compile(
+        r'(?P<prefix>(?:^|\n\n?)[^\n<]{0,240}?)'
+        r'(?P<quote>(?:\*\*)?\s*["\u201c][^"\u201c\u201d\n]{2,400}["\u201d](?:\s*\*\*)?)',
+        flags=re.MULTILINE,
+    )
+    speaker_cue_pattern = re.compile(
+        r'\b(?P<name>[A-Z][A-Za-z0-9\'._-]*(?:\s+[A-Z][A-Za-z0-9\'._-]*){0,3})\b'
+        r'(?:(?!<npc|["\u201c]).){0,220}\b'
+        r'(?i:(?:says?|said|asks?|asked|repl(?:y|ies|ied)|whispers?|murmurs?|growls?|snaps?|'
+        r'shouts?|laughs?|chuckles?|nods?|shrugs?|sighs?|smiles?|grins?|frowns?|smirks?|'
+        r'glances?|gestures?|motions?|waves?|points?|leans?|turns?|watches?|scratches?|'
+        r'mutters?|answers?|calls?))\b',
+        flags=re.DOTALL,
+    )
+    ignored_speakers = {'I', 'We', 'You', 'It', 'This', 'That', 'The'}
+
+    for match in quoted_dialogue_pattern.finditer(text):
+        prefix = match.group('prefix') or ''
+        speaker_match = speaker_cue_pattern.search(prefix)
+        if not speaker_match:
+            continue
+        speaker = str(speaker_match.group('name') or '').strip()
+        if not speaker or speaker in ignored_speakers:
+            continue
+        return {
+            'speaker': speaker,
+            'quote': ' '.join(str(match.group('quote') or '').split())[:240],
+            'context': ' '.join(prefix.split())[:240],
+        }
+    return None
+
+
 def normalize_session_spoiler_check(raw_check):
     data = raw_check if isinstance(raw_check, dict) else _json_loads_or_empty(raw_check)
     if not isinstance(data, dict) or not data:
@@ -1382,6 +1443,50 @@ def build_session_spoiler_check_messages(response_text, hot_context):
     ]
 
 
+def normalize_session_npc_tag_check(raw_check):
+    data = raw_check if isinstance(raw_check, dict) else _json_loads_or_empty(raw_check)
+    if not isinstance(data, dict) or not data:
+        return {
+            'requires_npc_tag': False,
+            'speaker': '',
+            'evidence': [],
+            'reason': 'Checker returned no usable decision.',
+        }
+
+    evidence = data.get('evidence')
+    if not isinstance(evidence, list):
+        evidence = []
+    evidence = [str(item).strip() for item in evidence if str(item).strip()]
+
+    return {
+        'requires_npc_tag': bool(data.get('requires_npc_tag')),
+        'speaker': str(data.get('speaker') or '').strip()[:120],
+        'evidence': evidence,
+        'reason': str(data.get('reason') or '').strip(),
+    }
+
+
+def build_session_npc_tag_check_messages(response_text, signal):
+    return [
+        {'role': 'system', 'content': SESSION_NPC_TAG_CHECK_SYSTEM_PROMPT},
+        {
+            'role': 'user',
+            'content': json.dumps({
+                'candidate_visible_dm_reply': response_text,
+                'heuristic_signal': signal or {},
+                'return_shape': {
+                    'requires_npc_tag': 'boolean',
+                    'speaker': 'speaker name if confidently identified, else empty string',
+                    'evidence': ['short exact snippets from the candidate reply'],
+                    'reason': 'one short explanation',
+                },
+            }, ensure_ascii=False),
+        },
+    ]
+
+
+
+
 def _spoiler_rewrite_feedback(spoiler_check):
     evidence = spoiler_check.get('evidence') if isinstance(spoiler_check, dict) else []
     snippets = [str(item).strip() for item in evidence or [] if str(item).strip()]
@@ -1472,6 +1577,48 @@ def check_session_mechanics_with_llm(response_text, preflight_decision, hot_cont
             'safe': True,
             'violations': [],
             'required_mechanic': '',
+            'reason': 'Checker failed open.',
+        }
+
+
+def check_session_missing_npc_tags_with_llm(response_text, signal, audit_context=None):
+    if not (response_text or '').strip() or not signal:
+        return {'requires_npc_tag': False, 'speaker': '', 'evidence': [], 'reason': ''}
+
+    base_audit = audit_context or {}
+    checker_audit = _child_audit_context(
+        base_audit,
+        'session_npc_tag_check',
+        'session_npc_tag_checker',
+        'session_npc_tag_checker: npc tag check',
+    )
+    try:
+        raw_check = _post_chat(
+            build_session_npc_tag_check_messages(response_text, signal),
+            json_mode=True,
+            audit_context=checker_audit,
+            allow_thinking=False,
+        )
+        return normalize_session_npc_tag_check(raw_check)
+    except Exception as err:
+        campaign_id = base_audit.get('campaign_id')
+        if campaign_id:
+            log_audit_event(
+                campaign_id,
+                'npc_tag_checker_error',
+                'Session NPC tag checker failed open.',
+                {'error': repr(err)},
+                source='session_dm.guard',
+                actor='server',
+                trace_id=base_audit.get('trace_id'),
+                trace_label=base_audit.get('trace_label'),
+                audit_role='guard',
+                commit=True,
+            )
+        return {
+            'requires_npc_tag': False,
+            'speaker': '',
+            'evidence': [],
             'reason': 'Checker failed open.',
         }
 
@@ -2222,6 +2369,31 @@ def get_session_dm_response_with_tools(
                 if decision.get('mode') == 'speak'
                 else None
             )
+            missing_npc_signal = (
+                _possible_missing_npc_tag_signal(content)
+                if decision.get('mode') == 'speak' and not format_violation
+                else None
+            )
+            npc_tag_check = (
+                check_session_missing_npc_tags_with_llm(content, missing_npc_signal, loop_audit)
+                if missing_npc_signal
+                else {'requires_npc_tag': False, 'speaker': '', 'evidence': [], 'reason': ''}
+            )
+            if not format_violation and npc_tag_check.get('requires_npc_tag'):
+                speaker = str(npc_tag_check.get('speaker') or missing_npc_signal.get('speaker') or '').strip() or 'the speaker'
+                evidence = npc_tag_check.get('evidence') or []
+                snippet = str(evidence[0] if evidence else missing_npc_signal.get('quote') or '').strip()
+                reason = str(npc_tag_check.get('reason') or '').strip()
+                detail = f'Quoted dialogue attributed to {speaker} should be wrapped in <npc target="{speaker}">...</npc>.'
+                if reason:
+                    detail = f'{detail} Checker reason: {reason}'
+                format_violation = {
+                    'errors': [{
+                        'kind': 'missing_npc_tag',
+                        'snippet': snippet[:160],
+                        'detail': detail,
+                    }],
+                }
             mechanics_check = (
                 check_session_mechanics_with_llm(content, preflight_decision, hot_context, loop_audit)
                 if decision.get('mode') == 'speak' and not format_violation
@@ -2280,7 +2452,12 @@ def get_session_dm_response_with_tools(
                     )
                 messages.append({
                     'role': 'system',
-                    'content': _session_dm_guard_retry_system_prompt('format', format_violation),
+                    'content': _session_dm_guard_retry_system_prompt(
+                        'missing_npc_tag'
+                        if any(err.get('kind') == 'missing_npc_tag' for err in (format_violation.get('errors') or []))
+                        else 'format',
+                        format_violation,
+                    ),
                 })
                 format_retried = True
                 continue

@@ -95,6 +95,11 @@ jobs:
           TS_OAUTH_SECRET: ${{ secrets.TS_OAUTH_SECRET }}
           DEPLOY_SSH_KEY: ${{ secrets.DEPLOY_SSH_KEY }}
           SECRET_KEY: ${{ secrets.SECRET_KEY }}
+          SSO_URL: ${{ vars.SSO_URL }}
+          REDIRECT_URI: ${{ vars.REDIRECT_URI }}
+          AUTH_COOKIE_SECURE: ${{ vars.AUTH_COOKIE_SECURE }}
+          CLIENT_ID: ${{ secrets.CLIENT_ID }}
+          CLIENT_SECRET: ${{ secrets.CLIENT_SECRET }}
           LLM_PROVIDER: ${{ vars.LLM_PROVIDER }}
           OPENROUTER_API_KEY: ${{ secrets.OPENROUTER_API_KEY }}
           OPENROUTER_MODEL: ${{ secrets.OPENROUTER_MODEL }}
@@ -112,6 +117,12 @@ jobs:
           : "${DEPLOY_SSH_KEY:?DEPLOY_SSH_KEY secret is required}"
           : "${SECRET_KEY:?SECRET_KEY secret is required}"
           : "${OPENAI_API_KEY:?OPENAI_API_KEY secret is required for encounter map generation}"
+          if [ -n "${SSO_URL:-}${REDIRECT_URI:-}${CLIENT_ID:-}${CLIENT_SECRET:-}" ]; then
+            : "${SSO_URL:?SSO_URL variable is required when Pendergrass SSO is enabled}"
+            : "${REDIRECT_URI:?REDIRECT_URI variable is required when Pendergrass SSO is enabled}"
+            : "${CLIENT_ID:?CLIENT_ID secret is required when Pendergrass SSO is enabled}"
+            : "${CLIENT_SECRET:?CLIENT_SECRET secret is required when Pendergrass SSO is enabled}"
+          fi
           GEMINI_EMBEDDINGS_ENABLED="${GEMINI_EMBEDDINGS_ENABLED:-true}"
           if [ "${GEMINI_EMBEDDINGS_ENABLED}" != "false" ]; then
             : "${GEMINI_API_KEY:?GEMINI_API_KEY secret is required when GEMINI_EMBEDDINGS_ENABLED is not false}"
@@ -182,6 +193,11 @@ jobs:
           DATABASE_URL: ${{ secrets.DATABASE_URL }}
           SECRET_KEY: ${{ secrets.SECRET_KEY }}
           JWT_EXPIRATION_HOURS: ${{ vars.JWT_EXPIRATION_HOURS }}
+          SSO_URL: ${{ vars.SSO_URL }}
+          REDIRECT_URI: ${{ vars.REDIRECT_URI }}
+          AUTH_COOKIE_SECURE: ${{ vars.AUTH_COOKIE_SECURE }}
+          CLIENT_ID: ${{ secrets.CLIENT_ID }}
+          CLIENT_SECRET: ${{ secrets.CLIENT_SECRET }}
           LLM_PROVIDER: ${{ vars.LLM_PROVIDER }}
           OPENROUTER_API_KEY: ${{ secrets.OPENROUTER_API_KEY }}
           OPENROUTER_MODEL: ${{ secrets.OPENROUTER_MODEL }}
@@ -216,6 +232,7 @@ jobs:
           FRONTEND_ORIGINS="${FRONTEND_ORIGINS:-http://localhost:${APP_PORT}}"
           PUBLIC_APP_BASE_URL="${PUBLIC_APP_BASE_URL:-http://localhost:${APP_PORT}}"
           JWT_EXPIRATION_HOURS="${JWT_EXPIRATION_HOURS:-24}"
+          AUTH_COOKIE_SECURE="${AUTH_COOKIE_SECURE:-false}"
           LLM_PROVIDER="${LLM_PROVIDER:-openrouter}"
           OPENCODE_GO_THINKING="${OPENCODE_GO_THINKING:-disabled}"
           OPENCODE_GO_REASONING_EFFORT="${OPENCODE_GO_REASONING_EFFORT:-high}"
@@ -245,6 +262,11 @@ jobs:
           DATABASE_URL=${DATABASE_URL}
           SECRET_KEY=${SECRET_KEY}
           JWT_EXPIRATION_HOURS=${JWT_EXPIRATION_HOURS}
+          SSO_URL=${SSO_URL}
+          REDIRECT_URI=${REDIRECT_URI}
+          AUTH_COOKIE_SECURE=${AUTH_COOKIE_SECURE}
+          CLIENT_ID=${CLIENT_ID}
+          CLIENT_SECRET=${CLIENT_SECRET}
           LLM_PROVIDER=${LLM_PROVIDER}
           OPENROUTER_API_KEY=${OPENROUTER_API_KEY}
           OPENROUTER_MODEL=${OPENROUTER_MODEL}

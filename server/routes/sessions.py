@@ -561,8 +561,6 @@ def send_message(current_user, session_id):
 def stream_session(session_id):
     token_str = request.args.get('token')
     api_key = request.args.get('api_key')
-    if not token_str and not api_key:
-        return jsonify({'error': 'Unauthorized'}), 401
 
     current_user, error_response = authenticate_request(token=token_str, api_key=api_key)
     if error_response is not None:
@@ -602,6 +600,16 @@ def _get_session_proposals(current_user, session_id):
 
     is_dm = campaign.user_id == current_user.id
     proposals = SheetProposal.query.filter_by(session_id=session_id, status='pending').all()
+    session_message_ids = {
+        message_id
+        for (message_id,) in db.session.query(SessionMessage.id)
+        .filter_by(session_id=session_id)
+        .all()
+    }
+    proposals = [
+        proposal for proposal in proposals
+        if proposal.message_id is None or proposal.message_id in session_message_ids
+    ]
 
     if is_dm:
         result = [p.to_dict() for p in proposals]
