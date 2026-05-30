@@ -42,7 +42,7 @@ Optional variables:
 - `FRONTEND_ORIGINS`: defaults to `http://localhost:$APP_PORT`.
 - `PUBLIC_APP_BASE_URL`: defaults to `http://localhost:$APP_PORT`.
 - `SSO_URL`: optional provider base URL for browser login. Set this to `https://auth.pendergrass.dev` when enabling hosted Pendergrass SSO.
-- `REDIRECT_URI`: optional app callback URL for browser login. For the current Tailscale deployment, use `http://100.99.192.92:$APP_PORT/api/auth/callback`.
+- `REDIRECT_URI`: optional app callback URL for browser login. For the current Tailscale deployment, use `http://camden-server.tailea98b.ts.net:$APP_PORT/api/auth/callback`.
 - `AUTH_COOKIE_SECURE`: defaults to `false`. Keep it `false` while the app itself is served over plain HTTP, even if `SSO_URL` is HTTPS.
 - `GUNICORN_TIMEOUT`: defaults to `420` in Docker Compose to allow slower image generation requests.
 - `GUNICORN_WORKER_CLASS`: defaults to `gthread` for better handling of long-lived streaming requests.
@@ -97,7 +97,7 @@ Enable hosted Pendergrass SSO for the current deployment:
 
 ```bash
 SSO_URL=https://auth.pendergrass.dev
-REDIRECT_URI=http://100.99.192.92:5889/api/auth/callback
+REDIRECT_URI=http://camden-server.tailea98b.ts.net:5889/api/auth/callback
 AUTH_COOKIE_SECURE=false
 CLIENT_ID=...
 CLIENT_SECRET=...
