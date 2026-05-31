@@ -1341,7 +1341,6 @@ select.input:focus {
 .roster-card:hover {
   border-color: rgba(168, 85, 247, 0.3);
   background: rgba(31, 32, 43, 0.65);
-  transform: translateX(3px);
 }
 
 .roster-card-header {
@@ -1374,11 +1373,11 @@ select.input:focus {
 
 .roster-name {
   font-size: 0.95rem;
-  font-weight: 600;
+  font-weight: 700;
   color: var(--text-bright);
-  white-space: nowrap;
-  overflow: hidden;
-  text-overflow: ellipsis;
+  white-space: normal;
+  overflow: visible;
+  text-overflow: clip;
   width: 100%;
 }
 
@@ -3371,11 +3370,11 @@ select.input:focus {
 
 /* DM speaking as NPC */
 .session-npc-message {
-  background: rgba(168, 85, 247, 0.04);
-  border: 1px solid rgba(168, 85, 247, 0.15);
+  background: rgba(197, 168, 128, 0.04);
+  border: 1px solid rgba(197, 168, 128, 0.15);
   border-radius: var(--radius-md);
   padding: 14px 18px;
-  box-shadow: inset 0 0 10px rgba(168, 85, 247, 0.05);
+  box-shadow: inset 0 0 10px rgba(197, 168, 128, 0.05);
 }
 
 .session-npc-banner {
@@ -7101,24 +7100,35 @@ select.input:focus {
   background: var(--bg-panel-elevated);
 }
 
-.end-session-btn {
-  background-color: var(--color-primary);
-  border-color: var(--color-primary);
+.end-session-btn,
+.start-session-btn {
+  background: var(--color-primary) !important;
+  border-color: var(--color-primary) !important;
+  color: #fff !important;
+  box-shadow: none !important;
 }
 
-.end-session-btn:hover {
-  background-color: var(--color-primary-hover);
-  border-color: var(--color-primary-hover);
+.end-session-btn:hover,
+.start-session-btn:hover {
+  background: var(--color-primary-hover) !important;
+  border-color: var(--color-primary-hover) !important;
+  transform: none !important;
+  box-shadow: none !important;
 }
 
 /* Right Sidebar Panels */
 .right-sidebar-widget {
-  background: var(--bg-panel);
-  border: 1px solid var(--border-color);
-  border-radius: var(--radius-md);
-  padding: 18px;
-  margin-bottom: 20px;
-  box-shadow: var(--shadow-sm);
+  background: transparent !important;
+  border: none !important;
+  border-bottom: 1px solid rgba(255, 255, 255, 0.05) !important;
+  border-radius: 0 !important;
+  padding: 16px 0 !important;
+  margin-bottom: 16px !important;
+  box-shadow: none !important;
+}
+
+.right-sidebar-widget:last-of-type {
+  border-bottom: none !important;
 }
 
 .widget-header {
@@ -7255,18 +7265,23 @@ select.input:focus {
 
 /* Party Roster Card Updates (Mockup style) */
 .roster-card {
-  background: var(--bg-panel);
-  border: 1px solid var(--border-color);
-  border-radius: var(--radius-md);
-  padding: 14px;
-  box-shadow: var(--shadow-sm);
+  background: transparent !important;
+  border: none !important;
+  border-bottom: 1px solid rgba(255, 255, 255, 0.05) !important;
+  border-radius: 0 !important;
+  padding: 12px 0 !important;
+  box-shadow: none !important;
   transition: var(--transition-smooth);
 }
 
 .roster-card:hover {
-  transform: translateY(-2px);
-  border-color: var(--color-primary);
-  box-shadow: var(--shadow-md);
+  background: transparent !important;
+  border-bottom-color: rgba(255, 255, 255, 0.1) !important;
+  box-shadow: none !important;
+}
+
+.roster-card:last-child {
+  border-bottom: none !important;
 }
 
 .roster-card-header {
@@ -7405,16 +7420,14 @@ select.input:focus {
 
 .session-input-editable,
 .session-input-placeholder {
-  background: var(--bg-dark) !important;
-  border: 1px solid var(--border-color) !important;
-  border-radius: 20px !important;
-  padding: 10px 20px !important;
-  color: var(--text-main) !important;
+  background: transparent !important;
+  border: none !important;
+  box-shadow: none !important;
+  color: var(--text-bright) !important;
 }
 
 .session-input-editable:focus {
-  border-color: var(--color-primary) !important;
-  outline: none;
+  outline: none !important;
 }
 
 .session-send-btn {
@@ -7429,10 +7442,15 @@ select.input:focus {
   align-items: center;
   justify-content: center;
   transition: var(--transition-smooth);
+  box-shadow: none !important;
 }
 
-.session-send-btn:hover {
+.session-send-btn:hover,
+.session-send-btn:hover:not(:disabled) {
   background: var(--color-primary-hover) !important;
+  border-color: var(--color-primary-hover) !important;
+  transform: none !important;
+  box-shadow: none !important;
 }
 
 .btn-roll-toggle {
@@ -7483,4 +7501,321 @@ select.input:focus {
 .modal-close:hover {
   color: var(--text-bright) !important;
 }
+
+
+/* ==========================================================================
+   RESTYLED D&D VTT SCREEN
+   ========================================================================== */
+
+/* Party Roster restyling */
+.roster-card-body-layout {
+  display: flex;
+  gap: 16px;
+  align-items: flex-start;
+}
+
+.roster-avatar-section {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 6px;
+  width: 60px;
+  flex-shrink: 0;
+}
+
+.roster-avatar {
+  width: 44px;
+  height: 44px;
+  border-radius: 50% !important;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  font-weight: 700;
+  color: #fff;
+  border: 2px solid rgba(255, 255, 255, 0.08);
+}
+
+.roster-hp-text-below {
+  font-size: 0.7rem;
+  font-weight: 600;
+  color: var(--text-main);
+  white-space: nowrap;
+  font-family: var(--mono);
+}
+
+.roster-details-section {
+  flex: 1;
+  min-width: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+
+.roster-name-row {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  gap: 8px;
+}
+
+.roster-name {
+  font-size: 0.95rem;
+  font-weight: 700;
+  color: var(--text-bright);
+}
+
+.roster-class-icon-wrapper {
+  color: var(--color-accent);
+  font-size: 1.05rem;
+  opacity: 0.85;
+}
+
+.roster-subtitle {
+  font-size: 0.75rem;
+  color: var(--text-muted);
+}
+
+.roster-hp-bar-bg {
+  background: var(--bg-dark) !important;
+  height: 6px !important;
+  border-radius: 3px !important;
+  overflow: hidden;
+  border: 1px solid rgba(255, 255, 255, 0.03) !important;
+}
+
+/* Chat Tabs styling */
+.chat-tabs-header {
+  display: flex;
+  background: var(--bg-panel);
+  border-bottom: 1px solid var(--border-color);
+  padding: 0 16px;
+  gap: 4px;
+}
+
+.chat-tab-btn {
+  background: transparent;
+  border: none;
+  border-bottom: 2px solid transparent;
+  color: var(--text-muted);
+  font-weight: 600;
+  font-size: 0.85rem;
+  padding: 12px 16px;
+  cursor: pointer;
+  transition: var(--transition-smooth);
+}
+
+.chat-tab-btn:hover {
+  color: var(--text-bright);
+}
+
+.chat-tab-btn.active {
+  color: var(--color-primary-hover);
+  border-bottom-color: var(--color-primary);
+}
+
+/* Message Item restyling */
+.session-msg {
+  padding: 14px 20px !important;
+}
+
+.session-msg-layout {
+  display: flex;
+  gap: 16px;
+  align-items: flex-start;
+  position: relative;
+}
+
+.session-msg-avatar-wrapper {
+  flex-shrink: 0;
+}
+
+.session-msg-avatar {
+  width: 38px;
+  height: 38px;
+  border-radius: 50%;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  font-weight: 700;
+  color: #fff;
+  font-size: 0.85rem;
+}
+
+.session-msg-avatar.dm-avatar {
+  background: linear-gradient(135deg, #8c7355, #5a4a35);
+  border: 1px solid var(--color-accent);
+}
+
+.session-msg-avatar.system-avatar {
+  background: linear-gradient(135deg, #475569, #1e293b);
+  border: 1px solid var(--border-color);
+}
+
+.session-msg-avatar.player-avatar {
+  border: 1px solid rgba(255, 255, 255, 0.08);
+}
+
+.session-msg-body {
+  flex: 1;
+  min-width: 0;
+}
+
+.session-msg-header {
+  display: flex;
+  align-items: baseline;
+  gap: 10px;
+  margin-bottom: 6px;
+}
+
+.session-msg-username {
+  font-weight: 700;
+  color: var(--text-bright);
+  font-size: 0.92rem;
+}
+
+.session-msg-time {
+  font-size: 0.72rem;
+  color: var(--text-dim);
+}
+
+.session-msg-content {
+  font-size: 0.92rem;
+  line-height: 1.55;
+}
+
+.session-msg-ic-badge-container {
+  flex-shrink: 0;
+  margin-left: 12px;
+  align-self: center;
+}
+
+.ic-badge {
+  font-size: 0.7rem;
+  font-weight: 700;
+  letter-spacing: 0.5px;
+  color: var(--text-gold);
+  border: 1px solid var(--color-accent);
+  padding: 2px 6px;
+  border-radius: 4px;
+  background: rgba(197, 168, 128, 0.05);
+  text-transform: uppercase;
+}
+
+/* Sidebar Pending Updates widget */
+.pending-updates-panel {
+  background: transparent !important;
+  border: none !important;
+  border-bottom: 1px solid rgba(255, 255, 255, 0.05) !important;
+  border-radius: 0 !important;
+  padding: 16px 0 !important;
+  margin-bottom: 16px !important;
+  box-shadow: none !important;
+}
+
+.updates-count-badge {
+  background: #a23b3b;
+  color: #fff;
+  font-size: 0.7rem;
+  font-weight: 700;
+  padding: 1px 6px;
+  border-radius: 10px;
+  margin-left: 6px;
+}
+
+.updates-list {
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+  margin-top: 14px;
+}
+
+.update-row {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  padding: 10px;
+  background: rgba(255, 255, 255, 0.02);
+  border: 1px solid var(--border-color);
+  border-radius: var(--radius-sm);
+  transition: var(--transition-smooth);
+}
+
+.update-row:hover {
+  background: rgba(255, 255, 255, 0.04);
+  border-color: rgba(255, 255, 255, 0.1);
+}
+
+.update-avatar {
+  width: 32px;
+  height: 32px;
+  border-radius: 50%;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  font-weight: 700;
+  color: #fff;
+  font-size: 0.75rem;
+  flex-shrink: 0;
+  border: 1px solid rgba(255, 255, 255, 0.08);
+}
+
+.update-details {
+  flex: 1;
+  min-width: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+}
+
+.update-char-name {
+  font-size: 0.82rem;
+  font-weight: 700;
+  color: var(--text-bright);
+}
+
+.update-reason {
+  font-size: 0.72rem;
+  color: var(--text-muted);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.review-btn {
+  background: var(--bg-dark) !important;
+  border: 1px solid var(--border-color) !important;
+  color: var(--text-bright) !important;
+  font-size: 0.75rem !important;
+  padding: 6px 12px !important;
+  font-weight: 600 !important;
+  border-radius: 6px !important;
+  cursor: pointer;
+  transition: var(--transition-smooth) !important;
+}
+
+.review-btn:hover {
+  background: var(--color-primary-glow) !important;
+  border-color: var(--color-primary) !important;
+  color: var(--color-primary-hover) !important;
+}
+
+.view-all-updates-row {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  background: none;
+  border: none;
+  color: var(--text-muted);
+  font-size: 0.8rem;
+  font-weight: 600;
+  padding: 6px 4px 0;
+  cursor: pointer;
+  width: 100%;
+  transition: var(--transition-smooth);
+}
+
+.view-all-updates-row:hover {
+  color: var(--text-bright);
+}
+
 

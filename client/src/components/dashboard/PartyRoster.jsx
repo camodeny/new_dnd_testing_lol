@@ -75,9 +75,6 @@ export default function PartyRoster({ characters = [], campaignId, onImport }) {
     <div style={{ display: 'flex', flexDirection: 'column', gap: '20px' }}>
       <div className="party-roster-title-section">
         <h4>Party</h4>
-        <span className="party-roster-count">
-          {charactersList.length}/{playerLimit} <i className="bi bi-people-fill"></i>
-        </span>
       </div>
 
       {charactersList.length === 0 ? (
@@ -113,38 +110,40 @@ export default function PartyRoster({ characters = [], campaignId, onImport }) {
                 className="roster-card"
                 onClick={() => navigate(`/characters/${c.id}`)}
               >
-                <div className="roster-card-header">
-                  <div className="roster-avatar" style={{ background: gradient }}>
-                    {initials}
+                <div className="roster-card-body-layout">
+                  <div className="roster-avatar-section">
+                    <div className="roster-avatar" style={{ background: gradient }}>
+                      {initials}
+                    </div>
+                    <span className="roster-hp-text-below">
+                      {combat.current_hp}/{combat.max_hp} HP
+                    </span>
                   </div>
-                  <div className="roster-card-info">
-                    <div className="roster-name">{c.name}</div>
-                    <div className="roster-subtitle">{mainRace} • {levelSummary}</div>
+                  
+                  <div className="roster-details-section">
+                    <div className="roster-name-row">
+                      <div className="roster-name">{c.name}</div>
+                    </div>
+                    <div className="roster-subtitle">{mainRace} {c.classes?.length ? c.classes.map(cl => cl.class_name).join('/') : ''} &bull; Level {c.total_level ?? 5}</div>
+                    
+                    <div className="roster-hp-bar-container" title={`${combat.current_hp} / ${combat.max_hp} HP`}>
+                      <div className="roster-hp-bar-bg">
+                        <div
+                          className="roster-hp-bar-fill"
+                          style={{ width: `${hpPct}%`, background: '#3e7a5e' }}
+                        />
+                        {combat.temp_hp > 0 && (
+                          <div
+                            className="roster-hp-bar-temp"
+                            style={{
+                              width: `${Math.min(100, ((combat.current_hp + combat.temp_hp) / combat.max_hp) * 100)}%`,
+                              left: `${hpPct}%`,
+                            }}
+                          />
+                        )}
+                      </div>
+                    </div>
                   </div>
-                  <div className="roster-ac-badge" title="Armor Class or Class symbol">
-                    <i className={classIcon}></i>
-                  </div>
-                </div>
-
-                <div className="roster-hp-bar-container" title={`${combat.current_hp} / ${combat.max_hp} HP`}>
-                  <div className="roster-hp-bar-bg">
-                    <div
-                      className="roster-hp-bar-fill"
-                      style={{ width: `${hpPct}%`, background: hpColor }}
-                    />
-                    {combat.temp_hp > 0 && (
-                      <div
-                        className="roster-hp-bar-temp"
-                        style={{
-                          width: `${Math.min(100, ((combat.current_hp + combat.temp_hp) / combat.max_hp) * 100)}%`,
-                          left: `${hpPct}%`,
-                        }}
-                      />
-                    )}
-                  </div>
-                  <span className="roster-hp-text">
-                    {combat.current_hp}{combat.temp_hp > 0 ? `+${combat.temp_hp}` : ''}/{combat.max_hp} HP
-                  </span>
                 </div>
 
                 {c.conditions?.length > 0 && (
@@ -171,17 +170,6 @@ export default function PartyRoster({ characters = [], campaignId, onImport }) {
         </div>
       )}
 
-      {onImport && emptySlotsCount > 0 && (
-        <div style={{ display: 'flex', flexDirection: 'column', gap: '8px' }}>
-          {Array.from({ length: Math.min(2, emptySlotsCount) }).map((_, index) => (
-            <div key={`empty-slot-${index}`} className="invite-player-slot">
-              <button className="invite-player-btn" onClick={onImport}>
-                <i className="bi bi-plus"></i> Invite a player
-              </button>
-            </div>
-          ))}
-        </div>
-      )}
     </div>
   )
 }

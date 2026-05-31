@@ -313,6 +313,21 @@ function DMMessageContent({ content }) {
   )
 }
 
+function getGradientSeed(str) {
+  if (!str) return 'linear-gradient(135deg, #475569, #1e293b)'
+  let hash = 0
+  for (let i = 0; i < str.length; i++) hash = str.charCodeAt(i) + ((hash << 5) - hash)
+  const hues = [250, 270, 290, 310, 330, 200, 220, 180]
+  const h1 = hues[Math.abs(hash) % hues.length]
+  const h2 = (h1 + 40) % 360
+  return `linear-gradient(135deg, hsl(${h1}, 60%, 55%), hsl(${h2}, 55%, 45%))`
+}
+
+function getInitials(name) {
+  if (!name) return '?'
+  return name.split(' ').map((w) => w[0]).join('').slice(0, 2).toUpperCase()
+}
+
 const SessionMessageItem = memo(function SessionMessageItem({
   msg,
   currentUser,
@@ -320,8 +335,13 @@ const SessionMessageItem = memo(function SessionMessageItem({
   onProposalApplied,
   onProposalDismissed,
 }) {
+  const isIc = msg.role === 'player' && hasIcSegment(msg.content || '')
+  const senderLabel = getMessageSenderLabel(msg, currentUser)
+  const initials = getInitials(msg.username || senderLabel)
+  const gradient = getGradientSeed(msg.username || senderLabel)
+
   return (
-    <div className={`session-msg session-msg-${msg.role}`}>
+    <div className={`session-msg session-msg-${msg.role} ${isIc ? 'is-ic' : ''}`}>
       {msg.is_proposal ? (
         <SheetProposalInline
           proposal={msg.proposal}
@@ -331,23 +351,45 @@ const SessionMessageItem = memo(function SessionMessageItem({
           onDismissed={onProposalDismissed}
         />
       ) : (
-        <>
-          <div className="session-msg-header">
-            <span className="session-msg-role">
-              <i className={getMessageSenderIcon(msg.role)}></i> {getMessageSenderLabel(msg, currentUser)}
-            </span>
-            <span className="session-msg-time">{formatTime(msg.created_at)}</span>
-          </div>
-          <div className={`session-msg-content ${msg.role === 'player' ? 'session-msg-content-tagged' : ''}`}>
+        <div className="session-msg-layout">
+          <div className="session-msg-avatar-wrapper">
             {msg.role === 'dm' ? (
-              <DMMessageContent content={msg.content} />
-            ) : msg.role === 'player' ? (
-              <PlayerMessageContent content={msg.content} />
+              <div className="session-msg-avatar dm-avatar">
+                <i className="bi bi-person-fill-check"></i>
+              </div>
+            ) : msg.role === 'system' ? (
+              <div className="session-msg-avatar system-avatar">
+                <i className="bi bi-gear-fill"></i>
+              </div>
             ) : (
-              msg.content
+              <div className="session-msg-avatar player-avatar" style={{ background: gradient }}>
+                {initials}
+              </div>
             )}
           </div>
-        </>
+
+          <div className="session-msg-body">
+            <div className="session-msg-header">
+              <span className="session-msg-username">{senderLabel}</span>
+              <span className="session-msg-time">{formatTime(msg.created_at)}</span>
+            </div>
+            <div className={`session-msg-content ${msg.role === 'player' ? 'session-msg-content-tagged' : ''}`}>
+              {msg.role === 'dm' ? (
+                <DMMessageContent content={msg.content} />
+              ) : msg.role === 'player' ? (
+                <PlayerMessageContent content={msg.content} />
+              ) : (
+                msg.content
+              )}
+            </div>
+          </div>
+
+          {isIc && (
+            <div className="session-msg-ic-badge-container">
+              <span className="ic-badge">IC</span>
+            </div>
+          )}
+        </div>
       )}
     </div>
   )
@@ -379,11 +421,53 @@ export default function SessionPanel({
   const [activeTab, setActiveTab] = useState('custom')
   const [showDice, setShowDice] = useState(false)
   const [lastRoll, setLastRoll] = useState(null)
+  const [activeChatTab, setActiveChatTab] = useState('chat')
   const messagesContainerRef = useRef(null)
   const messagesEndRef = useRef(null)
   const olderLoadScrollRef = useRef(null)
   const previousMessageCountRef = useRef(0)
   const rollIdRef = useRef(0)
+
+  const filteredMessages = useMemo(() => {
+    return messages.filter((msg) => {
+      // 1. System tab
+      if (activeChatTab === 'system') {
+        return msg.role === 'system' || msg.is_proposal;
+      }
+      
+      // 2. Dice tab
+      if (activeChatTab === 'dice') {
+        if (msg.is_proposal) return false;
+        const hasRoll = msg.content && (msg.content.includes('[Roll:') || msg.content.includes('rolled '));
+        const hasTurnEnd = msg.content && msg.content.includes('[Turn Ended]');
+        return Boolean(hasRoll || hasTurnEnd);
+      }
+      
+      // 3. OOC tab
+      if (activeChatTab === 'ooc') {
+        if (msg.role === 'system' || msg.is_proposal) return false;
+        const hasRoll = msg.content && (msg.content.includes('[Roll:') || msg.content.includes('rolled '));
+        const hasTurnEnd = msg.content && msg.content.includes('[Turn Ended]');
+        if (hasRoll || hasTurnEnd) return false;
+        
+        const segments = parseTaggedMessage(msg.content || '');
+        const hasOoc = segments.some(s => s.type === 'ooc');
+        const hasIc = segments.some(s => s.type === 'ic');
+        return msg.role === 'player' && hasOoc && !hasIc;
+      }
+      
+      // 4. Chat tab (default)
+      if (msg.is_proposal || msg.role === 'system') return false;
+      const hasRoll = msg.content && (msg.content.includes('[Roll:') || msg.content.includes('rolled '));
+      const hasTurnEnd = msg.content && msg.content.includes('[Turn Ended]');
+      if (hasRoll || hasTurnEnd) return false;
+      
+      if (msg.role === 'dm') return true;
+      const segments = parseTaggedMessage(msg.content || '');
+      const hasIc = segments.some(s => s.type === 'ic');
+      return hasIc || msg.role !== 'player';
+    });
+  }, [messages, activeChatTab])
 
   const [activeSlashCommand, setActiveSlashCommand] = useState(null)
   const [physicalLabel, setPhysicalLabel] = useState('')
@@ -736,6 +820,13 @@ export default function SessionPanel({
             </button>
           </div>
 
+          <div className="chat-tabs-header">
+            <button className={`chat-tab-btn ${activeChatTab === 'chat' ? 'active' : ''}`} onClick={() => setActiveChatTab('chat')}>Chat</button>
+            <button className={`chat-tab-btn ${activeChatTab === 'ooc' ? 'active' : ''}`} onClick={() => setActiveChatTab('ooc')}>OOC</button>
+            <button className={`chat-tab-btn ${activeChatTab === 'system' ? 'active' : ''}`} onClick={() => setActiveChatTab('system')}>System</button>
+            <button className={`chat-tab-btn ${activeChatTab === 'dice' ? 'active' : ''}`} onClick={() => setActiveChatTab('dice')}>Dice</button>
+          </div>
+
           <div className="session-messages" ref={messagesContainerRef} onScroll={handleMessagesScroll}>
             {(hasOlderMessages || loadingOlderMessages) && (
               <div className="session-load-history">
@@ -749,12 +840,12 @@ export default function SessionPanel({
                 </button>
               </div>
             )}
-            {messages.length === 0 && (
+            {filteredMessages.length === 0 && (
               <div className="session-empty-msg">
-                The session has begun. Type an action or speak to the DM.
+                No messages to display in this tab.
               </div>
             )}
-            {messages.map((msg) => (
+            {filteredMessages.map((msg) => (
               <SessionMessageItem
                 key={msg.id}
                 msg={msg}
@@ -781,14 +872,6 @@ export default function SessionPanel({
           </div>
 
           <div className="session-roll-bar">
-            <button
-              className={`btn btn-roll-toggle ${showDice ? 'active' : ''}`}
-              onClick={() => setShowDice(!showDice)}
-              title="Toggle dice roller"
-              aria-label="Toggle dice roller"
-            >
-              <i className="bi bi-dice-5-fill"></i>
-            </button>
             {showDice && (
               <>
                 {createPortal(
@@ -1205,10 +1288,18 @@ export default function SessionPanel({
                   onSubmit={handleSend}
                   onKeyDown={handleSlashKeyDown}
                   disabled={aiThinking}
-                  placeholder={aiThinking ? 'Waiting for DM...' : 'Type your action. Wrap speech in quotes for IC.'}
+                  placeholder={aiThinking ? 'Waiting for DM...' : 'Message the table...'}
                 />
               )}
             </div>
+            <button
+              className={`btn btn-roll-toggle ${showDice ? 'active' : ''}`}
+              onClick={() => setShowDice(!showDice)}
+              title="Toggle dice roller"
+              aria-label="Toggle dice roller"
+            >
+              <i className="bi bi-dice-5-fill"></i>
+            </button>
             <button
               className="btn btn-primary session-send-btn"
               onClick={handleSend}

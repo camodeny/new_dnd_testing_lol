@@ -3,7 +3,7 @@ import { getLootBoxes, openLootBox } from '../../api/client'
 import LootBoxCard from './LootBoxCard'
 import LootBoxOpeningModal from './LootBoxOpeningModal'
 
-export default function LootBoxStash({ campaignId, isOwner, onLootBoxOpened, characters = [] }) {
+export default function LootBoxStash({ campaignId, isOwner, onLootBoxOpened, characters = [], onViewAll }) {
   const [boxes, setBoxes] = useState([])
   const [opening, setOpening] = useState(null)
   const [error, setError] = useState('')
@@ -63,34 +63,36 @@ export default function LootBoxStash({ campaignId, isOwner, onLootBoxOpened, cha
 
   return (
     <>
-      {boxes.length === 0 ? (
-        <div className="dashboard-sidebar-panel loot-box-stash-empty">
-          <div className="loot-box-stash-title">
-            <i className="bi bi-box-seam"></i> Loot Stash
-          </div>
-          <div className="loot-box-stash-empty-text">
-            No loot boxes yet. The DM may drop one during the adventure.
-          </div>
+      <div className="right-sidebar-widget loot-treasure-panel">
+        <div className="widget-header">
+          <h3>Loot Stash {boxes.length > 0 && `(${boxes.length})`}</h3>
+          {onViewAll && (
+            <button className="view-all-link" onClick={onViewAll} style={{ background: 'none', border: 'none', cursor: 'pointer' }}>
+              View All
+            </button>
+          )}
         </div>
-      ) : (
-        <div className="dashboard-sidebar-panel loot-box-stash">
-          <div className="loot-box-stash-title">
-            <i className="bi bi-box-seam"></i> Loot Stash ({boxes.length})
-          </div>
-          {error && <div className="error-banner">{error}</div>}
-          <div className="loot-box-stash-list">
-            {boxes.map((box) => (
-              <LootBoxCard
-                key={box.id}
-                box={box}
-                isOwner={isOwner}
-                onOpen={handleOpen}
-                disabled={opening === box.id}
-              />
-            ))}
-          </div>
+        {error && <div className="error-banner" style={{ color: 'var(--color-danger)', fontSize: '0.8rem', marginBottom: '8px' }}>{error}</div>}
+        <div className="loot-item-list">
+          {boxes.length === 0 ? (
+            <div className="loot-box-stash-empty-text" style={{ fontSize: '0.82rem', color: 'var(--text-muted)', lineHeight: '1.4' }}>
+              No loot boxes yet. The DM may drop one during the adventure.
+            </div>
+          ) : (
+            <div className="loot-box-stash-list" style={{ display: 'flex', flexDirection: 'column', gap: '10px' }}>
+              {boxes.map((box) => (
+                <LootBoxCard
+                  key={box.id}
+                  box={box}
+                  isOwner={isOwner}
+                  onOpen={handleOpen}
+                  disabled={opening === box.id}
+                />
+              ))}
+            </div>
+          )}
         </div>
-      )}
+      </div>
 
       {activeOpeningBox && (
         <LootBoxOpeningModal

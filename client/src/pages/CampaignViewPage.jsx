@@ -24,6 +24,7 @@ import CharacterPlanningMode from '../components/dashboard/CharacterPlanningMode
 import EncounterMapPanel from '../components/dashboard/EncounterMapPanel'
 import WorldBuildingMode from '../components/dashboard/WorldBuildingMode'
 import LlmPlayerManager from '../components/dashboard/LlmPlayerManager'
+import SheetProposalPopup from '../components/session/SheetProposalPopup'
 
 const SESSION_MESSAGE_PAGE_SIZE = 50
 
@@ -219,6 +220,7 @@ export default function CampaignViewPage({ user }) {
   const [sheetProposals, setSheetProposals] = useState([])
   const [encounterMap, setEncounterMap] = useState(null)
   const [encounterMapLoading, setEncounterMapLoading] = useState(false)
+  const [showProposalPopup, setShowProposalPopup] = useState(false)
   const [isMapExpanded, setIsMapExpanded] = useState(() => {
     return localStorage.getItem('encounter_map_collapsed') === 'false'
   })
@@ -843,9 +845,6 @@ export default function CampaignViewPage({ user }) {
               <span className="campaign-logo-title">{campaign?.name || 'SALT & SONG'}</span>
               <span className="campaign-logo-subtitle">The Shattered Coast</span>
             </div>
-            <button className="campaign-header-dropdown-btn">
-              <i className="bi bi-chevron-down"></i>
-            </button>
           </div>
 
           <div style={{ flex: 1, overflowY: 'auto', display: 'flex', flexDirection: 'column', gap: '20px' }}>
@@ -873,7 +872,7 @@ export default function CampaignViewPage({ user }) {
             </div>
             <div className="sidebar-profile-info">
               <span className="sidebar-profile-name">{user?.username || 'Guest'}</span>
-              <span className="sidebar-profile-role">{isOwner ? 'Dungeon Master' : 'Player'}</span>
+              <span className="sidebar-profile-role">{isOwner ? 'Host' : 'Player'}</span>
             </div>
             <div className="sidebar-profile-actions">
               <button className="sidebar-profile-action-btn" onClick={() => setShowSettings(true)}>
@@ -895,7 +894,7 @@ export default function CampaignViewPage({ user }) {
             </div>
             
             <div className="current-location-dropdown">
-              <span className="location-name">{campaign?.settings?.current_location || 'Ruins of Greymarsh'}</span>
+              <span className="location-name">{campaign?.settings?.current_location || '<insert location here>'}</span>
               <span className="location-type">Exploration</span>
               <i className="bi bi-chevron-down"></i>
             </div>
@@ -904,14 +903,11 @@ export default function CampaignViewPage({ user }) {
               <button className="header-icon-btn" onClick={() => setIsMapExpanded(!isMapExpanded)} title="Toggle Map View">
                 <i className="bi bi-map"></i>
               </button>
-              <button className="header-icon-btn"><i className="bi bi-shield-slash"></i></button>
-              <button className="header-icon-btn" onClick={openImport} title="Players list"><i className="bi bi-people"></i></button>
               {session ? (
                 <button className="btn btn-primary end-session-btn" onClick={handleEndSession}>End Session</button>
               ) : (
                 <button className="btn btn-primary start-session-btn" onClick={handleStartSession}>Start Session</button>
               )}
-              <button className="header-icon-btn" onClick={() => setShowSettings(true)}><i className="bi bi-three-dots-vertical"></i></button>
             </div>
           </div>
 
@@ -958,81 +954,48 @@ export default function CampaignViewPage({ user }) {
             isOwner={isOwner}
             onAdded={handleLlmPlayerAdded}
           />
-          
-          <div className="right-sidebar-widget loot-treasure-panel">
-            <div className="widget-header">
-              <h3>Loot & Treasure</h3>
-              <button className="view-all-link" onClick={() => setShowLootStash(true)} style={{ background: 'none', border: 'none', cursor: 'pointer' }}>View All</button>
-            </div>
-            <div className="loot-item-list">
-              {currentCharacter?.equipment?.length > 0 ? (
-                currentCharacter.equipment.slice(0, 4).map((item, idx) => {
-                  let icon = 'bi bi-gem'
-                  const name = item.name.toLowerCase()
-                  if (name.includes('potion')) icon = 'bi bi-droplet-half'
-                  else if (name.includes('sword') || name.includes('blade') || name.includes('dagger') || name.includes('bow')) icon = 'bi bi-shield-slash'
-                  else if (name.includes('key')) icon = 'bi bi-key'
-                  else if (name.includes('scroll')) icon = 'bi bi-file-earmark-text'
 
+          {sheetProposals.length > 0 && (
+            <div className="right-sidebar-widget pending-updates-panel">
+              <div className="widget-header">
+                <h3>Pending Updates <span className="updates-count-badge">{sheetProposals.length}</span></h3>
+              </div>
+              <div className="updates-list">
+                {sheetProposals.map((proposal) => {
+                  const char = characters.find((c) => c.id === proposal.character_id)
+                  const charName = char ? char.name : 'Unknown Character'
+                  const cg = getGradientSeed(charName)
+                  const ci = getInitials(charName)
                   return (
-                    <div key={idx} className="loot-item-row">
-                      <div className="loot-item-icon-wrapper">
-                        <i className={icon}></i>
+                    <div key={proposal.id} className="update-row">
+                      <div className="update-avatar" style={{ background: cg }}>
+                        {ci}
                       </div>
-                      <div className="loot-item-details">
-                        <span className="loot-item-name">{item.name}</span>
-                        <span className="loot-item-type">{item.equipment_type || 'Item'}</span>
+                      <div className="update-details">
+                        <span className="update-char-name">{charName}</span>
+                        <span className="update-reason">{proposal.reason}</span>
                       </div>
-                      <span className="loot-item-quantity">x{item.quantity || 1}</span>
+                      <button className="btn btn-secondary small review-btn" onClick={() => setShowProposalPopup(true)}>
+                        Review
+                      </button>
                     </div>
                   )
-                })
-              ) : (
-                <>
-                  <div className="loot-item-row">
-                    <div className="loot-item-icon-wrapper">
-                      <i className="bi bi-droplet-half"></i>
-                    </div>
-                    <div className="loot-item-details">
-                      <span className="loot-item-name">Potion of Healing</span>
-                      <span className="loot-item-type">Potion</span>
-                    </div>
-                    <span className="loot-item-quantity">x2</span>
-                  </div>
-                  <div className="loot-item-row">
-                    <div className="loot-item-icon-wrapper">
-                      <i className="bi bi-shield-slash"></i>
-                    </div>
-                    <div className="loot-item-details">
-                      <span className="loot-item-name">Silvered Shortsword</span>
-                      <span className="loot-item-type">Weapon</span>
-                    </div>
-                    <span className="loot-item-quantity">x1</span>
-                  </div>
-                  <div className="loot-item-row">
-                    <div className="loot-item-icon-wrapper">
-                      <i className="bi bi-gem"></i>
-                    </div>
-                    <div className="loot-item-details">
-                      <span className="loot-item-name">Moonstone</span>
-                      <span className="loot-item-type">Gemstone</span>
-                    </div>
-                    <span className="loot-item-quantity">x1</span>
-                  </div>
-                  <div className="loot-item-row">
-                    <div className="loot-item-icon-wrapper">
-                      <i className="bi bi-key"></i>
-                    </div>
-                    <div className="loot-item-details">
-                      <span className="loot-item-name">Old Iron Key</span>
-                      <span className="loot-item-type">Quest Item</span>
-                    </div>
-                    <span className="loot-item-quantity">x1</span>
-                  </div>
-                </>
-              )}
+                })}
+                <button className="view-all-updates-row" onClick={() => setShowProposalPopup(true)}>
+                  <span>View all updates</span>
+                  <i className="bi bi-chevron-right"></i>
+                </button>
+              </div>
             </div>
-          </div>
+          )}
+          
+          <LootBoxStash
+            campaignId={id}
+            isOwner={isOwner}
+            characters={characters}
+            onLootBoxOpened={handleLootBoxOpened}
+            onViewAll={() => setShowLootStash(true)}
+          />
 
           {(() => {
             const activityLogs = [];
@@ -1116,8 +1079,6 @@ export default function CampaignViewPage({ user }) {
               </div>
             );
           })()}
-
-          <LootBoxStash campaignId={id} isOwner={isOwner} characters={characters} onLootBoxOpened={handleLootBoxOpened} />
         </aside>
       </div>
       {exportBtn}
@@ -1248,6 +1209,21 @@ export default function CampaignViewPage({ user }) {
             </div>
           </div>
         </div>
+      )}
+
+      {showProposalPopup && sheetProposals.length > 0 && (
+        <SheetProposalPopup
+          proposals={sheetProposals}
+          sessionId={session?.id}
+          onApplied={(prop, char) => {
+            handleProposalApplied(prop, char)
+            if (sheetProposals.length <= 1) setShowProposalPopup(false)
+          }}
+          onDismissed={(prop) => {
+            handleProposalDismissed(prop)
+            if (sheetProposals.length <= 1) setShowProposalPopup(false)
+          }}
+        />
       )}
     </div>
   )
