@@ -454,6 +454,8 @@ export default function CampaignViewPage({ user }) {
                   : m
               )
             )
+          } else if (payload.type === 'scene_updated') {
+            setCurrentScene(payload.current_scene || null)
           } else if (payload.type === 'refresh') {
             loadData()
           } else if (payload.type === 'done') {

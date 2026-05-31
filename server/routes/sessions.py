@@ -28,7 +28,7 @@ from services.dm_tools import (
     execute_dm_tool,
 )
 from services.planning_service import can_start_session, planning_context
-from services.world_service import approve_world, dm_world_context, ensure_world_generated
+from services.world_service import approve_world, dm_world_context, ensure_world_generated, world_public_payload
 
 sessions_bp = Blueprint('sessions', __name__)
 
@@ -97,6 +97,9 @@ def _run_session_memory_update(
         if not campaign or not session or not current_user:
             return
 
+        world_before = world_public_payload(campaign).get('world') or {}
+        current_scene_before = world_before.get('current_scene')
+
         memory_context = build_session_memory_context(
             campaign,
             session,
@@ -132,6 +135,14 @@ def _run_session_memory_update(
                 },
             )
         db.session.commit()
+
+        world_after = world_public_payload(campaign).get('world') or {}
+        current_scene_after = world_after.get('current_scene')
+        if current_scene_after != current_scene_before:
+            stream_manager.broadcast_event(session_id, {
+                'type': 'scene_updated',
+                'current_scene': current_scene_after,
+            })
     except Exception as err:
         db.session.rollback()
         log_audit_event(

@@ -16,7 +16,7 @@ os.environ['OPENROUTER_RUNTIME_MODEL_FILE'] = os.path.join(
 )
 
 from app import app
-from auth import generate_token
+from auth import _resolve_sso_redirect_uri, generate_token
 from models import (
     AuthSession,
     db,
@@ -167,6 +167,36 @@ class AppRouteTest(unittest.TestCase):
                 self.assertEqual(auth_session.provider, 'pendergrass_sso')
                 self.assertEqual(auth_session.refresh_token, 'refresh-123')
                 self.assertIsNone(auth_session.pending_oauth_state)
+
+    def test_sso_redirect_uri_uses_request_host_when_configured_redirect_is_localhost(self):
+        with (
+            patch.dict(os.environ, {
+                'SSO_URL': 'https://sso.example.test',
+                'CLIENT_ID': 'client-id',
+                'CLIENT_SECRET': 'client-secret',
+                'REDIRECT_URI': 'http://localhost:5889/api/auth/callback',
+            }, clear=False),
+            app.test_request_context('/api/auth/login', base_url='http://100.68.40.133:7824'),
+        ):
+            self.assertEqual(
+                _resolve_sso_redirect_uri(),
+                'http://100.68.40.133:7824/api/auth/callback',
+            )
+
+    def test_sso_redirect_uri_prefers_explicit_public_redirect_uri(self):
+        with (
+            patch.dict(os.environ, {
+                'SSO_URL': 'https://sso.example.test',
+                'CLIENT_ID': 'client-id',
+                'CLIENT_SECRET': 'client-secret',
+                'REDIRECT_URI': 'http://camden-server.tailea98b.ts.net:5889/api/auth/callback',
+            }, clear=False),
+            app.test_request_context('/api/auth/login', base_url='http://100.68.40.133:7824'),
+        ):
+            self.assertEqual(
+                _resolve_sso_redirect_uri(),
+                'http://camden-server.tailea98b.ts.net:5889/api/auth/callback',
+            )
 
     def test_logout_revokes_sso_refresh_token_and_clears_cookie_session(self):
         class FakeSSOClient:
@@ -1256,6 +1286,97 @@ class AppRouteTest(unittest.TestCase):
             self.assertEqual(payload['world']['current_scene']['location_id'], 'docks')
             self.assertEqual(payload['world']['current_scene']['location_name'], 'Blackwater Docks')
             self.assertEqual(payload['world']['current_scene']['time_of_day'], 'midnight')
+
+    def test_send_message_broadcasts_scene_update_when_memory_changes_location(self):
+        with app.app_context():
+            owner = User(username='owner', email='owner@example.com')
+            owner.set_password('password')
+            db.session.add(owner)
+            db.session.commit()
+
+            campaign = Campaign(name='Lost Stones', user_id=owner.id)
+            db.session.add(campaign)
+            db.session.flush()
+
+            character = Character(
+                user_id=owner.id,
+                campaign_id=campaign.id,
+                name='Raven Nightshade',
+                race='Human',
+            )
+            db.session.add(character)
+            db.session.flush()
+
+            db.session.add(CampaignMember(
+                campaign_id=campaign.id,
+                user_id=owner.id,
+                role='player',
+                selected_character_id=character.id,
+            ))
+            db.session.add(CampaignWorld(
+                campaign_id=campaign.id,
+                public_intro=json_dumps({
+                    'title': 'Lost Stones',
+                    'starting_location': 'Crossroads',
+                    'party_hook': 'The road is tense.',
+                }),
+                knowledge_graph='{}',
+                world_state=json_dumps({
+                    'current_scene': {
+                        'location_id': 'crossroads',
+                        'location_name': 'Crossroads',
+                        'time_of_day': 'dawn',
+                        'immediate_tension': 'Travelers gather.',
+                    }
+                }),
+                dm_private='{}',
+            ))
+            session = CampaignSession(campaign_id=campaign.id, is_active=True)
+            db.session.add(session)
+            db.session.commit()
+
+            campaign_id = campaign.id
+            session_id = session.id
+            token = generate_token(owner.id)
+
+        with (
+            patch.dict(app.config, {'TESTING': True}, clear=False),
+            patch('routes.sessions.get_session_dm_response_with_tools', return_value={
+                'mode': 'speak',
+                'content': 'You reach the harbor by dusk.',
+            }),
+            patch('routes.sessions.get_session_memory_patch', return_value={
+                'scene_patch': {
+                    'location_id': 'harbor',
+                    'location_name': 'Blackwater Harbor',
+                    'time_of_day': 'dusk',
+                },
+                'scene_reason': 'The party reached the harbor.',
+            }),
+            patch('routes.sessions.stream_manager.broadcast_event') as mock_broadcast,
+        ):
+            response = self.client.post(
+                f'/api/sessions/{session_id}/messages',
+                json={'content': 'We head to the harbor.'},
+                headers={'Authorization': f'Bearer {token}'},
+            )
+
+        self.assertEqual(response.status_code, 201)
+        scene_events = [
+            call.args[1]
+            for call in mock_broadcast.call_args_list
+            if len(call.args) == 2 and call.args[0] == session_id and call.args[1].get('type') == 'scene_updated'
+        ]
+        self.assertEqual(len(scene_events), 1)
+        self.assertEqual(scene_events[0]['current_scene']['location_id'], 'harbor')
+        self.assertEqual(scene_events[0]['current_scene']['location_name'], 'Blackwater Harbor')
+        self.assertEqual(scene_events[0]['current_scene']['time_of_day'], 'dusk')
+
+        with app.app_context():
+            world = CampaignWorld.query.filter_by(campaign_id=campaign_id).one()
+            world_state = json.loads(world.world_state)
+            self.assertEqual(world_state['current_scene']['location_id'], 'harbor')
+            self.assertEqual(world_state['current_scene']['location_name'], 'Blackwater Harbor')
 
     def test_pending_bond_blocks_character_ready(self):
         with app.app_context():

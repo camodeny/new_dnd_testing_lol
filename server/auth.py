@@ -5,10 +5,10 @@ import re
 import secrets
 from datetime import datetime, timedelta, timezone
 from functools import wraps
-from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
+from urllib.parse import parse_qsl, urlencode, urljoin, urlsplit, urlunsplit
 
 import jwt
-from flask import Blueprint, current_app, g, jsonify, redirect, request
+from flask import Blueprint, current_app, g, has_request_context, jsonify, redirect, request
 from werkzeug.security import check_password_hash
 
 from models import AuthSession, LLMPlayer, User, db
@@ -20,6 +20,7 @@ SESSION_COOKIE_NAME = 'dnd_session'
 SESSION_LIFETIME_DAYS = 30
 OAUTH_STATE_LIFETIME_MINUTES = 10
 SSO_PROVIDER_NAME = 'pendergrass_sso'
+LOOPBACK_HOSTNAMES = {'localhost', '127.0.0.1', '::1'}
 
 
 def generate_token(user_id):
@@ -230,23 +231,97 @@ def authenticate_request(token=None, api_key=None):
     return None, (jsonify({'error': 'Token is missing'}), 401)
 
 
+def _is_loopback_hostname(hostname):
+    normalized = (hostname or '').strip().lower().strip('[]')
+    return normalized in LOOPBACK_HOSTNAMES
+
+
+def _normalize_absolute_base_url(value):
+    parts = urlsplit((value or '').strip())
+    if not parts.scheme or not parts.netloc:
+        return None
+    return urlunsplit((parts.scheme, parts.netloc, parts.path.rstrip('/'), '', ''))
+
+
+def _request_public_base_url():
+    if not has_request_context():
+        return None
+    forwarded_proto = (request.headers.get('X-Forwarded-Proto') or '').split(',', 1)[0].strip()
+    forwarded_host = (request.headers.get('X-Forwarded-Host') or '').split(',', 1)[0].strip()
+    scheme = forwarded_proto or request.scheme
+    host = forwarded_host or request.host
+    if not scheme or not host:
+        return None
+    return _normalize_absolute_base_url(f'{scheme}://{host}')
+
+
+def _build_callback_url(base_url, callback_path):
+    normalized_base_url = _normalize_absolute_base_url(base_url)
+    if not normalized_base_url:
+        return None
+    return urljoin(f'{normalized_base_url.rstrip("/")}/', callback_path.lstrip('/'))
+
+
+def _resolve_sso_redirect_uri():
+    configured_redirect_uri = (os.environ.get('REDIRECT_URI') or '').strip()
+    configured_redirect_parts = urlsplit(configured_redirect_uri) if configured_redirect_uri else None
+    callback_path = (
+        configured_redirect_parts.path
+        if configured_redirect_parts and configured_redirect_parts.path
+        else '/api/auth/callback'
+    )
+
+    configured_public_base_url = _normalize_absolute_base_url(os.environ.get('PUBLIC_APP_BASE_URL'))
+    request_public_base_url = _request_public_base_url()
+
+    if (
+        configured_redirect_parts
+        and configured_redirect_parts.scheme
+        and configured_redirect_parts.netloc
+        and not _is_loopback_hostname(configured_redirect_parts.hostname)
+    ):
+        return configured_redirect_uri
+
+    if configured_public_base_url and not _is_loopback_hostname(urlsplit(configured_public_base_url).hostname):
+        return _build_callback_url(configured_public_base_url, callback_path)
+
+    if request_public_base_url and not _is_loopback_hostname(urlsplit(request_public_base_url).hostname):
+        return _build_callback_url(request_public_base_url, callback_path)
+
+    if configured_redirect_parts and configured_redirect_parts.scheme and configured_redirect_parts.netloc:
+        return configured_redirect_uri
+
+    if configured_public_base_url:
+        return _build_callback_url(configured_public_base_url, callback_path)
+
+    if request_public_base_url:
+        return _build_callback_url(request_public_base_url, callback_path)
+
+    return None
+
+
 def pendergrass_sso_enabled():
     return all([
         os.environ.get('SSO_URL'),
         os.environ.get('CLIENT_ID'),
         os.environ.get('CLIENT_SECRET'),
-        os.environ.get('REDIRECT_URI'),
+        _resolve_sso_redirect_uri(),
     ])
 
 
 def get_pendergrass_sso_client():
-    if not pendergrass_sso_enabled():
+    redirect_uri = _resolve_sso_redirect_uri()
+    if not redirect_uri or not all([
+        os.environ.get('SSO_URL'),
+        os.environ.get('CLIENT_ID'),
+        os.environ.get('CLIENT_SECRET'),
+    ]):
         raise PendergrassSSOError('Pendergrass SSO is not configured.')
     return PendergrassSSOClient(
         sso_url=os.environ['SSO_URL'],
         client_id=os.environ['CLIENT_ID'],
         client_secret=os.environ['CLIENT_SECRET'],
-        redirect_uri=os.environ['REDIRECT_URI'],
+        redirect_uri=redirect_uri,
     )
 
 

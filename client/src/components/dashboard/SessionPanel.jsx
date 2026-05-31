@@ -433,42 +433,13 @@ export default function SessionPanel({
 
   const filteredMessages = useMemo(() => {
     return messages.filter((msg) => {
-      // 1. System tab
-      if (activeChatTab === 'system') {
-        return msg.role === 'system' || msg.is_proposal;
+      // TBD tab always contains 0 chats
+      if (activeChatTab === 'tbd') {
+        return false;
       }
       
-      // 2. Dice tab
-      if (activeChatTab === 'dice') {
-        if (msg.is_proposal) return false;
-        const hasRoll = msg.content && (msg.content.includes('[Roll:') || msg.content.includes('rolled '));
-        const hasTurnEnd = msg.content && msg.content.includes('[Turn Ended]');
-        return Boolean(hasRoll || hasTurnEnd);
-      }
-      
-      // 3. OOC tab
-      if (activeChatTab === 'ooc') {
-        if (msg.role === 'system' || msg.is_proposal) return false;
-        const hasRoll = msg.content && (msg.content.includes('[Roll:') || msg.content.includes('rolled '));
-        const hasTurnEnd = msg.content && msg.content.includes('[Turn Ended]');
-        if (hasRoll || hasTurnEnd) return false;
-        
-        const segments = parseTaggedMessage(msg.content || '');
-        const hasOoc = segments.some(s => s.type === 'ooc');
-        const hasIc = segments.some(s => s.type === 'ic');
-        return msg.role === 'player' && hasOoc && !hasIc;
-      }
-      
-      // 4. Chat tab (default)
-      if (msg.is_proposal || msg.role === 'system') return false;
-      const hasRoll = msg.content && (msg.content.includes('[Roll:') || msg.content.includes('rolled '));
-      const hasTurnEnd = msg.content && msg.content.includes('[Turn Ended]');
-      if (hasRoll || hasTurnEnd) return false;
-      
-      if (msg.role === 'dm') return true;
-      const segments = parseTaggedMessage(msg.content || '');
-      const hasIc = segments.some(s => s.type === 'ic');
-      return hasIc || msg.role !== 'player';
+      // Chat tab (default) contains all chats
+      return true;
     });
   }, [messages, activeChatTab])
 
@@ -825,9 +796,7 @@ export default function SessionPanel({
 
           <div className="chat-tabs-header">
             <button className={`chat-tab-btn ${activeChatTab === 'chat' ? 'active' : ''}`} onClick={() => setActiveChatTab('chat')}>Chat</button>
-            <button className={`chat-tab-btn ${activeChatTab === 'ooc' ? 'active' : ''}`} onClick={() => setActiveChatTab('ooc')}>OOC</button>
-            <button className={`chat-tab-btn ${activeChatTab === 'system' ? 'active' : ''}`} onClick={() => setActiveChatTab('system')}>System</button>
-            <button className={`chat-tab-btn ${activeChatTab === 'dice' ? 'active' : ''}`} onClick={() => setActiveChatTab('dice')}>Dice</button>
+            <button className={`chat-tab-btn ${activeChatTab === 'tbd' ? 'active' : ''}`} onClick={() => setActiveChatTab('tbd')}>TBD</button>
           </div>
 
           <div className="session-messages" ref={messagesContainerRef} onScroll={handleMessagesScroll}>
