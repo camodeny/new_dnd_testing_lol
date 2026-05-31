@@ -1223,6 +1223,40 @@ class AppRouteTest(unittest.TestCase):
             self.assertEqual(error['status'], 409)
             self.assertTrue(error['generation_in_progress'])
 
+    def test_world_public_payload_includes_current_scene(self):
+        with app.app_context():
+            owner = User(username='owner', email='owner@example.com')
+            owner.set_password('password')
+            db.session.add(owner)
+            db.session.commit()
+
+            campaign = Campaign(name='Lost Stones', user_id=owner.id)
+            db.session.add(campaign)
+            db.session.flush()
+            db.session.add(CampaignWorld(
+                campaign_id=campaign.id,
+                public_intro=json_dumps({
+                    'title': 'Lost Stones',
+                    'starting_location': 'Crossroads',
+                }),
+                knowledge_graph='{}',
+                world_state=json_dumps({
+                    'current_scene': {
+                        'location_id': 'docks',
+                        'location_name': 'Blackwater Docks',
+                        'time_of_day': 'midnight',
+                    }
+                }),
+                dm_private='{}',
+            ))
+            db.session.commit()
+
+            payload = world_public_payload(campaign)
+
+            self.assertEqual(payload['world']['current_scene']['location_id'], 'docks')
+            self.assertEqual(payload['world']['current_scene']['location_name'], 'Blackwater Docks')
+            self.assertEqual(payload['world']['current_scene']['time_of_day'], 'midnight')
+
     def test_pending_bond_blocks_character_ready(self):
         with app.app_context():
             owner = User(username='owner', email='owner@example.com')

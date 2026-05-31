@@ -218,7 +218,7 @@ function TurnEndedCard({ characterName }) {
   )
 }
 
-function PlayerMessageContent({ content }) {
+function PlayerMessageContent({ content, charName }) {
   const segments = parseTaggedMessage(content)
 
   return (
@@ -231,8 +231,7 @@ function PlayerMessageContent({ content }) {
           return (
             <div key={`ic-${index}`} className="session-ic-message">
               <div className="session-ic-banner">
-                <span><i className="bi bi-chat-quote-fill"></i> PC</span>
-                <strong>In character</strong>
+                <strong>{charName}</strong>
               </div>
               <div className="session-ic-text">{text}</div>
             </div>
@@ -271,7 +270,6 @@ function PlayerMessageContent({ content }) {
 
         return (
           <div key={`ooc-${index}`} className="session-ooc-message">
-            <span className="session-ooc-label">OOC</span>
             <span>{text}</span>
           </div>
         )
@@ -334,11 +332,15 @@ const SessionMessageItem = memo(function SessionMessageItem({
   sessionId,
   onProposalApplied,
   onProposalDismissed,
+  characters = [],
 }) {
   const isIc = msg.role === 'player' && hasIcSegment(msg.content || '')
   const senderLabel = getMessageSenderLabel(msg, currentUser)
   const initials = getInitials(msg.username || senderLabel)
   const gradient = getGradientSeed(msg.username || senderLabel)
+
+  const char = characters.find((c) => c.user_id === msg.user_id)
+  const charName = char ? char.name : (msg.username || 'Player')
 
   return (
     <div className={`session-msg session-msg-${msg.role} ${isIc ? 'is-ic' : ''}`}>
@@ -377,7 +379,7 @@ const SessionMessageItem = memo(function SessionMessageItem({
               {msg.role === 'dm' ? (
                 <DMMessageContent content={msg.content} />
               ) : msg.role === 'player' ? (
-                <PlayerMessageContent content={msg.content} />
+                <PlayerMessageContent content={msg.content} charName={charName} />
               ) : (
                 msg.content
               )}
@@ -400,6 +402,7 @@ export default function SessionPanel({
   messages,
   currentUser,
   currentCharacter,
+  characters = [],
   onStartSession,
   onEndSession,
   onSendMessage,
@@ -853,6 +856,7 @@ export default function SessionPanel({
                 sessionId={session?.id}
                 onProposalApplied={onProposalApplied}
                 onProposalDismissed={onProposalDismissed}
+                characters={characters}
               />
             ))}
             {aiThinking && (
@@ -871,8 +875,8 @@ export default function SessionPanel({
             <div ref={messagesEndRef} />
           </div>
 
-          <div className="session-roll-bar">
-            {showDice && (
+          {showDice && (
+            <div className="session-roll-bar">
               <>
                 {createPortal(
                   <div className="dice-stage">
@@ -1190,8 +1194,8 @@ export default function SessionPanel({
                   )}
                 </div>
               </>
-            )}
-          </div>
+            </div>
+          )}
 
           {showCommandsHelp && (
             <div className="session-command-suggestions">

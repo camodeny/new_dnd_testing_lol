@@ -857,10 +857,24 @@ class CampaignWorld(db.Model):
         except (TypeError, ValueError):
             public_intro = {}
 
+        try:
+            world_state = json.loads(self.world_state)
+        except (TypeError, ValueError):
+            world_state = {}
+
+        current_scene = world_state.get('current_scene', {}) if isinstance(world_state, dict) else {}
+        if not isinstance(current_scene, dict):
+            current_scene = {}
+
         return {
             'id': self.id,
             'campaign_id': self.campaign_id,
             'public_intro': public_intro,
+            'current_scene': {
+                'location_id': current_scene.get('location_id'),
+                'location_name': current_scene.get('location_name') or public_intro.get('starting_location'),
+                'time_of_day': current_scene.get('time_of_day'),
+            },
             'is_ready': True,
             'approved_at': self.approved_at.isoformat() if self.approved_at else None,
             'created_at': self.created_at.isoformat() if self.created_at else None,

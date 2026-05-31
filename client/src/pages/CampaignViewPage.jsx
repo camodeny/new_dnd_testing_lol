@@ -129,12 +129,15 @@ function getClassSummary(character) {
 }
 
 async function fetchCampaignPageData(id) {
-  const [campData, charData] = await Promise.all([
+  const [campData, charData, worldData] = await Promise.all([
     getCampaign(id),
     getCampaignCharacters(id),
+    getCampaignWorld(id).catch(() => ({ world: null })),
   ])
   const campaign = campData.campaign
   const activeSession = campaign.active_session || null
+  const currentScene = worldData.world?.current_scene || null
+  const worldTitle = worldData.world?.public_intro?.title || ''
   let messages = []
   let sheetProposals = []
   let encounterMap = null
@@ -152,6 +155,8 @@ async function fetchCampaignPageData(id) {
       campaign,
       characters: charData.characters || [],
       activeSession,
+      currentScene,
+      worldTitle,
       messages,
       hasOlderMessages,
       sheetProposals,
@@ -163,6 +168,8 @@ async function fetchCampaignPageData(id) {
     campaign,
     characters: charData.characters || [],
     activeSession,
+    currentScene,
+    worldTitle,
     messages,
     hasOlderMessages: false,
     sheetProposals,
@@ -175,6 +182,8 @@ export default function CampaignViewPage({ user }) {
   const navigate = useNavigate()
   const [searchParams] = useSearchParams()
   const [campaign, setCampaign] = useState(null)
+  const [currentScene, setCurrentScene] = useState(null)
+  const [worldTitle, setWorldTitle] = useState('')
   const [characters, setCharacters] = useState([])
   const [loading, setLoading] = useState(true)
   const [error, setError] = useState('')
@@ -253,6 +262,8 @@ export default function CampaignViewPage({ user }) {
     try {
       const data = await fetchCampaignPageData(id)
       setCampaign(data.campaign)
+      setCurrentScene(data.currentScene)
+      setWorldTitle(data.worldTitle)
       setCharacters(data.characters)
       setSession(data.activeSession)
       setMessages(data.messages)
@@ -306,6 +317,8 @@ export default function CampaignViewPage({ user }) {
         if (!isMounted) return
 
         setCampaign(data.campaign)
+        setCurrentScene(data.currentScene)
+        setWorldTitle(data.worldTitle)
         setCharacters(data.characters)
         setSession(data.activeSession)
         setMessages(data.messages)
@@ -663,6 +676,7 @@ export default function CampaignViewPage({ user }) {
   }
 
   const currentCharacter = characters.find((c) => c.user_id === user?.id)
+  const locationName = currentScene?.location_name || campaign?.settings?.current_location || '<insert location here>'
 
   const loadOlderMessages = useCallback(async () => {
     if (!session || loadingOlderMessages || !hasOlderMessages) return 0
@@ -843,7 +857,7 @@ export default function CampaignViewPage({ user }) {
             </div>
             <div className="campaign-logo-details">
               <span className="campaign-logo-title">{campaign?.name || 'SALT & SONG'}</span>
-              <span className="campaign-logo-subtitle">The Shattered Coast</span>
+              <span className="campaign-logo-subtitle">{worldTitle}</span>
             </div>
           </div>
 
@@ -894,7 +908,7 @@ export default function CampaignViewPage({ user }) {
             </div>
             
             <div className="current-location-dropdown">
-              <span className="location-name">{campaign?.settings?.current_location || '<insert location here>'}</span>
+              <span className="location-name">{locationName}</span>
               <span className="location-type">Exploration</span>
               <i className="bi bi-chevron-down"></i>
             </div>
@@ -930,6 +944,7 @@ export default function CampaignViewPage({ user }) {
               messages={messages}
               currentUser={user}
               currentCharacter={currentCharacter}
+              characters={characters}
               onStartSession={handleStartSession}
               onEndSession={handleEndSession}
               onSendMessage={handleSendMessage}
