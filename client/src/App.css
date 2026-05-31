@@ -1502,6 +1502,8 @@ select.input:focus {
   border-right: 1px solid var(--border-color);
   padding: 24px;
   overflow-y: auto;
+  display: flex;
+  flex-direction: column;
 }
 
 .dashboard-center {
@@ -7823,6 +7825,255 @@ select.input:focus {
 
 .view-all-updates-row:hover {
   color: var(--text-bright);
+}
+
+/* ==========================================================================
+   MOBILE BOTTOM NAVIGATION & LAYOUT REDESIGN
+   ========================================================================== */
+
+.mobile-bottom-nav {
+  display: none;
+}
+
+@media (max-width: 768px) {
+  /* Hide the desktop floating export button on mobile to prevent overlap */
+  .campaign-export-fab {
+    display: none !important;
+  }
+
+  /* Main layouts display settings */
+  .dashboard-layout {
+    display: flex !important;
+    flex-direction: column !important;
+    height: 100vh !important;
+    overflow: hidden !important;
+    position: relative !important;
+  }
+
+  .dashboard-left,
+  .dashboard-right,
+  .dashboard-center {
+    display: none !important;
+    width: 100% !important;
+    height: calc(100vh - 65px) !important; /* leaves exact space for bottom nav */
+    overflow-y: auto !important;
+    position: relative !important;
+    box-sizing: border-box !important;
+    padding: 16px !important;
+    background: var(--bg-dark) !important;
+  }
+
+  /* Active tabs mapping */
+  .dashboard-layout.mobile-tab-menu .dashboard-left {
+    display: flex !important;
+  }
+
+  .dashboard-layout.mobile-tab-party .dashboard-right {
+    display: block !important;
+  }
+
+  .dashboard-layout.mobile-tab-chat .dashboard-center,
+  .dashboard-layout.mobile-tab-map .dashboard-center {
+    display: flex !important;
+    padding: 0 !important; /* center needs full bleed for chat and map */
+    height: calc(100vh - 65px) !important;
+  }
+
+  /* Ensure inner content fills space properly */
+  .dashboard-left {
+    gap: 16px !important;
+  }
+  
+  .dashboard-left .sidebar-profile-card {
+    margin-top: auto;
+  }
+
+  /* Specific handling for map/chat visibility inside dashboard-center */
+  .dashboard-layout.mobile-tab-chat .encounter-map-panel {
+    display: none !important;
+  }
+
+  .dashboard-layout.mobile-tab-chat .session-panel {
+    display: flex !important;
+    height: 100% !important;
+  }
+
+  .dashboard-layout.mobile-tab-map .encounter-map-panel {
+    display: flex !important;
+    flex: 1 !important;
+    height: 100% !important;
+    max-height: none !important;
+  }
+
+  .dashboard-layout.mobile-tab-map .session-panel {
+    display: none !important;
+  }
+
+  /* Bottom nav bar styling - Premium Glassmorphism */
+  .mobile-bottom-nav {
+    display: flex !important;
+    position: fixed !important;
+    bottom: 0 !important;
+    left: 0 !important;
+    right: 0 !important;
+    height: 65px !important;
+    background: rgba(18, 19, 26, 0.85) !important;
+    backdrop-filter: blur(16px) !important;
+    -webkit-backdrop-filter: blur(16px) !important;
+    border-top: 1px solid rgba(255, 255, 255, 0.08) !important;
+    z-index: 9999 !important;
+    justify-content: space-around !important;
+    align-items: center !important;
+    padding: 4px 10px 8px !important;
+    box-sizing: border-box !important;
+  }
+
+  .mobile-nav-item {
+    background: none !important;
+    border: none !important;
+    color: var(--text-dim) !important;
+    display: flex !important;
+    flex-direction: column !important;
+    align-items: center !important;
+    justify-content: center !important;
+    flex: 1 !important;
+    height: 100% !important;
+    font-size: 0.7rem !important;
+    font-weight: 500 !important;
+    gap: 3px !important;
+    cursor: pointer !important;
+    transition: color 0.2s ease, transform 0.1s ease !important;
+    position: relative !important;
+  }
+
+  .mobile-nav-item i {
+    font-size: 1.35rem !important;
+    transition: transform 0.2s ease !important;
+  }
+
+  .mobile-nav-item:active i {
+    transform: scale(0.9) !important;
+  }
+
+  .mobile-nav-item.active {
+    color: var(--color-accent, #c5a880) !important; /* Gold/Bronze accent */
+  }
+
+  /* Updates / proposals badge in mobile nav menu tab */
+  .menu-badge {
+    position: absolute !important;
+    top: 2px !important;
+    right: 25% !important;
+    background: #ef4444 !important;
+    color: white !important;
+    font-size: 0.65rem !important;
+    font-weight: 700 !important;
+    min-width: 16px !important;
+    height: 16px !important;
+    border-radius: 8px !important;
+    display: flex !important;
+    align-items: center !important;
+    justify-content: center !important;
+    padding: 0 4px !important;
+    border: 1.5px solid #12131a !important;
+    box-shadow: 0 2px 5px rgba(0,0,0,0.3) !important;
+  }
+
+  /* Header mobile optimization to prevent overlaps */
+  .dashboard-top-header {
+    padding: 0 12px !important;
+    height: 56px !important;
+    gap: 8px !important;
+  }
+
+  .session-progress-indicator {
+    font-size: 0.68rem !important;
+    gap: 6px !important;
+    flex-shrink: 0 !important;
+  }
+
+  .session-progress-indicator span:nth-of-type(2) {
+    display: none !important; /* Hide 'SESSION IN PROGRESS' text on mobile to save space */
+  }
+
+  .current-location-dropdown {
+    padding: 4px 6px !important;
+    max-width: 45% !important; /* Limit dropdown width on mobile */
+    overflow: hidden !important;
+    white-space: nowrap !important;
+    text-overflow: ellipsis !important;
+    gap: 4px !important;
+  }
+
+  .location-name {
+    font-size: 0.85rem !important;
+    overflow: hidden !important;
+    white-space: nowrap !important;
+    text-overflow: ellipsis !important;
+  }
+
+  .location-type {
+    display: none !important; /* Hide location type tag on mobile */
+  }
+
+  .header-actions {
+    gap: 6px !important;
+    flex-shrink: 0 !important;
+  }
+
+  .header-actions .btn {
+    padding: 4px 8px !important;
+    font-size: 0.75rem !important;
+  }
+
+  /* Chat Message Mobile Layout - Eliminate left avatar empty space column */
+  .session-msg-layout {
+    display: grid !important;
+    grid-template-columns: 32px 1fr !important;
+    grid-template-rows: auto auto !important;
+    gap: 8px 10px !important;
+  }
+
+  .session-msg-body {
+    display: contents !important; /* Flatten grid container so username/time and content are direct grid items */
+  }
+
+  .session-msg-avatar-wrapper {
+    grid-column: 1 !important;
+    grid-row: 1 !important;
+    align-self: center !important;
+  }
+
+  .session-msg-avatar {
+    width: 32px !important;
+    height: 32px !important;
+    font-size: 0.75rem !important;
+  }
+
+  .session-msg-avatar i {
+    font-size: 1rem !important;
+  }
+
+  .session-msg-header {
+    grid-column: 2 !important;
+    grid-row: 1 !important;
+    align-self: center !important;
+    margin-bottom: 0 !important;
+  }
+
+  .session-msg-content {
+    grid-column: 1 / span 2 !important;
+    grid-row: 2 !important;
+    width: 100% !important;
+  }
+
+  .session-msg-ic-badge-container {
+    grid-column: 2 !important;
+    grid-row: 1 !important;
+    justify-self: end !important;
+    align-self: center !important;
+    margin-left: 0 !important;
+  }
 }
 
 

@@ -202,6 +202,7 @@ export default function CampaignViewPage({ user }) {
   const [showLootStash, setShowLootStash] = useState(false)
   const [showShops, setShowShops] = useState(false)
   const [elapsedTime, setElapsedTime] = useState('00:00:00')
+  const [activeTab, setActiveTab] = useState('chat')
 
   useEffect(() => {
     if (!session) {
@@ -849,8 +850,8 @@ export default function CampaignViewPage({ user }) {
 
   return (
     <div className={`dashboard-page ${isMapExpanded && hasActiveMap ? 'map-expanded' : ''}`}>
-      <div className={`dashboard-layout ${isMapExpanded && hasActiveMap ? 'map-expanded' : ''}`}>
-        <aside className="dashboard-left" style={{ display: 'flex', flexDirection: 'column' }}>
+      <div className={`dashboard-layout mobile-tab-${activeTab} ${isMapExpanded && hasActiveMap ? 'map-expanded' : ''}`}>
+        <aside className="dashboard-left">
           <div className="campaign-logo-header">
             <div className="campaign-logo">
               <i className="bi bi-hexagon-fill"></i>
@@ -1240,6 +1241,31 @@ export default function CampaignViewPage({ user }) {
           }}
         />
       )}
+
+      {/* Mobile Bottom Navigation Bar */}
+      <nav className="mobile-bottom-nav">
+        <button className={`mobile-nav-item ${activeTab === 'chat' ? 'active' : ''}`} onClick={() => setActiveTab('chat')}>
+          <i className="bi bi-chat-left-text-fill"></i>
+          <span>Chat</span>
+        </button>
+        {hasActiveMap && (
+          <button className={`mobile-nav-item ${activeTab === 'map' ? 'active' : ''}`} onClick={() => setActiveTab('map')}>
+            <i className="bi bi-map-fill"></i>
+            <span>Map</span>
+          </button>
+        )}
+        <button className={`mobile-nav-item ${activeTab === 'party' ? 'active' : ''}`} onClick={() => setActiveTab('party')}>
+          <i className="bi bi-people-fill"></i>
+          <span>Party</span>
+        </button>
+        <button className={`mobile-nav-item ${activeTab === 'menu' ? 'active' : ''}`} onClick={() => setActiveTab('menu')}>
+          <i className="bi bi-grid-fill"></i>
+          <span>Menu</span>
+          {sheetProposals.length > 0 && (
+            <span className="menu-badge">{sheetProposals.length}</span>
+          )}
+        </button>
+      </nav>
     </div>
   )
 }
