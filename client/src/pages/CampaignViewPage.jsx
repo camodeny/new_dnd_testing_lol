@@ -31,6 +31,12 @@ function getInitials(name) {
   return name.split(' ').map((w) => w[0]).join('').slice(0, 2).toUpperCase()
 }
 
+function formatTime(iso) {
+  if (!iso) return ''
+  const d = new Date(iso)
+  return d.toLocaleTimeString(undefined, { hour: '2-digit', minute: '2-digit' })
+}
+
 function getGradientSeed(str) {
   let hash = 0
   for (let i = 0; i < str.length; i++) hash = str.charCodeAt(i) + ((hash << 5) - hash)
@@ -185,6 +191,24 @@ export default function CampaignViewPage({ user }) {
   const [showWorldBuilding, setShowWorldBuilding] = useState(false)
   const [showLootStash, setShowLootStash] = useState(false)
   const [showShops, setShowShops] = useState(false)
+  const [elapsedTime, setElapsedTime] = useState('00:00:00')
+
+  useEffect(() => {
+    if (!session) {
+      setElapsedTime('00:00:00')
+      return
+    }
+    const startTime = new Date(session.created_at || session.started_at || Date.now()).getTime()
+    const interval = setInterval(() => {
+      const diff = Date.now() - startTime
+      const hrs = String(Math.floor(diff / 3600000)).padStart(2, '0')
+      const mins = String(Math.floor((diff % 3600000) / 60000)).padStart(2, '0')
+      const secs = String(Math.floor((diff % 60000) / 1000)).padStart(2, '0')
+      setElapsedTime(`${hrs}:${mins}:${secs}`)
+    }, 1000)
+    return () => clearInterval(interval)
+  }, [session])
+
   const pendingMessageIdsRef = useRef(new Set())
 
   const [showImport, setShowImport] = useState(false)
@@ -810,43 +834,121 @@ export default function CampaignViewPage({ user }) {
   return (
     <div className={`dashboard-page ${isMapExpanded && hasActiveMap ? 'map-expanded' : ''}`}>
       <div className={`dashboard-layout ${isMapExpanded && hasActiveMap ? 'map-expanded' : ''}`}>
-        <aside className="dashboard-left">
-          <PartyRoster characters={characters} campaignId={id} onImport={openImport} />
+        <aside className="dashboard-left" style={{ display: 'flex', flexDirection: 'column' }}>
+          <div className="campaign-logo-header">
+            <div className="campaign-logo">
+              <i className="bi bi-hexagon-fill"></i>
+            </div>
+            <div className="campaign-logo-details">
+              <span className="campaign-logo-title">{campaign?.name || 'SALT & SONG'}</span>
+              <span className="campaign-logo-subtitle">The Shattered Coast</span>
+            </div>
+            <button className="campaign-header-dropdown-btn">
+              <i className="bi bi-chevron-down"></i>
+            </button>
+          </div>
+
+          <div style={{ flex: 1, overflowY: 'auto', display: 'flex', flexDirection: 'column', gap: '20px' }}>
+            <PartyRoster characters={characters} campaignId={id} onImport={openImport} />
+            
+            <div className="sidebar-nav">
+              <button className="sidebar-nav-item" onClick={() => setShowSettings(true)}>
+                <i className="bi bi-gear"></i> Campaign Settings
+              </button>
+              <button className="sidebar-nav-item" onClick={() => navigate('/characters')}>
+                <i className="bi bi-person-badge"></i> Characters
+              </button>
+              <button className="sidebar-nav-item" onClick={() => setShowWorldBuilding(true)}>
+                <i className="bi bi-journal-bookmark"></i> World Journal
+              </button>
+              <button className="sidebar-nav-item">
+                <i className="bi bi-clock-history"></i> Session History
+              </button>
+            </div>
+          </div>
+
+          <div className="sidebar-profile-card">
+            <div className="sidebar-profile-avatar">
+              {getInitials(user?.username || 'Player')}
+            </div>
+            <div className="sidebar-profile-info">
+              <span className="sidebar-profile-name">{user?.username || 'Guest'}</span>
+              <span className="sidebar-profile-role">{isOwner ? 'Dungeon Master' : 'Player'}</span>
+            </div>
+            <div className="sidebar-profile-actions">
+              <button className="sidebar-profile-action-btn" onClick={() => setShowSettings(true)}>
+                <i className="bi bi-gear-fill"></i>
+              </button>
+              <button className="sidebar-profile-action-btn" onClick={() => navigate('/logout')}>
+                <i className="bi bi-box-arrow-right"></i>
+              </button>
+            </div>
+          </div>
         </aside>
 
         <main className={`dashboard-center ${isMapExpanded && hasActiveMap ? 'map-expanded' : ''}`}>
-          {hasActiveMap && (
-            <EncounterMapPanel
-              encounterMap={encounterMap}
-              loading={encounterMapLoading}
-              isOwner={isOwner}
+          <div className="dashboard-top-header">
+            <div className="session-progress-indicator">
+              <span className="pulse-dot"></span>
+              <span>SESSION IN PROGRESS</span>
+              <span className="timer-text">{elapsedTime}</span>
+            </div>
+            
+            <div className="current-location-dropdown">
+              <span className="location-name">{campaign?.settings?.current_location || 'Ruins of Greymarsh'}</span>
+              <span className="location-type">Exploration</span>
+              <i className="bi bi-chevron-down"></i>
+            </div>
+
+            <div className="header-actions">
+              <button className="header-icon-btn" onClick={() => setIsMapExpanded(!isMapExpanded)} title="Toggle Map View">
+                <i className="bi bi-map"></i>
+              </button>
+              <button className="header-icon-btn"><i className="bi bi-shield-slash"></i></button>
+              <button className="header-icon-btn" onClick={openImport} title="Players list"><i className="bi bi-people"></i></button>
+              {session ? (
+                <button className="btn btn-primary end-session-btn" onClick={handleEndSession}>End Session</button>
+              ) : (
+                <button className="btn btn-primary start-session-btn" onClick={handleStartSession}>Start Session</button>
+              )}
+              <button className="header-icon-btn" onClick={() => setShowSettings(true)}><i className="bi bi-three-dots-vertical"></i></button>
+            </div>
+          </div>
+
+          <div style={{ flex: 1, display: 'flex', flexDirection: 'column', minHeight: 0, overflow: 'hidden', position: 'relative' }}>
+            {hasActiveMap && (
+              <EncounterMapPanel
+                encounterMap={encounterMap}
+                loading={encounterMapLoading}
+                isOwner={isOwner}
+                currentUser={user}
+                currentCharacter={currentCharacter}
+                onEncounterMapChange={setEncounterMap}
+                isMapExpanded={isMapExpanded}
+                setIsMapExpanded={setIsMapExpanded}
+                onSendMessage={handleSendMessage}
+              />
+            )}
+            <SessionPanel
+              session={session}
+              messages={messages}
               currentUser={user}
               currentCharacter={currentCharacter}
-              onEncounterMapChange={setEncounterMap}
-              isMapExpanded={isMapExpanded}
-              setIsMapExpanded={setIsMapExpanded}
+              onStartSession={handleStartSession}
+              onEndSession={handleEndSession}
               onSendMessage={handleSendMessage}
+              hasOlderMessages={hasOlderMessages}
+              loadingOlderMessages={loadingOlderMessages}
+              onLoadOlderMessages={loadOlderMessages}
+              aiThinking={aiThinking}
+              aiThinkingStatus={aiThinkingStatus}
+              sheetProposals={sheetProposals}
+              onProposalApplied={handleProposalApplied}
+              onProposalDismissed={handleProposalDismissed}
+              onToggleLootStash={() => setShowLootStash(true)}
+              onToggleShops={() => setShowShops(true)}
             />
-          )}
-          <SessionPanel
-            session={session}
-            messages={messages}
-            currentUser={user}
-            currentCharacter={currentCharacter}
-            onStartSession={handleStartSession}
-            onEndSession={handleEndSession}
-            onSendMessage={handleSendMessage}
-            hasOlderMessages={hasOlderMessages}
-            loadingOlderMessages={loadingOlderMessages}
-            onLoadOlderMessages={loadOlderMessages}
-            aiThinking={aiThinking}
-            aiThinkingStatus={aiThinkingStatus}
-            sheetProposals={sheetProposals}
-            onProposalApplied={handleProposalApplied}
-            onProposalDismissed={handleProposalDismissed}
-            onToggleLootStash={() => setShowLootStash(true)}
-            onToggleShops={() => setShowShops(true)}
-          />
+          </div>
         </main>
 
         <aside className="dashboard-right">
@@ -856,6 +958,165 @@ export default function CampaignViewPage({ user }) {
             isOwner={isOwner}
             onAdded={handleLlmPlayerAdded}
           />
+          
+          <div className="right-sidebar-widget loot-treasure-panel">
+            <div className="widget-header">
+              <h3>Loot & Treasure</h3>
+              <button className="view-all-link" onClick={() => setShowLootStash(true)} style={{ background: 'none', border: 'none', cursor: 'pointer' }}>View All</button>
+            </div>
+            <div className="loot-item-list">
+              {currentCharacter?.equipment?.length > 0 ? (
+                currentCharacter.equipment.slice(0, 4).map((item, idx) => {
+                  let icon = 'bi bi-gem'
+                  const name = item.name.toLowerCase()
+                  if (name.includes('potion')) icon = 'bi bi-droplet-half'
+                  else if (name.includes('sword') || name.includes('blade') || name.includes('dagger') || name.includes('bow')) icon = 'bi bi-shield-slash'
+                  else if (name.includes('key')) icon = 'bi bi-key'
+                  else if (name.includes('scroll')) icon = 'bi bi-file-earmark-text'
+
+                  return (
+                    <div key={idx} className="loot-item-row">
+                      <div className="loot-item-icon-wrapper">
+                        <i className={icon}></i>
+                      </div>
+                      <div className="loot-item-details">
+                        <span className="loot-item-name">{item.name}</span>
+                        <span className="loot-item-type">{item.equipment_type || 'Item'}</span>
+                      </div>
+                      <span className="loot-item-quantity">x{item.quantity || 1}</span>
+                    </div>
+                  )
+                })
+              ) : (
+                <>
+                  <div className="loot-item-row">
+                    <div className="loot-item-icon-wrapper">
+                      <i className="bi bi-droplet-half"></i>
+                    </div>
+                    <div className="loot-item-details">
+                      <span className="loot-item-name">Potion of Healing</span>
+                      <span className="loot-item-type">Potion</span>
+                    </div>
+                    <span className="loot-item-quantity">x2</span>
+                  </div>
+                  <div className="loot-item-row">
+                    <div className="loot-item-icon-wrapper">
+                      <i className="bi bi-shield-slash"></i>
+                    </div>
+                    <div className="loot-item-details">
+                      <span className="loot-item-name">Silvered Shortsword</span>
+                      <span className="loot-item-type">Weapon</span>
+                    </div>
+                    <span className="loot-item-quantity">x1</span>
+                  </div>
+                  <div className="loot-item-row">
+                    <div className="loot-item-icon-wrapper">
+                      <i className="bi bi-gem"></i>
+                    </div>
+                    <div className="loot-item-details">
+                      <span className="loot-item-name">Moonstone</span>
+                      <span className="loot-item-type">Gemstone</span>
+                    </div>
+                    <span className="loot-item-quantity">x1</span>
+                  </div>
+                  <div className="loot-item-row">
+                    <div className="loot-item-icon-wrapper">
+                      <i className="bi bi-key"></i>
+                    </div>
+                    <div className="loot-item-details">
+                      <span className="loot-item-name">Old Iron Key</span>
+                      <span className="loot-item-type">Quest Item</span>
+                    </div>
+                    <span className="loot-item-quantity">x1</span>
+                  </div>
+                </>
+              )}
+            </div>
+          </div>
+
+          {(() => {
+            const activityLogs = [];
+            messages.forEach(m => {
+              if (m.is_proposal) {
+                activityLogs.push({
+                  id: m.id,
+                  user: 'System',
+                  text: `Proposed update: ${m.proposal?.reason || 'Sheet changes'}`,
+                  time: m.created_at,
+                  avatar: '⚙️'
+                });
+              } else if (m.content && m.content.includes('[Roll:')) {
+                const rollMatch = m.content.match(/\[Roll:\s*([^\]]+)\]\s*total:\s*(-?\d+)/i);
+                const rollName = rollMatch ? rollMatch[1] : 'Dice Roll';
+                const total = rollMatch ? rollMatch[2] : '';
+                activityLogs.push({
+                  id: m.id,
+                  user: m.username || 'Player',
+                  text: `rolled ${rollName} ${total ? `(Total: ${total})` : ''}`,
+                  time: m.created_at,
+                  avatar: '🎲'
+                });
+              } else if (m.content && m.content.includes('[Turn Ended]')) {
+                const charName = m.content.replace('[Turn Ended]', '').trim();
+                activityLogs.push({
+                  id: m.id,
+                  user: charName,
+                  text: `ended turn`,
+                  time: m.created_at,
+                  avatar: '⏳'
+                });
+              }
+            });
+
+            const displayLogs = activityLogs.slice(-3).reverse();
+
+            return (
+              <div className="right-sidebar-widget recent-activity-panel">
+                <div className="widget-header">
+                  <h3>Recent Activity</h3>
+                  <button className="view-all-link" style={{ background: 'none', border: 'none', cursor: 'pointer' }}>View All</button>
+                </div>
+                <div className="activity-list">
+                  {displayLogs.length > 0 ? (
+                    displayLogs.map((log) => (
+                      <div key={log.id} className="activity-row">
+                        <div className="activity-avatar">{log.avatar}</div>
+                        <div className="activity-details">
+                          <strong>{log.user}</strong> {log.text}
+                        </div>
+                        <span className="activity-time">{formatTime(log.time)}</span>
+                      </div>
+                    ))
+                  ) : (
+                    <>
+                      <div className="activity-row">
+                        <div className="activity-avatar">🎲</div>
+                        <div className="activity-details">
+                          <strong>Kael Thorn</strong> rolled Stealth 18
+                        </div>
+                        <span className="activity-time">2m ago</span>
+                      </div>
+                      <div className="activity-row">
+                        <div className="activity-avatar">🎲</div>
+                        <div className="activity-details">
+                          <strong>Pip Quickfoot</strong> rolled Perception 12
+                        </div>
+                        <span className="activity-time">5m ago</span>
+                      </div>
+                      <div className="activity-row">
+                        <div className="activity-avatar">👑</div>
+                        <div className="activity-details">
+                          <strong>Dungeon Master</strong> created encounter
+                        </div>
+                        <span className="activity-time">8m ago</span>
+                      </div>
+                    </>
+                  )}
+                </div>
+              </div>
+            );
+          })()}
+
           <LootBoxStash campaignId={id} isOwner={isOwner} characters={characters} onLootBoxOpened={handleLootBoxOpened} />
         </aside>
       </div>
