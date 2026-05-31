@@ -893,8 +893,13 @@ export default function CampaignViewPage({ user }) {
               <button className="sidebar-profile-action-btn" onClick={() => setShowSettings(true)}>
                 <i className="bi bi-gear-fill"></i>
               </button>
-              <button className="sidebar-profile-action-btn" onClick={() => navigate('/logout')}>
-                <i className="bi bi-box-arrow-right"></i>
+              <button
+                className="sidebar-profile-action-btn"
+                onClick={() => navigate('/')}
+                title="Exit to campaigns"
+                aria-label="Exit to campaigns"
+              >
+                <i className="bi bi-door-open"></i>
               </button>
             </div>
           </div>
