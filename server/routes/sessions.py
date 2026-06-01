@@ -27,6 +27,7 @@ from services.dm_tools import (
     context_manifest,
     execute_dm_tool,
 )
+from services.dev_combat_sandbox import is_combat_sandbox_campaign, start_combat_sandbox_session
 from services.planning_service import can_start_session, planning_context
 from services.world_service import approve_world, dm_world_context, ensure_world_generated, world_public_payload
 
@@ -233,6 +234,23 @@ def start_session(current_user, campaign_id):
             'error': 'Every party member must select and ready a character before starting a session',
             'planning': details,
         }), 400
+
+    if is_combat_sandbox_campaign(campaign):
+        try:
+            started = start_combat_sandbox_session(campaign, current_user)
+        except ValueError as err:
+            db.session.rollback()
+            return jsonify({'error': str(err)}), 400
+        except RuntimeError as err:
+            db.session.rollback()
+            return jsonify({'error': str(err)}), 500
+
+        session = started['session']
+        data = session.to_dict()
+        data['messages'] = [message.to_dict() for message in session.messages]
+        stream_manager.broadcast_event(session.id, {"type": "refresh"})
+        planning_stream_manager.broadcast_campaign_event(campaign_id, {"type": "session_started"})
+        return jsonify({'session': data}), 201
 
     world, world_error = ensure_world_generated(campaign, current_user)
     if world_error:

@@ -24,6 +24,7 @@ from models import (
     CampaignAuditEvent,
     CampaignInvite,
     CampaignMember,
+    CampaignMonster,
     CampaignSession,
     CampaignWorld,
     Character,
@@ -1014,6 +1015,553 @@ class AppRouteTest(unittest.TestCase):
 
         self.assertEqual(response.status_code, 400)
         self.assertEqual(response.get_json(), {'error': 'Model is required'})
+
+    def test_list_combat_sandbox_maps_returns_owned_sandbox_maps(self):
+        with app.app_context():
+            owner = User(username='sandboxowner', email='sandboxowner@example.com')
+            owner.set_password('password')
+            db.session.add(owner)
+            db.session.commit()
+
+            sandbox_campaign = Campaign(
+                name='Sandbox One',
+                user_id=owner.id,
+                settings=json.dumps({'dev_mode': 'combat_sandbox'}),
+            )
+            regular_campaign = Campaign(
+                name='Regular Campaign',
+                user_id=owner.id,
+            )
+            db.session.add_all([sandbox_campaign, regular_campaign])
+            db.session.flush()
+
+            db.session.add(EncounterMap(
+                campaign_id=sandbox_campaign.id,
+                title='Saved Tavern',
+                prompt='A tavern fight.',
+                image_filename='saved-tavern.png',
+                model='gpt-image-2',
+                size='1024x1024',
+                quality='high',
+                vtt_setup_json=json.dumps({
+                    'map_summary': 'Tavern interior with central cover.',
+                    'tactical_notes': ['Tables break sight lines.'],
+                    'friendly_spawn_boxes': [],
+                    'enemy_spawn_boxes': [],
+                    'terrain_zones': [],
+                    'obstacles': [],
+                }),
+                setup_status='ready',
+            ))
+            db.session.add(EncounterMap(
+                campaign_id=regular_campaign.id,
+                title='Non Sandbox Map',
+                prompt='A forest clearing.',
+                image_filename='forest.png',
+                model='gpt-image-2',
+                size='1024x1024',
+                quality='high',
+                setup_status='ready',
+            ))
+            db.session.commit()
+            token = generate_token(owner.id)
+
+        response = self.client.get(
+            '/api/dev/combat-sandbox/maps',
+            headers={'Authorization': f'Bearer {token}'},
+        )
+
+        self.assertEqual(response.status_code, 200)
+        maps = response.get_json()['maps']
+        self.assertEqual(len(maps), 1)
+        self.assertEqual(maps[0]['title'], 'Saved Tavern')
+        self.assertEqual(maps[0]['campaign_name'], 'Sandbox One')
+
+    def test_create_combat_sandbox_from_existing_map_defers_until_party_ready(self):
+        map_dir = Path(self.temp_dir.name) / 'encounter_maps'
+        map_dir.mkdir(parents=True, exist_ok=True)
+
+        with app.app_context():
+            owner = User(username='sandboxmaker', email='sandboxmaker@example.com')
+            owner.set_password('password')
+            db.session.add(owner)
+            db.session.commit()
+
+            source_campaign = Campaign(
+                name='Source Sandbox',
+                user_id=owner.id,
+                settings=json.dumps({'dev_mode': 'combat_sandbox'}),
+            )
+            db.session.add(source_campaign)
+            db.session.flush()
+            db.session.add(CampaignMember(campaign_id=source_campaign.id, user_id=owner.id, role='player'))
+
+            source_map = EncounterMap(
+                campaign_id=source_campaign.id,
+                title='Warehouse Clash',
+                prompt='A warehouse map.',
+                image_filename='warehouse.png',
+                labeled_image_filename='warehouse_labeled.png',
+                model='gpt-image-2',
+                size='1024x1024',
+                quality='high',
+                grid_json=json.dumps({'columns': 8, 'rows': 8}),
+                vtt_setup_json=json.dumps({
+                    'map_summary': 'Warehouse with lanes and crates.',
+                    'dm_setup_context': '',
+                    'friendly_spawn_boxes': [{
+                        'label': 'South Entry',
+                        'rect': {'col': 1, 'row': 6, 'width': 2, 'height': 1},
+                        'description': '',
+                        'confidence': 0.9,
+                    }],
+                    'enemy_spawn_boxes': [{
+                        'label': 'North Catwalk',
+                        'rect': {'col': 5, 'row': 1, 'width': 2, 'height': 1},
+                        'description': '',
+                        'confidence': 0.9,
+                    }],
+                    'player_start_areas': [{
+                        'label': 'South Entry',
+                        'rect': {'col': 1, 'row': 6, 'width': 2, 'height': 1},
+                        'description': '',
+                        'confidence': 0.9,
+                    }],
+                    'enemy_start_areas': [{
+                        'label': 'North Catwalk',
+                        'rect': {'col': 5, 'row': 1, 'width': 2, 'height': 1},
+                        'description': '',
+                        'confidence': 0.9,
+                    }],
+                    'terrain_zones': [],
+                    'obstacles': [],
+                    'tactical_notes': ['Crates provide half cover.'],
+                }),
+                setup_status='ready',
+            )
+            db.session.add(source_map)
+            db.session.flush()
+
+            monster = CampaignMonster(
+                campaign_id=source_campaign.id,
+                monster_id='raider-1',
+                name='Warehouse Raider',
+                stat_block=json.dumps({'max_hp': 12, 'armor_class': 13, 'speed': 30, 'initiative_bonus': 2}),
+            )
+            db.session.add(monster)
+            db.session.flush()
+
+            db.session.add(EncounterMapPlacement(
+                encounter_map_id=source_map.id,
+                actor_type='monster',
+                actor_id='raider-1',
+                label='Warehouse Raider',
+                grid_col=5,
+                grid_row=1,
+            ))
+            db.session.commit()
+            token = generate_token(owner.id)
+            source_map_id = source_map.id
+
+        (map_dir / 'warehouse.png').write_bytes(b'png-data')
+        (map_dir / 'warehouse_labeled.png').write_bytes(b'labeled-data')
+
+        with patch.dict(os.environ, {'ENCOUNTER_MAP_STORAGE_DIR': str(map_dir)}, clear=False):
+            response = self.client.post(
+                '/api/dev/combat-sandboxes',
+                json={
+                    'name': 'Cloned Sandbox',
+                    'source_map_id': source_map_id,
+                    'required_players': 3,
+                },
+                headers={'Authorization': f'Bearer {token}'},
+            )
+
+        self.assertEqual(response.status_code, 201)
+        data = response.get_json()
+        self.assertEqual(data['campaign']['name'], 'Cloned Sandbox')
+        self.assertEqual(data['campaign']['settings']['dev_mode'], 'combat_sandbox')
+        self.assertTrue(data['invite']['code'])
+        self.assertTrue(data['deferred_start'])
+        self.assertIsNone(data['session'])
+        self.assertIsNone(data['encounter_map'])
+
+        with app.app_context():
+            sandbox_campaign = Campaign.query.filter_by(name='Cloned Sandbox').first()
+            self.assertIsNotNone(sandbox_campaign)
+            member = CampaignMember.query.filter_by(campaign_id=sandbox_campaign.id, user_id=owner.id).first()
+            self.assertIsNotNone(member.selected_character_id)
+            self.assertIsNone(member.character_ready_at)
+            self.assertFalse(sandbox_campaign.to_dict()['settings']['encounter_active'])
+            self.assertEqual(CampaignSession.query.filter_by(campaign_id=sandbox_campaign.id, is_active=True).count(), 0)
+            self.assertEqual(EncounterMap.query.filter_by(campaign_id=sandbox_campaign.id).count(), 0)
+
+    def test_create_combat_sandbox_can_generate_new_map(self):
+        with app.app_context():
+            owner = User(username='freshsandbox', email='freshsandbox@example.com')
+            owner.set_password('password')
+            db.session.add(owner)
+            db.session.commit()
+            token = generate_token(owner.id)
+
+        def fake_create_encounter_map(campaign, session, title, map_prompt, terrain='', tactical_features='', mood='', vtt_setup_notes='', audit_context=None):
+            encounter_map = EncounterMap(
+                campaign_id=campaign.id,
+                session_id=session.id,
+                title=title,
+                prompt=map_prompt,
+                image_filename='generated.png',
+                model='gpt-image-2',
+                size='1024x1024',
+                quality='medium',
+                grid_json=json.dumps({'columns': 8, 'rows': 8}),
+                vtt_setup_json=json.dumps({
+                    'map_summary': 'Freshly generated skirmish map.',
+                    'dm_setup_context': vtt_setup_notes,
+                    'friendly_spawn_boxes': [{
+                        'label': 'South Edge',
+                        'rect': {'col': 1, 'row': 6, 'width': 2, 'height': 1},
+                        'description': '',
+                        'confidence': 1,
+                    }],
+                    'enemy_spawn_boxes': [{
+                        'label': 'North Edge',
+                        'rect': {'col': 5, 'row': 1, 'width': 2, 'height': 1},
+                        'description': '',
+                        'confidence': 1,
+                    }],
+                    'player_start_areas': [{
+                        'label': 'South Edge',
+                        'rect': {'col': 1, 'row': 6, 'width': 2, 'height': 1},
+                        'description': '',
+                        'confidence': 1,
+                    }],
+                    'enemy_start_areas': [{
+                        'label': 'North Edge',
+                        'rect': {'col': 5, 'row': 1, 'width': 2, 'height': 1},
+                        'description': '',
+                        'confidence': 1,
+                    }],
+                    'terrain_zones': [],
+                    'obstacles': [],
+                    'tactical_notes': ['Barrels split the center lane.'],
+                }),
+                setup_status='ready',
+            )
+            db.session.add(encounter_map)
+            db.session.flush()
+            return encounter_map
+
+        with patch('services.dev_combat_sandbox.create_encounter_map', side_effect=fake_create_encounter_map):
+            response = self.client.post(
+                '/api/dev/combat-sandboxes',
+                json={
+                    'name': 'Fresh Sandbox',
+                    'map_title': 'Barrel Alley',
+                    'map_prompt': 'A narrow alley with stacked barrels and a rear loading gate.',
+                    'terrain': 'stone alley, muddy edges',
+                    'tactical_features': 'cover from barrels, one narrow chokepoint',
+                    'vtt_setup_notes': 'Players start south, enemies start north.',
+                },
+                headers={'Authorization': f'Bearer {token}'},
+            )
+
+        self.assertEqual(response.status_code, 201)
+        data = response.get_json()
+        self.assertEqual(data['campaign']['name'], 'Fresh Sandbox')
+        self.assertEqual(data['encounter_map']['title'], 'Barrel Alley')
+        self.assertTrue(data['encounter_map']['encounter_state']['active'])
+        self.assertEqual(data['campaign']['settings']['dev_mode'], 'combat_sandbox')
+
+    def test_starting_deferred_combat_sandbox_generates_map_after_party_ready(self):
+        map_dir = Path(self.temp_dir.name) / 'encounter_maps'
+        map_dir.mkdir(parents=True, exist_ok=True)
+
+        with app.app_context():
+            owner = User(username='deferredhost', email='deferredhost@example.com')
+            owner.set_password('password')
+            guest = User(username='deferredguest', email='deferredguest@example.com')
+            guest.set_password('password')
+            db.session.add_all([owner, guest])
+            db.session.commit()
+
+            source_campaign = Campaign(
+                name='Seed Sandbox',
+                user_id=owner.id,
+                settings=json.dumps({'dev_mode': 'combat_sandbox'}),
+            )
+            db.session.add(source_campaign)
+            db.session.flush()
+            db.session.add(CampaignMember(campaign_id=source_campaign.id, user_id=owner.id, role='player'))
+
+            source_map = EncounterMap(
+                campaign_id=source_campaign.id,
+                title='Gatehouse Clash',
+                prompt='A gatehouse skirmish map.',
+                image_filename='gatehouse.png',
+                labeled_image_filename='gatehouse_labeled.png',
+                model='gpt-image-2',
+                size='1024x1024',
+                quality='high',
+                grid_json=json.dumps({'columns': 8, 'rows': 8}),
+                vtt_setup_json=json.dumps({
+                    'map_summary': 'Gatehouse with a narrow bridge.',
+                    'dm_setup_context': '',
+                    'friendly_spawn_boxes': [{
+                        'label': 'Bridge Foot',
+                        'rect': {'col': 1, 'row': 6, 'width': 2, 'height': 1},
+                        'description': '',
+                        'confidence': 0.9,
+                    }],
+                    'enemy_spawn_boxes': [{
+                        'label': 'Gate Arch',
+                        'rect': {'col': 5, 'row': 1, 'width': 2, 'height': 1},
+                        'description': '',
+                        'confidence': 0.9,
+                    }],
+                    'player_start_areas': [{
+                        'label': 'Bridge Foot',
+                        'rect': {'col': 1, 'row': 6, 'width': 2, 'height': 1},
+                        'description': '',
+                        'confidence': 0.9,
+                    }],
+                    'enemy_start_areas': [{
+                        'label': 'Gate Arch',
+                        'rect': {'col': 5, 'row': 1, 'width': 2, 'height': 1},
+                        'description': '',
+                        'confidence': 0.9,
+                    }],
+                    'terrain_zones': [],
+                    'obstacles': [],
+                    'tactical_notes': ['The bridge is a chokepoint.'],
+                }),
+                setup_status='ready',
+            )
+            db.session.add(source_map)
+            db.session.flush()
+            db.session.add(CampaignMonster(
+                campaign_id=source_campaign.id,
+                monster_id='guard-1',
+                name='Gate Guard',
+                stat_block=json.dumps({'max_hp': 10, 'armor_class': 12, 'speed': 30, 'initiative_bonus': 1}),
+            ))
+            db.session.add(EncounterMapPlacement(
+                encounter_map_id=source_map.id,
+                actor_type='monster',
+                actor_id='guard-1',
+                label='Gate Guard',
+                grid_col=5,
+                grid_row=1,
+            ))
+            db.session.commit()
+
+            owner_token = generate_token(owner.id)
+            sandbox_source_map_id = source_map.id
+            guest_id = guest.id
+
+        (map_dir / 'gatehouse.png').write_bytes(b'png-data')
+        (map_dir / 'gatehouse_labeled.png').write_bytes(b'labeled-data')
+
+        with patch.dict(os.environ, {'ENCOUNTER_MAP_STORAGE_DIR': str(map_dir)}, clear=False):
+            create_response = self.client.post(
+                '/api/dev/combat-sandboxes',
+                json={
+                    'name': 'Deferred Sandbox',
+                    'source_map_id': sandbox_source_map_id,
+                    'required_players': 2,
+                },
+                headers={'Authorization': f'Bearer {owner_token}'},
+            )
+            self.assertEqual(create_response.status_code, 201)
+            campaign_id = create_response.get_json()['campaign']['id']
+
+            with app.app_context():
+                owner_member = CampaignMember.query.filter_by(campaign_id=campaign_id, user_id=owner.id).first()
+                owner_member.character_ready_at = datetime.utcnow()
+                guest_character = Character(
+                    user_id=guest_id,
+                    campaign_id=campaign_id,
+                    name='Guest Rogue',
+                    race='Elf',
+                    speed=30,
+                    max_hp=12,
+                    current_hp=12,
+                    armor_class=14,
+                    initiative_bonus=3,
+                )
+                db.session.add(guest_character)
+                db.session.flush()
+                db.session.add(CampaignMember(
+                    campaign_id=campaign_id,
+                    user_id=guest_id,
+                    role='player',
+                    selected_character_id=guest_character.id,
+                    character_ready_at=datetime.utcnow(),
+                ))
+                db.session.commit()
+
+            start_response = self.client.post(
+                f'/api/campaigns/{campaign_id}/sessions',
+                headers={'Authorization': f'Bearer {owner_token}'},
+            )
+
+        self.assertEqual(start_response.status_code, 201)
+        session_data = start_response.get_json()['session']
+        self.assertTrue(session_data['is_active'])
+
+        with app.app_context():
+            sandbox_campaign = db.session.get(Campaign, campaign_id)
+            settings = sandbox_campaign.to_dict()['settings']
+            self.assertTrue(settings['encounter_active'])
+            self.assertEqual(CampaignSession.query.filter_by(campaign_id=campaign_id, is_active=True).count(), 1)
+            encounter_map = EncounterMap.query.filter_by(campaign_id=campaign_id).one()
+            state = json.loads(encounter_map.encounter_state_json)
+            self.assertTrue(state['active'])
+            player_ids = sorted(
+                placement.actor_id
+                for placement in EncounterMapPlacement.query.filter_by(encounter_map_id=encounter_map.id, actor_type='player').all()
+            )
+            self.assertEqual(player_ids, [str(owner.id), str(guest_id)])
+            monster_ids = sorted(
+                placement.actor_id
+                for placement in EncounterMapPlacement.query.filter_by(encounter_map_id=encounter_map.id, actor_type='monster').all()
+            )
+            self.assertEqual(monster_ids, ['guard-1'])
+
+    def test_joining_combat_sandbox_auto_assigns_character_and_token(self):
+        from routes.encounter_maps import build_initial_encounter_state, check_and_start_turns
+
+        with app.app_context():
+            owner = User(username='sandboxhost', email='sandboxhost@example.com')
+            owner.set_password('password')
+            joiner = User(username='sandboxguest', email='sandboxguest@example.com')
+            joiner.set_password('password')
+            db.session.add_all([owner, joiner])
+            db.session.commit()
+
+            campaign = Campaign(
+                name='Joinable Sandbox',
+                user_id=owner.id,
+                invite_code='SANDBOX1',
+                settings=json.dumps({'dev_mode': 'combat_sandbox', 'encounter_active': True}),
+            )
+            db.session.add(campaign)
+            db.session.flush()
+
+            owner_character = Character(
+                user_id=owner.id,
+                campaign_id=campaign.id,
+                name='Owner Fighter',
+                race='Human',
+                speed=30,
+                max_hp=14,
+                current_hp=14,
+                armor_class=16,
+                initiative_bonus=2,
+            )
+            db.session.add(owner_character)
+            db.session.flush()
+
+            db.session.add(CampaignMember(
+                campaign_id=campaign.id,
+                user_id=owner.id,
+                role='player',
+                selected_character_id=owner_character.id,
+                character_ready_at=datetime.utcnow(),
+            ))
+            db.session.add(CampaignInvite(
+                campaign_id=campaign.id,
+                code='SANDBOX1',
+                created_by=owner.id,
+                expires_at=datetime.utcnow() + timedelta(days=7),
+                is_used=False,
+            ))
+
+            session = CampaignSession(campaign_id=campaign.id, is_active=True)
+            db.session.add(session)
+            db.session.flush()
+
+            encounter_map = EncounterMap(
+                campaign_id=campaign.id,
+                session_id=session.id,
+                title='Live Arena',
+                prompt='Arena map.',
+                image_filename='arena.png',
+                model='gpt-image-2',
+                size='1024x1024',
+                quality='high',
+                grid_json=json.dumps({'columns': 6, 'rows': 6}),
+                vtt_setup_json=json.dumps({
+                    'friendly_spawn_boxes': [{
+                        'label': 'South Line',
+                        'rect': {'col': 1, 'row': 4, 'width': 3, 'height': 1},
+                        'description': '',
+                        'confidence': 1,
+                    }],
+                    'player_start_areas': [{
+                        'label': 'South Line',
+                        'rect': {'col': 1, 'row': 4, 'width': 3, 'height': 1},
+                        'description': '',
+                        'confidence': 1,
+                    }],
+                    'enemy_spawn_boxes': [],
+                    'enemy_start_areas': [],
+                    'terrain_zones': [],
+                    'obstacles': [],
+                    'tactical_notes': [],
+                }),
+                setup_status='ready',
+            )
+            db.session.add(encounter_map)
+            db.session.flush()
+
+            owner_placement = EncounterMapPlacement(
+                encounter_map_id=encounter_map.id,
+                actor_type='player',
+                actor_id=str(owner.id),
+                label=owner_character.name,
+                grid_col=1,
+                grid_row=4,
+            )
+            db.session.add(owner_placement)
+            db.session.flush()
+
+            state = build_initial_encounter_state(encounter_map, campaign)
+            owner_combatant = next(item for item in state['turn_order'] if item['placement_id'] == owner_placement.id)
+            owner_combatant['initiative'] = 18
+            check_and_start_turns(state)
+            encounter_map.encounter_state_json = json.dumps(state)
+            db.session.commit()
+
+            joiner_token = generate_token(joiner.id)
+            campaign_id = campaign.id
+            encounter_map_id = encounter_map.id
+
+        response = self.client.post(
+            f'/api/campaigns/{campaign_id}/join',
+            json={'code': 'sandbox1'},
+            headers={'Authorization': f'Bearer {joiner_token}'},
+        )
+
+        self.assertEqual(response.status_code, 201)
+        member_data = response.get_json()['member']
+        self.assertIsNotNone(member_data['selected_character_id'])
+        self.assertTrue(member_data['is_character_ready'])
+
+        with app.app_context():
+            joined_member = CampaignMember.query.filter_by(campaign_id=campaign_id, user_id=joiner.id).first()
+            self.assertIsNotNone(joined_member.selected_character_id)
+            placement = EncounterMapPlacement.query.filter_by(
+                encounter_map_id=encounter_map_id,
+                actor_type='player',
+                actor_id=str(joiner.id),
+            ).first()
+            self.assertIsNotNone(placement)
+            updated_map = db.session.get(EncounterMap, encounter_map_id)
+            updated_state = json.loads(updated_map.encounter_state_json)
+            combatant = next((item for item in updated_state['turn_order'] if item['placement_id'] == placement.id), None)
+            self.assertIsNotNone(combatant)
+            self.assertIsInstance(combatant['initiative'], int)
 
     def test_create_character_normalizes_nested_model_output(self):
         token = self.create_user_token()

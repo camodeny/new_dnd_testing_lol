@@ -298,6 +298,7 @@ export default function CampaignViewPage({ user }) {
         })
       }
       const required = data.campaign.settings?.required_players || 1
+      const isSandbox = data.campaign.settings?.dev_mode === 'combat_sandbox'
       const memData = await listMembers(id)
       const memberCount = (memData.members || []).length
       if (!data.activeSession && memberCount < required) {
@@ -308,13 +309,13 @@ export default function CampaignViewPage({ user }) {
         const planningData = await getCampaignPlanning(id)
         const allReady = Boolean(planningData.planning?.all_ready)
         let needsWorldBuild = false
-        if (allReady) {
+        if (allReady && !isSandbox) {
           const worldData = await getCampaignWorld(id)
           needsWorldBuild = !worldData.world?.approved_at
         }
         setShowLobby(false)
         setShowPlanning(!allReady)
-        setShowWorldBuilding(allReady && needsWorldBuild)
+        setShowWorldBuilding(!isSandbox && allReady && needsWorldBuild)
       } else {
         setShowLobby(false)
         setShowPlanning(false)
@@ -354,6 +355,7 @@ export default function CampaignViewPage({ user }) {
         }
 
         const required = data.campaign.settings?.required_players || 1
+        const isSandbox = data.campaign.settings?.dev_mode === 'combat_sandbox'
         try {
           const memData = await listMembers(id)
           if (!isMounted) return
@@ -367,14 +369,14 @@ export default function CampaignViewPage({ user }) {
             if (!isMounted) return
             const allReady = Boolean(planningData.planning?.all_ready)
             let needsWorldBuild = false
-            if (allReady) {
+            if (allReady && !isSandbox) {
               const worldData = await getCampaignWorld(id)
               if (!isMounted) return
               needsWorldBuild = !worldData.world?.approved_at
             }
             setShowLobby(false)
             setShowPlanning(!allReady)
-            setShowWorldBuilding(allReady && needsWorldBuild)
+            setShowWorldBuilding(!isSandbox && allReady && needsWorldBuild)
           } else {
             setShowLobby(false)
             setShowPlanning(false)

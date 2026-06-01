@@ -35,6 +35,7 @@ from services.character_service import (
 from services.audit_service import AGENT_ACTORS, infer_audit_role
 from services.campaign_service import get_or_404
 from services.dm_tools import get_dm_tool_definitions, build_session_hot_context, context_manifest
+from services.dev_combat_sandbox import create_combat_sandbox, list_combat_sandbox_maps
 from services.planning_service import (
     get_campaign_members,
     planning_context,
@@ -86,6 +87,28 @@ def update_dev_model_settings(current_user):
         'message': 'LLM model updated',
         'settings': settings,
     }), 200
+
+
+@dev_bp.route('/api/dev/combat-sandbox/maps', methods=['GET'])
+@token_required
+def get_combat_sandbox_maps(current_user):
+    return jsonify({'maps': list_combat_sandbox_maps(current_user)}), 200
+
+
+@dev_bp.route('/api/dev/combat-sandboxes', methods=['POST'])
+@token_required
+def create_dev_combat_sandbox(current_user):
+    data = request.get_json(silent=True) or {}
+    try:
+        result = create_combat_sandbox(current_user, data)
+    except ValueError as err:
+        db.session.rollback()
+        return jsonify({'error': str(err)}), 400
+    except RuntimeError as err:
+        db.session.rollback()
+        return jsonify({'error': str(err)}), 500
+
+    return jsonify(result), 201
 
 
 def _serialize_session(session):

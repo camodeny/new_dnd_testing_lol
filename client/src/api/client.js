@@ -88,6 +88,14 @@ export function createDevCharacter() {
   return apiFetch('/dev/character', { method: 'POST' })
 }
 
+export function listCombatSandboxMaps() {
+  return apiFetch('/dev/combat-sandbox/maps')
+}
+
+export function createCombatSandbox(payload) {
+  return apiFetch('/dev/combat-sandboxes', { method: 'POST', body: JSON.stringify(payload) })
+}
+
 export function getDevModelSettings() {
   return apiFetch('/dev/model')
 }

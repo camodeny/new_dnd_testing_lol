@@ -563,6 +563,7 @@ select.input:focus {
   align-items: center;
   z-index: 1000;
   padding: 20px;
+  overflow-y: auto;
 }
 
 .modal-panel {
@@ -571,6 +572,9 @@ select.input:focus {
   border-radius: var(--radius-lg);
   width: 100%;
   max-width: 600px;
+  max-height: calc(100vh - 40px);
+  display: flex;
+  flex-direction: column;
   box-shadow: var(--shadow-lg), 0 0 40px rgba(0, 0, 0, 0.5);
   animation: slideUp 0.35s cubic-bezier(0.34, 1.56, 0.64, 1);
   overflow: hidden;
@@ -619,6 +623,9 @@ select.input:focus {
   display: flex;
   flex-direction: column;
   gap: 20px;
+  min-height: 0;
+  overflow-y: auto;
+  scrollbar-gutter: stable;
 }
 
 .form-row {
@@ -670,6 +677,104 @@ select.input:focus {
   justify-content: flex-end;
   gap: 12px;
   margin-top: 10px;
+}
+
+.form-help-text {
+  margin: 6px 0 0;
+  font-size: 0.78rem;
+  color: var(--text-muted);
+  line-height: 1.45;
+}
+
+.sandbox-mode-switch {
+  display: flex;
+  gap: 10px;
+  margin-bottom: 18px;
+  flex-wrap: wrap;
+}
+
+.sandbox-mode-chip {
+  border: 1px solid var(--border-color);
+  background: var(--bg-panel-elevated);
+  color: var(--text-muted);
+  border-radius: 999px;
+  padding: 8px 14px;
+  font-size: 0.78rem;
+  font-weight: 700;
+  cursor: pointer;
+  transition: var(--transition-smooth);
+}
+
+.sandbox-mode-chip:hover:not(:disabled) {
+  color: var(--text-bright);
+  border-color: rgba(255, 255, 255, 0.22);
+}
+
+.sandbox-mode-chip.active {
+  color: var(--text-gold);
+  border-color: var(--color-accent);
+  background: var(--color-accent-glow);
+}
+
+.sandbox-mode-chip:disabled {
+  cursor: not-allowed;
+  opacity: 0.55;
+}
+
+.sandbox-map-meta {
+  margin-top: 6px;
+  padding: 14px 16px;
+  border-radius: var(--radius-md);
+  border: 1px solid rgba(255, 255, 255, 0.08);
+  background: rgba(31, 32, 43, 0.45);
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+
+.sandbox-map-meta strong {
+  color: var(--text-bright);
+}
+
+.sandbox-map-meta span {
+  color: var(--text-gold);
+  font-size: 0.74rem;
+  text-transform: uppercase;
+  letter-spacing: 0.08em;
+}
+
+.sandbox-map-meta p {
+  margin: 0;
+  color: var(--text-muted);
+  line-height: 1.55;
+}
+
+.sandbox-map-note-list {
+  margin: 2px 0 0;
+  padding-left: 18px;
+  color: var(--text-main);
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  font-size: 0.82rem;
+}
+
+@media (max-width: 720px) {
+  .modal-overlay {
+    padding: 12px;
+  }
+
+  .modal-panel {
+    max-height: calc(100vh - 24px);
+  }
+
+  .modal-header {
+    padding: 18px 20px;
+  }
+
+  .campaign-form-compact {
+    padding: 20px;
+  }
 }
 
 /* ==========================================================================

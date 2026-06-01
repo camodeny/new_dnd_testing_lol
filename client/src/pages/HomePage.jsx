@@ -2,6 +2,7 @@ import { useState, useEffect, useCallback } from 'react'
 import { useNavigate } from 'react-router-dom'
 import CampaignForm from '../CampaignForm'
 import CampaignCard from '../components/campaign/CampaignCard'
+import CombatSandboxForm from '../components/campaign/CombatSandboxForm'
 import { getCampaigns, lookupInvite, deleteCampaign } from '../api/client'
 import Loading from '../components/common/Loading'
 import ErrorMessage from '../components/common/ErrorMessage'
@@ -13,6 +14,8 @@ export default function HomePage({ user }) {
   const [error, setError] = useState('')
   const [modalOpen, setModalOpen] = useState(false)
   const [animatingOut, setAnimatingOut] = useState(false)
+  const [sandboxModalOpen, setSandboxModalOpen] = useState(false)
+  const [sandboxAnimatingOut, setSandboxAnimatingOut] = useState(false)
 
   // Join Campaign Modal States
   const [joinModalOpen, setJoinModalOpen] = useState(false)
@@ -28,12 +31,19 @@ export default function HomePage({ user }) {
   const [deleteLoading, setDeleteLoading] = useState(false)
   const [deleteError, setDeleteError] = useState('')
 
+  useEffect(() => {
+    const hasModalOpen = modalOpen || sandboxModalOpen || joinModalOpen || deleteModalOpen
+    document.body.style.overflow = hasModalOpen ? 'hidden' : ''
+    return () => {
+      document.body.style.overflow = ''
+    }
+  }, [modalOpen, sandboxModalOpen, joinModalOpen, deleteModalOpen])
+
   const openDeleteModal = (campaign) => {
     setDeleteAnimatingOut(false)
     setDeleteError('')
     setCampaignToDelete(campaign)
     setDeleteModalOpen(true)
-    document.body.style.overflow = 'hidden'
   }
 
   const closeDeleteModal = () => {
@@ -41,7 +51,6 @@ export default function HomePage({ user }) {
     setTimeout(() => {
       setDeleteModalOpen(false)
       setCampaignToDelete(null)
-      document.body.style.overflow = ''
     }, 250)
   }
 
@@ -70,14 +79,24 @@ export default function HomePage({ user }) {
   const openModal = () => {
     setAnimatingOut(false)
     setModalOpen(true)
-    document.body.style.overflow = 'hidden'
+  }
+
+  const openSandboxModal = () => {
+    setSandboxAnimatingOut(false)
+    setSandboxModalOpen(true)
   }
 
   const closeModal = () => {
     setAnimatingOut(true)
     setTimeout(() => {
       setModalOpen(false)
-      document.body.style.overflow = ''
+    }, 250)
+  }
+
+  const closeSandboxModal = () => {
+    setSandboxAnimatingOut(true)
+    setTimeout(() => {
+      setSandboxModalOpen(false)
     }, 250)
   }
 
@@ -86,19 +105,23 @@ export default function HomePage({ user }) {
     closeModal()
   }, [])
 
+  const handleSandboxCreated = useCallback((newCampaign) => {
+    setCampaigns((prev) => [newCampaign, ...prev.filter((campaign) => campaign.id !== newCampaign.id)])
+    closeSandboxModal()
+    navigate(`/campaigns/${newCampaign.id}`)
+  }, [navigate])
+
   const openJoinModal = () => {
     setJoinAnimatingOut(false)
     setInviteCode('')
     setJoinError('')
     setJoinModalOpen(true)
-    document.body.style.overflow = 'hidden'
   }
 
   const closeJoinModal = () => {
     setJoinAnimatingOut(true)
     setTimeout(() => {
       setJoinModalOpen(false)
-      document.body.style.overflow = ''
     }, 250)
   }
 
@@ -142,6 +165,10 @@ export default function HomePage({ user }) {
             <i className="bi bi-key-fill"></i>
             Join with Code
           </button>
+          <button className="btn btn-secondary" onClick={openSandboxModal}>
+            <i className="bi bi-bullseye"></i>
+            Combat Sandbox
+          </button>
           <button className="btn btn-primary create-btn-header" onClick={openModal}>
             <i className="bi bi-plus-lg"></i>
             New Campaign
@@ -169,6 +196,9 @@ export default function HomePage({ user }) {
             <button className="btn btn-secondary" onClick={openJoinModal}>
               <i className="bi bi-key-fill"></i> Join with Code
             </button>
+            <button className="btn btn-secondary" onClick={openSandboxModal}>
+              <i className="bi bi-bullseye"></i> Combat Sandbox
+            </button>
             <button className="btn btn-primary" onClick={openModal}>
               <i className="bi bi-plus-lg"></i> New Campaign
             </button>
@@ -190,6 +220,20 @@ export default function HomePage({ user }) {
               </button>
             </div>
             <CampaignForm onCampaignCreated={handleCampaignCreated} onCancel={closeModal} />
+          </div>
+        </div>
+      )}
+
+      {sandboxModalOpen && (
+        <div className={`modal-overlay ${sandboxAnimatingOut ? 'fade-out' : 'fade-in'}`} onClick={closeSandboxModal}>
+          <div className={`modal-panel ${sandboxAnimatingOut ? 'slide-down' : 'slide-up'}`} onClick={(e) => e.stopPropagation()}>
+            <div className="modal-header">
+              <h2>Combat Sandbox</h2>
+              <button className="modal-close" onClick={closeSandboxModal} aria-label="Close">
+                <i className="bi bi-x-lg"></i>
+              </button>
+            </div>
+            <CombatSandboxForm onCreated={handleSandboxCreated} onCancel={closeSandboxModal} />
           </div>
         </div>
       )}
@@ -219,7 +263,7 @@ export default function HomePage({ user }) {
                   disabled={joinLoading}
                 />
                 <p className="form-help-text" style={{ fontSize: '0.8rem', color: 'var(--text-muted)', marginTop: '6px' }}>
-                  Ask your DM for the campaign invite code.
+                  Ask the campaign owner for the invite code.
                 </p>
               </div>
 
