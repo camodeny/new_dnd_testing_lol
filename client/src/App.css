@@ -2394,6 +2394,87 @@ select.input:focus {
   container-type: size;
 }
 
+.encounter-map-area-layer {
+  position: absolute;
+  inset: 0;
+  pointer-events: none;
+  z-index: 2;
+}
+
+.encounter-map-area-overlay {
+  position: absolute;
+  border-radius: 4px;
+  border: 1px solid transparent;
+  box-sizing: border-box;
+  opacity: 0.72;
+}
+
+.encounter-map-area-overlay.cover {
+  background: rgba(59, 130, 246, 0.06);
+  border-color: rgba(147, 197, 253, 0.28);
+  border-style: dashed;
+}
+
+.encounter-map-area-overlay.cover.directional-provider {
+  background: rgba(59, 130, 246, 0.18);
+  border-color: rgba(191, 219, 254, 0.9);
+  border-style: solid;
+  box-shadow: inset 0 0 0 1px rgba(191, 219, 254, 0.22), 0 0 18px rgba(59, 130, 246, 0.24);
+}
+
+.encounter-map-area-overlay.hazard {
+  background: rgba(239, 68, 68, 0.16);
+  border-color: rgba(252, 165, 165, 0.42);
+}
+
+.encounter-map-area-overlay.door {
+  background: rgba(245, 158, 11, 0.14);
+  border-color: rgba(253, 230, 138, 0.42);
+}
+
+.encounter-map-area-overlay.difficult {
+  background: rgba(217, 119, 6, 0.12);
+  border-color: rgba(251, 191, 36, 0.32);
+}
+
+.encounter-map-area-overlay.blocked {
+  background: rgba(71, 85, 105, 0.2);
+  border-color: rgba(148, 163, 184, 0.4);
+}
+
+.encounter-map-area-overlay.chokepoint {
+  background: rgba(168, 85, 247, 0.12);
+  border-color: rgba(216, 180, 254, 0.34);
+}
+
+.encounter-map-area-overlay.elevation {
+  background: rgba(16, 185, 129, 0.12);
+  border-color: rgba(110, 231, 183, 0.34);
+}
+
+.encounter-map-area-overlay.spawn {
+  background: rgba(34, 197, 94, 0.1);
+  border-color: rgba(134, 239, 172, 0.3);
+}
+
+.encounter-map-cell-highlight {
+  position: absolute;
+  box-sizing: border-box;
+  border: 1px solid rgba(255, 255, 255, 0.38);
+  background: rgba(255, 255, 255, 0.08);
+  box-shadow: inset 0 0 0 1px rgba(255, 255, 255, 0.14);
+}
+
+.encounter-map-cell-highlight.selected {
+  background: rgba(255, 255, 255, 0.18);
+  border-color: rgba(255, 255, 255, 0.72);
+}
+
+.encounter-map-cell-highlight.hovered {
+  background: rgba(255, 255, 255, 0.1);
+  border-color: rgba(255, 255, 255, 0.42);
+}
+
 .encounter-map-move-cell {
   position: absolute;
   box-sizing: border-box;
@@ -2477,6 +2558,24 @@ select.input:focus {
   box-shadow: 0 4px 8px rgba(0, 0, 0, 0.6), 0 0 10px var(--color-danger-bg);
 }
 
+.encounter-map-token.has-directional-cover {
+  box-shadow: 0 0 0 3px rgba(191, 219, 254, 0.25), 0 6px 16px rgba(0, 0, 0, 0.72);
+}
+
+.encounter-map-token.has-directional-cover.cover-half {
+  border-color: rgba(147, 197, 253, 0.88);
+}
+
+.encounter-map-token.has-directional-cover.cover-three_quarters {
+  border-color: rgba(125, 211, 252, 0.96);
+  box-shadow: 0 0 0 4px rgba(125, 211, 252, 0.24), 0 6px 16px rgba(0, 0, 0, 0.72);
+}
+
+.encounter-map-token.has-directional-cover.cover-full {
+  border-color: rgba(226, 232, 240, 0.96);
+  box-shadow: 0 0 0 4px rgba(226, 232, 240, 0.22), 0 6px 16px rgba(0, 0, 0, 0.72);
+}
+
 .encounter-map-token:hover,
 .encounter-map-token.highlighted {
   transform: translate(-50%, -50%) scale(1.2) translateY(-2px);
@@ -2538,6 +2637,135 @@ select.input:focus {
 .encounter-map-movement-hud.has-error i,
 .encounter-map-movement-hud.has-error small {
   color: var(--color-danger);
+}
+
+.encounter-map-cover-hud {
+  position: absolute;
+  top: 62px;
+  left: 12px;
+  z-index: 8;
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  max-width: min(360px, calc(100% - 24px));
+  padding: 9px 11px;
+  border-radius: var(--radius-sm);
+  border: 1px solid rgba(147, 197, 253, 0.26);
+  background: rgba(10, 11, 15, 0.82);
+  color: var(--text-main);
+  box-shadow: var(--shadow-md);
+  pointer-events: none;
+}
+
+.encounter-map-cover-hud strong {
+  color: var(--text-bright);
+  font-size: 0.76rem;
+}
+
+.encounter-map-cover-hud span {
+  font-size: 0.7rem;
+  color: var(--text-muted);
+  line-height: 1.35;
+}
+
+.encounter-map-cover-hud.cover-half {
+  border-color: rgba(147, 197, 253, 0.46);
+}
+
+.encounter-map-cover-hud.cover-three_quarters {
+  border-color: rgba(125, 211, 252, 0.56);
+}
+
+.encounter-map-cover-hud.cover-full {
+  border-color: rgba(226, 232, 240, 0.48);
+}
+
+.encounter-map-cell-inspector {
+  position: absolute;
+  right: 12px;
+  bottom: 12px;
+  z-index: 8;
+  width: min(320px, calc(100% - 24px));
+  padding: 10px 12px;
+  border-radius: var(--radius-sm);
+  border: 1px solid rgba(255, 255, 255, 0.12);
+  background: rgba(10, 11, 15, 0.88);
+  box-shadow: var(--shadow-md);
+  color: var(--text-main);
+}
+
+.encounter-map-cell-inspector-header {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: 10px;
+  margin-bottom: 8px;
+}
+
+.encounter-map-cell-inspector-header strong {
+  color: var(--text-bright);
+  font-family: var(--mono);
+  font-size: 0.84rem;
+}
+
+.encounter-map-cell-inspector-header span {
+  color: var(--text-dim);
+  font-size: 0.66rem;
+  text-transform: uppercase;
+  letter-spacing: 0.06em;
+  font-weight: 800;
+}
+
+.encounter-map-cell-tags {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+  margin-bottom: 8px;
+}
+
+.encounter-map-cell-tag {
+  padding: 2px 8px;
+  border-radius: 999px;
+  font-size: 0.64rem;
+  font-weight: 800;
+  letter-spacing: 0.03em;
+  text-transform: uppercase;
+  border: 1px solid rgba(255, 255, 255, 0.14);
+  color: var(--text-main);
+  background: rgba(255, 255, 255, 0.04);
+}
+
+.encounter-map-cell-tag.cover { border-color: rgba(147, 197, 253, 0.4); color: rgb(191, 219, 254); }
+.encounter-map-cell-tag.hazard { border-color: rgba(252, 165, 165, 0.4); color: rgb(254, 202, 202); }
+.encounter-map-cell-tag.door { border-color: rgba(253, 230, 138, 0.4); color: rgb(254, 240, 138); }
+.encounter-map-cell-tag.difficult { border-color: rgba(251, 191, 36, 0.4); color: rgb(253, 230, 138); }
+.encounter-map-cell-tag.blocked { border-color: rgba(148, 163, 184, 0.4); color: rgb(203, 213, 225); }
+.encounter-map-cell-tag.chokepoint { border-color: rgba(216, 180, 254, 0.4); color: rgb(233, 213, 255); }
+.encounter-map-cell-tag.elevation { border-color: rgba(110, 231, 183, 0.4); color: rgb(167, 243, 208); }
+.encounter-map-cell-tag.spawn { border-color: rgba(134, 239, 172, 0.4); color: rgb(187, 247, 208); }
+.encounter-map-cell-tag.neutral { border-color: rgba(148, 163, 184, 0.24); color: var(--text-muted); }
+
+.encounter-map-cell-stats {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  margin-bottom: 8px;
+  font-size: 0.72rem;
+  color: var(--text-muted);
+}
+
+.encounter-map-cell-feature-list {
+  margin: 0;
+  padding-left: 16px;
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  color: var(--text-main);
+  font-size: 0.72rem;
+}
+
+.encounter-map-cell-feature-list strong {
+  color: var(--text-bright);
 }
 
 .encounter-map-token.player:hover,
@@ -2605,6 +2833,16 @@ select.input:focus {
   letter-spacing: 0.6px;
   display: block;
 }
+
+.tooltip-cover {
+  display: block;
+  font-size: 0.63rem;
+  font-weight: 700;
+}
+
+.tooltip-cover.cover-half { color: rgb(191, 219, 254); }
+.tooltip-cover.cover-three_quarters { color: rgb(125, 211, 252); }
+.tooltip-cover.cover-full { color: rgb(226, 232, 240); }
 
 .encounter-map-token.player .tooltip-alliance { color: var(--text-gold); }
 .encounter-map-token.npc .tooltip-alliance { color: var(--color-success); }
@@ -2675,7 +2913,60 @@ select.input:focus {
   color: var(--text-muted);
   font-size: 0.85rem;
   line-height: 1.5;
-  padding-left: 26px;
+}
+
+.encounter-map-filter-strip {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+  margin: 0 0 12px;
+}
+
+.encounter-map-filter-chip {
+  padding: 5px 10px;
+  border-radius: 999px;
+  border: 1px solid var(--border-color);
+  background: var(--bg-panel-elevated);
+  color: var(--text-muted);
+  font-size: 0.7rem;
+  font-weight: 700;
+  cursor: pointer;
+  transition: var(--transition-smooth);
+}
+
+.encounter-map-filter-chip:hover {
+  color: var(--text-bright);
+  border-color: rgba(255, 255, 255, 0.18);
+}
+
+.encounter-map-filter-chip.active {
+  border-color: var(--color-accent);
+  background: var(--color-accent-glow);
+  color: var(--text-gold);
+}
+
+.encounter-map-briefing {
+  margin-bottom: 12px;
+  padding: 12px 14px;
+  border-radius: var(--radius-sm);
+  background: linear-gradient(135deg, rgba(31, 32, 43, 0.35), rgba(22, 23, 29, 0.55));
+  border-left: 3px solid var(--color-accent);
+  box-shadow: var(--shadow-sm);
+  transition: all 0.3s cubic-bezier(0.4, 0, 0.2, 1);
+}
+
+.encounter-map-briefing.collapsed {
+  padding: 8px 12px;
+}
+
+.encounter-map-notes {
+  margin: 10px 0 0;
+  padding-left: 18px;
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  color: var(--text-main);
+  font-size: 0.78rem;
 }
 
 /* Styled Combatants Roster list */
@@ -8140,5 +8431,3 @@ select.input:focus {
     margin-left: 0 !important;
   }
 }
-
-

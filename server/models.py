@@ -1072,6 +1072,7 @@ class EncounterMap(db.Model):
             return setup
         return {
             'map_summary': setup.get('map_summary'),
+            'tactical_notes': setup.get('tactical_notes', []),
             'friendly_spawn_boxes': setup.get('friendly_spawn_boxes', []),
             'player_start_areas': setup.get('player_start_areas', setup.get('friendly_spawn_boxes', [])),
             'terrain_zones': setup.get('terrain_zones', []),

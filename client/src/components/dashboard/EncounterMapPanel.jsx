@@ -19,12 +19,6 @@ function clamp(value, min, max) {
   return Math.min(Math.max(value, min), max)
 }
 
-function getMovementSquares(character) {
-  const speed = Number(character?.combat?.speed)
-  if (!Number.isFinite(speed) || speed <= 0) return 0
-  return Math.floor(speed / 5)
-}
-
 function getGridMoveDistance(fromCol, fromRow, toCol, toRow) {
   return Math.max(Math.abs(toCol - fromCol), Math.abs(toRow - fromRow))
 }
@@ -140,6 +134,304 @@ function getNearestReachableCell(target, reachableCells) {
   }, null)
 }
 
+function rollD20() {
+  const values = new Uint32Array(1)
+  globalThis.crypto.getRandomValues(values)
+  return (values[0] % 20) + 1
+}
+
+const TACTICAL_FILTERS = [
+  { id: 'cover', label: 'Cover' },
+  { id: 'hazard', label: 'Hazard' },
+  { id: 'door', label: 'Door' },
+  { id: 'difficult', label: 'Difficult' },
+  { id: 'blocked', label: 'Blocked' },
+  { id: 'chokepoint', label: 'Choke' },
+  { id: 'elevation', label: 'Elevation' },
+  { id: 'spawn', label: 'Start' },
+]
+
+const COVER_LEVEL_SCORES = {
+  none: 0,
+  half: 1,
+  three_quarters: 2,
+  full: 3,
+}
+
+function getAreaFeatureKey(area, group = '', index = 0) {
+  const label = String(area?.label || area?.kind || 'feature').toLowerCase().replace(/[^a-z0-9]+/g, '-')
+  return `${group}:${index}:${label}`
+}
+
+function getAreaDimensions(area) {
+  const rectWidth = Number(area?.rect?.width)
+  const rectHeight = Number(area?.rect?.height)
+  if ([rectWidth, rectHeight].every(Number.isFinite) && rectWidth > 0 && rectHeight > 0) {
+    return { width: rectWidth, height: rectHeight }
+  }
+
+  if (Array.isArray(area?.polygon) && area.polygon.length >= 3) {
+    const cols = area.polygon.map((point) => Number(point?.col)).filter(Number.isFinite)
+    const rows = area.polygon.map((point) => Number(point?.row)).filter(Number.isFinite)
+    if (cols.length >= 3 && rows.length >= 3) {
+      return {
+        width: Math.max(...cols) - Math.min(...cols),
+        height: Math.max(...rows) - Math.min(...rows),
+      }
+    }
+  }
+
+  return { width: 0, height: 0 }
+}
+
+function inferCoverType(area) {
+  const kind = String(area?.kind || '').toLowerCase()
+  const movementEffect = String(area?.movement_effect || '').toLowerCase()
+  const coverType = String(area?.cover_type || '').toLowerCase()
+
+  if (coverType && coverType in COVER_LEVEL_SCORES) return coverType
+  if (kind === 'wall' || kind === 'blocked' || movementEffect === 'blocks_movement') return 'full'
+  if (kind === 'cover' || movementEffect === 'provides_cover') return 'half'
+  return 'none'
+}
+
+function isCoverCandidate(area, group = '') {
+  const kind = String(area?.kind || '').toLowerCase()
+  const movementEffect = String(area?.movement_effect || '').toLowerCase()
+  const coverType = String(area?.cover_type || '').toLowerCase()
+
+  if (coverType === 'half' || coverType === 'three_quarters' || coverType === 'full') return true
+  if (kind === 'wall' || kind === 'cover') return true
+  if (movementEffect === 'provides_cover' || movementEffect === 'blocks_movement') return true
+  return group === 'terrain_zones' && kind === 'blocked'
+}
+
+function isPreciseCoverProvider(area, group = '') {
+  if (!isCoverCandidate(area, group)) return false
+  if (group === 'obstacles') return true
+
+  const { width, height } = getAreaDimensions(area)
+  if (width <= 0 || height <= 0) return false
+
+  const smallerSide = Math.max(Math.min(width, height), 1)
+  const largerSide = Math.max(width, height)
+  const cellArea = width * height
+  const isCompact = cellArea <= 6
+  const isNarrow = smallerSide <= 1.25
+  const isLongBarrier = smallerSide <= 2.25 && (largerSide / smallerSide) >= 3
+  return isCompact || isNarrow || isLongBarrier
+}
+
+function getAreaCategories(area, group = '') {
+  const kind = String(area?.kind || '').toLowerCase()
+  const movementEffect = String(area?.movement_effect || '').toLowerCase()
+  const categories = new Set()
+
+  if (group === 'friendly_spawn_boxes' || group === 'player_start_areas') categories.add('spawn')
+  if (isCoverCandidate(area, group) && isPreciseCoverProvider(area, group)) categories.add('cover')
+  if (kind === 'hazard' || movementEffect === 'hazardous') categories.add('hazard')
+  if (kind === 'door' || movementEffect === 'interactive') categories.add('door')
+  if (kind === 'difficult' || kind === 'water' || movementEffect === 'costs_extra_movement') categories.add('difficult')
+  if (kind === 'blocked' || kind === 'wall' || movementEffect === 'blocks_movement') categories.add('blocked')
+  if (kind === 'chokepoint') categories.add('chokepoint')
+  if (kind === 'elevation') categories.add('elevation')
+
+  return Array.from(categories)
+}
+
+function getPrimaryAreaCategory(area, group = '') {
+  const categories = getAreaCategories(area, group)
+  if (!categories.length) return null
+  const priority = ['hazard', 'door', 'blocked', 'cover', 'difficult', 'chokepoint', 'elevation', 'spawn']
+  return priority.find((item) => categories.includes(item)) || categories[0]
+}
+
+function getAreaOverlayStyle(area, columns, rows) {
+  if (Array.isArray(area?.polygon) && area.polygon.length >= 3) {
+    return {
+      left: '0%',
+      top: '0%',
+      width: '100%',
+      height: '100%',
+      clipPath: `polygon(${area.polygon.map((point) => (
+        `${(Number(point?.col) / columns) * 100}% ${(Number(point?.row) / rows) * 100}%`
+      )).join(', ')})`,
+    }
+  }
+
+  const rectCol = Number(area?.rect?.col)
+  const rectRow = Number(area?.rect?.row)
+  const rectWidth = Number(area?.rect?.width)
+  const rectHeight = Number(area?.rect?.height)
+  if (![rectCol, rectRow, rectWidth, rectHeight].every(Number.isFinite)) return null
+
+  return {
+    left: `${(rectCol / columns) * 100}%`,
+    top: `${(rectRow / rows) * 100}%`,
+    width: `${(rectWidth / columns) * 100}%`,
+    height: `${(rectHeight / rows) * 100}%`,
+  }
+}
+
+function areaContainsPoint(area, x, y) {
+  if (Array.isArray(area?.polygon) && area.polygon.length >= 3) {
+    return pointInPolygon(area.polygon, x, y)
+  }
+
+  const rectCol = Number(area?.rect?.col)
+  const rectRow = Number(area?.rect?.row)
+  const width = Number(area?.rect?.width)
+  const height = Number(area?.rect?.height)
+  if (![rectCol, rectRow, width, height].every(Number.isFinite)) return false
+  return rectCol <= x && x <= rectCol + width && rectRow <= y && y <= rectRow + height
+}
+
+function crossProduct(ax, ay, bx, by, cx, cy) {
+  return ((bx - ax) * (cy - ay)) - ((by - ay) * (cx - ax))
+}
+
+function pointOnSegment(ax, ay, bx, by, px, py) {
+  if (px < Math.min(ax, bx) - 1e-9 || px > Math.max(ax, bx) + 1e-9) return false
+  if (py < Math.min(ay, by) - 1e-9 || py > Math.max(ay, by) + 1e-9) return false
+  return Math.abs(crossProduct(ax, ay, bx, by, px, py)) <= 1e-9
+}
+
+function segmentsIntersect(a1x, a1y, a2x, a2y, b1x, b1y, b2x, b2y) {
+  const d1 = crossProduct(a1x, a1y, a2x, a2y, b1x, b1y)
+  const d2 = crossProduct(a1x, a1y, a2x, a2y, b2x, b2y)
+  const d3 = crossProduct(b1x, b1y, b2x, b2y, a1x, a1y)
+  const d4 = crossProduct(b1x, b1y, b2x, b2y, a2x, a2y)
+
+  if (((d1 > 0 && d2 < 0) || (d1 < 0 && d2 > 0)) && ((d3 > 0 && d4 < 0) || (d3 < 0 && d4 > 0))) {
+    return true
+  }
+  if (Math.abs(d1) <= 1e-9 && pointOnSegment(a1x, a1y, a2x, a2y, b1x, b1y)) return true
+  if (Math.abs(d2) <= 1e-9 && pointOnSegment(a1x, a1y, a2x, a2y, b2x, b2y)) return true
+  if (Math.abs(d3) <= 1e-9 && pointOnSegment(b1x, b1y, b2x, b2y, a1x, a1y)) return true
+  if (Math.abs(d4) <= 1e-9 && pointOnSegment(b1x, b1y, b2x, b2y, a2x, a2y)) return true
+  return false
+}
+
+function segmentIntersectsArea(area, startX, startY, endX, endY) {
+  if (Array.isArray(area?.polygon) && area.polygon.length >= 3) {
+    if (areaContainsPoint(area, startX, startY) || areaContainsPoint(area, endX, endY)) return true
+    let previous = area.polygon[area.polygon.length - 1]
+    for (const current of area.polygon) {
+      const x1 = Number(previous?.col)
+      const y1 = Number(previous?.row)
+      const x2 = Number(current?.col)
+      const y2 = Number(current?.row)
+      if ([x1, y1, x2, y2].every(Number.isFinite) && segmentsIntersect(startX, startY, endX, endY, x1, y1, x2, y2)) {
+        return true
+      }
+      previous = current
+    }
+    return false
+  }
+
+  const left = Number(area?.rect?.col)
+  const top = Number(area?.rect?.row)
+  const width = Number(area?.rect?.width)
+  const height = Number(area?.rect?.height)
+  if (![left, top, width, height].every(Number.isFinite) || width <= 0 || height <= 0) return false
+
+  if (areaContainsPoint(area, startX, startY) || areaContainsPoint(area, endX, endY)) return true
+  const right = left + width
+  const bottom = top + height
+  const edges = [
+    [left, top, right, top],
+    [right, top, right, bottom],
+    [right, bottom, left, bottom],
+    [left, bottom, left, top],
+  ]
+  return edges.some(([x1, y1, x2, y2]) => segmentsIntersect(startX, startY, endX, endY, x1, y1, x2, y2))
+}
+
+function evaluateDirectionalCover(vttSetup, attackerPlacement, targetPlacement) {
+  if (!attackerPlacement || !targetPlacement || attackerPlacement.id === targetPlacement.id) {
+    return {
+      coverType: 'none',
+      providers: [],
+      featureKeys: [],
+      strongestScore: 0,
+    }
+  }
+
+  const startX = Number(attackerPlacement.col) + 0.5
+  const startY = Number(attackerPlacement.row) + 0.5
+  const endX = Number(targetPlacement.col) + 0.5
+  const endY = Number(targetPlacement.row) + 0.5
+  const providers = []
+
+  ;['terrain_zones', 'obstacles'].forEach((group) => {
+    const areas = Array.isArray(vttSetup?.[group]) ? vttSetup[group] : []
+    areas.forEach((area, index) => {
+      if (!isPreciseCoverProvider(area, group)) return
+      if (areaContainsPoint(area, startX, startY) || areaContainsPoint(area, endX, endY)) return
+      if (!segmentIntersectsArea(area, startX, startY, endX, endY)) return
+
+      const coverType = inferCoverType(area)
+      const score = COVER_LEVEL_SCORES[coverType] || 0
+      if (!score) return
+      providers.push({
+        featureKey: getAreaFeatureKey(area, group, index),
+        label: area?.label || 'Map feature',
+        coverType,
+        score,
+      })
+    })
+  })
+
+  if (!providers.length) {
+    return {
+      coverType: 'none',
+      providers: [],
+      featureKeys: [],
+      strongestScore: 0,
+    }
+  }
+
+  const strongestScore = Math.max(...providers.map((provider) => provider.score))
+  const strongestProviders = providers.filter((provider) => provider.score === strongestScore)
+  return {
+    coverType: strongestProviders[0]?.coverType || 'none',
+    providers: strongestProviders,
+    featureKeys: strongestProviders.map((provider) => provider.featureKey),
+    strongestScore,
+  }
+}
+
+function summarizeCellFeatures(vttSetup, col, row) {
+  const groups = ['friendly_spawn_boxes', 'terrain_zones', 'obstacles']
+  const features = []
+
+  groups.forEach((group) => {
+    const areas = Array.isArray(vttSetup?.[group]) ? vttSetup[group] : []
+    areas.forEach((area) => {
+      if (!areaContainsCell(area, col, row)) return
+      features.push({
+        group,
+        label: area?.label || 'Map feature',
+        description: area?.description || '',
+        categories: getAreaCategories(area, group),
+        coverType: area?.cover_type || 'none',
+      })
+    })
+  })
+
+  return {
+    features,
+    blockedBy: features.filter((feature) => feature.categories.includes('blocked')).map((feature) => feature.label),
+    difficultBy: features.filter((feature) => feature.categories.includes('difficult')).map((feature) => feature.label),
+    coverBy: features.filter((feature) => feature.categories.includes('cover')).map((feature) => feature.label),
+    hazardBy: features.filter((feature) => feature.categories.includes('hazard')).map((feature) => feature.label),
+    doorBy: features.filter((feature) => feature.categories.includes('door')).map((feature) => feature.label),
+    chokepointBy: features.filter((feature) => feature.categories.includes('chokepoint')).map((feature) => feature.label),
+    elevationBy: features.filter((feature) => feature.categories.includes('elevation')).map((feature) => feature.label),
+    spawnBy: features.filter((feature) => feature.categories.includes('spawn')).map((feature) => feature.label),
+  }
+}
+
 export default function EncounterMapPanel({
   encounterMap,
   loading,
@@ -158,10 +450,13 @@ export default function EncounterMapPanel({
   // UX UI states
   const isCollapsed = mapViewMode === 'collapsed'
   const [showGridLines, setShowGridLines] = useState(true)
+  const [showTacticalOverlay, setShowTacticalOverlay] = useState(true)
+  const [showCellInspector, setShowCellInspector] = useState(true)
+  const [activeTacticalFilters, setActiveTacticalFilters] = useState(() => TACTICAL_FILTERS.map((filter) => filter.id))
   const [isRosterOpen, setIsRosterOpen] = useState(true)
+  const [isBriefingCollapsed, setIsBriefingCollapsed] = useState(false)
   const [showLabeledImage, setShowLabeledImage] = useState(false)
   const [activeHoverId, setActiveHoverId] = useState(null)
-  const [hasNotification, setHasNotification] = useState(false)
   const [prevMapId, setPrevMapId] = useState(encounterMap?.id || null)
   const [aspectRatio, setAspectRatio] = useState(null)
   const [imageDimensions, setImageDimensions] = useState({ width: 0, height: 0 })
@@ -171,6 +466,8 @@ export default function EncounterMapPanel({
   const [movementMessage, setMovementMessage] = useState('')
   const [isMovingToken, setIsMovingToken] = useState(false)
   const [manualInitValues, setManualInitValues] = useState({})
+  const [hoveredCell, setHoveredCell] = useState(null)
+  const [selectedCell, setSelectedCell] = useState(null)
 
   // Adjust state when map ID changes (during render phase to avoid effect cascades)
   const currentMapId = encounterMap?.id || null
@@ -184,9 +481,8 @@ export default function EncounterMapPanel({
     setMovementMessage('')
     setIsMovingToken(false)
     setManualInitValues({})
-    if (isCollapsed) {
-      setHasNotification(true)
-    }
+    setHoveredCell(null)
+    setSelectedCell(null)
   }
 
   const encounterState = useMemo(() => {
@@ -196,7 +492,7 @@ export default function EncounterMapPanel({
       return typeof rawState === 'string'
         ? JSON.parse(rawState)
         : rawState
-    } catch (err) {
+    } catch {
       return null
     }
   }, [encounterMap?.encounter_state, encounterMap?.encounter_state_json])
@@ -219,7 +515,7 @@ export default function EncounterMapPanel({
   const handleRollInitiative = async (combatant) => {
     if (!encounterMap?.id) return
     const bonus = combatant.initiative_bonus || 0
-    const d20 = Math.floor(Math.random() * 20) + 1
+    const d20 = rollD20()
     const total = d20 + bonus
     try {
       const data = await rollPlayerInitiative(encounterMap.id, combatant.actor_type, combatant.actor_id, total)
@@ -317,6 +613,10 @@ export default function EncounterMapPanel({
     })
     return map
   }, [reachableMovementCells])
+  const vttSetup = useMemo(() => encounterMap?.vtt_setup || {}, [encounterMap?.vtt_setup])
+  const mapSummary = typeof vttSetup?.map_summary === 'string' ? vttSetup.map_summary : ''
+  const tacticalNotes = Array.isArray(vttSetup?.tactical_notes) ? vttSetup.tactical_notes : []
+  const activeTacticalFilterSet = useMemo(() => new Set(activeTacticalFilters), [activeTacticalFilters])
   const displayPlacements = useMemo(() => (
     placements.map((placement) => {
       if (dragState?.placementId === placement.id) {
@@ -329,6 +629,46 @@ export default function EncounterMapPanel({
       return placement
     })
   ), [placements, dragState, pendingPlacementOverrides])
+  const hoveredPlacement = useMemo(
+    () => displayPlacements.find((placement) => placement.id === activeHoverId) || null,
+    [displayPlacements, activeHoverId],
+  )
+  const directionalCoverPreview = useMemo(() => {
+    if (!playerPlacement || !hoveredPlacement || hoveredPlacement.id === playerPlacement.id) {
+      return {
+        coverType: 'none',
+        providers: [],
+        featureKeys: [],
+        strongestScore: 0,
+      }
+    }
+    return evaluateDirectionalCover(vttSetup, playerPlacement, hoveredPlacement)
+  }, [vttSetup, playerPlacement, hoveredPlacement])
+  const tacticalOverlayAreas = useMemo(() => {
+    if (!showTacticalOverlay || !columns || !rows) return []
+
+    return [
+      ...(Array.isArray(vttSetup?.friendly_spawn_boxes) ? vttSetup.friendly_spawn_boxes.map((area) => ({ ...area, overlayGroup: 'friendly_spawn_boxes' })) : []),
+      ...(Array.isArray(vttSetup?.terrain_zones) ? vttSetup.terrain_zones.map((area) => ({ ...area, overlayGroup: 'terrain_zones' })) : []),
+      ...(Array.isArray(vttSetup?.obstacles) ? vttSetup.obstacles.map((area) => ({ ...area, overlayGroup: 'obstacles' })) : []),
+    ]
+      .map((area, index) => {
+        const category = getPrimaryAreaCategory(area, area.overlayGroup)
+        const style = getAreaOverlayStyle(area, columns, rows)
+        if (!category || !style || !activeTacticalFilterSet.has(category)) return null
+        const featureKey = getAreaFeatureKey(area, area.overlayGroup, index)
+        return {
+          id: `${area.overlayGroup}-${area.label || index}-${index}`,
+          featureKey,
+          category,
+          label: area.label || 'Map feature',
+          description: area.description || '',
+          style,
+          isDirectionalProvider: directionalCoverPreview.featureKeys.includes(featureKey),
+        }
+      })
+      .filter(Boolean)
+  }, [showTacticalOverlay, columns, rows, vttSetup, activeTacticalFilterSet, directionalCoverPreview.featureKeys])
   
   const gridLayout = useMemo(() => {
     if (!grid || !grid.origin_px || !grid.cell_size_px || !imageDimensions.width || !imageDimensions.height) {
@@ -401,14 +741,31 @@ export default function EncounterMapPanel({
     })
     return groups
   }, [displayPlacements])
+  const inspectedCell = selectedCell || hoveredCell
+  const inspectedCellDetails = useMemo(() => {
+    if (!showCellInspector || !inspectedCell || !columns || !rows) return null
+
+    const cellFeatures = summarizeCellFeatures(vttSetup, inspectedCell.col, inspectedCell.row)
+    const movementProfile = getCellMovementProfile(vttSetup, inspectedCell.col, inspectedCell.row)
+    const reachableCell = reachableMovementCellMap.get(`${inspectedCell.col},${inspectedCell.row}`) || null
+    const distanceFromPlayer = playerPlacement
+      ? getGridMoveDistance(playerPlacement.col, playerPlacement.row, inspectedCell.col, inspectedCell.row)
+      : null
+
+    return {
+      ...inspectedCell,
+      coordinate: getGridCoordinate(inspectedCell.col, inspectedCell.row),
+      movementProfile,
+      reachableCell,
+      distanceFromPlayer,
+      cellFeatures,
+    }
+  }, [showCellInspector, inspectedCell, columns, rows, vttSetup, reachableMovementCellMap, playerPlacement])
 
   // Sync state changes with localStorage
   const updateMapViewMode = (newMode) => {
     setMapViewMode(newMode)
     localStorage.setItem('encounter_map_view_mode', newMode)
-    if (newMode !== 'collapsed') {
-      setHasNotification(false)
-    }
   }
 
   const handleImageLoad = (e) => {
@@ -470,6 +827,33 @@ export default function EncounterMapPanel({
       col: clamp(Math.floor(x * columns), 0, columns - 1),
       row: clamp(Math.floor(y * rows), 0, rows - 1),
     }
+  }
+
+  const toggleTacticalFilter = (filterId) => {
+    setActiveTacticalFilters((current) => (
+      current.includes(filterId)
+        ? current.filter((item) => item !== filterId)
+        : [...current, filterId]
+    ))
+  }
+
+  const handleBoardPointerMove = (event) => {
+    if (!showCellInspector || dragState) return
+    const cell = getGridCellFromPointer(event)
+    setHoveredCell(cell)
+  }
+
+  const handleBoardPointerLeave = () => {
+    setHoveredCell(null)
+  }
+
+  const handleBoardClick = (event) => {
+    if (!showCellInspector || dragState) return
+    const cell = getGridCellFromPointer(event)
+    if (!cell) return
+    setSelectedCell((current) => (
+      current && current.col === cell.col && current.row === cell.row ? null : cell
+    ))
   }
 
   const getLimitedDestinationFromPointer = (event, state) => {
@@ -612,6 +996,258 @@ export default function EncounterMapPanel({
     )
   }
 
+  const renderMapBoard = (imagePadding = '18px') => {
+    if (loading) {
+      return (
+        <div className="encounter-map-placeholder">
+          <i className="bi bi-hourglass-split"></i>
+          <span>Loading Map State...</span>
+        </div>
+      )
+    }
+
+    if (encounterMap && imageUrl) {
+      const inspectorTags = inspectedCellDetails
+        ? Array.from(new Set(inspectedCellDetails.cellFeatures.features.flatMap((feature) => feature.categories)))
+        : []
+
+      return (
+        <div className="encounter-map-images" style={{ padding: imagePadding }}>
+          <figure className="encounter-map-frame">
+            <div
+              className="encounter-map-board"
+              style={{
+                aspectRatio: aspectRatio ? `${aspectRatio}` : 'auto',
+              }}
+              onPointerMove={handleBoardPointerMove}
+              onPointerLeave={handleBoardPointerLeave}
+              onClick={handleBoardClick}
+            >
+              <img
+                src={imageUrl}
+                alt={encounterMap.title || 'Encounter map'}
+                className="encounter-map-image"
+                onLoad={handleImageLoad}
+              />
+
+              {canOverlayPlacements && (
+                <div
+                  className="encounter-map-grid-overlay"
+                  style={{
+                    '--grid-cols': columns,
+                    '--grid-rows': rows,
+                    display: showGridLines ? 'block' : 'none',
+                    ...gridLayout,
+                  }}
+                />
+              )}
+
+              {canOverlayPlacements && (
+                <div className="encounter-map-area-layer" style={gridLayout}>
+                  {showTacticalOverlay && tacticalOverlayAreas.map((area) => (
+                    <div
+                      key={area.id}
+                      className={`encounter-map-area-overlay ${area.category} ${area.isDirectionalProvider ? 'directional-provider' : ''}`}
+                      style={area.style}
+                      title={area.label}
+                    />
+                  ))}
+                  {inspectedCell && (
+                    <div
+                      className={`encounter-map-cell-highlight ${selectedCell ? 'selected' : 'hovered'}`}
+                      style={{
+                        left: `${(inspectedCell.col / columns) * 100}%`,
+                        top: `${(inspectedCell.row / rows) * 100}%`,
+                        width: `${100 / columns}%`,
+                        height: `${100 / rows}%`,
+                      }}
+                    />
+                  )}
+                </div>
+              )}
+
+              {canOverlayPlacements && (
+                <div
+                  ref={tokenLayerRef}
+                  className="encounter-map-token-layer"
+                  aria-label="Placed combatants"
+                  style={gridLayout}
+                >
+                  {canMovePlayerToken && dragState && reachableMovementCells.map((cell) => {
+                    const isOrigin = cell.col === playerPlacement.col && cell.row === playerPlacement.row
+                    const isSelected = dragState?.col === cell.col && dragState?.row === cell.row
+                    return (
+                      <div
+                        key={`${cell.col},${cell.row}`}
+                        className={`encounter-map-move-cell ${cell.isDifficult ? 'difficult' : ''} ${isOrigin ? 'origin' : ''} ${isSelected ? 'selected' : ''}`}
+                        style={{
+                          left: `${(cell.col / columns) * 100}%`,
+                          top: `${(cell.row / rows) * 100}%`,
+                          width: `${100 / columns}%`,
+                          height: `${100 / rows}%`,
+                        }}
+                      />
+                    )
+                  })}
+                  {displayPlacements.map((placement) => {
+                    const isHighlighted = activeHoverId === placement.id
+                    const isDraggable = canDragPlacement(placement)
+                    const isDragging = dragState?.placementId === placement.id
+                    const directionalCoverForPlacement = (
+                      hoveredPlacement?.id === placement.id &&
+                      placement.id !== playerPlacement?.id &&
+                      directionalCoverPreview.coverType !== 'none'
+                    )
+                    const isActiveTurn = isEncounterActive &&
+                      encounterState?.active_turn_index !== null &&
+                      encounterState?.active_turn_index !== undefined &&
+                      encounterState?.turn_order?.[encounterState.active_turn_index]?.placement_id === placement.id
+
+                    return (
+                      <div
+                        key={placement.id}
+                        className={`encounter-map-token ${placement.actor_type} ${isHighlighted ? 'highlighted' : ''} ${isDraggable ? 'draggable' : ''} ${isDragging ? 'dragging' : ''} ${isActiveTurn ? 'active-turn' : ''} ${directionalCoverForPlacement ? `has-directional-cover cover-${directionalCoverPreview.coverType}` : ''}`}
+                        style={{
+                          left: `${((placement.col + 0.5) / columns) * 100}%`,
+                          top: `${((placement.row + 0.5) / rows) * 100}%`,
+                          width: `calc(0.8 * min(100cqw / ${columns}, 100cqh / ${rows}))`,
+                          height: `calc(0.8 * min(100cqw / ${columns}, 100cqh / ${rows}))`,
+                          aspectRatio: '1',
+                        }}
+                        onPointerDown={(event) => handleTokenPointerDown(event, placement)}
+                        onPointerMove={handleTokenPointerMove}
+                        onPointerUp={handleTokenPointerUp}
+                        onPointerCancel={handleTokenPointerCancel}
+                        onMouseEnter={() => setActiveHoverId(placement.id)}
+                        onMouseLeave={() => setActiveHoverId(null)}
+                      >
+                        <span className="token-initials">
+                          {placement.label?.slice(0, 2).toUpperCase() || '?'}
+                        </span>
+
+                        <div className="encounter-token-tooltip">
+                          <span className="tooltip-name">{placement.label}</span>
+                          <span className="tooltip-coord">
+                            Coordinate: {getGridCoordinate(placement.col, placement.row)}
+                          </span>
+                          {isDraggable && (
+                            <span className="tooltip-coord">
+                              Move: {dragState?.placementId === placement.id ? dragState.cost : 0}/{movementSquares} sq
+                            </span>
+                          )}
+                          {directionalCoverForPlacement && (
+                            <span className={`tooltip-cover cover-${directionalCoverPreview.coverType}`}>
+                              {directionalCoverPreview.coverType.replace('_', ' ')} cover from you
+                              {directionalCoverPreview.providers[0]?.label ? ` via ${directionalCoverPreview.providers[0].label}` : ''}
+                            </span>
+                          )}
+                          <span className="tooltip-alliance">{placement.actor_type}</span>
+                        </div>
+                      </div>
+                    )
+                  })}
+                </div>
+              )}
+
+              {canMovePlayerToken && (
+                <div className={`encounter-map-movement-hud ${moveError ? 'has-error' : ''}`}>
+                  <i className={isMovingToken ? 'bi bi-arrow-repeat' : 'bi bi-arrows-move'}></i>
+                  <span>
+                    {dragState
+                      ? `${dragState.cost}/${dragState.maxSquares} sq`
+                      : isMovingToken
+                        ? 'Saving move...'
+                        : `Move ${movementSquares} sq`}
+                  </span>
+                  {(moveError || movementMessage) && (
+                    <small>{moveError || movementMessage}</small>
+                  )}
+                </div>
+              )}
+
+              {hoveredPlacement && hoveredPlacement.id !== playerPlacement?.id && (
+                <div className={`encounter-map-cover-hud ${directionalCoverPreview.coverType !== 'none' ? `cover-${directionalCoverPreview.coverType}` : 'cover-none'}`}>
+                  <strong>{hoveredPlacement.label}</strong>
+                  <span>
+                    {directionalCoverPreview.coverType === 'none'
+                      ? 'No directional cover from your token.'
+                      : `${directionalCoverPreview.coverType.replace('_', ' ')} cover from ${directionalCoverPreview.providers.map((provider) => provider.label).join(', ')}.`}
+                  </span>
+                </div>
+              )}
+
+              {showCellInspector && inspectedCellDetails && (
+                <div className="encounter-map-cell-inspector">
+                  <div className="encounter-map-cell-inspector-header">
+                    <strong>{inspectedCellDetails.coordinate}</strong>
+                    <span>{selectedCell ? 'Pinned' : 'Hover'}</span>
+                  </div>
+                  <div className="encounter-map-cell-tags">
+                    {inspectorTags.length ? inspectorTags.map((tag) => (
+                      <span key={tag} className={`encounter-map-cell-tag ${tag}`}>
+                        {TACTICAL_FILTERS.find((item) => item.id === tag)?.label || tag}
+                      </span>
+                    )) : (
+                      <span className="encounter-map-cell-tag neutral">Open floor</span>
+                    )}
+                  </div>
+                  <div className="encounter-map-cell-stats">
+                    {inspectedCellDetails.reachableCell
+                      ? <span>Reachable in {inspectedCellDetails.reachableCell.cost} sq</span>
+                      : playerPlacement
+                        ? <span>{inspectedCellDetails.distanceFromPlayer} sq from you</span>
+                        : <span>Board reference</span>}
+                    {inspectedCellDetails.cellFeatures.blockedBy.length > 0 && (
+                      <span>Blocked by {inspectedCellDetails.cellFeatures.blockedBy[0]}</span>
+                    )}
+                    {inspectedCellDetails.cellFeatures.difficultBy.length > 0 && (
+                      <span>Difficult: {inspectedCellDetails.cellFeatures.difficultBy[0]}</span>
+                    )}
+                  </div>
+                  {inspectedCellDetails.cellFeatures.features.length > 0 && (
+                    <ul className="encounter-map-cell-feature-list">
+                      {inspectedCellDetails.cellFeatures.features.slice(0, 3).map((feature) => (
+                        <li key={`${feature.group}-${feature.label}`}>
+                          <strong>{feature.label}</strong>
+                          {feature.description ? `: ${feature.description}` : ''}
+                        </li>
+                      ))}
+                    </ul>
+                  )}
+                </div>
+              )}
+            </div>
+          </figure>
+        </div>
+      )
+    }
+
+    if (encounterMap && imageError) {
+      return (
+        <div className="encounter-map-placeholder">
+          <i className="bi bi-exclamation-triangle-fill"></i>
+          <span>{imageError}</span>
+        </div>
+      )
+    }
+
+    if (encounterMap) {
+      return (
+        <div className="encounter-map-placeholder">
+          <i className="bi bi-image"></i>
+          <span>Downloading map visual...</span>
+        </div>
+      )
+    }
+
+    return (
+      <div className="encounter-map-placeholder">
+        <i className="bi bi-map"></i>
+        <span>The AI Dungeon Master will generate a tactical map when positioning matters.</span>
+      </div>
+    )
+  }
+
   // --- COLLAPSED VIEW RENDER ---
   if (isCollapsed) {
     return null
@@ -646,6 +1282,26 @@ export default function EncounterMapPanel({
                 <i className="bi bi-grid-3x3"></i>
               </button>
             )}
+            {encounterMap && (
+              <>
+                <button
+                  className={`btn-icon-map ${showTacticalOverlay ? 'active' : ''}`}
+                  onClick={() => setShowTacticalOverlay(!showTacticalOverlay)}
+                  title="Toggle Tactical Overlay"
+                  aria-label="Toggle tactical overlay"
+                >
+                  <i className="bi bi-layers"></i>
+                </button>
+                <button
+                  className={`btn-icon-map ${showCellInspector ? 'active' : ''}`}
+                  onClick={() => setShowCellInspector(!showCellInspector)}
+                  title="Toggle Cell Inspector"
+                  aria-label="Toggle cell inspector"
+                >
+                  <i className="bi bi-crosshair2"></i>
+                </button>
+              </>
+            )}
             <button
               className={`btn-icon-map ${mapViewMode === 'collapsed' ? 'active' : ''}`}
               onClick={() => updateMapViewMode('collapsed')}
@@ -672,144 +1328,7 @@ export default function EncounterMapPanel({
             </button>
           </div>
 
-          {loading ? (
-            <div className="encounter-map-placeholder">
-              <i className="bi bi-hourglass-split"></i>
-              <span>Loading Map State...</span>
-            </div>
-          ) : encounterMap && imageUrl ? (
-            <div className="encounter-map-images" style={{ padding: '32px 18px 18px 18px' }}>
-              <figure className="encounter-map-frame">
-                <div
-                  className="encounter-map-board"
-                  style={{
-                    aspectRatio: aspectRatio ? `${aspectRatio}` : 'auto'
-                  }}
-                >
-                  <img
-                    src={imageUrl}
-                    alt={encounterMap.title || 'Encounter map'}
-                    className="encounter-map-image"
-                    onLoad={handleImageLoad}
-                  />
-                  
-                  {canOverlayPlacements && (
-                    <div
-                      className="encounter-map-grid-overlay"
-                      style={{
-                        '--grid-cols': columns,
-                        '--grid-rows': rows,
-                        display: showGridLines ? 'block' : 'none',
-                        ...gridLayout,
-                      }}
-                    />
-                  )}
-
-                  {canOverlayPlacements && (
-                    <div
-                      ref={tokenLayerRef}
-                      className="encounter-map-token-layer"
-                      aria-label="Placed combatants"
-                      style={gridLayout}
-                    >
-                      {canMovePlayerToken && dragState && reachableMovementCells.map((cell) => {
-                        const isOrigin = cell.col === playerPlacement.col && cell.row === playerPlacement.row
-                        const isSelected = dragState?.col === cell.col && dragState?.row === cell.row
-                        return (
-                          <div
-                            key={`${cell.col},${cell.row}`}
-                            className={`encounter-map-move-cell ${cell.isDifficult ? 'difficult' : ''} ${isOrigin ? 'origin' : ''} ${isSelected ? 'selected' : ''}`}
-                            style={{
-                              left: `${(cell.col / columns) * 100}%`,
-                              top: `${(cell.row / rows) * 100}%`,
-                              width: `${100 / columns}%`,
-                              height: `${100 / rows}%`,
-                            }}
-                          />
-                        )
-                      })}
-                      {displayPlacements.map((placement) => {
-                        const isHighlighted = activeHoverId === placement.id
-                        const isDraggable = canDragPlacement(placement)
-                        const isDragging = dragState?.placementId === placement.id
-                        const isActiveTurn = isEncounterActive && 
-                          encounterState?.active_turn_index !== null &&
-                          encounterState?.active_turn_index !== undefined &&
-                          encounterState?.turn_order?.[encounterState.active_turn_index]?.placement_id === placement.id
-
-                        return (
-                          <div
-                            key={placement.id}
-                            className={`encounter-map-token ${placement.actor_type} ${isHighlighted ? 'highlighted' : ''} ${isDraggable ? 'draggable' : ''} ${isDragging ? 'dragging' : ''} ${isActiveTurn ? 'active-turn' : ''}`}
-                            style={{
-                              left: `${((placement.col + 0.5) / columns) * 100}%`,
-                              top: `${((placement.row + 0.5) / rows) * 100}%`,
-                              width: `calc(0.8 * min(100cqw / ${columns}, 100cqh / ${rows}))`,
-                              height: `calc(0.8 * min(100cqw / ${columns}, 100cqh / ${rows}))`,
-                              aspectRatio: '1',
-                            }}
-                            onPointerDown={(event) => handleTokenPointerDown(event, placement)}
-                            onPointerMove={handleTokenPointerMove}
-                            onPointerUp={handleTokenPointerUp}
-                            onPointerCancel={handleTokenPointerCancel}
-                            onMouseEnter={() => setActiveHoverId(placement.id)}
-                            onMouseLeave={() => setActiveHoverId(null)}
-                          >
-                            <span className="token-initials">
-                              {placement.label?.slice(0, 2).toUpperCase() || '?'}
-                            </span>
-                            
-                            <div className="encounter-token-tooltip">
-                              <span className="tooltip-name">{placement.label}</span>
-                              <span className="tooltip-coord">
-                                Coordinate: {getGridCoordinate(placement.col, placement.row)}
-                              </span>
-                              {isDraggable && (
-                                <span className="tooltip-coord">
-                                  Move: {dragState?.placementId === placement.id ? dragState.cost : 0}/{movementSquares} sq
-                                </span>
-                              )}
-                              <span className="tooltip-alliance">{placement.actor_type}</span>
-                            </div>
-                          </div>
-                        )
-                      })}
-                    </div>
-                  )}
-                  {canMovePlayerToken && (
-                    <div className={`encounter-map-movement-hud ${moveError ? 'has-error' : ''}`}>
-                      <i className={isMovingToken ? 'bi bi-arrow-repeat' : 'bi bi-arrows-move'}></i>
-                      <span>
-                        {dragState
-                          ? `${dragState.cost}/${dragState.maxSquares} sq`
-                          : isMovingToken
-                            ? 'Saving move...'
-                            : `Move ${movementSquares} sq`}
-                      </span>
-                      {(moveError || movementMessage) && (
-                        <small>{moveError || movementMessage}</small>
-                      )}
-                    </div>
-                  )}
-                </div>
-              </figure>
-            </div>
-          ) : encounterMap && imageError ? (
-            <div className="encounter-map-placeholder">
-              <i className="bi bi-exclamation-triangle-fill"></i>
-              <span>{imageError}</span>
-            </div>
-          ) : encounterMap ? (
-            <div className="encounter-map-placeholder">
-              <i className="bi bi-image"></i>
-              <span>Downloading map visual...</span>
-            </div>
-          ) : (
-            <div className="encounter-map-placeholder">
-              <i className="bi bi-map"></i>
-              <span>The AI Dungeon Master will generate a tactical map when positioning matters.</span>
-            </div>
-          )}
+          {renderMapBoard('32px 18px 18px 18px')}
         </div>
       </section>
     )
@@ -837,6 +1356,22 @@ export default function EncounterMapPanel({
               >
                 <i className="bi bi-grid-3x3"></i>
               </button>
+              <button
+                className={`btn-icon-map ${showTacticalOverlay ? 'active' : ''}`}
+                onClick={() => setShowTacticalOverlay(!showTacticalOverlay)}
+                title="Toggle Tactical Overlay"
+                aria-label="Toggle tactical overlay"
+              >
+                <i className="bi bi-layers"></i>
+              </button>
+              <button
+                className={`btn-icon-map ${showCellInspector ? 'active' : ''}`}
+                onClick={() => setShowCellInspector(!showCellInspector)}
+                title="Toggle Cell Inspector"
+                aria-label="Toggle cell inspector"
+              >
+                <i className="bi bi-crosshair2"></i>
+              </button>
               {placements.length > 0 && (
                 <button
                   className={`btn-icon-map ${isRosterOpen ? 'active' : ''}`}
@@ -845,6 +1380,16 @@ export default function EncounterMapPanel({
                   aria-label="Toggle combat roster"
                 >
                   <i className="bi bi-people-fill"></i>
+                </button>
+              )}
+              {encounterMap && (mapSummary || tacticalNotes.length > 0) && (
+                <button
+                  className={`btn-icon-map ${!isBriefingCollapsed ? 'active' : ''}`}
+                  onClick={() => setIsBriefingCollapsed(!isBriefingCollapsed)}
+                  title="Toggle Map Briefing"
+                  aria-label="Toggle map briefing"
+                >
+                  <i className="bi bi-info-circle"></i>
                 </button>
               )}
             </>
@@ -998,149 +1543,58 @@ export default function EncounterMapPanel({
         </div>
       )}
 
+      {encounterMap && (
+        <div className="encounter-map-filter-strip">
+          {TACTICAL_FILTERS.map((filter) => (
+            <button
+              key={filter.id}
+              type="button"
+              className={`encounter-map-filter-chip ${activeTacticalFilterSet.has(filter.id) ? 'active' : ''}`}
+              onClick={() => toggleTacticalFilter(filter.id)}
+            >
+              {filter.label}
+            </button>
+          ))}
+        </div>
+      )}
+
+      {encounterMap && (mapSummary || tacticalNotes.length > 0) && !isBriefingCollapsed && (
+          <div className="encounter-map-briefing">
+            <div
+              className="encounter-map-briefing-header"
+              style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', userSelect: 'none' }}
+            >
+              <span className="briefing-title" style={{ fontSize: '0.72rem', fontWeight: 800, textTransform: 'uppercase', letterSpacing: '0.08em', color: 'var(--text-gold)', display: 'flex', alignItems: 'center', gap: '6px' }}>
+                <i className="bi bi-info-circle"></i> Map Briefing
+              </span>
+              <button
+                type="button"
+                className="btn-close-briefing"
+                onClick={() => setIsBriefingCollapsed(true)}
+                style={{ background: 'none', border: 'none', color: 'var(--text-muted)', cursor: 'pointer', padding: '2px', display: 'flex', alignItems: 'center', justifyContent: 'center' }}
+                title="Hide Briefing"
+                aria-label="Hide briefing"
+              >
+                <i className="bi bi-x-lg" style={{ fontSize: '0.8rem' }}></i>
+              </button>
+            </div>
+            <div className="briefing-content" style={{ marginTop: '10px' }}>
+              {mapSummary && <p className="encounter-map-summary">{mapSummary}</p>}
+              {tacticalNotes.length > 0 && (
+                <ul className="encounter-map-notes">
+                  {tacticalNotes.slice(0, 4).map((note, index) => (
+                    <li key={`${note}-${index}`}>{note}</li>
+                  ))}
+                </ul>
+              )}
+            </div>
+          </div>
+        )
+      }
+
       <div className="encounter-map-body-layout">
         <div className={`encounter-map-stage ${!encounterMap ? 'empty' : ''}`}>
-        {loading ? (
-          <div className="encounter-map-placeholder">
-            <i className="bi bi-hourglass-split"></i>
-            <span>Loading Map State...</span>
-          </div>
-        ) : encounterMap && imageUrl ? (
-          <div className="encounter-map-images">
-            <figure className="encounter-map-frame">
-              <div
-                className="encounter-map-board"
-                style={{
-                  aspectRatio: aspectRatio ? `${aspectRatio}` : 'auto'
-                }}
-              >
-                <img
-                  src={imageUrl}
-                  alt={encounterMap.title || 'Encounter map'}
-                  className="encounter-map-image"
-                  onLoad={handleImageLoad}
-                />
-                
-                {/* CSS Dynamic Grid Lines Overlay */}
-                {canOverlayPlacements && (
-                  <div
-                    className="encounter-map-grid-overlay"
-                    style={{
-                      '--grid-cols': columns,
-                      '--grid-rows': rows,
-                      display: showGridLines ? 'block' : 'none',
-                      ...gridLayout,
-                    }}
-                  />
-                )}
-
-                {/* Tokens Layer */}
-                {canOverlayPlacements && (
-                  <div
-                    ref={tokenLayerRef}
-                    className="encounter-map-token-layer"
-                    aria-label="Placed combatants"
-                    style={gridLayout}
-                  >
-                    {canMovePlayerToken && dragState && reachableMovementCells.map((cell) => {
-                      const isOrigin = cell.col === playerPlacement.col && cell.row === playerPlacement.row
-                      const isSelected = dragState?.col === cell.col && dragState?.row === cell.row
-                      return (
-                        <div
-                          key={`${cell.col},${cell.row}`}
-                          className={`encounter-map-move-cell ${cell.isDifficult ? 'difficult' : ''} ${isOrigin ? 'origin' : ''} ${isSelected ? 'selected' : ''}`}
-                          style={{
-                            left: `${(cell.col / columns) * 100}%`,
-                            top: `${(cell.row / rows) * 100}%`,
-                            width: `${100 / columns}%`,
-                            height: `${100 / rows}%`,
-                          }}
-                        />
-                      )
-                    })}
-                    {displayPlacements.map((placement) => {
-                      const isHighlighted = activeHoverId === placement.id
-                      const isDraggable = canDragPlacement(placement)
-                      const isDragging = dragState?.placementId === placement.id
-                      const isActiveTurn = isEncounterActive && 
-                        encounterState?.active_turn_index !== null &&
-                        encounterState?.active_turn_index !== undefined &&
-                        encounterState?.turn_order?.[encounterState.active_turn_index]?.placement_id === placement.id
-
-                      return (
-                        <div
-                          key={placement.id}
-                          className={`encounter-map-token ${placement.actor_type} ${isHighlighted ? 'highlighted' : ''} ${isDraggable ? 'draggable' : ''} ${isDragging ? 'dragging' : ''} ${isActiveTurn ? 'active-turn' : ''}`}
-                          style={{
-                            left: `${((placement.col + 0.5) / columns) * 100}%`,
-                            top: `${((placement.row + 0.5) / rows) * 100}%`,
-                            width: `calc(0.8 * min(100cqw / ${columns}, 100cqh / ${rows}))`,
-                            height: `calc(0.8 * min(100cqw / ${columns}, 100cqh / ${rows}))`,
-                            aspectRatio: '1',
-                          }}
-                          onPointerDown={(event) => handleTokenPointerDown(event, placement)}
-                          onPointerMove={handleTokenPointerMove}
-                          onPointerUp={handleTokenPointerUp}
-                          onPointerCancel={handleTokenPointerCancel}
-                          onMouseEnter={() => setActiveHoverId(placement.id)}
-                          onMouseLeave={() => setActiveHoverId(null)}
-                        >
-                          <span className="token-initials">
-                            {placement.label?.slice(0, 2).toUpperCase() || '?'}
-                          </span>
-                          
-                          {/* Miniature Tooltip on Hover */}
-                          <div className="encounter-token-tooltip">
-                            <span className="tooltip-name">{placement.label}</span>
-                            <span className="tooltip-coord">
-                              Coordinate: {getGridCoordinate(placement.col, placement.row)}
-                            </span>
-                            {isDraggable && (
-                              <span className="tooltip-coord">
-                                Move: {dragState?.placementId === placement.id ? dragState.cost : 0}/{movementSquares} sq
-                              </span>
-                            )}
-                            <span className="tooltip-alliance">{placement.actor_type}</span>
-                          </div>
-                        </div>
-                      )
-                    })}
-                  </div>
-                )}
-                {canMovePlayerToken && (
-                  <div className={`encounter-map-movement-hud ${moveError ? 'has-error' : ''}`}>
-                    <i className={isMovingToken ? 'bi bi-arrow-repeat' : 'bi bi-arrows-move'}></i>
-                    <span>
-                      {dragState
-                        ? `${dragState.cost}/${dragState.maxSquares} sq`
-                        : isMovingToken
-                          ? 'Saving move...'
-                          : `Move ${movementSquares} sq`}
-                    </span>
-                    {(moveError || movementMessage) && (
-                      <small>{moveError || movementMessage}</small>
-                    )}
-                  </div>
-                )}
-              </div>
-            </figure>
-          </div>
-        ) : encounterMap && imageError ? (
-          <div className="encounter-map-placeholder">
-            <i className="bi bi-exclamation-triangle-fill"></i>
-            <span>{imageError}</span>
-          </div>
-        ) : encounterMap ? (
-          <div className="encounter-map-placeholder">
-            <i className="bi bi-image"></i>
-            <span>Downloading map visual...</span>
-          </div>
-        ) : (
-          <div className="encounter-map-placeholder">
-            <i className="bi bi-map"></i>
-            <span>The AI Dungeon Master will generate a tactical map when positioning matters.</span>
-          </div>
-        )}
+        {renderMapBoard()}
         </div>
 
         {/* Styled Combatants Roster */}

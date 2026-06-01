@@ -1,4 +1,5 @@
 import json
+import re
 from datetime import datetime
 
 from models import (
@@ -22,6 +23,7 @@ from services.embedding_service import (
     search_weight,
     upsert_memory_embedding,
 )
+from services.encounter_movement import reachable_cells
 from services.encounter_map_service import create_encounter_map as do_create_encounter_map, latest_encounter_map
 from services.lootbox_service import generate_loot_box as do_generate_loot_box
 from services.planning_service import summary_dict_for_read
@@ -420,7 +422,8 @@ def build_session_hot_context(campaign, session, current_user):
             'or when a player explicitly asks for a map; include vtt_setup_notes when the DM has intended '
             'friendly starts, enemy starts, obstacles, objectives, or terrain calls for the playable setup JSON. '
             'After a map exists and combat positioning matters, use place_encounter_map_actors to place '
-            'players, NPCs, and monsters on grid coordinates. '
+            'players, NPCs, and monsters on grid coordinates, and use move_encounter_actor to move NPCs and monsters tactically '
+            'using real pathfinding and movement costs instead of resetting placements. '
             'When combat or initiative starts, use toggle_encounter_mode(active=True) to start Encounter Mode. '
             'This will return an instruction prompt. You must then immediately call create_encounter_map to generate '
             'a brand new combat map, and then place_encounter_map_actors to place everyone onto it. Do not re-use old maps. '
@@ -909,6 +912,51 @@ DM_TOOL_DEFINITIONS = [
     {
         'type': 'function',
         'function': {
+            'name': 'move_encounter_actor',
+            'description': 'Move an already-placed encounter actor across the current map using terrain-aware pathfinding. Use this for tactical enemy or NPC movement after actors are already on the board. During combat, this consumes movement_remaining and can enforce turn order.',
+            'parameters': {
+                'type': 'object',
+                'required': ['col', 'row'],
+                'properties': {
+                    'encounter_map_id': {
+                        'type': 'integer',
+                        'description': 'Optional explicit encounter map id. Defaults to the latest campaign encounter map.',
+                    },
+                    'placement_id': {
+                        'type': 'integer',
+                        'description': 'Preferred explicit placement id for the actor to move.',
+                    },
+                    'actor_type': {
+                        'type': 'string',
+                        'enum': ['player', 'npc', 'monster'],
+                        'description': 'Actor type when placement_id is not provided.',
+                    },
+                    'actor_id': {
+                        'type': 'string',
+                        'description': 'User id or selected character id for players, NPC actor_id, or monster_id when placement_id is not provided.',
+                    },
+                    'col': {
+                        'type': 'integer',
+                        'minimum': 0,
+                        'description': 'Destination grid column.',
+                    },
+                    'row': {
+                        'type': 'integer',
+                        'minimum': 0,
+                        'description': 'Destination grid row.',
+                    },
+                    'ignore_turn_order': {
+                        'type': 'boolean',
+                        'default': False,
+                        'description': 'Set true to move a combatant outside their active turn during combat. Use sparingly for forced movement, reactions, or repositioning corrections.',
+                    },
+                },
+            },
+        },
+    },
+    {
+        'type': 'function',
+        'function': {
             'name': 'toggle_encounter_mode',
             'description': 'Start or stop Encounter Mode (combat tracker). Starting it will return instructions to generate a new map and place actors. Stopping it will archive the current map.',
             'parameters': {
@@ -1057,6 +1105,7 @@ def get_dm_tool_definitions(campaign):
     exclude_names = {
         'create_encounter_map',
         'place_encounter_map_actors',
+        'move_encounter_actor',
         'next_combat_turn',
         'set_combat_turn',
         'update_combatant_actions',
@@ -1412,6 +1461,55 @@ def _encounter_map_grid_dimensions(encounter_map):
     return columns if isinstance(columns, int) else None, rows if isinstance(rows, int) else None
 
 
+def _coerce_speed_feet(value, default=30):
+    if isinstance(value, (int, float)):
+        return max(0, int(value))
+    if isinstance(value, str):
+        match = re.search(r'(\d+)', value)
+        if match:
+            return max(0, int(match.group(1)))
+    return max(0, int(default))
+
+
+def _movement_budget_feet_for_placement(campaign, placement, turn_combatant=None):
+    if isinstance(turn_combatant, dict):
+        actions = turn_combatant.get('actions') if isinstance(turn_combatant.get('actions'), dict) else {}
+        if 'movement_remaining' in actions:
+            return _coerce_speed_feet(actions.get('movement_remaining'), default=0)
+        return _coerce_speed_feet(turn_combatant.get('speed'), default=30)
+
+    if placement.actor_type == 'player':
+        member = CampaignMember.query.filter_by(
+            campaign_id=campaign.id,
+            user_id=int(placement.actor_id),
+        ).first() if str(placement.actor_id).isdigit() else None
+        character = member.selected_character if member and member.selected_character else None
+        if not character:
+            character = Character.query.filter_by(
+                campaign_id=campaign.id,
+                user_id=int(placement.actor_id),
+            ).first() if str(placement.actor_id).isdigit() else None
+        return _coerce_speed_feet(character.speed if character else 30, default=30)
+
+    if placement.actor_type == 'monster':
+        monster = CampaignMonster.query.filter_by(
+            campaign_id=campaign.id,
+            monster_id=placement.actor_id,
+        ).first()
+        stat_block = json_loads(monster.stat_block, {}) if monster and monster.stat_block else {}
+        return _coerce_speed_feet(stat_block.get('speed'), default=30)
+
+    if placement.actor_type == 'npc':
+        npc = NPCActor.query.filter_by(
+            campaign_id=campaign.id,
+            actor_id=placement.actor_id,
+        ).first()
+        dossier = json_loads(npc.dossier, {}) if npc and npc.dossier else {}
+        return _coerce_speed_feet(dossier.get('speed'), default=30)
+
+    return 30
+
+
 def _resolve_map_player(campaign, actor_id):
     try:
         numeric_id = int(actor_id)
@@ -1663,6 +1761,176 @@ def _tool_place_encounter_map_actors(campaign, current_user, args, session=None,
             'encounter_map_ids': [encounter_map.id],
             'placement_ids': [placement['id'] for placement in saved],
             'monster_ids': sorted(set(monster_ids)),
+            'world_event_ids': [event.id],
+        },
+    }
+
+
+def _tool_move_encounter_actor(campaign, current_user, args):
+    _ = current_user
+    encounter_map_id = args.get('encounter_map_id')
+    encounter_map = db.session.get(EncounterMap, encounter_map_id) if encounter_map_id else latest_encounter_map(campaign.id)
+    if not encounter_map or encounter_map.campaign_id != campaign.id:
+        return {'error': 'No encounter map is available for this campaign.'}
+
+    try:
+        grid_col = int(args.get('col'))
+        grid_row = int(args.get('row'))
+    except (TypeError, ValueError):
+        return {'error': 'Actor move requires integer col and row values.'}
+
+    columns, rows = _encounter_map_grid_dimensions(encounter_map)
+    if grid_col < 0 or grid_row < 0:
+        return {'error': 'Actor move col and row must be 0 or greater.'}
+    if columns is not None and grid_col >= columns:
+        return {'error': f'Actor move col must be less than map columns ({columns}).'}
+    if rows is not None and grid_row >= rows:
+        return {'error': f'Actor move row must be less than map rows ({rows}).'}
+
+    placement = None
+    placement_id = args.get('placement_id')
+    if placement_id is not None:
+        try:
+            placement = EncounterMapPlacement.query.filter_by(
+                encounter_map_id=encounter_map.id,
+                id=int(placement_id),
+            ).first()
+        except (TypeError, ValueError):
+            return {'error': 'placement_id must be an integer.'}
+    else:
+        actor_lookup = {
+            'actor_type': args.get('actor_type'),
+            'actor_id': args.get('actor_id'),
+        }
+        resolved_actor, error = _resolve_map_actor(campaign, actor_lookup)
+        if error:
+            return {'error': error}
+        placement = EncounterMapPlacement.query.filter_by(
+            encounter_map_id=encounter_map.id,
+            actor_type=clean_text(args.get('actor_type'), 20).lower(),
+            actor_id=resolved_actor['actor_id'],
+        ).first()
+
+    if not placement:
+        return {'error': 'Encounter actor placement not found on the current map.'}
+
+    state = EncounterMap._json_value(encounter_map.encounter_state_json, {})
+    is_encounter_active = state.get('active', False) if isinstance(state, dict) else False
+    turn_order = state.get('turn_order', []) if isinstance(state, dict) else []
+    target_combatant = next(
+        (
+            combatant for combatant in turn_order
+            if isinstance(combatant, dict) and combatant.get('placement_id') == placement.id
+        ),
+        None,
+    )
+
+    if is_encounter_active and not args.get('ignore_turn_order'):
+        active_turn_index = state.get('active_turn_index')
+        if active_turn_index is None:
+            return {'error': 'Combat is active, but initiative rolling is not yet complete.'}
+        if not isinstance(active_turn_index, int) or active_turn_index < 0 or active_turn_index >= len(turn_order):
+            return {'error': 'Invalid combat turn state.'}
+        active_combatant = turn_order[active_turn_index]
+        if active_combatant.get('placement_id') != placement.id:
+            return {'error': f"It is not {placement.label}'s turn. It is currently {active_combatant.get('label')}'s turn."}
+
+    available_speed = _movement_budget_feet_for_placement(campaign, placement, turn_combatant=target_combatant if is_encounter_active else None)
+    max_squares = available_speed // 5
+    setup = EncounterMap._json_value(encounter_map.vtt_setup_json, {})
+    if isinstance(columns, int) and isinstance(rows, int):
+        reachable = reachable_cells(
+            setup,
+            columns,
+            rows,
+            placement.grid_col,
+            placement.grid_row,
+            max_squares,
+        )
+        movement_cost = reachable.get((grid_col, grid_row))
+    else:
+        reachable = {}
+        movement_cost = max(abs(grid_col - placement.grid_col), abs(grid_row - placement.grid_row))
+
+    if movement_cost is None:
+        return {
+            'error': 'That destination is not reachable with the actor\'s current movement and the map terrain.',
+            'movement': {
+                'speed': available_speed,
+                'max_squares': max_squares,
+                'attempted_squares': max(abs(grid_col - placement.grid_col), abs(grid_row - placement.grid_row)),
+                'reachable_squares': len(reachable),
+            },
+        }
+
+    if movement_cost == 0:
+        return {
+            'encounter_map': encounter_map.to_dict(include_private=True),
+            'placement': placement.to_dict(),
+            'movement': {
+                'speed': available_speed,
+                'max_squares': max_squares,
+                'moved_squares': 0,
+                'from': {'col': placement.grid_col, 'row': placement.grid_row},
+                'to': {'col': placement.grid_col, 'row': placement.grid_row},
+            },
+            'affected_ids': {
+                'encounter_map_ids': [encounter_map.id],
+                'placement_ids': [placement.id],
+            },
+        }
+
+    from_col = placement.grid_col
+    from_row = placement.grid_row
+    placement.grid_col = grid_col
+    placement.grid_row = grid_row
+
+    if is_encounter_active and target_combatant:
+        target_combatant.setdefault('actions', {})
+        target_combatant['actions']['movement_remaining'] = max(0, available_speed - (movement_cost * 5))
+        encounter_map.encounter_state_json = json.dumps(state)
+
+    event = _record_event(
+        campaign,
+        'encounter_actor_moved',
+        f'{placement.label} moved on "{encounter_map.title}".',
+        {
+            'encounter_map_id': encounter_map.id,
+            'placement_id': placement.id,
+            'actor_type': placement.actor_type,
+            'actor_id': placement.actor_id,
+            'label': placement.label,
+            'from': {'col': from_col, 'row': from_row},
+            'to': {'col': grid_col, 'row': grid_row},
+            'movement_cost': movement_cost,
+            'movement_remaining': (
+                target_combatant.get('actions', {}).get('movement_remaining')
+                if isinstance(target_combatant, dict)
+                else None
+            ),
+        },
+        visibility='party_known',
+    )
+    db.session.commit()
+
+    return {
+        'encounter_map': encounter_map.to_dict(include_private=True),
+        'placement': placement.to_dict(),
+        'movement': {
+            'speed': available_speed,
+            'max_squares': max_squares,
+            'moved_squares': movement_cost,
+            'from': {'col': from_col, 'row': from_row},
+            'to': {'col': grid_col, 'row': grid_row},
+            'movement_remaining': (
+                target_combatant.get('actions', {}).get('movement_remaining')
+                if isinstance(target_combatant, dict)
+                else None
+            ),
+        },
+        'affected_ids': {
+            'encounter_map_ids': [encounter_map.id],
+            'placement_ids': [placement.id],
             'world_event_ids': [event.id],
         },
     }
@@ -1998,6 +2266,7 @@ TOOL_HANDLERS = {
     'generate_loot_box': _tool_generate_loot_box,
     'create_encounter_map': _tool_create_encounter_map,
     'place_encounter_map_actors': _tool_place_encounter_map_actors,
+    'move_encounter_actor': _tool_move_encounter_actor,
     'toggle_encounter_mode': _tool_toggle_encounter_mode,
     'next_combat_turn': _tool_next_combat_turn,
     'set_combat_turn': _tool_set_combat_turn,
@@ -2031,6 +2300,7 @@ def execute_dm_tool(campaign, session, current_user, name, args, audit_context=N
             'generate_loot_box',
             'create_encounter_map',
             'place_encounter_map_actors',
+            'move_encounter_actor',
             'toggle_encounter_mode',
             'next_combat_turn',
             'set_combat_turn',

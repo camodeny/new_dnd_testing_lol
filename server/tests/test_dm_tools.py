@@ -138,6 +138,7 @@ class DmToolsTest(unittest.TestCase):
         self.assertIn('advance_clock', names)
         self.assertIn('create_encounter_map', names)
         self.assertIn('place_encounter_map_actors', names)
+        self.assertIn('move_encounter_actor', names)
         self.assertIn('create_shop_list', names)
         self.assertNotIn('create_shop_menu', names)
         for tool in DM_TOOL_DEFINITIONS:
@@ -247,6 +248,184 @@ class DmToolsTest(unittest.TestCase):
         state = result['encounter_map']['encounter_state']
         self.assertTrue(state['active'])
         self.assertEqual(len(state['turn_order']), 2)
+
+    def test_move_encounter_actor_uses_pathfinding_and_consumes_movement(self):
+        self.campaign.settings = json.dumps({'encounter_active': True})
+        monster = CampaignMonster(
+            campaign_id=self.campaign.id,
+            monster_id='goblin_1',
+            name='Goblin',
+            stat_block=json.dumps({'speed': 30}),
+        )
+        encounter_map = EncounterMap(
+            campaign_id=self.campaign.id,
+            session_id=self.session.id,
+            title='Mud Hall',
+            prompt='A muddy hall.',
+            image_filename='map.png',
+            model='gpt-image-2',
+            size='1024x1024',
+            quality='high',
+            grid_json=json.dumps({'columns': 7, 'rows': 3}),
+            vtt_setup_json=json.dumps({
+                'terrain_zones': [{
+                    'label': 'Deep Mud',
+                    'kind': 'difficult',
+                    'shape_type': 'rect',
+                    'rect': {'col': 2, 'row': 0, 'width': 1, 'height': 3},
+                    'polygon': [],
+                    'description': 'Sticky ground.',
+                    'confidence': 0.9,
+                }],
+                'obstacles': [],
+            }),
+            setup_status='ready',
+        )
+        db.session.add_all([monster, encounter_map])
+        db.session.flush()
+        placement = EncounterMapPlacement(
+            encounter_map_id=encounter_map.id,
+            actor_type='monster',
+            actor_id='goblin_1',
+            label='Goblin',
+            grid_col=1,
+            grid_row=1,
+        )
+        db.session.add(placement)
+        db.session.flush()
+        encounter_map.encounter_state_json = json.dumps({
+            'active': True,
+            'round': 1,
+            'active_turn_index': 0,
+            'turn_order': [{
+                'placement_id': placement.id,
+                'actor_type': 'monster',
+                'actor_id': 'goblin_1',
+                'label': 'Goblin',
+                'initiative': 12,
+                'initiative_bonus': 2,
+                'speed': 30,
+                'actions': {
+                    'action': True,
+                    'bonus_action': True,
+                    'reaction': True,
+                    'movement_remaining': 30,
+                },
+            }],
+        })
+        db.session.commit()
+
+        result = execute_dm_tool(
+            self.campaign,
+            self.session,
+            self.user,
+            'move_encounter_actor',
+            {'actor_type': 'monster', 'actor_id': 'goblin_1', 'col': 3, 'row': 1},
+        )
+
+        self.assertNotIn('error', result)
+        self.assertEqual(result['movement']['moved_squares'], 3)
+        self.assertEqual(result['movement']['movement_remaining'], 15)
+        moved = db.session.get(EncounterMapPlacement, placement.id)
+        self.assertEqual((moved.grid_col, moved.grid_row), (3, 1))
+        updated_state = json.loads(db.session.get(EncounterMap, encounter_map.id).encounter_state_json)
+        self.assertEqual(updated_state['turn_order'][0]['actions']['movement_remaining'], 15)
+
+    def test_move_encounter_actor_requires_active_turn_by_default(self):
+        self.campaign.settings = json.dumps({'encounter_active': True})
+        goblin = CampaignMonster(
+            campaign_id=self.campaign.id,
+            monster_id='goblin_1',
+            name='Goblin',
+            stat_block=json.dumps({'speed': 30}),
+        )
+        wolf = CampaignMonster(
+            campaign_id=self.campaign.id,
+            monster_id='wolf_1',
+            name='Wolf',
+            stat_block=json.dumps({'speed': 40}),
+        )
+        encounter_map = EncounterMap(
+            campaign_id=self.campaign.id,
+            session_id=self.session.id,
+            title='Turn Order Test',
+            prompt='A narrow room.',
+            image_filename='map.png',
+            model='gpt-image-2',
+            size='1024x1024',
+            quality='high',
+            grid_json=json.dumps({'columns': 6, 'rows': 4}),
+            vtt_setup_json=json.dumps({'terrain_zones': [], 'obstacles': []}),
+            setup_status='ready',
+        )
+        db.session.add_all([goblin, wolf, encounter_map])
+        db.session.flush()
+        goblin_placement = EncounterMapPlacement(
+            encounter_map_id=encounter_map.id,
+            actor_type='monster',
+            actor_id='goblin_1',
+            label='Goblin',
+            grid_col=1,
+            grid_row=1,
+        )
+        wolf_placement = EncounterMapPlacement(
+            encounter_map_id=encounter_map.id,
+            actor_type='monster',
+            actor_id='wolf_1',
+            label='Wolf',
+            grid_col=2,
+            grid_row=1,
+        )
+        db.session.add_all([goblin_placement, wolf_placement])
+        db.session.flush()
+        encounter_map.encounter_state_json = json.dumps({
+            'active': True,
+            'round': 1,
+            'active_turn_index': 0,
+            'turn_order': [
+                {
+                    'placement_id': goblin_placement.id,
+                    'actor_type': 'monster',
+                    'actor_id': 'goblin_1',
+                    'label': 'Goblin',
+                    'initiative': 15,
+                    'initiative_bonus': 2,
+                    'speed': 30,
+                    'actions': {'action': True, 'bonus_action': True, 'reaction': True, 'movement_remaining': 30},
+                },
+                {
+                    'placement_id': wolf_placement.id,
+                    'actor_type': 'monster',
+                    'actor_id': 'wolf_1',
+                    'label': 'Wolf',
+                    'initiative': 10,
+                    'initiative_bonus': 2,
+                    'speed': 40,
+                    'actions': {'action': True, 'bonus_action': True, 'reaction': True, 'movement_remaining': 40},
+                },
+            ],
+        })
+        db.session.commit()
+
+        blocked = execute_dm_tool(
+            self.campaign,
+            self.session,
+            self.user,
+            'move_encounter_actor',
+            {'actor_type': 'monster', 'actor_id': 'wolf_1', 'col': 3, 'row': 1},
+        )
+        self.assertIn('error', blocked)
+        self.assertIn("not Wolf's turn", blocked['error'])
+
+        allowed = execute_dm_tool(
+            self.campaign,
+            self.session,
+            self.user,
+            'move_encounter_actor',
+            {'actor_type': 'monster', 'actor_id': 'wolf_1', 'col': 3, 'row': 1, 'ignore_turn_order': True},
+        )
+        self.assertNotIn('error', allowed)
+        self.assertEqual(allowed['placement']['col'], 3)
 
     def test_ai_dm_tool_rejects_out_of_bounds_map_placements(self):
         encounter_map = EncounterMap(
@@ -2553,6 +2732,7 @@ class DmToolsTest(unittest.TestCase):
         exclude_names = {
             'create_encounter_map',
             'place_encounter_map_actors',
+            'move_encounter_actor',
             'next_combat_turn',
             'set_combat_turn',
             'update_combatant_actions',
