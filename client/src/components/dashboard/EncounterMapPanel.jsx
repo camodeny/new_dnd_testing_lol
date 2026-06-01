@@ -147,8 +147,8 @@ export default function EncounterMapPanel({
   currentUser,
   currentCharacter,
   onEncounterMapChange,
-  isMapExpanded,
-  setIsMapExpanded,
+  mapViewMode,
+  setMapViewMode,
   onSendMessage,
 }) {
   const [imageState, setImageState] = useState({ mapId: null, url: '', error: '' })
@@ -156,7 +156,7 @@ export default function EncounterMapPanel({
   const tokenLayerRef = useRef(null)
   
   // UX UI states
-  const isCollapsed = !isMapExpanded
+  const isCollapsed = mapViewMode === 'collapsed'
   const [showGridLines, setShowGridLines] = useState(true)
   const [isRosterOpen, setIsRosterOpen] = useState(true)
   const [showLabeledImage, setShowLabeledImage] = useState(false)
@@ -171,9 +171,6 @@ export default function EncounterMapPanel({
   const [movementMessage, setMovementMessage] = useState('')
   const [isMovingToken, setIsMovingToken] = useState(false)
   const [manualInitValues, setManualInitValues] = useState({})
-  const [isNarrativeCollapsed, setIsNarrativeCollapsed] = useState(() => {
-    return localStorage.getItem('encounter_narrative_collapsed') === 'true'
-  })
 
   // Adjust state when map ID changes (during render phase to avoid effect cascades)
   const currentMapId = encounterMap?.id || null
@@ -187,7 +184,6 @@ export default function EncounterMapPanel({
     setMovementMessage('')
     setIsMovingToken(false)
     setManualInitValues({})
-    setIsNarrativeCollapsed(false)
     if (isCollapsed) {
       setHasNotification(true)
     }
@@ -407,21 +403,12 @@ export default function EncounterMapPanel({
   }, [displayPlacements])
 
   // Sync state changes with localStorage
-  const handleToggleCollapse = () => {
-    setIsMapExpanded((prev) => {
-      const next = !prev
-      localStorage.setItem('encounter_map_collapsed', String(!next))
-      if (next) {
-        setHasNotification(false) // clear notification once expanded
-      }
-      return next
-    })
-  }
-
-  const handleExpand = () => {
-    setIsMapExpanded(true)
-    localStorage.setItem('encounter_map_collapsed', 'false')
-    setHasNotification(false)
+  const updateMapViewMode = (newMode) => {
+    setMapViewMode(newMode)
+    localStorage.setItem('encounter_map_view_mode', newMode)
+    if (newMode !== 'collapsed') {
+      setHasNotification(false)
+    }
   }
 
   const handleImageLoad = (e) => {
@@ -627,38 +614,202 @@ export default function EncounterMapPanel({
 
   // --- COLLAPSED VIEW RENDER ---
   if (isCollapsed) {
+    return null
+  }
+
+  // --- SEMI-COLLAPSED (SPLIT) VIEW RENDER ---
+  if (mapViewMode === 'semi') {
     return (
-      <section className={`encounter-map-panel collapsed ${hasNotification ? 'has-notification' : ''}`} aria-label="Encounter map header">
-        <div className="encounter-map-collapsed-bar" onClick={handleExpand}>
-          <div className="encounter-map-collapsed-info">
-            <div className="encounter-map-kicker">
-              <i className="bi bi-map-fill"></i>
-              <span>Tactical Map</span>
-            </div>
-            <h2 className="encounter-map-collapsed-title">
-              {encounterMap?.title || 'No active map'}
-            </h2>
-            {encounterMap && placements.length > 0 && (
-              <span className="encounter-map-status-badge">
-                ⚔️ {placements.length} Combatant{placements.length !== 1 ? 's' : ''} Active
-              </span>
-            )}
-          </div>
-          <div className="encounter-map-collapsed-actions" onClick={(e) => e.stopPropagation()}>
+      <section className="encounter-map-panel semi" aria-label="Encounter map split view">
+        <div className={`encounter-map-stage ${!encounterMap ? 'empty' : ''}`}>
+          {/* Floating Controls Toolbar */}
+          <div className="encounter-map-floating-toolbar" style={{
+            position: 'absolute',
+            top: '12px',
+            right: '12px',
+            zIndex: 10,
+            display: 'flex',
+            gap: '6px',
+            background: 'rgba(10, 11, 15, 0.75)',
+            backdropFilter: 'blur(8px)',
+            padding: '6px 8px',
+            borderRadius: 'var(--radius-sm)',
+            border: '1px solid rgba(255,255,255,0.12)'
+          }}>
             {encounterMap && (
               <button
                 className={`btn-icon-map ${showGridLines ? 'active' : ''}`}
                 onClick={() => setShowGridLines(!showGridLines)}
-                title="Toggle Grid Lines"
-                aria-label="Toggle grid lines"
+                title="Toggle Grid Overlay"
+                aria-label="Toggle grid overlay"
               >
                 <i className="bi bi-grid-3x3"></i>
               </button>
             )}
-            <button className="btn btn-primary btn-sm btn-map-expand" onClick={handleExpand}>
-              <i className="bi bi-arrows-angle-expand"></i> View Map
+            <button
+              className={`btn-icon-map ${mapViewMode === 'collapsed' ? 'active' : ''}`}
+              onClick={() => updateMapViewMode('collapsed')}
+              title="Minimize Map"
+              aria-label="Minimize map"
+            >
+              <i className="bi bi-chevron-bar-up"></i>
+            </button>
+            <button
+              className={`btn-icon-map ${mapViewMode === 'semi' ? 'active' : ''}`}
+              onClick={() => updateMapViewMode('semi')}
+              title="Split View"
+              aria-label="Split view"
+            >
+              <i className="bi bi-layout-split"></i>
+            </button>
+            <button
+              className={`btn-icon-map ${mapViewMode === 'fullscreen' ? 'active' : ''}`}
+              onClick={() => updateMapViewMode('fullscreen')}
+              title="Full Screen VTT"
+              aria-label="Full screen VTT"
+            >
+              <i className="bi bi-arrows-fullscreen"></i>
             </button>
           </div>
+
+          {loading ? (
+            <div className="encounter-map-placeholder">
+              <i className="bi bi-hourglass-split"></i>
+              <span>Loading Map State...</span>
+            </div>
+          ) : encounterMap && imageUrl ? (
+            <div className="encounter-map-images" style={{ padding: '32px 18px 18px 18px' }}>
+              <figure className="encounter-map-frame">
+                <div
+                  className="encounter-map-board"
+                  style={{
+                    aspectRatio: aspectRatio ? `${aspectRatio}` : 'auto'
+                  }}
+                >
+                  <img
+                    src={imageUrl}
+                    alt={encounterMap.title || 'Encounter map'}
+                    className="encounter-map-image"
+                    onLoad={handleImageLoad}
+                  />
+                  
+                  {canOverlayPlacements && (
+                    <div
+                      className="encounter-map-grid-overlay"
+                      style={{
+                        '--grid-cols': columns,
+                        '--grid-rows': rows,
+                        display: showGridLines ? 'block' : 'none',
+                        ...gridLayout,
+                      }}
+                    />
+                  )}
+
+                  {canOverlayPlacements && (
+                    <div
+                      ref={tokenLayerRef}
+                      className="encounter-map-token-layer"
+                      aria-label="Placed combatants"
+                      style={gridLayout}
+                    >
+                      {canMovePlayerToken && dragState && reachableMovementCells.map((cell) => {
+                        const isOrigin = cell.col === playerPlacement.col && cell.row === playerPlacement.row
+                        const isSelected = dragState?.col === cell.col && dragState?.row === cell.row
+                        return (
+                          <div
+                            key={`${cell.col},${cell.row}`}
+                            className={`encounter-map-move-cell ${cell.isDifficult ? 'difficult' : ''} ${isOrigin ? 'origin' : ''} ${isSelected ? 'selected' : ''}`}
+                            style={{
+                              left: `${(cell.col / columns) * 100}%`,
+                              top: `${(cell.row / rows) * 100}%`,
+                              width: `${100 / columns}%`,
+                              height: `${100 / rows}%`,
+                            }}
+                          />
+                        )
+                      })}
+                      {displayPlacements.map((placement) => {
+                        const isHighlighted = activeHoverId === placement.id
+                        const isDraggable = canDragPlacement(placement)
+                        const isDragging = dragState?.placementId === placement.id
+                        const isActiveTurn = isEncounterActive && 
+                          encounterState?.active_turn_index !== null &&
+                          encounterState?.active_turn_index !== undefined &&
+                          encounterState?.turn_order?.[encounterState.active_turn_index]?.placement_id === placement.id
+
+                        return (
+                          <div
+                            key={placement.id}
+                            className={`encounter-map-token ${placement.actor_type} ${isHighlighted ? 'highlighted' : ''} ${isDraggable ? 'draggable' : ''} ${isDragging ? 'dragging' : ''} ${isActiveTurn ? 'active-turn' : ''}`}
+                            style={{
+                              left: `${((placement.col + 0.5) / columns) * 100}%`,
+                              top: `${((placement.row + 0.5) / rows) * 100}%`,
+                              width: `calc(0.8 * min(100cqw / ${columns}, 100cqh / ${rows}))`,
+                              height: `calc(0.8 * min(100cqw / ${columns}, 100cqh / ${rows}))`,
+                              aspectRatio: '1',
+                            }}
+                            onPointerDown={(event) => handleTokenPointerDown(event, placement)}
+                            onPointerMove={handleTokenPointerMove}
+                            onPointerUp={handleTokenPointerUp}
+                            onPointerCancel={handleTokenPointerCancel}
+                            onMouseEnter={() => setActiveHoverId(placement.id)}
+                            onMouseLeave={() => setActiveHoverId(null)}
+                          >
+                            <span className="token-initials">
+                              {placement.label?.slice(0, 2).toUpperCase() || '?'}
+                            </span>
+                            
+                            <div className="encounter-token-tooltip">
+                              <span className="tooltip-name">{placement.label}</span>
+                              <span className="tooltip-coord">
+                                Coordinate: {getGridCoordinate(placement.col, placement.row)}
+                              </span>
+                              {isDraggable && (
+                                <span className="tooltip-coord">
+                                  Move: {dragState?.placementId === placement.id ? dragState.cost : 0}/{movementSquares} sq
+                                </span>
+                              )}
+                              <span className="tooltip-alliance">{placement.actor_type}</span>
+                            </div>
+                          </div>
+                        )
+                      })}
+                    </div>
+                  )}
+                  {canMovePlayerToken && (
+                    <div className={`encounter-map-movement-hud ${moveError ? 'has-error' : ''}`}>
+                      <i className={isMovingToken ? 'bi bi-arrow-repeat' : 'bi bi-arrows-move'}></i>
+                      <span>
+                        {dragState
+                          ? `${dragState.cost}/${dragState.maxSquares} sq`
+                          : isMovingToken
+                            ? 'Saving move...'
+                            : `Move ${movementSquares} sq`}
+                      </span>
+                      {(moveError || movementMessage) && (
+                        <small>{moveError || movementMessage}</small>
+                      )}
+                    </div>
+                  )}
+                </div>
+              </figure>
+            </div>
+          ) : encounterMap && imageError ? (
+            <div className="encounter-map-placeholder">
+              <i className="bi bi-exclamation-triangle-fill"></i>
+              <span>{imageError}</span>
+            </div>
+          ) : encounterMap ? (
+            <div className="encounter-map-placeholder">
+              <i className="bi bi-image"></i>
+              <span>Downloading map visual...</span>
+            </div>
+          ) : (
+            <div className="encounter-map-placeholder">
+              <i className="bi bi-map"></i>
+              <span>The AI Dungeon Master will generate a tactical map when positioning matters.</span>
+            </div>
+          )}
         </div>
       </section>
     )
@@ -698,9 +849,33 @@ export default function EncounterMapPanel({
               )}
             </>
           )}
-          <button className="btn btn-secondary btn-sm btn-map-collapse" onClick={handleToggleCollapse}>
-            <i className="bi bi-arrows-angle-contract"></i> Collapse Map
-          </button>
+
+          <div className="map-view-mode-selector btn-group" style={{ display: 'inline-flex', gap: '2px', background: 'rgba(0,0,0,0.2)', padding: '2px', borderRadius: 'var(--radius-sm)' }}>
+            <button
+              className={`btn-icon-map ${mapViewMode === 'collapsed' ? 'active' : ''}`}
+              onClick={() => updateMapViewMode('collapsed')}
+              title="Minimize Map"
+              aria-label="Minimize map"
+            >
+              <i className="bi bi-chevron-bar-up"></i>
+            </button>
+            <button
+              className={`btn-icon-map ${mapViewMode === 'semi' ? 'active' : ''}`}
+              onClick={() => updateMapViewMode('semi')}
+              title="Split View"
+              aria-label="Split view"
+            >
+              <i className="bi bi-layout-split"></i>
+            </button>
+            <button
+              className={`btn-icon-map ${mapViewMode === 'fullscreen' ? 'active' : ''}`}
+              onClick={() => updateMapViewMode('fullscreen')}
+              title="Full Screen VTT"
+              aria-label="Full screen VTT"
+            >
+              <i className="bi bi-arrows-fullscreen"></i>
+            </button>
+          </div>
         </div>
       </div>
 
@@ -899,6 +1074,9 @@ export default function EncounterMapPanel({
                           style={{
                             left: `${((placement.col + 0.5) / columns) * 100}%`,
                             top: `${((placement.row + 0.5) / rows) * 100}%`,
+                            width: `calc(0.8 * min(100cqw / ${columns}, 100cqh / ${rows}))`,
+                            height: `calc(0.8 * min(100cqw / ${columns}, 100cqh / ${rows}))`,
+                            aspectRatio: '1',
                           }}
                           onPointerDown={(event) => handleTokenPointerDown(event, placement)}
                           onPointerMove={handleTokenPointerMove}
@@ -1000,34 +1178,10 @@ export default function EncounterMapPanel({
           </div>
         )}
 
-        {/* Narrative & Diagnostics HUD Overlays (floating bottom-left) */}
-        {(encounterMap?.vtt_setup?.map_summary || (isOwner && encounterMap)) && (
+        {/* Diagnostics HUD Overlays (floating bottom-left) */}
+        {isOwner && encounterMap && (
           <div className="encounter-vtt-overlays-bottom-left">
-            {encounterMap?.vtt_setup?.map_summary && (
-              <div className={`encounter-narrative ${isNarrativeCollapsed ? 'collapsed' : 'expanded'}`}>
-                <div 
-                  className="encounter-narrative-header"
-                  onClick={() => {
-                    const nextVal = !isNarrativeCollapsed
-                    setIsNarrativeCollapsed(nextVal)
-                    localStorage.setItem('encounter_narrative_collapsed', String(nextVal))
-                  }}
-                  title={isNarrativeCollapsed ? "Expand Narrative" : "Collapse Narrative"}
-                >
-                  <div className="narrative-header-left">
-                    <i className="bi bi-blockquote-left narrative-icon"></i>
-                    <span className="narrative-header-title">Narrative</span>
-                  </div>
-                  <i className={`bi bi-chevron-${isNarrativeCollapsed ? 'up' : 'down'} narrative-chevron`}></i>
-                </div>
-                {!isNarrativeCollapsed && (
-                  <p className="encounter-map-summary">{encounterMap.vtt_setup.map_summary}</p>
-                )}
-              </div>
-            )}
-
-            {isOwner && encounterMap && (
-              <details className="encounter-calibration-details">
+            <details className="encounter-calibration-details">
                 <summary>
                   <i className="bi bi-sliders"></i> System Calibration & Grid Diagnostics
                 </summary>
@@ -1083,8 +1237,7 @@ export default function EncounterMapPanel({
                   )}
                 </div>
               </details>
-            )}
-          </div>
+            </div>
         )}
       </div>
     </section>

@@ -231,9 +231,24 @@ export default function CampaignViewPage({ user }) {
   const [encounterMap, setEncounterMap] = useState(null)
   const [encounterMapLoading, setEncounterMapLoading] = useState(false)
   const [showProposalPopup, setShowProposalPopup] = useState(false)
-  const [isMapExpanded, setIsMapExpanded] = useState(() => {
-    return localStorage.getItem('encounter_map_collapsed') === 'false'
+  const [mapViewMode, setMapViewMode] = useState(() => {
+    const saved = localStorage.getItem('encounter_map_view_mode')
+    if (saved === 'collapsed' || saved === 'semi' || saved === 'fullscreen') return saved
+    const oldCollapsed = localStorage.getItem('encounter_map_collapsed')
+    if (oldCollapsed === 'false') return 'fullscreen'
+    return 'collapsed'
   })
+
+  const cycleMapViewMode = () => {
+    setMapViewMode((prev) => {
+      let next
+      if (prev === 'collapsed') next = 'semi'
+      else if (prev === 'semi') next = 'fullscreen'
+      else next = 'collapsed'
+      localStorage.setItem('encounter_map_view_mode', next)
+      return next
+    })
+  }
   const isEncounterActive = useMemo(() => {
     if (campaign?.settings?.encounter_active) return true
     if (!encounterMap) return false
@@ -254,8 +269,11 @@ export default function CampaignViewPage({ user }) {
 
   useEffect(() => {
     if (isEncounterActive && hasPlacements) {
-      setIsMapExpanded(true)
-      localStorage.setItem('encounter_map_collapsed', 'false')
+      setMapViewMode((prev) => {
+        if (prev !== 'collapsed') return prev
+        localStorage.setItem('encounter_map_view_mode', 'fullscreen')
+        return 'fullscreen'
+      })
     }
   }, [isEncounterActive, hasPlacements])
 
@@ -851,8 +869,8 @@ export default function CampaignViewPage({ user }) {
   const hasActiveMap = isEncounterActive || Boolean(encounterMap)
 
   return (
-    <div className={`dashboard-page ${isMapExpanded && hasActiveMap ? 'map-expanded' : ''}`}>
-      <div className={`dashboard-layout mobile-tab-${activeTab} ${isMapExpanded && hasActiveMap ? 'map-expanded' : ''}`}>
+    <div className={`dashboard-page ${mapViewMode === 'fullscreen' && hasActiveMap ? 'map-fullscreen' : mapViewMode === 'semi' && hasActiveMap ? 'map-semi' : ''}`}>
+      <div className={`dashboard-layout mobile-tab-${activeTab} ${mapViewMode === 'fullscreen' && hasActiveMap ? 'map-fullscreen' : mapViewMode === 'semi' && hasActiveMap ? 'map-semi' : ''}`}>
         <aside className="dashboard-left">
           <div className="campaign-logo-header">
             <div className="campaign-logo">
@@ -907,7 +925,7 @@ export default function CampaignViewPage({ user }) {
           </div>
         </aside>
 
-        <main className={`dashboard-center ${isMapExpanded && hasActiveMap ? 'map-expanded' : ''}`}>
+        <main className={`dashboard-center ${mapViewMode === 'fullscreen' && hasActiveMap ? 'map-fullscreen' : mapViewMode === 'semi' && hasActiveMap ? 'map-semi' : ''}`}>
           <div className="dashboard-top-header">
             <div className="session-progress-indicator">
               <span className="pulse-dot"></span>
@@ -922,8 +940,8 @@ export default function CampaignViewPage({ user }) {
             </div>
 
             <div className="header-actions">
-              <button className="header-icon-btn" onClick={() => setIsMapExpanded(!isMapExpanded)} title="Toggle Map View">
-                <i className="bi bi-map"></i>
+              <button className="header-icon-btn" onClick={cycleMapViewMode} title={`Toggle Map View (Current: ${mapViewMode})`}>
+                <i className={`bi bi-${mapViewMode === 'collapsed' ? 'map' : mapViewMode === 'semi' ? 'layout-split' : 'fullscreen'}`}></i>
               </button>
               {session ? (
                 <button className="btn btn-primary end-session-btn" onClick={handleEndSession}>End Session</button>
@@ -933,7 +951,7 @@ export default function CampaignViewPage({ user }) {
             </div>
           </div>
 
-          <div style={{ flex: 1, display: 'flex', flexDirection: 'column', minHeight: 0, overflow: 'hidden', position: 'relative' }}>
+          <div style={{ flex: 1, display: 'flex', flexDirection: (mapViewMode === 'fullscreen' && hasActiveMap) ? 'row' : 'column', minHeight: 0, overflow: 'hidden', position: 'relative' }}>
             {hasActiveMap && (
               <EncounterMapPanel
                 encounterMap={encounterMap}
@@ -942,8 +960,8 @@ export default function CampaignViewPage({ user }) {
                 currentUser={user}
                 currentCharacter={currentCharacter}
                 onEncounterMapChange={setEncounterMap}
-                isMapExpanded={isMapExpanded}
-                setIsMapExpanded={setIsMapExpanded}
+                mapViewMode={mapViewMode}
+                setMapViewMode={setMapViewMode}
                 onSendMessage={handleSendMessage}
               />
             )}
