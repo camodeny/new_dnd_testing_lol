@@ -101,6 +101,12 @@ def _trace_match(trace_id):
     return SESSION_DM_TRACE_RE.search(str(trace_id or ''))
 
 
+def _message_id_from_player_input(event):
+    payload = _payload(event)
+    message = payload.get('message') if isinstance(payload.get('message'), dict) else {}
+    return message.get('id') or payload.get('player_message_id')
+
+
 def _extract_tool_names(events):
     names = []
     for event in events:
@@ -154,7 +160,7 @@ def _extract_player_input(events):
         payload = _payload(event)
         message = payload.get('message') if isinstance(payload.get('message'), dict) else {}
         return {
-            'message_id': message.get('id') or payload.get('player_message_id'),
+            'message_id': _message_id_from_player_input(event),
             'role': message.get('role'),
             'content': message.get('content') or '',
             'username': message.get('username'),
@@ -222,6 +228,7 @@ def dm_turn_traces_from_audit_events(audit_events, limit=50):
     )
     by_trace = defaultdict(list)
     children_by_parent = defaultdict(list)
+    player_inputs_by_message_id = {}
 
     for entry in entries:
         trace_id = entry.get('trace_id')
@@ -230,6 +237,10 @@ def dm_turn_traces_from_audit_events(audit_events, limit=50):
         parent_trace_id = entry.get('parent_trace_id')
         if trace_id and parent_trace_id and trace_id != parent_trace_id:
             children_by_parent[parent_trace_id].append(trace_id)
+        if entry.get('event_type') == 'player_input_stored':
+            message_id = _message_id_from_player_input(entry)
+            if message_id is not None:
+                player_inputs_by_message_id[int(message_id)] = entry
 
     root_trace_ids = []
     for trace_id in by_trace:
@@ -246,6 +257,9 @@ def dm_turn_traces_from_audit_events(audit_events, limit=50):
         match = _trace_match(trace_id)
         child_trace_ids = _descendant_trace_ids(trace_id, children_by_parent)
         trace_events = []
+        player_message_id = int(match.group('message_id')) if match and match.group('message_id') else None
+        if player_message_id in player_inputs_by_message_id:
+            trace_events.append(player_inputs_by_message_id[player_message_id])
         for related_id in [trace_id, *child_trace_ids]:
             trace_events.extend(by_trace.get(related_id, []))
         trace_events.sort(key=lambda event: (event.get('id') or 0))
@@ -264,7 +278,7 @@ def dm_turn_traces_from_audit_events(audit_events, limit=50):
             'trace_id': trace_id,
             'trace_label': trace_events[0].get('trace_label') or trace_id,
             'session_id': int(match.group('session_id')) if match and match.group('session_id') else None,
-            'player_message_id': int(match.group('message_id')) if match and match.group('message_id') else None,
+            'player_message_id': player_message_id,
             'turn_kind': match.group('kind') if match else 'unknown',
             'started_at': trace_events[0].get('created_at'),
             'ended_at': trace_events[-1].get('created_at'),
