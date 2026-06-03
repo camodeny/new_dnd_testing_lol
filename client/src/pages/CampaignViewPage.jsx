@@ -281,7 +281,7 @@ export default function CampaignViewPage({ user }) {
     ])
     setSheetProposals(propData.sheet_proposals || [])
     setEncounterMap(mapData.encounter_map || null)
-  }, [handleStartSession, id])
+  }, [id])
 
   const handleStartSession = useCallback(async () => {
     try {
@@ -438,7 +438,7 @@ export default function CampaignViewPage({ user }) {
     return () => {
       isMounted = false
     }
-  }, [id])
+  }, [handleStartSession, id])
 
   // Background polling for encounter map when a session is active
   useEffect(() => {
