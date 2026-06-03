@@ -502,6 +502,26 @@ export default function CharacterPlanningMode({
     }
   }
 
+  const handleReadySelectedCharacter = async () => {
+    if (!selectedCharacter) return
+    if (blockingPendingBonds.length > 0) {
+      setError('Resolve pending bond proposals before marking ready.')
+      return
+    }
+
+    setImportLoading(true)
+    setError('')
+    try {
+      const readyData = await setPlanningReady(campaign.id, true)
+      setPlanning(readyData.planning)
+      setFlowMode('waiting')
+    } catch (err) {
+      setError(err.message)
+    } finally {
+      setImportLoading(false)
+    }
+  }
+
   const handleSend = async () => {
     const content = input.trim()
     if (!content) return
@@ -896,7 +916,25 @@ export default function CharacterPlanningMode({
           <h2>Choose how you want to join</h2>
           <p>Pick an existing character and wait for the table, or build a new sheet with the DM beside the form.</p>
         </div>
+        {selectedCharacter && !isReady && (
+          <div className="planning-selected-character planning-selected-character-large">
+            <div className="planning-character-avatar" style={{ background: getGradientSeed(selectedCharacter.name) }}>
+              {getInitials(selectedCharacter.name)}
+            </div>
+            <div>
+              <h3>{selectedCharacter.name}</h3>
+              <p>{selectedCharacter.race} - {getClassSummary(selectedCharacter)}</p>
+            </div>
+          </div>
+        )}
         <div className="planning-choice-actions">
+          {selectedCharacter && !isReady && (
+            <button className="planning-choice-card" onClick={handleReadySelectedCharacter} disabled={importLoading || blockingPendingBonds.length > 0}>
+              <i className="bi bi-check2-circle"></i>
+              <span>Use Selected Character</span>
+              <small>Keep the assigned sheet and mark yourself ready.</small>
+            </button>
+          )}
           <button className="planning-choice-card" onClick={openImport}>
             <i className="bi bi-download"></i>
             <span>Use Existing Character</span>

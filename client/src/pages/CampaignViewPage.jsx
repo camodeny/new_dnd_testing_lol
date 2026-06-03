@@ -267,6 +267,34 @@ export default function CampaignViewPage({ user }) {
     return Boolean(encounterMap?.placements && encounterMap.placements.length > 0)
   }, [encounterMap])
 
+  const applyStartedSession = useCallback(async (startedSession) => {
+    setSession(startedSession)
+    setMessages(startedSession.messages || [])
+    setHasOlderMessages(false)
+    setShowLobby(false)
+    setShowPlanning(false)
+    setShowWorldBuilding(false)
+
+    const [propData, mapData] = await Promise.all([
+      getSheetProposals(startedSession.id).catch(() => ({ sheet_proposals: [] })),
+      getCurrentEncounterMap(id).catch(() => ({ encounter_map: null })),
+    ])
+    setSheetProposals(propData.sheet_proposals || [])
+    setEncounterMap(mapData.encounter_map || null)
+  }, [handleStartSession, id])
+
+  const handleStartSession = useCallback(async () => {
+    try {
+      const data = await startSession(id)
+      const newSession = data.session
+      await applyStartedSession(newSession)
+      return newSession
+    } catch (err) {
+      setError(err.message)
+      return null
+    }
+  }, [applyStartedSession, id])
+
   useEffect(() => {
     if (isEncounterActive && hasPlacements) {
       setMapViewMode((prev) => {
@@ -309,6 +337,10 @@ export default function CampaignViewPage({ user }) {
         const planningData = await getCampaignPlanning(id)
         const allReady = Boolean(planningData.planning?.all_ready)
         let needsWorldBuild = false
+        if (allReady && isSandbox) {
+          await handleStartSession()
+          return
+        }
         if (allReady && !isSandbox) {
           const worldData = await getCampaignWorld(id)
           needsWorldBuild = !worldData.world?.approved_at
@@ -326,7 +358,7 @@ export default function CampaignViewPage({ user }) {
     } finally {
       setLoading(false)
     }
-  }, [id])
+  }, [handleStartSession, id])
 
   useEffect(() => {
     let isMounted = true
@@ -369,6 +401,10 @@ export default function CampaignViewPage({ user }) {
             if (!isMounted) return
             const allReady = Boolean(planningData.planning?.all_ready)
             let needsWorldBuild = false
+            if (allReady && isSandbox) {
+              await handleStartSession()
+              return
+            }
             if (allReady && !isSandbox) {
               const worldData = await getCampaignWorld(id)
               if (!isMounted) return
@@ -535,23 +571,7 @@ export default function CampaignViewPage({ user }) {
         eventSource.close()
       }
     }
-  }, [session?.id])
-
-  const handleStartSession = async () => {
-    try {
-      const data = await startSession(id)
-      const newSession = data.session
-      setSession(newSession)
-      setMessages(newSession.messages || [])
-      setHasOlderMessages(false)
-      setShowWorldBuilding(false)
-      const propData = await getSheetProposals(newSession.id).catch(() => ({ sheet_proposals: [] }))
-      setSheetProposals(propData.sheet_proposals || [])
-      return newSession
-    } catch (err) {
-      setError(err.message)
-    }
-  }
+  }, [loadData, session?.id])
 
   const handleEndSession = async () => {
     if (!session) return

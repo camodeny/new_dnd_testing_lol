@@ -11,7 +11,10 @@ from services.campaign_service import (
     get_or_404,
     invite_code_matches,
 )
-from services.dev_combat_sandbox import bootstrap_joined_member_into_combat_sandbox
+from services.dev_combat_sandbox import (
+    bootstrap_joined_member_into_combat_sandbox,
+    is_combat_sandbox_campaign,
+)
 
 members_bp = Blueprint('members', __name__)
 
@@ -115,11 +118,14 @@ def join_campaign(current_user, campaign_id):
 
     member = CampaignMember(campaign_id=campaign_id, user_id=current_user.id, role='player')
     db.session.add(member)
-    db.session.commit()
 
-    bootstrap_joined_member_into_combat_sandbox(campaign, current_user)
-    refreshed_member = CampaignMember.query.filter_by(campaign_id=campaign_id, user_id=current_user.id).first()
-    return jsonify({'member': refreshed_member.to_dict() if refreshed_member else member.to_dict()}), 201
+    if is_combat_sandbox_campaign(campaign):
+        bootstrap_joined_member_into_combat_sandbox(campaign, current_user)
+        refreshed_member = CampaignMember.query.filter_by(campaign_id=campaign_id, user_id=current_user.id).first()
+        return jsonify({'member': refreshed_member.to_dict() if refreshed_member else member.to_dict()}), 201
+
+    db.session.commit()
+    return jsonify({'member': member.to_dict()}), 201
 
 
 @members_bp.route('/api/campaigns/<int:campaign_id>/members/<int:user_id>', methods=['PUT'])

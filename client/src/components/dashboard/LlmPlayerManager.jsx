@@ -9,6 +9,36 @@ function classSummary(character) {
   return `Level ${character.total_level ?? 1}`
 }
 
+async function copyToClipboard(text) {
+  if (navigator.clipboard && navigator.clipboard.writeText) {
+    try {
+      await navigator.clipboard.writeText(text)
+      return true
+    } catch (err) {
+      // Fall through to fallback
+    }
+  }
+
+  // Fallback using temporary textarea
+  const textArea = document.createElement('textarea')
+  textArea.value = text
+  textArea.style.position = 'fixed'
+  textArea.style.left = '-999999px'
+  textArea.style.top = '-999999px'
+  document.body.appendChild(textArea)
+  textArea.focus()
+  textArea.select()
+
+  try {
+    const successful = document.execCommand('copy')
+    document.body.removeChild(textArea)
+    return successful
+  } catch (err) {
+    document.body.removeChild(textArea)
+    return false
+  }
+}
+
 export default function LlmPlayerManager({ campaignId, enabled, isOwner, onAdded }) {
   const [llmPlayers, setLlmPlayers] = useState([])
   const [availableLlmPlayers, setAvailableLlmPlayers] = useState([])
@@ -19,6 +49,7 @@ export default function LlmPlayerManager({ campaignId, enabled, isOwner, onAdded
   const [deletingId, setDeletingId] = useState(null)
   const [error, setError] = useState('')
   const [latestKey, setLatestKey] = useState('')
+  const [copied, setCopied] = useState(false)
 
   const loadLlmPlayers = async (active = true) => {
     const data = await listLlmPlayers(campaignId)
@@ -68,10 +99,10 @@ export default function LlmPlayerManager({ campaignId, enabled, isOwner, onAdded
       `GET /api/campaigns/${campaignId}`,
       `POST /api/sessions/{sessionId}/messages {"content":"...","role":"player"}`,
     ].join('\n')
-    try {
-      await navigator.clipboard.writeText(text)
-    } catch {
-      // Ignore clipboard failures.
+    const success = await copyToClipboard(text)
+    if (success) {
+      setCopied(true)
+      setTimeout(() => setCopied(false), 2000)
     }
   }
 
@@ -144,7 +175,13 @@ export default function LlmPlayerManager({ campaignId, enabled, isOwner, onAdded
         <div className="llm-manager-keybox">
           <div className="llm-manager-keyline">
             <strong>New API key</strong>
-            <button className="btn btn-secondary small" onClick={handleCopy}>Copy</button>
+            <button className={`btn btn-secondary small ${copied ? 'copied' : ''}`} onClick={handleCopy}>
+              {copied ? (
+                <><i className="bi bi-check-lg"></i> Copied</>
+              ) : (
+                <><i className="bi bi-clipboard"></i> Copy</>
+              )}
+            </button>
           </div>
           <code>{latestKey}</code>
           <p>Pass it as `X-API-Key` or `Authorization: Bearer ...`.</p>

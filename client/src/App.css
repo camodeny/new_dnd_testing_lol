@@ -1115,6 +1115,20 @@ select.input:focus {
   box-shadow: 0 0 10px var(--color-primary-glow);
 }
 
+.lobby-copy-btn.copied {
+  background: var(--color-success) !important;
+  color: white;
+  box-shadow: 0 0 12px var(--color-success-border);
+  transform: scale(1.03);
+}
+
+.btn.copied {
+  background: var(--color-success) !important;
+  border-color: var(--color-success) !important;
+  color: white !important;
+  box-shadow: 0 0 10px var(--color-success-border);
+}
+
 .lobby-invite-hint {
   font-size: 0.75rem;
   color: var(--text-dim);

@@ -36,6 +36,36 @@ function getDifficultyColor(difficulty) {
   return DIFFICULTY_COLORS[key] || '#a78bfa'
 }
 
+async function copyToClipboard(text) {
+  if (navigator.clipboard && navigator.clipboard.writeText) {
+    try {
+      await navigator.clipboard.writeText(text)
+      return true
+    } catch (err) {
+      // Fall through to fallback
+    }
+  }
+
+  // Fallback using temporary textarea
+  const textArea = document.createElement('textarea')
+  textArea.value = text
+  textArea.style.position = 'fixed'
+  textArea.style.left = '-999999px'
+  textArea.style.top = '-999999px'
+  document.body.appendChild(textArea)
+  textArea.focus()
+  textArea.select()
+
+  try {
+    const successful = document.execCommand('copy')
+    document.body.removeChild(textArea)
+    return successful
+  } catch (err) {
+    document.body.removeChild(textArea)
+    return false
+  }
+}
+
 export default function CampaignLobby({
   campaign,
   currentUser,
@@ -103,14 +133,18 @@ export default function CampaignLobby({
     if (!invite) return
     const joinUrl = `${window.location.origin}/join/${campaign.id}?code=${invite.code}`
     const text = `Join my D&D campaign "${campaign.name}"!\nUse invite code: ${invite.code}\nOr click: ${joinUrl}`
-    navigator.clipboard.writeText(text).then(() => {
-      setCopied(true)
-      setTimeout(() => setCopied(false), 2000)
-    }).catch(() => {
-      navigator.clipboard.writeText(invite.code).then(() => {
+    copyToClipboard(text).then((success) => {
+      if (success) {
         setCopied(true)
         setTimeout(() => setCopied(false), 2000)
-      }).catch(() => {})
+      } else {
+        copyToClipboard(invite.code).then((success2) => {
+          if (success2) {
+            setCopied(true)
+            setTimeout(() => setCopied(false), 2000)
+          }
+        })
+      }
     })
   }
 
@@ -301,7 +335,7 @@ export default function CampaignLobby({
                     <div className="lobby-invite-code-row">
                       <code className="lobby-invite-code">{invite.code}</code>
                       <button
-                        className="lobby-copy-btn"
+                        className={`lobby-copy-btn ${copied ? 'copied' : ''}`}
                         onClick={handleCopyInvite}
                       >
                         {copied ? (

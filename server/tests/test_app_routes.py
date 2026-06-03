@@ -1563,6 +1563,62 @@ class AppRouteTest(unittest.TestCase):
             self.assertIsNotNone(combatant)
             self.assertIsInstance(combatant['initiative'], int)
 
+    def test_joining_inactive_combat_sandbox_auto_assigns_character(self):
+        with app.app_context():
+            owner = User(username='sandboxhost2', email='sandboxhost2@example.com')
+            owner.set_password('password')
+            joiner = User(username='sandboxguest2', email='sandboxguest2@example.com')
+            joiner.set_password('password')
+            db.session.add_all([owner, joiner])
+            db.session.commit()
+
+            campaign = Campaign(
+                name='Deferred Sandbox',
+                user_id=owner.id,
+                invite_code='WAIT4IT',
+                settings=json.dumps({'dev_mode': 'combat_sandbox', 'encounter_active': False, 'required_players': 2}),
+            )
+            db.session.add(campaign)
+            db.session.flush()
+
+            db.session.add(CampaignMember(
+                campaign_id=campaign.id,
+                user_id=owner.id,
+                role='player',
+            ))
+            db.session.add(CampaignInvite(
+                campaign_id=campaign.id,
+                code='WAIT4IT',
+                created_by=owner.id,
+                expires_at=datetime.utcnow() + timedelta(days=7),
+                is_used=False,
+            ))
+            db.session.commit()
+
+            joiner_token = generate_token(joiner.id)
+            campaign_id = campaign.id
+
+        response = self.client.post(
+            f'/api/campaigns/{campaign_id}/join',
+            json={'code': 'wait4it'},
+            headers={'Authorization': f'Bearer {joiner_token}'},
+        )
+
+        self.assertEqual(response.status_code, 201)
+        member_data = response.get_json()['member']
+        self.assertIsNotNone(member_data['selected_character_id'])
+        self.assertFalse(member_data['is_character_ready'])
+
+        with app.app_context():
+            joined_member = CampaignMember.query.filter_by(campaign_id=campaign_id, user_id=joiner.id).first()
+            self.assertIsNotNone(joined_member)
+            self.assertIsNotNone(joined_member.selected_character_id)
+            self.assertIsNone(joined_member.character_ready_at)
+            character = db.session.get(Character, joined_member.selected_character_id)
+            self.assertIsNotNone(character)
+            self.assertEqual(character.user_id, joiner.id)
+            self.assertEqual(character.campaign_id, campaign_id)
+
     def test_create_character_normalizes_nested_model_output(self):
         token = self.create_user_token()
 
