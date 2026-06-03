@@ -5,6 +5,7 @@ import Header from './components/layout/Header'
 import HomePage from './pages/HomePage'
 import CampaignViewPage from './pages/CampaignViewPage'
 import CampaignDevPage from './pages/CampaignDevPage'
+import DmTurnTracesPage from './pages/DmTurnTracesPage'
 import CampaignJoinPage from './pages/CampaignJoinPage'
 import CharactersListPage from './pages/CharactersListPage'
 import CharacterCreatePage from './pages/CharacterCreatePage'
@@ -35,6 +36,7 @@ function AppRoutes() {
         <Routes>
           <Route path="/" element={<HomePage user={user} />} />
           <Route path="/campaigns/:id/dev" element={<CampaignDevPage user={user} />} />
+          <Route path="/campaigns/:id/dev/dm-turns" element={<DmTurnTracesPage user={user} />} />
           <Route path="/campaigns/:id" element={<CampaignViewPage user={user} />} />
           <Route path="/join/:id" element={<CampaignJoinPage />} />
           <Route path="/characters" element={<CharactersListPage />} />

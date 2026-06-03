@@ -11,6 +11,7 @@ from models import db
 from routes.campaigns import campaigns_bp
 from routes.characters import characters_bp
 from routes.dev import dev_bp
+from routes.dm_turn_traces import dm_turn_traces_bp
 from routes.encounter_maps import encounter_maps_bp
 from routes.members import members_bp
 from routes.planning import planning_bp
@@ -56,6 +57,7 @@ def create_app():
     app.register_blueprint(campaigns_bp)
     app.register_blueprint(characters_bp)
     app.register_blueprint(dev_bp)
+    app.register_blueprint(dm_turn_traces_bp)
     app.register_blueprint(encounter_maps_bp)
     app.register_blueprint(members_bp)
     app.register_blueprint(planning_bp)
