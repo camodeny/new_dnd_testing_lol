@@ -20,13 +20,32 @@ def build_initial_encounter_state(encounter_map, campaign):
         speed = 30
         
         if placement.actor_type == 'player':
-            character = Character.query.filter_by(campaign_id=campaign.id, user_id=int(placement.actor_id)).first()
+            member = CampaignMember.query.filter_by(
+                campaign_id=campaign.id,
+                user_id=int(placement.actor_id),
+            ).first() if str(placement.actor_id).isdigit() else None
+            character = member.selected_character if member and member.selected_character else None
+            if not character and str(placement.actor_id).isdigit():
+                character = Character.query.filter_by(campaign_id=campaign.id, user_id=int(placement.actor_id)).first()
             if character:
                 init_bonus = int(character.initiative_bonus or 0)
                 max_hp = int(character.max_hp or 10)
                 current_hp = int(character.current_hp or 10)
                 ac = int(character.armor_class or 10)
                 speed = int(character.speed or 30)
+                temp_hp = int(character.temp_hp or 0)
+                conditions = [
+                    {
+                        'name': condition.condition_name,
+                        'source': condition.source or '',
+                        'duration': condition.duration_remaining or '',
+                        'note': condition.description or '',
+                    }
+                    for condition in character.conditions
+                ]
+            else:
+                temp_hp = 0
+                conditions = []
         elif placement.actor_type == 'monster':
             monster = CampaignMonster.query.filter_by(campaign_id=campaign.id, monster_id=placement.actor_id).first()
             if monster:
@@ -41,18 +60,31 @@ def build_initial_encounter_state(encounter_map, campaign):
                 except (TypeError, ValueError):
                     init_bonus = 0
                 max_hp = stat_block.get('max_hp') or stat_block.get('hp') or 10
-                current_hp = max_hp
+                current_hp = stat_block.get('current_hp') or max_hp
                 ac = stat_block.get('armor_class') or stat_block.get('ac') or 10
                 speed = stat_block.get('speed') or 30
+                temp_hp = stat_block.get('temp_hp') or 0
+                conditions = stat_block.get('conditions') if isinstance(stat_block.get('conditions'), list) else []
+            else:
+                temp_hp = 0
+                conditions = []
         elif placement.actor_type == 'npc':
             npc = NPCActor.query.filter_by(campaign_id=campaign.id, actor_id=placement.actor_id).first()
             if npc:
                 dossier = json.loads(npc.dossier) if npc.dossier else {}
                 init_bonus = dossier.get('initiative_bonus') or dossier.get('initiative') or 0
                 max_hp = dossier.get('max_hp') or dossier.get('hp') or 10
-                current_hp = max_hp
+                current_hp = dossier.get('current_hp') or max_hp
                 ac = dossier.get('armor_class') or dossier.get('ac') or 10
                 speed = dossier.get('speed') or 30
+                temp_hp = dossier.get('temp_hp') or 0
+                conditions = dossier.get('conditions') if isinstance(dossier.get('conditions'), list) else []
+            else:
+                temp_hp = 0
+                conditions = []
+        else:
+            temp_hp = 0
+            conditions = []
                 
         initiative_value = None
         if placement.actor_type in ('monster', 'npc'):
@@ -67,8 +99,10 @@ def build_initial_encounter_state(encounter_map, campaign):
             'initiative_bonus': init_bonus,
             'max_hp': max_hp,
             'current_hp': current_hp,
+            'temp_hp': temp_hp,
             'armor_class': ac,
             'speed': speed,
+            'conditions': conditions,
             'actions': {
                 'action': True,
                 'bonus_action': True,
@@ -374,5 +408,4 @@ def next_encounter_turn(current_user, encounter_map_id):
     return jsonify({
         'encounter_map': encounter_map.to_dict(include_private=is_dm)
     }), 200
-
 

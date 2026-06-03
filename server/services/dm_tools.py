@@ -1,4 +1,5 @@
 import json
+import random
 import re
 from datetime import datetime
 
@@ -9,6 +10,7 @@ from models import (
     CampaignMonster,
     CampaignWorld,
     Character,
+    CharacterCondition,
     EncounterMap,
     EncounterMapPlacement,
     NPCActor,
@@ -427,7 +429,11 @@ def build_session_hot_context(campaign, session, current_user):
             'When combat or initiative starts, use toggle_encounter_mode(active=True) to start Encounter Mode. '
             'This will return an instruction prompt. You must then immediately call create_encounter_map to generate '
             'a brand new combat map, and then place_encounter_map_actors to place everyone onto it. Do not re-use old maps. '
-            'During combat, track turns: use next_combat_turn() to advance turns, update_combatant_actions() to deduct actions/movement, and set_combat_turn() to skip/set turns. '
+            'During combat, track turns and state with tools instead of narration guesses: use get_encounter_overview() or get_combatant_state() for compact reads, '
+            'list_reachable_positions() before tactical movement, move_encounter_actor() for terrain-aware movement, next_combat_turn() to advance turns, '
+            'set_combat_turn() to skip or correct turns, update_combatant_actions() to deduct actions/movement, roll_dice() for deterministic DM-side rolls, '
+            'apply_damage(), apply_healing(), grant_temp_hp(), set_combatant_hp(), set_combatant_initiative(), update_combatant_conditions(), and remove_encounter_actor() '
+            'to mutate combat state directly. '
             'When combat_coordinates is present, treat it as the latest exact grid location list for every PC, NPC, and enemy after the latest message. '
             'Do not generate maps for every ordinary scene. '
             + _campaign_loot_mode_policy(campaign)
@@ -822,6 +828,27 @@ DM_TOOL_DEFINITIONS = [
     {
         'type': 'function',
         'function': {
+            'name': 'roll_dice',
+            'description': 'Roll dice deterministically for DM-controlled mechanics such as monster attacks, damage, saves, recharge, or random tables. Supports additive expressions like 1d20+4, 2d6+3, and keep-highest/lowest forms like 2d20kh1.',
+            'parameters': {
+                'type': 'object',
+                'required': ['expression'],
+                'properties': {
+                    'expression': {
+                        'type': 'string',
+                        'description': 'Dice expression such as 1d20+4, 2d10, 4d6kh3, or 1d8+1d6+2.',
+                    },
+                    'reason': {
+                        'type': 'string',
+                        'description': 'Optional short note about why this roll is happening.',
+                    },
+                },
+            },
+        },
+    },
+    {
+        'type': 'function',
+        'function': {
             'name': 'create_encounter_map',
             'description': 'Generate a party-visible gridded D&D battle map for a tactical encounter area, then create structured VTT setup JSON with friendly/enemy spawn boxes, terrain labels, obstacles, and tactical notes. Use this when spatial positioning matters or when players ask for a map.',
             'parameters': {
@@ -957,6 +984,86 @@ DM_TOOL_DEFINITIONS = [
     {
         'type': 'function',
         'function': {
+            'name': 'get_encounter_overview',
+            'description': 'Read the current encounter round, active turn, and compact summaries for every combatant without dumping the full encounter state into the model context.',
+            'parameters': {
+                'type': 'object',
+                'properties': {
+                    'encounter_map_id': {
+                        'type': 'integer',
+                        'description': 'Optional explicit encounter map id. Defaults to the latest campaign encounter map.',
+                    },
+                },
+            },
+        },
+    },
+    {
+        'type': 'function',
+        'function': {
+            'name': 'get_combatant_state',
+            'description': 'Read a compact combat summary for one combatant, including HP, temp HP, conditions, actions, position, and whether it is their turn.',
+            'parameters': {
+                'type': 'object',
+                'properties': {
+                    'encounter_map_id': {
+                        'type': 'integer',
+                        'description': 'Optional explicit encounter map id. Defaults to the latest campaign encounter map.',
+                    },
+                    'placement_id': {
+                        'type': 'integer',
+                        'description': 'Preferred explicit placement id for the combatant.',
+                    },
+                    'actor_type': {
+                        'type': 'string',
+                        'enum': ['player', 'npc', 'monster'],
+                        'description': 'Actor type when placement_id is not provided.',
+                    },
+                    'actor_id': {
+                        'type': 'string',
+                        'description': 'User id or selected character id for players, NPC actor_id, or monster_id when placement_id is not provided.',
+                    },
+                },
+            },
+        },
+    },
+    {
+        'type': 'function',
+        'function': {
+            'name': 'list_reachable_positions',
+            'description': 'Return the legal grid cells a combatant can currently reach with its remaining movement, using map terrain and current movement budget.',
+            'parameters': {
+                'type': 'object',
+                'properties': {
+                    'encounter_map_id': {
+                        'type': 'integer',
+                        'description': 'Optional explicit encounter map id. Defaults to the latest campaign encounter map.',
+                    },
+                    'placement_id': {
+                        'type': 'integer',
+                        'description': 'Preferred explicit placement id for the combatant.',
+                    },
+                    'actor_type': {
+                        'type': 'string',
+                        'enum': ['player', 'npc', 'monster'],
+                        'description': 'Actor type when placement_id is not provided.',
+                    },
+                    'actor_id': {
+                        'type': 'string',
+                        'description': 'User id or selected character id for players, NPC actor_id, or monster_id when placement_id is not provided.',
+                    },
+                    'max_cells': {
+                        'type': 'integer',
+                        'minimum': 1,
+                        'maximum': 500,
+                        'description': 'Maximum number of reachable cells to return.',
+                    },
+                },
+            },
+        },
+    },
+    {
+        'type': 'function',
+        'function': {
             'name': 'toggle_encounter_mode',
             'description': 'Start or stop Encounter Mode (combat tracker). Starting it will return instructions to generate a new map and place actors. Stopping it will archive the current map.',
             'parameters': {
@@ -1035,6 +1142,152 @@ DM_TOOL_DEFINITIONS = [
     {
         'type': 'function',
         'function': {
+            'name': 'set_combatant_hp',
+            'description': 'Set exact HP values for a combatant and sync them to persistent state. Use this for corrections, imported results, or explicit overwrites.',
+            'parameters': {
+                'type': 'object',
+                'properties': {
+                    'encounter_map_id': {'type': 'integer'},
+                    'placement_id': {'type': 'integer'},
+                    'actor_type': {'type': 'string', 'enum': ['player', 'npc', 'monster']},
+                    'actor_id': {'type': 'string'},
+                    'max_hp': {'type': 'integer', 'minimum': 0},
+                    'current_hp': {'type': 'integer', 'minimum': 0},
+                    'temp_hp': {'type': 'integer', 'minimum': 0},
+                },
+            },
+        },
+    },
+    {
+        'type': 'function',
+        'function': {
+            'name': 'apply_damage',
+            'description': 'Apply damage to a combatant deterministically, consuming temp HP first by default and syncing the updated HP to persistent state.',
+            'parameters': {
+                'type': 'object',
+                'required': ['amount'],
+                'properties': {
+                    'encounter_map_id': {'type': 'integer'},
+                    'placement_id': {'type': 'integer'},
+                    'actor_type': {'type': 'string', 'enum': ['player', 'npc', 'monster']},
+                    'actor_id': {'type': 'string'},
+                    'amount': {'type': 'integer', 'minimum': 0},
+                    'damage_type': {'type': 'string'},
+                    'ignore_temp_hp': {'type': 'boolean', 'default': False},
+                },
+            },
+        },
+    },
+    {
+        'type': 'function',
+        'function': {
+            'name': 'apply_healing',
+            'description': 'Apply healing to a combatant deterministically, capping at max HP and syncing the updated HP to persistent state.',
+            'parameters': {
+                'type': 'object',
+                'required': ['amount'],
+                'properties': {
+                    'encounter_map_id': {'type': 'integer'},
+                    'placement_id': {'type': 'integer'},
+                    'actor_type': {'type': 'string', 'enum': ['player', 'npc', 'monster']},
+                    'actor_id': {'type': 'string'},
+                    'amount': {'type': 'integer', 'minimum': 0},
+                },
+            },
+        },
+    },
+    {
+        'type': 'function',
+        'function': {
+            'name': 'grant_temp_hp',
+            'description': 'Grant or adjust temporary HP for a combatant. Use mode=max for normal 5e temp-HP replacement, replace for hard set, or add for exceptional stacking cases.',
+            'parameters': {
+                'type': 'object',
+                'required': ['amount'],
+                'properties': {
+                    'encounter_map_id': {'type': 'integer'},
+                    'placement_id': {'type': 'integer'},
+                    'actor_type': {'type': 'string', 'enum': ['player', 'npc', 'monster']},
+                    'actor_id': {'type': 'string'},
+                    'amount': {'type': 'integer', 'minimum': 0},
+                    'mode': {'type': 'string', 'enum': ['max', 'replace', 'add']},
+                },
+            },
+        },
+    },
+    {
+        'type': 'function',
+        'function': {
+            'name': 'set_combatant_initiative',
+            'description': 'Set a combatant initiative value directly and re-sort turn order using initiative, then initiative_bonus, then placement order.',
+            'parameters': {
+                'type': 'object',
+                'required': ['initiative'],
+                'properties': {
+                    'encounter_map_id': {'type': 'integer'},
+                    'placement_id': {'type': 'integer'},
+                    'actor_type': {'type': 'string', 'enum': ['player', 'npc', 'monster']},
+                    'actor_id': {'type': 'string'},
+                    'initiative': {'type': 'integer'},
+                    'initiative_bonus': {'type': 'integer'},
+                },
+            },
+        },
+    },
+    {
+        'type': 'function',
+        'function': {
+            'name': 'update_combatant_conditions',
+            'description': 'Set, add, or remove combat conditions on a combatant and sync them to persistent state for players, NPCs, and monsters.',
+            'parameters': {
+                'type': 'object',
+                'required': ['conditions'],
+                'properties': {
+                    'encounter_map_id': {'type': 'integer'},
+                    'placement_id': {'type': 'integer'},
+                    'actor_type': {'type': 'string', 'enum': ['player', 'npc', 'monster']},
+                    'actor_id': {'type': 'string'},
+                    'mode': {'type': 'string', 'enum': ['set', 'add', 'remove']},
+                    'conditions': {
+                        'type': 'array',
+                        'items': {
+                            'oneOf': [
+                                {'type': 'string'},
+                                {
+                                    'type': 'object',
+                                    'properties': {
+                                        'name': {'type': 'string'},
+                                        'source': {'type': 'string'},
+                                        'duration': {'type': 'string'},
+                                        'note': {'type': 'string'},
+                                    },
+                                },
+                            ],
+                        },
+                    },
+                },
+            },
+        },
+    },
+    {
+        'type': 'function',
+        'function': {
+            'name': 'remove_encounter_actor',
+            'description': 'Remove a placed actor from the current encounter map and current turn order. Use this for defeated monsters, despawns, or cleanup corrections.',
+            'parameters': {
+                'type': 'object',
+                'properties': {
+                    'encounter_map_id': {'type': 'integer'},
+                    'placement_id': {'type': 'integer'},
+                    'actor_type': {'type': 'string', 'enum': ['player', 'npc', 'monster']},
+                    'actor_id': {'type': 'string'},
+                },
+            },
+        },
+    },
+    {
+        'type': 'function',
+        'function': {
             'name': 'create_shop_list',
             'description': 'Create or update all local merchants for the current scene. Provide concise shop summaries only; a separate shop generator will expand each merchant into a priced item menu and save the shop records.',
             'parameters': {
@@ -1106,9 +1359,19 @@ def get_dm_tool_definitions(campaign):
         'create_encounter_map',
         'place_encounter_map_actors',
         'move_encounter_actor',
+        'get_encounter_overview',
+        'get_combatant_state',
+        'list_reachable_positions',
         'next_combat_turn',
         'set_combat_turn',
         'update_combatant_actions',
+        'set_combatant_hp',
+        'apply_damage',
+        'apply_healing',
+        'grant_temp_hp',
+        'set_combatant_initiative',
+        'update_combatant_conditions',
+        'remove_encounter_actor',
     }
     return [tool for tool in DM_TOOL_DEFINITIONS if tool['function']['name'] not in exclude_names]
 
@@ -1527,6 +1790,24 @@ def _resolve_map_player(campaign, actor_id):
     return {'actor_id': str(member.user_id), 'label': label}, None
 
 
+def _character_for_player_actor(campaign, actor_id):
+    try:
+        numeric_id = int(actor_id)
+    except (TypeError, ValueError):
+        return None
+
+    member = CampaignMember.query.filter_by(campaign_id=campaign.id, user_id=numeric_id).first()
+    if member and member.selected_character:
+        return member.selected_character
+    return Character.query.filter_by(campaign_id=campaign.id, user_id=numeric_id).first()
+
+
+def _player_character_for_placement(campaign, placement):
+    if not placement or placement.actor_type != 'player':
+        return None
+    return _character_for_player_actor(campaign, placement.actor_id)
+
+
 def _resolve_map_npc(campaign, actor_id):
     actor = NPCActor.query.filter_by(campaign_id=campaign.id, actor_id=actor_id).first()
     if not actor and str(actor_id).isdigit():
@@ -1563,6 +1844,297 @@ def _resolve_map_actor(campaign, placement):
     if actor_type == 'monster':
         return _resolve_map_monster(campaign, placement)
     return None, 'actor_type must be player, npc, or monster.'
+
+
+def _normalize_condition_entries(items):
+    normalized = []
+    seen = set()
+    for raw in items or []:
+        if isinstance(raw, str):
+            entry = {
+                'name': clean_text(raw, 80),
+                'source': '',
+                'duration': '',
+                'note': '',
+            }
+        elif isinstance(raw, dict):
+            entry = {
+                'name': clean_text(raw.get('name') or raw.get('condition') or raw.get('condition_name'), 80),
+                'source': clean_text(raw.get('source'), 120),
+                'duration': clean_text(raw.get('duration') or raw.get('duration_remaining'), 120),
+                'note': clean_text(raw.get('note') or raw.get('description'), 240),
+            }
+        else:
+            continue
+
+        if not entry['name']:
+            continue
+        key = entry['name'].lower()
+        if key in seen:
+            continue
+        seen.add(key)
+        normalized.append(entry)
+    return normalized
+
+
+def _combatant_conditions(combatant):
+    conditions = combatant.get('conditions') if isinstance(combatant, dict) else []
+    return _normalize_condition_entries(conditions)
+
+
+def _combatant_action_state(combatant):
+    actions = combatant.get('actions') if isinstance(combatant, dict) and isinstance(combatant.get('actions'), dict) else {}
+    return {
+        'action': bool(actions.get('action', True)),
+        'bonus_action': bool(actions.get('bonus_action', True)),
+        'reaction': bool(actions.get('reaction', True)),
+        'movement_remaining': _coerce_speed_feet(actions.get('movement_remaining'), default=0),
+    }
+
+
+def _combatant_public_summary(combatant):
+    if not isinstance(combatant, dict):
+        return {}
+    return {
+        'placement_id': combatant.get('placement_id'),
+        'actor_type': combatant.get('actor_type'),
+        'actor_id': combatant.get('actor_id'),
+        'label': combatant.get('label'),
+        'initiative': combatant.get('initiative'),
+        'initiative_bonus': combatant.get('initiative_bonus'),
+        'max_hp': max(0, int(combatant.get('max_hp') or 0)),
+        'current_hp': max(0, int(combatant.get('current_hp') or 0)),
+        'temp_hp': max(0, int(combatant.get('temp_hp') or 0)),
+        'armor_class': max(0, int(combatant.get('armor_class') or 0)),
+        'speed': _coerce_speed_feet(combatant.get('speed'), default=30),
+        'conditions': _combatant_conditions(combatant),
+        'actions': _combatant_action_state(combatant),
+    }
+
+
+def _combatant_snapshot(encounter_map, combatant):
+    snapshot = _combatant_public_summary(combatant)
+    placement_id = snapshot.get('placement_id')
+    placement = db.session.get(EncounterMapPlacement, placement_id) if placement_id else None
+    if not placement and encounter_map and placement_id:
+        placement = EncounterMapPlacement.query.filter_by(
+            encounter_map_id=encounter_map.id,
+            id=placement_id,
+        ).first()
+    snapshot['placement'] = placement.to_dict() if placement else None
+    return snapshot
+
+
+def _get_encounter_map_for_tool(campaign, encounter_map_id=None):
+    encounter_map = db.session.get(EncounterMap, encounter_map_id) if encounter_map_id else latest_encounter_map(campaign.id)
+    if not encounter_map or encounter_map.campaign_id != campaign.id:
+        return None, None, 'No encounter map is available for this campaign.'
+    state = EncounterMap._json_value(encounter_map.encounter_state_json, {})
+    return encounter_map, state if isinstance(state, dict) else {}, None
+
+
+def _find_combatant(turn_order, placement_id):
+    for index, combatant in enumerate(turn_order):
+        if isinstance(combatant, dict) and combatant.get('placement_id') == placement_id:
+            return combatant, index
+    return None, None
+
+
+def _resolve_combatant_target(campaign, args, require_active=True):
+    encounter_map, state, error = _get_encounter_map_for_tool(campaign, args.get('encounter_map_id'))
+    if error:
+        return None, None, None, None, None, error
+
+    if require_active and not state.get('active'):
+        return encounter_map, state, None, None, None, 'Combat is not active.'
+
+    placement = None
+    placement_id = args.get('placement_id')
+    if placement_id is not None:
+        try:
+            placement = EncounterMapPlacement.query.filter_by(
+                encounter_map_id=encounter_map.id,
+                id=int(placement_id),
+            ).first()
+        except (TypeError, ValueError):
+            return encounter_map, state, None, None, None, 'placement_id must be an integer.'
+    else:
+        actor_type = clean_text(args.get('actor_type'), 20).lower()
+        actor_id = args.get('actor_id')
+        if not actor_type or actor_id in (None, ''):
+            return encounter_map, state, None, None, None, 'Provide placement_id or actor_type plus actor_id.'
+        if actor_type == 'monster':
+            resolved = {'actor_id': clean_id(actor_id, '')}
+            resolve_error = None if resolved['actor_id'] else 'Monster actor_id is required.'
+        else:
+            resolved, resolve_error = _resolve_map_actor(
+                campaign,
+                {'actor_type': actor_type, 'actor_id': actor_id},
+            )
+            if resolve_error:
+                return encounter_map, state, None, None, None, resolve_error
+        placement = EncounterMapPlacement.query.filter_by(
+            encounter_map_id=encounter_map.id,
+            actor_type=actor_type,
+            actor_id=resolved['actor_id'],
+        ).first()
+
+    if not placement:
+        return encounter_map, state, None, None, None, 'Encounter actor placement not found on the current map.'
+
+    turn_order = state.get('turn_order', []) if isinstance(state.get('turn_order'), list) else []
+    combatant, combatant_index = _find_combatant(turn_order, placement.id) if turn_order else (None, None)
+    if require_active and not combatant:
+        return encounter_map, state, placement, None, None, 'Combatant not found in turn order.'
+    return encounter_map, state, placement, combatant, combatant_index, None
+
+
+def _sync_player_conditions(character, conditions):
+    desired = {item['name'].lower(): item for item in _normalize_condition_entries(conditions)}
+    existing = {
+        (condition.condition_name or '').lower(): condition
+        for condition in CharacterCondition.query.filter_by(character_id=character.id).all()
+    }
+
+    for key, condition in existing.items():
+        if key not in desired:
+            db.session.delete(condition)
+
+    for key, item in desired.items():
+        row = existing.get(key)
+        if not row:
+            row = CharacterCondition(character_id=character.id, condition_name=item['name'])
+            db.session.add(row)
+        row.condition_name = item['name']
+        row.source = item['source'] or None
+        row.duration_remaining = item['duration'] or None
+        row.description = item['note'] or None
+
+
+def _sync_combatant_storage(campaign, placement, combatant, sync_conditions=False):
+    if not placement or not isinstance(combatant, dict):
+        return
+
+    combatant['max_hp'] = max(0, int(combatant.get('max_hp') or 0))
+    combatant['current_hp'] = max(0, min(int(combatant.get('current_hp') or 0), combatant['max_hp']))
+    combatant['temp_hp'] = max(0, int(combatant.get('temp_hp') or 0))
+
+    if placement.actor_type == 'player':
+        character = _player_character_for_placement(campaign, placement)
+        if not character:
+            return
+        character.max_hp = combatant['max_hp']
+        character.current_hp = combatant['current_hp']
+        character.temp_hp = combatant['temp_hp']
+        if sync_conditions:
+            _sync_player_conditions(character, combatant.get('conditions') or [])
+        return
+
+    if placement.actor_type == 'monster':
+        monster = CampaignMonster.query.filter_by(
+            campaign_id=campaign.id,
+            monster_id=placement.actor_id,
+        ).first()
+        if not monster:
+            return
+        stat_block = json_loads(monster.stat_block, {})
+        stat_block['max_hp'] = combatant['max_hp']
+        stat_block['current_hp'] = combatant['current_hp']
+        stat_block['temp_hp'] = combatant['temp_hp']
+        if sync_conditions:
+            stat_block['conditions'] = _combatant_conditions(combatant)
+        monster.stat_block = json.dumps(stat_block)
+        return
+
+    if placement.actor_type == 'npc':
+        npc = NPCActor.query.filter_by(
+            campaign_id=campaign.id,
+            actor_id=placement.actor_id,
+        ).first()
+        if not npc:
+            return
+        dossier = json_loads(npc.dossier, {})
+        dossier['max_hp'] = combatant['max_hp']
+        dossier['current_hp'] = combatant['current_hp']
+        dossier['temp_hp'] = combatant['temp_hp']
+        if sync_conditions:
+            dossier['conditions'] = _combatant_conditions(combatant)
+        npc.dossier = json.dumps(dossier)
+
+
+def _persist_encounter_state(encounter_map, state):
+    encounter_map.encounter_state_json = json.dumps(state)
+    db.session.commit()
+
+
+def _dice_term_tokenize(expression):
+    text = (expression or '').strip().lower().replace(' ', '')
+    if not text:
+        return []
+    if text[0] not in '+-':
+        text = f'+{text}'
+    parts = re.findall(r'[+-][^+-]+', text)
+    return parts if ''.join(parts) == text else []
+
+
+def _roll_dice_expression(expression):
+    parts = _dice_term_tokenize(expression)
+    if not parts:
+        raise ValueError('Unsupported dice expression.')
+
+    total = 0
+    breakdown = []
+
+    for part in parts:
+        sign = -1 if part[0] == '-' else 1
+        token = part[1:]
+        dice_match = re.fullmatch(r'(\d*)d(\d+)(kh|kl)?(\d+)?', token)
+        if dice_match:
+            count = int(dice_match.group(1) or 1)
+            sides = int(dice_match.group(2))
+            keep_mode = dice_match.group(3)
+            keep_count = int(dice_match.group(4) or 1)
+            if count < 1 or count > 100 or sides < 2 or sides > 1000:
+                raise ValueError('Dice expression is out of allowed bounds.')
+            rolls = [random.randint(1, sides) for _ in range(count)]
+            if keep_mode:
+                keep_count = max(1, min(keep_count, count))
+                ordered = sorted(rolls, reverse=(keep_mode == 'kh'))
+                kept = ordered[:keep_count]
+            else:
+                kept = list(rolls)
+            subtotal = sum(kept) * sign
+            total += subtotal
+            breakdown.append({
+                'kind': 'dice',
+                'sign': sign,
+                'count': count,
+                'sides': sides,
+                'rolls': rolls,
+                'kept': kept,
+                'keep': f'{keep_mode}{keep_count}' if keep_mode else None,
+                'subtotal': subtotal,
+            })
+            continue
+
+        if re.fullmatch(r'\d+', token):
+            value = int(token) * sign
+            total += value
+            breakdown.append({
+                'kind': 'constant',
+                'sign': sign,
+                'value': abs(value),
+                'subtotal': value,
+            })
+            continue
+
+        raise ValueError('Unsupported dice expression.')
+
+    return {
+        'expression': expression,
+        'total': total,
+        'terms': breakdown,
+    }
 
 
 def _point_in_polygon(points, x, y):
@@ -2138,6 +2710,453 @@ def _tool_update_combatant_actions(campaign, current_user, args):
     }
 
 
+def _tool_roll_dice(campaign, current_user, args):
+    _ = campaign, current_user
+    expression = clean_text(args.get('expression') or args.get('dice'), 120)
+    if not expression:
+        return {'error': 'expression is required.'}
+
+    try:
+        result = _roll_dice_expression(expression)
+    except ValueError as err:
+        return {'error': str(err)}
+
+    reason = clean_text(args.get('reason'), 240)
+    return {
+        'expression': expression,
+        'reason': reason,
+        'total': result['total'],
+        'terms': result['terms'],
+    }
+
+
+def _tool_get_encounter_overview(campaign, current_user, args):
+    _ = current_user
+    encounter_map, state, error = _get_encounter_map_for_tool(campaign, args.get('encounter_map_id'))
+    if error:
+        return {'error': error}
+    if not state.get('active'):
+        return {'error': 'Combat is not active.'}
+
+    turn_order = state.get('turn_order', []) if isinstance(state.get('turn_order'), list) else []
+    active_turn_index = state.get('active_turn_index')
+    active_combatant = None
+    if isinstance(active_turn_index, int) and 0 <= active_turn_index < len(turn_order):
+        active_combatant = turn_order[active_turn_index]
+
+    return {
+        'encounter_map_id': encounter_map.id,
+        'title': encounter_map.title,
+        'round': int(state.get('round') or 1),
+        'active_turn_index': active_turn_index,
+        'active_combatant': _combatant_snapshot(encounter_map, active_combatant) if active_combatant else None,
+        'turn_order': [_combatant_snapshot(encounter_map, combatant) for combatant in turn_order],
+        'affected_ids': {
+            'encounter_map_ids': [encounter_map.id],
+            'placement_ids': [combatant.get('placement_id') for combatant in turn_order if isinstance(combatant, dict)],
+        },
+    }
+
+
+def _tool_get_combatant_state(campaign, current_user, args):
+    _ = current_user
+    encounter_map, state, placement, combatant, combatant_index, error = _resolve_combatant_target(
+        campaign,
+        args,
+        require_active=True,
+    )
+    if error:
+        return {'error': error}
+
+    turn_order = state.get('turn_order', []) if isinstance(state.get('turn_order'), list) else []
+    active_turn_index = state.get('active_turn_index')
+    active_combatant = None
+    if isinstance(active_turn_index, int) and 0 <= active_turn_index < len(turn_order):
+        active_combatant = turn_order[active_turn_index]
+
+    return {
+        'encounter_map_id': encounter_map.id,
+        'combatant': _combatant_snapshot(encounter_map, combatant),
+        'combatant_index': combatant_index,
+        'is_active_turn': bool(active_combatant and active_combatant.get('placement_id') == placement.id),
+        'active_turn_index': active_turn_index,
+        'active_combatant': _combatant_snapshot(encounter_map, active_combatant) if active_combatant else None,
+        'affected_ids': {
+            'encounter_map_ids': [encounter_map.id],
+            'placement_ids': [placement.id],
+        },
+    }
+
+
+def _tool_list_reachable_positions(campaign, current_user, args):
+    _ = current_user
+    encounter_map, state, placement, combatant, _combatant_index, error = _resolve_combatant_target(
+        campaign,
+        args,
+        require_active=False,
+    )
+    if error:
+        return {'error': error}
+
+    columns, rows = _encounter_map_grid_dimensions(encounter_map)
+    if columns is None or rows is None:
+        return {'error': 'Encounter map grid dimensions are not available.'}
+
+    available_speed = _movement_budget_feet_for_placement(campaign, placement, turn_combatant=combatant)
+    max_squares = available_speed // 5
+    setup = EncounterMap._json_value(encounter_map.vtt_setup_json, {})
+    reachable = reachable_cells(
+        setup,
+        columns,
+        rows,
+        placement.grid_col,
+        placement.grid_row,
+        max_squares,
+    )
+    max_cells = max(1, min(int(args.get('max_cells') or 250), 500))
+    cells = [
+        {'col': col, 'row': row, 'cost': cost}
+        for (col, row), cost in sorted(reachable.items(), key=lambda item: (item[1], item[0][1], item[0][0]))[:max_cells]
+    ]
+
+    return {
+        'encounter_map_id': encounter_map.id,
+        'placement_id': placement.id,
+        'origin': {'col': placement.grid_col, 'row': placement.grid_row},
+        'movement': {
+            'speed': available_speed,
+            'max_squares': max_squares,
+            'reachable_count': len(reachable),
+        },
+        'reachable_positions': cells,
+        'affected_ids': {
+            'encounter_map_ids': [encounter_map.id],
+            'placement_ids': [placement.id],
+        },
+    }
+
+
+def _tool_set_combatant_hp(campaign, current_user, args):
+    _ = current_user
+    encounter_map, state, placement, combatant, _combatant_index, error = _resolve_combatant_target(
+        campaign,
+        args,
+        require_active=True,
+    )
+    if error:
+        return {'error': error}
+
+    updates = 0
+    for field in ('max_hp', 'current_hp', 'temp_hp'):
+        if field in args and args.get(field) is not None:
+            try:
+                combatant[field] = max(0, int(args.get(field)))
+            except (TypeError, ValueError):
+                return {'error': f'{field} must be an integer.'}
+            updates += 1
+
+    if updates == 0:
+        return {'error': 'Provide at least one of max_hp, current_hp, or temp_hp.'}
+
+    if combatant.get('max_hp') is not None:
+        combatant['current_hp'] = max(0, min(int(combatant.get('current_hp') or 0), int(combatant.get('max_hp') or 0)))
+    _sync_combatant_storage(campaign, placement, combatant)
+    _persist_encounter_state(encounter_map, state)
+
+    return {
+        'message': f'HP updated for {combatant.get("label")}.',
+        'combatant': _combatant_snapshot(encounter_map, combatant),
+        'encounter_state': state,
+        'affected_ids': {
+            'encounter_map_ids': [encounter_map.id],
+            'placement_ids': [placement.id],
+        },
+    }
+
+
+def _tool_apply_damage(campaign, current_user, args):
+    _ = current_user
+    encounter_map, state, placement, combatant, _combatant_index, error = _resolve_combatant_target(
+        campaign,
+        args,
+        require_active=True,
+    )
+    if error:
+        return {'error': error}
+
+    try:
+        amount = int(args.get('amount'))
+    except (TypeError, ValueError):
+        return {'error': 'amount must be an integer.'}
+    if amount < 0:
+        return {'error': 'amount must be 0 or greater.'}
+
+    ignore_temp_hp = bool(args.get('ignore_temp_hp'))
+    current_hp = max(0, int(combatant.get('current_hp') or 0))
+    temp_hp = max(0, int(combatant.get('temp_hp') or 0))
+    absorbed = 0
+    if not ignore_temp_hp and temp_hp:
+        absorbed = min(temp_hp, amount)
+        temp_hp -= absorbed
+    hp_damage = max(0, amount - absorbed)
+    combatant['temp_hp'] = temp_hp
+    combatant['current_hp'] = max(0, current_hp - hp_damage)
+
+    _sync_combatant_storage(campaign, placement, combatant)
+    _persist_encounter_state(encounter_map, state)
+
+    return {
+        'message': f'{combatant.get("label")} took {amount} damage.',
+        'combatant': _combatant_snapshot(encounter_map, combatant),
+        'damage': {
+            'requested': amount,
+            'damage_type': clean_text(args.get('damage_type'), 80),
+            'absorbed_by_temp_hp': absorbed,
+            'applied_to_current_hp': hp_damage,
+        },
+        'encounter_state': state,
+        'affected_ids': {
+            'encounter_map_ids': [encounter_map.id],
+            'placement_ids': [placement.id],
+        },
+    }
+
+
+def _tool_apply_healing(campaign, current_user, args):
+    _ = current_user
+    encounter_map, state, placement, combatant, _combatant_index, error = _resolve_combatant_target(
+        campaign,
+        args,
+        require_active=True,
+    )
+    if error:
+        return {'error': error}
+
+    try:
+        amount = int(args.get('amount'))
+    except (TypeError, ValueError):
+        return {'error': 'amount must be an integer.'}
+    if amount < 0:
+        return {'error': 'amount must be 0 or greater.'}
+
+    current_hp = max(0, int(combatant.get('current_hp') or 0))
+    max_hp = max(0, int(combatant.get('max_hp') or 0))
+    healed = min(amount, max(0, max_hp - current_hp))
+    combatant['current_hp'] = current_hp + healed
+
+    _sync_combatant_storage(campaign, placement, combatant)
+    _persist_encounter_state(encounter_map, state)
+
+    return {
+        'message': f'{combatant.get("label")} healed {healed} HP.',
+        'combatant': _combatant_snapshot(encounter_map, combatant),
+        'healing': {
+            'requested': amount,
+            'applied': healed,
+        },
+        'encounter_state': state,
+        'affected_ids': {
+            'encounter_map_ids': [encounter_map.id],
+            'placement_ids': [placement.id],
+        },
+    }
+
+
+def _tool_grant_temp_hp(campaign, current_user, args):
+    _ = current_user
+    encounter_map, state, placement, combatant, _combatant_index, error = _resolve_combatant_target(
+        campaign,
+        args,
+        require_active=True,
+    )
+    if error:
+        return {'error': error}
+
+    try:
+        amount = int(args.get('amount'))
+    except (TypeError, ValueError):
+        return {'error': 'amount must be an integer.'}
+    if amount < 0:
+        return {'error': 'amount must be 0 or greater.'}
+
+    mode = clean_text(args.get('mode') or 'max', 20).lower() or 'max'
+    current_temp = max(0, int(combatant.get('temp_hp') or 0))
+    if mode == 'replace':
+        next_temp = amount
+    elif mode == 'add':
+        next_temp = current_temp + amount
+    elif mode == 'max':
+        next_temp = max(current_temp, amount)
+    else:
+        return {'error': 'mode must be one of max, replace, or add.'}
+    combatant['temp_hp'] = next_temp
+
+    _sync_combatant_storage(campaign, placement, combatant)
+    _persist_encounter_state(encounter_map, state)
+
+    return {
+        'message': f'Temp HP updated for {combatant.get("label")}.',
+        'combatant': _combatant_snapshot(encounter_map, combatant),
+        'temp_hp': {
+            'previous': current_temp,
+            'requested': amount,
+            'mode': mode,
+            'current': next_temp,
+        },
+        'encounter_state': state,
+        'affected_ids': {
+            'encounter_map_ids': [encounter_map.id],
+            'placement_ids': [placement.id],
+        },
+    }
+
+
+def _tool_set_combatant_initiative(campaign, current_user, args):
+    _ = current_user
+    encounter_map, state, placement, combatant, combatant_index, error = _resolve_combatant_target(
+        campaign,
+        args,
+        require_active=True,
+    )
+    if error:
+        return {'error': error}
+
+    try:
+        initiative = int(args.get('initiative'))
+    except (TypeError, ValueError):
+        return {'error': 'initiative must be an integer.'}
+
+    combatant['initiative'] = initiative
+    if 'initiative_bonus' in args and args.get('initiative_bonus') is not None:
+        try:
+            combatant['initiative_bonus'] = int(args.get('initiative_bonus'))
+        except (TypeError, ValueError):
+            return {'error': 'initiative_bonus must be an integer.'}
+
+    turn_order = state.get('turn_order', [])
+    active_id = turn_order[state.get('active_turn_index')].get('placement_id') if (
+        isinstance(state.get('active_turn_index'), int)
+        and 0 <= state.get('active_turn_index') < len(turn_order)
+    ) else None
+    turn_order.sort(key=lambda item: item.get('placement_id', 0))
+    turn_order.sort(key=lambda item: item.get('initiative_bonus', 0), reverse=True)
+    turn_order.sort(key=lambda item: item.get('initiative', 0), reverse=True)
+    if active_id is not None:
+        for index, item in enumerate(turn_order):
+            if item.get('placement_id') == active_id:
+                state['active_turn_index'] = index
+                break
+    elif combatant_index is not None:
+        state['active_turn_index'] = combatant_index
+
+    _persist_encounter_state(encounter_map, state)
+
+    return {
+        'message': f'Initiative updated for {combatant.get("label")}.',
+        'combatant': _combatant_snapshot(encounter_map, combatant),
+        'encounter_state': state,
+        'affected_ids': {
+            'encounter_map_ids': [encounter_map.id],
+            'placement_ids': [placement.id],
+        },
+    }
+
+
+def _tool_update_combatant_conditions(campaign, current_user, args):
+    _ = current_user
+    encounter_map, state, placement, combatant, _combatant_index, error = _resolve_combatant_target(
+        campaign,
+        args,
+        require_active=True,
+    )
+    if error:
+        return {'error': error}
+
+    mode = clean_text(args.get('mode') or 'set', 20).lower() or 'set'
+    conditions_payload = args.get('conditions')
+    if not isinstance(conditions_payload, list):
+        return {'error': 'conditions must be an array.'}
+
+    current = {item['name'].lower(): item for item in _combatant_conditions(combatant)}
+    incoming = {item['name'].lower(): item for item in _normalize_condition_entries(conditions_payload)}
+
+    if mode == 'set':
+        next_conditions = list(incoming.values())
+    elif mode == 'add':
+        merged = dict(current)
+        merged.update(incoming)
+        next_conditions = list(merged.values())
+    elif mode == 'remove':
+        next_conditions = [item for key, item in current.items() if key not in incoming]
+    else:
+        return {'error': 'mode must be one of set, add, or remove.'}
+
+    combatant['conditions'] = _normalize_condition_entries(next_conditions)
+    _sync_combatant_storage(campaign, placement, combatant, sync_conditions=True)
+    _persist_encounter_state(encounter_map, state)
+
+    return {
+        'message': f'Conditions updated for {combatant.get("label")}.',
+        'combatant': _combatant_snapshot(encounter_map, combatant),
+        'encounter_state': state,
+        'affected_ids': {
+            'encounter_map_ids': [encounter_map.id],
+            'placement_ids': [placement.id],
+        },
+    }
+
+
+def _tool_remove_encounter_actor(campaign, current_user, args):
+    _ = current_user
+    encounter_map, state, placement, combatant, combatant_index, error = _resolve_combatant_target(
+        campaign,
+        args,
+        require_active=False,
+    )
+    if error:
+        return {'error': error}
+
+    active_turn_index = state.get('active_turn_index')
+    turn_order = state.get('turn_order', []) if isinstance(state.get('turn_order'), list) else []
+    if combatant_index is not None:
+        turn_order.pop(combatant_index)
+        if not turn_order:
+            state['active_turn_index'] = None
+            state['active'] = False
+        elif isinstance(active_turn_index, int):
+            if combatant_index < active_turn_index:
+                state['active_turn_index'] = active_turn_index - 1
+            elif combatant_index == active_turn_index:
+                if active_turn_index >= len(turn_order):
+                    state['active_turn_index'] = 0
+                next_combatant = turn_order[state['active_turn_index']]
+                speed = next_combatant.get('speed', 30)
+                next_combatant['actions'] = {
+                    'action': True,
+                    'bonus_action': True,
+                    'reaction': True,
+                    'movement_remaining': speed,
+                }
+
+    db.session.delete(placement)
+    _persist_encounter_state(encounter_map, state)
+
+    return {
+        'message': f'{placement.label} removed from the encounter map.',
+        'removed': {
+            'placement_id': placement.id,
+            'actor_type': placement.actor_type,
+            'actor_id': placement.actor_id,
+            'label': placement.label,
+        },
+        'encounter_state': state,
+        'affected_ids': {
+            'encounter_map_ids': [encounter_map.id],
+            'placement_ids': [placement.id],
+        },
+    }
+
+
 def _current_scene_for_shop(campaign):
     _world, _graph, world_state, _private = _world_json(campaign)
     current_scene = world_state.get('current_scene', {}) if isinstance(world_state, dict) else {}
@@ -2264,13 +3283,24 @@ TOOL_HANDLERS = {
     'reveal_fact': _tool_reveal_fact,
     'propose_sheet_update': _tool_propose_sheet_update,
     'generate_loot_box': _tool_generate_loot_box,
+    'roll_dice': _tool_roll_dice,
     'create_encounter_map': _tool_create_encounter_map,
     'place_encounter_map_actors': _tool_place_encounter_map_actors,
     'move_encounter_actor': _tool_move_encounter_actor,
+    'get_encounter_overview': _tool_get_encounter_overview,
+    'get_combatant_state': _tool_get_combatant_state,
+    'list_reachable_positions': _tool_list_reachable_positions,
     'toggle_encounter_mode': _tool_toggle_encounter_mode,
     'next_combat_turn': _tool_next_combat_turn,
     'set_combat_turn': _tool_set_combat_turn,
     'update_combatant_actions': _tool_update_combatant_actions,
+    'set_combatant_hp': _tool_set_combatant_hp,
+    'apply_damage': _tool_apply_damage,
+    'apply_healing': _tool_apply_healing,
+    'grant_temp_hp': _tool_grant_temp_hp,
+    'set_combatant_initiative': _tool_set_combatant_initiative,
+    'update_combatant_conditions': _tool_update_combatant_conditions,
+    'remove_encounter_actor': _tool_remove_encounter_actor,
     'create_shop_list': _tool_create_shop_list,
     'create_shop_menu': _tool_create_shop_menu,
 }
@@ -2305,6 +3335,13 @@ def execute_dm_tool(campaign, session, current_user, name, args, audit_context=N
             'next_combat_turn',
             'set_combat_turn',
             'update_combatant_actions',
+            'set_combatant_hp',
+            'apply_damage',
+            'apply_healing',
+            'grant_temp_hp',
+            'set_combatant_initiative',
+            'update_combatant_conditions',
+            'remove_encounter_actor',
             'create_shop_list',
             'create_shop_menu',
         }

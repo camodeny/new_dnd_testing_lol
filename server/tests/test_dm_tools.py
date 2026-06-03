@@ -26,6 +26,7 @@ from models import (
     CampaignSession,
     CampaignWorld,
     Character,
+    CharacterCondition,
     CharacterPlanningMessage,
     EncounterMap,
     EncounterMapPlacement,
@@ -136,9 +137,12 @@ class DmToolsTest(unittest.TestCase):
         self.assertIn('ask_character_sheet', names)
         self.assertIn('search_campaign_memory', names)
         self.assertIn('advance_clock', names)
+        self.assertIn('roll_dice', names)
         self.assertIn('create_encounter_map', names)
         self.assertIn('place_encounter_map_actors', names)
         self.assertIn('move_encounter_actor', names)
+        self.assertIn('get_encounter_overview', names)
+        self.assertIn('apply_damage', names)
         self.assertIn('create_shop_list', names)
         self.assertNotIn('create_shop_menu', names)
         for tool in DM_TOOL_DEFINITIONS:
@@ -2725,6 +2729,230 @@ class DmToolsTest(unittest.TestCase):
         self.assertNotIn('error', result_off)
         self.assertFalse(result_off['encounter_state']['active'])
 
+    def test_roll_dice_supports_compound_and_keep_highest(self):
+        with patch('services.dm_tools.random.randint', side_effect=[4, 17, 8, 5]):
+            result = execute_dm_tool(
+                self.campaign,
+                self.session,
+                self.user,
+                'roll_dice',
+                {'expression': '2d20kh1+1d6+3', 'reason': 'Goblin attack'},
+            )
+
+        self.assertNotIn('error', result)
+        self.assertEqual(result['total'], 28)
+        self.assertEqual(result['terms'][0]['rolls'], [4, 17])
+        self.assertEqual(result['terms'][0]['kept'], [17])
+        self.assertEqual(result['terms'][1]['rolls'], [8])
+        self.assertEqual(result['terms'][2]['subtotal'], 3)
+
+    def test_combat_state_tools_use_selected_character_and_sync(self):
+        alt_character = Character(
+            user_id=self.user.id,
+            campaign_id=self.campaign.id,
+            name='Lyra',
+            race='Human',
+            background='Soldier',
+            max_hp=32,
+            current_hp=30,
+            temp_hp=4,
+            armor_class=17,
+            speed=40,
+            initiative_bonus=5,
+        )
+        db.session.add(alt_character)
+        db.session.flush()
+        member = CampaignMember.query.filter_by(campaign_id=self.campaign.id, user_id=self.user.id).one()
+        member.selected_character_id = alt_character.id
+        db.session.add(CharacterCondition(
+            character_id=alt_character.id,
+            condition_name='Blessed',
+            source='Cleric',
+            duration_remaining='1 minute',
+            description='Add d4 to attacks and saves.',
+        ))
+
+        monster = CampaignMonster(
+            campaign_id=self.campaign.id,
+            monster_id='goblin_1',
+            name='Goblin',
+            stat_block=json.dumps({'max_hp': 11, 'current_hp': 11, 'armor_class': 13, 'speed': 30}),
+        )
+        encounter_map = EncounterMap(
+            campaign_id=self.campaign.id,
+            session_id=self.session.id,
+            title='Skirmish Area',
+            prompt='A small tactical area.',
+            image_filename='skirmish.png',
+            model='gpt-image-2',
+            size='1024x1024',
+            quality='high',
+            grid_json=json.dumps({'columns': 10, 'rows': 10}),
+            vtt_setup_json=json.dumps({}),
+            setup_status='ready',
+        )
+        db.session.add_all([monster, encounter_map])
+        db.session.commit()
+
+        db.session.add_all([
+            EncounterMapPlacement(
+                encounter_map_id=encounter_map.id,
+                actor_type='player',
+                actor_id=str(self.user.id),
+                label='Lyra',
+                grid_col=1,
+                grid_row=1,
+            ),
+            EncounterMapPlacement(
+                encounter_map_id=encounter_map.id,
+                actor_type='monster',
+                actor_id='goblin_1',
+                label='Goblin',
+                grid_col=5,
+                grid_row=5,
+            ),
+        ])
+        db.session.commit()
+
+        result = execute_dm_tool(
+            self.campaign,
+            self.session,
+            self.user,
+            'toggle_encounter_mode',
+            {'active': True},
+        )
+        self.assertNotIn('error', result)
+
+        encounter_map = db.session.get(EncounterMap, encounter_map.id)
+        state = json.loads(encounter_map.encounter_state_json)
+        player_combatant = next(item for item in state['turn_order'] if item['actor_type'] == 'player')
+        monster_combatant = next(item for item in state['turn_order'] if item['actor_type'] == 'monster')
+        self.assertEqual(player_combatant['max_hp'], 32)
+        self.assertEqual(player_combatant['current_hp'], 30)
+        self.assertEqual(player_combatant['temp_hp'], 4)
+        self.assertEqual(player_combatant['armor_class'], 17)
+        self.assertEqual(player_combatant['speed'], 40)
+        self.assertEqual(player_combatant['conditions'][0]['name'], 'Blessed')
+
+        player_combatant['initiative'] = 18
+        monster_combatant['initiative'] = 12
+        state['turn_order'].sort(key=lambda item: item['initiative'], reverse=True)
+        state['active_turn_index'] = 0
+        encounter_map.encounter_state_json = json.dumps(state)
+        db.session.commit()
+
+        overview = execute_dm_tool(
+            self.campaign,
+            self.session,
+            self.user,
+            'get_encounter_overview',
+            {},
+        )
+        self.assertEqual(overview['active_combatant']['label'], 'Lyra')
+
+        combatant_state = execute_dm_tool(
+            self.campaign,
+            self.session,
+            self.user,
+            'get_combatant_state',
+            {'actor_type': 'player', 'actor_id': str(self.user.id)},
+        )
+        self.assertTrue(combatant_state['is_active_turn'])
+        self.assertEqual(combatant_state['combatant']['current_hp'], 30)
+
+        reachable = execute_dm_tool(
+            self.campaign,
+            self.session,
+            self.user,
+            'list_reachable_positions',
+            {'actor_type': 'player', 'actor_id': str(self.user.id), 'max_cells': 12},
+        )
+        self.assertNotIn('error', reachable)
+        self.assertGreater(reachable['movement']['reachable_count'], 0)
+
+        damaged = execute_dm_tool(
+            self.campaign,
+            self.session,
+            self.user,
+            'apply_damage',
+            {'actor_type': 'monster', 'actor_id': 'goblin_1', 'amount': 7, 'damage_type': 'fire'},
+        )
+        self.assertEqual(damaged['combatant']['current_hp'], 4)
+        self.assertEqual(damaged['damage']['applied_to_current_hp'], 7)
+
+        healed = execute_dm_tool(
+            self.campaign,
+            self.session,
+            self.user,
+            'apply_healing',
+            {'actor_type': 'monster', 'actor_id': 'goblin_1', 'amount': 3},
+        )
+        self.assertEqual(healed['combatant']['current_hp'], 7)
+
+        temp_hp = execute_dm_tool(
+            self.campaign,
+            self.session,
+            self.user,
+            'grant_temp_hp',
+            {'actor_type': 'player', 'actor_id': str(self.user.id), 'amount': 8, 'mode': 'max'},
+        )
+        self.assertEqual(temp_hp['combatant']['temp_hp'], 8)
+
+        hp_set = execute_dm_tool(
+            self.campaign,
+            self.session,
+            self.user,
+            'set_combatant_hp',
+            {'actor_type': 'player', 'actor_id': str(self.user.id), 'current_hp': 21, 'temp_hp': 2},
+        )
+        self.assertEqual(hp_set['combatant']['current_hp'], 21)
+        self.assertEqual(hp_set['combatant']['temp_hp'], 2)
+
+        updated_conditions = execute_dm_tool(
+            self.campaign,
+            self.session,
+            self.user,
+            'update_combatant_conditions',
+            {
+                'actor_type': 'player',
+                'actor_id': str(self.user.id),
+                'mode': 'add',
+                'conditions': [{'name': 'Prone', 'duration': 'until stand'}],
+            },
+        )
+        names = {item['name'] for item in updated_conditions['combatant']['conditions']}
+        self.assertEqual(names, {'Blessed', 'Prone'})
+
+        updated_init = execute_dm_tool(
+            self.campaign,
+            self.session,
+            self.user,
+            'set_combatant_initiative',
+            {'actor_type': 'monster', 'actor_id': 'goblin_1', 'initiative': 25, 'initiative_bonus': 2},
+        )
+        self.assertEqual(updated_init['encounter_state']['turn_order'][0]['actor_id'], 'goblin_1')
+
+        removed = execute_dm_tool(
+            self.campaign,
+            self.session,
+            self.user,
+            'remove_encounter_actor',
+            {'actor_type': 'monster', 'actor_id': 'goblin_1'},
+        )
+        self.assertNotIn('error', removed)
+        self.assertEqual(EncounterMapPlacement.query.filter_by(encounter_map_id=encounter_map.id).count(), 1)
+
+        refreshed_character = db.session.get(Character, alt_character.id)
+        self.assertEqual(refreshed_character.current_hp, 21)
+        self.assertEqual(refreshed_character.temp_hp, 2)
+        self.assertEqual(
+            {row.condition_name for row in CharacterCondition.query.filter_by(character_id=alt_character.id).all()},
+            {'Blessed', 'Prone'},
+        )
+
+        refreshed_monster = CampaignMonster.query.filter_by(campaign_id=self.campaign.id, monster_id='goblin_1').one()
+        self.assertEqual(json.loads(refreshed_monster.stat_block)['current_hp'], 7)
+
     def test_dm_tools_filtered_by_encounter_mode(self):
         tools = get_dm_tool_definitions(self.campaign)
         tool_names = {t['function']['name'] for t in tools}
@@ -2733,14 +2961,25 @@ class DmToolsTest(unittest.TestCase):
             'create_encounter_map',
             'place_encounter_map_actors',
             'move_encounter_actor',
+            'get_encounter_overview',
+            'get_combatant_state',
+            'list_reachable_positions',
             'next_combat_turn',
             'set_combat_turn',
             'update_combatant_actions',
+            'set_combatant_hp',
+            'apply_damage',
+            'apply_healing',
+            'grant_temp_hp',
+            'set_combatant_initiative',
+            'update_combatant_conditions',
+            'remove_encounter_actor',
         }
         for name in exclude_names:
             self.assertNotIn(name, tool_names)
         self.assertIn('toggle_encounter_mode', tool_names)
         self.assertIn('ask_character_sheet', tool_names)
+        self.assertIn('roll_dice', tool_names)
 
         result_on = execute_dm_tool(
             self.campaign,
