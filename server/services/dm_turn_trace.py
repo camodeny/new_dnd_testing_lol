@@ -1,6 +1,6 @@
 import re
 from collections import defaultdict
-from datetime import datetime
+from datetime import datetime, timezone
 
 
 SESSION_DM_TRACE_RE = re.compile(r'(?:^|:)session_(?P<session_id>\d+):(?P<kind>message|opening)(?:_(?P<message_id>\d+))?')
@@ -27,11 +27,16 @@ def _parse_dt(value):
     if not value:
         return None
     if isinstance(value, datetime):
-        return value
-    try:
-        return datetime.fromisoformat(str(value).replace('Z', '+00:00'))
-    except ValueError:
-        return None
+        parsed = value
+    else:
+        try:
+            parsed = datetime.fromisoformat(str(value).replace('Z', '+00:00'))
+        except ValueError:
+            return None
+
+    if parsed.tzinfo is None:
+        return parsed.replace(tzinfo=timezone.utc)
+    return parsed.astimezone(timezone.utc)
 
 
 def _ms_between(start, end):
@@ -107,6 +112,47 @@ def _message_id_from_player_input(event):
     return message.get('id') or payload.get('player_message_id')
 
 
+def _is_session_support_event(entry):
+    event_type = entry.get('event_type')
+    source = entry.get('source')
+    if event_type in {'session_hot_context_read', 'knowledge_graph_read'}:
+        return True
+    if event_type == 'client_response_sent' and source in {'session_messages', 'campaign_sessions'}:
+        return True
+    return False
+
+
+def _with_inferred_session_trace_links(entries):
+    linked = [dict(entry) for entry in (entries or [])]
+    pending = []
+    active_session_trace = None
+    active_session_label = None
+
+    def apply_trace(entry, trace_id, trace_label):
+        entry['trace_id'] = trace_id
+        entry['trace_label'] = trace_label or entry.get('trace_label')
+
+    for entry in linked:
+        trace_id = entry.get('trace_id')
+        if _trace_match(trace_id):
+            active_session_trace = trace_id
+            active_session_label = entry.get('trace_label')
+            for pending_entry in pending:
+                apply_trace(pending_entry, active_session_trace, active_session_label)
+            pending = []
+            continue
+
+        if trace_id or not _is_session_support_event(entry):
+            continue
+
+        if active_session_trace and entry.get('event_type') == 'client_response_sent':
+            apply_trace(entry, active_session_trace, active_session_label)
+        else:
+            pending.append(entry)
+
+    return linked
+
+
 def _extract_tool_names(events):
     names = []
     for event in events:
@@ -172,13 +218,17 @@ def _timeline_and_totals(events):
     timeline = []
     phase_totals = defaultdict(int)
     phase_counts = defaultdict(int)
-    previous_at = None
+    parsed_times = [_parse_dt(event.get('created_at')) for event in events]
 
-    for event in events:
-        at = _parse_dt(event.get('created_at'))
+    for index, event in enumerate(events):
+        at = parsed_times[index]
+        previous_at = parsed_times[index - 1] if index > 0 else None
+        next_at = parsed_times[index + 1] if index + 1 < len(parsed_times) else None
         phase = _phase_for_event(event)
         delta_ms = _ms_between(previous_at, at) if previous_at else 0
-        phase_totals[phase] += delta_ms
+        phase_duration_ms = _ms_between(at, next_at) if next_at else 0
+
+        phase_totals[phase] += phase_duration_ms
         phase_counts[phase] += 1
         timeline.append({
             'event_id': event.get('id'),
@@ -186,14 +236,13 @@ def _timeline_and_totals(events):
             'phase': phase,
             'phase_label': _phase_label(phase),
             'delta_ms': delta_ms,
+            'duration_ms': phase_duration_ms,
             'created_at': event.get('created_at'),
             'actor': event.get('actor'),
             'source': event.get('source'),
             'summary': event.get('summary'),
             'operation': _operation(event),
         })
-        if at:
-            previous_at = at
 
     phases = [
         {
@@ -222,12 +271,15 @@ def _descendant_trace_ids(root_trace_id, children_by_parent):
 
 
 def dm_turn_traces_from_audit_events(audit_events, limit=50):
-    entries = sorted(
+    raw_entries = sorted(
         [_event_dict(event) for event in audit_events],
         key=lambda event: (event.get('id') or 0),
     )
+    entries = _with_inferred_session_trace_links(raw_entries)
+
     by_trace = defaultdict(list)
     children_by_parent = defaultdict(list)
+    parent_by_trace = {}
     player_inputs_by_message_id = {}
 
     for entry in entries:
@@ -237,6 +289,7 @@ def dm_turn_traces_from_audit_events(audit_events, limit=50):
         parent_trace_id = entry.get('parent_trace_id')
         if trace_id and parent_trace_id and trace_id != parent_trace_id:
             children_by_parent[parent_trace_id].append(trace_id)
+            parent_by_trace.setdefault(trace_id, parent_trace_id)
         if entry.get('event_type') == 'player_input_stored':
             message_id = _message_id_from_player_input(entry)
             if message_id is not None:
@@ -246,6 +299,9 @@ def dm_turn_traces_from_audit_events(audit_events, limit=50):
     for trace_id in by_trace:
         match = _trace_match(trace_id)
         if not match:
+            continue
+        parent_trace_id = parent_by_trace.get(trace_id)
+        if parent_trace_id and parent_trace_id in by_trace:
             continue
         if str(by_trace[trace_id][0].get('actor') or '') == 'session_memory_writer':
             continue
