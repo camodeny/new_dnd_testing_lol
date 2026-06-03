@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useState } from 'react'
+import { useCallback, useEffect, useMemo, useState } from 'react'
 import { useNavigate, useParams } from 'react-router-dom'
 import { apiFetch } from '../api/client'
 import Loading from '../components/common/Loading'
@@ -111,7 +111,7 @@ export default function DmTurnTracesPage() {
   const [refreshing, setRefreshing] = useState(false)
   const [error, setError] = useState('')
 
-  async function load(background = false) {
+  const load = useCallback(async (background = false) => {
     if (background) setRefreshing(true)
     else setLoading(true)
     setError('')
@@ -123,9 +123,9 @@ export default function DmTurnTracesPage() {
       setLoading(false)
       setRefreshing(false)
     }
-  }
+  }, [id])
 
-  useEffect(() => { load(false) }, [id])
+  useEffect(() => { load(false) }, [load])
 
   const traces = payload?.traces || []
   const stats = useMemo(() => {
