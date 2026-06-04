@@ -35,6 +35,42 @@
   font: inherit;
 }
 
+.dm-turn-focus-note {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 1rem;
+  border: 1px solid rgba(96, 165, 250, 0.35);
+  border-radius: 0.9rem;
+  background: rgba(30, 64, 175, 0.18);
+  padding: 0.9rem 1rem;
+  margin: 1rem 0;
+}
+
+.dm-turn-focus-note.missing {
+  border-color: rgba(245, 158, 11, 0.35);
+  background: rgba(146, 64, 14, 0.18);
+}
+
+.dm-turn-focus-note p {
+  margin: 0.25rem 0 0;
+  color: #cbd5e1;
+}
+
+.dm-turn-card-highlighted {
+  border-color: rgba(96, 165, 250, 0.75);
+  box-shadow: 0 0 0 1px rgba(96, 165, 250, 0.45), 0 18px 40px rgba(0, 0, 0, 0.22);
+}
+
+.dm-turn-focused-badge {
+  border-radius: 999px;
+  padding: 0.2rem 0.55rem;
+  font-size: 0.75rem;
+  background: rgba(96, 165, 250, 0.18);
+  color: #bfdbfe;
+  border: 1px solid rgba(96, 165, 250, 0.35);
+}
+
 .dm-turn-stat-grid {
   display: grid;
   grid-template-columns: repeat(auto-fit, minmax(150px, 1fr));
@@ -246,7 +282,8 @@
 
 @media (max-width: 760px) {
   .dm-turn-header,
-  .dm-turn-card-head {
+  .dm-turn-card-head,
+  .dm-turn-focus-note {
     flex-direction: column;
   }
 
