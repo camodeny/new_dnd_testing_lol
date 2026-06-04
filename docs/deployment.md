@@ -58,13 +58,13 @@ Optional variables:
 - `OPENAI_IMAGE_QUALITY`: `low`, `medium`, or `high`; defaults to `low` for cheaper map iteration.
 - `OPENAI_IMAGE_TIMEOUT_SECONDS`: defaults to `240`.
 - `OPENAI_IMAGE_QA_ENABLED`: `true` or `false`; defaults to `true` to review generated maps before saving.
-- `OPENAI_IMAGE_QA_MODEL`: defaults to `gpt-5.4-mini`.
+- `OPENAI_IMAGE_QA_MODEL`: defaults to `gpt-5.4`.
 - `OPENAI_IMAGE_QA_THRESHOLD`: 1-10 review score required to accept the first map; defaults to `8`.
 - `OPENAI_IMAGE_QA_MAX_RETRIES`: number of review-guided regeneration attempts; defaults to `1`.
 - `OPENAI_IMAGE_QA_TIMEOUT_SECONDS`: defaults to `90`.
 - `OPENAI_IMAGE_GRID_VALIDATION_ENABLED`: `true` or `false`; defaults to `true` to reject generated maps whose baked-in grid cannot be detected.
 - `OPENAI_IMAGE_GRID_MAX_RETRIES`: number of grid-guided regeneration attempts before saving the final candidate; defaults to `2`.
-- `OPENAI_IMAGE_SETUP_MODEL`: defaults to `gpt-5.4-mini` for VTT setup analysis.
+- `OPENAI_IMAGE_SETUP_MODEL`: defaults to `gpt-5.4` for VTT setup analysis.
 - `OPENAI_IMAGE_SETUP_TIMEOUT_SECONDS`: defaults to `90`.
 - `ENCOUNTER_MAP_STORAGE_DIR`: defaults to `/app/data/encounter_maps`.
 - `GEMINI_EMBEDDINGS_ENABLED`: `true` or `false`; defaults to `true` but fails open when `GEMINI_API_KEY` is unset.

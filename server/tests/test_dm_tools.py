@@ -735,7 +735,7 @@ class DmToolsTest(unittest.TestCase):
         self.assertEqual(result['encounter_map']['vtt_setup']['enemy_spawn_boxes'][0]['label'], 'North Ruins')
         self.assertEqual(result['encounter_map']['vtt_setup']['enemy_start_areas'][0]['label'], 'North Ruins')
         setup_call = post.call_args_list[1]
-        self.assertEqual(setup_call.kwargs['json']['model'], 'gpt-5.4-mini')
+        self.assertEqual(setup_call.kwargs['json']['model'], 'gpt-5.4')
         setup_text = setup_call.kwargs['json']['input'][0]['content'][0]['text']
         self.assertIn('DM setup and placement instructions', setup_text)
         self.assertIn('Friendlies enter from the south', setup_text)
@@ -911,7 +911,7 @@ class DmToolsTest(unittest.TestCase):
         self.assertEqual(image_call.kwargs['json']['model'], 'gpt-image-2')
         self.assertEqual(image_call.kwargs['json']['quality'], 'medium')
         self.assertEqual(image_call.kwargs['timeout'], 240)
-        self.assertEqual(qa_call.kwargs['json']['model'], 'gpt-5.4-mini')
+        self.assertEqual(qa_call.kwargs['json']['model'], 'gpt-5.4')
         self.assertEqual(qa_call.kwargs['json']['input'][0]['content'][1]['detail'], 'low')
         prompt = image_call.kwargs['json']['prompt']
         self.assertIn('VTT-ready', prompt)

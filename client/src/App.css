@@ -1671,6 +1671,10 @@ select.input:focus {
   display: none !important;
 }
 
+.dashboard-layout.map-fullscreen .dashboard-top-header {
+  display: none !important;
+}
+
 .dashboard-center.map-fullscreen {
   flex-direction: column;
   align-items: stretch;
@@ -1686,6 +1690,85 @@ select.input:focus {
   display: flex;
   flex-direction: column;
   overflow: hidden;
+  padding: 8px 12px;
+}
+
+.dashboard-center.map-fullscreen .encounter-map-toolbar {
+  margin-bottom: 6px;
+  align-items: center;
+}
+
+.dashboard-center.map-fullscreen .encounter-map-kicker {
+  display: none;
+}
+
+.dashboard-center.map-fullscreen .encounter-map-toolbar h2 {
+  font-size: 1.05rem;
+  margin: 0;
+}
+
+.dashboard-center.map-fullscreen .encounter-combat-tracker {
+  padding: 4px 12px;
+  margin-bottom: 6px;
+  border-radius: var(--radius-sm);
+  background: rgba(15, 16, 22, 0.6);
+  border: 1px solid rgba(255, 255, 255, 0.08);
+}
+
+.dashboard-center.map-fullscreen .encounter-combat-tracker-round {
+  padding: 2px 6px;
+  font-size: 0.75rem;
+}
+
+.dashboard-center.map-fullscreen .encounter-tracker-item {
+  padding: 2px 6px;
+  font-size: 0.75rem;
+}
+
+.dashboard-center.map-fullscreen .encounter-tracker-item .tracker-avatar {
+  width: 18px;
+  height: 18px;
+  font-size: 0.65rem;
+}
+
+.dashboard-center.map-fullscreen .active-combatant-details {
+  font-size: 0.75rem;
+}
+
+.dashboard-center.map-fullscreen .active-combatant-details .action-pill {
+  padding: 2px 6px;
+  font-size: 0.65rem;
+}
+
+.dashboard-center.map-fullscreen .btn-end-turn {
+  padding: 4px 8px;
+  font-size: 0.75rem;
+}
+
+.dashboard-center.map-fullscreen .encounter-map-filter-strip {
+  position: absolute;
+  bottom: 12px;
+  left: 50%;
+  transform: translateX(-50%);
+  z-index: 10;
+  margin: 0;
+  background: rgba(15, 16, 22, 0.85);
+  backdrop-filter: blur(12px);
+  padding: 4px 8px;
+  border-radius: 999px;
+  border: 1px solid rgba(255, 255, 255, 0.15);
+  box-shadow: 0 8px 24px rgba(0, 0, 0, 0.5);
+  display: flex;
+  gap: 4px;
+}
+
+.dashboard-center.map-fullscreen .encounter-map-filter-chip {
+  padding: 4px 10px;
+  font-size: 0.7rem;
+  border-radius: 999px;
+}
+
+.dashboard-center.map-fullscreen .encounter-map-images {
   padding: 0;
 }
 
