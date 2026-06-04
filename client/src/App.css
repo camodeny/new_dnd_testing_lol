@@ -6801,64 +6801,68 @@ select.input:focus {
    TURN ENDED CARD
    ========================================================================== */
 .turn-ended-card {
-  background: linear-gradient(135deg, rgba(31, 41, 55, 0.9), rgba(17, 24, 39, 0.95));
-  border: 1px solid rgba(139, 92, 246, 0.25);
-  border-left: 4px solid var(--color-primary, #8b5cf6);
+  background: linear-gradient(135deg, rgba(20, 20, 25, 0.85), rgba(28, 29, 37, 0.95));
+  border: 1px solid rgba(245, 158, 11, 0.15);
+  border-left: 3px solid var(--text-gold, #f59e0b);
   border-radius: var(--radius-md, 8px);
-  padding: 12px 16px;
+  padding: 10px 14px;
   margin: 8px 0;
-  box-shadow: var(--shadow-md), 0 4px 12px rgba(0, 0, 0, 0.3), inset 0 0 10px rgba(139, 92, 246, 0.05);
+  box-shadow: 
+    0 6px 20px rgba(0, 0, 0, 0.4),
+    inset 0 1px 0 rgba(255, 255, 255, 0.05);
   display: flex;
   align-items: center;
-  gap: 14px;
+  gap: 12px;
   max-width: 100%;
-  animation: turnCardSlideIn 0.35s cubic-bezier(0.34, 1.56, 0.64, 1);
+  animation: turnCardSlideIn 0.3s ease-out;
   box-sizing: border-box;
 }
 
 @keyframes turnCardSlideIn {
-  from { opacity: 0; transform: translateX(-12px) scale(0.98); }
-  to { opacity: 1; transform: translateX(0) scale(1); }
+  from { opacity: 0; transform: translateY(4px); }
+  to { opacity: 1; transform: translateY(0); }
 }
 
 .turn-ended-card-icon {
-  width: 36px;
-  height: 36px;
-  border-radius: 50%;
-  background: rgba(139, 92, 246, 0.15);
-  border: 1px solid rgba(139, 92, 246, 0.3);
+  width: 32px;
+  height: 32px;
+  border-radius: 6px;
+  background: rgba(245, 158, 11, 0.08);
+  border: 1px solid rgba(245, 158, 11, 0.25);
   display: flex;
   align-items: center;
   justify-content: center;
-  color: var(--color-primary-hover, #a78bfa);
-  font-size: 1.1rem;
+  color: var(--text-gold, #f59e0b);
+  font-size: 1rem;
   flex-shrink: 0;
-  box-shadow: 0 0 10px rgba(139, 92, 246, 0.2);
+  box-shadow: 0 0 12px rgba(245, 158, 11, 0.05);
 }
 
 .turn-ended-card-content {
   display: flex;
   flex-direction: column;
-  gap: 2px;
+  gap: 1px;
   flex-grow: 1;
 }
 
 .turn-ended-card-title {
-  font-size: 0.8rem;
-  font-weight: 700;
+  font-size: 0.65rem;
+  font-weight: 800;
   text-transform: uppercase;
-  color: var(--text-muted, #9ca3af);
-  letter-spacing: 1px;
+  color: var(--text-gold, #f59e0b);
+  letter-spacing: 1.5px;
+  opacity: 0.8;
 }
 
 .turn-ended-card-body {
-  font-size: 0.95rem;
+  font-size: 0.88rem;
   color: var(--text-bright, #f3f4f6);
   font-weight: 500;
 }
 
 .turn-ended-card-body strong {
-  color: var(--text-gold, #f59e0b);
+  color: var(--text-bright, #fff);
+  text-shadow: 0 0 8px rgba(255, 255, 255, 0.1);
 }
 
 
