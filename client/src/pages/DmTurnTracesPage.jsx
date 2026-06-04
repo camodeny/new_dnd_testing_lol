@@ -1,5 +1,5 @@
 import { useCallback, useEffect, useMemo, useState } from 'react'
-import { useNavigate, useParams } from 'react-router-dom'
+import { useNavigate, useParams, useSearchParams } from 'react-router-dom'
 import { apiFetch } from '../api/client'
 import Loading from '../components/common/Loading'
 import ErrorMessage from '../components/common/ErrorMessage'
@@ -18,6 +18,18 @@ function formatTime(iso) {
 function trimText(value, max = 180) {
   const text = String(value || '').trim()
   return text.length > max ? `${text.slice(0, max)}…` : text
+}
+
+function normalizeText(value) {
+  return String(value || '').replace(/\s+/g, ' ').trim().toLowerCase()
+}
+
+function traceMatchesDmText(trace, dmText) {
+  const needle = normalizeText(dmText)
+  if (!needle) return false
+  const result = trace.visible_result || {}
+  const haystack = normalizeText(result.content || result.reason || '')
+  return haystack.includes(needle) || needle.includes(haystack)
 }
 
 function PhaseBars({ phases, totalMs }) {
@@ -42,17 +54,23 @@ function PhaseBars({ phases, totalMs }) {
   )
 }
 
-function TurnTraceCard({ trace }) {
-  const [open, setOpen] = useState(false)
+function TurnTraceCard({ trace, highlighted = false }) {
+  const [open, setOpen] = useState(highlighted)
   const result = trace.visible_result || {}
   const input = trace.player_input || {}
+
+  useEffect(() => {
+    if (highlighted) setOpen(true)
+  }, [highlighted])
+
   return (
-    <article className="dm-turn-card">
+    <article className={`dm-turn-card ${highlighted ? 'dm-turn-card-highlighted' : ''}`}>
       <button className="dm-turn-card-head" onClick={() => setOpen((value) => !value)}>
         <div>
           <div className="dm-turn-title-row">
             <strong>{trace.turn_kind === 'opening' ? 'Opening scene' : `Player message #${trace.player_message_id || '?'}`}</strong>
             <span className={`dm-turn-mode dm-turn-mode-${result.mode || 'unknown'}`}>{result.mode || 'unknown'}</span>
+            {highlighted && <span className="dm-turn-focused-badge">Selected response</span>}
           </div>
           <p>{trimText(input.content || result.content || result.reason || trace.trace_label)}</p>
         </div>
@@ -106,6 +124,8 @@ function TurnTraceCard({ trace }) {
 export default function DmTurnTracesPage() {
   const { id } = useParams()
   const navigate = useNavigate()
+  const [searchParams, setSearchParams] = useSearchParams()
+  const focusedDmText = searchParams.get('dmText') || ''
   const [payload, setPayload] = useState(null)
   const [loading, setLoading] = useState(true)
   const [refreshing, setRefreshing] = useState(false)
@@ -128,6 +148,14 @@ export default function DmTurnTracesPage() {
   useEffect(() => { load(false) }, [load])
 
   const traces = payload?.traces || []
+  const focusedTrace = useMemo(() => {
+    if (!focusedDmText) return null
+    return traces.find((trace) => traceMatchesDmText(trace, focusedDmText)) || null
+  }, [focusedDmText, traces])
+  const orderedTraces = useMemo(() => {
+    if (!focusedTrace) return traces
+    return [focusedTrace, ...traces.filter((trace) => trace.trace_id !== focusedTrace.trace_id)]
+  }, [focusedTrace, traces])
   const stats = useMemo(() => {
     if (!traces.length) return { average: 0, slowest: 0, modelCalls: 0 }
     return {
@@ -143,8 +171,8 @@ export default function DmTurnTracesPage() {
     <div className="dm-turn-page">
       <header className="dm-turn-header">
         <div>
-          <button className="dm-turn-back" onClick={() => navigate(`/campaigns/${id}/dev`)}>
-            <i className="bi bi-arrow-left" /> Developer audit
+          <button className="dm-turn-back" onClick={() => navigate(`/campaigns/${id}`)}>
+            <i className="bi bi-arrow-left" /> Campaign
           </button>
           <h1>DM Turn Traces</h1>
           <p>Per-turn phase timings, tool usage, guard activity, memory activity, and visible outputs.</p>
@@ -156,6 +184,16 @@ export default function DmTurnTracesPage() {
 
       {error && <ErrorMessage message={error} />}
 
+      {focusedDmText && (
+        <div className={`dm-turn-focus-note ${focusedTrace ? 'matched' : 'missing'}`}>
+          <div>
+            <strong>{focusedTrace ? 'Showing trace for selected DM response' : 'Selected DM response not found in traces yet'}</strong>
+            <p>{trimText(focusedDmText, 220)}</p>
+          </div>
+          <button className="btn btn-secondary small" onClick={() => setSearchParams({})}>Show all</button>
+        </div>
+      )}
+
       <section className="dm-turn-stat-grid">
         <div><strong>{traces.length}</strong><span>turns</span></div>
         <div><strong>{formatMs(stats.average)}</strong><span>average</span></div>
@@ -164,7 +202,13 @@ export default function DmTurnTracesPage() {
       </section>
 
       <main className="dm-turn-list">
-        {traces.length ? traces.map((trace) => <TurnTraceCard trace={trace} key={trace.trace_id} />) : (
+        {orderedTraces.length ? orderedTraces.map((trace) => (
+          <TurnTraceCard
+            trace={trace}
+            key={trace.trace_id}
+            highlighted={focusedTrace?.trace_id === trace.trace_id}
+          />
+        )) : (
           <div className="dm-turn-empty">No DM turn traces found yet. Send a session message, then refresh.</div>
         )}
       </main>
