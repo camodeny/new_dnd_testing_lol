@@ -14,6 +14,7 @@ import CharacterViewPage from './pages/CharacterViewPage'
 import DevCharacterPage from './pages/DevCharacterPage'
 import DevModelPage from './pages/DevModelPage'
 import NotFoundPage from './pages/NotFoundPage'
+import DmTraceLinkInjector from './components/dev/DmTraceLinkInjector'
 import './App.css'
 
 function AppRoutes() {
@@ -31,6 +32,7 @@ function AppRoutes() {
 
   return (
     <>
+      <DmTraceLinkInjector />
       {!isCampaignView && <Header user={user} onLogout={logout} />}
       <main className={`app-main ${isCampaignView ? 'full-bleed' : ''}`}>
         <Routes>
