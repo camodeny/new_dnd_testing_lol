@@ -6224,9 +6224,9 @@ select.input:focus {
 }
 
 .btn-tab.active {
-  background: rgba(139, 92, 246, 0.1);
-  border-color: rgba(139, 92, 246, 0.3);
-  color: var(--color-primary-hover);
+  background: rgba(62, 122, 94, 0.12);
+  border-color: var(--color-primary);
+  color: var(--text-bright);
 }
 
 /* Grids in Dice Roller tabs */
@@ -8550,3 +8550,20 @@ select.input:focus {
     margin-left: 0 !important;
   }
 }
+
+.btn-post-queue {
+  background: var(--color-primary) !important;
+  border-color: var(--color-primary) !important;
+  color: #fff !important;
+  transform: none !important;
+  box-shadow: none !important;
+  transition: background-color 0.2s ease, border-color 0.2s ease !important;
+}
+
+.btn-post-queue:hover:not(:disabled) {
+  background: var(--color-primary-hover) !important;
+  border-color: var(--color-primary-hover) !important;
+  transform: none !important;
+  box-shadow: 0 4px 12px var(--color-primary-glow) !important;
+}
+

@@ -202,6 +202,70 @@ function RollCard({ label, total, rolls, modifier, sides }) {
   )
 }
 
+function ComboRollCard({ rollsList }) {
+  const grandTotal = rollsList.reduce((sum, r) => sum + r.total, 0)
+  
+  return (
+    <div className="roll-card combo-roll-card" style={{ borderLeft: '3px solid var(--color-primary)' }}>
+      <div className="roll-card-header" style={{ borderBottom: '1px solid var(--border-color)', paddingBottom: '8px', marginBottom: '8px', display: 'flex', alignItems: 'center' }}>
+        <span className="roll-card-icon"><i className="bi bi-dice-5-fill"></i></span>
+        <span className="roll-card-title" style={{ color: 'var(--text-gold)', fontWeight: 'bold' }}>Combo Dice Roll</span>
+        <span style={{ marginLeft: 'auto', fontSize: '0.75rem', color: 'var(--text-dim)' }}>{rollsList.length} rolls</span>
+      </div>
+      <div className="combo-rolls-list" style={{ display: 'flex', flexDirection: 'column', gap: '8px' }}>
+        {rollsList.map((roll, idx) => {
+          const isD20 = roll.sides === 20
+          let isCritHit = false
+          let isCritMiss = false
+          if (isD20) {
+            const chosenRoll = roll.total - roll.modifier
+            if (chosenRoll === 20) isCritHit = true
+            if (chosenRoll === 1) isCritMiss = true
+          }
+          const displayMod = roll.modifier > 0 ? `+${roll.modifier}` : roll.modifier < 0 ? `${roll.modifier}` : ''
+          const isAdv = roll.label.includes('(Advantage)')
+          const isDis = roll.label.includes('(Disadvantage)')
+          let modeStr = ''
+          if (isAdv) modeStr = ' (Adv)'
+          if (isDis) modeStr = ' (Dis)'
+          const formula = `${isD20 ? (roll.rolls.length > 1 ? '2' : '1') : roll.rolls.length}d${roll.sides}${modeStr}`
+
+          return (
+            <div key={idx} className="combo-roll-item" style={{
+              display: 'flex',
+              alignItems: 'center',
+              justifyContent: 'space-between',
+              padding: '6px 10px',
+              background: 'rgba(255,255,255,0.02)',
+              borderRadius: 'var(--radius-sm)',
+              border: '1px solid var(--border-color)',
+              gap: '12px'
+            }}>
+              <div style={{ display: 'flex', flexDirection: 'column', minWidth: 0 }}>
+                <span style={{ fontSize: '0.85rem', fontWeight: 'bold', color: 'var(--text-bright)', textOverflow: 'ellipsis', overflow: 'hidden', whiteSpace: 'nowrap' }}>
+                  {roll.label}
+                </span>
+                <span style={{ fontSize: '0.75rem', color: 'var(--text-dim)' }}>
+                  {formula} [{roll.rolls.join(', ')}] {displayMod && ` ${displayMod} modifier`}
+                </span>
+              </div>
+              <div style={{ display: 'flex', alignItems: 'center', gap: '6px', flexShrink: 0 }}>
+                {isCritHit && <span className="roll-card-badge crit-hit-badge" style={{ fontSize: '0.65rem', padding: '2px 4px' }}>CRIT!</span>}
+                {isCritMiss && <span className="roll-card-badge crit-miss-badge" style={{ fontSize: '0.65rem', padding: '2px 4px' }}>FAIL!</span>}
+                <strong style={{ fontSize: '1.2rem', color: 'var(--text-bright)', fontFamily: 'var(--heading)' }}>{roll.total}</strong>
+              </div>
+            </div>
+          )
+        })}
+      </div>
+      <div className="combo-roll-footer" style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginTop: '10px', borderTop: '1px solid var(--border-color)', paddingTop: '8px' }}>
+        <span style={{ fontSize: '0.85rem', color: 'var(--text-dim)' }}>Grand Total:</span>
+        <strong style={{ fontSize: '1.35rem', color: 'var(--color-primary)', fontFamily: 'var(--heading)' }}>{grandTotal}</strong>
+      </div>
+    </div>
+  )
+}
+
 function TurnEndedCard({ characterName }) {
   return (
     <div className="turn-ended-card">
@@ -238,41 +302,78 @@ function PlayerMessageContent({ content, charName }) {
           )
         }
 
-        if (segment.type === 'ooc' && text.startsWith('[Turn Ended]')) {
-          const name = text.replace('[Turn Ended]', '').trim() || 'Player'
+        if (segment.type === 'ooc') {
+          const lines = text.split('\n')
+          const rollsList = []
+          const nonRollLines = []
+
+          lines.forEach((line) => {
+            const trimmedLine = line.trim()
+            if (!trimmedLine) return
+
+            if (trimmedLine.startsWith('[Turn Ended]')) {
+              nonRollLines.push({ type: 'turn_ended', name: trimmedLine.replace('[Turn Ended]', '').trim() || 'Player' })
+              return
+            }
+
+            const match = trimmedLine.match(rollRegex)
+            if (match) {
+              rollsList.push({
+                label: match[1],
+                total: parseInt(match[2], 10),
+                rolls: match[3].split(',').map((r) => parseInt(r.trim(), 10)),
+                modifier: parseInt(match[4], 10),
+                sides: parseInt(match[5], 10)
+              })
+            } else {
+              nonRollLines.push({ type: 'text', content: line })
+            }
+          })
+
+          const renderedRoll = (() => {
+            if (rollsList.length === 0) return null
+            if (rollsList.length === 1) {
+              const r = rollsList[0]
+              return (
+                <RollCard
+                  key={`roll-${index}`}
+                  label={r.label}
+                  total={r.total}
+                  rolls={r.rolls}
+                  modifier={r.modifier}
+                  sides={r.sides}
+                />
+              )
+            }
+            return (
+              <ComboRollCard
+                key={`combo-${index}`}
+                rollsList={rollsList}
+              />
+            )
+          })()
+
           return (
-            <TurnEndedCard
-              key={`turn-ended-${index}`}
-              characterName={name}
-            />
+            <div key={`ooc-group-${index}`} style={{ display: 'flex', flexDirection: 'column', gap: '8px', width: '100%' }}>
+              {renderedRoll}
+              {nonRollLines.map((line, lineIdx) => {
+                if (line.type === 'turn_ended') {
+                  return (
+                    <TurnEndedCard
+                      key={`turn-ended-${index}-${lineIdx}`}
+                      characterName={line.name}
+                    />
+                  )
+                }
+                return (
+                  <div key={`ooc-${index}-${lineIdx}`} className="session-ooc-message">
+                    <span>{line.content}</span>
+                  </div>
+                )
+              })}
+            </div>
           )
         }
-
-        const match = text.match(rollRegex)
-        if (segment.type === 'ooc' && match) {
-          const label = match[1]
-          const total = parseInt(match[2], 10)
-          const rolls = match[3].split(',').map((r) => parseInt(r.trim(), 10))
-          const modifier = parseInt(match[4], 10)
-          const sides = parseInt(match[5], 10)
-
-          return (
-            <RollCard
-              key={`roll-${index}`}
-              label={label}
-              total={total}
-              rolls={rolls}
-              modifier={modifier}
-              sides={sides}
-            />
-          )
-        }
-
-        return (
-          <div key={`ooc-${index}`} className="session-ooc-message">
-            <span>{text}</span>
-          </div>
-        )
       })}
     </div>
   )
@@ -420,10 +521,10 @@ export default function SessionPanel({
   const [modifier, setModifier] = useState(0)
   const [rollMode, setRollMode] = useState('normal')
   const [customLabel, setCustomLabel] = useState('')
-  const [autoPost, setAutoPost] = useState(false)
   const [activeTab, setActiveTab] = useState('custom')
   const [showDice, setShowDice] = useState(false)
   const [lastRoll, setLastRoll] = useState(null)
+  const [rollQueue, setRollQueue] = useState([])
   const [activeChatTab, setActiveChatTab] = useState('chat')
   const messagesContainerRef = useRef(null)
   const messagesEndRef = useRef(null)
@@ -642,9 +743,20 @@ export default function SessionPanel({
       rolledAt: new Date().toISOString(),
     }
     setLastRoll(roll)
-    if (autoPost) {
-      postRollToChat(roll)
-    }
+    setRollQueue((prev) => [...prev, roll])
+  }
+
+  const handleRemoveRoll = (id) => {
+    setRollQueue((prev) => prev.filter((r) => r.id !== id))
+  }
+
+  const postQueueToChat = () => {
+    if (rollQueue.length === 0) return
+    const msg = rollQueue.map((roll) => {
+      return `[Roll: ${roll.label}] total: ${roll.total} | rolls: ${roll.rolls.join(',')} | mod: ${roll.modifier} | sides: ${roll.sides}`
+    }).join('\n')
+    onSendMessage(formatMessageForDm(msg))
+    setRollQueue([])
   }
 
   const handleCustomDieClick = (sides) => {
@@ -861,13 +973,6 @@ export default function SessionPanel({
                           <span className="dice-readout-label">{lastRoll.label}</span>
                           <strong>{lastRoll.result}</strong>
                           <span>{formatRollSummary(lastRoll)}</span>
-                          <button
-                            className="btn btn-secondary small btn-post-roll"
-                            onClick={() => postRollToChat(lastRoll)}
-                            title="Post roll to chat feed"
-                          >
-                            <i className="bi bi-chat-text-fill"></i> Post
-                          </button>
                         </>
                       ) : (
                         <>
@@ -886,6 +991,97 @@ export default function SessionPanel({
                       <i className="bi bi-x-lg"></i>
                     </button>
                   </div>
+
+                  {rollQueue.length > 0 && (
+                    <div className="dice-queue-bar" style={{
+                      display: 'flex',
+                      flexDirection: 'column',
+                      gap: '10px',
+                      background: 'rgba(255, 255, 255, 0.02)',
+                      border: '1px solid rgba(255, 255, 255, 0.06)',
+                      borderRadius: 'var(--radius-md)',
+                      padding: '12px',
+                      marginTop: '-4px',
+                    }}>
+                      <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between' }}>
+                        <span style={{ fontSize: '0.75rem', textTransform: 'uppercase', letterSpacing: '0.5px', color: 'var(--text-gold)', fontWeight: 'bold' }}>
+                          Dice Queue ({rollQueue.length})
+                        </span>
+                        <button
+                          type="button"
+                          className="btn-clear-queue"
+                          onClick={() => setRollQueue([])}
+                          style={{
+                            background: 'none',
+                            border: 'none',
+                            color: 'var(--text-dim)',
+                            cursor: 'pointer',
+                            fontSize: '0.75rem',
+                            textDecoration: 'underline',
+                            padding: 0
+                          }}
+                        >
+                          Clear All
+                        </button>
+                      </div>
+                      <div style={{ display: 'flex', flexWrap: 'wrap', gap: '6px', alignItems: 'center' }}>
+                        {rollQueue.map((roll, idx) => (
+                          <div key={roll.id || idx} className="dice-queue-chip" style={{
+                            display: 'inline-flex',
+                            alignItems: 'center',
+                            gap: '6px',
+                            background: 'var(--bg-panel-elevated)',
+                            border: '1px solid var(--border-color)',
+                            borderRadius: '16px',
+                            padding: '4px 10px',
+                            fontSize: '0.8rem',
+                            color: 'var(--text-bright)',
+                            boxShadow: '0 2px 6px rgba(0,0,0,0.15)'
+                          }}>
+                            <span style={{ fontWeight: 'bold', color: 'var(--text-bright)' }}>{roll.result}</span>
+                            <span style={{ color: 'var(--text-dim)', fontSize: '0.7rem' }}>({roll.label})</span>
+                            <button
+                              type="button"
+                              onClick={() => handleRemoveRoll(roll.id)}
+                              style={{
+                                background: 'none',
+                                border: 'none',
+                                color: 'var(--text-dim)',
+                                cursor: 'pointer',
+                                padding: '0 0 0 4px',
+                                display: 'inline-flex',
+                                alignItems: 'center',
+                                fontSize: '0.85rem'
+                              }}
+                              title="Remove"
+                            >
+                              <i className="bi bi-x" style={{ fontSize: '1rem', lineHeight: 1 }}></i>
+                            </button>
+                          </div>
+                        ))}
+                      </div>
+                      <button
+                        className="btn btn-primary btn-post-queue"
+                        onClick={postQueueToChat}
+                        style={{
+                          width: '100%',
+                          display: 'flex',
+                          alignItems: 'center',
+                          justifyContent: 'center',
+                          gap: '8px',
+                          padding: '8px 16px',
+                          fontSize: '0.9rem',
+                          fontWeight: 'bold',
+                          marginTop: '4px',
+                          background: 'var(--color-primary)',
+                          borderColor: 'var(--color-primary)',
+                          color: '#fff'
+                        }}
+                      >
+                        <i className="bi bi-chat-text-fill"></i> Post Rolls
+                      </button>
+                    </div>
+                  )}
 
                   {currentCharacter && (
                     <div className="dice-tabs">
@@ -964,14 +1160,6 @@ export default function SessionPanel({
                             <option value="disadvantage">Disadvantage</option>
                           </select>
                         </label>
-                        <label className="dice-auto-post">
-                          <input
-                            type="checkbox"
-                            checked={autoPost}
-                            onChange={(e) => setAutoPost(e.target.checked)}
-                          />
-                          Auto-post
-                        </label>
                       </div>
                     </>
                   ) : activeTab === 'skills' ? (
@@ -1010,14 +1198,6 @@ export default function SessionPanel({
                             <option value="advantage">Advantage</option>
                             <option value="disadvantage">Disadvantage</option>
                           </select>
-                        </label>
-                        <label className="dice-auto-post">
-                          <input
-                            type="checkbox"
-                            checked={autoPost}
-                            onChange={(e) => setAutoPost(e.target.checked)}
-                          />
-                          Auto-post
                         </label>
                       </div>
                     </>
@@ -1058,14 +1238,6 @@ export default function SessionPanel({
                             <option value="advantage">Advantage</option>
                             <option value="disadvantage">Disadvantage</option>
                           </select>
-                        </label>
-                        <label className="dice-auto-post">
-                          <input
-                            type="checkbox"
-                            checked={autoPost}
-                            onChange={(e) => setAutoPost(e.target.checked)}
-                          />
-                          Auto-post
                         </label>
                       </div>
                     </>
@@ -1149,14 +1321,6 @@ export default function SessionPanel({
                             <option value="advantage">Advantage</option>
                             <option value="disadvantage">Disadvantage</option>
                           </select>
-                        </label>
-                        <label className="dice-auto-post">
-                          <input
-                            type="checkbox"
-                            checked={autoPost}
-                            onChange={(e) => setAutoPost(e.target.checked)}
-                          />
-                          Auto-post
                         </label>
                       </div>
                     </>
