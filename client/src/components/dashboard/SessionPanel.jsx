@@ -516,6 +516,7 @@ export default function SessionPanel({
   onProposalDismissed,
   onToggleLootStash,
   onToggleShops,
+  encounterMap,
 }) {
   const [input, setInput] = useState('')
   const [modifier, setModifier] = useState(0)
@@ -532,10 +533,112 @@ export default function SessionPanel({
   const previousMessageCountRef = useRef(0)
   const rollIdRef = useRef(0)
 
+  const placements = encounterMap?.placements || []
+  const groupedPlacements = useMemo(() => {
+    const groups = { player: [], npc: [], monster: [] }
+    placements.forEach((p) => {
+      if (groups[p.actor_type]) {
+        groups[p.actor_type].push(p)
+      }
+    })
+    return groups
+  }, [placements])
+
+  function getGridCoordinate(col, row) {
+    if (typeof col !== 'number' || typeof row !== 'number') return ''
+    const letter = String.fromCharCode(65 + (col % 26))
+    const prefix = col >= 26 ? String.fromCharCode(65 + Math.floor(col / 26) - 1) : ''
+    return `${prefix}${letter}-${row + 1}`
+  }
+
+  const renderSidebarRosterCard = (placement) => {
+    return (
+      <div
+        key={placement.id}
+        className={`encounter-combatant-card ${placement.actor_type}`}
+        style={{
+          display: 'flex',
+          alignItems: 'center',
+          gap: '12px',
+          padding: '8px 12px',
+          background: 'rgba(255, 255, 255, 0.02)',
+          border: '1px solid var(--border-color)',
+          borderRadius: 'var(--radius-md)',
+        }}
+      >
+        <span className="combatant-avatar" style={{
+          width: '28px',
+          height: '28px',
+          borderRadius: '50%',
+          display: 'flex',
+          alignItems: 'center',
+          justifyContent: 'center',
+          fontSize: '0.75rem',
+          fontWeight: 'bold',
+          background: placement.actor_type === 'player' ? 'var(--color-primary-glow)' : placement.actor_type === 'monster' ? 'rgba(220, 38, 38, 0.2)' : 'rgba(255, 255, 255, 0.05)',
+          border: '1px solid ' + (placement.actor_type === 'player' ? 'var(--color-primary)' : placement.actor_type === 'monster' ? 'var(--color-danger)' : 'var(--border-color)'),
+          color: 'var(--text-bright)'
+        }}>
+          {placement.label?.slice(0, 2).toUpperCase() || '?'}
+        </span>
+        <div style={{ display: 'flex', flexDirection: 'column', minWidth: 0, flex: 1 }}>
+          <strong style={{ fontSize: '0.85rem', color: 'var(--text-bright)', textOverflow: 'ellipsis', overflow: 'hidden', whiteSpace: 'nowrap' }}>
+            {placement.label}
+          </strong>
+          <span style={{ fontSize: '0.7rem', color: 'var(--text-dim)' }}>Actor ID: {placement.actor_id}</span>
+        </div>
+        <span className="combatant-coord-badge" style={{
+          fontSize: '0.75rem',
+          background: 'var(--bg-input)',
+          border: '1px solid var(--border-color)',
+          color: 'var(--text-gold)',
+          padding: '2px 6px',
+          borderRadius: '4px',
+          fontFamily: 'var(--mono)',
+        }}>
+          {getGridCoordinate(placement.col, placement.row)}
+        </span>
+      </div>
+    )
+  }
+
+  const renderSidebarRoster = () => {
+    return (
+      <div className="session-roster-tab" style={{ padding: '4px 0', display: 'flex', flexDirection: 'column', gap: '16px' }}>
+        {groupedPlacements.player.length > 0 && (
+          <div className="roster-sidebar-group">
+            <h4 style={{ margin: '0 0 8px', fontSize: '0.75rem', fontWeight: 'bold', textTransform: 'uppercase', color: 'var(--text-gold)', letterSpacing: '0.5px' }}>🛡️ Party</h4>
+            <div style={{ display: 'flex', flexDirection: 'column', gap: '8px' }}>
+              {groupedPlacements.player.map(renderSidebarRosterCard)}
+            </div>
+          </div>
+        )}
+
+        {groupedPlacements.npc.length > 0 && (
+          <div className="roster-sidebar-group">
+            <h4 style={{ margin: '0 0 8px', fontSize: '0.75rem', fontWeight: 'bold', textTransform: 'uppercase', color: 'var(--text-gold)', letterSpacing: '0.5px' }}>🤝 Allies</h4>
+            <div style={{ display: 'flex', flexDirection: 'column', gap: '8px' }}>
+              {groupedPlacements.npc.map(renderSidebarRosterCard)}
+            </div>
+          </div>
+        )}
+
+        {groupedPlacements.monster.length > 0 && (
+          <div className="roster-sidebar-group">
+            <h4 style={{ margin: '0 0 8px', fontSize: '0.75rem', fontWeight: 'bold', textTransform: 'uppercase', color: 'var(--text-gold)', letterSpacing: '0.5px' }}>⚔️ Threats</h4>
+            <div style={{ display: 'flex', flexDirection: 'column', gap: '8px' }}>
+              {groupedPlacements.monster.map(renderSidebarRosterCard)}
+            </div>
+          </div>
+        )}
+      </div>
+    )
+  }
+
   const filteredMessages = useMemo(() => {
     return messages.filter((msg) => {
-      // TBD tab always contains 0 chats
-      if (activeChatTab === 'tbd') {
+      // TBD or Roster tab always contains 0 chats
+      if (activeChatTab === 'tbd' || activeChatTab === 'roster') {
         return false;
       }
       
@@ -908,53 +1011,62 @@ export default function SessionPanel({
 
           <div className="chat-tabs-header">
             <button className={`chat-tab-btn ${activeChatTab === 'chat' ? 'active' : ''}`} onClick={() => setActiveChatTab('chat')}>Chat</button>
+            {encounterMap?.placements?.length > 0 && (
+              <button className={`chat-tab-btn ${activeChatTab === 'roster' ? 'active' : ''}`} onClick={() => setActiveChatTab('roster')}>Roster</button>
+            )}
             <button className={`chat-tab-btn ${activeChatTab === 'tbd' ? 'active' : ''}`} onClick={() => setActiveChatTab('tbd')}>TBD</button>
           </div>
 
-          <div className="session-messages" ref={messagesContainerRef} onScroll={handleMessagesScroll}>
-            {(hasOlderMessages || loadingOlderMessages) && (
-              <div className="session-load-history">
-                <button
-                  type="button"
-                  className="btn btn-secondary small"
-                  onClick={() => loadOlderFromTop(true)}
-                  disabled={loadingOlderMessages}
-                >
-                  {loadingOlderMessages ? 'Loading older messages...' : 'Load older messages'}
-                </button>
-              </div>
-            )}
-            {filteredMessages.length === 0 && (
-              <div className="session-empty-msg">
-                No messages to display in this tab.
-              </div>
-            )}
-            {filteredMessages.map((msg) => (
-              <SessionMessageItem
-                key={msg.id}
-                msg={msg}
-                currentUser={currentUser}
-                sessionId={session?.id}
-                onProposalApplied={onProposalApplied}
-                onProposalDismissed={onProposalDismissed}
-                characters={characters}
-              />
-            ))}
-            {aiThinking && (
-              <div className="session-msg session-msg-dm">
-                <div className="session-msg-header">
-                  <span className="session-msg-role"><i className="bi bi-mic-fill"></i> DM</span>
+          {activeChatTab === 'roster' ? (
+            <div className="session-messages">
+              {renderSidebarRoster()}
+            </div>
+          ) : (
+            <div className="session-messages" ref={messagesContainerRef} onScroll={handleMessagesScroll}>
+              {(hasOlderMessages || loadingOlderMessages) && (
+                <div className="session-load-history">
+                  <button
+                    type="button"
+                    className="btn btn-secondary small"
+                    onClick={() => loadOlderFromTop(true)}
+                    disabled={loadingOlderMessages}
+                  >
+                    {loadingOlderMessages ? 'Loading older messages...' : 'Load older messages'}
+                  </button>
                 </div>
-                <div className="session-msg-content session-msg-thinking">
-                  <div className="thinking-indicator-wrapper">
-                    <span className="thinking-spinner"></span>
-                    <span className="thinking-status-text">{aiThinkingStatus || "Thinking..."}</span>
+              )}
+              {filteredMessages.length === 0 && (
+                <div className="session-empty-msg">
+                  No messages to display in this tab.
+                </div>
+              )}
+              {filteredMessages.map((msg) => (
+                <SessionMessageItem
+                  key={msg.id}
+                  msg={msg}
+                  currentUser={currentUser}
+                  sessionId={session?.id}
+                  onProposalApplied={onProposalApplied}
+                  onProposalDismissed={onProposalDismissed}
+                  characters={characters}
+                />
+              ))}
+              {aiThinking && (
+                <div className="session-msg session-msg-dm">
+                  <div className="session-msg-header">
+                    <span className="session-msg-role"><i className="bi bi-mic-fill"></i> DM</span>
+                  </div>
+                  <div className="session-msg-content session-msg-thinking">
+                    <div className="thinking-indicator-wrapper">
+                      <span className="thinking-spinner"></span>
+                      <span className="thinking-status-text">{aiThinkingStatus || "Thinking..."}</span>
+                    </div>
                   </div>
                 </div>
-              </div>
-            )}
-            <div ref={messagesEndRef} />
-          </div>
+              )}
+              <div ref={messagesEndRef} />
+            </div>
+          )}
 
           {showDice && (
             <div className="session-roll-bar">

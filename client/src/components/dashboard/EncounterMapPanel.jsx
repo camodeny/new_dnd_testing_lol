@@ -1372,7 +1372,7 @@ export default function EncounterMapPanel({
               >
                 <i className="bi bi-crosshair2"></i>
               </button>
-              {placements.length > 0 && (
+              {placements.length > 0 && mapViewMode !== 'fullscreen' && (
                 <button
                   className={`btn-icon-map ${isRosterOpen ? 'active' : ''}`}
                   onClick={() => setIsRosterOpen(!isRosterOpen)}
@@ -1598,7 +1598,7 @@ export default function EncounterMapPanel({
         </div>
 
         {/* Styled Combatants Roster */}
-        {encounterMap && placements.length > 0 && isRosterOpen && (
+        {encounterMap && placements.length > 0 && isRosterOpen && mapViewMode !== 'fullscreen' && (
           <div className="encounter-combatants-section">
             <h3>Combat Roster</h3>
             <div className="encounter-combatants-groups">

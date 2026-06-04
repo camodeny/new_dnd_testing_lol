@@ -2202,7 +2202,7 @@ def get_session_dm_response_with_tools(
     tools,
     execute_tool,
     audit_context=None,
-    max_tool_rounds=4,
+    max_tool_rounds=12,
     on_status_change=None,
 ):
     base_audit = audit_context or {}

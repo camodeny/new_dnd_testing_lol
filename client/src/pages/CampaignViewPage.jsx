@@ -1006,6 +1006,7 @@ export default function CampaignViewPage({ user }) {
               onProposalDismissed={handleProposalDismissed}
               onToggleLootStash={() => setShowLootStash(true)}
               onToggleShops={() => setShowShops(true)}
+              encounterMap={encounterMap}
             />
           </div>
         </main>
