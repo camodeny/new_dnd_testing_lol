@@ -1294,6 +1294,18 @@ class DmToolsTest(unittest.TestCase):
             hot_context,
         ))
 
+    def test_pc_control_guard_allows_damage_narration_for_pc_targets(self):
+        hot_context = {
+            'protected_player_characters': [
+                {'id': 2, 'name': 'Raven Nightshade', 'user_id': 2},
+            ],
+        }
+
+        self.assertIsNone(_pc_control_violation(
+            'The arrow punches through Raven\'s cloak and Raven takes 4 piercing damage.',
+            hot_context,
+        ))
+
     def test_private_output_guard_detects_hidden_terms(self):
         hot_context = {'private_output_terms': ['Crimson Veil']}
 

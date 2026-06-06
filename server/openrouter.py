@@ -1518,7 +1518,7 @@ def _pc_control_violation(response_text, hot_context):
     action_verbs = (
         'nods', 'nod', 'glances', 'glance', 'looks', 'look', 'turns', 'turn', 'steps', 'step',
         'moves', 'move', 'smiles', 'smile', 'frowns', 'frown', 'laughs', 'laugh', 'sighs',
-        'sigh', 'shrugs', 'shrug', 'reaches', 'reach', 'draws', 'draw', 'takes', 'take',
+        'sigh', 'shrugs', 'shrug', 'reaches', 'reach', 'draws', 'draw',
         'gives', 'give', 'straightens', 'straighten', 'waits', 'wait',
     )
     speech_verbs = (
