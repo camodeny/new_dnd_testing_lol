@@ -888,6 +888,7 @@ SESSION_DM_COMBAT_TOOL_NAMES = {
     'get_encounter_overview',
     'get_combatant_state',
     'list_reachable_positions',
+    'search_campaign_memory',
     'toggle_encounter_mode',
     'next_combat_turn',
     'set_combat_turn',
@@ -923,7 +924,7 @@ SESSION_DM_COMBAT_ACTOR_SCOPED_TOOL_NAMES = {
     'list_reachable_positions',
     'update_combatant_actions',
 }
-SESSION_DM_COMBAT_BLOCKED_TOOL_NAMES = {'set_combat_turn'}
+SESSION_DM_COMBAT_BLOCKED_TOOL_NAMES = {'set_combat_turn', 'search_campaign_memory'}
 SESSION_DM_COMBAT_HANDOFF_PATTERNS = (
     re.compile(r'\bnow let me\b', flags=re.IGNORECASE),
     re.compile(r'\blet me advance\b', flags=re.IGNORECASE),
@@ -1074,6 +1075,14 @@ def _session_dm_combat_tool_violation(tool_name, args, combat_tracker):
         }
 
     if tool_name in SESSION_DM_COMBAT_BLOCKED_TOOL_NAMES:
+        if tool_name == 'search_campaign_memory':
+            return {
+                'kind': 'blocked_combat_tool',
+                'detail': (
+                    'Do not search campaign memory during active combat turns. '
+                    'Use the live encounter state and combat tools to finish the current turn.'
+                ),
+            }
         return {
             'kind': 'blocked_combat_tool',
             'detail': 'set_combat_turn is reserved for explicit corrections and must not be used in session DM combat turns.',
@@ -2577,6 +2586,7 @@ def get_session_dm_response_with_tools(
     tool_round = 0
     json_contract_retry_count = 0
     combat_batch_retry_count = 0
+    combat_batch_force_tools = False
     format_retried = False
     mechanical_retried = False
     pc_control_retried = False
@@ -2638,7 +2648,7 @@ def get_session_dm_response_with_tools(
             private_output_retried,
             spoiler_checker_retried,
             combat_handoff_retried,
-        ))
+        )) and not combat_batch_force_tools
         active_tools = None if retrying_visible_answer else tools
         active_tool_choice = (
             'auto'
@@ -2757,6 +2767,7 @@ def get_session_dm_response_with_tools(
                     'role': 'system',
                     'content': _session_dm_guard_retry_system_prompt('combat_batch', combat_batch_violation),
                 })
+                combat_batch_force_tools = True
                 combat_batch_retry_count += 1
                 continue
             content = decision.get('content') or ''
@@ -3181,6 +3192,7 @@ def get_session_dm_response_with_tools(
             return decision
 
         messages.append(_assistant_tool_message(message))
+        combat_batch_force_tools = False
         for tool_call in tool_calls:
             function = tool_call.get('function') or {}
             tool_name = function.get('name')

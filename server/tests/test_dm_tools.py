@@ -1870,6 +1870,175 @@ class DmToolsTest(unittest.TestCase):
             if isinstance(message, dict)
         ))
 
+    def test_session_dm_combat_batch_retry_reenables_tools_after_json_contract_retry(self):
+        hot_context = {
+            'campaign': {'id': self.campaign.id},
+            'current_encounter_map': {
+                'id': 3,
+                'placements': [
+                    {'id': 7, 'actor_type': 'monster', 'actor_id': 'skirmisher_1', 'label': 'Skirmisher 1', 'col': 1, 'row': 1},
+                    {'id': 9, 'actor_type': 'monster', 'actor_id': 'brute_1', 'label': 'Training Brute', 'col': 3, 'row': 1},
+                    {'id': 5, 'actor_type': 'player', 'actor_id': '2', 'label': 'Seraphina Duskweaver', 'col': 3, 'row': 9},
+                ],
+                'encounter_state': {
+                    'active': True,
+                    'round': 1,
+                    'active_turn_index': 0,
+                    'turn_order': [
+                        {'placement_id': 7, 'actor_type': 'monster', 'actor_id': 'skirmisher_1', 'label': 'Skirmisher 1', 'current_hp': 11, 'actions': {'action': True, 'movement_remaining': 30}},
+                        {'placement_id': 9, 'actor_type': 'monster', 'actor_id': 'brute_1', 'label': 'Training Brute', 'current_hp': 18, 'actions': {'action': True, 'movement_remaining': 25}},
+                        {'placement_id': 5, 'actor_type': 'player', 'actor_id': '2', 'label': 'Seraphina Duskweaver', 'current_hp': 24, 'actions': {'action': True, 'movement_remaining': 30}},
+                    ],
+                },
+            },
+            'protected_player_characters': [{'id': self.character.id, 'name': self.character.name, 'user_id': self.user.id, 'username': self.user.username}],
+            'private_output_terms': [],
+            'private_spoiler_items': [],
+        }
+        executed = []
+
+        def execute_tool(name, args, _audit):
+            executed.append((name, args))
+            if len(executed) == 1:
+                return {
+                    'message': 'Actions updated.',
+                    'encounter_state': {
+                        'active': True,
+                        'round': 1,
+                        'active_turn_index': 0,
+                        'turn_order': [
+                            {'placement_id': 7, 'actor_type': 'monster', 'actor_id': 'skirmisher_1', 'label': 'Skirmisher 1', 'current_hp': 11, 'actions': {'action': False, 'bonus_action': False, 'movement_remaining': 0}},
+                            {'placement_id': 9, 'actor_type': 'monster', 'actor_id': 'brute_1', 'label': 'Training Brute', 'current_hp': 18, 'actions': {'action': True, 'bonus_action': True, 'movement_remaining': 25}},
+                            {'placement_id': 5, 'actor_type': 'player', 'actor_id': '2', 'label': 'Seraphina Duskweaver', 'current_hp': 24, 'actions': {'action': True, 'bonus_action': True, 'movement_remaining': 30}},
+                        ],
+                    },
+                }
+            if len(executed) == 2:
+                return {
+                    'message': 'Turn advanced.',
+                    'encounter_state': {
+                        'active': True,
+                        'round': 1,
+                        'active_turn_index': 1,
+                        'turn_order': [
+                            {'placement_id': 7, 'actor_type': 'monster', 'actor_id': 'skirmisher_1', 'label': 'Skirmisher 1', 'current_hp': 11, 'actions': {'action': False, 'bonus_action': False, 'movement_remaining': 0}},
+                            {'placement_id': 9, 'actor_type': 'monster', 'actor_id': 'brute_1', 'label': 'Training Brute', 'current_hp': 18, 'actions': {'action': True, 'bonus_action': True, 'movement_remaining': 25}},
+                            {'placement_id': 5, 'actor_type': 'player', 'actor_id': '2', 'label': 'Seraphina Duskweaver', 'current_hp': 24, 'actions': {'action': True, 'bonus_action': True, 'movement_remaining': 30}},
+                        ],
+                    },
+                }
+            if len(executed) == 3:
+                return {
+                    'message': 'Actions updated.',
+                    'encounter_state': {
+                        'active': True,
+                        'round': 1,
+                        'active_turn_index': 1,
+                        'turn_order': [
+                            {'placement_id': 7, 'actor_type': 'monster', 'actor_id': 'skirmisher_1', 'label': 'Skirmisher 1', 'current_hp': 11, 'actions': {'action': False, 'bonus_action': False, 'movement_remaining': 0}},
+                            {'placement_id': 9, 'actor_type': 'monster', 'actor_id': 'brute_1', 'label': 'Training Brute', 'current_hp': 18, 'actions': {'action': False, 'bonus_action': False, 'movement_remaining': 0}},
+                            {'placement_id': 5, 'actor_type': 'player', 'actor_id': '2', 'label': 'Seraphina Duskweaver', 'current_hp': 24, 'actions': {'action': True, 'bonus_action': True, 'movement_remaining': 30}},
+                        ],
+                    },
+                }
+            return {
+                'message': 'Turn advanced.',
+                'encounter_state': {
+                    'active': True,
+                    'round': 1,
+                    'active_turn_index': 2,
+                    'turn_order': [
+                        {'placement_id': 7, 'actor_type': 'monster', 'actor_id': 'skirmisher_1', 'label': 'Skirmisher 1', 'current_hp': 11, 'actions': {'action': False, 'bonus_action': False, 'movement_remaining': 0}},
+                        {'placement_id': 9, 'actor_type': 'monster', 'actor_id': 'brute_1', 'label': 'Training Brute', 'current_hp': 18, 'actions': {'action': False, 'bonus_action': False, 'movement_remaining': 0}},
+                        {'placement_id': 5, 'actor_type': 'player', 'actor_id': '2', 'label': 'Seraphina Duskweaver', 'current_hp': 24, 'actions': {'action': True, 'bonus_action': True, 'movement_remaining': 30}},
+                    ],
+                },
+            }
+
+        with patch('openrouter._post_chat_response', side_effect=[
+            {'choices': [{'message': {'content': '', 'tool_calls': [
+                {'id': 'call_1', 'function': {'name': 'update_combatant_actions', 'arguments': '{"placement_id":7,"actions":{"action":false,"bonus_action":false,"movement_remaining":0}}'}},
+                {'id': 'call_2', 'function': {'name': 'next_combat_turn', 'arguments': '{}'}},
+            ]}}]},
+            {'choices': [{'message': {'content': 'The skirmisher falls back.'}}]},
+            {'choices': [{'message': {'content': 'The skirmisher falls back.'}}]},
+            {'choices': [{'message': {'content': '', 'tool_calls': [
+                {'id': 'call_3', 'function': {'name': 'update_combatant_actions', 'arguments': '{"placement_id":9,"actions":{"action":false,"bonus_action":false,"movement_remaining":0}}'}},
+                {'id': 'call_4', 'function': {'name': 'next_combat_turn', 'arguments': '{}'}},
+            ]}}]},
+            {'choices': [{'message': {'content': '{"mode":"speak","content":"The skirmisher fades back and the brute gives ground. Seraphina, you are up."}'}}]},
+        ]):
+            result = get_session_dm_response_with_tools(
+                hot_context,
+                [],
+                [
+                    {'type': 'function', 'function': {'name': 'update_combatant_actions'}},
+                    {'type': 'function', 'function': {'name': 'next_combat_turn'}},
+                ],
+                execute_tool,
+                max_tool_rounds=6,
+            )
+
+        self.assertEqual(
+            result,
+            {'mode': 'speak', 'content': 'The skirmisher fades back and the brute gives ground. Seraphina, you are up.'},
+        )
+        self.assertEqual(executed[-2:], [
+            ('update_combatant_actions', {'placement_id': 9, 'actions': {'action': False, 'bonus_action': False, 'movement_remaining': 0}}),
+            ('next_combat_turn', {}),
+        ])
+
+    def test_session_dm_combat_turn_scope_blocks_memory_search(self):
+        hot_context = {
+            'campaign': {'id': self.campaign.id},
+            'current_encounter_map': {
+                'id': 3,
+                'placements': [
+                    {'id': 7, 'actor_type': 'monster', 'actor_id': 'skirmisher_1', 'label': 'Skirmisher 1', 'col': 1, 'row': 1},
+                    {'id': 5, 'actor_type': 'player', 'actor_id': '2', 'label': 'Seraphina Duskweaver', 'col': 3, 'row': 9},
+                ],
+                'encounter_state': {
+                    'active': True,
+                    'round': 1,
+                    'active_turn_index': 0,
+                    'turn_order': [
+                        {'placement_id': 7, 'actor_type': 'monster', 'actor_id': 'skirmisher_1', 'label': 'Skirmisher 1', 'current_hp': 11, 'actions': {'action': True, 'movement_remaining': 30}},
+                        {'placement_id': 5, 'actor_type': 'player', 'actor_id': '2', 'label': 'Seraphina Duskweaver', 'current_hp': 24, 'actions': {'action': True, 'movement_remaining': 30}},
+                    ],
+                },
+            },
+            'protected_player_characters': [{'id': self.character.id, 'name': self.character.name, 'user_id': self.user.id, 'username': self.user.username}],
+            'private_output_terms': [],
+            'private_spoiler_items': [],
+        }
+        executed = []
+
+        def execute_tool(name, args, _audit):
+            executed.append((name, args))
+            return {'message': 'unexpected'}
+
+        with patch('openrouter._post_chat_response', side_effect=[
+            {'choices': [{'message': {'content': '', 'tool_calls': [{'id': 'call_1', 'function': {'name': 'search_campaign_memory', 'arguments': '{"query":"training skirmisher"}'}}]}}]},
+            {'choices': [{'message': {'content': '{"mode":"speak","content":"The skirmisher gauges the field from the high ledge."}'}}]},
+        ]):
+            result = get_session_dm_response_with_tools(
+                hot_context,
+                [],
+                [{'type': 'function', 'function': {'name': 'search_campaign_memory'}}],
+                execute_tool,
+                max_tool_rounds=2,
+                audit_context={'campaign_id': self.campaign.id},
+            )
+
+        self.assertEqual(
+            result,
+            {'mode': 'speak', 'content': 'The skirmisher gauges the field from the high ledge.'},
+        )
+        self.assertEqual(executed, [])
+        blocked = CampaignAuditEvent.query.filter_by(event_type='combat_turn_scope_guard_blocked').one()
+        payload = json.loads(blocked.payload)
+        self.assertEqual(payload['tool_name'], 'search_campaign_memory')
+
     def test_session_dm_combat_turn_scope_blocks_set_turn_after_advancing(self):
         hot_context = {
             'campaign': {'id': self.campaign.id},
