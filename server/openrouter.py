@@ -1,5 +1,6 @@
 import os
 import json
+import re
 import tempfile
 import time
 from threading import Lock
@@ -882,6 +883,322 @@ def _looks_like_provider_tool_markup(raw_content):
     )
 
 
+SESSION_DM_COMBAT_TOOL_NAMES = {
+    'move_encounter_actor',
+    'get_encounter_overview',
+    'get_combatant_state',
+    'list_reachable_positions',
+    'toggle_encounter_mode',
+    'next_combat_turn',
+    'set_combat_turn',
+    'update_combatant_actions',
+    'set_combatant_hp',
+    'apply_damage',
+    'apply_healing',
+    'grant_temp_hp',
+    'set_combatant_initiative',
+    'update_combatant_conditions',
+    'remove_encounter_actor',
+}
+SESSION_DM_COMBAT_MUTATION_TOOL_NAMES = {
+    'move_encounter_actor',
+    'toggle_encounter_mode',
+    'next_combat_turn',
+    'set_combat_turn',
+    'update_combatant_actions',
+    'set_combatant_hp',
+    'apply_damage',
+    'apply_healing',
+    'grant_temp_hp',
+    'set_combatant_initiative',
+    'update_combatant_conditions',
+    'remove_encounter_actor',
+}
+SESSION_DM_COMBAT_PROGRESS_TOOL_NAMES = (
+    SESSION_DM_COMBAT_MUTATION_TOOL_NAMES - {'next_combat_turn', 'set_combat_turn', 'toggle_encounter_mode'}
+) | {'roll_dice'}
+SESSION_DM_COMBAT_ACTOR_SCOPED_TOOL_NAMES = {
+    'move_encounter_actor',
+    'get_combatant_state',
+    'list_reachable_positions',
+    'update_combatant_actions',
+}
+SESSION_DM_COMBAT_BLOCKED_TOOL_NAMES = {'set_combat_turn'}
+SESSION_DM_COMBAT_HANDOFF_PATTERNS = (
+    re.compile(r'\bnow let me\b', flags=re.IGNORECASE),
+    re.compile(r'\blet me advance\b', flags=re.IGNORECASE),
+    re.compile(r'\bnext enemy\b', flags=re.IGNORECASE),
+    re.compile(r'\bnext up\b', flags=re.IGNORECASE),
+    re.compile(r'\bfinal enemy of the round\b', flags=re.IGNORECASE),
+    re.compile(r'\bturn is finished\.\s*now\b', flags=re.IGNORECASE),
+)
+
+
+def _session_dm_combat_tracker(hot_context):
+    encounter_map = hot_context.get('current_encounter_map') if isinstance(hot_context, dict) else {}
+    encounter_map = encounter_map if isinstance(encounter_map, dict) else {}
+    encounter_state = encounter_map.get('encounter_state') if isinstance(encounter_map, dict) else {}
+    encounter_state = encounter_state if isinstance(encounter_state, dict) else {}
+    turn_order = encounter_state.get('turn_order') if isinstance(encounter_state.get('turn_order'), list) else []
+    active_turn_index = encounter_state.get('active_turn_index')
+    active_combatant = None
+    if isinstance(active_turn_index, int) and 0 <= active_turn_index < len(turn_order):
+        item = turn_order[active_turn_index]
+        active_combatant = item if isinstance(item, dict) else None
+    active_actions = active_combatant.get('actions') if isinstance(active_combatant, dict) else {}
+    active_actions = active_actions if isinstance(active_actions, dict) else {}
+
+    return {
+        'active': bool(encounter_state.get('active')) and bool(active_combatant),
+        'campaign_id': (hot_context.get('campaign') or {}).get('id') if isinstance(hot_context, dict) else None,
+        'encounter_map_id': encounter_map.get('id'),
+        'encounter_state_active': bool(encounter_state.get('active')),
+        'expected_active_turn_index': active_turn_index,
+        'expected_active_placement_id': active_combatant.get('placement_id') if active_combatant else None,
+        'expected_active_actor_type': active_combatant.get('actor_type') if active_combatant else None,
+        'expected_active_actor_id': (
+            str(active_combatant.get('actor_id'))
+            if active_combatant and active_combatant.get('actor_id') is not None
+            else None
+        ),
+        'expected_active_label': active_combatant.get('label') if active_combatant else None,
+        'expected_active_current_hp': active_combatant.get('current_hp') if active_combatant else None,
+        'expected_active_actions': json.loads(json.dumps(active_actions)),
+        'turn_progress_made': False,
+        'mutated': False,
+        'snapshot': None,
+    }
+
+
+def _session_dm_combat_target_matches_expected(args, combat_tracker):
+    expected_placement_id = combat_tracker.get('expected_active_placement_id')
+    expected_actor_type = combat_tracker.get('expected_active_actor_type')
+    expected_actor_id = combat_tracker.get('expected_active_actor_id')
+
+    placement_id = args.get('placement_id')
+    if placement_id is not None:
+        try:
+            return int(placement_id) == int(expected_placement_id)
+        except (TypeError, ValueError):
+            return False
+
+    actor_type = args.get('actor_type')
+    actor_id = args.get('actor_id')
+    if actor_type is None or actor_id is None:
+        return False
+    return (
+        str(actor_type).strip().lower() == str(expected_actor_type or '').strip().lower()
+        and str(actor_id) == str(expected_actor_id)
+    )
+
+
+def _session_dm_refresh_combat_tracker_from_state(combat_tracker, encounter_state):
+    if not isinstance(encounter_state, dict):
+        return
+
+    old_placement_id = combat_tracker.get('expected_active_placement_id')
+    turn_order = encounter_state.get('turn_order') if isinstance(encounter_state.get('turn_order'), list) else []
+    active_turn_index = encounter_state.get('active_turn_index')
+    active_combatant = None
+    if isinstance(active_turn_index, int) and 0 <= active_turn_index < len(turn_order):
+        item = turn_order[active_turn_index]
+        active_combatant = item if isinstance(item, dict) else None
+    active_actions = active_combatant.get('actions') if isinstance(active_combatant, dict) else {}
+    active_actions = active_actions if isinstance(active_actions, dict) else {}
+
+    combat_tracker['encounter_state_active'] = bool(encounter_state.get('active'))
+    combat_tracker['expected_active_turn_index'] = active_turn_index
+    combat_tracker['expected_active_placement_id'] = active_combatant.get('placement_id') if active_combatant else None
+    combat_tracker['expected_active_actor_type'] = active_combatant.get('actor_type') if active_combatant else None
+    combat_tracker['expected_active_actor_id'] = (
+        str(active_combatant.get('actor_id'))
+        if active_combatant and active_combatant.get('actor_id') is not None
+        else None
+    )
+    combat_tracker['expected_active_label'] = active_combatant.get('label') if active_combatant else None
+    combat_tracker['expected_active_current_hp'] = active_combatant.get('current_hp') if active_combatant else None
+    combat_tracker['expected_active_actions'] = json.loads(json.dumps(active_actions))
+
+    if combat_tracker.get('expected_active_placement_id') != old_placement_id:
+        combat_tracker['turn_progress_made'] = False
+
+
+def _session_dm_result_encounter_state(result):
+    if not isinstance(result, dict):
+        return None
+    if isinstance(result.get('encounter_state'), dict):
+        return result.get('encounter_state')
+    encounter_map = result.get('encounter_map')
+    if isinstance(encounter_map, dict) and isinstance(encounter_map.get('encounter_state'), dict):
+        return encounter_map.get('encounter_state')
+    return None
+
+
+def _session_dm_combatant_can_still_act(combat_tracker):
+    current_hp = combat_tracker.get('expected_active_current_hp')
+    try:
+        if current_hp is not None and int(current_hp) <= 0:
+            return False
+    except (TypeError, ValueError):
+        pass
+
+    actions = combat_tracker.get('expected_active_actions')
+    if not isinstance(actions, dict):
+        return True
+
+    if bool(actions.get('action', False)):
+        return True
+    if bool(actions.get('bonus_action', False)):
+        return True
+    try:
+        if int(actions.get('movement_remaining', 0) or 0) > 0:
+            return True
+    except (TypeError, ValueError):
+        return True
+    return False
+
+
+def _session_dm_combat_tool_violation(tool_name, args, combat_tracker):
+    if not combat_tracker.get('active') or tool_name not in SESSION_DM_COMBAT_TOOL_NAMES:
+        return None
+
+    label = combat_tracker.get('expected_active_label') or 'the current combatant'
+    actor_type = combat_tracker.get('expected_active_actor_type')
+    if actor_type == 'player' and tool_name in SESSION_DM_COMBAT_MUTATION_TOOL_NAMES:
+        return {
+            'kind': 'player_turn_mutation',
+            'detail': (
+                f'It is currently {label}\'s turn, and player-character combat turns must not be '
+                'mutated by the session DM loop.'
+            ),
+        }
+
+    if tool_name in SESSION_DM_COMBAT_BLOCKED_TOOL_NAMES:
+        return {
+            'kind': 'blocked_combat_tool',
+            'detail': 'set_combat_turn is reserved for explicit corrections and must not be used in session DM combat turns.',
+        }
+
+    if tool_name == 'next_combat_turn':
+        if (
+            not combat_tracker.get('turn_progress_made')
+            and combat_tracker.get('expected_active_actor_type') != 'player'
+            and _session_dm_combatant_can_still_act(combat_tracker)
+        ):
+            return {
+                'kind': 'combat_turn_skip',
+                'detail': (
+                    f'Do not skip {label} without first resolving that combatant\'s turn. '
+                    'Finish the current non-player turn before advancing.'
+                ),
+            }
+        return None
+
+    if tool_name in SESSION_DM_COMBAT_ACTOR_SCOPED_TOOL_NAMES and not _session_dm_combat_target_matches_expected(args, combat_tracker):
+        return {
+            'kind': 'wrong_active_combatant',
+            'detail': f'This combat step may only act for {label}, the current active combatant.',
+        }
+    return None
+
+
+def _session_dm_combat_batch_violation(decision, combat_tracker):
+    if not combat_tracker.get('active') or not combat_tracker.get('mutated'):
+        return None
+    if decision.get('mode') != 'speak':
+        return None
+    if not combat_tracker.get('encounter_state_active'):
+        return None
+    if combat_tracker.get('expected_active_actor_type') == 'player':
+        return None
+    label = combat_tracker.get('expected_active_label') or 'the next non-player combatant'
+    return {
+        'kind': 'combat_batch_incomplete',
+        'detail': (
+            f'Combat resolution stopped while it was still {label}\'s turn. '
+            'Continue resolving consecutive non-player turns until a player character is active or combat ends.'
+        ),
+    }
+
+
+def _session_dm_combat_handoff_violation(response_text, combat_tracker):
+    if not combat_tracker.get('active') or not combat_tracker.get('mutated'):
+        return None
+    if combat_tracker.get('expected_active_actor_type') != 'player':
+        return None
+    text = str(response_text or '').strip()
+    if not text:
+        return None
+    for pattern in SESSION_DM_COMBAT_HANDOFF_PATTERNS:
+        match = pattern.search(text)
+        if match:
+            return {
+                'kind': 'combat_handoff',
+                'detail': (
+                    'After resolving combat, narrate only the completed actions and hand the turn back cleanly. '
+                    'Do not announce that you are about to advance to another combatant.'
+                ),
+                'matched_phrase': match.group(0),
+            }
+    return None
+
+
+def _session_dm_build_combat_snapshot(combat_tracker):
+    if not combat_tracker.get('active') or not combat_tracker.get('encounter_map_id'):
+        return None
+    from models import EncounterMap, EncounterMapPlacement, db
+
+    encounter_map = db.session.get(EncounterMap, combat_tracker.get('encounter_map_id'))
+    if not encounter_map:
+        return None
+    placements = EncounterMapPlacement.query.filter_by(encounter_map_id=encounter_map.id).all()
+    return {
+        'campaign_id': combat_tracker.get('campaign_id'),
+        'encounter_map_id': encounter_map.id,
+        'encounter_state_json': encounter_map.encounter_state_json,
+        'placements': [placement.to_dict() for placement in placements],
+    }
+
+
+def _session_dm_restore_combat_snapshot(snapshot):
+    if not isinstance(snapshot, dict) or not snapshot.get('encounter_map_id'):
+        return False
+    from models import Campaign, EncounterMap, EncounterMapPlacement, db
+    from services.dm_tools import _sync_combatant_storage
+
+    encounter_map = db.session.get(EncounterMap, snapshot.get('encounter_map_id'))
+    campaign = db.session.get(Campaign, snapshot.get('campaign_id')) if snapshot.get('campaign_id') else None
+    if not encounter_map or not campaign:
+        return False
+
+    placements = EncounterMapPlacement.query.filter_by(encounter_map_id=encounter_map.id).all()
+    placements_by_id = {placement.id: placement for placement in placements}
+    for placement_snapshot in snapshot.get('placements') or []:
+        placement = placements_by_id.get(placement_snapshot.get('id'))
+        if not placement:
+            continue
+        placement.label = placement_snapshot.get('label') or placement.label
+        try:
+            placement.grid_col = int(placement_snapshot.get('col'))
+            placement.grid_row = int(placement_snapshot.get('row'))
+        except (TypeError, ValueError):
+            continue
+
+    encounter_state_json = snapshot.get('encounter_state_json')
+    encounter_map.encounter_state_json = encounter_state_json
+    encounter_state = _json_loads_or_empty(encounter_state_json) if encounter_state_json else {}
+    turn_order = encounter_state.get('turn_order') if isinstance(encounter_state.get('turn_order'), list) else []
+    for combatant in turn_order:
+        if not isinstance(combatant, dict):
+            continue
+        placement = placements_by_id.get(combatant.get('placement_id'))
+        if placement:
+            _sync_combatant_storage(campaign, placement, json.loads(json.dumps(combatant)), sync_conditions=True)
+
+    db.session.commit()
+    return True
+
+
 def _session_dm_json_contract_violation(raw_content):
     if _looks_like_provider_tool_markup(raw_content):
         return {
@@ -988,6 +1305,22 @@ def _session_dm_guard_retry_system_prompt(guard_name, details):
             'Guard reminder: keep the visible reply spoiler-safe. '
             'Keep only what players could currently observe or reasonably know in-world. '
             'Return exactly one JSON object in the final contract with spoiler-safe visible content.'
+            + silent_ack
+        )
+    if guard_name == 'combat_batch':
+        return (
+            'Combat turn reminder: if you are resolving combat for enemies or NPCs, continue through consecutive '
+            'non-player turns until control returns to a player character or combat ends. '
+            'Do not stop while a monster or NPC turn is still active. '
+            'Use tools to finish the remaining non-player turns, then return exactly one JSON object in the final contract.'
+            + silent_ack
+        )
+    if guard_name == 'combat_handoff':
+        return (
+            'Combat turn reminder: narrate only completed actions. '
+            'Do not say "now let me advance", "next enemy", or any similar procedural handoff text in visible content. '
+            'If the next active turn already belongs to a player character, end cleanly with the resolved combat narration '
+            'or a concise "you are up" handoff. Return exactly one JSON object in the final contract.'
             + silent_ack
         )
     return (
@@ -2243,13 +2576,19 @@ def get_session_dm_response_with_tools(
 
     tool_round = 0
     json_contract_retry_count = 0
+    combat_batch_retry_count = 0
     format_retried = False
     mechanical_retried = False
     pc_control_retried = False
     private_output_retried = False
     spoiler_checker_retried = False
+    combat_handoff_retried = False
     json_contract_fallback_draft = None
     guard_audits = {}
+    combat_tracker = _session_dm_combat_tracker(hot_context)
+    if not combat_tracker.get('campaign_id'):
+        combat_tracker['campaign_id'] = base_audit.get('campaign_id')
+    combat_tracker['snapshot'] = _session_dm_build_combat_snapshot(combat_tracker)
 
     def guard_audit(guard_name):
         if guard_name not in guard_audits:
@@ -2260,6 +2599,32 @@ def get_session_dm_response_with_tools(
                 f'session_dm_guard: {guard_name}',
             )
         return guard_audits[guard_name]
+
+    def rollback_combat_if_needed(reason, details=None):
+        if not combat_tracker.get('mutated') or not combat_tracker.get('snapshot'):
+            return False
+        restored = _session_dm_restore_combat_snapshot(combat_tracker.get('snapshot'))
+        if restored and base_audit.get('campaign_id'):
+            log_audit_event(
+                base_audit.get('campaign_id'),
+                'combat_turn_rollback',
+                'Rolled back combat state after a session DM turn failed to finish coherently.',
+                {
+                    'operation': 'combat_turn_rollback',
+                    'reason': reason,
+                    'details': details or {},
+                    'encounter_map_id': combat_tracker.get('encounter_map_id'),
+                },
+                source='session_dm.guard',
+                actor='session_dm_guard',
+                trace_id=trace_id,
+                parent_trace_id=base_audit.get('parent_trace_id'),
+                trace_label=trace_label,
+                audit_role='guard',
+                commit=True,
+            )
+        combat_tracker['mutated'] = False
+        return restored
 
     while True:
         if on_status_change:
@@ -2272,6 +2637,7 @@ def get_session_dm_response_with_tools(
             pc_control_retried,
             private_output_retried,
             spoiler_checker_retried,
+            combat_handoff_retried,
         ))
         active_tools = None if retrying_visible_answer else tools
         active_tool_choice = (
@@ -2357,12 +2723,42 @@ def get_session_dm_response_with_tools(
                 if json_contract_fallback_draft:
                     decision = normalize_session_dm_turn_decision(json_contract_fallback_draft)
                 else:
+                    rollback_combat_if_needed('invalid_final_output', {'json_contract_violation': json_contract_violation})
                     return {
                         'mode': 'silent',
                         'reason': 'The DM response did not produce a valid visible reply.',
                     }
             else:
                 decision = normalize_session_dm_turn_decision(raw_content)
+            combat_batch_violation = _session_dm_combat_batch_violation(decision, combat_tracker)
+            if combat_batch_violation and combat_batch_retry_count < 2 and tool_round < max_tool_rounds:
+                if on_status_change:
+                    on_status_change({"step": "revising", "violations": {"type": "combat_batch", "details": combat_batch_violation}})
+                if base_audit.get('campaign_id'):
+                    audit = guard_audit('combat_batch_guard')
+                    log_audit_event(
+                        base_audit.get('campaign_id'),
+                        'combat_batch_guard_retry',
+                        'Session DM stopped before resolving consecutive non-player combat turns; discarded candidate and continued with a combat-turn reminder.',
+                        {
+                            'operation': 'combat_batch_guard',
+                            'violation': combat_batch_violation,
+                            'draft_response': raw_content,
+                        },
+                        source='session_dm.guard',
+                        actor=audit.get('actor'),
+                        trace_id=audit.get('trace_id'),
+                        parent_trace_id=audit.get('parent_trace_id'),
+                        trace_label=audit.get('trace_label'),
+                        audit_role='guard',
+                        commit=True,
+                    )
+                messages.append({
+                    'role': 'system',
+                    'content': _session_dm_guard_retry_system_prompt('combat_batch', combat_batch_violation),
+                })
+                combat_batch_retry_count += 1
+                continue
             content = decision.get('content') or ''
             format_violation = (
                 _session_dm_format_violation(content)
@@ -2427,6 +2823,12 @@ def get_session_dm_response_with_tools(
                 if decision.get('mode') == 'speak' and not format_violation and not private_violation
                 and not mechanical_violation
                 else {'safe': True, 'leaked_item_ids': [], 'evidence': [], 'reason': ''}
+            )
+            combat_handoff_violation = (
+                _session_dm_combat_handoff_violation(content, combat_tracker)
+                if decision.get('mode') == 'speak' and not format_violation and not private_violation
+                and not mechanical_violation
+                else None
             )
             if format_violation and not format_retried:
                 if on_status_change:
@@ -2573,6 +2975,59 @@ def get_session_dm_response_with_tools(
                 })
                 spoiler_checker_retried = True
                 continue
+            if combat_handoff_violation and not combat_handoff_retried:
+                if on_status_change:
+                    on_status_change({"step": "revising", "violations": {"type": "combat_handoff", "details": combat_handoff_violation}})
+                if base_audit.get('campaign_id'):
+                    audit = guard_audit('combat_handoff_guard')
+                    log_audit_event(
+                        base_audit.get('campaign_id'),
+                        'combat_handoff_guard_retry',
+                        'Session DM response used procedural next-turn handoff text after combat resolution; discarded candidate and reran with a combat handoff reminder.',
+                        {
+                            'operation': 'combat_handoff_guard',
+                            'violation': combat_handoff_violation,
+                            'draft_response': raw_content,
+                        },
+                        source='session_dm.guard',
+                        actor=audit.get('actor'),
+                        trace_id=audit.get('trace_id'),
+                        parent_trace_id=audit.get('parent_trace_id'),
+                        trace_label=audit.get('trace_label'),
+                        audit_role='guard',
+                        commit=True,
+                    )
+                messages.append({
+                    'role': 'system',
+                    'content': _session_dm_guard_retry_system_prompt('combat_handoff', combat_handoff_violation),
+                })
+                combat_handoff_retried = True
+                continue
+            if combat_batch_violation:
+                if base_audit.get('campaign_id'):
+                    audit = guard_audit('combat_batch_guard')
+                    log_audit_event(
+                        base_audit.get('campaign_id'),
+                        'combat_batch_guard_blocked',
+                        'Session DM still stopped while a non-player combat turn was active.',
+                        {
+                            'operation': 'combat_batch_guard',
+                            'violation': combat_batch_violation,
+                            'draft_response': raw_content,
+                        },
+                        source='session_dm.guard',
+                        actor=audit.get('actor'),
+                        trace_id=audit.get('trace_id'),
+                        parent_trace_id=audit.get('parent_trace_id'),
+                        trace_label=audit.get('trace_label'),
+                        audit_role='guard',
+                        commit=True,
+                    )
+                rollback_combat_if_needed('combat_batch_incomplete', combat_batch_violation)
+                return {
+                    'mode': 'silent',
+                    'reason': 'The DM response stopped before combat returned to a player character.',
+                }
             if violation:
                 if base_audit.get('campaign_id'):
                     audit = guard_audit('pc_control_guard')
@@ -2593,6 +3048,7 @@ def get_session_dm_response_with_tools(
                         audit_role='guard',
                         commit=True,
                     )
+                rollback_combat_if_needed('pc_control_violation', violation)
                 return {
                     'mode': 'silent',
                     'reason': 'The DM response would have controlled a protected player character.',
@@ -2617,6 +3073,7 @@ def get_session_dm_response_with_tools(
                         audit_role='guard',
                         commit=True,
                     )
+                rollback_combat_if_needed('mechanical_resolution_violation', mechanical_violation)
                 return {
                     'mode': 'silent',
                     'reason': 'The DM response would have resolved combat without required D&D mechanics.',
@@ -2641,6 +3098,7 @@ def get_session_dm_response_with_tools(
                         audit_role='guard',
                         commit=True,
                     )
+                rollback_combat_if_needed('private_output_violation', private_violation)
                 return {
                     'mode': 'silent',
                     'reason': 'The DM response would have exposed DM-private information.',
@@ -2665,9 +3123,35 @@ def get_session_dm_response_with_tools(
                         audit_role='guard',
                         commit=True,
                     )
+                rollback_combat_if_needed('format_violation', format_violation)
                 return {
                     'mode': 'silent',
                     'reason': 'The DM response used malformed visible-message syntax.',
+                }
+            if combat_handoff_violation:
+                if base_audit.get('campaign_id'):
+                    audit = guard_audit('combat_handoff_guard')
+                    log_audit_event(
+                        base_audit.get('campaign_id'),
+                        'combat_handoff_guard_blocked',
+                        'Session DM response still used procedural combat handoff text after retry.',
+                        {
+                            'operation': 'combat_handoff_guard',
+                            'violation': combat_handoff_violation,
+                            'draft_response': raw_content,
+                        },
+                        source='session_dm.guard',
+                        actor=audit.get('actor'),
+                        trace_id=audit.get('trace_id'),
+                        parent_trace_id=audit.get('parent_trace_id'),
+                        trace_label=audit.get('trace_label'),
+                        audit_role='guard',
+                        commit=True,
+                    )
+                rollback_combat_if_needed('combat_handoff_violation', combat_handoff_violation)
+                return {
+                    'mode': 'silent',
+                    'reason': 'The DM response used procedural combat handoff text.',
                 }
             if not spoiler_check.get('safe', True):
                 if base_audit.get('campaign_id'):
@@ -2689,6 +3173,7 @@ def get_session_dm_response_with_tools(
                         audit_role='guard',
                         commit=True,
                     )
+                rollback_combat_if_needed('spoiler_checker_violation', spoiler_check)
                 return {
                     'mode': 'silent',
                     'reason': 'The DM response would have semantically exposed DM-private information.',
@@ -2706,15 +3191,46 @@ def get_session_dm_response_with_tools(
                     "tool_name": tool_name,
                     "arguments": args
                 })
-            result = execute_tool(
-                tool_name,
-                args,
-                {
-                    **loop_audit,
-                    'parent_trace_id': trace_id,
-                    'trace_id': trace_id,
-                },
-            )
+            combat_tool_violation = _session_dm_combat_tool_violation(tool_name, args, combat_tracker)
+            if combat_tool_violation:
+                if base_audit.get('campaign_id'):
+                    audit = guard_audit('combat_turn_scope_guard')
+                    log_audit_event(
+                        base_audit.get('campaign_id'),
+                        'combat_turn_scope_guard_blocked',
+                        'Blocked a session DM combat tool call that drifted outside the current allowed combat scope.',
+                        {
+                            'operation': 'combat_turn_scope_guard',
+                            'tool_name': tool_name,
+                            'arguments': args,
+                            'violation': combat_tool_violation,
+                        },
+                        source='session_dm.guard',
+                        actor=audit.get('actor'),
+                        trace_id=audit.get('trace_id'),
+                        parent_trace_id=audit.get('parent_trace_id'),
+                        trace_label=audit.get('trace_label'),
+                        audit_role='guard',
+                        commit=True,
+                    )
+                result = {'error': combat_tool_violation.get('detail') or 'Blocked combat tool call.'}
+            else:
+                result = execute_tool(
+                    tool_name,
+                    args,
+                    {
+                        **loop_audit,
+                        'parent_trace_id': trace_id,
+                        'trace_id': trace_id,
+                    },
+                )
+                if tool_name in SESSION_DM_COMBAT_PROGRESS_TOOL_NAMES and isinstance(result, dict) and not result.get('error'):
+                    combat_tracker['turn_progress_made'] = True
+                if tool_name in SESSION_DM_COMBAT_MUTATION_TOOL_NAMES and isinstance(result, dict) and not result.get('error'):
+                    combat_tracker['mutated'] = True
+                updated_state = _session_dm_result_encounter_state(result)
+                if updated_state:
+                    _session_dm_refresh_combat_tracker_from_state(combat_tracker, updated_state)
             messages.append({
                 'role': 'tool',
                 'tool_call_id': tool_call.get('id'),
