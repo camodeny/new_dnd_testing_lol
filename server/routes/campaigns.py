@@ -28,9 +28,58 @@ from models import (
     SessionMessage,
 )
 from services.campaign_service import ensure_member, get_or_404, invite_code_matches
+from services.campaign_brief_generator import generate_campaign_brief
 from services.character_service import character_full_dict
 
 campaigns_bp = Blueprint('campaigns', __name__)
+
+
+def _campaign_settings_from_request(data):
+    settings = {}
+
+    incoming_settings = data.get('settings')
+    if isinstance(incoming_settings, dict):
+        settings.update(incoming_settings)
+
+    required = data.get('required_players')
+    if required is not None:
+        try:
+            required = int(required)
+            if required < 1:
+                required = 1
+            elif required > 10:
+                required = 10
+            settings['required_players'] = required
+        except (ValueError, TypeError):
+            pass
+
+    loot_mode = data.get('loot_mode')
+    if loot_mode in ('frequent_gamble', 'rare_quality'):
+        settings['loot_mode'] = loot_mode
+
+    return settings
+
+
+def _create_campaign_record(current_user, data):
+    settings = _campaign_settings_from_request(data)
+
+    campaign = Campaign(
+        name=data['name'],
+        description=data.get('description', ''),
+        difficulty=data.get('difficulty', ''),
+        seed=data.get('seed', ''),
+        user_id=current_user.id,
+        settings=json.dumps(settings) if settings else None,
+    )
+
+    db.session.add(campaign)
+    db.session.commit()
+
+    member = CampaignMember(campaign_id=campaign.id, user_id=current_user.id, role='player')
+    db.session.add(member)
+    db.session.commit()
+
+    return campaign
 
 
 @campaigns_bp.route('/api/campaigns', methods=['GET'])
@@ -123,40 +172,44 @@ def create_campaign(current_user):
     if not data or not data.get('name'):
         return jsonify({'error': 'Missing required field: name'}), 400
 
-    required = data.get('required_players')
-    settings = {}
-    if required is not None:
-        try:
-            required = int(required)
-            if required < 1:
-                required = 1
-            elif required > 10:
-                required = 10
-            settings['required_players'] = required
-        except (ValueError, TypeError):
-            pass
-
-    loot_mode = data.get('loot_mode')
-    if loot_mode in ('frequent_gamble', 'rare_quality'):
-        settings['loot_mode'] = loot_mode
-
-    campaign = Campaign(
-        name=data['name'],
-        description=data.get('description', ''),
-        difficulty=data.get('difficulty', ''),
-        seed=data.get('seed', ''),
-        user_id=current_user.id,
-        settings=json.dumps(settings) if settings else None,
-    )
-
-    db.session.add(campaign)
-    db.session.commit()
-
-    member = CampaignMember(campaign_id=campaign.id, user_id=current_user.id, role='player')
-    db.session.add(member)
-    db.session.commit()
+    campaign = _create_campaign_record(current_user, data)
 
     return jsonify({'message': 'Campaign created successfully', 'campaign': campaign.to_dict()}), 201
+
+
+@campaigns_bp.route('/api/campaigns/random-brief', methods=['POST'])
+@token_required
+def random_campaign_brief(current_user):
+    data = request.get_json(silent=True) or {}
+    brief = generate_campaign_brief(
+        seed=data.get('seed'),
+        overrides={
+            'difficulty': data.get('difficulty'),
+            'required_players': data.get('required_players'),
+            'loot_mode': data.get('loot_mode'),
+        },
+    )
+    return jsonify({'brief': brief}), 200
+
+
+@campaigns_bp.route('/api/campaigns/quick-create', methods=['POST'])
+@token_required
+def quick_create_campaign(current_user):
+    data = request.get_json(silent=True) or {}
+    brief = generate_campaign_brief(
+        seed=data.get('seed'),
+        overrides={
+            'difficulty': data.get('difficulty'),
+            'required_players': data.get('required_players'),
+            'loot_mode': data.get('loot_mode'),
+        },
+    )
+    campaign = _create_campaign_record(current_user, brief)
+    return jsonify({
+        'message': 'Campaign created successfully',
+        'campaign': campaign.to_dict(),
+        'brief': brief,
+    }), 201
 
 
 @campaigns_bp.route('/api/campaigns/<int:campaign_id>/characters', methods=['GET'])

@@ -245,6 +245,57 @@ class AppRouteTest(unittest.TestCase):
         with app.app_context():
             self.assertEqual(AuthSession.query.count(), 0)
 
+    def test_random_campaign_brief_is_deterministic_for_seed(self):
+        token = self.create_user_token()
+
+        response_one = self.client.post(
+            '/api/campaigns/random-brief',
+            json={'seed': 'moon-bell-4242'},
+            headers={'Authorization': f'Bearer {token}'},
+        )
+        response_two = self.client.post(
+            '/api/campaigns/random-brief',
+            json={'seed': 'moon-bell-4242'},
+            headers={'Authorization': f'Bearer {token}'},
+        )
+
+        self.assertEqual(response_one.status_code, 200)
+        self.assertEqual(response_two.status_code, 200)
+        brief_one = response_one.get_json()['brief']
+        brief_two = response_two.get_json()['brief']
+        self.assertEqual(brief_one, brief_two)
+        self.assertEqual(brief_one['seed'], 'moon-bell-4242')
+        self.assertIn(brief_one['difficulty'], ('Easy', 'Medium', 'Hard', 'Deadly'))
+        self.assertIn(brief_one['loot_mode'], ('frequent_gamble', 'rare_quality'))
+        self.assertTrue(brief_one['name'])
+        self.assertTrue(brief_one['description'])
+        self.assertEqual(brief_one['settings']['generator']['type'], 'seed_pack')
+
+    def test_quick_create_campaign_uses_generated_brief(self):
+        token = self.create_user_token()
+
+        response = self.client.post(
+            '/api/campaigns/quick-create',
+            json={'seed': 'copper-engine-5150', 'required_players': 4, 'loot_mode': 'rare_quality'},
+            headers={'Authorization': f'Bearer {token}'},
+        )
+
+        self.assertEqual(response.status_code, 201)
+        data = response.get_json()
+        self.assertEqual(data['brief']['seed'], 'copper-engine-5150')
+        self.assertEqual(data['campaign']['seed'], 'copper-engine-5150')
+        self.assertEqual(data['campaign']['settings']['required_players'], 4)
+        self.assertEqual(data['campaign']['settings']['loot_mode'], 'rare_quality')
+        self.assertEqual(data['campaign']['settings']['generator']['seed'], 'copper-engine-5150')
+        self.assertEqual(data['campaign']['settings']['campaign_brief']['version'], 'v1')
+
+        with app.app_context():
+            campaign = db.session.get(Campaign, data['campaign']['id'])
+            self.assertIsNotNone(campaign)
+            self.assertEqual(campaign.to_dict()['settings']['required_players'], 4)
+            member = CampaignMember.query.filter_by(campaign_id=campaign.id).one()
+            self.assertEqual(member.role, 'player')
+
     def test_spa_routes_fall_back_to_index(self):
         response = self.client.get('/join/1?code=COWJVBID')
 

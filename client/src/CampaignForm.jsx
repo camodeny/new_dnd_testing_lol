@@ -1,5 +1,5 @@
 import { useState } from 'react'
-import { createCampaign } from './api/client'
+import { createCampaign, fetchRandomCampaignBrief, quickCreateCampaign } from './api/client'
 
 function CampaignForm({ onCampaignCreated, onCancel, className = '' }) {
   const [name, setName] = useState('')
@@ -8,8 +8,60 @@ function CampaignForm({ onCampaignCreated, onCancel, className = '' }) {
   const [seed, setSeed] = useState('')
   const [requiredPlayers, setRequiredPlayers] = useState(1)
   const [lootMode, setLootMode] = useState('frequent_gamble')
+  const [lastGeneratedSeed, setLastGeneratedSeed] = useState('')
+  const [generatedSettings, setGeneratedSettings] = useState(null)
   const [error, setError] = useState('')
   const [loading, setLoading] = useState(false)
+  const [generating, setGenerating] = useState(false)
+  const [quickCreating, setQuickCreating] = useState(false)
+
+  const applyBrief = (brief) => {
+    setName(brief.name || '')
+    setDescription(brief.description || '')
+    setDifficulty(brief.difficulty || '')
+    setSeed(brief.seed || '')
+    setRequiredPlayers(brief.required_players || 1)
+    setLootMode(brief.loot_mode || 'frequent_gamble')
+    setLastGeneratedSeed(brief.seed || '')
+    setGeneratedSettings(brief.settings || null)
+  }
+
+  const handleRandomize = async () => {
+    setError('')
+    setGenerating(true)
+
+    try {
+      const data = await fetchRandomCampaignBrief({
+        difficulty: difficulty || undefined,
+        required_players: requiredPlayers,
+        loot_mode: lootMode,
+      })
+      applyBrief(data.brief)
+    } catch (err) {
+      setError(err.message || 'Failed to generate a random campaign brief')
+    } finally {
+      setGenerating(false)
+    }
+  }
+
+  const handleQuickCreate = async () => {
+    setError('')
+    setQuickCreating(true)
+
+    try {
+      const data = await quickCreateCampaign({
+        difficulty: difficulty || undefined,
+        required_players: requiredPlayers,
+        loot_mode: lootMode,
+      })
+      setLastGeneratedSeed(data.brief?.seed || '')
+      onCampaignCreated(data.campaign)
+    } catch (err) {
+      setError(err.message || 'Failed to quick-create campaign')
+    } finally {
+      setQuickCreating(false)
+    }
+  }
 
   const handleSubmit = async (e) => {
     e.preventDefault()
@@ -17,11 +69,21 @@ function CampaignForm({ onCampaignCreated, onCancel, className = '' }) {
     setLoading(true)
 
     try {
-      const data = await createCampaign({ name, description, difficulty, seed, required_players: requiredPlayers, loot_mode: lootMode })
+      const data = await createCampaign({
+        name,
+        description,
+        difficulty,
+        seed,
+        required_players: requiredPlayers,
+        loot_mode: lootMode,
+        settings: generatedSettings || undefined,
+      })
       setName('')
       setDescription('')
       setDifficulty('')
       setSeed('')
+      setLastGeneratedSeed('')
+      setGeneratedSettings(null)
       onCampaignCreated(data.campaign)
     } catch (err) {
       setError(err.message || 'Network error occurred')
@@ -103,17 +165,45 @@ function CampaignForm({ onCampaignCreated, onCancel, className = '' }) {
           id="campaign-seed"
           type="text"
           value={seed}
-          onChange={(e) => setSeed(e.target.value)}
+          onChange={(e) => {
+            const nextSeed = e.target.value
+            setSeed(nextSeed)
+            if (lastGeneratedSeed && nextSeed !== lastGeneratedSeed) {
+              setLastGeneratedSeed('')
+              setGeneratedSettings(null)
+            }
+          }}
           placeholder="Random seed for generation (optional)"
         />
       </div>
+      {lastGeneratedSeed && (
+        <div className="form-help-text">
+          Generated from seed pack <strong>{lastGeneratedSeed}</strong>. You can edit any field before creating.
+        </div>
+      )}
       <div className="form-actions-compact">
         {onCancel && (
           <button type="button" className="btn btn-secondary" onClick={onCancel}>
             Cancel
           </button>
         )}
-        <button type="submit" className="btn btn-primary" disabled={loading}>
+        <button
+          type="button"
+          className="btn btn-secondary"
+          onClick={handleRandomize}
+          disabled={loading || generating || quickCreating}
+        >
+          {generating ? 'Randomizing...' : (lastGeneratedSeed ? 'Randomize Again' : 'Randomize')}
+        </button>
+        <button
+          type="button"
+          className="btn btn-secondary"
+          onClick={handleQuickCreate}
+          disabled={loading || generating || quickCreating}
+        >
+          {quickCreating ? 'Creating Random...' : 'Quick Create'}
+        </button>
+        <button type="submit" className="btn btn-primary" disabled={loading || generating || quickCreating}>
           {loading ? 'Creating...' : 'Create Campaign'}
         </button>
       </div>

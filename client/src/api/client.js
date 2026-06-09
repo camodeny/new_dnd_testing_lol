@@ -84,6 +84,14 @@ export function createCampaign(payload) {
   return apiFetch('/campaigns', { method: 'POST', body: JSON.stringify(payload) })
 }
 
+export function fetchRandomCampaignBrief(payload = {}) {
+  return apiFetch('/campaigns/random-brief', { method: 'POST', body: JSON.stringify(payload) })
+}
+
+export function quickCreateCampaign(payload = {}) {
+  return apiFetch('/campaigns/quick-create', { method: 'POST', body: JSON.stringify(payload) })
+}
+
 export function createDevCharacter() {
   return apiFetch('/dev/character', { method: 'POST' })
 }
