@@ -766,12 +766,6 @@ export default function SessionPanel({
 
   const handleMessagesScroll = () => loadOlderFromTop(false)
 
-  const postRollToChat = (roll) => {
-    if (!roll) return
-    const msg = `[Roll: ${roll.label}] total: ${roll.total} | rolls: ${roll.rolls.join(',')} | mod: ${roll.modifier} | sides: ${roll.sides}`
-    onSendMessage(formatMessageForDm(msg))
-  }
-
   const handleSend = () => {
     if (activeSlashCommand === 'roll') {
       submitPhysicalRoll()

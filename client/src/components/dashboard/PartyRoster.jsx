@@ -40,30 +40,10 @@ function getHpPercent(current, max) {
   return Math.max(0, Math.min(100, (current / max) * 100))
 }
 
-function getClassIcon(classes) {
-  if (!classes || classes.length === 0) return 'bi bi-person'
-  const primaryClass = classes[0].class_name?.toLowerCase() || ''
-  if (primaryClass.includes('paladin')) return 'bi bi-shield'
-  if (primaryClass.includes('druid')) return 'bi bi-leaf'
-  if (primaryClass.includes('rogue')) return 'bi bi-shield-slash'
-  if (primaryClass.includes('bard')) return 'bi bi-music-note-beamed'
-  if (primaryClass.includes('cleric')) return 'bi bi-brightness-high'
-  if (primaryClass.includes('fighter')) return 'bi bi-swords'
-  if (primaryClass.includes('wizard')) return 'bi bi-magic'
-  if (primaryClass.includes('warlock')) return 'bi bi-eye'
-  if (primaryClass.includes('sorcerer')) return 'bi bi-lightning-charge'
-  if (primaryClass.includes('ranger')) return 'bi bi-target'
-  if (primaryClass.includes('monk')) return 'bi bi-flower1'
-  if (primaryClass.includes('barbarian')) return 'bi bi-hammer'
-  return 'bi bi-person'
-}
-
 export default function PartyRoster({ characters = [], campaignId, onImport }) {
   const navigate = useNavigate()
 
-  const playerLimit = 6
   const charactersList = characters || []
-  const emptySlotsCount = Math.max(0, playerLimit - charactersList.length)
 
   return (
     <div style={{ display: 'flex', flexDirection: 'column', gap: '20px' }}>
@@ -93,10 +73,7 @@ export default function PartyRoster({ characters = [], campaignId, onImport }) {
             const initials = getInitials(c.name)
             const combat = c.combat || {}
             const hpPct = getHpPercent(combat.current_hp, combat.max_hp)
-            const hpColor = '#4d7c5a' // Using the beautiful primary green color for health bars
-            const levelSummary = c.classes?.map((cl) => `${cl.class_name} • Level ${cl.level}`).join(', ') || `Level ${c.total_level ?? '?'}`
             const mainRace = c.race || 'Race'
-            const classIcon = getClassIcon(c.classes)
 
             return (
               <div
