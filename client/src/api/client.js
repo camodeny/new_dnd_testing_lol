@@ -147,10 +147,6 @@ export function startSession(campaignId) {
   return apiFetch(`/campaigns/${campaignId}/sessions`, { method: 'POST' })
 }
 
-export function listSessions(campaignId) {
-  return apiFetch(`/campaigns/${campaignId}/sessions`)
-}
-
 export function getCampaignWorld(campaignId) {
   return apiFetch(`/campaigns/${campaignId}/world`)
 }
@@ -294,10 +290,6 @@ export function joinCampaign(campaignId, code) {
   return apiFetch(`/campaigns/${campaignId}/join`, { method: 'POST', body: JSON.stringify({ code }) })
 }
 
-export function updateMemberRole(campaignId, userId, role) {
-  return apiFetch(`/campaigns/${campaignId}/members/${userId}`, { method: 'PUT', body: JSON.stringify({ role }) })
-}
-
 export function removeMember(campaignId, userId) {
   return apiFetch(`/campaigns/${campaignId}/members/${userId}`, { method: 'DELETE' })
 }
@@ -344,51 +336,13 @@ export function updatePlanningBond(campaignId, bondId, payload) {
   })
 }
 
-// Notes
-export function listNotes(campaignId) {
-  return apiFetch(`/campaigns/${campaignId}/notes`)
-}
-
-export function createNote(campaignId, payload) {
-  return apiFetch(`/campaigns/${campaignId}/notes`, { method: 'POST', body: JSON.stringify(payload) })
-}
-
-export function updateNote(noteId, payload) {
-  return apiFetch(`/notes/${noteId}`, { method: 'PUT', body: JSON.stringify(payload) })
-}
-
-export function deleteNote(noteId) {
-  return apiFetch(`/notes/${noteId}`, { method: 'DELETE' })
-}
-
 // Loot Boxes
 export function getLootBoxes(campaignId) {
   return apiFetch(`/campaigns/${campaignId}/lootboxes`)
 }
 
-export function getLootBox(lootBoxId) {
-  return apiFetch(`/lootboxes/${lootBoxId}`)
-}
-
 export function openLootBox(lootBoxId) {
   return apiFetch(`/lootboxes/${lootBoxId}/open`, { method: 'POST' })
-}
-
-// NPCs
-export function listNPCs(campaignId) {
-  return apiFetch(`/campaigns/${campaignId}/npcs`)
-}
-
-export function createNPC(campaignId, payload) {
-  return apiFetch(`/campaigns/${campaignId}/npcs`, { method: 'POST', body: JSON.stringify(payload) })
-}
-
-export function updateNPC(npcId, payload) {
-  return apiFetch(`/npcs/${npcId}`, { method: 'PUT', body: JSON.stringify(payload) })
-}
-
-export function deleteNPC(npcId) {
-  return apiFetch(`/npcs/${npcId}`, { method: 'DELETE' })
 }
 
 // Shops

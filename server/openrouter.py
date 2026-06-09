@@ -1639,21 +1639,6 @@ def _session_dm_format_violation(response_text):
     return {'errors': errors} if errors else None
 
 
-def _session_dm_format_feedback(format_violation):
-    errors = format_violation.get('errors') if isinstance(format_violation, dict) else []
-    lines = []
-    for error in errors[:6]:
-        snippet = str(error.get('snippet') or '').strip()
-        detail = str(error.get('detail') or '').strip()
-        if snippet and detail:
-            lines.append(f'- {detail} Problem tag: {snippet}')
-        elif detail:
-            lines.append(f'- {detail}')
-    if not lines:
-        lines.append('- The visible reply contains malformed or disallowed visible-message syntax.')
-    return '\n'.join(lines)
-
-
 def _possible_missing_npc_tag_signal(response_text):
     import re
 
@@ -1825,48 +1810,6 @@ def build_session_npc_tag_check_messages(response_text, signal):
             }, ensure_ascii=False),
         },
     ]
-
-
-
-
-def _spoiler_rewrite_feedback(spoiler_check):
-    evidence = spoiler_check.get('evidence') if isinstance(spoiler_check, dict) else []
-    snippets = [str(item).strip() for item in evidence or [] if str(item).strip()]
-    if snippets:
-        quoted = '\n'.join(f'- "{snippet}"' for snippet in snippets)
-        reason = str(spoiler_check.get('reason') or '').strip()
-        reason_line = f'\nChecker reason: {reason}' if reason else ''
-        return (
-            'The checker flagged these visible spoiler-bearing snippets:\n'
-            f'{quoted}'
-            f'{reason_line}\n'
-            'Remove or generalize those claims while preserving the rest of the safe answer where possible. '
-            'Do not restate or paraphrase the hidden explanation behind them.'
-        )
-    return (
-        'Remove or generalize any claims that directly reveal or strongly imply unrevealed DM-private '
-        'information while preserving the rest of the safe answer where possible.'
-    )
-
-
-def _mechanics_rewrite_feedback(mechanics_check):
-    violations = mechanics_check.get('violations') if isinstance(mechanics_check, dict) else []
-    snippets = [str(item).strip() for item in violations or [] if str(item).strip()]
-    required = str((mechanics_check or {}).get('required_mechanic') or '').strip()
-    reason = str((mechanics_check or {}).get('reason') or '').strip()
-    lines = []
-    if snippets:
-        lines.append('The mechanics checker flagged these premature outcome decisions:')
-        lines.extend(f'- "{snippet}"' for snippet in snippets[:6])
-    if required:
-        lines.append(f'Required mechanic: {required}.')
-    if reason:
-        lines.append(f'Checker reason: {reason}')
-    if not lines:
-        lines.append('The response resolved an uncertain mechanical outcome before the required D&D step.')
-    return '\n'.join(lines)
-
-
 def _child_audit_context(base_audit, operation, actor, trace_label):
     parent_trace_id = base_audit.get('trace_id')
     return {

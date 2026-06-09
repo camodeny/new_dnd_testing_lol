@@ -40,12 +40,6 @@ function getHpPercent(current, max) {
   return Math.max(0, Math.min(100, (current / max) * 100))
 }
 
-function getHpColor(pct) {
-  if (pct > 60) return '#4ade80'
-  if (pct > 30) return '#facc15'
-  return '#f87171'
-}
-
 function getClassIcon(classes) {
   if (!classes || classes.length === 0) return 'bi bi-person'
   const primaryClass = classes[0].class_name?.toLowerCase() || ''

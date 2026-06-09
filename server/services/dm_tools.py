@@ -52,12 +52,6 @@ def estimate_tokens(value):
     return max(1, len(text) // 4) if text else 0
 
 
-def _safe_json(value, fallback):
-    if isinstance(value, str):
-        return json_loads(value, fallback)
-    return value if isinstance(value, type(fallback)) else fallback
-
-
 def _selected_member(campaign_id, user_id):
     return CampaignMember.query.filter_by(campaign_id=campaign_id, user_id=user_id).first()
 

@@ -95,10 +95,6 @@ def is_combat_sandbox_campaign(campaign):
     return _campaign_settings(campaign).get('dev_mode') == 'combat_sandbox'
 
 
-def _campaign_owner_member(campaign):
-    return CampaignMember.query.filter_by(campaign_id=campaign.id, user_id=campaign.user_id).first()
-
-
 def _create_dev_character(user_id, campaign_id, player_label=''):
     template = random.choice(DEV_CHARACTER_TEMPLATES)
     character = Character(user_id=user_id, campaign_id=campaign_id, player_name=player_label or None)
@@ -352,41 +348,6 @@ def _ensure_training_monsters(campaign, encounter_map):
         )
         db.session.add(placement)
     db.session.flush()
-
-
-def _owner_player_placement(encounter_map, owner_user_id):
-    return EncounterMapPlacement.query.filter_by(
-        encounter_map_id=encounter_map.id,
-        actor_type='player',
-        actor_id=str(owner_user_id),
-    ).first()
-
-
-def _place_player_character(encounter_map, user, character):
-    placement = _owner_player_placement(encounter_map, user.id) or EncounterMapPlacement.query.filter_by(
-        encounter_map_id=encounter_map.id,
-        actor_type='player',
-        actor_id=str(user.id),
-    ).first()
-    if placement:
-        return placement
-
-    fallback = None
-    source_player = EncounterMapPlacement.query.filter_by(encounter_map_id=encounter_map.id, actor_type='player').order_by(EncounterMapPlacement.id.asc()).first()
-    if source_player:
-        fallback = (source_player.grid_col, source_player.grid_row)
-    col, row = _choose_player_spawn(encounter_map, fallback=fallback)
-    placement = EncounterMapPlacement(
-        encounter_map_id=encounter_map.id,
-        actor_type='player',
-        actor_id=str(user.id),
-        label=character.name,
-        grid_col=col,
-        grid_row=row,
-    )
-    db.session.add(placement)
-    db.session.flush()
-    return placement
 
 
 def _build_player_combatant(placement, character, initiative=None):

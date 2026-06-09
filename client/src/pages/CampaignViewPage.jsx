@@ -95,18 +95,6 @@ function mergeUniqueMessages(messages, additions = []) {
   return next
 }
 
-function uniqueMessages(messages = []) {
-  const existing = new Set()
-  const next = []
-  messages.forEach((message) => {
-    if (!existing.has(message.id)) {
-      next.push(message)
-      existing.add(message.id)
-    }
-  })
-  return next
-}
-
 function proposalsToMessages(sessionId, proposals) {
   return (proposals || [])
     .filter((p) => p.status === 'pending')

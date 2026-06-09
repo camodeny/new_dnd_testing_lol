@@ -148,12 +148,6 @@ function getMessageSenderLabel(msg, currentUser) {
   return msg.username || 'Player'
 }
 
-function getMessageSenderIcon(role) {
-  if (role === 'dm') return 'bi bi-mic-fill'
-  if (role === 'system') return 'bi bi-gear-fill'
-  return 'bi bi-person-fill'
-}
-
 const rollRegex = /^\[Roll:\s*([^\]]+)\]\s*total:\s*(-?\d+)\s*\|\s*rolls:\s*([\d,\s]+)\s*\|\s*mod:\s*(-?\d+)\s*\|\s*sides:\s*(\d+)/i
 
 function RollCard({ label, total, rolls, modifier, sides }) {

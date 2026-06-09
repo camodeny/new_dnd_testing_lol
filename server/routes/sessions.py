@@ -1,5 +1,4 @@
 from datetime import datetime
-from threading import Thread
 import json
 import queue
 
@@ -159,61 +158,6 @@ def _run_session_memory_update(
             audit_role='tools',
             commit=True,
         )
-
-
-def _schedule_session_memory_update(
-    campaign_id,
-    session_id,
-    user_id,
-    player_message_id,
-    player_content,
-    ai_text,
-    hot_context,
-    parent_trace_id,
-    dm_message_id=None,
-):
-    app = current_app._get_current_object()
-
-    def run_with_app_context():
-        with app.app_context():
-            try:
-                _run_session_memory_update(
-                    campaign_id,
-                    session_id,
-                    user_id,
-                    player_message_id,
-                    player_content,
-                    ai_text,
-                    hot_context,
-                    parent_trace_id,
-                    dm_message_id=dm_message_id,
-                )
-            finally:
-                db.session.remove()
-
-    if (
-        app.config.get('TESTING')
-        or app.testing
-        or app.config.get('SQLALCHEMY_DATABASE_URI') == 'sqlite:///:memory:'
-    ):
-        _run_session_memory_update(
-            campaign_id,
-            session_id,
-            user_id,
-            player_message_id,
-            player_content,
-            ai_text,
-            hot_context,
-            parent_trace_id,
-            dm_message_id=dm_message_id,
-        )
-        return
-
-    Thread(
-        target=run_with_app_context,
-        name=f'session-memory-{session_id}',
-        daemon=True,
-    ).start()
 
 
 @sessions_bp.route('/api/campaigns/<int:campaign_id>/sessions', methods=['POST'])

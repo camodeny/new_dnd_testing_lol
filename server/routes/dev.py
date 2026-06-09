@@ -388,15 +388,6 @@ def _branch_response(events):
     return None
 
 
-def _json_loads_or_value(value):
-    if isinstance(value, str):
-        try:
-            return json.loads(value)
-        except (TypeError, ValueError):
-            return value
-    return value
-
-
 def _event_step_category(event):
     event_type = event.get('event_type') or ''
     actor = event.get('actor') or ''
@@ -568,15 +559,6 @@ def _prompt_message_step(event, message, index, summary=None):
         'tool_calls': message.get('tool_calls') or [],
         'source_message_index': index,
     }
-
-
-def _prompt_message_steps(event):
-    steps = []
-    for index, message in enumerate(event.get('messages') or []):
-        if not isinstance(message, dict):
-            continue
-        steps.append(_prompt_message_step(event, message, index))
-    return steps
 
 
 def _agent_setup_prompt_steps(event):
