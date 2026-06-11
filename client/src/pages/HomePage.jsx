@@ -3,6 +3,7 @@ import { useNavigate } from 'react-router-dom'
 import CampaignForm from '../CampaignForm'
 import CampaignCard from '../components/campaign/CampaignCard'
 import CombatSandboxForm from '../components/campaign/CombatSandboxForm'
+import AutomationKeyManager from '../components/dashboard/AutomationKeyManager'
 import { getCampaigns, lookupInvite, deleteCampaign } from '../api/client'
 import Loading from '../components/common/Loading'
 import ErrorMessage from '../components/common/ErrorMessage'
@@ -30,14 +31,16 @@ export default function HomePage({ user }) {
   const [campaignToDelete, setCampaignToDelete] = useState(null)
   const [deleteLoading, setDeleteLoading] = useState(false)
   const [deleteError, setDeleteError] = useState('')
+  const [automationModalOpen, setAutomationModalOpen] = useState(false)
+  const [automationAnimatingOut, setAutomationAnimatingOut] = useState(false)
 
   useEffect(() => {
-    const hasModalOpen = modalOpen || sandboxModalOpen || joinModalOpen || deleteModalOpen
+    const hasModalOpen = modalOpen || sandboxModalOpen || joinModalOpen || deleteModalOpen || automationModalOpen
     document.body.style.overflow = hasModalOpen ? 'hidden' : ''
     return () => {
       document.body.style.overflow = ''
     }
-  }, [modalOpen, sandboxModalOpen, joinModalOpen, deleteModalOpen])
+  }, [modalOpen, sandboxModalOpen, joinModalOpen, deleteModalOpen, automationModalOpen])
 
   const openDeleteModal = (campaign) => {
     setDeleteAnimatingOut(false)
@@ -125,6 +128,18 @@ export default function HomePage({ user }) {
     }, 250)
   }
 
+  const openAutomationModal = () => {
+    setAutomationAnimatingOut(false)
+    setAutomationModalOpen(true)
+  }
+
+  const closeAutomationModal = () => {
+    setAutomationAnimatingOut(true)
+    setTimeout(() => {
+      setAutomationModalOpen(false)
+    }, 250)
+  }
+
   const handleJoinSubmit = async (e) => {
     e.preventDefault()
     const cleanCode = inviteCode.trim()
@@ -161,6 +176,10 @@ export default function HomePage({ user }) {
           </p>
         </div>
         <div className="campaigns-header-actions">
+          <button className="btn btn-secondary" onClick={openAutomationModal}>
+            <i className="bi bi-cpu"></i>
+            Automation Keys
+          </button>
           <button className="btn btn-secondary join-btn-header" onClick={openJoinModal}>
             <i className="bi bi-key-fill"></i>
             Join with Code
@@ -193,6 +212,9 @@ export default function HomePage({ user }) {
           <h3>No campaigns yet</h3>
           <p>Every great story starts with a single step. Create your first campaign or join one with a code.</p>
           <div className="empty-state-actions">
+            <button className="btn btn-secondary" onClick={openAutomationModal}>
+              <i className="bi bi-cpu"></i> Automation Keys
+            </button>
             <button className="btn btn-secondary" onClick={openJoinModal}>
               <i className="bi bi-key-fill"></i> Join with Code
             </button>
@@ -234,6 +256,20 @@ export default function HomePage({ user }) {
               </button>
             </div>
             <CombatSandboxForm onCreated={handleSandboxCreated} onCancel={closeSandboxModal} />
+          </div>
+        </div>
+      )}
+
+      {automationModalOpen && (
+        <div className={`modal-overlay ${automationAnimatingOut ? 'fade-out' : 'fade-in'}`} onClick={closeAutomationModal}>
+          <div className={`modal-panel ${automationAnimatingOut ? 'slide-down' : 'slide-up'}`} onClick={(e) => e.stopPropagation()}>
+            <div className="modal-header">
+              <h2>Automation Keys</h2>
+              <button className="modal-close" onClick={closeAutomationModal} aria-label="Close">
+                <i className="bi bi-x-lg"></i>
+              </button>
+            </div>
+            <AutomationKeyManager />
           </div>
         </div>
       )}

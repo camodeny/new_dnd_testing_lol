@@ -75,6 +75,12 @@ def _session_dm_turn_decision(raw_result):
     }
 
 
+def _member_record(campaign_id, user_id):
+    from models import CampaignMember
+
+    return CampaignMember.query.filter_by(campaign_id=campaign_id, user_id=user_id).first()
+
+
 def _run_session_memory_update(
     campaign_id,
     session_id,
@@ -354,6 +360,10 @@ def send_message(current_user, session_id):
     campaign = db.session.get(Campaign, session.campaign_id)
     if not ensure_member(campaign, current_user):
         return jsonify({'error': 'Forbidden'}), 403
+
+    member = _member_record(campaign.id, current_user.id)
+    if member and (member.role or 'player') == 'spectator':
+        return jsonify({'error': 'Spectators can read this campaign but cannot send messages'}), 403
 
     data = request.get_json()
     if not data or not data.get('content'):

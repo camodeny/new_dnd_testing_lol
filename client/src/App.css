@@ -4284,6 +4284,19 @@ select.input:focus {
   box-shadow: 0 4px 14px var(--color-primary-glow) !important;
 }
 
+.session-spectator-banner {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  min-height: 52px;
+  padding: 12px 14px;
+  border: 1px solid rgba(197, 168, 128, 0.24);
+  border-radius: var(--radius-md);
+  background: rgba(197, 168, 128, 0.08);
+  color: var(--text-gold);
+  font-size: 0.92rem;
+}
+
 /* ==========================================================================
    CHARACTER SHEET STYLING
    ========================================================================== */
@@ -8653,4 +8666,3 @@ select.input:focus {
   transform: none !important;
   box-shadow: 0 4px 12px var(--color-primary-glow) !important;
 }
-

@@ -9,9 +9,9 @@ from urllib.parse import parse_qsl, urlencode, urljoin, urlsplit, urlunsplit
 
 import jwt
 from flask import Blueprint, current_app, g, has_request_context, jsonify, redirect, request
-from werkzeug.security import check_password_hash
+from werkzeug.security import check_password_hash, generate_password_hash
 
-from models import AuthSession, LLMPlayer, User, db
+from models import AuthSession, LLMPlayer, User, UserAutomationKey, db
 from pendergrass_sso import PendergrassSSOClient, PendergrassSSOError
 
 auth_bp = Blueprint('auth', __name__)
@@ -153,6 +153,7 @@ def _authenticate_jwt(token):
             return None, jsonify({'error': 'User not found'}), 401
         g.auth_mode = 'jwt'
         g.llm_player = None
+        g.automation_key = None
         g.auth_session = None
         return current_user, None, None
     except jwt.ExpiredSignatureError:
@@ -176,6 +177,21 @@ def _authenticate_api_key(api_key):
             db.session.commit()
             g.auth_mode = 'api_key'
             g.llm_player = llm_player
+            g.automation_key = None
+            g.auth_session = None
+            return current_user, None, None
+
+    automation_candidates = UserAutomationKey.query.filter_by(api_key_prefix=prefix).all()
+    for automation_key in automation_candidates:
+        if check_password_hash(automation_key.api_key_hash, api_key):
+            current_user = automation_key.user
+            if not current_user:
+                return None, jsonify({'error': 'User not found'}), 401
+            automation_key.last_used_at = datetime.utcnow()
+            db.session.commit()
+            g.auth_mode = 'api_key'
+            g.llm_player = None
+            g.automation_key = automation_key
             g.auth_session = None
             return current_user, None, None
 
@@ -195,6 +211,7 @@ def _authenticate_session_cookie(session_token):
     db.session.commit()
     g.auth_mode = 'session'
     g.llm_player = None
+    g.automation_key = None
     g.auth_session = auth_session
     return current_user, None, None
 
@@ -210,7 +227,7 @@ def authenticate_request(token=None, api_key=None):
         return current_user, None
 
     if bearer_token:
-        if bearer_token.startswith('dndllm_'):
+        if bearer_token.startswith('dndllm_') or bearer_token.startswith('dndauto_'):
             current_user, response, status = _authenticate_api_key(bearer_token)
             if response is not None:
                 return None, (response, status)
@@ -359,6 +376,11 @@ def _unique_username(base_username):
         suffix += 1
         candidate = f'{_slugify_username(base_username)[:55]}_{suffix}'
     return candidate
+
+
+def _generate_automation_api_key():
+    api_key = f'dndauto_{secrets.token_urlsafe(32)}'
+    return api_key, generate_password_hash(api_key), api_key[:24]
 
 
 def _provision_sso_user(userinfo):
@@ -547,3 +569,42 @@ def logout():
 @token_required
 def get_me(current_user):
     return jsonify({'user': current_user.to_dict()}), 200
+
+
+@auth_bp.route('/api/automation-keys', methods=['GET'])
+@token_required
+def list_automation_keys(current_user):
+    keys = (
+        UserAutomationKey.query
+        .filter_by(user_id=current_user.id)
+        .order_by(UserAutomationKey.created_at.desc())
+        .all()
+    )
+    return jsonify({'automation_keys': [key.to_dict() for key in keys]}), 200
+
+
+@auth_bp.route('/api/automation-keys', methods=['POST'])
+@token_required
+def create_automation_key(current_user):
+    data = request.get_json(silent=True) or {}
+    existing_count = UserAutomationKey.query.filter_by(user_id=current_user.id).count()
+    label = str(data.get('label') or f'Automation Key {existing_count + 1}').strip()[:120] or f'Automation Key {existing_count + 1}'
+    api_key, api_key_hash, api_key_prefix = _generate_automation_api_key()
+    automation_key = UserAutomationKey(
+        user_id=current_user.id,
+        label=label,
+        api_key_hash=api_key_hash,
+        api_key_prefix=api_key_prefix,
+    )
+    db.session.add(automation_key)
+    db.session.commit()
+    return jsonify({'automation_key': automation_key.to_dict(), 'api_key': api_key}), 201
+
+
+@auth_bp.route('/api/automation-keys/<int:key_id>', methods=['DELETE'])
+@token_required
+def delete_automation_key(current_user, key_id):
+    automation_key = UserAutomationKey.query.filter_by(id=key_id, user_id=current_user.id).first_or_404()
+    db.session.delete(automation_key)
+    db.session.commit()
+    return jsonify({'message': 'Automation key deleted'}), 200

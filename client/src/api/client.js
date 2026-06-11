@@ -96,6 +96,18 @@ export function createDevCharacter() {
   return apiFetch('/dev/character', { method: 'POST' })
 }
 
+export function listAutomationKeys() {
+  return apiFetch('/automation-keys')
+}
+
+export function createAutomationKey(payload = {}) {
+  return apiFetch('/automation-keys', { method: 'POST', body: JSON.stringify(payload) })
+}
+
+export function deleteAutomationKey(id) {
+  return apiFetch(`/automation-keys/${id}`, { method: 'DELETE' })
+}
+
 export function listCombatSandboxMaps() {
   return apiFetch('/dev/combat-sandbox/maps')
 }

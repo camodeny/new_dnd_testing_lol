@@ -96,6 +96,10 @@ def get_campaign_members(campaign):
     ).all()
 
 
+def active_party_members(members):
+    return [member for member in members if (member.role or 'player') != 'spectator']
+
+
 def get_member(campaign_id, user_id):
     return CampaignMember.query.filter_by(campaign_id=campaign_id, user_id=user_id).first()
 
@@ -221,12 +225,12 @@ def member_planning_dict(member, invalid_member_ids=None):
 
 
 def party_is_full(campaign, members):
-    return len(members) >= get_required_players(campaign)
+    return len(active_party_members(members)) >= get_required_players(campaign)
 
 
 def all_members_ready(campaign, members, invalid_member_ids=None):
     required = get_required_players(campaign)
-    relevant_members = members[:required]
+    relevant_members = active_party_members(members)[:required]
     return len(relevant_members) >= required and all(
         member_is_ready(member, invalid_member_ids)
         for member in relevant_members
@@ -245,7 +249,7 @@ def can_start_session(campaign, clean_ready_states=True):
         'required_players': required,
         'ready_players': sum(
             1
-            for member in members[:required]
+            for member in active_party_members(members)[:required]
             if member_is_ready(member, invalid_member_ids)
         ),
         'members': [member_planning_dict(member, invalid_member_ids) for member in members],

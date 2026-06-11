@@ -245,6 +245,54 @@ class AppRouteTest(unittest.TestCase):
         with app.app_context():
             self.assertEqual(AuthSession.query.count(), 0)
 
+    def test_user_can_create_automation_key_and_authenticate_with_it(self):
+        token = self.create_user_token()
+
+        create_response = self.client.post(
+            '/api/automation-keys',
+            headers={'Authorization': f'Bearer {token}'},
+            json={'label': 'Overseer Key'},
+        )
+
+        self.assertEqual(create_response.status_code, 201)
+        create_data = create_response.get_json()
+        self.assertTrue(create_data['api_key'].startswith('dndauto_'))
+        self.assertEqual(create_data['automation_key']['label'], 'Overseer Key')
+
+        list_response = self.client.get(
+            '/api/automation-keys',
+            headers={'Authorization': f'Bearer {token}'},
+        )
+        self.assertEqual(list_response.status_code, 200)
+        self.assertEqual(len(list_response.get_json()['automation_keys']), 1)
+
+        me_response = self.client.get(
+            '/api/me',
+            headers={'X-API-Key': create_data['api_key']},
+        )
+        self.assertEqual(me_response.status_code, 200)
+        self.assertEqual(me_response.get_json()['user']['username'], 'dev')
+
+    def test_user_can_delete_automation_key(self):
+        token = self.create_user_token()
+        create_response = self.client.post(
+            '/api/automation-keys',
+            headers={'Authorization': f'Bearer {token}'},
+            json={'label': 'Disposable Key'},
+        )
+        self.assertEqual(create_response.status_code, 201)
+        key_id = create_response.get_json()['automation_key']['id']
+        raw_key = create_response.get_json()['api_key']
+
+        delete_response = self.client.delete(
+            f'/api/automation-keys/{key_id}',
+            headers={'Authorization': f'Bearer {token}'},
+        )
+        self.assertEqual(delete_response.status_code, 200)
+
+        me_response = self.client.get('/api/me', headers={'X-API-Key': raw_key})
+        self.assertEqual(me_response.status_code, 401)
+
     def test_random_campaign_brief_is_deterministic_for_seed(self):
         token = self.create_user_token()
 
@@ -295,6 +343,89 @@ class AppRouteTest(unittest.TestCase):
             self.assertEqual(campaign.to_dict()['settings']['required_players'], 4)
             member = CampaignMember.query.filter_by(campaign_id=campaign.id).one()
             self.assertEqual(member.role, 'player')
+
+    def test_owner_spectator_does_not_block_fully_llm_session_start(self):
+        with app.app_context():
+            owner = User(username='spectator-owner', email='spectator-owner@example.com')
+            owner.set_password('password')
+            db.session.add(owner)
+            db.session.commit()
+
+            campaign = Campaign(
+                name='Spectated LLM Table',
+                user_id=owner.id,
+                settings=json.dumps({'required_players': 2}),
+            )
+            db.session.add(campaign)
+            db.session.flush()
+
+            db.session.add(CampaignMember(campaign_id=campaign.id, user_id=owner.id, role='spectator'))
+            db.session.add(CampaignWorld(
+                campaign_id=campaign.id,
+                public_intro=json.dumps({
+                    'title': 'Spectated LLM Table',
+                    'starting_location': 'The Gloam Market',
+                }),
+                knowledge_graph=json.dumps({'schema_version': '1.0', 'entities': [], 'relations': [], 'facts': []}),
+                world_state=json.dumps({
+                    'schema_version': '1.0',
+                    'current_scene': {
+                        'location_id': 'gloam_market',
+                        'location_name': 'The Gloam Market',
+                        'time_of_day': 'dusk',
+                    },
+                }),
+                dm_private=json.dumps({'schema_version': '1.0'}),
+            ))
+
+            for index in range(2):
+                llm_user = User(username=f'llm-user-{index}', email=f'llm-user-{index}@example.com')
+                llm_user.set_password('password')
+                db.session.add(llm_user)
+                db.session.flush()
+
+                character = Character(
+                    user_id=llm_user.id,
+                    campaign_id=campaign.id,
+                    player_name=f'Auto Player {index + 1}',
+                    name=f'Auto Character {index + 1}',
+                    race='Human',
+                    speed=30,
+                    max_hp=10,
+                    current_hp=10,
+                    armor_class=12,
+                    initiative_bonus=1,
+                )
+                db.session.add(character)
+                db.session.flush()
+
+                db.session.add(CampaignMember(
+                    campaign_id=campaign.id,
+                    user_id=llm_user.id,
+                    role='player',
+                    selected_character_id=character.id,
+                    character_ready_at=datetime.utcnow(),
+                ))
+                db.session.add(LLMPlayer(
+                    campaign_id=campaign.id,
+                    user_id=llm_user.id,
+                    label=f'Auto Player {index + 1}',
+                    api_key_hash='hash',
+                    api_key_prefix=f'dndllm_test_{index}',
+                ))
+
+            db.session.commit()
+            owner_token = generate_token(owner.id)
+            campaign_id = campaign.id
+
+        with patch('routes.sessions.get_opening_scene_response', return_value=''):
+            response = self.client.post(
+                f'/api/campaigns/{campaign_id}/sessions',
+                headers={'Authorization': f'Bearer {owner_token}'},
+            )
+
+        self.assertEqual(response.status_code, 201)
+        self.assertTrue(response.get_json()['session']['is_active'])
 
     def test_spa_routes_fall_back_to_index(self):
         response = self.client.get('/join/1?code=COWJVBID')
@@ -483,6 +614,46 @@ class AppRouteTest(unittest.TestCase):
         self.assertEqual(len(message_data), 1)
         self.assertEqual(message_data[0]['username'], llm_label)
         self.assertEqual(message_data[0]['role'], 'player')
+
+    def test_spectator_can_read_session_but_cannot_send_messages(self):
+        with app.app_context():
+            owner = User(username='spectator-reader', email='spectator-reader@example.com')
+            owner.set_password('password')
+            db.session.add(owner)
+            db.session.commit()
+
+            campaign = Campaign(name='Read Only Table', user_id=owner.id)
+            db.session.add(campaign)
+            db.session.flush()
+
+            db.session.add(CampaignMember(campaign_id=campaign.id, user_id=owner.id, role='spectator'))
+            session = CampaignSession(campaign_id=campaign.id, is_active=True)
+            db.session.add(session)
+            db.session.flush()
+            db.session.add(SessionMessage(
+                session_id=session.id,
+                role='dm',
+                content='The lantern-lit market hums with rumors.',
+            ))
+            db.session.commit()
+
+            token = generate_token(owner.id)
+            session_id = session.id
+
+        read_response = self.client.get(
+            f'/api/sessions/{session_id}',
+            headers={'Authorization': f'Bearer {token}'},
+        )
+        self.assertEqual(read_response.status_code, 200)
+        self.assertEqual(len(read_response.get_json()['session']['messages']), 1)
+
+        send_response = self.client.post(
+            f'/api/sessions/{session_id}/messages',
+            headers={'Authorization': f'Bearer {token}'},
+            json={'content': 'I interrupt the scene anyway.'},
+        )
+        self.assertEqual(send_response.status_code, 403)
+        self.assertIn('Spectators can read this campaign', send_response.get_json()['error'])
 
     def test_owner_can_rotate_llm_player_key(self):
         with app.app_context():

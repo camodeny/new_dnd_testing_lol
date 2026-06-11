@@ -19,6 +19,7 @@ class User(db.Model):
     campaigns = db.relationship('Campaign', backref='owner', lazy=True)
     characters = db.relationship('Character', backref='player', lazy=True)
     llm_player_profile = db.relationship('LLMPlayer', backref='user', uselist=False, lazy=True, cascade='all, delete-orphan')
+    automation_keys = db.relationship('UserAutomationKey', backref='user', lazy=True, cascade='all, delete-orphan')
     auth_sessions = db.relationship('AuthSession', backref='user', lazy=True, cascade='all, delete-orphan')
 
     def set_password(self, password):
@@ -59,6 +60,28 @@ class AuthSession(db.Model):
     created_at = db.Column(db.DateTime, default=datetime.utcnow, index=True)
     updated_at = db.Column(db.DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
     last_seen_at = db.Column(db.DateTime, default=datetime.utcnow, nullable=False)
+
+
+class UserAutomationKey(db.Model):
+    __tablename__ = 'user_automation_keys'
+
+    id = db.Column(db.Integer, primary_key=True)
+    user_id = db.Column(db.Integer, db.ForeignKey('users.id'), nullable=False, index=True)
+    label = db.Column(db.String(120), nullable=False)
+    api_key_hash = db.Column(db.String(256), nullable=False)
+    api_key_prefix = db.Column(db.String(24), nullable=False, index=True)
+    created_at = db.Column(db.DateTime, default=datetime.utcnow)
+    last_used_at = db.Column(db.DateTime, nullable=True)
+
+    def to_dict(self):
+        return {
+            'id': self.id,
+            'user_id': self.user_id,
+            'label': self.label,
+            'api_key_prefix': self.api_key_prefix,
+            'created_at': self.created_at.isoformat() if self.created_at else None,
+            'last_used_at': self.last_used_at.isoformat() if self.last_used_at else None,
+        }
 
 
 class Campaign(db.Model):

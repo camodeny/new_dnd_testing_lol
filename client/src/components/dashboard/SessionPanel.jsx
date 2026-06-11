@@ -497,6 +497,8 @@ export default function SessionPanel({
   messages,
   currentUser,
   currentCharacter,
+  canSendMessage = true,
+  readOnlyReason = '',
   characters = [],
   onStartSession,
   onEndSession,
@@ -767,6 +769,7 @@ export default function SessionPanel({
   const handleMessagesScroll = () => loadOlderFromTop(false)
 
   const handleSend = () => {
+    if (!canSendMessage) return
     if (activeSlashCommand === 'roll') {
       submitPhysicalRoll()
       return
@@ -842,6 +845,7 @@ export default function SessionPanel({
   }
 
   const postQueueToChat = () => {
+    if (!canSendMessage) return
     if (rollQueue.length === 0) return
     const msg = rollQueue.map((roll) => {
       return `[Roll: ${roll.label}] total: ${roll.total} | rolls: ${roll.rolls.join(',')} | mod: ${roll.modifier} | sides: ${roll.sides}`
@@ -1519,14 +1523,21 @@ export default function SessionPanel({
                   </div>
                 </div>
               ) : (
-                <SessionInput
-                  value={input}
-                  onChange={setInput}
-                  onSubmit={handleSend}
-                  onKeyDown={handleSlashKeyDown}
-                  disabled={aiThinking}
-                  placeholder={aiThinking ? 'Waiting for DM...' : 'Message the table...'}
-                />
+                canSendMessage ? (
+                  <SessionInput
+                    value={input}
+                    onChange={setInput}
+                    onSubmit={handleSend}
+                    onKeyDown={handleSlashKeyDown}
+                    disabled={aiThinking}
+                    placeholder={aiThinking ? 'Waiting for DM...' : 'Message the table...'}
+                  />
+                ) : (
+                  <div className="session-spectator-banner">
+                    <i className="bi bi-eye"></i>
+                    <span>{readOnlyReason || 'Read-only spectator mode.'}</span>
+                  </div>
+                )
               )}
             </div>
             <button
@@ -1540,7 +1551,7 @@ export default function SessionPanel({
             <button
               className="btn btn-primary session-send-btn"
               onClick={handleSend}
-              disabled={aiThinking || !canSubmitPhysicalRoll}
+              disabled={!canSendMessage || aiThinking || !canSubmitPhysicalRoll}
             >
               {aiThinking ? '...' : activeSlashCommand ? 'Post' : 'Send'}
             </button>

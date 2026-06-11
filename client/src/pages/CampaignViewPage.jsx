@@ -170,6 +170,7 @@ export default function CampaignViewPage({ user }) {
   const navigate = useNavigate()
   const [searchParams] = useSearchParams()
   const [campaign, setCampaign] = useState(null)
+  const [members, setMembers] = useState([])
   const [currentScene, setCurrentScene] = useState(null)
   const [worldTitle, setWorldTitle] = useState('')
   const [characters, setCharacters] = useState([])
@@ -316,6 +317,7 @@ export default function CampaignViewPage({ user }) {
       const required = data.campaign.settings?.required_players || 1
       const isSandbox = data.campaign.settings?.dev_mode === 'combat_sandbox'
       const memData = await listMembers(id)
+      setMembers(memData.members || [])
       const memberCount = (memData.members || []).length
       if (!data.activeSession && memberCount < required) {
         setShowLobby(true)
@@ -379,6 +381,7 @@ export default function CampaignViewPage({ user }) {
         try {
           const memData = await listMembers(id)
           if (!isMounted) return
+          setMembers(memData.members || [])
           const memberCount = (memData.members || []).length
           if (!data.activeSession && memberCount < required) {
             setShowLobby(true)
@@ -707,6 +710,8 @@ export default function CampaignViewPage({ user }) {
   }
 
   const currentCharacter = characters.find((c) => c.user_id === user?.id)
+  const currentMember = members.find((member) => member.user_id === user?.id) || null
+  const isSpectator = currentMember?.role === 'spectator'
   const locationName = currentScene?.location_name || campaign?.settings?.current_location || '<insert location here>'
 
   const loadOlderMessages = useCallback(async () => {
@@ -975,14 +980,16 @@ export default function CampaignViewPage({ user }) {
                 onSendMessage={handleSendMessage}
               />
             )}
-            <SessionPanel
-              session={session}
-              messages={messages}
-              currentUser={user}
-              currentCharacter={currentCharacter}
-              characters={characters}
-              onStartSession={handleStartSession}
-              onEndSession={handleEndSession}
+        <SessionPanel
+          session={session}
+          messages={messages}
+          currentUser={user}
+          currentCharacter={currentCharacter}
+          canSendMessage={!isSpectator}
+          readOnlyReason={isSpectator ? 'Spectating only. You can read the table, but you cannot post messages.' : ''}
+          characters={characters}
+          onStartSession={handleStartSession}
+          onEndSession={handleEndSession}
               onSendMessage={handleSendMessage}
               hasOlderMessages={hasOlderMessages}
               loadingOlderMessages={loadingOlderMessages}
