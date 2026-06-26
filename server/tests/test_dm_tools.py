@@ -6,7 +6,7 @@ import tempfile
 import unittest
 from io import BytesIO
 from pathlib import Path
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 
 import requests
 from flask import Flask
@@ -38,6 +38,7 @@ from models import (
 from openrouter import (
     check_session_missing_npc_tags_with_llm,
     check_session_mechanics_with_llm,
+    check_session_pc_control_with_llm,
     _possible_missing_npc_tag_signal,
     _pc_control_violation,
     _private_output_violation,
@@ -73,6 +74,40 @@ def synthetic_grid_png(size=256, cell=32, offset=0, blank=False):
     buffer = BytesIO()
     image.save(buffer, format='PNG')
     return buffer.getvalue()
+
+
+def dm_talk_tool_response(content):
+    return {
+        'choices': [{
+            'message': {
+                'content': '',
+                'tool_calls': [{
+                    'id': 'call_final',
+                    'function': {
+                        'name': 'talk_to_player',
+                        'arguments': json.dumps({'content': content}),
+                    },
+                }],
+            },
+        }],
+    }
+
+
+def dm_silent_tool_response(reason):
+    return {
+        'choices': [{
+            'message': {
+                'content': '',
+                'tool_calls': [{
+                    'id': 'call_final',
+                    'function': {
+                        'name': 'stay_silent',
+                        'arguments': json.dumps({'reason': reason}),
+                    },
+                }],
+            },
+        }],
+    }
 
 
 class DmToolsTest(unittest.TestCase):
@@ -1306,6 +1341,191 @@ class DmToolsTest(unittest.TestCase):
             hot_context,
         ))
 
+    def test_pc_control_guard_allows_player_declared_positioning_echo(self):
+        hot_context = {
+            'protected_player_characters': [
+                {'id': 10, 'name': 'Seraphina Duskweaver', 'user_id': 7},
+            ],
+            'recent_messages': [
+                {
+                    'id': 21,
+                    'session_id': 5,
+                    'user_id': 7,
+                    'role': 'player',
+                    'content': (
+                        'Seraphina drifts away from the commotion, tail curling lazily, and sidles closer to '
+                        'Miriam Saltwick. She adopts a tone of warm concern, lowering her voice conspiratorially.'
+                    ),
+                },
+            ],
+        }
+
+        self.assertIsNone(_pc_control_violation(
+            'Across the platform, Seraphina draws alongside Miriam Saltwick. '
+            'The silver-haired woman turns, and her carefully composed mask holds.',
+            hot_context,
+        ))
+
+    def test_pc_control_guard_allows_environmental_gives_way_narration(self):
+        hot_context = {
+            'protected_player_characters': [
+                {'id': 11, 'name': 'Elara Moonwhisper', 'user_id': 8},
+            ],
+            'recent_messages': [
+                {
+                    'id': 25,
+                    'session_id': 5,
+                    'user_id': 8,
+                    'role': 'player',
+                    'content': (
+                        "Elara's fingers grip the cold, slick rungs as the ladder groans beneath her. "
+                        'The third landing sways with each tremor. She steadies herself, ready to leap.\n'
+                        '[Roll: Dexterity (Acrobatics) check] total: 8 | rolls: 6 | mod: 2 | sides: 20'
+                    ),
+                },
+            ],
+        }
+
+        self.assertIsNone(_pc_control_violation(
+            "Elara's boot finds a corroded rung—and it gives way.\n\n"
+            'You slam into the gantry frame and nearly lose your grip.',
+            hot_context,
+        ))
+
+    def test_pc_control_checker_allows_environmental_consequence_narration(self):
+        hot_context = {
+            'current_player_character': {'id': 11, 'name': 'Elara Moonwhisper', 'user_id': 8},
+            'protected_player_characters': [
+                {'id': 11, 'name': 'Elara Moonwhisper', 'user_id': 8},
+            ],
+            'recent_messages': [
+                {
+                    'id': 25,
+                    'session_id': 5,
+                    'user_id': 8,
+                    'role': 'player',
+                    'content': "Elara's fingers grip the cold, slick rungs as the ladder groans beneath her.",
+                },
+            ],
+        }
+
+        with patch('openrouter._post_chat', return_value=json.dumps({
+            'safe': True,
+            'violations': [],
+            'confidence': 'high',
+            'reason': 'This narrates immediate environmental consequences of the attempted descent.',
+        })) as post_chat:
+            result = check_session_pc_control_with_llm(
+                "Elara's boot finds a corroded rung and it gives way. You slam into the gantry frame.",
+                hot_context,
+                {'operation': 'session_dm_response'},
+            )
+
+        self.assertTrue(result['safe'])
+        self.assertEqual(result['confidence'], 'high')
+        payload = json.loads(post_chat.call_args.args[0][1]['content'])
+        self.assertEqual(payload['current_player_character']['name'], 'Elara Moonwhisper')
+
+    def test_pc_control_checker_flags_invented_choice(self):
+        hot_context = {
+            'current_player_character': {'id': 11, 'name': 'Elara Moonwhisper', 'user_id': 8},
+            'protected_player_characters': [
+                {'id': 11, 'name': 'Elara Moonwhisper', 'user_id': 8},
+            ],
+            'recent_messages': [
+                {
+                    'id': 25,
+                    'session_id': 5,
+                    'user_id': 8,
+                    'role': 'player',
+                    'content': 'Elara braces herself on the ladder and looks for the landing below.',
+                },
+            ],
+        }
+
+        with patch('openrouter._post_chat', return_value=json.dumps({
+            'safe': False,
+            'violations': [{
+                'character': 'Elara Moonwhisper',
+                'sentence': 'You decide to abandon the landing and keep climbing downward.',
+                'kind': 'choice_or_intent',
+                'reason': 'The DM invented a strategic choice for the protected PC.',
+            }],
+            'confidence': 'high',
+            'reason': 'The reply assigns a new decision to the acting PC.',
+        })):
+            result = check_session_pc_control_with_llm(
+                'You decide to abandon the landing and keep climbing downward.',
+                hot_context,
+                {'operation': 'session_dm_response'},
+            )
+
+        self.assertFalse(result['safe'])
+        self.assertEqual(result['violations'][0]['kind'], 'choice_or_intent')
+
+    def test_session_dm_pc_control_classifier_rewrites_invented_choice(self):
+        hot_context = {
+            'current_player_character': {'id': 11, 'name': 'Elara Moonwhisper', 'user_id': 8},
+            'protected_player_characters': [
+                {'id': 11, 'name': 'Elara Moonwhisper', 'user_id': 8},
+            ],
+            'private_output_terms': [],
+            'private_spoiler_items': [],
+            'recent_messages': [
+                {
+                    'id': 25,
+                    'session_id': 5,
+                    'user_id': 8,
+                    'role': 'player',
+                    'content': 'Elara braces herself on the ladder and looks for the landing below.',
+                },
+            ],
+        }
+
+        with patch('openrouter.get_session_preflight_decision', return_value={
+            'dm_reply_mode': 'narrative',
+            'skip_spoiler_check': False,
+            'main_call_thinking': True,
+            'confidence': 'high',
+            'reason': 'The player is in an immediate hazard.',
+        }), patch('openrouter._post_chat_response', side_effect=[
+            dm_talk_tool_response('You decide to retreat up the ladder and try a safer approach.'),
+            dm_talk_tool_response('The rung shudders beneath you. The landing remains within reach, but the ladder is failing fast. What do you do?'),
+        ]) as post_chat, patch('openrouter._post_chat', side_effect=[
+            json.dumps({
+                'safe': False,
+                'violations': [{
+                    'character': 'Elara Moonwhisper',
+                    'sentence': 'You decide to retreat up the ladder and try a safer approach.',
+                    'kind': 'choice_or_intent',
+                    'reason': 'The DM invented a strategic choice for the protected PC.',
+                }],
+                'confidence': 'high',
+                'reason': 'The reply assigns a new decision to the acting PC.',
+            }),
+            json.dumps({
+                'safe': True,
+                'violations': [],
+                'confidence': 'high',
+                'reason': 'The revised reply describes only the hazard and asks the player to choose.',
+            }),
+        ]):
+            result = get_session_dm_response_with_tools(
+                hot_context,
+                [],
+                [],
+                lambda *_args, **_kwargs: {},
+                audit_context={'operation': 'session_dm_response'},
+                max_tool_rounds=0,
+            )
+
+        self.assertEqual(result, {
+            'mode': 'speak',
+            'content': 'The rung shudders beneath you. The landing remains within reach, but the ladder is failing fast. What do you do?',
+        })
+        retry_prompt = post_chat.call_args_list[1].args[0][-1]['content']
+        self.assertIn('do not control a protected player character', retry_prompt)
+
     def test_private_output_guard_detects_hidden_terms(self):
         hot_context = {'private_output_terms': ['Crimson Veil']}
 
@@ -1353,13 +1573,22 @@ class DmToolsTest(unittest.TestCase):
         self.assertEqual(signal['speaker'], 'Dee')
         self.assertIn('Alright.', signal['quote'])
 
-    def test_missing_npc_tag_checker_uses_llm_only_when_signaled(self):
-        signal = {
-            'speaker': 'Dee',
-            'quote': '**"Alright. Lock the creds down first."**',
-            'context': 'Dee gives a single, slow nod.',
-        }
+    def test_possible_missing_npc_tag_signal_detects_sentence_lead_speaker(self):
+        signal = _possible_missing_npc_tag_signal(
+            'Sheriff Coldharbour spins toward Brixby, her eyes narrowing. '
+            '"You there-pointing fingers will not help."'
+        )
+        self.assertEqual(signal['speaker'], 'Sheriff Coldharbour')
+        self.assertIn('pointing fingers', signal['quote'])
 
+    def test_possible_missing_npc_tag_signal_detects_markdown_speaker_label(self):
+        signal = _possible_missing_npc_tag_signal(
+            '**Seraphina:** "Keep your hood up and your eyes open."'
+        )
+        self.assertEqual(signal['speaker'], 'Seraphina')
+        self.assertIn('Keep your hood up', signal['quote'])
+
+    def test_missing_npc_tag_checker_uses_llm_without_heuristic_signal(self):
         with patch('openrouter._post_chat', return_value=json.dumps({
             'requires_npc_tag': True,
             'speaker': 'Dee',
@@ -1368,13 +1597,14 @@ class DmToolsTest(unittest.TestCase):
         })) as post_chat:
             result = check_session_missing_npc_tags_with_llm(
                 'Dee watches you for a long moment. **"Alright. Lock the creds down first."**',
-                signal,
                 {'operation': 'session_dm_response'},
             )
 
         self.assertTrue(result['requires_npc_tag'])
         self.assertEqual(result['speaker'], 'Dee')
         self.assertFalse(post_chat.call_args.kwargs['allow_thinking'])
+        payload = json.loads(post_chat.call_args.args[0][1]['content'])
+        self.assertEqual(payload['heuristic_signal'], {})
 
     def test_mechanical_guard_uses_llm_when_preflight_flags_mechanics(self):
         preflight = {
@@ -1421,8 +1651,8 @@ class DmToolsTest(unittest.TestCase):
             'confidence': 'high',
             'reason': 'The player is starting a fight.',
         }), patch('openrouter._post_chat_response', side_effect=[
-            {'choices': [{'message': {'content': '{"mode":"speak","content":"The blow catches you across the ribs and knocks you down."}'}}]},
-            {'choices': [{'message': {'content': '{"mode":"speak","content":"The constable snaps her truncheon up as you rush in. Roll initiative."}'}}]},
+            dm_talk_tool_response('The blow catches you across the ribs and knocks you down.'),
+            dm_talk_tool_response('The constable snaps her truncheon up as you rush in. Roll initiative.'),
         ]) as post_chat, patch('openrouter._post_chat', side_effect=[
             json.dumps({
                 'safe': False,
@@ -1458,8 +1688,8 @@ class DmToolsTest(unittest.TestCase):
         }
 
         with patch('openrouter._post_chat_response', side_effect=[
-            {'choices': [{'message': {'content': '{"mode":"speak","content":"<npc target=\\"Bram Truewood\\">\\"The candle is always lit.\\"</p>"}'}}]},
-            {'choices': [{'message': {'content': '{"mode":"speak","content":"<npc target=\\"Bram Truewood\\">\\"The candle is always lit.\\"</npc>"}'}}]},
+            dm_talk_tool_response('<npc target="Bram Truewood">"The candle is always lit."</p>'),
+            dm_talk_tool_response('<npc target="Bram Truewood">"The candle is always lit."</npc>'),
         ]) as post_chat:
             result = get_session_dm_response_with_tools(
                 hot_context,
@@ -1478,7 +1708,7 @@ class DmToolsTest(unittest.TestCase):
         self.assertIn('only allowed angle-bracket tag', retry_prompt)
         self.assertNotIn('</p>', retry_prompt)
         self.assertFalse(post_chat.call_args_list[1].kwargs.get('json_mode'))
-        self.assertIsNone(post_chat.call_args_list[1].kwargs.get('tools'))
+        self.assertIsNotNone(post_chat.call_args_list[1].kwargs.get('tools'))
         self.assertFalse(post_chat.call_args_list[1].kwargs.get('allow_thinking'))
 
     def test_session_dm_format_guard_rewrites_missing_npc_tag_reply_with_special_prompt(self):
@@ -1489,23 +1719,29 @@ class DmToolsTest(unittest.TestCase):
         }
 
         with patch('openrouter._post_chat_response', side_effect=[
-            {'choices': [{'message': {'content': json.dumps({
-                'mode': 'speak',
-                'content': 'Dee watches you for a long moment, reading your resolve. He does not argue. '
-                           'Instead, he gives a single, slow nod. **"Alright. Lock the creds down first."**',
-            })}}]},
-            {'choices': [{'message': {'content': json.dumps({
-                'mode': 'speak',
-                'content': 'Dee watches you for a long moment, reading your resolve. He does not argue. '
-                           'Instead, he gives a single, slow nod.\n\n'
-                           '<npc target="Dee">"Alright. Lock the creds down first."</npc>',
-            })}}]},
-        ]) as post_chat, patch('openrouter._post_chat', return_value=json.dumps({
-            'requires_npc_tag': True,
-            'speaker': 'Dee',
-            'evidence': ['**"Alright. Lock the creds down first."**'],
-            'reason': 'This is clearly Dee speaking in the current scene.',
-        })):
+            dm_talk_tool_response(
+                'Dee watches you for a long moment, reading your resolve. He does not argue. '
+                'Instead, he gives a single, slow nod. **"Alright. Lock the creds down first."**'
+            ),
+            dm_talk_tool_response(
+                'Dee watches you for a long moment, reading your resolve. He does not argue. '
+                'Instead, he gives a single, slow nod.\n\n'
+                '<npc target="Dee">"Alright. Lock the creds down first."</npc>'
+            ),
+        ]) as post_chat, patch('openrouter._post_chat', side_effect=[
+            json.dumps({
+                'requires_npc_tag': True,
+                'speaker': 'Dee',
+                'evidence': ['**"Alright. Lock the creds down first."**'],
+                'reason': 'This is clearly Dee speaking in the current scene.',
+            }),
+            json.dumps({
+                'requires_npc_tag': False,
+                'speaker': '',
+                'evidence': [],
+                'reason': 'The reply already uses the required NPC tag.',
+            }),
+        ]):
             result = get_session_dm_response_with_tools(
                 hot_context,
                 [],
@@ -1526,6 +1762,74 @@ class DmToolsTest(unittest.TestCase):
         self.assertNotIn('Rewrite the same reply', retry_prompt)
         self.assertNotIn('Preserve the narration', retry_prompt)
 
+    def test_session_dm_format_guard_runs_npc_checker_without_heuristic_signal(self):
+        hot_context = {
+            'protected_player_characters': [],
+            'private_output_terms': [],
+            'private_spoiler_items': [],
+        }
+
+        with patch('openrouter._post_chat_response', side_effect=[
+            dm_talk_tool_response(
+                'Sheriff Coldharbour spins toward Brixby, her eyes narrowing. '
+                '"You there-pointing fingers will not help."'
+            ),
+            dm_talk_tool_response(
+                'Sheriff Coldharbour spins toward Brixby, her eyes narrowing.\n\n'
+                '<npc target="Sheriff Coldharbour">"You there-pointing fingers will not help."</npc>'
+            ),
+        ]) as post_chat_response, patch('openrouter._post_chat', side_effect=[
+            json.dumps({
+                'requires_npc_tag': True,
+                'speaker': 'Sheriff Coldharbour',
+                'evidence': ['"You there-pointing fingers will not help."'],
+                'reason': 'This is clearly Sheriff Coldharbour speaking in the current scene.',
+            }),
+            json.dumps({
+                'requires_npc_tag': False,
+                'speaker': '',
+                'evidence': [],
+                'reason': 'The reply already uses the required NPC tag.',
+            }),
+        ]) as post_chat, patch('openrouter._possible_missing_npc_tag_signal', return_value=None):
+            result = get_session_dm_response_with_tools(
+                hot_context,
+                [],
+                [],
+                lambda *_args, **_kwargs: {},
+                max_tool_rounds=0,
+            )
+
+        self.assertEqual(result, {
+            'mode': 'speak',
+            'content': 'Sheriff Coldharbour spins toward Brixby, her eyes narrowing.\n\n'
+                       '<npc target="Sheriff Coldharbour">"You there-pointing fingers will not help."</npc>',
+        })
+        self.assertEqual(post_chat.call_count, 1)
+        self.assertEqual(post_chat_response.call_count, 2)
+
+    def test_session_npc_tag_checker_ignores_evidence_already_inside_npc_tags(self):
+        reply = (
+            '<npc target="Sheriff Adara Coldharbour">'
+            '"These are calibration tools, not standard issue."'
+            '</npc>'
+        )
+
+        with patch('openrouter._post_chat', return_value=json.dumps({
+            'requires_npc_tag': True,
+            'speaker': 'Sheriff Adara Coldharbour',
+            'evidence': ['"These are calibration tools, not standard issue."'],
+            'reason': 'The line is attributed to Sheriff Adara Coldharbour.',
+        })):
+            result = check_session_missing_npc_tags_with_llm(reply)
+
+        self.assertEqual(result, {
+            'requires_npc_tag': False,
+            'speaker': '',
+            'evidence': [],
+            'reason': 'Checker evidence was already wrapped in <npc> tags.',
+        })
+
     def test_session_dm_format_retry_repairs_non_json_meta_response(self):
         hot_context = {
             'protected_player_characters': [],
@@ -1534,9 +1838,9 @@ class DmToolsTest(unittest.TestCase):
         }
 
         with patch('openrouter._post_chat_response', side_effect=[
-            {'choices': [{'message': {'content': '{"mode":"speak","content":"<ic>\\"Green lights.\\"</ic>"}'}}]},
+            dm_talk_tool_response('<ic>"Green lights."</ic>'),
             {'choices': [{'message': {'content': 'Understood. No `<ic>` tags.\n\n<npc target="Brenn">"Green lights by the old willow."</npc>'}}]},
-            {'choices': [{'message': {'content': '{"mode":"speak","content":"<npc target=\\"Brenn\\">\\"Green lights by the old willow.\\"</npc>"}'}}]},
+            dm_talk_tool_response('<npc target="Brenn">"Green lights by the old willow."</npc>'),
         ]) as post_chat:
             result = get_session_dm_response_with_tools(
                 hot_context,
@@ -1552,10 +1856,10 @@ class DmToolsTest(unittest.TestCase):
         })
         self.assertEqual(post_chat.call_count, 3)
         contract_retry_prompt = post_chat.call_args_list[2].args[0][-1]['content']
-        self.assertIn('return exactly one JSON object only', contract_retry_prompt)
-        self.assertIn('exactly one JSON object', contract_retry_prompt)
+        self.assertIn('calling exactly one of talk_to_player or stay_silent', contract_retry_prompt)
+        self.assertIn('Do not send the final visible reply as plain assistant text', contract_retry_prompt)
 
-    def test_json_contract_retry_discards_candidate_and_reruns_with_system_reminder(self):
+    def test_finalizer_contract_retry_discards_candidate_and_reruns_with_system_reminder(self):
         hot_context = {
             'protected_player_characters': [],
             'private_output_terms': [],
@@ -1568,7 +1872,7 @@ class DmToolsTest(unittest.TestCase):
 
         with patch('openrouter._post_chat_response', side_effect=[
             {'choices': [{'message': {'content': draft}}]},
-            {'choices': [{'message': {'content': '{"mode":"silent","reason":"Awaiting player response."}'}}]},
+            dm_silent_tool_response('Awaiting player response.'),
         ]) as post_chat:
             result = get_session_dm_response_with_tools(
                 hot_context,
@@ -1580,10 +1884,16 @@ class DmToolsTest(unittest.TestCase):
 
         self.assertEqual(result, {'mode': 'silent', 'content': '', 'reason': 'Awaiting player response.'})
         contract_retry_prompt = post_chat.call_args_list[1].args[0][-1]['content']
-        self.assertIn('return exactly one JSON object only', contract_retry_prompt)
-        self.assertIn('exactly one JSON object', contract_retry_prompt)
+        retry_kwargs = post_chat.call_args_list[1].kwargs
+        self.assertIn('calling exactly one of talk_to_player or stay_silent', contract_retry_prompt)
+        self.assertIn('Do not send the final visible reply as plain assistant text', contract_retry_prompt)
+        self.assertEqual(retry_kwargs['tool_choice'], 'required')
+        self.assertEqual(
+            {tool['function']['name'] for tool in retry_kwargs['tools']},
+            {'talk_to_player', 'stay_silent'},
+        )
 
-    def test_json_contract_retry_uses_fresh_rerun_output(self):
+    def test_finalizer_contract_retry_uses_fresh_rerun_output(self):
         hot_context = {
             'protected_player_characters': [],
             'private_output_terms': [],
@@ -1594,7 +1904,7 @@ class DmToolsTest(unittest.TestCase):
 
         with patch('openrouter._post_chat_response', side_effect=[
             {'choices': [{'message': {'content': draft}}]},
-            {'choices': [{'message': {'content': f'{{"mode":"speak","content":"{stale}"}}'}}]},
+            dm_talk_tool_response(stale),
         ]) as post_chat:
             result = get_session_dm_response_with_tools(
                 hot_context,
@@ -1607,7 +1917,34 @@ class DmToolsTest(unittest.TestCase):
         self.assertEqual(result, {'mode': 'speak', 'content': stale})
         self.assertEqual(post_chat.call_count, 2)
 
-    def test_json_contract_fallback_still_rewrites_ooc_label(self):
+    def test_finalizer_contract_retry_switches_to_required_finalizer_only_tools(self):
+        hot_context = {
+            'protected_player_characters': [],
+            'private_output_terms': [],
+            'private_spoiler_items': [],
+        }
+
+        with patch('openrouter._post_chat_response', side_effect=[
+            {'choices': [{'message': {'content': 'Plain text draft only.'}}]},
+            dm_silent_tool_response('No visible reply needed.'),
+        ]) as post_chat:
+            result = get_session_dm_response_with_tools(
+                hot_context,
+                [],
+                [{'type': 'function', 'function': {'name': 'search_campaign_memory'}}],
+                lambda *_args, **_kwargs: {},
+                max_tool_rounds=2,
+            )
+
+        self.assertEqual(result, {'mode': 'silent', 'content': '', 'reason': 'No visible reply needed.'})
+        retry_kwargs = post_chat.call_args_list[1].kwargs
+        self.assertEqual(retry_kwargs['tool_choice'], 'required')
+        self.assertEqual(
+            {tool['function']['name'] for tool in retry_kwargs['tools']},
+            {'talk_to_player', 'stay_silent'},
+        )
+
+    def test_finalizer_contract_retry_still_rewrites_ooc_label(self):
         hot_context = {
             'protected_player_characters': [],
             'private_output_terms': [],
@@ -1617,8 +1954,8 @@ class DmToolsTest(unittest.TestCase):
 
         with patch('openrouter._post_chat_response', side_effect=[
             {'choices': [{'message': {'content': draft}}]},
-            {'choices': [{'message': {'content': '{"mode":"speak","content":"*OOC*: Make a Technology check."}'}}]},
-            {'choices': [{'message': {'content': '{"mode":"speak","content":"Make a Technology check."}'}}]},
+            dm_talk_tool_response('*OOC*: Make a Technology check.'),
+            dm_talk_tool_response('Make a Technology check.'),
         ]) as post_chat:
             result = get_session_dm_response_with_tools(
                 hot_context,
@@ -1634,7 +1971,7 @@ class DmToolsTest(unittest.TestCase):
         self.assertIn('use valid visible-message syntax', format_retry_prompt)
         self.assertNotIn('OOC/IC mode labels', format_retry_prompt)
 
-    def test_json_contract_retry_reprompts_provider_tool_markup_with_specific_reminder(self):
+    def test_finalizer_contract_retry_reprompts_provider_tool_markup_with_specific_reminder(self):
         hot_context = {
             'protected_player_characters': [],
             'private_output_terms': [],
@@ -1649,7 +1986,7 @@ class DmToolsTest(unittest.TestCase):
 
         with patch('openrouter._post_chat_response', side_effect=[
             {'choices': [{'message': {'content': dsml}}]},
-            {'choices': [{'message': {'content': "{\"mode\":\"speak\",\"content\":\"The Broker's instructions are clear: keep the crate sealed and deliver it intact.\"}"}}]},
+            dm_talk_tool_response("The Broker's instructions are clear: keep the crate sealed and deliver it intact."),
         ]) as post_chat:
             result = get_session_dm_response_with_tools(
                 hot_context,
@@ -1665,8 +2002,88 @@ class DmToolsTest(unittest.TestCase):
         })
         self.assertEqual(post_chat.call_count, 2)
         retry_prompt = post_chat.call_args_list[1].args[0][-1]['content']
-        self.assertIn('player-visible DM reply only', retry_prompt)
+        self.assertIn('player-facing visible result inside talk_to_player(content)', retry_prompt)
         self.assertIn('Do not output DSML', retry_prompt)
+
+    def test_session_dm_accepts_talk_to_player_finalizer_tool(self):
+        hot_context = {
+            'protected_player_characters': [],
+            'private_output_terms': [],
+            'private_spoiler_items': [],
+        }
+        execute_tool = Mock(return_value={})
+
+        with patch('openrouter._post_chat_response', return_value={
+            'choices': [{
+                'message': {
+                    'content': '',
+                    'tool_calls': [{
+                        'id': 'call_final',
+                        'function': {
+                            'name': 'talk_to_player',
+                            'arguments': json.dumps({
+                                'content': '<npc target="Brenn">"Green lights by the old willow."</npc>',
+                            }),
+                        },
+                    }],
+                },
+            }],
+        }) as post_chat:
+            result = get_session_dm_response_with_tools(
+                hot_context,
+                [],
+                [],
+                execute_tool,
+                max_tool_rounds=1,
+            )
+
+        self.assertEqual(result, {
+            'mode': 'speak',
+            'content': '<npc target="Brenn">"Green lights by the old willow."</npc>',
+        })
+        self.assertEqual(post_chat.call_args.kwargs['tool_choice'], 'required')
+        self.assertEqual(
+            {tool['function']['name'] for tool in post_chat.call_args.kwargs['tools']},
+            {'talk_to_player', 'stay_silent'},
+        )
+        execute_tool.assert_not_called()
+
+    def test_session_dm_accepts_stay_silent_finalizer_tool(self):
+        hot_context = {
+            'protected_player_characters': [],
+            'private_output_terms': [],
+            'private_spoiler_items': [],
+        }
+
+        with patch('openrouter._post_chat_response', return_value={
+            'choices': [{
+                'message': {
+                    'content': '',
+                    'tool_calls': [{
+                        'id': 'call_silent',
+                        'function': {
+                            'name': 'stay_silent',
+                            'arguments': json.dumps({
+                                'reason': 'PC-to-PC exchange.',
+                            }),
+                        },
+                    }],
+                },
+            }],
+        }):
+            result = get_session_dm_response_with_tools(
+                hot_context,
+                [],
+                [],
+                lambda *_args, **_kwargs: {},
+                max_tool_rounds=1,
+            )
+
+        self.assertEqual(result, {
+            'mode': 'silent',
+            'content': '',
+            'reason': 'PC-to-PC exchange.',
+        })
 
     def test_spoiler_checker_allows_safe_reply(self):
         hot_context = {
@@ -1676,7 +2093,7 @@ class DmToolsTest(unittest.TestCase):
         }
 
         with patch('openrouter._post_chat_response', return_value={
-            'choices': [{'message': {'content': '{"mode":"speak","content":"Jara watches the door."}'}}],
+            'choices': [{'message': dm_talk_tool_response('Jara watches the door.')['choices'][0]['message']}],
         }), patch('openrouter.check_session_spoilers_with_llm', return_value={
             'safe': True,
             'leaked_item_ids': [],
@@ -1702,7 +2119,7 @@ class DmToolsTest(unittest.TestCase):
             'confidence': 'high',
             'reason': 'Simple public narration.',
         }), patch('openrouter._post_chat_response', return_value={
-            'choices': [{'message': {'content': '{"mode":"speak","content":"Rain slicks the old stones."}'}}],
+            'choices': [{'message': dm_talk_tool_response('Rain slicks the old stones.')['choices'][0]['message']}],
         }) as post_chat:
             result = get_session_dm_response_with_tools(
                 hot_context,
@@ -1741,7 +2158,7 @@ class DmToolsTest(unittest.TestCase):
                     },
                 }],
             }}]},
-            {'choices': [{'message': {'content': '{"mode":"speak","content":"Your AC is 15."}'}}]},
+            dm_talk_tool_response('Your AC is 15.'),
         ]) as post_chat:
             result = get_session_dm_response_with_tools(
                 hot_context,
@@ -1847,12 +2264,12 @@ class DmToolsTest(unittest.TestCase):
                 {'id': 'call_1', 'function': {'name': 'update_combatant_actions', 'arguments': '{"placement_id":7,"actions":{"action":false,"bonus_action":false,"movement_remaining":10}}'}},
                 {'id': 'call_2', 'function': {'name': 'next_combat_turn', 'arguments': '{}'}},
             ]}}]},
-            {'choices': [{'message': {'content': '{"mode":"speak","content":"The skirmisher withdraws along the ledge."}'}}]},
+            dm_talk_tool_response('The skirmisher withdraws along the ledge.'),
             {'choices': [{'message': {'content': '', 'tool_calls': [
                 {'id': 'call_3', 'function': {'name': 'update_combatant_actions', 'arguments': '{"placement_id":9,"actions":{"action":false,"bonus_action":false,"movement_remaining":0}}'}},
                 {'id': 'call_4', 'function': {'name': 'next_combat_turn', 'arguments': '{}'}},
             ]}}]},
-            {'choices': [{'message': {'content': '{"mode":"speak","content":"The skirmisher falls back and the brute stomps into position. Seraphina, you are up."}'}}]},
+            dm_talk_tool_response('The skirmisher falls back and the brute stomps into position. Seraphina, you are up.'),
         ]) as post_chat:
             result = get_session_dm_response_with_tools(
                 hot_context,
@@ -1882,7 +2299,7 @@ class DmToolsTest(unittest.TestCase):
             if isinstance(message, dict)
         ))
 
-    def test_session_dm_combat_batch_retry_reenables_tools_after_json_contract_retry(self):
+    def test_session_dm_combat_batch_retry_reenables_tools_after_finalizer_contract_retry(self):
         hot_context = {
             'campaign': {'id': self.campaign.id},
             'current_encounter_map': {
@@ -1978,7 +2395,7 @@ class DmToolsTest(unittest.TestCase):
                 {'id': 'call_3', 'function': {'name': 'update_combatant_actions', 'arguments': '{"placement_id":9,"actions":{"action":false,"bonus_action":false,"movement_remaining":0}}'}},
                 {'id': 'call_4', 'function': {'name': 'next_combat_turn', 'arguments': '{}'}},
             ]}}]},
-            {'choices': [{'message': {'content': '{"mode":"speak","content":"The skirmisher fades back and the brute gives ground. Seraphina, you are up."}'}}]},
+            dm_talk_tool_response('The skirmisher fades back and the brute gives ground. Seraphina, you are up.'),
         ]):
             result = get_session_dm_response_with_tools(
                 hot_context,
@@ -2031,7 +2448,7 @@ class DmToolsTest(unittest.TestCase):
 
         with patch('openrouter._post_chat_response', side_effect=[
             {'choices': [{'message': {'content': '', 'tool_calls': [{'id': 'call_1', 'function': {'name': 'search_campaign_memory', 'arguments': '{"query":"training skirmisher"}'}}]}}]},
-            {'choices': [{'message': {'content': '{"mode":"speak","content":"The skirmisher gauges the field from the high ledge."}'}}]},
+            dm_talk_tool_response('The skirmisher gauges the field from the high ledge.'),
         ]):
             result = get_session_dm_response_with_tools(
                 hot_context,
@@ -2110,7 +2527,7 @@ class DmToolsTest(unittest.TestCase):
                 {'id': 'call_2', 'function': {'name': 'next_combat_turn', 'arguments': '{}'}},
             ]}}]},
             {'choices': [{'message': {'content': '', 'tool_calls': [{'id': 'call_3', 'function': {'name': 'set_combat_turn', 'arguments': '{"active_turn_index":0}'}}]}}]},
-            {'choices': [{'message': {'content': '{"mode":"speak","content":"The skirmisher scuttles back into cover. Seraphina, your turn."}'}}]},
+            dm_talk_tool_response('The skirmisher scuttles back into cover. Seraphina, your turn.'),
         ]):
             result = get_session_dm_response_with_tools(
                 hot_context,
@@ -2193,8 +2610,8 @@ class DmToolsTest(unittest.TestCase):
                 {'id': 'call_1', 'function': {'name': 'update_combatant_actions', 'arguments': '{"placement_id":7,"actions":{"action":false,"bonus_action":false,"movement_remaining":0}}'}},
                 {'id': 'call_2', 'function': {'name': 'next_combat_turn', 'arguments': '{}'}},
             ]}}]},
-            {'choices': [{'message': {'content': '{"mode":"speak","content":"The skirmisher ducks behind the gear housing. Now let me advance to Seraphina."}'}}]},
-            {'choices': [{'message': {'content': '{"mode":"speak","content":"The skirmisher ducks behind the gear housing. Seraphina, you are up."}'}}]},
+            dm_talk_tool_response('The skirmisher ducks behind the gear housing. Now let me advance to Seraphina.'),
+            dm_talk_tool_response('The skirmisher ducks behind the gear housing. Seraphina, you are up.'),
         ]) as post_chat:
             result = get_session_dm_response_with_tools(
                 hot_context,
@@ -2282,7 +2699,7 @@ class DmToolsTest(unittest.TestCase):
 
         self.assertEqual(result, {
             'mode': 'silent',
-            'reason': 'The DM response did not produce a valid visible reply.',
+            'reason': 'The DM response did not produce a valid finalizer tool call.',
         })
         encounter_map = db.session.get(EncounterMap, encounter_map.id)
         restored_state = json.loads(encounter_map.encounter_state_json)
@@ -2299,8 +2716,8 @@ class DmToolsTest(unittest.TestCase):
         }
 
         with patch('openrouter._post_chat_response', side_effect=[
-            {'choices': [{'message': {'content': '{"mode":"speak","content":"The trap closes around you."}'}}]},
-            {'choices': [{'message': {'content': '{"mode":"speak","content":"The air feels tense as you leave."}'}}]},
+            dm_talk_tool_response('The trap closes around you.'),
+            dm_talk_tool_response('The air feels tense as you leave.'),
         ]) as post_chat, patch('openrouter.check_session_spoilers_with_llm', side_effect=[
             {'safe': False, 'leaked_item_ids': ['fact_trap'], 'evidence': ['The trap closes'], 'reason': 'Directly implies the hidden truth.'},
             {'safe': True, 'leaked_item_ids': [], 'evidence': [], 'reason': ''},
@@ -2322,8 +2739,8 @@ class DmToolsTest(unittest.TestCase):
         trace_id = 'session_dm:session_2:message_15'
 
         with patch('openrouter._post_chat_response', side_effect=[
-            {'choices': [{'message': {'content': '{"mode":"speak","content":"The Crimson Veil watches you."}'}}]},
-            {'choices': [{'message': {'content': '{"mode":"speak","content":"Someone watches from the dark."}'}}]},
+            dm_talk_tool_response('The Crimson Veil watches you.'),
+            dm_talk_tool_response('Someone watches from the dark.'),
         ]):
             result = get_session_dm_response_with_tools(
                 hot_context,
@@ -2358,7 +2775,7 @@ class DmToolsTest(unittest.TestCase):
             return {'matches': [{'text': 'The symbol appears infernal.'}]}
 
         with patch('openrouter._post_chat_response', side_effect=[
-            {'choices': [{'message': {'content': '{"mode":"speak","content":"Your Fiendish Patron stirs."}'}}]},
+            dm_talk_tool_response('Your Fiendish Patron stirs.'),
             {'choices': [{'message': {
                 'content': '',
                 'tool_calls': [{
@@ -2369,7 +2786,7 @@ class DmToolsTest(unittest.TestCase):
                     },
                 }],
             }}]},
-            {'choices': [{'message': {'content': '{"mode":"speak","content":"The symbol appears infernal, but you do not know who left it."}'}}]},
+            dm_talk_tool_response('The symbol appears infernal, but you do not know who left it.'),
         ]):
             result = get_session_dm_response_with_tools(
                 hot_context,
@@ -2393,8 +2810,8 @@ class DmToolsTest(unittest.TestCase):
         }
 
         with patch('openrouter._post_chat_response', side_effect=[
-            {'choices': [{'message': {'content': '{"mode":"speak","content":"The trap closes around you."}'}}]},
-            {'choices': [{'message': {'content': '{"mode":"speak","content":"A hidden trap closes around you."}'}}]},
+            dm_talk_tool_response('The trap closes around you.'),
+            dm_talk_tool_response('A hidden trap closes around you.'),
         ]), patch('openrouter.check_session_spoilers_with_llm', side_effect=[
             {'safe': False, 'leaked_item_ids': ['fact_trap'], 'evidence': ['The trap closes'], 'reason': 'Directly implies the hidden truth.'},
             {'safe': False, 'leaked_item_ids': ['fact_trap'], 'evidence': ['hidden trap'], 'reason': 'Still implies the hidden truth.'},

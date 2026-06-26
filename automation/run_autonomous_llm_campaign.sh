@@ -10,4 +10,4 @@ if [[ -f "$ENV_FILE" ]]; then
   set +a
 fi
 
-exec python3 "$ROOT/automation/build_llm_overseer_context.py" "$@"
+exec python3 "$ROOT/automation/run_autonomous_llm_campaign.py" "$@"

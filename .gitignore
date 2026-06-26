@@ -9,4 +9,8 @@ __pycache__/
 *.db
 *.sqlite3
 *.env
+
+# Local automation state and run artifacts
 /automation/state/
+/automation/llm-campaign-*.json
+/automation/llm-campaign-*.runs.jsonl

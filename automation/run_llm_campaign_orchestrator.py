@@ -3,10 +3,13 @@ import argparse
 import json
 import os
 import pathlib
+import random
+import re
 import sys
 from datetime import datetime, timezone
 
 from llm_campaign_common import (
+    ApiError,
     STATE_DIR,
     api_get,
     api_post,
@@ -24,10 +27,25 @@ Rules:
 - Act only as the assigned player character.
 - Do not narrate for the DM or for other player characters.
 - Prefer one concrete in-character action or short spoken line.
+- If pending character-sheet proposals are present for your character, you may choose to apply or dismiss one instead of posting a table message.
+- If the DM explicitly asks you for a check, save, attack roll, damage roll, initiative, or another clear player-side roll, use the roll action instead of inventing a result.
+- For rolls, return strict JSON like {"action":"roll","label":"Arcana check","expression":"1d20+5"}.
+- You may include optional "content" in a roll action for a short setup line; the automation will append the visible roll line for you.
+- Use 2d20kh1+5 for advantage and 2d20kl1+5 for disadvantage.
+- Do not fabricate dice totals or write the [Roll: ...] line yourself inside content.
+- To accept a pending character-sheet proposal, return strict JSON like {"action":"apply_proposal","proposal_id":123}.
+- To reject a pending character-sheet proposal, return strict JSON like {"action":"dismiss_proposal","proposal_id":123}.
 - If no meaningful player action should happen now, return exactly: {"action":"no_action"}
 - Otherwise return strict JSON: {"action":"speak","content":"..."}
 - Do not wrap the JSON in markdown fences.
 """
+
+ROLL_REQUEST_PATTERNS = (
+    re.compile(r'\bmake an?\b[\s\S]{0,120}?\b(check|saving throw|save|attack roll|damage roll|initiative)\b', re.IGNORECASE),
+    re.compile(r'\broll(?: for)?\s+initiative\b', re.IGNORECASE),
+    re.compile(r'\bplease roll\b', re.IGNORECASE),
+    re.compile(r'\bgive me an?\b[\s\S]{0,120}?\b(check|saving throw|save|attack roll|damage roll)\b', re.IGNORECASE),
+)
 
 
 def parse_args():
@@ -79,7 +97,41 @@ def llm_players_by_id(manifest):
     return {entry['llm_player']['id']: entry for entry in manifest['llm_players']}
 
 
+def llm_players_by_user_id(manifest):
+    return {entry['llm_player']['user_id']: entry for entry in manifest['llm_players']}
+
+
+def dm_requests_player_roll(content):
+    text = str(content or '').strip()
+    if not text:
+        return False
+    return any(pattern.search(text) for pattern in ROLL_REQUEST_PATTERNS)
+
+
+def find_pending_roll_player(manifest, session):
+    messages = session.get('messages') or []
+    if not messages:
+        return None
+
+    latest = messages[-1]
+    if latest.get('role') != 'dm' or not dm_requests_player_roll(latest.get('content')):
+        return None
+
+    roster_by_user_id = llm_players_by_user_id(manifest)
+    for message in reversed(messages[:-1]):
+        if message.get('role') != 'player':
+            continue
+        user_id = message.get('user_id')
+        if user_id in roster_by_user_id:
+            return roster_by_user_id[user_id]
+    return None
+
+
 def choose_next_player(manifest, session):
+    pending_roll_player = find_pending_roll_player(manifest, session)
+    if pending_roll_player is not None:
+        return pending_roll_player
+
     roster = llm_players_by_id(manifest)
     order = manifest.get('turn_order') or list(roster)
     messages = session.get('messages') or []
@@ -103,6 +155,26 @@ def choose_next_player(manifest, session):
     return roster[order[(current_index + 1) % len(order)]]
 
 
+def get_pending_sheet_proposals(api_base, session_id, chosen_player):
+    proposals = api_get(
+        api_base,
+        f'/api/sessions/{session_id}/proposals',
+        api_key=chosen_player['api_key'],
+    ).get('sheet_proposals')
+    return proposals if isinstance(proposals, list) else []
+
+
+def find_pending_proposal_player(manifest, api_base, session_id):
+    roster = llm_players_by_id(manifest)
+    order = manifest.get('turn_order') or list(roster)
+    for llm_player_id in order:
+        chosen_player = roster[llm_player_id]
+        proposals = get_pending_sheet_proposals(api_base, session_id, chosen_player)
+        if proposals:
+            return chosen_player, proposals
+    return None, []
+
+
 def find_player(manifest, player_id=None, player_label=None):
     roster = manifest['llm_players']
     if player_id is not None:
@@ -119,7 +191,7 @@ def find_player(manifest, player_id=None, player_label=None):
     return None
 
 
-def build_prompt(manifest, campaign, world_payload, session, chosen_player, message_window):
+def build_prompt(manifest, campaign, world_payload, session, chosen_player, pending_proposals, message_window):
     recent_messages = (session.get('messages') or [])[-message_window:]
     other_players = [
         {
@@ -142,6 +214,7 @@ def build_prompt(manifest, campaign, world_payload, session, chosen_player, mess
             'started_at': session.get('started_at'),
         },
         'recent_messages': recent_messages,
+        'pending_sheet_proposals': pending_proposals,
         'you': {
             'label': chosen_player['llm_player']['label'],
             'character_name': chosen_player['character']['name'],
@@ -172,11 +245,279 @@ def extract_json_object(text):
     return json.loads(stripped[start:end + 1])
 
 
+def request_opencode_decision(server, password, model_payload, prompt):
+    base_payload = {
+        'agent': 'build',
+        'model': model_payload,
+        'system': SYSTEM_PROMPT,
+        'parts': [{'type': 'text', 'text': prompt}],
+    }
+    last_response_text = ''
+    last_error = None
+
+    for attempt in range(2):
+        payload = dict(base_payload)
+        if attempt:
+            payload['parts'] = [
+                {'type': 'text', 'text': prompt},
+                {
+                    'type': 'text',
+                    'text': (
+                        'Your previous reply was invalid because it was not a bare JSON object. '
+                        'Reply again with exactly one JSON object and no explanation, no markdown, '
+                        'and no text before or after the JSON.'
+                    ),
+                },
+            ]
+        response = opencode_request(
+            server,
+            create_opencode_message_path(server, password),
+            payload=payload,
+            password=password,
+            method='POST',
+        )
+        response_text = extract_text_parts(response.get('parts'))
+        last_response_text = response_text
+        try:
+            decision = extract_json_object(response_text)
+            return decision, response_text, attempt
+        except Exception as exc:
+            last_error = exc
+
+    raise RuntimeError(f'{last_error}; last response: {last_response_text}')
+
+
+def create_opencode_message_path(server, password):
+    opencode_session_id = create_opencode_session(server, password)
+    return f'/session/{opencode_session_id}/message'
+
+
 def append_run_log(manifest_path, payload):
     log_path = pathlib.Path(manifest_path).with_suffix('.runs.jsonl')
     log_path.parent.mkdir(parents=True, exist_ok=True)
     with log_path.open('a', encoding='utf-8') as handle:
         handle.write(json.dumps(payload) + '\n')
+
+
+def _dice_term_tokenize(expression):
+    text = (expression or '').strip().lower().replace(' ', '')
+    if not text:
+        return []
+    if text[0] not in '+-':
+        text = f'+{text}'
+    parts = re.findall(r'[+-][^+-]+', text)
+    return parts if ''.join(parts) == text else []
+
+
+def roll_dice_expression(expression):
+    parts = _dice_term_tokenize(expression)
+    if not parts:
+        raise ValueError('Unsupported dice expression.')
+
+    total = 0
+    breakdown = []
+
+    for part in parts:
+        sign = -1 if part[0] == '-' else 1
+        token = part[1:]
+        dice_match = re.fullmatch(r'(\d*)d(\d+)(kh|kl)?(\d+)?', token)
+        if dice_match:
+            count = int(dice_match.group(1) or 1)
+            sides = int(dice_match.group(2))
+            keep_mode = dice_match.group(3)
+            keep_count = int(dice_match.group(4) or 1)
+            if count < 1 or count > 100 or sides < 2 or sides > 1000:
+                raise ValueError('Dice expression is out of allowed bounds.')
+            rolls = [random.randint(1, sides) for _ in range(count)]
+            if keep_mode:
+                keep_count = max(1, min(keep_count, count))
+                ordered = sorted(rolls, reverse=(keep_mode == 'kh'))
+                kept = ordered[:keep_count]
+            else:
+                kept = list(rolls)
+            subtotal = sum(kept) * sign
+            total += subtotal
+            breakdown.append({
+                'kind': 'dice',
+                'sign': sign,
+                'count': count,
+                'sides': sides,
+                'rolls': rolls,
+                'kept': kept,
+                'keep': f'{keep_mode}{keep_count}' if keep_mode else None,
+                'subtotal': subtotal,
+            })
+            continue
+
+        if re.fullmatch(r'\d+', token):
+            value = int(token) * sign
+            total += value
+            breakdown.append({
+                'kind': 'constant',
+                'sign': sign,
+                'value': abs(value),
+                'subtotal': value,
+            })
+            continue
+
+        raise ValueError('Unsupported dice expression.')
+
+    return {
+        'expression': expression,
+        'total': total,
+        'terms': breakdown,
+    }
+
+
+def execute_player_roll(label, expression):
+    clean_label = str(label or '').strip()[:80]
+    if not clean_label:
+        raise ValueError('Roll label is required.')
+
+    result = roll_dice_expression(expression)
+    dice_terms = [term for term in result['terms'] if term['kind'] == 'dice']
+    if len(dice_terms) != 1:
+        raise ValueError('Player roll tool supports exactly one dice term plus numeric modifiers.')
+
+    dice_term = dice_terms[0]
+    if dice_term['sign'] != 1:
+        raise ValueError('Player roll tool requires a positive dice term.')
+
+    modifier = sum(term['subtotal'] for term in result['terms'] if term['kind'] == 'constant')
+    roll_summary = {
+        'label': clean_label,
+        'expression': result['expression'],
+        'total': result['total'],
+        'modifier': modifier,
+        'sides': dice_term['sides'],
+        'rolls': dice_term['rolls'],
+        'kept': dice_term['kept'],
+        'keep': dice_term['keep'],
+    }
+    roll_summary['message'] = (
+        f'[Roll: {roll_summary["label"]}] total: {roll_summary["total"]} | '
+        f'rolls: {", ".join(str(value) for value in roll_summary["rolls"])} | '
+        f'mod: {roll_summary["modifier"]} | sides: {roll_summary["sides"]}'
+    )
+    return roll_summary
+
+
+def build_player_roll_message(content, roll_summary):
+    prefix = str(content or '').strip()
+    if not prefix:
+        return roll_summary['message']
+    return f'{prefix}\n{roll_summary["message"]}'
+
+
+def maybe_submit_initiative_roll(api_base, campaign_id, chosen_player, roll_summary):
+    if 'initiative' not in roll_summary['label'].casefold():
+        return None
+
+    encounter_map = api_get(
+        api_base,
+        f'/api/campaigns/{campaign_id}/encounter-maps/current',
+        api_key=chosen_player['api_key'],
+    ).get('encounter_map')
+    if not encounter_map or not encounter_map.get('id'):
+        return {'status': 'skipped', 'reason': 'No current encounter map'}
+
+    try:
+        response = api_post(
+            api_base,
+            f'/api/encounter-maps/{encounter_map["id"]}/encounter/roll-initiative',
+            {
+                'actor_type': 'player',
+                'actor_id': str(chosen_player['llm_player']['user_id']),
+                'initiative': roll_summary['total'],
+            },
+            api_key=chosen_player['api_key'],
+        )
+    except ApiError as exc:
+        return {
+            'status': 'error',
+            'encounter_map_id': encounter_map['id'],
+            'error': str(exc),
+        }
+
+    return {
+        'status': 'submitted',
+        'encounter_map_id': encounter_map['id'],
+        'initiative': roll_summary['total'],
+        'encounter_state_active': bool((response.get('encounter_map') or {}).get('encounter_state_json')),
+    }
+
+
+def _normalize_proposal_id(raw_value):
+    try:
+        proposal_id = int(raw_value)
+    except (TypeError, ValueError) as exc:
+        raise RuntimeError('Proposal action requires an integer proposal_id') from exc
+    if proposal_id <= 0:
+        raise RuntimeError('Proposal action requires a positive proposal_id')
+    return proposal_id
+
+
+def execute_player_decision(api_base, campaign_id, session_id, chosen_player, decision, pending_proposals, dry_run=False):
+    run_result = {}
+    action = str(decision.get('action') or '').strip().lower()
+
+    if action == 'speak':
+        content = str(decision.get('content') or '').strip()
+        if not content:
+            raise RuntimeError('OpenCode returned action=speak without content')
+        if not dry_run:
+            posted = api_post(
+                api_base,
+                f'/api/sessions/{session_id}/messages',
+                {'content': content, 'role': 'player'},
+                api_key=chosen_player['api_key'],
+            )
+            run_result['posted_messages'] = posted.get('messages', [])
+        return run_result
+
+    if action == 'roll':
+        roll_summary = execute_player_roll(
+            decision.get('label'),
+            decision.get('expression'),
+        )
+        content = build_player_roll_message(decision.get('content'), roll_summary)
+        run_result['roll'] = roll_summary
+        decision['content'] = content
+        if not dry_run:
+            posted = api_post(
+                api_base,
+                f'/api/sessions/{session_id}/messages',
+                {'content': content, 'role': 'player'},
+                api_key=chosen_player['api_key'],
+            )
+            run_result['posted_messages'] = posted.get('messages', [])
+            initiative_result = maybe_submit_initiative_roll(api_base, campaign_id, chosen_player, roll_summary)
+            if initiative_result is not None:
+                run_result['initiative_submission'] = initiative_result
+        return run_result
+
+    if action in {'apply_proposal', 'dismiss_proposal'}:
+        proposal_id = _normalize_proposal_id(decision.get('proposal_id'))
+        pending_proposal_ids = {int(proposal.get('id')) for proposal in pending_proposals or [] if proposal.get('id') is not None}
+        if proposal_id not in pending_proposal_ids:
+            raise RuntimeError(f'Proposal {proposal_id} is not pending for {chosen_player["character"]["name"]}')
+        run_result['proposal_action'] = {
+            'action': action,
+            'proposal_id': proposal_id,
+            'reason': str(decision.get('reason') or '').strip(),
+        }
+        if not dry_run:
+            response = api_post(
+                api_base,
+                f'/api/sessions/{session_id}/proposals/{proposal_id}/{"apply" if action == "apply_proposal" else "dismiss"}',
+                {},
+                api_key=chosen_player['api_key'],
+            )
+            run_result['proposal_result'] = response
+        return run_result
+
+    run_result['status'] = 'no_action'
+    return run_result
 
 
 def main():
@@ -202,10 +543,15 @@ def main():
     manifest['session'] = {'id': session['id']}
     save_manifest(args.manifest, manifest)
 
-    chosen_player = find_player(manifest, player_id=args.player_id, player_label=args.player_label) or choose_next_player(manifest, session)
-    prompt = build_prompt(manifest, campaign, world_payload, session, chosen_player, args.message_window)
-    opencode_session_id = create_opencode_session(args.opencode_server, args.opencode_password)
-    
+    chosen_player = find_player(manifest, player_id=args.player_id, player_label=args.player_label)
+    pending_proposals = []
+    if chosen_player is None:
+        chosen_player, pending_proposals = find_pending_proposal_player(manifest, api_base, session['id'])
+    if chosen_player is None:
+        chosen_player = choose_next_player(manifest, session)
+    if not pending_proposals:
+        pending_proposals = get_pending_sheet_proposals(api_base, session['id'], chosen_player)
+    prompt = build_prompt(manifest, campaign, world_payload, session, chosen_player, pending_proposals, args.message_window)
     model_payload = args.model
     if isinstance(args.model, str) and '/' in args.model:
         provider_id, model_id = args.model.split('/', 1)
@@ -214,20 +560,12 @@ def main():
             'modelID': model_id
         }
 
-    response = opencode_request(
+    decision, response_text, json_retry_count = request_opencode_decision(
         args.opencode_server,
-        f'/session/{opencode_session_id}/message',
-        payload={
-            'agent': 'build',
-            'model': model_payload,
-            'system': SYSTEM_PROMPT,
-            'parts': [{'type': 'text', 'text': prompt}],
-        },
-        password=args.opencode_password,
-        method='POST',
+        args.opencode_password,
+        model_payload,
+        prompt,
     )
-    response_text = extract_text_parts(response.get('parts'))
-    decision = extract_json_object(response_text)
 
     run_result = {
         'timestamp': now_iso(),
@@ -239,24 +577,23 @@ def main():
             'character_name': chosen_player['character']['name'],
         },
         'message_window': args.message_window,
+        'pending_sheet_proposals': pending_proposals,
         'decision': decision,
         'dry_run': args.dry_run,
+        'raw_response_text': response_text,
+        'json_retry_count': json_retry_count,
     }
-
-    if decision.get('action') == 'speak':
-        content = str(decision.get('content') or '').strip()
-        if not content:
-            raise RuntimeError('OpenCode returned action=speak without content')
-        if not args.dry_run:
-            posted = api_post(
-                api_base,
-                f'/api/sessions/{session["id"]}/messages',
-                {'content': content, 'role': 'player'},
-                api_key=chosen_player['api_key'],
-            )
-            run_result['posted_messages'] = posted.get('messages', [])
-    else:
-        run_result['status'] = 'no_action'
+    run_result.update(
+        execute_player_decision(
+            api_base,
+            campaign_id,
+            session['id'],
+            chosen_player,
+            run_result['decision'],
+            pending_proposals,
+            dry_run=args.dry_run,
+        )
+    )
 
     append_run_log(args.manifest, run_result)
     print(json.dumps(run_result, indent=2))

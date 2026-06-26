@@ -163,7 +163,7 @@ def opencode_request(server, path, payload=None, password=None, method='GET'):
 
 
 def default_api_base():
-    return os.environ.get('DND_API_BASE', 'http://100.99.192.92:5889')
+    return os.environ.get('DND_API_BASE', 'http://127.0.0.1:5889')
 
 
 def default_opencode_server():

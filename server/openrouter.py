@@ -57,7 +57,8 @@ SESSION_PREFLIGHT_MAX_TOKENS = max(
 PC_CONTROL_POLICY = (
     "Player-character control policy: NPCs may speak and act. Player characters are protected. "
     "Do not write exact dialogue for any player character unless that player supplied the exact words. "
-    "Do not narrate another player's PC actions, gestures, thoughts, emotions, decisions, or answers. "
+    "Do not take over another player's PC by inventing their dialogue, choices, inner state, or consequential behavior. "
+    "Keep references to protected PCs light and non-controlling. "
     "For the current player's PC, resolve only the action or words they declared; prefer second person "
     "and do not add unprovided intent, emotion, or quoted speech. If one PC addresses another PC and "
     "no DM adjudication, NPC response, environmental consequence, or clarification is needed, stay silent."
@@ -114,9 +115,10 @@ SESSION_TOOL_PROMPT = (
     "tracking data; never surface that data structure directly to players. Keep visible text diegetic and "
     "player-facing, not system-facing. "
     "protected_player_characters and current_player_character; obey those boundaries exactly. "
-    "For the final turn decision, return only valid JSON. Use {\"mode\":\"speak\",\"content\":\"...\"} "
-    "when the DM should send a visible reply. Use {\"mode\":\"silent\",\"reason\":\"...\"} when the latest "
-    "message is only PC-to-PC conversation or waiting on another PC and the DM should not send anything. "
+    "For the final turn decision, call exactly one finalization tool: use talk_to_player with visible player-facing content "
+    "when the DM should send a visible reply, or call stay_silent with a short reason when the DM should not "
+    "send anything. Do not mix a finalization tool call with other tools in the same assistant message. "
+    "Do not send the final visible reply as plain assistant text. "
     "Do not send handoff prompts such as 'How do you respond?' for ordinary PC-to-PC conversation."
 )
 
@@ -210,7 +212,22 @@ SESSION_NPC_TAG_CHECK_SYSTEM_PROMPT = (
     "plain text. Be conservative. Safe replies include plain narration, unattributed quoted text, signage, "
     "interface text, remembered phrases, ambient sounds, or stylized prose that is not clearly an NPC's "
     "current performed line. Unsafe replies clearly attribute a current spoken line or performed utterance "
-    "to a specific NPC or named non-player speaker without the required <npc> wrapper."
+    "to a specific NPC or named non-player speaker without the required <npc> wrapper. "
+    "If the attributed speech is already correctly wrapped in <npc target=\"NPC name\">...</npc>, "
+    "return requires_npc_tag=false."
+)
+
+SESSION_PC_CONTROL_CHECK_SYSTEM_PROMPT = (
+    "You are a player-agency guard for visible Dungeon Master replies. "
+    "Return only valid JSON. Decide whether the candidate visible DM reply improperly takes control of a protected "
+    "player character. Unsafe replies invent a protected player's dialogue, strategic choices, intent, emotions, "
+    "interior thoughts, or consequential actions the player did not declare. Safe replies may narrate immediate "
+    "environmental consequences, hazards, impacts, forced movement, damage, slips, falls, collisions, or changed "
+    "positioning that naturally follow from the player's declared action, the scene, or a rolled outcome. "
+    "Safe replies may use second person to describe consequences. Do not mark a reply unsafe merely because it "
+    "describes what happens to the acting player character after they already attempted something risky. "
+    "Be especially careful to allow consequence narration such as losing footing, getting hit, taking damage, or "
+    "ending up in a new spot when the world caused it rather than the DM inventing a new choice."
 )
 
 SESSION_PREFLIGHT_SYSTEM_PROMPT = (
@@ -870,6 +887,80 @@ def normalize_session_dm_turn_decision(raw_decision):
     }
 
 
+SESSION_DM_FINALIZER_TOOL_NAMES = {'talk_to_player', 'stay_silent'}
+SESSION_DM_FINALIZER_TOOLS = [
+    {
+        'type': 'function',
+        'function': {
+            'name': 'talk_to_player',
+            'description': 'Finalize the DM turn by sending one player-visible reply. Put only player-facing visible content in content.',
+            'parameters': {
+                'type': 'object',
+                'required': ['content'],
+                'properties': {
+                    'content': {
+                        'type': 'string',
+                        'description': 'Visible DM reply for the player, using only valid visible-message syntax.',
+                    },
+                },
+            },
+        },
+    },
+    {
+        'type': 'function',
+        'function': {
+            'name': 'stay_silent',
+            'description': 'Finalize the DM turn with no visible reply when the DM should intentionally remain silent.',
+            'parameters': {
+                'type': 'object',
+                'required': ['reason'],
+                'properties': {
+                    'reason': {
+                        'type': 'string',
+                        'description': 'Short internal reason for the silence decision.',
+                    },
+                },
+            },
+        },
+    },
+]
+
+
+def _session_dm_tools_with_finalizers(tools):
+    return [*(tools or []), *SESSION_DM_FINALIZER_TOOLS]
+
+
+def _session_dm_finalizer_decision_from_tool_calls(tool_calls):
+    finalizer_calls = []
+    for tool_call in tool_calls or []:
+        function = tool_call.get('function') or {}
+        tool_name = function.get('name')
+        if tool_name in SESSION_DM_FINALIZER_TOOL_NAMES:
+            finalizer_calls.append(tool_call)
+
+    if not finalizer_calls:
+        return None, None
+
+    if len(finalizer_calls) != 1 or len(finalizer_calls) != len(tool_calls or []):
+        return None, {
+            'kind': 'invalid_finalizer_usage',
+            'detail': 'Use exactly one finalization tool call and do not mix it with other tools.',
+        }
+
+    function = finalizer_calls[0].get('function') or {}
+    tool_name = function.get('name')
+    args = _parse_tool_arguments(function.get('arguments'))
+    if tool_name == 'talk_to_player':
+        return {
+            'mode': 'speak',
+            'content': str(args.get('content') or '').strip(),
+        }, None
+    return {
+        'mode': 'silent',
+        'reason': str(args.get('reason') or 'The DM intentionally stayed silent.').strip(),
+    }, None
+
+
 def _looks_like_provider_tool_markup(raw_content):
     if not isinstance(raw_content, str):
         return False
@@ -1208,70 +1299,42 @@ def _session_dm_restore_combat_snapshot(snapshot):
     return True
 
 
-def _session_dm_json_contract_violation(raw_content):
+def _session_dm_finalizer_contract_violation(raw_content):
     if _looks_like_provider_tool_markup(raw_content):
         return {
             'kind': 'provider_tool_markup',
-            'detail': 'Session DM final answer contained provider tool-call markup instead of a visible JSON reply.',
+            'detail': 'Session DM final answer contained provider tool-call markup instead of a finalization tool call.',
         }
 
-    data = _json_loads_or_empty(raw_content)
-    if not isinstance(data, dict) or not data:
-        return {
-            'kind': 'non_json_response',
-            'detail': 'Session DM final answer must be a JSON object with mode/content or mode/reason.',
-        }
-
-    mode = str(data.get('mode') or data.get('action') or '').strip().lower()
-    if mode in {'silent', 'no_response', 'no_dm_response', 'none'}:
-        return None
-    if mode and mode != 'speak':
-        return {
-            'kind': 'invalid_mode',
-            'detail': 'Session DM mode must be "speak" or "silent".',
-            'mode': mode,
-        }
-    content_candidate = data.get('content')
-    if content_candidate is None:
-        content_candidate = data.get('message')
-    if content_candidate is None:
-        content_candidate = data.get('visible_message')
-    if content_candidate is None:
-        return {
-            'kind': 'missing_content',
-            'detail': 'Session DM speak decisions must include content, message, or visible_message.',
-        }
-    if mode != 'silent' and not str(content_candidate).strip():
-        return {
-            'kind': 'empty_content',
-            'detail': 'Session DM speak decisions must include non-empty visible content.',
-        }
-    return None
+    return {
+        'kind': 'missing_finalizer_tool_call',
+        'detail': 'Session DM final answer must use exactly one finalization tool call: talk_to_player or stay_silent.',
+    }
 
 
 def _session_dm_guard_retry_system_prompt(guard_name, details):
     silent_ack = ' Acknowledge these instructions silently and follow them. Do not output an acknowledgement.'
-    if guard_name == 'json_contract':
+    if guard_name == 'finalizer_contract':
         if isinstance(details, dict) and details.get('kind') == 'provider_tool_markup':
             return (
-                'Guard reminder: generate a player-visible DM reply only. '
+                'Guard reminder: finalize the turn by calling exactly one of talk_to_player or stay_silent. '
                 'Do not output DSML, <｜｜DSML｜｜tool_calls>, invoke tags, XML, or any tool-call markup in visible content. '
-                'The final answer must be exactly one JSON object only, with either '
-                '{"mode":"speak","content":"..."} or {"mode":"silent","reason":"..."}. '
-                'If you need to narrate what the player learns, write only the player-facing result in content.'
+                'Do not send the final reply as plain assistant text. If you need to narrate what the player learns, '
+                'put only the player-facing visible result inside talk_to_player(content).'
                 + silent_ack
             )
         return (
-            'Guard reminder: return exactly one JSON object only, with either '
-            '{"mode":"speak","content":"..."} or {"mode":"silent","reason":"..."}. '
-            'Do not output markdown fences, explanations, meta-commentary, or text outside the JSON object. '
-            'Use mode="silent" only when no visible DM response is actually needed.'
+            'Guard reminder: finalize the turn by calling exactly one of talk_to_player or stay_silent. '
+            'Do not send the final visible reply as plain assistant text. '
+            'Do not output markdown fences, explanations, meta-commentary, or text outside the tool call. '
+            'Use stay_silent only when no visible DM response is actually needed.'
             + silent_ack
         )
     if guard_name == 'format':
         return (
             'Guard reminder: use valid visible-message syntax. '
-            'Return exactly one JSON object in the final contract. If mode="speak", content may use Markdown and '
+            'Finalize with talk_to_player or stay_silent. '
+            'If you speak, talk_to_player content may use Markdown and '
             'plain text. The only allowed angle-bracket tag is <npc target="NPC name">...</npc>. '
             'Do not use <ic>, <ooc>, HTML, XML, or invalid closing tags.'
             + silent_ack
@@ -1282,23 +1345,23 @@ def _session_dm_guard_retry_system_prompt(guard_name, details):
             '<npc> wrapper. '
             'If you include clearly attributed current NPC spoken lines or performed utterances, wrap them in '
             '<npc target="NPC name">...</npc>, and leave narration outside the tag. '
-            'Do not use any other angle-bracket tags. Return exactly one JSON object in the final contract.'
+            'Do not use any other angle-bracket tags. Finalize with talk_to_player or stay_silent.'
             + silent_ack
         )
     if guard_name == 'mechanical_resolution':
         return (
             'Guard reminder: do not resolve uncertain combat outcomes before the required D&D mechanics. '
-            'Return exactly one JSON object in the final contract. If mode="speak", ask for the required roll or '
+            'Finalize with talk_to_player or stay_silent. If you speak, ask for the required roll or '
             'initiative instead of narrating hit/miss/damage/outcome.'
             + silent_ack
         )
     if guard_name == 'pc_control':
         return (
             'Guard reminder: do not control a protected player character. '
-            'Do not write dialogue, actions, gestures, thoughts, emotions, or decisions for any PC. '
-            'If no DM adjudication is needed (for example PC-to-PC exchange), return '
-            '{"mode":"silent","reason":"PC-to-PC exchange."}. Otherwise return mode="speak" with only safe DM-visible '
-            'content. Return exactly one JSON object in the final contract.'
+            'Do not invent dialogue, choices, inner state, or consequential behavior for any PC. '
+            'Keep any mention of a protected PC brief and non-controlling. '
+            'If no DM adjudication is needed (for example PC-to-PC exchange), use stay_silent("PC-to-PC exchange."). '
+            'Otherwise use talk_to_player with only safe DM-visible content.'
             + silent_ack
         )
     if guard_name == 'private_output':
@@ -1306,14 +1369,14 @@ def _session_dm_guard_retry_system_prompt(guard_name, details):
         return (
             'Guard reminder: do not expose DM-private information that has not become visible through '
             f'play. Do not mention these private terms in the visible reply: {terms or "(none listed)"}. '
-            'Return exactly one JSON object in the final contract with spoiler-safe visible content.'
+            'Finalize with talk_to_player or stay_silent using spoiler-safe visible content.'
             + silent_ack
         )
     if guard_name == 'spoiler_checker':
         return (
             'Guard reminder: keep the visible reply spoiler-safe. '
             'Keep only what players could currently observe or reasonably know in-world. '
-            'Return exactly one JSON object in the final contract with spoiler-safe visible content.'
+            'Finalize with talk_to_player or stay_silent using spoiler-safe visible content.'
             + silent_ack
         )
     if guard_name == 'combat_batch':
@@ -1321,7 +1384,7 @@ def _session_dm_guard_retry_system_prompt(guard_name, details):
             'Combat turn reminder: if you are resolving combat for enemies or NPCs, continue through consecutive '
             'non-player turns until control returns to a player character or combat ends. '
             'Do not stop while a monster or NPC turn is still active. '
-            'Use tools to finish the remaining non-player turns, then return exactly one JSON object in the final contract.'
+            'Use tools to finish the remaining non-player turns, then finalize with talk_to_player or stay_silent.'
             + silent_ack
         )
     if guard_name == 'combat_handoff':
@@ -1329,7 +1392,7 @@ def _session_dm_guard_retry_system_prompt(guard_name, details):
             'Combat turn reminder: narrate only completed actions. '
             'Do not say "now let me advance", "next enemy", or any similar procedural handoff text in visible content. '
             'If the next active turn already belongs to a player character, end cleanly with the resolved combat narration '
-            'or a concise "you are up" handoff. Return exactly one JSON object in the final contract.'
+            'or a concise "you are up" handoff. Finalize with talk_to_player or stay_silent.'
             + silent_ack
         )
     return (
@@ -1510,21 +1573,96 @@ def _strip_npc_blocks(text):
     return re.sub(r'<npc\b[^>]*>.*?</npc>', '', text or '', flags=re.IGNORECASE | re.DOTALL)
 
 
+def _sentence_containing_span(text, start, end):
+    text = str(text or '')
+    if not text:
+        return ''
+    left = max(text.rfind('.', 0, start), text.rfind('!', 0, start), text.rfind('?', 0, start), text.rfind('\n', 0, start))
+    right_candidates = [idx for idx in (
+        text.find('.', end),
+        text.find('!', end),
+        text.find('?', end),
+        text.find('\n', end),
+    ) if idx != -1]
+    right = min(right_candidates) if right_candidates else len(text)
+    return text[left + 1:right].strip()
+
+
+def _latest_player_message_for_character(hot_context, character):
+    recent_messages = (hot_context or {}).get('recent_messages') or []
+    user_id = character.get('user_id')
+    for message in reversed(recent_messages):
+        if message.get('role') != 'player':
+            continue
+        if user_id is not None and message.get('user_id') != user_id:
+            continue
+        return str(message.get('content') or '')
+    return ''
+
+
+def _pc_control_staging_echo_exception(sentence, latest_player_message, character):
+    import re
+
+    sentence = str(sentence or '').strip()
+    latest_player_message = str(latest_player_message or '').strip()
+    if not sentence or not latest_player_message:
+        return False
+
+    # Allow low-agency scene framing when it is plainly echoing the same player's
+    # just-declared positioning toward the same NPC. This avoids blocking harmless
+    # paraphrases like "Seraphina draws alongside Miriam Saltwick" after the player
+    # already said they sidled closer to Miriam.
+    if not re.search(r'\b(?:draws?\s+alongside|draws?\s+closer|steps?\s+closer|moves?\s+closer|approaches?|sidles?\s+closer|drifts?\s+closer)\b', sentence, flags=re.IGNORECASE):
+        return False
+
+    protected_names = {
+        str(character.get('name') or '').strip().lower(),
+        str((character.get('name') or '').split()[0] if character.get('name') else '').strip().lower(),
+    }
+    mentioned_names = {
+        match.group(0).strip()
+        for match in re.finditer(r'\b[A-Z][A-Za-z0-9\'._-]*(?:\s+[A-Z][A-Za-z0-9\'._-]*)+\b', sentence)
+    }
+    npc_names = [
+        name for name in mentioned_names
+        if name.lower() not in protected_names
+    ]
+    if not npc_names:
+        return False
+
+    player_has_matching_target = any(
+        re.search(re.escape(name), latest_player_message, flags=re.IGNORECASE)
+        for name in npc_names
+    )
+    if not player_has_matching_target:
+        return False
+
+    return bool(re.search(r'\b(?:sidles?|drifts?|approaches?|steps?|moves?|draws?)\b', latest_player_message, flags=re.IGNORECASE))
+
+
 def _pc_control_violation(response_text, hot_context):
     import re
 
     visible = _strip_npc_blocks(response_text)
     protected = hot_context.get('protected_player_characters') or []
     action_verbs = (
-        'nods', 'nod', 'glances', 'glance', 'looks', 'look', 'turns', 'turn', 'steps', 'step',
-        'moves', 'move', 'smiles', 'smile', 'frowns', 'frown', 'laughs', 'laugh', 'sighs',
-        'sigh', 'shrugs', 'shrug', 'reaches', 'reach', 'draws', 'draw',
-        'gives', 'give', 'straightens', 'straighten', 'waits', 'wait',
+        'nods', 'nod', 'glances', 'glance', 'looks', 'look', 'smiles', 'smile', 'frowns', 'frown', 'laughs', 'laugh', 'sighs',
+        'sigh', 'shrugs', 'shrug',
+        'straightens', 'straighten', 'waits', 'wait',
     )
     speech_verbs = (
         'says', 'say', 'asks', 'ask', 'replies', 'reply', 'responds', 'respond', 'whispers',
         'whisper', 'mutters', 'mutter', 'shouts', 'shout', 'calls', 'call', 'answers', 'answer',
     )
+    choice_verbs = (
+        'decides', 'decide', 'chooses', 'choose', 'agrees', 'agree', 'refuses', 'refuse',
+        'plans', 'plan', 'intends', 'intend', 'wants', 'want', 'hopes', 'hope',
+        'tries', 'try', 'attempts', 'attempt', 'commits', 'commit', 'opts', 'opt',
+    )
+    action_reason = 'Visible DM reply narrated a protected player character action.'
+    speech_reason = 'Visible DM reply put dialogue or speaking behavior in a protected player character\'s mouth.'
+    interior_reason = 'Visible DM reply narrated a protected player character\'s expression, voice, or body language.'
+    choice_reason = 'Visible DM reply invented a protected player character choice, intent, or strategy.'
 
     for character in protected:
         name = (character.get('name') or '').strip()
@@ -1535,18 +1673,27 @@ def _pc_control_violation(response_text, hot_context):
         name_pattern = f'(?:{escaped}|{first})'
         handoff_pattern = rf'\b{name_pattern}\s*,\s+how do you respond\?'
         visible_for_character = re.sub(handoff_pattern, '', visible, flags=re.IGNORECASE)
+        latest_player_message = _latest_player_message_for_character(hot_context, character)
         checks = [
-            rf'\*\*{name_pattern}\b[^*]*:\*\*',
-            rf'<npc\s+target=["\']{escaped}["\']',
-            rf'\b{name_pattern}\b[^.!?\n]{{0,80}}\b(?:{"|".join(speech_verbs)})\b',
-            rf'\b{name_pattern}(?:[’\']s)?\b[^.!?\n]{{0,80}}\b(?:{"|".join(action_verbs)})\b',
-            rf'\b{name_pattern}[’\']s\s+(?:eyes|expression|face|voice|smirk|smile|shoulders|hands)\b',
+            (rf'\*\*{name_pattern}\b[^*]*:\*\*', speech_reason),
+            (rf'<npc\s+target=["\']{escaped}["\']', speech_reason),
+            (rf'\b{name_pattern}\b[^.!?\n]{{0,80}}\b(?:{"|".join(speech_verbs)})\b', speech_reason),
+            (rf'\b{name_pattern}(?:[’\']s)?\b[^.!?\n]{{0,80}}\b(?:{"|".join(action_verbs)})\b', action_reason),
+            (rf'\b{name_pattern}\b[^.!?\n]{{0,80}}\b(?:{"|".join(choice_verbs)})\b', choice_reason),
+            (rf'\b{name_pattern}[’\']s\s+(?:eyes|expression|face|voice|smirk|smile|shoulders|hands)\b', interior_reason),
         ]
-        for pattern in checks:
-            if re.search(pattern, visible_for_character, flags=re.IGNORECASE):
+        for pattern, reason in checks:
+            match = re.search(pattern, visible_for_character, flags=re.IGNORECASE)
+            if match:
+                matched_text = match.group(0).strip()
+                sentence = _sentence_containing_span(visible_for_character, match.start(), match.end())
+                if reason == action_reason and _pc_control_staging_echo_exception(sentence, latest_player_message, character):
+                    continue
                 return {
                     'character': character,
                     'pattern': pattern,
+                    'matched_text': matched_text[:180],
+                    'reason': reason,
                 }
 
     return None
@@ -1646,6 +1793,19 @@ def _possible_missing_npc_tag_signal(response_text):
     if '<npc' in text.lower():
         return None
 
+    def _clean_speaker(raw_name):
+        return ' '.join(str(raw_name or '').replace('*', ' ').split()).strip()
+
+    def _build_signal(raw_name, raw_quote, raw_context):
+        speaker = _clean_speaker(raw_name)
+        if not speaker or speaker in ignored_speakers:
+            return None
+        return {
+            'speaker': speaker,
+            'quote': ' '.join(str(raw_quote or '').split())[:240],
+            'context': ' '.join(str(raw_context or '').split())[:240],
+        }
+
     quoted_dialogue_pattern = re.compile(
         r'(?P<prefix>(?:^|\n\n?)[^\n<]{0,240}?)'
         r'(?P<quote>(?:\*\*)?\s*["\u201c][^"\u201c\u201d\n]{2,400}["\u201d](?:\s*\*\*)?)',
@@ -1657,25 +1817,91 @@ def _possible_missing_npc_tag_signal(response_text):
         r'(?i:(?:says?|said|asks?|asked|repl(?:y|ies|ied)|whispers?|murmurs?|growls?|snaps?|'
         r'shouts?|laughs?|chuckles?|nods?|shrugs?|sighs?|smiles?|grins?|frowns?|smirks?|'
         r'glances?|gestures?|motions?|waves?|points?|leans?|turns?|watches?|scratches?|'
-        r'mutters?|answers?|calls?))\b',
+        r'mutters?|answers?|calls?|speaks?|warns?|orders?|adds?|continues?|stops?|spins?|'
+        r'squints?|leads?|steps?|stares?|glares?|glowers?|looks?))\b',
         flags=re.DOTALL,
     )
-    ignored_speakers = {'I', 'We', 'You', 'It', 'This', 'That', 'The'}
+    speaker_label_pattern = re.compile(
+        r'(?:^|[\n\r])\s*(?:\*\*)?(?P<name>[A-Z][A-Za-z0-9\'._-]*(?:\s+[A-Z][A-Za-z0-9\'._-]*){0,3})(?:\*\*)?\s*:\s*$',
+        flags=re.MULTILINE,
+    )
+    sentence_lead_pattern = re.compile(
+        r'^\s*(?:[*_]{1,3}\s*)?(?P<name>[A-Z][A-Za-z0-9\'._-]*(?:\s+[A-Z][A-Za-z0-9\'._-]*){0,3})\b'
+    )
+    ignored_speakers = {'I', 'We', 'You', 'He', 'She', 'They', 'It', 'This', 'That', 'The'}
 
     for match in quoted_dialogue_pattern.finditer(text):
         prefix = match.group('prefix') or ''
+        quote = match.group('quote') or ''
+
         speaker_match = speaker_cue_pattern.search(prefix)
-        if not speaker_match:
-            continue
-        speaker = str(speaker_match.group('name') or '').strip()
-        if not speaker or speaker in ignored_speakers:
-            continue
-        return {
-            'speaker': speaker,
-            'quote': ' '.join(str(match.group('quote') or '').split())[:240],
-            'context': ' '.join(prefix.split())[:240],
-        }
+        if speaker_match:
+            signal = _build_signal(speaker_match.group('name'), quote, prefix)
+            if signal:
+                return signal
+
+        label_match = speaker_label_pattern.search(prefix)
+        if label_match:
+            signal = _build_signal(label_match.group('name'), quote, prefix)
+            if signal:
+                return signal
+
+        current_clause = re.split(r'(?:\n+|(?<=[.!?])\s+)', prefix.strip())[-1] if prefix.strip() else ''
+        lead_match = sentence_lead_pattern.match(current_clause)
+        if lead_match:
+            signal = _build_signal(lead_match.group('name'), quote, current_clause)
+            if signal:
+                return signal
     return None
+
+
+def _should_run_npc_tag_check(response_text, signal=None):
+    text = str(response_text or '')
+    if not text.strip():
+        return False
+    if signal:
+        return True
+
+    # Only escalate to the LLM checker when there is quoted speech outside existing
+    # <npc> tags. This preserves the broader checker coverage for missed heuristics
+    # without spending a guard pass on narration-only replies.
+    visible = _strip_npc_blocks(text)
+    return bool(re.search(r'["\u201c][^"\u201c\u201d\n]{2,400}["\u201d]', visible))
+
+
+def _normalize_npc_tag_checker_text(text):
+    cleaned = re.sub(r'[*_`]+', ' ', str(text or ''))
+    return ' '.join(cleaned.split()).strip()
+
+
+def _npc_wrapped_segments(response_text):
+    text = str(response_text or '')
+    return [
+        _normalize_npc_tag_checker_text(match.group(1))
+        for match in re.finditer(r'<npc\b[^>]*>(.*?)</npc>', text, flags=re.IGNORECASE | re.DOTALL)
+        if _normalize_npc_tag_checker_text(match.group(1))
+    ]
+
+
+def _npc_tag_check_false_positive(response_text, normalized_check):
+    if not normalized_check.get('requires_npc_tag'):
+        return False
+
+    evidence = normalized_check.get('evidence') or []
+    if not evidence:
+        return False
+
+    wrapped_segments = _npc_wrapped_segments(response_text)
+    if not wrapped_segments:
+        return False
+
+    for snippet in evidence:
+        normalized_snippet = _normalize_npc_tag_checker_text(snippet)
+        if not normalized_snippet:
+            return False
+        if not any(normalized_snippet in wrapped for wrapped in wrapped_segments):
+            return False
+    return True
 
 
 def normalize_session_spoiler_check(raw_check):
@@ -1793,7 +2019,45 @@ def normalize_session_npc_tag_check(raw_check):
     }
 
 
-def build_session_npc_tag_check_messages(response_text, signal):
+def normalize_session_pc_control_check(raw_check):
+    data = raw_check if isinstance(raw_check, dict) else _json_loads_or_empty(raw_check)
+    if not isinstance(data, dict) or not data:
+        return {
+            'safe': True,
+            'violations': [],
+            'confidence': 'low',
+            'reason': 'Checker returned no usable decision.',
+        }
+
+    violations = data.get('violations')
+    if not isinstance(violations, list):
+        violations = []
+
+    normalized_violations = []
+    for item in violations:
+        if not isinstance(item, dict):
+            continue
+        normalized_violations.append({
+            'character': str(item.get('character') or '').strip()[:120],
+            'sentence': str(item.get('sentence') or '').strip()[:240],
+            'kind': str(item.get('kind') or '').strip()[:80],
+            'reason': str(item.get('reason') or '').strip()[:240],
+        })
+
+    confidence = str(data.get('confidence') or 'medium').strip().lower()
+    if confidence not in {'low', 'medium', 'high'}:
+        confidence = 'medium'
+
+    safe = bool(data.get('safe')) and not normalized_violations
+    return {
+        'safe': safe,
+        'violations': normalized_violations,
+        'confidence': confidence,
+        'reason': str(data.get('reason') or '').strip(),
+    }
+
+
+def build_session_npc_tag_check_messages(response_text, signal=None):
     return [
         {'role': 'system', 'content': SESSION_NPC_TAG_CHECK_SYSTEM_PROMPT},
         {
@@ -1810,6 +2074,66 @@ def build_session_npc_tag_check_messages(response_text, signal):
             }, ensure_ascii=False),
         },
     ]
+
+
+def build_session_pc_control_check_messages(response_text, hot_context):
+    protected = hot_context.get('protected_player_characters') or []
+    latest_player_messages = []
+    for character in protected:
+        latest_player_messages.append({
+            'character_name': str(character.get('name') or '').strip(),
+            'user_id': character.get('user_id'),
+            'latest_player_message': _latest_player_message_for_character(hot_context, character),
+        })
+
+    return [
+        {'role': 'system', 'content': SESSION_PC_CONTROL_CHECK_SYSTEM_PROMPT},
+        {
+            'role': 'user',
+            'content': json.dumps({
+                'candidate_visible_dm_reply': response_text,
+                'current_player_character': hot_context.get('current_player_character') or {},
+                'protected_player_characters': protected,
+                'latest_player_messages_by_character': latest_player_messages,
+                'return_shape': {
+                    'safe': 'boolean',
+                    'violations': [{
+                        'character': 'protected player character name',
+                        'sentence': 'short exact sentence from candidate reply',
+                        'kind': 'dialogue | interior_state | choice_or_intent | consequential_action',
+                        'reason': 'one short explanation',
+                    }],
+                    'confidence': 'low | medium | high',
+                    'reason': 'one short explanation',
+                },
+            }, ensure_ascii=False),
+        },
+    ]
+
+
+def _pc_control_check_needed(response_text, hot_context):
+    import re
+
+    visible = _strip_npc_blocks(response_text)
+    protected = hot_context.get('protected_player_characters') or []
+    if not protected:
+        return False
+
+    for character in protected:
+        name = str(character.get('name') or '').strip()
+        if not name:
+            continue
+        first = name.split()[0].strip()
+        visible_without_handoffs = re.sub(
+            rf'\b(?:{re.escape(name)}|{re.escape(first)})\s*,\s+(?:you are up|how do you respond\?)\.?',
+            '',
+            visible,
+            flags=re.IGNORECASE,
+        )
+        if re.search(rf'\b(?:{re.escape(name)}|{re.escape(first)})\b', visible_without_handoffs, flags=re.IGNORECASE):
+            return True
+
+    return bool(re.search(r"\b(?:you|your|you're|you've|you’d|you'll)\b", visible, flags=re.IGNORECASE))
 def _child_audit_context(base_audit, operation, actor, trace_label):
     parent_trace_id = base_audit.get('trace_id')
     return {
@@ -1866,8 +2190,8 @@ def check_session_mechanics_with_llm(response_text, preflight_decision, hot_cont
         }
 
 
-def check_session_missing_npc_tags_with_llm(response_text, signal, audit_context=None):
-    if not (response_text or '').strip() or not signal:
+def check_session_missing_npc_tags_with_llm(response_text, audit_context=None, signal=None):
+    if not (response_text or '').strip():
         return {'requires_npc_tag': False, 'speaker': '', 'evidence': [], 'reason': ''}
 
     base_audit = audit_context or {}
@@ -1884,7 +2208,15 @@ def check_session_missing_npc_tags_with_llm(response_text, signal, audit_context
             audit_context=checker_audit,
             allow_thinking=False,
         )
-        return normalize_session_npc_tag_check(raw_check)
+        normalized = normalize_session_npc_tag_check(raw_check)
+        if _npc_tag_check_false_positive(response_text, normalized):
+            return {
+                'requires_npc_tag': False,
+                'speaker': '',
+                'evidence': [],
+                'reason': 'Checker evidence was already wrapped in <npc> tags.',
+            }
+        return normalized
     except Exception as err:
         campaign_id = base_audit.get('campaign_id')
         if campaign_id:
@@ -1904,6 +2236,50 @@ def check_session_missing_npc_tags_with_llm(response_text, signal, audit_context
             'requires_npc_tag': False,
             'speaker': '',
             'evidence': [],
+            'reason': 'Checker failed open.',
+        }
+
+
+def check_session_pc_control_with_llm(response_text, hot_context, audit_context=None):
+    if not (response_text or '').strip():
+        return {'safe': True, 'violations': [], 'confidence': 'high', 'reason': ''}
+    if not _pc_control_check_needed(response_text, hot_context):
+        return {'safe': True, 'violations': [], 'confidence': 'high', 'reason': 'No protected-player reference or second-person consequence phrasing detected.'}
+
+    base_audit = audit_context or {}
+    checker_audit = _child_audit_context(
+        base_audit,
+        'session_pc_control_check',
+        'session_pc_control_checker',
+        'session_pc_control_checker: pc control check',
+    )
+    try:
+        raw_check = _post_chat(
+            build_session_pc_control_check_messages(response_text, hot_context),
+            json_mode=True,
+            audit_context=checker_audit,
+            allow_thinking=False,
+        )
+        return normalize_session_pc_control_check(raw_check)
+    except Exception as err:
+        campaign_id = base_audit.get('campaign_id')
+        if campaign_id:
+            log_audit_event(
+                campaign_id,
+                'pc_control_checker_error',
+                'Session PC-control checker failed open.',
+                {'error': repr(err)},
+                source='session_dm.guard',
+                actor='server',
+                trace_id=base_audit.get('trace_id'),
+                trace_label=base_audit.get('trace_label'),
+                audit_role='guard',
+                commit=True,
+            )
+        return {
+            'safe': True,
+            'violations': [],
+            'confidence': 'low',
             'reason': 'Checker failed open.',
         }
 
@@ -2493,6 +2869,8 @@ def get_session_dm_response_with_tools(
     base_audit = audit_context or {}
     trace_id = base_audit.get('trace_id') or f"session_dm:session_dm_response:{uuid4().hex[:10]}"
     trace_label = base_audit.get('trace_label') or 'session_dm: session_dm_response'
+    all_tools = _session_dm_tools_with_finalizers(tools)
+    finalizer_tools = SESSION_DM_FINALIZER_TOOLS
     messages = build_session_dm_tool_messages(hot_context)
     for msg in recent_messages:
         if msg.role == 'dm':
@@ -2513,7 +2891,7 @@ def get_session_dm_response_with_tools(
         preflight_decision = get_session_preflight_decision(
             hot_context,
             recent_messages,
-            tools,
+            all_tools,
             audit_context={
                 **base_audit,
                 'trace_id': trace_id,
@@ -2527,7 +2905,7 @@ def get_session_dm_response_with_tools(
         on_status_change({"step": "preflight"})
 
     tool_round = 0
-    json_contract_retry_count = 0
+    finalizer_contract_retry_count = 0
     combat_batch_retry_count = 0
     combat_batch_force_tools = False
     format_retried = False
@@ -2536,7 +2914,6 @@ def get_session_dm_response_with_tools(
     private_output_retried = False
     spoiler_checker_retried = False
     combat_handoff_retried = False
-    json_contract_fallback_draft = None
     guard_audits = {}
     combat_tracker = _session_dm_combat_tracker(hot_context)
     if not combat_tracker.get('campaign_id'):
@@ -2584,7 +2961,7 @@ def get_session_dm_response_with_tools(
             on_status_change({"step": "thinking", "reasoning": "Determining best actions or phrasing narration"})
 
         retrying_visible_answer = any((
-            json_contract_retry_count > 0,
+            finalizer_contract_retry_count > 0,
             format_retried,
             mechanical_retried,
             pc_control_retried,
@@ -2592,11 +2969,25 @@ def get_session_dm_response_with_tools(
             spoiler_checker_retried,
             combat_handoff_retried,
         )) and not combat_batch_force_tools
-        active_tools = None if retrying_visible_answer else tools
+        if retrying_visible_answer and finalizer_tools:
+            active_tools = finalizer_tools
+        elif tool_round < max_tool_rounds and all_tools:
+            active_tools = all_tools
+        elif finalizer_tools:
+            active_tools = finalizer_tools
+        else:
+            active_tools = None
+        finalizer_only_tools = (
+            bool(active_tools)
+            and {
+                str(((tool or {}).get('function') or {}).get('name') or '').strip()
+                for tool in (active_tools or [])
+            } == SESSION_DM_FINALIZER_TOOL_NAMES
+        )
         active_tool_choice = (
-            'auto'
-            if active_tools and tool_round < max_tool_rounds
-            else 'none'
+            'required'
+            if finalizer_only_tools
+            else 'auto'
             if active_tools
             else None
         )
@@ -2612,8 +3003,8 @@ def get_session_dm_response_with_tools(
         }
         data = _post_chat_response(
             messages,
-            # Some configured providers/models do not reliably support response_format JSON mode.
-            # Keep retries in plain chat mode and enforce JSON via guard prompts + contract checks.
+            # Keep session DM finalization in plain chat mode and enforce the finalizer-tool
+            # contract in the guard loop instead of relying on provider JSON mode.
             json_mode=False,
             audit_context=loop_audit,
             tools=active_tools,
@@ -2633,29 +3024,33 @@ def get_session_dm_response_with_tools(
             on_status_change({"step": "thinking", "reasoning": reasoning_val})
 
         tool_calls = message.get('tool_calls') or []
-        if not tool_calls or tool_round >= max_tool_rounds:
+        finalizer_decision, finalizer_violation = _session_dm_finalizer_decision_from_tool_calls(tool_calls)
+        if finalizer_violation:
+            tool_calls = []
+        if finalizer_decision is not None or not tool_calls or tool_round >= max_tool_rounds:
             if on_status_change:
                 on_status_change({"step": "guard_check"})
             raw_content = message.get('content') or ''
-            json_contract_violation = _session_dm_json_contract_violation(raw_content)
-            if (
-                json_contract_violation
-                and json_contract_violation.get('kind') == 'non_json_response'
-                and str(raw_content).strip()
-            ):
-                json_contract_fallback_draft = str(raw_content).strip()
-            if json_contract_violation and json_contract_retry_count < 2:
+            if finalizer_decision is not None:
+                decision = normalize_session_dm_turn_decision(finalizer_decision)
+                raw_content = json.dumps(finalizer_decision, ensure_ascii=False)
+                finalizer_contract_violation = None
+            elif finalizer_violation:
+                finalizer_contract_violation = finalizer_violation
+            else:
+                finalizer_contract_violation = _session_dm_finalizer_contract_violation(raw_content)
+            if finalizer_contract_violation and finalizer_contract_retry_count < 2:
                 if on_status_change:
-                    on_status_change({"step": "revising", "violations": {"type": "json_contract", "details": json_contract_violation}})
+                    on_status_change({"step": "revising", "violations": {"type": "finalizer_contract", "details": finalizer_contract_violation}})
                 if base_audit.get('campaign_id'):
-                    audit = guard_audit('json_contract_guard')
+                    audit = guard_audit('finalizer_contract_guard')
                     log_audit_event(
                         base_audit.get('campaign_id'),
-                        'json_contract_guard_retry',
-                        'Session DM response did not follow the final JSON contract; discarded candidate and reran with guard reminder.',
+                        'finalizer_contract_guard_retry',
+                        'Session DM response did not finish with a valid finalization tool call; discarded candidate and reran with guard reminder.',
                         {
-                            'operation': 'json_contract_guard',
-                            'violation': json_contract_violation,
+                            'operation': 'finalizer_contract_guard',
+                            'violation': finalizer_contract_violation,
                             'draft_response': raw_content,
                         },
                         source='session_dm.guard',
@@ -2668,21 +3063,16 @@ def get_session_dm_response_with_tools(
                     )
                 messages.append({
                     'role': 'system',
-                    'content': _session_dm_guard_retry_system_prompt('json_contract', json_contract_violation),
+                    'content': _session_dm_guard_retry_system_prompt('finalizer_contract', finalizer_contract_violation),
                 })
-                json_contract_retry_count += 1
+                finalizer_contract_retry_count += 1
                 continue
-            if json_contract_violation:
-                if json_contract_fallback_draft:
-                    decision = normalize_session_dm_turn_decision(json_contract_fallback_draft)
-                else:
-                    rollback_combat_if_needed('invalid_final_output', {'json_contract_violation': json_contract_violation})
-                    return {
-                        'mode': 'silent',
-                        'reason': 'The DM response did not produce a valid visible reply.',
-                    }
-            else:
-                decision = normalize_session_dm_turn_decision(raw_content)
+            if finalizer_contract_violation:
+                rollback_combat_if_needed('invalid_final_output', {'finalizer_contract_violation': finalizer_contract_violation})
+                return {
+                    'mode': 'silent',
+                    'reason': 'The DM response did not produce a valid finalizer tool call.',
+                }
             combat_batch_violation = _session_dm_combat_batch_violation(decision, combat_tracker)
             if combat_batch_violation and combat_batch_retry_count < 2 and tool_round < max_tool_rounds:
                 if on_status_change:
@@ -2725,14 +3115,22 @@ def get_session_dm_response_with_tools(
                 else None
             )
             npc_tag_check = (
-                check_session_missing_npc_tags_with_llm(content, missing_npc_signal, loop_audit)
-                if missing_npc_signal
+                check_session_missing_npc_tags_with_llm(
+                    content,
+                    loop_audit,
+                    missing_npc_signal,
+                )
+                if (
+                    decision.get('mode') == 'speak'
+                    and not format_violation
+                    and _should_run_npc_tag_check(content, missing_npc_signal)
+                )
                 else {'requires_npc_tag': False, 'speaker': '', 'evidence': [], 'reason': ''}
             )
             if not format_violation and npc_tag_check.get('requires_npc_tag'):
-                speaker = str(npc_tag_check.get('speaker') or missing_npc_signal.get('speaker') or '').strip() or 'the speaker'
+                speaker = str(npc_tag_check.get('speaker') or (missing_npc_signal or {}).get('speaker') or '').strip() or 'the speaker'
                 evidence = npc_tag_check.get('evidence') or []
-                snippet = str(evidence[0] if evidence else missing_npc_signal.get('quote') or '').strip()
+                snippet = str(evidence[0] if evidence else (missing_npc_signal or {}).get('quote') or '').strip()
                 reason = str(npc_tag_check.get('reason') or '').strip()
                 detail = f'Quoted dialogue attributed to {speaker} should be wrapped in <npc target="{speaker}">...</npc>.'
                 if reason:
@@ -2757,10 +3155,22 @@ def get_session_dm_response_with_tools(
                 if not mechanics_check.get('safe', True)
                 else None
             )
-            violation = (
+            pc_control_hard_violation = (
                 _pc_control_violation(content, hot_context)
                 if decision.get('mode') == 'speak' and not format_violation
                 else None
+            )
+            pc_control_check = (
+                check_session_pc_control_with_llm(content, hot_context, loop_audit)
+                if decision.get('mode') == 'speak' and not format_violation and not pc_control_hard_violation
+                else {'safe': True, 'violations': [], 'confidence': 'high', 'reason': ''}
+            )
+            violation = (
+                pc_control_hard_violation
+                or ({
+                    'kind': 'pc_control_classifier',
+                    **pc_control_check,
+                } if not pc_control_check.get('safe', True) else None)
             )
             private_violation = (
                 _private_output_violation(content, hot_context)

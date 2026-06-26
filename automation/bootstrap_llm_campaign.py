@@ -21,7 +21,7 @@ def parse_args():
     parser = argparse.ArgumentParser(description='Create a fully LLM campaign and store a local manifest.')
     parser.add_argument('--owner-token', help='Bearer token for the campaign owner')
     parser.add_argument('--owner-api-key', default=os.environ.get('DND_OWNER_API_KEY'), help='Owner automation API key')
-    parser.add_argument('--api-base', default=default_api_base(), help='Base app URL, for example http://100.99.192.92:5889')
+    parser.add_argument('--api-base', default=default_api_base(), help='Base app URL, for example http://127.0.0.1:5889')
     parser.add_argument('--campaign-name', help='Optional explicit campaign name override')
     parser.add_argument('--description', help='Optional explicit campaign description override')
     parser.add_argument('--seed', help='Optional deterministic seed for quick-create')
