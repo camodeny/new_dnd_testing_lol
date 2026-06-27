@@ -53,6 +53,22 @@ SESSION_PREFLIGHT_MAX_TOKENS = max(
     64,
     int(os.environ.get('SESSION_PREFLIGHT_MAX_TOKENS', '160')),
 )
+SESSION_MEMORY_TIMEOUT_SECONDS = max(
+    5.0,
+    float(os.environ.get('SESSION_MEMORY_TIMEOUT_SECONDS', '45')),
+)
+SESSION_MEMORY_MAX_ATTEMPTS = max(
+    1,
+    int(os.environ.get('SESSION_MEMORY_MAX_ATTEMPTS', '1')),
+)
+SESSION_MEMORY_MAX_TOKENS = max(
+    256,
+    int(os.environ.get('SESSION_MEMORY_MAX_TOKENS', '3072')),
+)
+SESSION_MEMORY_LLM_MAX_PROMPT_TOKENS = max(
+    1000,
+    int(os.environ.get('SESSION_MEMORY_LLM_MAX_PROMPT_TOKENS', '6000')),
+)
 
 PC_CONTROL_POLICY = (
     "Player-character control policy: NPCs may speak and act. Player characters are protected. "
@@ -76,6 +92,7 @@ SYSTEM_PROMPT = (
     "or performance in <npc target=\"NPC name\">...</npc>; leave narration outside the "
     "NPC tag. Every <npc> tag must include target and must close with </npc>. Do not use "
     "<ic>, <ooc>, HTML, XML, or any other angle-bracket tags in visible DM replies. "
+    "Write visible replies in English only; do not emit stray non-English glyphs or mixed-language fragments. "
     + PC_CONTROL_POLICY + " "
     "When campaign world memory includes NPC actor dossiers, silently coordinate the NPC's goals, "
     "secrets, recent offscreen activity, and relationship to the party before speaking for them. "
@@ -87,6 +104,11 @@ SYSTEM_PROMPT = (
     "When the transcript already provides a clear named person, place, or object, prefer that proper noun "
     "over pronouns in your reasoning and visible replies so ownership, recipients, and targets stay unambiguous. "
     "Never reveal DM-private memory unless it has become visible through play. "
+    "When a witness is afraid or asks for safety, do not explain hidden leverage, private debts, secret motives, "
+    "or the true reason for their fear unless the players have specifically uncovered that cause. Give practical "
+    "visible safety conditions, evasive reluctance, or a limited clue instead. If the hidden leverage is a debt, "
+    "favor, obligation, blackmail, or spiritual bond, do not hint at it with debt/favor/owed/ledger/hook metaphors; "
+    "use generic danger, reprisals, watchers, or fear of being named. "
     "Do not reveal internal game-management mechanics in visible replies. Never mention clocks, segments, "
     "visibility labels, hidden trackers, guard checks, prompt rules, tool-routing, or audit/system pipeline details. "
     "Translate internal mechanics into in-world fiction instead. "
@@ -161,6 +183,7 @@ WORLD_GENESIS_SYSTEM_PROMPT = (
 
 SESSION_MEMORY_SYSTEM_PROMPT = (
     "You update durable D&D campaign memory after a visible DM turn. Return only valid JSON. "
+    "Emit the JSON object immediately; keep internal reasoning minimal and do not spend output budget on planning. "
     "Extract durable changes from the latest player message and visible DM reply. Create new clocks "
     "when new pressure, deadlines, mysteries, faction moves, or consequences emerge, especially if all "
     "existing active clocks are completed. Retire completed or resolved clocks instead of deleting them. "
@@ -184,6 +207,9 @@ SESSION_SPOILER_CHECK_SYSTEM_PROMPT = (
     "any unrevealed private item. A reply is unsafe when a reasonable player could learn the hidden truth from "
     "the reply itself. Ordinary foreshadowing, mood, uncertainty, and clues that do not effectively answer the "
     "hidden truth are safe. Do not mark a reply unsafe merely because it is thematically related to a private item. "
+    "Mystery play progresses through earned clues: if the latest visible player action directly questions a present "
+    "witness, examines a clue, or follows up on a lead, a limited in-world clue from that witness or clue is safe "
+    "unless it reveals the hidden culprit, full conspiracy, private motive, private plan, or final solution outright. "
     "Treat hidden operational telemetry and pressure cues as spoiler-sensitive when they map to unrevealed private "
     "items, including sensor pings/contacts, launch detections, pursuit signatures, military-grade capability "
     "identification, and clock-like escalation details. "
@@ -429,6 +455,13 @@ def _provider_request_payload_options(provider, model, tools, tool_choice, paral
             # DeepSeek thinking mode rejects tool_choice and does not document parallel_tool_calls.
             options['tool_choice'] = None
             options['parallel_tool_calls'] = None
+    elif (
+        tools
+        and provider == 'opencode_go'
+        and str(model or '').strip().lower().startswith('deepseek-v4-')
+        and tool_choice == 'required'
+    ):
+        options['tool_choice'] = None
     return options
 
 
@@ -1336,7 +1369,8 @@ def _session_dm_guard_retry_system_prompt(guard_name, details):
             'Finalize with talk_to_player or stay_silent. '
             'If you speak, talk_to_player content may use Markdown and '
             'plain text. The only allowed angle-bracket tag is <npc target="NPC name">...</npc>. '
-            'Do not use <ic>, <ooc>, HTML, XML, or invalid closing tags.'
+            'Do not use <ic>, <ooc>, HTML, XML, invalid closing tags, or stray non-English glyphs. '
+            'Write visible replies in English only.'
             + silent_ack
         )
     if guard_name == 'missing_npc_tag':
@@ -1345,6 +1379,9 @@ def _session_dm_guard_retry_system_prompt(guard_name, details):
             '<npc> wrapper. '
             'If you include clearly attributed current NPC spoken lines or performed utterances, wrap them in '
             '<npc target="NPC name">...</npc>, and leave narration outside the tag. '
+            'If a prior guard reminder identified an unrevealed private term, do not use that private term '
+            'anywhere, including inside <npc target="...">. Use a public descriptor such as "old dockhand", '
+            '"guard captain", or "hooded figure" as the target until the name is revealed through play. '
             'Do not use any other angle-bracket tags. Finalize with talk_to_player or stay_silent.'
             + silent_ack
         )
@@ -1369,13 +1406,35 @@ def _session_dm_guard_retry_system_prompt(guard_name, details):
         return (
             'Guard reminder: do not expose DM-private information that has not become visible through '
             f'play. Do not mention these private terms in the visible reply: {terms or "(none listed)"}. '
+            'This includes narration, quoted speech, labels, and <npc target="..."> attributes. '
+            'Use public descriptors instead of unrevealed names when wrapping NPC speech. '
+            'Do not route around this by having another NPC reveal or label the private term. '
+            'If the latest player addressed a present NPC by public description, keep that NPC as the responder '
+            'using the public descriptor; do not say that NPC vanished or left unless the transcript already established it. '
             'Finalize with talk_to_player or stay_silent using spoiler-safe visible content.'
             + silent_ack
         )
     if guard_name == 'spoiler_checker':
+        leaked_ids = set(str(item or '') for item in (details or {}).get('leaked_item_ids') or [])
+        if 'deterministic_witness_private_leverage' in leaked_ids:
+            return (
+                'Guard reminder: the witness may give the factual clue, but must not explain or hint at hidden leverage. '
+                'Do not use these words or close metaphors for the witness: debt, debts, owe, owed, owing, favor, '
+                'obligation, spiritual, blackmail, ledger, hook, hooked, old ties. '
+                'Do not imply the witness has private obligations to the faction. '
+                'Show fear using only generic visible pressure: watchers, reprisals, danger, being named, vanishing, '
+                'or keeping their head down. Keep the latest addressed witness present unless the transcript says they left. '
+                'Use a public descriptor in <npc target="...">. Finalize with talk_to_player or stay_silent.'
+                + silent_ack
+            )
         return (
             'Guard reminder: keep the visible reply spoiler-safe. '
             'Keep only what players could currently observe or reasonably know in-world. '
+            'If a witness is afraid or asks for safety, do not reveal hidden leverage, private debts, '
+            'secret motives, or the true reason for their fear. Give practical safety conditions, '
+            'evasive reluctance, and a limited actionable clue instead. If the hidden leverage is a debt, '
+            'favor, obligation, blackmail, or spiritual bond, do not hint at it with debt/favor/owed/ledger/hook '
+            'metaphors; use generic danger, reprisals, watchers, or fear of being named. '
             'Finalize with talk_to_player or stay_silent using spoiler-safe visible content.'
             + silent_ack
         )
@@ -1415,7 +1474,7 @@ def _session_dm_prompt_context(hot_context):
 
 def build_session_dm_tool_messages(hot_context):
     prompt_context = _session_dm_prompt_context(hot_context)
-    return [
+    messages = [
         {'role': 'system', 'content': SESSION_TOOL_PROMPT},
         {
             'role': 'system',
@@ -1423,6 +1482,18 @@ def build_session_dm_tool_messages(hot_context):
             + json.dumps(prompt_context, ensure_ascii=False),
         },
     ]
+    naming_constraints = prompt_context.get('visible_naming_constraints') or []
+    if naming_constraints:
+        messages.append({
+            'role': 'system',
+            'content': (
+                'Visible naming constraints: obey these before drafting any visible reply. '
+                'Do not use any avoid_visible_name in narration, quoted speech labels, or <npc target="..."> '
+                'unless the latest player message already used that name. Use the listed public reference instead:\n'
+                + json.dumps(naming_constraints, ensure_ascii=False)
+            ),
+        })
+    return messages
 
 
 SAFE_SPOILER_SKIP_PREFLIGHT_MODES = {'silent', 'ooc_only', 'mechanics_only', 'clarification_only'}
@@ -1573,6 +1644,14 @@ def _strip_npc_blocks(text):
     return re.sub(r'<npc\b[^>]*>.*?</npc>', '', text or '', flags=re.IGNORECASE | re.DOTALL)
 
 
+def _latest_player_message(hot_context):
+    recent_messages = (hot_context or {}).get('recent_messages') or []
+    for message in reversed(recent_messages):
+        if message.get('role') == 'player':
+            return str(message.get('content') or '')
+    return ''
+
+
 def _sentence_containing_span(text, start, end):
     text = str(text or '')
     if not text:
@@ -1702,17 +1781,110 @@ def _pc_control_violation(response_text, hot_context):
 def _private_output_violation(response_text, hot_context):
     import re
 
-    visible = _strip_npc_blocks(response_text)
+    visible = re.sub(r'</?npc\b[^>]*>', '', response_text or '', flags=re.IGNORECASE)
+    npc_targets = ' '.join(
+        match.group(1)
+        for match in re.finditer(r'<npc\b[^>]*\btarget=["\']([^"\']+)["\']', response_text or '', flags=re.IGNORECASE)
+    )
+    visible_for_private_terms = f'{visible}\n{npc_targets}'
+    latest_player_message = _latest_player_message(hot_context)
     matched_terms = []
     for term in hot_context.get('private_output_terms') or []:
         candidate = str(term or '').strip()
         if len(candidate) < 4:
             continue
-        if re.search(re.escape(candidate), visible, flags=re.IGNORECASE):
+        if latest_player_message and re.search(re.escape(candidate), latest_player_message, flags=re.IGNORECASE):
+            continue
+        if re.search(re.escape(candidate), visible_for_private_terms, flags=re.IGNORECASE):
             matched_terms.append(candidate)
     if matched_terms:
         return {'matched_terms': matched_terms}
     return None
+
+
+def _spoiler_check_allows_earned_clue(response_text, hot_context, spoiler_check):
+    import re
+
+    if not spoiler_check or spoiler_check.get('safe', True):
+        return False
+    leaked_ids = [str(item or '') for item in (spoiler_check.get('leaked_item_ids') or [])]
+    if not leaked_ids:
+        return False
+    hard_private_markers = (
+        'dm_private',
+        'hidden_faction',
+        'true_inciting',
+        'villain_plan',
+        'mastermind',
+    )
+    if any(any(marker in leaked_id for marker in hard_private_markers) for leaked_id in leaked_ids):
+        return False
+
+    latest_player_message = _latest_player_message(hot_context)
+    if not re.search(
+        r'\b(?:ask|asks|question|press|listen|what\s+(?:he|she|they|you)\s+saw|what\s+happened|tell\s+me|heard|know)\b',
+        latest_player_message,
+        flags=re.IGNORECASE,
+    ):
+        return False
+    if not re.search(r'\b(?:saw|seen|heard|witness|know|noticed|dropped|figure|shape|clue)\b', response_text or '', flags=re.IGNORECASE):
+        return False
+    if not any(('witness' in leaked_id or 'npc_secret' in leaked_id or 'clue' in leaked_id) for leaked_id in leaked_ids):
+        return False
+    return True
+
+
+def _witness_private_leverage_spoiler_violation(response_text, hot_context):
+    latest_player_message = _latest_player_message(hot_context)
+    witness_exchange = re.search(
+        r'\b(?:witness|dockhand|old\s+man|elderly\s+dockhand|weathered\s+sailor|what\s+(?:he|she|they|you)\s+saw|'
+        r'tell\s+(?:me|us)|listening|safe|safety|protect|protection|name\s+stays?|keep\s+(?:me|him|her|them)\s+safe)\b',
+        latest_player_message,
+        flags=re.IGNORECASE,
+    )
+    witness_response = re.search(
+        r'\b(?:witness|dockhand|old\s+man|elderly\s+dockhand|weathered\s+sailor)\b',
+        response_text or '',
+        flags=re.IGNORECASE,
+    )
+    if not (witness_exchange or witness_response):
+        return None
+
+    private_items = (hot_context or {}).get('private_spoiler_items') or []
+    has_private_leverage_secret = any(
+        isinstance(item, dict)
+        and re.search(r'\b(?:debt|spiritual|favor|favour|owe|owed|obligation|blackmail|leverage)\b', str(item.get('text') or ''), flags=re.IGNORECASE)
+        and re.search(r'\b(?:witness|dockhand|npc_secret)\b', f"{item.get('id', '')} {item.get('kind', '')} {item.get('text', '')}", flags=re.IGNORECASE)
+        for item in private_items
+    )
+    if not has_private_leverage_secret:
+        return None
+
+    leak_patterns = [
+        r'\bdebts?\b(?!\s+priests?\b)',
+        r'\bfavo[u]?rs?\b',
+        r'\bowe[sd]?\b',
+        r'\bobligations?\b',
+        r'\bspiritual\b',
+        r'\bblackmail(?:ed)?\b',
+        r'\bledgers?\b',
+        r'\bhooks?\s+(?:in|into|on)\b',
+        r'\bties?\b[^.!?\n]{0,40}\bold\b',
+    ]
+    evidence = []
+    for pattern in leak_patterns:
+        match = re.search(pattern, response_text or '', flags=re.IGNORECASE)
+        if match:
+            evidence.append(_sentence_containing_span(response_text, match.start(), match.end()) or match.group(0))
+    if not evidence:
+        return None
+
+    return {
+        'safe': False,
+        'leaked_item_ids': ['deterministic_witness_private_leverage'],
+        'evidence': evidence[:3],
+        'reason': 'Visible reply hinted at hidden witness leverage/debt during a witness exchange.',
+    }
 
 
 def _session_dm_format_violation(response_text):
@@ -1739,6 +1911,14 @@ def _session_dm_format_violation(response_text):
             match.group(0),
             'Visible DM replies should not prefix content with OOC/IC mode labels.',
         )
+
+    for match in re.finditer(r'[\u3400-\u4DBF\u4E00-\u9FFF]', text):
+        add_error(
+            'non_english_glyph',
+            _sentence_containing_span(text, match.start(), match.end()) or match.group(0),
+            'Visible DM replies must be written in English and must not contain stray CJK glyphs.',
+        )
+        break
 
     for match in tag_pattern.finditer(text):
         raw_tag = match.group(0)
@@ -1985,6 +2165,7 @@ def build_session_spoiler_check_messages(response_text, hot_context):
             'content': json.dumps({
                 'candidate_visible_dm_reply': response_text,
                 'unrevealed_private_items': hot_context.get('private_spoiler_items') or [],
+                'recent_visible_messages': (hot_context.get('recent_messages') or [])[-6:],
                 'return_shape': {
                     'safe': 'boolean',
                     'leaked_item_ids': ['ids of unrevealed private items leaked or strongly implied'],
@@ -2134,6 +2315,8 @@ def _pc_control_check_needed(response_text, hot_context):
             return True
 
     return bool(re.search(r"\b(?:you|your|you're|you've|you’d|you'll)\b", visible, flags=re.IGNORECASE))
+
+
 def _child_audit_context(base_audit, operation, actor, trace_label):
     parent_trace_id = base_audit.get('trace_id')
     return {
@@ -2309,7 +2492,15 @@ def check_session_spoilers_with_llm(response_text, hot_context, audit_context=No
             audit_context=checker_audit,
             allow_thinking=False,
         )
-        return normalize_session_spoiler_check(raw_check)
+        spoiler_check = normalize_session_spoiler_check(raw_check)
+        if _spoiler_check_allows_earned_clue(response_text, hot_context, spoiler_check):
+            return {
+                'safe': True,
+                'leaked_item_ids': [],
+                'evidence': [],
+                'reason': 'Allowed limited clue reveal prompted by the latest visible player action.',
+            }
+        return spoiler_check
     except Exception as err:
         campaign_id = base_audit.get('campaign_id')
         if campaign_id:
@@ -2857,6 +3048,23 @@ def _assistant_tool_message(message):
     return assistant_message
 
 
+def _session_dm_tool_result_for_prompt(result, hot_context):
+    constraints = (hot_context or {}).get('visible_naming_constraints') or []
+    if not constraints:
+        return result
+    if isinstance(result, dict):
+        payload = dict(result)
+    else:
+        payload = {'tool_result': result}
+    payload['_visible_naming_constraints'] = constraints
+    payload['_visibility_policy'] = (
+        'These constraints still apply after reading this tool result. '
+        'Do not use any avoid_visible_name in visible narration, quoted labels, or <npc target="..."> '
+        'unless the latest player message already used that name; use use_public_reference instead.'
+    )
+    return payload
+
+
 def get_session_dm_response_with_tools(
     hot_context,
     recent_messages,
@@ -2908,11 +3116,11 @@ def get_session_dm_response_with_tools(
     finalizer_contract_retry_count = 0
     combat_batch_retry_count = 0
     combat_batch_force_tools = False
-    format_retried = False
+    format_retry_count = 0
     mechanical_retried = False
     pc_control_retried = False
-    private_output_retried = False
-    spoiler_checker_retried = False
+    private_output_retry_count = 0
+    spoiler_checker_retry_count = 0
     combat_handoff_retried = False
     guard_audits = {}
     combat_tracker = _session_dm_combat_tracker(hot_context)
@@ -2962,11 +3170,11 @@ def get_session_dm_response_with_tools(
 
         retrying_visible_answer = any((
             finalizer_contract_retry_count > 0,
-            format_retried,
+            format_retry_count > 0,
             mechanical_retried,
             pc_control_retried,
-            private_output_retried,
-            spoiler_checker_retried,
+            private_output_retry_count > 0,
+            spoiler_checker_retry_count > 0,
             combat_handoff_retried,
         )) and not combat_batch_force_tools
         if retrying_visible_answer and finalizer_tools:
@@ -3039,6 +3247,16 @@ def get_session_dm_response_with_tools(
                 finalizer_contract_violation = finalizer_violation
             else:
                 finalizer_contract_violation = _session_dm_finalizer_contract_violation(raw_content)
+                if (
+                    finalizer_contract_violation
+                    and finalizer_contract_violation.get('kind') == 'missing_finalizer_tool_call'
+                    and str(raw_content or '').strip()
+                ):
+                    decision = {
+                        'mode': 'speak',
+                        'content': str(raw_content or '').strip(),
+                    }
+                    finalizer_contract_violation = None
             if finalizer_contract_violation and finalizer_contract_retry_count < 2:
                 if on_status_change:
                     on_status_change({"step": "revising", "violations": {"type": "finalizer_contract", "details": finalizer_contract_violation}})
@@ -3177,8 +3395,15 @@ def get_session_dm_response_with_tools(
                 if decision.get('mode') == 'speak' and not format_violation
                 else None
             )
+            deterministic_spoiler_violation = (
+                _witness_private_leverage_spoiler_violation(content, hot_context)
+                if decision.get('mode') == 'speak' and not format_violation and not private_violation
+                and not mechanical_violation
+                else None
+            )
             spoiler_check = (
-                check_session_spoilers_with_llm(
+                deterministic_spoiler_violation
+                or check_session_spoilers_with_llm(
                     content,
                     hot_context,
                     loop_audit,
@@ -3194,7 +3419,7 @@ def get_session_dm_response_with_tools(
                 and not mechanical_violation
                 else None
             )
-            if format_violation and not format_retried:
+            if format_violation and format_retry_count < 2:
                 if on_status_change:
                     on_status_change({"step": "revising", "violations": {"type": "format", "details": format_violation}})
                 if base_audit.get('campaign_id'):
@@ -3225,7 +3450,7 @@ def get_session_dm_response_with_tools(
                         format_violation,
                     ),
                 })
-                format_retried = True
+                format_retry_count += 1
                 continue
             if mechanical_violation and not mechanical_retried:
                 if on_status_change:
@@ -3283,7 +3508,7 @@ def get_session_dm_response_with_tools(
                 })
                 pc_control_retried = True
                 continue
-            if private_violation and not private_output_retried:
+            if private_violation and private_output_retry_count < 2:
                 if on_status_change:
                     on_status_change({"step": "revising", "violations": {"type": "private_output", "details": private_violation}})
                 if base_audit.get('campaign_id'):
@@ -3309,9 +3534,9 @@ def get_session_dm_response_with_tools(
                     'role': 'system',
                     'content': _session_dm_guard_retry_system_prompt('private_output', private_violation),
                 })
-                private_output_retried = True
+                private_output_retry_count += 1
                 continue
-            if not spoiler_check.get('safe', True) and not spoiler_checker_retried:
+            if not spoiler_check.get('safe', True) and spoiler_checker_retry_count < 3:
                 if on_status_change:
                     on_status_change({"step": "revising", "violations": {"type": "spoiler", "details": spoiler_check}})
                 if base_audit.get('campaign_id'):
@@ -3337,7 +3562,7 @@ def get_session_dm_response_with_tools(
                     'role': 'system',
                     'content': _session_dm_guard_retry_system_prompt('spoiler_checker', spoiler_check),
                 })
-                spoiler_checker_retried = True
+                spoiler_checker_retry_count += 1
                 continue
             if combat_handoff_violation and not combat_handoff_retried:
                 if on_status_change:
@@ -3600,7 +3825,7 @@ def get_session_dm_response_with_tools(
                 'role': 'tool',
                 'tool_call_id': tool_call.get('id'),
                 'name': tool_name,
-                'content': json.dumps(result, ensure_ascii=False),
+                'content': json.dumps(_session_dm_tool_result_for_prompt(result, hot_context), ensure_ascii=False),
             })
         tool_round += 1
 
@@ -3626,6 +3851,59 @@ def get_opening_scene_response(context, world_context, audit_context=None):
     except Exception as e:
         print(f'[openrouter] Opening scene error: {e}')
         return None
+
+
+def _memory_fallback_text(value, limit=900):
+    text = re.sub(r'</?npc\b[^>]*>', '', str(value or ''), flags=re.IGNORECASE)
+    text = re.sub(r'\*\*|__|`', '', text)
+    text = ' '.join(text.split())
+    if len(text) <= limit:
+        return text
+    return text[:limit].rstrip() + '...'
+
+
+def _fallback_session_memory_patch(memory_context, telemetry):
+    memory_context = memory_context or {}
+    prior_summary = _memory_fallback_text(memory_context.get('prior_running_summary'), 1000)
+    latest_player = _memory_fallback_text(memory_context.get('latest_player_message'), 350)
+    latest_dm = _memory_fallback_text(memory_context.get('latest_dm_message'), 900)
+    latest_parts = []
+    if latest_player:
+        latest_parts.append(f'Player: {latest_player}')
+    if latest_dm:
+        latest_parts.append(f'DM: {latest_dm}')
+    latest_summary = ' '.join(latest_parts)
+    running_summary = ' '.join(part for part in [prior_summary, latest_summary] if part).strip()
+    if len(running_summary) > 1800:
+        running_summary = running_summary[-1800:].lstrip()
+
+    hot_context = memory_context.get('hot_context') if isinstance(memory_context.get('hot_context'), dict) else {}
+    current_scene = hot_context.get('current_scene') if isinstance(hot_context.get('current_scene'), dict) else {}
+    return {
+        'running_summary': running_summary,
+        'scene_patch': current_scene,
+        'scene_reason': 'Fallback summary applied because the memory writer returned no visible JSON.',
+        'upsert_graph_entities': [],
+        'upsert_graph_relations': [],
+        'upsert_graph_facts': [],
+        'create_clocks': [],
+        'retire_clocks': [],
+        'update_npc_actors': [],
+        'record_events': [],
+        '_fallback': {
+            'reason': 'empty_memory_writer_response',
+            'mode': 'summary_and_scene_only',
+        },
+        '_telemetry': telemetry,
+    }
+
+
+def _should_skip_session_memory_llm(provider, model, prompt_tokens_estimate):
+    return (
+        provider == 'opencode_go'
+        and str(model or '').strip().lower().startswith('deepseek-v4-')
+        and int(prompt_tokens_estimate or 0) > SESSION_MEMORY_LLM_MAX_PROMPT_TOKENS
+    )
 
 
 def get_session_memory_patch(memory_context, audit_context=None):
@@ -3662,6 +3940,32 @@ def get_session_memory_patch(memory_context, audit_context=None):
             audit_role='tools',
             commit=True,
         )
+    if _should_skip_session_memory_llm(provider, get_llm_model(), prompt_tokens_estimate):
+        telemetry = {
+            'prompt_chars': prompt_chars,
+            'prompt_tokens_estimate': prompt_tokens_estimate,
+            'context_breakdown': context_breakdown,
+            'skipped_llm': True,
+            'skip_reason': 'opencode_deepseek_memory_prompt_too_large',
+            'max_prompt_tokens': SESSION_MEMORY_LLM_MAX_PROMPT_TOKENS,
+        }
+        fallback_patch = _fallback_session_memory_patch(memory_context, telemetry)
+        fallback_patch['_fallback']['reason'] = 'memory_prompt_too_large_for_deepseek'
+        if campaign_id:
+            log_audit_event(
+                campaign_id,
+                'memory_writer_fallback',
+                'Skipped oversized DeepSeek memory-writer prompt and applied deterministic summary-only fallback.',
+                {'patch': fallback_patch},
+                source=provider,
+                actor='session_memory_writer',
+                trace_id=trace_id,
+                parent_trace_id=audit_context.get('parent_trace_id'),
+                trace_label=trace_label,
+                audit_role='tools',
+                commit=True,
+            )
+        return fallback_patch
     try:
         request_audit_context = {
             **audit_context,
@@ -3675,8 +3979,50 @@ def get_session_memory_patch(memory_context, audit_context=None):
             messages,
             json_mode=True,
             audit_context=request_audit_context,
+            allow_thinking=False,
+            timeout_seconds=SESSION_MEMORY_TIMEOUT_SECONDS,
+            max_attempts=SESSION_MEMORY_MAX_ATTEMPTS,
+            max_tokens=SESSION_MEMORY_MAX_TOKENS,
         )
         response_chars = len(text) if text else 0
+        if not text or not text.strip():
+            telemetry = {
+                'prompt_chars': prompt_chars,
+                'prompt_tokens_estimate': prompt_tokens_estimate,
+                'response_chars': response_chars,
+                'context_breakdown': context_breakdown,
+                'error': 'empty_response',
+            }
+            if campaign_id:
+                log_audit_event(
+                    campaign_id,
+                    'memory_writer_empty',
+                    'Post-turn session memory writer returned an empty patch.',
+                    {'_telemetry': telemetry},
+                    source=provider,
+                    actor='session_memory_writer',
+                    trace_id=trace_id,
+                    parent_trace_id=audit_context.get('parent_trace_id'),
+                    trace_label=trace_label,
+                    audit_role='tools',
+                    commit=True,
+                )
+            fallback_patch = _fallback_session_memory_patch(memory_context, telemetry)
+            if campaign_id:
+                log_audit_event(
+                    campaign_id,
+                    'memory_writer_fallback',
+                    'Applied deterministic summary-only fallback after empty memory writer response.',
+                    {'patch': fallback_patch},
+                    source=provider,
+                    actor='session_memory_writer',
+                    trace_id=trace_id,
+                    parent_trace_id=audit_context.get('parent_trace_id'),
+                    trace_label=trace_label,
+                    audit_role='tools',
+                    commit=True,
+                )
+            return fallback_patch
         data = _json_loads_with_repair(text, audit_context=request_audit_context)
         if not isinstance(data, dict):
             data = {}

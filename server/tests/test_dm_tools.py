@@ -39,10 +39,15 @@ from openrouter import (
     check_session_missing_npc_tags_with_llm,
     check_session_mechanics_with_llm,
     check_session_pc_control_with_llm,
+    check_session_spoilers_with_llm,
     _possible_missing_npc_tag_signal,
     _pc_control_violation,
     _private_output_violation,
     _session_dm_format_violation,
+    _session_dm_guard_retry_system_prompt,
+    _session_dm_tool_result_for_prompt,
+    _witness_private_leverage_spoiler_violation,
+    build_session_dm_tool_messages,
     get_session_dm_response_with_tools,
     normalize_session_dm_turn_decision,
 )
@@ -54,6 +59,7 @@ from services.dm_tools import (
     get_dm_tool_definitions,
     apply_memory_patch,
     build_session_hot_context,
+    build_session_memory_context,
     context_manifest,
     execute_dm_tool,
 )
@@ -631,6 +637,55 @@ class DmToolsTest(unittest.TestCase):
         self.assertIn('create_encounter_map', manifest['available_tools'])
         self.assertIn('recent_messages', manifest['estimated_tokens_by_section'])
 
+    def test_hot_context_includes_visible_naming_constraints_for_private_npc_names(self):
+        world = CampaignWorld.query.filter_by(campaign_id=self.campaign.id).one()
+        world.knowledge_graph = json.dumps({
+            'entities': [
+                {
+                    'id': 'witness_old_dockhand',
+                    'type': 'npc',
+                    'name': 'Mortimer',
+                    'visibility': 'dm_private',
+                    'summary': 'An old dockhand who saw something near the vault.',
+                },
+            ],
+            'relations': [],
+            'facts': [],
+        })
+        world.world_state = json.dumps({
+            'current_scene': {
+                'location_name': 'Tidewall Docks',
+                'immediate_tension': 'The old dockhand Mortimer lingers nearby.',
+                'active_npc_ids': ['witness_old_dockhand'],
+            },
+        })
+        db.session.add(NPCActor(
+            campaign_id=self.campaign.id,
+            actor_id='witness_old_dockhand',
+            name='Mortimer',
+            public_summary='An elderly dockhand who works the early shifts and knows the harbor secrets.',
+            dossier='{}',
+        ))
+        db.session.add(SessionMessage(
+            session_id=self.session.id,
+            user_id=self.user.id,
+            role='player',
+            content='I ask the old dockhand what he saw.',
+        ))
+        db.session.commit()
+
+        hot_context = build_session_hot_context(self.campaign, self.session, self.user)
+
+        self.assertEqual(hot_context['visible_naming_constraints'], [{
+            'avoid_visible_name': 'Mortimer',
+            'use_public_reference': 'elderly dockhand',
+            'applies_to': 'visible narration and <npc target="..."> until the name is revealed by play',
+        }])
+        messages = build_session_dm_tool_messages(hot_context)
+        self.assertIn('Visible naming constraints', messages[2]['content'])
+        self.assertIn('Mortimer', messages[2]['content'])
+        self.assertIn('elderly dockhand', messages[2]['content'])
+
     def test_grid_detector_finds_synthetic_grid_and_writes_labeled_copy(self):
         image_bytes = synthetic_grid_png(size=256, cell=32)
         grid = detect_grid_from_image(image_bytes)
@@ -1153,6 +1208,22 @@ class DmToolsTest(unittest.TestCase):
         self.assertIn('Crimson Veil', hot_context['private_output_terms'])
         self.assertEqual(hot_context['private_spoiler_items'][0]['text'], 'Crimson Veil')
 
+    def test_session_memory_context_omits_guard_only_spoiler_lists(self):
+        hot_context = build_session_hot_context(self.campaign, self.session, self.user)
+
+        memory_context = build_session_memory_context(
+            self.campaign,
+            self.session,
+            self.user,
+            'I ask the dockhand what he saw.',
+            'The dockhand points toward the south jetty.',
+            hot_context,
+        )
+
+        self.assertIn('current_scene', memory_context['hot_context'])
+        self.assertNotIn('private_output_terms', memory_context['hot_context'])
+        self.assertNotIn('private_spoiler_items', memory_context['hot_context'])
+
     def test_hot_context_private_spoilers_include_dm_private_world_events(self):
         db.session.add(WorldEvent(
             campaign_id=self.campaign.id,
@@ -1537,6 +1608,190 @@ class DmToolsTest(unittest.TestCase):
             _private_output_violation('A hidden scheme moves another step ahead.', hot_context),
         )
 
+    def test_private_output_guard_ignores_terms_already_used_by_latest_player(self):
+        hot_context = {
+            'private_output_terms': ['Mortimer'],
+            'recent_messages': [
+                {
+                    'role': 'player',
+                    'content': 'I ask Mortimer what he saw near the Temple vault that night.',
+                },
+            ],
+        }
+
+        self.assertIsNone(
+            _private_output_violation(
+                '<npc target="Mortimer">"I saw a figure near the vault."</npc>',
+                hot_context,
+            ),
+        )
+
+    def test_private_output_guard_checks_npc_target_names(self):
+        hot_context = {
+            'private_output_terms': ['Mortimer'],
+            'recent_messages': [
+                {
+                    'role': 'player',
+                    'content': 'I ask the old dockhand what he saw near the Temple vault that night.',
+                },
+            ],
+        }
+
+        self.assertEqual(
+            _private_output_violation(
+                '<npc target="Mortimer">"I saw a figure near the vault."</npc>',
+                hot_context,
+            ),
+            {'matched_terms': ['Mortimer']},
+        )
+
+    def test_private_output_guard_checks_npc_spoken_text(self):
+        hot_context = {
+            'private_output_terms': ['Mortimer'],
+            'recent_messages': [
+                {
+                    'role': 'player',
+                    'content': 'I ask the old dockhand what would make him safe.',
+                },
+            ],
+        }
+
+        self.assertEqual(
+            _private_output_violation(
+                '<npc target="elderly dockhand">"Safe means old Mortimer never had this conversation."</npc>',
+                hot_context,
+            ),
+            {'matched_terms': ['Mortimer']},
+        )
+
+    def test_private_output_retry_prompt_mentions_npc_targets(self):
+        prompt = _session_dm_guard_retry_system_prompt(
+            'private_output',
+            {'matched_terms': ['Mortimer']},
+        )
+
+        self.assertIn('Mortimer', prompt)
+        self.assertIn('<npc target="...">', prompt)
+        self.assertIn('Use public descriptors', prompt)
+
+    def test_missing_npc_tag_retry_prompt_respects_private_terms(self):
+        prompt = _session_dm_guard_retry_system_prompt('missing_npc_tag', {})
+
+        self.assertIn('do not use that private term', prompt)
+        self.assertIn('<npc target="...">', prompt)
+        self.assertIn('old dockhand', prompt)
+
+    def test_spoiler_retry_prompt_blocks_witness_private_debt_reveal(self):
+        prompt = _session_dm_guard_retry_system_prompt('spoiler_checker', {})
+
+        self.assertIn('witness is afraid', prompt)
+        self.assertIn('private debts', prompt)
+        self.assertIn('practical safety conditions', prompt)
+        self.assertIn('debt/favor/owed/ledger/hook', prompt)
+        self.assertIn('generic danger', prompt)
+
+    def test_spoiler_retry_prompt_special_cases_witness_leverage_guard(self):
+        prompt = _session_dm_guard_retry_system_prompt(
+            'spoiler_checker',
+            {'leaked_item_ids': ['deterministic_witness_private_leverage']},
+        )
+
+        self.assertIn('must not explain or hint at hidden leverage', prompt)
+        self.assertIn('debt, debts, owe, owed', prompt)
+        self.assertIn('watchers, reprisals, danger', prompt)
+        self.assertIn('the witness may give the factual clue', prompt)
+
+    def test_witness_private_leverage_guard_blocks_debt_metaphors_on_safety_questions(self):
+        hot_context = {
+            'recent_messages': [
+                {
+                    'role': 'player',
+                    'content': 'I ask the elderly dockhand what would make it safe for him to tell us more.',
+                },
+            ],
+            'private_spoiler_items': [
+                {
+                    'id': 'npc_secret_witness_old_dockhand_2',
+                    'kind': 'npc_secret',
+                    'text': 'The witness owes a spiritual debt to the Debt Priests from decades ago.',
+                },
+            ],
+        }
+
+        violation = _witness_private_leverage_spoiler_violation(
+            '<npc target="elderly dockhand">"I got old debts that are not measured in coin."</npc>',
+            hot_context,
+        )
+
+        self.assertFalse(violation['safe'])
+        self.assertEqual(violation['leaked_item_ids'], ['deterministic_witness_private_leverage'])
+        self.assertIn('debt', violation['reason'])
+
+    def test_witness_private_leverage_guard_blocks_debt_reveal_during_witness_question(self):
+        hot_context = {
+            'recent_messages': [
+                {
+                    'role': 'player',
+                    'content': "I approach the elderly dockhand and tell him I'm listening.",
+                },
+            ],
+            'private_spoiler_items': [
+                {
+                    'id': 'npc_secret_witness_old_dockhand_2',
+                    'kind': 'npc_secret',
+                    'text': 'The witness owes a spiritual debt to the Debt Priests from decades ago.',
+                },
+            ],
+        }
+
+        violation = _witness_private_leverage_spoiler_violation(
+            '<npc target="elderly dockhand">"Spiritual debt is the hardest kind to pay off."</npc>',
+            hot_context,
+        )
+
+        self.assertFalse(violation['safe'])
+        self.assertEqual(violation['leaked_item_ids'], ['deterministic_witness_private_leverage'])
+
+    def test_witness_private_leverage_guard_allows_generic_danger_on_safety_questions(self):
+        hot_context = {
+            'recent_messages': [
+                {
+                    'role': 'player',
+                    'content': 'I ask the elderly dockhand what would make it safe for him to tell us more.',
+                },
+            ],
+            'private_spoiler_items': [
+                {
+                    'id': 'npc_secret_witness_old_dockhand_2',
+                    'kind': 'npc_secret',
+                    'text': 'The witness owes a spiritual debt to the Debt Priests from decades ago.',
+                },
+            ],
+        }
+
+        self.assertIsNone(_witness_private_leverage_spoiler_violation(
+            '<npc target="elderly dockhand">"Keep my name out of it, and watch for the men at the jetty."</npc>',
+            hot_context,
+        ))
+
+    def test_tool_result_prompt_keeps_visible_naming_constraints_adjacent_to_private_results(self):
+        wrapped = _session_dm_tool_result_for_prompt(
+            {'matches': [{'value': {'name': 'Mortimer'}}]},
+            {
+                'visible_naming_constraints': [
+                    {
+                        'avoid_visible_name': 'Mortimer',
+                        'use_public_reference': 'elderly dockhand',
+                        'applies_to': 'visible narration and <npc target="...">',
+                    },
+                ],
+            },
+        )
+
+        self.assertEqual(wrapped['matches'][0]['value']['name'], 'Mortimer')
+        self.assertEqual(wrapped['_visible_naming_constraints'][0]['use_public_reference'], 'elderly dockhand')
+        self.assertIn('<npc target="...">', wrapped['_visibility_policy'])
+
     def test_session_dm_format_guard_detects_malformed_tags(self):
         self.assertIsNone(_session_dm_format_violation(
             'Bram smiles.\n\n<npc target="Bram Truewood">"Careful now."</npc>',
@@ -1564,6 +1819,14 @@ class DmToolsTest(unittest.TestCase):
             'Dee watches you for a long moment, reading your resolve. He does not argue. '
             'Instead, he gives a single, slow nod. **"Alright. Lock the creds down first."**'
         ))
+
+    def test_session_dm_format_guard_detects_stray_cjk_glyphs(self):
+        violation = _session_dm_format_violation(
+            'You hear footsteps that do not match any dock worker. 脚步声 echoes under the planks.'
+        )
+
+        self.assertEqual(violation['errors'][0]['kind'], 'non_english_glyph')
+        self.assertIn('English', violation['errors'][0]['detail'])
 
     def test_possible_missing_npc_tag_signal_detects_attributed_quote(self):
         signal = _possible_missing_npc_tag_signal(
@@ -1711,6 +1974,45 @@ class DmToolsTest(unittest.TestCase):
         self.assertIsNotNone(post_chat.call_args_list[1].kwargs.get('tools'))
         self.assertFalse(post_chat.call_args_list[1].kwargs.get('allow_thinking'))
 
+    def test_session_dm_format_guard_allows_second_retry_for_distinct_format_failures(self):
+        hot_context = {
+            'protected_player_characters': [],
+            'private_output_terms': [],
+            'private_spoiler_items': [],
+        }
+
+        with patch('openrouter._post_chat_response', side_effect=[
+            dm_talk_tool_response('<dramatis personae="elderly dockhand">"Tide turns."</dramatis personae>'),
+            dm_talk_tool_response('The elderly dockhand squints. "Tide turns."'),
+            dm_talk_tool_response('<npc target="elderly dockhand">"Tide turns."</npc>'),
+        ]), patch('openrouter._post_chat', side_effect=[
+            json.dumps({
+                'requires_npc_tag': True,
+                'speaker': 'elderly dockhand',
+                'evidence': ['"Tide turns."'],
+                'reason': 'This is clearly the elderly dockhand speaking.',
+            }),
+        ]):
+            result = get_session_dm_response_with_tools(
+                hot_context,
+                [],
+                [],
+                lambda *_args, **_kwargs: {},
+                audit_context={
+                    'campaign_id': self.campaign.id,
+                    'trace_id': 'session_dm:session_2:message_17',
+                    'trace_label': 'session_dm: session 2',
+                },
+                max_tool_rounds=0,
+            )
+
+        self.assertEqual(result, {
+            'mode': 'speak',
+            'content': '<npc target="elderly dockhand">"Tide turns."</npc>',
+        })
+        self.assertEqual(CampaignAuditEvent.query.filter_by(event_type='format_guard_retry').count(), 2)
+        self.assertEqual(CampaignAuditEvent.query.filter_by(event_type='format_guard_blocked').count(), 0)
+
     def test_session_dm_format_guard_rewrites_missing_npc_tag_reply_with_special_prompt(self):
         hot_context = {
             'protected_player_characters': [],
@@ -1839,8 +2141,7 @@ class DmToolsTest(unittest.TestCase):
 
         with patch('openrouter._post_chat_response', side_effect=[
             dm_talk_tool_response('<ic>"Green lights."</ic>'),
-            {'choices': [{'message': {'content': 'Understood. No `<ic>` tags.\n\n<npc target="Brenn">"Green lights by the old willow."</npc>'}}]},
-            dm_talk_tool_response('<npc target="Brenn">"Green lights by the old willow."</npc>'),
+            {'choices': [{'message': {'content': '<npc target="Brenn">"Green lights by the old willow."</npc>'}}]},
         ]) as post_chat:
             result = get_session_dm_response_with_tools(
                 hot_context,
@@ -1854,12 +2155,12 @@ class DmToolsTest(unittest.TestCase):
             'mode': 'speak',
             'content': '<npc target="Brenn">"Green lights by the old willow."</npc>',
         })
-        self.assertEqual(post_chat.call_count, 3)
-        contract_retry_prompt = post_chat.call_args_list[2].args[0][-1]['content']
-        self.assertIn('calling exactly one of talk_to_player or stay_silent', contract_retry_prompt)
-        self.assertIn('Do not send the final visible reply as plain assistant text', contract_retry_prompt)
+        self.assertEqual(post_chat.call_count, 2)
+        format_retry_prompt = post_chat.call_args_list[1].args[0][-1]['content']
+        self.assertIn('use valid visible-message syntax', format_retry_prompt)
+        self.assertNotIn('Do not send the final visible reply as plain assistant text', format_retry_prompt)
 
-    def test_finalizer_contract_retry_discards_candidate_and_reruns_with_system_reminder(self):
+    def test_session_dm_accepts_plain_text_visible_reply(self):
         hot_context = {
             'protected_player_characters': [],
             'private_output_terms': [],
@@ -1870,10 +2171,9 @@ class DmToolsTest(unittest.TestCase):
             'The startup sequence now reads **70 seconds**.'
         )
 
-        with patch('openrouter._post_chat_response', side_effect=[
-            {'choices': [{'message': {'content': draft}}]},
-            dm_silent_tool_response('Awaiting player response.'),
-        ]) as post_chat:
+        with patch('openrouter._post_chat_response', return_value={
+            'choices': [{'message': {'content': draft}}],
+        }) as post_chat:
             result = get_session_dm_response_with_tools(
                 hot_context,
                 [],
@@ -1882,24 +2182,16 @@ class DmToolsTest(unittest.TestCase):
                 max_tool_rounds=0,
             )
 
-        self.assertEqual(result, {'mode': 'silent', 'content': '', 'reason': 'Awaiting player response.'})
-        contract_retry_prompt = post_chat.call_args_list[1].args[0][-1]['content']
-        retry_kwargs = post_chat.call_args_list[1].kwargs
-        self.assertIn('calling exactly one of talk_to_player or stay_silent', contract_retry_prompt)
-        self.assertIn('Do not send the final visible reply as plain assistant text', contract_retry_prompt)
-        self.assertEqual(retry_kwargs['tool_choice'], 'required')
-        self.assertEqual(
-            {tool['function']['name'] for tool in retry_kwargs['tools']},
-            {'talk_to_player', 'stay_silent'},
-        )
+        self.assertEqual(result, {'mode': 'speak', 'content': draft})
+        self.assertEqual(post_chat.call_count, 1)
 
-    def test_finalizer_contract_retry_uses_fresh_rerun_output(self):
+    def test_provider_tool_markup_retry_uses_fresh_rerun_output(self):
         hot_context = {
             'protected_player_characters': [],
             'private_output_terms': [],
             'private_spoiler_items': [],
         }
-        draft = 'You watch the neon rain streak down the window while Dee studies the shard in silence.'
+        draft = '<｜｜DSML｜｜tool_calls>\n<｜｜DSML｜｜invoke name="talk_to_player"></｜｜DSML｜｜invoke>'
         stale = 'Dee leans back, the vinyl creaking under him.'
 
         with patch('openrouter._post_chat_response', side_effect=[
@@ -1917,17 +2209,16 @@ class DmToolsTest(unittest.TestCase):
         self.assertEqual(result, {'mode': 'speak', 'content': stale})
         self.assertEqual(post_chat.call_count, 2)
 
-    def test_finalizer_contract_retry_switches_to_required_finalizer_only_tools(self):
+    def test_plain_text_reply_with_tools_does_not_force_finalizer_retry(self):
         hot_context = {
             'protected_player_characters': [],
             'private_output_terms': [],
             'private_spoiler_items': [],
         }
 
-        with patch('openrouter._post_chat_response', side_effect=[
-            {'choices': [{'message': {'content': 'Plain text draft only.'}}]},
-            dm_silent_tool_response('No visible reply needed.'),
-        ]) as post_chat:
+        with patch('openrouter._post_chat_response', return_value={
+            'choices': [{'message': {'content': 'Plain text draft only.'}}],
+        }) as post_chat:
             result = get_session_dm_response_with_tools(
                 hot_context,
                 [],
@@ -1936,13 +2227,9 @@ class DmToolsTest(unittest.TestCase):
                 max_tool_rounds=2,
             )
 
-        self.assertEqual(result, {'mode': 'silent', 'content': '', 'reason': 'No visible reply needed.'})
-        retry_kwargs = post_chat.call_args_list[1].kwargs
-        self.assertEqual(retry_kwargs['tool_choice'], 'required')
-        self.assertEqual(
-            {tool['function']['name'] for tool in retry_kwargs['tools']},
-            {'talk_to_player', 'stay_silent'},
-        )
+        self.assertEqual(result, {'mode': 'speak', 'content': 'Plain text draft only.'})
+        self.assertEqual(post_chat.call_count, 1)
+        self.assertEqual(post_chat.call_args.kwargs['tool_choice'], 'auto')
 
     def test_finalizer_contract_retry_still_rewrites_ooc_label(self):
         hot_context = {
@@ -1954,7 +2241,6 @@ class DmToolsTest(unittest.TestCase):
 
         with patch('openrouter._post_chat_response', side_effect=[
             {'choices': [{'message': {'content': draft}}]},
-            dm_talk_tool_response('*OOC*: Make a Technology check.'),
             dm_talk_tool_response('Make a Technology check.'),
         ]) as post_chat:
             result = get_session_dm_response_with_tools(
@@ -1966,8 +2252,8 @@ class DmToolsTest(unittest.TestCase):
             )
 
         self.assertEqual(result, {'mode': 'speak', 'content': 'Make a Technology check.'})
-        self.assertEqual(post_chat.call_count, 3)
-        format_retry_prompt = post_chat.call_args_list[2].args[0][-1]['content']
+        self.assertEqual(post_chat.call_count, 2)
+        format_retry_prompt = post_chat.call_args_list[1].args[0][-1]['content']
         self.assertIn('use valid visible-message syntax', format_retry_prompt)
         self.assertNotIn('OOC/IC mode labels', format_retry_prompt)
 
@@ -2730,6 +3016,72 @@ class DmToolsTest(unittest.TestCase):
         self.assertIn('keep the visible reply spoiler-safe', retry_prompt)
         self.assertNotIn('The trap closes', retry_prompt)
 
+    def test_spoiler_checker_allows_player_prompted_witness_clue(self):
+        hot_context = {
+            'private_spoiler_items': [
+                {
+                    'id': 'npc_secret_witness_old_dockhand_1',
+                    'kind': 'npc_secret',
+                    'text': 'He saw a robed figure near the theft site that night.',
+                },
+            ],
+            'recent_messages': [
+                {
+                    'role': 'player',
+                    'content': 'I ask Mortimer what he saw near the Temple vault that night.',
+                },
+            ],
+        }
+        response = '<npc target="Mortimer">"I saw a tall robed figure near the vault alley."</npc>'
+
+        with patch('openrouter._post_chat', return_value=json.dumps({
+            'safe': False,
+            'leaked_item_ids': ['npc_secret_witness_old_dockhand_1'],
+            'evidence': ['I saw a tall robed figure'],
+            'reason': 'The reply reveals the witness clue.',
+        })):
+            result = check_session_spoilers_with_llm(response, hot_context)
+
+        self.assertEqual(result, {
+            'safe': True,
+            'leaked_item_ids': [],
+            'evidence': [],
+            'reason': 'Allowed limited clue reveal prompted by the latest visible player action.',
+        })
+
+    def test_spoiler_checker_still_blocks_player_prompted_final_solution(self):
+        hot_context = {
+            'private_spoiler_items': [
+                {
+                    'id': 'dm_private_true_inciting_incident',
+                    'kind': 'true_inciting_incident',
+                    'text': 'The Debt Priests orchestrated the theft.',
+                },
+            ],
+            'recent_messages': [
+                {
+                    'role': 'player',
+                    'content': 'I ask Mortimer what he saw near the Temple vault that night.',
+                },
+            ],
+        }
+        response = '<npc target="Mortimer">"The Debt Priests orchestrated the theft."</npc>'
+
+        with patch('openrouter._post_chat', return_value=json.dumps({
+            'safe': False,
+            'leaked_item_ids': ['dm_private_true_inciting_incident'],
+            'evidence': ['The Debt Priests orchestrated the theft'],
+            'reason': 'The reply reveals the hidden culprit.',
+        })):
+            result = check_session_spoilers_with_llm(response, hot_context)
+
+        self.assertEqual(result, {
+            'safe': False,
+            'leaked_item_ids': ['dm_private_true_inciting_incident'],
+            'evidence': ['The Debt Priests orchestrated the theft'],
+            'reason': 'The reply reveals the hidden culprit.',
+        })
+
     def test_private_output_guard_retry_uses_child_trace(self):
         hot_context = {
             'protected_player_characters': [],
@@ -2761,6 +3113,54 @@ class DmToolsTest(unittest.TestCase):
         self.assertEqual(retry_event.parent_trace_id, trace_id)
         self.assertNotEqual(retry_event.trace_id, trace_id)
         self.assertIn(':private_output_guard:', retry_event.trace_id)
+
+    def test_private_output_guard_allows_second_retry_after_pc_control_retry(self):
+        hot_context = {
+            'protected_player_characters': [],
+            'private_output_terms': ['Crimson Veil'],
+            'private_spoiler_items': [],
+        }
+        trace_id = 'session_dm:session_2:message_16'
+        safe_pc_check = {'safe': True, 'violations': [], 'confidence': 'high', 'reason': ''}
+
+        with patch('openrouter._post_chat_response', side_effect=[
+            dm_talk_tool_response('The Crimson Veil watches you.'),
+            dm_talk_tool_response('The watcher is gone.'),
+            dm_talk_tool_response('The Crimson Veil still watches.'),
+            dm_talk_tool_response('Someone watches from the dark.'),
+        ]), patch('openrouter.check_session_pc_control_with_llm', side_effect=[
+            safe_pc_check,
+            {
+                'safe': False,
+                'violations': [{
+                    'character': 'Aria',
+                    'sentence': 'The watcher is gone.',
+                    'kind': 'choice_or_intent',
+                    'reason': 'Forced regression-test classifier violation.',
+                }],
+                'confidence': 'medium',
+                'reason': 'Forced regression-test classifier violation.',
+            },
+            safe_pc_check,
+            safe_pc_check,
+        ]):
+            result = get_session_dm_response_with_tools(
+                hot_context,
+                [],
+                [],
+                lambda *_args, **_kwargs: {},
+                audit_context={
+                    'campaign_id': self.campaign.id,
+                    'trace_id': trace_id,
+                    'trace_label': 'session_dm: session 2',
+                },
+                max_tool_rounds=0,
+            )
+
+        self.assertEqual(result, {'mode': 'speak', 'content': 'Someone watches from the dark.'})
+        self.assertEqual(CampaignAuditEvent.query.filter_by(event_type='private_output_guard_retry').count(), 2)
+        self.assertEqual(CampaignAuditEvent.query.filter_by(event_type='pc_control_guard_retry').count(), 1)
+        self.assertEqual(CampaignAuditEvent.query.filter_by(event_type='private_output_guard_blocked').count(), 0)
 
     def test_private_output_guard_retry_can_finish_after_tool_call(self):
         hot_context = {
@@ -2812,9 +3212,13 @@ class DmToolsTest(unittest.TestCase):
         with patch('openrouter._post_chat_response', side_effect=[
             dm_talk_tool_response('The trap closes around you.'),
             dm_talk_tool_response('A hidden trap closes around you.'),
+            dm_talk_tool_response('The ambush was a trap all along.'),
+            dm_talk_tool_response('This confirms the note was a trap.'),
         ]), patch('openrouter.check_session_spoilers_with_llm', side_effect=[
             {'safe': False, 'leaked_item_ids': ['fact_trap'], 'evidence': ['The trap closes'], 'reason': 'Directly implies the hidden truth.'},
             {'safe': False, 'leaked_item_ids': ['fact_trap'], 'evidence': ['hidden trap'], 'reason': 'Still implies the hidden truth.'},
+            {'safe': False, 'leaked_item_ids': ['fact_trap'], 'evidence': ['trap all along'], 'reason': 'Still implies the hidden truth.'},
+            {'safe': False, 'leaked_item_ids': ['fact_trap'], 'evidence': ['note was a trap'], 'reason': 'Still implies the hidden truth.'},
         ]):
             result = get_session_dm_response_with_tools(hot_context, [], [], lambda *_args, **_kwargs: {}, max_tool_rounds=0)
 
@@ -2822,6 +3226,39 @@ class DmToolsTest(unittest.TestCase):
             'mode': 'silent',
             'reason': 'The DM response would have semantically exposed DM-private information.',
         })
+
+    def test_spoiler_checker_allows_second_retry_to_finish_cleanly(self):
+        hot_context = {
+            'protected_player_characters': [],
+            'private_output_terms': [],
+            'private_spoiler_items': [{'id': 'fact_trap', 'kind': 'fact', 'text': 'The note is a trap.'}],
+        }
+
+        with patch('openrouter._post_chat_response', side_effect=[
+            dm_talk_tool_response('The trap closes around you.'),
+            dm_talk_tool_response('A hidden trap closes around you.'),
+            dm_talk_tool_response('The corridor ahead is quiet and cold.'),
+        ]), patch('openrouter.check_session_spoilers_with_llm', side_effect=[
+            {'safe': False, 'leaked_item_ids': ['fact_trap'], 'evidence': ['The trap closes'], 'reason': 'Directly implies the hidden truth.'},
+            {'safe': False, 'leaked_item_ids': ['fact_trap'], 'evidence': ['hidden trap'], 'reason': 'Still implies the hidden truth.'},
+            {'safe': True, 'leaked_item_ids': [], 'evidence': [], 'reason': ''},
+        ]):
+            result = get_session_dm_response_with_tools(
+                hot_context,
+                [],
+                [],
+                lambda *_args, **_kwargs: {},
+                audit_context={
+                    'campaign_id': self.campaign.id,
+                    'trace_id': 'session_dm:session_2:message_18',
+                    'trace_label': 'session_dm: session 2',
+                },
+                max_tool_rounds=0,
+            )
+
+        self.assertEqual(result, {'mode': 'speak', 'content': 'The corridor ahead is quiet and cold.'})
+        self.assertEqual(CampaignAuditEvent.query.filter_by(event_type='spoiler_checker_guard_retry').count(), 2)
+        self.assertEqual(CampaignAuditEvent.query.filter_by(event_type='spoiler_checker_guard_blocked').count(), 0)
 
     def test_session_dm_turn_decision_normalizes_silence_contract(self):
         self.assertEqual(

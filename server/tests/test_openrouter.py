@@ -14,12 +14,17 @@ from openrouter import (
     _json_loads_with_error,
     _json_loads_with_repair,
     _post_chat_response,
+    SESSION_MEMORY_MAX_ATTEMPTS,
+    SESSION_MEMORY_MAX_TOKENS,
+    SESSION_MEMORY_LLM_MAX_PROMPT_TOKENS,
+    SESSION_MEMORY_TIMEOUT_SECONDS,
     SESSION_PREFLIGHT_MAX_TOKENS,
     SESSION_PREFLIGHT_TIMEOUT_SECONDS,
     build_session_dm_tool_messages,
     build_session_preflight_messages,
     check_session_spoilers_with_llm,
     get_character_sheet_answer,
+    get_session_memory_patch,
     get_opening_scene_response,
     get_planning_dm_response,
     get_planning_dm_response_streaming,
@@ -31,6 +36,52 @@ from openrouter import (
 
 
 class OpenRouterJsonRepairTest(unittest.TestCase):
+    def test_session_memory_patch_uses_bounded_best_effort_request(self):
+        with patch('openrouter._post_chat', return_value='{}') as post_chat:
+            patch_data = get_session_memory_patch({
+                'latest_player_message': 'What did Mortimer see?',
+                'latest_dm_response': 'He saw a dark figure near the vault.',
+            })
+
+        self.assertIn('_telemetry', patch_data)
+        self.assertFalse(post_chat.call_args.kwargs['allow_thinking'])
+        self.assertEqual(post_chat.call_args.kwargs['timeout_seconds'], SESSION_MEMORY_TIMEOUT_SECONDS)
+        self.assertEqual(post_chat.call_args.kwargs['max_attempts'], SESSION_MEMORY_MAX_ATTEMPTS)
+        self.assertEqual(post_chat.call_args.kwargs['max_tokens'], SESSION_MEMORY_MAX_TOKENS)
+
+    def test_session_memory_patch_returns_fallback_for_empty_response(self):
+        with patch('openrouter._post_chat', return_value=''):
+            patch_data = get_session_memory_patch({
+                'latest_player_message': 'What did the dockhand say?',
+                'latest_dm_response': 'He pointed toward the south jetty.',
+                'hot_context': {
+                    'current_scene': {
+                        'location_id': 'south_jetty',
+                        'location_name': 'South Jetty',
+                    },
+                },
+            })
+
+        self.assertEqual(patch_data['_fallback']['reason'], 'empty_memory_writer_response')
+        self.assertIn('dockhand', patch_data['running_summary'])
+        self.assertEqual(patch_data['scene_patch']['location_id'], 'south_jetty')
+
+    def test_session_memory_patch_skips_oversized_deepseek_memory_prompt(self):
+        large_text = 'x' * ((SESSION_MEMORY_LLM_MAX_PROMPT_TOKENS + 500) * 4)
+        with patch('openrouter.get_llm_provider', return_value='opencode_go'), \
+                patch('openrouter.get_llm_model', return_value='deepseek-v4-flash'), \
+                patch('openrouter._post_chat') as post_chat:
+            patch_data = get_session_memory_patch({
+                'latest_player_message': 'What did the dockhand say?',
+                'latest_dm_response': 'He pointed toward the south jetty.',
+                'hot_context': {'current_scene': {'location_id': 'south_jetty'}},
+                'relevant_memory': large_text,
+            })
+
+        self.assertEqual(patch_data['_fallback']['reason'], 'memory_prompt_too_large_for_deepseek')
+        self.assertTrue(patch_data['_telemetry']['skipped_llm'])
+        post_chat.assert_not_called()
+
     def test_json_error_excerpt_marks_the_bad_line(self):
         malformed = '{\n  "items": [\n    {"id": "one"},\n      "id": "two"\n  ]\n}'
 
@@ -226,6 +277,20 @@ class ProviderCompatibilityTest(unittest.TestCase):
         self.assertEqual(options['reasoning_effort'], 'max')
         self.assertIsNone(options['tool_choice'])
         self.assertIsNone(options['parallel_tool_calls'])
+
+    def test_deepseek_required_tool_choice_is_omitted_even_when_thinking_disabled(self):
+        options = _provider_request_payload_options(
+            'opencode_go',
+            'deepseek-v4-flash',
+            [{'type': 'function', 'function': {'name': 'talk_to_player'}}],
+            'required',
+            False,
+            allow_thinking=False,
+        )
+
+        self.assertFalse(options['thinking_enabled'])
+        self.assertIsNone(options['tool_choice'])
+        self.assertFalse(options['parallel_tool_calls'])
 
     def test_assistant_tool_message_preserves_deepseek_reasoning_content(self):
         self.assertEqual(

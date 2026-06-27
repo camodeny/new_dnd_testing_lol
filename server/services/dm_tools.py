@@ -154,6 +154,50 @@ def _private_output_terms(campaign):
     return sorted(terms, key=lambda value: value.lower())
 
 
+def _latest_player_content_from_messages(messages):
+    for message in reversed(messages or []):
+        role = getattr(message, 'role', None)
+        if role == 'player':
+            return getattr(message, 'content', '') or ''
+    return ''
+
+
+def _public_npc_reference(npc):
+    summary = clean_text(npc.public_summary, 160)
+    if summary:
+        match = re.match(r'^(?:an?|the)\s+([^.,;]+)', summary, flags=re.IGNORECASE)
+        if match:
+            reference = match.group(1).strip()
+        else:
+            reference = summary.split('.')[0].split(',')[0].strip()
+        reference = re.sub(r'\bwho\b.*$', '', reference, flags=re.IGNORECASE).strip()
+        if reference:
+            return reference[:80].strip()
+
+    actor_id = clean_text(npc.actor_id, 100)
+    if actor_id:
+        return actor_id.replace('_', ' ').strip()
+    return 'unrevealed NPC'
+
+
+def _visible_naming_constraints(campaign, recent_messages):
+    private_terms = {term.lower() for term in _private_output_terms(campaign)}
+    latest_player_content = _latest_player_content_from_messages(recent_messages)
+    constraints = []
+    for npc in NPCActor.query.filter_by(campaign_id=campaign.id).order_by(NPCActor.id.asc()).all():
+        name = clean_text(npc.name, 120)
+        if not name or name.lower() not in private_terms:
+            continue
+        if re.search(re.escape(name), latest_player_content, flags=re.IGNORECASE):
+            continue
+        constraints.append({
+            'avoid_visible_name': name,
+            'use_public_reference': _public_npc_reference(npc),
+            'applies_to': 'visible narration and <npc target="..."> until the name is revealed by play',
+        })
+    return constraints
+
+
 def _private_spoiler_items(campaign):
     _world, graph, _world_state, dm_private = _world_json(campaign)
     items = []
@@ -403,6 +447,7 @@ def build_session_hot_context(campaign, session, current_user):
         'current_encounter_map': _compact_encounter_map(encounter_map),
         'combat_coordinates': _combat_coordinate_context(campaign, encounter_map),
         'active_clocks': [clock.to_dict(include_private=True) for clock in active_clocks],
+        'visible_naming_constraints': _visible_naming_constraints(campaign, recent_messages),
         'private_output_terms': _private_output_terms(campaign),
         'private_spoiler_items': _private_spoiler_items(campaign),
         'recent_messages': [message.to_dict() for message in recent_messages],
@@ -453,12 +498,66 @@ def context_manifest(context, tools):
     }
 
 
+def _memory_text(value, limit=1600):
+    text = str(value or '')
+    if len(text) <= limit:
+        return text
+    return text[:limit].rstrip() + '...'
+
+
+def _memory_hot_context_summary(hot_context):
+    hot_context = hot_context or {}
+
+    def compact_clock(clock):
+        return {
+            'clock_id': clock.get('clock_id') or clock.get('id'),
+            'name': clock.get('name'),
+            'filled': clock.get('filled'),
+            'segments': clock.get('segments'),
+            'status': clock.get('status'),
+            'visibility': clock.get('visibility'),
+            'summary': _memory_text(clock.get('summary'), 500),
+        }
+
+    def compact_message(message):
+        return {
+            'role': message.get('role'),
+            'user_id': message.get('user_id'),
+            'content': _memory_text(message.get('content'), 1200),
+        }
+
+    return {
+        'campaign': hot_context.get('campaign'),
+        'session': hot_context.get('session'),
+        'current_user': {
+            'id': (hot_context.get('current_user') or {}).get('id'),
+            'username': (hot_context.get('current_user') or {}).get('username'),
+        },
+        'current_character': hot_context.get('current_character'),
+        'current_player_character': hot_context.get('current_player_character'),
+        'current_scene': hot_context.get('current_scene') or {},
+        'current_encounter_map': hot_context.get('current_encounter_map'),
+        'active_clocks': [
+            compact_clock(clock)
+            for clock in (hot_context.get('active_clocks') or [])[:8]
+            if isinstance(clock, dict)
+        ],
+        'visible_naming_constraints': hot_context.get('visible_naming_constraints') or [],
+        'recent_messages': [
+            compact_message(message)
+            for message in (hot_context.get('recent_messages') or [])[-6:]
+            if isinstance(message, dict)
+        ],
+    }
+
+
 def build_session_memory_context(campaign, session, current_user, player_message, dm_message, hot_context):
+    memory_hot_context = _memory_hot_context_summary(hot_context)
     search_terms = ' '.join(
         text for text in [
             player_message,
             dm_message,
-            json.dumps(hot_context.get('current_scene', {}), ensure_ascii=False),
+            json.dumps(memory_hot_context.get('current_scene', {}), ensure_ascii=False),
         ]
         if text
     )
@@ -469,12 +568,11 @@ def build_session_memory_context(campaign, session, current_user, player_message
         'prior_running_summary': session.running_summary or '',
         'latest_player_message': player_message,
         'latest_dm_message': dm_message,
-        'hot_context': hot_context,
-        'current_scene': _tool_get_current_scene(campaign, current_user, {'include_private': True}),
+        'hot_context': memory_hot_context,
         'relevant_memory': _tool_search_campaign_memory(
             campaign,
             current_user,
-            {'query': search_terms[:240], 'limit': 10},
+            {'query': search_terms[:240], 'limit': 5},
         ),
         'active_clock_count': len(_active_clocks(campaign, limit=50)),
         'all_active_clocks_completed': all(
