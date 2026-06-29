@@ -615,6 +615,131 @@ class AppRouteTest(unittest.TestCase):
         self.assertEqual(message_data[0]['username'], llm_label)
         self.assertEqual(message_data[0]['role'], 'player')
 
+        player_message_id = message_data[0]['id']
+        dm_status_response = self.client.get(
+            f'/api/sessions/{session_id}/dm-turn-status?after_message_id={player_message_id}',
+            headers={'X-API-Key': llm_api_key},
+        )
+        self.assertEqual(dm_status_response.status_code, 200)
+        dm_status = dm_status_response.get_json()
+        self.assertEqual(dm_status['status'], 'silent')
+        self.assertEqual(dm_status['player_message_id'], player_message_id)
+        self.assertEqual(dm_status['reason'], 'No reply')
+
+    def test_dm_turn_status_reports_speak_decision_after_normal_response(self):
+        with app.app_context():
+            owner = User(username='owner-speak-status', email='owner-speak-status@example.com')
+            owner.set_password('password')
+            db.session.add(owner)
+            db.session.commit()
+
+            campaign = Campaign(name='Speak Status Table', user_id=owner.id)
+            db.session.add(campaign)
+            db.session.commit()
+            db.session.add(CampaignMember(campaign_id=campaign.id, user_id=owner.id, role='player'))
+            session = CampaignSession(campaign_id=campaign.id, is_active=True)
+            db.session.add(session)
+            db.session.commit()
+
+            campaign_id = campaign.id
+            session_id = session.id
+            owner_token = generate_token(owner.id)
+
+        create_response = self.client.post(
+            f'/api/campaigns/{campaign_id}/llm-players',
+            headers={'Authorization': f'Bearer {owner_token}'},
+            json={},
+        )
+        self.assertEqual(create_response.status_code, 201)
+        llm_api_key = create_response.get_json()['api_key']
+
+        with patch(
+            'routes.sessions.get_session_dm_response_with_tools',
+            return_value='The door groans open onto a moonlit hall.',
+        ), patch('routes.sessions.get_session_memory_patch', return_value={}):
+            message_response = self.client.post(
+                f'/api/sessions/{session_id}/messages',
+                headers={'X-API-Key': llm_api_key},
+                json={'content': 'I peer through the doorway.', 'role': 'player'},
+            )
+
+        self.assertEqual(message_response.status_code, 201)
+        messages = message_response.get_json()['messages']
+        self.assertEqual([m['role'] for m in messages], ['player', 'dm'])
+
+        player_message_id = messages[0]['id']
+        dm_message_id = messages[1]['id']
+        dm_status_response = self.client.get(
+            f'/api/sessions/{session_id}/dm-turn-status?after_message_id={player_message_id}',
+            headers={'X-API-Key': llm_api_key},
+        )
+        self.assertEqual(dm_status_response.status_code, 200)
+        dm_status = dm_status_response.get_json()
+        self.assertEqual(dm_status['status'], 'speak')
+        self.assertEqual(dm_status['player_message_id'], player_message_id)
+        self.assertEqual(dm_status['dm_message_id'], dm_message_id)
+
+    def test_dm_turn_status_returns_pending_when_no_decision_recorded(self):
+        with app.app_context():
+            owner = User(username='owner-pending', email='owner-pending@example.com')
+            owner.set_password('password')
+            db.session.add(owner)
+            db.session.commit()
+
+            campaign = Campaign(name='Pending Table', user_id=owner.id)
+            db.session.add(campaign)
+            db.session.commit()
+            db.session.add(CampaignMember(campaign_id=campaign.id, user_id=owner.id, role='player'))
+            session = CampaignSession(campaign_id=campaign.id, is_active=True)
+            db.session.add(session)
+            db.session.flush()
+            db.session.add(SessionMessage(
+                session_id=session.id,
+                user_id=owner.id,
+                role='player',
+                content='I stand watch.',
+            ))
+            db.session.commit()
+
+            session_id = session.id
+            player_message_id = session.messages[0].id
+            owner_token = generate_token(owner.id)
+
+        dm_status_response = self.client.get(
+            f'/api/sessions/{session_id}/dm-turn-status?after_message_id={player_message_id}',
+            headers={'Authorization': f'Bearer {owner_token}'},
+        )
+        self.assertEqual(dm_status_response.status_code, 200)
+        dm_status = dm_status_response.get_json()
+        self.assertEqual(dm_status['status'], 'pending')
+        self.assertEqual(dm_status['player_message_id'], player_message_id)
+
+    def test_dm_turn_status_rejects_non_member(self):
+        with app.app_context():
+            owner = User(username='owner-status-private', email='owner-status-private@example.com')
+            owner.set_password('password')
+            intruder = User(username='intruder-status', email='intruder-status@example.com')
+            intruder.set_password('password')
+            db.session.add_all([owner, intruder])
+            db.session.commit()
+
+            campaign = Campaign(name='Status Private Table', user_id=owner.id)
+            db.session.add(campaign)
+            db.session.commit()
+            db.session.add(CampaignMember(campaign_id=campaign.id, user_id=owner.id, role='player'))
+            session = CampaignSession(campaign_id=campaign.id, is_active=True)
+            db.session.add(session)
+            db.session.commit()
+
+            session_id = session.id
+            intruder_token = generate_token(intruder.id)
+
+        dm_status_response = self.client.get(
+            f'/api/sessions/{session_id}/dm-turn-status',
+            headers={'Authorization': f'Bearer {intruder_token}'},
+        )
+        self.assertEqual(dm_status_response.status_code, 403)
+
     def test_spectator_can_read_session_but_cannot_send_messages(self):
         with app.app_context():
             owner = User(username='spectator-reader', email='spectator-reader@example.com')

@@ -4,19 +4,23 @@ import unittest
 import json
 import time
 import queue
+import tempfile
 from unittest.mock import patch, MagicMock
 
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), '..')))
 
-from app import app
+from app import create_app
 from models import db, Campaign, CampaignSession, User, SessionMessage
 from services.stream_manager import SessionStreamManager, SessionGeneratorWorker
 
 class StreamManagerTest(unittest.TestCase):
     def setUp(self):
-        self.app = app
-        self.app.config['SQLALCHEMY_DATABASE_URI'] = 'sqlite:///:memory:'
-        self.app.config['SQLALCHEMY_TRACK_MODIFICATIONS'] = False
+        self.db_fd, self.db_path = tempfile.mkstemp(prefix='stream-manager-test-', suffix='.db')
+        os.close(self.db_fd)
+        self.original_database_url = os.environ.get('DATABASE_URL')
+        os.environ['DATABASE_URL'] = f'sqlite:///{self.db_path}'
+
+        self.app = create_app()
         self.app.config['TESTING'] = True
         self.ctx = self.app.app_context()
         self.ctx.push()
@@ -40,6 +44,14 @@ class StreamManagerTest(unittest.TestCase):
         db.session.remove()
         db.drop_all()
         self.ctx.pop()
+        if self.original_database_url is None:
+            os.environ.pop('DATABASE_URL', None)
+        else:
+            os.environ['DATABASE_URL'] = self.original_database_url
+        try:
+            os.remove(self.db_path)
+        except FileNotFoundError:
+            pass
 
     def test_worker_listener_management(self):
         # Setup a worker without executing dm_turn
@@ -132,6 +144,53 @@ class StreamManagerTest(unittest.TestCase):
             worker1.finished_at = time.monotonic() - manager.DONE_WORKER_TTL_SECONDS - 1
             retrieved_after_ttl = manager.get_worker(self.session.id)
             self.assertIsNone(retrieved_after_ttl)
+
+    def test_stream_manager_replays_latest_pending_player_message_after_active_worker_finishes(self):
+        manager = SessionStreamManager()
+        first_started = queue.Queue()
+        second_finished = queue.Queue()
+        release_first = queue.Queue()
+        executed_player_message_ids = []
+
+        def fake_execute(worker_self):
+            executed_player_message_ids.append(worker_self.player_message_id)
+            if worker_self.player_message_id == 1:
+                first_started.put(True)
+                release_first.get(timeout=1)
+            worker_self.finish_success(
+                [{"role": "player", "content": worker_self.content}],
+                [],
+            )
+            if worker_self.player_message_id == 2:
+                second_finished.put(True)
+
+        with patch.object(SessionGeneratorWorker, '_execute_dm_turn', autospec=True, side_effect=fake_execute):
+            worker1 = manager.start_generation(
+                self.campaign.id,
+                self.session.id,
+                self.user.id,
+                "First",
+                player_message_id=1,
+            )
+            self.assertTrue(first_started.get(timeout=1))
+
+            worker2 = manager.start_generation(
+                self.campaign.id,
+                self.session.id,
+                self.user.id,
+                "Second",
+                player_message_id=2,
+            )
+            self.assertIs(worker1, worker2)
+
+            release_first.put(True)
+            self.assertTrue(second_finished.get(timeout=1))
+
+        self.assertEqual(executed_player_message_ids, [1, 2])
+        self.assertEqual(manager.pending_requests, {})
+        latest_worker = manager.get_worker(self.session.id)
+        self.assertIsNotNone(latest_worker)
+        self.assertEqual(latest_worker.player_message_id, 2)
 
     @patch('services.stream_manager.get_session_dm_response_with_tools')
     @patch('services.stream_manager.SessionGeneratorWorker._run_dynamic_summarization')

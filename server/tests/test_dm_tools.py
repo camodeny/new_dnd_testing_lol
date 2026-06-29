@@ -57,6 +57,7 @@ from services.audit_service import log_audit_event
 from services.dm_tools import (
     DM_TOOL_DEFINITIONS,
     get_dm_tool_definitions,
+    apply_clock_adjudication,
     apply_memory_patch,
     build_session_hot_context,
     build_session_memory_context,
@@ -1221,8 +1222,58 @@ class DmToolsTest(unittest.TestCase):
         )
 
         self.assertIn('current_scene', memory_context['hot_context'])
+        self.assertEqual(
+            memory_context['hot_context']['protected_player_characters'][0]['name'],
+            'Aria',
+        )
         self.assertNotIn('private_output_terms', memory_context['hot_context'])
         self.assertNotIn('private_spoiler_items', memory_context['hot_context'])
+
+    def test_session_memory_context_compacts_character_and_memory_payloads(self):
+        hot_context = build_session_hot_context(self.campaign, self.session, self.user)
+        large_memory = {
+            'query': 'dockhand vault clue',
+            'matches': [
+                {
+                    'kind': 'dm_private',
+                    'item_id': 'current',
+                    'score': 2.75,
+                    'value': {
+                        'true_inciting_incident': 'x' * 1200,
+                        'villain_plan': 'y' * 1200,
+                        'hidden_pressures': ['z' * 400, 'q' * 400],
+                    },
+                }
+            ],
+        }
+
+        with patch('services.dm_tools._tool_search_campaign_memory', return_value=large_memory):
+            memory_context = build_session_memory_context(
+                self.campaign,
+                self.session,
+                self.user,
+                'I ask the dockhand what he saw.',
+                'The dockhand points toward the south jetty.',
+                hot_context,
+            )
+
+        self.assertNotIn('spellcasting', memory_context['hot_context']['current_character'])
+        self.assertNotIn('combat', memory_context['hot_context']['current_character'])
+        self.assertEqual(
+            memory_context['current_user'],
+            {'id': self.user.id, 'username': self.user.username},
+        )
+        self.assertNotIn('email', memory_context['current_user'])
+        compact_memory = memory_context['relevant_memory']
+        self.assertEqual(compact_memory['matches'][0]['kind'], 'dm_private')
+        self.assertLess(
+            len(json.dumps(compact_memory, ensure_ascii=False)),
+            len(json.dumps(large_memory, ensure_ascii=False)),
+        )
+        self.assertLessEqual(
+            len(compact_memory['matches'][0]['memory']['true_inciting_incident']),
+            223,
+        )
 
     def test_hot_context_private_spoilers_include_dm_private_world_events(self):
         db.session.add(WorldEvent(
@@ -1437,6 +1488,48 @@ class DmToolsTest(unittest.TestCase):
             hot_context,
         ))
 
+    def test_pc_control_guard_blocks_undeclared_departure(self):
+        hot_context = {
+            'protected_player_characters': [
+                {'id': 11, 'name': 'Elara Moonwhisper', 'user_id': 8},
+            ],
+            'recent_messages': [
+                {
+                    'id': 25,
+                    'session_id': 5,
+                    'user_id': 8,
+                    'role': 'player',
+                    'content': 'Elara studies Lysander carefully and asks to inspect the lock.',
+                },
+            ],
+        }
+
+        self.assertIsNotNone(_pc_control_violation(
+            'Elara slips out the warehouse side door before anyone can object.',
+            hot_context,
+        ))
+
+    def test_pc_control_guard_allows_minor_flair_gesture(self):
+        hot_context = {
+            'protected_player_characters': [
+                {'id': 11, 'name': 'Elara Moonwhisper', 'user_id': 8},
+            ],
+            'recent_messages': [
+                {
+                    'id': 25,
+                    'session_id': 5,
+                    'user_id': 8,
+                    'role': 'player',
+                    'content': 'Elara gathers her things and prepares to inspect the crate.',
+                },
+            ],
+        }
+
+        self.assertIsNone(_pc_control_violation(
+            'Elara gives a curt nod, looping her component pouch more securely at her belt.',
+            hot_context,
+        ))
+
     def test_pc_control_guard_allows_environmental_gives_way_narration(self):
         hot_context = {
             'protected_player_characters': [
@@ -1534,6 +1627,80 @@ class DmToolsTest(unittest.TestCase):
         self.assertFalse(result['safe'])
         self.assertEqual(result['violations'][0]['kind'], 'choice_or_intent')
 
+    def test_pc_control_checker_allows_declared_action_followthrough(self):
+        hot_context = {
+            'current_player_character': {'id': 11, 'name': 'Elara Moonwhisper', 'user_id': 8},
+            'protected_player_characters': [
+                {'id': 11, 'name': 'Elara Moonwhisper', 'user_id': 8},
+            ],
+            'recent_messages': [
+                {
+                    'id': 25,
+                    'session_id': 5,
+                    'user_id': 8,
+                    'role': 'player',
+                    'content': 'Elara runs to the altar and drops beside the cracked basin.',
+                },
+            ],
+        }
+
+        with patch('openrouter._post_chat', return_value=json.dumps({
+            'safe': False,
+            'violations': [{
+                'character': 'Elara Moonwhisper',
+                'sentence': 'Elara sprints across the nave and drops beside the cracked altar basin.',
+                'kind': 'consequential_action',
+                'reason': 'The DM narrated movement for the protected PC.',
+            }],
+            'confidence': 'medium',
+            'reason': 'Conservative classifier result.',
+        })):
+            result = check_session_pc_control_with_llm(
+                'Elara sprints across the nave and drops beside the cracked altar basin.',
+                hot_context,
+                {'operation': 'session_dm_response'},
+            )
+
+        self.assertTrue(result['safe'])
+        self.assertEqual(result['violations'], [])
+
+    def test_pc_control_checker_allows_minor_affective_color(self):
+        hot_context = {
+            'current_player_character': {'id': 11, 'name': 'Elara Moonwhisper', 'user_id': 8},
+            'protected_player_characters': [
+                {'id': 11, 'name': 'Elara Moonwhisper', 'user_id': 8},
+            ],
+            'recent_messages': [
+                {
+                    'id': 25,
+                    'session_id': 5,
+                    'user_id': 8,
+                    'role': 'player',
+                    'content': 'Elara listens to the final prayer in silence.',
+                },
+            ],
+        }
+
+        with patch('openrouter._post_chat', return_value=json.dumps({
+            'safe': False,
+            'violations': [{
+                'character': 'Elara Moonwhisper',
+                'sentence': 'You feel a pang of sadness as the prayer fades into the rafters.',
+                'kind': 'interior_state',
+                'reason': 'The DM described the protected PC emotional state.',
+            }],
+            'confidence': 'medium',
+            'reason': 'Conservative classifier result.',
+        })):
+            result = check_session_pc_control_with_llm(
+                'You feel a pang of sadness as the prayer fades into the rafters.',
+                hot_context,
+                {'operation': 'session_dm_response'},
+            )
+
+        self.assertTrue(result['safe'])
+        self.assertEqual(result['violations'], [])
+
     def test_session_dm_pc_control_classifier_rewrites_invented_choice(self):
         hot_context = {
             'current_player_character': {'id': 11, 'name': 'Elara Moonwhisper', 'user_id': 8},
@@ -1594,8 +1761,11 @@ class DmToolsTest(unittest.TestCase):
             'mode': 'speak',
             'content': 'The rung shudders beneath you. The landing remains within reach, but the ladder is failing fast. What do you do?',
         })
-        retry_prompt = post_chat.call_args_list[1].args[0][-1]['content']
-        self.assertIn('do not control a protected player character', retry_prompt)
+        repair_messages = post_chat.call_args_list[1].args[0]
+        self.assertIn('repair unsafe visible Dungeon Master replies', repair_messages[0]['content'])
+        repair_payload = json.loads(repair_messages[1]['content'])
+        self.assertEqual(repair_payload['pc_control_violation']['kind'], 'pc_control_classifier')
+        self.assertEqual(repair_payload['latest_player_messages_by_character'][0]['latest_player_message'], hot_context['recent_messages'][0]['content'])
 
     def test_private_output_guard_detects_hidden_terms(self):
         hot_context = {'private_output_terms': ['Crimson Veil']}
@@ -1966,12 +2136,13 @@ class DmToolsTest(unittest.TestCase):
             'mode': 'speak',
             'content': '<npc target="Bram Truewood">"The candle is always lit."</npc>',
         })
-        retry_prompt = post_chat.call_args_list[1].args[0][-1]['content']
-        self.assertIn('Guard reminder', retry_prompt)
-        self.assertIn('only allowed angle-bracket tag', retry_prompt)
-        self.assertNotIn('</p>', retry_prompt)
+        repair_messages = post_chat.call_args_list[1].args[0]
+        self.assertIn('repair malformed visible Dungeon Master replies', repair_messages[0]['content'])
+        repair_payload = json.loads(repair_messages[1]['content'])
+        self.assertIn('</p>', repair_payload['candidate_visible_dm_reply'])
+        self.assertEqual(repair_payload['format_violation']['errors'][0]['kind'], 'disallowed_tag')
         self.assertFalse(post_chat.call_args_list[1].kwargs.get('json_mode'))
-        self.assertIsNotNone(post_chat.call_args_list[1].kwargs.get('tools'))
+        self.assertIsNone(post_chat.call_args_list[1].kwargs.get('tools'))
         self.assertFalse(post_chat.call_args_list[1].kwargs.get('allow_thinking'))
 
     def test_session_dm_format_guard_allows_second_retry_for_distinct_format_failures(self):
@@ -2058,11 +2229,60 @@ class DmToolsTest(unittest.TestCase):
                        'Instead, he gives a single, slow nod.\n\n'
                        '<npc target="Dee">"Alright. Lock the creds down first."</npc>',
         })
-        retry_prompt = post_chat.call_args_list[1].args[0][-1]['content']
-        self.assertIn('clearly attributed NPC speech', retry_prompt)
-        self.assertIn('use the required <npc> wrapper', retry_prompt)
-        self.assertNotIn('Rewrite the same reply', retry_prompt)
-        self.assertNotIn('Preserve the narration', retry_prompt)
+        repair_messages = post_chat.call_args_list[1].args[0]
+        self.assertIn('repair malformed visible Dungeon Master replies', repair_messages[0]['content'])
+        repair_payload = json.loads(repair_messages[1]['content'])
+        self.assertEqual(repair_payload['format_violation']['errors'][0]['kind'], 'missing_npc_tag')
+        self.assertIn('wrap only the spoken line in <npc target="NPC name">...</npc>', ' '.join(repair_payload['repair_requirements']))
+
+    def test_session_dm_format_guard_falls_back_to_local_missing_npc_tag_repair_after_blank_repair(self):
+        hot_context = {
+            'protected_player_characters': [],
+            'private_output_terms': [],
+            'private_spoiler_items': [],
+            'visible_naming_constraints': [{
+                'avoid_visible_name': 'Brother Silas',
+                'use_public_reference': 'Mirror Monk',
+                'applies_to': 'visible narration and <npc target="..."> until the name is revealed by play',
+            }],
+        }
+
+        with patch('openrouter._post_chat_response', side_effect=[
+            dm_talk_tool_response(
+                'Father Aldric leans close. "The canal door was left unbarred." '
+                'He glances toward Brother Silas. "Find the flooded crypts first."'
+            ),
+            {
+                'choices': [{
+                    'message': {
+                        'content': '',
+                        'reasoning_content': 'I should wrap the quotes, but I ran out of room.',
+                    },
+                    'finish_reason': 'length',
+                }],
+            },
+        ]) as post_chat, patch('openrouter._post_chat', return_value=json.dumps({
+            'requires_npc_tag': True,
+            'speaker': 'Father Aldric',
+            'evidence': ['"The canal door was left unbarred."'],
+            'reason': 'This is clearly Father Aldric speaking in the current scene.',
+        })):
+            result = get_session_dm_response_with_tools(
+                hot_context,
+                [],
+                [],
+                lambda *_args, **_kwargs: {},
+                max_tool_rounds=0,
+            )
+
+        self.assertEqual(result, {
+            'mode': 'speak',
+            'content': (
+                'Father Aldric leans close. <npc target="Father Aldric">"The canal door was left unbarred."</npc> '
+                'He glances toward Mirror Monk. <npc target="Father Aldric">"Find the flooded crypts first."</npc>'
+            ),
+        })
+        self.assertEqual(post_chat.call_count, 2)
 
     def test_session_dm_format_guard_runs_npc_checker_without_heuristic_signal(self):
         hot_context = {
@@ -2156,9 +2376,11 @@ class DmToolsTest(unittest.TestCase):
             'content': '<npc target="Brenn">"Green lights by the old willow."</npc>',
         })
         self.assertEqual(post_chat.call_count, 2)
-        format_retry_prompt = post_chat.call_args_list[1].args[0][-1]['content']
-        self.assertIn('use valid visible-message syntax', format_retry_prompt)
-        self.assertNotIn('Do not send the final visible reply as plain assistant text', format_retry_prompt)
+        repair_messages = post_chat.call_args_list[1].args[0]
+        self.assertIn('repair malformed visible Dungeon Master replies', repair_messages[0]['content'])
+        repair_payload = json.loads(repair_messages[1]['content'])
+        self.assertEqual(repair_payload['format_violation']['errors'][0]['kind'], 'disallowed_tag')
+        self.assertEqual(post_chat.call_args_list[1].kwargs.get('tools'), None)
 
     def test_session_dm_accepts_plain_text_visible_reply(self):
         hot_context = {
@@ -2253,9 +2475,11 @@ class DmToolsTest(unittest.TestCase):
 
         self.assertEqual(result, {'mode': 'speak', 'content': 'Make a Technology check.'})
         self.assertEqual(post_chat.call_count, 2)
-        format_retry_prompt = post_chat.call_args_list[1].args[0][-1]['content']
-        self.assertIn('use valid visible-message syntax', format_retry_prompt)
-        self.assertNotIn('OOC/IC mode labels', format_retry_prompt)
+        repair_messages = post_chat.call_args_list[1].args[0]
+        self.assertIn('repair malformed visible Dungeon Master replies', repair_messages[0]['content'])
+        repair_payload = json.loads(repair_messages[1]['content'])
+        self.assertEqual(repair_payload['format_violation']['errors'][0]['kind'], 'disallowed_mode_label')
+        self.assertIn('*OOC*:', repair_payload['candidate_visible_dm_reply'])
 
     def test_finalizer_contract_retry_reprompts_provider_tool_markup_with_specific_reminder(self):
         hot_context = {
@@ -3011,10 +3235,15 @@ class DmToolsTest(unittest.TestCase):
             result = get_session_dm_response_with_tools(hot_context, [], [], lambda *_args, **_kwargs: {}, max_tool_rounds=0)
 
         self.assertEqual(result, {'mode': 'speak', 'content': 'The air feels tense as you leave.'})
-        retry_prompt = post_chat.call_args_list[1].args[0][-1]['content']
-        self.assertIn('keep the visible reply spoiler-safe', retry_prompt)
-        self.assertIn('keep the visible reply spoiler-safe', retry_prompt)
-        self.assertNotIn('The trap closes', retry_prompt)
+        repair_messages = next(
+            call.args[0]
+            for call in post_chat.call_args_list
+            if call.args[0][0]['content'].startswith('You repair unsafe visible Dungeon Master replies.')
+        )
+        self.assertIn('repair unsafe visible Dungeon Master replies', repair_messages[0]['content'])
+        repair_payload = json.loads(repair_messages[1]['content'])
+        self.assertEqual(repair_payload['spoiler_violation']['leaked_item_ids'], ['fact_trap'])
+        self.assertEqual(repair_payload['leaked_private_items'][0]['text'], 'The note is a trap.')
 
     def test_spoiler_checker_allows_player_prompted_witness_clue(self):
         hot_context = {
@@ -3214,11 +3443,13 @@ class DmToolsTest(unittest.TestCase):
             dm_talk_tool_response('A hidden trap closes around you.'),
             dm_talk_tool_response('The ambush was a trap all along.'),
             dm_talk_tool_response('This confirms the note was a trap.'),
+            dm_talk_tool_response('You can feel that something is wrong here.'),
         ]), patch('openrouter.check_session_spoilers_with_llm', side_effect=[
             {'safe': False, 'leaked_item_ids': ['fact_trap'], 'evidence': ['The trap closes'], 'reason': 'Directly implies the hidden truth.'},
             {'safe': False, 'leaked_item_ids': ['fact_trap'], 'evidence': ['hidden trap'], 'reason': 'Still implies the hidden truth.'},
             {'safe': False, 'leaked_item_ids': ['fact_trap'], 'evidence': ['trap all along'], 'reason': 'Still implies the hidden truth.'},
             {'safe': False, 'leaked_item_ids': ['fact_trap'], 'evidence': ['note was a trap'], 'reason': 'Still implies the hidden truth.'},
+            {'safe': False, 'leaked_item_ids': ['fact_trap'], 'evidence': ['something is wrong'], 'reason': 'Still implies the hidden truth.'},
         ]):
             result = get_session_dm_response_with_tools(hot_context, [], [], lambda *_args, **_kwargs: {}, max_tool_rounds=0)
 
@@ -3257,8 +3488,68 @@ class DmToolsTest(unittest.TestCase):
             )
 
         self.assertEqual(result, {'mode': 'speak', 'content': 'The corridor ahead is quiet and cold.'})
-        self.assertEqual(CampaignAuditEvent.query.filter_by(event_type='spoiler_checker_guard_retry').count(), 2)
+        self.assertEqual(CampaignAuditEvent.query.filter_by(event_type='spoiler_checker_guard_retry').count(), 1)
         self.assertEqual(CampaignAuditEvent.query.filter_by(event_type='spoiler_checker_guard_blocked').count(), 0)
+
+    def test_pc_control_guard_repairs_protected_pc_control_in_place(self):
+        hot_context = {
+            'protected_player_characters': [{
+                'id': self.character.id,
+                'name': self.character.name,
+                'user_id': self.user.id,
+                'username': self.user.username,
+            }],
+            'private_output_terms': [],
+            'private_spoiler_items': [],
+            'recent_messages': [
+                {'role': 'player', 'content': 'Aria keeps a hand on the lantern and waits for the signal.'},
+            ],
+        }
+
+        with patch('openrouter._post_chat_response', side_effect=[
+            dm_talk_tool_response('Aria nods once. "I will take the left passage."'),
+            dm_talk_tool_response('The left passage yawns ahead. Aria looks to you for the call.'),
+            dm_talk_tool_response('The left passage yawns ahead. Aria looks to you for the call.'),
+        ]) as post_chat, patch('openrouter.check_session_pc_control_with_llm', side_effect=[
+            {
+                'safe': False,
+                'violations': [{
+                    'character': 'Aria',
+                    'sentence': 'Aria nods once. "I will take the left passage."',
+                    'kind': 'dialogue',
+                    'reason': 'Protected PC dialogue was invented.',
+                }],
+                'confidence': 'high',
+                'reason': 'Protected PC dialogue was invented.',
+            },
+            {
+                'safe': True,
+                'violations': [],
+                'confidence': 'high',
+                'reason': '',
+            },
+        ]):
+            result = get_session_dm_response_with_tools(
+                hot_context,
+                [],
+                [],
+                lambda *_args, **_kwargs: {},
+                audit_context={'campaign_id': self.campaign.id},
+                max_tool_rounds=0,
+            )
+
+        self.assertEqual(result, {'mode': 'speak', 'content': 'The left passage yawns ahead. Aria looks to you for the call.'})
+        repair_messages = next(
+            call.args[0]
+            for call in post_chat.call_args_list
+            if call.args[0][0]['content'].startswith('You repair unsafe visible Dungeon Master replies.')
+        )
+        self.assertIn('repair unsafe visible Dungeon Master replies', repair_messages[0]['content'])
+        repair_payload = json.loads(repair_messages[1]['content'])
+        self.assertEqual(repair_payload['pc_control_violation']['kind'], 'pc_control_classifier')
+        self.assertEqual(repair_payload['protected_player_characters'][0]['name'], self.character.name)
+        self.assertEqual(CampaignAuditEvent.query.filter_by(event_type='pc_control_guard_retry').count(), 1)
+        self.assertEqual(CampaignAuditEvent.query.filter_by(event_type='pc_control_guard_blocked').count(), 0)
 
     def test_session_dm_turn_decision_normalizes_silence_contract(self):
         self.assertEqual(
@@ -3770,6 +4061,99 @@ class DmToolsTest(unittest.TestCase):
         )
         self.assertEqual(result['clock']['filled'], 4)
         self.assertEqual(result['clock']['status'], 'completed')
+
+    def test_apply_clock_adjudication_advances_existing_clock(self):
+        db.session.add(CampaignClock(
+            campaign_id=self.campaign.id,
+            clock_id='race_to_crypts',
+            name='Race to the Crypts',
+            segments=4,
+            filled=0,
+            status='active',
+        ))
+        db.session.commit()
+
+        result = apply_clock_adjudication(
+            self.campaign,
+            {
+                'create_clocks': [],
+                'advance_clocks': [
+                    {
+                        'clock_id': 'race_to_crypts',
+                        'delta': 1,
+                        'reason': 'The pursuit visibly moved toward the crypt road.',
+                        'evidence': ['The chase left the market and hit the crypt road.'],
+                    }
+                ],
+                'retire_clocks': [],
+                'no_change_explanations': [],
+            },
+            audit_context={'trace_id': 'clock-trace'},
+        )
+
+        db.session.commit()
+        clock = CampaignClock.query.filter_by(campaign_id=self.campaign.id, clock_id='race_to_crypts').one()
+        self.assertEqual(clock.filled, 1)
+        self.assertEqual(clock.status, 'active')
+        self.assertEqual(result['errors'], [])
+        self.assertEqual(result['clock_changes'][0]['action'], 'advanced')
+
+    def test_session_message_route_runs_clock_adjudication_after_memory_patch(self):
+        token = generate_token(self.user.id)
+        db.session.add(CampaignClock(
+            campaign_id=self.campaign.id,
+            clock_id='race_to_crypts',
+            name='Race to the Crypts',
+            segments=4,
+            filled=0,
+            status='active',
+        ))
+        db.session.commit()
+
+        def clock_updates_side_effect(clock_context, audit_context=None):
+            self.assertEqual(clock_context['current_scene_after']['location_id'], 'crypt_road')
+            self.assertEqual(clock_context['current_scene_before']['location_name'], 'Dock Ward')
+            return {
+                'create_clocks': [],
+                'advance_clocks': [
+                    {
+                        'clock_id': 'race_to_crypts',
+                        'delta': 1,
+                        'reason': 'The visible chase moved onto the crypt road.',
+                        'evidence': ['The DM confirmed the chase left Dock Ward.'],
+                    }
+                ],
+                'retire_clocks': [],
+                'no_change_explanations': [],
+            }
+
+        with patch('routes.sessions.get_session_dm_response_with_tools', return_value='You break into a run toward the crypt road.'), \
+                patch('routes.sessions.get_session_memory_patch', return_value={
+                    'running_summary': 'The party pursued the robbers onto the crypt road.',
+                    'scene_patch': {
+                        'location_id': 'crypt_road',
+                        'location_name': 'Crypt Road',
+                        'immediate_tension': 'Boots pound after fleeing grave robbers.',
+                    },
+                    'scene_reason': 'The chase moved to the crypt road.',
+                    'upsert_graph_entities': [],
+                    'upsert_graph_relations': [],
+                    'upsert_graph_facts': [],
+                    'create_clocks': [],
+                    'retire_clocks': [],
+                    'update_npc_actors': [],
+                    'record_events': [],
+                }), \
+                patch('routes.sessions.get_session_clock_updates', side_effect=clock_updates_side_effect):
+            response = self.client.post(
+                f'/api/sessions/{self.session.id}/messages',
+                json={'content': 'I sprint after them toward the crypts.', 'role': 'player'},
+                headers={'Authorization': f'Bearer {token}'},
+            )
+
+        self.assertEqual(response.status_code, 201)
+        clock = CampaignClock.query.filter_by(campaign_id=self.campaign.id, clock_id='race_to_crypts').one()
+        self.assertEqual(clock.filled, 1)
 
     def test_session_message_route_persists_dm_reply_before_memory_update(self):
         token = generate_token(self.user.id)

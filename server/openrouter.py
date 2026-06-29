@@ -63,11 +63,7 @@ SESSION_MEMORY_MAX_ATTEMPTS = max(
 )
 SESSION_MEMORY_MAX_TOKENS = max(
     256,
-    int(os.environ.get('SESSION_MEMORY_MAX_TOKENS', '3072')),
-)
-SESSION_MEMORY_LLM_MAX_PROMPT_TOKENS = max(
-    1000,
-    int(os.environ.get('SESSION_MEMORY_LLM_MAX_PROMPT_TOKENS', '6000')),
+    int(os.environ.get('SESSION_MEMORY_MAX_TOKENS', '8192')),
 )
 
 PC_CONTROL_POLICY = (
@@ -94,6 +90,26 @@ SYSTEM_PROMPT = (
     "<ic>, <ooc>, HTML, XML, or any other angle-bracket tags in visible DM replies. "
     "Write visible replies in English only; do not emit stray non-English glyphs or mixed-language fragments. "
     + PC_CONTROL_POLICY + " "
+    "Before drafting a visible reply, identify from context which characters are protected player characters, "
+    "which spoken lines are NPC speech, which names or identities are still unrevealed, and what the players "
+    "have actually earned the right to know. "
+    "Never write dialogue, assent, banter, reactions, emotional tells, or decisions for a protected player "
+    "character unless the player already supplied those exact words or actions. This includes short confirmations "
+    "like \"okay,\" \"right,\" \"let's go,\" nods, thanks, sighs, and similar implied participation. If a protected "
+    "player character response is needed, ask the player, hand off briefly, or stay silent. "
+    "When using <npc target=\"...\">...</npc>, the target must be a concrete in-world speaker reference grounded "
+    "in the transcript or memory. Never use placeholders or meta labels such as \"the speaker,\" \"speaker,\" "
+    "\"NPC,\" \"someone,\" \"voice,\" \"figure,\" or vague pronouns as the target. If the true name is unrevealed, "
+    "use the best public-facing descriptor already supported by context. If you cannot identify a concrete speaker "
+    "reference with high confidence, do not invent one and do not write quoted NPC dialogue; paraphrase the "
+    "utterance in narration instead. "
+    "Preserve speaker identity and knowledge boundaries across retries and adjacent turns. Do not switch which NPC "
+    "is speaking, upgrade a public descriptor into a secret identity, merge multiple hidden sources into one speech, "
+    "or let a rejected draft drift the visible identity of the speaker. "
+    "Reveal at most one earned clue at a time. Do not compress hidden identity, secret motive, conspiracy, replica "
+    "truth, offscreen plan, and time pressure into one explanation or monologue. Witnesses may provide surface "
+    "facts, reluctance, fear, and practical conditions, but not the hidden why behind that fear unless the players "
+    "have already uncovered it. "
     "When campaign world memory includes NPC actor dossiers, silently coordinate the NPC's goals, "
     "secrets, recent offscreen activity, and relationship to the party before speaking for them. "
     "Treat persistent campaign memory as the authority for lore and state. Knowledge-graph facts, "
@@ -201,6 +217,43 @@ SESSION_MEMORY_SYSTEM_PROMPT = (
     "5. 'memory_type': 'npc | fact | relation | clock | location | quest | inventory | money'"
 )
 
+SESSION_MEMORY_SUMMARY_SCENE_SYSTEM_PROMPT = (
+    "You update only the compact session summary and current scene after a visible DM turn. "
+    "Return only valid JSON with keys turn_summary and scene_patch. "
+    "turn_summary must be one concise durable summary of what materially changed in the latest exchange. "
+    "scene_patch may include only location_id, location_name, time_of_day, active_npc_ids, and immediate_tension. "
+    "Do not include markdown, commentary, or any other keys."
+)
+
+SESSION_MEMORY_FACTS_SYSTEM_PROMPT = (
+    "You extract only durable campaign facts from the latest visible exchange. "
+    "Return only valid JSON with key upsert_graph_facts. "
+    "Use an empty array unless the exchange created or clarified a durable fact worth remembering after the scene moves on. "
+    "Each fact must include id, entity_ids, text, certainty, visibility, importance, expires_or_retire_condition, reason, and memory_type. "
+    "Do not include scene-transient occupancy, immediate tension, or repeated facts already obvious from the current scene."
+)
+
+SESSION_MEMORY_CLOCKS_SYSTEM_PROMPT = (
+    "You manage only campaign clocks after a visible DM turn. "
+    "Return only valid JSON with keys create_clocks and retire_clocks. "
+    "Prefer empty arrays unless the exchange clearly introduced new durable pressure, a deadline, a mystery clock, or resolved an existing clock. "
+    "Do not create clocks for ordinary scene beats or clues that do not change campaign pressure."
+)
+
+SESSION_CLOCK_ADJUDICATOR_SYSTEM_PROMPT = (
+    "You adjudicate campaign clock progression after a visible DM turn. "
+    "Return only valid JSON with keys create_clocks, advance_clocks, retire_clocks, and no_change_explanations. "
+    "Use only the visible player message, visible DM reply, scene transition, and existing active clocks. "
+    "Do not invent offscreen developments, hidden actions, or private causes that were not visible in the exchange. "
+    "For each existing active clock, either advance it or explain why it did not change. "
+    "Use delta 1 for ordinary visible progress or escalation, delta 2 only for major irreversible escalation, and delta -1 only for visible relief or setback. "
+    "Do not emit delta 0. Do not advance unrelated clocks. "
+    "If a new pressure is already underway, prefer creating the new clock with filled set to 1 instead of 0. "
+    "Do not create a new clock if an existing active clock already covers the same pressure. "
+    "Each advance_clocks item must include clock_id, delta, reason, and evidence. "
+    "Each no_change_explanations item must include clock_id and reason."
+)
+
 SESSION_SPOILER_CHECK_SYSTEM_PROMPT = (
     "You are a spoiler-safety checker for visible Dungeon Master replies. "
     "Return only valid JSON. Decide whether the candidate visible DM reply directly reveals or strongly implies "
@@ -246,10 +299,14 @@ SESSION_NPC_TAG_CHECK_SYSTEM_PROMPT = (
 SESSION_PC_CONTROL_CHECK_SYSTEM_PROMPT = (
     "You are a player-agency guard for visible Dungeon Master replies. "
     "Return only valid JSON. Decide whether the candidate visible DM reply improperly takes control of a protected "
-    "player character. Unsafe replies invent a protected player's dialogue, strategic choices, intent, emotions, "
+    "player character. Unsafe replies invent a protected player's dialogue, strategic choices, intent, major emotions, "
     "interior thoughts, or consequential actions the player did not declare. Safe replies may narrate immediate "
     "environmental consequences, hazards, impacts, forced movement, damage, slips, falls, collisions, or changed "
     "positioning that naturally follow from the player's declared action, the scene, or a rolled outcome. "
+    "Safe replies may also add low-stakes follow-through to an action the player already committed to, such as how "
+    "they run across the room, fall into step with an ally they agreed to accompany, or make a brief assent gesture "
+    "while carrying out the declared action. Safe replies may add minor affective color such as sadness, relief, "
+    "tension, or hesitation when it does not impose a new decision, belief, plan, or strategy. "
     "Safe replies may use second person to describe consequences. Do not mark a reply unsafe merely because it "
     "describes what happens to the acting player character after they already attempted something risky. "
     "Be especially careful to allow consequence narration such as losing footing, getting hit, taking damage, or "
@@ -286,6 +343,22 @@ JSON_REPAIR_SYSTEM_PROMPT = (
     "You repair malformed JSON. Return only valid JSON with the same intended data and structure as "
     "the original. Make the smallest changes needed to fix syntax errors. Do not add commentary, "
     "markdown fences, or new facts."
+)
+
+SESSION_FORMAT_REPAIR_SYSTEM_PROMPT = (
+    "You repair malformed visible Dungeon Master replies. Return only the repaired visible reply text. "
+    "Preserve the same story meaning, ordering, and wording as closely as possible. Make only the smallest "
+    "changes needed to satisfy the reported formatting rules. Do not add explanations, markdown fences, new "
+    "facts, new actions, or extra dialogue. Keep narration outside NPC tags. The only allowed angle-bracket "
+    "tag is <npc target=\"NPC name\">...</npc>. Write visible replies in English only."
+)
+
+SESSION_GUARD_REPAIR_SYSTEM_PROMPT = (
+    "You repair unsafe visible Dungeon Master replies. Return only the repaired visible reply text. "
+    "Preserve the same scene facts, ordering, and story meaning as closely as possible. Make only the smallest "
+    "changes needed to satisfy the reported guard violation. Do not add explanations, markdown fences, tool-call "
+    "markup, new facts, new actions, or extra dialogue. Keep narration outside NPC tags. The only allowed "
+    "angle-bracket tag is <npc target=\"NPC name\">...</npc>. Write visible replies in English only."
 )
 
 LOOT_GENERATION_SYSTEM_PROMPT = (
@@ -836,6 +909,199 @@ def _build_json_repair_messages(candidate, error):
     ]
 
 
+def _build_session_format_repair_messages(candidate, format_violation, hot_context=None):
+    return _build_session_guard_repair_messages(
+        candidate,
+        'format',
+        format_violation,
+        hot_context=hot_context,
+    )
+
+
+def _visible_naming_target(name, hot_context):
+    normalized = str(name or '').strip().casefold()
+    constraints = (hot_context or {}).get('visible_naming_constraints') or []
+    for constraint in constraints:
+        avoid_name = str((constraint or {}).get('avoid_visible_name') or '').strip()
+        public_reference = str((constraint or {}).get('use_public_reference') or '').strip()
+        if avoid_name and public_reference and avoid_name.casefold() == normalized:
+            return public_reference
+    return str(name or '').strip()
+
+
+def _latest_player_messages_by_character(hot_context):
+    latest_player_messages = []
+    for character in (hot_context or {}).get('protected_player_characters') or []:
+        latest_player_messages.append({
+            'character_name': str(character.get('name') or '').strip(),
+            'user_id': character.get('user_id'),
+            'latest_player_message': _latest_player_message_for_character(hot_context, character),
+        })
+    return latest_player_messages
+
+
+def _leaked_private_items_for_repair(details, hot_context):
+    leaked_ids = {
+        str(item or '').strip()
+        for item in ((details or {}).get('leaked_item_ids') or [])
+        if str(item or '').strip()
+    }
+    if not leaked_ids:
+        return []
+    return [
+        {
+            'id': str(item.get('id') or '').strip(),
+            'kind': str(item.get('kind') or '').strip(),
+            'text': str(item.get('text') or '').strip(),
+        }
+        for item in ((hot_context or {}).get('private_spoiler_items') or [])
+        if isinstance(item, dict) and str(item.get('id') or '').strip() in leaked_ids
+    ]
+
+
+def _session_dm_guard_repair_payload(candidate, guard_name, details, hot_context=None):
+    payload = {
+        'candidate_visible_dm_reply': candidate,
+        'visible_naming_constraints': (hot_context or {}).get('visible_naming_constraints') or [],
+        'repair_requirements': [],
+    }
+    if guard_name == 'format':
+        payload['format_violation'] = details or {}
+        payload['repair_requirements'] = [
+            'Return only the repaired visible reply text.',
+            'Preserve the existing wording and narrative meaning unless a change is required to fix formatting.',
+            'If clearly attributed NPC speech appears, wrap only the spoken line in <npc target="NPC name">...</npc>.',
+            'Leave narration outside any <npc> tag.',
+            'If a naming constraint applies, use use_public_reference as the NPC target instead of avoid_visible_name.',
+            'Do not use any angle-bracket tag other than <npc target="NPC name">...</npc>.',
+        ]
+        return payload
+    if guard_name == 'pc_control':
+        payload['pc_control_violation'] = details or {}
+        payload['protected_player_characters'] = (hot_context or {}).get('protected_player_characters') or []
+        payload['latest_player_messages_by_character'] = _latest_player_messages_by_character(hot_context)
+        payload['repair_requirements'] = [
+            'Return only the repaired visible reply text.',
+            'Preserve the scene facts, NPC actions, and DM intent unless a change is required to stop controlling a protected player character.',
+            'Do not invent dialogue, choices, intent, interior state, or consequential actions for any protected player character.',
+            'Convert protected player character dialogue or decisions into non-controlling DM narration, a direct question, or a brief player handoff.',
+            'Keep references to protected player characters brief and non-controlling.',
+            'Do not use any angle-bracket tag other than <npc target="NPC name">...</npc>.',
+        ]
+        return payload
+    if guard_name == 'spoiler_checker':
+        payload['spoiler_violation'] = details or {}
+        payload['latest_player_message'] = _latest_player_message(hot_context)
+        payload['leaked_private_items'] = _leaked_private_items_for_repair(details, hot_context)
+        payload['repair_requirements'] = [
+            'Return only the repaired visible reply text.',
+            'Preserve the scene intent and any safe public facts unless a change is required to remove the spoiler leak.',
+            'Keep only what players could currently observe, hear, or reasonably infer in-world.',
+            'Replace hidden motives, hidden leverage, secret causes, private plans, and hidden-tracker language with safe surface-level clues, visible pressure, practical conditions, or evasive reluctance.',
+            'Do not reveal or strongly imply unrevealed private items, hidden countdowns, or DM-private causality.',
+            'If a witness can safely offer a clue, keep it limited, public-facing, and incomplete rather than explaining the hidden truth.',
+            'Do not use any angle-bracket tag other than <npc target="NPC name">...</npc>.',
+        ]
+        return payload
+    raise ValueError(f'Unsupported session DM guard repair type: {guard_name}')
+
+
+def _session_dm_guard_repair_system_prompt(guard_name):
+    if guard_name == 'format':
+        return SESSION_FORMAT_REPAIR_SYSTEM_PROMPT
+    return SESSION_GUARD_REPAIR_SYSTEM_PROMPT
+
+
+def _build_session_guard_repair_messages(candidate, guard_name, details, hot_context=None):
+    return [
+        {
+            'role': 'system',
+            'content': _session_dm_guard_repair_system_prompt(guard_name),
+        },
+        {
+            'role': 'user',
+            'content': json.dumps(
+                _session_dm_guard_repair_payload(candidate, guard_name, details, hot_context),
+                ensure_ascii=False,
+            ),
+        },
+    ]
+
+
+def _apply_visible_naming_constraints(text, hot_context):
+    repaired = str(text or '')
+    constraints = (hot_context or {}).get('visible_naming_constraints') or []
+    ordered_constraints = sorted(
+        [constraint for constraint in constraints if isinstance(constraint, dict)],
+        key=lambda constraint: len(str(constraint.get('avoid_visible_name') or '')),
+        reverse=True,
+    )
+    for constraint in ordered_constraints:
+        avoid_name = str(constraint.get('avoid_visible_name') or '').strip()
+        public_reference = str(constraint.get('use_public_reference') or '').strip()
+        if not avoid_name or not public_reference:
+            continue
+        repaired = re.sub(
+            rf'(?<!\w){re.escape(avoid_name)}(?!\w)',
+            public_reference,
+            repaired,
+            flags=re.IGNORECASE,
+        )
+    return repaired
+
+
+def _extract_missing_npc_tag_speaker(format_violation):
+    errors = (format_violation or {}).get('errors') or []
+    for error in errors:
+        if str((error or {}).get('kind') or '').strip().lower() != 'missing_npc_tag':
+            continue
+        detail = str((error or {}).get('detail') or '')
+        match = re.search(r'<npc\s+target="([^"]+)">', detail)
+        if match:
+            return str(match.group(1) or '').strip()
+    return ''
+
+
+def _wrap_quoted_dialogue_with_npc_tag(text, speaker):
+    target = str(speaker or '').strip()
+    if not target:
+        return str(text or '')
+
+    segments = re.split(r'(<npc\b[^>]*>.*?</npc>)', str(text or ''), flags=re.IGNORECASE | re.DOTALL)
+    quote_pattern = re.compile(r'((?:\*\*)?\s*["\u201c][^"\u201c\u201d\n]{2,400}["\u201d](?:\s*\*\*)?)')
+    rebuilt = []
+    def _wrap_match(match):
+        raw_quote = match.group(1)
+        stripped_quote = raw_quote.strip()
+        if not stripped_quote:
+            return raw_quote
+        leading_ws = raw_quote[:len(raw_quote) - len(raw_quote.lstrip())]
+        trailing_ws = raw_quote[len(raw_quote.rstrip()):]
+        return f'{leading_ws}<npc target="{target}">{stripped_quote}</npc>{trailing_ws}'
+
+    for segment in segments:
+        if not segment:
+            continue
+        if re.match(r'<npc\b[^>]*>.*?</npc>$', segment, flags=re.IGNORECASE | re.DOTALL):
+            rebuilt.append(segment)
+            continue
+        rebuilt.append(quote_pattern.sub(_wrap_match, segment))
+    return ''.join(rebuilt)
+
+
+def _local_missing_npc_tag_repair(candidate, format_violation, hot_context=None):
+    speaker = _extract_missing_npc_tag_speaker(format_violation)
+    if not speaker:
+        return ''
+
+    target = _visible_naming_target(speaker, hot_context)
+    repaired = _apply_visible_naming_constraints(candidate, hot_context)
+    wrapped = _wrap_quoted_dialogue_with_npc_tag(repaired, target)
+    if wrapped == str(candidate or ''):
+        return ''
+    return wrapped.strip()
+
+
 def _json_loads_with_repair(text, audit_context=None):
     data, error, candidate = _json_loads_with_error(text)
     if error is None or not isinstance(error, json.JSONDecodeError):
@@ -866,6 +1132,39 @@ def _planning_blank_retry_messages(messages):
                 'player-visible message string, an active_page value from identity, scores, combat, '
                 'magic_gear, story, or null, and a form_patch object. Do not return whitespace, an empty '
                 'JSON object, markdown fences, hidden reasoning, or commentary outside the JSON object.'
+            ),
+        },
+    ]
+
+
+def _session_memory_retry_messages(messages, failure_kind):
+    issue = (
+        'blank or invalid'
+        if failure_kind == 'blank_response'
+        else 'an empty or no-op JSON object'
+    )
+    minimal_shape = {
+        'running_summary': 'non-empty compact summary of the latest visible state',
+        'scene_patch': {},
+        'scene_reason': 'brief reason or null',
+        'upsert_graph_entities': [],
+        'upsert_graph_relations': [],
+        'upsert_graph_facts': [],
+        'create_clocks': [],
+        'retire_clocks': [],
+        'update_npc_actors': [],
+        'record_events': [],
+    }
+    return [
+        *messages,
+        {
+            'role': 'user',
+            'content': (
+                f'Your previous response was {issue}. Return exactly one valid JSON object now, matching the '
+                'original return shape. If there are no durable graph or clock updates, you must still return a '
+                'non-empty running_summary and any current scene_patch you can confirm, while leaving unchanged '
+                'sections as empty arrays. Do not return whitespace, null, an empty object, markdown fences, or '
+                f'commentary outside the JSON object.\n\nMinimal valid shape:\n{json.dumps(minimal_shape, ensure_ascii=False)}'
             ),
         },
     ]
@@ -1379,9 +1678,14 @@ def _session_dm_guard_retry_system_prompt(guard_name, details):
             '<npc> wrapper. '
             'If you include clearly attributed current NPC spoken lines or performed utterances, wrap them in '
             '<npc target="NPC name">...</npc>, and leave narration outside the tag. '
+            'The <npc target="..."> value must be a concrete in-world speaker reference grounded in the transcript '
+            'or memory, not a placeholder or meta label. Never use targets like "the speaker", "speaker", "NPC", '
+            '"someone", "voice", or vague pronouns. '
             'If a prior guard reminder identified an unrevealed private term, do not use that private term '
             'anywhere, including inside <npc target="...">. Use a public descriptor such as "old dockhand", '
             '"guard captain", or "hooded figure" as the target until the name is revealed through play. '
+            'If you cannot identify a concrete speaker reference with high confidence, do not invent one and do not '
+            'write quoted NPC dialogue; paraphrase the utterance in narration instead. '
             'Do not use any other angle-bracket tags. Finalize with talk_to_player or stay_silent.'
             + silent_ack
         )
@@ -1719,15 +2023,174 @@ def _pc_control_staging_echo_exception(sentence, latest_player_message, characte
     return bool(re.search(r'\b(?:sidles?|drifts?|approaches?|steps?|moves?|draws?)\b', latest_player_message, flags=re.IGNORECASE))
 
 
+def _pc_control_minor_affect_exception(sentence, character):
+    import re
+
+    sentence = str(sentence or '').strip()
+    name = str((character or {}).get('name') or '').strip()
+    if not sentence:
+        return False
+
+    lowered = sentence.lower()
+    if '"' in sentence or "'" in sentence:
+        return False
+    if re.search(r'\b(?:decides?|chooses?|plans?|intends?|wants?|hopes?|realizes?|knows?|suspects?|remembers?|trusts?)\b', lowered):
+        return False
+
+    affect_words = (
+        'sad', 'sadness', 'saddened', 'sorrow', 'sorrowful', 'grief', 'grieving', 'unease', 'uneasy',
+        'relief', 'relieved', 'angry', 'anger', 'afraid', 'fear', 'dread', 'frustrated',
+        'frustration', 'embarrassed', 'shaken', 'startled', 'wary', 'tense', 'anxious',
+        'nervous', 'guilty', 'ashamed', 'hopeful', 'determined',
+    )
+    subject_patterns = [r'\byou\b']
+    if name:
+        subject_patterns.append(rf'\b{re.escape(name)}\b')
+        subject_patterns.append(rf'\b{re.escape(name.split()[0])}\b')
+    subject_pattern = '(?:' + '|'.join(subject_patterns) + ')'
+    affect_pattern = (
+        rf'{subject_pattern}[^.!?\n]{{0,60}}\b(?:feel|feels|felt|is|are|seems?|seem)\b[^.!?\n]{{0,60}}'
+        rf'\b(?:{"|".join(affect_words)})\b'
+    )
+    if re.search(affect_pattern, sentence, flags=re.IGNORECASE):
+        return True
+    return bool(re.search(rf'\b(?:pang|flash|wave)\s+of\s+(?:{"|".join(affect_words)})\b', sentence, flags=re.IGNORECASE))
+
+
+def _pc_control_minor_flair_exception(sentence):
+    import re
+
+    sentence = str(sentence or '').strip()
+    if not sentence:
+        return False
+    if '"' in sentence or "'" in sentence:
+        return False
+    if re.search(r'\b(?:decides?|chooses?|plans?|intends?|wants?|hopes?|asks?|says?|replies?|responds?)\b', sentence, flags=re.IGNORECASE):
+        return False
+    if re.search(
+        r'\b(?:run|rush|sprint|dash|leave|leaves|slip out|slips out|head|heads|walk|walks|move|moves|step away|steps away|follow|follows|grab|grabs|draw|draws|attack|attacks|cast|casts|open|opens|close|closes)\b',
+        sentence,
+        flags=re.IGNORECASE,
+    ):
+        return False
+    return bool(re.search(
+        r'\b(?:nods?|glances?|looks?|smiles?|frowns?|sighs?|shrugs?|straightens?|adjusts?|steadies?|tightens?|loosens?|grips?|swallows|blinks?|hesitates?)\b',
+        sentence,
+        flags=re.IGNORECASE,
+    ))
+
+
+def _pc_control_declared_followthrough_exception(sentence, latest_player_message, character):
+    import re
+
+    sentence = str(sentence or '').strip()
+    latest_player_message = str(latest_player_message or '').strip()
+    if not sentence or not latest_player_message:
+        return False
+    if _pc_control_staging_echo_exception(sentence, latest_player_message, character):
+        return True
+
+    categories = {
+        'movement': r'\b(?:go|goes|going|head|heads|headed|move|moves|moving|step|steps|walk|walks|run|runs|rush|rushes|sprint|sprints|dash|dashes|slip|slips|leave|leaves|follow|follows|climb|climbs|descend|descends|approach|approaches)\b',
+        'proximity': r'\b(?:draws?\s+closer|steps?\s+closer|moves?\s+closer|sidles?\s+closer|drifts?\s+closer|alongside)\b',
+    }
+    matched_category = None
+    for category, pattern in categories.items():
+        if re.search(pattern, sentence, flags=re.IGNORECASE) and re.search(pattern, latest_player_message, flags=re.IGNORECASE):
+            matched_category = category
+            break
+    if not matched_category:
+        return False
+
+    stopwords = {
+        'the', 'a', 'an', 'and', 'or', 'but', 'to', 'from', 'into', 'toward', 'towards', 'through',
+        'closer', 'alongside', 'with', 'their', 'there', 'here', 'away', 'over', 'under', 'inside',
+        'outside', 'forward', 'back', 'lead', 'watch', 'your', 'you', 'i', 'we',
+    }
+    sentence_tokens = {
+        token for token in re.findall(r"[A-Za-z][A-Za-z'-]{2,}", sentence.lower())
+        if token not in stopwords
+    }
+    latest_tokens = {
+        token for token in re.findall(r"[A-Za-z][A-Za-z'-]{2,}", latest_player_message.lower())
+        if token not in stopwords
+    }
+    if sentence_tokens & latest_tokens:
+        return True
+
+    if matched_category == 'movement' and re.search(r'\b(?:there|here|inside|outside|forward|away|down|up)\b', latest_player_message, flags=re.IGNORECASE):
+        return True
+    return False
+
+
+def _protected_character_for_violation(hot_context, character_name):
+    protected = (hot_context or {}).get('protected_player_characters') or []
+    target = str(character_name or '').strip().lower()
+    if not target:
+        return None
+    for character in protected:
+        name = str(character.get('name') or '').strip()
+        if not name:
+            continue
+        lowered = name.lower()
+        first = lowered.split()[0]
+        if target in {lowered, first}:
+            return character
+    return None
+
+
+def _pc_control_filter_allowed_violations(result, hot_context):
+    if not isinstance(result, dict):
+        return result
+    violations = result.get('violations') or []
+    if not violations:
+        return result
+
+    filtered = []
+    for violation in violations:
+        character = _protected_character_for_violation(hot_context, violation.get('character'))
+        latest_player_message = _latest_player_message_for_character(hot_context, character or {})
+        sentence = str(violation.get('sentence') or '').strip()
+        kind = str(violation.get('kind') or '').strip().lower()
+
+        if character and kind == 'consequential_action':
+            if _pc_control_declared_followthrough_exception(sentence, latest_player_message, character):
+                continue
+            if _pc_control_minor_flair_exception(sentence):
+                continue
+        if character and kind == 'interior_state' and _pc_control_minor_affect_exception(sentence, character):
+            continue
+        if character and kind == 'interior_state' and _pc_control_minor_flair_exception(sentence):
+            continue
+
+        filtered.append(violation)
+
+    if not filtered:
+        return {
+            'safe': True,
+            'violations': [],
+            'confidence': result.get('confidence') or 'medium',
+            'reason': 'Any protected-player references were limited to declared follow-through or minor flavor.',
+        }
+
+    return {
+        **result,
+        'safe': bool(result.get('safe')) and not filtered,
+        'violations': filtered,
+    }
+
+
 def _pc_control_violation(response_text, hot_context):
     import re
 
     visible = _strip_npc_blocks(response_text)
     protected = hot_context.get('protected_player_characters') or []
-    action_verbs = (
-        'nods', 'nod', 'glances', 'glance', 'looks', 'look', 'smiles', 'smile', 'frowns', 'frown', 'laughs', 'laugh', 'sighs',
-        'sigh', 'shrugs', 'shrug',
-        'straightens', 'straighten', 'waits', 'wait',
+    consequential_action_verbs = (
+        'moves', 'move', 'steps', 'step', 'walks', 'walk', 'runs', 'run', 'rushes', 'rush', 'sprints', 'sprint',
+        'dashes', 'dash', 'slips', 'slip', 'leaves', 'leave', 'heads', 'head', 'follows', 'follow',
+        'climbs', 'climb', 'descends', 'descend', 'grabs', 'grab', 'draws', 'draw', 'opens', 'open',
+        'closes', 'close', 'attacks', 'attack', 'casts', 'cast', 'fires', 'fire', 'strikes', 'strike',
+        'falls', 'fall',
     )
     speech_verbs = (
         'says', 'say', 'asks', 'ask', 'replies', 'reply', 'responds', 'respond', 'whispers',
@@ -1757,7 +2220,7 @@ def _pc_control_violation(response_text, hot_context):
             (rf'\*\*{name_pattern}\b[^*]*:\*\*', speech_reason),
             (rf'<npc\s+target=["\']{escaped}["\']', speech_reason),
             (rf'\b{name_pattern}\b[^.!?\n]{{0,80}}\b(?:{"|".join(speech_verbs)})\b', speech_reason),
-            (rf'\b{name_pattern}(?:[’\']s)?\b[^.!?\n]{{0,80}}\b(?:{"|".join(action_verbs)})\b', action_reason),
+            (rf'\b{name_pattern}(?:[’\']s)?\b[^.!?\n]{{0,80}}\b(?:{"|".join(consequential_action_verbs)})\b', action_reason),
             (rf'\b{name_pattern}\b[^.!?\n]{{0,80}}\b(?:{"|".join(choice_verbs)})\b', choice_reason),
             (rf'\b{name_pattern}[’\']s\s+(?:eyes|expression|face|voice|smirk|smile|shoulders|hands)\b', interior_reason),
         ]
@@ -1766,7 +2229,13 @@ def _pc_control_violation(response_text, hot_context):
             if match:
                 matched_text = match.group(0).strip()
                 sentence = _sentence_containing_span(visible_for_character, match.start(), match.end())
-                if reason == action_reason and _pc_control_staging_echo_exception(sentence, latest_player_message, character):
+                if reason == action_reason and _pc_control_declared_followthrough_exception(sentence, latest_player_message, character):
+                    continue
+                if reason == action_reason and _pc_control_minor_flair_exception(sentence):
+                    continue
+                if reason == interior_reason and _pc_control_minor_affect_exception(sentence, character):
+                    continue
+                if reason == interior_reason and _pc_control_minor_flair_exception(sentence):
                     continue
                 return {
                     'character': character,
@@ -2259,13 +2728,6 @@ def build_session_npc_tag_check_messages(response_text, signal=None):
 
 def build_session_pc_control_check_messages(response_text, hot_context):
     protected = hot_context.get('protected_player_characters') or []
-    latest_player_messages = []
-    for character in protected:
-        latest_player_messages.append({
-            'character_name': str(character.get('name') or '').strip(),
-            'user_id': character.get('user_id'),
-            'latest_player_message': _latest_player_message_for_character(hot_context, character),
-        })
 
     return [
         {'role': 'system', 'content': SESSION_PC_CONTROL_CHECK_SYSTEM_PROMPT},
@@ -2275,7 +2737,7 @@ def build_session_pc_control_check_messages(response_text, hot_context):
                 'candidate_visible_dm_reply': response_text,
                 'current_player_character': hot_context.get('current_player_character') or {},
                 'protected_player_characters': protected,
-                'latest_player_messages_by_character': latest_player_messages,
+                'latest_player_messages_by_character': _latest_player_messages_by_character(hot_context),
                 'return_shape': {
                     'safe': 'boolean',
                     'violations': [{
@@ -2327,6 +2789,75 @@ def _child_audit_context(base_audit, operation, actor, trace_label):
         'parent_trace_id': parent_trace_id,
         'trace_label': trace_label,
     }
+
+
+def _session_dm_content_format_violation(content, audit_context=None):
+    format_violation = _session_dm_format_violation(content)
+    missing_npc_signal = (
+        _possible_missing_npc_tag_signal(content)
+        if str(content or '').strip() and not format_violation
+        else None
+    )
+    npc_tag_check = (
+        check_session_missing_npc_tags_with_llm(
+            content,
+            audit_context,
+            missing_npc_signal,
+        )
+        if str(content or '').strip()
+        and not format_violation
+        and _should_run_npc_tag_check(content, missing_npc_signal)
+        else {'requires_npc_tag': False, 'speaker': '', 'evidence': [], 'reason': ''}
+    )
+    if not format_violation and npc_tag_check.get('requires_npc_tag'):
+        speaker = str(npc_tag_check.get('speaker') or (missing_npc_signal or {}).get('speaker') or '').strip() or 'the speaker'
+        evidence = npc_tag_check.get('evidence') or []
+        snippet = str(evidence[0] if evidence else (missing_npc_signal or {}).get('quote') or '').strip()
+        reason = str(npc_tag_check.get('reason') or '').strip()
+        detail = f'Quoted dialogue attributed to {speaker} should be wrapped in <npc target="{speaker}">...</npc>.'
+        if reason:
+            detail = f'{detail} Checker reason: {reason}'
+        format_violation = {
+            'errors': [{
+                'kind': 'missing_npc_tag',
+                'snippet': snippet[:160],
+                'detail': detail,
+            }],
+        }
+    return format_violation
+
+
+def _repair_session_dm_visible_reply(content, guard_name, details, hot_context, audit_context=None):
+    if not str(content or '').strip():
+        return ''
+
+    guard_operation = f'session_dm_{guard_name}_repair'
+    repair_audit = _child_audit_context(
+        audit_context or {},
+        guard_operation,
+        guard_operation,
+        f'{guard_operation}: visible reply repair',
+    )
+    data = _post_chat_response(
+        _build_session_guard_repair_messages(content, guard_name, details, hot_context),
+        json_mode=False,
+        audit_context=repair_audit,
+        tools=None,
+        allow_thinking=False,
+        max_tokens=max(128, min(2048, _estimate_tokens(content) * 2)),
+    )
+    message, finish_reason = _choice_message(data)
+    repaired_content = str(message.get('content') or '').strip()
+    if repaired_content:
+        return repaired_content
+    finalizer_decision, _violation = _session_dm_finalizer_decision_from_tool_calls(message.get('tool_calls') or [])
+    if isinstance(finalizer_decision, dict) and finalizer_decision.get('mode') == 'speak':
+        return str(finalizer_decision.get('content') or '').strip()
+    if guard_name == 'format' and str(finish_reason or '').strip().lower() == 'length':
+        local_repair = _local_missing_npc_tag_repair(content, details, hot_context)
+        if local_repair:
+            return local_repair
+    return ''
 
 
 def check_session_mechanics_with_llm(response_text, preflight_decision, hot_context, audit_context=None):
@@ -2443,7 +2974,10 @@ def check_session_pc_control_with_llm(response_text, hot_context, audit_context=
             audit_context=checker_audit,
             allow_thinking=False,
         )
-        return normalize_session_pc_control_check(raw_check)
+        return _pc_control_filter_allowed_violations(
+            normalize_session_pc_control_check(raw_check),
+            hot_context,
+        )
     except Exception as err:
         campaign_id = base_audit.get('campaign_id')
         if campaign_id:
@@ -2998,6 +3532,83 @@ def build_session_memory_messages(memory_context):
     ]
 
 
+def build_session_memory_summary_scene_messages(memory_context):
+    compact = _session_memory_compact_context(memory_context)
+    return [
+        {'role': 'system', 'content': SESSION_MEMORY_SUMMARY_SCENE_SYSTEM_PROMPT},
+        {
+            'role': 'user',
+            'content': json.dumps({
+                'current_scene': compact.get('current_scene'),
+                'latest_player_message': compact.get('latest_player_message'),
+                'latest_dm_message': compact.get('latest_dm_message'),
+            }, ensure_ascii=False),
+        },
+    ]
+
+
+def build_session_memory_facts_messages(memory_context):
+    compact = _session_memory_compact_context(memory_context)
+    return [
+        {'role': 'system', 'content': SESSION_MEMORY_FACTS_SYSTEM_PROMPT},
+        {
+            'role': 'user',
+            'content': json.dumps({
+                'current_scene': compact.get('current_scene'),
+                'latest_player_message': compact.get('latest_player_message'),
+                'latest_dm_message': compact.get('latest_dm_message'),
+            }, ensure_ascii=False),
+        },
+    ]
+
+
+def build_session_memory_clocks_messages(memory_context):
+    compact = _session_memory_compact_context(memory_context)
+    return [
+        {'role': 'system', 'content': SESSION_MEMORY_CLOCKS_SYSTEM_PROMPT},
+        {
+            'role': 'user',
+            'content': json.dumps({
+                'current_scene': compact.get('current_scene'),
+                'active_clocks': compact.get('active_clocks'),
+                'latest_player_message': compact.get('latest_player_message'),
+                'latest_dm_message': compact.get('latest_dm_message'),
+            }, ensure_ascii=False),
+        },
+    ]
+
+
+def build_session_clock_adjudication_messages(clock_context):
+    return [
+        {'role': 'system', 'content': SESSION_CLOCK_ADJUDICATOR_SYSTEM_PROMPT},
+        {
+            'role': 'user',
+            'content': json.dumps({
+                'current_scene_before': clock_context.get('current_scene_before') or {},
+                'current_scene_after': clock_context.get('current_scene_after') or {},
+                'active_clocks': clock_context.get('active_clocks') or [],
+                'latest_player_message': clock_context.get('latest_player_message'),
+                'latest_dm_message': clock_context.get('latest_dm_message'),
+                'recent_events': clock_context.get('recent_events') or [],
+            }, ensure_ascii=False),
+        },
+    ]
+
+
+def _session_memory_summary_scene_retry_messages(messages):
+    return [
+        *messages,
+        {
+            'role': 'user',
+            'content': (
+                'Your previous response was blank or invalid. Return exactly one valid JSON object now with a '
+                'non-empty turn_summary string and a scene_patch object. Do not return whitespace, null, an '
+                'empty object, markdown fences, or commentary outside the JSON object.'
+            ),
+        },
+    ]
+
+
 def build_character_sheet_agent_messages(question, scope, character_sheets):
     return [
         {'role': 'system', 'content': CHARACTER_SHEET_SYSTEM_PROMPT},
@@ -3119,8 +3730,10 @@ def get_session_dm_response_with_tools(
     format_retry_count = 0
     mechanical_retried = False
     pc_control_retried = False
+    pc_control_repair_attempted = False
     private_output_retry_count = 0
     spoiler_checker_retry_count = 0
+    spoiler_checker_repair_attempted = False
     combat_handoff_retried = False
     guard_audits = {}
     combat_tracker = _session_dm_combat_tracker(hot_context)
@@ -3322,136 +3935,198 @@ def get_session_dm_response_with_tools(
                 combat_batch_retry_count += 1
                 continue
             content = decision.get('content') or ''
-            format_violation = (
-                _session_dm_format_violation(content)
-                if decision.get('mode') == 'speak'
-                else None
-            )
-            missing_npc_signal = (
-                _possible_missing_npc_tag_signal(content)
-                if decision.get('mode') == 'speak' and not format_violation
-                else None
-            )
-            npc_tag_check = (
-                check_session_missing_npc_tags_with_llm(
-                    content,
-                    loop_audit,
-                    missing_npc_signal,
+            format_violation = None
+            mechanical_violation = None
+            violation = None
+            private_violation = None
+            spoiler_check = {'safe': True, 'leaked_item_ids': [], 'evidence': [], 'reason': ''}
+            combat_handoff_violation = None
+            while True:
+                format_violation = (
+                    _session_dm_content_format_violation(content, loop_audit)
+                    if decision.get('mode') == 'speak'
+                    else None
                 )
-                if (
-                    decision.get('mode') == 'speak'
-                    and not format_violation
-                    and _should_run_npc_tag_check(content, missing_npc_signal)
-                )
-                else {'requires_npc_tag': False, 'speaker': '', 'evidence': [], 'reason': ''}
-            )
-            if not format_violation and npc_tag_check.get('requires_npc_tag'):
-                speaker = str(npc_tag_check.get('speaker') or (missing_npc_signal or {}).get('speaker') or '').strip() or 'the speaker'
-                evidence = npc_tag_check.get('evidence') or []
-                snippet = str(evidence[0] if evidence else (missing_npc_signal or {}).get('quote') or '').strip()
-                reason = str(npc_tag_check.get('reason') or '').strip()
-                detail = f'Quoted dialogue attributed to {speaker} should be wrapped in <npc target="{speaker}">...</npc>.'
-                if reason:
-                    detail = f'{detail} Checker reason: {reason}'
-                format_violation = {
-                    'errors': [{
-                        'kind': 'missing_npc_tag',
-                        'snippet': snippet[:160],
-                        'detail': detail,
-                    }],
-                }
-            mechanics_check = (
-                check_session_mechanics_with_llm(content, preflight_decision, hot_context, loop_audit)
-                if decision.get('mode') == 'speak' and not format_violation
-                else {'safe': True, 'violations': [], 'required_mechanic': '', 'reason': ''}
-            )
-            mechanical_violation = (
-                {
-                    'kind': 'mechanics_resolved_without_required_step',
-                    **mechanics_check,
-                }
-                if not mechanics_check.get('safe', True)
-                else None
-            )
-            pc_control_hard_violation = (
-                _pc_control_violation(content, hot_context)
-                if decision.get('mode') == 'speak' and not format_violation
-                else None
-            )
-            pc_control_check = (
-                check_session_pc_control_with_llm(content, hot_context, loop_audit)
-                if decision.get('mode') == 'speak' and not format_violation and not pc_control_hard_violation
-                else {'safe': True, 'violations': [], 'confidence': 'high', 'reason': ''}
-            )
-            violation = (
-                pc_control_hard_violation
-                or ({
-                    'kind': 'pc_control_classifier',
-                    **pc_control_check,
-                } if not pc_control_check.get('safe', True) else None)
-            )
-            private_violation = (
-                _private_output_violation(content, hot_context)
-                if decision.get('mode') == 'speak' and not format_violation
-                else None
-            )
-            deterministic_spoiler_violation = (
-                _witness_private_leverage_spoiler_violation(content, hot_context)
-                if decision.get('mode') == 'speak' and not format_violation and not private_violation
-                and not mechanical_violation
-                else None
-            )
-            spoiler_check = (
-                deterministic_spoiler_violation
-                or check_session_spoilers_with_llm(
-                    content,
-                    hot_context,
-                    loop_audit,
-                    skip_spoiler_check=preflight_decision.get('skip_spoiler_check') is True,
-                )
-                if decision.get('mode') == 'speak' and not format_violation and not private_violation
-                and not mechanical_violation
-                else {'safe': True, 'leaked_item_ids': [], 'evidence': [], 'reason': ''}
-            )
-            combat_handoff_violation = (
-                _session_dm_combat_handoff_violation(content, combat_tracker)
-                if decision.get('mode') == 'speak' and not format_violation and not private_violation
-                and not mechanical_violation
-                else None
-            )
-            if format_violation and format_retry_count < 2:
-                if on_status_change:
-                    on_status_change({"step": "revising", "violations": {"type": "format", "details": format_violation}})
-                if base_audit.get('campaign_id'):
-                    audit = guard_audit('format_guard')
-                    log_audit_event(
-                        base_audit.get('campaign_id'),
-                        'format_guard_retry',
-                        'Session DM response used malformed visible-message syntax; discarded candidate and reran with guard reminder.',
-                        {
-                            'operation': 'format_guard',
-                            'violation': format_violation,
-                            'draft_response': raw_content,
-                        },
-                        source='session_dm.guard',
-                        actor=audit.get('actor'),
-                        trace_id=audit.get('trace_id'),
-                        parent_trace_id=audit.get('parent_trace_id'),
-                        trace_label=audit.get('trace_label'),
-                        audit_role='guard',
-                        commit=True,
-                    )
-                messages.append({
-                    'role': 'system',
-                    'content': _session_dm_guard_retry_system_prompt(
-                        'missing_npc_tag'
-                        if any(err.get('kind') == 'missing_npc_tag' for err in (format_violation.get('errors') or []))
-                        else 'format',
+                repaired_from_format_guard = False
+                while format_violation and format_retry_count < 2:
+                    if on_status_change:
+                        on_status_change({"step": "revising", "violations": {"type": "format", "details": format_violation}})
+                    if base_audit.get('campaign_id'):
+                        audit = guard_audit('format_guard')
+                        log_audit_event(
+                            base_audit.get('campaign_id'),
+                            'format_guard_retry',
+                            'Session DM response used malformed visible-message syntax; sent candidate to the format repair pass.',
+                            {
+                                'operation': 'format_guard',
+                                'violation': format_violation,
+                                'draft_response': content,
+                                'repair_strategy': 'separate_repair_pass',
+                            },
+                            source='session_dm.guard',
+                            actor=audit.get('actor'),
+                            trace_id=audit.get('trace_id'),
+                            parent_trace_id=audit.get('parent_trace_id'),
+                            trace_label=audit.get('trace_label'),
+                            audit_role='guard',
+                            commit=True,
+                        )
+                    repaired_content = _repair_session_dm_visible_reply(
+                        content,
+                        'format',
                         format_violation,
-                    ),
-                })
-                format_retry_count += 1
-                continue
+                        hot_context,
+                        audit_context=loop_audit,
+                    )
+                    format_retry_count += 1
+                    if not repaired_content:
+                        break
+                    repaired_from_format_guard = True
+                    content = repaired_content
+                    raw_content = repaired_content
+                    decision = {
+                        **decision,
+                        'content': repaired_content,
+                    }
+                    format_violation = _session_dm_content_format_violation(content, loop_audit)
+                mechanics_check = (
+                    check_session_mechanics_with_llm(content, preflight_decision, hot_context, loop_audit)
+                    if decision.get('mode') == 'speak' and not format_violation
+                    else {'safe': True, 'violations': [], 'required_mechanic': '', 'reason': ''}
+                )
+                mechanical_violation = (
+                    {
+                        'kind': 'mechanics_resolved_without_required_step',
+                        **mechanics_check,
+                    }
+                    if not mechanics_check.get('safe', True)
+                    else None
+                )
+                pc_control_check = (
+                    check_session_pc_control_with_llm(content, hot_context, loop_audit)
+                    if decision.get('mode') == 'speak' and not format_violation
+                    else {'safe': True, 'violations': [], 'confidence': 'high', 'reason': ''}
+                )
+                violation = (
+                    {
+                        'kind': 'pc_control_classifier',
+                        **pc_control_check,
+                    } if not pc_control_check.get('safe', True) else None
+                )
+                private_violation = (
+                    _private_output_violation(content, hot_context)
+                    if decision.get('mode') == 'speak' and not format_violation
+                    else None
+                )
+                deterministic_spoiler_violation = (
+                    _witness_private_leverage_spoiler_violation(content, hot_context)
+                    if decision.get('mode') == 'speak' and not format_violation and not private_violation
+                    and not mechanical_violation
+                    else None
+                )
+                spoiler_check = (
+                    deterministic_spoiler_violation
+                    or check_session_spoilers_with_llm(
+                        content,
+                        hot_context,
+                        loop_audit,
+                        skip_spoiler_check=preflight_decision.get('skip_spoiler_check') is True,
+                    )
+                    if decision.get('mode') == 'speak' and not format_violation and not private_violation
+                    and not mechanical_violation
+                    else {'safe': True, 'leaked_item_ids': [], 'evidence': [], 'reason': ''}
+                )
+                combat_handoff_violation = (
+                    _session_dm_combat_handoff_violation(content, combat_tracker)
+                    if decision.get('mode') == 'speak' and not format_violation and not private_violation
+                    and not mechanical_violation
+                    else None
+                )
+                if format_violation and repaired_from_format_guard and format_retry_count < 2:
+                    continue
+                if violation and not pc_control_repair_attempted and not pc_control_retried:
+                    if on_status_change:
+                        on_status_change({"step": "revising", "violations": {"type": "pc_control", "details": violation}})
+                    if base_audit.get('campaign_id'):
+                        audit = guard_audit('pc_control_guard')
+                        log_audit_event(
+                            base_audit.get('campaign_id'),
+                            'pc_control_guard_retry',
+                            'Session DM response controlled a protected player character; sent candidate to a repair pass and will rerun with a guard reminder if needed.',
+                            {
+                                'operation': 'pc_control_guard',
+                                'violation': violation,
+                                'draft_response': raw_content,
+                                'repair_strategy': 'repair_pass_then_rerun',
+                            },
+                            source='session_dm.guard',
+                            actor=audit.get('actor'),
+                            trace_id=audit.get('trace_id'),
+                            parent_trace_id=audit.get('parent_trace_id'),
+                            trace_label=audit.get('trace_label'),
+                            audit_role='guard',
+                            commit=True,
+                        )
+                    pc_control_repair_attempted = True
+                    repaired_content = _repair_session_dm_visible_reply(
+                        content,
+                        'pc_control',
+                        violation,
+                        hot_context,
+                        audit_context=loop_audit,
+                    )
+                    if repaired_content and repaired_content != content:
+                        content = repaired_content
+                        raw_content = repaired_content
+                        decision = {
+                            **decision,
+                            'content': repaired_content,
+                        }
+                        continue
+                if (
+                    not spoiler_check.get('safe', True)
+                    and spoiler_checker_retry_count < 3
+                    and not spoiler_checker_repair_attempted
+                ):
+                    if on_status_change:
+                        on_status_change({"step": "revising", "violations": {"type": "spoiler", "details": spoiler_check}})
+                    if base_audit.get('campaign_id'):
+                        audit = guard_audit('spoiler_checker_guard')
+                        log_audit_event(
+                            base_audit.get('campaign_id'),
+                            'spoiler_checker_guard_retry',
+                            'Session spoiler checker flagged a semantic leak; sent candidate to a repair pass and will rerun with a guard reminder if needed.',
+                            {
+                                'operation': 'spoiler_checker_guard',
+                                'checker_result': spoiler_check,
+                                'draft_response': raw_content,
+                                'repair_strategy': 'repair_pass_then_rerun',
+                            },
+                            source='session_dm.guard',
+                            actor=audit.get('actor'),
+                            trace_id=audit.get('trace_id'),
+                            parent_trace_id=audit.get('parent_trace_id'),
+                            trace_label=audit.get('trace_label'),
+                            audit_role='guard',
+                            commit=True,
+                        )
+                    spoiler_checker_repair_attempted = True
+                    repaired_content = _repair_session_dm_visible_reply(
+                        content,
+                        'spoiler_checker',
+                        spoiler_check,
+                        hot_context,
+                        audit_context=loop_audit,
+                    )
+                    if repaired_content and repaired_content != content:
+                        content = repaired_content
+                        raw_content = repaired_content
+                        decision = {
+                            **decision,
+                            'content': repaired_content,
+                        }
+                        continue
+                break
             if mechanical_violation and not mechanical_retried:
                 if on_status_change:
                     on_status_change({"step": "revising", "violations": {"type": "mechanical_resolution", "details": mechanical_violation}})
@@ -3481,9 +4156,9 @@ def get_session_dm_response_with_tools(
                 mechanical_retried = True
                 continue
             if violation and not pc_control_retried:
-                if on_status_change:
+                if on_status_change and not pc_control_repair_attempted:
                     on_status_change({"step": "revising", "violations": {"type": "pc_control", "details": violation}})
-                if base_audit.get('campaign_id'):
+                if base_audit.get('campaign_id') and not pc_control_repair_attempted:
                     audit = guard_audit('pc_control_guard')
                     log_audit_event(
                         base_audit.get('campaign_id'),
@@ -3493,6 +4168,7 @@ def get_session_dm_response_with_tools(
                             'operation': 'pc_control_guard',
                             'violation': violation,
                             'draft_response': raw_content,
+                            'repair_strategy': 'guard_reminder_rerun',
                         },
                         source='session_dm.guard',
                         actor=audit.get('actor'),
@@ -3537,9 +4213,9 @@ def get_session_dm_response_with_tools(
                 private_output_retry_count += 1
                 continue
             if not spoiler_check.get('safe', True) and spoiler_checker_retry_count < 3:
-                if on_status_change:
+                if on_status_change and (spoiler_checker_retry_count > 0 or not spoiler_checker_repair_attempted):
                     on_status_change({"step": "revising", "violations": {"type": "spoiler", "details": spoiler_check}})
-                if base_audit.get('campaign_id'):
+                if base_audit.get('campaign_id') and (spoiler_checker_retry_count > 0 or not spoiler_checker_repair_attempted):
                     audit = guard_audit('spoiler_checker_guard')
                     log_audit_event(
                         base_audit.get('campaign_id'),
@@ -3549,6 +4225,7 @@ def get_session_dm_response_with_tools(
                             'operation': 'spoiler_checker_guard',
                             'checker_result': spoiler_check,
                             'draft_response': raw_content,
+                            'repair_strategy': 'guard_reminder_rerun',
                         },
                         source='session_dm.guard',
                         actor=audit.get('actor'),
@@ -3862,11 +4539,229 @@ def _memory_fallback_text(value, limit=900):
     return text[:limit].rstrip() + '...'
 
 
+def _memory_context_lookup(memory_context, *keys):
+    if not isinstance(memory_context, dict):
+        return None
+    for key in keys:
+        value = memory_context.get(key)
+        if value:
+            return value
+    return None
+
+
+def _fallback_scene_npc_ids(latest_dm_message):
+    if not latest_dm_message:
+        return []
+    seen = set()
+    npc_ids = []
+    for raw_target in re.findall(r'<npc\b[^>]*\btarget="([^"]+)"', str(latest_dm_message), flags=re.IGNORECASE):
+        normalized = re.sub(r'[^a-z0-9]+', '_', raw_target.strip().lower()).strip('_')
+        if not normalized or normalized in seen:
+            continue
+        seen.add(normalized)
+        npc_ids.append(normalized)
+    return npc_ids
+
+
+def _fallback_scene_time_of_day(latest_dm_text, current_scene):
+    text = str(latest_dm_text or '').lower()
+    for label in ('dawn', 'morning', 'noon', 'afternoon', 'dusk', 'evening', 'night', 'midnight'):
+        if re.search(rf'\b{re.escape(label)}\b', text):
+            return label
+    if isinstance(current_scene, dict):
+        return current_scene.get('time_of_day')
+    return None
+
+
+def _normalize_fallback_location_name(raw_value):
+    text = str(raw_value or '').strip()
+    if not text:
+        return None
+    text = re.sub(r'\bby\s+(?:dawn|morning|noon|afternoon|dusk|evening|night|midnight)\b.*$', '', text, flags=re.IGNORECASE)
+    text = text.strip(" .,:;!-")
+    of_match = re.search(r'\bof\s+(?:the\s+)?([A-Za-z][A-Za-z0-9\' -]{1,80})$', text, flags=re.IGNORECASE)
+    if of_match:
+        text = of_match.group(1).strip()
+    text = re.sub(r'^(?:the|a|an)\s+', '', text, flags=re.IGNORECASE)
+    text = text.strip(" .,:;!-")
+    if not text:
+        return None
+    if len(text) <= 3:
+        return None
+    words = text.split()
+    if len(words) > 6:
+        return None
+    return ' '.join(word.capitalize() if word.islower() else word for word in words)
+
+
+def _fallback_scene_location(latest_dm_text, current_scene):
+    text = str(latest_dm_text or '')
+    patterns = [
+        r'\b(?:step|walk|move|head|slip|follow)\s+(?:inside|into|through)\s+([^.;\n]+)',
+        r'\b(?:reach|arrive(?:s|d)?(?: at| in)?|enter(?:s|ed)?)\s+([^.;\n]+)',
+        r'\b(?:inside|within)\s+([^.;\n]+)',
+    ]
+    for pattern in patterns:
+        match = re.search(pattern, text, flags=re.IGNORECASE)
+        if not match:
+            continue
+        location_name = _normalize_fallback_location_name(match.group(1))
+        if not location_name:
+            continue
+        location_id = re.sub(r'[^a-z0-9]+', '_', location_name.strip().lower()).strip('_') or None
+        return location_id, location_name
+    if isinstance(current_scene, dict):
+        return current_scene.get('location_id'), current_scene.get('location_name')
+    return None, None
+
+
+def _fallback_scene_immediate_tension(latest_dm_message, current_scene):
+    cleaned = _memory_fallback_text(latest_dm_message, 600)
+    paragraphs = [
+        ' '.join(chunk.split())
+        for chunk in re.split(r'\n\s*\n', str(cleaned or ''))
+        if chunk and chunk.strip()
+    ]
+    for paragraph in reversed(paragraphs):
+        plain = paragraph.strip()
+        if not plain:
+            continue
+        if plain.lower().startswith('what do you do'):
+            continue
+        if plain.lower().startswith('make a '):
+            continue
+        return _memory_fallback_text(plain, 260)
+    if isinstance(current_scene, dict):
+        return current_scene.get('immediate_tension')
+    return None
+
+
+def _fallback_scene_patch(memory_context):
+    hot_context = memory_context.get('hot_context') if isinstance(memory_context.get('hot_context'), dict) else {}
+    current_scene = hot_context.get('current_scene') if isinstance(hot_context.get('current_scene'), dict) else {}
+    latest_dm_message = _memory_context_lookup(memory_context, 'latest_dm_message', 'latest_dm_response') or ''
+    latest_dm_text = _memory_fallback_text(latest_dm_message, 1200)
+
+    scene_patch = dict(current_scene) if isinstance(current_scene, dict) else {}
+    location_id, location_name = _fallback_scene_location(latest_dm_text, current_scene)
+    if location_id:
+        scene_patch['location_id'] = location_id
+    if location_name:
+        scene_patch['location_name'] = location_name
+
+    time_of_day = _fallback_scene_time_of_day(latest_dm_text, current_scene)
+    if time_of_day:
+        scene_patch['time_of_day'] = time_of_day
+
+    npc_ids = _fallback_scene_npc_ids(latest_dm_message)
+    if npc_ids:
+        scene_patch['active_npc_ids'] = npc_ids
+
+    immediate_tension = _fallback_scene_immediate_tension(latest_dm_message, current_scene)
+    if immediate_tension:
+        scene_patch['immediate_tension'] = immediate_tension
+
+    return scene_patch
+
+
+def _protected_pc_scene_tokens(memory_context):
+    hot_context = memory_context.get('hot_context') if isinstance(memory_context.get('hot_context'), dict) else {}
+    protected = hot_context.get('protected_player_characters') if isinstance(hot_context.get('protected_player_characters'), list) else []
+    blocked = set()
+    for character in protected:
+        if not isinstance(character, dict):
+            continue
+        value = str(character.get('name') or '').strip().lower()
+        if not value:
+            continue
+        token = re.sub(r'[^a-z0-9]+', '_', value).strip('_')
+        if token:
+            blocked.add(token)
+    return blocked
+
+
+def _sanitize_scene_patch(scene_patch, memory_context):
+    if not isinstance(scene_patch, dict):
+        return {}
+    sanitized = dict(scene_patch)
+    blocked_tokens = _protected_pc_scene_tokens(memory_context)
+    active_npc_ids = sanitized.get('active_npc_ids')
+    if isinstance(active_npc_ids, list) and blocked_tokens:
+        filtered_ids = []
+        seen = set()
+        for raw_value in active_npc_ids:
+            normalized = re.sub(r'[^a-z0-9]+', '_', str(raw_value or '').strip().lower()).strip('_')
+            if not normalized or normalized in blocked_tokens or normalized in seen:
+                continue
+            seen.add(normalized)
+            filtered_ids.append(normalized)
+        sanitized['active_npc_ids'] = filtered_ids
+    return sanitized
+
+
+def _session_memory_compact_context(memory_context):
+    memory_context = memory_context if isinstance(memory_context, dict) else {}
+    hot_context = memory_context.get('hot_context') if isinstance(memory_context.get('hot_context'), dict) else {}
+    current_scene = hot_context.get('current_scene') if isinstance(hot_context.get('current_scene'), dict) else {}
+    active_clocks = hot_context.get('active_clocks') if isinstance(hot_context.get('active_clocks'), list) else []
+    scene_hint = _fallback_scene_patch(memory_context)
+    active_npc_ids = (
+        _sanitize_scene_patch({'active_npc_ids': scene_hint.get('active_npc_ids')}, memory_context).get('active_npc_ids')
+        or _sanitize_scene_patch({'active_npc_ids': current_scene.get('active_npc_ids')}, memory_context).get('active_npc_ids')
+        or []
+    )
+    compact_scene = {
+        'location_id': scene_hint.get('location_id') or current_scene.get('location_id'),
+        'location_name': scene_hint.get('location_name') or current_scene.get('location_name'),
+        'time_of_day': scene_hint.get('time_of_day') or current_scene.get('time_of_day'),
+        'active_npc_ids': active_npc_ids[:6] if isinstance(active_npc_ids, list) else [],
+        'immediate_tension': _memory_fallback_text(
+            scene_hint.get('immediate_tension') or current_scene.get('immediate_tension'),
+            220,
+        ) or None,
+    }
+    compact_clocks = []
+    for clock in active_clocks[:6]:
+        if not isinstance(clock, dict):
+            continue
+        compact_clocks.append({
+            'clock_id': clock.get('clock_id') or clock.get('id'),
+            'name': clock.get('name'),
+            'filled': clock.get('filled'),
+            'segments': clock.get('segments'),
+            'status': clock.get('status'),
+            'summary': _memory_fallback_text(clock.get('summary'), 160),
+        })
+    return {
+        'current_scene': compact_scene,
+        'active_clocks': compact_clocks,
+        'active_clock_count': memory_context.get('active_clock_count'),
+        'all_active_clocks_completed': bool(memory_context.get('all_active_clocks_completed')),
+        'latest_player_message': memory_context.get('latest_player_message'),
+        'latest_dm_message': _memory_context_lookup(memory_context, 'latest_dm_message', 'latest_dm_response'),
+    }
+
+
+def _merge_session_running_summary(prior_summary, turn_summary, limit=1800):
+    prior_text = _memory_fallback_text(prior_summary, 1000)
+    turn_text = _memory_fallback_text(turn_summary, 900)
+    running_summary = ' '.join(part for part in [prior_text, turn_text] if part).strip()
+    if len(running_summary) > limit:
+        running_summary = running_summary[-limit:].lstrip()
+    return running_summary
+
+
 def _fallback_session_memory_patch(memory_context, telemetry):
     memory_context = memory_context or {}
     prior_summary = _memory_fallback_text(memory_context.get('prior_running_summary'), 1000)
-    latest_player = _memory_fallback_text(memory_context.get('latest_player_message'), 350)
-    latest_dm = _memory_fallback_text(memory_context.get('latest_dm_message'), 900)
+    latest_player = _memory_fallback_text(
+        _memory_context_lookup(memory_context, 'latest_player_message'),
+        350,
+    )
+    latest_dm = _memory_fallback_text(
+        _memory_context_lookup(memory_context, 'latest_dm_message', 'latest_dm_response'),
+        900,
+    )
     latest_parts = []
     if latest_player:
         latest_parts.append(f'Player: {latest_player}')
@@ -3877,11 +4772,9 @@ def _fallback_session_memory_patch(memory_context, telemetry):
     if len(running_summary) > 1800:
         running_summary = running_summary[-1800:].lstrip()
 
-    hot_context = memory_context.get('hot_context') if isinstance(memory_context.get('hot_context'), dict) else {}
-    current_scene = hot_context.get('current_scene') if isinstance(hot_context.get('current_scene'), dict) else {}
     return {
         'running_summary': running_summary,
-        'scene_patch': current_scene,
+        'scene_patch': _fallback_scene_patch(memory_context),
         'scene_reason': 'Fallback summary applied because the memory writer returned no visible JSON.',
         'upsert_graph_entities': [],
         'upsert_graph_relations': [],
@@ -3898,12 +4791,146 @@ def _fallback_session_memory_patch(memory_context, telemetry):
     }
 
 
-def _should_skip_session_memory_llm(provider, model, prompt_tokens_estimate):
-    return (
-        provider == 'opencode_go'
-        and str(model or '').strip().lower().startswith('deepseek-v4-')
-        and int(prompt_tokens_estimate or 0) > SESSION_MEMORY_LLM_MAX_PROMPT_TOKENS
+def _session_memory_patch_has_substance(data):
+    if not isinstance(data, dict):
+        return False
+    if str(data.get('running_summary') or '').strip():
+        return True
+    scene_patch = data.get('scene_patch')
+    if isinstance(scene_patch, dict) and any(value not in (None, '', [], {}) for value in scene_patch.values()):
+        return True
+    for key in (
+        'upsert_graph_entities',
+        'upsert_graph_relations',
+        'upsert_graph_facts',
+        'create_clocks',
+        'retire_clocks',
+        'update_npc_actors',
+        'record_events',
+    ):
+        value = data.get(key)
+        if isinstance(value, list) and value:
+            return True
+    return False
+
+
+def _request_session_memory_json(messages, audit_context, operation, max_tokens, timeout_seconds):
+    text = _post_chat(
+        messages,
+        json_mode=True,
+        audit_context={
+            **(audit_context or {}),
+            'operation': operation,
+        },
+        allow_thinking=False,
+        timeout_seconds=timeout_seconds,
+        max_attempts=1,
+        max_tokens=max_tokens,
     )
+    if not isinstance(text, str) or not text.strip():
+        return None, 0
+    data = _json_loads_with_repair(
+        text,
+        audit_context={
+            **(audit_context or {}),
+            'operation': operation,
+        },
+    )
+    if not isinstance(data, dict):
+        return None, len(text)
+    return data, len(text)
+
+
+def _get_session_memory_patch_opencode_go(memory_context, audit_context, telemetry):
+    timeout_seconds = SESSION_MEMORY_TIMEOUT_SECONDS
+    max_tokens = SESSION_MEMORY_MAX_TOKENS
+    summary_messages = build_session_memory_summary_scene_messages(memory_context)
+
+    try:
+        summary_data, summary_chars = _request_session_memory_json(
+            summary_messages,
+            audit_context,
+            'session_memory_update_summary_scene',
+            max_tokens=max_tokens,
+            timeout_seconds=timeout_seconds,
+        )
+    except Exception as err:
+        telemetry['summary_scene_error'] = repr(err)
+        return _fallback_session_memory_patch(memory_context, telemetry)
+
+    if not isinstance(summary_data, dict) or not str(summary_data.get('turn_summary') or '').strip():
+        try:
+            summary_data, summary_chars = _request_session_memory_json(
+                _session_memory_summary_scene_retry_messages(summary_messages),
+                audit_context,
+                'session_memory_update_summary_scene_retry',
+                max_tokens=max_tokens,
+                timeout_seconds=timeout_seconds,
+            )
+            telemetry['summary_scene_retry'] = True
+        except Exception as err:
+            telemetry['summary_scene_retry_error'] = repr(err)
+
+    if not isinstance(summary_data, dict) or not str(summary_data.get('turn_summary') or '').strip():
+        telemetry['summary_scene_error'] = 'blank_or_invalid_summary_scene'
+        telemetry['summary_scene_response_chars'] = summary_chars
+        return _fallback_session_memory_patch(memory_context, telemetry)
+
+    telemetry['summary_scene_response_chars'] = summary_chars
+    scene_patch = _sanitize_scene_patch(
+        summary_data.get('scene_patch') if isinstance(summary_data.get('scene_patch'), dict) else {},
+        memory_context,
+    )
+
+    try:
+        facts_data, facts_chars = _request_session_memory_json(
+            build_session_memory_facts_messages(memory_context),
+            audit_context,
+            'session_memory_update_facts',
+            max_tokens=max_tokens,
+            timeout_seconds=timeout_seconds,
+        )
+    except Exception as err:
+        facts_data = None
+        facts_chars = 0
+        telemetry['facts_error'] = repr(err)
+
+    try:
+        clocks_data, clocks_chars = _request_session_memory_json(
+            build_session_memory_clocks_messages(memory_context),
+            audit_context,
+            'session_memory_update_clocks',
+            max_tokens=max_tokens,
+            timeout_seconds=timeout_seconds,
+        )
+    except Exception as err:
+        clocks_data = None
+        clocks_chars = 0
+        telemetry['clocks_error'] = repr(err)
+
+    telemetry['facts_response_chars'] = facts_chars
+    telemetry['clocks_response_chars'] = clocks_chars
+
+    facts = facts_data.get('upsert_graph_facts') if isinstance(facts_data, dict) and isinstance(facts_data.get('upsert_graph_facts'), list) else []
+    create_clocks = clocks_data.get('create_clocks') if isinstance(clocks_data, dict) and isinstance(clocks_data.get('create_clocks'), list) else []
+    retire_clocks = clocks_data.get('retire_clocks') if isinstance(clocks_data, dict) and isinstance(clocks_data.get('retire_clocks'), list) else []
+
+    return {
+        'running_summary': _merge_session_running_summary(
+            memory_context.get('prior_running_summary'),
+            summary_data.get('turn_summary'),
+        ),
+        'scene_patch': scene_patch,
+        'scene_reason': 'Session memory summary/scene pass updated the active scene state.',
+        'upsert_graph_entities': [],
+        'upsert_graph_relations': [],
+        'upsert_graph_facts': facts,
+        'create_clocks': create_clocks,
+        'retire_clocks': retire_clocks,
+        'update_npc_actors': [],
+        'record_events': [],
+        '_telemetry': telemetry,
+    }
 
 
 def get_session_memory_patch(memory_context, audit_context=None):
@@ -3940,51 +4967,73 @@ def get_session_memory_patch(memory_context, audit_context=None):
             audit_role='tools',
             commit=True,
         )
-    if _should_skip_session_memory_llm(provider, get_llm_model(), prompt_tokens_estimate):
+    if provider == 'opencode_go':
         telemetry = {
             'prompt_chars': prompt_chars,
             'prompt_tokens_estimate': prompt_tokens_estimate,
             'context_breakdown': context_breakdown,
-            'skipped_llm': True,
-            'skip_reason': 'opencode_deepseek_memory_prompt_too_large',
-            'max_prompt_tokens': SESSION_MEMORY_LLM_MAX_PROMPT_TOKENS,
+            'mode': 'split_opencode_go_memory_writer',
         }
-        fallback_patch = _fallback_session_memory_patch(memory_context, telemetry)
-        fallback_patch['_fallback']['reason'] = 'memory_prompt_too_large_for_deepseek'
+        patch = _get_session_memory_patch_opencode_go(
+            memory_context,
+            {
+                **audit_context,
+                'trace_id': trace_id,
+                'trace_label': trace_label,
+                'actor': 'session_memory_writer',
+                'full_world_graph_included': False,
+            },
+            telemetry,
+        )
         if campaign_id:
             log_audit_event(
                 campaign_id,
-                'memory_writer_fallback',
-                'Skipped oversized DeepSeek memory-writer prompt and applied deterministic summary-only fallback.',
-                {'patch': fallback_patch},
+                'memory_writer_response',
+                'Received post-turn session memory patch.',
+                {'patch': patch},
                 source=provider,
                 actor='session_memory_writer',
                 trace_id=trace_id,
                 parent_trace_id=audit_context.get('parent_trace_id'),
                 trace_label=trace_label,
-                audit_role='tools',
+                audit_role='agent',
                 commit=True,
             )
-        return fallback_patch
+        return patch
     try:
+        base_operation = audit_context.get('operation') or 'session_memory_update'
         request_audit_context = {
             **audit_context,
             'trace_id': trace_id,
             'trace_label': trace_label,
-            'operation': audit_context.get('operation') or 'session_memory_update',
+            'operation': base_operation,
             'actor': 'session_memory_writer',
             'full_world_graph_included': False,
         }
-        text = _post_chat(
-            messages,
-            json_mode=True,
-            audit_context=request_audit_context,
-            allow_thinking=False,
-            timeout_seconds=SESSION_MEMORY_TIMEOUT_SECONDS,
-            max_attempts=SESSION_MEMORY_MAX_ATTEMPTS,
-            max_tokens=SESSION_MEMORY_MAX_TOKENS,
-        )
-        response_chars = len(text) if text else 0
+
+        def request_patch_text(request_messages, operation_suffix=None):
+            request_context = dict(request_audit_context)
+            if operation_suffix:
+                request_context['operation'] = f'{base_operation}_{operation_suffix}'
+            response_text = _post_chat(
+                request_messages,
+                json_mode=True,
+                audit_context=request_context,
+                allow_thinking=False,
+                timeout_seconds=SESSION_MEMORY_TIMEOUT_SECONDS,
+                max_attempts=SESSION_MEMORY_MAX_ATTEMPTS,
+                max_tokens=SESSION_MEMORY_MAX_TOKENS,
+            )
+            return response_text, len(response_text) if response_text else 0
+
+        retry_suffix = None
+        text, response_chars = request_patch_text(messages)
+        if not text or not text.strip():
+            retry_suffix = 'blank_retry'
+            text, response_chars = request_patch_text(
+                _session_memory_retry_messages(messages, 'blank_response'),
+                operation_suffix=retry_suffix,
+            )
         if not text or not text.strip():
             telemetry = {
                 'prompt_chars': prompt_chars,
@@ -3992,6 +5041,7 @@ def get_session_memory_patch(memory_context, audit_context=None):
                 'response_chars': response_chars,
                 'context_breakdown': context_breakdown,
                 'error': 'empty_response',
+                'retry_suffix': retry_suffix,
             }
             if campaign_id:
                 log_audit_event(
@@ -4026,12 +5076,77 @@ def get_session_memory_patch(memory_context, audit_context=None):
         data = _json_loads_with_repair(text, audit_context=request_audit_context)
         if not isinstance(data, dict):
             data = {}
+        if isinstance(data.get('scene_patch'), dict):
+            data['scene_patch'] = _sanitize_scene_patch(data['scene_patch'], memory_context)
+
+        if not _session_memory_patch_has_substance(data):
+            retry_suffix = 'empty_patch_retry'
+            retry_text, retry_response_chars = request_patch_text(
+                _session_memory_retry_messages(messages, 'empty_patch'),
+                operation_suffix=retry_suffix,
+            )
+            if retry_text and retry_text.strip():
+                text = retry_text
+                response_chars = retry_response_chars
+                data = _json_loads_with_repair(
+                    text,
+                    audit_context={
+                        **request_audit_context,
+                        'operation': f'{base_operation}_{retry_suffix}',
+                    },
+                )
+                if not isinstance(data, dict):
+                    data = {}
+                if isinstance(data.get('scene_patch'), dict):
+                    data['scene_patch'] = _sanitize_scene_patch(data['scene_patch'], memory_context)
+
+        if not _session_memory_patch_has_substance(data):
+            telemetry = {
+                'prompt_chars': prompt_chars,
+                'prompt_tokens_estimate': prompt_tokens_estimate,
+                'response_chars': response_chars,
+                'context_breakdown': context_breakdown,
+                'error': 'empty_patch',
+                'retry_suffix': retry_suffix,
+                'patch_preview': data,
+            }
+            if campaign_id:
+                log_audit_event(
+                    campaign_id,
+                    'memory_writer_empty_patch',
+                    'Post-turn session memory writer returned an empty or no-op patch.',
+                    {'patch': data, '_telemetry': telemetry},
+                    source=provider,
+                    actor='session_memory_writer',
+                    trace_id=trace_id,
+                    parent_trace_id=audit_context.get('parent_trace_id'),
+                    trace_label=trace_label,
+                    audit_role='tools',
+                    commit=True,
+                )
+            fallback_patch = _fallback_session_memory_patch(memory_context, telemetry)
+            if campaign_id:
+                log_audit_event(
+                    campaign_id,
+                    'memory_writer_fallback',
+                    'Applied deterministic summary-only fallback after empty or no-op memory writer patch.',
+                    {'patch': fallback_patch},
+                    source=provider,
+                    actor='session_memory_writer',
+                    trace_id=trace_id,
+                    parent_trace_id=audit_context.get('parent_trace_id'),
+                    trace_label=trace_label,
+                    audit_role='tools',
+                    commit=True,
+                )
+            return fallback_patch
 
         data['_telemetry'] = {
             'prompt_chars': prompt_chars,
             'prompt_tokens_estimate': prompt_tokens_estimate,
             'response_chars': response_chars,
             'context_breakdown': context_breakdown,
+            'retry_suffix': retry_suffix,
         }
 
         if campaign_id:
@@ -4051,15 +5166,121 @@ def get_session_memory_patch(memory_context, audit_context=None):
         return data
     except Exception as e:
         print(f'[openrouter] Session memory writer error: {e}')
-        return {
-            '_telemetry': {
-                'prompt_chars': prompt_chars,
-                'prompt_tokens_estimate': prompt_tokens_estimate,
-                'response_chars': 0,
-                'context_breakdown': context_breakdown,
-                'error': str(e)
-            }
+        telemetry = {
+            'prompt_chars': prompt_chars,
+            'prompt_tokens_estimate': prompt_tokens_estimate,
+            'response_chars': 0,
+            'context_breakdown': context_breakdown,
+            'error': str(e),
         }
+        fallback_patch = _fallback_session_memory_patch(memory_context, telemetry)
+        fallback_patch['_fallback']['reason'] = 'memory_writer_model_error'
+        return fallback_patch
+
+
+def get_session_clock_updates(clock_context, audit_context=None):
+    messages = build_session_clock_adjudication_messages(clock_context or {})
+    audit_context = audit_context or {}
+    provider = get_llm_provider()
+    campaign_id = audit_context.get('campaign_id')
+    trace_id = audit_context.get('trace_id') or f"session_clock_adjudicator:clock_update:{uuid4().hex[:10]}"
+    trace_label = audit_context.get('trace_label') or 'session_clock_adjudicator: clock_update'
+
+    if campaign_id:
+        log_audit_event(
+            campaign_id,
+            'clock_adjudicator_request',
+            'Requested post-turn clock adjudication.',
+            {'context': clock_context, 'messages': messages},
+            source=provider,
+            actor='session_clock_adjudicator',
+            trace_id=trace_id,
+            parent_trace_id=audit_context.get('parent_trace_id'),
+            trace_label=trace_label,
+            audit_role='tools',
+            commit=True,
+        )
+
+    request_audit = {
+        **audit_context,
+        'trace_id': trace_id,
+        'trace_label': trace_label,
+        'actor': 'session_clock_adjudicator',
+        'full_world_graph_included': False,
+    }
+
+    try:
+        if provider == 'opencode_go':
+            data, _response_chars = _request_session_memory_json(
+                messages,
+                request_audit,
+                'session_clock_adjudication',
+                max_tokens=SESSION_MEMORY_MAX_TOKENS,
+                timeout_seconds=SESSION_MEMORY_TIMEOUT_SECONDS,
+            )
+        else:
+            text = _post_chat(
+                messages,
+                json_mode=True,
+                audit_context={
+                    **request_audit,
+                    'operation': 'session_clock_adjudication',
+                },
+                allow_thinking=False,
+                timeout_seconds=SESSION_MEMORY_TIMEOUT_SECONDS,
+                max_attempts=1,
+                max_tokens=SESSION_MEMORY_MAX_TOKENS,
+            )
+            data = _json_loads_with_repair(
+                text,
+                audit_context={
+                    **request_audit,
+                    'operation': 'session_clock_adjudication',
+                },
+            ) if text else None
+    except Exception as err:
+        if campaign_id:
+            log_audit_event(
+                campaign_id,
+                'clock_adjudicator_error',
+                'Post-turn clock adjudication failed.',
+                {'error': repr(err)},
+                source=provider,
+                actor='session_clock_adjudicator',
+                trace_id=trace_id,
+                parent_trace_id=audit_context.get('parent_trace_id'),
+                trace_label=trace_label,
+                audit_role='tools',
+                commit=True,
+            )
+        data = None
+
+    result = {
+        'create_clocks': data.get('create_clocks') if isinstance(data, dict) and isinstance(data.get('create_clocks'), list) else [],
+        'advance_clocks': data.get('advance_clocks') if isinstance(data, dict) and isinstance(data.get('advance_clocks'), list) else [],
+        'retire_clocks': data.get('retire_clocks') if isinstance(data, dict) and isinstance(data.get('retire_clocks'), list) else [],
+        'no_change_explanations': (
+            data.get('no_change_explanations')
+            if isinstance(data, dict) and isinstance(data.get('no_change_explanations'), list)
+            else []
+        ),
+    }
+
+    if campaign_id:
+        log_audit_event(
+            campaign_id,
+            'clock_adjudicator_response',
+            'Received post-turn clock adjudication.',
+            {'updates': result},
+            source=provider,
+            actor='session_clock_adjudicator',
+            trace_id=trace_id,
+            parent_trace_id=audit_context.get('parent_trace_id'),
+            trace_label=trace_label,
+            audit_role='agent',
+            commit=True,
+        )
+    return result
 
 
 def get_character_sheet_answer(question, scope, character_sheets, audit_context=None):

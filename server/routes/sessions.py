@@ -5,9 +5,19 @@ import queue
 from flask import Blueprint, current_app, jsonify, request
 
 from auth import authenticate_request, token_required
-from models import db, Campaign, CampaignSession, SessionMessage, SheetProposal, Character, User
+from models import (
+    db,
+    Campaign,
+    CampaignAuditEvent,
+    CampaignSession,
+    SessionMessage,
+    SheetProposal,
+    Character,
+    User,
+)
 from openrouter import (
     get_opening_scene_response,
+    get_session_clock_updates,
     get_session_dm_response_with_tools,
     get_session_memory_patch,
     normalize_session_dm_turn_decision,
@@ -20,8 +30,10 @@ from services.character_service import character_full_dict
 from services.dm_tools import (
     get_dm_tool_definitions,
     SHEET_SCALAR_FIELDS,
+    apply_clock_adjudication,
     apply_memory_patch,
     build_session_hot_context,
+    build_session_clock_context,
     build_session_memory_context,
     context_manifest,
     execute_dm_tool,
@@ -96,6 +108,8 @@ def _run_session_memory_update(
     memory_run_id = f"memrun_{uuid4().hex[:12]}"
     memory_trace_id = f'session_memory_writer:session_{session_id}:message_{player_message_id}'
     trace_label = f'session_memory_writer: session {session_id}'
+    clock_trace_id = f'session_clock_adjudicator:session_{session_id}:message_{player_message_id}'
+    clock_trace_label = f'session_clock_adjudicator: session {session_id}'
     try:
         campaign = db.session.get(Campaign, campaign_id)
         session = db.session.get(CampaignSession, session_id)
@@ -140,6 +154,38 @@ def _run_session_memory_update(
                     'source_dm_message_id': dm_message_id,
                 },
             )
+        world_after_memory = world_public_payload(campaign).get('world') or {}
+        current_scene_after_memory = world_after_memory.get('current_scene')
+        clock_context = build_session_clock_context(
+            campaign,
+            session,
+            current_user,
+            player_content,
+            ai_text,
+            current_scene_before,
+            current_scene_after_memory,
+        )
+        clock_updates = get_session_clock_updates(
+            clock_context,
+            audit_context={
+                'campaign_id': campaign.id,
+                'operation': 'session_clock_adjudication',
+                'actor': 'session_clock_adjudicator',
+                'trace_id': clock_trace_id,
+                'parent_trace_id': parent_trace_id,
+                'trace_label': clock_trace_label,
+            },
+        )
+        if clock_updates:
+            apply_clock_adjudication(
+                campaign,
+                clock_updates,
+                audit_context={
+                    'trace_id': clock_trace_id,
+                    'parent_trace_id': parent_trace_id,
+                    'trace_label': clock_trace_label,
+                },
+            )
         db.session.commit()
 
         world_after = world_public_payload(campaign).get('world') or {}
@@ -164,6 +210,65 @@ def _run_session_memory_update(
             audit_role='tools',
             commit=True,
         )
+
+
+def _dm_turn_status_for_player(campaign_id, player_message_id=None):
+    """Return the most recent completed session-DM turn decision."""
+    query = (
+        CampaignAuditEvent.query
+        .filter_by(
+            campaign_id=campaign_id,
+            source='session_messages',
+            actor='session_dm',
+        )
+        .filter(CampaignAuditEvent.event_type.in_([
+            'dm_output_stored',
+            'dm_silence_chosen',
+            'dm_output_empty',
+        ]))
+        .order_by(CampaignAuditEvent.id.desc())
+    )
+    for event in query.limit(64).all():
+        try:
+            payload = json.loads(event.payload) if event.payload else {}
+        except (TypeError, ValueError):
+            payload = {}
+        event_player_message_id = payload.get('player_message_id')
+        if player_message_id is not None and event_player_message_id != player_message_id:
+            continue
+        if event.event_type == 'dm_output_stored':
+            return {
+                'status': 'speak',
+                'player_message_id': event_player_message_id,
+                'dm_message_id': payload.get('dm_message_id'),
+            }
+        if event.event_type == 'dm_silence_chosen':
+            decision = payload.get('decision') if isinstance(payload.get('decision'), dict) else {}
+            return {
+                'status': 'silent',
+                'player_message_id': event_player_message_id,
+                'reason': decision.get('reason') or '',
+            }
+        if event.event_type == 'dm_output_empty':
+            return {
+                'status': 'empty',
+                'player_message_id': event_player_message_id,
+                'decision': payload.get('decision'),
+            }
+    return {'status': 'pending', 'player_message_id': player_message_id}
+
+
+@sessions_bp.route('/api/sessions/<int:session_id>/dm-turn-status', methods=['GET'])
+@token_required
+def get_dm_turn_status(current_user, session_id):
+    session = get_or_404(CampaignSession, session_id)
+    campaign = db.session.get(Campaign, session.campaign_id)
+    if not ensure_member(campaign, current_user):
+        return jsonify({'error': 'Forbidden'}), 403
+
+    after_message_id = request.args.get('after_message_id', type=int)
+    status = _dm_turn_status_for_player(campaign.id, player_message_id=after_message_id)
+    return jsonify(status)
 
 
 @sessions_bp.route('/api/campaigns/<int:campaign_id>/sessions', methods=['POST'])
@@ -453,6 +558,8 @@ def send_message(current_user, session_id):
                 'Stored visible session DM response.',
                 {
                     'session_id': session_id,
+                    'player_message_id': msg.id,
+                    'dm_message_id': ai_msg.id,
                     'message': {
                         'role': 'dm',
                         'content': ai_text,

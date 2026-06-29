@@ -27,12 +27,13 @@ except Exception:  # pragma: no cover - redis package may be omitted in some env
     redis = None
 
 class SessionGeneratorWorker:
-    def __init__(self, campaign_id, session_id, user_id, content, player_message_id=None):
+    def __init__(self, campaign_id, session_id, user_id, content, player_message_id=None, manager=None):
         self.campaign_id = campaign_id
         self.session_id = session_id
         self.user_id = user_id
         self.content = content
         self.player_message_id = player_message_id
+        self.manager = manager
         self.listeners = []
         self.listener_lock = threading.Lock()
         self.status = "Initializing DM response..."
@@ -196,6 +197,8 @@ class SessionGeneratorWorker:
                     self.is_done = True
                     self.finished_at = time.monotonic()
                 db.session.remove()
+                if self.manager is not None:
+                    self.manager.on_worker_finished(self)
 
     def _execute_dm_turn(self):
         campaign = db.session.get(Campaign, self.campaign_id)
@@ -277,6 +280,8 @@ class SessionGeneratorWorker:
                 'Stored visible session DM response.',
                 {
                     'session_id': self.session_id,
+                    'player_message_id': player_msg_id,
+                    'dm_message_id': ai_msg.id,
                     'message': {
                         'role': 'dm',
                         'content': ai_text,
@@ -373,6 +378,7 @@ class SessionStreamManager:
 
     def __init__(self):
         self.workers = {}
+        self.pending_requests = {}
         self.listeners = {}  # session_id -> list of queue.Queue
         self.lock = threading.Lock()
         self.instance_id = str(uuid4())
@@ -457,19 +463,39 @@ class SessionStreamManager:
         with self.lock:
             return self._ensure_redis_subscription_locked()
 
+    def _spawn_worker_locked(self, campaign_id, session_id, user_id, content, player_message_id=None):
+        worker = SessionGeneratorWorker(
+            campaign_id,
+            session_id,
+            user_id,
+            content,
+            player_message_id,
+            manager=self,
+        )
+        self.workers[session_id] = worker
+        app = current_app._get_current_object()
+        t = threading.Thread(target=worker.run, args=(app,), daemon=True)
+        t.start()
+        return worker
+
     def start_generation(self, campaign_id, session_id, user_id, content, player_message_id=None):
         with self.lock:
             self._ensure_redis_subscription_locked()
             # If there's already a worker running for this session, don't spawn a new one.
             if session_id in self.workers and not self.workers[session_id].is_done:
+                if player_message_id is not None:
+                    pending = self.pending_requests.get(session_id)
+                    pending_message_id = pending.get('player_message_id') if pending else None
+                    if pending_message_id is None or player_message_id >= pending_message_id:
+                        self.pending_requests[session_id] = {
+                            'campaign_id': campaign_id,
+                            'session_id': session_id,
+                            'user_id': user_id,
+                            'content': content,
+                            'player_message_id': player_message_id,
+                        }
                 return self.workers[session_id]
-
-            worker = SessionGeneratorWorker(campaign_id, session_id, user_id, content, player_message_id)
-            self.workers[session_id] = worker
-            app = current_app._get_current_object()
-            t = threading.Thread(target=worker.run, args=(app,), daemon=True)
-            t.start()
-            return worker
+            return self._spawn_worker_locked(campaign_id, session_id, user_id, content, player_message_id)
 
     def get_worker(self, session_id):
         with self.lock:
@@ -523,5 +549,32 @@ class SessionStreamManager:
             with self.lock:
                 self._close_redis_locked()
                 self.redis_disabled_until = time.monotonic() + self.REDIS_RETRY_SECONDS
+
+    def on_worker_finished(self, worker):
+        with self.lock:
+            current_worker = self.workers.get(worker.session_id)
+            if current_worker is not worker:
+                return None
+
+            pending = self.pending_requests.pop(worker.session_id, None)
+            if not pending:
+                return None
+
+            pending_player_message_id = pending.get('player_message_id')
+            handled_player_message_id = worker.player_message_id
+            if (
+                pending_player_message_id is not None
+                and handled_player_message_id is not None
+                and pending_player_message_id <= handled_player_message_id
+            ):
+                return None
+
+            return self._spawn_worker_locked(
+                pending['campaign_id'],
+                pending['session_id'],
+                pending['user_id'],
+                pending['content'],
+                pending_player_message_id,
+            )
 
 stream_manager = SessionStreamManager()

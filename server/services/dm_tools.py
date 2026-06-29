@@ -508,6 +508,30 @@ def _memory_text(value, limit=1600):
 def _memory_hot_context_summary(hot_context):
     hot_context = hot_context or {}
 
+    def compact_character_summary(character):
+        if not isinstance(character, dict):
+            return None
+        classes = []
+        for entry in character.get('classes') or []:
+            if not isinstance(entry, dict):
+                continue
+            classes.append({
+                'class_name': entry.get('class_name'),
+                'level': entry.get('level'),
+                'subclass': entry.get('subclass'),
+            })
+        return {
+            'id': character.get('id'),
+            'user_id': character.get('user_id'),
+            'name': character.get('name'),
+            'race': character.get('race'),
+            'subrace': character.get('subrace'),
+            'background': character.get('background'),
+            'total_level': character.get('total_level'),
+            'classes': classes,
+            'current_location': character.get('current_location'),
+        }
+
     def compact_clock(clock):
         return {
             'clock_id': clock.get('clock_id') or clock.get('id'),
@@ -516,14 +540,14 @@ def _memory_hot_context_summary(hot_context):
             'segments': clock.get('segments'),
             'status': clock.get('status'),
             'visibility': clock.get('visibility'),
-            'summary': _memory_text(clock.get('summary'), 500),
+            'summary': _memory_text(clock.get('summary'), 220),
         }
 
     def compact_message(message):
         return {
             'role': message.get('role'),
             'user_id': message.get('user_id'),
-            'content': _memory_text(message.get('content'), 1200),
+            'content': _memory_text(message.get('content'), 450),
         }
 
     return {
@@ -533,8 +557,13 @@ def _memory_hot_context_summary(hot_context):
             'id': (hot_context.get('current_user') or {}).get('id'),
             'username': (hot_context.get('current_user') or {}).get('username'),
         },
-        'current_character': hot_context.get('current_character'),
-        'current_player_character': hot_context.get('current_player_character'),
+        'current_character': compact_character_summary(hot_context.get('current_character')),
+        'current_player_character': compact_character_summary(hot_context.get('current_player_character')),
+        'protected_player_characters': [
+            compact_character_summary(character)
+            for character in (hot_context.get('protected_player_characters') or [])
+            if isinstance(character, dict)
+        ],
         'current_scene': hot_context.get('current_scene') or {},
         'current_encounter_map': hot_context.get('current_encounter_map'),
         'active_clocks': [
@@ -545,9 +574,112 @@ def _memory_hot_context_summary(hot_context):
         'visible_naming_constraints': hot_context.get('visible_naming_constraints') or [],
         'recent_messages': [
             compact_message(message)
-            for message in (hot_context.get('recent_messages') or [])[-6:]
+            for message in (hot_context.get('recent_messages') or [])[-4:]
             if isinstance(message, dict)
         ],
+    }
+
+
+def _compact_memory_search_value(kind, value):
+    if kind == 'world_state' and isinstance(value, dict):
+        current_scene = value.get('current_scene') if isinstance(value.get('current_scene'), dict) else {}
+        return {
+            'current_arc': value.get('current_arc'),
+            'current_scene': {
+                'location_id': current_scene.get('location_id'),
+                'location_name': current_scene.get('location_name'),
+                'time_of_day': current_scene.get('time_of_day'),
+                'active_npc_ids': current_scene.get('active_npc_ids'),
+                'immediate_tension': _memory_text(current_scene.get('immediate_tension'), 220),
+            },
+        }
+    if kind == 'dm_private' and isinstance(value, dict):
+        return {
+            'true_inciting_incident': _memory_text(value.get('true_inciting_incident'), 220),
+            'villain_plan': _memory_text(value.get('villain_plan'), 220),
+            'hidden_pressures': [
+                _memory_text(item, 120)
+                for item in (value.get('hidden_pressures') or [])[:3]
+            ],
+        }
+    if kind == 'planning_summary' and isinstance(value, dict):
+        return {
+            'summary': _memory_text(value.get('summary') or value.get('planning_summary'), 220),
+            'party_goals': [
+                _memory_text(item, 120)
+                for item in (value.get('party_goals') or [])[:3]
+            ],
+        }
+    if kind == 'clock' and isinstance(value, dict):
+        return {
+            'name': value.get('name'),
+            'summary': _memory_text(value.get('summary'), 220),
+            'filled': value.get('filled'),
+            'segments': value.get('segments'),
+            'status': value.get('status'),
+            'visibility': value.get('visibility'),
+        }
+    if kind == 'world_event' and isinstance(value, dict):
+        return {
+            'event_type': value.get('event_type'),
+            'summary': _memory_text(value.get('summary'), 220),
+            'visibility': value.get('visibility'),
+        }
+    if kind == 'npc_actor' and isinstance(value, dict):
+        return {
+            'name': value.get('name'),
+            'role': value.get('role'),
+            'public_summary': _memory_text(value.get('public_summary'), 220),
+            'wants': [
+                _memory_text(item, 100)
+                for item in (value.get('wants') or [])[:3]
+            ],
+            'fears': [
+                _memory_text(item, 100)
+                for item in (value.get('fears') or [])[:3]
+            ],
+        }
+    if isinstance(value, dict):
+        compact = {}
+        for key in (
+            'name',
+            'type',
+            'summary',
+            'text',
+            'visibility',
+            'certainty',
+            'importance',
+            'source_id',
+            'target_id',
+            'entity_ids',
+        ):
+            if key not in value:
+                continue
+            compact[key] = value.get(key)
+        if 'summary' in compact:
+            compact['summary'] = _memory_text(compact['summary'], 220)
+        if 'text' in compact:
+            compact['text'] = _memory_text(compact['text'], 220)
+        return compact
+    return _memory_text(value, 220)
+
+
+def _compact_memory_search_result(result):
+    if not isinstance(result, dict):
+        return result
+    matches = []
+    for item in (result.get('matches') or [])[:4]:
+        if not isinstance(item, dict):
+            continue
+        matches.append({
+            'kind': item.get('kind'),
+            'item_id': item.get('item_id'),
+            'score': round(float(item.get('score') or 0.0), 3),
+            'memory': _compact_memory_search_value(item.get('kind'), item.get('value')),
+        })
+    return {
+        'query': result.get('query'),
+        'matches': matches,
     }
 
 
@@ -564,21 +696,52 @@ def build_session_memory_context(campaign, session, current_user, player_message
     return {
         'campaign_id': campaign.id,
         'session_id': session.id,
-        'current_user': current_user.to_dict(),
+        'current_user': {
+            'id': current_user.id,
+            'username': current_user.username,
+        },
         'prior_running_summary': session.running_summary or '',
         'latest_player_message': player_message,
         'latest_dm_message': dm_message,
         'hot_context': memory_hot_context,
-        'relevant_memory': _tool_search_campaign_memory(
-            campaign,
-            current_user,
-            {'query': search_terms[:240], 'limit': 5},
+        'relevant_memory': _compact_memory_search_result(
+            _tool_search_campaign_memory(
+                campaign,
+                current_user,
+                {'query': search_terms[:240], 'limit': 5},
+            )
         ),
         'active_clock_count': len(_active_clocks(campaign, limit=50)),
         'all_active_clocks_completed': all(
             (clock.status or 'active') not in ACTIVE_CLOCK_STATUSES or (clock.filled or 0) >= (clock.segments or 4)
             for clock in CampaignClock.query.filter_by(campaign_id=campaign.id).all()
         ),
+    }
+
+
+def build_session_clock_context(
+    campaign,
+    session,
+    current_user,
+    player_message,
+    dm_message,
+    current_scene_before,
+    current_scene_after,
+):
+    recent_events = WorldEvent.query.filter_by(campaign_id=campaign.id).order_by(WorldEvent.created_at.desc()).limit(6).all()
+    return {
+        'campaign_id': campaign.id,
+        'session_id': session.id,
+        'current_user': {
+            'id': current_user.id,
+            'username': current_user.username,
+        },
+        'latest_player_message': player_message,
+        'latest_dm_message': dm_message,
+        'current_scene_before': current_scene_before if isinstance(current_scene_before, dict) else {},
+        'current_scene_after': current_scene_after if isinstance(current_scene_after, dict) else {},
+        'active_clocks': [clock.to_dict(include_private=True) for clock in _active_clocks(campaign, limit=50)],
+        'recent_events': [event.to_dict(include_private=True) for event in reversed(recent_events)],
     }
 
 
@@ -1682,13 +1845,23 @@ def _tool_advance_clock(campaign, _current_user, args):
         clock.status = clean_text(args.get('status'), 30)
     elif clock.filled >= (clock.segments or 4):
         clock.status = 'completed'
+    elif (clock.status or 'active') == 'completed' and clock.filled < (clock.segments or 4):
+        clock.status = 'active'
     clock.updated_at = datetime.utcnow()
     upsert_memory_embedding(campaign, 'clock', clock.clock_id, clock.to_dict(include_private=True))
+    evidence = args.get('evidence') if isinstance(args.get('evidence'), list) else []
     event = _record_event(
         campaign,
         'clock_advanced',
         args.get('reason') or f'{clock.name} changed by {delta}.',
-        {'clock_id': clock.clock_id, 'from': old_filled, 'to': clock.filled, 'delta': delta, 'status': clock.status},
+        {
+            'clock_id': clock.clock_id,
+            'from': old_filled,
+            'to': clock.filled,
+            'delta': delta,
+            'status': clock.status,
+            'evidence': [clean_text(item, 240) for item in evidence if clean_text(item, 240)],
+        },
         visibility=clock.visibility or 'dm_private',
     )
     return {'clock': clock.to_dict(include_private=True), 'affected_ids': {'clock_ids': [clock.id], 'world_event_ids': [event.id]}}
@@ -3614,6 +3787,98 @@ def _retire_clock_from_patch(campaign, patch):
         visibility=clock.visibility or 'dm_private',
     )
     return {'clock': clock.to_dict(include_private=True), 'event_id': event.id, 'action': 'retired'}
+
+
+def apply_clock_adjudication(campaign, updates, audit_context=None):
+    audit_context = audit_context or {}
+    updates = updates if isinstance(updates, dict) else {}
+    result = {
+        'clock_changes': [],
+        'world_event_ids': [],
+        'no_change_explanations': [],
+        'errors': [],
+    }
+
+    for item in updates.get('create_clocks', []) if isinstance(updates.get('create_clocks'), list) else []:
+        change = _create_clock_from_patch(campaign, item if isinstance(item, dict) else {})
+        result['clock_changes'].append(change)
+        if change.get('event_id'):
+            result['world_event_ids'].append(change['event_id'])
+        if change.get('error'):
+            result['errors'].append(change['error'])
+
+    for item in updates.get('advance_clocks', []) if isinstance(updates.get('advance_clocks'), list) else []:
+        if not isinstance(item, dict):
+            continue
+        clock_id = clean_id(item.get('clock_id') or item.get('id'), '')
+        if not clock_id:
+            result['errors'].append('Clock adjudication advance was missing clock_id.')
+            continue
+        try:
+            delta = int(item.get('delta') or 0)
+        except (TypeError, ValueError):
+            delta = 0
+        if delta > 2:
+            delta = 2
+        elif delta < -2:
+            delta = -2
+        if delta == 0:
+            result['no_change_explanations'].append({
+                'clock_id': clock_id,
+                'reason': clean_text(item.get('reason'), 420) or 'Clock adjudicator returned no change.',
+            })
+            continue
+        change = _tool_advance_clock(campaign, None, {
+            'clock_id': clock_id,
+            'delta': delta,
+            'reason': clean_text(item.get('reason'), 420),
+            'status': clean_text(item.get('status'), 30),
+            'evidence': item.get('evidence') if isinstance(item.get('evidence'), list) else [],
+        })
+        if change.get('error'):
+            result['errors'].append(change['error'])
+            continue
+        result['clock_changes'].append({
+            'clock': change.get('clock'),
+            'action': 'advanced',
+        })
+        affected = change.get('affected_ids') or {}
+        for event_id in affected.get('world_event_ids', []) if isinstance(affected.get('world_event_ids'), list) else []:
+            result['world_event_ids'].append(event_id)
+
+    for item in updates.get('retire_clocks', []) if isinstance(updates.get('retire_clocks'), list) else []:
+        change = _retire_clock_from_patch(campaign, item if isinstance(item, dict) else {})
+        result['clock_changes'].append(change)
+        if change.get('event_id'):
+            result['world_event_ids'].append(change['event_id'])
+        if change.get('error'):
+            result['errors'].append(change['error'])
+
+    for item in updates.get('no_change_explanations', []) if isinstance(updates.get('no_change_explanations'), list) else []:
+        if not isinstance(item, dict):
+            continue
+        clock_id = clean_id(item.get('clock_id') or item.get('id'), '')
+        reason = clean_text(item.get('reason'), 420)
+        if clock_id and reason:
+            result['no_change_explanations'].append({
+                'clock_id': clock_id,
+                'reason': reason,
+            })
+
+    log_audit_event(
+        campaign.id,
+        'clock_adjudication_applied',
+        'Applied post-turn clock adjudication.',
+        {'updates': updates, 'result': result},
+        source='session_clock',
+        actor='session_clock_adjudicator',
+        trace_id=audit_context.get('trace_id'),
+        parent_trace_id=audit_context.get('parent_trace_id'),
+        trace_label=audit_context.get('trace_label'),
+        audit_role='tools',
+        commit=False,
+    )
+    return result
 
 
 def _update_npc_actor(campaign, patch):
