@@ -56,6 +56,10 @@ def clean_text(value, max_length=1200):
     return ' '.join(str(value or '').strip().split())[:max_length]
 
 
+def normalize_text(value):
+    return ' '.join(str(value or '').strip().split())
+
+
 def clean_id(value, fallback):
     raw = clean_text(value, 100).lower()
     safe = ''.join(ch if ch.isalnum() else '_' for ch in raw).strip('_')
@@ -66,24 +70,26 @@ def clean_id(value, fallback):
 
 def sanitize_public_intro(raw_intro, campaign):
     raw_intro = raw_intro if isinstance(raw_intro, dict) else {}
-    title = clean_text(raw_intro.get('title'), 90) or clean_text(campaign.name, 90) or 'Untitled Campaign'
-    elevator_pitch = clean_text(raw_intro.get('elevator_pitch'), 420)
-    if not elevator_pitch:
-        elevator_pitch = clean_text(campaign.description, 420) or (
-            'A newly formed party arrives at the edge of an unfolding adventure, where local trouble '
-            'and personal stakes are already beginning to collide.'
-        )
-
-    starting_location = clean_text(raw_intro.get('starting_location'), 120) or 'A tense local crossroads'
-    party_hook = clean_text(raw_intro.get('party_hook'), 360) or (
+    default_elevator_pitch = (
+        'A newly formed party arrives at the edge of an unfolding adventure, where local trouble '
+        'and personal stakes are already beginning to collide.'
+    )
+    default_party_hook = (
         'The party begins together as a nearby situation demands quick choices and reveals larger stakes.'
     )
+    title = normalize_text(raw_intro.get('title')) or normalize_text(campaign.name) or 'Untitled Campaign'
+    elevator_pitch = normalize_text(raw_intro.get('elevator_pitch'))
+    if not elevator_pitch:
+        elevator_pitch = normalize_text(campaign.description) or default_elevator_pitch
+
+    starting_location = normalize_text(raw_intro.get('starting_location')) or 'A tense local crossroads'
+    party_hook = normalize_text(raw_intro.get('party_hook')) or default_party_hook
     tone = raw_intro.get('campaign_tone', [])
     if not isinstance(tone, list):
         tone = [tone]
     campaign_tone = []
     for item in tone:
-        text = clean_text(item, 40)
+        text = normalize_text(item)
         if text and text not in campaign_tone:
             campaign_tone.append(text)
         if len(campaign_tone) >= 5:
