@@ -3676,7 +3676,7 @@ class DmToolsTest(unittest.TestCase):
 
         logs = CampaignMemoryLog.query.all()
         self.assertEqual(len(logs), 2)
-        
+
         fact_log = next(l for l in logs if l.memory_id == 'dock_warning_bell')
         self.assertEqual(fact_log.operation, 'create')
         self.assertEqual(fact_log.memory_type, 'fact')
@@ -3685,6 +3685,257 @@ class DmToolsTest(unittest.TestCase):
         self.assertEqual(fact_log.reason, 'A bell rang to warn of guards.')
         self.assertEqual(fact_log.source_player_message_id, 42)
         self.assertEqual(fact_log.source_dm_message_id, 43)
+
+    def test_memory_patch_normalizes_list_valued_scalars_before_logging(self):
+        from models import CampaignMemoryLog
+
+        result = apply_memory_patch(
+            self.campaign,
+            self.session,
+            {
+                'running_summary': ['The party heard a warning bell at the docks.'],
+                'scene_patch': {
+                    'location_id': ['crypt_road'],
+                    'location_name': ['Crypt Road'],
+                    'time_of_day': ['dusk'],
+                    'active_npc_ids': ['renn', ['elara'], 'renn', {'bad': 'value'}],
+                    'immediate_tension': ['Boots pound after fleeing grave robbers.'],
+                    'ignored_field': ['should not persist'],
+                },
+                'scene_reason': ['The chase moved to the crypt road.'],
+                'upsert_graph_facts': [
+                    {
+                        'id': ['dock_warning_bell'],
+                        'entity_ids': ['dock_ward', ['crypt_road']],
+                        'text': ['A warning bell rang in the Dock Ward.'],
+                        'certainty': ['confirmed'],
+                        'visibility': ['party_known'],
+                        'importance': ['4'],
+                        'reason': ['A bell rang to warn of guards.'],
+                    }
+                ],
+                'create_clocks': [
+                    {
+                        'id': ['dock_alarm_spreads'],
+                        'name': ['Dock Alarm Spreads'],
+                        'segments': ['4'],
+                        'filled': ['1'],
+                        'summary': ['The alarm draws more attention.'],
+                        'trigger': ['The party delays or makes noise.'],
+                        'on_complete': ['Guards lock down the docks.'],
+                        'visibility': ['party_known'],
+                        'reason': ['The alarm clock should start ticking.'],
+                    }
+                ],
+            },
+            {},
+        )
+        db.session.commit()
+
+        self.assertTrue(result['running_summary_updated'])
+        self.assertEqual(self.session.running_summary, 'The party heard a warning bell at the docks.')
+
+        world = CampaignWorld.query.filter_by(campaign_id=self.campaign.id).one()
+        world_state = json.loads(world.world_state)
+        current_scene = world_state['current_scene']
+        self.assertEqual(current_scene['location_id'], 'crypt_road')
+        self.assertEqual(current_scene['location_name'], 'Crypt Road')
+        self.assertEqual(current_scene['time_of_day'], 'dusk')
+        self.assertEqual(current_scene['active_npc_ids'], ['renn', 'elara'])
+        self.assertEqual(current_scene['immediate_tension'], 'Boots pound after fleeing grave robbers.')
+        self.assertNotIn('ignored_field', current_scene)
+
+        graph = json.loads(world.knowledge_graph)
+        fact = next(item for item in graph['facts'] if item['id'] == 'dock_warning_bell')
+        self.assertEqual(fact['entity_ids'], ['dock_ward', 'crypt_road'])
+        self.assertEqual(fact['text'], 'A warning bell rang in the Dock Ward.')
+        self.assertEqual(fact['visibility'], 'party_known')
+
+        clock = CampaignClock.query.filter_by(campaign_id=self.campaign.id, clock_id='dock_alarm_spreads').one()
+        self.assertEqual(clock.filled, 1)
+        self.assertEqual(clock.visibility, 'party_known')
+
+        logs = CampaignMemoryLog.query.all()
+        self.assertEqual(len(logs), 4)
+        
+        fact_log = next(l for l in logs if l.memory_id == 'dock_warning_bell')
+        self.assertEqual(fact_log.operation, 'create')
+        self.assertEqual(fact_log.memory_type, 'fact')
+        self.assertEqual(fact_log.importance, 4)
+        self.assertEqual(fact_log.certainty, 'confirmed')
+        self.assertEqual(fact_log.reason, 'A bell rang to warn of guards.')
+
+    def test_memory_patch_promotes_visible_exchange_fact_to_party_known(self):
+        apply_memory_patch(
+            self.campaign,
+            self.session,
+            {
+                'upsert_graph_facts': [
+                    {
+                        'id': 'speaker_left_door_open',
+                        'entity_ids': ['the_speaker'],
+                        'text': 'The speaker left the door open and invited Dev to come see what she found.',
+                        'certainty': 'confirmed',
+                        'visibility': 'dm_private',
+                        'importance': 3,
+                        'reason': 'Established in the visible DM response.',
+                    }
+                ],
+            },
+            {
+                'latest_player_message': 'Dev presses himself flat against the wet stone.',
+                'latest_dm_message': 'The speaker left the door open and invited Dev to come see what she found.',
+            },
+        )
+        db.session.commit()
+
+        world = CampaignWorld.query.filter_by(campaign_id=self.campaign.id).one()
+        graph = json.loads(world.knowledge_graph)
+        fact = next(item for item in graph['facts'] if item['id'] == 'speaker_left_door_open')
+        self.assertEqual(fact['visibility'], 'party_known')
+
+    def test_memory_patch_demotes_unrevealed_private_term_from_visible_bucket(self):
+        apply_memory_patch(
+            self.campaign,
+            self.session,
+            {
+                'upsert_graph_facts': [
+                    {
+                        'id': 'crimson_veil_cause',
+                        'entity_ids': ['fac_crimson_veil'],
+                        'text': 'The Crimson Veil secretly caused the dock alarm.',
+                        'certainty': 'suspected',
+                        'visibility': 'party_known',
+                        'importance': 4,
+                        'reason': 'Hidden faction involvement not revealed in the visible exchange.',
+                    }
+                ],
+            },
+            {
+                'latest_player_message': 'Aria listens for the alarm.',
+                'latest_dm_message': 'A warning bell rings across the docks.',
+            },
+        )
+        db.session.commit()
+
+        world = CampaignWorld.query.filter_by(campaign_id=self.campaign.id).one()
+        graph = json.loads(world.knowledge_graph)
+        fact = next(item for item in graph['facts'] if item['id'] == 'crimson_veil_cause')
+        self.assertEqual(fact['visibility'], 'dm_private')
+
+    def test_memory_patch_records_visible_scene_event_as_party_known(self):
+        result = apply_memory_patch(
+            self.campaign,
+            self.session,
+            {
+                'scene_patch': {
+                    'location_id': 'crypt_road',
+                    'location_name': 'Crypt Road',
+                    'immediate_tension': 'Boots pound after fleeing grave robbers.',
+                },
+                'scene_reason': 'The chase moved to the crypt road.',
+            },
+            {
+                'latest_player_message': 'I sprint after them toward the crypts.',
+                'latest_dm_message': 'You break into a run toward the crypt road.',
+            },
+        )
+        db.session.commit()
+
+        event = db.session.get(WorldEvent, result['world_event_ids'][0])
+        self.assertEqual(event.event_type, 'scene_updated')
+        self.assertEqual(event.visibility, 'party_known')
+
+    def test_memory_patch_skips_unsupported_scene_location_change(self):
+        from models import CampaignMemoryLog
+
+        result = apply_memory_patch(
+            self.campaign,
+            self.session,
+            {
+                'scene_patch': {
+                    'location_id': 'blackwater_harbor',
+                    'location_name': 'Blackwater Harbor',
+                    'active_npc_ids': ['renn'],
+                    'immediate_tension': 'A storm tide threatens the harbor.',
+                },
+                'scene_reason': 'The scene moved to the harbor.',
+            },
+            {
+                'latest_player_message': 'I listen for the Dock Ward bell.',
+                'latest_dm_message': 'The warning bell keeps ringing across the Dock Ward.',
+            },
+        )
+        db.session.commit()
+
+        self.assertEqual(result['world_event_ids'], [])
+        world = CampaignWorld.query.filter_by(campaign_id=self.campaign.id).one()
+        current_scene = json.loads(world.world_state)['current_scene']
+        self.assertEqual(current_scene['location_name'], 'Dock Ward')
+        self.assertNotIn('location_id', current_scene)
+        self.assertNotIn('active_npc_ids', current_scene)
+
+        validation_log = CampaignMemoryLog.query.filter_by(
+            memory_id='current_scene',
+            status='validation_failed',
+        ).one()
+        self.assertEqual(validation_log.error, 'unsupported_scene_patch_fields')
+        self.assertEqual(
+            validation_log.patch_json['skipped_scene_patch']['location_id'],
+            'blackwater_harbor',
+        )
+
+    def test_memory_patch_clears_stale_npcs_on_supported_location_change(self):
+        world = CampaignWorld.query.filter_by(campaign_id=self.campaign.id).one()
+        world.world_state = json.dumps({
+            'current_scene': {
+                'location_id': 'dock_ward',
+                'location_name': 'Dock Ward',
+                'active_npc_ids': ['renn', 'elara'],
+                'immediate_tension': 'A bell rings.',
+            },
+        })
+        db.session.add(NPCActor(
+            campaign_id=self.campaign.id,
+            actor_id='renn',
+            name='Renn',
+            public_summary='A dockhand.',
+            dossier='{}',
+        ))
+        db.session.add(NPCActor(
+            campaign_id=self.campaign.id,
+            actor_id='elara',
+            name='Elara',
+            public_summary='A watch scout.',
+            dossier='{}',
+        ))
+        db.session.commit()
+
+        result = apply_memory_patch(
+            self.campaign,
+            self.session,
+            {
+                'scene_patch': {
+                    'location_id': 'crypt_road',
+                    'location_name': 'Crypt Road',
+                    'active_npc_ids': ['renn', 'elara'],
+                    'immediate_tension': 'You stand alone on the crypt road.',
+                },
+                'scene_reason': 'The party left the docks for the crypt road.',
+            },
+            {
+                'latest_player_message': 'I sprint away from the docks toward the crypts.',
+                'latest_dm_message': 'You reach the Crypt Road alone.',
+            },
+        )
+        db.session.commit()
+
+        self.assertTrue(result['world_event_ids'])
+        current_scene = json.loads(world.world_state)['current_scene']
+        self.assertEqual(current_scene['location_id'], 'crypt_road')
+        self.assertEqual(current_scene['location_name'], 'Crypt Road')
+        self.assertEqual(current_scene['active_npc_ids'], [])
+        self.assertEqual(current_scene['immediate_tension'], 'You stand alone on the crypt road.')
 
     def test_memory_patch_no_op_logging(self):
         from models import CampaignMemoryRun, CampaignMemoryLog
@@ -3783,6 +4034,161 @@ class DmToolsTest(unittest.TestCase):
             result['graph_changes'][0]['embedding_dedupe']['dedupe_match_id'],
             'silver_street_bookshop',
         )
+
+    def test_memory_patch_deterministically_remaps_entity_by_name_without_embeddings(self):
+        from models import CampaignMemoryLog
+
+        world = CampaignWorld.query.filter_by(campaign_id=self.campaign.id).first()
+        world.knowledge_graph = json.dumps({
+            'entities': [
+                {
+                    'id': 'silver_street_bookshop',
+                    'type': 'location',
+                    'name': "Bram Truewood's Bookshop",
+                    'summary': 'A bookshop on Silver Street.',
+                    'visibility': 'party_known',
+                }
+            ],
+            'relations': [],
+            'facts': [],
+        })
+        db.session.commit()
+
+        with patch('services.dm_tools.find_duplicate_graph_item', return_value={'duplicate_id': None}) as embedding_dedupe:
+            result = apply_memory_patch(
+                self.campaign,
+                self.session,
+                {
+                    'upsert_graph_entities': [
+                        {
+                            'id': 'bram_truewood_bookshop',
+                            'type': 'location',
+                            'name': "Bram Truewood's Bookshop",
+                            'summary': 'A cluttered bookshop on Silver Street run by Bram.',
+                            'visibility': 'party_known',
+                        }
+                    ],
+                    'upsert_graph_facts': [
+                        {
+                            'id': 'fact_bookshop_visit',
+                            'entity_ids': ['bram_truewood_bookshop'],
+                            'text': "The party visited Bram Truewood's bookshop.",
+                            'certainty': 'confirmed',
+                            'visibility': 'party_known',
+                        }
+                    ],
+                },
+                {},
+            )
+
+        graph = json.loads(world.knowledge_graph)
+        self.assertEqual(embedding_dedupe.call_count, 1)
+        self.assertEqual(embedding_dedupe.call_args.args[1], 'fact')
+        self.assertEqual(len(graph['entities']), 1)
+        self.assertEqual(graph['entities'][0]['id'], 'silver_street_bookshop')
+        self.assertIn('cluttered bookshop', graph['entities'][0]['summary'])
+        self.assertEqual(graph['facts'][0]['entity_ids'], ['silver_street_bookshop'])
+        self.assertEqual(result['graph_changes'][0]['action'], 'updated')
+        self.assertEqual(
+            result['graph_changes'][0]['embedding_dedupe']['dedupe_strategy'],
+            'entity_name',
+        )
+        entity_log = CampaignMemoryLog.query.filter_by(memory_id='silver_street_bookshop').one()
+        self.assertEqual(entity_log.operation, 'update')
+        self.assertEqual(entity_log.before_json['id'], 'silver_street_bookshop')
+
+    def test_memory_patch_deterministically_updates_existing_fact_identity(self):
+        world = CampaignWorld.query.filter_by(campaign_id=self.campaign.id).first()
+        world.knowledge_graph = json.dumps({
+            'entities': [
+                {'id': 'dock_ward', 'type': 'location', 'name': 'Dock Ward'},
+            ],
+            'relations': [],
+            'facts': [
+                {
+                    'id': 'dock_warning_bell',
+                    'entity_ids': ['dock_ward'],
+                    'text': 'A warning bell rang in the Dock Ward.',
+                    'certainty': 'confirmed',
+                    'visibility': 'party_known',
+                },
+            ],
+        })
+        db.session.commit()
+
+        with patch('services.dm_tools.find_duplicate_graph_item') as embedding_dedupe:
+            result = apply_memory_patch(
+                self.campaign,
+                self.session,
+                {
+                    'upsert_graph_facts': [
+                        {
+                            'id': 'fact_dock_bell_new',
+                            'entity_ids': ['dock_ward'],
+                            'text': 'Warning bell rang at Dock Ward',
+                            'certainty': 'confirmed',
+                            'visibility': 'party_known',
+                            'importance': 4,
+                        }
+                    ],
+                },
+                {},
+            )
+
+        graph = json.loads(world.knowledge_graph)
+        self.assertFalse(embedding_dedupe.called)
+        self.assertEqual(len(graph['facts']), 1)
+        self.assertEqual(graph['facts'][0]['id'], 'dock_warning_bell')
+        self.assertEqual(graph['facts'][0]['importance'], 4)
+        self.assertEqual(result['graph_changes'][0]['action'], 'updated')
+        self.assertEqual(
+            result['graph_changes'][0]['embedding_dedupe']['dedupe_strategy'],
+            'fact_identity',
+        )
+
+    def test_memory_patch_does_not_merge_same_fact_text_for_different_entities(self):
+        world = CampaignWorld.query.filter_by(campaign_id=self.campaign.id).first()
+        world.knowledge_graph = json.dumps({
+            'entities': [
+                {'id': 'north_gate', 'type': 'location', 'name': 'North Gate'},
+                {'id': 'south_gate', 'type': 'location', 'name': 'South Gate'},
+            ],
+            'relations': [],
+            'facts': [
+                {
+                    'id': 'north_gate_locked',
+                    'entity_ids': ['north_gate'],
+                    'text': 'The gate is locked.',
+                    'certainty': 'confirmed',
+                    'visibility': 'party_known',
+                },
+            ],
+        })
+        db.session.commit()
+
+        with patch('services.dm_tools.find_duplicate_graph_item', return_value={'duplicate_id': None}) as embedding_dedupe:
+            result = apply_memory_patch(
+                self.campaign,
+                self.session,
+                {
+                    'upsert_graph_facts': [
+                        {
+                            'id': 'south_gate_locked',
+                            'entity_ids': ['south_gate'],
+                            'text': 'The gate is locked.',
+                            'certainty': 'confirmed',
+                            'visibility': 'party_known',
+                        }
+                    ],
+                },
+                {},
+            )
+
+        graph = json.loads(world.knowledge_graph)
+        self.assertTrue(embedding_dedupe.called)
+        self.assertEqual(len(graph['facts']), 2)
+        self.assertEqual(result['graph_changes'][0]['action'], 'created')
+        self.assertIsNone(result['graph_changes'][0]['embedding_dedupe']['dedupe_strategy'])
 
     def test_memory_patch_keeps_distinct_companion_relations(self):
         world = CampaignWorld.query.filter_by(campaign_id=self.campaign.id).first()

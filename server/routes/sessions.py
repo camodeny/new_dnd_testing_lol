@@ -152,6 +152,8 @@ def _run_session_memory_update(
                     'memory_run_id': memory_run_id,
                     'source_player_message_id': player_message_id,
                     'source_dm_message_id': dm_message_id,
+                    'latest_player_message': player_content,
+                    'latest_dm_message': ai_text,
                 },
             )
         world_after_memory = world_public_payload(campaign).get('world') or {}

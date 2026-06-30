@@ -204,7 +204,11 @@ SESSION_MEMORY_SYSTEM_PROMPT = (
     "when new pressure, deadlines, mysteries, faction moves, or consequences emerge, especially if all "
     "existing active clocks are completed. Retire completed or resolved clocks instead of deleting them. "
     "Update knowledge graph entities, relations, and facts without duplicating existing ids. Preserve "
-    "visibility as dm_private, party_known, or public. Do not invent large new lore unless it follows "
+    "existing entity, relation, and fact ids from context or relevant_memory whenever a patch updates the same "
+    "durable concept; create new ids only for distinct concepts not already represented. Preserve "
+    "visibility as dm_private, party_known, or public. Use party_known for facts established in the latest "
+    "visible player/DM exchange; use public only for broadly public world facts; use dm_private only for "
+    "unrevealed secrets, hidden causes, off-screen actions, or DM-only pressure. Do not invent large new lore unless it follows "
     "from the exchange. Only write graph facts for durable truths that should remain useful after the "
     "current scene changes. Put current location, occupants, and tension in scene_patch instead. "
     "Prefer explicit proper nouns over pronouns, and preserve named ownership. "
@@ -230,6 +234,11 @@ SESSION_MEMORY_FACTS_SYSTEM_PROMPT = (
     "Return only valid JSON with key upsert_graph_facts. "
     "Use an empty array unless the exchange created or clarified a durable fact worth remembering after the scene moves on. "
     "Each fact must include id, entity_ids, text, certainty, visibility, importance, expires_or_retire_condition, reason, and memory_type. "
+    "Visibility policy: facts directly established by latest_player_message or latest_dm_message are party_known unless they are broadly public; "
+    "public means generally known beyond the party; dm_private is only for unrevealed secrets, hidden causes, off-screen actions, or DM-only pressure. "
+    "When relevant_memory includes a matching fact item_id, reuse that id and update/clarify the fact instead of creating a sibling. "
+    "When relevant_memory includes matching entity item_ids, use those ids in entity_ids instead of inventing new ids. "
+    "Only create a new fact id when no existing relevant_memory fact represents the same durable truth. "
     "Do not include scene-transient occupancy, immediate tension, or repeated facts already obvious from the current scene."
 )
 
@@ -3555,6 +3564,17 @@ def build_session_memory_facts_messages(memory_context):
             'role': 'user',
             'content': json.dumps({
                 'current_scene': compact.get('current_scene'),
+                'relevant_memory': compact.get('relevant_memory'),
+                'identity_rules': [
+                    'Reuse a relevant_memory match item_id when the latest exchange updates the same fact.',
+                    'Use relevant_memory entity item_id values in entity_ids for known entities.',
+                    'Create a new fact id only for a distinct durable truth not represented by relevant_memory.',
+                ],
+                'visibility_policy': {
+                    'party_known': 'Use for facts established in latest_player_message or latest_dm_message.',
+                    'public': 'Use only for facts generally known outside the party.',
+                    'dm_private': 'Use only for unrevealed secrets, hidden causes, off-screen actions, or DM-only pressure.',
+                },
                 'latest_player_message': compact.get('latest_player_message'),
                 'latest_dm_message': compact.get('latest_dm_message'),
             }, ensure_ascii=False),
@@ -4704,6 +4724,7 @@ def _session_memory_compact_context(memory_context):
     hot_context = memory_context.get('hot_context') if isinstance(memory_context.get('hot_context'), dict) else {}
     current_scene = hot_context.get('current_scene') if isinstance(hot_context.get('current_scene'), dict) else {}
     active_clocks = hot_context.get('active_clocks') if isinstance(hot_context.get('active_clocks'), list) else []
+    relevant_memory = memory_context.get('relevant_memory') if isinstance(memory_context.get('relevant_memory'), dict) else {}
     scene_hint = _fallback_scene_patch(memory_context)
     active_npc_ids = (
         _sanitize_scene_patch({'active_npc_ids': scene_hint.get('active_npc_ids')}, memory_context).get('active_npc_ids')
@@ -4739,6 +4760,7 @@ def _session_memory_compact_context(memory_context):
         'all_active_clocks_completed': bool(memory_context.get('all_active_clocks_completed')),
         'latest_player_message': memory_context.get('latest_player_message'),
         'latest_dm_message': _memory_context_lookup(memory_context, 'latest_dm_message', 'latest_dm_response'),
+        'relevant_memory': relevant_memory,
     }
 
 

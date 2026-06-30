@@ -133,6 +133,30 @@ class OpenRouterJsonRepairTest(unittest.TestCase):
                     }
                 ],
             },
+            'relevant_memory': {
+                'query': 'floorboard shadow hale residence',
+                'matches': [
+                    {
+                        'kind': 'fact',
+                        'item_id': 'hale_residence_hidden_watcher',
+                        'score': 0.91,
+                        'memory': {
+                            'entity_ids': ['lake_ward_hale_residence'],
+                            'text': 'Someone watches from inside the Hale residence.',
+                            'visibility': 'party_known',
+                        },
+                    },
+                    {
+                        'kind': 'entity',
+                        'item_id': 'lake_ward_hale_residence',
+                        'score': 0.84,
+                        'memory': {
+                            'name': 'Hale Residence, Lake Ward',
+                            'type': 'location',
+                        },
+                    },
+                ],
+            },
             'active_clock_count': 1,
             'all_active_clocks_completed': False,
         }
@@ -147,6 +171,11 @@ class OpenRouterJsonRepairTest(unittest.TestCase):
 
         self.assertIn('current_scene', facts_payload)
         self.assertNotIn('active_clocks', facts_payload)
+        self.assertEqual(
+            facts_payload['relevant_memory']['matches'][0]['item_id'],
+            'hale_residence_hidden_watcher',
+        )
+        self.assertIn('Reuse a relevant_memory match item_id', facts_payload['identity_rules'][0])
         self.assertEqual(
             facts_payload['latest_dm_message'],
             'A floorboard creaks inside and a shadow retreats.',

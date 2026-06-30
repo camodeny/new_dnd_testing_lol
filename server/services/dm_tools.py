@@ -36,6 +36,17 @@ from openrouter import get_character_sheet_answer
 
 VALID_VISIBILITIES = {'public', 'party_known', 'dm_private'}
 ACTIVE_CLOCK_STATUSES = {'active', 'ticking', 'pending'}
+VALID_MEMORY_CERTAINTIES = {'confirmed', 'suspected', 'inferred', 'false', 'retconned'}
+PRIVATE_VISIBILITY_TERMS = {
+    'dm_private',
+    'private',
+    'secret',
+    'hidden',
+    'unrevealed',
+    'spoiler',
+    'offscreen',
+    'off-screen',
+}
 SYMMETRIC_RELATION_TYPES = {
     'allied_with',
     'associated_with',
@@ -50,6 +61,539 @@ SYMMETRIC_RELATION_TYPES = {
 def estimate_tokens(value):
     text = value if isinstance(value, str) else json.dumps(value, ensure_ascii=False)
     return max(1, len(text) // 4) if text else 0
+
+
+def _iter_patch_scalars(value):
+    if isinstance(value, dict):
+        return
+    if isinstance(value, (list, tuple, set)):
+        for item in value:
+            yield from _iter_patch_scalars(item)
+        return
+    if value not in (None, ''):
+        yield value
+
+
+def _first_patch_scalar(value):
+    for item in _iter_patch_scalars(value):
+        return item
+    return None
+
+
+def _coerce_patch_text(value, max_length=1200, default=''):
+    cleaned = clean_text(_first_patch_scalar(value), max_length)
+    return cleaned or default
+
+
+def _coerce_patch_id(value, fallback=''):
+    scalar = _first_patch_scalar(value)
+    if scalar in (None, ''):
+        return fallback
+    return clean_id(scalar, fallback)
+
+
+def _coerce_patch_text_list(value, max_items=8, max_length=120):
+    values = value if isinstance(value, (list, tuple, set)) else [value]
+    cleaned = []
+    seen = set()
+    for raw in _iter_patch_scalars(values):
+        text = clean_text(raw, max_length)
+        if not text or text in seen:
+            continue
+        seen.add(text)
+        cleaned.append(text)
+        if len(cleaned) >= max_items:
+            break
+    return cleaned
+
+
+def _coerce_patch_id_list(value, max_items=8):
+    values = value if isinstance(value, (list, tuple, set)) else [value]
+    cleaned = []
+    seen = set()
+    for raw in _iter_patch_scalars(values):
+        item_id = clean_id(raw, '')
+        if not item_id or item_id in seen:
+            continue
+        seen.add(item_id)
+        cleaned.append(item_id)
+        if len(cleaned) >= max_items:
+            break
+    return cleaned
+
+
+def _coerce_patch_int(value, default=None, minimum=None, maximum=None):
+    scalar = _first_patch_scalar(value)
+    if scalar in (None, ''):
+        return default
+    try:
+        number = int(scalar)
+    except (TypeError, ValueError):
+        return default
+    if minimum is not None:
+        number = max(minimum, number)
+    if maximum is not None:
+        number = min(maximum, number)
+    return number
+
+
+def _coerce_patch_visibility(value, default=None):
+    visibility = _coerce_patch_text(value, 30)
+    return visibility if visibility in VALID_VISIBILITIES else default
+
+
+def _coerce_patch_certainty(value, default=None):
+    certainty = _coerce_patch_text(value, 40)
+    if certainty == 'false_rumor':
+        certainty = 'false'
+    return certainty if certainty in VALID_MEMORY_CERTAINTIES else default
+
+
+def _apply_memory_item_metadata(clean_item, raw_item, include_memory_type=False):
+    visibility = _coerce_patch_visibility(raw_item.get('visibility'))
+    if visibility:
+        clean_item['visibility'] = visibility
+    certainty = _coerce_patch_certainty(raw_item.get('certainty'))
+    if certainty:
+        clean_item['certainty'] = certainty
+    importance = _coerce_patch_int(raw_item.get('importance'), default=None, minimum=1, maximum=5)
+    if importance is not None:
+        clean_item['importance'] = importance
+    reason = _coerce_patch_text(raw_item.get('reason'), 420)
+    if reason:
+        clean_item['reason'] = reason
+    expires = _coerce_patch_text(raw_item.get('expires_or_retire_condition'), 520)
+    if expires:
+        clean_item['expires_or_retire_condition'] = expires
+    if include_memory_type:
+        memory_type = _coerce_patch_text(raw_item.get('memory_type'), 50)
+        if memory_type:
+            clean_item['memory_type'] = memory_type
+    return clean_item
+
+
+def _normalize_memory_scene_patch(scene_patch):
+    if not isinstance(scene_patch, dict):
+        return {}
+    clean_scene = {}
+    location_id = _coerce_patch_id(scene_patch.get('location_id'), '')
+    if location_id:
+        clean_scene['location_id'] = location_id
+    location_name = _coerce_patch_text(scene_patch.get('location_name'), 160)
+    if location_name:
+        clean_scene['location_name'] = location_name
+    time_of_day = _coerce_patch_text(scene_patch.get('time_of_day'), 80)
+    if time_of_day:
+        clean_scene['time_of_day'] = time_of_day
+    if 'active_npc_ids' in scene_patch:
+        clean_scene['active_npc_ids'] = _coerce_patch_id_list(scene_patch.get('active_npc_ids'), max_items=8)
+    immediate_tension = _coerce_patch_text(scene_patch.get('immediate_tension'), 420)
+    if immediate_tension:
+        clean_scene['immediate_tension'] = immediate_tension
+    return clean_scene
+
+
+def _scene_visible_text(audit_context):
+    return ' '.join(
+        clean_text(audit_context.get(key), 2400)
+        for key in ('latest_player_message', 'latest_dm_message')
+        if audit_context.get(key)
+    ).strip()
+
+
+def _scene_terms(value):
+    text = clean_text(value, 240).lower()
+    return {
+        term
+        for term in re.findall(r"[a-z0-9']+", text.replace('_', ' '))
+        if len(term) >= 3 and term not in {'the', 'and', 'with', 'into', 'from', 'near'}
+    }
+
+
+def _scene_visible_terms(visible_text):
+    terms = _scene_terms(visible_text)
+    return terms | {term[:-1] for term in terms if len(term) > 4 and term.endswith('s')}
+
+
+def _scene_value_supported(value, visible_terms):
+    value_terms = _scene_terms(value)
+    if not value_terms:
+        return False
+    expanded = value_terms | {term[:-1] for term in value_terms if len(term) > 4 and term.endswith('s')}
+    return bool(expanded & visible_terms)
+
+
+def _npc_scene_names_by_id(campaign):
+    if not campaign:
+        return {}
+    return {
+        npc.actor_id: npc.name
+        for npc in NPCActor.query.filter_by(campaign_id=campaign.id).all()
+        if npc.actor_id
+    }
+
+
+def _scene_npc_supported(actor_id, npc_names, visible_terms):
+    if _scene_value_supported(actor_id, visible_terms):
+        return True
+    return _scene_value_supported(npc_names.get(actor_id), visible_terms)
+
+
+def _validate_memory_scene_patch(campaign, current_scene, scene_patch, audit_context):
+    if not isinstance(scene_patch, dict):
+        return {}, {}
+    visible_text = _scene_visible_text(audit_context or {})
+    if not visible_text:
+        return scene_patch, {}
+
+    current_scene = current_scene if isinstance(current_scene, dict) else {}
+    visible_terms = _scene_visible_terms(visible_text)
+    validated = {}
+    skipped = {}
+
+    def keep_or_skip(field, supported):
+        if supported:
+            validated[field] = scene_patch[field]
+        else:
+            skipped[field] = scene_patch[field]
+
+    location_changed = False
+    for field in ('location_id', 'location_name'):
+        if field not in scene_patch:
+            continue
+        value = scene_patch.get(field)
+        if value == current_scene.get(field):
+            validated[field] = value
+            continue
+        supported = _scene_value_supported(value, visible_terms)
+        keep_or_skip(field, supported)
+        location_changed = location_changed or supported
+
+    if 'time_of_day' in scene_patch:
+        value = scene_patch.get('time_of_day')
+        keep_or_skip(
+            'time_of_day',
+            value == current_scene.get('time_of_day') or _scene_value_supported(value, visible_terms),
+        )
+
+    if 'active_npc_ids' in scene_patch:
+        requested_ids = scene_patch.get('active_npc_ids') if isinstance(scene_patch.get('active_npc_ids'), list) else []
+        current_ids = current_scene.get('active_npc_ids') if isinstance(current_scene.get('active_npc_ids'), list) else []
+        current_id_set = set(current_ids)
+        npc_names = _npc_scene_names_by_id(campaign)
+        supported_ids = []
+        skipped_ids = []
+        for actor_id in requested_ids:
+            if _scene_npc_supported(actor_id, npc_names, visible_terms):
+                supported_ids.append(actor_id)
+            elif actor_id in current_id_set and not location_changed:
+                supported_ids.append(actor_id)
+            else:
+                skipped_ids.append(actor_id)
+        if supported_ids or location_changed:
+            validated['active_npc_ids'] = supported_ids
+        elif requested_ids:
+            skipped_ids = requested_ids
+        if skipped_ids:
+            skipped['active_npc_ids'] = skipped_ids
+
+    if 'immediate_tension' in scene_patch:
+        value = scene_patch.get('immediate_tension')
+        if (
+            value == current_scene.get('immediate_tension')
+            or _is_supported_by_visible_exchange(value, visible_text)
+            or _scene_value_supported(value, visible_terms)
+        ):
+            validated['immediate_tension'] = value
+        else:
+            skipped['immediate_tension'] = value
+
+    return validated, skipped
+
+
+def _normalize_memory_entity_patch(item, fallback_id):
+    if not isinstance(item, dict):
+        return None
+    clean_item = {
+        'id': _coerce_patch_id(item.get('id'), fallback_id),
+        'type': _coerce_patch_id(item.get('type'), 'other') or 'other',
+    }
+    name = _coerce_patch_text(item.get('name'), 160)
+    if name:
+        clean_item['name'] = name
+    summary = _coerce_patch_text(item.get('summary'), 500)
+    if summary:
+        clean_item['summary'] = summary
+    tags = _coerce_patch_text_list(item.get('tags'), max_items=8, max_length=40)
+    if tags:
+        clean_item['tags'] = tags
+    return _apply_memory_item_metadata(clean_item, item, include_memory_type=True)
+
+
+def _normalize_memory_relation_patch(item, fallback_id):
+    if not isinstance(item, dict):
+        return None
+    clean_item = _normalize_graph_relation({
+        'id': _coerce_patch_id(item.get('id'), fallback_id),
+        'type': _coerce_patch_id(item.get('type'), ''),
+        'source_id': _coerce_patch_id(item.get('source_id'), ''),
+        'target_id': _coerce_patch_id(item.get('target_id'), ''),
+    })
+    summary = _coerce_patch_text(item.get('summary'), 500)
+    if summary:
+        clean_item['summary'] = summary
+    return _apply_memory_item_metadata(clean_item, item, include_memory_type=True)
+
+
+def _normalize_memory_fact_patch(item, fallback_id):
+    if not isinstance(item, dict):
+        return None
+    text = _coerce_patch_text(item.get('text'), 700)
+    if not text:
+        return None
+    clean_item = {
+        'id': _coerce_patch_id(item.get('id'), fallback_id),
+        'entity_ids': _coerce_patch_id_list(item.get('entity_ids'), max_items=8),
+        'text': text,
+    }
+    return _apply_memory_item_metadata(clean_item, item, include_memory_type=True)
+
+
+def _normalize_memory_clock_patch(item, fallback_id):
+    if not isinstance(item, dict):
+        return None
+    segments = _coerce_patch_int(item.get('segments'), default=4, minimum=2, maximum=12)
+    filled = _coerce_patch_int(item.get('filled'), default=0, minimum=0, maximum=segments)
+    clean_item = {
+        'id': _coerce_patch_id(item.get('id') or item.get('clock_id'), fallback_id),
+        'clock_id': _coerce_patch_id(item.get('clock_id') or item.get('id'), fallback_id),
+        'name': _coerce_patch_text(item.get('name'), 200),
+        'segments': segments,
+        'filled': filled,
+        'pressure_type': _coerce_patch_text(item.get('pressure_type'), 80, default='story'),
+        'status': _coerce_patch_text(item.get('status'), 30),
+    }
+    for field, limit in (
+        ('summary', 420),
+        ('trigger', 420),
+        ('on_complete', 520),
+    ):
+        value = _coerce_patch_text(item.get(field), limit)
+        if value:
+            clean_item[field] = value
+    return _apply_memory_item_metadata(clean_item, item, include_memory_type=False)
+
+
+def _normalize_memory_npc_patch(item, fallback_id):
+    if not isinstance(item, dict):
+        return None
+    actor_id = _coerce_patch_id(item.get('id') or item.get('actor_id'), fallback_id)
+    clean_item = {
+        'id': actor_id,
+        'actor_id': actor_id,
+    }
+    for field, limit in (
+        ('name', 200),
+        ('role', 200),
+        ('public_summary', 420),
+        ('voice', 240),
+        ('background', 700),
+    ):
+        value = _coerce_patch_text(item.get(field), limit)
+        if value:
+            clean_item[field] = value
+    for field, max_items, limit in (
+        ('wants', 6, 180),
+        ('fears', 6, 180),
+        ('secrets', 8, 240),
+    ):
+        values = _coerce_patch_text_list(item.get(field), max_items=max_items, max_length=limit)
+        if values:
+            clean_item[field] = values
+    return _apply_memory_item_metadata(clean_item, item, include_memory_type=False)
+
+
+def _normalize_memory_event_patch(item):
+    if not isinstance(item, dict):
+        return None
+    clean_item = {
+        'event_type': _coerce_patch_text(item.get('event_type'), 80, default='session_memory'),
+        'summary': _coerce_patch_text(item.get('summary'), 1200, default='Session memory updated.'),
+        'payload': item.get('payload') if isinstance(item.get('payload'), dict) else {},
+    }
+    return _apply_memory_item_metadata(clean_item, item, include_memory_type=False)
+
+
+def _normalize_memory_patch(patch):
+    patch = patch if isinstance(patch, dict) else {}
+    normalized = {}
+
+    telemetry = patch.get('_telemetry')
+    if isinstance(telemetry, dict):
+        normalized['_telemetry'] = telemetry
+    fallback = patch.get('_fallback')
+    if isinstance(fallback, dict):
+        normalized['_fallback'] = fallback
+
+    running_summary = _coerce_patch_text(patch.get('running_summary'), 4000)
+    if running_summary:
+        normalized['running_summary'] = running_summary
+
+    scene_patch = _normalize_memory_scene_patch(patch.get('scene_patch'))
+    if scene_patch:
+        normalized['scene_patch'] = scene_patch
+
+    scene_reason = _coerce_patch_text(patch.get('scene_reason'), 420)
+    if scene_reason:
+        normalized['scene_reason'] = scene_reason
+
+    normalized['upsert_graph_entities'] = [
+        clean_item
+        for index, item in enumerate(patch.get('upsert_graph_entities', []) if isinstance(patch.get('upsert_graph_entities'), list) else [])
+        if (clean_item := _normalize_memory_entity_patch(item, f'entity_{index + 1}')) is not None
+    ]
+    normalized['upsert_graph_relations'] = [
+        clean_item
+        for index, item in enumerate(patch.get('upsert_graph_relations', []) if isinstance(patch.get('upsert_graph_relations'), list) else [])
+        if (clean_item := _normalize_memory_relation_patch(item, f'relation_{index + 1}')) is not None
+    ]
+    normalized['upsert_graph_facts'] = [
+        clean_item
+        for index, item in enumerate(patch.get('upsert_graph_facts', []) if isinstance(patch.get('upsert_graph_facts'), list) else [])
+        if (clean_item := _normalize_memory_fact_patch(item, f'fact_{index + 1}')) is not None
+    ]
+    normalized['create_clocks'] = [
+        clean_item
+        for index, item in enumerate(patch.get('create_clocks', []) if isinstance(patch.get('create_clocks'), list) else [])
+        if (clean_item := _normalize_memory_clock_patch(item, f'clock_{index + 1}')) is not None
+    ]
+    normalized['retire_clocks'] = [
+        clean_item
+        for index, item in enumerate(patch.get('retire_clocks', []) if isinstance(patch.get('retire_clocks'), list) else [])
+        if (clean_item := _normalize_memory_clock_patch(item, f'clock_{index + 1}')) is not None
+    ]
+    normalized['update_npc_actors'] = [
+        clean_item
+        for index, item in enumerate(patch.get('update_npc_actors', []) if isinstance(patch.get('update_npc_actors'), list) else [])
+        if (clean_item := _normalize_memory_npc_patch(item, f'npc_{index + 1}')) is not None
+    ]
+    normalized['record_events'] = [
+        clean_item
+        for item in (patch.get('record_events', []) if isinstance(patch.get('record_events'), list) else [])
+        if (clean_item := _normalize_memory_event_patch(item)) is not None
+    ]
+    return normalized
+
+
+def _visibility_text_for_item(item, fields):
+    if not isinstance(item, dict):
+        return ''
+    values = []
+    for field in fields:
+        value = item.get(field)
+        if isinstance(value, list):
+            values.extend(str(part) for part in value if part not in (None, ''))
+        elif value not in (None, ''):
+            values.append(str(value))
+    return ' '.join(values)
+
+
+def _visibility_words(text):
+    return {
+        word
+        for word in re.findall(r"[a-z0-9']+", clean_text(text, 4000).lower())
+        if len(word) >= 4
+    }
+
+
+def _is_supported_by_visible_exchange(item_text, visible_text):
+    item_words = _visibility_words(item_text)
+    if not item_words:
+        return False
+    visible_words = _visibility_words(visible_text)
+    if not visible_words:
+        return False
+    overlap = item_words & visible_words
+    if len(overlap) >= 4 and len(overlap) / max(len(item_words), 1) >= 0.45:
+        return True
+    clean_item = clean_text(item_text, 700).lower()
+    clean_visible = clean_text(visible_text, 4000).lower()
+    return len(clean_item) >= 24 and clean_item in clean_visible
+
+
+def _contains_hidden_policy_signal(item_text):
+    item_words = _visibility_words(item_text)
+    return bool(item_words & PRIVATE_VISIBILITY_TERMS)
+
+
+def _contains_unrevealed_private_term(campaign, item_text, visible_text):
+    if not campaign:
+        return False
+    lowered_item = clean_text(item_text, 4000).lower()
+    lowered_visible = clean_text(visible_text, 4000).lower()
+    if not lowered_item:
+        return False
+    for term in _private_output_terms(campaign):
+        lowered_term = clean_text(term, 240).lower()
+        if len(lowered_term) < 4:
+            continue
+        if lowered_term in lowered_item and lowered_term not in lowered_visible:
+            return True
+    return False
+
+
+def _visibility_policy_text(audit_context):
+    return ' '.join(
+        clean_text(audit_context.get(key), 4000)
+        for key in ('latest_player_message', 'latest_dm_message', 'player_message', 'dm_message')
+        if audit_context.get(key)
+    )
+
+
+def _apply_visibility_policy_to_item(campaign, item, visible_text, fields):
+    if not isinstance(item, dict):
+        return item
+    item_text = _visibility_text_for_item(item, fields)
+    current_visibility = _coerce_patch_visibility(item.get('visibility'))
+    supported = _is_supported_by_visible_exchange(item_text, visible_text)
+    hidden_signal = (
+        _contains_hidden_policy_signal(_visibility_text_for_item(item, [*fields, 'reason']))
+        or _contains_unrevealed_private_term(campaign, item_text, visible_text)
+    )
+
+    if hidden_signal and not supported:
+        item['visibility'] = 'dm_private'
+    elif supported and current_visibility != 'public':
+        item['visibility'] = 'party_known'
+    elif current_visibility:
+        item['visibility'] = current_visibility
+    else:
+        item['visibility'] = 'dm_private'
+    return item
+
+
+def _apply_memory_visibility_policy(campaign, patch, audit_context):
+    visible_text = _visibility_policy_text(audit_context or {})
+    if not visible_text:
+        return patch
+
+    for key, fields in (
+        ('upsert_graph_entities', ('name', 'summary', 'tags')),
+        ('upsert_graph_relations', ('summary', 'type')),
+        ('upsert_graph_facts', ('text',)),
+        ('create_clocks', ('name', 'summary', 'trigger', 'on_complete')),
+        ('retire_clocks', ('name', 'summary', 'reason')),
+        ('record_events', ('event_type', 'summary')),
+    ):
+        items = patch.get(key)
+        if not isinstance(items, list):
+            continue
+        patch[key] = [
+            _apply_visibility_policy_to_item(campaign, item, visible_text, fields)
+            for item in items
+        ]
+
+    return patch
 
 
 def _selected_member(campaign_id, user_id):
@@ -3662,6 +4206,100 @@ def _normalize_graph_relation(item):
     return item
 
 
+def _entity_name_key(item):
+    if not isinstance(item, dict):
+        return ''
+    return clean_id(item.get('name'), '')
+
+
+def _entity_type_key(item):
+    if not isinstance(item, dict):
+        return ''
+    return clean_id(item.get('type'), '')
+
+
+def _entity_types_compatible(left, right):
+    left_type = _entity_type_key(left)
+    right_type = _entity_type_key(right)
+    return not left_type or not right_type or left_type == 'other' or right_type == 'other' or left_type == right_type
+
+
+def _find_existing_entity_id(items, item):
+    name_key = _entity_name_key(item)
+    if not name_key:
+        return None
+    for existing in items:
+        if _entity_name_key(existing) == name_key and _entity_types_compatible(existing, item):
+            return existing.get('id')
+    return None
+
+
+def _fact_text_key(item):
+    if not isinstance(item, dict):
+        return ''
+    text = clean_text(item.get('text'), 700).casefold()
+    return re.sub(r'[^a-z0-9]+', ' ', text).strip()
+
+
+def _fact_entity_ids(item):
+    if not isinstance(item, dict):
+        return set()
+    entity_ids = item.get('entity_ids', [])
+    if not isinstance(entity_ids, list):
+        entity_ids = [entity_ids]
+    cleaned = set()
+    for entity_id in entity_ids:
+        clean_entity_id = clean_id(entity_id, '')
+        if clean_entity_id:
+            cleaned.add(clean_entity_id)
+    return cleaned
+
+
+def _fact_content_tokens(item):
+    stopwords = {
+        'a', 'an', 'and', 'are', 'as', 'at', 'be', 'by', 'for', 'from', 'has', 'have', 'in', 'is',
+        'it', 'its', 'of', 'on', 'or', 'that', 'the', 'their', 'to', 'was', 'were', 'with',
+    }
+    return {
+        token
+        for token in _fact_text_key(item).split()
+        if len(token) > 2 and token not in stopwords
+    }
+
+
+def _fact_token_similarity(left, right):
+    left_tokens = _fact_content_tokens(left)
+    right_tokens = _fact_content_tokens(right)
+    if not left_tokens or not right_tokens:
+        return 0.0
+    overlap = len(left_tokens & right_tokens)
+    containment = overlap / min(len(left_tokens), len(right_tokens))
+    jaccard = overlap / len(left_tokens | right_tokens)
+    return max(containment, jaccard)
+
+
+def _find_existing_fact_id(items, item):
+    text_key = _fact_text_key(item)
+    if not text_key:
+        return None
+    item_entities = _fact_entity_ids(item)
+    for existing in items:
+        existing_entities = _fact_entity_ids(existing)
+        entity_context_compatible = not item_entities or not existing_entities or existing_entities == item_entities
+        if _fact_text_key(existing) == text_key and entity_context_compatible:
+            return existing.get('id')
+
+    if not item_entities:
+        return None
+    for existing in items:
+        existing_entities = _fact_entity_ids(existing)
+        if not existing_entities or existing_entities != item_entities:
+            continue
+        if _fact_token_similarity(existing, item) >= 0.82:
+            return existing.get('id')
+    return None
+
+
 def _relation_identity(item):
     item = _normalize_graph_relation(item)
     return (
@@ -3681,6 +4319,19 @@ def _find_existing_relation_id(items, item):
     return None
 
 
+def _find_existing_graph_item_id(item_type, items, item):
+    if item_type == 'entity':
+        existing_id = _find_existing_entity_id(items, item)
+        return existing_id, 'entity_name' if existing_id else None
+    if item_type == 'relation':
+        existing_id = _find_existing_relation_id(items, item)
+        return existing_id, 'relation_identity' if existing_id else None
+    if item_type == 'fact':
+        existing_id = _find_existing_fact_id(items, item)
+        return existing_id, 'fact_identity' if existing_id else None
+    return None, None
+
+
 def _upsert_graph_item(campaign, item_type, items, item, fallback_id, audit_context=None):
     item = item if isinstance(item, dict) else {}
     if item_type == 'relation':
@@ -3689,9 +4340,9 @@ def _upsert_graph_item(campaign, item_type, items, item, fallback_id, audit_cont
     exact_exists = any(existing.get('id') == requested_id for existing in items)
     dedupe = {'duplicate_id': None}
     if not exact_exists:
-        duplicate_id = _find_existing_relation_id(items, item) if item_type == 'relation' else None
+        duplicate_id, strategy = _find_existing_graph_item_id(item_type, items, item)
         if duplicate_id:
-            dedupe = {'duplicate_id': duplicate_id, 'strategy': 'relation_identity'}
+            dedupe = {'duplicate_id': duplicate_id, 'strategy': strategy}
         elif item_type != 'relation':
             dedupe = find_duplicate_graph_item(campaign, item_type, item, audit_context=audit_context)
             duplicate_id = dedupe.get('duplicate_id')
@@ -3914,7 +4565,8 @@ def apply_memory_patch(campaign, session, patch, audit_context=None):
     import uuid
 
     audit_context = audit_context or {}
-    patch = patch if isinstance(patch, dict) else {}
+    patch = _normalize_memory_patch(patch)
+    patch = _apply_memory_visibility_policy(campaign, patch, audit_context)
     telemetry = patch.pop('_telemetry', None)
 
     # Initialize memory run ID and turn ID tracking
@@ -3936,7 +4588,7 @@ def apply_memory_patch(campaign, session, patch, audit_context=None):
         prompt_chars = telemetry.get('prompt_chars')
         prompt_tokens_estimate = telemetry.get('prompt_tokens_estimate')
         response_chars = telemetry.get('response_chars')
-        context_breakdown = telemetry.get('context_breakdown')
+        context_breakdown = telemetry.get('context_breakdown') if isinstance(telemetry.get('context_breakdown'), dict) else None
 
     # Record the overall memory run context
     run_record = CampaignMemoryRun(
@@ -3961,12 +4613,7 @@ def apply_memory_patch(campaign, session, patch, audit_context=None):
                    before_json=None, after_json=None, patch_json=None, error=None):
         nonlocal logs_written
         # Normalize certainty
-        cert_val = certainty
-        if cert_val not in ('confirmed', 'suspected', 'inferred', 'false', 'retconned'):
-            if cert_val == 'false_rumor':
-                cert_val = 'false'
-            else:
-                cert_val = 'confirmed'
+        cert_val = _coerce_patch_certainty(certainty, default='confirmed')
 
         # Normalize importance
         imp_val = 3
@@ -3988,21 +4635,21 @@ def apply_memory_patch(campaign, session, patch, audit_context=None):
             turn_id=turn_id,
             source_player_message_id=player_message_id,
             source_dm_message_id=dm_message_id,
-            memory_id=memory_id,
-            target_table=target_table,
-            target_id=target_id,
-            operation=operation,
-            status=status,
-            memory_type=memory_type or 'fact',
-            visibility=visibility or 'dm_private',
+            memory_id=_coerce_patch_text(memory_id, 200) or None,
+            target_table=_coerce_patch_text(target_table, 100) or None,
+            target_id=_coerce_patch_text(target_id, 200) or None,
+            operation=_coerce_patch_text(operation, 50, default='update'),
+            status=_coerce_patch_text(status, 50, default='applied'),
+            memory_type=_coerce_patch_text(memory_type, 50, default='fact'),
+            visibility=_coerce_patch_visibility(visibility, default='dm_private'),
             certainty=cert_val,
             importance=imp_val,
-            reason=reason,
-            expires_or_retire_condition=expires_or_retire_condition,
+            reason=_coerce_patch_text(reason, 420) or None,
+            expires_or_retire_condition=_coerce_patch_text(expires_or_retire_condition, 520) or None,
             before_json=before_json,
             after_json=after_json,
             patch_json=patch_json,
-            error=error
+            error=_coerce_patch_text(error, 1200) or None
         )
         db.session.add(log_entry)
         logs_written += 1
@@ -4061,6 +4708,13 @@ def apply_memory_patch(campaign, session, patch, audit_context=None):
                     'id': item.get('id'),
                     'embedding_dedupe': embedding_dedupe,
                 })
+                if before_val is None:
+                    if kind == 'entity':
+                        before_val = before_entities.get(item.get('id'))
+                    elif kind == 'relation':
+                        before_val = before_relations.get(item.get('id'))
+                    elif kind == 'fact':
+                        before_val = before_facts.get(item.get('id'))
 
                 # Fetch after snapshot
                 after_val = next((x for x in graph[plural] if x.get('id') == item.get('id')), None)
@@ -4102,10 +4756,47 @@ def apply_memory_patch(campaign, session, patch, audit_context=None):
         scene_patch = patch.get('scene_patch') if isinstance(patch.get('scene_patch'), dict) else {}
         if scene_patch:
             current_scene = world_state.get('current_scene', {}) if isinstance(world_state, dict) else {}
+            raw_scene_patch = dict(scene_patch)
+            scene_patch, skipped_scene_patch = _validate_memory_scene_patch(
+                campaign,
+                current_scene,
+                scene_patch,
+                audit_context,
+            )
+            if skipped_scene_patch:
+                log_change(
+                    memory_id='current_scene',
+                    target_table='campaign_worlds',
+                    target_id=str(world.id),
+                    operation='update',
+                    status='validation_failed',
+                    memory_type='location',
+                    visibility='party_known',
+                    certainty='suspected',
+                    importance=3,
+                    reason='Scene patch fields lacked support in the latest visible exchange.',
+                    before_json={'current_scene': dict(current_scene)},
+                    after_json={'current_scene': dict(current_scene)},
+                    patch_json={
+                        'scene_patch': raw_scene_patch,
+                        'skipped_scene_patch': skipped_scene_patch,
+                    },
+                    error='unsupported_scene_patch_fields',
+                )
+            if not scene_patch:
+                scene_patch = {}
+        if scene_patch:
+            current_scene = world_state.get('current_scene', {}) if isinstance(world_state, dict) else {}
             before_scene = dict(current_scene)
             current_scene.update(scene_patch)
             world_state['current_scene'] = current_scene
-            event = _record_event(campaign, 'scene_updated', patch.get('scene_reason') or 'Scene updated by memory writer.', {'scene_patch': scene_patch})
+            event = _record_event(
+                campaign,
+                'scene_updated',
+                patch.get('scene_reason') or 'Scene updated by memory writer.',
+                {'scene_patch': scene_patch},
+                visibility='party_known',
+            )
             result['world_event_ids'].append(event.id)
 
             log_change(
