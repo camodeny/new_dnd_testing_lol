@@ -3245,6 +3245,175 @@ class DmToolsTest(unittest.TestCase):
         self.assertEqual(repair_payload['spoiler_violation']['leaked_item_ids'], ['fact_trap'])
         self.assertEqual(repair_payload['leaked_private_items'][0]['text'], 'The note is a trap.')
 
+    def test_canon_discipline_rewrites_unsupported_player_claim_confirmation(self):
+        hot_context = {
+            'protected_player_characters': [],
+            'private_output_terms': [],
+            'private_spoiler_items': [],
+            'session': {
+                'running_summary': 'The party found an unidentified corpse and a half-burned letter mentioning only a thorn and a coach.',
+            },
+            'current_scene': {
+                'location_name': 'Glassway crossroads',
+                'immediate_tension': 'Armed riders are questioning the party about the dead courier.',
+            },
+            'recent_messages': [
+                {'role': 'dm', 'content': 'The riders keep their crossbows trained on you while they ask what you found.'},
+                {'role': 'player', 'content': 'He had the Vane brand on his arm, two fingers missing, and the letter named Orrin Vane.'},
+            ],
+            'established_public_facts': [
+                {
+                    'id': 'corpse_unknown',
+                    'text': 'The party found an unidentified corpse carrying a half-burned letter that mentioned a thorn and a coach.',
+                    'certainty': 'confirmed',
+                    'visibility': 'party_known',
+                },
+            ],
+            'recent_public_world_events': [],
+            'open_public_threads': ['Identify the dead courier and learn who wanted the letter.'],
+            'visible_naming_constraints': [],
+        }
+
+        with patch('openrouter._post_chat_response', side_effect=[
+            dm_talk_tool_response('<npc target="Harl">"That was Orrin Vane, all right."</npc>'),
+            dm_talk_tool_response('<npc target="Harl">"That is a very specific description. If it is true, someone important is missing."</npc>'),
+        ]) as post_chat, patch('openrouter.check_session_canon_discipline_with_llm', side_effect=[
+            {
+                'safe': False,
+                'unsupported_confirmations': [{
+                    'sentence': 'That was Orrin Vane, all right.',
+                    'claim_source': 'player_claim',
+                    'reason': 'The reply confirms a player-supplied identity with no corroborating public evidence.',
+                }],
+                'coherence_conflicts': [],
+                'confidence': 'high',
+                'reason': 'Unsupported player claim promoted into objective truth.',
+            },
+            {
+                'safe': True,
+                'unsupported_confirmations': [],
+                'coherence_conflicts': [],
+                'confidence': 'high',
+                'reason': '',
+            },
+        ]):
+            result = get_session_dm_response_with_tools(hot_context, [], [], lambda *_args, **_kwargs: {}, max_tool_rounds=0)
+
+        self.assertEqual(
+            result,
+            {'mode': 'speak', 'content': '<npc target="Harl">"That is a very specific description. If it is true, someone important is missing."</npc>'},
+        )
+        repair_messages = next(
+            call.args[0]
+            for call in post_chat.call_args_list
+            if call.args[0][0]['content'].startswith('You repair unsafe visible Dungeon Master replies.')
+        )
+        repair_payload = json.loads(repair_messages[1]['content'])
+        self.assertEqual(
+            repair_payload['canon_discipline_violation']['unsupported_confirmations'][0]['claim_source'],
+            'player_claim',
+        )
+        self.assertIn('unidentified corpse', repair_payload['established_public_facts'][0]['text'])
+
+    def test_canon_discipline_blocks_repeated_established_lead_conflict(self):
+        hot_context = {
+            'protected_player_characters': [],
+            'private_output_terms': [],
+            'private_spoiler_items': [],
+            'session': {
+                'running_summary': 'The party learned that the Spike tower is Agent Mercer\'s base and is deciding whether to head there next.',
+            },
+            'current_scene': {
+                'location_name': 'Ashglass road',
+                'immediate_tension': 'The party is debating whether to pursue the tower lead or the grove lead first.',
+            },
+            'recent_messages': [
+                {'role': 'dm', 'content': 'The Spike tower remains the clearest lead on Mercer.'},
+                {'role': 'player', 'content': 'Could the grove matter more than the tower?'},
+            ],
+            'established_public_facts': [
+                {
+                    'id': 'tower_base',
+                    'text': 'The Spike tower is Agent Mercer\'s base of operations.',
+                    'certainty': 'confirmed',
+                    'visibility': 'party_known',
+                },
+            ],
+            'recent_public_world_events': [],
+            'open_public_threads': ['Decide whether to strike the tower or investigate the grove first.'],
+            'visible_naming_constraints': [],
+        }
+
+        with patch('openrouter._post_chat_response', side_effect=[
+            dm_talk_tool_response('The tower was never important. The grove is the true heart of the whole operation.'),
+            dm_talk_tool_response('Forget the tower. Everything that matters is in the grove.'),
+            dm_talk_tool_response('The tower lead is dead. The grove is the only real answer.'),
+            dm_talk_tool_response('You can ignore the tower now. It was a false trail from the start.'),
+            dm_talk_tool_response('The grove is what matters. The tower never did.'),
+        ]), patch('openrouter.check_session_canon_discipline_with_llm', side_effect=[
+            {
+                'safe': False,
+                'unsupported_confirmations': [],
+                'coherence_conflicts': [{
+                    'sentence': 'The tower was never important.',
+                    'claim_source': 'contradicted_lead',
+                    'reason': 'The reply discards an established public lead without visible evidence.',
+                }],
+                'confidence': 'high',
+                'reason': 'Established lead overwritten without support.',
+            },
+            {
+                'safe': False,
+                'unsupported_confirmations': [],
+                'coherence_conflicts': [{
+                    'sentence': 'Forget the tower.',
+                    'claim_source': 'unsupported_reframe',
+                    'reason': 'The reply still replaces the established tower lead outright.',
+                }],
+                'confidence': 'high',
+                'reason': 'Established lead overwritten without support.',
+            },
+            {
+                'safe': False,
+                'unsupported_confirmations': [],
+                'coherence_conflicts': [{
+                    'sentence': 'The tower lead is dead.',
+                    'claim_source': 'contradicted_lead',
+                    'reason': 'The reply keeps nullifying the established lead.',
+                }],
+                'confidence': 'high',
+                'reason': 'Established lead overwritten without support.',
+            },
+            {
+                'safe': False,
+                'unsupported_confirmations': [],
+                'coherence_conflicts': [{
+                    'sentence': 'You can ignore the tower now.',
+                    'claim_source': 'unsupported_reframe',
+                    'reason': 'The reply still tells the party to discard the established lead.',
+                }],
+                'confidence': 'high',
+                'reason': 'Established lead overwritten without support.',
+            },
+            {
+                'safe': False,
+                'unsupported_confirmations': [],
+                'coherence_conflicts': [{
+                    'sentence': 'The tower never did.',
+                    'claim_source': 'contradicted_lead',
+                    'reason': 'The reply still contradicts the established public fact.',
+                }],
+                'confidence': 'high',
+                'reason': 'Established lead overwritten without support.',
+            },
+        ]):
+            result = get_session_dm_response_with_tools(hot_context, [], [], lambda *_args, **_kwargs: {}, max_tool_rounds=0)
+
+        self.assertEqual(result, {
+            'mode': 'silent',
+            'reason': 'The DM response would have promoted unsupported claims or contradicted established public facts.',
+        })
+
     def test_spoiler_checker_allows_player_prompted_witness_clue(self):
         hot_context = {
             'private_spoiler_items': [

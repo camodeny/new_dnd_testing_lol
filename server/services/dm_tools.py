@@ -659,6 +659,68 @@ def _active_clocks(campaign, limit=8):
     return (active or clocks)[:limit]
 
 
+def _established_public_facts(campaign, limit=8):
+    _world, graph, _world_state, _dm_private = _world_json(campaign)
+    facts = []
+    for fact in graph.get('facts', []) if isinstance(graph, dict) else []:
+        if not isinstance(fact, dict):
+            continue
+        visibility = clean_text(fact.get('visibility'), 30) or 'dm_private'
+        if visibility not in {'public', 'party_known'}:
+            continue
+        text = clean_text(fact.get('text'), 220)
+        if not text:
+            continue
+        facts.append({
+            'id': clean_id(fact.get('id'), f'fact_{len(facts) + 1}'),
+            'text': text,
+            'certainty': clean_text(fact.get('certainty'), 40) or 'confirmed',
+            'visibility': visibility,
+            'entity_ids': _coerce_patch_id_list(fact.get('entity_ids'), max_items=4),
+        })
+        if len(facts) >= limit:
+            break
+    return facts
+
+
+def _recent_public_world_events(campaign, limit=6):
+    events = (
+        WorldEvent.query.filter_by(campaign_id=campaign.id)
+        .order_by(WorldEvent.id.desc())
+        .limit(max(limit * 3, limit))
+        .all()
+    )
+    public_events = []
+    for event in events:
+        visibility = clean_text(event.visibility, 30) or 'dm_private'
+        if visibility not in {'public', 'party_known'}:
+            continue
+        summary = clean_text(event.summary, 220)
+        if not summary:
+            continue
+        public_events.append({
+            'id': event.id,
+            'event_type': clean_text(event.event_type, 80),
+            'summary': summary,
+            'visibility': visibility,
+        })
+        if len(public_events) >= limit:
+            break
+    return list(reversed(public_events))
+
+
+def _open_public_threads(campaign, limit=6):
+    _world, _graph, world_state, _dm_private = _world_json(campaign)
+    open_threads = world_state.get('open_threads', []) if isinstance(world_state, dict) else []
+    if not isinstance(open_threads, list):
+        open_threads = [open_threads]
+    return [
+        clean_text(thread, 180)
+        for thread in open_threads[:limit]
+        if clean_text(thread, 180)
+    ]
+
+
 def _private_output_terms(campaign):
     _world, graph, _world_state, dm_private = _world_json(campaign)
     terms = set()
@@ -991,6 +1053,9 @@ def build_session_hot_context(campaign, session, current_user):
         'current_encounter_map': _compact_encounter_map(encounter_map),
         'combat_coordinates': _combat_coordinate_context(campaign, encounter_map),
         'active_clocks': [clock.to_dict(include_private=True) for clock in active_clocks],
+        'established_public_facts': _established_public_facts(campaign),
+        'recent_public_world_events': _recent_public_world_events(campaign),
+        'open_public_threads': _open_public_threads(campaign),
         'visible_naming_constraints': _visible_naming_constraints(campaign, recent_messages),
         'private_output_terms': _private_output_terms(campaign),
         'private_spoiler_items': _private_spoiler_items(campaign),
@@ -1003,6 +1068,11 @@ def build_session_hot_context(campaign, session, current_user):
             'before improvising. Do not claim to update world state unless a write tool succeeds. Never reveal '
             'DM-private tool results unless they have become visible through play. private_output_terms are '
             'reasoning-only strings that must not appear in visible narration unless they are first revealed through play. '
+            'Treat specific player-supplied recollections, accusations, guesses, bluff details, and theories as claims, '
+            'not confirmed truth, unless they are corroborated by the visible scene, established public facts, a '
+            'successful check, or another grounded source. NPCs may react to a claim without validating it. '
+            'When a new interpretation would reframe an existing public lead or clue, preserve the old lead unless the '
+            'fiction clearly earns the update; if uncertain, speak conditionally instead of replacing prior truth. '
             'Use create_encounter_map when the party enters a tactical area where spatial positioning matters, '
             'or when a player explicitly asks for a map; include vtt_setup_notes when the DM has intended '
             'friendly starts, enemy starts, obstacles, objectives, or terrain calls for the playable setup JSON. '

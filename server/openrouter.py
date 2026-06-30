@@ -152,6 +152,11 @@ SESSION_TOOL_PROMPT = (
     "results in visible narration unless they became known through play. The hot context contains internal "
     "tracking data; never surface that data structure directly to players. Keep visible text diegetic and "
     "player-facing, not system-facing. "
+    "Player-supplied specifics are not automatically true. Treat recollections, accusations, bluff details, "
+    "and theories from players as claims unless they are corroborated by the visible scene, a successful check, "
+    "established public facts, or another grounded source. NPCs may react to such claims without validating "
+    "them as objective truth. If a reply would reinterpret an established public lead, preserve uncertainty "
+    "and avoid replacing prior committed facts unless the fiction clearly earns it. "
     "protected_player_characters and current_player_character; obey those boundaries exactly. "
     "For the final turn decision, call exactly one finalization tool: use talk_to_player with visible player-facing content "
     "when the DM should send a visible reply, or call stay_silent with a short reason when the DM should not "
@@ -320,6 +325,22 @@ SESSION_PC_CONTROL_CHECK_SYSTEM_PROMPT = (
     "describes what happens to the acting player character after they already attempted something risky. "
     "Be especially careful to allow consequence narration such as losing footing, getting hit, taking damage, or "
     "ending up in a new spot when the world caused it rather than the DM inventing a new choice."
+)
+
+SESSION_CANON_DISCIPLINE_CHECK_SYSTEM_PROMPT = (
+    "You are an evidence-discipline and continuity guard for visible Dungeon Master replies. "
+    "Return only valid JSON. The DM may improvise in open space, but must not present unsupported claims as "
+    "objective truth. Unsafe replies do either of these: "
+    "1. convert player-supplied specifics, guesses, accusations, or remembered details into confirmed world truth "
+    "without corroboration from public evidence, the visible scene, a successful check, or an already-established fact; "
+    "2. contradict, discard, or sharply reframe an already-established public lead, clue, ownership claim, relationship, "
+    "or location truth without visible support. "
+    "Safe replies may react skeptically, conditionally, or provisionally to player claims, may let NPCs say "
+    "that a detail sounds familiar, and may leave uncertainty in place. "
+    "Be especially cautious when a candidate reply introduces a new proper noun, identity, ownership, or hidden "
+    "connection that appears to come only from the player's speculative framing. "
+    "If the reply can be made safe by adding uncertainty language or by keeping an NPC reaction non-authoritative, "
+    "mark the original unsafe."
 )
 
 SESSION_PREFLIGHT_SYSTEM_PROMPT = (
@@ -995,6 +1016,22 @@ def _session_dm_guard_repair_payload(candidate, guard_name, details, hot_context
             'Do not invent dialogue, choices, intent, interior state, or consequential actions for any protected player character.',
             'Convert protected player character dialogue or decisions into non-controlling DM narration, a direct question, or a brief player handoff.',
             'Keep references to protected player characters brief and non-controlling.',
+            'Do not use any angle-bracket tag other than <npc target="NPC name">...</npc>.',
+        ]
+        return payload
+    if guard_name == 'canon_discipline':
+        payload['canon_discipline_violation'] = details or {}
+        payload['latest_player_message'] = _latest_player_message(hot_context)
+        payload['established_public_facts'] = (hot_context or {}).get('established_public_facts') or []
+        payload['recent_public_world_events'] = (hot_context or {}).get('recent_public_world_events') or []
+        payload['open_public_threads'] = (hot_context or {}).get('open_public_threads') or []
+        payload['repair_requirements'] = [
+            'Return only the repaired visible reply text.',
+            'Preserve scene momentum, atmosphere, and any safe established facts unless a change is required to restore evidence discipline.',
+            'Do not turn player-supplied specifics into confirmed truth unless the confirmation is grounded in visible evidence already present in the payload.',
+            'If a player claim is not corroborated, keep it conditional, skeptical, or merely reactive from the NPC point of view.',
+            'Do not replace or sharply reframe an established public lead unless the visible evidence already supports that update.',
+            'Prefer uncertainty language over authoritative confirmation when the evidence is incomplete.',
             'Do not use any angle-bracket tag other than <npc target="NPC name">...</npc>.',
         ]
         return payload
@@ -1712,6 +1749,17 @@ def _session_dm_guard_retry_system_prompt(guard_name, details):
             'Keep any mention of a protected PC brief and non-controlling. '
             'If no DM adjudication is needed (for example PC-to-PC exchange), use stay_silent("PC-to-PC exchange."). '
             'Otherwise use talk_to_player with only safe DM-visible content.'
+            + silent_ack
+        )
+    if guard_name == 'canon_discipline':
+        return (
+            'Guard reminder: do not promote unsupported claims into objective truth. '
+            'Treat player-supplied details, accusations, recollections, and theories as claims unless they are '
+            'corroborated by the visible scene, a successful check, or established public facts. '
+            'NPCs may react to a claim without validating it. '
+            'Do not sharply replace or contradict an established public lead unless the visible evidence clearly earns that change. '
+            'If certainty is incomplete, speak conditionally instead of authoritatively. '
+            'Finalize with talk_to_player or stay_silent.'
             + silent_ack
         )
     if guard_name == 'private_output':
@@ -2716,6 +2764,46 @@ def normalize_session_pc_control_check(raw_check):
     }
 
 
+def normalize_session_canon_discipline_check(raw_check):
+    data = raw_check if isinstance(raw_check, dict) else _json_loads_or_empty(raw_check)
+    if not isinstance(data, dict) or not data:
+        return {
+            'safe': True,
+            'unsupported_confirmations': [],
+            'coherence_conflicts': [],
+            'confidence': 'low',
+            'reason': 'Checker returned no usable decision.',
+        }
+
+    def normalize_items(items):
+        if not isinstance(items, list):
+            return []
+        normalized = []
+        for item in items:
+            if not isinstance(item, dict):
+                continue
+            normalized.append({
+                'sentence': str(item.get('sentence') or '').strip()[:260],
+                'claim_source': str(item.get('claim_source') or '').strip()[:80],
+                'reason': str(item.get('reason') or '').strip()[:260],
+            })
+        return [item for item in normalized if item['sentence'] or item['reason']]
+
+    unsupported_confirmations = normalize_items(data.get('unsupported_confirmations'))
+    coherence_conflicts = normalize_items(data.get('coherence_conflicts'))
+    confidence = str(data.get('confidence') or 'medium').strip().lower()
+    if confidence not in {'low', 'medium', 'high'}:
+        confidence = 'medium'
+    safe = bool(data.get('safe')) and not unsupported_confirmations and not coherence_conflicts
+    return {
+        'safe': safe,
+        'unsupported_confirmations': unsupported_confirmations,
+        'coherence_conflicts': coherence_conflicts,
+        'confidence': confidence,
+        'reason': str(data.get('reason') or '').strip(),
+    }
+
+
 def build_session_npc_tag_check_messages(response_text, signal=None):
     return [
         {'role': 'system', 'content': SESSION_NPC_TAG_CHECK_SYSTEM_PROMPT},
@@ -2763,6 +2851,45 @@ def build_session_pc_control_check_messages(response_text, hot_context):
     ]
 
 
+def build_session_canon_discipline_check_messages(response_text, hot_context):
+    established_public_facts = (hot_context or {}).get('established_public_facts') or []
+    recent_public_world_events = (hot_context or {}).get('recent_public_world_events') or []
+    open_public_threads = (hot_context or {}).get('open_public_threads') or []
+    session_meta = (hot_context or {}).get('session') or {}
+
+    return [
+        {'role': 'system', 'content': SESSION_CANON_DISCIPLINE_CHECK_SYSTEM_PROMPT},
+        {
+            'role': 'user',
+            'content': json.dumps({
+                'candidate_visible_dm_reply': response_text,
+                'latest_player_message': _latest_player_message(hot_context),
+                'recent_visible_messages': (hot_context.get('recent_messages') or [])[-6:],
+                'current_scene': (hot_context.get('current_scene') or {}),
+                'session_running_summary': str(session_meta.get('running_summary') or '')[:1800],
+                'established_public_facts': established_public_facts[:8],
+                'recent_public_world_events': recent_public_world_events[:6],
+                'open_public_threads': open_public_threads[:6],
+                'return_shape': {
+                    'safe': 'boolean',
+                    'unsupported_confirmations': [{
+                        'sentence': 'short exact sentence from candidate reply',
+                        'claim_source': 'player_claim | guess | accusation | bluff | unsupported_lore | other',
+                        'reason': 'one short explanation',
+                    }],
+                    'coherence_conflicts': [{
+                        'sentence': 'short exact sentence from candidate reply',
+                        'claim_source': 'contradicted_lead | replaced_fact | unsupported_reframe | other',
+                        'reason': 'one short explanation',
+                    }],
+                    'confidence': 'low | medium | high',
+                    'reason': 'one short explanation',
+                },
+            }, ensure_ascii=False),
+        },
+    ]
+
+
 def _pc_control_check_needed(response_text, hot_context):
     import re
 
@@ -2786,6 +2913,19 @@ def _pc_control_check_needed(response_text, hot_context):
             return True
 
     return bool(re.search(r"\b(?:you|your|you're|you've|you’d|you'll)\b", visible, flags=re.IGNORECASE))
+
+
+def _canon_discipline_check_needed(response_text, hot_context):
+    if not (response_text or '').strip():
+        return False
+    latest_player_message = _latest_player_message(hot_context)
+    if not latest_player_message:
+        return False
+    return bool(
+        (hot_context or {}).get('established_public_facts')
+        or (hot_context or {}).get('recent_public_world_events')
+        or (hot_context or {}).get('open_public_threads')
+    )
 
 
 def _child_audit_context(base_audit, operation, actor, trace_label):
@@ -3005,6 +3145,55 @@ def check_session_pc_control_with_llm(response_text, hot_context, audit_context=
         return {
             'safe': True,
             'violations': [],
+            'confidence': 'low',
+            'reason': 'Checker failed open.',
+        }
+
+
+def check_session_canon_discipline_with_llm(response_text, hot_context, audit_context=None):
+    if not _canon_discipline_check_needed(response_text, hot_context):
+        return {
+            'safe': True,
+            'unsupported_confirmations': [],
+            'coherence_conflicts': [],
+            'confidence': 'high',
+            'reason': '',
+        }
+
+    base_audit = audit_context or {}
+    checker_audit = _child_audit_context(
+        base_audit,
+        'session_canon_discipline_check',
+        'session_canon_discipline_checker',
+        'session_canon_discipline_checker: canon discipline check',
+    )
+    try:
+        raw_check = _post_chat(
+            build_session_canon_discipline_check_messages(response_text, hot_context),
+            json_mode=True,
+            audit_context=checker_audit,
+            allow_thinking=False,
+        )
+        return normalize_session_canon_discipline_check(raw_check)
+    except Exception as err:
+        campaign_id = base_audit.get('campaign_id')
+        if campaign_id:
+            log_audit_event(
+                campaign_id,
+                'canon_discipline_checker_error',
+                'Session canon-discipline checker failed open.',
+                {'error': repr(err)},
+                source='session_dm.guard',
+                actor='server',
+                trace_id=base_audit.get('trace_id'),
+                trace_label=base_audit.get('trace_label'),
+                audit_role='guard',
+                commit=True,
+            )
+        return {
+            'safe': True,
+            'unsupported_confirmations': [],
+            'coherence_conflicts': [],
             'confidence': 'low',
             'reason': 'Checker failed open.',
         }
@@ -3751,6 +3940,8 @@ def get_session_dm_response_with_tools(
     mechanical_retried = False
     pc_control_retried = False
     pc_control_repair_attempted = False
+    canon_checker_retry_count = 0
+    canon_checker_repair_attempted = False
     private_output_retry_count = 0
     spoiler_checker_retry_count = 0
     spoiler_checker_repair_attempted = False
@@ -3806,6 +3997,7 @@ def get_session_dm_response_with_tools(
             format_retry_count > 0,
             mechanical_retried,
             pc_control_retried,
+            canon_checker_retry_count > 0,
             private_output_retry_count > 0,
             spoiler_checker_retry_count > 0,
             combat_handoff_retried,
@@ -3958,6 +4150,7 @@ def get_session_dm_response_with_tools(
             format_violation = None
             mechanical_violation = None
             violation = None
+            canon_violation = None
             private_violation = None
             spoiler_check = {'safe': True, 'leaked_item_ids': [], 'evidence': [], 'reason': ''}
             combat_handoff_violation = None
@@ -4033,15 +4226,32 @@ def get_session_dm_response_with_tools(
                         **pc_control_check,
                     } if not pc_control_check.get('safe', True) else None
                 )
+                canon_check = (
+                    check_session_canon_discipline_with_llm(content, hot_context, loop_audit)
+                    if decision.get('mode') == 'speak' and not format_violation and not mechanical_violation
+                    else {
+                        'safe': True,
+                        'unsupported_confirmations': [],
+                        'coherence_conflicts': [],
+                        'confidence': 'high',
+                        'reason': '',
+                    }
+                )
+                canon_violation = (
+                    {
+                        'kind': 'canon_discipline',
+                        **canon_check,
+                    } if not canon_check.get('safe', True) else None
+                )
                 private_violation = (
                     _private_output_violation(content, hot_context)
-                    if decision.get('mode') == 'speak' and not format_violation
+                    if decision.get('mode') == 'speak' and not format_violation and not canon_violation
                     else None
                 )
                 deterministic_spoiler_violation = (
                     _witness_private_leverage_spoiler_violation(content, hot_context)
                     if decision.get('mode') == 'speak' and not format_violation and not private_violation
-                    and not mechanical_violation
+                    and not mechanical_violation and not canon_violation
                     else None
                 )
                 spoiler_check = (
@@ -4053,13 +4263,13 @@ def get_session_dm_response_with_tools(
                         skip_spoiler_check=preflight_decision.get('skip_spoiler_check') is True,
                     )
                     if decision.get('mode') == 'speak' and not format_violation and not private_violation
-                    and not mechanical_violation
+                    and not mechanical_violation and not canon_violation
                     else {'safe': True, 'leaked_item_ids': [], 'evidence': [], 'reason': ''}
                 )
                 combat_handoff_violation = (
                     _session_dm_combat_handoff_violation(content, combat_tracker)
                     if decision.get('mode') == 'speak' and not format_violation and not private_violation
-                    and not mechanical_violation
+                    and not mechanical_violation and not canon_violation
                     else None
                 )
                 if format_violation and repaired_from_format_guard and format_retry_count < 2:
@@ -4092,6 +4302,49 @@ def get_session_dm_response_with_tools(
                         content,
                         'pc_control',
                         violation,
+                        hot_context,
+                        audit_context=loop_audit,
+                    )
+                    if repaired_content and repaired_content != content:
+                        content = repaired_content
+                        raw_content = repaired_content
+                        decision = {
+                            **decision,
+                            'content': repaired_content,
+                        }
+                        continue
+                if (
+                    canon_violation
+                    and canon_checker_retry_count < 3
+                    and not canon_checker_repair_attempted
+                ):
+                    if on_status_change:
+                        on_status_change({"step": "revising", "violations": {"type": "canon_discipline", "details": canon_violation}})
+                    if base_audit.get('campaign_id'):
+                        audit = guard_audit('canon_discipline_guard')
+                        log_audit_event(
+                            base_audit.get('campaign_id'),
+                            'canon_discipline_guard_retry',
+                            'Session DM response promoted unsupported claims or conflicted with established public facts; sent candidate to a repair pass and will rerun with a guard reminder if needed.',
+                            {
+                                'operation': 'canon_discipline_guard',
+                                'violation': canon_violation,
+                                'draft_response': raw_content,
+                                'repair_strategy': 'repair_pass_then_rerun',
+                            },
+                            source='session_dm.guard',
+                            actor=audit.get('actor'),
+                            trace_id=audit.get('trace_id'),
+                            parent_trace_id=audit.get('parent_trace_id'),
+                            trace_label=audit.get('trace_label'),
+                            audit_role='guard',
+                            commit=True,
+                        )
+                    canon_checker_repair_attempted = True
+                    repaired_content = _repair_session_dm_visible_reply(
+                        content,
+                        'canon_discipline',
+                        canon_violation,
                         hot_context,
                         audit_context=loop_audit,
                     )
@@ -4203,6 +4456,35 @@ def get_session_dm_response_with_tools(
                     'content': _session_dm_guard_retry_system_prompt('pc_control', violation),
                 })
                 pc_control_retried = True
+                continue
+            if canon_violation and canon_checker_retry_count < 3:
+                if on_status_change and (canon_checker_retry_count > 0 or not canon_checker_repair_attempted):
+                    on_status_change({"step": "revising", "violations": {"type": "canon_discipline", "details": canon_violation}})
+                if base_audit.get('campaign_id') and (canon_checker_retry_count > 0 or not canon_checker_repair_attempted):
+                    audit = guard_audit('canon_discipline_guard')
+                    log_audit_event(
+                        base_audit.get('campaign_id'),
+                        'canon_discipline_guard_retry',
+                        'Session DM response promoted unsupported claims or conflicted with established public facts; discarded candidate and reran with a guard reminder.',
+                        {
+                            'operation': 'canon_discipline_guard',
+                            'violation': canon_violation,
+                            'draft_response': raw_content,
+                            'repair_strategy': 'guard_reminder_rerun',
+                        },
+                        source='session_dm.guard',
+                        actor=audit.get('actor'),
+                        trace_id=audit.get('trace_id'),
+                        parent_trace_id=audit.get('parent_trace_id'),
+                        trace_label=audit.get('trace_label'),
+                        audit_role='guard',
+                        commit=True,
+                    )
+                messages.append({
+                    'role': 'system',
+                    'content': _session_dm_guard_retry_system_prompt('canon_discipline', canon_violation),
+                })
+                canon_checker_retry_count += 1
                 continue
             if private_violation and private_output_retry_count < 2:
                 if on_status_change:
@@ -4338,6 +4620,31 @@ def get_session_dm_response_with_tools(
                 return {
                     'mode': 'silent',
                     'reason': 'The DM response would have controlled a protected player character.',
+                }
+            if canon_violation:
+                if base_audit.get('campaign_id'):
+                    audit = guard_audit('canon_discipline_guard')
+                    log_audit_event(
+                        base_audit.get('campaign_id'),
+                        'canon_discipline_guard_blocked',
+                        'Session DM response still promoted unsupported claims or conflicted with established public facts after retry.',
+                        {
+                            'operation': 'canon_discipline_guard',
+                            'violation': canon_violation,
+                            'draft_response': raw_content,
+                        },
+                        source='session_dm.guard',
+                        actor=audit.get('actor'),
+                        trace_id=audit.get('trace_id'),
+                        parent_trace_id=audit.get('parent_trace_id'),
+                        trace_label=audit.get('trace_label'),
+                        audit_role='guard',
+                        commit=True,
+                    )
+                rollback_combat_if_needed('canon_discipline_violation', canon_violation)
+                return {
+                    'mode': 'silent',
+                    'reason': 'The DM response would have promoted unsupported claims or contradicted established public facts.',
                 }
             if mechanical_violation:
                 if base_audit.get('campaign_id'):
