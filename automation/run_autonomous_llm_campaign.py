@@ -17,6 +17,8 @@ from llm_campaign_common import (
     extract_text_parts,
     load_manifest,
     opencode_request,
+    save_manifest,
+    start_session,
 )
 
 
@@ -507,12 +509,40 @@ def resolve_manifest(args):
     return manifest_path
 
 
+def ensure_manifest_session_started(args, manifest_path, manifest):
+    session_id = ((manifest.get('session') or {}).get('id'))
+    if session_id:
+        return manifest
+
+    owner_token = manifest.get('owner', {}).get('token')
+    owner_api_key = manifest.get('owner', {}).get('api_key') or os.environ.get('DND_OWNER_API_KEY')
+    session = start_session(
+        manifest['api_base'],
+        manifest['campaign']['id'],
+        owner_token=owner_token,
+        api_key=owner_api_key,
+        timeout=args.session_start_timeout,
+    )
+    manifest['session'] = {'id': session['id']}
+    manifest['bootstrap_state'] = 'started'
+    save_manifest(manifest_path, manifest)
+    print_event({
+        'event': 'session_started',
+        'timestamp': utc_now(),
+        'manifest': str(manifest_path),
+        'campaign_id': manifest['campaign']['id'],
+        'session_id': session['id'],
+    })
+    return manifest
+
+
 def main():
     args = parse_args()
     manifest_path = resolve_manifest(args)
     lock_path = acquire_manifest_lock(manifest_path)
     try:
         manifest = load_manifest(manifest_path)
+        manifest = ensure_manifest_session_started(args, manifest_path, manifest)
         start_time = time.monotonic()
         deadline = start_time + (args.max_minutes * 60.0)
         last_seen_fingerprint = None

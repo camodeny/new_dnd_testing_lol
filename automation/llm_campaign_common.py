@@ -4,6 +4,7 @@ import json
 import os
 import pathlib
 import socket
+import time
 import urllib.error
 import urllib.parse
 import urllib.request
@@ -117,6 +118,61 @@ def api_put_with_key(base, path, payload, api_key=None):
         headers=auth_headers(api_key=api_key),
         payload=payload,
         timeout=default_api_timeout(),
+    )
+
+
+def find_active_session(base, campaign_id, owner_token=None, api_key=None):
+    sessions = api_get(
+        base,
+        f'/api/campaigns/{campaign_id}/sessions',
+        owner_token=owner_token,
+        api_key=api_key,
+    ).get('sessions') or []
+    for session in sessions:
+        if session.get('is_active'):
+            return session
+    return None
+
+
+def start_session(base, campaign_id, owner_token=None, api_key=None, timeout=None, poll_interval=5):
+    timeout = timeout if timeout is not None else default_session_start_timeout()
+    active_session = find_active_session(
+        base,
+        campaign_id,
+        owner_token=owner_token,
+        api_key=api_key,
+    )
+    if active_session:
+        return active_session
+
+    try:
+        return api_post(
+            base,
+            f'/api/campaigns/{campaign_id}/sessions',
+            {},
+            owner_token=owner_token,
+            api_key=api_key,
+            timeout=timeout,
+        )['session']
+    except ApiError as exc:
+        if 'timed out' not in str(exc):
+            raise
+
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        active_session = find_active_session(
+            base,
+            campaign_id,
+            owner_token=owner_token,
+            api_key=api_key,
+        )
+        if active_session:
+            return active_session
+        time.sleep(poll_interval)
+
+    raise RuntimeError(
+        f'Session start request timed out and no active session appeared within {timeout}s. '
+        'The server may be overloaded or stuck in opening-scene generation.'
     )
 
 

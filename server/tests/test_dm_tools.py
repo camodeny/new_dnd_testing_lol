@@ -178,7 +178,7 @@ class DmToolsTest(unittest.TestCase):
         names = {tool['function']['name'] for tool in DM_TOOL_DEFINITIONS}
         self.assertIn('ask_character_sheet', names)
         self.assertIn('search_campaign_memory', names)
-        self.assertIn('advance_clock', names)
+        self.assertNotIn('advance_clock', names)
         self.assertIn('roll_dice', names)
         self.assertIn('create_encounter_map', names)
         self.assertIn('place_encounter_map_actors', names)
@@ -2235,7 +2235,7 @@ class DmToolsTest(unittest.TestCase):
         self.assertEqual(repair_payload['format_violation']['errors'][0]['kind'], 'missing_npc_tag')
         self.assertIn('wrap only the spoken line in <npc target="NPC name">...</npc>', ' '.join(repair_payload['repair_requirements']))
 
-    def test_session_dm_format_guard_falls_back_to_local_missing_npc_tag_repair_after_blank_repair(self):
+    def test_session_dm_format_guard_falls_back_to_local_missing_npc_tag_repair_after_repeated_length_repairs(self):
         hot_context = {
             'protected_player_characters': [],
             'private_output_terms': [],
@@ -2252,6 +2252,24 @@ class DmToolsTest(unittest.TestCase):
                 'Father Aldric leans close. "The canal door was left unbarred." '
                 'He glances toward Brother Silas. "Find the flooded crypts first."'
             ),
+            {
+                'choices': [{
+                    'message': {
+                        'content': '',
+                        'reasoning_content': 'I should wrap the quotes, but I ran out of room.',
+                    },
+                    'finish_reason': 'length',
+                }],
+            },
+            {
+                'choices': [{
+                    'message': {
+                        'content': '',
+                        'reasoning_content': 'I should wrap the quotes, but I ran out of room.',
+                    },
+                    'finish_reason': 'length',
+                }],
+            },
             {
                 'choices': [{
                     'message': {
@@ -2282,7 +2300,7 @@ class DmToolsTest(unittest.TestCase):
                 'He glances toward Mirror Monk. <npc target="Father Aldric">"Find the flooded crypts first."</npc>'
             ),
         })
-        self.assertEqual(post_chat.call_count, 2)
+        self.assertEqual(post_chat.call_count, 4)
 
     def test_session_dm_format_guard_runs_npc_checker_without_heuristic_signal(self):
         hot_context = {
@@ -3315,6 +3333,79 @@ class DmToolsTest(unittest.TestCase):
         )
         self.assertIn('unidentified corpse', repair_payload['established_public_facts'][0]['text'])
 
+    def test_canon_discipline_truncated_repair_retries_with_larger_budget(self):
+        hot_context = {
+            'protected_player_characters': [],
+            'private_output_terms': [],
+            'private_spoiler_items': [],
+            'session': {
+                'running_summary': 'The party just took Vex\'s pouch and asked about the old well.',
+            },
+            'current_scene': {
+                'location_name': 'Grain Exchange office',
+                'immediate_tension': 'The bell keeps ringing and Vex wants the party moving.',
+            },
+            'recent_messages': [
+                {'role': 'dm', 'content': 'She holds out the pouch.'},
+                {'role': 'player', 'content': 'I take the pouch and ask what waits by the old well.'},
+            ],
+            'established_public_facts': [
+                {
+                    'id': 'vex_paid_advance',
+                    'text': 'Vex already handed over the advance pouch and the player took it.',
+                    'certainty': 'confirmed',
+                    'visibility': 'party_known',
+                },
+            ],
+            'recent_public_world_events': [],
+            'open_public_threads': ['Reach the old well before the crowd gets worse.'],
+            'visible_naming_constraints': [],
+        }
+
+        truncated_repair = {
+            'choices': [{
+                'message': {
+                    'content': 'Vex answers the question and starts to explain the path to the well, but',
+                },
+                'finish_reason': 'length',
+            }],
+        }
+
+        with patch('openrouter._post_chat_response', side_effect=[
+            dm_talk_tool_response('<npc target="Baronessa Rina Vex">"Half now, as promised."</npc> She holds out the pouch again.'),
+            truncated_repair,
+            dm_talk_tool_response('<npc target="Baronessa Rina Vex">"The well is dry. Stay low in the west ditch and you can reach it unseen."</npc>'),
+        ]) as post_chat, patch('openrouter.check_session_canon_discipline_with_llm', side_effect=[
+            {
+                'safe': False,
+                'unsupported_confirmations': [],
+                'coherence_conflicts': [{
+                    'sentence': 'She holds out the pouch again.',
+                    'claim_source': 'other',
+                    'reason': 'The player already took the pouch in the immediately preceding visible exchange.',
+                }],
+                'confidence': 'high',
+                'reason': 'Transactional continuity was reset without visible support.',
+            },
+            {
+                'safe': True,
+                'unsupported_confirmations': [],
+                'coherence_conflicts': [],
+                'confidence': 'high',
+                'reason': '',
+            },
+        ]):
+            result = get_session_dm_response_with_tools(hot_context, [], [], lambda *_args, **_kwargs: {}, max_tool_rounds=0)
+
+        self.assertEqual(
+            result,
+            {'mode': 'speak', 'content': '<npc target="Baronessa Rina Vex">"The well is dry. Stay low in the west ditch and you can reach it unseen."</npc>'},
+        )
+        self.assertGreater(
+            post_chat.call_args_list[2].kwargs['max_tokens'],
+            post_chat.call_args_list[1].kwargs['max_tokens'],
+        )
+
     def test_canon_discipline_blocks_repeated_established_lead_conflict(self):
         hot_context = {
             'protected_player_characters': [],
@@ -4015,6 +4106,31 @@ class DmToolsTest(unittest.TestCase):
         self.assertEqual(event.event_type, 'scene_updated')
         self.assertEqual(event.visibility, 'party_known')
 
+    def test_memory_patch_syncs_party_known_location_to_scene_location(self):
+        result = apply_memory_patch(
+            self.campaign,
+            self.session,
+            {
+                'scene_patch': {
+                    'location_id': 'crypt_road',
+                    'location_name': 'Crypt Road',
+                    'immediate_tension': 'Boots pound after fleeing grave robbers.',
+                },
+                'scene_reason': 'The chase moved to the crypt road.',
+            },
+            {
+                'latest_player_message': 'I sprint after them toward the crypts.',
+                'latest_dm_message': 'You break into a run toward the crypt road.',
+            },
+        )
+        db.session.commit()
+
+        self.assertTrue(result['world_event_ids'])
+        world = CampaignWorld.query.filter_by(campaign_id=self.campaign.id).one()
+        world_state = json.loads(world.world_state)
+        self.assertEqual(world_state['current_scene']['location_id'], 'crypt_road')
+        self.assertEqual(world_state['party']['known_location_id'], 'crypt_road')
+
     def test_memory_patch_skips_unsupported_scene_location_change(self):
         from models import CampaignMemoryLog
 
@@ -4048,7 +4164,7 @@ class DmToolsTest(unittest.TestCase):
             memory_id='current_scene',
             status='validation_failed',
         ).one()
-        self.assertEqual(validation_log.error, 'unsupported_scene_patch_fields')
+        self.assertEqual(validation_log.error, 'scene_patch_field_not_evidenced')
         self.assertEqual(
             validation_log.patch_json['skipped_scene_patch']['location_id'],
             'blackwater_harbor',
@@ -4105,6 +4221,236 @@ class DmToolsTest(unittest.TestCase):
         self.assertEqual(current_scene['location_name'], 'Crypt Road')
         self.assertEqual(current_scene['active_npc_ids'], [])
         self.assertEqual(current_scene['immediate_tension'], 'You stand alone on the crypt road.')
+
+    def test_memory_patch_preserves_unmentioned_current_npcs_same_location(self):
+        world = CampaignWorld.query.filter_by(campaign_id=self.campaign.id).one()
+        world.world_state = json.dumps({
+            'current_scene': {
+                'location_id': 'dock_ward',
+                'location_name': 'Dock Ward',
+                'active_npc_ids': ['kaine', 'saltbeard', 'debt_priest'],
+                'immediate_tension': 'The signing is poised.',
+            },
+        })
+        for actor_id, name in (
+            ('kaine', 'Kaine'),
+            ('saltbeard', 'Saltbeard'),
+            ('debt_priest', 'Debt Priest'),
+            ('watcher', 'Scarred Watcher'),
+        ):
+            db.session.add(NPCActor(
+                campaign_id=self.campaign.id,
+                actor_id=actor_id,
+                name=name,
+                public_summary='A public figure.',
+                dossier='{}',
+            ))
+        db.session.commit()
+
+        # Writer proposes only a partial subset of the current cast.
+        result = apply_memory_patch(
+            self.campaign,
+            self.session,
+            {
+                'scene_patch': {
+                    'active_npc_ids': ['watcher'],
+                },
+                'scene_reason': 'The scarred watcher steps forward.',
+            },
+            {
+                'latest_player_message': 'Brixby watches the scarred watcher.',
+                'latest_dm_message': 'The scarred watcher steps forward to speak.',
+            },
+        )
+        db.session.commit()
+
+        self.assertTrue(result['world_event_ids'])
+        current_scene = json.loads(world.world_state)['current_scene']
+        self.assertEqual(
+            current_scene['active_npc_ids'],
+            ['kaine', 'saltbeard', 'debt_priest', 'watcher'],
+        )
+
+    def test_memory_patch_evicts_npc_only_via_departed_ids(self):
+        world = CampaignWorld.query.filter_by(campaign_id=self.campaign.id).one()
+        world.world_state = json.dumps({
+            'current_scene': {
+                'location_id': 'dock_ward',
+                'location_name': 'Dock Ward',
+                'active_npc_ids': ['kaine', 'saltbeard'],
+                'immediate_tension': 'The signing is poised.',
+            },
+        })
+        for actor_id, name in (('kaine', 'Kaine'), ('saltbeard', 'Saltbeard')):
+            db.session.add(NPCActor(
+                campaign_id=self.campaign.id,
+                actor_id=actor_id,
+                name=name,
+                public_summary='A public figure.',
+                dossier='{}',
+            ))
+        db.session.commit()
+
+        result = apply_memory_patch(
+            self.campaign,
+            self.session,
+            {
+                'scene_patch': {
+                    'active_npc_ids': ['kaine'],
+                    'departed_npc_ids': ['saltbeard'],
+                },
+                'scene_reason': 'Saltbeard storms out of the signing.',
+            },
+            {
+                'latest_player_message': 'We let him leave.',
+                'latest_dm_message': 'Saltbeard storms out of the square. Kaine watches him go.',
+            },
+        )
+        db.session.commit()
+
+        self.assertTrue(result['world_event_ids'])
+        current_scene = json.loads(world.world_state)['current_scene']
+        self.assertEqual(current_scene['active_npc_ids'], ['kaine'])
+
+    def test_memory_patch_departures_win_over_active_when_conflict(self):
+        world = CampaignWorld.query.filter_by(campaign_id=self.campaign.id).one()
+        world.world_state = json.dumps({
+            'current_scene': {
+                'location_id': 'dock_ward',
+                'location_name': 'Dock Ward',
+                'active_npc_ids': ['kaine', 'saltbeard'],
+                'immediate_tension': 'The signing is poised.',
+            },
+        })
+        for actor_id, name in (('kaine', 'Kaine'), ('saltbeard', 'Saltbeard')):
+            db.session.add(NPCActor(
+                campaign_id=self.campaign.id,
+                actor_id=actor_id,
+                name=name,
+                public_summary='A public figure.',
+                dossier='{}',
+            ))
+        db.session.commit()
+
+        # Writer accidentally re-lists Saltbeard in active AND declares him departed.
+        apply_memory_patch(
+            self.campaign,
+            self.session,
+            {
+                'scene_patch': {
+                    'active_npc_ids': ['kaine', 'saltbeard'],
+                    'departed_npc_ids': ['saltbeard'],
+                },
+                'scene_reason': 'Saltbeard leaves.',
+            },
+            {
+                'latest_player_message': 'We watch Saltbeard go.',
+                'latest_dm_message': 'Saltbeard turns on his heel and leaves the square.',
+            },
+        )
+        db.session.commit()
+
+        current_scene = json.loads(world.world_state)['current_scene']
+        self.assertEqual(current_scene['active_npc_ids'], ['kaine'])
+
+    def test_memory_patch_departed_for_unknown_npc_is_noop(self):
+        from models import CampaignMemoryLog
+        world = CampaignWorld.query.filter_by(campaign_id=self.campaign.id).one()
+        world.world_state = json.dumps({
+            'current_scene': {
+                'location_id': 'dock_ward',
+                'location_name': 'Dock Ward',
+                'active_npc_ids': ['kaine'],
+                'immediate_tension': 'The signing is poised.',
+            },
+        })
+        db.session.add(NPCActor(
+            campaign_id=self.campaign.id,
+            actor_id='kaine',
+            name='Kaine',
+            public_summary='A public figure.',
+            dossier='{}',
+        ))
+        db.session.commit()
+
+        result = apply_memory_patch(
+            self.campaign,
+            self.session,
+            {
+                'scene_patch': {
+                    'departed_npc_ids': ['ghost'],
+                },
+                'scene_reason': 'A nonexistent NPC supposedly departs.',
+            },
+            {
+                'latest_player_message': 'Nothing happens.',
+                'latest_dm_message': 'The square stays still. Kaine waits.',
+            },
+        )
+        db.session.commit()
+
+        self.assertEqual(result['world_event_ids'], [])
+        current_scene = json.loads(world.world_state)['current_scene']
+        self.assertEqual(current_scene['active_npc_ids'], ['kaine'])
+        departed_log = CampaignMemoryLog.query.filter_by(
+            memory_id='current_scene',
+            status='validation_failed',
+        ).first()
+        self.assertIsNotNone(departed_log)
+        self.assertIn('ghost', departed_log.patch_json['skipped_scene_patch']['departed_npc_ids'])
+
+    def test_memory_patch_no_op_when_final_equals_current(self):
+        from models import CampaignMemoryLog
+        CampaignMemoryRun = None
+        from models import CampaignMemoryRun as CampaignMemoryRunModel
+        CampaignMemoryRunModel.query.delete()
+        CampaignMemoryLog.query.delete()
+        db.session.commit()
+
+        world = CampaignWorld.query.filter_by(campaign_id=self.campaign.id).one()
+        world.world_state = json.dumps({
+            'current_scene': {
+                'location_id': 'dock_ward',
+                'location_name': 'Dock Ward',
+                'active_npc_ids': ['kaine', 'saltbeard'],
+                'immediate_tension': 'The signing is poised.',
+            },
+        })
+        for actor_id, name in (('kaine', 'Kaine'), ('saltbeard', 'Saltbeard')):
+            db.session.add(NPCActor(
+                campaign_id=self.campaign.id,
+                actor_id=actor_id,
+                name=name,
+                public_summary='A public figure.',
+                dossier='{}',
+            ))
+        db.session.commit()
+
+        # Writer re-lists the same cast that's already current; no departures, no location change.
+        result = apply_memory_patch(
+            self.campaign,
+            self.session,
+            {
+                'scene_patch': {
+                    'active_npc_ids': ['kaine', 'saltbeard'],
+                },
+                'scene_reason': 'No change.',
+            },
+            {
+                'latest_player_message': 'We stand our ground.',
+                'latest_dm_message': 'Kaine and Saltbeard hold the signing square.',
+            },
+        )
+        db.session.commit()
+
+        self.assertEqual(result['world_event_ids'], [])
+        current_scene = json.loads(world.world_state)['current_scene']
+        self.assertEqual(current_scene['active_npc_ids'], ['kaine', 'saltbeard'])
+        applied_scene_logs = CampaignMemoryLog.query.filter_by(
+            memory_id='current_scene',
+            status='applied',
+        ).all()
+        self.assertEqual(applied_scene_logs, [])
 
     def test_memory_patch_no_op_logging(self):
         from models import CampaignMemoryRun, CampaignMemoryLog
@@ -4616,7 +4962,11 @@ class DmToolsTest(unittest.TestCase):
         self.assertEqual(result['matches'][0]['item_id'], 'dock_warning_bell')
         self.assertGreater(result['matches'][0]['keyword_score'], 0)
 
-    def test_advance_clock_mutates_existing_clock(self):
+    def test_advance_clock_is_not_a_dm_tool(self):
+        # Regression: `advance_clock` used to be an inline DM tool, and its
+        # mutations committed before guard repair could roll them back. The
+        # post-turn clock adjudicator now owns all clock advancement, so the
+        # DM must not be able to advance clocks via the tool surface.
         db.session.add(CampaignClock(
             campaign_id=self.campaign.id,
             clock_id='guards_arrive',
@@ -4626,6 +4976,7 @@ class DmToolsTest(unittest.TestCase):
             status='active',
         ))
         db.session.commit()
+
         result = execute_dm_tool(
             self.campaign,
             self.session,
@@ -4634,8 +4985,11 @@ class DmToolsTest(unittest.TestCase):
             {'clock_id': 'guards_arrive', 'delta': 1, 'reason': 'The party made noise.'},
             {},
         )
-        self.assertEqual(result['clock']['filled'], 4)
-        self.assertEqual(result['clock']['status'], 'completed')
+
+        self.assertEqual(result, {'error': 'Unknown DM tool: advance_clock'})
+        clock = CampaignClock.query.filter_by(campaign_id=self.campaign.id, clock_id='guards_arrive').one()
+        self.assertEqual(clock.filled, 3)
+        self.assertEqual(clock.status, 'active')
 
     def test_apply_clock_adjudication_advances_existing_clock(self):
         db.session.add(CampaignClock(
@@ -4672,6 +5026,48 @@ class DmToolsTest(unittest.TestCase):
         self.assertEqual(clock.status, 'active')
         self.assertEqual(result['errors'], [])
         self.assertEqual(result['clock_changes'][0]['action'], 'advanced')
+
+    def test_apply_clock_adjudication_accepts_database_clock_id_reference(self):
+        clock = CampaignClock(
+            campaign_id=self.campaign.id,
+            clock_id='race_to_crypts',
+            name='Race to the Crypts',
+            segments=4,
+            filled=0,
+            status='active',
+        )
+        db.session.add(clock)
+        db.session.commit()
+
+        result = apply_clock_adjudication(
+            self.campaign,
+            {
+                'create_clocks': [],
+                'advance_clocks': [
+                    {
+                        'clock_id': clock.id,
+                        'delta': 1,
+                        'reason': 'The pursuit visibly moved toward the crypt road.',
+                        'evidence': ['The chase left the market and hit the crypt road.'],
+                    }
+                ],
+                'retire_clocks': [],
+                'no_change_explanations': [
+                    {
+                        'clock_id': clock.id,
+                        'reason': 'Reference normalization should report the symbolic clock id.',
+                    }
+                ],
+            },
+            audit_context={'trace_id': 'clock-trace-db-id'},
+        )
+
+        db.session.commit()
+        clock = CampaignClock.query.filter_by(campaign_id=self.campaign.id, clock_id='race_to_crypts').one()
+        self.assertEqual(clock.filled, 1)
+        self.assertEqual(result['errors'], [])
+        self.assertEqual(result['clock_changes'][0]['action'], 'advanced')
+        self.assertEqual(result['no_change_explanations'][0]['clock_id'], 'race_to_crypts')
 
     def test_session_message_route_runs_clock_adjudication_after_memory_patch(self):
         token = generate_token(self.user.id)

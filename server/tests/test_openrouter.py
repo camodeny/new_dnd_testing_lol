@@ -37,6 +37,7 @@ from openrouter import (
     get_world_genesis_package,
     normalize_session_preflight_decision,
     normalize_session_spoiler_check,
+    _fallback_scene_patch,
 )
 
 
@@ -111,6 +112,44 @@ class OpenRouterJsonRepairTest(unittest.TestCase):
             post_chat.call_args_list[1].kwargs['audit_context']['operation'],
             'session_memory_update_empty_patch_retry',
         )
+
+    def test_fallback_scene_patch_unions_spoken_npcs_with_current(self):
+        memory_context = {
+            'latest_player_message': 'Brixby keeps his eyes on the watcher.',
+            'latest_dm_message': (
+                'Kaine watches the square. '
+                '<npc target="Scarred Watcher">A scarred figure steps forward.</npc>'
+            ),
+            'hot_context': {
+                'current_scene': {
+                    'location_id': 'tidewall_square',
+                    'location_name': 'Tidewall Square',
+                    'time_of_day': 'late afternoon',
+                    'active_npc_ids': ['kaine', 'saltbeard'],
+                    'immediate_tension': 'The signing is poised.',
+                },
+            },
+        }
+        patch = _fallback_scene_patch(memory_context)
+        self.assertEqual(
+            patch['active_npc_ids'],
+            ['kaine', 'saltbeard', 'scarred_watcher'],
+        )
+        self.assertEqual(patch['location_id'], 'tidewall_square')
+        self.assertEqual(patch['time_of_day'], 'late afternoon')
+
+    def test_fallback_scene_patch_preserves_current_when_no_npc_tags(self):
+        memory_context = {
+            'latest_player_message': 'We wait.',
+            'latest_dm_message': 'The square holds its breath. Nothing moves.',
+            'hot_context': {
+                'current_scene': {
+                    'active_npc_ids': ['kaine', 'saltbeard'],
+                },
+            },
+        }
+        patch = _fallback_scene_patch(memory_context)
+        self.assertEqual(patch['active_npc_ids'], ['kaine', 'saltbeard'])
 
     def test_split_memory_builders_use_specialized_contexts(self):
         memory_context = {
@@ -380,7 +419,7 @@ class OpenRouterJsonRepairTest(unittest.TestCase):
         self.assertEqual(patch_data['_fallback']['reason'], 'empty_memory_writer_response')
         self.assertEqual(patch_data['scene_patch']['location_id'], 'blackwater_harbor')
         self.assertEqual(patch_data['scene_patch']['location_name'], 'Blackwater Harbor')
-        self.assertEqual(patch_data['scene_patch']['time_of_day'], 'dusk')
+        self.assertEqual(patch_data['scene_patch']['time_of_day'], 'dawn')
         self.assertEqual(
             patch_data['scene_patch']['active_npc_ids'],
             ['maren_ashworth', 'lysander_hale'],

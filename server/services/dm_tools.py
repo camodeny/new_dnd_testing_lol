@@ -187,6 +187,8 @@ def _normalize_memory_scene_patch(scene_patch):
         clean_scene['time_of_day'] = time_of_day
     if 'active_npc_ids' in scene_patch:
         clean_scene['active_npc_ids'] = _coerce_patch_id_list(scene_patch.get('active_npc_ids'), max_items=8)
+    if 'departed_npc_ids' in scene_patch:
+        clean_scene['departed_npc_ids'] = _coerce_patch_id_list(scene_patch.get('departed_npc_ids'), max_items=8)
     immediate_tension = _coerce_patch_text(scene_patch.get('immediate_tension'), 420)
     if immediate_tension:
         clean_scene['immediate_tension'] = immediate_tension
@@ -239,6 +241,18 @@ def _scene_npc_supported(actor_id, npc_names, visible_terms):
     return _scene_value_supported(npc_names.get(actor_id), visible_terms)
 
 
+def _sync_party_known_location(world_state, current_scene):
+    if not isinstance(world_state, dict):
+        return
+    current_scene = current_scene if isinstance(current_scene, dict) else {}
+    location_id = clean_id(current_scene.get('location_id'), '')
+    if not location_id:
+        return
+    party = world_state.get('party') if isinstance(world_state.get('party'), dict) else {}
+    party['known_location_id'] = location_id
+    world_state['party'] = party
+
+
 def _validate_memory_scene_patch(campaign, current_scene, scene_patch, audit_context):
     if not isinstance(scene_patch, dict):
         return {}, {}
@@ -276,26 +290,39 @@ def _validate_memory_scene_patch(campaign, current_scene, scene_patch, audit_con
             value == current_scene.get('time_of_day') or _scene_value_supported(value, visible_terms),
         )
 
-    if 'active_npc_ids' in scene_patch:
+    npc_names = _npc_scene_names_by_id(campaign)
+    departed_ids = scene_patch.get('departed_npc_ids') if 'departed_npc_ids' in scene_patch and isinstance(scene_patch.get('departed_npc_ids'), list) else []
+    departed_id_set = set(departed_ids)
+    if 'active_npc_ids' in scene_patch or departed_ids:
         requested_ids = scene_patch.get('active_npc_ids') if isinstance(scene_patch.get('active_npc_ids'), list) else []
         current_ids = current_scene.get('active_npc_ids') if isinstance(current_scene.get('active_npc_ids'), list) else []
         current_id_set = set(current_ids)
-        npc_names = _npc_scene_names_by_id(campaign)
-        supported_ids = []
+        supported_proposed = []
         skipped_ids = []
         for actor_id in requested_ids:
             if _scene_npc_supported(actor_id, npc_names, visible_terms):
-                supported_ids.append(actor_id)
+                supported_proposed.append(actor_id)
             elif actor_id in current_id_set and not location_changed:
-                supported_ids.append(actor_id)
+                supported_proposed.append(actor_id)
             else:
                 skipped_ids.append(actor_id)
-        if supported_ids or location_changed:
-            validated['active_npc_ids'] = supported_ids
-        elif requested_ids:
-            skipped_ids = requested_ids
+        # Floor: current cast is preserved unless the location reset this turn.
+        floor = [] if location_changed else list(current_ids)
+        final = list(floor)
+        final_set = set(final)
+        for actor_id in supported_proposed:
+            if actor_id not in final_set:
+                final_set.add(actor_id)
+                final.append(actor_id)
+        # Departures win over inclusion and are applied after the union.
+        final = [actor_id for actor_id in final if actor_id not in departed_id_set]
+        if final != list(current_ids):
+            validated['active_npc_ids'] = final
         if skipped_ids:
             skipped['active_npc_ids'] = skipped_ids
+        skipped_departed = [actor_id for actor_id in departed_ids if actor_id not in current_id_set]
+        if skipped_departed:
+            skipped['departed_npc_ids'] = skipped_departed
 
     if 'immediate_tension' in scene_patch:
         value = scene_patch.get('immediate_tension')
@@ -1343,6 +1370,20 @@ def build_session_clock_context(
     current_scene_after,
 ):
     recent_events = WorldEvent.query.filter_by(campaign_id=campaign.id).order_by(WorldEvent.created_at.desc()).limit(6).all()
+    active_clocks = []
+    for clock in _active_clocks(campaign, limit=50):
+        active_clocks.append({
+            'clock_id': clock.clock_id,
+            'name': clock.name,
+            'segments': clock.segments,
+            'filled': clock.filled,
+            'pressure_type': clock.pressure_type,
+            'visibility': clock.visibility,
+            'summary': clock.summary,
+            'trigger': clock.trigger,
+            'on_complete': clock.on_complete,
+            'status': clock.status,
+        })
     return {
         'campaign_id': campaign.id,
         'session_id': session.id,
@@ -1354,7 +1395,7 @@ def build_session_clock_context(
         'latest_dm_message': dm_message,
         'current_scene_before': current_scene_before if isinstance(current_scene_before, dict) else {},
         'current_scene_after': current_scene_after if isinstance(current_scene_after, dict) else {},
-        'active_clocks': [clock.to_dict(include_private=True) for clock in _active_clocks(campaign, limit=50)],
+        'active_clocks': active_clocks,
         'recent_events': [event.to_dict(include_private=True) for event in reversed(recent_events)],
     }
 
@@ -1598,23 +1639,6 @@ DM_TOOL_DEFINITIONS = [
                 'properties': {
                     'scene_patch': {'type': 'object'},
                     'reason': {'type': 'string'},
-                },
-            },
-        },
-    },
-    {
-        'type': 'function',
-        'function': {
-            'name': 'advance_clock',
-            'description': 'Advance or reduce an existing campaign clock and record the change.',
-            'parameters': {
-                'type': 'object',
-                'required': ['clock_id', 'delta'],
-                'properties': {
-                    'clock_id': {'type': 'string'},
-                    'delta': {'type': 'integer'},
-                    'reason': {'type': 'string'},
-                    'status': {'type': 'string'},
                 },
             },
         },
@@ -2432,6 +2456,7 @@ def _tool_update_current_scene(campaign, _current_user, args):
     current_scene = world_state.get('current_scene', {}) if isinstance(world_state, dict) else {}
     current_scene.update(scene_patch)
     world_state['current_scene'] = current_scene
+    _sync_party_known_location(world_state, current_scene)
     world.world_state = json_dumps(world_state)
     world.updated_at = datetime.utcnow()
     upsert_memory_embedding(campaign, 'world_state', 'current', world_state)
@@ -4158,7 +4183,6 @@ TOOL_HANDLERS = {
     'search_campaign_memory': _tool_search_campaign_memory,
     'record_world_event': _tool_record_world_event,
     'update_current_scene': _tool_update_current_scene,
-    'advance_clock': _tool_advance_clock,
     'reveal_fact': _tool_reveal_fact,
     'propose_sheet_update': _tool_propose_sheet_update,
     'generate_loot_box': _tool_generate_loot_box,
@@ -4204,7 +4228,6 @@ def execute_dm_tool(campaign, session, current_user, name, args, audit_context=N
         mutated = name in {
             'record_world_event',
             'update_current_scene',
-            'advance_clock',
             'reveal_fact',
             'generate_loot_box',
             'create_encounter_map',
@@ -4520,6 +4543,17 @@ def apply_clock_adjudication(campaign, updates, audit_context=None):
         'errors': [],
     }
 
+    def resolve_clock_reference(raw_clock_ref):
+        clock_key = clean_id(raw_clock_ref, '')
+        if clock_key:
+            clock = CampaignClock.query.filter_by(campaign_id=campaign.id, clock_id=clock_key).first()
+            if clock:
+                return clock
+        numeric_ref = _coerce_patch_int(raw_clock_ref, default=None, minimum=1)
+        if numeric_ref is None:
+            return None
+        return CampaignClock.query.filter_by(campaign_id=campaign.id, id=numeric_ref).first()
+
     for item in updates.get('create_clocks', []) if isinstance(updates.get('create_clocks'), list) else []:
         change = _create_clock_from_patch(campaign, item if isinstance(item, dict) else {})
         result['clock_changes'].append(change)
@@ -4531,10 +4565,18 @@ def apply_clock_adjudication(campaign, updates, audit_context=None):
     for item in updates.get('advance_clocks', []) if isinstance(updates.get('advance_clocks'), list) else []:
         if not isinstance(item, dict):
             continue
-        clock_id = clean_id(item.get('clock_id') or item.get('id'), '')
-        if not clock_id:
-            result['errors'].append('Clock adjudication advance was missing clock_id.')
+        raw_clock_ref = item.get('clock_id')
+        if raw_clock_ref in (None, ''):
+            raw_clock_ref = item.get('id')
+        clock = resolve_clock_reference(raw_clock_ref)
+        if not clock:
+            missing_ref = clean_text(raw_clock_ref, 80) or str(raw_clock_ref or '').strip()
+            if not missing_ref:
+                result['errors'].append('Clock adjudication advance was missing clock_id.')
+            else:
+                result['errors'].append(f'Clock not found: {missing_ref}')
             continue
+        clock_id = clock.clock_id
         try:
             delta = int(item.get('delta') or 0)
         except (TypeError, ValueError):
@@ -4578,7 +4620,11 @@ def apply_clock_adjudication(campaign, updates, audit_context=None):
     for item in updates.get('no_change_explanations', []) if isinstance(updates.get('no_change_explanations'), list) else []:
         if not isinstance(item, dict):
             continue
-        clock_id = clean_id(item.get('clock_id') or item.get('id'), '')
+        raw_clock_ref = item.get('clock_id')
+        if raw_clock_ref in (None, ''):
+            raw_clock_ref = item.get('id')
+        clock = resolve_clock_reference(raw_clock_ref)
+        clock_id = clock.clock_id if clock else clean_id(raw_clock_ref, '')
         reason = clean_text(item.get('reason'), 420)
         if clock_id and reason:
             result['no_change_explanations'].append({
@@ -4851,7 +4897,7 @@ def apply_memory_patch(campaign, session, patch, audit_context=None):
                         'scene_patch': raw_scene_patch,
                         'skipped_scene_patch': skipped_scene_patch,
                     },
-                    error='unsupported_scene_patch_fields',
+                    error='scene_patch_field_not_evidenced',
                 )
             if not scene_patch:
                 scene_patch = {}
@@ -4860,6 +4906,7 @@ def apply_memory_patch(campaign, session, patch, audit_context=None):
             before_scene = dict(current_scene)
             current_scene.update(scene_patch)
             world_state['current_scene'] = current_scene
+            _sync_party_known_location(world_state, current_scene)
             event = _record_event(
                 campaign,
                 'scene_updated',

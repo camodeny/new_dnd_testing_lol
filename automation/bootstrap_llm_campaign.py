@@ -2,10 +2,8 @@
 import argparse
 import os
 import pathlib
-import time
 
 from llm_campaign_common import (
-    ApiError,
     STATE_DIR,
     api_get,
     api_post,
@@ -14,6 +12,7 @@ from llm_campaign_common import (
     default_api_base,
     default_session_start_timeout,
     save_manifest,
+    start_session,
 )
 
 
@@ -31,6 +30,7 @@ def parse_args():
     parser.add_argument('--required-players', type=int, help='Defaults to llm-count when omitted')
     parser.add_argument('--label-prefix', default='Auto Player', help='Base label for created LLM players')
     parser.add_argument('--manifest', help='Output manifest path')
+    parser.add_argument('--no-start', action='store_true', help='Create campaign and LLM players but do not start the first session yet')
     parser.add_argument(
         '--session-start-timeout',
         type=int,
@@ -38,51 +38,6 @@ def parse_args():
         help='Seconds to wait for initial session creation and opening DM scene',
     )
     return parser.parse_args()
-
-
-def find_active_session(api_base, campaign_id, owner_token=None, owner_api_key=None):
-    sessions = api_get(
-        api_base,
-        f'/api/campaigns/{campaign_id}/sessions',
-        owner_token=owner_token,
-        api_key=owner_api_key,
-    )['sessions']
-    for session in sessions:
-        if session.get('is_active'):
-            return session
-    return None
-
-
-def start_session(api_base, campaign_id, owner_token=None, owner_api_key=None, timeout=180):
-    try:
-        return api_post(
-            api_base,
-            f'/api/campaigns/{campaign_id}/sessions',
-            {},
-            owner_token=owner_token,
-            api_key=owner_api_key,
-            timeout=timeout,
-        )['session']
-    except ApiError as exc:
-        if 'timed out' not in str(exc):
-            raise
-
-    deadline = time.monotonic() + timeout
-    while time.monotonic() < deadline:
-        session = find_active_session(
-            api_base,
-            campaign_id,
-            owner_token=owner_token,
-            owner_api_key=owner_api_key,
-        )
-        if session:
-            return session
-        time.sleep(5)
-
-    raise RuntimeError(
-        f'Session start request timed out and no active session appeared within {timeout}s. '
-        'The server may be overloaded or stuck in opening-scene generation.'
-    )
 
 
 def main():
@@ -159,13 +114,15 @@ def main():
             'api_key': created_player['api_key'],
         })
 
-    session = start_session(
-        args.api_base,
-        campaign['id'],
-        owner_token=args.owner_token,
-        owner_api_key=args.owner_api_key,
-        timeout=args.session_start_timeout,
-    )
+    session = None
+    if not args.no_start:
+        session = start_session(
+            args.api_base,
+            campaign['id'],
+            owner_token=args.owner_token,
+            api_key=args.owner_api_key,
+            timeout=args.session_start_timeout,
+        )
 
     manifest_path = pathlib.Path(args.manifest) if args.manifest else STATE_DIR / f'llm-campaign-{campaign["id"]}.json'
     payload = {
@@ -179,8 +136,9 @@ def main():
             'api_key': args.owner_api_key,
         },
         'session': {
-            'id': session['id'],
+            'id': session['id'] if session else None,
         },
+        'bootstrap_state': 'started' if session else 'prestart',
         'opencode': {
             'server': None,
             'model': 'opencode-go/deepseek-v4-flash',
@@ -191,7 +149,10 @@ def main():
     save_manifest(manifest_path, payload)
 
     print(f'Created campaign {campaign["id"]}: {campaign["name"]}')
-    print(f'Active session: {session["id"]}')
+    if session:
+        print(f'Active session: {session["id"]}')
+    else:
+        print('Active session: not started')
     print(f'Manifest: {manifest_path}')
     print('LLM players:')
     for entry in llm_players:

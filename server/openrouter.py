@@ -230,7 +230,12 @@ SESSION_MEMORY_SUMMARY_SCENE_SYSTEM_PROMPT = (
     "You update only the compact session summary and current scene after a visible DM turn. "
     "Return only valid JSON with keys turn_summary and scene_patch. "
     "turn_summary must be one concise durable summary of what materially changed in the latest exchange. "
-    "scene_patch may include only location_id, location_name, time_of_day, active_npc_ids, and immediate_tension. "
+    "scene_patch may include only location_id, location_name, time_of_day, active_npc_ids, departed_npc_ids, and immediate_tension. "
+    "time_of_day must match the value shown in current_scene unless the visible exchange explicitly describes a time transition. "
+    "active_npc_ids is the NPC ids currently on stage. Listing an NPC is encouraged but not required: "
+    "NPCs already on stage stay on stage unless you also list them in departed_npc_ids. "
+    "departed_npc_ids is the NPC ids who actually left the scene this turn (walked out, fled, were escorted away, "
+    "or otherwise exited). Do not infer departure from omission. "
     "Do not include markdown, commentary, or any other keys."
 )
 
@@ -334,7 +339,10 @@ SESSION_CANON_DISCIPLINE_CHECK_SYSTEM_PROMPT = (
     "1. convert player-supplied specifics, guesses, accusations, or remembered details into confirmed world truth "
     "without corroboration from public evidence, the visible scene, a successful check, or an already-established fact; "
     "2. contradict, discard, or sharply reframe an already-established public lead, clue, ownership claim, relationship, "
-    "or location truth without visible support. "
+    "location truth, or recent visible action outcome without visible support. "
+    "Also treat transactional continuity as evidence discipline: if a recent visible exchange established that an object "
+    "was already taken, given away, pocketed, spent, opened, broken, or otherwise resolved, the candidate reply must not "
+    "re-offer, re-place, or reset that same object state unless the fiction visibly explains the reversal. "
     "Safe replies may react skeptically, conditionally, or provisionally to player claims, may let NPCs say "
     "that a detail sounds familiar, and may leave uncertainty in place. "
     "Be especially cautious when a candidate reply introduces a new proper noun, identity, ownership, or hidden "
@@ -2981,28 +2989,51 @@ def _repair_session_dm_visible_reply(content, guard_name, details, hot_context, 
         return ''
 
     guard_operation = f'session_dm_{guard_name}_repair'
-    repair_audit = _child_audit_context(
+    base_repair_audit = _child_audit_context(
         audit_context or {},
         guard_operation,
         guard_operation,
         f'{guard_operation}: visible reply repair',
     )
-    data = _post_chat_response(
-        _build_session_guard_repair_messages(content, guard_name, details, hot_context),
-        json_mode=False,
-        audit_context=repair_audit,
-        tools=None,
-        allow_thinking=False,
-        max_tokens=max(128, min(2048, _estimate_tokens(content) * 2)),
-    )
-    message, finish_reason = _choice_message(data)
-    repaired_content = str(message.get('content') or '').strip()
-    if repaired_content:
-        return repaired_content
-    finalizer_decision, _violation = _session_dm_finalizer_decision_from_tool_calls(message.get('tool_calls') or [])
-    if isinstance(finalizer_decision, dict) and finalizer_decision.get('mode') == 'speak':
-        return str(finalizer_decision.get('content') or '').strip()
-    if guard_name == 'format' and str(finish_reason or '').strip().lower() == 'length':
+
+    estimated_tokens = max(1, _estimate_tokens(content))
+    repair_token_budgets = []
+    next_budget = max(512, estimated_tokens + 256)
+    while len(repair_token_budgets) < 3:
+        repair_token_budgets.append(next_budget)
+        if next_budget >= 16384:
+            break
+        next_budget = min(16384, max(next_budget * 2, next_budget + 1024))
+
+    for attempt_index, max_tokens in enumerate(repair_token_budgets, start=1):
+        repair_audit = base_repair_audit
+        if attempt_index > 1:
+            repair_audit = _child_audit_context(
+                base_repair_audit,
+                f'{guard_operation}_retry_{attempt_index}',
+                guard_operation,
+                f'{guard_operation}: visible reply repair retry {attempt_index}',
+            )
+        data = _post_chat_response(
+            _build_session_guard_repair_messages(content, guard_name, details, hot_context),
+            json_mode=False,
+            audit_context=repair_audit,
+            tools=None,
+            allow_thinking=False,
+            max_tokens=max_tokens,
+        )
+        message, finish_reason = _choice_message(data)
+        finish_reason = str(finish_reason or '').strip().lower()
+        if finish_reason == 'length':
+            continue
+        repaired_content = str(message.get('content') or '').strip()
+        if repaired_content:
+            return repaired_content
+        finalizer_decision, _violation = _session_dm_finalizer_decision_from_tool_calls(message.get('tool_calls') or [])
+        if isinstance(finalizer_decision, dict) and finalizer_decision.get('mode') == 'speak':
+            return str(finalizer_decision.get('content') or '').strip()
+
+    if guard_name == 'format':
         local_repair = _local_missing_npc_tag_repair(content, details, hot_context)
         if local_repair:
             return local_repair
@@ -3615,8 +3646,9 @@ def build_session_memory_messages(memory_context):
                     'scene_patch': {
                         'location_id': 'optional current scene location id; use for temporary location state',
                         'location_name': 'optional current scene location name',
-                        'time_of_day': 'optional current scene timing',
-                        'active_npc_ids': ['npc ids currently present or active in the scene; use this instead of graph facts for occupants'],
+                        'time_of_day': 'must match current_scene.time_of_day unless the exchange explicitly describes a time transition',
+                        'active_npc_ids': ['npc ids currently present or active in the scene; use this instead of graph facts for occupants. Listing an NPC is optional; NPCs already on stage are retained unless you also list them in departed_npc_ids.'],
+                        'departed_npc_ids': ['npc ids who actually left the scene this turn (walked out, fled, were escorted away, or otherwise exited). Do not infer departure from omission.'],
                         'immediate_tension': 'optional current scene tension; use for transient pressure visible right now',
                     },
                     'scene_reason': 'why scene changed',
@@ -4890,15 +4922,6 @@ def _fallback_scene_npc_ids(latest_dm_message):
     return npc_ids
 
 
-def _fallback_scene_time_of_day(latest_dm_text, current_scene):
-    text = str(latest_dm_text or '').lower()
-    for label in ('dawn', 'morning', 'noon', 'afternoon', 'dusk', 'evening', 'night', 'midnight'):
-        if re.search(rf'\b{re.escape(label)}\b', text):
-            return label
-    if isinstance(current_scene, dict):
-        return current_scene.get('time_of_day')
-    return None
-
 
 def _normalize_fallback_location_name(raw_value):
     text = str(raw_value or '').strip()
@@ -4976,13 +4999,17 @@ def _fallback_scene_patch(memory_context):
     if location_name:
         scene_patch['location_name'] = location_name
 
-    time_of_day = _fallback_scene_time_of_day(latest_dm_text, current_scene)
-    if time_of_day:
-        scene_patch['time_of_day'] = time_of_day
-
-    npc_ids = _fallback_scene_npc_ids(latest_dm_message)
-    if npc_ids:
-        scene_patch['active_npc_ids'] = npc_ids
+    spoken_ids = _fallback_scene_npc_ids(latest_dm_message)
+    if spoken_ids:
+        existing_ids = scene_patch.get('active_npc_ids') if isinstance(scene_patch.get('active_npc_ids'), list) else []
+        merged = list(existing_ids)
+        merged_set = set(merged)
+        for actor_id in spoken_ids:
+            if actor_id not in merged_set:
+                merged_set.add(actor_id)
+                merged.append(actor_id)
+        if merged != list(existing_ids):
+            scene_patch['active_npc_ids'] = merged
 
     immediate_tension = _fallback_scene_immediate_tension(latest_dm_message, current_scene)
     if immediate_tension:

@@ -198,6 +198,50 @@ class RunAutonomousLlmCampaignTests(unittest.TestCase):
         self.assertTrue(timed_out)
         self.assertEqual(result, pending)
 
+    def test_ensure_manifest_session_started_keeps_existing_session(self):
+        args = SimpleNamespace(session_start_timeout=180)
+        manifest = {
+            'api_base': 'http://127.0.0.1:5889',
+            'campaign': {'id': 12},
+            'owner': {'token': 'tok', 'api_key': None},
+            'session': {'id': 44},
+        }
+
+        with patch.object(autonomous, 'start_session') as start_session, \
+                patch.object(autonomous, 'save_manifest') as save_manifest:
+            result = autonomous.ensure_manifest_session_started(args, pathlib.Path('campaign.json'), manifest)
+
+        self.assertEqual(result['session']['id'], 44)
+        start_session.assert_not_called()
+        save_manifest.assert_not_called()
+
+    def test_ensure_manifest_session_started_starts_prestart_manifest(self):
+        args = SimpleNamespace(session_start_timeout=180)
+        manifest = {
+            'api_base': 'http://127.0.0.1:5889',
+            'campaign': {'id': 12},
+            'owner': {'token': 'tok', 'api_key': None},
+            'session': {'id': None},
+            'bootstrap_state': 'prestart',
+        }
+
+        with patch.object(autonomous, 'start_session', return_value={'id': 77}) as start_session, \
+                patch.object(autonomous, 'save_manifest') as save_manifest, \
+                patch.object(autonomous, 'print_event') as print_event:
+            result = autonomous.ensure_manifest_session_started(args, pathlib.Path('campaign.json'), manifest)
+
+        self.assertEqual(result['session']['id'], 77)
+        self.assertEqual(result['bootstrap_state'], 'started')
+        start_session.assert_called_once_with(
+            'http://127.0.0.1:5889',
+            12,
+            owner_token='tok',
+            api_key=None,
+            timeout=180,
+        )
+        save_manifest.assert_called_once()
+        print_event.assert_called_once()
+
 
 if __name__ == '__main__':
     unittest.main()
