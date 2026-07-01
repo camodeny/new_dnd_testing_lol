@@ -1,0 +1,1286 @@
+import json
+import secrets
+from collections import Counter
+from datetime import datetime, timedelta
+from statistics import median
+
+from models import (
+    AutomationRun,
+    AutomationRunAuditResult,
+    AutomationRunEvent,
+    AutomationRunProviderCall,
+    AutomationScenario,
+    AutomationSnapshot,
+    AutomationWorkspaceEvent,
+    Campaign,
+    CampaignAuditEvent,
+    CampaignClock,
+    CampaignMember,
+    CampaignPlanningSummary,
+    CampaignSession,
+    CampaignShop,
+    CampaignWorld,
+    Character,
+    CharacterPlanningMessage,
+    EncounterMap,
+    EncounterMapPlacement,
+    LLMPlayer,
+    LootBox,
+    NPCActor,
+    PlanningBondProposal,
+    SessionMessage,
+    SheetProposal,
+    db,
+)
+from services.character_service import build_character_from_data, character_full_dict, update_character_relations
+
+
+AUTOMATION_ACTIVE_STATUSES = {'queued', 'claimed', 'running', 'stop_requested'}
+DEFAULT_LEASE_SECONDS = 45
+DEFAULT_RETENTION_POLICY = {
+    'retention_days': 14,
+    'keep_recent_runs': 5,
+    'cleanup_action': 'archive',
+}
+DEFAULT_AUDIT_CONFIG = {
+    'checks': [
+        {
+            'id': 'run_completion',
+            'metric': 'run_status',
+            'kind': 'enum',
+            'pass_values': ['completed'],
+            'warn_values': ['queued', 'claimed', 'running'],
+            'fail_values': ['stop_requested', 'stopped', 'failed'],
+            'weight': 3,
+            'better_direction': 'higher',
+            'summary_template': 'Run status is {value}.',
+        },
+        {
+            'id': 'error_count',
+            'metric': 'error_count',
+            'kind': 'number',
+            'pass_if': {'lte': 0},
+            'fail_if': {'gt': 0},
+            'weight': 3,
+            'better_direction': 'lower',
+            'summary_template': '{value} automation errors recorded.',
+        },
+        {
+            'id': 'turn_count',
+            'metric': 'turn_count',
+            'kind': 'number',
+            'warn_if': {'lte': 0},
+            'pass_if': {'gt': 0},
+            'weight': 2,
+            'better_direction': 'higher',
+            'summary_template': '{value} turn results recorded.',
+        },
+        {
+            'id': 'dm_silence_count',
+            'metric': 'dm_silence_count',
+            'kind': 'number',
+            'warn_if': {'gt': 0},
+            'fail_if': {'gt': 2},
+            'weight': 1,
+            'better_direction': 'lower',
+            'summary_template': '{value} DM silence decisions.',
+        },
+        {
+            'id': 'dm_empty_count',
+            'metric': 'dm_empty_count',
+            'kind': 'number',
+            'warn_if': {'gt': 0},
+            'fail_if': {'gt': 2},
+            'weight': 1,
+            'better_direction': 'lower',
+            'summary_template': '{value} empty DM outputs.',
+        },
+        {
+            'id': 'model_retry_count',
+            'metric': 'model_retry_count',
+            'kind': 'number',
+            'warn_if': {'gt': 0},
+            'fail_if': {'gt': 4},
+            'weight': 1,
+            'better_direction': 'lower',
+            'summary_template': '{value} model retries or parse repairs.',
+        },
+    ],
+    'budgets': {
+        'max_failures': 0,
+        'max_warnings': 2,
+    },
+}
+STATUS_RANK = {'fail': 0, 'warn': 1, 'pass': 2}
+
+
+def _utcnow():
+    return datetime.utcnow()
+
+
+def _parse_iso(value):
+    if not value:
+        return None
+    try:
+        return datetime.fromisoformat(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def _loads_text(value, fallback):
+    if not value:
+        return fallback
+    try:
+        return json.loads(value)
+    except (TypeError, ValueError):
+        return fallback
+
+
+def _latency_bucket(latency_ms):
+    if latency_ms is None:
+        return None
+    if latency_ms < 1000:
+        return '<1s'
+    if latency_ms < 5000:
+        return '1s-5s'
+    if latency_ms < 15000:
+        return '5s-15s'
+    return '15s+'
+
+
+def _safe_int(value, default=0):
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return default
+
+
+def _session_messages(session_id):
+    return [
+        message.to_dict()
+        for message in SessionMessage.query.filter_by(session_id=session_id)
+        .order_by(SessionMessage.created_at.asc(), SessionMessage.id.asc())
+        .all()
+    ]
+
+
+def _session_proposals(session_id):
+    return [
+        proposal.to_dict()
+        for proposal in SheetProposal.query.filter_by(session_id=session_id)
+        .order_by(SheetProposal.created_at.asc(), SheetProposal.id.asc())
+        .all()
+    ]
+
+
+def visible_campaigns_for_user(user):
+    owned = Campaign.query.filter_by(user_id=user.id, is_automation_clone=False).all()
+    member_campaign_ids = [
+        member.campaign_id
+        for member in CampaignMember.query.filter_by(user_id=user.id).all()
+    ]
+    if not member_campaign_ids:
+        return owned
+    member_of = Campaign.query.filter(
+        Campaign.id.in_(member_campaign_ids),
+        Campaign.is_automation_clone.is_(False),
+    ).all()
+    return list({campaign.id: campaign for campaign in [*owned, *member_of]}.values())
+
+
+def scenario_roster_from_campaign(campaign):
+    members = CampaignMember.query.filter_by(campaign_id=campaign.id).order_by(CampaignMember.id.asc()).all()
+    character_ids = {member.selected_character_id for member in members if member.selected_character_id}
+    characters = {
+        character.id: character
+        for character in Character.query.filter(Character.id.in_(character_ids)).all()
+    } if character_ids else {}
+    llm_players = {
+        player.user_id: player
+        for player in LLMPlayer.query.filter_by(campaign_id=campaign.id).all()
+    }
+    roster = []
+    for member in members:
+        if (member.role or 'player') == 'spectator':
+            continue
+        character = characters.get(member.selected_character_id)
+        if not character:
+            continue
+        llm_player = llm_players.get(member.user_id)
+        roster.append({
+            'user_id': member.user_id,
+            'member_role': member.role,
+            'character_id': character.id,
+            'character_name': character.name,
+            'label': llm_player.label if llm_player else (member.user.username if member.user else f'User {member.user_id}'),
+            'llm_player_id': llm_player.id if llm_player else None,
+        })
+    return roster
+
+
+def serialize_campaign_snapshot(campaign, source_session_id=None):
+    members = CampaignMember.query.filter_by(campaign_id=campaign.id).order_by(CampaignMember.id.asc()).all()
+    characters = Character.query.filter_by(campaign_id=campaign.id).order_by(Character.party_order.asc(), Character.id.asc()).all()
+    sessions_query = CampaignSession.query.filter_by(campaign_id=campaign.id).order_by(CampaignSession.started_at.asc(), CampaignSession.id.asc())
+    if source_session_id is not None:
+        sessions_query = sessions_query.filter_by(id=source_session_id)
+    sessions = sessions_query.all()
+    world = CampaignWorld.query.filter_by(campaign_id=campaign.id).first()
+    planning_summary = CampaignPlanningSummary.query.filter_by(campaign_id=campaign.id).first()
+    planning_messages = CharacterPlanningMessage.query.filter_by(campaign_id=campaign.id).order_by(CharacterPlanningMessage.created_at.asc(), CharacterPlanningMessage.id.asc()).all()
+    bond_proposals = PlanningBondProposal.query.filter_by(campaign_id=campaign.id).order_by(PlanningBondProposal.id.asc()).all()
+    npcs = NPCActor.query.filter_by(campaign_id=campaign.id).order_by(NPCActor.id.asc()).all()
+    clocks = CampaignClock.query.filter_by(campaign_id=campaign.id).order_by(CampaignClock.id.asc()).all()
+    shops = CampaignShop.query.filter_by(campaign_id=campaign.id).order_by(CampaignShop.id.asc()).all()
+    loot_boxes = LootBox.query.filter_by(campaign_id=campaign.id).order_by(LootBox.id.asc()).all()
+    encounter_maps = EncounterMap.query.filter_by(campaign_id=campaign.id).order_by(EncounterMap.created_at.asc(), EncounterMap.id.asc()).all()
+    audit_events = CampaignAuditEvent.query.filter_by(campaign_id=campaign.id).order_by(CampaignAuditEvent.created_at.asc(), CampaignAuditEvent.id.asc()).all()
+
+    serialized_sessions = []
+    for session in sessions:
+        serialized_sessions.append({
+            **session.to_dict(),
+            'messages': _session_messages(session.id),
+            'sheet_proposals': _session_proposals(session.id),
+        })
+
+    serialized_maps = []
+    for encounter_map in encounter_maps:
+        serialized_maps.append({
+            **encounter_map.to_dict(include_private=True),
+            'image_filename': encounter_map.image_filename,
+            'labeled_image_filename': encounter_map.labeled_image_filename,
+        })
+
+    return {
+        'campaign': campaign.to_dict(),
+        'members': [member.to_dict() for member in members],
+        'characters': [character_full_dict(character) for character in characters],
+        'roster': scenario_roster_from_campaign(campaign),
+        'sessions': serialized_sessions,
+        'world': {
+            'public_intro': _loads_text(world.public_intro, {}) if world else None,
+            'knowledge_graph': _loads_text(world.knowledge_graph, {}) if world else None,
+            'world_state': _loads_text(world.world_state, {}) if world else None,
+            'dm_private': _loads_text(world.dm_private, {}) if world else None,
+            'approved_at': world.approved_at.isoformat() if world and world.approved_at else None,
+        } if world else None,
+        'planning_summary': planning_summary.to_dict(include_private=True) if planning_summary else None,
+        'planning_messages': [message.to_dict() for message in planning_messages],
+        'bond_proposals': [proposal.to_dict() for proposal in bond_proposals],
+        'npcs': [npc.to_dict(include_private=True) for npc in npcs],
+        'clocks': [clock.to_dict(include_private=True) for clock in clocks if clock.to_dict(include_private=True) is not None],
+        'shops': [shop.to_dict() for shop in shops],
+        'loot_boxes': [loot_box.to_dict(is_dm=True) for loot_box in loot_boxes],
+        'encounter_maps': serialized_maps,
+        'audit_events': [event.to_dict() for event in audit_events],
+        'captured_at': _utcnow().isoformat(),
+    }
+
+
+def create_snapshot_for_scenario(scenario, label=None, summary=None, source_session_id=None):
+    campaign = db.session.get(Campaign, scenario.source_campaign_id)
+    payload = serialize_campaign_snapshot(campaign, source_session_id=source_session_id)
+    active_session = next((session for session in payload['sessions'] if session.get('is_active')), None)
+    snapshot = AutomationSnapshot(
+        scenario_id=scenario.id,
+        source_campaign_id=scenario.source_campaign_id,
+        source_session_id=active_session.get('id') if active_session else source_session_id,
+        label=label or f'{campaign.name} snapshot {_utcnow().strftime("%Y-%m-%d %H:%M:%S")}',
+        summary=summary or f'Snapshot of {campaign.name}',
+        snapshot_json=payload,
+        metadata_json={
+            'campaign_name': campaign.name,
+            'campaign_status': campaign.status,
+            'active_session_id': active_session.get('id') if active_session else None,
+            'message_count': sum(len(session.get('messages') or []) for session in payload['sessions']),
+            'proposal_count': sum(len(session.get('sheet_proposals') or []) for session in payload['sessions']),
+            'encounter_map_count': len(payload.get('encounter_maps') or []),
+            'audit_event_count': len(payload.get('audit_events') or []),
+        },
+    )
+    db.session.add(snapshot)
+    db.session.commit()
+    return snapshot
+
+
+def _clone_character(source_data, campaign_id):
+    clone = Character(campaign_id=campaign_id, user_id=source_data.get('user_id'))
+    build_character_from_data(clone, source_data)
+    clone.party_order = source_data.get('party_order', clone.party_order)
+    clone.current_location = source_data.get('current_location')
+    db.session.add(clone)
+    db.session.flush()
+    update_character_relations(clone, source_data)
+    return clone
+
+
+def retention_policy_for_scenario(scenario):
+    policy = dict(DEFAULT_RETENTION_POLICY)
+    policy.update(scenario.retention_policy_json or {})
+    return policy
+
+
+def materialize_run_campaign(run):
+    if run.derived_campaign_id:
+        return db.session.get(Campaign, run.derived_campaign_id), {}
+
+    snapshot = run.snapshot
+    data = snapshot.snapshot_json or {}
+    source_campaign = data.get('campaign') or {}
+    clone = Campaign(
+        name=f'{source_campaign.get("name") or "Automation"} [Run {run.id}]',
+        description=source_campaign.get('description'),
+        difficulty=source_campaign.get('difficulty'),
+        seed=source_campaign.get('seed'),
+        user_id=run.user_id,
+        status='automation_run',
+        settings=json.dumps(source_campaign.get('settings') or {}),
+        is_automation_clone=True,
+        automation_source_campaign_id=snapshot.source_campaign_id,
+        automation_source_snapshot_id=snapshot.id,
+        automation_source_run_id=run.id,
+        last_played_at=None,
+    )
+    db.session.add(clone)
+    db.session.flush()
+
+    character_map = {}
+    for character_data in data.get('characters') or []:
+        source_character_id = character_data.get('id')
+        clone_character = _clone_character(character_data, clone.id)
+        character_map[source_character_id] = clone_character.id
+
+    for member_data in data.get('members') or []:
+        db.session.add(CampaignMember(
+            campaign_id=clone.id,
+            user_id=member_data.get('user_id'),
+            role=member_data.get('role') or 'player',
+            selected_character_id=character_map.get(member_data.get('selected_character_id')),
+            character_ready_at=_parse_iso(member_data.get('character_ready_at')),
+        ))
+
+    session_map = {}
+    for session_data in data.get('sessions') or []:
+        session = CampaignSession(
+            campaign_id=clone.id,
+            started_at=_parse_iso(session_data.get('started_at')) or _utcnow(),
+            ended_at=_parse_iso(session_data.get('ended_at')),
+            recap=session_data.get('recap'),
+            running_summary=session_data.get('running_summary'),
+            is_active=bool(session_data.get('is_active')),
+        )
+        db.session.add(session)
+        db.session.flush()
+        session_map[session_data.get('id')] = session.id
+        for message_data in session_data.get('messages') or []:
+            db.session.add(SessionMessage(
+                session_id=session.id,
+                user_id=message_data.get('user_id'),
+                role=message_data.get('role') or 'player',
+                content=message_data.get('content') or '',
+                created_at=_parse_iso(message_data.get('created_at')) or _utcnow(),
+            ))
+        for proposal_data in session_data.get('sheet_proposals') or []:
+            db.session.add(SheetProposal(
+                session_id=session.id,
+                character_id=character_map.get(proposal_data.get('character_id')),
+                dm_user_id=proposal_data.get('dm_user_id'),
+                message_id=None,
+                reason=proposal_data.get('reason') or 'Imported proposal',
+                changes=proposal_data.get('changes') or [],
+                status=proposal_data.get('status') or 'pending',
+                created_at=_parse_iso(proposal_data.get('created_at')) or _utcnow(),
+                applied_at=_parse_iso(proposal_data.get('applied_at')),
+            ))
+
+    world_data = data.get('world')
+    if world_data:
+        db.session.add(CampaignWorld(
+            campaign_id=clone.id,
+            public_intro=json.dumps(world_data.get('public_intro') or {}),
+            knowledge_graph=json.dumps(world_data.get('knowledge_graph') or {}),
+            world_state=json.dumps(world_data.get('world_state') or {}),
+            dm_private=json.dumps(world_data.get('dm_private') or {}),
+            approved_at=_parse_iso(world_data.get('approved_at')),
+        ))
+
+    planning_summary = data.get('planning_summary')
+    if planning_summary:
+        db.session.add(CampaignPlanningSummary(
+            campaign_id=clone.id,
+            party_balance=json.dumps(planning_summary.get('party_balance') or ''),
+            confirmed_public_facts=json.dumps(planning_summary.get('confirmed_public_facts') or []),
+            dm_private_secrets=json.dumps(planning_summary.get('dm_private_secrets') or {}),
+            explicit_player_points=json.dumps(planning_summary.get('explicit_player_points') or {}),
+            unresolved_gaps=json.dumps(planning_summary.get('unresolved_gaps') or []),
+            accepted_hooks=json.dumps(planning_summary.get('accepted_hooks') or []),
+        ))
+
+    for planning_message in data.get('planning_messages') or []:
+        db.session.add(CharacterPlanningMessage(
+            campaign_id=clone.id,
+            user_id=planning_message.get('user_id'),
+            role=planning_message.get('role') or 'player',
+            content=planning_message.get('content') or '',
+            created_at=_parse_iso(planning_message.get('created_at')) or _utcnow(),
+        ))
+
+    for proposal in data.get('bond_proposals') or []:
+        db.session.add(PlanningBondProposal(
+            campaign_id=clone.id,
+            title=proposal.get('title') or 'Bond proposal',
+            description=proposal.get('description') or '',
+            involved_user_ids=json.dumps(proposal.get('involved_user_ids') or []),
+            approval_states=json.dumps(proposal.get('approval_states') or {}),
+            status=proposal.get('status') or 'pending',
+        ))
+
+    for npc in data.get('npcs') or []:
+        db.session.add(NPCActor(
+            campaign_id=clone.id,
+            actor_id=npc.get('actor_id') or npc.get('name') or f'npc_{npc.get("id")}',
+            name=npc.get('name') or 'NPC',
+            role=npc.get('role'),
+            public_summary=npc.get('public_summary'),
+            dossier=json.dumps(npc.get('dossier') or {}),
+        ))
+
+    for clock in data.get('clocks') or []:
+        db.session.add(CampaignClock(
+            campaign_id=clone.id,
+            clock_id=clock.get('clock_id') or f'clock_{clock.get("id")}',
+            name=clock.get('name') or 'Clock',
+            segments=clock.get('segments') or 4,
+            filled=clock.get('filled') or 0,
+            pressure_type=clock.get('pressure_type'),
+            visibility=clock.get('visibility') or 'dm_private',
+            summary=clock.get('summary'),
+            trigger=clock.get('trigger'),
+            on_complete=clock.get('on_complete'),
+            status=clock.get('status') or 'active',
+        ))
+
+    for shop in data.get('shops') or []:
+        db.session.add(CampaignShop(
+            campaign_id=clone.id,
+            location_id=shop.get('location_id'),
+            location_name=shop.get('location_name'),
+            name=shop.get('name') or 'Shop',
+            description=shop.get('description'),
+            items_json=json.dumps(shop.get('items') or []),
+            is_open=bool(shop.get('is_open', True)),
+        ))
+
+    for loot_box in data.get('loot_boxes') or []:
+        db.session.add(LootBox(
+            campaign_id=clone.id,
+            session_id=None,
+            name=loot_box.get('name') or 'Loot Box',
+            description=loot_box.get('description'),
+            items_json=json.dumps(loot_box.get('pools') or {}),
+            currency_json=json.dumps(loot_box.get('currency') or {}),
+            draw_results_json=json.dumps(loot_box.get('draws') or {}),
+            status=loot_box.get('status') or 'unopened',
+        ))
+
+    for map_data in data.get('encounter_maps') or []:
+        encounter_map = EncounterMap(
+            campaign_id=clone.id,
+            session_id=session_map.get(map_data.get('session_id')),
+            title=map_data.get('title') or 'Encounter Map',
+            prompt=map_data.get('prompt') or '',
+            image_filename=map_data.get('image_filename') or '',
+            labeled_image_filename=map_data.get('labeled_image_filename'),
+            model=map_data.get('model') or 'unknown',
+            size=map_data.get('size') or '1024x1024',
+            quality=map_data.get('quality') or 'standard',
+            grid_json=json.dumps(map_data.get('grid') or {}),
+            vtt_setup_json=json.dumps(map_data.get('vtt_setup') or {}),
+            encounter_state_json=json.dumps(map_data.get('encounter_state') or {}),
+            setup_status=map_data.get('setup_status') or 'pending',
+            setup_error=map_data.get('setup_error'),
+            created_by_tool=bool(map_data.get('created_by_tool', True)),
+            is_archived=bool(map_data.get('is_archived', False)),
+            created_at=_parse_iso(map_data.get('created_at')) or _utcnow(),
+            updated_at=_parse_iso(map_data.get('updated_at')) or _utcnow(),
+        )
+        db.session.add(encounter_map)
+        db.session.flush()
+        for placement_data in map_data.get('placements') or []:
+            db.session.add(EncounterMapPlacement(
+                encounter_map_id=encounter_map.id,
+                actor_type=placement_data.get('actor_type') or 'npc',
+                actor_id=str(placement_data.get('actor_id') or ''),
+                label=placement_data.get('label') or '',
+                grid_col=_safe_int(placement_data.get('col')),
+                grid_row=_safe_int(placement_data.get('row')),
+                created_at=_parse_iso(placement_data.get('created_at')) or _utcnow(),
+                updated_at=_parse_iso(placement_data.get('updated_at')) or _utcnow(),
+            ))
+
+    for audit_event in data.get('audit_events') or []:
+        db.session.add(CampaignAuditEvent(
+            campaign_id=clone.id,
+            event_type=audit_event.get('event_type') or 'automation_snapshot_event',
+            source=audit_event.get('source'),
+            actor=audit_event.get('actor'),
+            trace_id=audit_event.get('trace_id'),
+            parent_trace_id=audit_event.get('parent_trace_id'),
+            trace_label=audit_event.get('trace_label'),
+            audit_role=audit_event.get('audit_role'),
+            summary=audit_event.get('summary') or '',
+            payload=json.dumps(audit_event.get('payload') or {}),
+            created_at=_parse_iso(audit_event.get('created_at')) or _utcnow(),
+        ))
+
+    policy = retention_policy_for_scenario(run.scenario) if run.scenario else dict(DEFAULT_RETENTION_POLICY)
+    retention_days = max(0, _safe_int(policy.get('retention_days'), DEFAULT_RETENTION_POLICY['retention_days']))
+    run.derived_campaign_id = clone.id
+    run.clone_retention_expires_at = _utcnow() + timedelta(days=retention_days) if retention_days else None
+    run.updated_at = _utcnow()
+    db.session.commit()
+    return clone, character_map
+
+
+def append_workspace_event(user_id, event_type, payload, *, resource_type=None, resource_id=None, commit=True):
+    row = AutomationWorkspaceEvent(
+        user_id=user_id,
+        event_type=event_type,
+        resource_type=resource_type,
+        resource_id=resource_id,
+        payload_json=payload or {},
+    )
+    db.session.add(row)
+    if commit:
+        db.session.commit()
+    return row
+
+
+def lease_seconds_for_run(run):
+    return max(15, _safe_int((run.runner_config_json or {}).get('lease_seconds'), DEFAULT_LEASE_SECONDS))
+
+
+def lease_is_expired(run, at=None):
+    if run.status == 'queued':
+        return False
+    if not run.lease_expires_at:
+        return run.status in {'claimed', 'running', 'stop_requested'}
+    return (at or _utcnow()) >= run.lease_expires_at
+
+
+def ensure_worker_lease(run, *, worker_id=None, lease_token=None):
+    if worker_id and run.worker_id and run.worker_id != worker_id:
+        raise ValueError('Run is leased by another worker')
+    if lease_token and run.lease_token and run.lease_token != lease_token:
+        raise ValueError('Run lease token is no longer valid')
+    if run.status in {'claimed', 'running', 'stop_requested'} and lease_is_expired(run):
+        raise ValueError('Run lease has expired')
+
+
+def _run_workspace_payload(run, event=None):
+    payload = {
+        'type': 'run_updated',
+        'run': run.to_dict(),
+        'scenario_id': run.scenario_id,
+    }
+    if event is not None:
+        payload['event'] = event.to_dict()
+    return payload
+
+
+def append_run_event(run, event_type, payload=None, *, dedupe_key=None, worker_id=None, lease_token=None, commit=True, skip_workspace=False):
+    if worker_id or lease_token:
+        ensure_worker_lease(run, worker_id=worker_id, lease_token=lease_token)
+
+    if dedupe_key:
+        existing = AutomationRunEvent.query.filter_by(run_id=run.id, dedupe_key=dedupe_key).first()
+        if existing:
+            return existing, False
+
+    row = AutomationRunEvent(
+        run_id=run.id,
+        event_type=event_type,
+        sequence_number=(run.last_event_sequence or 0) + 1,
+        attempt_number=run.attempt_count or 0,
+        dedupe_key=dedupe_key,
+        payload_json=payload or {},
+    )
+    db.session.add(row)
+    db.session.flush()
+    run.last_event_id = row.id
+    run.last_event_sequence = row.sequence_number
+    run.updated_at = _utcnow()
+    if commit:
+        db.session.commit()
+        if not skip_workspace:
+            append_workspace_event(
+                run.user_id,
+                'run_updated',
+                _run_workspace_payload(run, row),
+                resource_type='run',
+                resource_id=run.id,
+            )
+    return row, True
+
+
+def claim_run_for_worker(run, worker_id):
+    now = _utcnow()
+    reclaimed = run.status in {'claimed', 'running', 'stop_requested'} and lease_is_expired(run, at=now)
+    if run.status not in {'queued', 'claimed', 'running', 'stop_requested'}:
+        raise ValueError(f'Run is not claimable from status {run.status}')
+    if run.status != 'queued' and not reclaimed:
+        raise ValueError(f'Run is already leased by {run.worker_id or "another worker"}')
+
+    run.worker_id = worker_id
+    run.lease_token = secrets.token_hex(16)
+    run.heartbeat_at = now
+    run.lease_expires_at = now + timedelta(seconds=lease_seconds_for_run(run))
+    run.claimed_at = run.claimed_at or now
+    run.status = 'claimed'
+    run.attempt_count = (run.attempt_count or 0) + 1
+    if reclaimed:
+        run.reclaim_count = (run.reclaim_count or 0) + 1
+    clone_campaign, character_map = materialize_run_campaign(run)
+    latest_session = CampaignSession.query.filter_by(campaign_id=clone_campaign.id, is_active=True).first()
+    if latest_session is None:
+        latest_session = CampaignSession.query.filter_by(campaign_id=clone_campaign.id).order_by(CampaignSession.started_at.desc(), CampaignSession.id.desc()).first()
+    db.session.commit()
+    return {
+        'run': run,
+        'clone_campaign': clone_campaign,
+        'character_map': character_map,
+        'latest_session': latest_session,
+        'reclaimed': reclaimed,
+    }
+
+
+def heartbeat_run(run, *, worker_id=None, lease_token=None):
+    ensure_worker_lease(run, worker_id=worker_id, lease_token=lease_token)
+    now = _utcnow()
+    run.heartbeat_at = now
+    run.lease_expires_at = now + timedelta(seconds=lease_seconds_for_run(run))
+    run.updated_at = now
+    db.session.commit()
+    return run
+
+
+def persist_provider_call(run, payload):
+    dedupe_key = payload.get('dedupe_key')
+    if not dedupe_key:
+        raise ValueError('dedupe_key is required')
+    existing = AutomationRunProviderCall.query.filter_by(run_id=run.id, dedupe_key=dedupe_key).first()
+    if existing:
+        return existing, False
+
+    usage = payload.get('usage') or {}
+    row = AutomationRunProviderCall(
+        run_id=run.id,
+        dedupe_key=dedupe_key,
+        phase=payload.get('phase') or 'unknown',
+        prompt_version_id=payload.get('prompt_version_id'),
+        provider=payload.get('provider'),
+        model=payload.get('model'),
+        provider_response_id=payload.get('provider_response_id'),
+        usage_input_tokens=usage.get('prompt_tokens') or usage.get('input_tokens'),
+        usage_output_tokens=usage.get('completion_tokens') or usage.get('output_tokens'),
+        usage_total_tokens=usage.get('total_tokens'),
+        latency_ms=payload.get('latency_ms'),
+        latency_bucket=payload.get('latency_bucket') or _latency_bucket(payload.get('latency_ms')),
+        parse_repair_attempts=_safe_int(payload.get('parse_repair_attempts')),
+        failure_class=payload.get('failure_class'),
+        request_json=payload.get('request') or {},
+        response_json=payload.get('response') or {},
+        parsed_output_json=payload.get('parsed_output') or {},
+        response_text=payload.get('response_text'),
+    )
+    db.session.add(row)
+    db.session.commit()
+    return row, True
+
+
+def provider_call_for_replay(run_id, dedupe_key):
+    return AutomationRunProviderCall.query.filter_by(run_id=run_id, dedupe_key=dedupe_key).first()
+
+
+def _run_context(run):
+    event_rows = AutomationRunEvent.query.filter_by(run_id=run.id).order_by(AutomationRunEvent.sequence_number.asc(), AutomationRunEvent.id.asc()).all()
+    audit_rows = CampaignAuditEvent.query.filter_by(campaign_id=run.derived_campaign_id).order_by(CampaignAuditEvent.created_at.asc(), CampaignAuditEvent.id.asc()).all() if run.derived_campaign_id else []
+    provider_rows = AutomationRunProviderCall.query.filter_by(run_id=run.id).order_by(AutomationRunProviderCall.created_at.asc(), AutomationRunProviderCall.id.asc()).all()
+    return event_rows, audit_rows, provider_rows
+
+
+def calculate_run_incidents(run, event_rows=None, audit_rows=None, provider_rows=None):
+    if event_rows is None or audit_rows is None or provider_rows is None:
+        event_rows, audit_rows, provider_rows = _run_context(run)
+
+    audit_counts = Counter(audit.event_type for audit in audit_rows)
+    incidents = []
+    dm_silence_count = audit_counts.get('dm_silence_chosen', 0)
+    if dm_silence_count >= 2:
+        incidents.append({
+            'incident_type': 'dm_silence_loop',
+            'severity': 'warn' if dm_silence_count < 4 else 'fail',
+            'summary': f'DM chose silence {dm_silence_count} times.',
+            'count': dm_silence_count,
+        })
+
+    dm_empty_count = audit_counts.get('dm_output_empty', 0)
+    if dm_empty_count >= 2:
+        incidents.append({
+            'incident_type': 'dm_empty_loop',
+            'severity': 'warn' if dm_empty_count < 4 else 'fail',
+            'summary': f'DM returned empty output {dm_empty_count} times.',
+            'count': dm_empty_count,
+        })
+
+    retry_count = audit_counts.get('model_retry', 0) + sum((row.parse_repair_attempts or 0) for row in provider_rows)
+    if retry_count >= 3:
+        incidents.append({
+            'incident_type': 'retry_storm',
+            'severity': 'warn' if retry_count < 6 else 'fail',
+            'summary': f'Recorded {retry_count} provider retries or parse repairs.',
+            'count': retry_count,
+        })
+
+    failure_count = sum(1 for row in provider_rows if row.failure_class)
+    if failure_count >= 2:
+        incidents.append({
+            'incident_type': 'provider_failure_storm',
+            'severity': 'warn' if failure_count < 4 else 'fail',
+            'summary': f'Provider failures occurred {failure_count} times.',
+            'count': failure_count,
+        })
+
+    no_action_streak = 0
+    max_no_action_streak = 0
+    for row in event_rows:
+        payload = row.payload_json or {}
+        action = None
+        if row.event_type == 'turn_result':
+            action = (payload.get('action') or '').strip().lower()
+        elif row.event_type == 'player_no_action':
+            action = 'no_action'
+        if action == 'no_action':
+            no_action_streak += 1
+            max_no_action_streak = max(max_no_action_streak, no_action_streak)
+        elif action:
+            no_action_streak = 0
+    if max_no_action_streak >= 3:
+        incidents.append({
+            'incident_type': 'no_progress_loop',
+            'severity': 'warn' if max_no_action_streak < 5 else 'fail',
+            'summary': f'Observed a no-progress loop of {max_no_action_streak} consecutive no_action turns.',
+            'count': max_no_action_streak,
+        })
+
+    return incidents
+
+
+def _collect_run_metrics(run, event_rows=None, audit_rows=None, provider_rows=None):
+    if event_rows is None or audit_rows is None or provider_rows is None:
+        event_rows, audit_rows, provider_rows = _run_context(run)
+
+    audit_counts = Counter(audit.event_type for audit in audit_rows)
+    errors = [event for event in event_rows if event.event_type == 'error']
+    turn_results = [event for event in event_rows if event.event_type == 'turn_result']
+    latencies = [row.latency_ms for row in provider_rows if row.latency_ms is not None]
+    incidents = calculate_run_incidents(run, event_rows, audit_rows, provider_rows)
+
+    return {
+        'run_status': run.status,
+        'error_count': len(errors),
+        'turn_count': len(turn_results),
+        'completed_turns': len(turn_results),
+        'dm_silence_count': audit_counts.get('dm_silence_chosen', 0),
+        'dm_empty_count': audit_counts.get('dm_output_empty', 0),
+        'model_retry_count': audit_counts.get('model_retry', 0) + sum((row.parse_repair_attempts or 0) for row in provider_rows),
+        'provider_failure_count': sum(1 for row in provider_rows if row.failure_class),
+        'provider_call_count': len(provider_rows),
+        'median_provider_latency_ms': median(latencies) if latencies else None,
+        'incident_count': len(incidents),
+        'warning_incident_count': sum(1 for incident in incidents if incident.get('severity') == 'warn'),
+        'failing_incident_count': sum(1 for incident in incidents if incident.get('severity') == 'fail'),
+    }
+
+
+def _matches_condition(value, condition):
+    if not isinstance(condition, dict):
+        return False
+    for operator, expected in condition.items():
+        if operator == 'lt' and not (value < expected):
+            return False
+        if operator == 'lte' and not (value <= expected):
+            return False
+        if operator == 'gt' and not (value > expected):
+            return False
+        if operator == 'gte' and not (value >= expected):
+            return False
+        if operator == 'eq' and not (value == expected):
+            return False
+        if operator == 'neq' and not (value != expected):
+            return False
+        if operator == 'in' and not (value in (expected or [])):
+            return False
+        if operator == 'not_in' and not (value not in (expected or [])):
+            return False
+    return True
+
+
+def _evaluate_check(metric_value, check):
+    kind = check.get('kind') or 'number'
+    if kind == 'enum':
+        if metric_value in (check.get('fail_values') or []):
+            return 'fail'
+        if metric_value in (check.get('warn_values') or []):
+            return 'warn'
+        if not check.get('pass_values') or metric_value in (check.get('pass_values') or []):
+            return 'pass'
+        return 'warn'
+    if check.get('fail_if') and _matches_condition(metric_value, check.get('fail_if')):
+        return 'fail'
+    if check.get('warn_if') and _matches_condition(metric_value, check.get('warn_if')):
+        return 'warn'
+    if check.get('pass_if'):
+        return 'pass' if _matches_condition(metric_value, check.get('pass_if')) else 'warn'
+    return 'pass'
+
+
+def baseline_run_for_scenario(scenario):
+    if not scenario or not scenario.baseline_run_id:
+        return None
+    return db.session.get(AutomationRun, scenario.baseline_run_id)
+
+
+def compare_check_values(left, right, better_direction):
+    if left is None or right is None:
+        return 'unchanged'
+    if better_direction == 'lower':
+        if right < left:
+            return 'better'
+        if right > left:
+            return 'worse'
+        return 'unchanged'
+    if better_direction == 'higher':
+        if right > left:
+            return 'better'
+        if right < left:
+            return 'worse'
+        return 'unchanged'
+    return 'unchanged'
+
+
+def baseline_comparison_for_run(run, results):
+    scenario = run.scenario
+    baseline_run = baseline_run_for_scenario(scenario)
+    if baseline_run is None or baseline_run.id == run.id:
+        return {}
+
+    refresh_run_scorecard(baseline_run)
+    baseline_results = {
+        item.check_id: item
+        for item in AutomationRunAuditResult.query.filter_by(run_id=baseline_run.id).all()
+    }
+    comparisons = []
+    better = worse = unchanged = 0
+    for result in results:
+        baseline_result = baseline_results.get(result.check_id)
+        if baseline_result is None:
+            continue
+        current_value = (result.details_json or {}).get('metric_value')
+        baseline_value = (baseline_result.details_json or {}).get('metric_value')
+        direction = (result.details_json or {}).get('better_direction')
+        relationship = compare_check_values(baseline_value, current_value, direction)
+        if STATUS_RANK.get(result.status, 0) > STATUS_RANK.get(baseline_result.status, 0):
+            relationship = 'better'
+        elif STATUS_RANK.get(result.status, 0) < STATUS_RANK.get(baseline_result.status, 0):
+            relationship = 'worse'
+        if relationship == 'better':
+            better += 1
+        elif relationship == 'worse':
+            worse += 1
+        else:
+            unchanged += 1
+        comparisons.append({
+            'check_id': result.check_id,
+            'relationship': relationship,
+            'baseline_status': baseline_result.status,
+            'current_status': result.status,
+            'baseline_value': baseline_value,
+            'current_value': current_value,
+        })
+    return {
+        'baseline_run_id': baseline_run.id,
+        'better': better,
+        'worse': worse,
+        'unchanged': unchanged,
+        'comparisons': comparisons,
+    }
+
+
+def refresh_run_scorecard(run):
+    event_rows, audit_rows, provider_rows = _run_context(run)
+    metrics = _collect_run_metrics(run, event_rows, audit_rows, provider_rows)
+    config = dict(DEFAULT_AUDIT_CONFIG)
+    config.update(run.scenario.audit_config_json or {} if run.scenario else {})
+    checks = config.get('checks') or DEFAULT_AUDIT_CONFIG['checks']
+
+    results_payload = []
+    weighted_total = 0
+    weighted_pass = 0
+    for check in checks:
+        metric_key = check.get('metric')
+        metric_value = metrics.get(metric_key)
+        status = _evaluate_check(metric_value, check)
+        weight = max(1, _safe_int(check.get('weight'), 1))
+        weighted_total += weight
+        if status == 'pass':
+            weighted_pass += weight
+        summary_template = check.get('summary_template') or '{id}: {value}'
+        results_payload.append({
+            'check_id': check.get('id') or metric_key,
+            'status': status,
+            'summary': summary_template.format(id=check.get('id') or metric_key, metric=metric_key, value=metric_value),
+            'details': {
+                'metric': metric_key,
+                'metric_value': metric_value,
+                'weight': weight,
+                'thresholds': {
+                    'pass_if': check.get('pass_if'),
+                    'warn_if': check.get('warn_if'),
+                    'fail_if': check.get('fail_if'),
+                    'pass_values': check.get('pass_values'),
+                    'warn_values': check.get('warn_values'),
+                    'fail_values': check.get('fail_values'),
+                },
+                'better_direction': check.get('better_direction'),
+            },
+        })
+
+    budgets = dict(DEFAULT_AUDIT_CONFIG['budgets'])
+    budgets.update(config.get('budgets') or {})
+    fail_count = sum(1 for check in results_payload if check['status'] == 'fail')
+    warn_count = sum(1 for check in results_payload if check['status'] == 'warn')
+    weighted_score = round((weighted_pass / weighted_total) if weighted_total else 0.0, 4)
+    pass_budget_ok = fail_count <= _safe_int(budgets.get('max_failures'), 0) and warn_count <= _safe_int(budgets.get('max_warnings'), 999)
+
+    AutomationRunAuditResult.query.filter_by(run_id=run.id).delete()
+    created_results = []
+    for check in results_payload:
+        row = AutomationRunAuditResult(
+            run_id=run.id,
+            check_id=check['check_id'],
+            status=check['status'],
+            summary=check['summary'],
+            details_json=check['details'],
+        )
+        db.session.add(row)
+        created_results.append(row)
+
+    db.session.flush()
+    baseline_summary = baseline_comparison_for_run(run, created_results)
+    run.baseline_comparison_json = baseline_summary
+    run.scorecard_summary_json = {
+        'check_count': len(results_payload),
+        'failing_checks': fail_count,
+        'warning_checks': warn_count,
+        'completed_turns': metrics.get('completed_turns', 0),
+        'error_count': metrics.get('error_count', 0),
+        'weighted_score': weighted_score,
+        'budget_passed': pass_budget_ok,
+        'budgets': budgets,
+        'incidents': calculate_run_incidents(run, event_rows, audit_rows, provider_rows),
+    }
+    db.session.commit()
+    return results_payload
+
+
+def latest_session_for_run(run):
+    if not run.derived_campaign_id:
+        return None
+    latest_session = CampaignSession.query.filter_by(campaign_id=run.derived_campaign_id, is_active=True).first()
+    if latest_session is None:
+        latest_session = CampaignSession.query.filter_by(campaign_id=run.derived_campaign_id).order_by(CampaignSession.started_at.desc(), CampaignSession.id.desc()).first()
+    return latest_session
+
+
+def run_watch_payload(run):
+    latest_session = latest_session_for_run(run)
+    encounter_map = None
+    messages = []
+    pending_sheet_proposals = []
+    if latest_session:
+        messages = _session_messages(latest_session.id)
+        pending_sheet_proposals = [
+            proposal.to_dict()
+            for proposal in SheetProposal.query.filter_by(session_id=latest_session.id, status='pending')
+            .order_by(SheetProposal.created_at.asc(), SheetProposal.id.asc())
+            .all()
+        ]
+    if run.derived_campaign_id:
+        encounter_map = EncounterMap.query.filter_by(campaign_id=run.derived_campaign_id, is_archived=False).order_by(EncounterMap.created_at.desc(), EncounterMap.id.desc()).first()
+
+    refresh_run_scorecard(run)
+    provider_calls = [
+        row.to_dict()
+        for row in AutomationRunProviderCall.query.filter_by(run_id=run.id)
+        .order_by(AutomationRunProviderCall.created_at.asc(), AutomationRunProviderCall.id.asc())
+        .all()
+    ]
+
+    return {
+        'run': run.to_dict(),
+        'scenario': run.scenario.to_dict() if run.scenario else None,
+        'snapshot': run.snapshot.to_dict() if run.snapshot else None,
+        'latest_session': {
+            **latest_session.to_dict(),
+            'messages': messages,
+            'pending_sheet_proposals': pending_sheet_proposals,
+        } if latest_session else None,
+        'encounter_map': encounter_map.to_dict(include_private=True) if encounter_map else None,
+        'events': [
+            event.to_dict()
+            for event in AutomationRunEvent.query.filter_by(run_id=run.id)
+            .order_by(AutomationRunEvent.sequence_number.asc(), AutomationRunEvent.id.asc())
+            .all()
+        ],
+        'scorecard': [
+            result.to_dict()
+            for result in AutomationRunAuditResult.query.filter_by(run_id=run.id)
+            .order_by(AutomationRunAuditResult.check_id.asc())
+            .all()
+        ],
+        'incidents': run.scorecard_summary_json.get('incidents') or [],
+        'provider_calls': provider_calls,
+        'baseline_comparison': run.baseline_comparison_json or {},
+    }
+
+
+def workspace_trends_for_user(user_id):
+    scenarios = AutomationScenario.query.filter_by(user_id=user_id).all()
+    trends = []
+    for scenario in scenarios:
+        runs = AutomationRun.query.filter_by(scenario_id=scenario.id).order_by(AutomationRun.created_at.asc(), AutomationRun.id.asc()).all()
+        completed_like = [run for run in runs if run.status in {'completed', 'failed', 'stopped'}]
+        if not completed_like:
+            trends.append({
+                'scenario_id': scenario.id,
+                'scenario_name': scenario.name,
+                'run_count': len(runs),
+                'failure_rate': 0.0,
+                'median_turns': 0,
+                'retry_count': 0,
+                'silence_incidents': 0,
+                'score_movement': 0,
+            })
+            continue
+        failure_rate = round(sum(1 for run in completed_like if run.status != 'completed') / len(completed_like), 4)
+        median_turns = median([_safe_int((run.scorecard_summary_json or {}).get('completed_turns')) for run in completed_like]) if completed_like else 0
+        retry_count = sum(
+            _safe_int((run.scorecard_summary_json or {}).get('warning_checks'))
+            for run in completed_like
+        )
+        silence_incidents = sum(
+            1
+            for run in completed_like
+            for incident in ((run.scorecard_summary_json or {}).get('incidents') or [])
+            if incident.get('incident_type') == 'dm_silence_loop'
+        )
+        scores = [_safe_int(((run.scorecard_summary_json or {}).get('weighted_score') or 0) * 1000) for run in completed_like]
+        trends.append({
+            'scenario_id': scenario.id,
+            'scenario_name': scenario.name,
+            'run_count': len(runs),
+            'failure_rate': failure_rate,
+            'median_turns': median_turns,
+            'retry_count': retry_count,
+            'silence_incidents': silence_incidents,
+            'score_movement': (scores[-1] - scores[0]) / 1000 if len(scores) >= 2 else 0,
+        })
+    return trends
+
+
+def cleanup_hidden_clone_campaigns(scenario, *, action=None, older_than_days=None, keep_recent_runs=None):
+    policy = retention_policy_for_scenario(scenario)
+    action = (action or policy.get('cleanup_action') or 'archive').strip().lower()
+    older_than_days = _safe_int(older_than_days, policy.get('retention_days'))
+    keep_recent_runs = _safe_int(keep_recent_runs, policy.get('keep_recent_runs'))
+
+    runs = AutomationRun.query.filter(
+        AutomationRun.scenario_id == scenario.id,
+        AutomationRun.derived_campaign_id.isnot(None),
+        AutomationRun.status.in_(('completed', 'failed', 'stopped')),
+    ).order_by(AutomationRun.created_at.desc(), AutomationRun.id.desc()).all()
+
+    now = _utcnow()
+    cutoff = now - timedelta(days=max(0, older_than_days))
+    targets = []
+    for index, run in enumerate(runs):
+        if index < keep_recent_runs:
+            continue
+        if run.finished_at and run.finished_at > cutoff:
+            continue
+        targets.append(run)
+
+    archived = []
+    deleted = []
+    for run in targets:
+        campaign = db.session.get(Campaign, run.derived_campaign_id) if run.derived_campaign_id else None
+        if action == 'delete' and campaign is not None:
+            db.session.delete(campaign)
+            run.clone_retention_status = 'deleted'
+            run.derived_campaign_id = None
+            deleted.append(run.id)
+        else:
+            if campaign is not None:
+                campaign.status = 'automation_archived'
+            run.clone_retention_status = 'archived'
+            archived.append(run.id)
+        run.updated_at = now
+    db.session.commit()
+    return {'archived_run_ids': archived, 'deleted_run_ids': deleted}
+
+
+def create_matrix_runs(scenario, snapshot, current_user, matrix_entries):
+    group_id = f'matrix-{secrets.token_hex(6)}'
+    runs = []
+    for index, entry in enumerate(matrix_entries):
+        merged_runner_config = dict(scenario.runner_config_json or {})
+        merged_runner_config.update(entry.get('runner_config') or {})
+        run = AutomationRun(
+            scenario_id=scenario.id,
+            snapshot_id=snapshot.id,
+            user_id=current_user.id,
+            status='queued',
+            matrix_group_id=group_id,
+            matrix_label=entry.get('label') or f'Variant {index + 1}',
+            runner_config_json=merged_runner_config,
+        )
+        db.session.add(run)
+        db.session.flush()
+        append_run_event(run, 'run_queued', {'status': run.status, 'matrix_label': run.matrix_label}, dedupe_key=f'run_queued:{run.id}', commit=False, skip_workspace=True)
+        runs.append(run)
+    db.session.commit()
+    for run in runs:
+        append_workspace_event(
+            current_user.id,
+            'run_created',
+            {'type': 'run_created', 'run': run.to_dict(), 'scenario_id': scenario.id},
+            resource_type='run',
+            resource_id=run.id,
+        )
+    return group_id, runs
+
+
+def _json_diff(left, right, path=''):
+    diffs = []
+    if type(left) != type(right):
+        return [{'path': path or '$', 'left': left, 'right': right}]
+    if isinstance(left, dict):
+        for key in sorted(set(left) | set(right)):
+            child_path = f'{path}.{key}' if path else key
+            if key not in left or key not in right:
+                diffs.append({'path': child_path, 'left': left.get(key), 'right': right.get(key)})
+                continue
+            diffs.extend(_json_diff(left.get(key), right.get(key), child_path))
+        return diffs
+    if isinstance(left, list):
+        max_len = max(len(left), len(right))
+        for index in range(max_len):
+            child_path = f'{path}[{index}]' if path else f'[{index}]'
+            if index >= len(left) or index >= len(right):
+                diffs.append({'path': child_path, 'left': left[index] if index < len(left) else None, 'right': right[index] if index < len(right) else None})
+                continue
+            diffs.extend(_json_diff(left[index], right[index], child_path))
+        return diffs
+    if left != right:
+        return [{'path': path or '$', 'left': left, 'right': right}]
+    return diffs
+
+
+def compare_runs_payload(left_run, right_run):
+    refresh_run_scorecard(left_run)
+    refresh_run_scorecard(right_run)
+
+    left_results = {result.check_id: result for result in AutomationRunAuditResult.query.filter_by(run_id=left_run.id).all()}
+    right_results = {result.check_id: result for result in AutomationRunAuditResult.query.filter_by(run_id=right_run.id).all()}
+    all_check_ids = sorted(set(left_results) | set(right_results))
+    scorecard_comparisons = []
+    for check_id in all_check_ids:
+        left = left_results.get(check_id)
+        right = right_results.get(check_id)
+        scorecard_comparisons.append({
+            'check_id': check_id,
+            'left': left.to_dict() if left else None,
+            'right': right.to_dict() if right else None,
+        })
+
+    left_session = latest_session_for_run(left_run)
+    right_session = latest_session_for_run(right_run)
+    left_messages = _session_messages(left_session.id) if left_session else []
+    right_messages = _session_messages(right_session.id) if right_session else []
+    transcript_diff = _json_diff(
+        [{'role': item.get('role'), 'content': item.get('content')} for item in left_messages],
+        [{'role': item.get('role'), 'content': item.get('content')} for item in right_messages],
+    )[:50]
+
+    left_audit = [event.to_dict() for event in CampaignAuditEvent.query.filter_by(campaign_id=left_run.derived_campaign_id).order_by(CampaignAuditEvent.created_at.asc(), CampaignAuditEvent.id.asc()).all()] if left_run.derived_campaign_id else []
+    right_audit = [event.to_dict() for event in CampaignAuditEvent.query.filter_by(campaign_id=right_run.derived_campaign_id).order_by(CampaignAuditEvent.created_at.asc(), CampaignAuditEvent.id.asc()).all()] if right_run.derived_campaign_id else []
+    audit_event_counts = {
+        'left': Counter(item['event_type'] for item in left_audit),
+        'right': Counter(item['event_type'] for item in right_audit),
+    }
+    audit_event_diff = [
+        {
+            'event_type': event_type,
+            'left_count': audit_event_counts['left'].get(event_type, 0),
+            'right_count': audit_event_counts['right'].get(event_type, 0),
+        }
+        for event_type in sorted(set(audit_event_counts['left']) | set(audit_event_counts['right']))
+    ]
+
+    left_world = CampaignWorld.query.filter_by(campaign_id=left_run.derived_campaign_id).first() if left_run.derived_campaign_id else None
+    right_world = CampaignWorld.query.filter_by(campaign_id=right_run.derived_campaign_id).first() if right_run.derived_campaign_id else None
+    world_state_diff = _json_diff(
+        _loads_text(left_world.world_state, {}) if left_world else {},
+        _loads_text(right_world.world_state, {}) if right_world else {},
+    )[:50]
+
+    def _clock_payload(run):
+        if not run.derived_campaign_id:
+            return []
+        return [
+            clock.to_dict(include_private=True)
+            for clock in CampaignClock.query.filter_by(campaign_id=run.derived_campaign_id)
+            .order_by(CampaignClock.clock_id.asc(), CampaignClock.id.asc())
+            .all()
+            if clock.to_dict(include_private=True) is not None
+        ]
+
+    clock_diff = _json_diff(_clock_payload(left_run), _clock_payload(right_run))[:50]
+    left_trace = [
+        event.to_dict()
+        for event in AutomationRunEvent.query.filter(
+            AutomationRunEvent.run_id == left_run.id,
+            AutomationRunEvent.event_type.in_(('overseer_decision', 'player_decision', 'turn_result', 'dm_turn_status', 'error')),
+        ).order_by(AutomationRunEvent.sequence_number.asc(), AutomationRunEvent.id.asc()).all()
+    ]
+    right_trace = [
+        event.to_dict()
+        for event in AutomationRunEvent.query.filter(
+            AutomationRunEvent.run_id == right_run.id,
+            AutomationRunEvent.event_type.in_(('overseer_decision', 'player_decision', 'turn_result', 'dm_turn_status', 'error')),
+        ).order_by(AutomationRunEvent.sequence_number.asc(), AutomationRunEvent.id.asc()).all()
+    ]
+    decision_trace_diff = _json_diff(left_trace, right_trace)[:50]
+
+    return {
+        'left_run': left_run.to_dict(),
+        'right_run': right_run.to_dict(),
+        'comparisons': scorecard_comparisons,
+        'transcript_diff': transcript_diff,
+        'audit_event_diff': audit_event_diff,
+        'world_state_diff': world_state_diff,
+        'clock_diff': clock_diff,
+        'decision_trace_diff': decision_trace_diff,
+    }

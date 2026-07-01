@@ -12,6 +12,10 @@ import CharacterEditPage from './pages/CharacterEditPage'
 import CharacterViewPage from './pages/CharacterViewPage'
 import DevCharacterPage from './pages/DevCharacterPage'
 import DevModelPage from './pages/DevModelPage'
+import AutomationHomePage from './pages/AutomationHomePage'
+import AutomationScenarioPage from './pages/AutomationScenarioPage'
+import AutomationRunPage from './pages/AutomationRunPage'
+import AutomationComparePage from './pages/AutomationComparePage'
 import NotFoundPage from './pages/NotFoundPage'
 import './App.css'
 
@@ -43,6 +47,10 @@ function AppRoutes() {
           <Route path="/characters/:id/edit" element={<CharacterEditPage />} />
           <Route path="/dev/character" element={<DevCharacterPage />} />
           <Route path="/dev/model" element={<DevModelPage />} />
+          <Route path="/automation" element={<AutomationHomePage />} />
+          <Route path="/automation/scenarios/:scenarioId" element={<AutomationScenarioPage />} />
+          <Route path="/automation/runs/:runId" element={<AutomationRunPage />} />
+          <Route path="/automation/compare" element={<AutomationComparePage />} />
           <Route path="*" element={<NotFoundPage />} />
         </Routes>
       </main>

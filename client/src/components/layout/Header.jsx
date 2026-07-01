@@ -6,6 +6,7 @@ export default function Header({ user, onLogout }) {
       <h1><Link to="/" className="header-link">D&D Adventure</Link></h1>
       <nav className="app-nav">
         <Link to="/" className="nav-link">Campaigns</Link>
+        <Link to="/automation" className="nav-link">Automation</Link>
         <Link to="/characters" className="nav-link">Characters</Link>
         <Link to="/dev/model" className="nav-link">Model</Link>
       </nav>

@@ -14,12 +14,11 @@ from llm_campaign_common import (
     api_get,
     default_api_base,
     default_opencode_server,
-    extract_text_parts,
     load_manifest,
-    opencode_request,
     save_manifest,
     start_session,
 )
+from provider_client import request_json_decision
 
 
 ROOT = pathlib.Path(__file__).resolve().parents[1]
@@ -90,33 +89,6 @@ def utc_now():
     return datetime.now(timezone.utc).isoformat()
 
 
-def create_opencode_session(server, password):
-    response = opencode_request(
-        server,
-        '/session',
-        payload={'title': 'llm-campaign-overseer'},
-        password=password,
-        method='POST',
-    )
-    return response['id']
-
-
-def create_opencode_message_path(server, password):
-    opencode_session_id = create_opencode_session(server, password)
-    return f'/session/{opencode_session_id}/message'
-
-
-def extract_json_object(text):
-    stripped = text.strip()
-    if not stripped:
-        raise RuntimeError('OpenCode returned an empty response')
-    start = stripped.find('{')
-    end = stripped.rfind('}')
-    if start == -1 or end == -1 or end < start:
-        raise RuntimeError(f'OpenCode response did not contain JSON: {text}')
-    return json.loads(stripped[start:end + 1])
-
-
 def build_overseer_context(manifest, session, message_window, last_dm_turn=None):
     api_base = manifest['api_base']
     owner_token = manifest['owner'].get('token')
@@ -185,45 +157,15 @@ def build_overseer_retry_prompt(context, manifest, error):
 
 
 def request_overseer_decision(server, password, model_payload, prompt):
-    base_payload = {
-        'agent': 'build',
-        'model': model_payload,
-        'system': OVERSEER_SYSTEM_PROMPT,
-        'parts': [{'type': 'text', 'text': prompt}],
-    }
-    last_response_text = ''
-    last_error = None
-
-    for attempt in range(2):
-        payload = dict(base_payload)
-        if attempt:
-            payload['parts'] = [
-                {'type': 'text', 'text': prompt},
-                {
-                    'type': 'text',
-                    'text': (
-                        'Your previous reply was invalid because it was not a bare JSON object. '
-                        'Reply again with exactly one JSON object and no explanation, no markdown, '
-                        'and no text before or after the JSON.'
-                    ),
-                },
-            ]
-        response = opencode_request(
-            server,
-            create_opencode_message_path(server, password),
-            payload=payload,
-            password=password,
-            method='POST',
-        )
-        response_text = extract_text_parts(response.get('parts'))
-        last_response_text = response_text
-        try:
-            decision = extract_json_object(response_text)
-            return decision, response_text, attempt
-        except Exception as exc:
-            last_error = exc
-
-    raise RuntimeError(f'{last_error}; last response: {last_response_text}')
+    del server, password
+    result = request_json_decision(
+        OVERSEER_SYSTEM_PROMPT,
+        prompt,
+        model=model_payload if isinstance(model_payload, str) else None,
+        timeout_seconds=120,
+        max_attempts=2,
+    )
+    return result['decision'], result['raw_response_text'], result['json_retry_count']
 
 
 def normalize_overseer_decision(manifest, decision):
@@ -255,12 +197,6 @@ def choose_player_with_overseer(args, manifest, session, last_dm_turn=None):
     context = build_overseer_context(manifest, session, args.message_window, last_dm_turn=last_dm_turn)
     prompt = build_overseer_prompt(context)
     model_payload = args.model
-    if isinstance(args.model, str) and '/' in args.model:
-        provider_id, model_id = args.model.split('/', 1)
-        model_payload = {
-            'providerID': provider_id,
-            'modelID': model_id,
-        }
     validation_retry_count = 0
     last_error = None
     last_response_text = ''

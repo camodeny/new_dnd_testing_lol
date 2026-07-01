@@ -85,9 +85,10 @@ def _create_campaign_record(current_user, data):
 @campaigns_bp.route('/api/campaigns', methods=['GET'])
 @token_required
 def get_campaigns(current_user):
-    owned = Campaign.query.filter_by(user_id=current_user.id).all()
+    owned = Campaign.query.filter_by(user_id=current_user.id, is_automation_clone=False).all()
     member_of = Campaign.query.join(CampaignMember).filter(
-        CampaignMember.user_id == current_user.id
+        CampaignMember.user_id == current_user.id,
+        Campaign.is_automation_clone.is_(False),
     ).all()
     all_campaigns = list({c.id: c for c in owned + member_of}.values())
     return jsonify({'campaigns': [c.to_dict() for c in all_campaigns]}), 200

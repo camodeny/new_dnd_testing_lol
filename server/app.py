@@ -7,6 +7,7 @@ from sqlalchemy import text
 from werkzeug.utils import safe_join
 
 from auth import auth_bp
+from routes.automation import automation_bp
 from models import db
 from routes.campaigns import campaigns_bp
 from routes.characters import characters_bp
@@ -53,6 +54,7 @@ def create_app():
     db.init_app(app)
 
     app.register_blueprint(auth_bp)
+    app.register_blueprint(automation_bp)
     app.register_blueprint(campaigns_bp)
     app.register_blueprint(characters_bp)
     app.register_blueprint(dev_bp)
@@ -161,6 +163,59 @@ def ensure_lightweight_schema():
     user_columns = table_columns('users')
     if 'sso_subject' not in user_columns:
         db.session.execute(text('ALTER TABLE users ADD COLUMN sso_subject VARCHAR(160)'))
+
+    campaign_columns = table_columns('campaign')
+    if 'is_automation_clone' not in campaign_columns:
+        db.session.execute(text('ALTER TABLE campaign ADD COLUMN is_automation_clone BOOLEAN DEFAULT 0 NOT NULL'))
+    if 'automation_source_campaign_id' not in campaign_columns:
+        db.session.execute(text('ALTER TABLE campaign ADD COLUMN automation_source_campaign_id INTEGER'))
+    if 'automation_source_snapshot_id' not in campaign_columns:
+        db.session.execute(text('ALTER TABLE campaign ADD COLUMN automation_source_snapshot_id INTEGER'))
+    if 'automation_source_run_id' not in campaign_columns:
+        db.session.execute(text('ALTER TABLE campaign ADD COLUMN automation_source_run_id INTEGER'))
+
+    automation_scenario_columns = table_columns('automation_scenarios')
+    if automation_scenario_columns:
+        if 'baseline_run_id' not in automation_scenario_columns:
+            db.session.execute(text('ALTER TABLE automation_scenarios ADD COLUMN baseline_run_id INTEGER'))
+        if 'retention_policy_json' not in automation_scenario_columns:
+            db.session.execute(text('ALTER TABLE automation_scenarios ADD COLUMN retention_policy_json JSON'))
+            db.session.execute(text("UPDATE automation_scenarios SET retention_policy_json = '{}' WHERE retention_policy_json IS NULL"))
+
+    automation_run_columns = table_columns('automation_runs')
+    if automation_run_columns:
+        if 'lease_token' not in automation_run_columns:
+            db.session.execute(text('ALTER TABLE automation_runs ADD COLUMN lease_token VARCHAR(64)'))
+        if 'heartbeat_at' not in automation_run_columns:
+            db.session.execute(text('ALTER TABLE automation_runs ADD COLUMN heartbeat_at DATETIME'))
+        if 'lease_expires_at' not in automation_run_columns:
+            db.session.execute(text('ALTER TABLE automation_runs ADD COLUMN lease_expires_at DATETIME'))
+        if 'attempt_count' not in automation_run_columns:
+            db.session.execute(text('ALTER TABLE automation_runs ADD COLUMN attempt_count INTEGER DEFAULT 0 NOT NULL'))
+        if 'reclaim_count' not in automation_run_columns:
+            db.session.execute(text('ALTER TABLE automation_runs ADD COLUMN reclaim_count INTEGER DEFAULT 0 NOT NULL'))
+        if 'matrix_group_id' not in automation_run_columns:
+            db.session.execute(text('ALTER TABLE automation_runs ADD COLUMN matrix_group_id VARCHAR(120)'))
+        if 'matrix_label' not in automation_run_columns:
+            db.session.execute(text('ALTER TABLE automation_runs ADD COLUMN matrix_label VARCHAR(200)'))
+        if 'baseline_comparison_json' not in automation_run_columns:
+            db.session.execute(text('ALTER TABLE automation_runs ADD COLUMN baseline_comparison_json JSON'))
+            db.session.execute(text("UPDATE automation_runs SET baseline_comparison_json = '{}' WHERE baseline_comparison_json IS NULL"))
+        if 'clone_retention_status' not in automation_run_columns:
+            db.session.execute(text('ALTER TABLE automation_runs ADD COLUMN clone_retention_status VARCHAR(30) DEFAULT "active" NOT NULL'))
+        if 'clone_retention_expires_at' not in automation_run_columns:
+            db.session.execute(text('ALTER TABLE automation_runs ADD COLUMN clone_retention_expires_at DATETIME'))
+        if 'last_event_sequence' not in automation_run_columns:
+            db.session.execute(text('ALTER TABLE automation_runs ADD COLUMN last_event_sequence INTEGER'))
+
+    automation_event_columns = table_columns('automation_run_events')
+    if automation_event_columns:
+        if 'sequence_number' not in automation_event_columns:
+            db.session.execute(text('ALTER TABLE automation_run_events ADD COLUMN sequence_number INTEGER DEFAULT 0 NOT NULL'))
+        if 'attempt_number' not in automation_event_columns:
+            db.session.execute(text('ALTER TABLE automation_run_events ADD COLUMN attempt_number INTEGER DEFAULT 0 NOT NULL'))
+        if 'dedupe_key' not in automation_event_columns:
+            db.session.execute(text('ALTER TABLE automation_run_events ADD COLUMN dedupe_key VARCHAR(160)'))
     db.session.commit()
 
 

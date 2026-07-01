@@ -176,6 +176,10 @@ export default function HomePage({ user }) {
           </p>
         </div>
         <div className="campaigns-header-actions">
+          <button className="btn btn-secondary" onClick={() => navigate('/automation')}>
+            <i className="bi bi-activity"></i>
+            Automation
+          </button>
           <button className="btn btn-secondary" onClick={openAutomationModal}>
             <i className="bi bi-cpu"></i>
             Automation Keys
@@ -212,6 +216,9 @@ export default function HomePage({ user }) {
           <h3>No campaigns yet</h3>
           <p>Every great story starts with a single step. Create your first campaign or join one with a code.</p>
           <div className="empty-state-actions">
+            <button className="btn btn-secondary" onClick={() => navigate('/automation')}>
+              <i className="bi bi-activity"></i> Automation
+            </button>
             <button className="btn btn-secondary" onClick={openAutomationModal}>
               <i className="bi bi-cpu"></i> Automation Keys
             </button>

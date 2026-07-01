@@ -98,6 +98,10 @@ class Campaign(db.Model):
     last_played_at = db.Column(db.DateTime, nullable=True)
     settings = db.Column(db.Text, nullable=True)
     invite_code = db.Column(db.String(20), nullable=True, unique=True)
+    is_automation_clone = db.Column(db.Boolean, default=False, nullable=False, index=True)
+    automation_source_campaign_id = db.Column(db.Integer, db.ForeignKey('campaign.id'), nullable=True, index=True)
+    automation_source_snapshot_id = db.Column(db.Integer, nullable=True, index=True)
+    automation_source_run_id = db.Column(db.Integer, nullable=True, index=True)
     characters = db.relationship('Character', backref='campaign', lazy=True)
     sessions = db.relationship('CampaignSession', backref='campaign', lazy=True, cascade='all, delete-orphan')
     members = db.relationship('CampaignMember', backref='campaign', lazy=True, cascade='all, delete-orphan')
@@ -125,6 +129,10 @@ class Campaign(db.Model):
             'last_played_at': self.last_played_at.isoformat() if self.last_played_at else None,
             'settings': json.loads(self.settings) if self.settings else {},
             'invite_code': self.invite_code,
+            'is_automation_clone': bool(self.is_automation_clone),
+            'automation_source_campaign_id': self.automation_source_campaign_id,
+            'automation_source_snapshot_id': self.automation_source_snapshot_id,
+            'automation_source_run_id': self.automation_source_run_id,
         }
 
 
@@ -1338,6 +1346,290 @@ class CampaignAuditEvent(db.Model):
             'summary': self.summary,
             'payload': payload,
             'created_at': self.created_at.isoformat() if self.created_at else None,
+        }
+
+
+class AutomationScenario(db.Model):
+    __tablename__ = 'automation_scenarios'
+
+    id = db.Column(db.Integer, primary_key=True)
+    user_id = db.Column(db.Integer, db.ForeignKey('users.id'), nullable=False, index=True)
+    source_campaign_id = db.Column(db.Integer, db.ForeignKey('campaign.id'), nullable=False, index=True)
+    baseline_run_id = db.Column(db.Integer, db.ForeignKey('automation_runs.id'), nullable=True, index=True)
+    name = db.Column(db.String(200), nullable=False)
+    description = db.Column(db.Text, nullable=True)
+    runner_config_json = db.Column(db.JSON, nullable=False, default=dict)
+    audit_config_json = db.Column(db.JSON, nullable=False, default=dict)
+    retention_policy_json = db.Column(db.JSON, nullable=False, default=dict)
+    roster_json = db.Column(db.JSON, nullable=False, default=list)
+    created_at = db.Column(db.DateTime, default=datetime.utcnow, index=True)
+    updated_at = db.Column(db.DateTime, default=datetime.utcnow, onupdate=datetime.utcnow, index=True)
+
+    owner = db.relationship('User')
+    source_campaign = db.relationship('Campaign', foreign_keys=[source_campaign_id])
+    baseline_run = db.relationship('AutomationRun', foreign_keys=[baseline_run_id])
+
+    def to_dict(self):
+        return {
+            'id': self.id,
+            'user_id': self.user_id,
+            'source_campaign_id': self.source_campaign_id,
+            'baseline_run_id': self.baseline_run_id,
+            'name': self.name,
+            'description': self.description,
+            'runner_config': self.runner_config_json or {},
+            'audit_config': self.audit_config_json or {},
+            'retention_policy': self.retention_policy_json or {},
+            'roster': self.roster_json or [],
+            'created_at': self.created_at.isoformat() if self.created_at else None,
+            'updated_at': self.updated_at.isoformat() if self.updated_at else None,
+        }
+
+
+class AutomationSnapshot(db.Model):
+    __tablename__ = 'automation_snapshots'
+
+    id = db.Column(db.Integer, primary_key=True)
+    scenario_id = db.Column(db.Integer, db.ForeignKey('automation_scenarios.id'), nullable=False, index=True)
+    source_campaign_id = db.Column(db.Integer, db.ForeignKey('campaign.id'), nullable=False, index=True)
+    source_session_id = db.Column(db.Integer, db.ForeignKey('campaign_sessions.id'), nullable=True, index=True)
+    label = db.Column(db.String(200), nullable=False)
+    summary = db.Column(db.Text, nullable=True)
+    snapshot_json = db.Column(db.JSON, nullable=False, default=dict)
+    metadata_json = db.Column(db.JSON, nullable=False, default=dict)
+    created_at = db.Column(db.DateTime, default=datetime.utcnow, index=True)
+
+    scenario = db.relationship('AutomationScenario')
+    source_campaign = db.relationship('Campaign', foreign_keys=[source_campaign_id])
+
+    def to_dict(self, include_payload=False):
+        data = {
+            'id': self.id,
+            'scenario_id': self.scenario_id,
+            'source_campaign_id': self.source_campaign_id,
+            'source_session_id': self.source_session_id,
+            'label': self.label,
+            'summary': self.summary,
+            'metadata': self.metadata_json or {},
+            'created_at': self.created_at.isoformat() if self.created_at else None,
+        }
+        if include_payload:
+            data['snapshot'] = self.snapshot_json or {}
+        return data
+
+
+class AutomationRun(db.Model):
+    __tablename__ = 'automation_runs'
+
+    id = db.Column(db.Integer, primary_key=True)
+    scenario_id = db.Column(db.Integer, db.ForeignKey('automation_scenarios.id'), nullable=False, index=True)
+    snapshot_id = db.Column(db.Integer, db.ForeignKey('automation_snapshots.id'), nullable=False, index=True)
+    user_id = db.Column(db.Integer, db.ForeignKey('users.id'), nullable=False, index=True)
+    derived_campaign_id = db.Column(db.Integer, db.ForeignKey('campaign.id'), nullable=True, index=True)
+    status = db.Column(db.String(40), nullable=False, default='queued', index=True)
+    worker_id = db.Column(db.String(120), nullable=True, index=True)
+    lease_token = db.Column(db.String(64), nullable=True, index=True)
+    heartbeat_at = db.Column(db.DateTime, nullable=True, index=True)
+    lease_expires_at = db.Column(db.DateTime, nullable=True, index=True)
+    attempt_count = db.Column(db.Integer, nullable=False, default=0)
+    reclaim_count = db.Column(db.Integer, nullable=False, default=0)
+    matrix_group_id = db.Column(db.String(120), nullable=True, index=True)
+    matrix_label = db.Column(db.String(200), nullable=True)
+    baseline_comparison_json = db.Column(db.JSON, nullable=False, default=dict)
+    clone_retention_status = db.Column(db.String(30), nullable=False, default='active', index=True)
+    clone_retention_expires_at = db.Column(db.DateTime, nullable=True, index=True)
+    runner_config_json = db.Column(db.JSON, nullable=False, default=dict)
+    scorecard_summary_json = db.Column(db.JSON, nullable=False, default=dict)
+    last_event_id = db.Column(db.Integer, nullable=True, index=True)
+    last_event_sequence = db.Column(db.Integer, nullable=True, index=True)
+    error_text = db.Column(db.Text, nullable=True)
+    stop_requested_at = db.Column(db.DateTime, nullable=True)
+    claimed_at = db.Column(db.DateTime, nullable=True)
+    started_at = db.Column(db.DateTime, nullable=True)
+    finished_at = db.Column(db.DateTime, nullable=True)
+    created_at = db.Column(db.DateTime, default=datetime.utcnow, index=True)
+    updated_at = db.Column(db.DateTime, default=datetime.utcnow, onupdate=datetime.utcnow, index=True)
+
+    scenario = db.relationship('AutomationScenario', foreign_keys=[scenario_id])
+    snapshot = db.relationship('AutomationSnapshot', foreign_keys=[snapshot_id])
+    owner = db.relationship('User')
+    derived_campaign = db.relationship('Campaign', foreign_keys=[derived_campaign_id])
+
+    def to_dict(self):
+        return {
+            'id': self.id,
+            'scenario_id': self.scenario_id,
+            'snapshot_id': self.snapshot_id,
+            'user_id': self.user_id,
+            'derived_campaign_id': self.derived_campaign_id,
+            'status': self.status,
+            'worker_id': self.worker_id,
+            'lease_token': self.lease_token,
+            'heartbeat_at': self.heartbeat_at.isoformat() if self.heartbeat_at else None,
+            'lease_expires_at': self.lease_expires_at.isoformat() if self.lease_expires_at else None,
+            'attempt_count': self.attempt_count,
+            'reclaim_count': self.reclaim_count,
+            'matrix_group_id': self.matrix_group_id,
+            'matrix_label': self.matrix_label,
+            'baseline_comparison': self.baseline_comparison_json or {},
+            'clone_retention_status': self.clone_retention_status,
+            'clone_retention_expires_at': self.clone_retention_expires_at.isoformat() if self.clone_retention_expires_at else None,
+            'runner_config': self.runner_config_json or {},
+            'scorecard_summary': self.scorecard_summary_json or {},
+            'last_event_id': self.last_event_id,
+            'last_event_sequence': self.last_event_sequence,
+            'error_text': self.error_text,
+            'stop_requested_at': self.stop_requested_at.isoformat() if self.stop_requested_at else None,
+            'claimed_at': self.claimed_at.isoformat() if self.claimed_at else None,
+            'started_at': self.started_at.isoformat() if self.started_at else None,
+            'finished_at': self.finished_at.isoformat() if self.finished_at else None,
+            'created_at': self.created_at.isoformat() if self.created_at else None,
+            'updated_at': self.updated_at.isoformat() if self.updated_at else None,
+        }
+
+
+class AutomationRunEvent(db.Model):
+    __tablename__ = 'automation_run_events'
+
+    id = db.Column(db.Integer, primary_key=True)
+    run_id = db.Column(db.Integer, db.ForeignKey('automation_runs.id'), nullable=False, index=True)
+    event_type = db.Column(db.String(80), nullable=False, index=True)
+    sequence_number = db.Column(db.Integer, nullable=False, default=0, index=True)
+    attempt_number = db.Column(db.Integer, nullable=False, default=0, index=True)
+    dedupe_key = db.Column(db.String(160), nullable=True, index=True)
+    payload_json = db.Column(db.JSON, nullable=False, default=dict)
+    created_at = db.Column(db.DateTime, default=datetime.utcnow, index=True)
+
+    __table_args__ = (
+        db.UniqueConstraint('run_id', 'sequence_number', name='uq_automation_run_event_run_sequence'),
+        db.UniqueConstraint('run_id', 'dedupe_key', name='uq_automation_run_event_run_dedupe'),
+    )
+
+    run = db.relationship('AutomationRun')
+
+    def to_dict(self):
+        return {
+            'id': self.id,
+            'run_id': self.run_id,
+            'event_type': self.event_type,
+            'sequence_number': self.sequence_number,
+            'attempt_number': self.attempt_number,
+            'dedupe_key': self.dedupe_key,
+            'payload': self.payload_json or {},
+            'created_at': self.created_at.isoformat() if self.created_at else None,
+        }
+
+
+class AutomationWorkspaceEvent(db.Model):
+    __tablename__ = 'automation_workspace_events'
+
+    id = db.Column(db.Integer, primary_key=True)
+    user_id = db.Column(db.Integer, db.ForeignKey('users.id'), nullable=False, index=True)
+    event_type = db.Column(db.String(80), nullable=False, index=True)
+    resource_type = db.Column(db.String(60), nullable=True, index=True)
+    resource_id = db.Column(db.Integer, nullable=True, index=True)
+    payload_json = db.Column(db.JSON, nullable=False, default=dict)
+    created_at = db.Column(db.DateTime, default=datetime.utcnow, index=True)
+
+    owner = db.relationship('User')
+
+    def to_dict(self):
+        return {
+            'id': self.id,
+            'user_id': self.user_id,
+            'event_type': self.event_type,
+            'resource_type': self.resource_type,
+            'resource_id': self.resource_id,
+            'payload': self.payload_json or {},
+            'created_at': self.created_at.isoformat() if self.created_at else None,
+        }
+
+
+class AutomationRunProviderCall(db.Model):
+    __tablename__ = 'automation_run_provider_calls'
+
+    id = db.Column(db.Integer, primary_key=True)
+    run_id = db.Column(db.Integer, db.ForeignKey('automation_runs.id'), nullable=False, index=True)
+    dedupe_key = db.Column(db.String(160), nullable=False, index=True)
+    phase = db.Column(db.String(80), nullable=False, index=True)
+    prompt_version_id = db.Column(db.String(120), nullable=True, index=True)
+    provider = db.Column(db.String(80), nullable=True, index=True)
+    model = db.Column(db.String(200), nullable=True, index=True)
+    provider_response_id = db.Column(db.String(200), nullable=True, index=True)
+    usage_input_tokens = db.Column(db.Integer, nullable=True)
+    usage_output_tokens = db.Column(db.Integer, nullable=True)
+    usage_total_tokens = db.Column(db.Integer, nullable=True)
+    latency_ms = db.Column(db.Integer, nullable=True, index=True)
+    latency_bucket = db.Column(db.String(40), nullable=True, index=True)
+    parse_repair_attempts = db.Column(db.Integer, nullable=False, default=0)
+    failure_class = db.Column(db.String(120), nullable=True, index=True)
+    request_json = db.Column(db.JSON, nullable=False, default=dict)
+    response_json = db.Column(db.JSON, nullable=True)
+    parsed_output_json = db.Column(db.JSON, nullable=True)
+    response_text = db.Column(db.Text, nullable=True)
+    created_at = db.Column(db.DateTime, default=datetime.utcnow, index=True)
+
+    __table_args__ = (
+        db.UniqueConstraint('run_id', 'dedupe_key', name='uq_automation_provider_call_run_dedupe'),
+    )
+
+    run = db.relationship('AutomationRun')
+
+    def to_dict(self, include_artifacts=False):
+        data = {
+            'id': self.id,
+            'run_id': self.run_id,
+            'dedupe_key': self.dedupe_key,
+            'phase': self.phase,
+            'prompt_version_id': self.prompt_version_id,
+            'provider': self.provider,
+            'model': self.model,
+            'provider_response_id': self.provider_response_id,
+            'usage_input_tokens': self.usage_input_tokens,
+            'usage_output_tokens': self.usage_output_tokens,
+            'usage_total_tokens': self.usage_total_tokens,
+            'latency_ms': self.latency_ms,
+            'latency_bucket': self.latency_bucket,
+            'parse_repair_attempts': self.parse_repair_attempts,
+            'failure_class': self.failure_class,
+            'created_at': self.created_at.isoformat() if self.created_at else None,
+        }
+        if include_artifacts:
+            data['request'] = self.request_json or {}
+            data['response'] = self.response_json or {}
+            data['parsed_output'] = self.parsed_output_json or {}
+            data['response_text'] = self.response_text
+        return data
+
+
+class AutomationRunAuditResult(db.Model):
+    __tablename__ = 'automation_run_audit_results'
+
+    id = db.Column(db.Integer, primary_key=True)
+    run_id = db.Column(db.Integer, db.ForeignKey('automation_runs.id'), nullable=False, index=True)
+    check_id = db.Column(db.String(120), nullable=False)
+    status = db.Column(db.String(30), nullable=False)
+    summary = db.Column(db.Text, nullable=True)
+    details_json = db.Column(db.JSON, nullable=False, default=dict)
+    created_at = db.Column(db.DateTime, default=datetime.utcnow, index=True)
+    updated_at = db.Column(db.DateTime, default=datetime.utcnow, onupdate=datetime.utcnow, index=True)
+
+    __table_args__ = (
+        db.UniqueConstraint('run_id', 'check_id', name='uq_automation_run_audit_result_run_check'),
+    )
+
+    run = db.relationship('AutomationRun')
+
+    def to_dict(self):
+        return {
+            'id': self.id,
+            'run_id': self.run_id,
+            'check_id': self.check_id,
+            'status': self.status,
+            'summary': self.summary,
+            'details': self.details_json or {},
+            'created_at': self.created_at.isoformat() if self.created_at else None,
+            'updated_at': self.updated_at.isoformat() if self.updated_at else None,
         }
 
 

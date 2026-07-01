@@ -128,6 +128,78 @@ export function resetDevModel() {
   return apiFetch('/dev/model', { method: 'PUT', body: JSON.stringify({ reset: true }) })
 }
 
+// -- Automation Workspace API --
+
+export function getAutomationWorkspace() {
+  return apiFetch('/automation')
+}
+
+export function getAutomationWorkspaceStreamUrl() {
+  const token = getToken()
+  return `${API_BASE}/automation/stream?token=${encodeURIComponent(token || '')}`
+}
+
+export function listAutomationScenarios() {
+  return apiFetch('/automation/scenarios')
+}
+
+export function createAutomationScenario(payload) {
+  return apiFetch('/automation/scenarios', { method: 'POST', body: JSON.stringify(payload) })
+}
+
+export function getAutomationScenario(scenarioId) {
+  return apiFetch(`/automation/scenarios/${scenarioId}`)
+}
+
+export function updateAutomationScenario(scenarioId, payload) {
+  return apiFetch(`/automation/scenarios/${scenarioId}`, { method: 'PUT', body: JSON.stringify(payload) })
+}
+
+export function deleteAutomationScenario(scenarioId) {
+  return apiFetch(`/automation/scenarios/${scenarioId}`, { method: 'DELETE' })
+}
+
+export function cleanupAutomationScenario(scenarioId, payload = {}) {
+  return apiFetch(`/automation/scenarios/${scenarioId}/cleanup`, { method: 'POST', body: JSON.stringify(payload) })
+}
+
+export function listAutomationSnapshots(scenarioId) {
+  return apiFetch(`/automation/scenarios/${scenarioId}/snapshots`)
+}
+
+export function createAutomationSnapshot(scenarioId, payload = {}) {
+  return apiFetch(`/automation/scenarios/${scenarioId}/snapshots`, { method: 'POST', body: JSON.stringify(payload) })
+}
+
+export function listAutomationRuns(scenarioId) {
+  return apiFetch(`/automation/scenarios/${scenarioId}/runs`)
+}
+
+export function createAutomationRun(scenarioId, payload = {}) {
+  return apiFetch(`/automation/scenarios/${scenarioId}/runs`, { method: 'POST', body: JSON.stringify(payload) })
+}
+
+export function getAutomationRun(runId) {
+  return apiFetch(`/automation/runs/${runId}`)
+}
+
+export function stopAutomationRun(runId) {
+  return apiFetch(`/automation/runs/${runId}/stop`, { method: 'POST', body: JSON.stringify({}) })
+}
+
+export function getAutomationRunScorecard(runId) {
+  return apiFetch(`/automation/runs/${runId}/scorecard`)
+}
+
+export function compareAutomationRuns(payload) {
+  return apiFetch('/automation/compare', { method: 'POST', body: JSON.stringify(payload) })
+}
+
+export function getAutomationRunStreamUrl(runId) {
+  const token = getToken()
+  return `${API_BASE}/automation/runs/${runId}/stream?token=${encodeURIComponent(token || '')}`
+}
+
 // -- Campaign Dashboard API --
 
 export function updateCampaign(id, payload) {

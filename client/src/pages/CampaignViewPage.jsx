@@ -904,6 +904,15 @@ export default function CampaignViewPage({ user }) {
               <button className="sidebar-nav-item" onClick={() => setShowSettings(true)}>
                 <i className="bi bi-gear"></i> Campaign Settings
               </button>
+              <button className="sidebar-nav-item" onClick={() => navigate(`/automation?sourceCampaignId=${id}`)}>
+                <i className="bi bi-activity"></i> Automation Workspace
+              </button>
+              <button className="sidebar-nav-item" onClick={() => navigate(`/automation?sourceCampaignId=${id}&autoCreateScenario=1`)}>
+                <i className="bi bi-diagram-3"></i> Create Automation Scenario
+              </button>
+              <button className="sidebar-nav-item" onClick={() => navigate(`/automation?sourceCampaignId=${id}&autoCreateScenario=1&captureSnapshot=1`)}>
+                <i className="bi bi-camera"></i> Capture Automation Snapshot
+              </button>
               <button className="sidebar-nav-item" onClick={() => navigate('/characters')}>
                 <i className="bi bi-person-badge"></i> Characters
               </button>
