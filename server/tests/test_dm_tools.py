@@ -1417,6 +1417,34 @@ class DmToolsTest(unittest.TestCase):
         self.assertIn('burned_symbol', fact_text)
         self.assertIn('confirmed', fact_text)
 
+    def test_party_known_clock_embedding_omits_private_completion_fields(self):
+        clock_text = canonical_text_for_item('clock', {
+            'clock_id': 'party_obligation',
+            'name': 'Contractual Entanglement',
+            'visibility': 'party_known',
+            'summary': 'Lyle offered the party work.',
+            'trigger': 'Accepting hidden contract terms advances the clock.',
+            'on_complete': "The party becomes bound to the Ashen Hand's agenda.",
+            'status': 'active',
+        })
+        private_clock_text = canonical_text_for_item('clock', {
+            'clock_id': 'ashen_hand_scheme',
+            'name': "Ashen Hand's Machinations",
+            'visibility': 'dm_private',
+            'summary': 'A secret faction advances its plan.',
+            'trigger': 'The party takes the bait.',
+            'on_complete': 'The Ashen Hand gains control.',
+            'status': 'active',
+        })
+
+        self.assertIn('Contractual Entanglement', clock_text)
+        self.assertIn('Lyle offered the party work.', clock_text)
+        self.assertNotIn('Trigger:', clock_text)
+        self.assertNotIn('On complete:', clock_text)
+        self.assertNotIn('Ashen Hand', clock_text)
+        self.assertIn('Trigger:', private_clock_text)
+        self.assertIn('On complete:', private_clock_text)
+
     def test_cosine_similarity_handles_matching_vectors(self):
         self.assertAlmostEqual(cosine_similarity([1, 0], [1, 0]), 1.0)
         self.assertAlmostEqual(cosine_similarity([1, 0], [0, 1]), 0.0)
@@ -4083,6 +4111,54 @@ class DmToolsTest(unittest.TestCase):
         fact = next(item for item in graph['facts'] if item['id'] == 'crimson_veil_cause')
         self.assertEqual(fact['visibility'], 'dm_private')
 
+    def test_memory_patch_remaps_hidden_actor_id_to_visible_public_entity(self):
+        db.session.add(NPCActor(
+            campaign_id=self.campaign.id,
+            actor_id='lyle_ashen_hand',
+            name='Lyle',
+            public_summary='A nervous merchant who offers the party investigative work.',
+            dossier=json.dumps({
+                'id': 'lyle_ashen_hand',
+                'name': 'Lyle',
+                'secrets': ['Works for the Ashen Hand.'],
+            }),
+        ))
+        db.session.commit()
+
+        apply_memory_patch(
+            self.campaign,
+            self.session,
+            {
+                'upsert_graph_facts': [
+                    {
+                        'id': 'fact_lyle_offer',
+                        'entity_ids': ['lyle_ashen_hand'],
+                        'text': 'Lyle offers the party a hundred gold retainer for an unbiased investigation.',
+                        'certainty': 'confirmed',
+                        'visibility': 'party_known',
+                    }
+                ],
+            },
+            {
+                'latest_player_message': "Kaelen catches the merchant's eye.",
+                'latest_dm_message': (
+                    '<npc target="Lyle">"Name is Lyle. I can offer a hundred gold retainer '
+                    'for an unbiased investigation."</npc>'
+                ),
+            },
+        )
+        db.session.commit()
+
+        world = CampaignWorld.query.filter_by(campaign_id=self.campaign.id).one()
+        graph = json.loads(world.knowledge_graph)
+        lyle = next(item for item in graph['entities'] if item['id'] == 'lyle')
+        fact = next(item for item in graph['facts'] if item['id'] == 'fact_lyle_offer')
+        self.assertEqual(lyle['visibility'], 'party_known')
+        self.assertEqual(lyle['name'], 'Lyle')
+        self.assertEqual(fact['visibility'], 'party_known')
+        self.assertEqual(fact['entity_ids'], ['lyle'])
+        self.assertNotIn('lyle_ashen_hand', json.dumps(graph))
+
     def test_memory_patch_records_visible_scene_event_as_party_known(self):
         result = apply_memory_patch(
             self.campaign,
@@ -4169,6 +4245,44 @@ class DmToolsTest(unittest.TestCase):
             validation_log.patch_json['skipped_scene_patch']['location_id'],
             'blackwater_harbor',
         )
+
+    def test_memory_patch_scene_validation_uses_full_visible_exchange_for_active_npcs(self):
+        world = CampaignWorld.query.filter_by(campaign_id=self.campaign.id).one()
+        world.world_state = json.dumps({
+            'current_scene': {
+                'location_id': 'hanging_switchyard',
+                'location_name': 'The Hanging Switchyard',
+                'active_npc_ids': ['mira_kellson'],
+                'immediate_tension': 'Mira argues in the yard.',
+            },
+        })
+        db.session.commit()
+
+        long_intro = ' '.join(['The crowd keeps shifting around the switchyard.'] * 12)
+        result = apply_memory_patch(
+            self.campaign,
+            self.session,
+            {
+                'scene_patch': {
+                    'active_npc_ids': ['lyle', 'deputy_rona'],
+                    'departed_npc_ids': ['mira_kellson'],
+                    'immediate_tension': 'Lyle waits while Deputy Rona watches from the platform.',
+                },
+                'scene_reason': 'The visible focus moved to Lyle and Deputy Rona.',
+            },
+            {
+                'latest_player_message': 'Kaelen asks for the documents.',
+                'latest_dm_message': (
+                    f'{long_intro} <npc target="Lyle">"I have the documents here."</npc> '
+                    'Deputy Rona watches from the platform edge.'
+                ),
+            },
+        )
+        db.session.commit()
+
+        self.assertTrue(result['world_event_ids'])
+        current_scene = json.loads(world.world_state)['current_scene']
+        self.assertEqual(current_scene['active_npc_ids'], ['lyle', 'deputy_rona'])
 
     def test_memory_patch_clears_stale_npcs_on_supported_location_change(self):
         world = CampaignWorld.query.filter_by(campaign_id=self.campaign.id).one()

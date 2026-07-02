@@ -73,6 +73,8 @@ def _dict_text(value):
 
 def canonical_text_for_item(item_type, value):
     value = value if isinstance(value, dict) else {}
+    visibility = clean_text(value.get('visibility'), 40)
+    include_private_fields = visibility not in {'public', 'party_known'}
     if item_type == 'entity':
         parts = [
             f"Entity: {clean_text(value.get('name'), 200)}",
@@ -118,9 +120,12 @@ def canonical_text_for_item(item_type, value):
             f"Status: {clean_text(value.get('status'), 80)}",
             f"Visibility: {clean_text(value.get('visibility'), 40)}",
             f"Summary: {clean_text(value.get('summary'), 800)}",
-            f"Trigger: {clean_text(value.get('trigger'), 600)}",
-            f"On complete: {clean_text(value.get('on_complete'), 600)}",
         ]
+        if include_private_fields:
+            parts.extend([
+                f"Trigger: {clean_text(value.get('trigger'), 600)}",
+                f"On complete: {clean_text(value.get('on_complete'), 600)}",
+            ])
     elif item_type == 'world_event':
         parts = [
             f"World event: {clean_text(value.get('summary'), 1000)}",

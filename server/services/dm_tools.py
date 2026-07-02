@@ -203,8 +203,8 @@ def _scene_visible_text(audit_context):
     ).strip()
 
 
-def _scene_terms(value):
-    text = clean_text(value, 240).lower()
+def _scene_terms(value, max_length=240):
+    text = clean_text(value, max_length).lower()
     return {
         term
         for term in re.findall(r"[a-z0-9']+", text.replace('_', ' '))
@@ -213,7 +213,7 @@ def _scene_terms(value):
 
 
 def _scene_visible_terms(visible_text):
-    terms = _scene_terms(visible_text)
+    terms = _scene_terms(visible_text, max_length=6000)
     return terms | {term[:-1] for term in terms if len(term) > 4 and term.endswith('s')}
 
 
@@ -599,6 +599,133 @@ def _apply_visibility_policy_to_item(campaign, item, visible_text, fields):
     return item
 
 
+def _existing_graph_entities_by_id(campaign):
+    _world, graph, _world_state, _dm_private = _world_json(campaign)
+    if not isinstance(graph, dict):
+        return {}
+    return {
+        entity.get('id'): entity
+        for entity in graph.get('entities', [])
+        if isinstance(entity, dict) and entity.get('id')
+    }
+
+
+def _npc_actor_aliases_by_public_id(campaign):
+    if not campaign:
+        return {}
+    aliases = {}
+    for npc in NPCActor.query.filter_by(campaign_id=campaign.id).all():
+        public_id = clean_id(npc.name, '')
+        if public_id:
+            aliases[public_id] = npc
+        if npc.actor_id:
+            aliases[npc.actor_id] = npc
+    return aliases
+
+
+def _public_campaign_terms(campaign):
+    _world, graph, _world_state, _dm_private = _world_json(campaign)
+    terms = set()
+    for entity in graph.get('entities', []) if isinstance(graph, dict) else []:
+        if entity.get('visibility') in {'public', 'party_known'}:
+            terms.update(_scene_terms(entity.get('id')))
+            terms.update(_scene_terms(entity.get('name')))
+            terms.update(_scene_terms(entity.get('summary'), max_length=800))
+    if campaign:
+        for npc in NPCActor.query.filter_by(campaign_id=campaign.id).all():
+            terms.update(_scene_terms(npc.name))
+            terms.update(_scene_terms(npc.public_summary, max_length=800))
+    return terms
+
+
+def _private_campaign_terms(campaign):
+    terms = set()
+    for value in _private_output_terms(campaign):
+        terms.update(_scene_terms(value, max_length=1200))
+    return terms - {
+        'this', 'that', 'they', 'them', 'their', 'when', 'what', 'where', 'which',
+        'will', 'would', 'could', 'should', 'from', 'into', 'onto', 'under',
+        'over', 'secret', 'hidden', 'private', 'unrevealed', 'party',
+    }
+
+
+def _entity_id_has_unrevealed_private_terms(campaign, entity_id, visible_terms):
+    id_terms = _scene_terms(entity_id)
+    if not id_terms:
+        return False
+    private_terms = _private_campaign_terms(campaign)
+    if not private_terms:
+        return False
+    safe_terms = visible_terms | _public_campaign_terms(campaign)
+    return bool(id_terms & (private_terms - safe_terms))
+
+
+def _public_entity_alias_for_visible_npc(npc, visible_terms):
+    if not npc:
+        return None
+    name = clean_text(npc.name, 160)
+    public_id = clean_id(name, '')
+    if not public_id or not _scene_value_supported(name or public_id, visible_terms):
+        return None
+    alias = {
+        'id': public_id,
+        'type': 'npc',
+        'name': name or public_id.replace('_', ' ').title(),
+        'visibility': 'party_known',
+        'reason': 'Visible NPC referenced by a party-known memory fact.',
+    }
+    summary = clean_text(npc.public_summary, 500)
+    if summary:
+        alias['summary'] = summary
+    return alias
+
+
+def _sanitize_party_known_fact_entity_ids(campaign, item, visible_text):
+    if not isinstance(item, dict) or item.get('visibility') not in {'public', 'party_known'}:
+        return item, []
+    entity_ids = item.get('entity_ids')
+    if not isinstance(entity_ids, list) or not entity_ids:
+        return item, []
+
+    visible_terms = _scene_visible_terms(visible_text)
+    existing_entities = _existing_graph_entities_by_id(campaign)
+    npc_aliases = _npc_actor_aliases_by_public_id(campaign)
+    clean_ids = []
+    aliases = []
+    seen = set()
+
+    for entity_id in entity_ids:
+        entity_id = clean_id(entity_id, '')
+        if not entity_id:
+            continue
+        existing = existing_entities.get(entity_id)
+        existing_visibility = existing.get('visibility') if isinstance(existing, dict) else None
+        if existing_visibility in {'public', 'party_known'}:
+            candidate_id = entity_id
+        else:
+            npc = npc_aliases.get(entity_id)
+            alias = _public_entity_alias_for_visible_npc(npc, visible_terms)
+            if alias:
+                candidate_id = alias['id']
+                aliases.append(alias)
+            elif existing is None and _scene_value_supported(entity_id, visible_terms):
+                candidate_id = entity_id
+            elif _entity_id_has_unrevealed_private_terms(campaign, entity_id, visible_terms):
+                continue
+            else:
+                candidate_id = entity_id
+
+        if _entity_id_has_unrevealed_private_terms(campaign, candidate_id, visible_terms):
+            continue
+        if candidate_id not in seen:
+            seen.add(candidate_id)
+            clean_ids.append(candidate_id)
+
+    item = dict(item)
+    item['entity_ids'] = clean_ids
+    return item, aliases
+
+
 def _apply_memory_visibility_policy(campaign, patch, audit_context):
     visible_text = _visibility_policy_text(audit_context or {})
     if not visible_text:
@@ -619,6 +746,28 @@ def _apply_memory_visibility_policy(campaign, patch, audit_context):
             _apply_visibility_policy_to_item(campaign, item, visible_text, fields)
             for item in items
         ]
+
+    extra_entities = []
+    facts = patch.get('upsert_graph_facts')
+    if isinstance(facts, list):
+        clean_facts = []
+        for fact in facts:
+            fact, aliases = _sanitize_party_known_fact_entity_ids(campaign, fact, visible_text)
+            clean_facts.append(fact)
+            extra_entities.extend(aliases)
+        patch['upsert_graph_facts'] = clean_facts
+
+    if extra_entities:
+        existing_ids = {
+            clean_id(item.get('id'), '')
+            for item in patch.get('upsert_graph_entities', []) if isinstance(item, dict)
+        }
+        for entity in extra_entities:
+            entity_id = clean_id(entity.get('id'), '')
+            if not entity_id or entity_id in existing_ids:
+                continue
+            patch.setdefault('upsert_graph_entities', []).append(entity)
+            existing_ids.add(entity_id)
 
     return patch
 

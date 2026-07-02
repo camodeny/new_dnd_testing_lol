@@ -1,3 +1,4 @@
+import json
 import os
 import sys
 import tempfile
@@ -187,6 +188,122 @@ class AutomationRouteTest(unittest.TestCase):
         self.assertEqual(campaigns_response.status_code, 200)
         campaign_ids = {campaign['id'] for campaign in campaigns_response.get_json()['campaigns']}
         self.assertEqual(campaign_ids, {self.campaign_id})
+
+    def test_snapshot_audit_events_do_not_complete_clone_post_turn_status(self):
+        with app.app_context():
+            latest_session = CampaignSession.query.order_by(CampaignSession.id.desc()).first()
+            latest_message = SessionMessage.query.order_by(SessionMessage.id.desc()).first()
+            expected_derived_session_id = (latest_session.id if latest_session else 0) + 1
+            cloned_message_count = SessionMessage.query.filter_by(session_id=self.session_id).count()
+            expected_player_message_id = (latest_message.id if latest_message else 0) + cloned_message_count + 1
+            stale_memory_trace_id = (
+                f'session_memory_writer:session_{expected_derived_session_id}:message_{expected_player_message_id}'
+            )
+            stale_clock_trace_id = (
+                f'session_clock_adjudicator:session_{expected_derived_session_id}:message_{expected_player_message_id}'
+            )
+            db.session.add_all([
+                CampaignAuditEvent(
+                    campaign_id=self.campaign_id,
+                    event_type='memory_patch_applied',
+                    source='dm_tools.memory',
+                    actor='session_memory_writer',
+                    trace_id=stale_memory_trace_id,
+                    parent_trace_id=f'session_dm:session_{expected_derived_session_id}:message_{expected_player_message_id}',
+                    summary='Historical memory patch from the source campaign.',
+                    payload=json.dumps({'session_id': expected_derived_session_id, 'patch': {}, 'result': {}}),
+                ),
+                CampaignAuditEvent(
+                    campaign_id=self.campaign_id,
+                    event_type='clock_adjudication_applied',
+                    source='session_clock',
+                    actor='session_clock_adjudicator',
+                    trace_id=stale_clock_trace_id,
+                    parent_trace_id=f'session_dm:session_{expected_derived_session_id}:message_{expected_player_message_id}',
+                    summary='Historical clock adjudication from the source campaign.',
+                    payload=json.dumps({'updates': {}, 'result': {}}),
+                ),
+            ])
+            db.session.commit()
+
+        scenario_id = self.client.post(
+            '/api/automation/scenarios',
+            headers=self.headers,
+            json={'source_campaign_id': self.campaign_id},
+        ).get_json()['scenario']['id']
+        snapshot = self.client.post(
+            f'/api/automation/scenarios/{scenario_id}/snapshots',
+            headers=self.headers,
+            json={},
+        ).get_json()['snapshot']
+        self.assertGreaterEqual(snapshot['metadata']['audit_event_count'], 2)
+        run_id = self.client.post(
+            f'/api/automation/scenarios/{scenario_id}/runs',
+            headers=self.headers,
+            json={'snapshot_id': snapshot['id']},
+        ).get_json()['run']['id']
+        self.client.post(
+            f'/api/automation/runs/{run_id}/claim',
+            headers=self.headers,
+            json={'worker_id': 'worker-a'},
+        )
+
+        with app.app_context():
+            run = db.session.get(AutomationRun, run_id)
+            derived_session = CampaignSession.query.filter_by(
+                campaign_id=run.derived_campaign_id,
+                is_active=True,
+            ).one()
+            self.assertEqual(derived_session.id, expected_derived_session_id)
+            cloned_stale_events = CampaignAuditEvent.query.filter(
+                CampaignAuditEvent.campaign_id == run.derived_campaign_id,
+                CampaignAuditEvent.trace_id.in_([stale_memory_trace_id, stale_clock_trace_id]),
+            ).all()
+            self.assertEqual(cloned_stale_events, [])
+
+            player_message = SessionMessage(
+                session_id=derived_session.id,
+                user_id=self.owner_id,
+                role='player',
+                content='I test whether the fresh turn is still pending.',
+            )
+            dm_message = SessionMessage(
+                session_id=derived_session.id,
+                role='dm',
+                content='The switchyard holds its breath.',
+            )
+            db.session.add_all([player_message, dm_message])
+            db.session.flush()
+            self.assertEqual(player_message.id, expected_player_message_id)
+            dm_trace_id = f'session_dm:session_{derived_session.id}:message_{player_message.id}'
+            db.session.add(CampaignAuditEvent(
+                campaign_id=run.derived_campaign_id,
+                event_type='dm_output_stored',
+                source='session_messages',
+                actor='session_dm',
+                trace_id=dm_trace_id,
+                summary='Stored visible session DM response.',
+                payload=json.dumps({
+                    'session_id': derived_session.id,
+                    'player_message_id': player_message.id,
+                    'dm_message_id': dm_message.id,
+                }),
+            ))
+            db.session.commit()
+            derived_session_id = derived_session.id
+            player_message_id = player_message.id
+
+        status_response = self.client.get(
+            f'/api/sessions/{derived_session_id}/dm-turn-status?after_message_id={player_message_id}',
+            headers=self.headers,
+        )
+        self.assertEqual(status_response.status_code, 200)
+        status = status_response.get_json()
+        self.assertEqual(status['status'], 'speak')
+        self.assertFalse(status['post_turn_complete'])
+        self.assertEqual(status['post_turn_status'], 'pending')
+        self.assertEqual(status['memory_status'], 'pending')
+        self.assertEqual(status['clock_status'], 'pending')
 
     def test_run_decision_posts_message_for_derived_run(self):
         scenario_id = self.client.post(
@@ -762,6 +879,8 @@ class AutomationRouteTest(unittest.TestCase):
         self.assertEqual(scorecards['custom:memory_quality']['status'], 'pass')
         self.assertEqual(scorecards['custom:story_consistency']['status'], 'warn')
         self.assertEqual(scorecard_response.get_json()['run']['scorecard_summary']['audited_cycle_count'], 1)
+        self.assertNotIn('budget_passed', scorecard_response.get_json()['run']['scorecard_summary'])
+        self.assertNotIn('budgets', scorecard_response.get_json()['run']['scorecard_summary'])
 
         with app.app_context():
             cycle = db.session.get(AutomationRunAuditCycle, cycle_id)

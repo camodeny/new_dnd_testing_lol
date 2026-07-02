@@ -110,10 +110,6 @@ DEFAULT_AUDIT_CONFIG = {
             'summary_template': '{value} model retries or parse repairs.',
         },
     ],
-    'budgets': {
-        'max_failures': 0,
-        'max_warnings': 2,
-    },
 }
 STATUS_RANK = {'fail': 0, 'warn': 1, 'pass': 2}
 
@@ -617,20 +613,9 @@ def materialize_run_campaign(run):
                 updated_at=_parse_iso(placement_data.get('updated_at')) or _utcnow(),
             ))
 
-    for audit_event in data.get('audit_events') or []:
-        db.session.add(CampaignAuditEvent(
-            campaign_id=clone.id,
-            event_type=audit_event.get('event_type') or 'automation_snapshot_event',
-            source=audit_event.get('source'),
-            actor=audit_event.get('actor'),
-            trace_id=audit_event.get('trace_id'),
-            parent_trace_id=audit_event.get('parent_trace_id'),
-            trace_label=audit_event.get('trace_label'),
-            audit_role=audit_event.get('audit_role'),
-            summary=audit_event.get('summary') or '',
-            payload=json.dumps(audit_event.get('payload') or {}),
-            created_at=_parse_iso(audit_event.get('created_at')) or _utcnow(),
-        ))
+    # Snapshot audit rows are historical telemetry, not campaign state. Replaying
+    # them into the clone can make fresh post-turn status checks match stale
+    # trace IDs from the source campaign.
 
     policy = retention_policy_for_scenario(run.scenario) if run.scenario else dict(DEFAULT_RETENTION_POLICY)
     retention_days = max(0, _safe_int(policy.get('retention_days'), DEFAULT_RETENTION_POLICY['retention_days']))
@@ -1215,12 +1200,9 @@ def refresh_run_scorecard(run):
 
     results_payload.extend(custom_scorecard_results(run, cycle_rows))
 
-    budgets = dict(DEFAULT_AUDIT_CONFIG['budgets'])
-    budgets.update(config.get('budgets') or {})
     fail_count = sum(1 for check in results_payload if check['status'] == 'fail')
     warn_count = sum(1 for check in results_payload if check['status'] == 'warn')
     weighted_score = round((weighted_pass / weighted_total) if weighted_total else 0.0, 4)
-    pass_budget_ok = fail_count <= _safe_int(budgets.get('max_failures'), 0) and warn_count <= _safe_int(budgets.get('max_warnings'), 999)
 
     AutomationRunAuditResult.query.filter_by(run_id=run.id).delete()
     created_results = []
@@ -1246,8 +1228,6 @@ def refresh_run_scorecard(run):
         'error_count': metrics.get('error_count', 0),
         'audited_cycle_count': metrics.get('audited_cycle_count', 0),
         'weighted_score': weighted_score,
-        'budget_passed': pass_budget_ok,
-        'budgets': budgets,
         'incidents': calculate_run_incidents(run, event_rows, audit_rows, provider_rows),
         'custom_scorecard_name': current_scorecard_template_for_run(run).get('name'),
     }
