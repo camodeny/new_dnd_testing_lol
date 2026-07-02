@@ -678,6 +678,132 @@ class AppRouteTest(unittest.TestCase):
         self.assertEqual(dm_status['status'], 'speak')
         self.assertEqual(dm_status['player_message_id'], player_message_id)
         self.assertEqual(dm_status['dm_message_id'], dm_message_id)
+        self.assertIn('post_turn_complete', dm_status)
+        self.assertIn(dm_status['post_turn_status'], {'pending', 'complete'})
+
+    def test_dm_turn_status_reports_pending_post_turn_work_for_speak(self):
+        with app.app_context():
+            owner = User(username='owner-post-turn-pending', email='owner-post-turn-pending@example.com')
+            owner.set_password('password')
+            db.session.add(owner)
+            db.session.commit()
+
+            campaign = Campaign(name='Pending Post Turn Table', user_id=owner.id)
+            db.session.add(campaign)
+            db.session.commit()
+            db.session.add(CampaignMember(campaign_id=campaign.id, user_id=owner.id, role='player'))
+            session = CampaignSession(campaign_id=campaign.id, is_active=True)
+            db.session.add(session)
+            db.session.flush()
+            player_message = SessionMessage(session_id=session.id, user_id=owner.id, role='player', content='I tail Mira.')
+            dm_message = SessionMessage(session_id=session.id, user_id=owner.id, role='dm', content='You move through the yard.')
+            db.session.add_all([player_message, dm_message])
+            db.session.flush()
+            db.session.add(CampaignAuditEvent(
+                campaign_id=campaign.id,
+                event_type='dm_output_stored',
+                source='session_messages',
+                actor='session_dm',
+                trace_id=f'session_dm:session_{session.id}:message_{player_message.id}',
+                summary='Stored visible session DM response.',
+                payload=json.dumps({
+                    'session_id': session.id,
+                    'player_message_id': player_message.id,
+                    'dm_message_id': dm_message.id,
+                }),
+            ))
+            db.session.commit()
+
+            session_id = session.id
+            player_message_id = player_message.id
+            owner_token = generate_token(owner.id)
+
+        dm_status_response = self.client.get(
+            f'/api/sessions/{session_id}/dm-turn-status?after_message_id={player_message_id}',
+            headers={'Authorization': f'Bearer {owner_token}'},
+        )
+        self.assertEqual(dm_status_response.status_code, 200)
+        dm_status = dm_status_response.get_json()
+        self.assertEqual(dm_status['status'], 'speak')
+        self.assertFalse(dm_status['post_turn_complete'])
+        self.assertEqual(dm_status['post_turn_status'], 'pending')
+        self.assertEqual(dm_status['memory_status'], 'pending')
+        self.assertEqual(dm_status['clock_status'], 'pending')
+
+    def test_dm_turn_status_reports_complete_after_post_turn_events(self):
+        with app.app_context():
+            owner = User(username='owner-post-turn-complete', email='owner-post-turn-complete@example.com')
+            owner.set_password('password')
+            db.session.add(owner)
+            db.session.commit()
+
+            campaign = Campaign(name='Complete Post Turn Table', user_id=owner.id)
+            db.session.add(campaign)
+            db.session.commit()
+            db.session.add(CampaignMember(campaign_id=campaign.id, user_id=owner.id, role='player'))
+            session = CampaignSession(campaign_id=campaign.id, is_active=True)
+            db.session.add(session)
+            db.session.flush()
+            player_message = SessionMessage(session_id=session.id, user_id=owner.id, role='player', content='I tail Mira.')
+            dm_message = SessionMessage(session_id=session.id, user_id=owner.id, role='dm', content='You move through the yard.')
+            db.session.add_all([player_message, dm_message])
+            db.session.flush()
+
+            dm_trace_id = f'session_dm:session_{session.id}:message_{player_message.id}'
+            memory_trace_id = f'session_memory_writer:session_{session.id}:message_{player_message.id}'
+            clock_trace_id = f'session_clock_adjudicator:session_{session.id}:message_{player_message.id}'
+            db.session.add_all([
+                CampaignAuditEvent(
+                    campaign_id=campaign.id,
+                    event_type='dm_output_stored',
+                    source='session_messages',
+                    actor='session_dm',
+                    trace_id=dm_trace_id,
+                    summary='Stored visible session DM response.',
+                    payload=json.dumps({
+                        'session_id': session.id,
+                        'player_message_id': player_message.id,
+                        'dm_message_id': dm_message.id,
+                    }),
+                ),
+                CampaignAuditEvent(
+                    campaign_id=campaign.id,
+                    event_type='memory_patch_applied',
+                    source='dm_tools.memory',
+                    actor='session_memory_writer',
+                    trace_id=memory_trace_id,
+                    parent_trace_id=dm_trace_id,
+                    summary='Applied post-turn session memory patch.',
+                    payload=json.dumps({'session_id': session.id, 'patch': {}, 'result': {}}),
+                ),
+                CampaignAuditEvent(
+                    campaign_id=campaign.id,
+                    event_type='clock_adjudication_applied',
+                    source='session_clock',
+                    actor='session_clock_adjudicator',
+                    trace_id=clock_trace_id,
+                    parent_trace_id=dm_trace_id,
+                    summary='Applied post-turn clock adjudication.',
+                    payload=json.dumps({'updates': {}, 'result': {}}),
+                ),
+            ])
+            db.session.commit()
+
+            session_id = session.id
+            player_message_id = player_message.id
+            owner_token = generate_token(owner.id)
+
+        dm_status_response = self.client.get(
+            f'/api/sessions/{session_id}/dm-turn-status?after_message_id={player_message_id}',
+            headers={'Authorization': f'Bearer {owner_token}'},
+        )
+        self.assertEqual(dm_status_response.status_code, 200)
+        dm_status = dm_status_response.get_json()
+        self.assertEqual(dm_status['status'], 'speak')
+        self.assertTrue(dm_status['post_turn_complete'])
+        self.assertEqual(dm_status['post_turn_status'], 'complete')
+        self.assertEqual(dm_status['memory_status'], 'complete')
+        self.assertEqual(dm_status['clock_status'], 'complete')
 
     def test_dm_turn_status_returns_pending_when_no_decision_recorded(self):
         with app.app_context():

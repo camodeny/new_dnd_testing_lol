@@ -1349,6 +1349,45 @@ class CampaignAuditEvent(db.Model):
         }
 
 
+class AutomationScorecardTemplate(db.Model):
+    __tablename__ = 'automation_scorecard_templates'
+
+    id = db.Column(db.Integer, primary_key=True)
+    user_id = db.Column(db.Integer, db.ForeignKey('users.id'), nullable=False, index=True)
+    name = db.Column(db.String(200), nullable=False)
+    description = db.Column(db.Text, nullable=True)
+    instructions = db.Column(db.Text, nullable=True)
+    criteria_json = db.Column(db.JSON, nullable=False, default=list)
+    defaults_json = db.Column(db.JSON, nullable=False, default=dict)
+    created_at = db.Column(db.DateTime, default=datetime.utcnow, index=True)
+    updated_at = db.Column(db.DateTime, default=datetime.utcnow, onupdate=datetime.utcnow, index=True)
+
+    owner = db.relationship('User')
+
+    def snapshot(self):
+        return {
+            'template_id': self.id,
+            'name': self.name,
+            'description': self.description,
+            'instructions': self.instructions,
+            'criteria': self.criteria_json or [],
+            'defaults': self.defaults_json or {},
+        }
+
+    def to_dict(self):
+        return {
+            'id': self.id,
+            'user_id': self.user_id,
+            'name': self.name,
+            'description': self.description,
+            'instructions': self.instructions,
+            'criteria': self.criteria_json or [],
+            'defaults': self.defaults_json or {},
+            'created_at': self.created_at.isoformat() if self.created_at else None,
+            'updated_at': self.updated_at.isoformat() if self.updated_at else None,
+        }
+
+
 class AutomationScenario(db.Model):
     __tablename__ = 'automation_scenarios'
 
@@ -1356,6 +1395,7 @@ class AutomationScenario(db.Model):
     user_id = db.Column(db.Integer, db.ForeignKey('users.id'), nullable=False, index=True)
     source_campaign_id = db.Column(db.Integer, db.ForeignKey('campaign.id'), nullable=False, index=True)
     baseline_run_id = db.Column(db.Integer, db.ForeignKey('automation_runs.id'), nullable=True, index=True)
+    scorecard_template_id = db.Column(db.Integer, db.ForeignKey('automation_scorecard_templates.id'), nullable=True, index=True)
     name = db.Column(db.String(200), nullable=False)
     description = db.Column(db.Text, nullable=True)
     runner_config_json = db.Column(db.JSON, nullable=False, default=dict)
@@ -1368,6 +1408,7 @@ class AutomationScenario(db.Model):
     owner = db.relationship('User')
     source_campaign = db.relationship('Campaign', foreign_keys=[source_campaign_id])
     baseline_run = db.relationship('AutomationRun', foreign_keys=[baseline_run_id])
+    scorecard_template = db.relationship('AutomationScorecardTemplate', foreign_keys=[scorecard_template_id])
 
     def to_dict(self):
         return {
@@ -1375,12 +1416,14 @@ class AutomationScenario(db.Model):
             'user_id': self.user_id,
             'source_campaign_id': self.source_campaign_id,
             'baseline_run_id': self.baseline_run_id,
+            'scorecard_template_id': self.scorecard_template_id,
             'name': self.name,
             'description': self.description,
             'runner_config': self.runner_config_json or {},
             'audit_config': self.audit_config_json or {},
             'retention_policy': self.retention_policy_json or {},
             'roster': self.roster_json or [],
+            'scorecard_template': self.scorecard_template.to_dict() if self.scorecard_template else None,
             'created_at': self.created_at.isoformat() if self.created_at else None,
             'updated_at': self.updated_at.isoformat() if self.updated_at else None,
         }
@@ -1438,10 +1481,14 @@ class AutomationRun(db.Model):
     baseline_comparison_json = db.Column(db.JSON, nullable=False, default=dict)
     clone_retention_status = db.Column(db.String(30), nullable=False, default='active', index=True)
     clone_retention_expires_at = db.Column(db.DateTime, nullable=True, index=True)
+    scorecard_template_json = db.Column(db.JSON, nullable=False, default=dict)
     runner_config_json = db.Column(db.JSON, nullable=False, default=dict)
     scorecard_summary_json = db.Column(db.JSON, nullable=False, default=dict)
     last_event_id = db.Column(db.Integer, nullable=True, index=True)
     last_event_sequence = db.Column(db.Integer, nullable=True, index=True)
+    awaiting_audit_cycle_id = db.Column(db.Integer, nullable=True, index=True)
+    awaiting_audit_phase = db.Column(db.String(40), nullable=True, index=True)
+    audit_resumed_at = db.Column(db.DateTime, nullable=True, index=True)
     error_text = db.Column(db.Text, nullable=True)
     stop_requested_at = db.Column(db.DateTime, nullable=True)
     claimed_at = db.Column(db.DateTime, nullable=True)
@@ -1454,7 +1501,6 @@ class AutomationRun(db.Model):
     snapshot = db.relationship('AutomationSnapshot', foreign_keys=[snapshot_id])
     owner = db.relationship('User')
     derived_campaign = db.relationship('Campaign', foreign_keys=[derived_campaign_id])
-
     def to_dict(self):
         return {
             'id': self.id,
@@ -1474,10 +1520,14 @@ class AutomationRun(db.Model):
             'baseline_comparison': self.baseline_comparison_json or {},
             'clone_retention_status': self.clone_retention_status,
             'clone_retention_expires_at': self.clone_retention_expires_at.isoformat() if self.clone_retention_expires_at else None,
+            'scorecard_template': self.scorecard_template_json or {},
             'runner_config': self.runner_config_json or {},
             'scorecard_summary': self.scorecard_summary_json or {},
             'last_event_id': self.last_event_id,
             'last_event_sequence': self.last_event_sequence,
+            'awaiting_audit_cycle_id': self.awaiting_audit_cycle_id,
+            'awaiting_audit_phase': self.awaiting_audit_phase,
+            'audit_resumed_at': self.audit_resumed_at.isoformat() if self.audit_resumed_at else None,
             'error_text': self.error_text,
             'stop_requested_at': self.stop_requested_at.isoformat() if self.stop_requested_at else None,
             'claimed_at': self.claimed_at.isoformat() if self.claimed_at else None,
@@ -1517,6 +1567,51 @@ class AutomationRunEvent(db.Model):
             'dedupe_key': self.dedupe_key,
             'payload': self.payload_json or {},
             'created_at': self.created_at.isoformat() if self.created_at else None,
+        }
+
+
+class AutomationRunAuditCycle(db.Model):
+    __tablename__ = 'automation_run_audit_cycles'
+
+    id = db.Column(db.Integer, primary_key=True)
+    run_id = db.Column(db.Integer, db.ForeignKey('automation_runs.id'), nullable=False, index=True)
+    cycle_number = db.Column(db.Integer, nullable=False, index=True)
+    phase = db.Column(db.String(40), nullable=False, index=True)
+    status = db.Column(db.String(30), nullable=False, default='pending', index=True)
+    player_message_id = db.Column(db.Integer, nullable=True, index=True)
+    dm_message_id = db.Column(db.Integer, nullable=True, index=True)
+    summary = db.Column(db.Text, nullable=True)
+    notes = db.Column(db.Text, nullable=True)
+    payload_json = db.Column(db.JSON, nullable=False, default=dict)
+    scorecard_json = db.Column(db.JSON, nullable=False, default=dict)
+    scorecard_summary_json = db.Column(db.JSON, nullable=False, default=dict)
+    audited_at = db.Column(db.DateTime, nullable=True, index=True)
+    created_at = db.Column(db.DateTime, default=datetime.utcnow, index=True)
+    updated_at = db.Column(db.DateTime, default=datetime.utcnow, onupdate=datetime.utcnow, index=True)
+
+    __table_args__ = (
+        db.UniqueConstraint('run_id', 'cycle_number', name='uq_automation_run_audit_cycle_run_cycle'),
+    )
+
+    run = db.relationship('AutomationRun', foreign_keys=[run_id])
+
+    def to_dict(self):
+        return {
+            'id': self.id,
+            'run_id': self.run_id,
+            'cycle_number': self.cycle_number,
+            'phase': self.phase,
+            'status': self.status,
+            'player_message_id': self.player_message_id,
+            'dm_message_id': self.dm_message_id,
+            'summary': self.summary,
+            'notes': self.notes,
+            'payload': self.payload_json or {},
+            'scorecard': self.scorecard_json or {},
+            'scorecard_summary': self.scorecard_summary_json or {},
+            'audited_at': self.audited_at.isoformat() if self.audited_at else None,
+            'created_at': self.created_at.isoformat() if self.created_at else None,
+            'updated_at': self.updated_at.isoformat() if self.updated_at else None,
         }
 
 

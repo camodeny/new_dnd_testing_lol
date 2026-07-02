@@ -74,7 +74,7 @@ def parse_args():
     parser.add_argument(
         '--dm-response-timeout',
         type=float,
-        default=float(os.environ.get('DND_DM_RESPONSE_TIMEOUT', '60')),
+        default=float(os.environ.get('DND_DM_RESPONSE_TIMEOUT', '300')),
         help='Stop the runner if the DM does not finish responding to the latest player message within this many seconds',
     )
     parser.add_argument('--idle-timeout', type=float, default=180.0, help='Stop if the transcript stops changing for this many seconds')
@@ -276,8 +276,26 @@ def fetch_dm_turn_status(manifest, player_message_id):
     ) or {'status': 'pending', 'player_message_id': player_message_id}
 
 
+def dm_turn_status_resolved(dm_turn_status):
+    status = (dm_turn_status or {}).get('status')
+    if status in {None, 'pending'}:
+        return False
+    if status in {'silent', 'empty'}:
+        return True
+
+    post_turn_status = str((dm_turn_status or {}).get('post_turn_status') or '').strip().lower()
+    if post_turn_status:
+        return post_turn_status in {'complete', 'error'}
+
+    if 'post_turn_complete' in (dm_turn_status or {}):
+        return bool((dm_turn_status or {}).get('post_turn_complete'))
+
+    # Backward compatibility for older servers that only report visible DM output state.
+    return True
+
+
 def wait_for_dm_response(args, manifest, player_message_id):
-    """Poll the DM turn status until a decision has been recorded or the timeout fires.
+    """Poll the DM turn status until the visible turn and post-turn work have settled.
 
     Returns (dm_turn_status_dict, timed_out: bool).
     """
@@ -294,7 +312,7 @@ def wait_for_dm_response(args, manifest, player_message_id):
                 'error': str(exc),
             })
 
-        if last_status.get('status') != 'pending':
+        if dm_turn_status_resolved(last_status):
             return last_status, False
 
         if time.monotonic() >= deadline:

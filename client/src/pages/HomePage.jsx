@@ -175,28 +175,30 @@ export default function HomePage({ user }) {
               : 'Where will your next adventure take you?'}
           </p>
         </div>
-        <div className="campaigns-header-actions">
-          <button className="btn btn-secondary" onClick={() => navigate('/automation')}>
-            <i className="bi bi-activity"></i>
-            Automation
-          </button>
-          <button className="btn btn-secondary" onClick={openAutomationModal}>
-            <i className="bi bi-cpu"></i>
-            Automation Keys
-          </button>
-          <button className="btn btn-secondary join-btn-header" onClick={openJoinModal}>
-            <i className="bi bi-key-fill"></i>
-            Join with Code
-          </button>
-          <button className="btn btn-secondary" onClick={openSandboxModal}>
-            <i className="bi bi-bullseye"></i>
-            Combat Sandbox
-          </button>
-          <button className="btn btn-primary create-btn-header" onClick={openModal}>
-            <i className="bi bi-plus-lg"></i>
-            New Campaign
-          </button>
-        </div>
+        {hasCampaigns && (
+          <div className="campaigns-header-actions">
+            <button className="btn btn-secondary" onClick={() => navigate('/automation')}>
+              <i className="bi bi-activity"></i>
+              Automation
+            </button>
+            <button className="btn btn-secondary" onClick={openAutomationModal}>
+              <i className="bi bi-cpu"></i>
+              Automation Keys
+            </button>
+            <button className="btn btn-secondary join-btn-header" onClick={openJoinModal}>
+              <i className="bi bi-key-fill"></i>
+              Join with Code
+            </button>
+            <button className="btn btn-secondary" onClick={openSandboxModal}>
+              <i className="bi bi-bullseye"></i>
+              Combat Sandbox
+            </button>
+            <button className="btn btn-primary create-btn-header" onClick={openModal}>
+              <i className="bi bi-plus-lg"></i>
+              New Campaign
+            </button>
+          </div>
+        )}
       </header>
 
       {hasCampaigns ? (
@@ -216,20 +218,14 @@ export default function HomePage({ user }) {
           <h3>No campaigns yet</h3>
           <p>Every great story starts with a single step. Create your first campaign or join one with a code.</p>
           <div className="empty-state-actions">
-            <button className="btn btn-secondary" onClick={() => navigate('/automation')}>
-              <i className="bi bi-activity"></i> Automation
-            </button>
-            <button className="btn btn-secondary" onClick={openAutomationModal}>
-              <i className="bi bi-cpu"></i> Automation Keys
+            <button className="btn btn-primary" onClick={openModal}>
+              <i className="bi bi-plus-lg"></i> New Campaign
             </button>
             <button className="btn btn-secondary" onClick={openJoinModal}>
               <i className="bi bi-key-fill"></i> Join with Code
             </button>
             <button className="btn btn-secondary" onClick={openSandboxModal}>
               <i className="bi bi-bullseye"></i> Combat Sandbox
-            </button>
-            <button className="btn btn-primary" onClick={openModal}>
-              <i className="bi bi-plus-lg"></i> New Campaign
             </button>
           </div>
         </div>

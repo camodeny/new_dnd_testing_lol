@@ -36,7 +36,7 @@ function applyWorkspaceDelta(previous, payload) {
   }
   if (payload.type === 'run_created' || payload.type === 'run_updated') {
     const run = payload.run
-    const activeRuns = ['queued', 'claimed', 'running', 'stop_requested'].includes(run?.status)
+    const activeRuns = ['queued', 'claimed', 'running', 'stop_requested', 'awaiting_audit'].includes(run?.status)
       ? upsertById(previous.active_runs || [], run)
       : removeById(previous.active_runs || [], run?.id)
     const recentFailures = ['failed', 'stopped'].includes(run?.status)

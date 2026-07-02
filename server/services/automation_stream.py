@@ -17,13 +17,15 @@ def run_stream_cursor(run_id):
     return latest.id if latest else 0
 
 
-def iter_workspace_events(user_id, after_id=0, *, poll_interval=STREAM_POLL_INTERVAL_SECONDS, batch_size=50):
+def iter_workspace_events(after_id=0, *, user_id=None, poll_interval=STREAM_POLL_INTERVAL_SECONDS, batch_size=50):
     cursor = max(0, int(after_id or 0))
     while True:
-        rows = AutomationWorkspaceEvent.query.filter(
-            AutomationWorkspaceEvent.user_id == user_id,
+        query = AutomationWorkspaceEvent.query.filter(
             AutomationWorkspaceEvent.id > cursor,
-        ).order_by(AutomationWorkspaceEvent.id.asc()).limit(batch_size).all()
+        )
+        if user_id is not None:
+            query = query.filter(AutomationWorkspaceEvent.user_id == user_id)
+        rows = query.order_by(AutomationWorkspaceEvent.id.asc()).limit(batch_size).all()
         if rows:
             for row in rows:
                 cursor = row.id

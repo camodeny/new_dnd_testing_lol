@@ -27,7 +27,7 @@ def parse_args():
     parser.add_argument('--max-minutes', type=float, default=30.0)
     parser.add_argument('--idle-timeout', type=float, default=180.0)
     parser.add_argument('--heartbeat-interval', type=float, default=10.0)
-    parser.add_argument('--dm-response-timeout', type=float, default=float(os.environ.get('DND_DM_RESPONSE_TIMEOUT', '60')))
+    parser.add_argument('--dm-response-timeout', type=float, default=float(os.environ.get('DND_DM_RESPONSE_TIMEOUT', '300')))
     parser.add_argument('--message-window', type=int, default=16)
     parser.add_argument('--model', default=os.environ.get('OPENCODE_MODEL') or os.environ.get('OPENROUTER_MODEL') or '')
     parser.add_argument('--opencode-server', default=None, help='Unused compatibility flag')
@@ -51,7 +51,7 @@ def list_candidate_run_ids(api_base, owner_api_key):
     resumable = [
         run.get('id')
         for run in active_runs
-        if run.get('status') in {'claimed', 'running', 'stop_requested'}
+        if run.get('status') in {'claimed', 'running', 'stop_requested', 'awaiting_audit'}
     ]
     return [run_id for run_id in [*queued, *resumable] if run_id is not None]
 
@@ -122,6 +122,24 @@ def complete_run(api_base, owner_api_key, run_id, worker_id, lease_token, status
 
 def fetch_run(api_base, owner_api_key, run_id):
     return api_get(api_base, f'/api/automation/runs/{run_id}', api_key=owner_api_key)
+
+
+def pause_run(api_base, owner_api_key, run_id, worker_id, lease_token, phase, payload=None, summary=None, player_message_id=None, dm_message_id=None, dedupe_key=None):
+    return api_post(
+        api_base,
+        f'/api/automation/runs/{run_id}/pause',
+        {
+            'worker_id': worker_id,
+            'lease_token': lease_token,
+            'phase': phase,
+            'payload': payload or {},
+            'summary': summary,
+            'player_message_id': player_message_id,
+            'dm_message_id': dm_message_id,
+            'dedupe_key': dedupe_key,
+        },
+        api_key=owner_api_key,
+    )
 
 
 def build_manifest_for_run(api_base, owner_api_key, claim_payload):
@@ -209,6 +227,14 @@ def stage_key(turns_completed, session):
 
 def runner_config(claim_payload):
     return ((claim_payload.get('run') or {}).get('runner_config') or {})
+
+
+def pause_phases(claim_payload):
+    return {
+        str(value).strip().lower()
+        for value in (runner_config(claim_payload).get('audit_pause_phases') or [])
+        if str(value).strip().lower() in {'after_player', 'after_dm'}
+    }
 
 
 def replay_source_run_id(claim_payload):
@@ -381,7 +407,7 @@ def wait_for_dm_response(args, manifest, player_message_id, maybe_heartbeat_fn):
         except ApiError:
             pass
 
-        if last_status.get('status') != 'pending':
+        if autonomous.dm_turn_status_resolved(last_status):
             return last_status, False
         if time.monotonic() >= deadline:
             return last_status, True
@@ -389,6 +415,51 @@ def wait_for_dm_response(args, manifest, player_message_id, maybe_heartbeat_fn):
         remaining = deadline - time.monotonic()
         sleep_for = min(args.poll_interval, max(0.5, remaining))
         time.sleep(sleep_for)
+
+
+def finalize_terminal_state(args, run_id, lease_token, run_state):
+    status = (run_state or {}).get('status')
+    if status in {'stop_requested', 'stopped', 'failed'}:
+        complete_run(
+            args.api_base,
+            args.owner_api_key,
+            run_id,
+            args.worker_id,
+            lease_token,
+            status='stopped' if status != 'failed' else 'failed',
+            error_text=(run_state or {}).get('error_text'),
+            dedupe_key=f'run_completed:{run_id}:external-stop',
+        )
+        return True
+    return status in {'completed'}
+
+
+def pause_for_audit_if_needed(args, claim_payload, run_id, lease_token, phase, maybe_heartbeat_fn, **payload):
+    if phase not in pause_phases(claim_payload):
+        return False, lease_token
+    response = pause_run(
+        args.api_base,
+        args.owner_api_key,
+        run_id,
+        args.worker_id,
+        lease_token,
+        phase,
+        payload=payload.get('payload'),
+        summary=payload.get('summary'),
+        player_message_id=payload.get('player_message_id'),
+        dm_message_id=payload.get('dm_message_id'),
+        dedupe_key=payload.get('dedupe_key'),
+    )
+    lease_token = ((response.get('run') or {}).get('lease_token')) or lease_token
+    while True:
+        maybe_heartbeat_fn()
+        run_payload = fetch_run(args.api_base, args.owner_api_key, run_id)
+        run_state = run_payload.get('run') or {}
+        lease_token = (run_state.get('lease_token') or lease_token)
+        if run_state.get('status') == 'awaiting_audit':
+            time.sleep(args.poll_interval)
+            continue
+        return finalize_terminal_state(args, run_id, lease_token, run_state), lease_token
 
 
 def execute_run(args, run_id):
@@ -596,6 +667,27 @@ def execute_run(args, run_id):
                     turns_completed += 1
 
                 if posted_message_id is not None:
+                    should_stop, lease_token = pause_for_audit_if_needed(
+                        args,
+                        claim_payload,
+                        run_id,
+                        lease_token,
+                        'after_player',
+                        maybe_heartbeat,
+                        payload={
+                            'speaker': chosen_player['llm_player'],
+                            'character': chosen_player['character'],
+                            'decision': decision,
+                            'posted_message_id': posted_message_id,
+                            'turns_completed': turns_completed,
+                        },
+                        summary=f'Paused after player action from {chosen_player["character"].get("name") or chosen_player["llm_player"]["label"]}.',
+                        player_message_id=posted_message_id,
+                        dedupe_key=f'audit_pause:after_player:{logical_key}:{posted_message_id}',
+                    )
+                    if should_stop:
+                        return True
+                    last_change_at = time.monotonic()
                     dm_turn, dm_timed_out = wait_for_dm_response(args, manifest, posted_message_id, maybe_heartbeat)
                     append_event(
                         args.api_base,
@@ -622,6 +714,26 @@ def execute_run(args, run_id):
                     last_dm_turn = dm_turn if dm_turn.get('status') in {'silent', 'empty'} else None
                     force_overseer_retry = True
                     same_fingerprint_no_action_retries = 0
+                    last_change_at = time.monotonic()
+                    should_stop, lease_token = pause_for_audit_if_needed(
+                        args,
+                        claim_payload,
+                        run_id,
+                        lease_token,
+                        'after_dm',
+                        maybe_heartbeat,
+                        payload={
+                            'dm_turn': dm_turn,
+                            'posted_message_id': posted_message_id,
+                            'turns_completed': turns_completed,
+                        },
+                        summary='Paused after DM response.',
+                        player_message_id=posted_message_id,
+                        dm_message_id=dm_turn.get('dm_message_id'),
+                        dedupe_key=f'audit_pause:after_dm:{logical_key}:{posted_message_id}',
+                    )
+                    if should_stop:
+                        return True
                     last_change_at = time.monotonic()
                 else:
                     force_overseer_retry, same_fingerprint_no_action_retries = autonomous.update_same_fingerprint_retry_state(

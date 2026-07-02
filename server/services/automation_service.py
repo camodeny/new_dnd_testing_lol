@@ -6,10 +6,12 @@ from statistics import median
 
 from models import (
     AutomationRun,
+    AutomationRunAuditCycle,
     AutomationRunAuditResult,
     AutomationRunEvent,
     AutomationRunProviderCall,
     AutomationScenario,
+    AutomationScorecardTemplate,
     AutomationSnapshot,
     AutomationWorkspaceEvent,
     Campaign,
@@ -35,8 +37,10 @@ from models import (
 from services.character_service import build_character_from_data, character_full_dict, update_character_relations
 
 
-AUTOMATION_ACTIVE_STATUSES = {'queued', 'claimed', 'running', 'stop_requested'}
+AUTOMATION_ACTIVE_STATUSES = {'queued', 'claimed', 'running', 'stop_requested', 'awaiting_audit'}
 DEFAULT_LEASE_SECONDS = 45
+AUDIT_READY_STATUSES = {'audited', 'skipped'}
+CUSTOM_SCORECARD_STATUS_ORDER = ('pass', 'warn', 'fail')
 DEFAULT_RETENTION_POLICY = {
     'retention_days': 14,
     'keep_recent_runs': 5,
@@ -155,6 +159,20 @@ def _safe_int(value, default=0):
         return default
 
 
+def _normalize_identifier(value):
+    cleaned = ''.join(ch.lower() if ch.isalnum() else '_' for ch in str(value or '').strip())
+    normalized = '_'.join(part for part in cleaned.split('_') if part)
+    return normalized[:120]
+
+
+def _json_object(value, fallback):
+    return value if isinstance(value, dict) else fallback
+
+
+def _json_list(value, fallback):
+    return value if isinstance(value, list) else fallback
+
+
 def _session_messages(session_id):
     return [
         message.to_dict()
@@ -186,6 +204,79 @@ def visible_campaigns_for_user(user):
         Campaign.is_automation_clone.is_(False),
     ).all()
     return list({campaign.id: campaign for campaign in [*owned, *member_of]}.values())
+
+
+def validate_scorecard_template_payload(data):
+    name = (data.get('name') or '').strip()
+    if not name:
+        raise ValueError('name is required')
+
+    criteria = []
+    seen_ids = set()
+    raw_criteria = _json_list(data.get('criteria'), [])
+    if not raw_criteria:
+        raise ValueError('criteria must contain at least one entry')
+    for index, raw in enumerate(raw_criteria, start=1):
+        if not isinstance(raw, dict):
+            raise ValueError(f'criteria[{index - 1}] must be an object')
+        criterion_id = _normalize_identifier(raw.get('id') or raw.get('label') or f'criterion_{index}')
+        if not criterion_id:
+            raise ValueError(f'criteria[{index - 1}] requires id or label')
+        if criterion_id in seen_ids:
+            raise ValueError(f'duplicate criterion id: {criterion_id}')
+        seen_ids.add(criterion_id)
+        criteria.append({
+            'id': criterion_id,
+            'label': (raw.get('label') or criterion_id.replace('_', ' ').title()).strip(),
+            'description': (raw.get('description') or '').strip() or None,
+            'better_direction': (raw.get('better_direction') or 'higher').strip().lower(),
+        })
+
+    defaults = _json_object(data.get('defaults'), {})
+    pause_phases = [
+        str(item).strip().lower()
+        for item in _json_list(defaults.get('pause_phases'), [])
+        if str(item).strip().lower() in {'after_player', 'after_dm'}
+    ]
+    return {
+        'name': name,
+        'description': (data.get('description') or '').strip() or None,
+        'instructions': (data.get('instructions') or '').strip() or None,
+        'criteria': criteria,
+        'defaults': {
+            **defaults,
+            'pause_phases': pause_phases,
+        },
+    }
+
+
+def scorecard_template_snapshot(template):
+    if template is None:
+        return {}
+    return template.snapshot() if hasattr(template, 'snapshot') else {}
+
+
+def current_scorecard_template_for_run(run):
+    snapshot = _json_object(run.scorecard_template_json, {})
+    if snapshot:
+        return snapshot
+    scenario = run.scenario
+    if scenario and scenario.scorecard_template:
+        return scorecard_template_snapshot(scenario.scorecard_template)
+    return {}
+
+
+def configured_pause_phases(run):
+    config = _json_object(run.runner_config_json, {})
+    raw = config.get('audit_pause_phases')
+    if raw is None:
+        raw = _json_object(current_scorecard_template_for_run(run).get('defaults'), {}).get('pause_phases')
+    phases = []
+    for value in _json_list(raw, []):
+        phase = str(value).strip().lower()
+        if phase in {'after_player', 'after_dm'} and phase not in phases:
+            phases.append(phase)
+    return phases
 
 
 def scenario_roster_from_campaign(campaign):
@@ -280,18 +371,25 @@ def serialize_campaign_snapshot(campaign, source_session_id=None):
 
 def create_snapshot_for_scenario(scenario, label=None, summary=None, source_session_id=None):
     campaign = db.session.get(Campaign, scenario.source_campaign_id)
-    payload = serialize_campaign_snapshot(campaign, source_session_id=source_session_id)
+    snapshot_campaign = campaign
+    if source_session_id is not None:
+        source_session = db.session.get(CampaignSession, source_session_id)
+        if source_session is not None:
+            session_campaign = db.session.get(Campaign, source_session.campaign_id)
+            if session_campaign is not None:
+                snapshot_campaign = session_campaign
+    payload = serialize_campaign_snapshot(snapshot_campaign, source_session_id=source_session_id)
     active_session = next((session for session in payload['sessions'] if session.get('is_active')), None)
     snapshot = AutomationSnapshot(
         scenario_id=scenario.id,
-        source_campaign_id=scenario.source_campaign_id,
+        source_campaign_id=snapshot_campaign.id,
         source_session_id=active_session.get('id') if active_session else source_session_id,
-        label=label or f'{campaign.name} snapshot {_utcnow().strftime("%Y-%m-%d %H:%M:%S")}',
-        summary=summary or f'Snapshot of {campaign.name}',
+        label=label or f'{snapshot_campaign.name} snapshot {_utcnow().strftime("%Y-%m-%d %H:%M:%S")}',
+        summary=summary or f'Snapshot of {snapshot_campaign.name}',
         snapshot_json=payload,
         metadata_json={
-            'campaign_name': campaign.name,
-            'campaign_status': campaign.status,
+            'campaign_name': snapshot_campaign.name,
+            'campaign_status': snapshot_campaign.status,
             'active_session_id': active_session.get('id') if active_session else None,
             'message_count': sum(len(session.get('messages') or []) for session in payload['sessions']),
             'proposal_count': sum(len(session.get('sheet_proposals') or []) for session in payload['sessions']),
@@ -557,6 +655,97 @@ def append_workspace_event(user_id, event_type, payload, *, resource_type=None, 
     return row
 
 
+def next_audit_cycle_number(run):
+    latest = AutomationRunAuditCycle.query.filter_by(run_id=run.id).order_by(AutomationRunAuditCycle.cycle_number.desc()).first()
+    return (latest.cycle_number if latest else 0) + 1
+
+
+def create_audit_cycle(run, phase, payload=None, *, summary=None, player_message_id=None, dm_message_id=None):
+    cycle = AutomationRunAuditCycle(
+        run_id=run.id,
+        cycle_number=next_audit_cycle_number(run),
+        phase=phase,
+        status='pending',
+        player_message_id=player_message_id,
+        dm_message_id=dm_message_id,
+        summary=summary,
+        payload_json=payload or {},
+    )
+    db.session.add(cycle)
+    db.session.flush()
+    run.status = 'awaiting_audit'
+    run.awaiting_audit_cycle_id = cycle.id
+    run.awaiting_audit_phase = phase
+    run.updated_at = _utcnow()
+    db.session.commit()
+    return cycle
+
+
+def submit_audit_cycle_feedback(cycle, *, summary=None, notes=None, scorecard=None):
+    cycle.summary = summary if summary is not None else cycle.summary
+    cycle.notes = notes if notes is not None else cycle.notes
+
+    scorecard_payload = _json_object(scorecard, {})
+    criteria_results = []
+    template = current_scorecard_template_for_run(cycle.run)
+    template_criteria = {
+        item.get('id'): item
+        for item in _json_list(template.get('criteria'), [])
+        if isinstance(item, dict) and item.get('id')
+    }
+    for raw in _json_list(scorecard_payload.get('criteria'), []):
+        if not isinstance(raw, dict):
+            continue
+        criterion_id = _normalize_identifier(raw.get('criterion_id') or raw.get('id'))
+        if not criterion_id:
+            continue
+        template_row = template_criteria.get(criterion_id, {})
+        status = str(raw.get('status') or 'warn').strip().lower()
+        if status not in STATUS_RANK:
+            status = 'warn'
+        criteria_results.append({
+            'criterion_id': criterion_id,
+            'label': template_row.get('label') or raw.get('label') or criterion_id,
+            'status': status,
+            'summary': (raw.get('summary') or '').strip() or None,
+            'evidence': (raw.get('evidence') or '').strip() or None,
+        })
+
+    overall_status = str(scorecard_payload.get('overall_status') or 'pass').strip().lower()
+    if overall_status not in STATUS_RANK:
+        overall_status = 'pass'
+    cycle.scorecard_json = {
+        'template': template,
+        'criteria': criteria_results,
+    }
+    cycle.scorecard_summary_json = {
+        'overall_status': overall_status,
+        'overall_summary': (scorecard_payload.get('overall_summary') or '').strip() or None,
+        'criteria_count': len(criteria_results),
+    }
+    cycle.status = 'audited'
+    cycle.audited_at = _utcnow()
+    cycle.updated_at = _utcnow()
+    db.session.commit()
+    return cycle
+
+
+def continue_audit_run(run, *, force=False):
+    cycle = db.session.get(AutomationRunAuditCycle, run.awaiting_audit_cycle_id) if run.awaiting_audit_cycle_id else None
+    if cycle and cycle.status not in AUDIT_READY_STATUSES:
+        if not force:
+            raise ValueError('Current audit cycle must be audited before continuing')
+        cycle.status = 'skipped'
+        cycle.audited_at = cycle.audited_at or _utcnow()
+    run.status = 'running'
+    run.awaiting_audit_phase = None
+    run.awaiting_audit_cycle_id = None
+    run.audit_resumed_at = _utcnow()
+    run.updated_at = _utcnow()
+    db.session.commit()
+    return cycle
+
+
 def lease_seconds_for_run(run):
     return max(15, _safe_int((run.runner_config_json or {}).get('lease_seconds'), DEFAULT_LEASE_SECONDS))
 
@@ -565,7 +754,7 @@ def lease_is_expired(run, at=None):
     if run.status == 'queued':
         return False
     if not run.lease_expires_at:
-        return run.status in {'claimed', 'running', 'stop_requested'}
+        return run.status in {'claimed', 'running', 'stop_requested', 'awaiting_audit'}
     return (at or _utcnow()) >= run.lease_expires_at
 
 
@@ -574,7 +763,7 @@ def ensure_worker_lease(run, *, worker_id=None, lease_token=None):
         raise ValueError('Run is leased by another worker')
     if lease_token and run.lease_token and run.lease_token != lease_token:
         raise ValueError('Run lease token is no longer valid')
-    if run.status in {'claimed', 'running', 'stop_requested'} and lease_is_expired(run):
+    if run.status in {'claimed', 'running', 'stop_requested', 'awaiting_audit'} and lease_is_expired(run):
         raise ValueError('Run lease has expired')
 
 
@@ -626,8 +815,8 @@ def append_run_event(run, event_type, payload=None, *, dedupe_key=None, worker_i
 
 def claim_run_for_worker(run, worker_id):
     now = _utcnow()
-    reclaimed = run.status in {'claimed', 'running', 'stop_requested'} and lease_is_expired(run, at=now)
-    if run.status not in {'queued', 'claimed', 'running', 'stop_requested'}:
+    reclaimed = run.status in {'claimed', 'running', 'stop_requested', 'awaiting_audit'} and lease_is_expired(run, at=now)
+    if run.status not in {'queued', 'claimed', 'running', 'stop_requested', 'awaiting_audit'}:
         raise ValueError(f'Run is not claimable from status {run.status}')
     if run.status != 'queued' and not reclaimed:
         raise ValueError(f'Run is already leased by {run.worker_id or "another worker"}')
@@ -707,12 +896,13 @@ def _run_context(run):
     event_rows = AutomationRunEvent.query.filter_by(run_id=run.id).order_by(AutomationRunEvent.sequence_number.asc(), AutomationRunEvent.id.asc()).all()
     audit_rows = CampaignAuditEvent.query.filter_by(campaign_id=run.derived_campaign_id).order_by(CampaignAuditEvent.created_at.asc(), CampaignAuditEvent.id.asc()).all() if run.derived_campaign_id else []
     provider_rows = AutomationRunProviderCall.query.filter_by(run_id=run.id).order_by(AutomationRunProviderCall.created_at.asc(), AutomationRunProviderCall.id.asc()).all()
-    return event_rows, audit_rows, provider_rows
+    cycle_rows = AutomationRunAuditCycle.query.filter_by(run_id=run.id).order_by(AutomationRunAuditCycle.cycle_number.asc(), AutomationRunAuditCycle.id.asc()).all()
+    return event_rows, audit_rows, provider_rows, cycle_rows
 
 
 def calculate_run_incidents(run, event_rows=None, audit_rows=None, provider_rows=None):
     if event_rows is None or audit_rows is None or provider_rows is None:
-        event_rows, audit_rows, provider_rows = _run_context(run)
+        event_rows, audit_rows, provider_rows, _ = _run_context(run)
 
     audit_counts = Counter(audit.event_type for audit in audit_rows)
     incidents = []
@@ -777,15 +967,16 @@ def calculate_run_incidents(run, event_rows=None, audit_rows=None, provider_rows
     return incidents
 
 
-def _collect_run_metrics(run, event_rows=None, audit_rows=None, provider_rows=None):
-    if event_rows is None or audit_rows is None or provider_rows is None:
-        event_rows, audit_rows, provider_rows = _run_context(run)
+def _collect_run_metrics(run, event_rows=None, audit_rows=None, provider_rows=None, cycle_rows=None):
+    if event_rows is None or audit_rows is None or provider_rows is None or cycle_rows is None:
+        event_rows, audit_rows, provider_rows, cycle_rows = _run_context(run)
 
     audit_counts = Counter(audit.event_type for audit in audit_rows)
     errors = [event for event in event_rows if event.event_type == 'error']
     turn_results = [event for event in event_rows if event.event_type == 'turn_result']
     latencies = [row.latency_ms for row in provider_rows if row.latency_ms is not None]
     incidents = calculate_run_incidents(run, event_rows, audit_rows, provider_rows)
+    audited_cycles = [cycle for cycle in cycle_rows if cycle.status == 'audited']
 
     return {
         'run_status': run.status,
@@ -801,6 +992,7 @@ def _collect_run_metrics(run, event_rows=None, audit_rows=None, provider_rows=No
         'incident_count': len(incidents),
         'warning_incident_count': sum(1 for incident in incidents if incident.get('severity') == 'warn'),
         'failing_incident_count': sum(1 for incident in incidents if incident.get('severity') == 'fail'),
+        'audited_cycle_count': len(audited_cycles),
     }
 
 
@@ -870,6 +1062,70 @@ def compare_check_values(left, right, better_direction):
     return 'unchanged'
 
 
+def custom_scorecard_results(run, cycle_rows):
+    template = current_scorecard_template_for_run(run)
+    criteria = [item for item in _json_list(template.get('criteria'), []) if isinstance(item, dict) and item.get('id')]
+    if not criteria:
+        return []
+
+    by_criterion = {criterion['id']: [] for criterion in criteria}
+    for cycle in cycle_rows:
+        if cycle.status != 'audited':
+            continue
+        for result in _json_list((cycle.scorecard_json or {}).get('criteria'), []):
+            if not isinstance(result, dict):
+                continue
+            criterion_id = _normalize_identifier(result.get('criterion_id') or result.get('id'))
+            if criterion_id in by_criterion:
+                by_criterion[criterion_id].append({
+                    'cycle_number': cycle.cycle_number,
+                    'phase': cycle.phase,
+                    'status': str(result.get('status') or 'warn').strip().lower(),
+                    'summary': result.get('summary'),
+                    'evidence': result.get('evidence'),
+                })
+
+    rows = []
+    for criterion in criteria:
+        criterion_id = criterion['id']
+        assessments = by_criterion.get(criterion_id) or []
+        if not assessments:
+            status = 'warn'
+            summary = 'No custom audit feedback recorded for this criterion.'
+            counts = {'pass': 0, 'warn': 0, 'fail': 0}
+        else:
+            counts = Counter(item['status'] for item in assessments if item.get('status') in STATUS_RANK)
+            if counts.get('fail'):
+                status = 'fail'
+            elif counts.get('warn'):
+                status = 'warn'
+            else:
+                status = 'pass'
+            summary = (
+                f'{counts.get("pass", 0)} pass, '
+                f'{counts.get("warn", 0)} warn, '
+                f'{counts.get("fail", 0)} fail across {len(assessments)} audited cycle(s).'
+            )
+        rows.append({
+            'check_id': f'custom:{criterion_id}',
+            'status': status,
+            'summary': summary,
+            'details': {
+                'metric': f'custom:{criterion_id}',
+                'metric_value': STATUS_RANK.get(status, 0),
+                'weight': 2,
+                'thresholds': {},
+                'better_direction': criterion.get('better_direction') or 'higher',
+                'criterion': criterion,
+                'counts': counts,
+                'aggregate_status': status,
+                'assessments': assessments,
+                'template_name': template.get('name'),
+            },
+        })
+    return rows
+
+
 def baseline_comparison_for_run(run, results):
     scenario = run.scenario
     baseline_run = baseline_run_for_scenario(scenario)
@@ -919,8 +1175,8 @@ def baseline_comparison_for_run(run, results):
 
 
 def refresh_run_scorecard(run):
-    event_rows, audit_rows, provider_rows = _run_context(run)
-    metrics = _collect_run_metrics(run, event_rows, audit_rows, provider_rows)
+    event_rows, audit_rows, provider_rows, cycle_rows = _run_context(run)
+    metrics = _collect_run_metrics(run, event_rows, audit_rows, provider_rows, cycle_rows)
     config = dict(DEFAULT_AUDIT_CONFIG)
     config.update(run.scenario.audit_config_json or {} if run.scenario else {})
     checks = config.get('checks') or DEFAULT_AUDIT_CONFIG['checks']
@@ -957,6 +1213,8 @@ def refresh_run_scorecard(run):
             },
         })
 
+    results_payload.extend(custom_scorecard_results(run, cycle_rows))
+
     budgets = dict(DEFAULT_AUDIT_CONFIG['budgets'])
     budgets.update(config.get('budgets') or {})
     fail_count = sum(1 for check in results_payload if check['status'] == 'fail')
@@ -986,10 +1244,12 @@ def refresh_run_scorecard(run):
         'warning_checks': warn_count,
         'completed_turns': metrics.get('completed_turns', 0),
         'error_count': metrics.get('error_count', 0),
+        'audited_cycle_count': metrics.get('audited_cycle_count', 0),
         'weighted_score': weighted_score,
         'budget_passed': pass_budget_ok,
         'budgets': budgets,
         'incidents': calculate_run_incidents(run, event_rows, audit_rows, provider_rows),
+        'custom_scorecard_name': current_scorecard_template_for_run(run).get('name'),
     }
     db.session.commit()
     return results_payload
@@ -1004,7 +1264,7 @@ def latest_session_for_run(run):
     return latest_session
 
 
-def run_watch_payload(run):
+def run_watch_payload(run, current_user=None):
     latest_session = latest_session_for_run(run)
     encounter_map = None
     messages = []
@@ -1027,11 +1287,27 @@ def run_watch_payload(run):
         .order_by(AutomationRunProviderCall.created_at.asc(), AutomationRunProviderCall.id.asc())
         .all()
     ]
+    audit_cycles = [
+        cycle.to_dict()
+        for cycle in AutomationRunAuditCycle.query.filter_by(run_id=run.id)
+        .order_by(AutomationRunAuditCycle.cycle_number.asc(), AutomationRunAuditCycle.id.asc())
+        .all()
+    ]
+    current_audit_cycle = next((cycle for cycle in audit_cycles if cycle['id'] == run.awaiting_audit_cycle_id), None)
 
     return {
         'run': run.to_dict(),
         'scenario': run.scenario.to_dict() if run.scenario else None,
         'snapshot': run.snapshot.to_dict() if run.snapshot else None,
+        'viewer_permissions': {
+            'manage_run': True,
+            'stop_run': True,
+            'submit_audit': True,
+            'continue_run': True,
+        },
+        'scorecard_template': current_scorecard_template_for_run(run),
+        'current_audit_cycle': current_audit_cycle,
+        'audit_cycles': audit_cycles,
         'latest_session': {
             **latest_session.to_dict(),
             'messages': messages,
@@ -1056,8 +1332,11 @@ def run_watch_payload(run):
     }
 
 
-def workspace_trends_for_user(user_id):
-    scenarios = AutomationScenario.query.filter_by(user_id=user_id).all()
+def workspace_trends_for_user(user_id=None):
+    query = AutomationScenario.query
+    if user_id is not None:
+        query = query.filter_by(user_id=user_id)
+    scenarios = query.all()
     trends = []
     for scenario in scenarios:
         runs = AutomationRun.query.filter_by(scenario_id=scenario.id).order_by(AutomationRun.created_at.asc(), AutomationRun.id.asc()).all()
@@ -1141,12 +1420,22 @@ def cleanup_hidden_clone_campaigns(scenario, *, action=None, older_than_days=Non
     return {'archived_run_ids': archived, 'deleted_run_ids': deleted}
 
 
+def merged_runner_config_for_scenario(scenario, override=None):
+    config = dict(scenario.runner_config_json or {})
+    config.update(override or {})
+    template = scenario.scorecard_template
+    if template is not None:
+        defaults = _json_object(template.defaults_json, {})
+        if config.get('audit_pause_phases') is None and isinstance(defaults.get('pause_phases'), list):
+            config['audit_pause_phases'] = defaults.get('pause_phases') or []
+    return config
+
+
 def create_matrix_runs(scenario, snapshot, current_user, matrix_entries):
     group_id = f'matrix-{secrets.token_hex(6)}'
     runs = []
     for index, entry in enumerate(matrix_entries):
-        merged_runner_config = dict(scenario.runner_config_json or {})
-        merged_runner_config.update(entry.get('runner_config') or {})
+        merged_runner_config = merged_runner_config_for_scenario(scenario, entry.get('runner_config') or {})
         run = AutomationRun(
             scenario_id=scenario.id,
             snapshot_id=snapshot.id,
@@ -1154,6 +1443,7 @@ def create_matrix_runs(scenario, snapshot, current_user, matrix_entries):
             status='queued',
             matrix_group_id=group_id,
             matrix_label=entry.get('label') or f'Variant {index + 1}',
+            scorecard_template_json=scorecard_template_snapshot(scenario.scorecard_template),
             runner_config_json=merged_runner_config,
         )
         db.session.add(run)

@@ -47,6 +47,12 @@ def _generate_llm_api_key():
     return api_key, generate_password_hash(api_key), api_key[:24]
 
 
+def _next_safe_llm_user_id():
+    max_user_id = db.session.query(db.func.max(User.id)).scalar() or 0
+    max_llm_user_id = db.session.query(db.func.max(LLMPlayer.user_id)).scalar() or 0
+    return max(max_user_id, max_llm_user_id) + 1
+
+
 def _serialize_llm_player(campaign, llm_player):
     member = CampaignMember.query.filter_by(campaign_id=campaign.id, user_id=llm_player.user_id).first()
     character = member.selected_character if member and member.selected_character else None
@@ -112,7 +118,7 @@ def create_llm_player(current_user, campaign_id):
 
     username = _unique_llm_username(label)
     email = f'llm-player-{campaign.id}-{secrets.token_hex(8)}@local.llm'
-    llm_user = User(username=username, email=email)
+    llm_user = User(id=_next_safe_llm_user_id(), username=username, email=email)
     llm_user.set_password(secrets.token_urlsafe(32))
     db.session.add(llm_user)
     db.session.flush()

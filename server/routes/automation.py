@@ -6,10 +6,12 @@ from flask import Blueprint, current_app, jsonify, request, stream_with_context
 from auth import authenticate_request, token_required
 from models import (
     AutomationRun,
+    AutomationRunAuditCycle,
     AutomationRunAuditResult,
     AutomationRunEvent,
     AutomationRunProviderCall,
     AutomationScenario,
+    AutomationScorecardTemplate,
     AutomationSnapshot,
     Campaign,
     CampaignMember,
@@ -29,6 +31,8 @@ from services.automation_service import (
     claim_run_for_worker,
     cleanup_hidden_clone_campaigns,
     compare_runs_payload,
+    continue_audit_run,
+    create_audit_cycle,
     create_matrix_runs,
     create_snapshot_for_scenario,
     ensure_worker_lease,
@@ -36,11 +40,15 @@ from services.automation_service import (
     latest_session_for_run,
     lease_is_expired,
     materialize_run_campaign,
+    merged_runner_config_for_scenario,
     persist_provider_call,
     provider_call_for_replay,
     refresh_run_scorecard,
     run_watch_payload,
     scenario_roster_from_campaign,
+    scorecard_template_snapshot,
+    submit_audit_cycle_feedback,
+    validate_scorecard_template_payload,
     visible_campaigns_for_user,
     workspace_trends_for_user,
 )
@@ -61,30 +69,68 @@ automation_bp = Blueprint('automation', __name__)
 
 
 def _scenario_visible_to_user(current_user, scenario):
-    return scenario and scenario.user_id == current_user.id
+    return scenario is not None
 
 
 def _run_visible_to_user(current_user, run):
-    return run and run.user_id == current_user.id
+    return run is not None
+
+
+def _scenario_owned_by_user(current_user, scenario):
+    return _scenario_visible_to_user(current_user, scenario)
+
+
+def _run_owned_by_user(current_user, run):
+    return _run_visible_to_user(current_user, run)
+
+
+def _scorecard_visible_to_user(current_user, scorecard):
+    return scorecard is not None
+
+
+def _scorecard_owned_by_user(current_user, scorecard):
+    return _scorecard_visible_to_user(current_user, scorecard)
+
+
+def _scenario_viewer_permissions(current_user, scenario):
+    can_manage = _scenario_owned_by_user(current_user, scenario)
+    return {
+        'manage_scenario': can_manage,
+        'create_snapshot': can_manage,
+        'queue_run': can_manage,
+        'update_scenario': can_manage,
+        'cleanup_scenario': can_manage,
+        'set_baseline': can_manage,
+    }
+
+
+def _run_viewer_permissions(current_user, run):
+    can_manage = _run_owned_by_user(current_user, run)
+    return {
+        'manage_run': can_manage,
+        'stop_run': can_manage,
+        'submit_audit': can_manage,
+        'continue_run': can_manage,
+    }
 
 
 def _workspace_payload(current_user):
-    scenarios = AutomationScenario.query.filter_by(user_id=current_user.id).order_by(AutomationScenario.updated_at.desc(), AutomationScenario.id.desc()).all()
+    scenarios = AutomationScenario.query.order_by(AutomationScenario.updated_at.desc(), AutomationScenario.id.desc()).all()
+    scorecards = AutomationScorecardTemplate.query.order_by(AutomationScorecardTemplate.updated_at.desc(), AutomationScorecardTemplate.id.desc()).all()
     active_runs = AutomationRun.query.filter(
-        AutomationRun.user_id == current_user.id,
         AutomationRun.status.in_(tuple(AUTOMATION_ACTIVE_STATUSES)),
     ).order_by(AutomationRun.created_at.desc(), AutomationRun.id.desc()).all()
     recent_failures = AutomationRun.query.filter(
-        AutomationRun.user_id == current_user.id,
         AutomationRun.status.in_(('failed', 'stopped')),
     ).order_by(AutomationRun.updated_at.desc(), AutomationRun.id.desc()).limit(8).all()
 
     return {
+        'scorecards': [scorecard.to_dict() for scorecard in scorecards],
         'scenarios': [scenario.to_dict() for scenario in scenarios],
         'active_runs': [run.to_dict() for run in active_runs],
         'recent_failures': [run.to_dict() for run in recent_failures],
         'source_campaigns': [campaign.to_dict() for campaign in visible_campaigns_for_user(current_user)],
-        'scenario_trends': workspace_trends_for_user(current_user.id),
+        'scenario_trends': workspace_trends_for_user(),
     }
 
 
@@ -194,7 +240,7 @@ def stream_automation_workspace():
             workspace = _workspace_payload(current_user)
             yield sse_message({'type': 'bootstrap', 'workspace': workspace})
             cursor = workspace_stream_cursor()
-        for row in iter_workspace_events(current_user.id, cursor):
+        for row in iter_workspace_events(cursor):
             if row is None:
                 yield ': ping\n\n'
                 continue
@@ -203,10 +249,110 @@ def stream_automation_workspace():
     return _stream_response(event_stream())
 
 
+@automation_bp.route('/api/automation/scorecards', methods=['GET'])
+@token_required
+def list_automation_scorecards(current_user):
+    rows = AutomationScorecardTemplate.query.order_by(AutomationScorecardTemplate.updated_at.desc(), AutomationScorecardTemplate.id.desc()).all()
+    return jsonify({'scorecards': [row.to_dict() for row in rows]}), 200
+
+
+@automation_bp.route('/api/automation/scorecards', methods=['POST'])
+@token_required
+def create_automation_scorecard(current_user):
+    data = request.get_json(silent=True) or {}
+    try:
+        normalized = validate_scorecard_template_payload(data)
+    except ValueError as exc:
+        return jsonify({'error': str(exc)}), 400
+
+    row = AutomationScorecardTemplate(
+        user_id=current_user.id,
+        name=normalized['name'],
+        description=normalized['description'],
+        instructions=normalized['instructions'],
+        criteria_json=normalized['criteria'],
+        defaults_json=normalized['defaults'],
+    )
+    db.session.add(row)
+    db.session.commit()
+    append_workspace_event(
+        current_user.id,
+        'scorecard_created',
+        {'type': 'scorecard_created', 'scorecard': row.to_dict()},
+        resource_type='scorecard',
+        resource_id=row.id,
+    )
+    return jsonify({'scorecard': row.to_dict()}), 201
+
+
+@automation_bp.route('/api/automation/scorecards/<int:scorecard_id>', methods=['GET'])
+@token_required
+def get_automation_scorecard(current_user, scorecard_id):
+    row = get_or_404(AutomationScorecardTemplate, scorecard_id)
+    if not _scorecard_visible_to_user(current_user, row):
+        return jsonify({'error': 'Forbidden'}), 403
+    return jsonify({'scorecard': row.to_dict()}), 200
+
+
+@automation_bp.route('/api/automation/scorecards/<int:scorecard_id>', methods=['PUT'])
+@token_required
+def update_automation_scorecard(current_user, scorecard_id):
+    row = get_or_404(AutomationScorecardTemplate, scorecard_id)
+    if not _scorecard_owned_by_user(current_user, row):
+        return jsonify({'error': 'Forbidden'}), 403
+
+    data = request.get_json(silent=True) or {}
+    payload = {
+        'name': data.get('name', row.name),
+        'description': data.get('description', row.description),
+        'instructions': data.get('instructions', row.instructions),
+        'criteria': data.get('criteria', row.criteria_json),
+        'defaults': data.get('defaults', row.defaults_json),
+    }
+    try:
+        normalized = validate_scorecard_template_payload(payload)
+    except ValueError as exc:
+        return jsonify({'error': str(exc)}), 400
+
+    row.name = normalized['name']
+    row.description = normalized['description']
+    row.instructions = normalized['instructions']
+    row.criteria_json = normalized['criteria']
+    row.defaults_json = normalized['defaults']
+    db.session.commit()
+    append_workspace_event(
+        current_user.id,
+        'scorecard_updated',
+        {'type': 'scorecard_updated', 'scorecard': row.to_dict()},
+        resource_type='scorecard',
+        resource_id=row.id,
+    )
+    return jsonify({'scorecard': row.to_dict()}), 200
+
+
+@automation_bp.route('/api/automation/scorecards/<int:scorecard_id>', methods=['DELETE'])
+@token_required
+def delete_automation_scorecard(current_user, scorecard_id):
+    row = get_or_404(AutomationScorecardTemplate, scorecard_id)
+    if not _scorecard_owned_by_user(current_user, row):
+        return jsonify({'error': 'Forbidden'}), 403
+    AutomationScenario.query.filter_by(scorecard_template_id=row.id).update({'scorecard_template_id': None}, synchronize_session=False)
+    db.session.delete(row)
+    db.session.commit()
+    append_workspace_event(
+        current_user.id,
+        'scorecard_deleted',
+        {'type': 'scorecard_deleted', 'scorecard_id': scorecard_id},
+        resource_type='scorecard',
+        resource_id=scorecard_id,
+    )
+    return jsonify({'ok': True}), 200
+
+
 @automation_bp.route('/api/automation/scenarios', methods=['GET'])
 @token_required
 def list_automation_scenarios(current_user):
-    scenarios = AutomationScenario.query.filter_by(user_id=current_user.id).order_by(AutomationScenario.updated_at.desc(), AutomationScenario.id.desc()).all()
+    scenarios = AutomationScenario.query.order_by(AutomationScenario.updated_at.desc(), AutomationScenario.id.desc()).all()
     return jsonify({'scenarios': [scenario.to_dict() for scenario in scenarios]}), 200
 
 
@@ -222,9 +368,16 @@ def create_automation_scenario(current_user):
     if campaign.is_automation_clone or not ensure_member(campaign, current_user):
         return jsonify({'error': 'Forbidden'}), 403
 
+    scorecard_template = None
+    if data.get('scorecard_template_id') is not None:
+        scorecard_template = get_or_404(AutomationScorecardTemplate, data.get('scorecard_template_id'))
+        if scorecard_template.user_id != current_user.id:
+            return jsonify({'error': 'Forbidden'}), 403
+
     scenario = AutomationScenario(
         user_id=current_user.id,
         source_campaign_id=campaign.id,
+        scorecard_template_id=scorecard_template.id if scorecard_template else None,
         name=(data.get('name') or f'{campaign.name} benchmark').strip(),
         description=data.get('description'),
         runner_config_json=data.get('runner_config') or {},
@@ -258,6 +411,7 @@ def get_automation_scenario(current_user, scenario_id):
         'baseline_run': baseline_run_for_scenario(scenario).to_dict() if baseline_run_for_scenario(scenario) else None,
         'snapshots': [snapshot.to_dict() for snapshot in snapshots],
         'runs': [run.to_dict() for run in runs],
+        'viewer_permissions': _scenario_viewer_permissions(current_user, scenario),
     }), 200
 
 
@@ -265,7 +419,7 @@ def get_automation_scenario(current_user, scenario_id):
 @token_required
 def update_automation_scenario(current_user, scenario_id):
     scenario = get_or_404(AutomationScenario, scenario_id)
-    if not _scenario_visible_to_user(current_user, scenario):
+    if not _scenario_owned_by_user(current_user, scenario):
         return jsonify({'error': 'Forbidden'}), 403
 
     data = request.get_json(silent=True) or {}
@@ -279,6 +433,15 @@ def update_automation_scenario(current_user, scenario_id):
         scenario.audit_config_json = data.get('audit_config') or {}
     if 'retention_policy' in data:
         scenario.retention_policy_json = data.get('retention_policy') or {}
+    if 'scorecard_template_id' in data:
+        scorecard_template_id = data.get('scorecard_template_id')
+        if scorecard_template_id is None:
+            scenario.scorecard_template_id = None
+        else:
+            scorecard_template = get_or_404(AutomationScorecardTemplate, scorecard_template_id)
+            if scorecard_template.user_id != current_user.id:
+                return jsonify({'error': 'Forbidden'}), 403
+            scenario.scorecard_template_id = scorecard_template.id
     if 'baseline_run_id' in data:
         baseline_run_id = data.get('baseline_run_id')
         if baseline_run_id is None:
@@ -304,7 +467,7 @@ def update_automation_scenario(current_user, scenario_id):
 @token_required
 def delete_automation_scenario(current_user, scenario_id):
     scenario = get_or_404(AutomationScenario, scenario_id)
-    if not _scenario_visible_to_user(current_user, scenario):
+    if not _scenario_owned_by_user(current_user, scenario):
         return jsonify({'error': 'Forbidden'}), 403
     run_ids = [run.id for run in AutomationRun.query.filter_by(scenario_id=scenario.id).all()]
     if run_ids:
@@ -339,7 +502,7 @@ def list_automation_snapshots(current_user, scenario_id):
 @token_required
 def create_automation_snapshot(current_user, scenario_id):
     scenario = get_or_404(AutomationScenario, scenario_id)
-    if not _scenario_visible_to_user(current_user, scenario):
+    if not _scenario_owned_by_user(current_user, scenario):
         return jsonify({'error': 'Forbidden'}), 403
     data = request.get_json(silent=True) or {}
     snapshot = create_snapshot_for_scenario(
@@ -362,7 +525,7 @@ def create_automation_snapshot(current_user, scenario_id):
 @token_required
 def cleanup_automation_scenario(current_user, scenario_id):
     scenario = get_or_404(AutomationScenario, scenario_id)
-    if not _scenario_visible_to_user(current_user, scenario):
+    if not _scenario_owned_by_user(current_user, scenario):
         return jsonify({'error': 'Forbidden'}), 403
     data = request.get_json(silent=True) or {}
     result = cleanup_hidden_clone_campaigns(
@@ -395,7 +558,7 @@ def list_automation_runs(current_user, scenario_id):
 @token_required
 def create_automation_run(current_user, scenario_id):
     scenario = get_or_404(AutomationScenario, scenario_id)
-    if not _scenario_visible_to_user(current_user, scenario):
+    if not _scenario_owned_by_user(current_user, scenario):
         return jsonify({'error': 'Forbidden'}), 403
 
     data = request.get_json(silent=True) or {}
@@ -415,13 +578,13 @@ def create_automation_run(current_user, scenario_id):
         group_id, runs = create_matrix_runs(scenario, snapshot, current_user, matrix)
         return jsonify({'group_id': group_id, 'runs': [run.to_dict() for run in runs]}), 201
 
-    merged_runner_config = dict(scenario.runner_config_json or {})
-    merged_runner_config.update(data.get('runner_config') or {})
+    merged_runner_config = merged_runner_config_for_scenario(scenario, data.get('runner_config') or {})
     run = AutomationRun(
         scenario_id=scenario.id,
         snapshot_id=snapshot.id,
         user_id=current_user.id,
         status='queued',
+        scorecard_template_json=scorecard_template_snapshot(scenario.scorecard_template),
         runner_config_json=merged_runner_config,
     )
     db.session.add(run)
@@ -436,7 +599,7 @@ def get_automation_run(current_user, run_id):
     run = get_or_404(AutomationRun, run_id)
     if not _run_visible_to_user(current_user, run):
         return jsonify({'error': 'Forbidden'}), 403
-    return jsonify(run_watch_payload(run)), 200
+    return jsonify(run_watch_payload(run, current_user=current_user)), 200
 
 
 @automation_bp.route('/api/automation/runs/<int:run_id>/stream', methods=['GET'])
@@ -455,7 +618,7 @@ def stream_automation_run(run_id):
         if last_event_id:
             cursor = int(last_event_id)
         else:
-            yield sse_message({'type': 'bootstrap', 'run': run_watch_payload(run)})
+            yield sse_message({'type': 'bootstrap', 'run': run_watch_payload(run, current_user=current_user)})
             cursor = run_stream_cursor(run.id)
         for row in iter_run_events(run.id, cursor):
             if row is None:
@@ -478,6 +641,17 @@ def stream_automation_run(run_id):
                     .order_by(SheetProposal.created_at.asc(), SheetProposal.id.asc())
                     .all()
                 ]
+            if row.event_type in {'audit_cycle_paused', 'audit_cycle_audited', 'audit_cycle_continued', 'run_scorecard_updated'}:
+                audit_cycles = [
+                    cycle.to_dict()
+                    for cycle in AutomationRunAuditCycle.query.filter_by(run_id=current_run.id)
+                    .order_by(AutomationRunAuditCycle.cycle_number.asc(), AutomationRunAuditCycle.id.asc())
+                    .all()
+                ]
+                delta['audit_cycles'] = audit_cycles
+                delta['current_audit_cycle'] = next((cycle for cycle in audit_cycles if cycle['id'] == current_run.awaiting_audit_cycle_id), None)
+            if row.event_type == 'run_scorecard_updated':
+                delta['scorecard'] = payload.get('scorecard') or []
             yield sse_message({
                 'type': 'run_event',
                 'run_id': run.id,
@@ -486,6 +660,8 @@ def stream_automation_run(run_id):
                 'delta': delta,
                 'incidents': (current_run.scorecard_summary_json or {}).get('incidents') or [],
                 'baseline_comparison': current_run.baseline_comparison_json or {},
+                'scorecard_template': current_run.scorecard_template_json or {},
+                'viewer_permissions': _run_viewer_permissions(current_user, current_run),
             }, event_id=row.id)
 
     return _stream_response(event_stream())
@@ -495,7 +671,7 @@ def stream_automation_run(run_id):
 @token_required
 def stop_automation_run(current_user, run_id):
     run = get_or_404(AutomationRun, run_id)
-    if not _run_visible_to_user(current_user, run):
+    if not _run_owned_by_user(current_user, run):
         return jsonify({'error': 'Forbidden'}), 403
 
     if run.status in {'completed', 'failed', 'stopped'}:
@@ -516,7 +692,7 @@ def stop_automation_run(current_user, run_id):
 @token_required
 def claim_automation_run(current_user, run_id):
     run = get_or_404(AutomationRun, run_id)
-    if not _run_visible_to_user(current_user, run):
+    if not _run_owned_by_user(current_user, run):
         return jsonify({'error': 'Forbidden'}), 403
 
     data = request.get_json(silent=True) or {}
@@ -563,7 +739,7 @@ def claim_automation_run(current_user, run_id):
 @token_required
 def heartbeat_automation_run(current_user, run_id):
     run = get_or_404(AutomationRun, run_id)
-    if not _run_visible_to_user(current_user, run):
+    if not _run_owned_by_user(current_user, run):
         return jsonify({'error': 'Forbidden'}), 403
     data = request.get_json(silent=True) or {}
     try:
@@ -577,11 +753,108 @@ def heartbeat_automation_run(current_user, run_id):
     return jsonify({'run': run.to_dict()}), 200
 
 
+@automation_bp.route('/api/automation/runs/<int:run_id>/pause', methods=['POST'])
+@token_required
+def pause_automation_run(current_user, run_id):
+    run = get_or_404(AutomationRun, run_id)
+    if not _run_owned_by_user(current_user, run):
+        return jsonify({'error': 'Forbidden'}), 403
+
+    data = request.get_json(silent=True) or {}
+    phase = (data.get('phase') or '').strip().lower()
+    if phase not in {'after_player', 'after_dm'}:
+        return jsonify({'error': 'phase must be after_player or after_dm'}), 400
+    try:
+        ensure_worker_lease(run, worker_id=data.get('worker_id'), lease_token=data.get('lease_token'))
+    except ValueError as exc:
+        return jsonify({'error': str(exc)}), 409
+
+    if run.awaiting_audit_cycle_id and run.status == 'awaiting_audit':
+        cycle = db.session.get(AutomationRunAuditCycle, run.awaiting_audit_cycle_id)
+        return jsonify({'run': run.to_dict(), 'audit_cycle': cycle.to_dict() if cycle else None, 'paused': True}), 200
+
+    cycle = create_audit_cycle(
+        run,
+        phase,
+        payload=data.get('payload') or {},
+        summary=data.get('summary'),
+        player_message_id=data.get('player_message_id'),
+        dm_message_id=data.get('dm_message_id'),
+    )
+    append_run_event(
+        run,
+        'audit_cycle_paused',
+        {'phase': phase, 'audit_cycle': cycle.to_dict()},
+        dedupe_key=data.get('dedupe_key') or f'audit_cycle_paused:{cycle.id}',
+        worker_id=data.get('worker_id'),
+        lease_token=data.get('lease_token'),
+    )
+    return jsonify({'run': run.to_dict(), 'audit_cycle': cycle.to_dict(), 'paused': True}), 200
+
+
+@automation_bp.route('/api/automation/runs/<int:run_id>/audit-cycles/<int:cycle_id>/audit', methods=['POST'])
+@token_required
+def audit_automation_run_cycle(current_user, run_id, cycle_id):
+    run = get_or_404(AutomationRun, run_id)
+    if not _run_owned_by_user(current_user, run):
+        return jsonify({'error': 'Forbidden'}), 403
+    cycle = get_or_404(AutomationRunAuditCycle, cycle_id)
+    if cycle.run_id != run.id:
+        return jsonify({'error': 'Audit cycle does not belong to this run'}), 400
+
+    data = request.get_json(silent=True) or {}
+    cycle = submit_audit_cycle_feedback(
+        cycle,
+        summary=data.get('summary'),
+        notes=data.get('notes'),
+        scorecard=data.get('scorecard'),
+    )
+    append_run_event(
+        run,
+        'audit_cycle_audited',
+        {'audit_cycle': cycle.to_dict()},
+        dedupe_key=data.get('dedupe_key') or f'audit_cycle_audited:{cycle.id}:{cycle.updated_at.isoformat() if cycle.updated_at else cycle.id}',
+    )
+    scorecard = refresh_run_scorecard(run)
+    append_run_event(
+        run,
+        'run_scorecard_updated',
+        {
+            'scorecard': scorecard,
+            'scorecard_summary': run.scorecard_summary_json or {},
+            'baseline_comparison': run.baseline_comparison_json or {},
+        },
+        dedupe_key=f'run_scorecard_updated:{run.id}:{run.last_event_sequence or 0}',
+    )
+    return jsonify({'run': run.to_dict(), 'audit_cycle': cycle.to_dict(), 'scorecard': scorecard}), 200
+
+
+@automation_bp.route('/api/automation/runs/<int:run_id>/continue', methods=['POST'])
+@token_required
+def continue_automation_run(current_user, run_id):
+    run = get_or_404(AutomationRun, run_id)
+    if not _run_owned_by_user(current_user, run):
+        return jsonify({'error': 'Forbidden'}), 403
+    data = request.get_json(silent=True) or {}
+    try:
+        cycle = continue_audit_run(run, force=bool(data.get('force')))
+    except ValueError as exc:
+        return jsonify({'error': str(exc)}), 409
+
+    append_run_event(
+        run,
+        'audit_cycle_continued',
+        {'audit_cycle_id': cycle.id if cycle else None, 'force': bool(data.get('force'))},
+        dedupe_key=data.get('dedupe_key') or f'audit_cycle_continued:{run.id}:{cycle.id if cycle else "none"}:{run.audit_resumed_at.isoformat() if run.audit_resumed_at else "now"}',
+    )
+    return jsonify({'run': run.to_dict(), 'audit_cycle': cycle.to_dict() if cycle else None}), 200
+
+
 @automation_bp.route('/api/automation/runs/<int:run_id>/events', methods=['POST'])
 @token_required
 def append_automation_run_event(current_user, run_id):
     run = get_or_404(AutomationRun, run_id)
-    if not _run_visible_to_user(current_user, run):
+    if not _run_owned_by_user(current_user, run):
         return jsonify({'error': 'Forbidden'}), 403
 
     data = request.get_json(silent=True) or {}
@@ -633,7 +906,7 @@ def get_automation_run_provider_calls(current_user, run_id):
 @token_required
 def create_automation_run_provider_call(current_user, run_id):
     run = get_or_404(AutomationRun, run_id)
-    if not _run_visible_to_user(current_user, run):
+    if not _run_owned_by_user(current_user, run):
         return jsonify({'error': 'Forbidden'}), 403
     data = request.get_json(silent=True) or {}
     if data.get('worker_id') or data.get('lease_token'):
@@ -667,7 +940,7 @@ def get_automation_run_provider_call_replay(current_user, run_id):
 @token_required
 def complete_automation_run(current_user, run_id):
     run = get_or_404(AutomationRun, run_id)
-    if not _run_visible_to_user(current_user, run):
+    if not _run_owned_by_user(current_user, run):
         return jsonify({'error': 'Forbidden'}), 403
 
     data = request.get_json(silent=True) or {}
@@ -680,6 +953,8 @@ def complete_automation_run(current_user, run_id):
     run.status = data.get('status') or 'completed'
     run.error_text = data.get('error_text')
     run.finished_at = datetime.utcnow()
+    run.awaiting_audit_cycle_id = None
+    run.awaiting_audit_phase = None
     if run.started_at is None:
         run.started_at = run.claimed_at or run.created_at
     run.heartbeat_at = datetime.utcnow()
@@ -735,7 +1010,7 @@ def compare_automation_runs(current_user):
 @token_required
 def execute_automation_run_decision(current_user, run_id):
     run = get_or_404(AutomationRun, run_id)
-    if not _run_visible_to_user(current_user, run):
+    if not _run_owned_by_user(current_user, run):
         return jsonify({'error': 'Forbidden'}), 403
     if not run.derived_campaign_id:
         return jsonify({'error': 'Run has no derived campaign'}), 400

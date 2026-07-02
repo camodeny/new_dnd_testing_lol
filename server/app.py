@@ -178,6 +178,8 @@ def ensure_lightweight_schema():
     if automation_scenario_columns:
         if 'baseline_run_id' not in automation_scenario_columns:
             db.session.execute(text('ALTER TABLE automation_scenarios ADD COLUMN baseline_run_id INTEGER'))
+        if 'scorecard_template_id' not in automation_scenario_columns:
+            db.session.execute(text('ALTER TABLE automation_scenarios ADD COLUMN scorecard_template_id INTEGER'))
         if 'retention_policy_json' not in automation_scenario_columns:
             db.session.execute(text('ALTER TABLE automation_scenarios ADD COLUMN retention_policy_json JSON'))
             db.session.execute(text("UPDATE automation_scenarios SET retention_policy_json = '{}' WHERE retention_policy_json IS NULL"))
@@ -205,8 +207,17 @@ def ensure_lightweight_schema():
             db.session.execute(text('ALTER TABLE automation_runs ADD COLUMN clone_retention_status VARCHAR(30) DEFAULT "active" NOT NULL'))
         if 'clone_retention_expires_at' not in automation_run_columns:
             db.session.execute(text('ALTER TABLE automation_runs ADD COLUMN clone_retention_expires_at DATETIME'))
+        if 'scorecard_template_json' not in automation_run_columns:
+            db.session.execute(text('ALTER TABLE automation_runs ADD COLUMN scorecard_template_json JSON'))
+            db.session.execute(text("UPDATE automation_runs SET scorecard_template_json = '{}' WHERE scorecard_template_json IS NULL"))
         if 'last_event_sequence' not in automation_run_columns:
             db.session.execute(text('ALTER TABLE automation_runs ADD COLUMN last_event_sequence INTEGER'))
+        if 'awaiting_audit_cycle_id' not in automation_run_columns:
+            db.session.execute(text('ALTER TABLE automation_runs ADD COLUMN awaiting_audit_cycle_id INTEGER'))
+        if 'awaiting_audit_phase' not in automation_run_columns:
+            db.session.execute(text('ALTER TABLE automation_runs ADD COLUMN awaiting_audit_phase VARCHAR(40)'))
+        if 'audit_resumed_at' not in automation_run_columns:
+            db.session.execute(text('ALTER TABLE automation_runs ADD COLUMN audit_resumed_at DATETIME'))
 
     automation_event_columns = table_columns('automation_run_events')
     if automation_event_columns:

@@ -143,6 +143,18 @@ export function listAutomationScenarios() {
   return apiFetch('/automation/scenarios')
 }
 
+export function listAutomationScorecards() {
+  return apiFetch('/automation/scorecards')
+}
+
+export function createAutomationScorecard(payload) {
+  return apiFetch('/automation/scorecards', { method: 'POST', body: JSON.stringify(payload) })
+}
+
+export function updateAutomationScorecard(scorecardId, payload) {
+  return apiFetch(`/automation/scorecards/${scorecardId}`, { method: 'PUT', body: JSON.stringify(payload) })
+}
+
 export function createAutomationScenario(payload) {
   return apiFetch('/automation/scenarios', { method: 'POST', body: JSON.stringify(payload) })
 }
@@ -185,6 +197,14 @@ export function getAutomationRun(runId) {
 
 export function stopAutomationRun(runId) {
   return apiFetch(`/automation/runs/${runId}/stop`, { method: 'POST', body: JSON.stringify({}) })
+}
+
+export function continueAutomationRun(runId, payload = {}) {
+  return apiFetch(`/automation/runs/${runId}/continue`, { method: 'POST', body: JSON.stringify(payload) })
+}
+
+export function submitAutomationRunAudit(runId, cycleId, payload) {
+  return apiFetch(`/automation/runs/${runId}/audit-cycles/${cycleId}/audit`, { method: 'POST', body: JSON.stringify(payload) })
 }
 
 export function getAutomationRunScorecard(runId) {

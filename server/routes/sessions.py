@@ -214,7 +214,58 @@ def _run_session_memory_update(
         )
 
 
-def _dm_turn_status_for_player(campaign_id, player_message_id=None):
+def _post_turn_status_for_player(campaign_id, session_id, player_message_id):
+    memory_trace_id = f'session_memory_writer:session_{session_id}:message_{player_message_id}'
+    clock_trace_id = f'session_clock_adjudicator:session_{session_id}:message_{player_message_id}'
+
+    memory_error = CampaignAuditEvent.query.filter_by(
+        campaign_id=campaign_id,
+        trace_id=memory_trace_id,
+        event_type='memory_update_error',
+    ).order_by(CampaignAuditEvent.id.desc()).first()
+    if memory_error is not None:
+        return {
+            'post_turn_complete': True,
+            'post_turn_status': 'error',
+            'memory_status': 'error',
+            'clock_status': 'skipped',
+        }
+
+    memory_applied = CampaignAuditEvent.query.filter_by(
+        campaign_id=campaign_id,
+        trace_id=memory_trace_id,
+        event_type='memory_patch_applied',
+    ).order_by(CampaignAuditEvent.id.desc()).first()
+    if memory_applied is None:
+        return {
+            'post_turn_complete': False,
+            'post_turn_status': 'pending',
+            'memory_status': 'pending',
+            'clock_status': 'pending',
+        }
+
+    clock_applied = CampaignAuditEvent.query.filter_by(
+        campaign_id=campaign_id,
+        trace_id=clock_trace_id,
+        event_type='clock_adjudication_applied',
+    ).order_by(CampaignAuditEvent.id.desc()).first()
+    if clock_applied is None:
+        return {
+            'post_turn_complete': False,
+            'post_turn_status': 'pending',
+            'memory_status': 'complete',
+            'clock_status': 'pending',
+        }
+
+    return {
+        'post_turn_complete': True,
+        'post_turn_status': 'complete',
+        'memory_status': 'complete',
+        'clock_status': 'complete',
+    }
+
+
+def _dm_turn_status_for_player(campaign_id, session_id, player_message_id=None):
     """Return the most recent completed session-DM turn decision."""
     query = (
         CampaignAuditEvent.query
@@ -239,25 +290,43 @@ def _dm_turn_status_for_player(campaign_id, player_message_id=None):
         if player_message_id is not None and event_player_message_id != player_message_id:
             continue
         if event.event_type == 'dm_output_stored':
-            return {
+            status = {
                 'status': 'speak',
                 'player_message_id': event_player_message_id,
                 'dm_message_id': payload.get('dm_message_id'),
             }
+            if event_player_message_id is not None:
+                status.update(_post_turn_status_for_player(campaign_id, session_id, event_player_message_id))
+            return status
         if event.event_type == 'dm_silence_chosen':
             decision = payload.get('decision') if isinstance(payload.get('decision'), dict) else {}
             return {
                 'status': 'silent',
                 'player_message_id': event_player_message_id,
                 'reason': decision.get('reason') or '',
+                'post_turn_complete': True,
+                'post_turn_status': 'complete',
+                'memory_status': 'skipped',
+                'clock_status': 'skipped',
             }
         if event.event_type == 'dm_output_empty':
             return {
                 'status': 'empty',
                 'player_message_id': event_player_message_id,
                 'decision': payload.get('decision'),
+                'post_turn_complete': True,
+                'post_turn_status': 'complete',
+                'memory_status': 'skipped',
+                'clock_status': 'skipped',
             }
-    return {'status': 'pending', 'player_message_id': player_message_id}
+    return {
+        'status': 'pending',
+        'player_message_id': player_message_id,
+        'post_turn_complete': False,
+        'post_turn_status': 'pending',
+        'memory_status': 'pending',
+        'clock_status': 'pending',
+    }
 
 
 @sessions_bp.route('/api/sessions/<int:session_id>/dm-turn-status', methods=['GET'])
@@ -269,7 +338,7 @@ def get_dm_turn_status(current_user, session_id):
         return jsonify({'error': 'Forbidden'}), 403
 
     after_message_id = request.args.get('after_message_id', type=int)
-    status = _dm_turn_status_for_player(campaign.id, player_message_id=after_message_id)
+    status = _dm_turn_status_for_player(campaign.id, session_id, player_message_id=after_message_id)
     return jsonify(status)
 
 

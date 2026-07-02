@@ -309,7 +309,7 @@ select.input:focus {
 .home-page-v2 {
   max-width: 1100px;
   margin: 0 auto;
-  padding: 40px 24px 100px;
+  padding: 10px 24px 40px;
   position: relative;
   animation: fadeIn 0.4s ease-out;
 }
@@ -318,7 +318,7 @@ select.input:focus {
   display: flex;
   justify-content: space-between;
   align-items: flex-end;
-  margin-bottom: 40px;
+  margin-bottom: 24px;
   gap: 20px;
   flex-wrap: wrap;
 }
@@ -495,19 +495,19 @@ select.input:focus {
 /* Empty State */
 .empty-state-v2 {
   text-align: center;
-  padding: 80px 24px;
+  padding: 40px 24px;
   background: rgba(31, 32, 43, 0.2);
   border: 1px dashed var(--border-color);
   border-radius: var(--radius-lg);
   max-width: 500px;
-  margin: 40px auto;
+  margin: 20px auto;
 }
 
 .empty-illustration {
   display: block;
-  font-size: 4rem;
+  font-size: 3.5rem;
   color: var(--text-dim);
-  margin-bottom: 20px;
+  margin-bottom: 12px;
 }
 
 .empty-state-v2 h3 {
@@ -6897,9 +6897,10 @@ select.input:focus {
 
 .empty-state-actions {
   display: flex;
+  flex-wrap: wrap;
   gap: 12px;
   justify-content: center;
-  margin-top: 24px;
+  margin-top: 28px;
 }
 
 @media (max-width: 600px) {

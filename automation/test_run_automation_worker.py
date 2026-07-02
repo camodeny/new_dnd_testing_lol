@@ -1,0 +1,140 @@
+import os
+import sys
+import unittest
+from types import SimpleNamespace
+from unittest.mock import patch
+
+
+sys.path.insert(0, os.path.abspath(os.path.dirname(__file__)))
+import run_automation_worker as worker
+
+
+class RunAutomationWorkerTests(unittest.TestCase):
+    def test_parse_args_defaults_dm_response_timeout_to_five_minutes(self):
+        with patch.object(sys, 'argv', ['run_automation_worker.py']):
+            args = worker.parse_args()
+
+        self.assertEqual(args.dm_response_timeout, 300.0)
+
+    def test_wait_for_dm_response_waits_for_post_turn_completion(self):
+        args = SimpleNamespace(poll_interval=0.01, dm_response_timeout=5.0)
+        manifest = {'session': {'id': 4}}
+        statuses = [
+            {
+                'status': 'speak',
+                'player_message_id': 411,
+                'dm_message_id': 412,
+                'post_turn_complete': False,
+                'post_turn_status': 'pending',
+            },
+            {
+                'status': 'speak',
+                'player_message_id': 411,
+                'dm_message_id': 412,
+                'post_turn_complete': True,
+                'post_turn_status': 'complete',
+            },
+        ]
+
+        with patch.object(worker.autonomous, 'fetch_dm_turn_status', side_effect=statuses) as fetch_status, \
+                patch.object(worker.time, 'sleep') as sleep:
+            result, timed_out = worker.wait_for_dm_response(args, manifest, 411, lambda: None)
+
+        self.assertFalse(timed_out)
+        self.assertEqual(result, statuses[-1])
+        self.assertEqual(fetch_status.call_count, 2)
+        sleep.assert_called_once()
+
+    def test_execute_run_resets_idle_timer_after_after_dm_audit_resume(self):
+        args = SimpleNamespace(
+            api_base='http://127.0.0.1:5889',
+            owner_api_key='owner-key',
+            worker_id='audit-worker-test',
+            max_minutes=30.0,
+            idle_timeout=180.0,
+            heartbeat_interval=999.0,
+            poll_interval=0.01,
+            max_turns=50,
+            dm_response_timeout=60.0,
+            model='opencode-go/deepseek-v4-flash',
+        )
+        claim_payload = {
+            'run': {'id': 2, 'attempt_count': 1, 'runner_config': {'audit_pause_phases': ['after_dm']}},
+            'lease_token': 'lease-1',
+            'derived_campaign': {'id': 100003},
+            'roster': [
+                {
+                    'llm_player_id': 33,
+                    'user_id': 35,
+                    'label': 'Audit Player 3',
+                    'character_name': 'Kaelen Shadowstep',
+                    'derived_character_id': 38,
+                },
+            ],
+        }
+        initial_session = {
+            'id': 4,
+            'is_active': True,
+            'started_at': '2026-07-01T15:58:50.044971',
+            'messages': [
+                {'id': 410, 'role': 'dm', 'content': 'Opening scene.', 'created_at': '2026-07-01T15:59:05.608343'},
+            ],
+        }
+        stop_requested_run = {
+            'run': {'status': 'stop_requested', 'error_text': 'done'},
+            'latest_session': initial_session,
+        }
+        monotonic_values = iter([
+            0.0,    # start_time
+            0.0,    # initial last_change_at
+            0.0,    # maybe_heartbeat loop 1
+            0.0,    # deadline loop 1
+            0.0,    # fingerprint_changed activity reset
+            0.0,    # pre-after_dm pause activity reset
+            500.0,  # post-after_dm audit resume activity reset
+            500.1,  # idle timeout check after resume
+            500.2,  # maybe_heartbeat loop 2
+            500.2,  # deadline loop 2
+            500.2,
+            500.2,
+        ])
+
+        def fake_monotonic():
+            return next(monotonic_values, 500.2)
+
+        with patch.object(worker, 'claim_run', return_value=claim_payload), \
+                patch.object(worker, 'build_manifest_for_run', return_value={'campaign': {'id': 100003}}), \
+                patch.object(worker, 'append_event'), \
+                patch.object(worker, 'request_overseer_decision', return_value={'action': 'choose_player', 'llm_player_id': 33}), \
+                patch.object(worker, 'api_get', side_effect=[{'world': {}}, {'campaign': {'id': 100003}}]), \
+                patch.object(worker, 'fetch_campaign_characters', return_value=[{'id': 38, 'name': 'Kaelen Shadowstep'}]), \
+                patch.object(worker, 'request_player_decision', return_value=(
+                    {'action': 'speak', 'content': 'Kaelen asks about the patrols.'},
+                    '{"action":"speak"}',
+                    0,
+                    'opencode_go',
+                    'deepseek-v4-flash',
+                )), \
+                patch.object(worker, 'submit_decision', return_value={'message': {'id': 411}}), \
+                patch.object(worker, 'wait_for_dm_response', return_value=(
+                    {'status': 'speak', 'player_message_id': 411, 'dm_message_id': 412},
+                    False,
+                )), \
+                patch.object(worker, 'pause_for_audit_if_needed', side_effect=[(False, 'lease-1'), (False, 'lease-1')]), \
+                patch.object(worker, 'fetch_run', side_effect=[
+                    {'run': {'status': 'running'}, 'latest_session': initial_session},
+                    stop_requested_run,
+                ]), \
+                patch.object(worker, 'complete_run') as complete_run, \
+                patch.object(worker.time, 'sleep'), \
+                patch.object(worker.time, 'monotonic', side_effect=fake_monotonic):
+            finished = worker.execute_run(args, 2)
+
+        self.assertTrue(finished)
+        complete_run.assert_called_once()
+        self.assertEqual(complete_run.call_args.kwargs['error_text'], 'done')
+        self.assertNotEqual(complete_run.call_args.kwargs['error_text'], 'idle_timeout')
+
+
+if __name__ == '__main__':
+    unittest.main()
