@@ -25,6 +25,21 @@ export default function AutomationScenarioPage() {
   const [selectedSnapshotId, setSelectedSnapshotId] = useState('')
   const [matrixModels, setMatrixModels] = useState('')
   const [autoCaptureAttempted, setAutoCaptureAttempted] = useState(false)
+  const [selectedRunIds, setSelectedRunIds] = useState([])
+
+  const scenario = data?.scenario
+  const snapshots = data?.snapshots || []
+  const runs = data?.runs || []
+  const latestTwoRuns = useMemo(() => runs.slice(0, 2), [runs])
+  const baselineRunId = data?.baseline_run?.id || scenario?.baseline_run_id
+
+  const handleToggleRunSelection = (runId) => {
+    setSelectedRunIds((prev) =>
+      prev.includes(runId)
+        ? prev.filter((id) => id !== runId)
+        : [...prev, runId]
+    )
+  }
 
   const autoCaptureSnapshot = searchParams.get('captureSnapshot') === '1'
 
@@ -64,12 +79,6 @@ export default function AutomationScenarioPage() {
     }
     run()
   }, [autoCaptureAttempted, autoCaptureSnapshot, creatingSnapshot, loadData, scenario, scenarioId, snapshots.length])
-
-  const scenario = data?.scenario
-  const snapshots = data?.snapshots || []
-  const runs = data?.runs || []
-  const latestTwoRuns = useMemo(() => runs.slice(0, 2), [runs])
-  const baselineRunId = data?.baseline_run?.id || scenario?.baseline_run_id
 
   const handleCreateSnapshot = async (event) => {
     event?.preventDefault?.()
@@ -268,26 +277,57 @@ export default function AutomationScenarioPage() {
       <section className="automation-panel">
         <div className="automation-section-header">
           <h2>Runs</h2>
-          {latestTwoRuns.length === 2 ? (
-            <Link className="btn btn-secondary btn-small" to={`/automation/compare?left=${latestTwoRuns[1].id}&right=${latestTwoRuns[0].id}`}>
-              Compare latest two
-            </Link>
-          ) : (
-            <span>{runs.length} total</span>
-          )}
+          <div className="automation-inline-actions">
+            {selectedRunIds.length === 2 ? (
+              <Link
+                className="btn btn-primary btn-small"
+                to={`/automation/compare?left=${selectedRunIds[0]}&right=${selectedRunIds[1]}`}
+              >
+                Compare Selected ({selectedRunIds.length})
+              </Link>
+            ) : (
+              <button
+                className="btn btn-secondary btn-small"
+                disabled
+                title="Select exactly 2 runs to compare"
+              >
+                Compare Selected (select 2)
+              </button>
+            )}
+            {latestTwoRuns.length === 2 && (
+              <Link
+                className="btn btn-secondary btn-small"
+                to={`/automation/compare?left=${latestTwoRuns[1].id}&right=${latestTwoRuns[0].id}`}
+              >
+                Compare Latest Two
+              </Link>
+            )}
+          </div>
         </div>
         {runs.length === 0 ? (
           <div className="automation-empty">No runs yet.</div>
         ) : (
           <div className="automation-list">
             {runs.map((run) => (
-              <Link key={run.id} className="automation-list-item" to={`/automation/runs/${run.id}`}>
-                <div>
-                  <strong>Run #{run.id}</strong>
-                  <span>{run.status}</span>
-                </div>
-                <span>{run.id === baselineRunId ? 'Baseline' : `${run.scorecard_summary?.completed_turns || 0} turns`}</span>
-              </Link>
+              <div key={run.id} className="automation-run-list-row">
+                <input
+                  type="checkbox"
+                  checked={selectedRunIds.includes(run.id)}
+                  onChange={() => handleToggleRunSelection(run.id)}
+                  className="automation-run-checkbox"
+                  title="Select run for comparison"
+                />
+                <Link className="automation-list-item" style={{ flex: 1 }} to={`/automation/runs/${run.id}`}>
+                  <div>
+                    <strong>
+                      Run #{run.id}
+                      {run.matrix_label ? ` (${run.matrix_label})` : ''}
+                    </strong>
+                    <span>{run.status}</span>
+                  </div>
+                  <span>{run.id === baselineRunId ? 'Baseline' : `${run.scorecard_summary?.completed_turns || 0} turns`}</span>
+                </Link>
+              </div>
             ))}
           </div>
         )}

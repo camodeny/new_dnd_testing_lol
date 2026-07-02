@@ -1,15 +1,72 @@
 import { useEffect, useState } from 'react'
-import { Link, useSearchParams } from 'react-router-dom'
-import { compareAutomationRuns } from '../api/client'
+import { Link, useSearchParams, useNavigate } from 'react-router-dom'
+import { compareAutomationRuns, getAutomationScenario } from '../api/client'
 import Loading from '../components/common/Loading'
 import ErrorMessage from '../components/common/ErrorMessage'
 import './AutomationWorkspace.css'
 
+function DiffTable({ diffs }) {
+  if (!diffs || diffs.length === 0) {
+    return <div className="automation-empty">No differences detected.</div>
+  }
+
+  const formatVal = (val) => {
+    if (val === null || val === undefined) {
+      return <span className="diff-val-nochange">—</span>
+    }
+    if (typeof val === 'object') {
+      return (
+        <pre className="llm-json-box" style={{ margin: 0, padding: '6px 10px', fontSize: '0.8rem', maxHeight: '180px' }}>
+          {JSON.stringify(val, null, 2)}
+        </pre>
+      )
+    }
+    return String(val)
+  }
+
+  return (
+    <table className="diff-table">
+      <thead>
+        <tr>
+          <th style={{ width: '25%' }}>Path / Element</th>
+          <th style={{ width: '37.5%' }}>Left Run Value</th>
+          <th style={{ width: '37.5%' }}>Right Run Value</th>
+        </tr>
+      </thead>
+      <tbody>
+        {diffs.map((diff, idx) => (
+          <tr key={idx}>
+            <td>
+              <code style={{ fontSize: '0.8rem', wordBreak: 'break-all' }}>{diff.path}</code>
+            </td>
+            <td>
+              {diff.left !== undefined && diff.left !== null ? (
+                <div className="diff-val-removed">{formatVal(diff.left)}</div>
+              ) : (
+                <span className="diff-val-nochange">(Added on right)</span>
+              )}
+            </td>
+            <td>
+              {diff.right !== undefined && diff.right !== null ? (
+                <div className="diff-val-added">{formatVal(diff.right)}</div>
+              ) : (
+                <span className="diff-val-nochange">(Removed on right)</span>
+              )}
+            </td>
+          </tr>
+        ))}
+      </tbody>
+    </table>
+  )
+}
+
 export default function AutomationComparePage() {
+  const navigate = useNavigate()
   const [searchParams] = useSearchParams()
   const leftRunId = searchParams.get('left')
   const rightRunId = searchParams.get('right')
   const [data, setData] = useState(null)
+  const [scenarioRuns, setScenarioRuns] = useState([])
   const [loading, setLoading] = useState(true)
   const [error, setError] = useState('')
 
@@ -27,6 +84,13 @@ export default function AutomationComparePage() {
         })
         setData(payload)
         setError('')
+
+        // Fetch other scenario runs for switching dropdowns
+        const scenarioId = payload.left_run?.scenario_id
+        if (scenarioId) {
+          const scenarioData = await getAutomationScenario(scenarioId)
+          setScenarioRuns(scenarioData.runs || [])
+        }
       } catch (err) {
         setError(err.message)
       } finally {
@@ -36,6 +100,20 @@ export default function AutomationComparePage() {
     load()
   }, [leftRunId, rightRunId])
 
+  const handleLeftChange = (e) => {
+    const val = e.target.value
+    if (val) {
+      navigate(`/automation/compare?left=${val}&right=${rightRunId}`)
+    }
+  }
+
+  const handleRightChange = (e) => {
+    const val = e.target.value
+    if (val) {
+      navigate(`/automation/compare?left=${leftRunId}&right=${val}`)
+    }
+  }
+
   if (loading) return <Loading message="Comparing runs..." />
   if (!data) return <ErrorMessage message={error || 'Comparison unavailable.'} />
 
@@ -43,11 +121,47 @@ export default function AutomationComparePage() {
     <div className="automation-page">
       <div className="automation-header">
         <div>
-          <Link className="automation-back-link" to="/automation">← Back to automation</Link>
+          <Link className="automation-back-link" to={data.left_run?.scenario_id ? `/automation/scenarios/${data.left_run.scenario_id}` : '/automation'}>← Back to scenario</Link>
           <h1 className="automation-title">Run Comparison</h1>
           <p className="automation-subtitle">Left run #{data.left_run?.id} compared with right run #{data.right_run?.id}</p>
         </div>
       </div>
+
+      {scenarioRuns.length > 0 && (
+        <div className="compare-selects-row">
+          <div className="compare-select-group">
+            <label htmlFor="left-run-select">Left Run:</label>
+            <select
+              id="left-run-select"
+              value={leftRunId || ''}
+              onChange={handleLeftChange}
+            >
+              {scenarioRuns.map((r) => (
+                <option key={r.id} value={r.id}>
+                  Run #{r.id} ({r.status}) {r.matrix_label ? `· ${r.matrix_label}` : ''} · {r.created_at?.slice(0, 16).replace('T', ' ')}
+                </option>
+              ))}
+            </select>
+          </div>
+
+          <div className="compare-select-vs">VS</div>
+
+          <div className="compare-select-group">
+            <label htmlFor="right-run-select">Right Run:</label>
+            <select
+              id="right-run-select"
+              value={rightRunId || ''}
+              onChange={handleRightChange}
+            >
+              {scenarioRuns.map((r) => (
+                <option key={r.id} value={r.id}>
+                  Run #{r.id} ({r.status}) {r.matrix_label ? `· ${r.matrix_label}` : ''} · {r.created_at?.slice(0, 16).replace('T', ' ')}
+                </option>
+              ))}
+            </select>
+          </div>
+        </div>
+      )}
 
       <section className="automation-panel">
         <div className="automation-compare-header">
@@ -67,11 +181,11 @@ export default function AutomationComparePage() {
                 <strong>{comparison.check_id}</strong>
               </div>
               <div>
-                <span>{comparison.left?.status || 'missing'}</span>
+                <span className={`status-${comparison.left?.status || 'missing'}`}>{comparison.left?.status || 'missing'}</span>
                 <small>{comparison.left?.summary || 'No result'}</small>
               </div>
               <div>
-                <span>{comparison.right?.status || 'missing'}</span>
+                <span className={`status-${comparison.right?.status || 'missing'}`}>{comparison.right?.status || 'missing'}</span>
                 <small>{comparison.right?.summary || 'No result'}</small>
               </div>
             </div>
@@ -81,20 +195,7 @@ export default function AutomationComparePage() {
 
       <section className="automation-panel">
         <h2>Transcript Diff</h2>
-        {data.transcript_diff?.length ? (
-          <div className="automation-events">
-            {data.transcript_diff.map((diff) => (
-              <details key={diff.path} className="automation-event">
-                <summary>
-                  <strong>{diff.path}</strong>
-                </summary>
-                <pre>{JSON.stringify(diff, null, 2)}</pre>
-              </details>
-            ))}
-          </div>
-        ) : (
-          <div className="automation-empty">No transcript differences detected.</div>
-        )}
+        <DiffTable diffs={data.transcript_diff} />
       </section>
 
       <section className="automation-panel">
@@ -116,48 +217,18 @@ export default function AutomationComparePage() {
       </section>
 
       <section className="automation-panel">
-        <h2>World / Clock Diff</h2>
-        <div className="automation-events">
-          {(data.world_state_diff || []).map((diff) => (
-            <details key={`world-${diff.path}`} className="automation-event">
-              <summary>
-                <strong>World</strong>
-                <span>{diff.path}</span>
-              </summary>
-              <pre>{JSON.stringify(diff, null, 2)}</pre>
-            </details>
-          ))}
-          {(data.clock_diff || []).map((diff) => (
-            <details key={`clock-${diff.path}`} className="automation-event">
-              <summary>
-                <strong>Clock</strong>
-                <span>{diff.path}</span>
-              </summary>
-              <pre>{JSON.stringify(diff, null, 2)}</pre>
-            </details>
-          ))}
-          {!(data.world_state_diff?.length || data.clock_diff?.length) && (
-            <div className="automation-empty">No world or clock differences detected.</div>
-          )}
-        </div>
+        <h2>World State Diff</h2>
+        <DiffTable diffs={data.world_state_diff} />
       </section>
 
       <section className="automation-panel">
-        <h2>Decision Trace Diff</h2>
-        {data.decision_trace_diff?.length ? (
-          <div className="automation-events">
-            {data.decision_trace_diff.map((diff) => (
-              <details key={`trace-${diff.path}`} className="automation-event">
-                <summary>
-                  <strong>{diff.path}</strong>
-                </summary>
-                <pre>{JSON.stringify(diff, null, 2)}</pre>
-              </details>
-            ))}
-          </div>
-        ) : (
-          <div className="automation-empty">No decision trace differences detected.</div>
-        )}
+        <h2>Clock Diff</h2>
+        <DiffTable diffs={data.clock_diff} />
+      </section>
+
+      <section className="automation-panel">
+        <h2>Decision Trace Diff (AI Overseer Actions)</h2>
+        <DiffTable diffs={data.decision_trace_diff} />
       </section>
 
       <ErrorMessage message={error} />

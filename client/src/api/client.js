@@ -220,6 +220,10 @@ export function getAutomationRunStreamUrl(runId) {
   return `${API_BASE}/automation/runs/${runId}/stream?token=${encodeURIComponent(token || '')}`
 }
 
+export function getAutomationRunProviderCalls(runId, includeArtifacts = false) {
+  return apiFetch(`/automation/runs/${runId}/provider-calls?include_artifacts=${includeArtifacts}`)
+}
+
 // -- Campaign Dashboard API --
 
 export function updateCampaign(id, payload) {

@@ -3,6 +3,7 @@ import { Link, useParams } from 'react-router-dom'
 import {
   continueAutomationRun,
   getAutomationRun,
+  getAutomationRunProviderCalls,
   getAutomationRunStreamUrl,
   stopAutomationRun,
   submitAutomationRunAudit,
@@ -68,6 +69,36 @@ export default function AutomationRunPage() {
   const { runId } = useParams()
   const [data, setData] = useState(null)
   const [loading, setLoading] = useState(true)
+  const [providerCalls, setProviderCalls] = useState([])
+  const [loadingCalls, setLoadingCalls] = useState(false)
+  const [activeTab, setActiveTab] = useState('scorecard')
+  const [expandedCallId, setExpandedCallId] = useState(null)
+
+  const loadProviderCalls = async () => {
+    if (!runId) return
+    try {
+      setLoadingCalls(true)
+      const res = await getAutomationRunProviderCalls(runId, true)
+      setProviderCalls(res.provider_calls || [])
+    } catch (err) {
+      console.error('Failed to load provider calls:', err)
+    } finally {
+      setLoadingCalls(false)
+    }
+  }
+
+  // Load provider calls when runId changes or tab switches to llm-calls
+  useEffect(() => {
+    if (runId) {
+      loadProviderCalls()
+    }
+  }, [runId])
+
+  useEffect(() => {
+    if (activeTab === 'llm-calls' && runId) {
+      loadProviderCalls()
+    }
+  }, [activeTab, runId])
   const [error, setError] = useState('')
   const [stopping, setStopping] = useState(false)
   const [continuing, setContinuing] = useState(false)
@@ -257,202 +288,343 @@ export default function AutomationRunPage() {
         </div>
       </div>
 
-      <div className="automation-grid">
-        <section className="automation-panel">
-          <div className="automation-section-header">
-            <h2>Status</h2>
-            {canStop && (
-              <button className="btn btn-secondary btn-small" onClick={handleStop} disabled={stopping}>
-                {stopping ? 'Stopping…' : 'Stop Run'}
-              </button>
-            )}
-          </div>
-          <div className="automation-meta-grid">
-            <div><strong>Status</strong><span>{run.status}</span></div>
-            <div><strong>Created</strong><span>{formatTime(run.created_at)}</span></div>
-            <div><strong>Started</strong><span>{formatTime(run.started_at)}</span></div>
-            <div><strong>Finished</strong><span>{formatTime(run.finished_at)}</span></div>
-            <div><strong>Derived campaign</strong><span>{run.derived_campaign_id || 'Not created'}</span></div>
-            <div><strong>Snapshot</strong><span>{data.snapshot?.label || run.snapshot_id}</span></div>
-            <div><strong>Encounter map</strong><span>{encounterMap?.title || 'None'}</span></div>
-          </div>
-          {run.error_text && <ErrorMessage message={run.error_text} />}
-        </section>
-
-        <section className="automation-panel">
-          <h2>Scorecard</h2>
-          {scorecard.length === 0 ? (
-            <div className="automation-empty">No scorecard results yet.</div>
+      <div className="automation-run-workspace-grid">
+        {/* Left Column: Live RPG Chat Transcript */}
+        <div className="automation-chat-column">
+          <h2>Live Session Transcript</h2>
+          {messages.length === 0 ? (
+            <div className="automation-empty">No session messages yet.</div>
           ) : (
-            <div className="automation-scorecard">
-              {scorecard.map((result) => (
-                <div key={result.check_id} className={`automation-scorecard-row status-${result.status}`}>
-                  <div>
-                    <strong>{result.check_id}</strong>
-                    <span>{result.summary}</span>
+            <div className="automation-chat-viewport">
+              {messages.map((message) => (
+                <div key={message.id} className={`chat-msg chat-msg-${message.role}`}>
+                  <div className="chat-msg-meta">
+                    <span className="chat-msg-sender">
+                      {message.role === 'dm' ? '🤖 AI DM' : `🧙 ${message.username || message.role}`}
+                    </span>
+                    <span className="chat-msg-time">{formatTime(message.created_at)}</span>
                   </div>
-                  <span>{result.status}</span>
+                  <div className="chat-msg-body">{message.content}</div>
                 </div>
               ))}
             </div>
           )}
-        </section>
-      </div>
-
-      <section className="automation-panel">
-        <div className="automation-section-header">
-          <h2>Audit Gate</h2>
-          <span>{run.status === 'awaiting_audit' ? 'Paused for audit' : 'Live or finished'}</span>
         </div>
-        {currentAuditCycle ? (
-          <div className="automation-form">
-            <div className="automation-meta-grid">
-              <div><strong>Cycle</strong><span>#{currentAuditCycle.cycle_number}</span></div>
-              <div><strong>Phase</strong><span>{currentAuditCycle.phase}</span></div>
-              <div><strong>Scorecard</strong><span>{scorecardTemplate.name || 'Freeform audit'}</span></div>
-            </div>
-            <label>
-              Audit summary
-              <input value={auditSummary} onChange={(event) => setAuditSummary(event.target.value)} placeholder="Short verdict for this pause point" />
-            </label>
-            <label>
-              Audit notes
-              <textarea className="automation-textarea" value={auditNotes} onChange={(event) => setAuditNotes(event.target.value)} placeholder="Runtime-truth notes, evidence, and repair concerns" />
-            </label>
-            <label>
-              Overall status
-              <select value={overallStatus} onChange={(event) => setOverallStatus(event.target.value)}>
-                <option value="pass">pass</option>
-                <option value="warn">warn</option>
-                <option value="fail">fail</option>
-              </select>
-            </label>
-            <label>
-              Overall summary
-              <input value={overallSummary} onChange={(event) => setOverallSummary(event.target.value)} placeholder="Optional overall summary" />
-            </label>
-            {criteriaDrafts.length > 0 && (
-              <div className="automation-events">
-                {criteriaDrafts.map((criterion) => (
-                  <div key={criterion.criterion_id} className="automation-event">
-                    <div className="automation-message-meta">
-                      <strong>{criterion.label}</strong>
-                      <span>{criterion.description}</span>
+
+        {/* Right Column: Diagnostics Workspace Tab panel */}
+        <div className="diagnostics-tabs">
+          <div className="tabs-header">
+            <button
+              className={`tab-btn ${activeTab === 'scorecard' ? 'active' : ''}`}
+              onClick={() => setActiveTab('scorecard')}
+            >
+              Scorecard & Audits
+            </button>
+            <button
+              className={`tab-btn ${activeTab === 'llm-calls' ? 'active' : ''}`}
+              onClick={() => setActiveTab('llm-calls')}
+            >
+              LLM Calls ({providerCalls.length})
+            </button>
+            <button
+              className={`tab-btn ${activeTab === 'events' ? 'active' : ''}`}
+              onClick={() => setActiveTab('events')}
+            >
+              System Events ({events.length})
+            </button>
+          </div>
+
+          <div className="tab-body">
+            {activeTab === 'scorecard' && (
+              <>
+                <section className="automation-panel">
+                  <div className="automation-section-header">
+                    <h2>Status</h2>
+                    {canStop && (
+                      <button className="btn btn-secondary btn-small" onClick={handleStop} disabled={stopping}>
+                        {stopping ? 'Stopping…' : 'Stop Run'}
+                      </button>
+                    )}
+                  </div>
+                  <div className="automation-meta-grid">
+                    <div><strong>Status</strong><span>{run.status}</span></div>
+                    <div><strong>Created</strong><span>{formatTime(run.created_at)}</span></div>
+                    <div><strong>Started</strong><span>{formatTime(run.started_at)}</span></div>
+                    <div><strong>Finished</strong><span>{formatTime(run.finished_at)}</span></div>
+                    <div><strong>Derived campaign</strong><span>{run.derived_campaign_id || 'Not created'}</span></div>
+                    <div><strong>Snapshot</strong><span>{data.snapshot?.label || run.snapshot_id}</span></div>
+                    <div><strong>Encounter map</strong><span>{encounterMap?.title || 'None'}</span></div>
+                  </div>
+                  {run.error_text && <ErrorMessage message={run.error_text} />}
+                </section>
+
+                <section className="automation-panel">
+                  <h2>Scorecard</h2>
+                  {scorecard.length === 0 ? (
+                    <div className="automation-empty">No scorecard results yet.</div>
+                  ) : (
+                    <div className="automation-scorecard">
+                      {scorecard.map((result) => (
+                        <div key={result.check_id} className={`automation-scorecard-row status-${result.status}`}>
+                          <div>
+                            <strong>{result.check_id}</strong>
+                            <span>{result.summary}</span>
+                          </div>
+                          <span>{result.status}</span>
+                        </div>
+                      ))}
                     </div>
+                  )}
+                </section>
+
+                <section className="automation-panel">
+                  <div className="automation-section-header">
+                    <h2>Audit Gate</h2>
+                    <span>{run.status === 'awaiting_audit' ? 'Paused for manual audit' : 'Live or finished'}</span>
+                  </div>
+                  {currentAuditCycle ? (
                     <div className="automation-form">
+                      <div className="automation-meta-grid">
+                        <div><strong>Cycle</strong><span>#{currentAuditCycle.cycle_number}</span></div>
+                        <div><strong>Phase</strong><span>{currentAuditCycle.phase}</span></div>
+                        <div><strong>Scorecard</strong><span>{scorecardTemplate.name || 'Freeform audit'}</span></div>
+                      </div>
                       <label>
-                        Status
-                        <select value={criterion.status} onChange={(event) => handleCriterionChange(criterion.criterion_id, 'status', event.target.value)}>
+                        Audit summary
+                        <input value={auditSummary} onChange={(event) => setAuditSummary(event.target.value)} placeholder="Short verdict for this pause point" />
+                      </label>
+                      <label>
+                        Audit notes
+                        <textarea className="automation-textarea" value={auditNotes} onChange={(event) => setAuditNotes(event.target.value)} placeholder="Runtime-truth notes, evidence, and repair concerns" />
+                      </label>
+                      <label>
+                        Overall status
+                        <select value={overallStatus} onChange={(event) => setOverallStatus(event.target.value)}>
                           <option value="pass">pass</option>
                           <option value="warn">warn</option>
                           <option value="fail">fail</option>
                         </select>
                       </label>
                       <label>
-                        Summary
-                        <input value={criterion.summary} onChange={(event) => handleCriterionChange(criterion.criterion_id, 'summary', event.target.value)} />
+                        Overall summary
+                        <input value={overallSummary} onChange={(event) => setOverallSummary(event.target.value)} placeholder="Optional overall summary" />
                       </label>
-                      <label>
-                        Evidence
-                        <input value={criterion.evidence} onChange={(event) => handleCriterionChange(criterion.criterion_id, 'evidence', event.target.value)} />
-                      </label>
+                      {criteriaDrafts.length > 0 && (
+                        <div className="automation-events">
+                          {criteriaDrafts.map((criterion) => (
+                            <div key={criterion.criterion_id} className="automation-event">
+                              <div className="automation-message-meta">
+                                <strong>{criterion.label}</strong>
+                                <span>{criterion.description}</span>
+                              </div>
+                              <div className="automation-form" style={{ padding: '14px' }}>
+                                <label>
+                                  Status
+                                  <select value={criterion.status} onChange={(event) => handleCriterionChange(criterion.criterion_id, 'status', event.target.value)}>
+                                    <option value="pass">pass</option>
+                                    <option value="warn">warn</option>
+                                    <option value="fail">fail</option>
+                                  </select>
+                                </label>
+                                <label>
+                                  Summary
+                                  <input value={criterion.summary} onChange={(event) => handleCriterionChange(criterion.criterion_id, 'summary', event.target.value)} />
+                                </label>
+                                <label>
+                                  Evidence
+                                  <input value={criterion.evidence} onChange={(event) => handleCriterionChange(criterion.criterion_id, 'evidence', event.target.value)} />
+                                </label>
+                              </div>
+                            </div>
+                          ))}
+                        </div>
+                      )}
+                      <div className="automation-inline-actions">
+                        <button className="btn btn-secondary" type="button" onClick={handleSaveAudit} disabled={savingAudit}>
+                          {savingAudit ? 'Saving…' : 'Save Audit'}
+                        </button>
+                        <button className="btn btn-primary" type="button" onClick={handleContinue} disabled={continuing || currentAuditCycle.status !== 'audited'}>
+                          {continuing ? 'Continuing…' : 'Continue Run'}
+                        </button>
+                      </div>
                     </div>
-                  </div>
-                ))}
-              </div>
+                  ) : (
+                    <div className="automation-empty">This run is not currently paused for manual audit.</div>
+                  )}
+                </section>
+
+                <section className="automation-panel">
+                  <h2>Incidents</h2>
+                  {incidents.length === 0 ? (
+                    <div className="automation-empty">No halt or retry incidents detected.</div>
+                  ) : (
+                    <div className="automation-scorecard">
+                      {incidents.map((incident, idx) => (
+                        <div
+                          key={idx}
+                          className={`automation-scorecard-row status-${incident.severity === 'fail' ? 'fail' : 'warn'}`}
+                        >
+                          <div>
+                            <strong>{incident.incident_type}</strong>
+                            <span>{incident.summary}</span>
+                          </div>
+                          <span>{incident.severity}</span>
+                        </div>
+                      ))}
+                    </div>
+                  )}
+                </section>
+
+                <section className="automation-panel">
+                  <h2>Audit Cycles History</h2>
+                  {auditCycles.length === 0 ? (
+                    <div className="automation-empty">No audit pauses recorded yet.</div>
+                  ) : (
+                    <div className="automation-events">
+                      {auditCycles.map((cycle) => (
+                        <details key={cycle.id} className="automation-event">
+                          <summary>
+                            <strong>Cycle #{cycle.cycle_number}</strong>
+                            <span>{cycle.phase} · {cycle.status}</span>
+                          </summary>
+                          <pre className="llm-json-box">{JSON.stringify(cycle, null, 2)}</pre>
+                        </details>
+                      ))}
+                    </div>
+                  )}
+                </section>
+              </>
             )}
-            <div className="automation-inline-actions">
-              <button className="btn btn-secondary" type="button" onClick={handleSaveAudit} disabled={savingAudit}>
-                {savingAudit ? 'Saving…' : 'Save Audit'}
-              </button>
-              <button className="btn btn-primary" type="button" onClick={handleContinue} disabled={continuing || currentAuditCycle.status !== 'audited'}>
-                {continuing ? 'Continuing…' : 'Continue Run'}
-              </button>
-            </div>
-          </div>
-        ) : (
-          <div className="automation-empty">This run is not currently paused for manual audit.</div>
-        )}
-      </section>
 
-      <section className="automation-panel">
-        <h2>Incidents</h2>
-        {incidents.length === 0 ? (
-          <div className="automation-empty">No halt or retry incidents detected.</div>
-        ) : (
-          <div className="automation-scorecard">
-            {incidents.map((incident) => (
-              <div
-                key={`${incident.incident_type}-${incident.count}`}
-                className={`automation-scorecard-row status-${incident.severity === 'fail' ? 'fail' : 'warn'}`}
-              >
-                <div>
-                  <strong>{incident.incident_type}</strong>
-                  <span>{incident.summary}</span>
+            {activeTab === 'llm-calls' && (
+              <section className="automation-panel">
+                <div className="automation-section-header">
+                  <h2>LLM Provider Calls</h2>
+                  {loadingCalls ? (
+                    <span>Refreshing…</span>
+                  ) : (
+                    <button className="btn btn-secondary btn-small" onClick={loadProviderCalls}>
+                      Refresh Calls
+                    </button>
+                  )}
                 </div>
-                <span>{incident.severity}</span>
-              </div>
-            ))}
-          </div>
-        )}
-      </section>
 
-      <section className="automation-panel">
-        <h2>Audit Cycles</h2>
-        {auditCycles.length === 0 ? (
-          <div className="automation-empty">No audit pauses recorded yet.</div>
-        ) : (
-          <div className="automation-events">
-            {auditCycles.map((cycle) => (
-              <details key={cycle.id} className="automation-event">
-                <summary>
-                  <strong>Cycle #{cycle.cycle_number}</strong>
-                  <span>{cycle.phase} · {cycle.status}</span>
-                </summary>
-                <pre>{JSON.stringify(cycle, null, 2)}</pre>
-              </details>
-            ))}
-          </div>
-        )}
-      </section>
+                {providerCalls.length === 0 ? (
+                  <div className="automation-empty">No LLM provider calls logged for this run yet.</div>
+                ) : (
+                  <div className="llm-call-list">
+                    {providerCalls.map((call) => {
+                      const isExpanded = expandedCallId === call.id
+                      return (
+                        <div key={call.id} className="llm-call-card">
+                          <div
+                            className="llm-call-header"
+                            onClick={() => setExpandedCallId(isExpanded ? null : call.id)}
+                          >
+                            <div className="llm-call-summary">
+                              <span className="llm-call-phase">
+                                {call.phase?.replace(/_/g, ' ')}
+                              </span>
+                              <span className="llm-call-model">{call.model}</span>
+                            </div>
+                            <div className="llm-call-metrics">
+                              <div className="llm-metric">
+                                <span>Latency</span>
+                                <strong>{call.latency_ms ? `${(call.latency_ms / 1000).toFixed(2)}s` : '—'}</strong>
+                              </div>
+                              <div className="llm-metric">
+                                <span>Tokens</span>
+                                <strong>{call.usage_total_tokens || '—'}</strong>
+                              </div>
+                              <button className="btn btn-secondary btn-small" style={{ pointerEvents: 'none' }}>
+                                {isExpanded ? 'Collapse' : 'Inspect'}
+                              </button>
+                            </div>
+                          </div>
 
-      <section className="automation-panel">
-        <h2>Live Transcript</h2>
-        {messages.length === 0 ? (
-          <div className="automation-empty">No session messages yet.</div>
-        ) : (
-          <div className="automation-transcript">
-            {messages.map((message) => (
-              <div key={message.id} className={`automation-message automation-message-${message.role}`}>
-                <div className="automation-message-meta">
-                  <strong>{message.username || message.role}</strong>
-                  <span>{formatTime(message.created_at)}</span>
-                </div>
-                <div>{message.content}</div>
-              </div>
-            ))}
-          </div>
-        )}
-      </section>
+                          {isExpanded && (
+                            <div className="llm-call-details">
+                              {call.request?.system && (
+                                <div className="llm-details-section">
+                                  <h4>System Prompt (DM Behavior Instructions)</h4>
+                                  <div className="llm-prompt-box">
+                                    {call.request.system}
+                                  </div>
+                                </div>
+                              )}
 
-      <section className="automation-panel">
-        <h2>Run Events</h2>
-        {events.length === 0 ? (
-          <div className="automation-empty">No structured run events yet.</div>
-        ) : (
-          <div className="automation-events">
-            {events.map((event) => (
-              <details key={event.id} className="automation-event">
-                <summary>
-                  <strong>{event.event_type}</strong>
-                  <span>{formatTime(event.created_at)}</span>
-                </summary>
-                <pre>{JSON.stringify(event.payload, null, 2)}</pre>
-              </details>
-            ))}
+                              {call.request?.messages && (
+                                <div className="llm-details-section">
+                                  <h4>Prompt Message History ({call.request.messages.length} turns)</h4>
+                                  <div className="llm-prompt-box">
+                                    {call.request.messages.map((m, idx) => (
+                                      <div key={idx} style={{ marginBottom: '14px', borderBottom: '1px dashed rgba(255,255,255,0.05)', paddingBottom: '8px' }}>
+                                        <strong>[{m.role}]:</strong>
+                                        <div style={{ marginTop: '4px', whiteSpace: 'pre-wrap' }}>
+                                          {typeof m.content === 'string' ? m.content : JSON.stringify(m.content, null, 2)}
+                                        </div>
+                                      </div>
+                                    ))}
+                                  </div>
+                                </div>
+                              )}
+
+                              {call.response_text && (
+                                <div className="llm-details-section">
+                                  <h4>Model Raw Output Text</h4>
+                                  <div className="llm-response-box">
+                                    {call.response_text}
+                                  </div>
+                                </div>
+                              )}
+
+                              {call.parsed_output && Object.keys(call.parsed_output).length > 0 && (
+                                <div className="llm-details-section">
+                                  <h4>Parsed Structured Proposals</h4>
+                                  <div className="llm-json-box">
+                                    {JSON.stringify(call.parsed_output, null, 2)}
+                                  </div>
+                                </div>
+                              )}
+
+                              <div style={{ fontSize: '0.8rem', color: 'var(--text-muted)', borderTop: '1px solid var(--border-color)', paddingTop: '10px', display: 'flex', justifyContent: 'space-between', flexWrap: 'wrap', gap: '8px' }}>
+                                <span>Provider: {call.provider}</span>
+                                <span>ID: {call.provider_response_id || 'N/A'}</span>
+                                <span>Repair Attempts: {call.parse_repair_attempts || 0}</span>
+                              </div>
+                            </div>
+                          )}
+                        </div>
+                      )
+                    })}
+                  </div>
+                )}
+              </section>
+            )}
+
+            {activeTab === 'events' && (
+              <section className="automation-panel">
+                <h2>Structured Run Events</h2>
+                {events.length === 0 ? (
+                  <div className="automation-empty">No structured run events yet.</div>
+                ) : (
+                  <div className="automation-events">
+                    {events.map((event) => (
+                      <details key={event.id} className="automation-event">
+                        <summary>
+                          <strong>{event.event_type}</strong>
+                          <span>{formatTime(event.created_at)}</span>
+                        </summary>
+                        <pre className="llm-json-box">{JSON.stringify(event.payload, null, 2)}</pre>
+                      </details>
+                    ))}
+                  </div>
+                )}
+              </section>
+            )}
           </div>
-        )}
-      </section>
+        </div>
+      </div>
 
       <ErrorMessage message={error} />
     </div>
