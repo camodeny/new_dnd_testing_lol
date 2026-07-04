@@ -1615,6 +1615,55 @@ class AutomationRunAuditCycle(db.Model):
         }
 
 
+class AutomationRunAuditorJob(db.Model):
+    __tablename__ = 'automation_run_auditor_jobs'
+
+    id = db.Column(db.Integer, primary_key=True)
+    run_id = db.Column(db.Integer, db.ForeignKey('automation_runs.id'), nullable=False, index=True)
+    cycle_id = db.Column(db.Integer, db.ForeignKey('automation_run_audit_cycles.id'), nullable=False, index=True)
+    auditor_slot = db.Column(db.Integer, nullable=False, default=1)
+    status = db.Column(db.String(30), nullable=False, default='queued', index=True)
+    provider = db.Column(db.String(80), nullable=True, index=True)
+    model = db.Column(db.String(200), nullable=True, index=True)
+    provider_call_id = db.Column(db.Integer, db.ForeignKey('automation_run_provider_calls.id'), nullable=True, index=True)
+    tool_call_count = db.Column(db.Integer, nullable=False, default=0)
+    submitted_scorecard_json = db.Column(db.JSON, nullable=False, default=dict)
+    tool_trace_json = db.Column(db.JSON, nullable=False, default=list)
+    error_text = db.Column(db.Text, nullable=True)
+    started_at = db.Column(db.DateTime, nullable=True, index=True)
+    finished_at = db.Column(db.DateTime, nullable=True, index=True)
+    created_at = db.Column(db.DateTime, default=datetime.utcnow, index=True)
+    updated_at = db.Column(db.DateTime, default=datetime.utcnow, onupdate=datetime.utcnow, index=True)
+
+    __table_args__ = (
+        db.UniqueConstraint('run_id', 'cycle_id', 'auditor_slot', name='uq_automation_auditor_job_run_cycle_slot'),
+    )
+
+    run = db.relationship('AutomationRun', foreign_keys=[run_id])
+    cycle = db.relationship('AutomationRunAuditCycle', foreign_keys=[cycle_id])
+    provider_call = db.relationship('AutomationRunProviderCall', foreign_keys=[provider_call_id])
+
+    def to_dict(self):
+        return {
+            'id': self.id,
+            'run_id': self.run_id,
+            'cycle_id': self.cycle_id,
+            'auditor_slot': self.auditor_slot,
+            'status': self.status,
+            'provider': self.provider,
+            'model': self.model,
+            'provider_call_id': self.provider_call_id,
+            'tool_call_count': self.tool_call_count,
+            'submitted_scorecard': self.submitted_scorecard_json or {},
+            'tool_trace': self.tool_trace_json or [],
+            'error_text': self.error_text,
+            'started_at': self.started_at.isoformat() if self.started_at else None,
+            'finished_at': self.finished_at.isoformat() if self.finished_at else None,
+            'created_at': self.created_at.isoformat() if self.created_at else None,
+            'updated_at': self.updated_at.isoformat() if self.updated_at else None,
+        }
+
+
 class AutomationWorkspaceEvent(db.Model):
     __tablename__ = 'automation_workspace_events'
 

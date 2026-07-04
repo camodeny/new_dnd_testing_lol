@@ -7,6 +7,7 @@ from statistics import median
 from models import (
     AutomationRun,
     AutomationRunAuditCycle,
+    AutomationRunAuditorJob,
     AutomationRunAuditResult,
     AutomationRunEvent,
     AutomationRunProviderCall,
@@ -40,7 +41,7 @@ from services.character_service import build_character_from_data, character_full
 AUTOMATION_ACTIVE_STATUSES = {'queued', 'claimed', 'running', 'stop_requested', 'awaiting_audit'}
 DEFAULT_LEASE_SECONDS = 45
 AUDIT_READY_STATUSES = {'audited', 'skipped'}
-CUSTOM_SCORECARD_STATUS_ORDER = ('pass', 'warn', 'fail')
+CUSTOM_SCORECARD_STATUS_ORDER = ('pass', 'warn', 'fail', 'not_assessed')
 DEFAULT_RETENTION_POLICY = {
     'retention_days': 14,
     'keep_recent_runs': 5,
@@ -111,7 +112,28 @@ DEFAULT_AUDIT_CONFIG = {
         },
     ],
 }
-STATUS_RANK = {'fail': 0, 'warn': 1, 'pass': 2}
+STATUS_RANK = {'fail': 0, 'warn': 1, 'not_assessed': 1, 'pass': 2}
+
+
+def _normalize_custom_scorecard_status(value, default='warn'):
+    status = str(value or default).strip().lower()
+    return status if status in CUSTOM_SCORECARD_STATUS_ORDER else default
+
+
+def _aggregate_custom_scorecard_statuses(statuses, default='warn'):
+    normalized = [_normalize_custom_scorecard_status(status, default='warn') for status in statuses if status]
+    if not normalized:
+        return default
+    assessed = [status for status in normalized if status in {'pass', 'warn', 'fail'}]
+    if assessed:
+        if 'fail' in assessed:
+            return 'fail'
+        if 'warn' in assessed:
+            return 'warn'
+        return 'pass'
+    if any(status == 'not_assessed' for status in normalized):
+        return 'not_assessed'
+    return default
 
 
 def _utcnow():
@@ -221,11 +243,26 @@ def validate_scorecard_template_payload(data):
         if criterion_id in seen_ids:
             raise ValueError(f'duplicate criterion id: {criterion_id}')
         seen_ids.add(criterion_id)
+        evidence_requirements = []
+        for item in _json_list(raw.get('evidence_requirements'), []):
+            if not isinstance(item, dict):
+                continue
+            evidence_requirements.append({
+                'surface': (item.get('surface') or '').strip() or None,
+                'reason': (item.get('reason') or '').strip() or None,
+                'priority': (item.get('priority') or '').strip().lower() or None,
+                'recommended_tools': [
+                    str(tool).strip()
+                    for tool in _json_list(item.get('recommended_tools'), [])
+                    if str(tool).strip()
+                ],
+            })
         criteria.append({
             'id': criterion_id,
             'label': (raw.get('label') or criterion_id.replace('_', ' ').title()).strip(),
             'description': (raw.get('description') or '').strip() or None,
             'better_direction': (raw.get('better_direction') or 'higher').strip().lower(),
+            'evidence_requirements': evidence_requirements,
         })
 
     defaults = _json_object(data.get('defaults'), {})
@@ -685,28 +722,41 @@ def submit_audit_cycle_feedback(cycle, *, summary=None, notes=None, scorecard=No
         if not criterion_id:
             continue
         template_row = template_criteria.get(criterion_id, {})
-        status = str(raw.get('status') or 'warn').strip().lower()
-        if status not in STATUS_RANK:
-            status = 'warn'
+        status = _normalize_custom_scorecard_status(raw.get('status'))
         criteria_results.append({
             'criterion_id': criterion_id,
             'label': template_row.get('label') or raw.get('label') or criterion_id,
             'status': status,
             'summary': (raw.get('summary') or '').strip() or None,
+            'primary_evidence': (raw.get('primary_evidence') or '').strip() or None,
             'evidence': (raw.get('evidence') or '').strip() or None,
         })
 
-    overall_status = str(scorecard_payload.get('overall_status') or 'pass').strip().lower()
-    if overall_status not in STATUS_RANK:
-        overall_status = 'pass'
+    overall_status = (
+        _aggregate_custom_scorecard_statuses([item.get('status') for item in criteria_results], default='warn')
+        if criteria_results
+        else _normalize_custom_scorecard_status(scorecard_payload.get('overall_status'))
+    )
+    criteria_assessed_count = sum(1 for item in criteria_results if item.get('status') in {'pass', 'warn', 'fail'})
+    criteria_not_assessed_count = sum(1 for item in criteria_results if item.get('status') == 'not_assessed')
     cycle.scorecard_json = {
         'template': template,
         'criteria': criteria_results,
+        'source': scorecard_payload.get('source'),
+        'auditor_jobs': _json_list(scorecard_payload.get('auditor_jobs'), []),
+        'tool_calls_used': _json_list(scorecard_payload.get('tool_calls_used'), []),
+        'unresolved_evidence_gaps': _json_list(scorecard_payload.get('unresolved_evidence_gaps'), []),
+        'visible_findings': _json_list(scorecard_payload.get('visible_findings'), []),
+        'hidden_state_findings': _json_list(scorecard_payload.get('hidden_state_findings'), []),
     }
     cycle.scorecard_summary_json = {
         'overall_status': overall_status,
         'overall_summary': (scorecard_payload.get('overall_summary') or '').strip() or None,
         'criteria_count': len(criteria_results),
+        'criteria_assessed_count': criteria_assessed_count,
+        'criteria_not_assessed_count': criteria_not_assessed_count,
+        'auditor_job_count': len(_json_list(scorecard_payload.get('auditor_jobs'), [])),
+        'unresolved_evidence_gap_count': len(_json_list(scorecard_payload.get('unresolved_evidence_gaps'), [])),
     }
     cycle.status = 'audited'
     cycle.audited_at = _utcnow()
@@ -1065,7 +1115,7 @@ def custom_scorecard_results(run, cycle_rows):
                 by_criterion[criterion_id].append({
                     'cycle_number': cycle.cycle_number,
                     'phase': cycle.phase,
-                    'status': str(result.get('status') or 'warn').strip().lower(),
+                    'status': _normalize_custom_scorecard_status(result.get('status')),
                     'summary': result.get('summary'),
                     'evidence': result.get('evidence'),
                 })
@@ -1077,19 +1127,18 @@ def custom_scorecard_results(run, cycle_rows):
         if not assessments:
             status = 'warn'
             summary = 'No custom audit feedback recorded for this criterion.'
-            counts = {'pass': 0, 'warn': 0, 'fail': 0}
+            counts = {'pass': 0, 'warn': 0, 'fail': 0, 'not_assessed': 0}
+            exercised_count = 0
         else:
-            counts = Counter(item['status'] for item in assessments if item.get('status') in STATUS_RANK)
-            if counts.get('fail'):
-                status = 'fail'
-            elif counts.get('warn'):
-                status = 'warn'
-            else:
-                status = 'pass'
+            counts = Counter(item['status'] for item in assessments if item.get('status') in CUSTOM_SCORECARD_STATUS_ORDER)
+            exercised_count = counts.get('pass', 0) + counts.get('warn', 0) + counts.get('fail', 0)
+            status = _aggregate_custom_scorecard_statuses([item.get('status') for item in assessments], default='warn')
             summary = (
                 f'{counts.get("pass", 0)} pass, '
                 f'{counts.get("warn", 0)} warn, '
-                f'{counts.get("fail", 0)} fail across {len(assessments)} audited cycle(s).'
+                f'{counts.get("fail", 0)} fail, '
+                f'{counts.get("not_assessed", 0)} not_assessed across {len(assessments)} audited cycle(s); '
+                f'exercised in {exercised_count} cycle(s).'
             )
         rows.append({
             'check_id': f'custom:{criterion_id}',
@@ -1104,6 +1153,8 @@ def custom_scorecard_results(run, cycle_rows):
                 'criterion': criterion,
                 'counts': counts,
                 'aggregate_status': status,
+                'exercised_cycle_count': exercised_count,
+                'not_assessed_cycle_count': counts.get('not_assessed', 0),
                 'assessments': assessments,
                 'template_name': template.get('name'),
             },
@@ -1273,6 +1324,12 @@ def run_watch_payload(run, current_user=None):
         .order_by(AutomationRunAuditCycle.cycle_number.asc(), AutomationRunAuditCycle.id.asc())
         .all()
     ]
+    auditor_jobs = [
+        job.to_dict()
+        for job in AutomationRunAuditorJob.query.filter_by(run_id=run.id)
+        .order_by(AutomationRunAuditorJob.cycle_id.asc(), AutomationRunAuditorJob.auditor_slot.asc(), AutomationRunAuditorJob.id.asc())
+        .all()
+    ]
     current_audit_cycle = next((cycle for cycle in audit_cycles if cycle['id'] == run.awaiting_audit_cycle_id), None)
 
     return {
@@ -1288,6 +1345,7 @@ def run_watch_payload(run, current_user=None):
         'scorecard_template': current_scorecard_template_for_run(run),
         'current_audit_cycle': current_audit_cycle,
         'audit_cycles': audit_cycles,
+        'auditor_jobs': auditor_jobs,
         'latest_session': {
             **latest_session.to_dict(),
             'messages': messages,

@@ -14,7 +14,9 @@ from auth import generate_token
 from models import (
     AutomationRun,
     AutomationRunAuditCycle,
+    AutomationRunAuditorJob,
     AutomationRunEvent,
+    AutomationRunProviderCall,
     AutomationScorecardTemplate,
     Campaign,
     CampaignAuditEvent,
@@ -28,6 +30,12 @@ from models import (
     SessionMessage,
     User,
     db,
+)
+from services.automation_auditor import (
+    _auditor_user_prompt,
+    aggregate_completed_auditor_jobs,
+    execute_auditor_tool,
+    request_auditor_decision_with_tools,
 )
 from services.character_service import update_character_relations
 
@@ -885,6 +893,802 @@ class AutomationRouteTest(unittest.TestCase):
         with app.app_context():
             cycle = db.session.get(AutomationRunAuditCycle, cycle_id)
             self.assertEqual(cycle.status, 'audited')
+            self.assertEqual(cycle.scorecard_summary_json['criteria_assessed_count'], 2)
+            self.assertEqual(cycle.scorecard_summary_json['criteria_not_assessed_count'], 0)
+
+    def test_builtin_auditor_config_persists_on_run_creation(self):
+        scenario_id = self.client.post(
+            '/api/automation/scenarios',
+            headers=self.headers,
+            json={
+                'source_campaign_id': self.campaign_id,
+                'runner_config': {
+                    'auditor_config': {
+                        'mode': 'built_in',
+                        'model': 'opencode-go/deepseek-v4-flash',
+                        'count': 2,
+                        'auto_continue': True,
+                        'target_cycles': 3,
+                    },
+                },
+            },
+        ).get_json()['scenario']['id']
+        snapshot_id = self.client.post(
+            f'/api/automation/scenarios/{scenario_id}/snapshots',
+            headers=self.headers,
+            json={},
+        ).get_json()['snapshot']['id']
+        run_id = self.client.post(
+            f'/api/automation/scenarios/{scenario_id}/runs',
+            headers=self.headers,
+            json={'snapshot_id': snapshot_id},
+        ).get_json()['run']['id']
+
+        with app.app_context():
+            run = db.session.get(AutomationRun, run_id)
+            auditor_config = run.runner_config_json['auditor_config']
+            self.assertEqual(auditor_config['mode'], 'built_in')
+            self.assertEqual(auditor_config['model'], 'opencode-go/deepseek-v4-flash')
+            self.assertEqual(auditor_config['count'], 2)
+            self.assertTrue(auditor_config['auto_continue'])
+            self.assertEqual(auditor_config['target_cycles'], 3)
+
+    def test_auditor_tools_read_runtime_truth_without_mutating(self):
+        scenario_id = self.client.post(
+            '/api/automation/scenarios',
+            headers=self.headers,
+            json={'source_campaign_id': self.campaign_id},
+        ).get_json()['scenario']['id']
+        snapshot_id = self.client.post(
+            f'/api/automation/scenarios/{scenario_id}/snapshots',
+            headers=self.headers,
+            json={},
+        ).get_json()['snapshot']['id']
+        run_id = self.client.post(
+            f'/api/automation/scenarios/{scenario_id}/runs',
+            headers=self.headers,
+            json={'snapshot_id': snapshot_id},
+        ).get_json()['run']['id']
+        self.client.post(
+            f'/api/automation/runs/{run_id}/claim',
+            headers=self.headers,
+            json={'worker_id': 'worker-a'},
+        )
+
+        with app.app_context():
+            run = db.session.get(AutomationRun, run_id)
+            before_messages = SessionMessage.query.count()
+            transcript = execute_auditor_tool(run, 'get_transcript', {'limit': 10})
+            world_state = execute_auditor_tool(run, 'get_world_state', {})
+            audit_events = execute_auditor_tool(run, 'get_audit_events', {'limit': 10})
+            memory_results = execute_auditor_tool(run, 'search_campaign_memory', {'query': 'Mirror Dock', 'limit': 5})
+            after_messages = SessionMessage.query.count()
+
+            self.assertEqual(before_messages, after_messages)
+            self.assertTrue(transcript['messages'])
+            self.assertTrue(world_state['has_world'])
+            self.assertIn('world_state', world_state)
+            self.assertIn('events', audit_events)
+            self.assertIn('matches', memory_results)
+
+    def test_auditor_compact_tools_preserve_detail_drilldown(self):
+        scenario_id = self.client.post(
+            '/api/automation/scenarios',
+            headers=self.headers,
+            json={'source_campaign_id': self.campaign_id},
+        ).get_json()['scenario']['id']
+        snapshot_id = self.client.post(
+            f'/api/automation/scenarios/{scenario_id}/snapshots',
+            headers=self.headers,
+            json={},
+        ).get_json()['snapshot']['id']
+        run_id = self.client.post(
+            f'/api/automation/scenarios/{scenario_id}/runs',
+            headers=self.headers,
+            json={'snapshot_id': snapshot_id},
+        ).get_json()['run']['id']
+        claim = self.client.post(
+            f'/api/automation/runs/{run_id}/claim',
+            headers=self.headers,
+            json={'worker_id': 'worker-a'},
+        ).get_json()
+        cycle_id = self.client.post(
+            f'/api/automation/runs/{run_id}/pause',
+            headers=self.headers,
+            json={
+                'worker_id': 'worker-a',
+                'lease_token': claim['lease_token'],
+                'phase': 'after_dm',
+                'summary': 'Pause after DM turn',
+                'payload': {'turns_completed': 1},
+            },
+        ).get_json()['audit_cycle']['id']
+
+        with app.app_context():
+            run = db.session.get(AutomationRun, run_id)
+            db.session.add(CampaignAuditEvent(
+                campaign_id=run.derived_campaign_id,
+                event_type='memory_patch_applied',
+                source='dm_tools.memory',
+                actor='session_memory_writer',
+                summary='Applied clone memory patch.',
+                payload='{"scene_patch":{"location_name":"Mirror Dock"},"facts":[{"id":"dock_fact"}]}',
+            ))
+            db.session.add(AutomationRunProviderCall(
+                run_id=run_id,
+                dedupe_key='test:provider:detail',
+                phase='overseer',
+                prompt_version_id='test_prompt',
+                provider='opencode_go',
+                model='deepseek-v4-flash',
+                request_json={'messages': [{'role': 'user', 'content': 'Inspect the dock standoff.'}]},
+                response_json={'choices': [{'message': {'content': 'Dock standoff summary.'}}]},
+                parsed_output_json={'overall_status': 'warn'},
+                response_text='Dock standoff summary.',
+            ))
+            db.session.add(AutomationRunEvent(
+                run_id=run_id,
+                event_type='player_decision',
+                sequence_number=99,
+                attempt_number=1,
+                dedupe_key='test:run:event',
+                payload_json={'speaker': 'Seraphina', 'decision': {'action': 'speak'}},
+            ))
+            db.session.add(AutomationRunAuditorJob(
+                run_id=run_id,
+                cycle_id=cycle_id,
+                auditor_slot=7,
+                status='completed',
+                provider='opencode_go',
+                model='deepseek-v4-flash',
+                provider_call_id=1234,
+                tool_call_count=4,
+                submitted_scorecard_json={'overall_status': 'warn'},
+                tool_trace_json=[{'tool_name': 'get_world_state', 'result': {'huge': True}}],
+            ))
+            db.session.commit()
+
+            run_status = execute_auditor_tool(run, 'get_run_status', {})
+            compact_events = execute_auditor_tool(run, 'get_audit_events', {'limit': 5})
+            compact_provider_calls = execute_auditor_tool(run, 'get_provider_calls', {'limit': 5})
+            compact_run_events = execute_auditor_tool(run, 'get_run_events', {'limit': 5})
+            compact_snapshot = execute_auditor_tool(run, 'get_snapshot_manifest', {})
+            evidence_packet = execute_auditor_tool(run, 'get_cycle_evidence_packet', {})
+            blocked_bulk_events = execute_auditor_tool(run, 'get_audit_events', {'limit': 5, 'include_payload': True})
+            blocked_bulk_provider_calls = execute_auditor_tool(run, 'get_provider_calls', {'limit': 5, 'include_artifacts': True})
+            blocked_bulk_run_events = execute_auditor_tool(run, 'get_run_events', {'limit': 5, 'include_payload': True})
+            blocked_bulk_snapshot = execute_auditor_tool(run, 'get_snapshot_manifest', {'include_payload': True})
+
+            event_id = compact_events['events'][0]['id']
+            provider_call_id = compact_provider_calls['provider_calls'][-1]['id']
+            run_event_id = compact_run_events['events'][-1]['id']
+
+            event_detail = execute_auditor_tool(run, 'get_audit_event_detail', {'event_id': event_id})
+            escalated_event_detail = execute_auditor_tool(run, 'get_audit_event_detail', {'event_id': event_id, 'include_full_payload': True})
+            provider_call_detail = execute_auditor_tool(run, 'get_provider_call_detail', {'provider_call_id': provider_call_id})
+            run_event_detail = execute_auditor_tool(run, 'get_run_event_detail', {'event_id': run_event_id})
+            selected_event_detail = execute_auditor_tool(
+                run,
+                'get_audit_event_detail',
+                {'event_id': event_id, 'paths': ['payload.scene_patch.location_name', 'payload.facts[0].id']},
+            )
+            selected_provider_call_detail = execute_auditor_tool(
+                run,
+                'get_provider_call_detail',
+                {
+                    'provider_call_id': provider_call_id,
+                    'request_paths': ['messages[0].content'],
+                    'response_paths': ['choices[0].message.content'],
+                    'parsed_output_paths': ['overall_status'],
+                },
+            )
+            selected_run_event_detail = execute_auditor_tool(
+                run,
+                'get_run_event_detail',
+                {'event_id': run_event_id, 'paths': ['payload.decision.action']},
+            )
+            selected_snapshot = execute_auditor_tool(
+                run,
+                'get_snapshot_manifest',
+                {'sections': ['campaign'], 'paths': ['campaign.id']},
+            )
+
+            self.assertIn('payload_preview', compact_events['events'][0])
+            self.assertNotIn('payload', compact_events['events'][0])
+            self.assertIn('artifact_sizes', compact_provider_calls['provider_calls'][-1])
+            self.assertNotIn('request', compact_provider_calls['provider_calls'][-1])
+            self.assertIn('payload_preview', compact_run_events['events'][-1])
+            self.assertNotIn('payload', compact_run_events['events'][-1])
+            self.assertIn('metadata', compact_snapshot['snapshot'])
+            self.assertNotIn('snapshot', compact_snapshot['snapshot'])
+            self.assertEqual(run_status['run']['id'], run_id)
+            self.assertEqual(run_status['current_audit_cycle']['id'], cycle_id)
+            self.assertEqual(run_status['auditor_jobs'][0]['auditor_slot'], 7)
+            self.assertNotIn('tool_trace', run_status['auditor_jobs'][0])
+            self.assertNotIn('submitted_scorecard', run_status['auditor_jobs'][0])
+            self.assertIn('Bulk audit-event payload fetch is disabled', blocked_bulk_events['error'])
+            self.assertIn('Bulk provider artifacts are disabled', blocked_bulk_provider_calls['error'])
+            self.assertIn('Bulk run-event payload fetch is disabled', blocked_bulk_run_events['error'])
+            self.assertIn('Full snapshot payload fetch is disabled', blocked_bulk_snapshot['error'])
+
+            self.assertEqual(evidence_packet['audit_cycle']['id'], cycle_id)
+            self.assertTrue(evidence_packet['recent_audit_events'])
+            self.assertTrue(evidence_packet['recent_provider_calls'])
+            self.assertTrue(evidence_packet['recent_run_events'])
+            self.assertIn('get_audit_event_detail', evidence_packet['follow_up_tools'])
+
+            self.assertIn('escalation_required', event_detail)
+            self.assertNotIn('payload', event_detail['event'])
+            self.assertIn('payload.scene_patch', event_detail['suggested_paths'])
+            self.assertIn('payload', escalated_event_detail['event'])
+            self.assertIn('request', provider_call_detail['provider_call'])
+            self.assertIn('payload', run_event_detail['event'])
+
+            self.assertEqual(selected_event_detail['selected_paths']['payload.scene_patch.location_name'], 'Mirror Dock')
+            self.assertEqual(selected_event_detail['selected_paths']['payload.facts[0].id'], 'dock_fact')
+            self.assertNotIn('payload', selected_event_detail['event'])
+
+            self.assertEqual(
+                selected_provider_call_detail['selected_request_paths']['request.messages[0].content'],
+                'Inspect the dock standoff.',
+            )
+            self.assertEqual(
+                selected_provider_call_detail['selected_response_paths']['response.choices[0].message.content'],
+                'Dock standoff summary.',
+            )
+            self.assertEqual(
+                selected_provider_call_detail['selected_parsed_output_paths']['parsed_output.overall_status'],
+                'warn',
+            )
+            self.assertNotIn('request', selected_provider_call_detail['provider_call'])
+
+            self.assertEqual(selected_run_event_detail['selected_paths']['payload.decision.action'], 'speak')
+            self.assertNotIn('payload', selected_run_event_detail['event'])
+
+            self.assertIn('campaign', selected_snapshot['selected_sections'])
+            self.assertEqual(selected_snapshot['selected_paths']['campaign.id'], self.campaign_id)
+            self.assertNotIn('snapshot', selected_snapshot['snapshot'])
+
+    def test_scorecard_template_evidence_requirements_persist_and_reach_auditor_prompt(self):
+        scorecard = self.client.post(
+            '/api/automation/scorecards',
+            headers=self.headers,
+            json={
+                'name': 'Evidence Requirements Scorecard',
+                'criteria': [
+                    {
+                        'id': 'scene_state',
+                        'label': 'Scene State',
+                        'description': 'Transcript and world state stay aligned.',
+                        'evidence_requirements': [
+                            {
+                                'surface': 'cycle_evidence_packet.scene_state_summary',
+                                'reason': 'Primary scene alignment check.',
+                                'priority': 'high',
+                                'recommended_tools': ['get_cycle_evidence_packet'],
+                            },
+                            {
+                                'surface': 'audit_event.payload.updates',
+                                'reason': 'Verify patch-level scene mutations.',
+                                'priority': 'medium',
+                                'recommended_tools': ['get_audit_event_detail'],
+                            },
+                        ],
+                    },
+                ],
+            },
+        ).get_json()['scorecard']
+        self.assertEqual(scorecard['criteria'][0]['evidence_requirements'][0]['surface'], 'cycle_evidence_packet.scene_state_summary')
+
+        scenario_id = self.client.post(
+            '/api/automation/scenarios',
+            headers=self.headers,
+            json={'source_campaign_id': self.campaign_id, 'scorecard_template_id': scorecard['id']},
+        ).get_json()['scenario']['id']
+        snapshot_id = self.client.post(
+            f'/api/automation/scenarios/{scenario_id}/snapshots',
+            headers=self.headers,
+            json={},
+        ).get_json()['snapshot']['id']
+        run_id = self.client.post(
+            f'/api/automation/scenarios/{scenario_id}/runs',
+            headers=self.headers,
+            json={'snapshot_id': snapshot_id},
+        ).get_json()['run']['id']
+        claim = self.client.post(
+            f'/api/automation/runs/{run_id}/claim',
+            headers=self.headers,
+            json={'worker_id': 'worker-a'},
+        ).get_json()
+        cycle_id = self.client.post(
+            f'/api/automation/runs/{run_id}/pause',
+            headers=self.headers,
+            json={
+                'worker_id': 'worker-a',
+                'lease_token': claim['lease_token'],
+                'phase': 'after_dm',
+                'summary': 'Pause after DM turn',
+            },
+        ).get_json()['audit_cycle']['id']
+
+        with app.app_context():
+            run = db.session.get(AutomationRun, run_id)
+            cycle = db.session.get(AutomationRunAuditCycle, cycle_id)
+            prompt = json.loads(_auditor_user_prompt(run, cycle, 1, {'count': 1, 'required_tools': 'runtime_truth_full'}))
+            self.assertIn('criterion_workflow', prompt)
+            self.assertIn('nominate one primary evidence source per criterion', prompt['recommended_sequence'])
+            self.assertIn('mark it not_assessed instead of pass', prompt['criterion_workflow'][2])
+            self.assertEqual(prompt['final_response_contract']['overall_status'], 'pass|warn|fail|not_assessed')
+            self.assertIn('primary_evidence', prompt['final_response_contract']['criteria'][0])
+            self.assertEqual(prompt['final_response_contract']['criteria'][0]['status'], 'pass|warn|fail|not_assessed')
+            self.assertEqual(
+                prompt['criterion_evidence_requirements'][0]['evidence_requirements'][0]['surface'],
+                'cycle_evidence_packet.scene_state_summary',
+            )
+            self.assertEqual(
+                run.scorecard_template_json['criteria'][0]['evidence_requirements'][1]['recommended_tools'],
+                ['get_audit_event_detail'],
+            )
+
+    def test_builtin_auditor_job_completes_paused_cycle_and_updates_scorecard(self):
+        scorecard_id = self.client.post(
+            '/api/automation/scorecards',
+            headers=self.headers,
+            json={
+                'name': 'Built-In Auditor Scorecard',
+                'criteria': [
+                    {'id': 'memory_quality', 'label': 'Memory Quality'},
+                    {'id': 'scene_state', 'label': 'Scene State'},
+                ],
+            },
+        ).get_json()['scorecard']['id']
+        scenario_id = self.client.post(
+            '/api/automation/scenarios',
+            headers=self.headers,
+            json={
+                'source_campaign_id': self.campaign_id,
+                'scorecard_template_id': scorecard_id,
+                'runner_config': {
+                    'audit_pause_phases': ['after_dm'],
+                    'auditor_config': {'mode': 'built_in', 'count': 1, 'auto_continue': False},
+                },
+            },
+        ).get_json()['scenario']['id']
+        snapshot_id = self.client.post(
+            f'/api/automation/scenarios/{scenario_id}/snapshots',
+            headers=self.headers,
+            json={},
+        ).get_json()['snapshot']['id']
+        run_id = self.client.post(
+            f'/api/automation/scenarios/{scenario_id}/runs',
+            headers=self.headers,
+            json={'snapshot_id': snapshot_id},
+        ).get_json()['run']['id']
+        claim = self.client.post(
+            f'/api/automation/runs/{run_id}/claim',
+            headers=self.headers,
+            json={'worker_id': 'worker-a'},
+        ).get_json()
+        pause = self.client.post(
+            f'/api/automation/runs/{run_id}/pause',
+            headers=self.headers,
+            json={
+                'worker_id': 'worker-a',
+                'lease_token': claim['lease_token'],
+                'phase': 'after_dm',
+                'summary': 'Pause after DM turn',
+                'payload': {'turns_completed': 1},
+            },
+        ).get_json()
+        cycle_id = pause['audit_cycle']['id']
+
+        def fake_auditor_decision(run, cycle, job, config, **_kwargs):
+            from services.automation_service import persist_provider_call
+
+            provider_call, _created = persist_provider_call(run, {
+                'dedupe_key': f'auditor:{cycle.id}:slot:{job.auditor_slot}',
+                'phase': 'auditor_decision',
+                'prompt_version_id': 'test',
+                'provider': 'opencode_go',
+                'model': 'deepseek-v4-flash',
+                'request': {'messages': []},
+                'response': {'id': 'test-response'},
+                'parsed_output': {'overall_status': 'warn'},
+                'response_text': '{"overall_status":"warn"}',
+            })
+            return {
+                'provider': 'opencode_go',
+                'model': 'deepseek-v4-flash',
+                'provider_call': provider_call,
+                'tool_call_count': 3,
+                'tool_trace': [{'tool_name': 'get_transcript'}],
+                'scorecard': {
+                    'overall_status': 'warn',
+                    'overall_summary': 'Memory passed, scene state needs attention.',
+                    'criteria': [
+                        {'criterion_id': 'memory_quality', 'status': 'pass', 'summary': 'Memory held.', 'evidence': 'Transcript and world state agree.'},
+                        {'criterion_id': 'scene_state', 'status': 'warn', 'summary': 'Scene drift risk.', 'evidence': 'Clock did not move.'},
+                    ],
+                    'tool_calls_used': ['get_transcript', 'get_world_state', 'get_clocks'],
+                    'unresolved_evidence_gaps': [],
+                },
+            }
+
+        with patch('services.automation_auditor.request_auditor_decision_with_tools', side_effect=fake_auditor_decision):
+            response = self.client.post(
+                f'/api/automation/runs/{run_id}/auditors/start',
+                headers=self.headers,
+                json={'sync': True},
+            )
+        self.assertEqual(response.status_code, 200)
+        payload = response.get_json()
+        self.assertTrue(payload['completed'])
+        self.assertEqual(payload['run']['status'], 'awaiting_audit')
+        self.assertEqual(payload['auditor_jobs'][0]['status'], 'completed')
+        self.assertEqual(payload['auditor_jobs'][0]['tool_call_count'], 3)
+
+        with app.app_context():
+            cycle = db.session.get(AutomationRunAuditCycle, cycle_id)
+            job = AutomationRunAuditorJob.query.filter_by(run_id=run_id, cycle_id=cycle_id).one()
+            provider_call = db.session.get(AutomationRunProviderCall, job.provider_call_id)
+            self.assertEqual(cycle.status, 'audited')
+            self.assertEqual(job.status, 'completed')
+            self.assertEqual(provider_call.phase, 'auditor_decision')
+            self.assertEqual(cycle.scorecard_json['tool_calls_used'], ['get_clocks', 'get_transcript', 'get_world_state'])
+
+        scorecard_response = self.client.get(f'/api/automation/runs/{run_id}/scorecard', headers=self.headers)
+        scorecards = {row['check_id']: row for row in scorecard_response.get_json()['scorecard']}
+        self.assertEqual(scorecards['custom:memory_quality']['status'], 'pass')
+        self.assertEqual(scorecards['custom:scene_state']['status'], 'warn')
+
+    def test_canceled_in_flight_auditor_does_not_complete_cycle(self):
+        scorecard_id = self.client.post(
+            '/api/automation/scorecards',
+            headers=self.headers,
+            json={
+                'name': 'Cancelable Auditor Scorecard',
+                'criteria': [{'id': 'memory_quality', 'label': 'Memory Quality'}],
+            },
+        ).get_json()['scorecard']['id']
+        scenario_id = self.client.post(
+            '/api/automation/scenarios',
+            headers=self.headers,
+            json={
+                'source_campaign_id': self.campaign_id,
+                'scorecard_template_id': scorecard_id,
+                'runner_config': {
+                    'audit_pause_phases': ['after_dm'],
+                    'auditor_config': {'mode': 'built_in', 'count': 1, 'auto_continue': False},
+                },
+            },
+        ).get_json()['scenario']['id']
+        snapshot_id = self.client.post(
+            f'/api/automation/scenarios/{scenario_id}/snapshots',
+            headers=self.headers,
+            json={},
+        ).get_json()['snapshot']['id']
+        run_id = self.client.post(
+            f'/api/automation/scenarios/{scenario_id}/runs',
+            headers=self.headers,
+            json={'snapshot_id': snapshot_id},
+        ).get_json()['run']['id']
+        claim = self.client.post(
+            f'/api/automation/runs/{run_id}/claim',
+            headers=self.headers,
+            json={'worker_id': 'worker-a'},
+        ).get_json()
+        cycle_id = self.client.post(
+            f'/api/automation/runs/{run_id}/pause',
+            headers=self.headers,
+            json={
+                'worker_id': 'worker-a',
+                'lease_token': claim['lease_token'],
+                'phase': 'after_dm',
+                'summary': 'Pause after DM turn',
+            },
+        ).get_json()['audit_cycle']['id']
+
+        def fake_auditor_decision(run, cycle, job, config, **_kwargs):
+            from services.automation_service import persist_provider_call
+
+            provider_call, _created = persist_provider_call(run, {
+                'dedupe_key': f'auditor:{cycle.id}:slot:{job.auditor_slot}',
+                'phase': 'auditor_decision',
+                'prompt_version_id': 'test',
+                'provider': 'opencode_go',
+                'model': 'deepseek-v4-flash',
+                'request': {'messages': []},
+                'response': {'id': 'test-response'},
+                'parsed_output': {'overall_status': 'pass'},
+                'response_text': '{"overall_status":"pass"}',
+            })
+            job.status = 'canceled'
+            job.finished_at = datetime.utcnow()
+            db.session.commit()
+            return {
+                'provider': 'opencode_go',
+                'model': 'deepseek-v4-flash',
+                'provider_call': provider_call,
+                'tool_call_count': 1,
+                'tool_trace': [{'tool_name': 'get_run_status'}],
+                'scorecard': {
+                    'overall_status': 'pass',
+                    'overall_summary': 'Would have passed.',
+                    'criteria': [
+                        {'criterion_id': 'memory_quality', 'status': 'pass', 'summary': 'Stable.', 'evidence': 'Run status.'},
+                    ],
+                    'tool_calls_used': ['get_run_status'],
+                    'unresolved_evidence_gaps': [],
+                },
+            }
+
+        with patch('services.automation_auditor.request_auditor_decision_with_tools', side_effect=fake_auditor_decision):
+            response = self.client.post(
+                f'/api/automation/runs/{run_id}/auditors/start',
+                headers=self.headers,
+                json={'sync': True},
+            )
+        self.assertEqual(response.status_code, 200)
+        payload = response.get_json()
+        self.assertFalse(payload['completed'])
+        self.assertEqual(payload['run']['status'], 'awaiting_audit')
+
+        with app.app_context():
+            cycle = db.session.get(AutomationRunAuditCycle, cycle_id)
+            job = AutomationRunAuditorJob.query.filter_by(run_id=run_id, cycle_id=cycle_id).one()
+            self.assertEqual(cycle.status, 'pending')
+            self.assertEqual(job.status, 'canceled')
+            self.assertIsNotNone(job.provider_call_id)
+            self.assertEqual(job.tool_call_count, 1)
+
+    def test_multi_auditor_aggregation_uses_worst_status_per_criterion(self):
+        scorecard_id = self.client.post(
+            '/api/automation/scorecards',
+            headers=self.headers,
+            json={
+                'name': 'Multi Auditor Scorecard',
+                'criteria': [{'id': 'memory_quality', 'label': 'Memory Quality'}],
+            },
+        ).get_json()['scorecard']['id']
+        scenario_id = self.client.post(
+            '/api/automation/scenarios',
+            headers=self.headers,
+            json={'source_campaign_id': self.campaign_id, 'scorecard_template_id': scorecard_id},
+        ).get_json()['scenario']['id']
+        snapshot_id = self.client.post(
+            f'/api/automation/scenarios/{scenario_id}/snapshots',
+            headers=self.headers,
+            json={},
+        ).get_json()['snapshot']['id']
+        run_id = self.client.post(
+            f'/api/automation/scenarios/{scenario_id}/runs',
+            headers=self.headers,
+            json={'snapshot_id': snapshot_id},
+        ).get_json()['run']['id']
+        claim = self.client.post(
+            f'/api/automation/runs/{run_id}/claim',
+            headers=self.headers,
+            json={'worker_id': 'worker-a'},
+        ).get_json()
+        cycle_id = self.client.post(
+            f'/api/automation/runs/{run_id}/pause',
+            headers=self.headers,
+            json={
+                'worker_id': 'worker-a',
+                'lease_token': claim['lease_token'],
+                'phase': 'after_dm',
+            },
+        ).get_json()['audit_cycle']['id']
+
+        with app.app_context():
+            run = db.session.get(AutomationRun, run_id)
+            cycle = db.session.get(AutomationRunAuditCycle, cycle_id)
+            jobs = [
+                AutomationRunAuditorJob(
+                    run_id=run_id,
+                    cycle_id=cycle_id,
+                    auditor_slot=1,
+                    status='completed',
+                    submitted_scorecard_json={
+                        'overall_status': 'pass',
+                        'overall_summary': 'Looks good.',
+                        'criteria': [{'criterion_id': 'memory_quality', 'status': 'pass', 'summary': 'Stable.', 'evidence': 'Transcript.'}],
+                        'tool_calls_used': ['get_transcript'],
+                    },
+                ),
+                AutomationRunAuditorJob(
+                    run_id=run_id,
+                    cycle_id=cycle_id,
+                    auditor_slot=2,
+                    status='completed',
+                    submitted_scorecard_json={
+                        'overall_status': 'warn',
+                        'overall_summary': 'One gap.',
+                        'criteria': [{'criterion_id': 'memory_quality', 'status': 'warn', 'summary': 'Missing clock evidence.', 'evidence': 'Clock table.'}],
+                        'tool_calls_used': ['get_clocks'],
+                        'unresolved_evidence_gaps': ['No provider-call replay checked.'],
+                    },
+                ),
+            ]
+            db.session.add_all(jobs)
+            db.session.commit()
+
+            aggregate = aggregate_completed_auditor_jobs(run, cycle, jobs)
+            self.assertEqual(aggregate['overall_status'], 'warn')
+            self.assertEqual(aggregate['criteria'][0]['status'], 'warn')
+            self.assertEqual(aggregate['tool_calls_used'], ['get_clocks', 'get_transcript'])
+            self.assertEqual(aggregate['unresolved_evidence_gaps'], ['No provider-call replay checked.'])
+
+    def test_custom_scorecard_not_assessed_does_not_count_as_pass(self):
+        scorecard_id = self.client.post(
+            '/api/automation/scorecards',
+            headers=self.headers,
+            json={
+                'name': 'Scoped Audit Scorecard',
+                'criteria': [{'id': 'retrieval_relevance', 'label': 'Retrieval Relevance'}],
+            },
+        ).get_json()['scorecard']['id']
+        scenario_id = self.client.post(
+            '/api/automation/scenarios',
+            headers=self.headers,
+            json={'source_campaign_id': self.campaign_id, 'scorecard_template_id': scorecard_id},
+        ).get_json()['scenario']['id']
+        snapshot_id = self.client.post(
+            f'/api/automation/scenarios/{scenario_id}/snapshots',
+            headers=self.headers,
+            json={},
+        ).get_json()['snapshot']['id']
+        run_id = self.client.post(
+            f'/api/automation/scenarios/{scenario_id}/runs',
+            headers=self.headers,
+            json={'snapshot_id': snapshot_id},
+        ).get_json()['run']['id']
+        claim = self.client.post(
+            f'/api/automation/runs/{run_id}/claim',
+            headers=self.headers,
+            json={'worker_id': 'worker-a'},
+        ).get_json()
+        cycle_id = self.client.post(
+            f'/api/automation/runs/{run_id}/pause',
+            headers=self.headers,
+            json={
+                'worker_id': 'worker-a',
+                'lease_token': claim['lease_token'],
+                'phase': 'after_dm',
+                'summary': 'Pause after DM turn',
+            },
+        ).get_json()['audit_cycle']['id']
+
+        audit_response = self.client.post(
+            f'/api/automation/runs/{run_id}/audit-cycles/{cycle_id}/audit',
+            headers=self.headers,
+            json={
+                'summary': 'Retrieval was not exercised this cycle.',
+                'scorecard': {
+                    'overall_status': 'pass',
+                    'overall_summary': 'No retrieval happened.',
+                    'criteria': [
+                        {'criterion_id': 'retrieval_relevance', 'status': 'not_assessed', 'summary': 'No retrieval query occurred.'},
+                    ],
+                },
+            },
+        )
+        self.assertEqual(audit_response.status_code, 200)
+
+        scorecard_response = self.client.get(f'/api/automation/runs/{run_id}/scorecard', headers=self.headers)
+        self.assertEqual(scorecard_response.status_code, 200)
+        payload = scorecard_response.get_json()
+        scorecards = {row['check_id']: row for row in payload['scorecard']}
+        self.assertEqual(scorecards['custom:retrieval_relevance']['status'], 'not_assessed')
+        self.assertEqual(scorecards['custom:retrieval_relevance']['details']['exercised_cycle_count'], 0)
+        self.assertEqual(scorecards['custom:retrieval_relevance']['details']['not_assessed_cycle_count'], 1)
+
+        with app.app_context():
+            cycle = db.session.get(AutomationRunAuditCycle, cycle_id)
+            self.assertEqual(cycle.scorecard_summary_json['overall_status'], 'not_assessed')
+            self.assertEqual(cycle.scorecard_summary_json['criteria_assessed_count'], 0)
+            self.assertEqual(cycle.scorecard_summary_json['criteria_not_assessed_count'], 1)
+
+    def test_auditor_tool_loop_executes_tool_and_persists_artifact(self):
+        scorecard_id = self.client.post(
+            '/api/automation/scorecards',
+            headers=self.headers,
+            json={
+                'name': 'Tool Loop Scorecard',
+                'criteria': [{'id': 'memory_quality', 'label': 'Memory Quality'}],
+            },
+        ).get_json()['scorecard']['id']
+        scenario_id = self.client.post(
+            '/api/automation/scenarios',
+            headers=self.headers,
+            json={
+                'source_campaign_id': self.campaign_id,
+                'scorecard_template_id': scorecard_id,
+            },
+        ).get_json()['scenario']['id']
+        snapshot_id = self.client.post(
+            f'/api/automation/scenarios/{scenario_id}/snapshots',
+            headers=self.headers,
+            json={},
+        ).get_json()['snapshot']['id']
+        run_id = self.client.post(
+            f'/api/automation/scenarios/{scenario_id}/runs',
+            headers=self.headers,
+            json={'snapshot_id': snapshot_id},
+        ).get_json()['run']['id']
+        claim = self.client.post(
+            f'/api/automation/runs/{run_id}/claim',
+            headers=self.headers,
+            json={'worker_id': 'worker-a'},
+        ).get_json()
+        cycle_id = self.client.post(
+            f'/api/automation/runs/{run_id}/pause',
+            headers=self.headers,
+            json={
+                'worker_id': 'worker-a',
+                'lease_token': claim['lease_token'],
+                'phase': 'after_dm',
+            },
+        ).get_json()['audit_cycle']['id']
+
+        tool_response = {
+            'id': 'resp-tool',
+            'choices': [{
+                'message': {
+                    'content': '',
+                    'tool_calls': [{
+                        'id': 'call_1',
+                        'function': {'name': 'get_run_status', 'arguments': '{}'},
+                    }],
+                },
+                'finish_reason': 'tool_calls',
+            }],
+            'usage': {'prompt_tokens': 10, 'completion_tokens': 5, 'total_tokens': 15},
+        }
+        final_response = {
+            'id': 'resp-final',
+            'choices': [{
+                'message': {
+                    'content': json.dumps({
+                        'overall_status': 'pass',
+                        'overall_summary': 'Tool-backed audit passed.',
+                        'criteria': [{
+                            'criterion_id': 'memory_quality',
+                            'status': 'pass',
+                            'summary': 'Memory evidence was available.',
+                            'evidence': 'get_run_status returned the current audit cycle.',
+                        }],
+                        'tool_calls_used': ['get_run_status'],
+                        'unresolved_evidence_gaps': [],
+                    }),
+                },
+                'finish_reason': 'stop',
+            }],
+            'usage': {'prompt_tokens': 20, 'completion_tokens': 10, 'total_tokens': 30},
+        }
+
+        with app.app_context():
+            run = db.session.get(AutomationRun, run_id)
+            cycle = db.session.get(AutomationRunAuditCycle, cycle_id)
+            job = AutomationRunAuditorJob(run_id=run_id, cycle_id=cycle_id, auditor_slot=1, status='queued')
+            db.session.add(job)
+            db.session.commit()
+
+            with patch('services.automation_auditor._post_chat_response', side_effect=[tool_response, final_response]):
+                result = request_auditor_decision_with_tools(
+                    run,
+                    cycle,
+                    job,
+                    {'mode': 'built_in', 'count': 1, 'model': 'opencode-go/deepseek-v4-flash'},
+                )
+
+            self.assertEqual(result['tool_call_count'], 1)
+            self.assertEqual(result['tool_trace'][0]['tool_name'], 'get_run_status')
+            self.assertEqual(result['scorecard']['overall_status'], 'pass')
+            provider_call = result['provider_call']
+            self.assertEqual(provider_call.phase, 'auditor_decision')
+            self.assertEqual(provider_call.parsed_output_json['tool_calls_used'], ['get_run_status'])
+            self.assertEqual(provider_call.usage_total_tokens, 45)
 
 
 if __name__ == '__main__':

@@ -5,7 +5,9 @@ import {
   getAutomationRun,
   getAutomationRunProviderCalls,
   getAutomationRunStreamUrl,
+  startAutomationRunAuditors,
   stopAutomationRun,
+  stopAutomationRunAuditors,
   submitAutomationRunAudit,
 } from '../api/client'
 import Loading from '../components/common/Loading'
@@ -60,6 +62,10 @@ function applyRunEvent(previous, payload) {
     next.current_audit_cycle = payload.delta.current_audit_cycle || null
   }
 
+  if (payload.delta?.auditor_jobs) {
+    next.auditor_jobs = payload.delta.auditor_jobs
+  }
+
   if (payload.scorecard_template) next.scorecard_template = payload.scorecard_template
 
   return next
@@ -103,9 +109,11 @@ export default function AutomationRunPage() {
   const [stopping, setStopping] = useState(false)
   const [continuing, setContinuing] = useState(false)
   const [savingAudit, setSavingAudit] = useState(false)
+  const [startingAuditors, setStartingAuditors] = useState(false)
+  const [stoppingAuditors, setStoppingAuditors] = useState(false)
   const [auditSummary, setAuditSummary] = useState('')
   const [auditNotes, setAuditNotes] = useState('')
-  const [overallStatus, setOverallStatus] = useState('pass')
+  const [overallStatus, setOverallStatus] = useState('not_assessed')
   const [overallSummary, setOverallSummary] = useState('')
   const [criteriaDrafts, setCriteriaDrafts] = useState([])
 
@@ -156,14 +164,14 @@ export default function AutomationRunPage() {
     if (!cycle) {
       setAuditSummary('')
       setAuditNotes('')
-      setOverallStatus('pass')
+      setOverallStatus('not_assessed')
       setOverallSummary('')
       setCriteriaDrafts([])
       return
     }
     setAuditSummary(cycle.summary || '')
     setAuditNotes(cycle.notes || '')
-    setOverallStatus(cycle.scorecard_summary?.overall_status || 'pass')
+    setOverallStatus(cycle.scorecard_summary?.overall_status || 'not_assessed')
     setOverallSummary(cycle.scorecard_summary?.overall_summary || '')
     const existing = new Map((cycle.scorecard?.criteria || []).map((item) => [item.criterion_id, item]))
     setCriteriaDrafts((template.criteria || []).map((criterion) => {
@@ -172,7 +180,7 @@ export default function AutomationRunPage() {
         criterion_id: criterion.id,
         label: criterion.label || criterion.id,
         description: criterion.description || '',
-        status: previous.status || 'pass',
+        status: previous.status || 'not_assessed',
         summary: previous.summary || '',
         evidence: previous.evidence || '',
       }
@@ -243,6 +251,42 @@ export default function AutomationRunPage() {
     }
   }
 
+  const handleStartAuditors = async () => {
+    setStartingAuditors(true)
+    try {
+      const payload = await startAutomationRunAuditors(runId)
+      setData((previous) => previous ? {
+        ...previous,
+        run: payload.run || previous.run,
+        auditor_jobs: payload.auditor_jobs || previous.auditor_jobs || [],
+        current_audit_cycle: payload.audit_cycle || previous.current_audit_cycle,
+        scorecard: payload.scorecard || previous.scorecard,
+      } : previous)
+      setError('')
+    } catch (err) {
+      setError(err.message)
+    } finally {
+      setStartingAuditors(false)
+    }
+  }
+
+  const handleStopAuditors = async () => {
+    setStoppingAuditors(true)
+    try {
+      const payload = await stopAutomationRunAuditors(runId)
+      setData((previous) => previous ? {
+        ...previous,
+        run: payload.run || previous.run,
+        auditor_jobs: payload.auditor_jobs || previous.auditor_jobs || [],
+      } : previous)
+      setError('')
+    } catch (err) {
+      setError(err.message)
+    } finally {
+      setStoppingAuditors(false)
+    }
+  }
+
   if (loading) return <Loading message="Loading run..." />
   if (!data?.run) return <ErrorMessage message={error || 'Run not found.'} />
 
@@ -255,7 +299,13 @@ export default function AutomationRunPage() {
   const incidents = data.incidents || run.scorecard_summary?.incidents || []
   const encounterMap = data.encounter_map
   const auditCycles = data.audit_cycles || []
+  const auditorJobs = data.auditor_jobs || []
   const currentAuditCycle = data.current_audit_cycle
+  const auditorConfig = run.runner_config?.auditor_config || {}
+  const currentAuditorJobs = currentAuditCycle
+    ? auditorJobs.filter((job) => job.cycle_id === currentAuditCycle.id)
+    : []
+  const canStartBuiltInAuditors = run.status === 'awaiting_audit' && currentAuditCycle && auditorConfig.mode === 'built_in'
   const scorecardTemplate = data.scorecard_template || {}
   const compareLink = scenario ? `/automation/scenarios/${scenario.id}` : '/automation'
   const canStop = ['queued', 'claimed', 'running', 'awaiting_audit'].includes(run.status)
@@ -380,8 +430,26 @@ export default function AutomationRunPage() {
                 <section className="automation-panel">
                   <div className="automation-section-header">
                     <h2>Audit Gate</h2>
-                    <span>{run.status === 'awaiting_audit' ? 'Paused for manual audit' : 'Live or finished'}</span>
+                    <span>{run.status === 'awaiting_audit' ? 'Paused for audit' : 'Live or finished'}</span>
                   </div>
+                  <div className="automation-meta-grid">
+                    <div><strong>Auditor mode</strong><span>{auditorConfig.mode || 'manual'}</span></div>
+                    <div><strong>Auditor model</strong><span>{auditorConfig.model || 'Default app model'}</span></div>
+                    <div><strong>Auditor count</strong><span>{auditorConfig.count || 1}</span></div>
+                    <div><strong>Auto-continue</strong><span>{auditorConfig.auto_continue ? 'Yes' : 'No'}</span></div>
+                  </div>
+                  {canStartBuiltInAuditors && (
+                    <div className="automation-inline-actions" style={{ marginTop: '14px' }}>
+                      <button className="btn btn-primary" type="button" onClick={handleStartAuditors} disabled={startingAuditors}>
+                        {startingAuditors ? 'Starting Auditors…' : 'Run Built-In Auditors'}
+                      </button>
+                      {currentAuditorJobs.some((job) => ['queued', 'running'].includes(job.status)) && (
+                        <button className="btn btn-secondary" type="button" onClick={handleStopAuditors} disabled={stoppingAuditors}>
+                          {stoppingAuditors ? 'Stopping…' : 'Stop Auditors'}
+                        </button>
+                      )}
+                    </div>
+                  )}
                   {currentAuditCycle ? (
                     <div className="automation-form">
                       <div className="automation-meta-grid">
@@ -403,6 +471,7 @@ export default function AutomationRunPage() {
                           <option value="pass">pass</option>
                           <option value="warn">warn</option>
                           <option value="fail">fail</option>
+                          <option value="not_assessed">not_assessed</option>
                         </select>
                       </label>
                       <label>
@@ -424,6 +493,7 @@ export default function AutomationRunPage() {
                                     <option value="pass">pass</option>
                                     <option value="warn">warn</option>
                                     <option value="fail">fail</option>
+                                    <option value="not_assessed">not_assessed</option>
                                   </select>
                                 </label>
                                 <label>
@@ -450,6 +520,60 @@ export default function AutomationRunPage() {
                     </div>
                   ) : (
                     <div className="automation-empty">This run is not currently paused for manual audit.</div>
+                  )}
+                </section>
+
+                <section className="automation-panel">
+                  <h2>Built-In Auditor Jobs</h2>
+                  {auditorJobs.length === 0 ? (
+                    <div className="automation-empty">No built-in auditor jobs recorded for this run.</div>
+                  ) : (
+                    <div className="automation-events">
+                      {auditorJobs.map((job) => (
+                        <details key={job.id} className="automation-event">
+                          <summary>
+                            <strong>Cycle #{auditCycles.find((cycle) => cycle.id === job.cycle_id)?.cycle_number || job.cycle_id} · Auditor {job.auditor_slot}</strong>
+                            <span>{job.status} · {job.model || 'default model'} · {job.tool_call_count || 0} tools</span>
+                          </summary>
+                          {job.error_text && <ErrorMessage message={job.error_text} />}
+                          <div className="automation-meta-grid">
+                            <div><strong>Provider</strong><span>{job.provider || 'Unknown'}</span></div>
+                            <div><strong>Provider call</strong><span>{job.provider_call_id || 'None'}</span></div>
+                            <div><strong>Started</strong><span>{formatTime(job.started_at)}</span></div>
+                            <div><strong>Finished</strong><span>{formatTime(job.finished_at)}</span></div>
+                          </div>
+                          {job.submitted_scorecard?.overall_summary && (
+                            <p className="automation-subtitle">{job.submitted_scorecard.overall_summary}</p>
+                          )}
+                          {job.tool_trace?.length > 0 && (
+                            <div className="automation-tool-trace">
+                              <strong>Tool calls</strong>
+                              <ol>
+                                {job.tool_trace.map((toolCall, index) => (
+                                  <li key={`${job.id}-tool-${index}`}>
+                                    <code>{toolCall.tool_name || 'unknown_tool'}</code>
+                                    <pre className="llm-json-box">{JSON.stringify({
+                                      arguments: toolCall.arguments || {},
+                                      result: toolCall.result || {},
+                                    }, null, 2)}</pre>
+                                  </li>
+                                ))}
+                              </ol>
+                            </div>
+                          )}
+                          {job.submitted_scorecard?.unresolved_evidence_gaps?.length > 0 && (
+                            <div className="automation-scorecard-row status-warn">
+                              <div>
+                                <strong>Evidence gaps</strong>
+                                <span>{job.submitted_scorecard.unresolved_evidence_gaps.join(' | ')}</span>
+                              </div>
+                              <span>warn</span>
+                            </div>
+                          )}
+                          <pre className="llm-json-box">{JSON.stringify(job.submitted_scorecard || {}, null, 2)}</pre>
+                        </details>
+                      ))}
+                    </div>
                   )}
                 </section>
 

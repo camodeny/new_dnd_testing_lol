@@ -1,5 +1,6 @@
 from datetime import datetime
 import json
+import threading
 
 from flask import Blueprint, current_app, jsonify, request, stream_with_context
 
@@ -7,6 +8,7 @@ from auth import authenticate_request, token_required
 from models import (
     AutomationRun,
     AutomationRunAuditCycle,
+    AutomationRunAuditorJob,
     AutomationRunAuditResult,
     AutomationRunEvent,
     AutomationRunProviderCall,
@@ -21,6 +23,14 @@ from models import (
     SheetProposal,
     User,
     db,
+)
+from services.automation_auditor import (
+    cancel_auditor_jobs_for_current_cycle,
+    ensure_auditor_jobs_for_cycle,
+    list_auditor_jobs,
+    merge_auditor_config_into_runner_config,
+    normalize_auditor_config,
+    run_builtin_auditors_for_current_cycle,
 )
 from services.audit_service import log_audit_event
 from services.automation_service import (
@@ -111,7 +121,16 @@ def _run_viewer_permissions(current_user, run):
         'stop_run': can_manage,
         'submit_audit': can_manage,
         'continue_run': can_manage,
+        'manage_auditors': can_manage,
     }
+
+
+def _run_auditors_in_background(app, run_id):
+    with app.app_context():
+        try:
+            run_builtin_auditors_for_current_cycle(run_id)
+        except Exception:
+            current_app.logger.exception('Built-in automation auditor failed for run %s', run_id)
 
 
 def _workspace_payload(current_user):
@@ -380,7 +399,7 @@ def create_automation_scenario(current_user):
         scorecard_template_id=scorecard_template.id if scorecard_template else None,
         name=(data.get('name') or f'{campaign.name} benchmark').strip(),
         description=data.get('description'),
-        runner_config_json=data.get('runner_config') or {},
+        runner_config_json=merge_auditor_config_into_runner_config(data.get('runner_config') or {}),
         audit_config_json=data.get('audit_config') or {},
         retention_policy_json=data.get('retention_policy') or {},
         roster_json=scenario_roster_from_campaign(campaign),
@@ -428,7 +447,7 @@ def update_automation_scenario(current_user, scenario_id):
     if 'description' in data:
         scenario.description = data.get('description')
     if 'runner_config' in data:
-        scenario.runner_config_json = data.get('runner_config') or {}
+        scenario.runner_config_json = merge_auditor_config_into_runner_config(data.get('runner_config') or {})
     if 'audit_config' in data:
         scenario.audit_config_json = data.get('audit_config') or {}
     if 'retention_policy' in data:
@@ -471,6 +490,8 @@ def delete_automation_scenario(current_user, scenario_id):
         return jsonify({'error': 'Forbidden'}), 403
     run_ids = [run.id for run in AutomationRun.query.filter_by(scenario_id=scenario.id).all()]
     if run_ids:
+        AutomationRunAuditorJob.query.filter(AutomationRunAuditorJob.run_id.in_(run_ids)).delete(synchronize_session=False)
+        AutomationRunAuditCycle.query.filter(AutomationRunAuditCycle.run_id.in_(run_ids)).delete(synchronize_session=False)
         AutomationRunProviderCall.query.filter(AutomationRunProviderCall.run_id.in_(run_ids)).delete(synchronize_session=False)
         AutomationRunAuditResult.query.filter(AutomationRunAuditResult.run_id.in_(run_ids)).delete(synchronize_session=False)
         AutomationRunEvent.query.filter(AutomationRunEvent.run_id.in_(run_ids)).delete(synchronize_session=False)
@@ -575,10 +596,19 @@ def create_automation_run(current_user, scenario_id):
 
     matrix = data.get('matrix')
     if isinstance(matrix, list) and matrix:
-        group_id, runs = create_matrix_runs(scenario, snapshot, current_user, matrix)
+        normalized_matrix = []
+        for entry in matrix:
+            entry = entry if isinstance(entry, dict) else {}
+            normalized_matrix.append({
+                **entry,
+                'runner_config': merge_auditor_config_into_runner_config(entry.get('runner_config') or {}),
+            })
+        group_id, runs = create_matrix_runs(scenario, snapshot, current_user, normalized_matrix)
         return jsonify({'group_id': group_id, 'runs': [run.to_dict() for run in runs]}), 201
 
-    merged_runner_config = merged_runner_config_for_scenario(scenario, data.get('runner_config') or {})
+    merged_runner_config = merge_auditor_config_into_runner_config(
+        merged_runner_config_for_scenario(scenario, data.get('runner_config') or {})
+    )
     run = AutomationRun(
         scenario_id=scenario.id,
         snapshot_id=snapshot.id,
@@ -641,7 +671,17 @@ def stream_automation_run(run_id):
                     .order_by(SheetProposal.created_at.asc(), SheetProposal.id.asc())
                     .all()
                 ]
-            if row.event_type in {'audit_cycle_paused', 'audit_cycle_audited', 'audit_cycle_continued', 'run_scorecard_updated'}:
+            if row.event_type in {
+                'audit_cycle_paused',
+                'audit_cycle_audited',
+                'audit_cycle_continued',
+                'run_scorecard_updated',
+                'auditor_jobs_updated',
+                'auditor_job_started',
+                'auditor_job_completed',
+                'auditor_job_failed',
+                'auditor_target_cycles_reached',
+            }:
                 audit_cycles = [
                     cycle.to_dict()
                     for cycle in AutomationRunAuditCycle.query.filter_by(run_id=current_run.id)
@@ -650,6 +690,12 @@ def stream_automation_run(run_id):
                 ]
                 delta['audit_cycles'] = audit_cycles
                 delta['current_audit_cycle'] = next((cycle for cycle in audit_cycles if cycle['id'] == current_run.awaiting_audit_cycle_id), None)
+                delta['auditor_jobs'] = [
+                    job.to_dict()
+                    for job in AutomationRunAuditorJob.query.filter_by(run_id=current_run.id)
+                    .order_by(AutomationRunAuditorJob.cycle_id.asc(), AutomationRunAuditorJob.auditor_slot.asc(), AutomationRunAuditorJob.id.asc())
+                    .all()
+                ]
             if row.event_type == 'run_scorecard_updated':
                 delta['scorecard'] = payload.get('scorecard') or []
             yield sse_message({
@@ -848,6 +894,71 @@ def continue_automation_run(current_user, run_id):
         dedupe_key=data.get('dedupe_key') or f'audit_cycle_continued:{run.id}:{cycle.id if cycle else "none"}:{run.audit_resumed_at.isoformat() if run.audit_resumed_at else "now"}',
     )
     return jsonify({'run': run.to_dict(), 'audit_cycle': cycle.to_dict() if cycle else None}), 200
+
+
+@automation_bp.route('/api/automation/runs/<int:run_id>/auditors', methods=['GET'])
+@token_required
+def list_automation_run_auditors(current_user, run_id):
+    run = get_or_404(AutomationRun, run_id)
+    if not _run_visible_to_user(current_user, run):
+        return jsonify({'error': 'Forbidden'}), 403
+    cycle_id = request.args.get('cycle_id', type=int)
+    jobs = list_auditor_jobs(run.id, cycle_id)
+    return jsonify({'run': run.to_dict(), 'auditor_jobs': [job.to_dict() for job in jobs]}), 200
+
+
+@automation_bp.route('/api/automation/runs/<int:run_id>/auditors/start', methods=['POST'])
+@token_required
+def start_automation_run_auditors(current_user, run_id):
+    run = get_or_404(AutomationRun, run_id)
+    if not _run_owned_by_user(current_user, run):
+        return jsonify({'error': 'Forbidden'}), 403
+    if run.status != 'awaiting_audit' or not run.awaiting_audit_cycle_id:
+        return jsonify({'error': 'Run is not awaiting an audit cycle'}), 409
+
+    data = request.get_json(silent=True) or {}
+    config = dict(run.runner_config_json or {})
+    auditor_config = normalize_auditor_config({
+        **((config.get('auditor_config') or {}) if isinstance(config.get('auditor_config'), dict) else {}),
+        **((data.get('auditor_config') or {}) if isinstance(data.get('auditor_config'), dict) else {}),
+    })
+    if auditor_config.get('mode') != 'built_in':
+        auditor_config['mode'] = 'built_in'
+    config['auditor_config'] = auditor_config
+    run.runner_config_json = config
+    db.session.commit()
+
+    cycle = db.session.get(AutomationRunAuditCycle, run.awaiting_audit_cycle_id)
+    if cycle is None:
+        return jsonify({'error': 'Current audit cycle was not found'}), 409
+    jobs = ensure_auditor_jobs_for_cycle(run, cycle, auditor_config, rerun_failed=bool(data.get('rerun_failed')))
+    append_run_event(
+        run,
+        'auditor_jobs_updated',
+        {'auditor_jobs': [job.to_dict() for job in jobs], 'cycle_id': cycle.id},
+        dedupe_key=f'auditor_jobs_requested:{run.id}:{cycle.id}:{datetime.utcnow().isoformat()}',
+    )
+    if data.get('sync'):
+        try:
+            result = run_builtin_auditors_for_current_cycle(run.id, rerun_failed=bool(data.get('rerun_failed')))
+        except ValueError as exc:
+            return jsonify({'error': str(exc)}), 409
+        return jsonify(result), 200
+
+    app = current_app._get_current_object()
+    thread = threading.Thread(target=_run_auditors_in_background, args=(app, run.id), daemon=True)
+    thread.start()
+    return jsonify({'run': run.to_dict(), 'auditor_jobs': [job.to_dict() for job in jobs], 'started': True}), 202
+
+
+@automation_bp.route('/api/automation/runs/<int:run_id>/auditors/stop', methods=['POST'])
+@token_required
+def stop_automation_run_auditors(current_user, run_id):
+    run = get_or_404(AutomationRun, run_id)
+    if not _run_owned_by_user(current_user, run):
+        return jsonify({'error': 'Forbidden'}), 403
+    jobs = cancel_auditor_jobs_for_current_cycle(run)
+    return jsonify({'run': run.to_dict(), 'auditor_jobs': [job.to_dict() for job in jobs], 'stopped': True}), 200
 
 
 @automation_bp.route('/api/automation/runs/<int:run_id>/events', methods=['POST'])

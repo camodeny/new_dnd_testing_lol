@@ -587,6 +587,8 @@ def _post_chat_response(
     timeout_seconds=60,
     max_attempts=None,
     max_tokens=None,
+    provider=None,
+    model=None,
 ):
     audit_context = audit_context or {}
     campaign_id = audit_context.get('campaign_id')
@@ -596,8 +598,8 @@ def _post_chat_response(
     parent_trace_id = audit_context.get('parent_trace_id')
     trace_label = audit_context.get('trace_label') or f'{actor}: {operation}'
 
-    provider = get_llm_provider()
-    model = get_llm_model()
+    provider = provider or get_llm_provider()
+    model = model or get_llm_model()
     try:
         _require_llm_config(provider, model)
     except Exception as err:

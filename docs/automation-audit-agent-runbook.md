@@ -113,6 +113,34 @@ JSON
   --pretty
 ```
 
+## Built-In Tool-Calling Auditors
+
+The app can run built-in auditors at audit gates without launching external `opencode run` processes. Built-in auditors use the app provider stack and a dedicated read-only auditor tool registry. They can inspect transcript, `campaign_audit_events`, persisted world state, clocks, NPCs, characters, provider calls, run events, snapshots, and scorecard templates.
+
+The built-in path now starts from a compact cycle evidence packet and uses targeted drill-down tools for specific audit events, provider calls, and run events. Raw truth is still reachable, but the default loop avoids replaying giant JSON blobs unless the auditor explicitly asks for them. Detail tools now also support exact field-path selection for event payloads, provider artifacts, and snapshot data when the auditor only needs a few concrete facts.
+
+To queue a run for built-in auditors, set `runner_config.auditor_config.mode` to `built_in` and make sure the run pauses at `after_dm`.
+
+```json
+{
+  "runner_config": {
+    "audit_pause_phases": ["after_dm"],
+    "auditor_config": {
+      "mode": "built_in",
+      "model": "opencode-go/deepseek-v4-flash",
+      "count": 1,
+      "auto_continue": false,
+      "target_cycles": 3,
+      "required_tools": "runtime_truth_full"
+    }
+  }
+}
+```
+
+When the run reaches `awaiting_audit`, use the Automation Run page's **Run Built-In Auditors** button. The app records auditor jobs, tool-call traces, provider artifacts with phase `auditor_decision`, and the aggregated cycle scorecard.
+
+External smarter auditors are still supported. Use the CLI loop below when you want another agent or model to inspect the same runtime truth and submit feedback through `automationctl run audit`.
+
 ## Snapshot and Run
 
 ### Capture a snapshot

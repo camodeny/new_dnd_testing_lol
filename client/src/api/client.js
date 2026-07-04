@@ -207,6 +207,19 @@ export function submitAutomationRunAudit(runId, cycleId, payload) {
   return apiFetch(`/automation/runs/${runId}/audit-cycles/${cycleId}/audit`, { method: 'POST', body: JSON.stringify(payload) })
 }
 
+export function listAutomationRunAuditors(runId, cycleId) {
+  const query = cycleId ? `?cycle_id=${encodeURIComponent(cycleId)}` : ''
+  return apiFetch(`/automation/runs/${runId}/auditors${query}`)
+}
+
+export function startAutomationRunAuditors(runId, payload = {}) {
+  return apiFetch(`/automation/runs/${runId}/auditors/start`, { method: 'POST', body: JSON.stringify(payload) })
+}
+
+export function stopAutomationRunAuditors(runId) {
+  return apiFetch(`/automation/runs/${runId}/auditors/stop`, { method: 'POST', body: JSON.stringify({}) })
+}
+
 export function getAutomationRunScorecard(runId) {
   return apiFetch(`/automation/runs/${runId}/scorecard`)
 }

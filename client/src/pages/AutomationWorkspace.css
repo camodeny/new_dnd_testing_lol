@@ -186,6 +186,27 @@
   letter-spacing: 0.5px;
 }
 
+.automation-form .automation-checkbox-label {
+  flex-direction: row;
+  align-items: center;
+}
+
+.automation-form .automation-checkbox-label input {
+  width: auto;
+}
+
+.automation-tool-trace {
+  margin-top: 12px;
+}
+
+.automation-tool-trace ol {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+  margin: 8px 0 0;
+  padding-left: 22px;
+}
+
 .automation-form input,
 .automation-form select,
 .automation-form textarea {
@@ -433,6 +454,17 @@
   color: var(--color-accent);
   background: rgba(197, 168, 128, 0.12);
   border: 1px solid rgba(197, 168, 128, 0.25);
+}
+
+.status-not_assessed, .status-not-assessed {
+  border-color: rgba(129, 141, 165, 0.25);
+  background: rgba(129, 141, 165, 0.05);
+}
+
+.status-not_assessed > span:last-child, .status-not-assessed > span:last-child {
+  color: var(--text-muted);
+  background: rgba(129, 141, 165, 0.12);
+  border: 1px solid rgba(129, 141, 165, 0.25);
 }
 
 /* Compare Row & Table */

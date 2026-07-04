@@ -24,6 +24,11 @@ export default function AutomationScenarioPage() {
   const [cleaningUp, setCleaningUp] = useState(false)
   const [selectedSnapshotId, setSelectedSnapshotId] = useState('')
   const [matrixModels, setMatrixModels] = useState('')
+  const [auditorMode, setAuditorMode] = useState('manual')
+  const [auditorModel, setAuditorModel] = useState('')
+  const [auditorCount, setAuditorCount] = useState(1)
+  const [auditorAutoContinue, setAuditorAutoContinue] = useState(false)
+  const [auditorTargetCycles, setAuditorTargetCycles] = useState('')
   const [autoCaptureAttempted, setAutoCaptureAttempted] = useState(false)
   const [selectedRunIds, setSelectedRunIds] = useState([])
 
@@ -94,6 +99,22 @@ export default function AutomationScenarioPage() {
     }
   }
 
+  const buildRunnerConfig = (overrides = {}) => {
+    const config = { ...overrides }
+    config.auditor_config = {
+      mode: auditorMode,
+      model: auditorModel.trim() || undefined,
+      count: Number(auditorCount) || 1,
+      auto_continue: auditorAutoContinue,
+      target_cycles: auditorTargetCycles ? Number(auditorTargetCycles) : undefined,
+      required_tools: 'runtime_truth_full',
+    }
+    if (auditorMode === 'built_in' || auditorMode === 'external') {
+      config.audit_pause_phases = ['after_dm']
+    }
+    return config
+  }
+
   const handleQueueRun = async () => {
     if (!selectedSnapshotId) {
       setError('Choose a snapshot first.')
@@ -101,7 +122,10 @@ export default function AutomationScenarioPage() {
     }
     setCreatingRun(true)
     try {
-      const result = await createAutomationRun(scenarioId, { snapshot_id: Number(selectedSnapshotId) })
+      const result = await createAutomationRun(scenarioId, {
+        snapshot_id: Number(selectedSnapshotId),
+        runner_config: buildRunnerConfig(),
+      })
       navigate(`/automation/runs/${result.run.id}`)
     } catch (err) {
       setError(err.message)
@@ -126,7 +150,7 @@ export default function AutomationScenarioPage() {
         snapshot_id: Number(selectedSnapshotId),
         matrix: models.map((model) => ({
           label: model,
-          runner_config: { model },
+          runner_config: buildRunnerConfig({ model }),
         })),
       })
       const newestRun = result.runs?.[0]
@@ -217,6 +241,51 @@ export default function AutomationScenarioPage() {
             <button className="btn btn-primary" type="button" onClick={handleQueueRun} disabled={creatingRun}>
               {creatingRun ? 'Queueing…' : 'Queue Run'}
             </button>
+            <label>
+              Auditor mode
+              <select value={auditorMode} onChange={(event) => setAuditorMode(event.target.value)}>
+                <option value="manual">Manual audit gate</option>
+                <option value="built_in">Built-in tool-calling auditors</option>
+                <option value="external">External CLI/API auditors</option>
+              </select>
+            </label>
+            <label>
+              Auditor model
+              <input
+                value={auditorModel}
+                onChange={(event) => setAuditorModel(event.target.value)}
+                placeholder="optional, e.g. opencode-go/deepseek-v4-flash"
+              />
+            </label>
+            <label>
+              Built-in auditor count
+              <input
+                type="number"
+                min="1"
+                max="8"
+                value={auditorCount}
+                onChange={(event) => setAuditorCount(event.target.value)}
+              />
+            </label>
+            <label>
+              Target audited cycles
+              <input
+                type="number"
+                min="1"
+                max="100"
+                value={auditorTargetCycles}
+                onChange={(event) => setAuditorTargetCycles(event.target.value)}
+                placeholder="optional"
+              />
+            </label>
+            <label className="automation-checkbox-label">
+              <input
+                type="checkbox"
+                checked={auditorAutoContinue}
+                onChange={(event) => setAuditorAutoContinue(event.target.checked)}
+              />
+              Auto-continue after built-in audits
+            </label>
             <label>
               Model matrix
               <input
