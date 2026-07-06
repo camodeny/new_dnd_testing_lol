@@ -32,6 +32,7 @@ from models import (
     EncounterMapPlacement,
     LLMPlayer,
     PlanningBondProposal,
+    SessionDmTurn,
     SessionMessage,
     SheetProposal,
     User,
@@ -804,6 +805,76 @@ class AppRouteTest(unittest.TestCase):
         self.assertEqual(dm_status['post_turn_status'], 'complete')
         self.assertEqual(dm_status['memory_status'], 'complete')
         self.assertEqual(dm_status['clock_status'], 'complete')
+
+    def test_dm_turn_status_includes_first_class_timing_fields(self):
+        with app.app_context():
+            owner = User(username='owner-turn-timing', email='owner-turn-timing@example.com')
+            owner.set_password('password')
+            db.session.add(owner)
+            db.session.commit()
+
+            campaign = Campaign(name='Timed Turn Table', user_id=owner.id)
+            db.session.add(campaign)
+            db.session.commit()
+            db.session.add(CampaignMember(campaign_id=campaign.id, user_id=owner.id, role='player'))
+            session = CampaignSession(campaign_id=campaign.id, is_active=True)
+            db.session.add(session)
+            db.session.flush()
+            player_message = SessionMessage(session_id=session.id, user_id=owner.id, role='player', content='I wait.')
+            dm_message = SessionMessage(session_id=session.id, role='dm', content='The wind answers.')
+            db.session.add_all([player_message, dm_message])
+            db.session.flush()
+
+            started_at = datetime(2026, 7, 4, 12, 0, 0)
+            visible_completed_at = started_at + timedelta(seconds=2)
+            finished_at = started_at + timedelta(seconds=5)
+            db.session.add(CampaignAuditEvent(
+                campaign_id=campaign.id,
+                event_type='dm_output_stored',
+                source='session_messages',
+                actor='session_dm',
+                trace_id=f'session_dm:session_{session.id}:message_{player_message.id}',
+                summary='Stored visible session DM response.',
+                payload=json.dumps({
+                    'session_id': session.id,
+                    'player_message_id': player_message.id,
+                    'dm_message_id': dm_message.id,
+                }),
+            ))
+            db.session.add(SessionDmTurn(
+                campaign_id=campaign.id,
+                session_id=session.id,
+                player_message_id=player_message.id,
+                dm_message_id=dm_message.id,
+                trace_id=f'session_dm:session_{session.id}:message_{player_message.id}',
+                status='speak',
+                post_turn_status='complete',
+                memory_status='complete',
+                clock_status='complete',
+                started_at=started_at,
+                visible_completed_at=visible_completed_at,
+                finished_at=finished_at,
+                generation_duration_ms=2000,
+                full_duration_ms=5000,
+            ))
+            db.session.commit()
+
+            session_id = session.id
+            player_message_id = player_message.id
+            owner_token = generate_token(owner.id)
+
+        dm_status_response = self.client.get(
+            f'/api/sessions/{session_id}/dm-turn-status?after_message_id={player_message_id}',
+            headers={'Authorization': f'Bearer {owner_token}'},
+        )
+        self.assertEqual(dm_status_response.status_code, 200)
+        dm_status = dm_status_response.get_json()
+        self.assertEqual(dm_status['started_at'], started_at.isoformat())
+        self.assertEqual(dm_status['visible_completed_at'], visible_completed_at.isoformat())
+        self.assertEqual(dm_status['finished_at'], finished_at.isoformat())
+        self.assertEqual(dm_status['generation_duration_ms'], 2000)
+        self.assertEqual(dm_status['full_duration_ms'], 5000)
+        self.assertEqual(dm_status['status'], 'speak')
 
     def test_dm_turn_status_returns_pending_when_no_decision_recorded(self):
         with app.app_context():

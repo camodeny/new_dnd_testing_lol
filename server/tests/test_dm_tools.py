@@ -24,6 +24,7 @@ from models import (
     CampaignMember,
     CampaignMonster,
     CampaignSession,
+    SessionDmTurn,
     CampaignWorld,
     Character,
     CharacterCondition,
@@ -48,6 +49,7 @@ from openrouter import (
     _session_dm_tool_result_for_prompt,
     _witness_private_leverage_spoiler_violation,
     build_session_dm_tool_messages,
+    get_session_memory_patch,
     get_session_dm_response_with_tools,
     normalize_session_dm_turn_decision,
 )
@@ -1274,6 +1276,237 @@ class DmToolsTest(unittest.TestCase):
             len(compact_memory['matches'][0]['memory']['true_inciting_incident']),
             223,
         )
+
+    def test_session_memory_patch_staged_resolves_canonical_ids_before_fact_write(self):
+        world = CampaignWorld.query.filter_by(campaign_id=self.campaign.id).first()
+        world.knowledge_graph = json.dumps({
+            'entities': [
+                {'id': 'hanging_switchyard', 'type': 'location', 'name': 'Hanging Switchyard', 'visibility': 'party_known'},
+            ],
+            'relations': [],
+            'facts': [
+                {
+                    'id': 'rona_signal_token',
+                    'entity_ids': ['deputy_rona'],
+                    'text': 'Deputy Rona controls the signal token.',
+                    'visibility': 'party_known',
+                }
+            ],
+        })
+        world.world_state = json.dumps({
+            'current_scene': {
+                'location_id': 'hanging_switchyard',
+                'location_name': 'Hanging Switchyard',
+                'active_npc_ids': ['deputy_rona'],
+                'immediate_tension': 'The yard is tense.',
+            }
+        })
+        db.session.add(NPCActor(
+            campaign_id=self.campaign.id,
+            actor_id='deputy_rona',
+            name='Deputy Rona',
+            role='deputy',
+            public_summary='A tired deputy watching the switchyard.',
+            dossier='{}',
+        ))
+        db.session.commit()
+
+        hot_context = build_session_hot_context(self.campaign, self.session, self.user)
+        memory_context = build_session_memory_context(
+            self.campaign,
+            self.session,
+            self.user,
+            'I ask who has the token now.',
+            'Deputy Rona keeps the signal token and refuses to hand it over.',
+            hot_context,
+        )
+
+        with patch('openrouter.SESSION_MEMORY_MODE', 'staged'), \
+                patch('openrouter.get_llm_provider', return_value='openrouter'), \
+                patch('openrouter._post_chat', side_effect=[
+                    json.dumps({
+                        'running_summary': 'At the Hanging Switchyard, Deputy Rona kept control of the signal token.',
+                        'scene_patch': {
+                            'location_name': 'Hanging Switchyard',
+                            'active_npc_ids': ['deputy_rona'],
+                            'immediate_tension': 'Rona refuses to surrender the token.',
+                        },
+                        'scene_reason': 'The exchange stayed focused on Rona at the switchyard.',
+                        'fact_claims': [
+                            {
+                                'text': 'Deputy Rona has the signal token.',
+                                'entity_refs': ['Deputy Rona'],
+                                'source_surface': 'visible_transcript',
+                                'intended_visibility': 'party_known',
+                                'certainty': 'confirmed',
+                                'importance': 3,
+                                'reason': 'The DM explicitly said Rona kept the token.',
+                                'expires_or_retire_condition': None,
+                                'memory_type': 'fact',
+                            }
+                        ],
+                    }),
+                    json.dumps({'create_clocks': [], 'retire_clocks': []}),
+                ]), \
+                patch('openrouter._post_chat_response', side_effect=[
+                    {
+                        'choices': [{
+                            'message': {
+                                'content': '',
+                                'tool_calls': [{
+                                    'id': 'tool_1',
+                                    'function': {
+                                        'name': 'get_entity_candidates',
+                                        'arguments': json.dumps({'query': 'Deputy Rona', 'entity_type': 'npc', 'limit': 5}),
+                                    },
+                                }],
+                            },
+                        }],
+                    },
+                    {
+                        'choices': [{
+                            'message': {
+                                'content': json.dumps({
+                                    'running_summary': 'At the Hanging Switchyard, Deputy Rona kept control of the signal token.',
+                                    'scene_patch': {
+                                        'location_name': 'Hanging Switchyard',
+                                        'active_npc_ids': ['deputy_rona'],
+                                        'immediate_tension': 'Rona refuses to surrender the token.',
+                                    },
+                                    'scene_reason': 'The exchange stayed focused on Rona at the switchyard.',
+                                    'upsert_graph_facts': [
+                                        {
+                                            'id': 'rona_signal_token',
+                                            'text': 'Deputy Rona has the signal token.',
+                                            'entity_ids': ['deputy_rona'],
+                                            'source_surface': 'visible_transcript',
+                                            'intended_visibility': 'party_known',
+                                            'certainty': 'confirmed',
+                                            'importance': 3,
+                                            'reason': 'The DM explicitly said Rona kept the token.',
+                                            'expires_or_retire_condition': None,
+                                            'memory_type': 'fact',
+                                        }
+                                    ],
+                                    'unresolved_items': [],
+                                    'evidence_basis': [{'surface': 'latest_dm_message', 'summary': 'Rona kept the token.'}],
+                                    'resolved_entity_refs': [{'label': 'Deputy Rona', 'entity_id': 'deputy_rona'}],
+                                    'resolved_location_refs': [{'label': 'Hanging Switchyard', 'location_id': 'hanging_switchyard'}],
+                                }),
+                            },
+                        }],
+                    },
+                ]):
+            patch_data = get_session_memory_patch(
+                memory_context,
+                audit_context={
+                    'campaign_id': self.campaign.id,
+                    'trace_id': 'memory_trace',
+                    'trace_label': 'session_memory_writer: test',
+                },
+            )
+
+        self.assertEqual(
+            patch_data['running_summary'],
+            'At the Hanging Switchyard, Deputy Rona kept control of the signal token.',
+        )
+        self.assertEqual(patch_data['scene_patch']['location_id'], 'hanging_switchyard')
+        self.assertEqual(patch_data['upsert_graph_facts'][0]['entity_ids'], ['deputy_rona'])
+        self.assertEqual(patch_data['upsert_graph_facts'][0]['id'], 'rona_signal_token')
+        self.assertEqual(patch_data['_telemetry']['mode'], 'staged_memory_writer')
+        self.assertEqual(patch_data['_telemetry']['staged_tool_call_count'], 1)
+
+    def test_session_memory_patch_staged_skips_unresolved_identity_fact(self):
+        world = CampaignWorld.query.filter_by(campaign_id=self.campaign.id).first()
+        world.knowledge_graph = json.dumps({
+            'entities': [
+                {'id': 'hanging_switchyard', 'type': 'location', 'name': 'Hanging Switchyard', 'visibility': 'party_known'},
+            ],
+            'relations': [],
+            'facts': [],
+        })
+        world.world_state = json.dumps({
+            'current_scene': {
+                'location_id': 'hanging_switchyard',
+                'location_name': 'Hanging Switchyard',
+            }
+        })
+        db.session.commit()
+
+        hot_context = build_session_hot_context(self.campaign, self.session, self.user)
+        memory_context = build_session_memory_context(
+            self.campaign,
+            self.session,
+            self.user,
+            'I ask who moved the crate.',
+            'A porter moved the crate before dawn, but no one names them.',
+            hot_context,
+        )
+
+        with patch('openrouter.SESSION_MEMORY_MODE', 'staged'), \
+                patch('openrouter.get_llm_provider', return_value='openrouter'), \
+                patch('openrouter._post_chat', side_effect=[
+                    json.dumps({
+                        'running_summary': 'Someone unnamed moved the crate before dawn at the Hanging Switchyard.',
+                        'scene_patch': {'location_name': 'Hanging Switchyard'},
+                        'scene_reason': 'The exchange remained at the switchyard.',
+                        'fact_claims': [
+                            {
+                                'text': 'The porter moved the crate before dawn.',
+                                'entity_refs': ['porter'],
+                                'source_surface': 'visible_transcript',
+                                'intended_visibility': 'party_known',
+                                'certainty': 'confirmed',
+                                'importance': 2,
+                                'reason': 'The DM stated the crate was moved.',
+                                'expires_or_retire_condition': None,
+                                'memory_type': 'fact',
+                            }
+                        ],
+                    }),
+                    json.dumps({'create_clocks': [], 'retire_clocks': []}),
+                ]), \
+                patch('openrouter._post_chat_response', return_value={
+                    'choices': [{
+                        'message': {
+                            'content': json.dumps({
+                                'running_summary': 'Someone unnamed moved the crate before dawn at the Hanging Switchyard.',
+                                'scene_patch': {'location_name': 'Hanging Switchyard'},
+                                'scene_reason': 'The exchange remained at the switchyard.',
+                                'upsert_graph_facts': [
+                                    {
+                                        'text': 'The porter moved the crate before dawn.',
+                                        'entity_ids': ['unknown_porter'],
+                                        'source_surface': 'visible_transcript',
+                                        'intended_visibility': 'party_known',
+                                        'certainty': 'confirmed',
+                                        'importance': 2,
+                                        'reason': 'The DM stated the crate was moved.',
+                                        'expires_or_retire_condition': None,
+                                        'memory_type': 'fact',
+                                    }
+                                ],
+                                'unresolved_items': [{'kind': 'entity', 'label': 'porter', 'reason': 'no_canonical_match'}],
+                                'evidence_basis': [{'surface': 'latest_dm_message', 'summary': 'An unnamed porter moved the crate.'}],
+                                'resolved_entity_refs': [],
+                                'resolved_location_refs': [{'label': 'Hanging Switchyard', 'location_id': 'hanging_switchyard'}],
+                            }),
+                        },
+                    }],
+                }):
+            patch_data = get_session_memory_patch(
+                memory_context,
+                audit_context={
+                    'campaign_id': self.campaign.id,
+                    'trace_id': 'memory_trace',
+                    'trace_label': 'session_memory_writer: test',
+                },
+            )
+
+        self.assertEqual(patch_data['upsert_graph_facts'], [])
+        self.assertEqual(patch_data['compile_summary']['skipped_fact_count'], 1)
+        self.assertEqual(patch_data['scene_patch']['location_id'], 'hanging_switchyard')
+        self.assertEqual(patch_data['unresolved_items'][0]['reason'], 'no_canonical_match')
 
     def test_hot_context_private_spoilers_include_dm_private_world_events(self):
         db.session.add(WorldEvent(
@@ -5329,6 +5562,50 @@ class DmToolsTest(unittest.TestCase):
         self.assertIsNotNone(silence_event)
         self.assertTrue(dm_response.called)
         self.assertFalse(memory_patch.called)
+
+    def test_session_message_route_persists_first_class_dm_turn_timing(self):
+        token = generate_token(self.user.id)
+        client = self.app.test_client()
+
+        with patch('routes.sessions.get_session_dm_response_with_tools', return_value='The alley falls quiet.'), \
+                patch('routes.sessions.get_session_memory_patch', return_value={
+                    'running_summary': 'The alley fell quiet.',
+                    'scene_patch': {},
+                    'upsert_graph_entities': [],
+                    'upsert_graph_relations': [],
+                    'upsert_graph_facts': [],
+                    'create_clocks': [],
+                    'retire_clocks': [],
+                    'update_npc_actors': [],
+                    'record_events': [],
+                }), \
+                patch('routes.sessions.get_session_clock_updates', return_value={
+                    'create_clocks': [],
+                    'advance_clocks': [],
+                    'retire_clocks': [],
+                    'no_change_explanations': [],
+                }):
+            response = client.post(
+                f'/api/sessions/{self.session.id}/messages',
+                json={'content': '<ooc>What changed?</ooc>', 'role': 'player'},
+                headers={'Authorization': f'Bearer {token}'},
+            )
+
+        self.assertEqual(response.status_code, 201)
+        turn = SessionDmTurn.query.one()
+        self.assertEqual(turn.session_id, self.session.id)
+        self.assertEqual(turn.status, 'speak')
+        self.assertEqual(turn.post_turn_status, 'complete')
+        self.assertEqual(turn.memory_status, 'complete')
+        self.assertEqual(turn.clock_status, 'complete')
+        self.assertIsNotNone(turn.started_at)
+        self.assertIsNotNone(turn.visible_completed_at)
+        self.assertIsNotNone(turn.finished_at)
+        self.assertIsNotNone(turn.dm_message_id)
+        self.assertIsInstance(turn.generation_duration_ms, int)
+        self.assertGreaterEqual(turn.generation_duration_ms, 0)
+        self.assertIsInstance(turn.full_duration_ms, int)
+        self.assertGreaterEqual(turn.full_duration_ms, turn.generation_duration_ms)
 
     def test_chat_flow_groups_visible_messages_and_nested_branches(self):
         planning_player = CharacterPlanningMessage(

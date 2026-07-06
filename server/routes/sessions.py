@@ -38,6 +38,14 @@ from services.dm_tools import (
     context_manifest,
     execute_dm_tool,
 )
+from services.dm_turns import (
+    begin_session_dm_turn,
+    mark_session_dm_turn_error,
+    mark_session_dm_turn_post_turn_complete,
+    mark_session_dm_turn_visible,
+    session_dm_trace_id,
+    session_dm_turn_status_payload,
+)
 from services.dev_combat_sandbox import is_combat_sandbox_campaign, start_combat_sandbox_session
 from services.planning_service import can_start_session, planning_context
 from services.world_service import approve_world, dm_world_context, ensure_world_generated, world_public_payload
@@ -110,6 +118,8 @@ def _run_session_memory_update(
     trace_label = f'session_memory_writer: session {session_id}'
     clock_trace_id = f'session_clock_adjudicator:session_{session_id}:message_{player_message_id}'
     clock_trace_label = f'session_clock_adjudicator: session {session_id}'
+    memory_complete = False
+    clock_complete = False
     try:
         campaign = db.session.get(Campaign, campaign_id)
         session = db.session.get(CampaignSession, session_id)
@@ -156,6 +166,7 @@ def _run_session_memory_update(
                     'latest_dm_message': ai_text,
                 },
             )
+            memory_complete = True
         world_after_memory = world_public_payload(campaign).get('world') or {}
         current_scene_after_memory = world_after_memory.get('current_scene')
         clock_context = build_session_clock_context(
@@ -188,6 +199,13 @@ def _run_session_memory_update(
                     'trace_label': clock_trace_label,
                 },
             )
+            clock_complete = True
+        db.session.commit()
+
+        mark_session_dm_turn_post_turn_complete(
+            player_message_id,
+            dm_message_id=dm_message_id,
+        )
         db.session.commit()
 
         world_after = world_public_payload(campaign).get('world') or {}
@@ -212,6 +230,17 @@ def _run_session_memory_update(
             audit_role='tools',
             commit=True,
         )
+        mark_session_dm_turn_error(
+            campaign_id,
+            session_id,
+            player_message_id,
+            parent_trace_id,
+            repr(err),
+            dm_message_id=dm_message_id,
+            memory_status='complete' if memory_complete else 'error',
+            clock_status='error' if memory_complete and not clock_complete else 'skipped',
+        )
+        db.session.commit()
 
 
 def _post_turn_status_for_player(campaign_id, session_id, player_message_id):
@@ -297,10 +326,11 @@ def _dm_turn_status_for_player(campaign_id, session_id, player_message_id=None):
             }
             if event_player_message_id is not None:
                 status.update(_post_turn_status_for_player(campaign_id, session_id, event_player_message_id))
+                status.update(session_dm_turn_status_payload(event_player_message_id))
             return status
         if event.event_type == 'dm_silence_chosen':
             decision = payload.get('decision') if isinstance(payload.get('decision'), dict) else {}
-            return {
+            status = {
                 'status': 'silent',
                 'player_message_id': event_player_message_id,
                 'reason': decision.get('reason') or '',
@@ -309,8 +339,11 @@ def _dm_turn_status_for_player(campaign_id, session_id, player_message_id=None):
                 'memory_status': 'skipped',
                 'clock_status': 'skipped',
             }
+            if event_player_message_id is not None:
+                status.update(session_dm_turn_status_payload(event_player_message_id))
+            return status
         if event.event_type == 'dm_output_empty':
-            return {
+            status = {
                 'status': 'empty',
                 'player_message_id': event_player_message_id,
                 'decision': payload.get('decision'),
@@ -319,7 +352,10 @@ def _dm_turn_status_for_player(campaign_id, session_id, player_message_id=None):
                 'memory_status': 'skipped',
                 'clock_status': 'skipped',
             }
-    return {
+            if event_player_message_id is not None:
+                status.update(session_dm_turn_status_payload(event_player_message_id))
+            return status
+    status = {
         'status': 'pending',
         'player_message_id': player_message_id,
         'post_turn_complete': False,
@@ -327,6 +363,9 @@ def _dm_turn_status_for_player(campaign_id, session_id, player_message_id=None):
         'memory_status': 'pending',
         'clock_status': 'pending',
     }
+    if player_message_id is not None:
+        status.update(session_dm_turn_status_payload(player_message_id))
+    return status
 
 
 @sessions_bp.route('/api/sessions/<int:session_id>/dm-turn-status', methods=['GET'])
@@ -565,6 +604,10 @@ def send_message(current_user, session_id):
         actor=current_user.username,
         commit=True,
     )
+    trace_id = session_dm_trace_id(session_id, msg.id)
+    trace_label = f'session_dm: session {session_id}'
+    db.session.add(begin_session_dm_turn(campaign.id, session_id, msg.id, trace_id))
+    db.session.commit()
 
     # Start generation asynchronously
     if (
@@ -575,8 +618,6 @@ def send_message(current_user, session_id):
         recent_messages = SessionMessage.query.filter_by(session_id=session_id).order_by(
             SessionMessage.created_at.asc(),
         ).all()[-8:]
-        trace_id = f'session_dm:session_{session_id}:message_{msg.id}'
-        trace_label = f'session_dm: session {session_id}'
 
         hot_context = build_session_hot_context(campaign, session, current_user)
         dm_tools_filtered = get_dm_tool_definitions(campaign)
@@ -610,6 +651,14 @@ def send_message(current_user, session_id):
                 },
             )
         except Exception as err:
+            db.session.add(mark_session_dm_turn_error(
+                campaign.id,
+                session_id,
+                msg.id,
+                trace_id,
+                repr(err),
+            ))
+            db.session.commit()
             return jsonify({'error': repr(err), 'messages': result_messages}), 500
 
         ai_turn = _session_dm_turn_decision(ai_result)
@@ -647,6 +696,14 @@ def send_message(current_user, session_id):
             ).all()
             for proposal in pending_proposals:
                 proposal.message_id = ai_msg.id
+            db.session.add(mark_session_dm_turn_visible(
+                campaign.id,
+                session_id,
+                msg.id,
+                trace_id,
+                status='speak',
+                dm_message_id=ai_msg.id,
+            ))
             db.session.commit()
             result_messages.append(ai_msg.to_dict())
 
@@ -682,6 +739,13 @@ def send_message(current_user, session_id):
                 audit_role='agent',
                 commit=False,
             )
+            db.session.add(mark_session_dm_turn_visible(
+                campaign.id,
+                session_id,
+                msg.id,
+                trace_id,
+                status='silent',
+            ))
             db.session.commit()
         else:
             log_audit_event(
@@ -700,6 +764,13 @@ def send_message(current_user, session_id):
                 audit_role='agent',
                 commit=False,
             )
+            db.session.add(mark_session_dm_turn_visible(
+                campaign.id,
+                session_id,
+                msg.id,
+                trace_id,
+                status='empty',
+            ))
             db.session.commit()
 
         log_audit_event(

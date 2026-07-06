@@ -65,6 +65,7 @@ SESSION_MEMORY_MAX_TOKENS = max(
     256,
     int(os.environ.get('SESSION_MEMORY_MAX_TOKENS', '8192')),
 )
+SESSION_MEMORY_MODE = os.environ.get('SESSION_MEMORY_MODE', 'staged').strip().lower() or 'staged'
 
 PC_CONTROL_POLICY = (
     "Player-character control policy: NPCs may speak and act. Player characters are protected. "
@@ -257,6 +258,30 @@ SESSION_MEMORY_CLOCKS_SYSTEM_PROMPT = (
     "Return only valid JSON with keys create_clocks and retire_clocks. "
     "Prefer empty arrays unless the exchange clearly introduced new durable pressure, a deadline, a mystery clock, or resolved an existing clock. "
     "Do not create clocks for ordinary scene beats or clues that do not change campaign pressure."
+)
+
+SESSION_MEMORY_EXTRACTOR_SYSTEM_PROMPT = (
+    "You are the extraction stage of a D&D session memory writer. "
+    "Return only valid JSON. "
+    "Write a fresh running_summary that cleanly replaces the old one. "
+    "Do not append fragments to the prior summary. Rewrite the current durable state after the latest visible exchange in one compact paragraph. "
+    "Extract only candidate scene updates and durable fact claims from the visible exchange. "
+    "Do not invent canonical ids. If a name is not already a known id in the prompt, preserve it as a raw label for later resolution. "
+    "Scene updates may include location_id, location_name, time_of_day, active_npc_ids, departed_npc_ids, and immediate_tension. "
+    "Fact claims must use source_surface of visible_transcript, hidden_state, or inferred. "
+    "When a fact was directly established in the latest visible exchange, set source_surface to visible_transcript and intended_visibility to party_known unless it is broadly public. "
+    "Return keys running_summary, scene_patch, scene_reason, and fact_claims. "
+    "Each fact_claim must include text, entity_refs, source_surface, intended_visibility, certainty, importance, reason, expires_or_retire_condition, and memory_type."
+)
+
+SESSION_MEMORY_RESOLVER_SYSTEM_PROMPT = (
+    "You are the resolver stage of a D&D session memory writer. "
+    "Use read-only tools to resolve scene, entity, and fact references before any durable write is compiled. "
+    "Never invent ids. If you cannot resolve a reference with confidence, return it in unresolved_items instead of mutating memory. "
+    "Prefer get_entity_candidates, get_scene_candidates, get_fact_candidates, and search_campaign_memory before broad raw-state tools. "
+    "Use get_world_state, get_npcs, get_clocks, or transcript tools only when narrower tools are insufficient. "
+    "Final response must be exactly one JSON object with keys running_summary, scene_patch, scene_reason, upsert_graph_facts, unresolved_items, evidence_basis, resolved_entity_refs, and resolved_location_refs. "
+    "Each upsert_graph_facts item must include text, entity_ids, id if reusing an existing fact, source_surface, intended_visibility, certainty, importance, reason, expires_or_retire_condition, and memory_type."
 )
 
 SESSION_CLOCK_ADJUDICATOR_SYSTEM_PROMPT = (
@@ -3821,6 +3846,76 @@ def build_session_memory_clocks_messages(memory_context):
     ]
 
 
+def build_session_memory_extractor_messages(memory_context):
+    compact = _session_memory_compact_context(memory_context)
+    return [
+        {'role': 'system', 'content': SESSION_MEMORY_EXTRACTOR_SYSTEM_PROMPT},
+        {
+            'role': 'user',
+            'content': json.dumps({
+                'prior_running_summary': memory_context.get('prior_running_summary'),
+                'current_scene': compact.get('current_scene'),
+                'relevant_memory': compact.get('relevant_memory'),
+                'latest_player_message': compact.get('latest_player_message'),
+                'latest_dm_message': compact.get('latest_dm_message'),
+                'return_shape': {
+                    'running_summary': 'fresh compact replacement summary for the session after this turn',
+                    'scene_patch': {
+                        'location_id': 'optional existing location id only if already known in prompt context',
+                        'location_name': 'optional location name',
+                        'time_of_day': 'optional scene time only if visibly changed',
+                        'active_npc_ids': ['optional known ids already present in prompt context'],
+                        'departed_npc_ids': ['optional known ids already present in prompt context'],
+                        'immediate_tension': 'optional compact visible tension',
+                    },
+                    'scene_reason': 'why scene state should change',
+                    'fact_claims': [
+                        {
+                            'text': 'durable fact text',
+                            'entity_refs': ['raw names or ids that need resolution'],
+                            'source_surface': 'visible_transcript',
+                            'intended_visibility': 'party_known',
+                            'certainty': 'confirmed',
+                            'importance': 3,
+                            'reason': 'why this fact matters',
+                            'expires_or_retire_condition': None,
+                            'memory_type': 'fact',
+                        }
+                    ],
+                },
+            }, ensure_ascii=False),
+        },
+    ]
+
+
+def build_session_memory_resolver_messages(memory_context, extracted):
+    compact = _session_memory_compact_context(memory_context)
+    return [
+        {'role': 'system', 'content': SESSION_MEMORY_RESOLVER_SYSTEM_PROMPT},
+        {
+            'role': 'user',
+            'content': json.dumps({
+                'current_scene': compact.get('current_scene'),
+                'latest_player_message': compact.get('latest_player_message'),
+                'latest_dm_message': compact.get('latest_dm_message'),
+                'extracted_memory_candidates': extracted,
+                'available_tools': [
+                    'get_running_summary',
+                    'get_transcript_window',
+                    'search_campaign_memory',
+                    'get_world_state',
+                    'get_clocks',
+                    'get_npcs',
+                    'get_recent_world_events',
+                    'get_scene_candidates',
+                    'get_entity_candidates',
+                    'get_fact_candidates',
+                ],
+            }, ensure_ascii=False),
+        },
+    ]
+
+
 def build_session_clock_adjudication_messages(clock_context):
     return [
         {'role': 'system', 'content': SESSION_CLOCK_ADJUDICATOR_SYSTEM_PROMPT},
@@ -3877,6 +3972,17 @@ def _choice_message(data):
         return {}, None
     message = choices[0].get('message') or {}
     return message if isinstance(message, dict) else {}, choices[0].get('finish_reason')
+
+
+def _json_object_from_text(text):
+    raw = str(text or '').strip()
+    if not raw:
+        raise ValueError('LLM response was empty.')
+    start = raw.find('{')
+    end = raw.rfind('}')
+    if start == -1 or end == -1 or end < start:
+        raise ValueError('LLM response did not contain a JSON object.')
+    return json.loads(raw[start:end + 1])
 
 
 def _parse_tool_arguments(raw_arguments):
@@ -5109,6 +5215,170 @@ def _merge_session_running_summary(prior_summary, turn_summary, limit=1800):
     return running_summary
 
 
+def _should_use_staged_session_memory(memory_context):
+    if SESSION_MEMORY_MODE != 'staged':
+        return False
+    if not isinstance(memory_context, dict):
+        return False
+    return bool(memory_context.get('campaign_id') and memory_context.get('session_id'))
+
+
+def _memory_tool_result_message(tool_call, tool_name, result):
+    return {
+        'role': 'tool',
+        'tool_call_id': tool_call.get('id'),
+        'name': tool_name,
+        'content': json.dumps(result, ensure_ascii=False),
+    }
+
+
+def _get_session_memory_patch_staged(memory_context, audit_context, telemetry):
+    from services.session_memory_agent import (
+        SESSION_MEMORY_TOOL_DEFINITIONS,
+        compile_staged_memory_patch,
+        execute_memory_tool,
+    )
+
+    campaign_id = audit_context.get('campaign_id')
+    trace_id = audit_context.get('trace_id')
+    trace_label = audit_context.get('trace_label')
+
+    extractor_messages = build_session_memory_extractor_messages(memory_context)
+    try:
+        extracted, extractor_chars = _request_session_memory_json(
+            extractor_messages,
+            audit_context,
+            'session_memory_extract',
+            max_tokens=SESSION_MEMORY_MAX_TOKENS,
+            timeout_seconds=SESSION_MEMORY_TIMEOUT_SECONDS,
+        )
+    except Exception as err:
+        telemetry['staged_extractor_error'] = repr(err)
+        return None
+    if not isinstance(extracted, dict) or not str(extracted.get('running_summary') or '').strip():
+        telemetry['staged_extractor_error'] = 'blank_or_invalid_extractor'
+        telemetry['staged_extractor_response_chars'] = extractor_chars
+        return None
+    telemetry['staged_extractor_response_chars'] = extractor_chars
+    if campaign_id:
+        log_audit_event(
+            campaign_id,
+            'memory_writer_extracted',
+            'Built staged memory extraction candidates.',
+            {'extracted': extracted},
+            source=get_llm_provider(),
+            actor='session_memory_writer',
+            trace_id=trace_id,
+            parent_trace_id=audit_context.get('parent_trace_id'),
+            trace_label=trace_label,
+            audit_role='agent',
+            commit=True,
+        )
+
+    messages = build_session_memory_resolver_messages(memory_context, extracted)
+    tool_trace = []
+    response_chain = []
+    max_tool_rounds = 6
+    final_payload = None
+    for tool_round in range(max_tool_rounds + 1):
+        data = _post_chat_response(
+            messages,
+            json_mode=False,
+            audit_context={
+                **audit_context,
+                'operation': 'session_memory_resolve',
+                'full_world_graph_included': False,
+            },
+            tools=SESSION_MEMORY_TOOL_DEFINITIONS,
+            tool_choice='auto',
+            parallel_tool_calls=False,
+            allow_thinking=False,
+        )
+        response_chain.append(data)
+        message, _finish_reason = _choice_message(data)
+        tool_calls = message.get('tool_calls') or []
+        if tool_calls and tool_round < max_tool_rounds:
+            messages.append(_assistant_tool_message(message))
+            for tool_call in tool_calls:
+                function = tool_call.get('function') if isinstance(tool_call, dict) else {}
+                tool_name = function.get('name') if isinstance(function, dict) else None
+                tool_args = _parse_tool_arguments(function.get('arguments') if isinstance(function, dict) else None)
+                result = execute_memory_tool(memory_context, tool_name, tool_args)
+                tool_trace.append({
+                    'tool_name': tool_name,
+                    'args': tool_args,
+                    'result': result,
+                })
+                if campaign_id:
+                    log_audit_event(
+                        campaign_id,
+                        'memory_writer_tool_call',
+                        f'Staged memory resolver called {tool_name}.',
+                        {'tool_name': tool_name, 'args': tool_args, 'result': result},
+                        source='session_memory_writer.tool',
+                        actor='session_memory_writer',
+                        trace_id=trace_id,
+                        parent_trace_id=audit_context.get('parent_trace_id'),
+                        trace_label=trace_label,
+                        audit_role='tools',
+                        commit=True,
+                    )
+                messages.append(_memory_tool_result_message(tool_call, tool_name, result))
+            continue
+        content = message.get('content') or ''
+        try:
+            final_payload = _json_object_from_text(content)
+        except Exception as err:
+            telemetry['staged_resolver_error'] = repr(err)
+            return None
+        break
+    if final_payload is None:
+        telemetry['staged_resolver_error'] = 'max_tool_rounds_exceeded'
+        return None
+
+    compiled = compile_staged_memory_patch(memory_context, extracted, final_payload)
+    telemetry['mode'] = 'staged_memory_writer'
+    telemetry['staged_tool_call_count'] = len(tool_trace)
+    telemetry['staged_resolver_response_count'] = len(response_chain)
+    telemetry['staged_compile_summary'] = compiled.get('compile_summary')
+    if campaign_id:
+        log_audit_event(
+            campaign_id,
+            'memory_writer_resolved',
+            'Compiled staged memory patch after tool-backed resolution.',
+            {
+                'resolved': final_payload,
+                'compile_summary': compiled.get('compile_summary'),
+                'unresolved_items': compiled.get('unresolved_items') or [],
+            },
+            source=get_llm_provider(),
+            actor='session_memory_writer',
+            trace_id=trace_id,
+            parent_trace_id=audit_context.get('parent_trace_id'),
+            trace_label=trace_label,
+            audit_role='agent',
+            commit=True,
+        )
+
+    try:
+        clocks_data, clocks_chars = _request_session_memory_json(
+            build_session_memory_clocks_messages(memory_context),
+            audit_context,
+            'session_memory_update_clocks',
+            max_tokens=SESSION_MEMORY_MAX_TOKENS,
+            timeout_seconds=SESSION_MEMORY_TIMEOUT_SECONDS,
+        )
+    except Exception as err:
+        clocks_data = None
+        clocks_chars = 0
+        telemetry['clocks_error'] = repr(err)
+    telemetry['clocks_response_chars'] = clocks_chars
+    if isinstance(clocks_data, dict):
+        compiled['create_clocks'] = clocks_data.get('create_clocks') if isinstance(clocks_data.get('create_clocks'), list) else []
+        compiled['retire_clocks'] = clocks_data.get('retire_clocks') if isinstance(clocks_data.get('retire_clocks'), list) else []
+    return compiled
+
+
 def _fallback_session_memory_patch(memory_context, telemetry):
     memory_context = memory_context or {}
     prior_summary = _memory_fallback_text(memory_context.get('prior_running_summary'), 1000)
@@ -5325,6 +5595,40 @@ def get_session_memory_patch(memory_context, audit_context=None):
             audit_role='tools',
             commit=True,
         )
+    if _should_use_staged_session_memory(memory_context):
+        telemetry = {
+            'prompt_chars': prompt_chars,
+            'prompt_tokens_estimate': prompt_tokens_estimate,
+            'context_breakdown': context_breakdown,
+        }
+        patch = _get_session_memory_patch_staged(
+            memory_context,
+            {
+                **audit_context,
+                'trace_id': trace_id,
+                'trace_label': trace_label,
+                'actor': 'session_memory_writer',
+                'full_world_graph_included': False,
+            },
+            telemetry,
+        )
+        if patch and campaign_id:
+            log_audit_event(
+                campaign_id,
+                'memory_writer_response',
+                'Received staged post-turn session memory patch.',
+                {'patch': patch},
+                source=provider,
+                actor='session_memory_writer',
+                trace_id=trace_id,
+                parent_trace_id=audit_context.get('parent_trace_id'),
+                trace_label=trace_label,
+                audit_role='agent',
+                commit=True,
+            )
+        if patch:
+            patch['_telemetry'] = {**telemetry, **(patch.get('_telemetry') or {})}
+            return patch
     if provider == 'opencode_go':
         telemetry = {
             'prompt_chars': prompt_chars,

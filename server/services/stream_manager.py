@@ -19,6 +19,12 @@ from services.dm_tools import (
     context_manifest,
     execute_dm_tool,
 )
+from services.dm_turns import (
+    begin_session_dm_turn,
+    mark_session_dm_turn_error,
+    mark_session_dm_turn_visible,
+    session_dm_trace_id,
+)
 from services.audit_service import log_audit_event
 
 try:
@@ -191,6 +197,17 @@ class SessionGeneratorWorker:
                 self._execute_dm_turn()
             except Exception as e:
                 db.session.rollback()
+                if self.player_message_id:
+                    campaign = db.session.get(Campaign, self.campaign_id)
+                    if campaign is not None:
+                        db.session.add(mark_session_dm_turn_error(
+                            self.campaign_id,
+                            self.session_id,
+                            self.player_message_id,
+                            session_dm_trace_id(self.session_id, self.player_message_id),
+                            repr(e),
+                        ))
+                        db.session.commit()
                 self.finish_error(str(e))
             finally:
                 if not self.is_done:
@@ -220,8 +237,11 @@ class SessionGeneratorWorker:
             ).order_by(SessionMessage.id.desc()).first()
         player_msg_id = player_msg.id if player_msg else None
 
-        trace_id = f'session_dm:session_{self.session_id}:message_{player_msg_id}' if player_msg_id else f'session_dm:session_{self.session_id}:message_async'
+        trace_id = session_dm_trace_id(self.session_id, player_msg_id)
         trace_label = f'session_dm: session {self.session_id}'
+        if player_msg_id:
+            db.session.add(begin_session_dm_turn(campaign.id, self.session_id, player_msg_id, trace_id))
+            db.session.commit()
 
         hot_context = build_session_hot_context(campaign, session, current_user)
         dm_tools_filtered = get_dm_tool_definitions(campaign)
@@ -298,6 +318,14 @@ class SessionGeneratorWorker:
             ).all()
             for proposal in pending_proposals:
                 proposal.message_id = ai_msg.id
+            db.session.add(mark_session_dm_turn_visible(
+                campaign.id,
+                self.session_id,
+                player_msg_id,
+                trace_id,
+                status='speak',
+                dm_message_id=ai_msg.id,
+            ))
             db.session.commit()
             result_messages.append(ai_msg.to_dict())
             sheet_proposals = [p.to_dict() for p in pending_proposals]
@@ -336,6 +364,13 @@ class SessionGeneratorWorker:
                 audit_role='agent',
                 commit=False,
             )
+            db.session.add(mark_session_dm_turn_visible(
+                campaign.id,
+                self.session_id,
+                player_msg_id,
+                trace_id,
+                status='silent',
+            ))
             db.session.commit()
         else:
             log_audit_event(
@@ -354,6 +389,13 @@ class SessionGeneratorWorker:
                 audit_role='agent',
                 commit=False,
             )
+            db.session.add(mark_session_dm_turn_visible(
+                campaign.id,
+                self.session_id,
+                player_msg_id,
+                trace_id,
+                status='empty',
+            ))
             db.session.commit()
 
         self.finish_success(result_messages, sheet_proposals)

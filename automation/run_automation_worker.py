@@ -24,7 +24,7 @@ def parse_args():
     parser.add_argument('--worker-id', default=f'worker-{os.getpid()}')
     parser.add_argument('--poll-interval', type=float, default=3.0)
     parser.add_argument('--max-turns', type=int, default=50)
-    parser.add_argument('--max-minutes', type=float, default=30.0)
+    parser.add_argument('--max-minutes', type=float, default=None)
     parser.add_argument('--idle-timeout', type=float, default=180.0)
     parser.add_argument('--heartbeat-interval', type=float, default=10.0)
     parser.add_argument('--dm-response-timeout', type=float, default=float(os.environ.get('DND_DM_RESPONSE_TIMEOUT', '300')))
@@ -480,7 +480,11 @@ def execute_run(args, run_id):
     )
 
     start_time = time.monotonic()
-    deadline = start_time + (args.max_minutes * 60.0)
+    deadline = (
+        start_time + (args.max_minutes * 60.0)
+        if args.max_minutes is not None and args.max_minutes > 0
+        else None
+    )
     last_seen_fingerprint = None
     last_change_at = time.monotonic()
     last_heartbeat_at = 0.0
@@ -499,7 +503,7 @@ def execute_run(args, run_id):
 
     while True:
         maybe_heartbeat()
-        if time.monotonic() >= deadline:
+        if deadline is not None and time.monotonic() >= deadline:
             complete_run(
                 args.api_base,
                 args.owner_api_key,

@@ -1349,6 +1349,55 @@ class CampaignAuditEvent(db.Model):
         }
 
 
+class SessionDmTurn(db.Model):
+    __tablename__ = 'session_dm_turns'
+
+    id = db.Column(db.Integer, primary_key=True)
+    campaign_id = db.Column(db.Integer, db.ForeignKey('campaign.id'), nullable=False, index=True)
+    session_id = db.Column(db.Integer, db.ForeignKey('campaign_sessions.id'), nullable=False, index=True)
+    player_message_id = db.Column(db.Integer, db.ForeignKey('session_messages.id'), nullable=False, unique=True, index=True)
+    dm_message_id = db.Column(db.Integer, db.ForeignKey('session_messages.id'), nullable=True, index=True)
+    trace_id = db.Column(db.String(160), nullable=True, index=True)
+
+    status = db.Column(db.String(20), nullable=False, default='pending')
+    post_turn_status = db.Column(db.String(20), nullable=False, default='pending')
+    memory_status = db.Column(db.String(20), nullable=False, default='pending')
+    clock_status = db.Column(db.String(20), nullable=False, default='pending')
+    error_text = db.Column(db.Text, nullable=True)
+
+    started_at = db.Column(db.DateTime, nullable=False, default=datetime.utcnow, index=True)
+    visible_completed_at = db.Column(db.DateTime, nullable=True)
+    finished_at = db.Column(db.DateTime, nullable=True)
+
+    generation_duration_ms = db.Column(db.Integer, nullable=True)
+    full_duration_ms = db.Column(db.Integer, nullable=True)
+
+    created_at = db.Column(db.DateTime, default=datetime.utcnow, index=True)
+    updated_at = db.Column(db.DateTime, default=datetime.utcnow, onupdate=datetime.utcnow, index=True)
+
+    def to_dict(self):
+        return {
+            'id': self.id,
+            'campaign_id': self.campaign_id,
+            'session_id': self.session_id,
+            'player_message_id': self.player_message_id,
+            'dm_message_id': self.dm_message_id,
+            'trace_id': self.trace_id,
+            'status': self.status,
+            'post_turn_status': self.post_turn_status,
+            'memory_status': self.memory_status,
+            'clock_status': self.clock_status,
+            'error_text': self.error_text,
+            'started_at': self.started_at.isoformat() if self.started_at else None,
+            'visible_completed_at': self.visible_completed_at.isoformat() if self.visible_completed_at else None,
+            'finished_at': self.finished_at.isoformat() if self.finished_at else None,
+            'generation_duration_ms': self.generation_duration_ms,
+            'full_duration_ms': self.full_duration_ms,
+            'created_at': self.created_at.isoformat() if self.created_at else None,
+            'updated_at': self.updated_at.isoformat() if self.updated_at else None,
+        }
+
+
 class AutomationScorecardTemplate(db.Model):
     __tablename__ = 'automation_scorecard_templates'
 

@@ -79,7 +79,7 @@ def parse_args():
     )
     parser.add_argument('--idle-timeout', type=float, default=180.0, help='Stop if the transcript stops changing for this many seconds')
     parser.add_argument('--max-turns', type=int, default=50, help='Maximum number of non-no_action orchestrator steps to run')
-    parser.add_argument('--max-minutes', type=float, default=30.0, help='Maximum wall-clock runtime in minutes')
+    parser.add_argument('--max-minutes', type=float, default=None, help='Maximum wall-clock runtime in minutes')
     parser.add_argument('--dry-run', action='store_true')
     parser.add_argument('--stop-on-error', action='store_true')
     return parser.parse_args()
@@ -498,7 +498,11 @@ def main():
         manifest = load_manifest(manifest_path)
         manifest = ensure_manifest_session_started(args, manifest_path, manifest)
         start_time = time.monotonic()
-        deadline = start_time + (args.max_minutes * 60.0)
+        deadline = (
+            start_time + (args.max_minutes * 60.0)
+            if args.max_minutes is not None and args.max_minutes > 0
+            else None
+        )
         last_seen_fingerprint = None
         last_change_at = time.monotonic()
         turns_completed = 0
@@ -518,7 +522,7 @@ def main():
         })
 
         while True:
-            if time.monotonic() >= deadline:
+            if deadline is not None and time.monotonic() >= deadline:
                 print_event({
                     'event': 'stop',
                     'timestamp': utc_now(),

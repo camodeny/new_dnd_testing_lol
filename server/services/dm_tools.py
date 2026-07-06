@@ -4830,6 +4830,10 @@ def apply_memory_patch(campaign, session, patch, audit_context=None):
     import uuid
 
     audit_context = audit_context or {}
+    raw_patch = patch if isinstance(patch, dict) else {}
+    unresolved_items = raw_patch.get('unresolved_items') if isinstance(raw_patch.get('unresolved_items'), list) else []
+    compile_summary = raw_patch.get('compile_summary') if isinstance(raw_patch.get('compile_summary'), dict) else None
+    evidence_basis = raw_patch.get('evidence_basis') if isinstance(raw_patch.get('evidence_basis'), list) else []
     patch = _normalize_memory_patch(patch)
     patch = _apply_memory_visibility_policy(campaign, patch, audit_context)
     telemetry = patch.pop('_telemetry', None)
@@ -4918,6 +4922,28 @@ def apply_memory_patch(campaign, session, patch, audit_context=None):
         )
         db.session.add(log_entry)
         logs_written += 1
+
+    if compile_summary or unresolved_items or evidence_basis:
+        log_change(
+            memory_id='staged_memory_compile',
+            target_table='campaign_memory_runs',
+            target_id=memory_run_id,
+            operation='compile',
+            status='skipped_unresolved' if unresolved_items else 'applied',
+            memory_type='fact',
+            visibility='dm_private',
+            certainty='confirmed',
+            importance=2,
+            reason='Staged memory resolver compiled the final patch before persistence.',
+            before_json=None,
+            after_json=None,
+            patch_json={
+                'compile_summary': compile_summary,
+                'unresolved_items': unresolved_items,
+                'evidence_basis': evidence_basis[:12],
+            },
+            error='unresolved_references_present' if unresolved_items else None,
+        )
 
     world, graph, world_state, _private = _world_json(campaign)
     result = {

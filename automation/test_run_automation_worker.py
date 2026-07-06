@@ -10,6 +10,12 @@ import run_automation_worker as worker
 
 
 class RunAutomationWorkerTests(unittest.TestCase):
+    def test_parse_args_defaults_to_no_wall_clock_cap(self):
+        with patch.object(sys, 'argv', ['run_automation_worker.py']):
+            args = worker.parse_args()
+
+        self.assertIsNone(args.max_minutes)
+
     def test_parse_args_defaults_dm_response_timeout_to_five_minutes(self):
         with patch.object(sys, 'argv', ['run_automation_worker.py']):
             args = worker.parse_args()
@@ -50,7 +56,7 @@ class RunAutomationWorkerTests(unittest.TestCase):
             api_base='http://127.0.0.1:5889',
             owner_api_key='owner-key',
             worker_id='audit-worker-test',
-            max_minutes=30.0,
+            max_minutes=None,
             idle_timeout=180.0,
             heartbeat_interval=999.0,
             poll_interval=0.01,

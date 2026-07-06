@@ -15,6 +15,12 @@ import run_autonomous_llm_campaign as autonomous
 
 
 class RunAutonomousLlmCampaignTests(unittest.TestCase):
+    def test_parse_args_defaults_to_no_wall_clock_cap(self):
+        with patch.object(sys, 'argv', ['run_autonomous_llm_campaign.py']):
+            args = autonomous.parse_args()
+
+        self.assertIsNone(args.max_minutes)
+
     def test_update_same_fingerprint_retry_state_retries_until_budget_exhausted(self):
         force_retry, retry_count = autonomous.update_same_fingerprint_retry_state('no_action', 0, 3)
         self.assertTrue(force_retry)
