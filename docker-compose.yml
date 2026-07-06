@@ -1,10 +1,4 @@
-services:
-  app:
-    build: .
-    image: dnd-app:latest
-    ports:
-      - "${APP_PORT:-5889}:5001"
-    environment:
+x-app-environment: &app-environment
       FLASK_ENV: production
       FLASK_DEBUG: "false"
       PORT: 5001
@@ -53,9 +47,40 @@ services:
       GEMINI_EMBEDDING_DIMENSIONS: ${GEMINI_EMBEDDING_DIMENSIONS:-768}
       MEMORY_EMBEDDING_DEDUPE_THRESHOLD: ${MEMORY_EMBEDDING_DEDUPE_THRESHOLD:-0.90}
       MEMORY_EMBEDDING_SEARCH_WEIGHT: ${MEMORY_EMBEDDING_SEARCH_WEIGHT:-0.70}
+
+services:
+  app:
+    build: .
+    image: dnd-app:latest
+    ports:
+      - "${APP_PORT:-5889}:5001"
+    environment: *app-environment
     volumes:
       - ./data:/app/data
     depends_on:
+      - redis
+    restart: unless-stopped
+
+  worker:
+    build: .
+    image: dnd-app:latest
+    command:
+      - /app/automation/automationctl.sh
+      - worker
+      - start
+      - --api-base
+      - http://app:5001
+      - --worker-id
+      - deployed-automation-worker
+      - --poll-interval
+      - "3"
+      - --max-turns
+      - "50"
+    environment: *app-environment
+    volumes:
+      - ./data:/app/data
+    depends_on:
+      - app
       - redis
     restart: unless-stopped
 

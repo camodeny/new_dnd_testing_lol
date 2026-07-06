@@ -312,6 +312,29 @@ def configured_pause_phases(run):
     return phases
 
 
+def _normalized_pause_phases(value):
+    phases = []
+    for item in _json_list(value, []):
+        phase = str(item).strip().lower()
+        if phase in {'after_player', 'after_dm'} and phase not in phases:
+            phases.append(phase)
+    return phases
+
+
+def runner_config_from_request(runner_config=None, audit_config=None):
+    config = dict(_json_object(runner_config, {}))
+    if config.get('audit_pause_phases') is not None:
+        return config
+
+    audit_settings = _json_object(audit_config, {})
+    raw_pause_phases = audit_settings.get('audit_pause_phases')
+    if raw_pause_phases is None:
+        raw_pause_phases = audit_settings.get('pause_phases')
+    if raw_pause_phases is not None:
+        config['audit_pause_phases'] = _normalized_pause_phases(raw_pause_phases)
+    return config
+
+
 def scenario_roster_from_campaign(campaign):
     members = CampaignMember.query.filter_by(campaign_id=campaign.id).order_by(CampaignMember.id.asc()).all()
     character_ids = {member.selected_character_id for member in members if member.selected_character_id}
@@ -524,6 +547,12 @@ def materialize_run_campaign(run):
                 created_at=_parse_iso(proposal_data.get('created_at')) or _utcnow(),
                 applied_at=_parse_iso(proposal_data.get('applied_at')),
             ))
+    if not session_map:
+        db.session.add(CampaignSession(
+            campaign_id=clone.id,
+            started_at=_utcnow(),
+            is_active=True,
+        ))
 
     world_data = data.get('world')
     if world_data:

@@ -441,6 +441,45 @@ class AutomationRouteTest(unittest.TestCase):
         self.assertEqual(len(derived_messages), 1)
         self.assertEqual(derived_messages[0].content, 'I follow Mira deeper into the rail yard.')
 
+    def test_claim_from_empty_source_campaign_creates_active_run_session(self):
+        with app.app_context():
+            empty_campaign = Campaign(name='Empty Automation Source', user_id=self.owner_id)
+            db.session.add(empty_campaign)
+            db.session.flush()
+            db.session.add(CampaignMember(
+                campaign_id=empty_campaign.id,
+                user_id=self.owner_id,
+                role='player',
+            ))
+            db.session.commit()
+            empty_campaign_id = empty_campaign.id
+
+        scenario_id = self.client.post(
+            '/api/automation/scenarios',
+            headers=self.headers,
+            json={'source_campaign_id': empty_campaign_id},
+        ).get_json()['scenario']['id']
+        snapshot_id = self.client.post(
+            f'/api/automation/scenarios/{scenario_id}/snapshots',
+            headers=self.headers,
+            json={},
+        ).get_json()['snapshot']['id']
+        run_id = self.client.post(
+            f'/api/automation/scenarios/{scenario_id}/runs',
+            headers=self.headers,
+            json={'snapshot_id': snapshot_id},
+        ).get_json()['run']['id']
+        claim_response = self.client.post(
+            f'/api/automation/runs/{run_id}/claim',
+            headers=self.headers,
+            json={'worker_id': 'empty-source-worker'},
+        )
+
+        self.assertEqual(claim_response.status_code, 200)
+        latest_session = claim_response.get_json()['latest_session']
+        self.assertIsNotNone(latest_session)
+        self.assertTrue(latest_session['is_active'])
+
     def test_run_scorecard_and_compare(self):
         scenario_id = self.client.post(
             '/api/automation/scenarios',
@@ -794,6 +833,55 @@ class AutomationRouteTest(unittest.TestCase):
             self.assertEqual(run.scorecard_template_json['template_id'], scorecard_id)
             self.assertEqual(run.scorecard_template_json['criteria'][0]['id'], 'memory_quality')
             self.assertEqual(run.runner_config_json['audit_pause_phases'], ['after_dm'])
+
+    def test_audit_config_pause_phases_are_copied_to_queued_run(self):
+        scenario_id = self.client.post(
+            '/api/automation/scenarios',
+            headers=self.headers,
+            json={
+                'source_campaign_id': self.campaign_id,
+                'audit_config': {'pause_phases': ['after_dm', 'after_player', 'after_dm', 'invalid']},
+            },
+        ).get_json()['scenario']['id']
+        snapshot_id = self.client.post(
+            f'/api/automation/scenarios/{scenario_id}/snapshots',
+            headers=self.headers,
+            json={},
+        ).get_json()['snapshot']['id']
+        run_id = self.client.post(
+            f'/api/automation/scenarios/{scenario_id}/runs',
+            headers=self.headers,
+            json={'snapshot_id': snapshot_id},
+        ).get_json()['run']['id']
+
+        with app.app_context():
+            run = db.session.get(AutomationRun, run_id)
+            self.assertEqual(run.runner_config_json['audit_pause_phases'], ['after_dm', 'after_player'])
+
+    def test_runner_config_pause_phases_override_audit_config_alias(self):
+        scenario_id = self.client.post(
+            '/api/automation/scenarios',
+            headers=self.headers,
+            json={
+                'source_campaign_id': self.campaign_id,
+                'runner_config': {'audit_pause_phases': ['after_player']},
+                'audit_config': {'audit_pause_phases': ['after_dm']},
+            },
+        ).get_json()['scenario']['id']
+        snapshot_id = self.client.post(
+            f'/api/automation/scenarios/{scenario_id}/snapshots',
+            headers=self.headers,
+            json={},
+        ).get_json()['snapshot']['id']
+        run_id = self.client.post(
+            f'/api/automation/scenarios/{scenario_id}/runs',
+            headers=self.headers,
+            json={'snapshot_id': snapshot_id},
+        ).get_json()['run']['id']
+
+        with app.app_context():
+            run = db.session.get(AutomationRun, run_id)
+            self.assertEqual(run.runner_config_json['audit_pause_phases'], ['after_player'])
 
     def test_pause_audit_continue_cycle_updates_custom_scorecard(self):
         scorecard_id = self.client.post(

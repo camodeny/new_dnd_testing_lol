@@ -59,6 +59,7 @@ from services.automation_service import (
     provider_call_for_replay,
     refresh_run_scorecard,
     run_watch_payload,
+    runner_config_from_request,
     scenario_roster_from_campaign,
     scorecard_template_snapshot,
     submit_audit_cycle_feedback,
@@ -426,7 +427,9 @@ def create_automation_scenario(current_user):
         scorecard_template_id=scorecard_template.id if scorecard_template else None,
         name=(data.get('name') or f'{campaign.name} benchmark').strip(),
         description=data.get('description'),
-        runner_config_json=merge_auditor_config_into_runner_config(data.get('runner_config') or {}),
+        runner_config_json=merge_auditor_config_into_runner_config(
+            runner_config_from_request(data.get('runner_config'), data.get('audit_config'))
+        ),
         audit_config_json=data.get('audit_config') or {},
         retention_policy_json=data.get('retention_policy') or {},
         roster_json=scenario_roster_from_campaign(campaign),
@@ -473,10 +476,14 @@ def update_automation_scenario(current_user, scenario_id):
         scenario.name = (data.get('name') or '').strip() or scenario.name
     if 'description' in data:
         scenario.description = data.get('description')
-    if 'runner_config' in data:
-        scenario.runner_config_json = merge_auditor_config_into_runner_config(data.get('runner_config') or {})
-    if 'audit_config' in data:
-        scenario.audit_config_json = data.get('audit_config') or {}
+    if 'runner_config' in data or 'audit_config' in data:
+        next_runner_config = data.get('runner_config') if 'runner_config' in data else scenario.runner_config_json
+        next_audit_config = data.get('audit_config') if 'audit_config' in data else scenario.audit_config_json
+        scenario.runner_config_json = merge_auditor_config_into_runner_config(
+            runner_config_from_request(next_runner_config, next_audit_config)
+        )
+        if 'audit_config' in data:
+            scenario.audit_config_json = data.get('audit_config') or {}
     if 'retention_policy' in data:
         scenario.retention_policy_json = data.get('retention_policy') or {}
     if 'scorecard_template_id' in data:
@@ -628,13 +635,18 @@ def create_automation_run(current_user, scenario_id):
             entry = entry if isinstance(entry, dict) else {}
             normalized_matrix.append({
                 **entry,
-                'runner_config': merge_auditor_config_into_runner_config(entry.get('runner_config') or {}),
+                'runner_config': merge_auditor_config_into_runner_config(
+                    runner_config_from_request(entry.get('runner_config'), entry.get('audit_config'))
+                ),
             })
         group_id, runs = create_matrix_runs(scenario, snapshot, current_user, normalized_matrix)
         return jsonify({'group_id': group_id, 'runs': [run.to_dict() for run in runs]}), 201
 
     merged_runner_config = merge_auditor_config_into_runner_config(
-        merged_runner_config_for_scenario(scenario, data.get('runner_config') or {})
+        merged_runner_config_for_scenario(
+            scenario,
+            runner_config_from_request(data.get('runner_config'), data.get('audit_config')),
+        )
     )
     run = AutomationRun(
         scenario_id=scenario.id,
