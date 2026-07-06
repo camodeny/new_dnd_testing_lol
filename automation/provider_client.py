@@ -48,6 +48,8 @@ def resolve_provider_and_model(model=None):
         provider = _normalize_provider(provider_hint)
         if provider:
             return provider, model_id
+        provider = _normalize_provider(LLM_PROVIDER) or 'openrouter'
+        return provider, _env_model(provider)
     provider = _normalize_provider(LLM_PROVIDER) or 'openrouter'
     return provider, raw_model or _env_model(provider)
 

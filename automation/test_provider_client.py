@@ -13,6 +13,14 @@ class ProviderClientTests(unittest.TestCase):
         self.assertEqual(provider, 'opencode_go')
         self.assertEqual(model, 'deepseek-v4-flash')
 
+    def test_resolve_provider_and_model_unknown_vendor_prefix_falls_back_to_env_model(self):
+        with patch.object(provider_client, 'LLM_PROVIDER', 'opencode_go'), \
+                patch.object(provider_client, 'OPENCODE_GO_MODEL', 'deepseek-v4-flash'), \
+                patch.object(provider_client, 'OPENROUTER_MODEL', 'nvidia/nemotron-3-super-120b-a12b:free'):
+            provider, model = provider_client.resolve_provider_and_model('nvidia/nemotron-3-super-120b-a12b:free')
+        self.assertEqual(provider, 'opencode_go')
+        self.assertEqual(model, 'deepseek-v4-flash')
+
     @patch.object(provider_client.requests, 'post')
     def test_request_json_decision_retries_invalid_json(self, mock_post):
         invalid_response = MagicMock()

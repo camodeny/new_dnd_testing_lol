@@ -29,7 +29,7 @@ def parse_args():
     parser.add_argument('--heartbeat-interval', type=float, default=10.0)
     parser.add_argument('--dm-response-timeout', type=float, default=float(os.environ.get('DND_DM_RESPONSE_TIMEOUT', '300')))
     parser.add_argument('--message-window', type=int, default=16)
-    parser.add_argument('--model', default=os.environ.get('OPENCODE_MODEL') or os.environ.get('OPENROUTER_MODEL') or '')
+    parser.add_argument('--model', default=os.environ.get('OPENCODE_GO_MODEL') or os.environ.get('OPENCODE_MODEL') or os.environ.get('OPENROUTER_MODEL') or '')
     parser.add_argument('--opencode-server', default=None, help='Unused compatibility flag')
     parser.add_argument('--opencode-password', default=None, help='Unused compatibility flag')
     parser.add_argument('--once', action='store_true', help='Claim and execute at most one run, then exit')
