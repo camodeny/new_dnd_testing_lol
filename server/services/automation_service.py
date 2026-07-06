@@ -14,6 +14,7 @@ from models import (
     AutomationScenario,
     AutomationScorecardTemplate,
     AutomationSnapshot,
+    AutomationWorker,
     AutomationWorkspaceEvent,
     Campaign,
     CampaignAuditEvent,
@@ -877,6 +878,24 @@ def append_run_event(run, event_type, payload=None, *, dedupe_key=None, worker_i
     return row, True
 
 
+def record_worker_activity(worker_id, api_base=None, is_heartbeat=False):
+    if not worker_id:
+        return
+    now = datetime.utcnow()
+    worker = AutomationWorker.query.filter_by(worker_id=worker_id).first()
+    if not worker:
+        worker = AutomationWorker(worker_id=worker_id)
+        db.session.add(worker)
+    if api_base:
+        worker.api_base = api_base
+    if is_heartbeat:
+        worker.last_heartbeat_at = now
+    else:
+        worker.last_poll_at = now
+    worker.updated_at = now
+    db.session.commit()
+
+
 def claim_run_for_worker(run, worker_id):
     now = _utcnow()
     reclaimed = run.status in {'claimed', 'running', 'stop_requested', 'awaiting_audit'} and lease_is_expired(run, at=now)
@@ -1038,6 +1057,7 @@ def _collect_run_metrics(run, event_rows=None, audit_rows=None, provider_rows=No
     audit_counts = Counter(audit.event_type for audit in audit_rows)
     errors = [event for event in event_rows if event.event_type == 'error']
     turn_results = [event for event in event_rows if event.event_type == 'turn_result']
+    completed_turns = [event for event in turn_results if (event.payload_json or {}).get('action') != 'no_action']
     latencies = [row.latency_ms for row in provider_rows if row.latency_ms is not None]
     incidents = calculate_run_incidents(run, event_rows, audit_rows, provider_rows)
     audited_cycles = [cycle for cycle in cycle_rows if cycle.status == 'audited']
@@ -1045,8 +1065,8 @@ def _collect_run_metrics(run, event_rows=None, audit_rows=None, provider_rows=No
     return {
         'run_status': run.status,
         'error_count': len(errors),
-        'turn_count': len(turn_results),
-        'completed_turns': len(turn_results),
+        'turn_count': len(completed_turns),
+        'completed_turns': len(completed_turns),
         'dm_silence_count': audit_counts.get('dm_silence_chosen', 0),
         'dm_empty_count': audit_counts.get('dm_output_empty', 0),
         'model_retry_count': audit_counts.get('model_retry', 0) + sum((row.parse_repair_attempts or 0) for row in provider_rows),

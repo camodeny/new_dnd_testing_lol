@@ -218,6 +218,12 @@ def ensure_lightweight_schema():
             db.session.execute(text('ALTER TABLE automation_runs ADD COLUMN awaiting_audit_phase VARCHAR(40)'))
         if 'audit_resumed_at' not in automation_run_columns:
             db.session.execute(text('ALTER TABLE automation_runs ADD COLUMN audit_resumed_at DATETIME'))
+        if 'last_claim_attempt_at' not in automation_run_columns:
+            db.session.execute(text('ALTER TABLE automation_runs ADD COLUMN last_claim_attempt_at DATETIME'))
+        if 'claim_failure_reason' not in automation_run_columns:
+            db.session.execute(text('ALTER TABLE automation_runs ADD COLUMN claim_failure_reason TEXT'))
+        if 'worker_api_base' not in automation_run_columns:
+            db.session.execute(text('ALTER TABLE automation_runs ADD COLUMN worker_api_base VARCHAR(200)'))
 
     automation_event_columns = table_columns('automation_run_events')
     if automation_event_columns:

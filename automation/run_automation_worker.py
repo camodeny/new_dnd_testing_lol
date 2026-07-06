@@ -40,12 +40,16 @@ def utc_now():
     return datetime.now(timezone.utc).isoformat()
 
 
-def workspace(api_base, owner_api_key):
-    return api_get(api_base, '/api/automation', api_key=owner_api_key)
+def workspace(api_base, owner_api_key, worker_id=None):
+    query = {}
+    if worker_id:
+        query['worker_id'] = worker_id
+        query['api_base'] = api_base
+    return api_get(api_base, '/api/automation', api_key=owner_api_key, query=query)
 
 
-def list_candidate_run_ids(api_base, owner_api_key):
-    data = workspace(api_base, owner_api_key)
+def list_candidate_run_ids(api_base, owner_api_key, worker_id=None):
+    data = workspace(api_base, owner_api_key, worker_id=worker_id)
     active_runs = data.get('active_runs') or []
     queued = [run.get('id') for run in active_runs if run.get('status') == 'queued']
     resumable = [
@@ -60,7 +64,7 @@ def claim_run(api_base, owner_api_key, run_id, worker_id):
     return api_post(
         api_base,
         f'/api/automation/runs/{run_id}/claim',
-        {'worker_id': worker_id},
+        {'worker_id': worker_id, 'api_base': api_base},
         api_key=owner_api_key,
     )
 
@@ -69,7 +73,7 @@ def heartbeat(api_base, owner_api_key, run_id, worker_id, lease_token):
     return api_post(
         api_base,
         f'/api/automation/runs/{run_id}/heartbeat',
-        {'worker_id': worker_id, 'lease_token': lease_token},
+        {'worker_id': worker_id, 'lease_token': lease_token, 'api_base': api_base},
         api_key=owner_api_key,
     )
 
@@ -488,7 +492,7 @@ def execute_run(args, run_id):
     last_seen_fingerprint = None
     last_change_at = time.monotonic()
     last_heartbeat_at = 0.0
-    turns_completed = 0
+    turns_completed = (claim_payload.get('run') or {}).get('completed_turns') or 0
     same_fingerprint_no_action_retries = 0
     force_overseer_retry = False
     last_dm_turn = None
@@ -746,6 +750,29 @@ def execute_run(args, run_id):
                         len(manifest.get('llm_players') or []),
                     )
 
+                # Log turn result event
+                append_event(
+                    args.api_base,
+                    args.owner_api_key,
+                    run_id,
+                    args.worker_id,
+                    lease_token,
+                    'turn_result',
+                    {
+                        'campaign_id': campaign_id,
+                        'session_id': session_for_prompt['id'],
+                        'speaker': {
+                            'llm_player_id': chosen_player['llm_player']['id'],
+                            'label': chosen_player['llm_player']['label'],
+                            'character_name': chosen_player['character'].get('name'),
+                        } if chosen_player else None,
+                        'action': (decision.get('action') or '').strip().lower(),
+                        'turns_completed': turns_completed,
+                        'json_retry_count': json_retry_count,
+                    },
+                    dedupe_key=f'turn_result:{logical_key}',
+                )
+
                 if turns_completed >= args.max_turns:
                     complete_run(
                         args.api_base,
@@ -807,7 +834,7 @@ def main():
         raise SystemExit('DND_OWNER_API_KEY or --owner-api-key is required')
 
     while True:
-        candidate_ids = [args.run_id] if args.run_id else list_candidate_run_ids(args.api_base, args.owner_api_key)
+        candidate_ids = [args.run_id] if args.run_id else list_candidate_run_ids(args.api_base, args.owner_api_key, worker_id=args.worker_id)
         if not candidate_ids:
             if args.once:
                 return

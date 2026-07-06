@@ -15,6 +15,7 @@ from models import (
     AutomationScenario,
     AutomationScorecardTemplate,
     AutomationSnapshot,
+    AutomationWorker,
     Campaign,
     CampaignMember,
     CampaignSession,
@@ -56,6 +57,7 @@ from services.automation_service import (
     materialize_run_campaign,
     merged_runner_config_for_scenario,
     persist_provider_call,
+    record_worker_activity,
     provider_call_for_replay,
     refresh_run_scorecard,
     run_watch_payload,
@@ -139,6 +141,7 @@ def _run_auditors_in_background(app, run_id):
 
 
 def _workspace_payload(current_user):
+    from datetime import timedelta
     scenarios = AutomationScenario.query.order_by(AutomationScenario.updated_at.desc(), AutomationScenario.id.desc()).all()
     scorecards = AutomationScorecardTemplate.query.order_by(AutomationScorecardTemplate.updated_at.desc(), AutomationScorecardTemplate.id.desc()).all()
     active_runs = AutomationRun.query.filter(
@@ -148,6 +151,12 @@ def _workspace_payload(current_user):
         AutomationRun.status.in_(('failed', 'stopped')),
     ).order_by(AutomationRun.updated_at.desc(), AutomationRun.id.desc()).limit(8).all()
 
+    active_workers_query = AutomationWorker.query.filter(
+        (AutomationWorker.last_poll_at >= datetime.utcnow() - timedelta(minutes=5)) |
+        (AutomationWorker.last_heartbeat_at >= datetime.utcnow() - timedelta(minutes=5))
+    ).all()
+    queue_length = AutomationRun.query.filter_by(status='queued').count()
+
     return {
         'scorecards': [scorecard.to_dict() for scorecard in scorecards],
         'scenarios': [scenario.to_dict() for scenario in scenarios],
@@ -155,6 +164,8 @@ def _workspace_payload(current_user):
         'recent_failures': [run.to_dict() for run in recent_failures],
         'source_campaigns': [campaign.to_dict() for campaign in visible_campaigns_for_user(current_user)],
         'scenario_trends': workspace_trends_for_user(),
+        'active_workers': [worker.to_dict() for worker in active_workers_query],
+        'queue_length': queue_length,
     }
 
 
@@ -269,6 +280,10 @@ def _apply_proposal_direct(proposal):
 @automation_bp.route('/api/automation', methods=['GET'])
 @token_required
 def get_automation_workspace(current_user):
+    worker_id = request.args.get('worker_id')
+    api_base = request.args.get('api_base')
+    if worker_id:
+        record_worker_activity(worker_id, api_base=api_base, is_heartbeat=False)
     return jsonify(_workspace_payload(current_user)), 200
 
 
@@ -782,9 +797,23 @@ def claim_automation_run(current_user, run_id):
 
     data = request.get_json(silent=True) or {}
     worker_id = data.get('worker_id') or f'worker-{current_user.id}'
+    api_base = data.get('api_base')
+
+    run.last_claim_attempt_at = datetime.utcnow()
+    db.session.commit()
+
+    if worker_id:
+        record_worker_activity(worker_id, api_base=api_base, is_heartbeat=False)
+
     try:
         claim_data = claim_run_for_worker(run, worker_id)
+        run.claim_failure_reason = None
+        if api_base:
+            run.worker_api_base = api_base
+        db.session.commit()
     except ValueError as exc:
+        run.claim_failure_reason = str(exc)
+        db.session.commit()
         return jsonify({'error': str(exc)}), 409
 
     append_run_event(
@@ -826,13 +855,22 @@ def heartbeat_automation_run(current_user, run_id):
     run = get_or_404(AutomationRun, run_id)
     if not _run_owned_by_user(current_user, run):
         return jsonify({'error': 'Forbidden'}), 403
+
     data = request.get_json(silent=True) or {}
+    worker_id = data.get('worker_id')
+    api_base = data.get('api_base')
+    if worker_id:
+        record_worker_activity(worker_id, api_base=api_base, is_heartbeat=True)
+
     try:
         heartbeat_run(
             run,
-            worker_id=data.get('worker_id'),
+            worker_id=worker_id,
             lease_token=data.get('lease_token'),
         )
+        if api_base:
+            run.worker_api_base = api_base
+            db.session.commit()
     except ValueError as exc:
         return jsonify({'error': str(exc)}), 409
     return jsonify({'run': run.to_dict()}), 200

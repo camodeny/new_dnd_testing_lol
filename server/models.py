@@ -1510,6 +1510,29 @@ class AutomationSnapshot(db.Model):
         return data
 
 
+class AutomationWorker(db.Model):
+    __tablename__ = 'automation_workers'
+
+    id = db.Column(db.Integer, primary_key=True)
+    worker_id = db.Column(db.String(120), unique=True, nullable=False, index=True)
+    api_base = db.Column(db.String(200), nullable=True)
+    last_heartbeat_at = db.Column(db.DateTime, nullable=True)
+    last_poll_at = db.Column(db.DateTime, nullable=True)
+    created_at = db.Column(db.DateTime, default=datetime.utcnow)
+    updated_at = db.Column(db.DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
+
+    def to_dict(self):
+        return {
+            'id': self.id,
+            'worker_id': self.worker_id,
+            'api_base': self.api_base,
+            'last_heartbeat_at': self.last_heartbeat_at.isoformat() if self.last_heartbeat_at else None,
+            'last_poll_at': self.last_poll_at.isoformat() if self.last_poll_at else None,
+            'created_at': self.created_at.isoformat() if self.created_at else None,
+            'updated_at': self.updated_at.isoformat() if self.updated_at else None,
+        }
+
+
 class AutomationRun(db.Model):
     __tablename__ = 'automation_runs'
 
@@ -1546,11 +1569,152 @@ class AutomationRun(db.Model):
     created_at = db.Column(db.DateTime, default=datetime.utcnow, index=True)
     updated_at = db.Column(db.DateTime, default=datetime.utcnow, onupdate=datetime.utcnow, index=True)
 
+    # Added columns for P0 worker claiming
+    last_claim_attempt_at = db.Column(db.DateTime, nullable=True)
+    claim_failure_reason = db.Column(db.Text, nullable=True)
+    worker_api_base = db.Column(db.String(200), nullable=True)
+
     scenario = db.relationship('AutomationScenario', foreign_keys=[scenario_id])
     snapshot = db.relationship('AutomationSnapshot', foreign_keys=[snapshot_id])
     owner = db.relationship('User')
     derived_campaign = db.relationship('Campaign', foreign_keys=[derived_campaign_id])
+
+    def get_audit_pause_summary(self):
+        config = self.runner_config_json or {}
+        raw = config.get('audit_pause_phases')
+        if raw is None:
+            defaults = (self.scorecard_template_json or {}).get('defaults') or {}
+            raw = defaults.get('pause_phases')
+        configured = []
+        if isinstance(raw, list):
+            for value in raw:
+                phase = str(value).strip().lower()
+                if phase in {'after_player', 'after_dm'} and phase not in configured:
+                    configured.append(phase)
+
+        cycles = AutomationRunAuditCycle.query.filter_by(run_id=self.id).order_by(AutomationRunAuditCycle.cycle_number.asc()).all()
+        events = AutomationRunEvent.query.filter_by(run_id=self.id).order_by(AutomationRunEvent.sequence_number.asc()).all()
+
+        last_phase_reached = None
+        last_pause_created = None
+        if cycles:
+            last_phase_reached = cycles[-1].phase
+            last_pause_created = cycles[-1].created_at.isoformat() if cycles[-1].created_at else None
+
+        skipped = []
+        cycle_map = {}
+        for c in cycles:
+            if c.phase == 'after_player' and c.player_message_id is not None:
+                cycle_map[('after_player', c.player_message_id)] = c
+            elif c.phase == 'after_dm' and c.dm_message_id is not None:
+                cycle_map[('after_dm', c.dm_message_id)] = c
+            else:
+                cycle_map[(c.phase, c.cycle_number)] = c
+
+        player_decisions = [e for e in events if e.event_type == 'player_decision']
+        dm_turns = [e for e in events if e.event_type == 'dm_turn_status']
+
+        for idx, pd in enumerate(player_decisions):
+            payload = pd.payload_json or {}
+            posted_message_id = payload.get('posted_message_id')
+            decision = payload.get('decision') or {}
+            action = (decision.get('action') or '').strip().lower()
+
+            if 'after_player' in configured:
+                has_pause = False
+                if posted_message_id is not None and ('after_player', posted_message_id) in cycle_map:
+                    has_pause = True
+                elif ('after_player', idx + 1) in cycle_map:
+                    has_pause = True
+
+                is_pending = (self.status == 'awaiting_audit' and self.awaiting_audit_phase == 'after_player' and
+                              (posted_message_id is not None and self.awaiting_audit_cycle_id and
+                               db.session.get(AutomationRunAuditCycle, self.awaiting_audit_cycle_id).player_message_id == posted_message_id))
+
+                is_terminal = self.status in {'completed', 'failed', 'stopped'}
+                has_subsequent_activity = False
+                for dt in dm_turns:
+                    if dt.created_at > pd.created_at:
+                        has_subsequent_activity = True
+                        break
+
+                if not has_pause and not is_pending and (has_subsequent_activity or is_terminal):
+                    reason = "Skipped by worker."
+                    if action == 'no_action':
+                        reason = "Skipped because player took no action (no_action)."
+                    elif posted_message_id is None:
+                        reason = "Skipped because no message was posted."
+                    skipped.append({
+                        'phase': 'after_player',
+                        'message_id': posted_message_id,
+                        'reason': reason
+                    })
+
+        for idx, dt in enumerate(dm_turns):
+            payload = dt.payload_json or {}
+            dm_message_id = payload.get('dm_message_id')
+            status = payload.get('status')
+
+            if 'after_dm' in configured:
+                has_pause = False
+                if dm_message_id is not None and ('after_dm', dm_message_id) in cycle_map:
+                    has_pause = True
+                elif ('after_dm', idx + 1) in cycle_map:
+                    has_pause = True
+
+                is_pending = (self.status == 'awaiting_audit' and self.awaiting_audit_phase == 'after_dm' and
+                              (dm_message_id is not None and self.awaiting_audit_cycle_id and
+                               db.session.get(AutomationRunAuditCycle, self.awaiting_audit_cycle_id).dm_message_id == dm_message_id))
+
+                is_terminal = self.status in {'completed', 'failed', 'stopped'}
+                has_subsequent_activity = False
+                for pd in player_decisions:
+                    if pd.created_at > dt.created_at:
+                        has_subsequent_activity = True
+                        break
+
+                if not has_pause and not is_pending and (has_subsequent_activity or is_terminal):
+                    reason = "Skipped by worker."
+                    if status in {'silent', 'empty'}:
+                        reason = f"Skipped because DM response was {status}."
+                    elif dm_message_id is None:
+                        reason = "Skipped because no DM message was created."
+                    skipped.append({
+                        'phase': 'after_dm',
+                        'message_id': dm_message_id,
+                        'reason': reason
+                    })
+
+        next_expected_pause = None
+        if self.status not in {'completed', 'failed', 'stopped'}:
+            if self.status == 'awaiting_audit':
+                if self.awaiting_audit_phase == 'after_player' and 'after_dm' in configured:
+                    next_expected_pause = 'after_dm'
+                elif self.awaiting_audit_phase == 'after_dm' and 'after_player' in configured:
+                    next_expected_pause = 'after_player'
+                else:
+                    next_expected_pause = self.awaiting_audit_phase
+            else:
+                if not last_phase_reached:
+                    next_expected_pause = configured[0] if configured else None
+                elif last_phase_reached == 'after_player':
+                    next_expected_pause = 'after_dm' if 'after_dm' in configured else ('after_player' if 'after_player' in configured else None)
+                elif last_phase_reached == 'after_dm':
+                    next_expected_pause = 'after_player' if 'after_player' in configured else ('after_dm' if 'after_dm' in configured else None)
+
+        return {
+            'configured_pause_phases': configured,
+            'last_phase_reached': last_phase_reached,
+            'last_pause_created': last_pause_created,
+            'any_configured_pause_skipped': len(skipped) > 0,
+            'skipped_pauses': skipped,
+            'next_expected_pause_phase': next_expected_pause
+        }
+
     def to_dict(self):
+        turn_results = AutomationRunEvent.query.filter_by(run_id=self.id, event_type='turn_result').all()
+        completed_turns_count = len([e for e in turn_results if (e.payload_json or {}).get('action') != 'no_action'])
+
         return {
             'id': self.id,
             'scenario_id': self.scenario_id,
@@ -1584,6 +1748,12 @@ class AutomationRun(db.Model):
             'finished_at': self.finished_at.isoformat() if self.finished_at else None,
             'created_at': self.created_at.isoformat() if self.created_at else None,
             'updated_at': self.updated_at.isoformat() if self.updated_at else None,
+            'last_claim_attempt_at': self.last_claim_attempt_at.isoformat() if self.last_claim_attempt_at else None,
+            'claim_failure_reason': self.claim_failure_reason,
+            'worker_api_base': self.worker_api_base,
+            'completed_turns': completed_turns_count,
+            'turn_count': completed_turns_count,
+            'audit_pause_summary': self.get_audit_pause_summary(),
         }
 
 
