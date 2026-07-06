@@ -32,6 +32,8 @@ Optional secrets:
 
 If `DATABASE_URL` is not set, the app uses a SQLite database stored in the remote `data/` volume.
 Local `.env` files are intentionally excluded from the deploy archive. Values that need to reach the server must be configured as GitHub secrets or variables and are written to the remote `.deploy.env` during deployment.
+For automation-audit shell work on the deployed host, the container now expects `LLM_CAMPAIGN_ENV_FILE` to point at a writable volume path, defaulting to `/app/data/automation/llm_campaign.env`.
+If the host's home directory is mounted `noexec`, host convenience wrappers copied into `~/bin` should be run through `sh` rather than executed directly.
 
 ## GitHub environment variables
 
@@ -44,7 +46,9 @@ Optional variables:
 - `SSO_URL`: optional provider base URL for browser login. Set this to `https://auth.pendergrass.dev` when enabling hosted Pendergrass SSO.
 - `REDIRECT_URI`: optional app callback URL for browser login. For the current Tailscale deployment, use `http://camden-server.tailea98b.ts.net:$APP_PORT/api/auth/callback`.
 - `AUTH_COOKIE_SECURE`: defaults to `false`. Keep it `false` while the app itself is served over plain HTTP, even if `SSO_URL` is HTTPS.
+- `DND_API_BASE`: defaults to `http://127.0.0.1:$PORT` inside the app container for host-driven automation CLI usage.
 - `GUNICORN_TIMEOUT`: defaults to `420` in Docker Compose to allow slower image generation requests.
+- `LLM_CAMPAIGN_ENV_FILE`: defaults to `/app/data/automation/llm_campaign.env` so host-driven audit wrappers can source a persisted owner automation key.
 - `GUNICORN_WORKER_CLASS`: defaults to `gthread` for better handling of long-lived streaming requests.
 - `WEB_CONCURRENCY`: defaults to `3` Gunicorn workers.
 - `WEB_THREADS`: defaults to `12` threads per worker when using `gthread`.

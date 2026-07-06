@@ -1,12 +1,12 @@
-#!/usr/bin/env zsh
-set -euo pipefail
+#!/usr/bin/env sh
+set -eu
 
-ROOT="/Users/cpendergrass/Programming/new_dnd_testing_lol"
+ROOT="$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)"
 ENV_FILE="${LLM_CAMPAIGN_ENV_FILE:-$ROOT/automation/llm_campaign.env}"
 
-if [[ -f "$ENV_FILE" ]]; then
+if [ -f "$ENV_FILE" ]; then
   set -a
-  source "$ENV_FILE"
+  . "$ENV_FILE"
   set +a
 fi
 

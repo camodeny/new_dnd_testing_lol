@@ -39,6 +39,33 @@ Notes:
 - The CLI can also bootstrap a fresh manifest-backed campaign for later use with `"$AUTOMATION_CTL" campaign create --manifest automation/state/my-campaign.json --no-start`.
 - Raw `curl` examples are no longer the recommended path for this workflow.
 
+### Deployed host shell usage
+
+When you have shell access on the deployed host rather than a local checkout, run the CLI inside the app container.
+
+First create or rotate a host-side owner automation key and write the env file that the wrappers will source:
+
+```bash
+docker exec new_dnd_testing_lol-app-1 \
+  dnd-ensure-host-audit-env \
+  --username phazedrl \
+  --env-file /app/data/automation/llm_campaign.env
+```
+
+Then run the normal CLI from inside the same container:
+
+```bash
+docker exec new_dnd_testing_lol-app-1 \
+  dnd-automationctl run status \
+  --run-id "$RUN_ID" \
+  --pretty
+```
+
+The container inherits provider credentials from deploy env, so the worker path only needs the generated owner automation key file plus the existing app env.
+
+If you want shorter commands on the host, copy `automation/deployed_host/dnd-automationctl` and `automation/deployed_host/dnd-ensure-host-audit-env` into a host bin directory and run those wrappers instead of spelling out `docker exec` every time.
+If the host home filesystem is mounted `noexec`, invoke them as `sh ~/bin/dnd-automationctl ...` and `sh ~/bin/dnd-ensure-host-audit-env ...`.
+
 ## Audit Workflow
 
 1. Ask the user what they want audited.

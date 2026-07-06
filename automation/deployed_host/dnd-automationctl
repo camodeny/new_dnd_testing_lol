@@ -1,0 +1,13 @@
+#!/usr/bin/env sh
+set -eu
+
+CONTAINER="${DND_APP_CONTAINER:-new_dnd_testing_lol-app-1}"
+ENV_FILE="${DND_HOST_AUDIT_ENV_FILE:-/app/data/automation/llm_campaign.env}"
+API_BASE="${DND_API_BASE:-http://127.0.0.1:5001}"
+
+exec docker exec \
+  -e "LLM_CAMPAIGN_ENV_FILE=$ENV_FILE" \
+  -e "DND_API_BASE=$API_BASE" \
+  "$CONTAINER" \
+  /app/automation/automationctl.sh \
+  "$@"

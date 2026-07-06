@@ -23,9 +23,12 @@ RUN --mount=type=cache,target=/root/.cache/pip \
     pip install --no-cache-dir -r requirements.txt
 
 COPY server/ ./
+COPY automation/ /app/automation/
 COPY --from=client-build /app/client/dist ./static
 
-RUN chmod +x ./entrypoint.sh
+RUN chmod +x ./entrypoint.sh /app/automation/*.sh /app/automation/ensure_host_audit_env.py \
+    && ln -sf /app/automation/automationctl.sh /usr/local/bin/dnd-automationctl \
+    && ln -sf /app/automation/ensure_host_audit_env.py /usr/local/bin/dnd-ensure-host-audit-env
 
 EXPOSE 5001
 

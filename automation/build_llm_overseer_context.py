@@ -57,7 +57,7 @@ def main():
         'recent_messages': session.get('messages', [])[-args.message_window:],
         'message_window': args.message_window,
         'orchestrator_command_template': (
-            '/Users/cpendergrass/Programming/new_dnd_testing_lol/automation/run_llm_campaign_orchestrator.sh '
+            './automation/run_llm_campaign_orchestrator.sh '
             f'{args.manifest} --player-id <llm_player_id> --message-window {args.message_window}'
         ),
     }
