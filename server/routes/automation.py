@@ -19,14 +19,18 @@ from models import (
     CampaignMember,
     CampaignSession,
     Character,
+    CharacterCondition,
+    CharacterEquipment,
     SessionMessage,
     SheetProposal,
     User,
     db,
 )
 from services.automation_auditor import (
+    AUDITOR_TOOL_DEFINITIONS,
     cancel_auditor_jobs_for_current_cycle,
     ensure_auditor_jobs_for_cycle,
+    execute_auditor_tool,
     list_auditor_jobs,
     merge_auditor_config_into_runner_config,
     normalize_auditor_config,
@@ -198,6 +202,29 @@ def _pending_proposal_for_entry(session_id, acting_entry, proposal_id):
         if acting_entry.get('character_id') == proposal.character_id:
             return proposal
     return None
+
+
+def _coerce_sheet_scalar_value(field, value):
+    config = SHEET_SCALAR_FIELDS.get(field)
+    if not config:
+        raise ValueError(f'Unsupported character field: {field}')
+    if config['type'] == 'bool':
+        return bool(value)
+    coerced = int(value)
+    if 'min' in config:
+        coerced = max(config['min'], coerced)
+    if 'max' in config:
+        coerced = min(config['max'], coerced)
+    return coerced
+
+
+def _automation_run_character(run, character_id):
+    if not run.derived_campaign_id:
+        raise ValueError('Run has no derived campaign')
+    character = db.session.get(Character, character_id)
+    if character is None or character.campaign_id != run.derived_campaign_id:
+        raise ValueError('Character not found for this automation run')
+    return character
 
 
 def _apply_proposal_direct(proposal):
@@ -959,6 +986,143 @@ def stop_automation_run_auditors(current_user, run_id):
         return jsonify({'error': 'Forbidden'}), 403
     jobs = cancel_auditor_jobs_for_current_cycle(run)
     return jsonify({'run': run.to_dict(), 'auditor_jobs': [job.to_dict() for job in jobs], 'stopped': True}), 200
+
+
+@automation_bp.route('/api/automation/runs/<int:run_id>/auditor-tools/<tool_name>', methods=['POST'])
+@token_required
+def execute_automation_auditor_tool(current_user, run_id, tool_name):
+    run = get_or_404(AutomationRun, run_id)
+    if not _run_visible_to_user(current_user, run):
+        return jsonify({'error': 'Forbidden'}), 403
+
+    allowed_tools = {
+        item.get('function', {}).get('name')
+        for item in AUDITOR_TOOL_DEFINITIONS
+        if item.get('function', {}).get('name')
+    }
+    if tool_name not in allowed_tools:
+        return jsonify({'error': f'Unknown auditor tool: {tool_name}'}), 404
+
+    data = request.get_json(silent=True) or {}
+    args = data.get('args') if isinstance(data.get('args'), dict) else {}
+    result = execute_auditor_tool(run, tool_name, args)
+    return jsonify({'run_id': run.id, 'tool_name': tool_name, 'result': result}), 200
+
+
+@automation_bp.route('/api/automation/runs/<int:run_id>/player-repairs', methods=['POST'])
+@token_required
+def apply_automation_player_repair(current_user, run_id):
+    run = get_or_404(AutomationRun, run_id)
+    if not _run_owned_by_user(current_user, run):
+        return jsonify({'error': 'Forbidden'}), 403
+
+    data = request.get_json(silent=True) or {}
+    action = (data.get('action') or '').strip().lower()
+    reason = (data.get('reason') or '').strip()
+    if not reason:
+        return jsonify({'error': 'reason is required for player-side repairs'}), 400
+
+    before = None
+    after = None
+    character_id = data.get('character_id')
+    try:
+        if action == 'set_character_field':
+            character = _automation_run_character(run, character_id)
+            field = (data.get('field') or '').strip()
+            value = _coerce_sheet_scalar_value(field, data.get('value'))
+            before = character_full_dict(character)
+            setattr(character, field, value)
+            character.updated_at = datetime.utcnow()
+            db.session.commit()
+            after = character_full_dict(character)
+        elif action == 'set_condition':
+            character = _automation_run_character(run, character_id)
+            condition_name = (data.get('condition_name') or '').strip()
+            if not condition_name:
+                return jsonify({'error': 'condition_name is required'}), 400
+            before = character_full_dict(character)
+            present = bool(data.get('present', True))
+            existing = CharacterCondition.query.filter_by(
+                character_id=character.id,
+                condition_name=condition_name,
+            ).first()
+            if present:
+                if existing is None:
+                    existing = CharacterCondition(character_id=character.id, condition_name=condition_name)
+                    db.session.add(existing)
+                if 'description' in data:
+                    existing.description = data.get('description')
+                if 'source' in data:
+                    existing.source = data.get('source')
+                if 'is_permanent' in data:
+                    existing.is_permanent = bool(data.get('is_permanent'))
+                if 'duration_remaining' in data:
+                    existing.duration_remaining = data.get('duration_remaining')
+            elif existing is not None:
+                db.session.delete(existing)
+            character.updated_at = datetime.utcnow()
+            db.session.commit()
+            after = character_full_dict(character)
+        elif action == 'adjust_equipment':
+            character = _automation_run_character(run, character_id)
+            item_name = (data.get('item_name') or data.get('name') or '').strip()
+            if not item_name:
+                return jsonify({'error': 'item_name is required'}), 400
+            before = character_full_dict(character)
+            existing = CharacterEquipment.query.filter_by(character_id=character.id, name=item_name).first()
+            if existing is None:
+                existing = CharacterEquipment(character_id=character.id, name=item_name, quantity=0)
+                db.session.add(existing)
+            if data.get('quantity') is not None:
+                existing.quantity = max(0, int(data.get('quantity')))
+            else:
+                existing.quantity = max(0, int(existing.quantity or 0) + int(data.get('quantity_delta') or 0))
+            for field in ('equipment_type', 'description', 'weight', 'is_equipped', 'armor_bonus', 'properties'):
+                if field in data:
+                    setattr(existing, field, data.get(field))
+            if existing.quantity <= 0:
+                db.session.delete(existing)
+            character.updated_at = datetime.utcnow()
+            db.session.commit()
+            after = character_full_dict(character)
+        elif action in {'apply_proposal', 'dismiss_proposal'}:
+            session = latest_session_for_run(run)
+            if session is None:
+                return jsonify({'error': 'Run has no session to repair'}), 400
+            proposal = db.session.get(SheetProposal, data.get('proposal_id'))
+            if proposal is None or proposal.session_id != session.id or proposal.status != 'pending':
+                return jsonify({'error': 'Pending proposal not found for this run'}), 400
+            character = _automation_run_character(run, proposal.character_id)
+            before = character_full_dict(character)
+            if action == 'apply_proposal':
+                character = _apply_proposal_direct(proposal)
+            else:
+                proposal.status = 'dismissed'
+                db.session.commit()
+            after = character_full_dict(character)
+            character_id = character.id
+        else:
+            return jsonify({'error': 'action must be set_character_field, set_condition, adjust_equipment, apply_proposal, or dismiss_proposal'}), 400
+    except (TypeError, ValueError) as exc:
+        db.session.rollback()
+        return jsonify({'error': str(exc)}), 400
+
+    repair_payload = {
+        'repair_scope': 'player_side',
+        'action': action,
+        'reason': reason,
+        'character_id': character_id,
+        'exclude_from_dm_fault': bool(data.get('exclude_from_dm_fault', True)),
+        'before': before,
+        'after': after,
+    }
+    event_row, _created = append_run_event(
+        run,
+        'player_state_repaired',
+        repair_payload,
+        dedupe_key=data.get('dedupe_key'),
+    )
+    return jsonify({'run': run.to_dict(), 'event': event_row.to_dict(), 'repair': repair_payload}), 200
 
 
 @automation_bp.route('/api/automation/runs/<int:run_id>/events', methods=['POST'])
