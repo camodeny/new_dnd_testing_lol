@@ -651,7 +651,7 @@ def create_automation_run(current_user, scenario_id):
             normalized_matrix.append({
                 **entry,
                 'runner_config': merge_auditor_config_into_runner_config(
-                    runner_config_from_request(entry.get('runner_config'), entry.get('audit_config'))
+                    runner_config_from_request(entry.get('runner_config'), entry.get('audit_config'), entry)
                 ),
             })
         group_id, runs = create_matrix_runs(scenario, snapshot, current_user, normalized_matrix)
@@ -660,7 +660,7 @@ def create_automation_run(current_user, scenario_id):
     merged_runner_config = merge_auditor_config_into_runner_config(
         merged_runner_config_for_scenario(
             scenario,
-            runner_config_from_request(data.get('runner_config'), data.get('audit_config')),
+            runner_config_from_request(data.get('runner_config'), data.get('audit_config'), data),
         )
     )
     run = AutomationRun(

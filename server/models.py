@@ -1714,6 +1714,12 @@ class AutomationRun(db.Model):
     def to_dict(self):
         turn_results = AutomationRunEvent.query.filter_by(run_id=self.id, event_type='turn_result').all()
         completed_turns_count = len([e for e in turn_results if (e.payload_json or {}).get('action') != 'no_action'])
+        if completed_turns_count == 0:
+            player_decisions = AutomationRunEvent.query.filter_by(run_id=self.id, event_type='player_decision').all()
+            completed_turns_count = len([
+                e for e in player_decisions
+                if (e.payload_json or {}).get('decision', {}).get('action') != 'no_action'
+            ])
 
         return {
             'id': self.id,
