@@ -1778,6 +1778,192 @@ class AutomationRouteTest(unittest.TestCase):
             self.assertEqual(provider_call.parsed_output_json['tool_calls_used'], ['get_run_status'])
             self.assertEqual(provider_call.usage_total_tokens, 45)
 
+    def test_pause_endpoint_idempotency(self):
+        scenario_id = self.client.post(
+            '/api/automation/scenarios',
+            headers=self.headers,
+            json={'source_campaign_id': self.campaign_id, 'name': 'Benchmark Pause'},
+        ).get_json()['scenario']['id']
+        snapshot_id = self.client.post(
+            f'/api/automation/scenarios/{scenario_id}/snapshots',
+            headers=self.headers,
+            json={},
+        ).get_json()['snapshot']['id']
+        run_id = self.client.post(
+            f'/api/automation/scenarios/{scenario_id}/runs',
+            headers=self.headers,
+            json={'snapshot_id': snapshot_id},
+        ).get_json()['run']['id']
+        claim = self.client.post(
+            f'/api/automation/runs/{run_id}/claim',
+            headers=self.headers,
+            json={'worker_id': 'worker-pauser'},
+        ).get_json()
+
+        # 1. Duplicate after_player pause returns same cycle
+        pause_1_resp = self.client.post(
+            f'/api/automation/runs/{run_id}/pause',
+            headers=self.headers,
+            json={
+                'worker_id': 'worker-pauser',
+                'lease_token': claim['lease_token'],
+                'phase': 'after_player',
+                'player_message_id': 9901,
+            },
+        )
+        self.assertEqual(pause_1_resp.status_code, 200)
+        cycle_1 = pause_1_resp.get_json()['audit_cycle']
+
+        pause_2_resp = self.client.post(
+            f'/api/automation/runs/{run_id}/pause',
+            headers=self.headers,
+            json={
+                'worker_id': 'worker-pauser',
+                'lease_token': claim['lease_token'],
+                'phase': 'after_player',
+                'player_message_id': 9901,
+            },
+        )
+        self.assertEqual(pause_2_resp.status_code, 200)
+        cycle_2 = pause_2_resp.get_json()['audit_cycle']
+        self.assertEqual(cycle_1['id'], cycle_2['id'])
+
+        # Reset run status to running
+        with app.app_context():
+            from models import AutomationRun
+            r = db.session.get(AutomationRun, run_id)
+            r.status = 'running'
+            r.awaiting_audit_cycle_id = None
+            r.awaiting_audit_phase = None
+            db.session.commit()
+
+        # 2. Duplicate after_dm pause with same dm_message_id
+        pause_3_resp = self.client.post(
+            f'/api/automation/runs/{run_id}/pause',
+            headers=self.headers,
+            json={
+                'worker_id': 'worker-pauser',
+                'lease_token': claim['lease_token'],
+                'phase': 'after_dm',
+                'player_message_id': 9901,
+                'dm_message_id': 9902,
+            },
+        )
+        self.assertEqual(pause_3_resp.status_code, 200)
+        cycle_3 = pause_3_resp.get_json()['audit_cycle']
+
+        pause_4_resp = self.client.post(
+            f'/api/automation/runs/{run_id}/pause',
+            headers=self.headers,
+            json={
+                'worker_id': 'worker-pauser',
+                'lease_token': claim['lease_token'],
+                'phase': 'after_dm',
+                'player_message_id': 9901,
+                'dm_message_id': 9902,
+            },
+        )
+        self.assertEqual(pause_4_resp.status_code, 200)
+        cycle_4 = pause_4_resp.get_json()['audit_cycle']
+        self.assertEqual(cycle_3['id'], cycle_4['id'])
+
+        # Reset run status to running
+        with app.app_context():
+            from models import AutomationRun
+            r = db.session.get(AutomationRun, run_id)
+            r.status = 'running'
+            r.awaiting_audit_cycle_id = None
+            r.awaiting_audit_phase = None
+            db.session.commit()
+
+        # 3. Duplicate after_dm pause with same player_message_id but no dm_message_id (silent/empty)
+        pause_5_resp = self.client.post(
+            f'/api/automation/runs/{run_id}/pause',
+            headers=self.headers,
+            json={
+                'worker_id': 'worker-pauser',
+                'lease_token': claim['lease_token'],
+                'phase': 'after_dm',
+                'player_message_id': 9903,
+            },
+        )
+        self.assertEqual(pause_5_resp.status_code, 200)
+        cycle_5 = pause_5_resp.get_json()['audit_cycle']
+
+        pause_6_resp = self.client.post(
+            f'/api/automation/runs/{run_id}/pause',
+            headers=self.headers,
+            json={
+                'worker_id': 'worker-pauser',
+                'lease_token': claim['lease_token'],
+                'phase': 'after_dm',
+                'player_message_id': 9903,
+            },
+        )
+        self.assertEqual(pause_6_resp.status_code, 200)
+        cycle_6 = pause_6_resp.get_json()['audit_cycle']
+        self.assertEqual(cycle_5['id'], cycle_6['id'])
+
+        # Reset run status to running
+        with app.app_context():
+            from models import AutomationRun
+            r = db.session.get(AutomationRun, run_id)
+            r.status = 'running'
+            r.awaiting_audit_cycle_id = None
+            r.awaiting_audit_phase = None
+            db.session.commit()
+
+        # 4. Existing audited/skipped cycle does NOT force run back into awaiting_audit
+        with app.app_context():
+            from models import AutomationRunAuditCycle, AutomationRun
+            c5 = db.session.get(AutomationRunAuditCycle, cycle_5['id'])
+            c5.status = 'skipped'
+            r = db.session.get(AutomationRun, run_id)
+            r.status = 'running'
+            r.awaiting_audit_cycle_id = None
+            r.awaiting_audit_phase = None
+            db.session.commit()
+
+        pause_7_resp = self.client.post(
+            f'/api/automation/runs/{run_id}/pause',
+            headers=self.headers,
+            json={
+                'worker_id': 'worker-pauser',
+                'lease_token': claim['lease_token'],
+                'phase': 'after_dm',
+                'player_message_id': 9903,
+            },
+        )
+        self.assertEqual(pause_7_resp.status_code, 200)
+        res_data = pause_7_resp.get_json()
+        self.assertEqual(res_data['run']['status'], 'running')
+        self.assertIsNone(res_data['run']['awaiting_audit_cycle_id'])
+        self.assertFalse(res_data['paused'])
+
+        # 5. Run already awaiting a different audit cycle returns 409
+        with app.app_context():
+            from models import AutomationRunAuditCycle, AutomationRun
+            c1 = db.session.get(AutomationRunAuditCycle, cycle_1['id'])
+            c1.status = 'pending'
+            r = db.session.get(AutomationRun, run_id)
+            r.status = 'awaiting_audit'
+            r.awaiting_audit_cycle_id = c1.id
+            r.awaiting_audit_phase = 'after_player'
+            db.session.commit()
+
+        pause_8_resp = self.client.post(
+            f'/api/automation/runs/{run_id}/pause',
+            headers=self.headers,
+            json={
+                'worker_id': 'worker-pauser',
+                'lease_token': claim['lease_token'],
+                'phase': 'after_dm',
+                'player_message_id': 9904,
+            },
+        )
+        self.assertEqual(pause_8_resp.status_code, 409)
+        self.assertIn('already awaiting a different audit cycle', pause_8_resp.get_json()['error'])
+
 
 if __name__ == '__main__':
     unittest.main()

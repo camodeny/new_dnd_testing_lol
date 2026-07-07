@@ -455,7 +455,8 @@ def pause_for_audit_if_needed(args, claim_payload, run_id, lease_token, phase, m
         dedupe_key=payload.get('dedupe_key'),
     )
     lease_token = ((response.get('run') or {}).get('lease_token')) or lease_token
-    return True, lease_token
+    paused = bool(response.get('paused', True))
+    return paused, lease_token
 
 
 def execute_run(args, run_id):
@@ -501,6 +502,22 @@ def execute_run(args, run_id):
                 dm_turn_status = autonomous.fetch_dm_turn_status(manifest, latest_player_message_id)
                 if not autonomous.dm_turn_status_resolved(dm_turn_status):
                     resume_dm_wait_message_id = latest_player_message_id
+                elif 'after_dm' in pause_phases(claim_payload):
+                    initial_run_payload = fetch_run(args.api_base, args.owner_api_key, run_id)
+                    audit_cycles = initial_run_payload.get('audit_cycles') or []
+                    has_matching_after_dm = False
+                    for cycle in audit_cycles:
+                        if cycle.get('phase') == 'after_dm' and (
+                            cycle.get('player_message_id') == latest_player_message_id
+                            or (
+                                dm_turn_status.get('dm_message_id') is not None
+                                and cycle.get('dm_message_id') == dm_turn_status.get('dm_message_id')
+                            )
+                        ):
+                            has_matching_after_dm = True
+                            break
+                    if not has_matching_after_dm:
+                        resume_dm_wait_message_id = latest_player_message_id
             except Exception:
                 pass
 
@@ -628,6 +645,18 @@ def execute_run(args, run_id):
                 )
                 return True
             continue
+
+        if turns_completed >= max_turns:
+            complete_run(
+                args.api_base,
+                args.owner_api_key,
+                run_id,
+                args.worker_id,
+                lease_token,
+                status='completed',
+                dedupe_key=f'run_completed:{run_id}:max-turns',
+            )
+            return True
 
         current_fingerprint = messages_fingerprint(session)
         fingerprint_changed = current_fingerprint != last_seen_fingerprint
