@@ -1711,7 +1711,7 @@ class AutomationRun(db.Model):
             'next_expected_pause_phase': next_expected_pause
         }
 
-    def to_dict(self):
+    def to_dict(self, include_secrets=False):
         turn_results = AutomationRunEvent.query.filter_by(run_id=self.id, event_type='turn_result').all()
         completed_turns_count = len([e for e in turn_results if (e.payload_json or {}).get('action') != 'no_action'])
         if completed_turns_count == 0:
@@ -1721,7 +1721,7 @@ class AutomationRun(db.Model):
                 if (e.payload_json or {}).get('decision', {}).get('action') != 'no_action'
             ])
 
-        return {
+        result = {
             'id': self.id,
             'scenario_id': self.scenario_id,
             'snapshot_id': self.snapshot_id,
@@ -1729,7 +1729,7 @@ class AutomationRun(db.Model):
             'derived_campaign_id': self.derived_campaign_id,
             'status': self.status,
             'worker_id': self.worker_id,
-            'lease_token': self.lease_token,
+            'has_lease_token': bool(self.lease_token),
             'heartbeat_at': self.heartbeat_at.isoformat() if self.heartbeat_at else None,
             'lease_expires_at': self.lease_expires_at.isoformat() if self.lease_expires_at else None,
             'attempt_count': self.attempt_count,
@@ -1761,6 +1761,9 @@ class AutomationRun(db.Model):
             'turn_count': completed_turns_count,
             'audit_pause_summary': self.get_audit_pause_summary(),
         }
+        if include_secrets:
+            result['lease_token'] = self.lease_token
+        return result
 
 
 class AutomationRunEvent(db.Model):

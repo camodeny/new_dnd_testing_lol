@@ -3,6 +3,7 @@ from collections import Counter
 from datetime import datetime
 from uuid import uuid4
 
+from utils.redaction import redact_secrets
 from models import (
     AutomationRun,
     AutomationRunAuditCycle,
@@ -545,7 +546,7 @@ def _select_paths(value, paths):
 
 def _compact_audit_event(row, *, include_payload=False):
     data = row.to_dict()
-    payload = data.get('payload') or {}
+    payload = redact_secrets(data.get('payload') or {})
     compact = {
         'id': data.get('id'),
         'event_type': data.get('event_type'),
@@ -568,7 +569,7 @@ def _compact_audit_event(row, *, include_payload=False):
 
 
 def _compact_provider_call(row, *, include_artifacts=False):
-    data = row.to_dict(include_artifacts=include_artifacts)
+    data = redact_secrets(row.to_dict(include_artifacts=include_artifacts))
     compact = {
         'id': data.get('id'),
         'dedupe_key': data.get('dedupe_key'),
@@ -593,18 +594,18 @@ def _compact_provider_call(row, *, include_artifacts=False):
         compact['response_text'] = data.get('response_text')
     else:
         compact['artifact_sizes'] = {
-            'request_chars': len(json.dumps(row.request_json or {}, ensure_ascii=False)),
-            'response_chars': len(json.dumps(row.response_json or {}, ensure_ascii=False)),
-            'parsed_output_chars': len(json.dumps(row.parsed_output_json or {}, ensure_ascii=False)),
+            'request_chars': len(json.dumps(redact_secrets(row.request_json or {}), ensure_ascii=False)),
+            'response_chars': len(json.dumps(redact_secrets(row.response_json or {}), ensure_ascii=False)),
+            'parsed_output_chars': len(json.dumps(redact_secrets(row.parsed_output_json or {}), ensure_ascii=False)),
             'response_text_chars': len(row.response_text or ''),
         }
-        compact['parsed_output_preview'] = _payload_preview(row.parsed_output_json or {}, max_chars=220)
+        compact['parsed_output_preview'] = _payload_preview(redact_secrets(row.parsed_output_json or {}), max_chars=220)
     return compact
 
 
 def _compact_run_event(row, *, include_payload=False):
     data = row.to_dict()
-    payload = data.get('payload') or {}
+    payload = redact_secrets(data.get('payload') or {})
     compact = {
         'id': data.get('id'),
         'event_type': data.get('event_type'),
@@ -623,9 +624,10 @@ def _compact_run_event(row, *, include_payload=False):
 
 
 def _selected_audit_event_detail(row, paths):
+    redacted_data = redact_secrets(row.to_dict())
     return {
         'event': _compact_audit_event(row, include_payload=False),
-        **_select_paths(row.to_dict(), paths),
+        **_select_paths(redacted_data, paths),
     }
 
 
@@ -652,25 +654,29 @@ def _selected_provider_call_detail(row, request_paths, response_paths, parsed_ou
         'selected_parsed_output_paths': {},
         'missing_paths': [],
     }
+    redacted_req = redact_secrets({'request': row.request_json or {}})
+    redacted_resp = redact_secrets({'response': row.response_json or {}})
+    redacted_parsed = redact_secrets({'parsed_output': row.parsed_output_json or {}})
     if request_paths:
-        request_selection = _select_paths({'request': row.request_json or {}}, [f'request.{path}' for path in request_paths])
+        request_selection = _select_paths(redacted_req, [f'request.{path}' for path in request_paths])
         detail['selected_request_paths'] = request_selection['selected_paths']
         detail['missing_paths'].extend(request_selection['missing_paths'])
     if response_paths:
-        response_selection = _select_paths({'response': row.response_json or {}}, [f'response.{path}' for path in response_paths])
+        response_selection = _select_paths(redacted_resp, [f'response.{path}' for path in response_paths])
         detail['selected_response_paths'] = response_selection['selected_paths']
         detail['missing_paths'].extend(response_selection['missing_paths'])
     if parsed_output_paths:
-        parsed_output_selection = _select_paths({'parsed_output': row.parsed_output_json or {}}, [f'parsed_output.{path}' for path in parsed_output_paths])
+        parsed_output_selection = _select_paths(redacted_parsed, [f'parsed_output.{path}' for path in parsed_output_paths])
         detail['selected_parsed_output_paths'] = parsed_output_selection['selected_paths']
         detail['missing_paths'].extend(parsed_output_selection['missing_paths'])
     return detail
 
 
 def _selected_run_event_detail(row, paths):
+    redacted_data = redact_secrets(row.to_dict())
     return {
         'event': _compact_run_event(row, include_payload=False),
-        **_select_paths(row.to_dict(), paths),
+        **_select_paths(redacted_data, paths),
     }
 
 
@@ -1951,7 +1957,7 @@ def get_current_audit_bundle_data(run):
     retrievals = get_memory_retrieval_summary(run, cycle)
     exposure = get_model_context_exposure(run, cycle)
     
-    return {
+    return redact_secrets({
         'manifest_version': 'audit_bundle_v1',
         'run': {
             'id': run.id,
@@ -1981,4 +1987,4 @@ def get_current_audit_bundle_data(run):
             'private_memory_text_redacted': True,
             'provider_request_messages_redacted': True
         }
-    }
+    })

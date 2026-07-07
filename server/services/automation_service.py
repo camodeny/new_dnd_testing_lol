@@ -4,6 +4,7 @@ from collections import Counter
 from datetime import datetime, timedelta
 from statistics import median
 
+from utils.redaction import redact_secrets
 from models import (
     AutomationRun,
     AutomationRunAuditCycle,
@@ -1487,7 +1488,7 @@ def run_watch_payload(run, current_user=None):
     ]
     current_audit_cycle = next((cycle for cycle in audit_cycles if cycle['id'] == run.awaiting_audit_cycle_id), None)
 
-    return {
+    return redact_secrets({
         'run': run.to_dict(),
         'scenario': run.scenario.to_dict() if run.scenario else None,
         'snapshot': run.snapshot.to_dict() if run.snapshot else None,
@@ -1522,7 +1523,7 @@ def run_watch_payload(run, current_user=None):
         'incidents': run.scorecard_summary_json.get('incidents') or [],
         'provider_calls': provider_calls,
         'baseline_comparison': run.baseline_comparison_json or {},
-    }
+    })
 
 
 def workspace_trends_for_user(user_id=None):
