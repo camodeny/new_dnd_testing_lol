@@ -322,8 +322,15 @@ def _normalized_pause_phases(value):
     return phases
 
 
-def runner_config_from_request(runner_config=None, audit_config=None):
+def runner_config_from_request(runner_config=None, audit_config=None, raw_data=None):
     config = dict(_json_object(runner_config, {}))
+    
+    if isinstance(raw_data, dict):
+        ignored_keys = {'snapshot_id', 'matrix', 'runner_config', 'audit_config', 'label'}
+        for k, v in raw_data.items():
+            if k not in ignored_keys and v is not None:
+                config[k] = v
+
     if config.get('audit_pause_phases') is not None:
         return config
 
@@ -331,6 +338,8 @@ def runner_config_from_request(runner_config=None, audit_config=None):
     raw_pause_phases = audit_settings.get('audit_pause_phases')
     if raw_pause_phases is None:
         raw_pause_phases = audit_settings.get('pause_phases')
+    if raw_pause_phases is None and isinstance(raw_data, dict):
+        raw_pause_phases = raw_data.get('audit_pause_phases') or raw_data.get('pause_phases')
     if raw_pause_phases is not None:
         config['audit_pause_phases'] = _normalized_pause_phases(raw_pause_phases)
     return config
@@ -901,7 +910,7 @@ def claim_run_for_worker(run, worker_id):
     reclaimed = run.status in {'claimed', 'running', 'stop_requested', 'awaiting_audit'} and lease_is_expired(run, at=now)
     if run.status not in {'queued', 'claimed', 'running', 'stop_requested', 'awaiting_audit'}:
         raise ValueError(f'Run is not claimable from status {run.status}')
-    if run.status != 'queued' and not reclaimed:
+    if run.status != 'queued' and not reclaimed and run.worker_id != worker_id:
         raise ValueError(f'Run is already leased by {run.worker_id or "another worker"}')
 
     run.worker_id = worker_id
@@ -1058,6 +1067,12 @@ def _collect_run_metrics(run, event_rows=None, audit_rows=None, provider_rows=No
     errors = [event for event in event_rows if event.event_type == 'error']
     turn_results = [event for event in event_rows if event.event_type == 'turn_result']
     completed_turns = [event for event in turn_results if (event.payload_json or {}).get('action') != 'no_action']
+    if not completed_turns:
+        player_decisions = [event for event in event_rows if event.event_type == 'player_decision']
+        completed_turns = [
+            event for event in player_decisions
+            if (event.payload_json or {}).get('decision', {}).get('action') != 'no_action'
+        ]
     latencies = [row.latency_ms for row in provider_rows if row.latency_ms is not None]
     incidents = calculate_run_incidents(run, event_rows, audit_rows, provider_rows)
     audited_cycles = [cycle for cycle in cycle_rows if cycle.status == 'audited']

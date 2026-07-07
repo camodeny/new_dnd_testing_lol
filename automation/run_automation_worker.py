@@ -55,7 +55,7 @@ def list_candidate_run_ids(api_base, owner_api_key, worker_id=None):
     resumable = [
         run.get('id')
         for run in active_runs
-        if run.get('status') in {'claimed', 'running', 'stop_requested', 'awaiting_audit'}
+        if run.get('status') in {'claimed', 'running', 'stop_requested'}
     ]
     return [run_id for run_id in [*queued, *resumable] if run_id is not None]
 
@@ -455,15 +455,7 @@ def pause_for_audit_if_needed(args, claim_payload, run_id, lease_token, phase, m
         dedupe_key=payload.get('dedupe_key'),
     )
     lease_token = ((response.get('run') or {}).get('lease_token')) or lease_token
-    while True:
-        maybe_heartbeat_fn()
-        run_payload = fetch_run(args.api_base, args.owner_api_key, run_id)
-        run_state = run_payload.get('run') or {}
-        lease_token = (run_state.get('lease_token') or lease_token)
-        if run_state.get('status') == 'awaiting_audit':
-            time.sleep(args.poll_interval)
-            continue
-        return finalize_terminal_state(args, run_id, lease_token, run_state), lease_token
+    return True, lease_token
 
 
 def execute_run(args, run_id):
@@ -674,6 +666,29 @@ def execute_run(args, run_id):
                 if (decision.get('action') or '').strip().lower() != 'no_action':
                     turns_completed += 1
 
+                # Log turn result event here BEFORE any pause!
+                append_event(
+                    args.api_base,
+                    args.owner_api_key,
+                    run_id,
+                    args.worker_id,
+                    lease_token,
+                    'turn_result',
+                    {
+                        'campaign_id': campaign_id,
+                        'session_id': session_for_prompt['id'],
+                        'speaker': {
+                            'llm_player_id': chosen_player['llm_player']['id'],
+                            'label': chosen_player['llm_player']['label'],
+                            'character_name': chosen_player['character'].get('name'),
+                        } if chosen_player else None,
+                        'action': (decision.get('action') or '').strip().lower(),
+                        'turns_completed': turns_completed,
+                        'json_retry_count': json_retry_count,
+                    },
+                    dedupe_key=f'turn_result:{logical_key}',
+                )
+
                 if posted_message_id is not None:
                     should_stop, lease_token = pause_for_audit_if_needed(
                         args,
@@ -750,28 +765,7 @@ def execute_run(args, run_id):
                         len(manifest.get('llm_players') or []),
                     )
 
-                # Log turn result event
-                append_event(
-                    args.api_base,
-                    args.owner_api_key,
-                    run_id,
-                    args.worker_id,
-                    lease_token,
-                    'turn_result',
-                    {
-                        'campaign_id': campaign_id,
-                        'session_id': session_for_prompt['id'],
-                        'speaker': {
-                            'llm_player_id': chosen_player['llm_player']['id'],
-                            'label': chosen_player['llm_player']['label'],
-                            'character_name': chosen_player['character'].get('name'),
-                        } if chosen_player else None,
-                        'action': (decision.get('action') or '').strip().lower(),
-                        'turns_completed': turns_completed,
-                        'json_retry_count': json_retry_count,
-                    },
-                    dedupe_key=f'turn_result:{logical_key}',
-                )
+
 
                 if turns_completed >= args.max_turns:
                     complete_run(
