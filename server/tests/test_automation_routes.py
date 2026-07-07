@@ -1938,6 +1938,7 @@ class AutomationRouteTest(unittest.TestCase):
         res_data = pause_7_resp.get_json()
         self.assertEqual(res_data['run']['status'], 'running')
         self.assertIsNone(res_data['run']['awaiting_audit_cycle_id'])
+        self.assertFalse(res_data['paused'])
 
 
 if __name__ == '__main__':

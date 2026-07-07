@@ -455,7 +455,8 @@ def pause_for_audit_if_needed(args, claim_payload, run_id, lease_token, phase, m
         dedupe_key=payload.get('dedupe_key'),
     )
     lease_token = ((response.get('run') or {}).get('lease_token')) or lease_token
-    return True, lease_token
+    paused = bool(response.get('paused', True))
+    return paused, lease_token
 
 
 def execute_run(args, run_id):
