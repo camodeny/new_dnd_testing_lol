@@ -32,6 +32,7 @@ from models import (
     LootBox,
     NPCActor,
     PlanningBondProposal,
+    SessionDmTurn,
     SessionMessage,
     SheetProposal,
     db,
@@ -742,6 +743,40 @@ def create_audit_cycle(run, phase, payload=None, *, summary=None, player_message
     return cycle
 
 
+def _parse_strict_bool(val, default=True):
+    if val is None:
+        return default
+    if isinstance(val, bool):
+        return val
+    s = str(val).strip().lower()
+    if s in {"false", "0", "no", "n", "off"}:
+        return False
+    if s in {"true", "1", "yes", "y", "on"}:
+        return True
+    return bool(val)
+
+
+def validate_evidence_ref(ref):
+    if not isinstance(ref, dict):
+        return False
+    if not ref:
+        return False
+    kind = ref.get("kind")
+    if kind not in {"audit_event", "provider_call", "run_event", "session_message", "memory_result", "snapshot_path"}:
+        return False
+    if not any(ref.get(k) is not None for k in ("id", "item_id", "text_hash", "path")):
+        return False
+    vis = ref.get("visibility")
+    if vis not in {"public", "dm_private"}:
+        ref["visibility"] = "unknown"
+    path = ref.get("path")
+    if path:
+        import re
+        if not re.match(r'^[a-zA-Z0-9_\.\[\]]+$', str(path)):
+            return False
+    return True
+
+
 def submit_audit_cycle_feedback(cycle, *, summary=None, notes=None, scorecard=None):
     cycle.summary = summary if summary is not None else cycle.summary
     cycle.notes = notes if notes is not None else cycle.notes
@@ -762,6 +797,27 @@ def submit_audit_cycle_feedback(cycle, *, summary=None, notes=None, scorecard=No
             continue
         template_row = template_criteria.get(criterion_id, {})
         status = _normalize_custom_scorecard_status(raw.get('status'))
+        
+        evidence_refs = []
+        for ref in _json_list(raw.get('evidence_refs'), []):
+            if validate_evidence_ref(ref):
+                evidence_refs.append({
+                    'kind': ref.get('kind'),
+                    'id': ref.get('id'),
+                    'item_id': ref.get('item_id'),
+                    'text_hash': ref.get('text_hash'),
+                    'path': ref.get('path'),
+                    'summary': ref.get('summary'),
+                    'visibility': ref.get('visibility'),
+                })
+                
+        applicability = _json_object(raw.get('applicability'), {})
+        applicability = {
+            'applicable': _parse_strict_bool(applicability.get('applicable'), True),
+            'reason': str(applicability.get('reason') or '').strip() or None,
+            'phase': str(applicability.get('phase') or '').strip() or None,
+        }
+
         criteria_results.append({
             'criterion_id': criterion_id,
             'label': template_row.get('label') or raw.get('label') or criterion_id,
@@ -769,15 +825,26 @@ def submit_audit_cycle_feedback(cycle, *, summary=None, notes=None, scorecard=No
             'summary': (raw.get('summary') or '').strip() or None,
             'primary_evidence': (raw.get('primary_evidence') or '').strip() or None,
             'evidence': (raw.get('evidence') or '').strip() or None,
+            'evidence_refs': evidence_refs,
+            'applicability': applicability,
         })
 
-    overall_status = (
-        _aggregate_custom_scorecard_statuses([item.get('status') for item in criteria_results], default='warn')
-        if criteria_results
-        else _normalize_custom_scorecard_status(scorecard_payload.get('overall_status'))
-    )
+    if criteria_results:
+        applicable_results = [
+            item for item in criteria_results
+            if item.get('applicability', {}).get('applicable', True)
+        ]
+        overall_status = (
+            _aggregate_custom_scorecard_statuses([item.get('status') for item in applicable_results], default='warn')
+            if applicable_results
+            else _aggregate_custom_scorecard_statuses([item.get('status') for item in criteria_results], default='warn')
+        )
+    else:
+        overall_status = _normalize_custom_scorecard_status(scorecard_payload.get('overall_status')) or 'warn'
     criteria_assessed_count = sum(1 for item in criteria_results if item.get('status') in {'pass', 'warn', 'fail'})
-    criteria_not_assessed_count = sum(1 for item in criteria_results if item.get('status') == 'not_assessed')
+    criteria_not_assessed_count = sum(1 for item in criteria_results if item.get('status') == 'not_assessed' and item.get('applicability', {}).get('applicable', True))
+    criteria_not_applicable_count = sum(1 for item in criteria_results if item.get('status') == 'not_assessed' and not item.get('applicability', {}).get('applicable', True))
+    
     cycle.scorecard_json = {
         'template': template,
         'criteria': criteria_results,
@@ -794,6 +861,7 @@ def submit_audit_cycle_feedback(cycle, *, summary=None, notes=None, scorecard=No
         'criteria_count': len(criteria_results),
         'criteria_assessed_count': criteria_assessed_count,
         'criteria_not_assessed_count': criteria_not_assessed_count,
+        'criteria_not_applicable_count': criteria_not_applicable_count,
         'auditor_job_count': len(_json_list(scorecard_payload.get('auditor_jobs'), [])),
         'unresolved_evidence_gap_count': len(_json_list(scorecard_payload.get('unresolved_evidence_gaps'), [])),
     }
@@ -1182,28 +1250,50 @@ def custom_scorecard_results(run, cycle_rows):
                     'status': _normalize_custom_scorecard_status(result.get('status')),
                     'summary': result.get('summary'),
                     'evidence': result.get('evidence'),
+                    'evidence_refs': _json_list(result.get('evidence_refs'), []),
+                    'applicability': _json_object(result.get('applicability'), {}),
                 })
 
     rows = []
     for criterion in criteria:
         criterion_id = criterion['id']
         assessments = by_criterion.get(criterion_id) or []
+        
+        # If there are no assessments, it defaults to warn
         if not assessments:
             status = 'warn'
             summary = 'No custom audit feedback recorded for this criterion.'
-            counts = {'pass': 0, 'warn': 0, 'fail': 0, 'not_assessed': 0}
+            counts = {'pass': 0, 'warn': 0, 'fail': 0, 'not_assessed': 0, 'not_applicable': 0}
             exercised_count = 0
+            not_assessed_applicable_count = 0
+            na_count = 0
         else:
+            applicable_assessments = [
+                item for item in assessments
+                if item.get('applicability', {}).get('applicable', True)
+            ]
+            
             counts = Counter(item['status'] for item in assessments if item.get('status') in CUSTOM_SCORECARD_STATUS_ORDER)
+            na_count = sum(1 for item in assessments if item.get('status') == 'not_assessed' and not item.get('applicability', {}).get('applicable', True))
+            not_assessed_applicable_count = sum(1 for item in assessments if item.get('status') == 'not_assessed' and item.get('applicability', {}).get('applicable', True))
+            
             exercised_count = counts.get('pass', 0) + counts.get('warn', 0) + counts.get('fail', 0)
-            status = _aggregate_custom_scorecard_statuses([item.get('status') for item in assessments], default='warn')
+            
+            # If there are only N/A assessments for this criterion across cycles:
+            if not applicable_assessments:
+                status = 'not_assessed'
+            else:
+                status = _aggregate_custom_scorecard_statuses([item.get('status') for item in applicable_assessments], default='warn')
+                
             summary = (
                 f'{counts.get("pass", 0)} pass, '
                 f'{counts.get("warn", 0)} warn, '
                 f'{counts.get("fail", 0)} fail, '
-                f'{counts.get("not_assessed", 0)} not_assessed across {len(assessments)} audited cycle(s); '
+                f'{not_assessed_applicable_count} not_assessed, '
+                f'{na_count} not_applicable across {len(assessments)} audited cycle(s); '
                 f'exercised in {exercised_count} cycle(s).'
             )
+            
         rows.append({
             'check_id': f'custom:{criterion_id}',
             'status': status,
@@ -1218,7 +1308,8 @@ def custom_scorecard_results(run, cycle_rows):
                 'counts': counts,
                 'aggregate_status': status,
                 'exercised_cycle_count': exercised_count,
-                'not_assessed_cycle_count': counts.get('not_assessed', 0),
+                'not_assessed_cycle_count': not_assessed_applicable_count,
+                'not_applicable_cycle_count': na_count,
                 'assessments': assessments,
                 'template_name': template.get('name'),
             },
@@ -1675,4 +1766,119 @@ def compare_runs_payload(left_run, right_run):
         'world_state_diff': world_state_diff,
         'clock_diff': clock_diff,
         'decision_trace_diff': decision_trace_diff,
+    }
+
+
+def find_provider_calls_for_turn(run_id, trace_id):
+    if not trace_id:
+        return []
+    provider_calls = AutomationRunProviderCall.query.filter_by(run_id=run_id).all()
+    matching = []
+    for pc in provider_calls:
+        if trace_id in str(pc.dedupe_key):
+            matching.append(pc)
+            continue
+        req = pc.request_json or {}
+        if isinstance(req, dict):
+            if str(trace_id) in str(req):
+                matching.append(pc)
+                continue
+    return matching
+
+
+def run_debug_summary(run_id):
+    run = db.session.get(AutomationRun, run_id)
+    if not run:
+        return {'error': 'Run not found'}
+        
+    worker = None
+    if run.worker_id:
+        worker = AutomationWorker.query.filter_by(worker_id=run.worker_id).first()
+        
+    recent_workers = AutomationWorker.query.all()
+    has_recent_poll = False
+    now = datetime.utcnow()
+    for wk in recent_workers:
+        if wk.last_poll_at and (now - wk.last_poll_at).total_seconds() < 300:
+            has_recent_poll = True
+            break
+            
+    stuck_reasons = []
+    
+    if run.status == 'queued' and not has_recent_poll:
+        stuck_reasons.append('queued_no_recent_worker_poll')
+        
+    if run.claim_failure_reason:
+        stuck_reasons.append('worker_claim_failure')
+        
+    if run.status == 'claimed' and run.lease_expires_at and now >= run.lease_expires_at:
+        stuck_reasons.append('claimed_lease_expired')
+        
+    if run.status == 'running':
+        if not run.heartbeat_at or (now - run.heartbeat_at).total_seconds() > 120:
+            stuck_reasons.append('running_heartbeat_stale')
+            
+    if run.status == 'awaiting_audit' and run.awaiting_audit_cycle_id:
+        cycle = db.session.get(AutomationRunAuditCycle, run.awaiting_audit_cycle_id)
+        if cycle:
+            if cycle.status == 'pending':
+                stuck_reasons.append('awaiting_audit_pending_cycle')
+            elif cycle.status == 'audited':
+                stuck_reasons.append('awaiting_audit_audited_but_not_continued')
+                
+    if run.status == 'stop_requested' and run.stop_requested_at:
+        if (now - run.stop_requested_at).total_seconds() > 60:
+            stuck_reasons.append('stop_requested_not_acknowledged')
+            
+    last_turn = SessionDmTurn.query.filter_by(campaign_id=run.derived_campaign_id).order_by(SessionDmTurn.id.desc()).first() if run.derived_campaign_id else None
+    if last_turn and last_turn.status != 'completed':
+        pcs = []
+        if last_turn.trace_id:
+            pcs = find_provider_calls_for_turn(run.id, last_turn.trace_id)
+        if not pcs and last_turn.status == 'pending':
+            stuck_reasons.append('provider_calls_missing_for_dm_turn')
+        if last_turn.memory_status == 'pending':
+            stuck_reasons.append('post_turn_memory_pending')
+        if last_turn.clock_status == 'pending':
+            stuck_reasons.append('post_turn_clock_pending')
+            
+    lease_summary = {
+        'has_lease_token': bool(run.lease_token),
+        'worker_id': run.worker_id,
+        'heartbeat_age_seconds': int((now - run.heartbeat_at).total_seconds()) if run.heartbeat_at else None,
+        'lease_expires_at': run.lease_expires_at.isoformat() if run.lease_expires_at else None,
+        'lease_expired': bool(run.lease_expires_at and now >= run.lease_expires_at)
+    }
+    
+    last_event = None
+    last_event_row = AutomationRunEvent.query.filter_by(run_id=run.id).order_by(AutomationRunEvent.id.desc()).first()
+    if last_event_row:
+        last_event = {
+            'id': last_event_row.id,
+            'type': last_event_row.event_type,
+            'created_at': last_event_row.created_at.isoformat() if last_event_row.created_at else None
+        }
+        
+    return {
+        'run_id': run.id,
+        'status': run.status,
+        'last_event': last_event,
+        'lease': lease_summary,
+        'worker': {
+            'id': worker.worker_id if worker else None,
+            'last_heartbeat_at': worker.last_heartbeat_at.isoformat() if worker and worker.last_heartbeat_at else None,
+            'last_poll_at': worker.last_poll_at.isoformat() if worker and worker.last_poll_at else None,
+        } if worker else None,
+        'queue': {
+            'position': AutomationRun.query.filter(AutomationRun.status == 'queued', AutomationRun.id < run.id).count() if run.status == 'queued' else None,
+            'queued_run_count': AutomationRun.query.filter_by(status='queued').count()
+        },
+        'audit': {
+            'configured_pause_phases': (run.runner_config_json or {}).get('audit_pause_phases') or (run.runner_config_json or {}).get('pause_phases') or [],
+            'current_cycle_id': run.awaiting_audit_cycle_id,
+            'last_audited_cycle_id': AutomationRunAuditCycle.query.filter_by(run_id=run.id, status='audited').order_by(AutomationRunAuditCycle.id.desc()).first().id if AutomationRunAuditCycle.query.filter_by(run_id=run.id, status='audited').first() else None,
+            'next_expected_pause': run.awaiting_audit_phase
+        },
+        'stuck_reasons': stuck_reasons,
+        'next_expected_action': 'worker_should_continue_run' if run.status == 'running' and not stuck_reasons else ('awaiting_manual_audit' if run.status == 'awaiting_audit' else 'queued_waiting_for_worker')
     }
