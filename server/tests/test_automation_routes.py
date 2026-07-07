@@ -1940,6 +1940,30 @@ class AutomationRouteTest(unittest.TestCase):
         self.assertIsNone(res_data['run']['awaiting_audit_cycle_id'])
         self.assertFalse(res_data['paused'])
 
+        # 5. Run already awaiting a different audit cycle returns 409
+        with app.app_context():
+            from models import AutomationRunAuditCycle, AutomationRun
+            c1 = db.session.get(AutomationRunAuditCycle, cycle_1['id'])
+            c1.status = 'pending'
+            r = db.session.get(AutomationRun, run_id)
+            r.status = 'awaiting_audit'
+            r.awaiting_audit_cycle_id = c1.id
+            r.awaiting_audit_phase = 'after_player'
+            db.session.commit()
+
+        pause_8_resp = self.client.post(
+            f'/api/automation/runs/{run_id}/pause',
+            headers=self.headers,
+            json={
+                'worker_id': 'worker-pauser',
+                'lease_token': claim['lease_token'],
+                'phase': 'after_dm',
+                'player_message_id': 9904,
+            },
+        )
+        self.assertEqual(pause_8_resp.status_code, 409)
+        self.assertIn('already awaiting a different audit cycle', pause_8_resp.get_json()['error'])
+
 
 if __name__ == '__main__':
     unittest.main()

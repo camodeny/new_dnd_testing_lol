@@ -944,6 +944,7 @@ def pause_automation_run(current_user, run_id):
                     matches_msg = (cycle.player_message_id == player_message_id)
             if matches_msg:
                 return jsonify({'run': run.to_dict(), 'audit_cycle': cycle.to_dict(), 'paused': True}), 200
+        return jsonify({'error': 'Run is already awaiting a different audit cycle'}), 409
 
     cycle = create_audit_cycle(
         run,
