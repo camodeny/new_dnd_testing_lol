@@ -896,6 +896,34 @@ def pause_automation_run(current_user, run_id):
         cycle = db.session.get(AutomationRunAuditCycle, run.awaiting_audit_cycle_id)
         return jsonify({'run': run.to_dict(), 'audit_cycle': cycle.to_dict() if cycle else None, 'paused': True}), 200
 
+    player_message_id = data.get('player_message_id')
+    dm_message_id = data.get('dm_message_id')
+
+    # Idempotency check
+    existing = None
+    if phase == 'after_player' and player_message_id is not None:
+        existing = AutomationRunAuditCycle.query.filter_by(
+            run_id=run.id, phase='after_player', player_message_id=player_message_id
+        ).first()
+    elif phase == 'after_dm':
+        if dm_message_id is not None:
+            existing = AutomationRunAuditCycle.query.filter_by(
+                run_id=run.id, phase='after_dm', dm_message_id=dm_message_id
+            ).first()
+        if not existing and player_message_id is not None:
+            existing = AutomationRunAuditCycle.query.filter_by(
+                run_id=run.id, phase='after_dm', player_message_id=player_message_id
+            ).first()
+
+    if existing:
+        if existing.status == 'pending':
+            run.status = 'awaiting_audit'
+            run.awaiting_audit_cycle_id = existing.id
+            run.awaiting_audit_phase = phase
+            run.updated_at = datetime.utcnow()
+            db.session.commit()
+        return jsonify({'run': run.to_dict(), 'audit_cycle': existing.to_dict(), 'paused': True}), 200
+
     cycle = create_audit_cycle(
         run,
         phase,

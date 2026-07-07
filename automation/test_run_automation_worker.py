@@ -141,6 +141,244 @@ class RunAutomationWorkerTests(unittest.TestCase):
         self.assertEqual(complete_run.call_args.kwargs['error_text'], 'done')
         self.assertNotEqual(complete_run.call_args.kwargs['error_text'], 'idle_timeout')
 
+    def test_resolved_dm_on_startup_no_after_dm_cycle(self):
+        args = SimpleNamespace(
+            api_base='http://127.0.0.1:5889',
+            owner_api_key='owner-key',
+            worker_id='test-worker',
+            max_minutes=None,
+            idle_timeout=180.0,
+            heartbeat_interval=999.0,
+            poll_interval=0.01,
+            max_turns=50,
+            dm_response_timeout=60.0,
+            message_window=16,
+            model='test-model',
+        )
+        initial_session = {
+            'id': 4,
+            'is_active': True,
+            'messages': [
+                {'id': 410, 'role': 'player', 'content': 'Hello.'},
+                {'id': 411, 'role': 'dm', 'content': 'DM Response.'},
+            ],
+        }
+        claim_payload = {
+            'run': {'id': 2, 'attempt_count': 1, 'runner_config': {'audit_pause_phases': ['after_dm']}},
+            'lease_token': 'lease-1',
+            'derived_campaign': {'id': 100003},
+            'latest_session': initial_session,
+            'roster': [],
+        }
+        run_payload_with_empty_cycles = {
+            'run': {'status': 'running'},
+            'latest_session': initial_session,
+            'audit_cycles': []
+        }
+        dm_status = {
+            'status': 'speak',
+            'player_message_id': 410,
+            'dm_message_id': 411,
+            'post_turn_complete': True,
+            'post_turn_status': 'complete',
+        }
+
+        with patch.object(worker, 'claim_run', return_value=claim_payload), \
+             patch.object(worker, 'build_manifest_for_run', return_value={}), \
+             patch.object(worker, 'append_event'), \
+             patch.object(worker, 'fetch_run', return_value=run_payload_with_empty_cycles), \
+             patch.object(worker.autonomous, 'fetch_dm_turn_status', return_value=dm_status), \
+             patch.object(worker, 'wait_for_dm_response', return_value=(dm_status, False)), \
+             patch.object(worker, 'heartbeat', return_value={'run': {'lease_token': 'lease-1'}}), \
+             patch.object(worker, 'complete_run') as complete_mock, \
+             patch.object(worker, 'pause_for_audit_if_needed', return_value=(True, 'lease-1')) as pause_mock:
+            
+            finished = worker.execute_run(args, 2)
+
+        self.assertTrue(finished)
+        pause_mock.assert_called_once()
+        self.assertEqual(pause_mock.call_args[0][4], 'after_dm')
+        complete_mock.assert_not_called()
+
+    def test_resolved_dm_on_startup_with_existing_after_dm_cycle(self):
+        args = SimpleNamespace(
+            api_base='http://127.0.0.1:5889',
+            owner_api_key='owner-key',
+            worker_id='test-worker',
+            max_minutes=None,
+            idle_timeout=180.0,
+            heartbeat_interval=999.0,
+            poll_interval=0.01,
+            max_turns=1,
+            dm_response_timeout=60.0,
+            message_window=16,
+            model='test-model',
+        )
+        initial_session = {
+            'id': 4,
+            'is_active': True,
+            'messages': [
+                {'id': 410, 'role': 'player', 'content': 'Hello.'},
+                {'id': 411, 'role': 'dm', 'content': 'DM Response.'},
+            ],
+        }
+        claim_payload = {
+            'run': {'id': 2, 'attempt_count': 1, 'completed_turns': 1, 'runner_config': {'audit_pause_phases': ['after_dm']}},
+            'lease_token': 'lease-1',
+            'derived_campaign': {'id': 100003},
+            'latest_session': initial_session,
+            'roster': [],
+        }
+        run_payload_with_existing_cycle = {
+            'run': {'status': 'running', 'completed_turns': 1},
+            'latest_session': initial_session,
+            'audit_cycles': [
+                {'phase': 'after_dm', 'player_message_id': 410, 'dm_message_id': 411}
+            ]
+        }
+        dm_status = {
+            'status': 'speak',
+            'player_message_id': 410,
+            'dm_message_id': 411,
+            'post_turn_complete': True,
+            'post_turn_status': 'complete',
+        }
+
+        with patch.object(worker, 'claim_run', return_value=claim_payload), \
+             patch.object(worker, 'build_manifest_for_run', return_value={}), \
+             patch.object(worker, 'append_event'), \
+             patch.object(worker, 'fetch_run', return_value=run_payload_with_existing_cycle), \
+             patch.object(worker.autonomous, 'fetch_dm_turn_status', return_value=dm_status), \
+             patch.object(worker, 'pause_for_audit_if_needed') as pause_mock, \
+             patch.object(worker, 'request_overseer_decision') as overseer_mock, \
+             patch.object(worker, 'heartbeat', return_value={'run': {'lease_token': 'lease-1'}}), \
+             patch.object(worker, 'complete_run') as complete_mock:
+            
+            finished = worker.execute_run(args, 2)
+
+        self.assertTrue(finished)
+        pause_mock.assert_not_called()
+        overseer_mock.assert_not_called()
+        complete_mock.assert_called_once()
+        self.assertEqual(complete_mock.call_args.kwargs['status'], 'completed')
+
+    def test_max_cycles_missing_after_dm(self):
+        args = SimpleNamespace(
+            api_base='http://127.0.0.1:5889',
+            owner_api_key='owner-key',
+            worker_id='test-worker',
+            max_minutes=None,
+            idle_timeout=180.0,
+            heartbeat_interval=999.0,
+            poll_interval=0.01,
+            max_turns=1,
+            dm_response_timeout=60.0,
+            message_window=16,
+            model='test-model',
+        )
+        initial_session = {
+            'id': 4,
+            'is_active': True,
+            'messages': [
+                {'id': 410, 'role': 'player', 'content': 'Hello.'},
+                {'id': 411, 'role': 'dm', 'content': 'DM Response.'},
+            ],
+        }
+        claim_payload = {
+            'run': {'id': 2, 'attempt_count': 1, 'completed_turns': 1, 'runner_config': {'audit_pause_phases': ['after_dm']}},
+            'lease_token': 'lease-1',
+            'derived_campaign': {'id': 100003},
+            'latest_session': initial_session,
+            'roster': [],
+        }
+        run_payload_with_empty_cycles = {
+            'run': {'status': 'running', 'completed_turns': 1},
+            'latest_session': initial_session,
+            'audit_cycles': []
+        }
+        dm_status = {
+            'status': 'speak',
+            'player_message_id': 410,
+            'dm_message_id': 411,
+            'post_turn_complete': True,
+            'post_turn_status': 'complete',
+        }
+
+        with patch.object(worker, 'claim_run', return_value=claim_payload), \
+             patch.object(worker, 'build_manifest_for_run', return_value={}), \
+             patch.object(worker, 'append_event'), \
+             patch.object(worker, 'fetch_run', return_value=run_payload_with_empty_cycles), \
+             patch.object(worker.autonomous, 'fetch_dm_turn_status', return_value=dm_status), \
+             patch.object(worker, 'wait_for_dm_response', return_value=(dm_status, False)), \
+             patch.object(worker, 'heartbeat', return_value={'run': {'lease_token': 'lease-1'}}), \
+             patch.object(worker, 'pause_for_audit_if_needed', return_value=(True, 'lease-1')) as pause_mock, \
+             patch.object(worker, 'complete_run') as complete_mock:
+            
+            finished = worker.execute_run(args, 2)
+
+        self.assertTrue(finished)
+        pause_mock.assert_called_once()
+        self.assertEqual(pause_mock.call_args[0][4], 'after_dm')
+        complete_mock.assert_not_called()
+
+    def test_silent_empty_dm_matching_by_player_message_id(self):
+        args = SimpleNamespace(
+            api_base='http://127.0.0.1:5889',
+            owner_api_key='owner-key',
+            worker_id='test-worker',
+            max_minutes=None,
+            idle_timeout=180.0,
+            heartbeat_interval=999.0,
+            poll_interval=0.01,
+            max_turns=50,
+            dm_response_timeout=60.0,
+            message_window=16,
+            model='test-model',
+        )
+        initial_session = {
+            'id': 4,
+            'is_active': True,
+            'messages': [
+                {'id': 410, 'role': 'player', 'content': 'Hello.'},
+            ],
+        }
+        claim_payload = {
+            'run': {'id': 2, 'attempt_count': 1, 'runner_config': {'audit_pause_phases': ['after_dm']}},
+            'lease_token': 'lease-1',
+            'derived_campaign': {'id': 100003},
+            'latest_session': initial_session,
+            'roster': [],
+        }
+        run_payload_with_silent_cycle = {
+            'run': {'status': 'running'},
+            'latest_session': initial_session,
+            'audit_cycles': [
+                {'phase': 'after_dm', 'player_message_id': 410, 'dm_message_id': None}
+            ]
+        }
+        dm_status = {
+            'status': 'silent',
+            'player_message_id': 410,
+            'dm_message_id': None,
+        }
+
+        with patch.object(worker, 'claim_run', return_value=claim_payload), \
+             patch.object(worker, 'build_manifest_for_run', return_value={}), \
+             patch.object(worker, 'append_event'), \
+             patch.object(worker.autonomous, 'fetch_dm_turn_status', return_value=dm_status), \
+             patch.object(worker, 'pause_for_audit_if_needed') as pause_mock, \
+             patch.object(worker, 'request_overseer_decision', return_value={'action': 'no_action'}), \
+             patch.object(worker, 'heartbeat', return_value={'run': {'lease_token': 'lease-1'}}), \
+             patch.object(worker, 'complete_run') as complete_mock, \
+             patch.object(worker.time, 'sleep'):
+            
+            run_payload_stop = {'run': {'status': 'stop_requested', 'error_text': 'done'}, 'latest_session': initial_session}
+            with patch.object(worker, 'fetch_run', side_effect=[run_payload_with_silent_cycle, run_payload_stop]):
+                finished = worker.execute_run(args, 2)
+
+        self.assertTrue(finished)
+        pause_mock.assert_not_called()
+
 
 if __name__ == '__main__':
     unittest.main()
