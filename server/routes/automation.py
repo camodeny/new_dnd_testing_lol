@@ -824,7 +824,7 @@ def claim_automation_run(current_user, run_id):
         {
             'status': run.status,
             'worker_id': run.worker_id,
-            'lease_token': run.lease_token,
+            'has_lease_token': bool(run.lease_token),
             'lease_expires_at': run.lease_expires_at.isoformat() if run.lease_expires_at else None,
             'derived_campaign_id': run.derived_campaign_id,
             'reclaimed': claim_data['reclaimed'],

@@ -2191,6 +2191,299 @@ class AutomationRouteTest(unittest.TestCase):
             cycle_db = db.session.get(AutomationRunAuditCycle, cycle_id)
             self.assertEqual(cycle_db.scorecard_summary_json['overall_status'], 'fail')
 
+    def test_security_redaction_and_lease_token_safety(self):
+        scorecard = self.client.post(
+            '/api/automation/scorecards',
+            headers=self.headers,
+            json={
+                'name': 'Security Testing Scorecard',
+                'criteria': [{'id': 'criterion_sec', 'label': 'Security Criterion'}]
+            }
+        ).get_json()['scorecard']
+        
+        scenario_id = self.client.post(
+            '/api/automation/scenarios',
+            headers=self.headers,
+            json={'source_campaign_id': self.campaign_id, 'scorecard_template_id': scorecard['id']},
+        ).get_json()['scenario']['id']
+        
+        snapshot_id = self.client.post(
+            f'/api/automation/scenarios/{scenario_id}/snapshots',
+            headers=self.headers,
+            json={},
+        ).get_json()['snapshot']['id']
+        
+        run_id = self.client.post(
+            f'/api/automation/scenarios/{scenario_id}/runs',
+            headers=self.headers,
+            json={'snapshot_id': snapshot_id},
+        ).get_json()['run']['id']
+        
+        # Claim the run
+        claim_resp = self.client.post(
+            f'/api/automation/runs/{run_id}/claim',
+            headers=self.headers,
+            json={'worker_id': 'worker-security'},
+        )
+        self.assertEqual(claim_resp.status_code, 200)
+        claim = claim_resp.get_json()
+        
+        # Verify root lease_token is present but NOT inside run dict
+        self.assertIn('lease_token', claim)
+        self.assertIsNotNone(claim['lease_token'])
+        expected_token = claim['lease_token']
+        self.assertNotIn('lease_token', claim['run'])
+        self.assertTrue(claim['run']['has_lease_token'])
+
+        # Query GET /api/automation/runs/<run_id> and verify no lease_token key exists
+        run_resp = self.client.get(
+            f'/api/automation/runs/{run_id}',
+            headers=self.headers
+        )
+        self.assertEqual(run_resp.status_code, 200)
+        run_json = run_resp.get_json()
+        run_dict_serialized = json.dumps(run_json)
+        self.assertNotIn(expected_token, run_dict_serialized)
+        self.assertNotIn('"lease_token"', run_dict_serialized)
+        self.assertTrue(run_json['run']['has_lease_token'])
+
+        # Verify run_claimed event does not leak token
+        events_resp = self.client.post(
+            f'/api/automation/runs/{run_id}/auditor-tools/get_run_events',
+            headers=self.headers,
+            json={'args': {'include_payload': False}}
+        )
+        self.assertEqual(events_resp.status_code, 200)
+        events_serialized = json.dumps(events_resp.get_json())
+        self.assertNotIn(expected_token, events_serialized)
+        self.assertNotIn('"lease_token"', events_serialized)
+
+        # Pause to create a cycle so we can test audit bundle
+        cycle_resp = self.client.post(
+            f'/api/automation/runs/{run_id}/pause',
+            headers=self.headers,
+            json={
+                'worker_id': 'worker-security',
+                'lease_token': expected_token,
+                'phase': 'after_dm',
+                'summary': 'Pause for security audit',
+            },
+        )
+        self.assertEqual(cycle_resp.status_code, 200)
+        cycle_id = cycle_resp.get_json()['audit_cycle']['id']
+
+        # Inject sensitive logs/events into DB to verify redaction utilities
+        with app.app_context():
+            from models import CampaignAuditEvent, AutomationRunProviderCall, AutomationRunEvent, AutomationRun
+            run_db = db.session.get(AutomationRun, run_id)
+            derived_campaign_id = run_db.derived_campaign_id
+            
+            # Audit event with API Key
+            audit_ev = CampaignAuditEvent(
+                campaign_id=derived_campaign_id,
+                event_type='test_security',
+                summary='test security event',
+                payload=json.dumps({
+                    'api_key': 'super-secret-key-123',
+                    'client_secret': 'client-secret-999',
+                    'usage_input_tokens': 150, # Should NOT be redacted
+                    'token_count': 45
+                })
+            )
+            db.session.add(audit_ev)
+            
+            # Provider call with passwords/tokens
+            pc = AutomationRunProviderCall(
+                run_id=run_id,
+                dedupe_key='test-security-pc-1',
+                phase='after_dm',
+                request_json={
+                    'authorization': 'Bearer some-auth-token-1234',
+                    'api_key': 'provider-api-key-abc',
+                    'usage_input_tokens': 100
+                },
+                response_json={
+                    'access_token': 'oauth-access-token-xyz',
+                    'usage_output_tokens': 200
+                },
+                parsed_output_json={
+                    'secret_data': 'sensitive info',
+                    'usage_total_tokens': 300
+                }
+            )
+            db.session.add(pc)
+            
+            # Run event with password
+            run_ev = AutomationRunEvent(
+                run_id=run_id,
+                event_type='user_action',
+                sequence_number=10,
+                dedupe_key='test-user-action-ev-10',
+                payload_json={
+                    'password': 'my-secure-password-789',
+                    'normal_field': 'not-sensitive'
+                }
+            )
+            db.session.add(run_ev)
+
+            # Legacy Run event with lease_token
+            legacy_run_ev = AutomationRunEvent(
+                run_id=run_id,
+                event_type='run_claimed',
+                sequence_number=11,
+                dedupe_key='test-run-claimed-ev-11',
+                payload_json={
+                    'lease_token': expected_token,
+                    'normal_field': 'not-sensitive'
+                }
+            )
+            db.session.add(legacy_run_ev)
+            db.session.commit()
+            
+            audit_ev_id = audit_ev.id
+            pc_id = pc.id
+            run_ev_id = run_ev.id
+            legacy_run_ev_id = legacy_run_ev.id
+
+        # Verify get_audit_event_detail redacts secrets but preserves token counts
+        audit_detail_resp = self.client.post(
+            f'/api/automation/runs/{run_id}/auditor-tools/get_audit_event_detail',
+            headers=self.headers,
+            json={'args': {'event_id': audit_ev_id, 'paths': ['payload.api_key', 'payload.client_secret', 'payload.usage_input_tokens', 'payload.token_count']}}
+        )
+        self.assertEqual(audit_detail_resp.status_code, 200)
+        audit_detail = audit_detail_resp.get_json()['result']
+        self.assertEqual(audit_detail['selected_paths'].get('payload.api_key'), '[REDACTED]')
+        self.assertEqual(audit_detail['selected_paths'].get('payload.client_secret'), '[REDACTED]')
+        self.assertEqual(audit_detail['selected_paths'].get('payload.usage_input_tokens'), 150)
+        self.assertEqual(audit_detail['selected_paths'].get('payload.token_count'), 45)
+
+        # Assert get_audit_event_detail with include_full_payload=True
+        audit_full_resp = self.client.post(
+            f'/api/automation/runs/{run_id}/auditor-tools/get_audit_event_detail',
+            headers=self.headers,
+            json={'args': {'event_id': audit_ev_id, 'include_full_payload': True}}
+        )
+        self.assertEqual(audit_full_resp.status_code, 200)
+        audit_full_data = audit_full_resp.get_json()['result']
+        self.assertNotIn('super-secret-key-123', json.dumps(audit_full_data))
+        self.assertNotIn('client-secret-999', json.dumps(audit_full_data))
+        # Ensure secret keys are filtered from payload_keys in metadata
+        self.assertNotIn('api_key', audit_full_data['event']['payload_keys'])
+        self.assertNotIn('client_secret', audit_full_data['event']['payload_keys'])
+        self.assertEqual(audit_full_data['event']['redacted_payload_key_count'], 2)
+        self.assertTrue(audit_full_data['event']['has_redacted_payload_keys'])
+
+        # Verify get_run_event_detail redacts secrets
+        run_detail_resp = self.client.post(
+            f'/api/automation/runs/{run_id}/auditor-tools/get_run_event_detail',
+            headers=self.headers,
+            json={'args': {'event_id': run_ev_id, 'paths': ['payload.password', 'payload.normal_field']}}
+        )
+        self.assertEqual(run_detail_resp.status_code, 200)
+        run_detail = run_detail_resp.get_json()['result']
+        self.assertEqual(run_detail['selected_paths'].get('payload.password'), '[REDACTED]')
+        self.assertEqual(run_detail['selected_paths'].get('payload.normal_field'), 'not-sensitive')
+
+        # Assert neither lease_token value nor key string "lease_token" appears in run events
+        run_events_resp = self.client.post(
+            f'/api/automation/runs/{run_id}/auditor-tools/get_run_events',
+            headers=self.headers,
+            json={'args': {'include_payload': False}}
+        )
+        self.assertEqual(run_events_resp.status_code, 200)
+        run_events_serialized = json.dumps(run_events_resp.get_json())
+        self.assertNotIn(expected_token, run_events_serialized)
+        self.assertNotIn('"lease_token"', run_events_serialized)
+
+        # Assert neither lease_token value nor key string "lease_token" appears in get_run_event_detail with no paths
+        run_detail_no_paths_resp = self.client.post(
+            f'/api/automation/runs/{run_id}/auditor-tools/get_run_event_detail',
+            headers=self.headers,
+            json={'args': {'event_id': legacy_run_ev_id}}
+        )
+        self.assertEqual(run_detail_no_paths_resp.status_code, 200)
+        run_detail_no_paths_serialized = json.dumps(run_detail_no_paths_resp.get_json())
+        self.assertNotIn(expected_token, run_detail_no_paths_serialized)
+        self.assertNotIn('"lease_token"', run_detail_no_paths_serialized)
+
+        # Assert neither lease_token value nor key string "lease_token" appears in get_run_event_detail with paths=["payload.lease_token"]
+        run_detail_paths_resp = self.client.post(
+            f'/api/automation/runs/{run_id}/auditor-tools/get_run_event_detail',
+            headers=self.headers,
+            json={'args': {'event_id': legacy_run_ev_id, 'paths': ['payload.lease_token']}}
+        )
+        self.assertEqual(run_detail_paths_resp.status_code, 200)
+        run_detail_paths_serialized = json.dumps(run_detail_paths_resp.get_json())
+        self.assertNotIn(expected_token, run_detail_paths_serialized)
+        self.assertNotIn('"lease_token"', run_detail_paths_serialized)
+
+        # Verify get_provider_call_detail redacts secrets
+        pc_detail_resp = self.client.post(
+            f'/api/automation/runs/{run_id}/auditor-tools/get_provider_call_detail',
+            headers=self.headers,
+            json={
+                'args': {
+                    'provider_call_id': pc_id,
+                    'request_paths': ['authorization', 'api_key', 'usage_input_tokens'],
+                    'response_paths': ['access_token', 'usage_output_tokens'],
+                    'parsed_output_paths': ['secret_data', 'usage_total_tokens']
+                }
+            }
+        )
+        self.assertEqual(pc_detail_resp.status_code, 200)
+        pc_detail = pc_detail_resp.get_json()['result']
+        self.assertEqual(pc_detail['selected_request_paths'].get('request.authorization'), '[REDACTED]')
+        self.assertEqual(pc_detail['selected_request_paths'].get('request.api_key'), '[REDACTED]')
+        self.assertEqual(pc_detail['selected_request_paths'].get('request.usage_input_tokens'), 100)
+        
+        self.assertEqual(pc_detail['selected_response_paths'].get('response.access_token'), '[REDACTED]')
+        self.assertEqual(pc_detail['selected_response_paths'].get('response.usage_output_tokens'), 200)
+        
+        self.assertEqual(pc_detail['selected_parsed_output_paths'].get('parsed_output.secret_data'), '[REDACTED]')
+        self.assertEqual(pc_detail['selected_parsed_output_paths'].get('parsed_output.usage_total_tokens'), 300)
+
+        # Assert get_provider_call_detail with no path args returns redacted artifacts and does not include raw secret values
+        pc_no_paths_resp = self.client.post(
+            f'/api/automation/runs/{run_id}/auditor-tools/get_provider_call_detail',
+            headers=self.headers,
+            json={'args': {'provider_call_id': pc_id}}
+        )
+        self.assertEqual(pc_no_paths_resp.status_code, 200)
+        pc_no_paths_data = pc_no_paths_resp.get_json()['result']
+        pc_no_paths_serialized = json.dumps(pc_no_paths_data)
+        self.assertNotIn('Bearer some-auth-token-1234', pc_no_paths_serialized)
+        self.assertNotIn('provider-api-key-abc', pc_no_paths_serialized)
+        self.assertNotIn('oauth-access-token-xyz', pc_no_paths_serialized)
+        self.assertNotIn('sensitive info', pc_no_paths_serialized)
+        # Verify token counts are preserved
+        self.assertEqual(pc_no_paths_data['provider_call']['request']['usage_input_tokens'], 100)
+        self.assertEqual(pc_no_paths_data['provider_call']['response']['usage_output_tokens'], 200)
+        self.assertEqual(pc_no_paths_data['provider_call']['parsed_output']['usage_total_tokens'], 300)
+
+        # Verify GET /api/automation/runs/<run_id>/audit-bundle redacts all secrets
+        bundle_resp = self.client.get(
+            f'/api/automation/runs/{run_id}/audit-bundle',
+            headers=self.headers
+        )
+        self.assertEqual(bundle_resp.status_code, 200)
+        bundle_serialized = json.dumps(bundle_resp.get_json())
+        self.assertNotIn('super-secret-key-123', bundle_serialized)
+        self.assertNotIn('some-auth-token-1234', bundle_serialized)
+        self.assertNotIn('my-secure-password-789', bundle_serialized)
+        self.assertNotIn(expected_token, bundle_serialized)
+        self.assertNotIn('"lease_token"', bundle_serialized)
+
+        # Verify GET /api/automation/runs/<run_id>/debug-summary has no raw lease_token key
+        debug_resp = self.client.get(
+            f'/api/automation/runs/{run_id}/debug-summary',
+            headers=self.headers
+        )
+        self.assertEqual(debug_resp.status_code, 200)
+        debug_serialized = json.dumps(debug_resp.get_json())
+        self.assertNotIn(expected_token, debug_serialized)
+        self.assertNotIn('"lease_token"', debug_serialized)
+
 
     def test_summary_detects_missing_after_dm_when_no_dm_turn_status(self):
         """When a player_decision has an after_player audit cycle but no
