@@ -2077,6 +2077,23 @@ class AutomationRouteTest(unittest.TestCase):
             self.assertEqual(crit_b_res['status'], 'not_assessed')
             self.assertEqual(crit_b_res['details']['not_applicable_cycle_count'], 1)
 
+        # Test get_private_candidates works when there is no CampaignWorld
+        with app.app_context():
+            from models import CampaignWorld, NPCActor
+            from services.automation_auditor import get_private_candidates
+            CampaignWorld.query.filter_by(campaign_id=self.campaign_id).delete()
+            npc = NPCActor(
+                campaign_id=self.campaign_id,
+                actor_id='test_npc_unbound',
+                name='NPC Unbound',
+                dossier='{"secret_note": "UnboundSecretValue"}'
+            )
+            db.session.add(npc)
+            db.session.commit()
+            
+            candidates = get_private_candidates(self.campaign_id)
+            self.assertTrue(any(c['text'] == 'UnboundSecretValue' for c in candidates))
+
         bundle_resp = self.client.get(
             f'/api/automation/runs/{run_id}/audit-bundle',
             headers=self.headers
@@ -2086,6 +2103,14 @@ class AutomationRouteTest(unittest.TestCase):
         self.assertEqual(bundle['manifest_version'], 'audit_bundle_v1')
         self.assertIn('evidence_gaps', bundle)
         self.assertIn('model_context_exposure', bundle)
+        
+        # Verify raw notes are redacted and not leaked in bundle
+        npc_summaries = bundle['evidence_packet']['active_npc_summaries']
+        for npc_item in npc_summaries:
+            self.assertNotIn('private_notes_preview', npc_item)
+            self.assertNotIn('UnboundSecretValue', str(npc_item))
+            self.assertTrue(npc_item.get('has_private_notes'))
+            self.assertIsNotNone(npc_item.get('private_notes_hash'))
         
         debug_resp = self.client.get(
             f'/api/automation/runs/{run_id}/debug-summary',
@@ -2097,6 +2122,74 @@ class AutomationRouteTest(unittest.TestCase):
         self.assertIn('stuck_reasons', summary)
         self.assertTrue(summary['lease']['has_lease_token'])
         self.assertNotIn('lease_token', summary['lease'])
+
+        # Test applicability parsing string booleans
+        audit_payload_string_bool = {
+            'source': 'manual_auditor',
+            'criteria': [
+                {
+                    'id': 'criterion_a',
+                    'status': 'pass',
+                    'applicability': {
+                        'applicable': 'false',
+                        'reason': 'string false'
+                    }
+                }
+            ]
+        }
+        submit_resp_2 = self.client.post(
+            f'/api/automation/runs/{run_id}/audit-cycles/{cycle_id}/audit',
+            headers=self.headers,
+            json={'scorecard': audit_payload_string_bool}
+        )
+        self.assertEqual(submit_resp_2.status_code, 200)
+        with app.app_context():
+            cycle_db = db.session.get(AutomationRunAuditCycle, cycle_id)
+            crit_a = next(c for c in cycle_db.scorecard_json['criteria'] if c['criterion_id'] == 'criterion_a')
+            self.assertFalse(crit_a['applicability']['applicable'])
+
+        # Test empty/invalid evidence refs
+        audit_payload_invalid_refs = {
+            'source': 'manual_auditor',
+            'criteria': [
+                {
+                    'id': 'criterion_a',
+                    'status': 'pass',
+                    'evidence_refs': [
+                        {}, 
+                        {'kind': 'session_message'}, 
+                        {'kind': 'session_message', 'id': 999, 'visibility': 'invalid_vis'}
+                    ]
+                }
+            ]
+        }
+        submit_resp_3 = self.client.post(
+            f'/api/automation/runs/{run_id}/audit-cycles/{cycle_id}/audit',
+            headers=self.headers,
+            json={'scorecard': audit_payload_invalid_refs}
+        )
+        self.assertEqual(submit_resp_3.status_code, 200)
+        with app.app_context():
+            cycle_db = db.session.get(AutomationRunAuditCycle, cycle_id)
+            crit_a = next(c for c in cycle_db.scorecard_json['criteria'] if c['criterion_id'] == 'criterion_a')
+            self.assertEqual(len(crit_a['evidence_refs']), 1)
+            self.assertEqual(crit_a['evidence_refs'][0]['visibility'], 'unknown')
+
+        # Test empty criteria fallback
+        audit_payload_empty_criteria = {
+            'source': 'manual_auditor',
+            'overall_status': 'fail',
+            'criteria': []
+        }
+        submit_resp_4 = self.client.post(
+            f'/api/automation/runs/{run_id}/audit-cycles/{cycle_id}/audit',
+            headers=self.headers,
+            json={'scorecard': audit_payload_empty_criteria}
+        )
+        self.assertEqual(submit_resp_4.status_code, 200)
+        with app.app_context():
+            cycle_db = db.session.get(AutomationRunAuditCycle, cycle_id)
+            self.assertEqual(cycle_db.scorecard_summary_json['overall_status'], 'fail')
 
 
 if __name__ == '__main__':

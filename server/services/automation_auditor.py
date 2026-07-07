@@ -26,6 +26,7 @@ from services.automation_service import (
     append_run_event,
     continue_audit_run,
     current_scorecard_template_for_run,
+    find_provider_calls_for_turn,
     latest_session_for_run,
     persist_provider_call,
     refresh_run_scorecard,
@@ -805,6 +806,7 @@ def _compact_clock(row):
 
 def _compact_npc(row):
     data = row.to_dict(include_private=True) or {}
+    dos = data.get('dossier')
     return {
         'actor_id': data.get('actor_id'),
         'name': data.get('name'),
@@ -812,7 +814,8 @@ def _compact_npc(row):
         'location_id': data.get('location_id'),
         'is_active': data.get('is_active'),
         'tags': data.get('tags') or [],
-        'private_notes_preview': _truncate_text((data.get('private_notes') or ''), max_chars=180) if data.get('private_notes') else None,
+        'has_private_notes': bool(dos),
+        'private_notes_hash': hash_private_text(json.dumps(dos, sort_keys=True)) if dos else None,
     }
 
 
@@ -1602,6 +1605,19 @@ def cancel_auditor_jobs_for_current_cycle(run):
 def get_private_candidates(campaign_id):
     candidates = []
     
+    def extract_strings(val):
+        res = []
+        if isinstance(val, str):
+            if len(val.strip()) > 5:
+                res.append(val)
+        elif isinstance(val, dict):
+            for v in val.values():
+                res.extend(extract_strings(v))
+        elif isinstance(val, list):
+            for v in val:
+                res.extend(extract_strings(v))
+        return res
+
     embeddings = CampaignMemoryEmbedding.query.filter_by(campaign_id=campaign_id, visibility='dm_private').all()
     for emb in embeddings:
         if emb.canonical_text:
@@ -1619,18 +1635,6 @@ def get_private_candidates(campaign_id):
         except Exception:
             dm_priv_dict = {}
             
-        def extract_strings(val):
-            res = []
-            if isinstance(val, str):
-                if len(val.strip()) > 5:
-                    res.append(val)
-            elif isinstance(val, dict):
-                for v in val.values():
-                    res.extend(extract_strings(v))
-            elif isinstance(val, list):
-                for v in val:
-                    res.extend(extract_strings(v))
-            return res
         for s in extract_strings(dm_priv_dict):
             candidates.append({
                 'source': 'world_dm_private',
@@ -1723,31 +1727,23 @@ def check_leak_status(private_text, visible_text):
     return 'none'
 
 
-def find_provider_calls_for_turn(run_id, trace_id):
-    if not trace_id:
-        return []
-    provider_calls = AutomationRunProviderCall.query.filter_by(run_id=run_id).all()
-    matching = []
-    for pc in provider_calls:
-        if trace_id in str(pc.dedupe_key):
-            matching.append(pc)
-            continue
-        req = pc.request_json or {}
-        if isinstance(req, dict):
-            if str(trace_id) in str(req):
-                matching.append(pc)
-                continue
-    return matching
-
-
 def get_model_context_exposure(run, cycle):
     dm_message = db.session.get(SessionMessage, cycle.dm_message_id) if cycle.dm_message_id else None
     if not dm_message:
         return {
             'dm_message_id': cycle.dm_message_id,
             'private_memory_available_to_model': False,
+            'private_memory_available_in_state': False,
+            'private_memory_sent_to_model': False,
+            'private_memory_revealed_visibly': False,
             'private_memory_items': [],
-            'visible_leak_check': {'performed': False, 'status': 'none', 'matched_private_items_in_visible_text': []}
+            'visible_leak_check': {
+                'performed': False,
+                'status': 'none',
+                'max_leak_status': 'none',
+                'severity': 'pass',
+                'matched_private_items_in_visible_text': []
+            }
         }
         
     turn = SessionDmTurn.query.filter_by(dm_message_id=cycle.dm_message_id).first()
@@ -1758,7 +1754,6 @@ def get_model_context_exposure(run, cycle):
     
     private_items = []
     matched_leaks = []
-    private_memory_available = len(private_candidates) > 0
     
     for candidate in private_candidates:
         sent = False
@@ -1785,19 +1780,36 @@ def get_model_context_exposure(run, cycle):
                 'leak_status': leak_status
             })
             
-    leak_status_overall = 'pass'
+    max_leak_status = 'none'
     if any(l['leak_status'] == 'confirmed_exact_leak' for l in matched_leaks):
-        leak_status_overall = 'fail'
-    elif any(l['leak_status'] in ('likely_leak', 'possible_overlap') for l in matched_leaks):
-        leak_status_overall = 'warn'
+        max_leak_status = 'confirmed_exact_leak'
+    elif any(l['leak_status'] == 'likely_leak' for l in matched_leaks):
+        max_leak_status = 'likely_leak'
+    elif any(l['leak_status'] == 'possible_overlap' for l in matched_leaks):
+        max_leak_status = 'possible_overlap'
+
+    severity = 'pass'
+    if max_leak_status == 'confirmed_exact_leak':
+        severity = 'fail'
+    elif max_leak_status in ('likely_leak', 'possible_overlap'):
+        severity = 'warn'
+
+    private_memory_available_in_state = len(private_candidates) > 0
+    private_memory_sent_to_model = any(item['sent_to_model'] for item in private_items)
+    private_memory_revealed_visibly = max_leak_status != 'none'
         
     return {
         'dm_message_id': cycle.dm_message_id,
-        'private_memory_available_to_model': private_memory_available,
+        'private_memory_available_to_model': private_memory_available_in_state,
+        'private_memory_available_in_state': private_memory_available_in_state,
+        'private_memory_sent_to_model': private_memory_sent_to_model,
+        'private_memory_revealed_visibly': private_memory_revealed_visibly,
         'private_memory_items': private_items,
         'visible_leak_check': {
             'performed': True,
-            'status': leak_status_overall,
+            'status': max_leak_status,
+            'max_leak_status': max_leak_status,
+            'severity': severity,
             'matched_private_items_in_visible_text': matched_leaks
         }
     }

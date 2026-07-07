@@ -743,12 +743,32 @@ def create_audit_cycle(run, phase, payload=None, *, summary=None, player_message
     return cycle
 
 
+def _parse_strict_bool(val, default=True):
+    if val is None:
+        return default
+    if isinstance(val, bool):
+        return val
+    s = str(val).strip().lower()
+    if s in {"false", "0", "no", "n", "off"}:
+        return False
+    if s in {"true", "1", "yes", "y", "on"}:
+        return True
+    return bool(val)
+
+
 def validate_evidence_ref(ref):
     if not isinstance(ref, dict):
+        return False
+    if not ref:
         return False
     kind = ref.get("kind")
     if kind not in {"audit_event", "provider_call", "run_event", "session_message", "memory_result", "snapshot_path"}:
         return False
+    if not any(ref.get(k) is not None for k in ("id", "item_id", "text_hash", "path")):
+        return False
+    vis = ref.get("visibility")
+    if vis not in {"public", "dm_private"}:
+        ref["visibility"] = "unknown"
     path = ref.get("path")
     if path:
         import re
@@ -793,7 +813,7 @@ def submit_audit_cycle_feedback(cycle, *, summary=None, notes=None, scorecard=No
                 
         applicability = _json_object(raw.get('applicability'), {})
         applicability = {
-            'applicable': bool(applicability.get('applicable', True)),
+            'applicable': _parse_strict_bool(applicability.get('applicable'), True),
             'reason': str(applicability.get('reason') or '').strip() or None,
             'phase': str(applicability.get('phase') or '').strip() or None,
         }
@@ -809,15 +829,18 @@ def submit_audit_cycle_feedback(cycle, *, summary=None, notes=None, scorecard=No
             'applicability': applicability,
         })
 
-    applicable_results = [
-        item for item in criteria_results
-        if item.get('applicability', {}).get('applicable', True)
-    ]
-    overall_status = (
-        _aggregate_custom_scorecard_statuses([item.get('status') for item in applicable_results], default='warn')
-        if applicable_results
-        else _aggregate_custom_scorecard_statuses([item.get('status') for item in criteria_results], default='warn')
-    )
+    if criteria_results:
+        applicable_results = [
+            item for item in criteria_results
+            if item.get('applicability', {}).get('applicable', True)
+        ]
+        overall_status = (
+            _aggregate_custom_scorecard_statuses([item.get('status') for item in applicable_results], default='warn')
+            if applicable_results
+            else _aggregate_custom_scorecard_statuses([item.get('status') for item in criteria_results], default='warn')
+        )
+    else:
+        overall_status = _normalize_custom_scorecard_status(scorecard_payload.get('overall_status')) or 'warn'
     criteria_assessed_count = sum(1 for item in criteria_results if item.get('status') in {'pass', 'warn', 'fail'})
     criteria_not_assessed_count = sum(1 for item in criteria_results if item.get('status') == 'not_assessed' and item.get('applicability', {}).get('applicable', True))
     criteria_not_applicable_count = sum(1 for item in criteria_results if item.get('status') == 'not_assessed' and not item.get('applicability', {}).get('applicable', True))
@@ -1746,6 +1769,23 @@ def compare_runs_payload(left_run, right_run):
     }
 
 
+def find_provider_calls_for_turn(run_id, trace_id):
+    if not trace_id:
+        return []
+    provider_calls = AutomationRunProviderCall.query.filter_by(run_id=run_id).all()
+    matching = []
+    for pc in provider_calls:
+        if trace_id in str(pc.dedupe_key):
+            matching.append(pc)
+            continue
+        req = pc.request_json or {}
+        if isinstance(req, dict):
+            if str(trace_id) in str(req):
+                matching.append(pc)
+                continue
+    return matching
+
+
 def run_debug_summary(run_id):
     run = db.session.get(AutomationRun, run_id)
     if not run:
@@ -1794,15 +1834,7 @@ def run_debug_summary(run_id):
     if last_turn and last_turn.status != 'completed':
         pcs = []
         if last_turn.trace_id:
-            pcs = AutomationRunProviderCall.query.filter(
-                AutomationRunProviderCall.run_id == run.id,
-                AutomationRunProviderCall.dedupe_key.like(f'%{last_turn.trace_id}%')
-            ).all()
-            if not pcs:
-                pcs = AutomationRunProviderCall.query.filter(
-                    AutomationRunProviderCall.run_id == run.id,
-                    AutomationRunProviderCall.request_json.like(f'%{last_turn.trace_id}%')
-                ).all()
+            pcs = find_provider_calls_for_turn(run.id, last_turn.trace_id)
         if not pcs and last_turn.status == 'pending':
             stuck_reasons.append('provider_calls_missing_for_dm_turn')
         if last_turn.memory_status == 'pending':
