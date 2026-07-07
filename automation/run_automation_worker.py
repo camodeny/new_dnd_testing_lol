@@ -687,14 +687,21 @@ def execute_run(args, run_id):
                 if audit_cycles_raw:
                     last_cycle = audit_cycles_raw[-1] if isinstance(audit_cycles_raw[-1], dict) else {}
                     if last_cycle.get('phase') == 'after_player':
-                        latest_player_msg_id = autonomous.find_latest_player_message_id(session.get('messages') or [])
-                        if latest_player_msg_id is not None:
+                        last_player_msg_id = last_cycle.get('player_message_id')
+                        if last_player_msg_id is not None:
                             has_after_dm = any(
-                                c.get('phase') == 'after_dm' and c.get('player_message_id') == latest_player_msg_id
+                                c.get('phase') == 'after_dm'
+                                and (
+                                    c.get('player_message_id') == last_player_msg_id
+                                    or (
+                                        last_cycle.get('dm_message_id') is not None
+                                        and c.get('dm_message_id') == last_cycle.get('dm_message_id')
+                                    )
+                                )
                                 for c in audit_cycles_raw
                             )
                             if not has_after_dm:
-                                resume_dm_wait_message_id = latest_player_msg_id
+                                resume_dm_wait_message_id = last_player_msg_id
                                 continue
             try:
                 session_for_prompt = {

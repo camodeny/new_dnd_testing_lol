@@ -1688,10 +1688,18 @@ class AutomationRun(db.Model):
         # Detect missing after_dm pauses when no dm_turn_status event was recorded
         # (e.g. worker resumed player loop without entering the DM wait path).
         if 'after_dm' in configured:
+            dm_turn_player_ids = {
+                (dt.payload_json or {}).get('player_message_id')
+                for dt in dm_turns
+            }
             for pd in player_decisions:
                 pd_payload = pd.payload_json or {}
                 posted_message_id = pd_payload.get('posted_message_id')
                 if posted_message_id is None:
+                    continue
+                # Skip if a dm_turn_status event was already recorded for this message;
+                # the existing dm_turn loop above handles those cases.
+                if posted_message_id in dm_turn_player_ids:
                     continue
                 if ('after_player', posted_message_id) not in cycle_map:
                     continue
