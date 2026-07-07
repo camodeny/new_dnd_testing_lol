@@ -1964,6 +1964,140 @@ class AutomationRouteTest(unittest.TestCase):
         self.assertEqual(pause_8_resp.status_code, 409)
         self.assertIn('already awaiting a different audit cycle', pause_8_resp.get_json()['error'])
 
+    def test_p1_features_integration(self):
+        scorecard = self.client.post(
+            '/api/automation/scorecards',
+            headers=self.headers,
+            json={
+                'name': 'P1 Testing Scorecard',
+                'criteria': [
+                    {'id': 'criterion_a', 'label': 'Criterion A'},
+                    {'id': 'criterion_b', 'label': 'Criterion B'}
+                ]
+            }
+        ).get_json()['scorecard']
+        
+        scenario_id = self.client.post(
+            '/api/automation/scenarios',
+            headers=self.headers,
+            json={'source_campaign_id': self.campaign_id, 'scorecard_template_id': scorecard['id']},
+        ).get_json()['scenario']['id']
+        snapshot_id = self.client.post(
+            f'/api/automation/scenarios/{scenario_id}/snapshots',
+            headers=self.headers,
+            json={},
+        ).get_json()['snapshot']['id']
+        run_id = self.client.post(
+            f'/api/automation/scenarios/{scenario_id}/runs',
+            headers=self.headers,
+            json={'snapshot_id': snapshot_id},
+        ).get_json()['run']['id']
+        claim = self.client.post(
+            f'/api/automation/runs/{run_id}/claim',
+            headers=self.headers,
+            json={'worker_id': 'worker-p1'},
+        ).get_json()
+        cycle_id = self.client.post(
+            f'/api/automation/runs/{run_id}/pause',
+            headers=self.headers,
+            json={
+                'worker_id': 'worker-p1',
+                'lease_token': claim['lease_token'],
+                'phase': 'after_dm',
+                'summary': 'Pause for P1 test',
+            },
+        ).get_json()['audit_cycle']['id']
+
+        audit_payload = {
+            'source': 'manual_auditor',
+            'criteria': [
+                {
+                    'id': 'criterion_a',
+                    'status': 'pass',
+                    'summary': 'Criteria A passed',
+                    'evidence_refs': [
+                        {
+                            'kind': 'session_message',
+                            'id': 123,
+                            'path': 'payload.some.path',
+                            'summary': 'Nice message',
+                            'visibility': 'public'
+                        }
+                    ],
+                    'applicability': {
+                        'applicable': True,
+                        'reason': 'applicable for after_dm',
+                        'phase': 'after_dm'
+                    }
+                },
+                {
+                    'id': 'criterion_b',
+                    'status': 'not_assessed',
+                    'summary': 'Criteria B is N/A',
+                    'evidence_refs': [],
+                    'applicability': {
+                        'applicable': False,
+                        'reason': 'not_applicable_for_phase',
+                        'phase': 'after_dm'
+                    },
+                    'random_unknown_field': 'should_be_rejected'
+                }
+            ]
+        }
+        
+        submit_resp = self.client.post(
+            f'/api/automation/runs/{run_id}/audit-cycles/{cycle_id}/audit',
+            headers=self.headers,
+            json={'scorecard': audit_payload}
+        )
+        self.assertEqual(submit_resp.status_code, 200)
+        
+        with app.app_context():
+            from models import AutomationRunAuditCycle, AutomationRun
+            cycle = db.session.get(AutomationRunAuditCycle, cycle_id)
+            crit_a = next(c for c in cycle.scorecard_json['criteria'] if c['criterion_id'] == 'criterion_a')
+            self.assertEqual(crit_a['status'], 'pass')
+            self.assertEqual(crit_a['evidence_refs'][0]['id'], 123)
+            self.assertEqual(crit_a['evidence_refs'][0]['kind'], 'session_message')
+            self.assertTrue(crit_a['applicability']['applicable'])
+            
+            crit_b = next(c for c in cycle.scorecard_json['criteria'] if c['criterion_id'] == 'criterion_b')
+            self.assertEqual(crit_b['status'], 'not_assessed')
+            self.assertFalse(crit_b['applicability']['applicable'])
+            self.assertNotIn('random_unknown_field', crit_b)
+            
+            self.assertEqual(cycle.scorecard_summary_json['criteria_assessed_count'], 1)
+            self.assertEqual(cycle.scorecard_summary_json['criteria_not_assessed_count'], 0)
+            self.assertEqual(cycle.scorecard_summary_json['criteria_not_applicable_count'], 1)
+            
+            run = db.session.get(AutomationRun, run_id)
+            from services.automation_service import refresh_run_scorecard
+            scorecard_res = refresh_run_scorecard(run)
+            crit_b_res = next(r for r in scorecard_res if r['check_id'] == 'custom:criterion_b')
+            self.assertEqual(crit_b_res['status'], 'not_assessed')
+            self.assertEqual(crit_b_res['details']['not_applicable_cycle_count'], 1)
+
+        bundle_resp = self.client.get(
+            f'/api/automation/runs/{run_id}/audit-bundle',
+            headers=self.headers
+        )
+        self.assertEqual(bundle_resp.status_code, 200)
+        bundle = bundle_resp.get_json()
+        self.assertEqual(bundle['manifest_version'], 'audit_bundle_v1')
+        self.assertIn('evidence_gaps', bundle)
+        self.assertIn('model_context_exposure', bundle)
+        
+        debug_resp = self.client.get(
+            f'/api/automation/runs/{run_id}/debug-summary',
+            headers=self.headers
+        )
+        self.assertEqual(debug_resp.status_code, 200)
+        summary = debug_resp.get_json()
+        self.assertEqual(summary['run_id'], run_id)
+        self.assertIn('stuck_reasons', summary)
+        self.assertTrue(summary['lease']['has_lease_token'])
+        self.assertNotIn('lease_token', summary['lease'])
+
 
 if __name__ == '__main__':
     unittest.main()

@@ -32,6 +32,7 @@ from services.automation_auditor import (
     cancel_auditor_jobs_for_current_cycle,
     ensure_auditor_jobs_for_cycle,
     execute_auditor_tool,
+    get_current_audit_bundle_data,
     list_auditor_jobs,
     merge_auditor_config_into_runner_config,
     normalize_auditor_config,
@@ -60,6 +61,7 @@ from services.automation_service import (
     record_worker_activity,
     provider_call_for_replay,
     refresh_run_scorecard,
+    run_debug_summary,
     run_watch_payload,
     runner_config_from_request,
     scenario_roster_from_campaign,
@@ -1461,3 +1463,23 @@ def execute_automation_run_decision(current_user, run_id):
     stream_manager.start_generation(run.derived_campaign_id, session.id, acting_user.id, content, msg.id)
     append_run_event(run, 'player_message_posted', {'actor': acting_entry, 'message': msg.to_dict(), 'decision': decision}, dedupe_key=dedupe_key)
     return jsonify({'message': msg.to_dict()}), 201
+
+
+@automation_bp.route('/api/automation/runs/<int:run_id>/audit-bundle', methods=['GET'])
+@token_required
+def get_automation_run_audit_bundle(current_user, run_id):
+    run = get_or_404(AutomationRun, run_id)
+    if not _run_visible_to_user(current_user, run):
+        return jsonify({'error': 'Forbidden'}), 403
+    bundle = get_current_audit_bundle_data(run)
+    return jsonify(bundle), 200
+
+
+@automation_bp.route('/api/automation/runs/<int:run_id>/debug-summary', methods=['GET'])
+@token_required
+def get_automation_run_debug_summary_route(current_user, run_id):
+    run = get_or_404(AutomationRun, run_id)
+    if not _run_visible_to_user(current_user, run):
+        return jsonify({'error': 'Forbidden'}), 403
+    summary = run_debug_summary(run.id)
+    return jsonify(summary), 200

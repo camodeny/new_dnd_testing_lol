@@ -12,9 +12,11 @@ from models import (
     AutomationSnapshot,
     CampaignAuditEvent,
     CampaignClock,
+    CampaignMemoryEmbedding,
     CampaignWorld,
     Character,
     NPCActor,
+    SessionDmTurn,
     SessionMessage,
     WorldEvent,
     db,
@@ -54,6 +56,14 @@ AUDITOR_TOOL_DEFINITIONS = [
         'function': {
             'name': 'get_run_status',
             'description': 'Read compact automation run status, scenario metadata, current audit cycle metadata, auditor config, and compact auditor-job summaries. This is not a full trace dump.',
+            'parameters': {'type': 'object', 'properties': {}},
+        },
+    },
+    {
+        'type': 'function',
+        'function': {
+            'name': 'get_current_audit_bundle',
+            'description': 'Read high-level audit table of contents/bundle for the current cycle: run info, cycle info, scorecard criteria, recommended detail paths, evidence gaps, retrieval summaries, and context exposure check.',
             'parameters': {'type': 'object', 'properties': {}},
         },
     },
@@ -769,18 +779,27 @@ def _compact_run_status(run):
     }
 
 
+def hash_private_text(text):
+    if not text:
+        return None
+    import hashlib
+    return hashlib.sha256(str(text).encode('utf-8')).hexdigest()
+
+
 def _compact_clock(row):
     data = row.to_dict(include_private=True) or {}
     return {
         'clock_id': data.get('clock_id'),
         'name': data.get('name'),
-        'filled_segments': data.get('filled_segments'),
-        'max_segments': data.get('max_segments'),
-        'visible_to_players': data.get('visible_to_players'),
+        'filled_segments': data.get('filled'),
+        'max_segments': data.get('segments'),
+        'visible_to_players': data.get('visibility') != 'dm_private',
         'status': data.get('status'),
-        'current_effect': data.get('current_effect'),
-        'trigger_condition': data.get('trigger_condition'),
-        'completion_effect': data.get('completion_effect'),
+        'summary': data.get('summary'),
+        'has_private_trigger': bool(data.get('trigger')),
+        'has_private_on_complete': bool(data.get('on_complete')),
+        'trigger_hash': hash_private_text(data.get('trigger')),
+        'on_complete_hash': hash_private_text(data.get('on_complete')),
     }
 
 
@@ -911,6 +930,8 @@ def execute_auditor_tool(run, tool_name, args=None):
     campaign = _campaign_for_run(run)
     if tool_name == 'get_run_status':
         return _compact_run_status(run)
+    if tool_name == 'get_current_audit_bundle':
+        return get_current_audit_bundle_data(run)
     if tool_name == 'get_cycle_evidence_packet':
         cycle = db.session.get(AutomationRunAuditCycle, run.awaiting_audit_cycle_id) if run.awaiting_audit_cycle_id else None
         if cycle is None:
@@ -1576,3 +1597,376 @@ def cancel_auditor_jobs_for_current_cycle(run):
         dedupe_key=f'auditor_jobs_canceled:{run.id}:{cycle_id}:{datetime.utcnow().isoformat()}',
     )
     return jobs
+
+
+def get_private_candidates(campaign_id):
+    candidates = []
+    
+    embeddings = CampaignMemoryEmbedding.query.filter_by(campaign_id=campaign_id, visibility='dm_private').all()
+    for emb in embeddings:
+        if emb.canonical_text:
+            candidates.append({
+                'source': 'memory_embedding',
+                'id': str(emb.id),
+                'text': emb.canonical_text
+            })
+            
+    world = CampaignWorld.query.filter_by(campaign_id=campaign_id).first()
+    if world and world.dm_private:
+        try:
+            import json
+            dm_priv_dict = json.loads(world.dm_private)
+        except Exception:
+            dm_priv_dict = {}
+            
+        def extract_strings(val):
+            res = []
+            if isinstance(val, str):
+                if len(val.strip()) > 5:
+                    res.append(val)
+            elif isinstance(val, dict):
+                for v in val.values():
+                    res.extend(extract_strings(v))
+            elif isinstance(val, list):
+                for v in val:
+                    res.extend(extract_strings(v))
+            return res
+        for s in extract_strings(dm_priv_dict):
+            candidates.append({
+                'source': 'world_dm_private',
+                'id': 'world',
+                'text': s
+            })
+            
+    npcs = NPCActor.query.filter_by(campaign_id=campaign_id).all()
+    for npc in npcs:
+        if npc.dossier:
+            try:
+                import json
+                dos_dict = json.loads(npc.dossier)
+            except Exception:
+                dos_dict = {}
+            for s in extract_strings(dos_dict):
+                candidates.append({
+                    'source': 'npc_dossier',
+                    'id': npc.actor_id,
+                    'text': s
+                })
+                
+    clocks = CampaignClock.query.filter_by(campaign_id=campaign_id).all()
+    for clock in clocks:
+        if clock.visibility == 'dm_private':
+            if clock.trigger:
+                candidates.append({
+                    'source': 'clock_trigger',
+                    'id': clock.clock_id,
+                    'text': clock.trigger
+                })
+            if clock.on_complete:
+                candidates.append({
+                    'source': 'clock_on_complete',
+                    'id': clock.clock_id,
+                    'text': clock.on_complete
+                })
+                
+    return candidates
+
+
+def normalize_and_tokenize(text):
+    if not text:
+        return []
+    import re
+    text = text.lower()
+    text = re.sub(r'[^a-z0-9\s]', '', text)
+    tokens = text.split()
+    stopwords = {"the", "and", "a", "of", "to", "in", "is", "that", "it", "he", "was", "for", "on", "are", "as", "with", "his", "they", "i", "at", "be", "this", "have", "from", "or", "one", "had", "by", "word", "but", "not", "what"}
+    meaningful = [t for t in tokens if len(t) >= 3 and t not in stopwords]
+    return meaningful
+
+
+def get_ngrams(tokens, n):
+    if len(tokens) < n:
+        return set()
+    return set(zip(*(tokens[i:] for i in range(n))))
+
+
+def check_leak_status(private_text, visible_text):
+    if not private_text or not visible_text:
+        return 'none'
+        
+    private_meaningful = normalize_and_tokenize(private_text)
+    visible_meaningful = normalize_and_tokenize(visible_text)
+    
+    if len(private_meaningful) >= 6:
+        priv_6grams = get_ngrams(private_meaningful, 6)
+        vis_6grams = get_ngrams(visible_meaningful, 6)
+        if priv_6grams.intersection(vis_6grams):
+            return 'confirmed_exact_leak'
+                
+    if len(private_meaningful) >= 12:
+        priv_5grams = get_ngrams(private_meaningful, 5)
+        vis_5grams = get_ngrams(visible_meaningful, 5)
+        if priv_5grams and vis_5grams:
+            overlap = len(priv_5grams.intersection(vis_5grams)) / len(priv_5grams)
+            if overlap >= 0.35:
+                return 'likely_leak'
+                
+    import re
+    proper_nouns = set(re.findall(r'\b[A-Z][a-zA-Z0-9_]{2,}\b', private_text))
+    common_proper = {"DM", "Player", "D&D", "DnD", "The", "He", "She", "It", "They", "You", "This", "That"}
+    proper_nouns = proper_nouns - common_proper
+    if len(proper_nouns) >= 2:
+        matched_proper = [pn for pn in proper_nouns if pn in visible_text]
+        if len(matched_proper) >= 2:
+            return 'possible_overlap'
+            
+    return 'none'
+
+
+def find_provider_calls_for_turn(run_id, trace_id):
+    if not trace_id:
+        return []
+    provider_calls = AutomationRunProviderCall.query.filter_by(run_id=run_id).all()
+    matching = []
+    for pc in provider_calls:
+        if trace_id in str(pc.dedupe_key):
+            matching.append(pc)
+            continue
+        req = pc.request_json or {}
+        if isinstance(req, dict):
+            if str(trace_id) in str(req):
+                matching.append(pc)
+                continue
+    return matching
+
+
+def get_model_context_exposure(run, cycle):
+    dm_message = db.session.get(SessionMessage, cycle.dm_message_id) if cycle.dm_message_id else None
+    if not dm_message:
+        return {
+            'dm_message_id': cycle.dm_message_id,
+            'private_memory_available_to_model': False,
+            'private_memory_items': [],
+            'visible_leak_check': {'performed': False, 'status': 'none', 'matched_private_items_in_visible_text': []}
+        }
+        
+    turn = SessionDmTurn.query.filter_by(dm_message_id=cycle.dm_message_id).first()
+    trace_id = turn.trace_id if turn else None
+    
+    pcs = find_provider_calls_for_turn(run.id, trace_id)
+    private_candidates = get_private_candidates(run.derived_campaign_id)
+    
+    private_items = []
+    matched_leaks = []
+    private_memory_available = len(private_candidates) > 0
+    
+    for candidate in private_candidates:
+        sent = False
+        for pc in pcs:
+            req_str = json.dumps(pc.request_json or {})
+            if candidate['text'] in req_str:
+                sent = True
+                break
+                
+        leak_status = check_leak_status(candidate['text'], dm_message.content)
+        
+        item = {
+            'item_id': candidate['id'],
+            'kind': candidate['source'],
+            'sent_to_model': sent,
+            'eligible_for_visible_reveal': False
+        }
+        private_items.append(item)
+        
+        if leak_status != 'none':
+            matched_leaks.append({
+                'item_id': candidate['id'],
+                'kind': candidate['source'],
+                'leak_status': leak_status
+            })
+            
+    leak_status_overall = 'pass'
+    if any(l['leak_status'] == 'confirmed_exact_leak' for l in matched_leaks):
+        leak_status_overall = 'fail'
+    elif any(l['leak_status'] in ('likely_leak', 'possible_overlap') for l in matched_leaks):
+        leak_status_overall = 'warn'
+        
+    return {
+        'dm_message_id': cycle.dm_message_id,
+        'private_memory_available_to_model': private_memory_available,
+        'private_memory_items': private_items,
+        'visible_leak_check': {
+            'performed': True,
+            'status': leak_status_overall,
+            'matched_private_items_in_visible_text': matched_leaks
+        }
+    }
+
+
+def get_memory_retrieval_summary(run, cycle):
+    turn = SessionDmTurn.query.filter_by(dm_message_id=cycle.dm_message_id).first()
+    trace_id = turn.trace_id if turn else None
+    
+    events = []
+    if trace_id:
+        events = CampaignAuditEvent.query.filter_by(
+            campaign_id=run.derived_campaign_id,
+            trace_id=trace_id,
+            event_type='dm_tool_execution'
+        ).all()
+    else:
+        events = CampaignAuditEvent.query.filter_by(
+            campaign_id=run.derived_campaign_id,
+            event_type='dm_tool_execution'
+        ).order_by(CampaignAuditEvent.id.desc()).limit(10).all()
+        
+    retrievals = []
+    for ev in events:
+        try:
+            payload = json.loads(ev.payload) if isinstance(ev.payload, str) else (ev.payload or {})
+        except Exception:
+            payload = {}
+        if payload.get('tool_name') == 'search_campaign_memory':
+            args = payload.get('arguments') or {}
+            query = args.get('query')
+            result = payload.get('result') or {}
+            matches = result.get('matches') or []
+            
+            top_match_ids = [m.get('item_id') or m.get('id') for m in matches[:3]]
+            match_kinds = [m.get('kind') for m in matches[:3]]
+            
+            private_results_present = any(m.get('visibility') == 'dm_private' for m in matches)
+            top_match_relevant = len(matches) > 0
+            
+            retrievals.append({
+                'event_id': ev.id,
+                'tool_name': 'search_campaign_memory',
+                'query': query,
+                'top_match_ids': top_match_ids,
+                'match_kinds': match_kinds,
+                'contains_private_results': private_results_present,
+                'contains_public_results': any(m.get('visibility') != 'dm_private' for m in matches),
+                'top_match_relevant': top_match_relevant,
+                'recommended_detail_paths': [
+                    'payload.arguments',
+                    'payload.result.matches',
+                    'payload.tool_name',
+                    'payload.mutated'
+                ]
+            })
+    return retrievals
+
+
+def get_evidence_gaps(run, cycle):
+    gaps = []
+    
+    latest_session = latest_session_for_run(run)
+    if not latest_session or not latest_session.running_summary:
+        gaps.append({
+            'criterion_id': 'running_summary_quality',
+            'reason': 'running_summary is null at this checkpoint',
+            'severity': 'not_applicable_for_phase' if cycle.phase == 'after_player' else 'warn'
+        })
+        
+    turn = SessionDmTurn.query.filter_by(dm_message_id=cycle.dm_message_id).first()
+    trace_id = turn.trace_id if turn else None
+    pcs = find_provider_calls_for_turn(run.id, trace_id)
+    if not pcs:
+        gaps.append({
+            'criterion_id': 'audit_evidence_quality',
+            'reason': 'no provider call artifacts available for this turn',
+            'severity': 'warn'
+        })
+        
+    has_memory_event = False
+    if trace_id:
+        has_memory_event = CampaignAuditEvent.query.filter_by(
+            campaign_id=run.derived_campaign_id,
+            trace_id=trace_id,
+            event_type='memory_patch'
+        ).first() is not None
+        if not has_memory_event:
+            has_memory_event = CampaignAuditEvent.query.filter(
+                CampaignAuditEvent.campaign_id == run.derived_campaign_id,
+                CampaignAuditEvent.trace_id == trace_id,
+                CampaignAuditEvent.event_type == 'dm_tool_execution',
+                CampaignAuditEvent.payload.like('%memory%')
+            ).first() is not None
+            
+    if not has_memory_event:
+        gaps.append({
+            'criterion_id': 'memory_selection_quality',
+            'reason': 'no durable memory write or memory patch observed yet',
+            'severity': 'not_applicable_for_phase'
+        })
+        
+    has_clock_event = False
+    if trace_id:
+        has_clock_event = CampaignAuditEvent.query.filter(
+            CampaignAuditEvent.campaign_id == run.derived_campaign_id,
+            CampaignAuditEvent.trace_id == trace_id,
+            CampaignAuditEvent.payload.like('%clock%')
+        ).first() is not None
+    if not has_clock_event:
+        gaps.append({
+            'criterion_id': 'clock_memory_alignment',
+            'reason': 'no clock update event observed for this turn',
+            'severity': 'not_applicable_for_phase'
+        })
+        
+    return gaps
+
+
+def get_current_audit_bundle_data(run):
+    cycle = db.session.get(AutomationRunAuditCycle, run.awaiting_audit_cycle_id) if run.awaiting_audit_cycle_id else None
+    if cycle is None:
+        return {'error': 'Run is not currently paused at an audit cycle.'}
+        
+    evidence_packet = _cycle_evidence_packet(run, cycle, {})
+    template = current_scorecard_template_for_run(run)
+    
+    recommended_detail_paths = []
+    for ev in evidence_packet.get('recent_audit_events') or []:
+        recommended_detail_paths.append({
+            'tool': 'get_audit_event_detail',
+            'args': {
+                'event_id': ev.get('id'),
+                'paths': ['payload.arguments', 'payload.result.matches', 'payload.tool_name', 'payload.mutated']
+            }
+        })
+        
+    gaps = get_evidence_gaps(run, cycle)
+    retrievals = get_memory_retrieval_summary(run, cycle)
+    exposure = get_model_context_exposure(run, cycle)
+    
+    return {
+        'manifest_version': 'audit_bundle_v1',
+        'run': {
+            'id': run.id,
+            'status': run.status,
+            'awaiting_audit_cycle_id': run.awaiting_audit_cycle_id,
+            'awaiting_audit_phase': run.awaiting_audit_phase,
+            'derived_campaign_id': run.derived_campaign_id,
+            'worker_id': run.worker_id
+        },
+        'audit_cycle': {
+            'id': cycle.id,
+            'cycle_number': cycle.cycle_number,
+            'phase': cycle.phase,
+            'status': cycle.status
+        },
+        'scorecard_template': {
+            'id': template.get('id'),
+            'name': template.get('name'),
+            'criteria': [c.get('id') for c in _json_list(template.get('criteria'), []) if c.get('id')]
+        },
+        'evidence_packet': evidence_packet,
+        'recommended_detail_paths': recommended_detail_paths,
+        'evidence_gaps': gaps,
+        'memory_retrieval_summary': retrievals,
+        'model_context_exposure': exposure,
+        'redaction_policy': {
+            'private_memory_text_redacted': True,
+            'provider_request_messages_redacted': True
+        }
+    }
