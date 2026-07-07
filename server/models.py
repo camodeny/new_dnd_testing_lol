@@ -1685,6 +1685,39 @@ class AutomationRun(db.Model):
                         'reason': reason
                     })
 
+        # Detect missing after_dm pauses when no dm_turn_status event was recorded
+        # (e.g. worker resumed player loop without entering the DM wait path).
+        if 'after_dm' in configured:
+            for pd in player_decisions:
+                pd_payload = pd.payload_json or {}
+                posted_message_id = pd_payload.get('posted_message_id')
+                if posted_message_id is None:
+                    continue
+                if ('after_player', posted_message_id) not in cycle_map:
+                    continue
+                has_after_dm_cycle = any(
+                    c.phase == 'after_dm' and c.player_message_id == posted_message_id
+                    for c in cycles
+                )
+                if has_after_dm_cycle:
+                    continue
+                is_dm_pending = (self.status == 'awaiting_audit' and self.awaiting_audit_phase == 'after_dm' and
+                                 self.awaiting_audit_cycle_id is not None and
+                                 db.session.get(AutomationRunAuditCycle, self.awaiting_audit_cycle_id).player_message_id == posted_message_id)
+                if is_dm_pending:
+                    continue
+                is_terminal = self.status in {'completed', 'failed', 'stopped'}
+                has_next_decision = any(
+                    next_pd.created_at > pd.created_at
+                    for next_pd in player_decisions
+                )
+                if has_next_decision or is_terminal:
+                    skipped.append({
+                        'phase': 'after_dm',
+                        'message_id': posted_message_id,
+                        'reason': "Skipped because worker resumed player loop before creating after_dm pause."
+                    })
+
         next_expected_pause = None
         if self.status not in {'completed', 'failed', 'stopped'}:
             if self.status == 'awaiting_audit':
