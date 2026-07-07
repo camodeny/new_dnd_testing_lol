@@ -3,7 +3,7 @@ from collections import Counter
 from datetime import datetime
 from uuid import uuid4
 
-from utils.redaction import redact_secrets
+from utils.redaction import redact_secrets, is_sensitive_key
 from models import (
     AutomationRun,
     AutomationRunAuditCycle,
@@ -454,10 +454,17 @@ def _truncate_text(value, max_chars=320):
 
 def _payload_keys(value):
     if isinstance(value, dict):
-        return sorted(value.keys())
+        return sorted([k for k in value.keys() if not is_sensitive_key(k)])
     if isinstance(value, list):
         return [f'list[{len(value)}]']
     return []
+
+
+def _redacted_key_count(value):
+    if isinstance(value, dict):
+        return sum(1 for k in value.keys() if is_sensitive_key(k))
+    return 0
+
 
 
 def _payload_preview(value, max_chars=320):
@@ -547,6 +554,7 @@ def _select_paths(value, paths):
 def _compact_audit_event(row, *, include_payload=False):
     data = row.to_dict()
     payload = redact_secrets(data.get('payload') or {})
+    redacted_count = _redacted_key_count(payload)
     compact = {
         'id': data.get('id'),
         'event_type': data.get('event_type'),
@@ -560,6 +568,8 @@ def _compact_audit_event(row, *, include_payload=False):
         'created_at': data.get('created_at'),
         'payload_size_chars': len(json.dumps(payload, ensure_ascii=False)) if payload else 0,
         'payload_keys': _payload_keys(payload),
+        'redacted_payload_key_count': redacted_count,
+        'has_redacted_payload_keys': redacted_count > 0,
     }
     if include_payload:
         compact['payload'] = payload
@@ -606,6 +616,7 @@ def _compact_provider_call(row, *, include_artifacts=False):
 def _compact_run_event(row, *, include_payload=False):
     data = row.to_dict()
     payload = redact_secrets(data.get('payload') or {})
+    redacted_count = _redacted_key_count(payload)
     compact = {
         'id': data.get('id'),
         'event_type': data.get('event_type'),
@@ -615,6 +626,8 @@ def _compact_run_event(row, *, include_payload=False):
         'created_at': data.get('created_at'),
         'payload_size_chars': len(json.dumps(payload, ensure_ascii=False)) if payload else 0,
         'payload_keys': _payload_keys(payload),
+        'redacted_payload_key_count': redacted_count,
+        'has_redacted_payload_keys': redacted_count > 0,
     }
     if include_payload:
         compact['payload'] = payload
@@ -934,103 +947,122 @@ def _keyword_search_campaign_memory(campaign, args):
     return {'query': query, 'matches': scored[:limit]}
 
 
+def _sanitize_response_for_lease_token(data):
+    if isinstance(data, dict):
+        new_dict = {}
+        for k, v in data.items():
+            new_key = str(k).replace('lease_token', 'redacted_token')
+            new_dict[new_key] = _sanitize_response_for_lease_token(v)
+        return new_dict
+    elif isinstance(data, list):
+        return [_sanitize_response_for_lease_token(item) for item in data]
+    elif isinstance(data, str):
+        return data.replace('lease_token', 'redacted_token')
+    return data
+
+
 def execute_auditor_tool(run, tool_name, args=None):
     args = args or {}
     campaign = _campaign_for_run(run)
-    if tool_name == 'get_run_status':
-        return _compact_run_status(run)
-    if tool_name == 'get_current_audit_bundle':
-        return get_current_audit_bundle_data(run)
-    if tool_name == 'get_cycle_evidence_packet':
-        cycle = db.session.get(AutomationRunAuditCycle, run.awaiting_audit_cycle_id) if run.awaiting_audit_cycle_id else None
-        if cycle is None:
-            return {'error': 'Run is not currently paused at an audit cycle.'}
-        return _cycle_evidence_packet(run, cycle, args)
-    if campaign is None:
-        return {'error': 'Run has no derived or source campaign available.'}
-    if tool_name == 'get_transcript':
-        return {'messages': _latest_session_messages(run, _limit_arg(args, 80, 200))}
-    if tool_name == 'get_audit_events':
-        limit = _limit_arg(args, 40, 200)
-        include_payload = bool(args.get('include_payload'))
-        if include_payload:
-            return {'error': 'Bulk audit-event payload fetch is disabled for built-in auditors. Use get_audit_event_detail with exact paths.'}
-        query = CampaignAuditEvent.query.filter_by(campaign_id=campaign.id)
-        if args.get('event_type'):
-            query = query.filter_by(event_type=str(args.get('event_type')).strip())
-        if args.get('trace_id'):
-            query = query.filter_by(trace_id=str(args.get('trace_id')).strip())
-        rows = query.order_by(CampaignAuditEvent.id.desc()).limit(limit).all()
-        return {'campaign_id': campaign.id, 'events': [_compact_audit_event(row, include_payload=include_payload) for row in reversed(rows)]}
-    if tool_name == 'get_world_state':
-        return _world_payload(campaign)
-    if tool_name == 'get_clocks':
-        rows = CampaignClock.query.filter_by(campaign_id=campaign.id).order_by(CampaignClock.id.asc()).all()
-        return {'clocks': [row.to_dict(include_private=True) for row in rows]}
-    if tool_name == 'get_npcs':
-        rows = NPCActor.query.filter_by(campaign_id=campaign.id).order_by(NPCActor.id.asc()).all()
-        return {'npcs': [row.to_dict(include_private=True) for row in rows]}
-    if tool_name == 'get_characters':
-        rows = Character.query.filter_by(campaign_id=campaign.id).order_by(Character.id.asc()).all()
-        return {'characters': [character_full_dict(row) for row in rows]}
-    if tool_name == 'get_provider_calls':
-        limit = _limit_arg(args, 12, 100)
-        include_artifacts = bool(args.get('include_artifacts'))
-        if include_artifacts:
-            return {'error': 'Bulk provider artifacts are disabled for built-in auditors. Use get_provider_call_detail with exact paths.'}
-        rows = AutomationRunProviderCall.query.filter_by(run_id=run.id).order_by(AutomationRunProviderCall.id.desc()).limit(limit).all()
-        return {'provider_calls': [_compact_provider_call(row, include_artifacts=include_artifacts) for row in reversed(rows)]}
-    if tool_name == 'get_run_events':
-        limit = _limit_arg(args, 20, 200)
-        include_payload = bool(args.get('include_payload'))
-        if include_payload:
-            return {'error': 'Bulk run-event payload fetch is disabled for built-in auditors. Use get_run_event_detail with exact paths.'}
-        rows = AutomationRunEvent.query.filter_by(run_id=run.id).order_by(AutomationRunEvent.id.desc()).limit(limit).all()
-        return {'events': [_compact_run_event(row, include_payload=include_payload) for row in reversed(rows)]}
-    if tool_name == 'get_audit_event_detail':
-        row = db.session.get(CampaignAuditEvent, _safe_int(args.get('event_id'), 0, minimum=0))
-        if row is None or row.campaign_id != campaign.id:
-            return {'error': 'Audit event not found for this campaign.'}
-        paths = _path_args(args, 'paths')
-        if paths:
-            return _selected_audit_event_detail(row, paths)
-        if bool(args.get('include_full_payload')):
-            return {'event': row.to_dict()}
-        return _audit_event_detail_escalation(row)
-    if tool_name == 'get_provider_call_detail':
-        row = db.session.get(AutomationRunProviderCall, _safe_int(args.get('provider_call_id'), 0, minimum=0))
-        if row is None or row.run_id != run.id:
-            return {'error': 'Provider call not found for this run.'}
-        request_paths = _path_args(args, 'request_paths')
-        response_paths = _path_args(args, 'response_paths')
-        parsed_output_paths = _path_args(args, 'parsed_output_paths')
-        if request_paths or response_paths or parsed_output_paths:
-            return _selected_provider_call_detail(row, request_paths, response_paths, parsed_output_paths)
-        return {'provider_call': row.to_dict(include_artifacts=True)}
-    if tool_name == 'get_run_event_detail':
-        row = db.session.get(AutomationRunEvent, _safe_int(args.get('event_id'), 0, minimum=0))
-        if row is None or row.run_id != run.id:
-            return {'error': 'Run event not found for this run.'}
-        paths = _path_args(args, 'paths')
-        if paths:
-            return _selected_run_event_detail(row, paths)
-        return {'event': row.to_dict()}
-    if tool_name == 'search_campaign_memory':
-        return _keyword_search_campaign_memory(campaign, args)
-    if tool_name == 'get_snapshot_manifest':
-        snapshot = db.session.get(AutomationSnapshot, run.snapshot_id)
-        if snapshot is None:
-            return {'snapshot': None}
-        sections = _path_args(args, 'sections')
-        paths = _path_args(args, 'paths')
-        if sections or paths:
-            return _selected_snapshot_detail(snapshot, sections, paths)
-        if bool(args.get('include_payload')):
-            return {'error': 'Full snapshot payload fetch is disabled for built-in auditors. Use snapshot sections or exact paths.'}
-        return {'snapshot': snapshot.to_dict(include_payload=bool(args.get('include_payload')))}
-    if tool_name == 'get_scorecard_template':
-        return {'scorecard_template': current_scorecard_template_for_run(run)}
-    return {'error': f'Unknown auditor tool: {tool_name}'}
+    
+    def _execute():
+        if tool_name == 'get_run_status':
+            return _compact_run_status(run)
+        if tool_name == 'get_current_audit_bundle':
+            return get_current_audit_bundle_data(run)
+        if tool_name == 'get_cycle_evidence_packet':
+            cycle = db.session.get(AutomationRunAuditCycle, run.awaiting_audit_cycle_id) if run.awaiting_audit_cycle_id else None
+            if cycle is None:
+                return {'error': 'Run is not currently paused at an audit cycle.'}
+            return _cycle_evidence_packet(run, cycle, args)
+        if campaign is None:
+            return {'error': 'Run has no derived or source campaign available.'}
+        if tool_name == 'get_transcript':
+            return {'messages': _latest_session_messages(run, _limit_arg(args, 80, 200))}
+        if tool_name == 'get_audit_events':
+            limit = _limit_arg(args, 40, 200)
+            include_payload = bool(args.get('include_payload'))
+            if include_payload:
+                return {'error': 'Bulk audit-event payload fetch is disabled for built-in auditors. Use get_audit_event_detail with exact paths.'}
+            query = CampaignAuditEvent.query.filter_by(campaign_id=campaign.id)
+            if args.get('event_type'):
+                query = query.filter_by(event_type=str(args.get('event_type')).strip())
+            if args.get('trace_id'):
+                query = query.filter_by(trace_id=str(args.get('trace_id')).strip())
+            rows = query.order_by(CampaignAuditEvent.id.desc()).limit(limit).all()
+            return {'campaign_id': campaign.id, 'events': [_compact_audit_event(row, include_payload=include_payload) for row in reversed(rows)]}
+        if tool_name == 'get_world_state':
+            return _world_payload(campaign)
+        if tool_name == 'get_clocks':
+            rows = CampaignClock.query.filter_by(campaign_id=campaign.id).order_by(CampaignClock.id.asc()).all()
+            return {'clocks': [row.to_dict(include_private=True) for row in rows]}
+        if tool_name == 'get_npcs':
+            rows = NPCActor.query.filter_by(campaign_id=campaign.id).order_by(NPCActor.id.asc()).all()
+            return {'npcs': [row.to_dict(include_private=True) for row in rows]}
+        if tool_name == 'get_characters':
+            rows = Character.query.filter_by(campaign_id=campaign.id).order_by(Character.id.asc()).all()
+            return {'characters': [character_full_dict(row) for row in rows]}
+        if tool_name == 'get_provider_calls':
+            limit = _limit_arg(args, 12, 100)
+            include_artifacts = bool(args.get('include_artifacts'))
+            if include_artifacts:
+                return {'error': 'Bulk provider artifacts are disabled for built-in auditors. Use get_provider_call_detail with exact paths.'}
+            rows = AutomationRunProviderCall.query.filter_by(run_id=run.id).order_by(AutomationRunProviderCall.id.desc()).limit(limit).all()
+            return {'provider_calls': [_compact_provider_call(row, include_artifacts=include_artifacts) for row in reversed(rows)]}
+        if tool_name == 'get_run_events':
+            limit = _limit_arg(args, 20, 200)
+            include_payload = bool(args.get('include_payload'))
+            if include_payload:
+                return {'error': 'Bulk run-event payload fetch is disabled for built-in auditors. Use get_run_event_detail with exact paths.'}
+            rows = AutomationRunEvent.query.filter_by(run_id=run.id).order_by(AutomationRunEvent.id.desc()).limit(limit).all()
+            return {'events': [_compact_run_event(row, include_payload=include_payload) for row in reversed(rows)]}
+        if tool_name == 'get_audit_event_detail':
+            row = db.session.get(CampaignAuditEvent, _safe_int(args.get('event_id'), 0, minimum=0))
+            if row is None or row.campaign_id != campaign.id:
+                return {'error': 'Audit event not found for this campaign.'}
+            paths = _path_args(args, 'paths')
+            if paths:
+                return _selected_audit_event_detail(row, paths)
+            if bool(args.get('include_full_payload')):
+                return {'event': _compact_audit_event(row, include_payload=True)}
+            return _audit_event_detail_escalation(row)
+        if tool_name == 'get_provider_call_detail':
+            row = db.session.get(AutomationRunProviderCall, _safe_int(args.get('provider_call_id'), 0, minimum=0))
+            if row is None or row.run_id != run.id:
+                return {'error': 'Provider call not found for this run.'}
+            request_paths = _path_args(args, 'request_paths')
+            response_paths = _path_args(args, 'response_paths')
+            parsed_output_paths = _path_args(args, 'parsed_output_paths')
+            if request_paths or response_paths or parsed_output_paths:
+                return _selected_provider_call_detail(row, request_paths, response_paths, parsed_output_paths)
+            return {'provider_call': _compact_provider_call(row, include_artifacts=True)}
+        if tool_name == 'get_run_event_detail':
+            row = db.session.get(AutomationRunEvent, _safe_int(args.get('event_id'), 0, minimum=0))
+            if row is None or row.run_id != run.id:
+                return {'error': 'Run event not found for this run.'}
+            paths = _path_args(args, 'paths')
+            if paths:
+                return _selected_run_event_detail(row, paths)
+            return {'event': _compact_run_event(row, include_payload=True)}
+        if tool_name == 'search_campaign_memory':
+            return _keyword_search_campaign_memory(campaign, args)
+        if tool_name == 'get_snapshot_manifest':
+            snapshot = db.session.get(AutomationSnapshot, run.snapshot_id)
+            if snapshot is None:
+                return {'snapshot': None}
+            sections = _path_args(args, 'sections')
+            paths = _path_args(args, 'paths')
+            if sections or paths:
+                return _selected_snapshot_detail(snapshot, sections, paths)
+            if bool(args.get('include_payload')):
+                return {'error': 'Full snapshot payload fetch is disabled for built-in auditors. Use snapshot sections or exact paths.'}
+            return {'snapshot': snapshot.to_dict(include_payload=bool(args.get('include_payload')))}
+        if tool_name == 'get_scorecard_template':
+            return {'scorecard_template': current_scorecard_template_for_run(run)}
+        return {'error': f'Unknown auditor tool: {tool_name}'}
+
+    res = _execute()
+    return _sanitize_response_for_lease_token(res)
 
 
 def _json_object_from_text(text):
