@@ -489,6 +489,21 @@ def execute_run(args, run_id):
     force_overseer_retry = False
     last_dm_turn = None
 
+    run_config = runner_config(claim_payload)
+    max_turns = run_config.get('max_turns') or run_config.get('max_cycles') or args.max_turns
+
+    session_on_start = active_session_from_run_payload(claim_payload)
+    resume_dm_wait_message_id = None
+    if session_on_start:
+        latest_player_message_id = autonomous.find_latest_player_message_id(session_on_start.get('messages') or [])
+        if latest_player_message_id is not None:
+            try:
+                dm_turn_status = autonomous.fetch_dm_turn_status(manifest, latest_player_message_id)
+                if not autonomous.dm_turn_status_resolved(dm_turn_status):
+                    resume_dm_wait_message_id = latest_player_message_id
+            except Exception:
+                pass
+
     def maybe_heartbeat():
         nonlocal last_heartbeat_at, lease_token
         if time.monotonic() - last_heartbeat_at < args.heartbeat_interval:
@@ -540,6 +555,79 @@ def execute_run(args, run_id):
                 dedupe_key=f'run_completed:{run_id}:no-session',
             )
             return True
+
+        if resume_dm_wait_message_id is not None:
+            posted_message_id = resume_dm_wait_message_id
+            resume_dm_wait_message_id = None
+            last_seen_fingerprint = messages_fingerprint(session)
+            session_for_prompt = {
+                'id': session.get('id'),
+                'started_at': session.get('started_at'),
+                'is_active': session.get('is_active', True),
+                'messages': session.get('messages') or [],
+            }
+            logical_key = stage_key(turns_completed, session_for_prompt)
+            last_change_at = time.monotonic()
+            dm_turn, dm_timed_out = wait_for_dm_response(args, manifest, posted_message_id, maybe_heartbeat)
+            append_event(
+                args.api_base,
+                args.owner_api_key,
+                run_id,
+                args.worker_id,
+                lease_token,
+                'dm_turn_status',
+                dm_turn,
+                dedupe_key=f'dm_turn_status:{logical_key}:{posted_message_id}',
+            )
+            if dm_timed_out:
+                complete_run(
+                    args.api_base,
+                    args.owner_api_key,
+                    run_id,
+                    args.worker_id,
+                    lease_token,
+                    status='failed',
+                    error_text='dm_response_timeout',
+                    dedupe_key=f'run_completed:{run_id}:dm-timeout',
+                )
+                return True
+            last_dm_turn = dm_turn if dm_turn.get('status') in {'silent', 'empty'} else None
+            force_overseer_retry = True
+            same_fingerprint_no_action_retries = 0
+            last_change_at = time.monotonic()
+            should_stop, lease_token = pause_for_audit_if_needed(
+                args,
+                claim_payload,
+                run_id,
+                lease_token,
+                'after_dm',
+                maybe_heartbeat,
+                payload={
+                    'dm_turn': dm_turn,
+                    'posted_message_id': posted_message_id,
+                    'turns_completed': turns_completed,
+                },
+                summary='Paused after DM response.',
+                player_message_id=posted_message_id,
+                dm_message_id=dm_turn.get('dm_message_id'),
+                dedupe_key=f'audit_pause:after_dm:{logical_key}:{posted_message_id}',
+            )
+            if should_stop:
+                return True
+            last_change_at = time.monotonic()
+
+            if turns_completed >= max_turns:
+                complete_run(
+                    args.api_base,
+                    args.owner_api_key,
+                    run_id,
+                    args.worker_id,
+                    lease_token,
+                    status='completed',
+                    dedupe_key=f'run_completed:{run_id}:max-turns',
+                )
+                return True
+            continue
 
         current_fingerprint = messages_fingerprint(session)
         fingerprint_changed = current_fingerprint != last_seen_fingerprint
@@ -767,7 +855,7 @@ def execute_run(args, run_id):
 
 
 
-                if turns_completed >= args.max_turns:
+                if turns_completed >= max_turns:
                     complete_run(
                         args.api_base,
                         args.owner_api_key,
