@@ -442,5 +442,72 @@ class RunAutomationWorkerTests(unittest.TestCase):
         overseer_mock.assert_not_called()
 
 
+    def test_pre_overseer_guard_resume_after_after_player_audit(self):
+        """When session-on-start resume block is skipped (no session in claim payload),
+        the pre-overseer guard should detect a missing after_dm cycle after an
+        after_player audit and force the DM wait/pause path before any overseer decision."""
+        args = SimpleNamespace(
+            api_base='http://127.0.0.1:5889',
+            owner_api_key='owner-key',
+            worker_id='test-worker',
+            max_minutes=None,
+            idle_timeout=180.0,
+            heartbeat_interval=999.0,
+            poll_interval=0.01,
+            max_turns=50,
+            dm_response_timeout=60.0,
+            message_window=16,
+            model='test-model',
+        )
+        initial_session = {
+            'id': 4,
+            'is_active': True,
+            'messages': [
+                {'id': 410, 'role': 'player', 'content': 'Hello.'},
+                {'id': 411, 'role': 'dm', 'content': 'DM Response.'},
+            ],
+        }
+        claim_payload = {
+            'run': {'id': 2, 'attempt_count': 1, 'runner_config': {'audit_pause_phases': ['after_dm', 'after_player']}},
+            'lease_token': 'lease-1',
+            'derived_campaign': {'id': 100003},
+            'roster': [],
+        }
+        run_payload = {
+            'run': {'status': 'running', 'completed_turns': 1},
+            'latest_session': initial_session,
+            'audit_cycles': [
+                {'phase': 'after_player', 'player_message_id': 410, 'dm_message_id': 411}
+            ]
+        }
+        dm_status = {
+            'status': 'speak',
+            'player_message_id': 410,
+            'dm_message_id': 411,
+            'post_turn_complete': True,
+            'post_turn_status': 'complete',
+        }
+
+        with patch.object(worker, 'claim_run', return_value=claim_payload), \
+             patch.object(worker, 'build_manifest_for_run', return_value={}), \
+             patch.object(worker, 'append_event'), \
+             patch.object(worker, 'fetch_run', return_value=run_payload), \
+             patch.object(worker.autonomous, 'fetch_dm_turn_status', return_value=dm_status), \
+             patch.object(worker, 'wait_for_dm_response', return_value=(dm_status, False)), \
+             patch.object(worker, 'heartbeat', return_value={'run': {'lease_token': 'lease-1'}}), \
+             patch.object(worker, 'pause_for_audit_if_needed', return_value=(True, 'lease-1')) as pause_mock, \
+             patch.object(worker, 'complete_run') as complete_mock, \
+             patch.object(worker, 'request_overseer_decision') as overseer_mock, \
+             patch.object(worker.time, 'sleep'):
+
+            finished = worker.execute_run(args, 2)
+
+        self.assertTrue(finished)
+        pause_mock.assert_called_once()
+        self.assertEqual(pause_mock.call_args[0][4], 'after_dm')
+        overseer_mock.assert_not_called()
+        complete_mock.assert_not_called()
+
+
 if __name__ == '__main__':
     unittest.main()

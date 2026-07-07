@@ -1965,5 +1965,64 @@ class AutomationRouteTest(unittest.TestCase):
         self.assertIn('already awaiting a different audit cycle', pause_8_resp.get_json()['error'])
 
 
+    def test_summary_detects_missing_after_dm_when_no_dm_turn_status(self):
+        """When a player_decision has an after_player audit cycle but no
+        corresponding after_dm cycle and no dm_turn_status event was recorded,
+        get_audit_pause_summary should flag the missing after_dm pause."""
+        scenario_id = self.client.post(
+            '/api/automation/scenarios',
+            headers=self.headers,
+            json={'source_campaign_id': self.campaign_id, 'name': 'Summary Missing After DM'},
+        ).get_json()['scenario']['id']
+        snapshot_id = self.client.post(
+            f'/api/automation/scenarios/{scenario_id}/snapshots',
+            headers=self.headers,
+            json={},
+        ).get_json()['snapshot']['id']
+        run_id = self.client.post(
+            f'/api/automation/scenarios/{scenario_id}/runs',
+            headers=self.headers,
+            json={'snapshot_id': snapshot_id, 'runner_config': {'audit_pause_phases': ['after_dm', 'after_player']}},
+        ).get_json()['run']['id']
+
+        with app.app_context():
+            run = db.session.get(AutomationRun, run_id)
+            from datetime import datetime, timedelta, timezone
+
+            t1 = datetime.now(timezone.utc)
+            t2 = t1 + timedelta(seconds=1)
+            # Player decision event for message 410
+            db.session.add(AutomationRunEvent(
+                run_id=run_id, event_type='player_decision', sequence_number=1001,
+                attempt_number=1, dedupe_key='summ:pd:1001',
+                payload_json={'posted_message_id': 410, 'decision': {'action': 'speak'}},
+                created_at=t1,
+            ))
+            # After_player audit cycle for message 410
+            ap_cycle = AutomationRunAuditCycle(
+                run_id=run_id, cycle_number=1, phase='after_player',
+                status='completed', player_message_id=410,
+                created_at=t1, updated_at=t1,
+            )
+            db.session.add(ap_cycle)
+            db.session.flush()
+            # Second player decision (no after_dm in between)
+            db.session.add(AutomationRunEvent(
+                run_id=run_id, event_type='player_decision', sequence_number=1002,
+                attempt_number=1, dedupe_key='summ:pd:1002',
+                payload_json={'posted_message_id': 411, 'decision': {'action': 'speak'}},
+                created_at=t2,
+            ))
+            db.session.commit()
+
+            summary = run.get_audit_pause_summary()
+
+        self.assertTrue(summary['any_configured_pause_skipped'])
+        after_dm_skipped = [s for s in summary['skipped_pauses'] if s['phase'] == 'after_dm']
+        self.assertEqual(len(after_dm_skipped), 1)
+        self.assertEqual(after_dm_skipped[0]['message_id'], 410)
+        self.assertIn('resumed player loop', after_dm_skipped[0]['reason'])
+
+
 if __name__ == '__main__':
     unittest.main()

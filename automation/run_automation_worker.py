@@ -518,8 +518,22 @@ def execute_run(args, run_id):
                             break
                     if not has_matching_after_dm:
                         resume_dm_wait_message_id = latest_player_message_id
-            except Exception:
-                pass
+            except Exception as exc:
+                append_event(
+                    args.api_base,
+                    args.owner_api_key,
+                    run_id,
+                    args.worker_id,
+                    lease_token,
+                    "after_dm_resume_probe_error",
+                    {
+                        "latest_player_message_id": latest_player_message_id,
+                        "error": str(exc),
+                    },
+                    dedupe_key=f"after_dm_resume_probe_error:{run_id}:{latest_player_message_id}",
+                )
+                if "after_dm" in pause_phases(claim_payload):
+                    resume_dm_wait_message_id = latest_player_message_id
 
     def maybe_heartbeat():
         nonlocal last_heartbeat_at, lease_token
@@ -668,6 +682,27 @@ def execute_run(args, run_id):
             last_dm_turn = None
 
         if fingerprint_changed or force_overseer_retry:
+            if 'after_dm' in pause_phases(claim_payload) and resume_dm_wait_message_id is None:
+                audit_cycles_raw = run_payload.get('audit_cycles') or []
+                if audit_cycles_raw:
+                    last_cycle = audit_cycles_raw[-1] if isinstance(audit_cycles_raw[-1], dict) else {}
+                    if last_cycle.get('phase') == 'after_player':
+                        last_player_msg_id = last_cycle.get('player_message_id')
+                        if last_player_msg_id is not None:
+                            has_after_dm = any(
+                                c.get('phase') == 'after_dm'
+                                and (
+                                    c.get('player_message_id') == last_player_msg_id
+                                    or (
+                                        last_cycle.get('dm_message_id') is not None
+                                        and c.get('dm_message_id') == last_cycle.get('dm_message_id')
+                                    )
+                                )
+                                for c in audit_cycles_raw
+                            )
+                            if not has_after_dm:
+                                resume_dm_wait_message_id = last_player_msg_id
+                                continue
             try:
                 session_for_prompt = {
                     'id': session.get('id'),
