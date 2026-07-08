@@ -400,5 +400,22 @@ class P1ImprovementsTest(unittest.TestCase):
         calls = res.get('provider_calls', [])
         self.assertEqual(len(calls), 0)
 
+    def test_metadata_only_scene_patch_does_not_mutate_or_trigger_events(self):
+        patch = {
+            'scene_patch': {
+                'provenance': {'source_player_message_id': 1},
+                'resolution_mode': 'canonical'
+            }
+        }
+        result = apply_memory_patch(self.campaign, self.session, patch)
+        self.assertNotIn('scene_updated', result.get('world_event_ids', []))
+
+        db.session.refresh(self.world)
+        import json
+        state = json.loads(self.world.world_state)
+        current_scene = state.get('current_scene', {})
+        self.assertNotIn('provenance', current_scene)
+        self.assertNotIn('resolution_mode', current_scene)
+
 if __name__ == '__main__':
     unittest.main()

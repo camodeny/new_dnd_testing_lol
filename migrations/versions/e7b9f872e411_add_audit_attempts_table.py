@@ -51,4 +51,4 @@ def downgrade():
     op.drop_index(op.f('ix_automation_run_audit_attempts_auditor_job_id'), table_name='automation_run_audit_attempts')
     op.drop_index(op.f('ix_automation_run_audit_attempts_cycle_id'), table_name='automation_run_audit_attempts')
     op.drop_index(op.f('ix_automation_run_audit_attempts_run_id'), table_name='automation_run_audit_attempts')
-    sa.drop_table('automation_run_audit_attempts')
+    op.drop_table('automation_run_audit_attempts')

@@ -5128,11 +5128,19 @@ def apply_memory_patch(campaign, session, patch, audit_context=None):
                 )
             if not scene_patch:
                 scene_patch = {}
-        if scene_patch:
+        # Check if the scene patch actually contains state keys
+        SCENE_STATE_KEYS = {'location_id', 'location_name', 'time_of_day', 'active_npc_ids', 'departed_npc_ids', 'immediate_tension'}
+        has_actual_scene_changes = any(k in scene_patch for k in SCENE_STATE_KEYS)
+
+        if scene_patch and has_actual_scene_changes:
             current_scene = world_state.get('current_scene', {}) if isinstance(world_state, dict) else {}
             before_scene = dict(current_scene)
-            current_scene.update(scene_patch)
+            
+            # Update only actual scene state keys in durable current_scene, NOT metadata
+            clean_scene_state = {k: v for k, v in scene_patch.items() if k in SCENE_STATE_KEYS}
+            current_scene.update(clean_scene_state)
             world_state['current_scene'] = current_scene
+            
             _sync_party_known_location(world_state, current_scene)
             event = _record_event(
                 campaign,
@@ -5156,13 +5164,13 @@ def apply_memory_patch(campaign, session, patch, audit_context=None):
                 reason=patch.get('scene_reason') or 'Scene transition/patch',
                 before_json={'current_scene': before_scene},
                 after_json={'current_scene': current_scene},
-                patch_json={'scene_patch': scene_patch}
+                patch_json=scene_patch
             )
 
         world.knowledge_graph = json_dumps(graph)
         world.world_state = json_dumps(world_state)
         world.updated_at = datetime.utcnow()
-        if scene_patch:
+        if scene_patch and has_actual_scene_changes:
             upsert_memory_embedding(campaign, 'world_state', 'current', world_state, audit_context=audit_context)
 
     for item in patch.get('create_clocks', []) if isinstance(patch.get('create_clocks'), list) else []:
