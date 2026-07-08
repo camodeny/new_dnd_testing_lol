@@ -164,7 +164,7 @@ class DmToolsTest(unittest.TestCase):
         db.session.add(CampaignWorld(
             campaign_id=self.campaign.id,
             public_intro='{}',
-            knowledge_graph='{"entities":[{"id":"fac_crimson_veil","type":"faction","name":"Crimson Veil","visibility":"dm_private"}],"relations":[],"facts":[]}',
+            knowledge_graph='{"entities":[{"id":"fac_crimson_veil","type":"faction","name":"Crimson Veil","visibility":"dm_private"},{"id":"crypt_road","type":"location","name":"Crypt Road"}],"relations":[],"facts":[]}',
             world_state='{"current_scene":{"location_name":"Dock Ward","immediate_tension":"A bell rings."}}',
             dm_private='{"hidden_factions":["Crimson Veil"]}',
         ))

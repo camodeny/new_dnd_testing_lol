@@ -257,10 +257,24 @@ def _validate_memory_scene_patch(campaign, current_scene, scene_patch, audit_con
     if not isinstance(scene_patch, dict):
         return {}, {}
     visible_text = _scene_visible_text(audit_context or {})
-    if not visible_text:
-        return scene_patch, {}
-
     current_scene = current_scene if isinstance(current_scene, dict) else {}
+
+    if not visible_text:
+        from services.scene_location_resolver import resolve_scene_location_patch
+        resolved_loc = resolve_scene_location_patch(scene_patch, campaign, current_scene)
+        safe_patch = dict(scene_patch)
+        if resolved_loc is None:
+            safe_patch.pop('location_id', None)
+            safe_patch.pop('location_name', None)
+            skipped = {k: v for k, v in scene_patch.items() if k in ('location_id', 'location_name')}
+            return safe_patch, skipped
+        elif resolved_loc:
+            safe_patch['location_id'] = resolved_loc['location_id']
+            safe_patch['location_name'] = resolved_loc['location_name']
+            return safe_patch, {}
+        else:
+            return safe_patch, {}
+
     visible_terms = _scene_visible_terms(visible_text)
     validated = {}
     skipped = {}
@@ -271,17 +285,27 @@ def _validate_memory_scene_patch(campaign, current_scene, scene_patch, audit_con
         else:
             skipped[field] = scene_patch[field]
 
+    from services.scene_location_resolver import resolve_scene_location_patch
+    resolved_loc = resolve_scene_location_patch(scene_patch, campaign, current_scene)
     location_changed = False
-    for field in ('location_id', 'location_name'):
-        if field not in scene_patch:
-            continue
-        value = scene_patch.get(field)
-        if value == current_scene.get(field):
-            validated[field] = value
-            continue
-        supported = _scene_value_supported(value, visible_terms)
-        keep_or_skip(field, supported)
-        location_changed = location_changed or supported
+
+    if resolved_loc is None:
+        if 'location_id' in scene_patch:
+            skipped['location_id'] = scene_patch['location_id']
+        if 'location_name' in scene_patch:
+            skipped['location_name'] = scene_patch['location_name']
+    elif resolved_loc:
+        id_supported = _scene_value_supported(resolved_loc['location_id'], visible_terms)
+        name_supported = _scene_value_supported(resolved_loc['location_name'], visible_terms)
+        if id_supported or name_supported:
+            validated['location_id'] = resolved_loc['location_id']
+            validated['location_name'] = resolved_loc['location_name']
+            location_changed = True
+        else:
+            if 'location_id' in scene_patch:
+                skipped['location_id'] = scene_patch['location_id']
+            if 'location_name' in scene_patch:
+                skipped['location_name'] = scene_patch['location_name']
 
     if 'time_of_day' in scene_patch:
         value = scene_patch.get('time_of_day')
@@ -2603,7 +2627,16 @@ def _tool_update_current_scene(campaign, _current_user, args):
         return {'error': 'No world package exists.'}
     scene_patch = args.get('scene_patch') if isinstance(args.get('scene_patch'), dict) else {}
     current_scene = world_state.get('current_scene', {}) if isinstance(world_state, dict) else {}
-    current_scene.update(scene_patch)
+    
+    from services.scene_location_resolver import resolve_scene_location_patch
+    loc_patch = resolve_scene_location_patch(scene_patch, campaign, current_scene)
+    
+    # Enforce resolver or omission
+    clean_scene_patch = {k: v for k, v in scene_patch.items() if k not in ('location_id', 'location_name')}
+    if loc_patch:
+        clean_scene_patch.update(loc_patch)
+        
+    current_scene.update(clean_scene_patch)
     world_state['current_scene'] = current_scene
     _sync_party_known_location(world_state, current_scene)
     world.world_state = json_dumps(world_state)

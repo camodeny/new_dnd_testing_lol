@@ -500,21 +500,23 @@ def compile_staged_memory_patch(memory_context, extracted, resolved):
     if not scene_patch:
         scene_patch = extracted.get('scene_patch') if isinstance(extracted.get('scene_patch'), dict) else {}
     compiled_scene = {}
-    location_id = clean_id(scene_patch.get('location_id'), '')
-    location_name = clean_text(scene_patch.get('location_name'), 160)
-    if location_id and location_id in known['location_ids']:
-        compiled_scene['location_id'] = location_id
-    elif location_name and location_name.lower() in known['location_names']:
-        compiled_scene['location_id'] = known['location_names'][location_name.lower()]
-    elif location_id:
+    from services.scene_location_resolver import resolve_scene_location_patch
+    hot_context = memory_context.get('hot_context') if isinstance(memory_context.get('hot_context'), dict) else {}
+    current_scene = hot_context.get('current_scene') if isinstance(hot_context.get('current_scene'), dict) else {}
+
+    resolved_loc = resolve_scene_location_patch(scene_patch, campaign, current_scene)
+    if resolved_loc is None:
+        proposed_id = clean_id(scene_patch.get('location_id'), '')
+        proposed_name = clean_text(scene_patch.get('location_name'), 160)
         unresolved.append({
             'kind': 'scene_location',
-            'location_id': location_id,
-            'location_name': location_name,
-            'reason': 'unknown_location_id',
+            'location_id': proposed_id,
+            'location_name': proposed_name,
+            'reason': 'unresolved_scene_location',
         })
-    if location_name:
-        compiled_scene['location_name'] = location_name
+    elif resolved_loc:
+        compiled_scene['location_id'] = resolved_loc['location_id']
+        compiled_scene['location_name'] = resolved_loc['location_name']
     for field, limit in (('time_of_day', 80), ('immediate_tension', 420)):
         value = clean_text(scene_patch.get(field), limit)
         if value:

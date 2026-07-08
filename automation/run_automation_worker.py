@@ -610,6 +610,44 @@ def execute_run(args, run_id):
                 dm_turn,
                 dedupe_key=f'dm_turn_status:{logical_key}:{posted_message_id}',
             )
+            if dm_turn.get('status') == 'error' or dm_turn.get('post_turn_status') == 'error':
+                failure_payload = {
+                    'player_message_id': posted_message_id,
+                    'dm_message_id': dm_turn.get('dm_message_id'),
+                    'status': dm_turn.get('status'),
+                    'post_turn_status': dm_turn.get('post_turn_status'),
+                    'memory_status': dm_turn.get('memory_status', 'skipped'),
+                    'clock_status': dm_turn.get('clock_status', 'skipped'),
+                    'turn_error': dm_turn.get('turn_error') or dm_turn.get('error_text') or dm_turn.get('post_turn_error'),
+                    'phase': 'after_dm',
+                    'retry_count': 0,
+                    'skipped_downstream_expectations': [
+                        'dm_response_audit',
+                        'memory_validation',
+                        'clock_validation',
+                    ],
+                }
+                append_event(
+                    args.api_base,
+                    args.owner_api_key,
+                    run_id,
+                    args.worker_id,
+                    lease_token,
+                    'dm_turn_failed',
+                    failure_payload,
+                    dedupe_key=f'dm_turn_failed:{logical_key}:{posted_message_id}',
+                )
+                complete_run(
+                    args.api_base,
+                    args.owner_api_key,
+                    run_id,
+                    args.worker_id,
+                    lease_token,
+                    status='failed',
+                    error_text=dm_turn.get('turn_error') or dm_turn.get('error_text') or dm_turn.get('post_turn_error') or 'dm_turn_failed',
+                    dedupe_key=f'run_completed:{run_id}:dm-failure:{posted_message_id}',
+                )
+                return True
             if dm_timed_out:
                 complete_run(
                     args.api_base,
@@ -874,6 +912,44 @@ def execute_run(args, run_id):
                         dm_turn,
                         dedupe_key=f'dm_turn_status:{logical_key}:{posted_message_id}',
                     )
+                    if dm_turn.get('status') == 'error' or dm_turn.get('post_turn_status') == 'error':
+                        failure_payload = {
+                            'player_message_id': posted_message_id,
+                            'dm_message_id': dm_turn.get('dm_message_id'),
+                            'status': dm_turn.get('status'),
+                            'post_turn_status': dm_turn.get('post_turn_status'),
+                            'memory_status': dm_turn.get('memory_status', 'skipped'),
+                            'clock_status': dm_turn.get('clock_status', 'skipped'),
+                            'turn_error': dm_turn.get('turn_error') or dm_turn.get('error_text') or dm_turn.get('post_turn_error'),
+                            'phase': 'after_dm',
+                            'retry_count': 0,
+                            'skipped_downstream_expectations': [
+                                'dm_response_audit',
+                                'memory_validation',
+                                'clock_validation',
+                            ],
+                        }
+                        append_event(
+                            args.api_base,
+                            args.owner_api_key,
+                            run_id,
+                            args.worker_id,
+                            lease_token,
+                            'dm_turn_failed',
+                            failure_payload,
+                            dedupe_key=f'dm_turn_failed:{logical_key}:{posted_message_id}',
+                        )
+                        complete_run(
+                            args.api_base,
+                            args.owner_api_key,
+                            run_id,
+                            args.worker_id,
+                            lease_token,
+                            status='failed',
+                            error_text=dm_turn.get('turn_error') or dm_turn.get('error_text') or dm_turn.get('post_turn_error') or 'dm_turn_failed',
+                            dedupe_key=f'run_completed:{run_id}:dm-failure:{posted_message_id}',
+                        )
+                        return True
                     if dm_timed_out:
                         complete_run(
                             args.api_base,

@@ -417,8 +417,8 @@ class OpenRouterJsonRepairTest(unittest.TestCase):
             })
 
         self.assertEqual(patch_data['_fallback']['reason'], 'empty_memory_writer_response')
-        self.assertEqual(patch_data['scene_patch']['location_id'], 'blackwater_harbor')
-        self.assertEqual(patch_data['scene_patch']['location_name'], 'Blackwater Harbor')
+        self.assertEqual(patch_data['scene_patch']['location_id'], 'crossroads')
+        self.assertEqual(patch_data['scene_patch']['location_name'], 'Crossroads')
         self.assertEqual(patch_data['scene_patch']['time_of_day'], 'dawn')
         self.assertEqual(
             patch_data['scene_patch']['active_npc_ids'],
