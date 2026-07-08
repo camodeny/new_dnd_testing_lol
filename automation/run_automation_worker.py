@@ -618,7 +618,7 @@ def execute_run(args, run_id):
                     'post_turn_status': dm_turn.get('post_turn_status'),
                     'memory_status': dm_turn.get('memory_status', 'skipped'),
                     'clock_status': dm_turn.get('clock_status', 'skipped'),
-                    'turn_error': dm_turn.get('turn_error') or dm_turn.get('error_text'),
+                    'turn_error': dm_turn.get('turn_error') or dm_turn.get('error_text') or dm_turn.get('post_turn_error'),
                     'phase': 'after_dm',
                     'retry_count': 0,
                     'skipped_downstream_expectations': [
@@ -644,7 +644,7 @@ def execute_run(args, run_id):
                     args.worker_id,
                     lease_token,
                     status='failed',
-                    error_text=dm_turn.get('turn_error') or dm_turn.get('error_text') or 'dm_turn_failed',
+                    error_text=dm_turn.get('turn_error') or dm_turn.get('error_text') or dm_turn.get('post_turn_error') or 'dm_turn_failed',
                     dedupe_key=f'run_completed:{run_id}:dm-failure:{posted_message_id}',
                 )
                 return True
@@ -920,7 +920,7 @@ def execute_run(args, run_id):
                             'post_turn_status': dm_turn.get('post_turn_status'),
                             'memory_status': dm_turn.get('memory_status', 'skipped'),
                             'clock_status': dm_turn.get('clock_status', 'skipped'),
-                            'turn_error': dm_turn.get('turn_error') or dm_turn.get('error_text'),
+                            'turn_error': dm_turn.get('turn_error') or dm_turn.get('error_text') or dm_turn.get('post_turn_error'),
                             'phase': 'after_dm',
                             'retry_count': 0,
                             'skipped_downstream_expectations': [
@@ -946,7 +946,7 @@ def execute_run(args, run_id):
                             args.worker_id,
                             lease_token,
                             status='failed',
-                            error_text=dm_turn.get('turn_error') or dm_turn.get('error_text') or 'dm_turn_failed',
+                            error_text=dm_turn.get('turn_error') or dm_turn.get('error_text') or dm_turn.get('post_turn_error') or 'dm_turn_failed',
                             dedupe_key=f'run_completed:{run_id}:dm-failure:{posted_message_id}',
                         )
                         return True
