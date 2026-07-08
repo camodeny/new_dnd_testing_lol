@@ -415,11 +415,31 @@ def _campaign_for_run(run):
     return run.derived_campaign or (run.scenario.source_campaign if run.scenario else None)
 
 
-def _latest_session_messages(run, limit):
+def _cycle_boundaries(cycle):
+    if not cycle:
+        return {
+            "audit_event_id": None,
+            "provider_call_id": None,
+            "run_event_id": None,
+            "message_id": None,
+        }
+    payload = cycle.payload_json or {}
+    return {
+        "audit_event_id": _safe_int(payload.get("boundary_audit_event_id"), 0, minimum=0) or None,
+        "provider_call_id": _safe_int(payload.get("boundary_provider_call_id"), 0, minimum=0) or None,
+        "run_event_id": _safe_int(payload.get("boundary_run_event_id"), 0, minimum=0) or None,
+        "message_id": _safe_int(payload.get("boundary_message_id"), 0, minimum=0) or None,
+    }
+
+
+def _latest_session_messages(run, limit, max_message_id=None):
     session = latest_session_for_run(run)
     if session is None:
         return []
-    rows = SessionMessage.query.filter_by(session_id=session.id).order_by(SessionMessage.id.desc()).limit(limit).all()
+    query = SessionMessage.query.filter_by(session_id=session.id)
+    if max_message_id is not None:
+        query = query.filter(SessionMessage.id <= max_message_id)
+    rows = query.order_by(SessionMessage.id.desc()).limit(limit).all()
     return [row.to_dict() for row in reversed(rows)]
 
 
@@ -838,8 +858,8 @@ def _compact_npc(row):
     }
 
 
-def _transcript_focus_window(run, cycle, limit):
-    messages = _latest_session_messages(run, limit)
+def _transcript_focus_window(run, cycle, limit, max_message_id=None):
+    messages = _latest_session_messages(run, limit, max_message_id=max_message_id)
     focus_ids = {cycle.player_message_id, cycle.dm_message_id}
     for item in messages:
         item['is_focus_message'] = item.get('id') in focus_ids
@@ -870,9 +890,24 @@ def _cycle_evidence_packet(run, cycle, args):
     audit_event_limit = _limit_arg({'limit': (args or {}).get('audit_event_limit')}, 12, 40)
     provider_call_limit = _limit_arg({'limit': (args or {}).get('provider_call_limit')}, 6, 20)
     run_event_limit = _limit_arg({'limit': (args or {}).get('run_event_limit')}, 8, 30)
-    audit_rows = CampaignAuditEvent.query.filter_by(campaign_id=campaign.id).order_by(CampaignAuditEvent.id.desc()).limit(audit_event_limit).all() if campaign else []
-    provider_rows = AutomationRunProviderCall.query.filter_by(run_id=run.id).order_by(AutomationRunProviderCall.id.desc()).limit(provider_call_limit).all()
-    run_event_rows = AutomationRunEvent.query.filter_by(run_id=run.id).order_by(AutomationRunEvent.id.desc()).limit(run_event_limit).all()
+
+    boundaries = _cycle_boundaries(cycle)
+
+    audit_query = CampaignAuditEvent.query.filter_by(campaign_id=campaign.id)
+    if boundaries.get("audit_event_id") is not None:
+        audit_query = audit_query.filter(CampaignAuditEvent.id <= boundaries["audit_event_id"])
+    audit_rows = audit_query.order_by(CampaignAuditEvent.id.desc()).limit(audit_event_limit).all() if campaign else []
+
+    provider_query = AutomationRunProviderCall.query.filter_by(run_id=run.id)
+    if boundaries.get("provider_call_id") is not None:
+        provider_query = provider_query.filter(AutomationRunProviderCall.id <= boundaries["provider_call_id"])
+    provider_rows = provider_query.order_by(AutomationRunProviderCall.id.desc()).limit(provider_call_limit).all()
+
+    run_event_query = AutomationRunEvent.query.filter_by(run_id=run.id)
+    if boundaries.get("run_event_id") is not None:
+        run_event_query = run_event_query.filter(AutomationRunEvent.id <= boundaries["run_event_id"])
+    run_event_rows = run_event_query.order_by(AutomationRunEvent.id.desc()).limit(run_event_limit).all()
+
     clock_rows = CampaignClock.query.filter_by(campaign_id=campaign.id).order_by(CampaignClock.id.asc()).all() if campaign else []
     npc_rows = NPCActor.query.filter_by(campaign_id=campaign.id).order_by(NPCActor.id.asc()).all() if campaign else []
     return {
@@ -893,7 +928,7 @@ def _cycle_evidence_packet(run, cycle, args):
             'dm_message_id': cycle.dm_message_id,
             'payload': cycle.payload_json or {},
         },
-        'transcript_window': _transcript_focus_window(run, cycle, transcript_limit),
+        'transcript_window': _transcript_focus_window(run, cycle, transcript_limit, max_message_id=boundaries.get("message_id")),
         'scene_state_summary': _scene_state_summary(world_payload),
         'running_summary': latest_session.running_summary if latest_session else None,
         'clock_summaries': [_compact_clock(row) for row in clock_rows],
@@ -977,14 +1012,19 @@ def execute_auditor_tool(run, tool_name, args=None):
             return _cycle_evidence_packet(run, cycle, args)
         if campaign is None:
             return {'error': 'Run has no derived or source campaign available.'}
+        cycle = db.session.get(AutomationRunAuditCycle, run.awaiting_audit_cycle_id) if run.awaiting_audit_cycle_id else None
+        boundaries = _cycle_boundaries(cycle)
+
         if tool_name == 'get_transcript':
-            return {'messages': _latest_session_messages(run, _limit_arg(args, 80, 200))}
+            return {'messages': _latest_session_messages(run, _limit_arg(args, 80, 200), max_message_id=boundaries.get("message_id"))}
         if tool_name == 'get_audit_events':
             limit = _limit_arg(args, 40, 200)
             include_payload = bool(args.get('include_payload'))
             if include_payload:
                 return {'error': 'Bulk audit-event payload fetch is disabled for built-in auditors. Use get_audit_event_detail with exact paths.'}
             query = CampaignAuditEvent.query.filter_by(campaign_id=campaign.id)
+            if boundaries.get("audit_event_id") is not None:
+                query = query.filter(CampaignAuditEvent.id <= boundaries["audit_event_id"])
             if args.get('event_type'):
                 query = query.filter_by(event_type=str(args.get('event_type')).strip())
             if args.get('trace_id'):
@@ -1007,18 +1047,26 @@ def execute_auditor_tool(run, tool_name, args=None):
             include_artifacts = bool(args.get('include_artifacts'))
             if include_artifacts:
                 return {'error': 'Bulk provider artifacts are disabled for built-in auditors. Use get_provider_call_detail with exact paths.'}
-            rows = AutomationRunProviderCall.query.filter_by(run_id=run.id).order_by(AutomationRunProviderCall.id.desc()).limit(limit).all()
+            query = AutomationRunProviderCall.query.filter_by(run_id=run.id)
+            if boundaries.get("provider_call_id") is not None:
+                query = query.filter(AutomationRunProviderCall.id <= boundaries["provider_call_id"])
+            rows = query.order_by(AutomationRunProviderCall.id.desc()).limit(limit).all()
             return {'provider_calls': [_compact_provider_call(row, include_artifacts=include_artifacts) for row in reversed(rows)]}
         if tool_name == 'get_run_events':
             limit = _limit_arg(args, 20, 200)
             include_payload = bool(args.get('include_payload'))
             if include_payload:
                 return {'error': 'Bulk run-event payload fetch is disabled for built-in auditors. Use get_run_event_detail with exact paths.'}
-            rows = AutomationRunEvent.query.filter_by(run_id=run.id).order_by(AutomationRunEvent.id.desc()).limit(limit).all()
+            query = AutomationRunEvent.query.filter_by(run_id=run.id)
+            if boundaries.get("run_event_id") is not None:
+                query = query.filter(AutomationRunEvent.id <= boundaries["run_event_id"])
+            rows = query.order_by(AutomationRunEvent.id.desc()).limit(limit).all()
             return {'events': [_compact_run_event(row, include_payload=include_payload) for row in reversed(rows)]}
         if tool_name == 'get_audit_event_detail':
             row = db.session.get(CampaignAuditEvent, _safe_int(args.get('event_id'), 0, minimum=0))
             if row is None or row.campaign_id != campaign.id:
+                return {'error': 'Audit event not found for this campaign.'}
+            if boundaries.get("audit_event_id") is not None and row.id > boundaries["audit_event_id"]:
                 return {'error': 'Audit event not found for this campaign.'}
             paths = _path_args(args, 'paths')
             if paths:
@@ -1030,6 +1078,8 @@ def execute_auditor_tool(run, tool_name, args=None):
             row = db.session.get(AutomationRunProviderCall, _safe_int(args.get('provider_call_id'), 0, minimum=0))
             if row is None or row.run_id != run.id:
                 return {'error': 'Provider call not found for this run.'}
+            if boundaries.get("provider_call_id") is not None and row.id > boundaries["provider_call_id"]:
+                return {'error': 'Provider call not found for this run.'}
             request_paths = _path_args(args, 'request_paths')
             response_paths = _path_args(args, 'response_paths')
             parsed_output_paths = _path_args(args, 'parsed_output_paths')
@@ -1039,6 +1089,8 @@ def execute_auditor_tool(run, tool_name, args=None):
         if tool_name == 'get_run_event_detail':
             row = db.session.get(AutomationRunEvent, _safe_int(args.get('event_id'), 0, minimum=0))
             if row is None or row.run_id != run.id:
+                return {'error': 'Run event not found for this run.'}
+            if boundaries.get("run_event_id") is not None and row.id > boundaries["run_event_id"]:
                 return {'error': 'Run event not found for this run.'}
             paths = _path_args(args, 'paths')
             if paths:

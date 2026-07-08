@@ -8,6 +8,7 @@ from auth import authenticate_request, token_required
 from models import (
     AutomationRun,
     AutomationRunAuditCycle,
+    AutomationRunAuditAttempt,
     AutomationRunAuditorJob,
     AutomationRunAuditResult,
     AutomationRunEvent,
@@ -955,12 +956,7 @@ def pause_automation_run(current_user, run_id):
         summary=data.get('summary'),
         player_message_id=data.get('player_message_id'),
         dm_message_id=data.get('dm_message_id'),
-    )
-    append_run_event(
-        run,
-        'audit_cycle_paused',
-        {'phase': phase, 'audit_cycle': cycle.to_dict()},
-        dedupe_key=data.get('dedupe_key') or f'audit_cycle_paused:{cycle.id}',
+        dedupe_key=data.get('dedupe_key'),
         worker_id=data.get('worker_id'),
         lease_token=data.get('lease_token'),
     )
@@ -978,12 +974,62 @@ def audit_automation_run_cycle(current_user, run_id, cycle_id):
         return jsonify({'error': 'Audit cycle does not belong to this run'}), 400
 
     data = request.get_json(silent=True) or {}
-    cycle = submit_audit_cycle_feedback(
-        cycle,
-        summary=data.get('summary'),
-        notes=data.get('notes'),
-        scorecard=data.get('scorecard'),
-    )
+
+    # Sanitize auditor_job_id to ensure it exists for this run
+    job_id = None
+    raw_job_id = data.get('auditor_job_id')
+    if raw_job_id:
+        job = AutomationRunAuditorJob.query.filter_by(id=raw_job_id, run_id=run.id).first()
+        if job:
+            job_id = job.id
+
+    # Snapshot context for logging attempts safely
+    attempt_context = {
+        "run_id": run.id,
+        "cycle_id": cycle.id,
+        "cycle_number": cycle.cycle_number,
+        "phase": cycle.phase,
+        "auditor_job_id": job_id,
+        "auditor_slot": data.get('auditor_slot'),
+        "provider": data.get('provider'),
+        "model": data.get('model'),
+        "raw_payload_json": data,
+    }
+
+    try:
+        cycle = submit_audit_cycle_feedback(
+            cycle,
+            summary=data.get('summary'),
+            notes=data.get('notes'),
+            scorecard=data.get('scorecard'),
+        )
+        
+        # Log successful attempt
+        attempt = AutomationRunAuditAttempt(
+            status="success",
+            normalized_payload_json={
+                "summary": cycle.summary,
+                "notes": cycle.notes,
+                "scorecard": cycle.scorecard_json,
+            },
+            **attempt_context
+        )
+        db.session.add(attempt)
+        db.session.commit()
+    except Exception as e:
+        db.session.rollback()
+        
+        # Log failed attempt in clean transaction
+        attempt = AutomationRunAuditAttempt(
+            status="failed",
+            error_class=e.__class__.__name__,
+            error_message=str(e),
+            **attempt_context
+        )
+        db.session.add(attempt)
+        db.session.commit()
+        raise
+
     append_run_event(
         run,
         'audit_cycle_audited',

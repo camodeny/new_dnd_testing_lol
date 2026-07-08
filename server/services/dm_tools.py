@@ -169,6 +169,13 @@ def _apply_memory_item_metadata(clean_item, raw_item, include_memory_type=False)
         memory_type = _coerce_patch_text(raw_item.get('memory_type'), 50)
         if memory_type:
             clean_item['memory_type'] = memory_type
+
+    # Preserve provenance and resolution mode metadata
+    if 'provenance' in raw_item:
+        clean_item['provenance'] = raw_item['provenance']
+    if 'resolution_mode' in raw_item:
+        clean_item['resolution_mode'] = raw_item['resolution_mode']
+
     return clean_item
 
 
@@ -358,6 +365,11 @@ def _validate_memory_scene_patch(campaign, current_scene, scene_patch, audit_con
             validated['immediate_tension'] = value
         else:
             skipped['immediate_tension'] = value
+
+    if 'provenance' in scene_patch:
+        validated['provenance'] = scene_patch['provenance']
+    if 'resolution_mode' in scene_patch:
+        validated['resolution_mode'] = scene_patch['resolution_mode']
 
     return validated, skipped
 

@@ -496,14 +496,35 @@ def compile_staged_memory_patch(memory_context, extracted, resolved):
         4000,
     )
 
+    hot_context = memory_context.get('hot_context') if isinstance(memory_context.get('hot_context'), dict) else {}
+    source_player_message_id = memory_context.get('latest_player_message_id') or memory_context.get('source_player_message_id') or hot_context.get('player_message_id') or hot_context.get('source_player_message_id')
+    source_dm_message_id = memory_context.get('latest_dm_message_id') or memory_context.get('source_dm_message_id') or hot_context.get('dm_message_id') or hot_context.get('source_dm_message_id')
+
+    def make_provenance(item_raw, default_tool=None):
+        raw_prov = item_raw.get('provenance') if isinstance(item_raw.get('provenance'), dict) else {}
+        evidence = item_raw.get('evidence')
+        if not isinstance(evidence, list):
+            evidence = [evidence] if evidence else []
+        basis = raw_prov.get('evidence_basis') or item_raw.get('evidence_basis') or evidence
+        if not isinstance(basis, list):
+            basis = [basis] if basis else []
+        basis = [str(b).strip() for b in basis if str(b).strip()]
+        return {
+            'source_player_message_id': raw_prov.get('source_player_message_id') or source_player_message_id,
+            'source_dm_message_id': raw_prov.get('source_dm_message_id') or source_dm_message_id,
+            'tool_name': raw_prov.get('tool_name') or default_tool,
+            'tool_result_id': raw_prov.get('tool_result_id'),
+            'evidence_basis': basis
+        }
+
     scene_patch = resolved.get('scene_patch') if isinstance(resolved.get('scene_patch'), dict) else {}
     if not scene_patch:
         scene_patch = extracted.get('scene_patch') if isinstance(extracted.get('scene_patch'), dict) else {}
     compiled_scene = {}
     from services.scene_location_resolver import resolve_scene_location_patch
-    hot_context = memory_context.get('hot_context') if isinstance(memory_context.get('hot_context'), dict) else {}
     current_scene = hot_context.get('current_scene') if isinstance(hot_context.get('current_scene'), dict) else {}
 
+    scene_resolution_mode = 'inferred'
     resolved_loc = resolve_scene_location_patch(scene_patch, campaign, current_scene)
     if resolved_loc is None:
         proposed_id = clean_id(scene_patch.get('location_id'), '')
@@ -513,21 +534,41 @@ def compile_staged_memory_patch(memory_context, extracted, resolved):
             'location_id': proposed_id,
             'location_name': proposed_name,
             'reason': 'unresolved_scene_location',
+            'provenance': make_provenance(scene_patch, default_tool='resolve_scene_location_patch'),
+            'resolution_mode': 'unresolved'
         })
     elif resolved_loc:
-        compiled_scene['location_id'] = resolved_loc['location_id']
-        compiled_scene['location_name'] = resolved_loc['location_name']
+        if resolved_loc.get('location_id'):
+            compiled_scene['location_id'] = resolved_loc['location_id']
+            compiled_scene['location_name'] = resolved_loc['location_name']
+            scene_resolution_mode = 'canonical'
+        else:
+            # Resolved to current (direct)
+            compiled_scene['location_id'] = current_scene.get('location_id')
+            compiled_scene['location_name'] = current_scene.get('location_name')
+            scene_resolution_mode = 'direct'
+
+    compiled_scene['provenance'] = make_provenance(scene_patch, default_tool='resolve_scene_location_patch')
+    compiled_scene['resolution_mode'] = scene_resolution_mode
+
     for field, limit in (('time_of_day', 80), ('immediate_tension', 420)):
         value = clean_text(scene_patch.get(field), limit)
         if value:
             compiled_scene[field] = value
+
     active_npc_ids = []
     for raw_id in scene_patch.get('active_npc_ids') if isinstance(scene_patch.get('active_npc_ids'), list) else []:
         actor_id = clean_id(raw_id, '')
         if actor_id and actor_id in known['npc_ids'] and actor_id not in active_npc_ids:
             active_npc_ids.append(actor_id)
         elif actor_id:
-            unresolved.append({'kind': 'active_npc', 'actor_id': actor_id, 'reason': 'unknown_npc_id'})
+            unresolved.append({
+                'kind': 'active_npc',
+                'actor_id': actor_id,
+                'reason': 'unknown_npc_id',
+                'provenance': make_provenance(scene_patch),
+                'resolution_mode': 'unresolved'
+            })
     if active_npc_ids:
         compiled_scene['active_npc_ids'] = active_npc_ids
     departed_npc_ids = []
@@ -536,7 +577,13 @@ def compile_staged_memory_patch(memory_context, extracted, resolved):
         if actor_id and actor_id in known['npc_ids'] and actor_id not in departed_npc_ids:
             departed_npc_ids.append(actor_id)
         elif actor_id:
-            unresolved.append({'kind': 'departed_npc', 'actor_id': actor_id, 'reason': 'unknown_npc_id'})
+            unresolved.append({
+                'kind': 'departed_npc',
+                'actor_id': actor_id,
+                'reason': 'unknown_npc_id',
+                'provenance': make_provenance(scene_patch),
+                'resolution_mode': 'unresolved'
+            })
     if departed_npc_ids:
         compiled_scene['departed_npc_ids'] = departed_npc_ids
 
@@ -572,6 +619,8 @@ def compile_staged_memory_patch(memory_context, extracted, resolved):
                 'text': text,
                 'reason': 'all_entity_ids_unresolved',
                 'requested_entity_ids': [clean_id(item, '') for item in raw_entity_ids if clean_id(item, '')],
+                'provenance': make_provenance(raw_fact),
+                'resolution_mode': 'unresolved'
             })
             continue
         fact_id = clean_id(raw_fact.get('id'), '')
@@ -587,6 +636,8 @@ def compile_staged_memory_patch(memory_context, extracted, resolved):
             'expires_or_retire_condition': clean_text(raw_fact.get('expires_or_retire_condition'), 520) or None,
             'reason': clean_text(raw_fact.get('reason'), 420) or 'Resolved staged memory fact.',
             'memory_type': clean_text(raw_fact.get('memory_type'), 40).lower() or 'fact',
+            'provenance': make_provenance(raw_fact, default_tool='get_entity_candidates'),
+            'resolution_mode': raw_fact.get('resolution_mode') or ('canonical' if entity_ids else 'direct')
         })
         if unknown_entity_ids:
             unresolved.append({
@@ -594,6 +645,27 @@ def compile_staged_memory_patch(memory_context, extracted, resolved):
                 'text': text,
                 'reason': 'partial_entity_resolution',
                 'unknown_entity_ids': unknown_entity_ids,
+                'provenance': make_provenance(raw_fact),
+                'resolution_mode': 'unresolved'
+            })
+
+    # Preserve any incoming create_clocks or retire_clocks if present, populating their metadata
+    create_clocks = []
+    for raw_clock in resolved.get('create_clocks') or []:
+        if isinstance(raw_clock, dict):
+            create_clocks.append({
+                **raw_clock,
+                'provenance': make_provenance(raw_clock, default_tool='session_memory_update_clocks'),
+                'resolution_mode': raw_clock.get('resolution_mode') or 'inferred'
+            })
+
+    retire_clocks = []
+    for raw_clock in resolved.get('retire_clocks') or []:
+        if isinstance(raw_clock, dict):
+            retire_clocks.append({
+                **raw_clock,
+                'provenance': make_provenance(raw_clock, default_tool='session_memory_update_clocks'),
+                'resolution_mode': raw_clock.get('resolution_mode') or 'inferred'
             })
 
     return {
@@ -606,8 +678,8 @@ def compile_staged_memory_patch(memory_context, extracted, resolved):
         'upsert_graph_entities': [],
         'upsert_graph_relations': [],
         'upsert_graph_facts': accepted_facts,
-        'create_clocks': [],
-        'retire_clocks': [],
+        'create_clocks': create_clocks,
+        'retire_clocks': retire_clocks,
         'update_npc_actors': [],
         'record_events': [],
         'unresolved_items': unresolved,
