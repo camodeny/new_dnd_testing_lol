@@ -271,17 +271,27 @@ def _validate_memory_scene_patch(campaign, current_scene, scene_patch, audit_con
         else:
             skipped[field] = scene_patch[field]
 
+    from services.scene_location_resolver import resolve_scene_location_patch
+    resolved_loc = resolve_scene_location_patch(scene_patch, campaign, current_scene)
     location_changed = False
-    for field in ('location_id', 'location_name'):
-        if field not in scene_patch:
-            continue
-        value = scene_patch.get(field)
-        if value == current_scene.get(field):
-            validated[field] = value
-            continue
-        supported = _scene_value_supported(value, visible_terms)
-        keep_or_skip(field, supported)
-        location_changed = location_changed or supported
+
+    if resolved_loc is None:
+        if 'location_id' in scene_patch:
+            skipped['location_id'] = scene_patch['location_id']
+        if 'location_name' in scene_patch:
+            skipped['location_name'] = scene_patch['location_name']
+    elif resolved_loc:
+        id_supported = _scene_value_supported(resolved_loc['location_id'], visible_terms)
+        name_supported = _scene_value_supported(resolved_loc['location_name'], visible_terms)
+        if id_supported or name_supported:
+            validated['location_id'] = resolved_loc['location_id']
+            validated['location_name'] = resolved_loc['location_name']
+            location_changed = True
+        else:
+            if 'location_id' in scene_patch:
+                skipped['location_id'] = scene_patch['location_id']
+            if 'location_name' in scene_patch:
+                skipped['location_name'] = scene_patch['location_name']
 
     if 'time_of_day' in scene_patch:
         value = scene_patch.get('time_of_day')

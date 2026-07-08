@@ -5031,48 +5031,6 @@ def _fallback_scene_npc_ids(latest_dm_message):
 
 
 
-def _normalize_fallback_location_name(raw_value):
-    text = str(raw_value or '').strip()
-    if not text:
-        return None
-    text = re.sub(r'\bby\s+(?:dawn|morning|noon|afternoon|dusk|evening|night|midnight)\b.*$', '', text, flags=re.IGNORECASE)
-    text = text.strip(" .,:;!-")
-    of_match = re.search(r'\bof\s+(?:the\s+)?([A-Za-z][A-Za-z0-9\' -]{1,80})$', text, flags=re.IGNORECASE)
-    if of_match:
-        text = of_match.group(1).strip()
-    text = re.sub(r'^(?:the|a|an)\s+', '', text, flags=re.IGNORECASE)
-    text = text.strip(" .,:;!-")
-    if not text:
-        return None
-    if len(text) <= 3:
-        return None
-    words = text.split()
-    if len(words) > 6:
-        return None
-    return ' '.join(word.capitalize() if word.islower() else word for word in words)
-
-
-def _fallback_scene_location(latest_dm_text, current_scene):
-    text = str(latest_dm_text or '')
-    patterns = [
-        r'\b(?:step|walk|move|head|slip|follow)\s+(?:inside|into|through)\s+([^.;\n]+)',
-        r'\b(?:reach|arrive(?:s|d)?(?: at| in)?|enter(?:s|ed)?)\s+([^.;\n]+)',
-        r'\b(?:inside|within)\s+([^.;\n]+)',
-    ]
-    for pattern in patterns:
-        match = re.search(pattern, text, flags=re.IGNORECASE)
-        if not match:
-            continue
-        location_name = _normalize_fallback_location_name(match.group(1))
-        if not location_name:
-            continue
-        location_id = re.sub(r'[^a-z0-9]+', '_', location_name.strip().lower()).strip('_') or None
-        return location_id, location_name
-    if isinstance(current_scene, dict):
-        return current_scene.get('location_id'), current_scene.get('location_name')
-    return None, None
-
-
 def _fallback_scene_immediate_tension(latest_dm_message, current_scene):
     cleaned = _memory_fallback_text(latest_dm_message, 600)
     paragraphs = [
@@ -5098,14 +5056,8 @@ def _fallback_scene_patch(memory_context):
     hot_context = memory_context.get('hot_context') if isinstance(memory_context.get('hot_context'), dict) else {}
     current_scene = hot_context.get('current_scene') if isinstance(hot_context.get('current_scene'), dict) else {}
     latest_dm_message = _memory_context_lookup(memory_context, 'latest_dm_message', 'latest_dm_response') or ''
-    latest_dm_text = _memory_fallback_text(latest_dm_message, 1200)
 
     scene_patch = dict(current_scene) if isinstance(current_scene, dict) else {}
-    location_id, location_name = _fallback_scene_location(latest_dm_text, current_scene)
-    if location_id:
-        scene_patch['location_id'] = location_id
-    if location_name:
-        scene_patch['location_name'] = location_name
 
     spoken_ids = _fallback_scene_npc_ids(latest_dm_message)
     if spoken_ids:
