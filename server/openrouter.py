@@ -265,12 +265,13 @@ SESSION_MEMORY_EXTRACTOR_SYSTEM_PROMPT = (
     "Return only valid JSON. "
     "Write a fresh running_summary that cleanly replaces the old one. "
     "Do not append fragments to the prior summary. Rewrite the current durable state after the latest visible exchange in one compact paragraph. "
+    "Additionally, extract or update the structured memory_anchors representing the current session state: current_goal (string or null), current_scene (string or null), open_clues (array of strings), unresolved_questions (array of strings), npc_observations (array of strings), and recent_offers_promises (array of strings). Do not append fragments; completely rewrite or prune these anchors to reflect the current state. "
     "Extract only candidate scene updates and durable fact claims from the visible exchange. "
     "Do not invent canonical ids. If a name is not already a known id in the prompt, preserve it as a raw label for later resolution. "
     "Scene updates may include location_id, location_name, time_of_day, active_npc_ids, departed_npc_ids, and immediate_tension. "
     "Fact claims must use source_surface of visible_transcript, hidden_state, or inferred. "
     "When a fact was directly established in the latest visible exchange, set source_surface to visible_transcript and intended_visibility to party_known unless it is broadly public. "
-    "Return keys running_summary, scene_patch, scene_reason, and fact_claims. "
+    "Return keys running_summary, memory_anchors, scene_patch, scene_reason, and fact_claims. "
     "Each fact_claim must include text, entity_refs, source_surface, intended_visibility, certainty, importance, reason, expires_or_retire_condition, and memory_type."
 )
 
@@ -280,7 +281,8 @@ SESSION_MEMORY_RESOLVER_SYSTEM_PROMPT = (
     "Never invent ids. If you cannot resolve a reference with confidence, return it in unresolved_items instead of mutating memory. "
     "Prefer get_entity_candidates, get_scene_candidates, get_fact_candidates, and search_campaign_memory before broad raw-state tools. "
     "Use get_world_state, get_npcs, get_clocks, or transcript tools only when narrower tools are insufficient. "
-    "Final response must be exactly one JSON object with keys running_summary, scene_patch, scene_reason, upsert_graph_facts, unresolved_items, evidence_basis, resolved_entity_refs, and resolved_location_refs. "
+    "Final response must be exactly one JSON object with keys running_summary, memory_anchors, scene_patch, scene_reason, upsert_graph_facts, unresolved_items, evidence_basis, resolved_entity_refs, and resolved_location_refs. "
+    "Return the resolved/updated memory_anchors representing the current session state: current_goal (string or null), current_scene (string or null), open_clues (array of strings), unresolved_questions (array of strings), npc_observations (array of strings), and recent_offers_promises (array of strings)."
     "Each upsert_graph_facts item must include text, entity_ids, id if reusing an existing fact, source_surface, intended_visibility, certainty, importance, reason, expires_or_retire_condition, and memory_type."
 )
 
@@ -700,6 +702,10 @@ def _post_chat_response(
 
     attempt_limit = max(1, int(max_attempts or LLM_MAX_ATTEMPTS))
     for attempt in range(1, attempt_limit + 1):
+        if attempt > 1:
+            tracker = audit_context.get('telemetry_tracker') if isinstance(audit_context, dict) else None
+            if isinstance(tracker, dict):
+                tracker['provider_retries'] = tracker.get('provider_retries', 0) + 1
         try:
             resp = requests.post(
                 _api_url_for_provider(provider),
@@ -1189,6 +1195,10 @@ def _json_loads_with_repair(text, audit_context=None):
         return data
 
     audit_context = audit_context or {}
+    tracker = audit_context.get('telemetry_tracker')
+    if isinstance(tracker, dict):
+        tracker['parse_repairs'] = tracker.get('parse_repairs', 0) + 1
+
     operation = audit_context.get('operation') or 'json_response'
     repair_context = {
         **audit_context,
@@ -3854,12 +3864,21 @@ def build_session_memory_extractor_messages(memory_context):
             'role': 'user',
             'content': json.dumps({
                 'prior_running_summary': memory_context.get('prior_running_summary'),
+                'prior_memory_anchors': memory_context.get('prior_memory_anchors'),
                 'current_scene': compact.get('current_scene'),
                 'relevant_memory': compact.get('relevant_memory'),
                 'latest_player_message': compact.get('latest_player_message'),
                 'latest_dm_message': compact.get('latest_dm_message'),
                 'return_shape': {
                     'running_summary': 'fresh compact replacement summary for the session after this turn',
+                    'memory_anchors': {
+                        'current_goal': 'string goal, or null',
+                        'current_scene': 'string scene description, or null',
+                        'open_clues': ['list of open clues'],
+                        'unresolved_questions': ['list of open questions'],
+                        'npc_observations': ['list of observations about NPCs'],
+                        'recent_offers_promises': ['list of recent offers or promises made']
+                    },
                     'scene_patch': {
                         'location_id': 'optional existing location id only if already known in prompt context',
                         'location_name': 'optional location name',
@@ -3895,6 +3914,7 @@ def build_session_memory_resolver_messages(memory_context, extracted):
         {
             'role': 'user',
             'content': json.dumps({
+                'prior_memory_anchors': memory_context.get('prior_memory_anchors'),
                 'current_scene': compact.get('current_scene'),
                 'latest_player_message': compact.get('latest_player_message'),
                 'latest_dm_message': compact.get('latest_dm_message'),
@@ -5352,8 +5372,19 @@ def _fallback_session_memory_patch(memory_context, telemetry):
     if len(running_summary) > 1800:
         running_summary = running_summary[-1800:].lstrip()
 
+    prior_anchors = memory_context.get('prior_memory_anchors') if isinstance(memory_context.get('prior_memory_anchors'), dict) else {}
+    normalized_anchors = {
+        "current_goal": prior_anchors.get("current_goal"),
+        "current_scene": prior_anchors.get("current_scene"),
+        "open_clues": prior_anchors.get("open_clues") if isinstance(prior_anchors.get("open_clues"), list) else [],
+        "unresolved_questions": prior_anchors.get("unresolved_questions") if isinstance(prior_anchors.get("unresolved_questions"), list) else [],
+        "npc_observations": prior_anchors.get("npc_observations") if isinstance(prior_anchors.get("npc_observations"), list) else [],
+        "recent_offers_promises": prior_anchors.get("recent_offers_promises") if isinstance(prior_anchors.get("recent_offers_promises"), list) else []
+    }
+
     return {
         'running_summary': running_summary,
+        'memory_anchors': normalized_anchors,
         'scene_patch': _fallback_scene_patch(memory_context),
         'scene_reason': 'Fallback summary applied because the memory writer returned no visible JSON.',
         'upsert_graph_entities': [],
@@ -5378,6 +5409,11 @@ def _session_memory_patch_has_substance(data):
         return True
     scene_patch = data.get('scene_patch')
     if isinstance(scene_patch, dict) and any(value not in (None, '', [], {}) for value in scene_patch.values()):
+        return True
+    anchors = data.get("memory_anchors")
+    if isinstance(anchors, dict) and any(
+        value not in (None, "", [], {}) for value in anchors.values()
+    ):
         return True
     for key in (
         'upsert_graph_entities',
@@ -5421,6 +5457,14 @@ def _request_session_memory_json(messages, audit_context, operation, max_tokens,
     return data, len(text)
 
 
+def _mark_memory_fallback_active(telemetry, audit_context):
+    tracker = audit_context.get("telemetry_tracker") if isinstance(audit_context, dict) else None
+    if isinstance(tracker, dict):
+        tracker["fallback_active"] = True
+    if isinstance(telemetry, dict):
+        telemetry["fallback_active"] = True
+
+
 def _get_session_memory_patch_opencode_go(memory_context, audit_context, telemetry):
     timeout_seconds = SESSION_MEMORY_TIMEOUT_SECONDS
     max_tokens = SESSION_MEMORY_MAX_TOKENS
@@ -5436,7 +5480,11 @@ def _get_session_memory_patch_opencode_go(memory_context, audit_context, telemet
         )
     except Exception as err:
         telemetry['summary_scene_error'] = repr(err)
-        return _fallback_session_memory_patch(memory_context, telemetry)
+        _mark_memory_fallback_active(telemetry, audit_context)
+        fallback_patch = _fallback_session_memory_patch(memory_context, telemetry)
+        fallback_patch['_telemetry'] = {**telemetry, **(fallback_patch.get('_telemetry') or {})}
+        _compile_telemetry_summary(fallback_patch['_telemetry'], audit_context)
+        return fallback_patch
 
     if not isinstance(summary_data, dict) or not str(summary_data.get('turn_summary') or '').strip():
         try:
@@ -5454,7 +5502,11 @@ def _get_session_memory_patch_opencode_go(memory_context, audit_context, telemet
     if not isinstance(summary_data, dict) or not str(summary_data.get('turn_summary') or '').strip():
         telemetry['summary_scene_error'] = 'blank_or_invalid_summary_scene'
         telemetry['summary_scene_response_chars'] = summary_chars
-        return _fallback_session_memory_patch(memory_context, telemetry)
+        _mark_memory_fallback_active(telemetry, audit_context)
+        fallback_patch = _fallback_session_memory_patch(memory_context, telemetry)
+        fallback_patch['_telemetry'] = {**telemetry, **(fallback_patch.get('_telemetry') or {})}
+        _compile_telemetry_summary(fallback_patch['_telemetry'], audit_context)
+        return fallback_patch
 
     telemetry['summary_scene_response_chars'] = summary_chars
     scene_patch = _sanitize_scene_patch(
@@ -5513,9 +5565,79 @@ def _get_session_memory_patch_opencode_go(memory_context, audit_context, telemet
     }
 
 
+def _compile_telemetry_summary(telemetry, audit_context):
+    tracker = audit_context.get('telemetry_tracker') if isinstance(audit_context, dict) else None
+    if not isinstance(tracker, dict):
+        tracker = {
+            'status': 'success',
+            'provider_retries': 0,
+            'parse_repairs': 0,
+            'guard_retries': 0,
+            'fallback_active': False,
+            'failure_category': None,
+            'warnings': {
+                'scene_mutation_rejected': 0,
+                'unresolved_scene_references': 0
+            }
+        }
+
+    # If telemetry has any errors, override status/failure_category
+    err_str = ""
+    for k in ('error', 'staged_extractor_error', 'staged_resolver_error', 'summary_scene_error', 'clocks_error'):
+        if telemetry.get(k):
+            err_str = str(telemetry.get(k))
+            break
+
+    if err_str:
+        if 'JSONDecodeError' in err_str or 'blank_or_invalid' in err_str:
+            tracker['status'] = 'parser_failure'
+            tracker['failure_category'] = 'parser'
+        elif 'empty_response' in err_str or 'empty_patch' in err_str:
+            tracker['status'] = 'model_output_failure'
+            tracker['failure_category'] = 'model'
+        else:
+            tracker['status'] = 'provider_failure'
+            tracker['failure_category'] = 'provider'
+
+    if telemetry.get('fallback_active') or tracker.get('fallback_active'):
+        tracker['fallback_active'] = True
+        if tracker.get('status', 'success') == 'success':
+            tracker['status'] = 'partial_fallback'
+
+    telemetry_summary = {
+        'status': tracker.get('status', 'success'),
+        'provider_retries': tracker.get('provider_retries', 0),
+        'parse_repairs': tracker.get('parse_repairs', 0),
+        'guard_retries': tracker.get('guard_retries', 0),
+        'fallback_active': tracker.get('fallback_active', False),
+        'failure_category': tracker.get('failure_category'),
+        'warnings': tracker.get('warnings', {
+            'scene_mutation_rejected': 0,
+            'unresolved_scene_references': 0
+        })
+    }
+    telemetry['telemetry_summary'] = telemetry_summary
+    return telemetry_summary
+
+
 def get_session_memory_patch(memory_context, audit_context=None):
     messages = build_session_memory_messages(memory_context)
-    audit_context = audit_context or {}
+    if not isinstance(audit_context, dict):
+        audit_context = {}
+    tracker = {
+        'status': 'success',
+        'provider_retries': 0,
+        'parse_repairs': 0,
+        'guard_retries': 0,
+        'fallback_active': False,
+        'failure_category': None,
+        'warnings': {
+            'scene_mutation_rejected': 0,
+            'unresolved_scene_references': 0
+        }
+    }
+    audit_context['telemetry_tracker'] = tracker
+
     provider = get_llm_provider()
     campaign_id = audit_context.get('campaign_id')
     trace_id = audit_context.get('trace_id') or f"session_memory_writer:memory_update:{uuid4().hex[:10]}"
@@ -5580,6 +5702,7 @@ def get_session_memory_patch(memory_context, audit_context=None):
             )
         if patch:
             patch['_telemetry'] = {**telemetry, **(patch.get('_telemetry') or {})}
+            _compile_telemetry_summary(patch['_telemetry'], audit_context)
             return patch
     if provider == 'opencode_go':
         telemetry = {
@@ -5613,6 +5736,9 @@ def get_session_memory_patch(memory_context, audit_context=None):
                 audit_role='agent',
                 commit=True,
             )
+        if patch:
+            patch['_telemetry'] = {**telemetry, **(patch.get('_telemetry') or {})}
+            _compile_telemetry_summary(patch['_telemetry'], audit_context)
         return patch
     try:
         base_operation = audit_context.get('operation') or 'session_memory_update'
@@ -5686,6 +5812,12 @@ def get_session_memory_patch(memory_context, audit_context=None):
                     audit_role='tools',
                     commit=True,
                 )
+            tracker = audit_context.get("telemetry_tracker")
+            if isinstance(tracker, dict):
+                tracker["fallback_active"] = True
+            telemetry["fallback_active"] = True
+            fallback_patch['_telemetry'] = {**telemetry, **(fallback_patch.get('_telemetry') or {})}
+            _compile_telemetry_summary(fallback_patch['_telemetry'], audit_context)
             return fallback_patch
         data = _json_loads_with_repair(text, audit_context=request_audit_context)
         if not isinstance(data, dict):
@@ -5695,6 +5827,9 @@ def get_session_memory_patch(memory_context, audit_context=None):
 
         if not _session_memory_patch_has_substance(data):
             retry_suffix = 'empty_patch_retry'
+            tracker = audit_context.get('telemetry_tracker')
+            if isinstance(tracker, dict):
+                tracker['guard_retries'] = tracker.get('guard_retries', 0) + 1
             retry_text, retry_response_chars = request_patch_text(
                 _session_memory_retry_messages(messages, 'empty_patch'),
                 operation_suffix=retry_suffix,
@@ -5753,6 +5888,12 @@ def get_session_memory_patch(memory_context, audit_context=None):
                     audit_role='tools',
                     commit=True,
                 )
+            tracker = audit_context.get("telemetry_tracker")
+            if isinstance(tracker, dict):
+                tracker["fallback_active"] = True
+            telemetry["fallback_active"] = True
+            fallback_patch['_telemetry'] = {**telemetry, **(fallback_patch.get('_telemetry') or {})}
+            _compile_telemetry_summary(fallback_patch['_telemetry'], audit_context)
             return fallback_patch
 
         data['_telemetry'] = {
@@ -5777,6 +5918,7 @@ def get_session_memory_patch(memory_context, audit_context=None):
                 audit_role='agent',
                 commit=True,
             )
+        _compile_telemetry_summary(data['_telemetry'], audit_context)
         return data
     except Exception as e:
         print(f'[openrouter] Session memory writer error: {e}')
@@ -5789,6 +5931,12 @@ def get_session_memory_patch(memory_context, audit_context=None):
         }
         fallback_patch = _fallback_session_memory_patch(memory_context, telemetry)
         fallback_patch['_fallback']['reason'] = 'memory_writer_model_error'
+        tracker = audit_context.get("telemetry_tracker")
+        if isinstance(tracker, dict):
+            tracker["fallback_active"] = True
+        telemetry["fallback_active"] = True
+        fallback_patch['_telemetry'] = {**telemetry, **(fallback_patch.get('_telemetry') or {})}
+        _compile_telemetry_summary(fallback_patch['_telemetry'], audit_context)
         return fallback_patch
 
 

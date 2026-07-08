@@ -648,9 +648,19 @@ class CampaignSession(db.Model):
     recap = db.Column(db.Text, nullable=True)
     running_summary = db.Column(db.Text, nullable=True)
     is_active = db.Column(db.Boolean, default=True)
+    memory_anchors = db.Column(db.JSON, nullable=True)
     messages = db.relationship('SessionMessage', backref='session', lazy=True, cascade='all, delete-orphan')
 
     def to_dict(self):
+        anchors = self.memory_anchors if isinstance(self.memory_anchors, dict) else {}
+        normalized_anchors = {
+            "current_goal": anchors.get("current_goal"),
+            "current_scene": anchors.get("current_scene"),
+            "open_clues": anchors.get("open_clues") if isinstance(anchors.get("open_clues"), list) else [],
+            "unresolved_questions": anchors.get("unresolved_questions") if isinstance(anchors.get("unresolved_questions"), list) else [],
+            "npc_observations": anchors.get("npc_observations") if isinstance(anchors.get("npc_observations"), list) else [],
+            "recent_offers_promises": anchors.get("recent_offers_promises") if isinstance(anchors.get("recent_offers_promises"), list) else []
+        }
         return {
             'id': self.id,
             'campaign_id': self.campaign_id,
@@ -659,6 +669,7 @@ class CampaignSession(db.Model):
             'recap': self.recap,
             'running_summary': self.running_summary,
             'is_active': self.is_active,
+            'memory_anchors': normalized_anchors,
         }
 
 

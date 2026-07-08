@@ -116,6 +116,8 @@ def ensure_lightweight_schema():
     campaign_session_columns = table_columns('campaign_sessions')
     if 'running_summary' not in campaign_session_columns:
         db.session.execute(text('ALTER TABLE campaign_sessions ADD COLUMN running_summary TEXT'))
+    if 'memory_anchors' not in campaign_session_columns:
+        db.session.execute(text('ALTER TABLE campaign_sessions ADD COLUMN memory_anchors JSON'))
 
     audit_event_columns = table_columns('campaign_audit_events')
     if 'trace_id' not in audit_event_columns:

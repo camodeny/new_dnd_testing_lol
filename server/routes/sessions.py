@@ -138,33 +138,30 @@ def _run_session_memory_update(
             ai_text,
             hot_context,
         )
+        memory_audit_context = {
+            'campaign_id': campaign.id,
+            'operation': 'session_memory_update',
+            'actor': 'session_memory_writer',
+            'trace_id': memory_trace_id,
+            'parent_trace_id': parent_trace_id,
+            'trace_label': trace_label,
+            'memory_run_id': memory_run_id,
+            'source_player_message_id': player_message_id,
+            'source_dm_message_id': dm_message_id,
+            'latest_player_message': player_content,
+            'latest_dm_message': ai_text,
+        }
+
         memory_patch = get_session_memory_patch(
             memory_context,
-            audit_context={
-                'campaign_id': campaign.id,
-                'operation': 'session_memory_update',
-                'actor': 'session_memory_writer',
-                'trace_id': memory_trace_id,
-                'parent_trace_id': parent_trace_id,
-                'trace_label': trace_label,
-                'memory_run_id': memory_run_id,
-            },
+            audit_context=memory_audit_context,
         )
         if memory_patch:
             apply_memory_patch(
                 campaign,
                 session,
                 memory_patch,
-                audit_context={
-                    'trace_id': memory_trace_id,
-                    'parent_trace_id': parent_trace_id,
-                    'trace_label': trace_label,
-                    'memory_run_id': memory_run_id,
-                    'source_player_message_id': player_message_id,
-                    'source_dm_message_id': dm_message_id,
-                    'latest_player_message': player_content,
-                    'latest_dm_message': ai_text,
-                },
+                audit_context=memory_audit_context,
             )
             memory_complete = True
         world_after_memory = world_public_payload(campaign).get('world') or {}
@@ -217,11 +214,16 @@ def _run_session_memory_update(
             })
     except Exception as err:
         db.session.rollback()
+        telemetry = memory_audit_context.get('telemetry') if 'memory_audit_context' in locals() else None
+        if isinstance(telemetry, dict):
+            summary = telemetry.setdefault("telemetry_summary", {})
+            summary["status"] = "persistence_failure"
+            summary["failure_category"] = "persistence"
         log_audit_event(
             campaign_id,
             'memory_update_error',
             'Post-turn memory update failed after visible DM response.',
-            {'session_id': session_id, 'error': repr(err)},
+            {'session_id': session_id, 'error': repr(err), 'telemetry': telemetry},
             source='session_memory',
             actor='session_memory_writer',
             trace_id=memory_trace_id,
