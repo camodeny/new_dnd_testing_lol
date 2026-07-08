@@ -1136,6 +1136,11 @@ class AutomationRouteTest(unittest.TestCase):
             ))
             db.session.commit()
 
+            # Reset boundaries on the cycle so the test tool queries can fetch post-pause injected data
+            cycle = db.session.get(AutomationRunAuditCycle, cycle_id)
+            cycle.payload_json = {}
+            db.session.commit()
+
             run_status = execute_auditor_tool(run, 'get_run_status', {})
             compact_events = execute_auditor_tool(run, 'get_audit_events', {'limit': 5})
             compact_provider_calls = execute_auditor_tool(run, 'get_provider_calls', {'limit': 5})
@@ -2338,6 +2343,11 @@ class AutomationRouteTest(unittest.TestCase):
                 }
             )
             db.session.add(legacy_run_ev)
+            db.session.commit()
+
+            # Reset boundaries on the cycle so the test tool queries can fetch post-pause injected data
+            cycle = db.session.get(AutomationRunAuditCycle, cycle_id)
+            cycle.payload_json = {}
             db.session.commit()
             
             audit_ev_id = audit_ev.id
