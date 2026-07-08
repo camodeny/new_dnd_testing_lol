@@ -509,6 +509,29 @@ def _normalize_memory_patch(patch):
     if running_summary:
         normalized['running_summary'] = running_summary
 
+    anchors = patch.get('memory_anchors')
+    if isinstance(anchors, dict):
+        normalized['memory_anchors'] = {
+            "current_goal": _coerce_patch_text(anchors.get("current_goal"), 400) if anchors.get("current_goal") else None,
+            "current_scene": _coerce_patch_text(anchors.get("current_scene"), 400) if anchors.get("current_scene") else None,
+            "open_clues": [
+                _coerce_patch_text(c, 260) for c in anchors.get("open_clues", [])
+                if isinstance(c, str) and c.strip()
+            ] if isinstance(anchors.get("open_clues"), list) else [],
+            "unresolved_questions": [
+                _coerce_patch_text(q, 260) for q in anchors.get("unresolved_questions", [])
+                if isinstance(q, str) and q.strip()
+            ] if isinstance(anchors.get("unresolved_questions"), list) else [],
+            "npc_observations": [
+                _coerce_patch_text(o, 260) for o in anchors.get("npc_observations", [])
+                if isinstance(o, str) and o.strip()
+            ] if isinstance(anchors.get("npc_observations"), list) else [],
+            "recent_offers_promises": [
+                _coerce_patch_text(p, 260) for p in anchors.get("recent_offers_promises", [])
+                if isinstance(p, str) and p.strip()
+            ] if isinstance(anchors.get("recent_offers_promises"), list) else []
+        }
+
     scene_patch = _normalize_memory_scene_patch(patch.get('scene_patch'))
     if scene_patch:
         normalized['scene_patch'] = scene_patch
@@ -1534,6 +1557,7 @@ def build_session_memory_context(campaign, session, current_user, player_message
             'username': current_user.username,
         },
         'prior_running_summary': session.running_summary or '',
+        'prior_memory_anchors': session.to_dict().get('memory_anchors'),
         'latest_player_message': player_message,
         'latest_dm_message': dm_message,
         'hot_context': memory_hot_context,
@@ -4879,6 +4903,7 @@ def _update_npc_actor(campaign, patch):
 
 def apply_memory_patch(campaign, session, patch, audit_context=None):
     from models import CampaignMemoryRun, CampaignMemoryLog, CampaignClock, NPCActor, db
+    from services.audit_service import log_audit_event
     import uuid
 
     audit_context = audit_context or {}
@@ -4911,6 +4936,10 @@ def apply_memory_patch(campaign, session, patch, audit_context=None):
         response_chars = telemetry.get('response_chars')
         context_breakdown = telemetry.get('context_breakdown') if isinstance(telemetry.get('context_breakdown'), dict) else None
 
+    # Initialize warning counters
+    warnings_scene_rejected = 0
+    warnings_scene_unresolved = 0
+
     # Record the overall memory run context
     run_record = CampaignMemoryRun(
         memory_run_id=memory_run_id,
@@ -4922,9 +4951,10 @@ def apply_memory_patch(campaign, session, patch, audit_context=None):
         prompt_chars=prompt_chars,
         prompt_tokens_estimate=prompt_tokens_estimate,
         response_chars=response_chars,
-        context_breakdown_json=context_breakdown
+        context_breakdown_json=telemetry
     )
     db.session.add(run_record)
+
 
     logs_written = 0
 
@@ -5106,6 +5136,84 @@ def apply_memory_patch(campaign, session, patch, audit_context=None):
                 scene_patch,
                 audit_context,
             )
+
+            # Scene-mutation warning checks (unresolved, rejected, repaired)
+            proposed_id = raw_scene_patch.get('location_id')
+            proposed_name = raw_scene_patch.get('location_name')
+            if proposed_id is not None or proposed_name is not None:
+                current_id = current_scene.get('location_id')
+                current_name = current_scene.get('location_name')
+                if proposed_id != current_id or proposed_name != current_name:
+                    from services.scene_location_resolver import resolve_scene_location_patch
+                    resolved_loc = resolve_scene_location_patch(raw_scene_patch, campaign, current_scene)
+                    warning_type = None
+                    unresolved_items = []
+                    if resolved_loc is None:
+                        warning_type = "scene_location_unresolved"
+                        warnings_scene_unresolved += 1
+                        unresolved_items = [f"Could not resolve proposed location: id={proposed_id}, name={proposed_name}"]
+                    else:
+                        skipped_id = skipped_scene_patch.get('location_id') if isinstance(skipped_scene_patch, dict) else None
+                        skipped_name = skipped_scene_patch.get('location_name') if isinstance(skipped_scene_patch, dict) else None
+                        if skipped_id is not None or skipped_name is not None:
+                            warning_type = "scene_location_rejected"
+                            warnings_scene_rejected += 1
+                            unresolved_items = [f"Proposed location change rejected (unsupported by transcript): id={proposed_id}, name={proposed_name}"]
+                        else:
+                            is_repaired = False
+                            if proposed_id is not None and proposed_id != resolved_loc.get('location_id'):
+                                is_repaired = True
+                            if proposed_name is not None and proposed_name != resolved_loc.get('location_name'):
+                                is_repaired = True
+                            if is_repaired:
+                                warning_type = "scene_location_repaired"
+                    if warning_type:
+                        warning_payload = {
+                            "warning_type": warning_type,
+                            "previous_location": {
+                                "location_id": current_id,
+                                "location_name": current_name
+                            },
+                            "proposed_location": {
+                                "location_id": proposed_id,
+                                "location_name": proposed_name
+                            },
+                            "resolved_location": {
+                                "location_id": resolved_loc.get('location_id'),
+                                "location_name": resolved_loc.get('location_name')
+                            } if resolved_loc else None,
+                            "source_player_message_id": player_message_id,
+                            "source_dm_message_id": dm_message_id,
+                            "resolver_output": resolved_loc,
+                            "unresolved_items": unresolved_items
+                        }
+                        log_change(
+                            memory_id='scene_mutation_warning',
+                            target_table='campaign_worlds',
+                            target_id=str(world.id) if 'world' in locals() and world else str(campaign.id),
+                            operation='warning',
+                            status='warning',
+                            memory_type='location',
+                            visibility='dm_private',
+                            certainty='confirmed',
+                            importance=3,
+                            reason=f"Scene mutation warning: {warning_type}",
+                            patch_json=warning_payload,
+                            error=warning_type
+                        )
+                        from services.audit_service import log_audit_event
+                        log_audit_event(
+                            campaign_id=campaign.id,
+                            event_type='scene_mutation_warning',
+                            summary=f"Scene mutation warning: {warning_type}",
+                            payload=warning_payload,
+                            actor='system',
+                            trace_id=trace_id,
+                            parent_trace_id=audit_context.get('parent_trace_id') if isinstance(audit_context, dict) else None,
+                            trace_label=audit_context.get('trace_label') if isinstance(audit_context, dict) else None,
+                            commit=False
+                        )
+
             if skipped_scene_patch:
                 log_change(
                     memory_id='current_scene',
@@ -5312,6 +5420,29 @@ def apply_memory_patch(campaign, session, patch, audit_context=None):
             patch_json={'running_summary': summary}
         )
 
+    anchors = patch.get('memory_anchors')
+    if isinstance(anchors, dict):
+        before_anchors = session.memory_anchors if session else None
+        if session:
+            session.memory_anchors = anchors
+        result['memory_anchors_updated'] = True
+
+        log_change(
+            memory_id='memory_anchors',
+            target_table='campaign_sessions',
+            target_id=str(session.id) if session else None,
+            operation='update',
+            status='applied',
+            memory_type='fact',
+            visibility='dm_private',
+            certainty='confirmed',
+            importance=4,
+            reason='Memory anchors updated by LLM memory pass',
+            before_json={'memory_anchors': before_anchors},
+            after_json={'memory_anchors': anchors},
+            patch_json={'memory_anchors': anchors}
+        )
+
     # Log fallback no-op if no logs were written
     if logs_written == 0:
         log_change(
@@ -5343,4 +5474,15 @@ def apply_memory_patch(campaign, session, patch, audit_context=None):
         audit_role='tools',
         commit=False,
     )
+
+    if isinstance(telemetry, dict) and 'telemetry_summary' in telemetry:
+        summary_obj = telemetry['telemetry_summary']
+        if isinstance(summary_obj, dict):
+            if 'warnings' not in summary_obj:
+                summary_obj['warnings'] = {}
+            summary_obj['warnings']['scene_mutation_rejected'] = warnings_scene_rejected
+            summary_obj['warnings']['unresolved_scene_references'] = warnings_scene_unresolved
+    if isinstance(audit_context, dict):
+        audit_context['telemetry'] = telemetry
+
     return result
