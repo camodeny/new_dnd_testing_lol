@@ -2188,3 +2188,55 @@ class CampaignMemoryLog(db.Model):
             'error': self.error,
             'created_at': self.created_at.isoformat() if self.created_at else None,
         }
+
+
+class AutomationRunAuditAttempt(db.Model):
+    __tablename__ = "automation_run_audit_attempts"
+
+    id = db.Column(db.Integer, primary_key=True)
+
+    run_id = db.Column(db.Integer, db.ForeignKey("automation_runs.id"), nullable=False, index=True)
+    cycle_id = db.Column(db.Integer, db.ForeignKey("automation_run_audit_cycles.id"), nullable=False, index=True)
+    auditor_job_id = db.Column(db.Integer, db.ForeignKey("automation_run_auditor_jobs.id"), nullable=True, index=True)
+
+    cycle_number = db.Column(db.Integer, nullable=False)
+    phase = db.Column(db.String(40), nullable=False)
+
+    attempt_source = db.Column(db.String(40), nullable=False, default="built_in_auditor")
+    auditor_slot = db.Column(db.Integer, nullable=True)
+    provider = db.Column(db.String(80), nullable=True)
+    model = db.Column(db.String(200), nullable=True)
+
+    status = db.Column(db.String(30), nullable=False)  # "success" | "failed"
+
+    error_class = db.Column(db.String(120), nullable=True)
+    error_message = db.Column(db.Text, nullable=True)
+
+    raw_payload_json = db.Column(db.JSON, nullable=True)
+    normalized_payload_json = db.Column(db.JSON, nullable=True)
+
+    created_at = db.Column(db.DateTime, default=datetime.utcnow, index=True)
+
+    run = db.relationship("AutomationRun")
+    cycle = db.relationship("AutomationRunAuditCycle")
+    auditor_job = db.relationship("AutomationRunAuditorJob")
+
+    def to_dict(self):
+        return {
+            "id": self.id,
+            "run_id": self.run_id,
+            "cycle_id": self.cycle_id,
+            "auditor_job_id": self.auditor_job_id,
+            "cycle_number": self.cycle_number,
+            "phase": self.phase,
+            "attempt_source": self.attempt_source,
+            "auditor_slot": self.auditor_slot,
+            "provider": self.provider,
+            "model": self.model,
+            "status": self.status,
+            "error_class": self.error_class,
+            "error_message": self.error_message,
+            "raw_payload_json": self.raw_payload_json,
+            "normalized_payload_json": self.normalized_payload_json,
+            "created_at": self.created_at.isoformat() if self.created_at else None,
+        }

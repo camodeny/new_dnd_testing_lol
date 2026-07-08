@@ -231,8 +231,36 @@ def ensure_lightweight_schema():
             db.session.execute(text('ALTER TABLE automation_run_events ADD COLUMN sequence_number INTEGER DEFAULT 0 NOT NULL'))
         if 'attempt_number' not in automation_event_columns:
             db.session.execute(text('ALTER TABLE automation_run_events ADD COLUMN attempt_number INTEGER DEFAULT 0 NOT NULL'))
-        if 'dedupe_key' not in automation_event_columns:
-            db.session.execute(text('ALTER TABLE automation_run_events ADD COLUMN dedupe_key VARCHAR(160)'))
+    attempts_columns = table_columns('automation_run_audit_attempts')
+    if not attempts_columns:
+        db.session.execute(text('''
+            CREATE TABLE automation_run_audit_attempts (
+                id INTEGER NOT NULL PRIMARY KEY AUTOINCREMENT,
+                run_id INTEGER NOT NULL,
+                cycle_id INTEGER NOT NULL,
+                auditor_job_id INTEGER,
+                cycle_number INTEGER NOT NULL,
+                phase VARCHAR(40) NOT NULL,
+                attempt_source VARCHAR(40) NOT NULL DEFAULT 'built_in_auditor',
+                auditor_slot INTEGER,
+                provider VARCHAR(80),
+                model VARCHAR(200),
+                status VARCHAR(30) NOT NULL,
+                error_class VARCHAR(120),
+                error_message TEXT,
+                raw_payload_json JSON,
+                normalized_payload_json JSON,
+                created_at DATETIME,
+                FOREIGN KEY(run_id) REFERENCES automation_runs (id),
+                FOREIGN KEY(cycle_id) REFERENCES automation_run_audit_cycles (id),
+                FOREIGN KEY(auditor_job_id) REFERENCES automation_run_auditor_jobs (id)
+            )
+        '''))
+        db.session.execute(text('CREATE INDEX ix_automation_run_audit_attempts_run_id ON automation_run_audit_attempts (run_id)'))
+        db.session.execute(text('CREATE INDEX ix_automation_run_audit_attempts_cycle_id ON automation_run_audit_attempts (cycle_id)'))
+        db.session.execute(text('CREATE INDEX ix_automation_run_audit_attempts_auditor_job_id ON automation_run_audit_attempts (auditor_job_id)'))
+        db.session.execute(text('CREATE INDEX ix_automation_run_audit_attempts_created_at ON automation_run_audit_attempts (created_at)'))
+
     db.session.commit()
 
 

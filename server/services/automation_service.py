@@ -723,7 +723,8 @@ def next_audit_cycle_number(run):
     return (latest.cycle_number if latest else 0) + 1
 
 
-def create_audit_cycle(run, phase, payload=None, *, summary=None, player_message_id=None, dm_message_id=None):
+def create_audit_cycle(run, phase, payload=None, *, summary=None, player_message_id=None, dm_message_id=None, dedupe_key=None, worker_id=None, lease_token=None):
+    payload = payload or {}
     cycle = AutomationRunAuditCycle(
         run_id=run.id,
         cycle_number=next_audit_cycle_number(run),
@@ -732,7 +733,7 @@ def create_audit_cycle(run, phase, payload=None, *, summary=None, player_message
         player_message_id=player_message_id,
         dm_message_id=dm_message_id,
         summary=summary,
-        payload_json=payload or {},
+        payload_json=payload,
     )
     db.session.add(cycle)
     db.session.flush()
@@ -740,7 +741,63 @@ def create_audit_cycle(run, phase, payload=None, *, summary=None, player_message
     run.awaiting_audit_cycle_id = cycle.id
     run.awaiting_audit_phase = phase
     run.updated_at = _utcnow()
+
+    # Create the run event representing the pause event
+    run_event, _ = append_run_event(
+        run,
+        'audit_cycle_paused',
+        {'phase': phase, 'audit_cycle': cycle.to_dict()},
+        dedupe_key=dedupe_key or f'audit_cycle_paused:{cycle.id}',
+        worker_id=worker_id,
+        lease_token=lease_token,
+        commit=False,
+    )
+    db.session.flush()
+
+    # Query latest IDs scoped to current run/session/campaign
+    campaign = run.derived_campaign or (run.scenario.source_campaign if run.scenario else None)
+    campaign_id = campaign.id if campaign else None
+
+    latest_session = latest_session_for_run(run)
+    session_id = latest_session.id if latest_session else None
+
+    boundary_audit_event_id = None
+    if campaign_id:
+        boundary_audit_event_id = db.session.query(db.func.max(CampaignAuditEvent.id)).filter_by(campaign_id=campaign_id).scalar()
+    if boundary_audit_event_id is None:
+        boundary_audit_event_id = 0
+
+    boundary_provider_call_id = db.session.query(db.func.max(AutomationRunProviderCall.id)).filter_by(run_id=run.id).scalar()
+    if boundary_provider_call_id is None:
+        boundary_provider_call_id = 0
+
+    boundary_message_id = None
+    if session_id:
+        boundary_message_id = db.session.query(db.func.max(SessionMessage.id)).filter_by(session_id=session_id).scalar()
+    if boundary_message_id is None:
+        boundary_message_id = 0
+
+    boundary_run_event_id = run_event.id
+
+    # Update cycle.payload_json
+    payload = dict(cycle.payload_json or {})
+    payload['boundary_audit_event_id'] = boundary_audit_event_id
+    payload['boundary_provider_call_id'] = boundary_provider_call_id
+    payload['boundary_run_event_id'] = boundary_run_event_id
+    payload['boundary_message_id'] = boundary_message_id
+    cycle.payload_json = payload
+
     db.session.commit()
+
+    # Append workspace event for the run event
+    append_workspace_event(
+        run.user_id,
+        'run_updated',
+        _run_workspace_payload(run, run_event),
+        resource_type='run',
+        resource_id=run.id,
+    )
+
     return cycle
 
 
