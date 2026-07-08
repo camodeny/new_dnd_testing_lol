@@ -5457,6 +5457,14 @@ def _request_session_memory_json(messages, audit_context, operation, max_tokens,
     return data, len(text)
 
 
+def _mark_memory_fallback_active(telemetry, audit_context):
+    tracker = audit_context.get("telemetry_tracker") if isinstance(audit_context, dict) else None
+    if isinstance(tracker, dict):
+        tracker["fallback_active"] = True
+    if isinstance(telemetry, dict):
+        telemetry["fallback_active"] = True
+
+
 def _get_session_memory_patch_opencode_go(memory_context, audit_context, telemetry):
     timeout_seconds = SESSION_MEMORY_TIMEOUT_SECONDS
     max_tokens = SESSION_MEMORY_MAX_TOKENS
@@ -5472,7 +5480,11 @@ def _get_session_memory_patch_opencode_go(memory_context, audit_context, telemet
         )
     except Exception as err:
         telemetry['summary_scene_error'] = repr(err)
-        return _fallback_session_memory_patch(memory_context, telemetry)
+        _mark_memory_fallback_active(telemetry, audit_context)
+        fallback_patch = _fallback_session_memory_patch(memory_context, telemetry)
+        fallback_patch['_telemetry'] = {**telemetry, **(fallback_patch.get('_telemetry') or {})}
+        _compile_telemetry_summary(fallback_patch['_telemetry'], audit_context)
+        return fallback_patch
 
     if not isinstance(summary_data, dict) or not str(summary_data.get('turn_summary') or '').strip():
         try:
@@ -5490,7 +5502,11 @@ def _get_session_memory_patch_opencode_go(memory_context, audit_context, telemet
     if not isinstance(summary_data, dict) or not str(summary_data.get('turn_summary') or '').strip():
         telemetry['summary_scene_error'] = 'blank_or_invalid_summary_scene'
         telemetry['summary_scene_response_chars'] = summary_chars
-        return _fallback_session_memory_patch(memory_context, telemetry)
+        _mark_memory_fallback_active(telemetry, audit_context)
+        fallback_patch = _fallback_session_memory_patch(memory_context, telemetry)
+        fallback_patch['_telemetry'] = {**telemetry, **(fallback_patch.get('_telemetry') or {})}
+        _compile_telemetry_summary(fallback_patch['_telemetry'], audit_context)
+        return fallback_patch
 
     telemetry['summary_scene_response_chars'] = summary_chars
     scene_patch = _sanitize_scene_patch(

@@ -4906,14 +4906,17 @@ def apply_memory_patch(campaign, session, patch, audit_context=None):
     from services.audit_service import log_audit_event
     import uuid
 
-    audit_context = audit_context or {}
+    if audit_context is None:
+        audit_context = {}
     raw_patch = patch if isinstance(patch, dict) else {}
+    telemetry = raw_patch.pop('_telemetry', None) if isinstance(patch, dict) else None
+    if isinstance(audit_context, dict):
+        audit_context['telemetry'] = telemetry
     unresolved_items = raw_patch.get('unresolved_items') if isinstance(raw_patch.get('unresolved_items'), list) else []
     compile_summary = raw_patch.get('compile_summary') if isinstance(raw_patch.get('compile_summary'), dict) else None
     evidence_basis = raw_patch.get('evidence_basis') if isinstance(raw_patch.get('evidence_basis'), list) else []
     patch = _normalize_memory_patch(patch)
     patch = _apply_memory_visibility_policy(campaign, patch, audit_context)
-    telemetry = patch.pop('_telemetry', None)
 
     # Initialize memory run ID and turn ID tracking
     memory_run_id = audit_context.get('memory_run_id') or f"memrun_{uuid.uuid4().hex[:12]}"

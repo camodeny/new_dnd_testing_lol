@@ -236,3 +236,49 @@ class P2HardeningTest(unittest.TestCase):
         summary = _compile_telemetry_summary(telemetry, audit_context)
         self.assertEqual(summary['status'], 'model_output_failure')
         self.assertEqual(summary['failure_category'], 'model')
+
+    def test_opencode_go_summary_scene_fallback_marks_fallback_active(self):
+        from unittest.mock import patch as mock_patch
+        from openrouter import _get_session_memory_patch_opencode_go
+        
+        memory_context = {
+            'prior_running_summary': 'Prior summary',
+            'prior_memory_anchors': {},
+            'hot_context': {
+                'current_scene': {
+                    'location_id': 'waterdeep',
+                    'location_name': 'Waterdeep'
+                }
+            }
+        }
+        telemetry = {}
+        audit_context = {'telemetry_tracker': {}}
+        
+        # When _get_session_memory_patch_opencode_go hits an exception, it should trigger fallback and set fallback_active
+        with mock_patch('openrouter._request_session_memory_json', side_effect=Exception("Forced LLM exception")):
+            patch = _get_session_memory_patch_opencode_go(memory_context, audit_context, telemetry)
+        
+        self.assertTrue(patch['_telemetry']['fallback_active'])
+        self.assertTrue(patch['_telemetry']['telemetry_summary']['fallback_active'])
+        self.assertIn(patch['_telemetry']['telemetry_summary']['status'], {
+            "partial_fallback",
+            "parser_failure",
+            "model_output_failure",
+            "provider_failure",
+        })
+
+    def test_early_persistence_telemetry_attachment(self):
+        # Create a trace context and check if telemetry is attached to audit_context on failure midway
+        audit_context = {}
+        patch = {
+            '_telemetry': {'status': 'testing_early_telemetry'},
+            'memory_anchors': 'invalid_anchors_type_causes_type_error_in_apply'  # will fail apply_memory_patch
+        }
+        
+        try:
+            apply_memory_patch(object(), self.session, patch, audit_context=audit_context)
+        except Exception:
+            pass
+        
+        self.assertIsNotNone(audit_context.get('telemetry'))
+        self.assertEqual(audit_context['telemetry']['status'], 'testing_early_telemetry')
