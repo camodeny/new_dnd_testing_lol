@@ -2468,7 +2468,7 @@ class AppRouteTest(unittest.TestCase):
                     'starting_location': 'Crossroads',
                     'party_hook': 'The road is tense.',
                 }),
-                knowledge_graph='{}',
+                knowledge_graph='{"entities":[{"id":"harbor","type":"location","name":"Blackwater Harbor"}],"relations":[],"facts":[]}',
                 world_state=json_dumps({
                     'current_scene': {
                         'location_id': 'crossroads',
