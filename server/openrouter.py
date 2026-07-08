@@ -5410,6 +5410,11 @@ def _session_memory_patch_has_substance(data):
     scene_patch = data.get('scene_patch')
     if isinstance(scene_patch, dict) and any(value not in (None, '', [], {}) for value in scene_patch.values()):
         return True
+    anchors = data.get("memory_anchors")
+    if isinstance(anchors, dict) and any(
+        value not in (None, "", [], {}) for value in anchors.values()
+    ):
+        return True
     for key in (
         'upsert_graph_entities',
         'upsert_graph_relations',
@@ -5571,7 +5576,7 @@ def _compile_telemetry_summary(telemetry, audit_context):
         if 'JSONDecodeError' in err_str or 'blank_or_invalid' in err_str:
             tracker['status'] = 'parser_failure'
             tracker['failure_category'] = 'parser'
-        elif 'empty_response' in err_str:
+        elif 'empty_response' in err_str or 'empty_patch' in err_str:
             tracker['status'] = 'model_output_failure'
             tracker['failure_category'] = 'model'
         else:
@@ -5791,6 +5796,10 @@ def get_session_memory_patch(memory_context, audit_context=None):
                     audit_role='tools',
                     commit=True,
                 )
+            tracker = audit_context.get("telemetry_tracker")
+            if isinstance(tracker, dict):
+                tracker["fallback_active"] = True
+            telemetry["fallback_active"] = True
             fallback_patch['_telemetry'] = {**telemetry, **(fallback_patch.get('_telemetry') or {})}
             _compile_telemetry_summary(fallback_patch['_telemetry'], audit_context)
             return fallback_patch
@@ -5863,6 +5872,10 @@ def get_session_memory_patch(memory_context, audit_context=None):
                     audit_role='tools',
                     commit=True,
                 )
+            tracker = audit_context.get("telemetry_tracker")
+            if isinstance(tracker, dict):
+                tracker["fallback_active"] = True
+            telemetry["fallback_active"] = True
             fallback_patch['_telemetry'] = {**telemetry, **(fallback_patch.get('_telemetry') or {})}
             _compile_telemetry_summary(fallback_patch['_telemetry'], audit_context)
             return fallback_patch
@@ -5902,6 +5915,10 @@ def get_session_memory_patch(memory_context, audit_context=None):
         }
         fallback_patch = _fallback_session_memory_patch(memory_context, telemetry)
         fallback_patch['_fallback']['reason'] = 'memory_writer_model_error'
+        tracker = audit_context.get("telemetry_tracker")
+        if isinstance(tracker, dict):
+            tracker["fallback_active"] = True
+        telemetry["fallback_active"] = True
         fallback_patch['_telemetry'] = {**telemetry, **(fallback_patch.get('_telemetry') or {})}
         _compile_telemetry_summary(fallback_patch['_telemetry'], audit_context)
         return fallback_patch

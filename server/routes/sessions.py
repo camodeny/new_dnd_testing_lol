@@ -214,11 +214,16 @@ def _run_session_memory_update(
             })
     except Exception as err:
         db.session.rollback()
+        telemetry = memory_audit_context.get('telemetry') if 'memory_audit_context' in locals() else None
+        if isinstance(telemetry, dict):
+            summary = telemetry.setdefault("telemetry_summary", {})
+            summary["status"] = "persistence_failure"
+            summary["failure_category"] = "persistence"
         log_audit_event(
             campaign_id,
             'memory_update_error',
             'Post-turn memory update failed after visible DM response.',
-            {'session_id': session_id, 'error': repr(err), 'telemetry': memory_audit_context.get('telemetry') if 'memory_audit_context' in locals() else None},
+            {'session_id': session_id, 'error': repr(err), 'telemetry': telemetry},
             source='session_memory',
             actor='session_memory_writer',
             trace_id=memory_trace_id,

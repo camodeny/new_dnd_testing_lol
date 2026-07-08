@@ -5127,8 +5127,61 @@ def apply_memory_patch(campaign, session, patch, audit_context=None):
                     entity_id_remaps[embedding_dedupe['requested_id']] = item.get('id')
 
         scene_patch = patch.get('scene_patch') if isinstance(patch.get('scene_patch'), dict) else {}
+        current_scene = world_state.get('current_scene', {}) if isinstance(world_state, dict) else {}
+
+        # Check for unresolved scene locations from the staged pipeline
+        for item in (raw_patch.get('unresolved_items') or []):
+            if isinstance(item, dict) and item.get('kind') == 'scene_location':
+                proposed_id = item.get('location_id')
+                proposed_name = item.get('location_name')
+                current_id = current_scene.get('location_id')
+                current_name = current_scene.get('location_name')
+                
+                warning_type = "scene_location_unresolved"
+                warnings_scene_unresolved += 1
+                warning_payload = {
+                    "warning_type": warning_type,
+                    "previous_location": {
+                        "location_id": current_id,
+                        "location_name": current_name
+                    },
+                    "proposed_location": {
+                        "location_id": proposed_id,
+                        "location_name": proposed_name
+                    },
+                    "resolved_location": None,
+                    "source_player_message_id": player_message_id,
+                    "source_dm_message_id": dm_message_id,
+                    "resolver_output": None,
+                    "unresolved_items": [f"Could not resolve proposed location: id={proposed_id}, name={proposed_name}"]
+                }
+                log_change(
+                    memory_id='scene_mutation_warning',
+                    target_table='campaign_worlds',
+                    target_id=str(world.id) if 'world' in locals() and world else str(campaign.id),
+                    operation='warning',
+                    status='warning',
+                    memory_type='location',
+                    visibility='dm_private',
+                    certainty='confirmed',
+                    importance=3,
+                    reason=f"Scene mutation warning: {warning_type}",
+                    patch_json=warning_payload,
+                    error=warning_type
+                )
+                log_audit_event(
+                    campaign_id=campaign.id,
+                    event_type='scene_mutation_warning',
+                    summary=f"Scene mutation warning: {warning_type}",
+                    payload=warning_payload,
+                    actor='system',
+                    trace_id=trace_id,
+                    parent_trace_id=audit_context.get('parent_trace_id') if isinstance(audit_context, dict) else None,
+                    trace_label=audit_context.get('trace_label') if isinstance(audit_context, dict) else None,
+                    commit=False
+                )
+
         if scene_patch:
-            current_scene = world_state.get('current_scene', {}) if isinstance(world_state, dict) else {}
             raw_scene_patch = dict(scene_patch)
             scene_patch, skipped_scene_patch = _validate_memory_scene_patch(
                 campaign,

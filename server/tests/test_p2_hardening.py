@@ -193,3 +193,46 @@ class P2HardeningTest(unittest.TestCase):
         summary_c = _compile_telemetry_summary(telemetry_c, audit_context_c)
         self.assertEqual(summary_c['status'], 'partial_fallback')
         self.assertEqual(summary_c['fallback_active'], True)
+
+    def test_substance_check_includes_anchors(self):
+        from openrouter import _session_memory_patch_has_substance
+        # Patch with empty anchors has no substance
+        self.assertFalse(_session_memory_patch_has_substance({'memory_anchors': {}}))
+        self.assertFalse(_session_memory_patch_has_substance({'memory_anchors': {'current_goal': None}}))
+        # Patch with non-empty anchors has substance
+        self.assertTrue(_session_memory_patch_has_substance({'memory_anchors': {'current_goal': 'Find the lost mine'}}))
+
+    def test_staged_unresolved_scene_location_emits_warning(self):
+        patch = {
+            'unresolved_items': [{
+                'kind': 'scene_location',
+                'location_id': 'baldurs_gate',
+                'location_name': 'Baldur\'s Gate',
+                'reason': 'unresolved_scene_location'
+            }]
+        }
+        # Clear existing logs/events
+        CampaignMemoryLog.query.delete()
+        CampaignAuditEvent.query.delete()
+        db.session.commit()
+
+        apply_memory_patch(self.campaign, self.session, patch)
+        db.session.commit()
+
+        # Should log scene_mutation_warning for staged unresolved location change
+        log = CampaignMemoryLog.query.filter_by(operation='warning').first()
+        self.assertIsNotNone(log)
+        self.assertEqual(log.error, 'scene_location_unresolved')
+        self.assertIn('baldurs_gate', log.patch_json['unresolved_items'][0])
+
+        event = CampaignAuditEvent.query.filter_by(event_type='scene_mutation_warning').first()
+        self.assertIsNotNone(event)
+        payload_data = json.loads(event.payload)
+        self.assertEqual(payload_data['warning_type'], 'scene_location_unresolved')
+
+    def test_compile_telemetry_summary_classifies_empty_patch_as_model_failure(self):
+        telemetry = {'error': 'empty_patch'}
+        audit_context = {'telemetry_tracker': {}}
+        summary = _compile_telemetry_summary(telemetry, audit_context)
+        self.assertEqual(summary['status'], 'model_output_failure')
+        self.assertEqual(summary['failure_category'], 'model')
