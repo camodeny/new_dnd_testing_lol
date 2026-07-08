@@ -215,6 +215,7 @@ class P1ImprovementsTest(unittest.TestCase):
             payload_json={}
         )
         db.session.add(cycle)
+        db.session.flush()
         self.run.awaiting_audit_cycle_id = cycle.id
         db.session.commit()
 
@@ -382,6 +383,22 @@ class P1ImprovementsTest(unittest.TestCase):
         resolved_unresolved = {'scene_patch': {'location_name': 'Neverwinter Wood'}}
         compiled_unresolved = compile_staged_memory_patch(memory_context, extracted_unresolved, resolved_unresolved)
         self.assertEqual(compiled_unresolved['unresolved_items'][0]['resolution_mode'], 'unresolved')
+
+    def test_boundary_with_zero_excludes_all_future_provider_calls(self):
+        # Create cycle when there are absolutely NO provider calls
+        cycle = create_audit_cycle(self.run, 'after_player')
+        boundaries = _cycle_boundaries(cycle)
+        self.assertEqual(boundaries.get("provider_call_id"), 0)
+
+        # Create a future provider call
+        pc1 = AutomationRunProviderCall(run_id=self.run.id, dedupe_key="pc1", phase="after_player", request_json={})
+        db.session.add(pc1)
+        db.session.commit()
+
+        # Auditor tool shouldn't return pc1, because max provider_call_id is 0
+        res = execute_auditor_tool(self.run, 'get_provider_calls')
+        calls = res.get('provider_calls', [])
+        self.assertEqual(len(calls), 0)
 
 if __name__ == '__main__':
     unittest.main()

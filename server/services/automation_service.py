@@ -764,12 +764,18 @@ def create_audit_cycle(run, phase, payload=None, *, summary=None, player_message
     boundary_audit_event_id = None
     if campaign_id:
         boundary_audit_event_id = db.session.query(db.func.max(CampaignAuditEvent.id)).filter_by(campaign_id=campaign_id).scalar()
+    if boundary_audit_event_id is None:
+        boundary_audit_event_id = 0
 
     boundary_provider_call_id = db.session.query(db.func.max(AutomationRunProviderCall.id)).filter_by(run_id=run.id).scalar()
+    if boundary_provider_call_id is None:
+        boundary_provider_call_id = 0
 
     boundary_message_id = None
     if session_id:
         boundary_message_id = db.session.query(db.func.max(SessionMessage.id)).filter_by(session_id=session_id).scalar()
+    if boundary_message_id is None:
+        boundary_message_id = 0
 
     boundary_run_event_id = run_event.id
 

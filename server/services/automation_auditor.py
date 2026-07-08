@@ -424,11 +424,23 @@ def _cycle_boundaries(cycle):
             "message_id": None,
         }
     payload = cycle.payload_json or {}
+
+    def get_boundary(key):
+        if key not in payload:
+            return None
+        val = payload[key]
+        if val is None:
+            return 0
+        try:
+            return int(val)
+        except (ValueError, TypeError):
+            return 0
+
     return {
-        "audit_event_id": _safe_int(payload.get("boundary_audit_event_id"), 0, minimum=0) or None,
-        "provider_call_id": _safe_int(payload.get("boundary_provider_call_id"), 0, minimum=0) or None,
-        "run_event_id": _safe_int(payload.get("boundary_run_event_id"), 0, minimum=0) or None,
-        "message_id": _safe_int(payload.get("boundary_message_id"), 0, minimum=0) or None,
+        "audit_event_id": get_boundary("boundary_audit_event_id"),
+        "provider_call_id": get_boundary("boundary_provider_call_id"),
+        "run_event_id": get_boundary("boundary_run_event_id"),
+        "message_id": get_boundary("boundary_message_id"),
     }
 
 
@@ -893,10 +905,12 @@ def _cycle_evidence_packet(run, cycle, args):
 
     boundaries = _cycle_boundaries(cycle)
 
-    audit_query = CampaignAuditEvent.query.filter_by(campaign_id=campaign.id)
-    if boundaries.get("audit_event_id") is not None:
-        audit_query = audit_query.filter(CampaignAuditEvent.id <= boundaries["audit_event_id"])
-    audit_rows = audit_query.order_by(CampaignAuditEvent.id.desc()).limit(audit_event_limit).all() if campaign else []
+    audit_rows = []
+    if campaign:
+        audit_query = CampaignAuditEvent.query.filter_by(campaign_id=campaign.id)
+        if boundaries.get("audit_event_id") is not None:
+            audit_query = audit_query.filter(CampaignAuditEvent.id <= boundaries["audit_event_id"])
+        audit_rows = audit_query.order_by(CampaignAuditEvent.id.desc()).limit(audit_event_limit).all()
 
     provider_query = AutomationRunProviderCall.query.filter_by(run_id=run.id)
     if boundaries.get("provider_call_id") is not None:

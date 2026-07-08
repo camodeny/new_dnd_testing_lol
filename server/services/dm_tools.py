@@ -199,6 +199,13 @@ def _normalize_memory_scene_patch(scene_patch):
     immediate_tension = _coerce_patch_text(scene_patch.get('immediate_tension'), 420)
     if immediate_tension:
         clean_scene['immediate_tension'] = immediate_tension
+
+    # Preserve provenance and resolution_mode metadata in scene patches
+    if 'provenance' in scene_patch:
+        clean_scene['provenance'] = scene_patch['provenance']
+    if 'resolution_mode' in scene_patch:
+        clean_scene['resolution_mode'] = scene_patch['resolution_mode']
+
     return clean_scene
 
 
