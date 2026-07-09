@@ -51,7 +51,7 @@ SESSION_PREFLIGHT_TIMEOUT_SECONDS = max(
 )
 SESSION_PREFLIGHT_MAX_TOKENS = max(
     64,
-    int(os.environ.get('SESSION_PREFLIGHT_MAX_TOKENS', '160')),
+    int(os.environ.get('SESSION_PREFLIGHT_MAX_TOKENS', '320')),
 )
 SESSION_MEMORY_TIMEOUT_SECONDS = max(
     5.0,
@@ -163,6 +163,7 @@ SESSION_TOOL_PROMPT = (
     "when the DM should send a visible reply, or call stay_silent with a short reason when the DM should not "
     "send anything. Do not mix a finalization tool call with other tools in the same assistant message. "
     "Do not send the final visible reply as plain assistant text. "
+    "When finalizing with talk_to_player, always include commit_action_ids. Select only pending action IDs whose durable mutation should commit with this exact reply, or use an empty array. "
     "Do not send handoff prompts such as 'How do you respond?' for ordinary PC-to-PC conversation."
 )
 
@@ -1307,6 +1308,7 @@ def normalize_session_dm_turn_decision(raw_decision):
     return {
         'mode': 'speak',
         'content': str(content or '').strip(),
+        'commit_action_ids': data.get('commit_action_ids') if isinstance(data.get('commit_action_ids'), list) else None,
     }
 
 
@@ -1316,14 +1318,19 @@ SESSION_DM_FINALIZER_TOOLS = [
         'type': 'function',
         'function': {
             'name': 'talk_to_player',
-            'description': 'Finalize the DM turn by sending one player-visible reply. Put only player-facing visible content in content.',
+            'description': 'Finalize the DM turn by sending one player-visible reply. Put only player-facing visible content in content and explicitly select which pending narrative actions should commit.',
             'parameters': {
                 'type': 'object',
-                'required': ['content'],
+                'required': ['content', 'commit_action_ids'],
                 'properties': {
                     'content': {
                         'type': 'string',
                         'description': 'Visible DM reply for the player, using only valid visible-message syntax.',
+                    },
+                    'commit_action_ids': {
+                        'type': 'array',
+                        'items': {'type': 'string'},
+                        'description': 'Pending action IDs to commit with this reply. Use [] when no pending action should commit.',
                     },
                 },
             },
@@ -1374,9 +1381,15 @@ def _session_dm_finalizer_decision_from_tool_calls(tool_calls):
     tool_name = function.get('name')
     args = _parse_tool_arguments(function.get('arguments'))
     if tool_name == 'talk_to_player':
+        if 'commit_action_ids' not in args or not isinstance(args.get('commit_action_ids'), list):
+            return None, {
+                'kind': 'missing_commit_action_ids',
+                'detail': 'talk_to_player must include commit_action_ids, using [] when no pending action should commit.',
+            }
         return {
             'mode': 'speak',
             'content': str(args.get('content') or '').strip(),
+            'commit_action_ids': args.get('commit_action_ids'),
         }, None
     return {
         'mode': 'silent',
@@ -1888,6 +1901,17 @@ def build_session_dm_tool_messages(hot_context):
             + json.dumps(prompt_context, ensure_ascii=False),
         },
     ]
+    retrieval_packet = (hot_context or {}).get('retrieval_packet')
+    if isinstance(retrieval_packet, dict):
+        messages.append({
+            'role': 'system',
+            'content': (
+                'Focused retrieval evidence for this turn. Treat public and party_known items as grounded context. '
+                'Items marked internal_only are DM-private constraints: use them to guide consequences and NPC behavior, '
+                'but never reveal them unless play has earned the information. Player theories remain unconfirmed unless '
+                'corroborated.\n' + json.dumps(retrieval_packet, ensure_ascii=False)
+            ),
+        })
     naming_constraints = prompt_context.get('visible_naming_constraints') or []
     if naming_constraints:
         messages.append({
@@ -1941,7 +1965,9 @@ def build_session_preflight_messages(hot_context, recent_messages, tools):
             'combat, complex rules, likely tool use, hidden/private context, lore-heavy reasoning, or major consequences. '
             'Set latest_player_intent_requires_mechanics true when the latest player is trying to attack, harm, '
             'grapple, shove, restrain, flee pursuit, start a fight, or attempt any risky/contested action whose '
-            'outcome should not be narrated until a D&D roll or initiative step happens.'
+            'outcome should not be narrated until a D&D roll or initiative step happens. '
+            'For narrative or uncertain turns, provide four focused retrieval queries. For silent, ooc_only, '
+            'mechanics_only, or clarification_only turns, use empty retrieval queries.'
         ),
         'return_shape': {
             'dm_reply_mode': 'silent | ooc_only | mechanics_only | clarification_only | simple_narrative | narrative | unknown',
@@ -1951,6 +1977,12 @@ def build_session_preflight_messages(hot_context, recent_messages, tools):
             'required_mechanic': 'short label such as attack roll, initiative, contested check, saving throw, or empty string',
             'confidence': 'high | medium | low',
             'reason': 'short explanation',
+            'retrieval_queries': {
+                'entities': 'short focused query for named people, places, objects, or factions',
+                'scene_events': 'short focused query for scene state and recent events',
+                'clocks_promises': 'short focused query for clocks, promises, and pressure',
+                'prior_facts': 'short focused query for prior campaign facts',
+            },
         },
     }
     return [
@@ -1989,7 +2021,7 @@ def normalize_session_preflight_decision(raw_decision):
         and confidence == 'high'
     )
 
-    return {
+    normalized = {
         'dm_reply_mode': mode,
         'skip_spoiler_check': skip_spoiler_check,
         'main_call_thinking': main_call_thinking,
@@ -1998,6 +2030,12 @@ def normalize_session_preflight_decision(raw_decision):
         'confidence': confidence,
         'reason': str(data.get('reason') or '').strip(),
     }
+    if isinstance(data.get('retrieval_queries'), dict):
+        normalized['retrieval_queries'] = {
+            key: str(data['retrieval_queries'].get(key) or '').strip()[:240]
+            for key in ('entities', 'scene_events', 'clocks_promises', 'prior_facts')
+        }
+    return normalized
 
 
 def get_session_preflight_decision(hot_context, recent_messages, tools, audit_context=None):
@@ -4053,21 +4091,14 @@ def get_session_dm_response_with_tools(
     audit_context=None,
     max_tool_rounds=30,
     on_status_change=None,
+    build_retrieval_packet=None,
 ):
     base_audit = audit_context or {}
     trace_id = base_audit.get('trace_id') or f"session_dm:session_dm_response:{uuid4().hex[:10]}"
     trace_label = base_audit.get('trace_label') or 'session_dm: session_dm_response'
     all_tools = _session_dm_tools_with_finalizers(tools)
     finalizer_tools = SESSION_DM_FINALIZER_TOOLS
-    messages = build_session_dm_tool_messages(hot_context)
-    for msg in recent_messages:
-        if msg.role == 'dm':
-            role = 'assistant'
-        elif msg.role == 'player':
-            role = 'user'
-        else:
-            role = msg.role
-        messages.append({'role': role, 'content': msg.content})
+    action_buffer = {'actions': []}
     preflight_decision = {
         'dm_reply_mode': 'unknown',
         'skip_spoiler_check': False,
@@ -4088,6 +4119,37 @@ def get_session_dm_response_with_tools(
                 'actor': 'session_preflight_router',
             },
         )
+
+    if callable(build_retrieval_packet):
+        try:
+            packet = build_retrieval_packet(preflight_decision)
+            if isinstance(packet, dict):
+                hot_context = {**(hot_context or {}), 'retrieval_packet': packet}
+        except Exception as err:
+            if base_audit.get('campaign_id'):
+                log_audit_event(
+                    base_audit['campaign_id'],
+                    'session_retrieval_packet_error',
+                    'Focused pre-generation retrieval failed open.',
+                    {'error': repr(err)},
+                    source='session_context',
+                    actor='session_retrieval',
+                    trace_id=trace_id,
+                    parent_trace_id=base_audit.get('parent_trace_id'),
+                    trace_label=trace_label,
+                    audit_role='tools',
+                    commit=True,
+                )
+
+    messages = build_session_dm_tool_messages(hot_context)
+    for msg in recent_messages:
+        if msg.role == 'dm':
+            role = 'assistant'
+        elif msg.role == 'player':
+            role = 'user'
+        else:
+            role = msg.role
+        messages.append({'role': role, 'content': msg.content})
 
     if on_status_change:
         on_status_change({"step": "preflight"})
@@ -4236,6 +4298,7 @@ def get_session_dm_response_with_tools(
                     finalizer_contract_violation
                     and finalizer_contract_violation.get('kind') == 'missing_finalizer_tool_call'
                     and str(raw_content or '').strip()
+                    and not action_buffer['actions']
                 ):
                     decision = {
                         'mode': 'speak',
@@ -4931,7 +4994,11 @@ def get_session_dm_response_with_tools(
                     'mode': 'silent',
                     'reason': 'The DM response would have semantically exposed DM-private information.',
                 }
-            return decision
+            if base_audit.get('operation') == 'session_dm_response':
+                return {**decision, '_pending_actions': list(action_buffer['actions'])}
+            # Preserve the direct helper's historical public return shape; production callers
+            # receive the action IDs through the session-DM operation result above.
+            return {key: value for key, value in decision.items() if key != 'commit_action_ids'}
 
         messages.append(_assistant_tool_message(message))
         combat_batch_force_tools = False
@@ -4976,6 +5043,7 @@ def get_session_dm_response_with_tools(
                         **loop_audit,
                         'parent_trace_id': trace_id,
                         'trace_id': trace_id,
+                        'pending_action_buffer': action_buffer,
                     },
                 )
                 if tool_name in SESSION_DM_COMBAT_PROGRESS_TOOL_NAMES and isinstance(result, dict) and not result.get('error'):

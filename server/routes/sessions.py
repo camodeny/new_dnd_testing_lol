@@ -35,9 +35,11 @@ from services.dm_tools import (
     build_session_hot_context,
     build_session_clock_context,
     build_session_memory_context,
+    build_session_retrieval_packet,
     context_manifest,
     execute_dm_tool,
 )
+from services.dm_turn_commit import commit_accepted_dm_turn
 from services.dm_turns import (
     begin_session_dm_turn,
     mark_session_dm_turn_error,
@@ -92,6 +94,7 @@ def _session_dm_turn_decision(raw_result):
     return {
         'mode': 'speak',
         'content': decision.get('content') or '',
+        'commit_action_ids': decision.get('commit_action_ids'),
     }
 
 
@@ -651,6 +654,17 @@ def send_message(current_user, session_id):
                     'context_manifest': manifest,
                     'full_world_graph_included': False,
                 },
+                build_retrieval_packet=lambda preflight: build_session_retrieval_packet(
+                    campaign,
+                    current_user,
+                    hot_context,
+                    preflight,
+                    audit_context={
+                        'trace_id': trace_id,
+                        'trace_label': trace_label,
+                        'campaign_id': campaign.id,
+                    },
+                ),
             )
         except Exception as err:
             db.session.add(mark_session_dm_turn_error(
@@ -667,46 +681,22 @@ def send_message(current_user, session_id):
         ai_text = ai_turn.get('content') or ''
 
         if ai_turn.get('mode') == 'speak' and ai_text:
-            ai_msg = SessionMessage(
-                session_id=session_id,
-                role='dm',
-                content=ai_text,
-            )
-            db.session.add(ai_msg)
-            db.session.flush()
-            log_audit_event(
-                campaign.id,
-                'dm_output_stored',
-                'Stored visible session DM response.',
-                {
-                    'session_id': session_id,
-                    'player_message_id': msg.id,
-                    'dm_message_id': ai_msg.id,
-                    'message': {
-                        'role': 'dm',
-                        'content': ai_text,
-                    },
-                },
-                source='session_messages',
-                actor='session_dm',
-                trace_id=trace_id,
-                trace_label=trace_label,
-                commit=False,
-            )
-            pending_proposals = SheetProposal.query.filter_by(
-                session_id=session_id, message_id=None, status='pending',
-            ).all()
-            for proposal in pending_proposals:
-                proposal.message_id = ai_msg.id
-            db.session.add(mark_session_dm_turn_visible(
-                campaign.id,
-                session_id,
-                msg.id,
-                trace_id,
-                status='speak',
-                dm_message_id=ai_msg.id,
-            ))
-            db.session.commit()
+            try:
+                ai_msg, pending_proposals, _action_results = commit_accepted_dm_turn(
+                    campaign,
+                    session,
+                    current_user,
+                    msg.id,
+                    trace_id,
+                    trace_label,
+                    ai_text,
+                    ai_turn.get('commit_action_ids') if isinstance(ai_turn.get('commit_action_ids'), list) else [],
+                    {'actions': ai_result.get('_pending_actions')}
+                    if isinstance(ai_result, dict) and isinstance(ai_result.get('_pending_actions'), list)
+                    else None,
+                )
+            except Exception as err:
+                return jsonify({'error': repr(err), 'messages': result_messages}), 500
             result_messages.append(ai_msg.to_dict())
 
             # Synchronous memory update

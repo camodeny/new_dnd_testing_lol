@@ -14,10 +14,12 @@ from openrouter import (
 )
 from services.dm_tools import (
     build_session_hot_context,
+    build_session_retrieval_packet,
     get_dm_tool_definitions,
     context_manifest,
     execute_dm_tool,
 )
+from services.dm_turn_commit import commit_accepted_dm_turn
 from services.dm_turns import (
     begin_session_dm_turn,
     mark_session_dm_turn_error,
@@ -277,6 +279,17 @@ class SessionGeneratorWorker:
                 'full_world_graph_included': False,
             },
             on_status_change=self.update_status,
+            build_retrieval_packet=lambda preflight: build_session_retrieval_packet(
+                campaign,
+                current_user,
+                hot_context,
+                preflight,
+                audit_context={
+                    'trace_id': trace_id,
+                    'trace_label': trace_label,
+                    'campaign_id': campaign.id,
+                },
+            ),
         )
 
         ai_turn = _session_dm_turn_decision(ai_result)
@@ -286,46 +299,19 @@ class SessionGeneratorWorker:
         result_messages = [player_msg.to_dict()] if player_msg else []
 
         if ai_turn.get('mode') == 'speak' and ai_text:
-            ai_msg = SessionMessage(
-                session_id=self.session_id,
-                role='dm',
-                content=ai_text,
-            )
-            db.session.add(ai_msg)
-            db.session.flush()
-            log_audit_event(
-                campaign.id,
-                'dm_output_stored',
-                'Stored visible session DM response.',
-                {
-                    'session_id': self.session_id,
-                    'player_message_id': player_msg_id,
-                    'dm_message_id': ai_msg.id,
-                    'message': {
-                        'role': 'dm',
-                        'content': ai_text,
-                    },
-                },
-                source='session_messages',
-                actor='session_dm',
-                trace_id=trace_id,
-                trace_label=trace_label,
-                commit=False,
-            )
-            pending_proposals = SheetProposal.query.filter_by(
-                session_id=self.session_id, message_id=None, status='pending',
-            ).all()
-            for proposal in pending_proposals:
-                proposal.message_id = ai_msg.id
-            db.session.add(mark_session_dm_turn_visible(
-                campaign.id,
-                self.session_id,
+            ai_msg, pending_proposals, _action_results = commit_accepted_dm_turn(
+                campaign,
+                session,
+                current_user,
                 player_msg_id,
                 trace_id,
-                status='speak',
-                dm_message_id=ai_msg.id,
-            ))
-            db.session.commit()
+                trace_label,
+                ai_text,
+                ai_turn.get('commit_action_ids') if isinstance(ai_turn.get('commit_action_ids'), list) else [],
+                {'actions': ai_result.get('_pending_actions')}
+                if isinstance(ai_result, dict) and isinstance(ai_result.get('_pending_actions'), list)
+                else None,
+            )
             result_messages.append(ai_msg.to_dict())
             sheet_proposals = [p.to_dict() for p in pending_proposals]
 
@@ -411,6 +397,7 @@ def _session_dm_turn_decision(raw_result):
     return {
         'mode': 'speak',
         'content': decision.get('content') or '',
+        'commit_action_ids': decision.get('commit_action_ids'),
     }
 
 class SessionStreamManager:
