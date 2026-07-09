@@ -4,7 +4,6 @@ Manages background workers that stream planning DM responses token-by-token
 to connected SSE listeners. Since planning has no spoiler-sensitive content,
 the visible message text streams directly without guard checks.
 """
-import json
 import queue
 import re
 import threading
@@ -18,11 +17,9 @@ from services.audit_service import log_audit_event
 from services.planning_service import (
     apply_bond_suggestions,
     get_campaign_members,
-    get_member,
     get_or_create_summary,
     merge_summary_update,
     planning_context,
-    visible_planning_payload,
 )
 
 

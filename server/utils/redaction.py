@@ -1,4 +1,3 @@
-import copy
 
 EXACT_SENSITIVE_KEYS = {
     'token',

@@ -101,7 +101,7 @@ export default function ItemListEditor({ title, items, onChange, fields, emptyIt
       <span className={`item-badge ${type}`} key={label}>{label}</span>
     )
 
-    let content = null
+    let content
 
     switch (listKey) {
       case 'classes':
