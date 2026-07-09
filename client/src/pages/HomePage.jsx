@@ -166,14 +166,36 @@ export default function HomePage({ user }) {
 
   return (
     <div className="home-page-v2">
+      <section className="wildwood-home-hero">
+        <div className="wildwood-home-copy">
+          <span className="wildwood-kicker">YOUR TABLE IS SET</span>
+          <h1>{hasCampaigns ? <>There’s a story<br />waiting for you.</> : <>Begin somewhere<br />worth remembering.</>}</h1>
+          <p>{hasCampaigns ? `${campaigns.length} adventure${campaigns.length !== 1 ? 's are' : ' is'} waiting for its next turn.` : 'Create a campaign, gather your party, and see what unfolds.'}</p>
+          <div className="wildwood-hero-actions">
+            <button className="btn btn-primary" onClick={openModal}><i className="bi bi-plus-lg" /> New campaign</button>
+            <button className="btn btn-secondary" onClick={openJoinModal}><i className="bi bi-key-fill" /> Join a campaign</button>
+          </div>
+        </div>
+        <div className="wildwood-home-illustration" aria-hidden="true">
+          <span className="wildwood-story-halo" />
+          <span className="wildwood-story-portal">
+            <span className="wildwood-story-moon" />
+            <span className="wildwood-story-moon-mark moon-mark-one" /><span className="wildwood-story-moon-mark moon-mark-two" />
+            <span className="wildwood-story-ridge ridge-far" /><span className="wildwood-story-ridge ridge-near" />
+            <span className="wildwood-story-cairn"><i /><i /></span>
+            <span className="wildwood-story-path" />
+            <span className="wildwood-story-figure">♙</span>
+            <span className="wildwood-story-firefly firefly-one">✦</span><span className="wildwood-story-firefly firefly-two">·</span><span className="wildwood-story-firefly firefly-three">·</span>
+          </span>
+          <span className="wildwood-story-star story-star-one">✦</span><span className="wildwood-story-star story-star-two">✧</span>
+          <span className="wildwood-story-caption">A door into the next chapter</span>
+        </div>
+      </section>
+
       <header className="campaigns-header">
         <div>
-          <h1 className="campaigns-title">Your Campaigns</h1>
-          <p className="campaigns-subtitle">
-            {hasCampaigns
-              ? `${campaigns.length} adventure${campaigns.length !== 1 ? 's' : ''} underway`
-              : 'Where will your next adventure take you?'}
-          </p>
+          <span className="wildwood-kicker">YOUR STORIES</span>
+          <h2 className="campaigns-title">{hasCampaigns ? 'Choose a world' : 'A quiet table, for now.'}</h2>
         </div>
         {hasCampaigns && (
           <div className="campaigns-header-actions">
@@ -192,10 +214,6 @@ export default function HomePage({ user }) {
             <button className="btn btn-secondary" onClick={openSandboxModal}>
               <i className="bi bi-bullseye"></i>
               Combat Sandbox
-            </button>
-            <button className="btn btn-primary create-btn-header" onClick={openModal}>
-              <i className="bi bi-plus-lg"></i>
-              New Campaign
             </button>
           </div>
         )}

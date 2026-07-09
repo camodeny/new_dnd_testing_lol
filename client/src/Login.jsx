@@ -75,10 +75,12 @@ function Login({ onLogin }) {
 
   return (
     <div className="login-container">
+      <div className="login-illustration" aria-hidden="true"><span className="login-moon" /><span className="login-hill login-hill-one" /><span className="login-hill login-hill-two" /><span className="login-spark spark-one">✦</span><span className="login-spark spark-two">✧</span></div>
       <div className="login-card">
-        <h1>{isRegistering ? 'Create Account' : 'Welcome Back'}</h1>
+        <div className="login-brand"><span>✺</span> Campfire</div>
+        <h1>{isRegistering ? 'Begin a story' : 'Welcome back'}</h1>
         <p className="login-subtitle">
-          {isRegistering ? 'Start your D&D adventure' : 'Sign in to continue'}
+          {isRegistering ? 'Make a place at the table.' : 'Your next chapter is waiting.'}
         </p>
 
         {ssoEnabled && (

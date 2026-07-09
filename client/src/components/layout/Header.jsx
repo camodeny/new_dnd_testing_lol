@@ -1,18 +1,24 @@
-import { Link } from 'react-router-dom'
+import { Link, NavLink } from 'react-router-dom'
+
+function navigationClass({ isActive }) {
+  return `nav-link ${isActive ? 'active' : ''}`
+}
 
 export default function Header({ user, onLogout }) {
   return (
     <header className="app-header">
-      <h1><Link to="/" className="header-link">D&D Adventure</Link></h1>
+      <h1><Link to="/" className="header-link"><span className="header-mark">✺</span> Campfire</Link></h1>
       <nav className="app-nav">
-        <Link to="/" className="nav-link">Campaigns</Link>
-        <Link to="/automation" className="nav-link">Automation</Link>
-        <Link to="/characters" className="nav-link">Characters</Link>
-        <Link to="/dev/model" className="nav-link">Model</Link>
+        <NavLink to="/" end className={navigationClass}>Campaigns</NavLink>
+        <NavLink to="/characters" className={navigationClass}>Characters</NavLink>
+        <NavLink to="/automation" className={navigationClass}>Automation</NavLink>
+        <NavLink to="/design-lab" className={navigationClass}>Design Lab</NavLink>
+        <NavLink to="/dev/model" className={navigationClass}>Model</NavLink>
       </nav>
       <div className="user-info">
-        <span>Welcome, {user?.username}!</span>
-        <button onClick={onLogout} className="logout-button">Logout</button>
+        <span className="user-monogram">{user?.username?.slice(0, 2).toUpperCase() || '?'}</span>
+        <span className="user-name">{user?.username}</span>
+        <button onClick={onLogout} className="logout-button" title="Log out" aria-label="Log out"><i className="bi bi-box-arrow-right" /></button>
       </div>
     </header>
   )
