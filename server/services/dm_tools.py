@@ -8,7 +8,6 @@ from models import (
     CampaignClock,
     CampaignMember,
     CampaignMonster,
-    CampaignWorld,
     Character,
     CharacterCondition,
     EncounterMap,

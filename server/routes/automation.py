@@ -1,5 +1,4 @@
 from datetime import datetime
-import json
 import threading
 
 from flask import Blueprint, current_app, jsonify, request, stream_with_context
@@ -18,8 +17,6 @@ from models import (
     AutomationSnapshot,
     AutomationWorker,
     Campaign,
-    CampaignMember,
-    CampaignSession,
     Character,
     CharacterCondition,
     CharacterEquipment,
@@ -55,8 +52,6 @@ from services.automation_service import (
     ensure_worker_lease,
     heartbeat_run,
     latest_session_for_run,
-    lease_is_expired,
-    materialize_run_campaign,
     merged_runner_config_for_scenario,
     persist_provider_call,
     record_worker_activity,

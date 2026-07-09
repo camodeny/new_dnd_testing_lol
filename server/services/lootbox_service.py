@@ -1,7 +1,7 @@
 import json
 import random
 from datetime import datetime
-from models import db, LootBox, Character, SheetProposal, CampaignSession
+from models import db, LootBox, Character, SheetProposal
 
 LOOT_RARITIES = ('common', 'uncommon', 'rare', 'very_rare')
 

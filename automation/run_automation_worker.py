@@ -421,23 +421,6 @@ def wait_for_dm_response(args, manifest, player_message_id, maybe_heartbeat_fn):
         time.sleep(sleep_for)
 
 
-def finalize_terminal_state(args, run_id, lease_token, run_state):
-    status = (run_state or {}).get('status')
-    if status in {'stop_requested', 'stopped', 'failed'}:
-        complete_run(
-            args.api_base,
-            args.owner_api_key,
-            run_id,
-            args.worker_id,
-            lease_token,
-            status='stopped' if status != 'failed' else 'failed',
-            error_text=(run_state or {}).get('error_text'),
-            dedupe_key=f'run_completed:{run_id}:external-stop',
-        )
-        return True
-    return status in {'completed'}
-
-
 def pause_for_audit_if_needed(args, claim_payload, run_id, lease_token, phase, maybe_heartbeat_fn, **payload):
     if phase not in pause_phases(claim_payload):
         return False, lease_token

@@ -288,7 +288,6 @@ def _confidence_from_contrast(debug):
 
 
 def _scan_top_periods(projection, min_period, max_period, p_step, o_step, top_n):
-    n = len(projection)
     best_by_period = {}
 
     for period in np.arange(min_period, max_period + 0.001, p_step):

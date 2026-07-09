@@ -139,22 +139,6 @@ export function getAutomationWorkspaceStreamUrl() {
   return `${API_BASE}/automation/stream?token=${encodeURIComponent(token || '')}`
 }
 
-export function listAutomationScenarios() {
-  return apiFetch('/automation/scenarios')
-}
-
-export function listAutomationScorecards() {
-  return apiFetch('/automation/scorecards')
-}
-
-export function createAutomationScorecard(payload) {
-  return apiFetch('/automation/scorecards', { method: 'POST', body: JSON.stringify(payload) })
-}
-
-export function updateAutomationScorecard(scorecardId, payload) {
-  return apiFetch(`/automation/scorecards/${scorecardId}`, { method: 'PUT', body: JSON.stringify(payload) })
-}
-
 export function createAutomationScenario(payload) {
   return apiFetch('/automation/scenarios', { method: 'POST', body: JSON.stringify(payload) })
 }
@@ -167,24 +151,12 @@ export function updateAutomationScenario(scenarioId, payload) {
   return apiFetch(`/automation/scenarios/${scenarioId}`, { method: 'PUT', body: JSON.stringify(payload) })
 }
 
-export function deleteAutomationScenario(scenarioId) {
-  return apiFetch(`/automation/scenarios/${scenarioId}`, { method: 'DELETE' })
-}
-
 export function cleanupAutomationScenario(scenarioId, payload = {}) {
   return apiFetch(`/automation/scenarios/${scenarioId}/cleanup`, { method: 'POST', body: JSON.stringify(payload) })
 }
 
-export function listAutomationSnapshots(scenarioId) {
-  return apiFetch(`/automation/scenarios/${scenarioId}/snapshots`)
-}
-
 export function createAutomationSnapshot(scenarioId, payload = {}) {
   return apiFetch(`/automation/scenarios/${scenarioId}/snapshots`, { method: 'POST', body: JSON.stringify(payload) })
-}
-
-export function listAutomationRuns(scenarioId) {
-  return apiFetch(`/automation/scenarios/${scenarioId}/runs`)
 }
 
 export function createAutomationRun(scenarioId, payload = {}) {
@@ -207,21 +179,12 @@ export function submitAutomationRunAudit(runId, cycleId, payload) {
   return apiFetch(`/automation/runs/${runId}/audit-cycles/${cycleId}/audit`, { method: 'POST', body: JSON.stringify(payload) })
 }
 
-export function listAutomationRunAuditors(runId, cycleId) {
-  const query = cycleId ? `?cycle_id=${encodeURIComponent(cycleId)}` : ''
-  return apiFetch(`/automation/runs/${runId}/auditors${query}`)
-}
-
 export function startAutomationRunAuditors(runId, payload = {}) {
   return apiFetch(`/automation/runs/${runId}/auditors/start`, { method: 'POST', body: JSON.stringify(payload) })
 }
 
 export function stopAutomationRunAuditors(runId) {
   return apiFetch(`/automation/runs/${runId}/auditors/stop`, { method: 'POST', body: JSON.stringify({}) })
-}
-
-export function getAutomationRunScorecard(runId) {
-  return apiFetch(`/automation/runs/${runId}/scorecard`)
 }
 
 export function compareAutomationRuns(payload) {

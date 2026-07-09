@@ -10,7 +10,6 @@ from datetime import datetime, timezone
 
 from llm_campaign_common import (
     ApiError,
-    STATE_DIR,
     api_get,
     api_post,
     default_opencode_server,

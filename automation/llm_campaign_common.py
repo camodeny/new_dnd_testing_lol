@@ -184,38 +184,12 @@ def save_manifest(path, payload):
     json_dump(path, payload)
 
 
-def extract_text_parts(parts):
-    text_chunks = []
-    for part in parts or []:
-        if isinstance(part, str):
-            text_chunks.append(part)
-            continue
-        if not isinstance(part, dict):
-            continue
-        for key in ('text', 'content'):
-            value = part.get(key)
-            if isinstance(value, str) and value.strip():
-                text_chunks.append(value)
-                break
-    return '\n'.join(chunk.strip() for chunk in text_chunks if chunk and chunk.strip()).strip()
-
-
 def opencode_headers(password=None):
     headers = {'Content-Type': 'application/json'}
     if password:
         token = base64.b64encode(f'opencode:{password}'.encode('utf-8')).decode('ascii')
         headers['Authorization'] = f'Basic {token}'
     return headers
-
-
-def opencode_request(server, path, payload=None, password=None, method='GET'):
-    return request_json(
-        f'{server.rstrip("/")}{path}',
-        method=method,
-        headers=opencode_headers(password=password),
-        payload=payload,
-        timeout=120,
-    )
 
 
 def default_api_base():

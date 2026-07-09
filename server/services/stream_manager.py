@@ -9,7 +9,6 @@ from models import db, Campaign, CampaignSession, SessionMessage, SheetProposal,
 from openrouter import (
     get_session_dm_response_with_tools,
     normalize_session_dm_turn_decision,
-    get_openrouter_model,
     get_llm_provider,
     _post_chat,
 )

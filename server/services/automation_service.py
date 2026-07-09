@@ -13,7 +13,6 @@ from models import (
     AutomationRunEvent,
     AutomationRunProviderCall,
     AutomationScenario,
-    AutomationScorecardTemplate,
     AutomationSnapshot,
     AutomationWorker,
     AutomationWorkspaceEvent,

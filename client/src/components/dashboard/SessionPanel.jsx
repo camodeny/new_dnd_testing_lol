@@ -632,7 +632,7 @@ export default function SessionPanel({
   }
 
   const filteredMessages = useMemo(() => {
-    return messages.filter((msg) => {
+    return messages.filter(() => {
       // TBD or Roster tab always contains 0 chats
       if (activeChatTab === 'tbd' || activeChatTab === 'roster') {
         return false;

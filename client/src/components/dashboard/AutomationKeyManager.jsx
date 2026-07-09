@@ -6,7 +6,7 @@ async function copyToClipboard(text) {
     try {
       await navigator.clipboard.writeText(text)
       return true
-    } catch (err) {
+    } catch {
       // Fall back to the textarea path below.
     }
   }
@@ -24,7 +24,7 @@ async function copyToClipboard(text) {
     const successful = document.execCommand('copy')
     document.body.removeChild(textArea)
     return successful
-  } catch (err) {
+  } catch {
     document.body.removeChild(textArea)
     return false
   }
