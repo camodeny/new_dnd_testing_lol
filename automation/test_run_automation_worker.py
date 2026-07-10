@@ -2,7 +2,7 @@ import os
 import sys
 import unittest
 from types import SimpleNamespace
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 
 
 sys.path.insert(0, os.path.abspath(os.path.dirname(__file__)))
@@ -50,6 +50,74 @@ class RunAutomationWorkerTests(unittest.TestCase):
         self.assertEqual(result, statuses[-1])
         self.assertEqual(fetch_status.call_count, 2)
         sleep.assert_called_once()
+
+    def test_wait_for_audit_resume_keeps_worker_alive_until_continue(self):
+        args = SimpleNamespace(
+            api_base='http://127.0.0.1:5889',
+            owner_api_key='owner-key',
+            poll_interval=0.01,
+        )
+        waiting = {
+            'run': {
+                'status': 'awaiting_audit',
+                'awaiting_audit_cycle_id': 17,
+            },
+        }
+        resumed = {
+            'run': {
+                'status': 'running',
+                'awaiting_audit_cycle_id': None,
+            },
+        }
+        heartbeat = Mock()
+
+        with patch.object(worker, 'fetch_run', side_effect=[waiting, resumed]) as fetch_run, \
+                patch.object(worker.time, 'sleep') as sleep:
+            stopped, lease_token = worker.wait_for_audit_resume(
+                args,
+                run_id=7,
+                lease_token='lease-1',
+                maybe_heartbeat_fn=heartbeat,
+            )
+
+        self.assertFalse(stopped)
+        self.assertEqual(lease_token, 'lease-1')
+        self.assertEqual(fetch_run.call_count, 2)
+        heartbeat.assert_called_once()
+        sleep.assert_called_once_with(0.01)
+
+    def test_pause_for_audit_waits_then_returns_to_same_worker(self):
+        args = SimpleNamespace(
+            api_base='http://127.0.0.1:5889',
+            owner_api_key='owner-key',
+            worker_id='audit-worker',
+            poll_interval=0.01,
+        )
+        claim_payload = {'run': {'runner_config': {'audit_pause_phases': ['after_dm']}}}
+
+        with patch.object(worker, 'pause_run', return_value={
+            'run': {'lease_token': 'lease-2'},
+            'paused': True,
+            'audit_cycle': {'id': 17},
+        }), patch.object(worker, 'wait_for_audit_resume', return_value=(False, 'lease-3')) as wait_for_resume, \
+                patch.object(worker, 'append_event') as append_event:
+            should_stop, lease_token = worker.pause_for_audit_if_needed(
+                args,
+                claim_payload,
+                run_id=7,
+                lease_token='lease-1',
+                phase='after_dm',
+                maybe_heartbeat_fn=Mock(),
+                summary='Paused after DM response.',
+            )
+
+        self.assertFalse(should_stop)
+        self.assertEqual(lease_token, 'lease-3')
+        wait_for_resume.assert_called_once()
+        self.assertEqual(
+            [call.args[5] for call in append_event.call_args_list],
+            ['worker_waiting_for_audit_resume', 'worker_resumed_after_audit'],
+        )
 
     def test_execute_run_resets_idle_timer_after_after_dm_audit_resume(self):
         args = SimpleNamespace(

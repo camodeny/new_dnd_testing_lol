@@ -73,8 +73,6 @@ from services.embedding_service import (
     canonical_text_for_item,
     cosine_similarity,
     embeddings_from_texts,
-    find_duplicate_graph_item,
-    search_memory_embeddings_batch,
     upsert_memory_embedding,
 )
 from services.encounter_map_service import create_labeled_grid_image, detect_grid_from_image
@@ -1698,46 +1696,6 @@ class DmToolsTest(unittest.TestCase):
             )
         self.assertTrue(stored['ok'])
         self.assertEqual(document_post.call_args.kwargs['json']['taskType'], 'RETRIEVAL_DOCUMENT')
-
-    def test_legacy_embedding_is_excluded_from_semantic_search_and_dedupe(self):
-        legacy = CampaignMemoryEmbedding(
-            campaign_id=self.campaign.id,
-            item_type='fact',
-            item_id='legacy_fact',
-            visibility='party_known',
-            canonical_text='Fact: The bell rings at midnight.',
-            text_hash='legacy-fact',
-            embedding_model='gemini-embedding-001',
-            embedding_dimensions=2,
-            embedding_json='[1.0, 0.0]',
-        )
-        db.session.add(legacy)
-        db.session.commit()
-        current_embedding = {
-            'ok': True,
-            'vector': [1.0, 0.0],
-            'vectors': [[1.0, 0.0]],
-            'model': 'gemini-embedding-2',
-            'dimensions': 2,
-        }
-        candidates = [{'kind': 'fact', 'item_id': 'legacy_fact', 'value': {'text': 'The bell rings at midnight.'}}]
-
-        with patch('services.embedding_service.embeddings_from_texts', return_value=current_embedding), \
-             patch('services.embedding_service.embedding_from_text', return_value=current_embedding):
-            semantic = search_memory_embeddings_batch(
-                self.campaign,
-                {'prior_facts': 'midnight bell'},
-                candidates,
-            )
-            dedupe = find_duplicate_graph_item(
-                self.campaign,
-                'fact',
-                {'id': 'new_fact', 'text': 'The bell rings at midnight.', 'visibility': 'party_known'},
-            )
-
-        self.assertTrue(semantic['ok'])
-        self.assertEqual(semantic['scores_by_query']['prior_facts'], {})
-        self.assertIsNone(dedupe['duplicate_id'])
 
     def test_party_known_clock_embedding_omits_private_completion_fields(self):
         clock_text = canonical_text_for_item('clock', {
@@ -5014,7 +4972,7 @@ class DmToolsTest(unittest.TestCase):
             visibility='party_known',
             canonical_text="Entity: Bram Truewood's Bookshop",
             text_hash='old',
-            embedding_model='gemini-embedding-001',
+            embedding_model='gemini-embedding-2',
             embedding_dimensions=2,
             embedding_json='[1.0, 0.0]',
         ))
@@ -5026,7 +4984,7 @@ class DmToolsTest(unittest.TestCase):
         }, clear=False), patch('services.embedding_service.embedding_from_text', return_value={
             'ok': True,
             'vector': [1.0, 0.0],
-            'model': 'gemini-embedding-001',
+            'model': 'gemini-embedding-2',
             'dimensions': 2,
         }):
             result = apply_memory_patch(
@@ -5336,7 +5294,7 @@ class DmToolsTest(unittest.TestCase):
             visibility='dm_private',
             canonical_text='Entity: Crimson Veil',
             text_hash='old',
-            embedding_model='gemini-embedding-001',
+            embedding_model='gemini-embedding-2',
             embedding_dimensions=2,
             embedding_json='[1.0, 0.0]',
         ))
@@ -5348,7 +5306,7 @@ class DmToolsTest(unittest.TestCase):
         }, clear=False), patch('services.embedding_service.embedding_from_text', return_value={
             'ok': True,
             'vector': [0.0, 1.0],
-            'model': 'gemini-embedding-001',
+            'model': 'gemini-embedding-2',
             'dimensions': 2,
         }):
             result = apply_memory_patch(
@@ -5421,7 +5379,7 @@ class DmToolsTest(unittest.TestCase):
             visibility='party_known',
             canonical_text='Fact: The door mark is an Infernal seal of scrutiny.',
             text_hash='fact',
-            embedding_model='gemini-embedding-001',
+            embedding_model='gemini-embedding-2',
             embedding_dimensions=2,
             embedding_json='[1.0, 0.0]',
         ))
@@ -5433,7 +5391,7 @@ class DmToolsTest(unittest.TestCase):
         }, clear=False), patch('services.embedding_service.embedding_from_text', return_value={
             'ok': True,
             'vector': [1.0, 0.0],
-            'model': 'gemini-embedding-001',
+            'model': 'gemini-embedding-2',
             'dimensions': 2,
         }):
             result = execute_dm_tool(

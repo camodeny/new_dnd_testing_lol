@@ -439,7 +439,54 @@ def pause_for_audit_if_needed(args, claim_payload, run_id, lease_token, phase, m
     )
     lease_token = ((response.get('run') or {}).get('lease_token')) or lease_token
     paused = bool(response.get('paused', True))
-    return paused, lease_token
+    if not paused:
+        return False, lease_token
+
+    cycle = response.get('audit_cycle') or {}
+    cycle_id = cycle.get('id')
+    append_event(
+        args.api_base,
+        args.owner_api_key,
+        run_id,
+        args.worker_id,
+        lease_token,
+        'worker_waiting_for_audit_resume',
+        {'audit_cycle_id': cycle_id, 'phase': phase},
+        dedupe_key=f'worker_waiting_for_audit_resume:{run_id}:{cycle_id or phase}',
+    )
+    stopped, lease_token = wait_for_audit_resume(
+        args,
+        run_id,
+        lease_token,
+        maybe_heartbeat_fn,
+    )
+    if stopped:
+        return True, lease_token
+    append_event(
+        args.api_base,
+        args.owner_api_key,
+        run_id,
+        args.worker_id,
+        lease_token,
+        'worker_resumed_after_audit',
+        {'audit_cycle_id': cycle_id, 'phase': phase},
+        dedupe_key=f'worker_resumed_after_audit:{run_id}:{cycle_id or phase}:{time.monotonic()}',
+    )
+    return False, lease_token
+
+
+def wait_for_audit_resume(args, run_id, lease_token, maybe_heartbeat_fn):
+    """Keep a claimed worker alive while an audit checkpoint is under review."""
+    while True:
+        run_payload = fetch_run(args.api_base, args.owner_api_key, run_id)
+        run_state = run_payload.get('run') or {}
+        status = str(run_state.get('status') or '').strip().lower()
+        if status == 'running' and not run_state.get('awaiting_audit_cycle_id'):
+            return False, lease_token
+        if status in {'stop_requested', 'stopped', 'failed', 'completed'}:
+            return True, lease_token
+        maybe_heartbeat_fn()
+        time.sleep(args.poll_interval)
 
 
 def execute_run(args, run_id):

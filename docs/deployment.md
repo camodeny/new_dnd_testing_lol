@@ -72,7 +72,7 @@ Optional variables:
 - `OPENAI_IMAGE_SETUP_TIMEOUT_SECONDS`: defaults to `90`.
 - `ENCOUNTER_MAP_STORAGE_DIR`: defaults to `/app/data/encounter_maps`.
 - `GEMINI_EMBEDDINGS_ENABLED`: `true` or `false`; defaults to `true` but fails open when `GEMINI_API_KEY` is unset.
-- `GEMINI_EMBEDDING_MODEL`: defaults to `gemini-embedding-001`.
+- `GEMINI_EMBEDDING_MODEL`: defaults to `gemini-embedding-2`.
 - `GEMINI_EMBEDDING_DIMENSIONS`: defaults to `768`.
 - `MEMORY_EMBEDDING_DEDUPE_THRESHOLD`: defaults to `0.90`.
 - `MEMORY_EMBEDDING_SEARCH_WEIGHT`: defaults to `0.70`.

@@ -24,7 +24,7 @@ The recommended evidence order is:
 
 ## CLI Setup
 
-Use the CLI wrapper by default. It re-sources `automation/llm_campaign.env` before delegating to `automation/automationctl.py`.
+Use the CLI wrapper by default. It loads project provider settings from `.env` first, then `automation/llm_campaign.env` for automation-specific control settings before delegating to `automation/automationctl.py`. The latter may intentionally override a provider setting when needed.
 
 ```bash
 export API_BASE="${API_BASE:-http://127.0.0.1:5889}"
@@ -36,6 +36,7 @@ Notes:
 
 - Add `--pretty` to any CLI command when you want formatted JSON.
 - The CLI is the default path for scorecards, scenarios, snapshots, runs, audit submission, scorecard fetches, comparisons, and worker start.
+- A worker now stays alive through an `awaiting_audit` checkpoint, heartbeating while the cycle is reviewed and resuming after `run continue`. Do not start a second worker merely to continue an audited cycle.
 - The CLI can also bootstrap a fresh manifest-backed campaign for later use with `"$AUTOMATION_CTL" campaign create --manifest automation/state/my-campaign.json --no-start`.
 - Raw `curl` examples are no longer the recommended path for this workflow.
 
