@@ -712,6 +712,15 @@ def execute_run(args, run_id):
                 dedupe_key=f'audit_pause:after_dm:{logical_key}:{posted_message_id}',
             )
             if should_stop:
+                complete_run(
+                    args.api_base,
+                    args.owner_api_key,
+                    run_id,
+                    args.worker_id,
+                    lease_token,
+                    status='stopped',
+                    dedupe_key=f'run_completed:{run_id}:audit-stop',
+                )
                 return True
             last_change_at = time.monotonic()
 
@@ -929,6 +938,15 @@ def execute_run(args, run_id):
                         dedupe_key=f'audit_pause:after_player:{logical_key}:{posted_message_id}',
                     )
                     if should_stop:
+                        complete_run(
+                            args.api_base,
+                            args.owner_api_key,
+                            run_id,
+                            args.worker_id,
+                            lease_token,
+                            status='stopped',
+                            dedupe_key=f'run_completed:{run_id}:audit-stop',
+                        )
                         return True
                     last_change_at = time.monotonic()
                     dm_turn, dm_timed_out = wait_for_dm_response(args, manifest, posted_message_id, maybe_heartbeat)
@@ -1014,6 +1032,15 @@ def execute_run(args, run_id):
                         dedupe_key=f'audit_pause:after_dm:{logical_key}:{posted_message_id}',
                     )
                     if should_stop:
+                        complete_run(
+                            args.api_base,
+                            args.owner_api_key,
+                            run_id,
+                            args.worker_id,
+                            lease_token,
+                            status='stopped',
+                            dedupe_key=f'run_completed:{run_id}:audit-stop',
+                        )
                         return True
                     last_change_at = time.monotonic()
                 else:

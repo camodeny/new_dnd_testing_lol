@@ -182,16 +182,15 @@ def _embedding_values(response):
     return []
 
 
-def _embedding_payload(model, text, task_type):
+def _embedding_payload(model, text):
     return {
         'model': f'models/{model}',
         'content': {'parts': [{'text': text}]},
-        'taskType': task_type,
         'outputDimensionality': embedding_dimensions(),
     }
 
 
-def _post_embedding(text, task_type='RETRIEVAL_QUERY'):
+def _post_embedding(text):
     if not embeddings_enabled():
         raise RuntimeError('Gemini embeddings are disabled')
     api_key = _api_key()
@@ -199,7 +198,7 @@ def _post_embedding(text, task_type='RETRIEVAL_QUERY'):
         raise RuntimeError('GEMINI_API_KEY is not set')
 
     model = embedding_model()
-    payload = _embedding_payload(model, text, task_type)
+    payload = _embedding_payload(model, text)
     response = requests.post(
         f'{GEMINI_EMBEDDING_BASE_URL}/models/{model}:embedContent',
         headers={
@@ -216,7 +215,7 @@ def _post_embedding(text, task_type='RETRIEVAL_QUERY'):
     return vector
 
 
-def _post_embeddings(texts, task_type='RETRIEVAL_QUERY'):
+def _post_embeddings(texts):
     if not embeddings_enabled():
         raise RuntimeError('Gemini embeddings are disabled')
     api_key = _api_key()
@@ -234,7 +233,7 @@ def _post_embeddings(texts, task_type='RETRIEVAL_QUERY'):
             'Content-Type': 'application/json',
             'x-goog-api-key': api_key,
         },
-        json={'requests': [_embedding_payload(model, text, task_type) for text in cleaned]},
+        json={'requests': [_embedding_payload(model, text) for text in cleaned]},
         timeout=30,
     )
     response.raise_for_status()
@@ -271,7 +270,7 @@ def embedding_from_text(campaign_id, text, audit_context=None, reason='embedding
     model = embedding_model()
     dimensions = embedding_dimensions()
     try:
-        vector = _post_embedding(text, task_type=task_type)
+        vector = _post_embedding(text)
         return {
             'ok': True,
             'vector': vector,
@@ -304,7 +303,7 @@ def embeddings_from_texts(campaign_id, texts, audit_context=None, reason='embedd
     model = embedding_model()
     dimensions = embedding_dimensions()
     try:
-        vectors = _post_embeddings(texts, task_type=task_type)
+        vectors = _post_embeddings(texts)
         return {
             'ok': True,
             'vectors': vectors,
@@ -345,12 +344,12 @@ def upsert_memory_embedding(campaign, item_type, item_id, value, audit_context=N
     canonical_text = canonical_text_for_item(item_type, value)
     if not canonical_text:
         return {'ok': False, 'reason': 'empty_canonical_text'}
+    wrapping_text = f'title: none | text: {canonical_text}'
     embedding = embedding_result or embedding_from_text(
         campaign.id,
-        canonical_text,
+        wrapping_text,
         audit_context=audit_context,
         reason=f'upsert_{item_type}',
-        task_type='RETRIEVAL_DOCUMENT',
     )
     if not embedding['ok']:
         return embedding
@@ -401,10 +400,9 @@ def find_duplicate_graph_item(campaign, item_type, candidate, audit_context=None
     canonical_text = canonical_text_for_item(item_type, candidate)
     embedding = embedding_from_text(
         campaign.id,
-        canonical_text,
+        f'title: none | text: {canonical_text}',
         audit_context=audit_context,
         reason=f'dedupe_{item_type}',
-        task_type='RETRIEVAL_DOCUMENT',
     )
     if not embedding['ok']:
         return {'ok': False, 'duplicate_id': None, 'reason': embedding.get('error'), 'embedding': embedding}
@@ -450,10 +448,9 @@ def search_memory_embeddings(campaign, query, candidates, limit, audit_context=N
     query = clean_text(query, 800)
     embedding = embedding_from_text(
         campaign.id,
-        query,
+        f'task: search result | query: {query}' if query else query,
         audit_context=audit_context,
         reason='memory_search',
-        task_type='RETRIEVAL_QUERY',
     )
     if not embedding['ok']:
         return {'ok': False, 'scores': {}, 'reason': embedding.get('error')}
@@ -508,10 +505,9 @@ def search_memory_embeddings_batch(campaign, queries, candidates, limit=20, audi
 
     embedding = embeddings_from_texts(
         campaign.id,
-        list(normalized.values()),
+        [f'task: search result | query: {q}' for q in normalized.values()],
         audit_context=audit_context,
         reason='memory_search_batch',
-        task_type='RETRIEVAL_QUERY',
     )
     if not embedding['ok']:
         return {'ok': False, 'scores_by_query': {}, 'reason': embedding.get('error')}

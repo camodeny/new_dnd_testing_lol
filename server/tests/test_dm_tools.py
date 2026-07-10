@@ -73,6 +73,8 @@ from services.embedding_service import (
     canonical_text_for_item,
     cosine_similarity,
     embeddings_from_texts,
+    find_duplicate_graph_item,
+    search_memory_embeddings,
     upsert_memory_embedding,
 )
 from services.encounter_map_service import create_labeled_grid_image, detect_grid_from_image
@@ -1659,8 +1661,8 @@ class DmToolsTest(unittest.TestCase):
         self.assertIn('confirmed', fact_text)
 
     def test_embedding_2_uses_retrieval_query_and_document_formatting(self):
-        response = Mock()
-        response.json.return_value = {
+        batch_response = Mock()
+        batch_response.json.return_value = {
             'embeddings': [
                 {'values': [1.0, 0.0]},
                 {'values': [0.0, 1.0]},
@@ -1671,7 +1673,7 @@ class DmToolsTest(unittest.TestCase):
             'GEMINI_API_KEY': 'test-key',
             'GEMINI_EMBEDDING_MODEL': 'gemini-embedding-2',
             'GEMINI_EMBEDDING_DIMENSIONS': '768',
-        }, clear=False), patch('services.embedding_service.requests.post', return_value=response) as post:
+        }, clear=False), patch('services.embedding_service.requests.post', return_value=batch_response) as post:
             result = embeddings_from_texts(self.campaign.id, ['first query', 'second query'])
 
         self.assertTrue(result['ok'])
@@ -1679,15 +1681,20 @@ class DmToolsTest(unittest.TestCase):
         self.assertTrue(post.call_args.args[0].endswith('/models/gemini-embedding-2:batchEmbedContents'))
         requests_payload = post.call_args.kwargs['json']['requests']
         self.assertEqual([request['content']['parts'][0]['text'] for request in requests_payload], ['first query', 'second query'])
-        self.assertTrue(all(request['taskType'] == 'RETRIEVAL_QUERY' for request in requests_payload))
-        self.assertTrue(all(request['outputDimensionality'] == 768 for request in requests_payload))
+        for request in requests_payload:
+            self.assertNotIn('taskType', request)
+            self.assertEqual(request['outputDimensionality'], 768)
 
+        single_response = Mock()
+        single_response.json.return_value = {
+            'embedding': {'values': [1.0, 0.0]},
+        }
         with patch.dict(os.environ, {
             'GEMINI_EMBEDDINGS_ENABLED': 'true',
             'GEMINI_API_KEY': 'test-key',
             'GEMINI_EMBEDDING_MODEL': 'gemini-embedding-2',
             'GEMINI_EMBEDDING_DIMENSIONS': '768',
-        }, clear=False), patch('services.embedding_service.requests.post', return_value=response) as document_post:
+        }, clear=False), patch('services.embedding_service.requests.post', return_value=single_response) as document_post:
             stored = upsert_memory_embedding(
                 self.campaign,
                 'fact',
@@ -1695,7 +1702,54 @@ class DmToolsTest(unittest.TestCase):
                 {'id': 'new_embedding_fact', 'text': 'A newly documented fact.', 'visibility': 'party_known'},
             )
         self.assertTrue(stored['ok'])
-        self.assertEqual(document_post.call_args.kwargs['json']['taskType'], 'RETRIEVAL_DOCUMENT')
+        self.assertNotIn('taskType', document_post.call_args.kwargs['json'])
+        sent_text = document_post.call_args.kwargs['json']['content']['parts'][0]['text']
+        self.assertIn('title: none | text:', sent_text)
+        self.assertIn('A newly documented fact.', sent_text)
+
+    def test_gemini_embedding_2_payload_contract(self):
+        """Provider-contract test: gemini-embedding-2 rejects taskType, requires formatted text."""
+        query_response = Mock()
+        query_response.json.return_value = {
+            'embedding': {'values': [0.5, 0.5]},
+        }
+        single_response = Mock()
+        single_response.json.return_value = {
+            'embedding': {'values': [0.5, 0.5]},
+        }
+        with patch.dict(os.environ, {
+            'GEMINI_EMBEDDINGS_ENABLED': 'true',
+            'GEMINI_API_KEY': 'test-key',
+            'GEMINI_EMBEDDING_MODEL': 'gemini-embedding-2',
+            'GEMINI_EMBEDDING_DIMENSIONS': '768',
+        }, clear=False), \
+                patch('services.embedding_service.requests.post', return_value=query_response) as post:
+            result = search_memory_embeddings(
+                self.campaign, 'Who is the Black Harbinger?',
+                candidates=[], limit=5,
+            )
+        self.assertTrue(result['ok'])
+        sent_text = post.call_args.kwargs['json']['content']['parts'][0]['text']
+        self.assertIn('task: search result | query:', sent_text)
+        self.assertIn('Who is the Black Harbinger?', sent_text)
+        self.assertNotIn('taskType', post.call_args.kwargs['json'])
+
+        with patch.dict(os.environ, {
+            'GEMINI_EMBEDDINGS_ENABLED': 'true',
+            'GEMINI_API_KEY': 'test-key',
+            'GEMINI_EMBEDDING_MODEL': 'gemini-embedding-2',
+            'GEMINI_EMBEDDING_DIMENSIONS': '768',
+        }, clear=False), \
+                patch('services.embedding_service.requests.post', return_value=single_response) as doc_post:
+            result = find_duplicate_graph_item(
+                self.campaign, 'entity',
+                {'id': 'dup_test', 'name': 'Test Entity', 'type': 'person', 'summary': 'A test entity.', 'visibility': 'public'},
+            )
+        self.assertTrue(result['ok'])
+        sent_text = doc_post.call_args.kwargs['json']['content']['parts'][0]['text']
+        self.assertIn('title: none | text:', sent_text)
+        self.assertIn('Test Entity', sent_text)
+        self.assertNotIn('taskType', doc_post.call_args.kwargs['json'])
 
     def test_party_known_clock_embedding_omits_private_completion_fields(self):
         clock_text = canonical_text_for_item('clock', {

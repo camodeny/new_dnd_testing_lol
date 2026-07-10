@@ -266,7 +266,8 @@ class RunAutomationWorkerTests(unittest.TestCase):
         self.assertTrue(finished)
         pause_mock.assert_called_once()
         self.assertEqual(pause_mock.call_args[0][4], 'after_dm')
-        complete_mock.assert_not_called()
+        complete_mock.assert_called_once()
+        self.assertEqual(complete_mock.call_args.kwargs['status'], 'stopped')
 
     def test_resolved_dm_on_startup_with_existing_after_dm_cycle(self):
         args = SimpleNamespace(
@@ -387,7 +388,8 @@ class RunAutomationWorkerTests(unittest.TestCase):
         self.assertTrue(finished)
         pause_mock.assert_called_once()
         self.assertEqual(pause_mock.call_args[0][4], 'after_dm')
-        complete_mock.assert_not_called()
+        complete_mock.assert_called_once()
+        self.assertEqual(complete_mock.call_args.kwargs['status'], 'stopped')
 
     def test_silent_empty_dm_matching_by_player_message_id(self):
         args = SimpleNamespace(
@@ -574,7 +576,82 @@ class RunAutomationWorkerTests(unittest.TestCase):
         pause_mock.assert_called_once()
         self.assertEqual(pause_mock.call_args[0][4], 'after_dm')
         overseer_mock.assert_not_called()
-        complete_mock.assert_not_called()
+        complete_mock.assert_called_once()
+        self.assertEqual(complete_mock.call_args.kwargs['status'], 'stopped')
+
+
+    def test_stop_during_audit_finalizes_as_stopped(self):
+        """Regression: stopping a run during audit review must finalize as stopped, not leave it as stop_requested."""
+        args = SimpleNamespace(
+            api_base='http://127.0.0.1:5889',
+            owner_api_key='owner-key',
+            worker_id='test-worker',
+            max_minutes=None,
+            idle_timeout=180.0,
+            heartbeat_interval=999.0,
+            poll_interval=0.01,
+            max_turns=50,
+            dm_response_timeout=60.0,
+            model='test-model',
+        )
+        claim_payload = {
+            'run': {'id': 2, 'attempt_count': 1, 'runner_config': {'audit_pause_phases': ['after_dm']}},
+            'lease_token': 'lease-1',
+            'derived_campaign': {'id': 100003},
+            'roster': [
+                {
+                    'llm_player_id': 33,
+                    'user_id': 35,
+                    'label': 'Test Player',
+                    'character_name': 'Kaelen Shadowstep',
+                    'derived_character_id': 38,
+                },
+            ],
+        }
+        initial_session = {
+            'id': 4,
+            'is_active': True,
+            'started_at': '2026-07-01T15:58:50.044971',
+            'messages': [
+                {'id': 410, 'role': 'dm', 'content': 'Opening scene.', 'created_at': '2026-07-01T15:59:05.608343'},
+            ],
+        }
+
+        monotonic_values = [0.0] * 20
+        monotonic_iter = iter(monotonic_values)
+
+        with patch.object(worker, 'claim_run', return_value=claim_payload), \
+                patch.object(worker, 'build_manifest_for_run', return_value={'campaign': {'id': 100003}}), \
+                patch.object(worker, 'append_event'), \
+                patch.object(worker, 'request_overseer_decision', return_value={'action': 'choose_player', 'llm_player_id': 33}), \
+                patch.object(worker, 'api_get', side_effect=[{'world': {}}, {'campaign': {'id': 100003}}]), \
+                patch.object(worker, 'fetch_campaign_characters', return_value=[{'id': 38, 'name': 'Kaelen Shadowstep'}]), \
+                patch.object(worker, 'request_player_decision', return_value=(
+                    {'action': 'speak', 'content': 'Kaelen asks about the patrols.'},
+                    '{"action":"speak"}',
+                    0,
+                    'opencode_go',
+                    'deepseek-v4-flash',
+                )), \
+                patch.object(worker, 'submit_decision', return_value={'message': {'id': 411}}), \
+                patch.object(worker, 'wait_for_dm_response', return_value=(
+                    {'status': 'speak', 'player_message_id': 411, 'dm_message_id': 412},
+                    False,
+                )), \
+                patch.object(worker, 'pause_for_audit_if_needed', side_effect=[(False, 'lease-1'), (True, 'lease-1')]) as pause_mock, \
+                patch.object(worker, 'fetch_run', side_effect=[
+                    {'run': {'status': 'running'}, 'latest_session': initial_session},
+                    {'run': {'status': 'running'}, 'latest_session': initial_session},
+                ]), \
+                patch.object(worker, 'complete_run') as complete_run_mock, \
+                patch.object(worker.time, 'sleep'), \
+                patch.object(worker.time, 'monotonic', side_effect=lambda: next(monotonic_iter, 0.0)):
+            finished = worker.execute_run(args, 2)
+
+        self.assertTrue(finished)
+        self.assertEqual(pause_mock.call_count, 2)
+        complete_run_mock.assert_called_once()
+        self.assertEqual(complete_run_mock.call_args.kwargs['status'], 'stopped')
 
 
 if __name__ == '__main__':
