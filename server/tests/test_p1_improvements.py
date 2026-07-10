@@ -909,5 +909,63 @@ class P1ImprovementsTest(unittest.TestCase):
         unresolved = compiled.get('unresolved_items', [])
         self.assertTrue(any(u.get('kind') == 'npc_relationship_target' for u in unresolved))
 
+    def test_noid_entity_by_name_same_patch_resolution(self):
+        memory_context = {'campaign_id': self.campaign.id}
+        extracted = {}
+        resolved = {
+            'upsert_graph_entities': [
+                {
+                    'name': 'Gundren Rockseeker',
+                    'type': 'npc'
+                }
+            ],
+            'update_npc_actors': [
+                {
+                    'actor_ref': 'Gundren Rockseeker',
+                    'role': 'Patron'
+                }
+            ],
+            'upsert_graph_relations': [
+                {
+                    'type': 'allied_with',
+                    'source_ref': 'Gundren Rockseeker',
+                    'target_ref': 'sildar_hallwinter_canonical',
+                    'summary': 'Allied'
+                }
+            ]
+        }
+
+        # Seed canonical sildar entity and NPCActor
+        self.world.knowledge_graph = '{"entities":[{"id":"sildar_hallwinter_canonical","type":"npc","name":"Sildar Hallwinter"}],"relations":[],"facts":[]}'
+        db.session.add(self.world)
+        sildar = NPCActor(campaign_id=self.campaign.id, actor_id='sildar_hallwinter_canonical', name='Sildar', public_summary='Warrior', dossier='{}')
+        db.session.add(sildar)
+
+        # Seed NPCActor for the new gundren generated ID so persistence passes
+        gundren = NPCActor(campaign_id=self.campaign.id, actor_id='gundren_rockseeker', name='Gundren', public_summary='Dwarf', dossier='{}')
+        db.session.add(gundren)
+        db.session.commit()
+
+        compiled = compile_staged_memory_patch(memory_context, extracted, resolved)
+
+        # Verify compilation remapped the no-ID entity by name
+        entities = compiled.get('upsert_graph_entities', [])
+        self.assertEqual(len(entities), 1)
+        self.assertEqual(entities[0]['id'], 'gundren_rockseeker')
+
+        npcs = compiled.get('update_npc_actors', [])
+        self.assertEqual(len(npcs), 1)
+        self.assertEqual(npcs[0]['id'], 'gundren_rockseeker')
+
+        rels = compiled.get('upsert_graph_relations', [])
+        self.assertEqual(len(rels), 1)
+        self.assertEqual(rels[0]['source_id'], 'gundren_rockseeker')
+        self.assertEqual(rels[0]['target_id'], 'sildar_hallwinter_canonical')
+
+        # Run persistence to verify it applies fully
+        res = apply_memory_patch(self.campaign, self.session, compiled)
+        self.assertEqual(len(res['npc_changes']), 1)
+        self.assertEqual(res['npc_changes'][0]['npc_actor']['actor_id'], 'gundren_rockseeker')
+
 if __name__ == '__main__':
     unittest.main()

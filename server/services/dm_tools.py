@@ -524,7 +524,7 @@ def _normalize_memory_event_patch(item):
         'summary': _coerce_patch_text(item.get('summary'), 1200, default='Session memory updated.'),
         'payload': item.get('payload') if isinstance(item.get('payload'), dict) else {},
     }
-    return _apply_memory_item_metadata(clean_item, item, include_memory_type=False)
+    return _apply_memory_item_metadata(clean_item, item, include_memory_type=True)
 
 
 def _normalize_memory_patch(patch):

@@ -677,6 +677,8 @@ def compile_staged_memory_patch(memory_context, extracted, resolved):
         if raw_id:
             patch_entity_id_remaps[raw_id] = entity_id
             patch_entity_id_remaps[raw_id.lower()] = entity_id
+        patch_entity_id_remaps[entity_id] = entity_id
+        patch_entity_id_remaps[clean_id(name, '')] = entity_id
         patch_entity_id_remaps[name.lower()] = entity_id
         patch_created_entity_ids.add(entity_id)
         
@@ -707,8 +709,8 @@ def compile_staged_memory_patch(memory_context, extracted, resolved):
         if not isinstance(raw_rel, dict):
             continue
         rel_type = clean_id(raw_rel.get('type'), '')
-        raw_source = clean_id(raw_rel.get('source_id') or raw_rel.get('source_ref'), '')
-        raw_target = clean_id(raw_rel.get('target_id') or raw_rel.get('target_ref'), '')
+        raw_source = raw_rel.get('source_id') or raw_rel.get('source_ref') or ''
+        raw_target = raw_rel.get('target_id') or raw_rel.get('target_ref') or ''
         source_id = resolve_ref(raw_source)
         target_id = resolve_ref(raw_target)
         
@@ -762,7 +764,7 @@ def compile_staged_memory_patch(memory_context, extracted, resolved):
     for index, raw_npc in enumerate(raw_npc_updates):
         if not isinstance(raw_npc, dict):
             continue
-        raw_actor_id = clean_id(raw_npc.get('id') or raw_npc.get('actor_id') or raw_npc.get('actor_ref'), '')
+        raw_actor_id = raw_npc.get('id') or raw_npc.get('actor_id') or raw_npc.get('actor_ref') or ''
         actor_id = resolve_ref(raw_actor_id)
         
         is_known = actor_id in known['npc_ids'] or actor_id in patch_created_npc_ids
@@ -847,6 +849,7 @@ def compile_staged_memory_patch(memory_context, extracted, resolved):
             'importance': _normalize_importance(raw_event.get('importance')),
             'expires_or_retire_condition': clean_text(raw_event.get('expires_or_retire_condition'), 520) or None,
             'reason': clean_text(raw_event.get('reason'), 420) or 'Resolved staged event record.',
+            'memory_type': 'fact',
             'provenance': make_provenance(raw_event, default_tool='session_memory_record_event'),
             'resolution_mode': raw_event.get('resolution_mode') or 'direct'
         })

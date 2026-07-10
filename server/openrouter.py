@@ -4011,6 +4011,7 @@ def build_session_memory_extractor_messages(memory_context):
                             'importance': 3,
                             'reason': 'why this event is recorded',
                             'expires_or_retire_condition': None,
+                            'memory_type': 'fact',
                         }
                     ],
                 },
