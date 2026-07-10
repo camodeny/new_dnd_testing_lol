@@ -1139,7 +1139,7 @@ class DmToolsTest(unittest.TestCase):
             def json(self):
                 return {'data': [{'b64_json': base64.b64encode(image_bytes).decode('ascii')}]}
 
-        def dm_response(_hot_context, _recent_messages, _tools, execute_tool, audit_context=None):
+        def dm_response(_hot_context, _recent_messages, _tools, execute_tool, audit_context=None, **kwargs):
             execute_tool(
                 'create_encounter_map',
                 {
@@ -2122,6 +2122,8 @@ class DmToolsTest(unittest.TestCase):
         self.assertEqual(result, {
             'mode': 'speak',
             'content': 'The rung shudders beneath you. The landing remains within reach, but the ladder is failing fast. What do you do?',
+            'commit_action_ids': [],
+            '_pending_actions': [],
         })
         repair_messages = post_chat.call_args_list[1].args[0]
         self.assertIn('repair unsafe visible Dungeon Master replies', repair_messages[0]['content'])
@@ -2469,6 +2471,8 @@ class DmToolsTest(unittest.TestCase):
         self.assertEqual(result, {
             'mode': 'speak',
             'content': 'The constable snaps her truncheon up as you rush in. Roll initiative.',
+            'commit_action_ids': [],
+            '_pending_actions': [],
         })
         retry_prompt = post_chat.call_args_list[1].args[0][-1]['content']
         self.assertIn('required D&D mechanics', retry_prompt)
@@ -3100,7 +3104,12 @@ class DmToolsTest(unittest.TestCase):
                 max_tool_rounds=0,
             )
 
-        self.assertEqual(result, {'mode': 'speak', 'content': 'Rain slicks the old stones.'})
+        self.assertEqual(result, {
+            'mode': 'speak',
+            'content': 'Rain slicks the old stones.',
+            'commit_action_ids': [],
+            '_pending_actions': [],
+        })
         self.assertFalse(post_chat.call_args.kwargs['allow_thinking'])
 
     def test_session_preflight_thinking_off_upgrades_after_tool_call(self):
@@ -3139,7 +3148,12 @@ class DmToolsTest(unittest.TestCase):
                 max_tool_rounds=1,
             )
 
-        self.assertEqual(result, {'mode': 'speak', 'content': 'Your AC is 15.'})
+        self.assertEqual(result, {
+            'mode': 'speak',
+            'content': 'Your AC is 15.',
+            'commit_action_ids': [],
+            '_pending_actions': [],
+        })
         self.assertFalse(post_chat.call_args_list[0].kwargs['allow_thinking'])
         self.assertTrue(post_chat.call_args_list[1].kwargs['allow_thinking'])
 
