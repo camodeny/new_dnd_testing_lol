@@ -266,7 +266,7 @@ def _log(campaign_id, event_type, summary, payload=None, audit_context=None):
     )
 
 
-def embedding_from_text(campaign_id, text, audit_context=None, reason='embedding_request', task_type='RETRIEVAL_QUERY'):
+def embedding_from_text(campaign_id, text, audit_context=None, reason='embedding_request'):
     model = embedding_model()
     dimensions = embedding_dimensions()
     try:
@@ -299,7 +299,7 @@ def embedding_from_text(campaign_id, text, audit_context=None, reason='embedding
         }
 
 
-def embeddings_from_texts(campaign_id, texts, audit_context=None, reason='embedding_batch_request', task_type='RETRIEVAL_QUERY'):
+def embeddings_from_texts(campaign_id, texts, audit_context=None, reason='embedding_batch_request'):
     model = embedding_model()
     dimensions = embedding_dimensions()
     try:
