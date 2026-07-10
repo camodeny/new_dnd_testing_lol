@@ -612,6 +612,167 @@ def compile_staged_memory_patch(memory_context, extracted, resolved):
     if departed_npc_ids:
         compiled_scene['departed_npc_ids'] = departed_npc_ids
 
+    # Track entity IDs created in this patch to resolve relations and NPC updates
+    patch_created_entity_ids = set()
+    patch_created_npc_ids = set()
+
+    # 1. Compile Entity Upserts
+    accepted_entities = []
+    raw_entities = resolved.get('upsert_graph_entities') if isinstance(resolved.get('upsert_graph_entities'), list) else []
+    for index, raw_entity in enumerate(raw_entities):
+        if not isinstance(raw_entity, dict):
+            continue
+        name = clean_text(raw_entity.get('name'), 160)
+        if not name:
+            continue
+        entity_id = clean_id(raw_entity.get('id') or raw_entity.get('entity_id'), '')
+        
+        is_known = entity_id in known['entity_ids']
+        if not entity_id or not is_known:
+            if not entity_id:
+                entity_id = clean_id(name.lower().replace(' ', '_'), '') or f"entity_{index + 1}"
+            resolution_mode = 'direct'
+        else:
+            resolution_mode = 'canonical'
+            
+        patch_created_entity_ids.add(entity_id)
+        
+        entity_type = clean_text(raw_entity.get('type'), 40).lower() or 'other'
+        if entity_type in ('npc', 'person'):
+            patch_created_npc_ids.add(entity_id)
+
+        accepted_entities.append({
+            'id': entity_id,
+            'name': name,
+            'type': entity_type,
+            'summary': clean_text(raw_entity.get('summary'), 500) or None,
+            'tags': [clean_text(t, 40) for t in raw_entity.get('tags') if clean_text(t, 40)] if isinstance(raw_entity.get('tags'), list) else [],
+            'visibility': _normalize_visibility(raw_entity.get('source_surface'), raw_entity.get('intended_visibility')),
+            'certainty': _normalize_certainty(raw_entity.get('certainty')),
+            'importance': _normalize_importance(raw_entity.get('importance')),
+            'expires_or_retire_condition': clean_text(raw_entity.get('expires_or_retire_condition'), 520) or None,
+            'reason': clean_text(raw_entity.get('reason'), 420) or 'Resolved staged memory entity.',
+            'memory_type': 'entity',
+            'provenance': make_provenance(raw_entity, default_tool='get_entity_candidates'),
+            'resolution_mode': raw_entity.get('resolution_mode') or resolution_mode
+        })
+
+    # 2. Compile Relation Upserts
+    accepted_relations = []
+    raw_relations = resolved.get('upsert_graph_relations') if isinstance(resolved.get('upsert_graph_relations'), list) else []
+    for index, raw_rel in enumerate(raw_relations):
+        if not isinstance(raw_rel, dict):
+            continue
+        rel_type = clean_id(raw_rel.get('type'), '')
+        source_id = clean_id(raw_rel.get('source_id') or raw_rel.get('source_ref'), '')
+        target_id = clean_id(raw_rel.get('target_id') or raw_rel.get('target_ref'), '')
+        
+        all_valid_entities = known['entity_ids'] | patch_created_entity_ids
+        source_ok = source_id in all_valid_entities
+        target_ok = target_id in all_valid_entities
+        
+        if not source_id or not target_id or not rel_type or not source_ok or not target_ok:
+            unresolved_endpoints = []
+            if not source_ok:
+                unresolved_endpoints.append(source_id or 'missing_source')
+            if not target_ok:
+                unresolved_endpoints.append(target_id or 'missing_target')
+                
+            unresolved.append({
+                'kind': 'relation',
+                'type': rel_type,
+                'source_id': source_id,
+                'target_id': target_id,
+                'reason': 'unresolved_relation_endpoints',
+                'unresolved_endpoints': unresolved_endpoints,
+                'provenance': make_provenance(raw_rel),
+                'resolution_mode': 'unresolved'
+            })
+            continue
+            
+        rel_id = clean_id(raw_rel.get('id'), '')
+        accepted_relations.append({
+            'id': rel_id or f'relation_{index + 1}',
+            'type': rel_type,
+            'source_id': source_id,
+            'target_id': target_id,
+            'summary': clean_text(raw_rel.get('summary'), 500) or None,
+            'visibility': _normalize_visibility(raw_rel.get('source_surface'), raw_rel.get('intended_visibility')),
+            'certainty': _normalize_certainty(raw_rel.get('certainty')),
+            'importance': _normalize_importance(raw_rel.get('importance')),
+            'expires_or_retire_condition': clean_text(raw_rel.get('expires_or_retire_condition'), 520) or None,
+            'reason': clean_text(raw_rel.get('reason'), 420) or 'Resolved staged memory relation.',
+            'memory_type': 'relation',
+            'provenance': make_provenance(raw_rel, default_tool='get_entity_candidates'),
+            'resolution_mode': raw_rel.get('resolution_mode') or 'canonical'
+        })
+
+    # 3. Compile NPC Actor Updates
+    accepted_npc_updates = []
+    raw_npc_updates = resolved.get('update_npc_actors') if isinstance(resolved.get('update_npc_actors'), list) else []
+    for index, raw_npc in enumerate(raw_npc_updates):
+        if not isinstance(raw_npc, dict):
+            continue
+        actor_id = clean_id(raw_npc.get('id') or raw_npc.get('actor_id') or raw_npc.get('actor_ref'), '')
+        
+        is_known = actor_id in known['npc_ids'] or actor_id in patch_created_npc_ids
+        if not actor_id or not is_known:
+            unresolved.append({
+                'kind': 'npc_actor',
+                'actor_id': actor_id or 'missing_actor_id',
+                'reason': 'unknown_npc_id',
+                'provenance': make_provenance(raw_npc),
+                'resolution_mode': 'unresolved'
+            })
+            continue
+            
+        npc_data = {
+            'id': actor_id,
+            'actor_id': actor_id,
+            'name': clean_text(raw_npc.get('name'), 200) or None,
+            'role': clean_text(raw_npc.get('role'), 200) or None,
+            'public_summary': clean_text(raw_npc.get('public_summary'), 420) or None,
+            'voice': clean_text(raw_npc.get('voice'), 240) or None,
+            'background': clean_text(raw_npc.get('background'), 700) or None,
+            'certainty': _normalize_certainty(raw_npc.get('certainty')),
+            'importance': _normalize_importance(raw_npc.get('importance')),
+            'reason': clean_text(raw_npc.get('reason'), 420) or 'Resolved staged NPC actor update.',
+            'provenance': make_provenance(raw_npc, default_tool='get_npcs'),
+            'resolution_mode': raw_npc.get('resolution_mode') or 'canonical'
+        }
+        for field, max_items, limit in (
+            ('wants', 6, 180),
+            ('fears', 6, 180),
+            ('secrets', 8, 240),
+        ):
+            values = raw_npc.get(field)
+            if isinstance(values, list):
+                npc_data[field] = [clean_text(v, limit) for v in values if clean_text(v, limit)]
+        
+        npc_data = {k: v for k, v in npc_data.items() if v is not None}
+        accepted_npc_updates.append(npc_data)
+
+    # 4. Compile World Event Records
+    accepted_events = []
+    raw_events = resolved.get('record_events') if isinstance(resolved.get('record_events'), list) else []
+    for raw_event in raw_events:
+        if not isinstance(raw_event, dict):
+            continue
+        summary = clean_text(raw_event.get('summary'), 1200) or 'Session memory updated.'
+        accepted_events.append({
+            'event_type': clean_text(raw_event.get('event_type'), 80) or 'session_memory',
+            'summary': summary,
+            'payload': raw_event.get('payload') if isinstance(raw_event.get('payload'), dict) else {},
+            'visibility': _normalize_visibility(raw_event.get('source_surface'), raw_event.get('intended_visibility')),
+            'certainty': _normalize_certainty(raw_event.get('certainty')),
+            'importance': _normalize_importance(raw_event.get('importance')),
+            'expires_or_retire_condition': clean_text(raw_event.get('expires_or_retire_condition'), 520) or None,
+            'reason': clean_text(raw_event.get('reason'), 420) or 'Resolved staged event record.',
+            'provenance': make_provenance(raw_event, default_tool='session_memory_record_event'),
+            'resolution_mode': raw_event.get('resolution_mode') or 'direct'
+        })
+
+    # 5. Compile Facts
     accepted_facts = []
     skipped_facts = []
     raw_facts = resolved.get('upsert_graph_facts') if isinstance(resolved.get('upsert_graph_facts'), list) else []
@@ -628,7 +789,7 @@ def compile_staged_memory_patch(memory_context, extracted, resolved):
             entity_id = clean_id(raw_entity_id, '')
             if not entity_id:
                 continue
-            if entity_id in known['entity_ids'] and entity_id not in entity_ids:
+            if (entity_id in known['entity_ids'] or entity_id in patch_created_entity_ids) and entity_id not in entity_ids:
                 entity_ids.append(entity_id)
             else:
                 unknown_entity_ids.append(entity_id)
@@ -701,13 +862,13 @@ def compile_staged_memory_patch(memory_context, extracted, resolved):
             resolved.get('scene_reason') or extracted.get('scene_reason'),
             420,
         ) or None,
-        'upsert_graph_entities': [],
-        'upsert_graph_relations': [],
+        'upsert_graph_entities': accepted_entities,
+        'upsert_graph_relations': accepted_relations,
         'upsert_graph_facts': accepted_facts,
         'create_clocks': create_clocks,
         'retire_clocks': retire_clocks,
-        'update_npc_actors': [],
-        'record_events': [],
+        'update_npc_actors': accepted_npc_updates,
+        'record_events': accepted_events,
         'unresolved_items': unresolved,
         'compile_summary': {
             'accepted_fact_count': len(accepted_facts),

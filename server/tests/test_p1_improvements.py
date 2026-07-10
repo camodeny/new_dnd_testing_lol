@@ -417,5 +417,241 @@ class P1ImprovementsTest(unittest.TestCase):
         self.assertNotIn('provenance', current_scene)
         self.assertNotIn('resolution_mode', current_scene)
 
+    def test_staged_entity_upsert_survives_compilation(self):
+        memory_context = {'campaign_id': self.campaign.id}
+        extracted = {}
+        resolved = {
+            'upsert_graph_entities': [
+                {
+                    'id': 'gundren_rockseeker',
+                    'name': 'Gundren Rockseeker',
+                    'type': 'npc',
+                    'summary': 'A dwarf patron.',
+                    'tags': ['dwarf', 'patron'],
+                    'certainty': 'confirmed',
+                    'importance': 4,
+                    'intended_visibility': 'party_known',
+                    'source_surface': 'visible_transcript',
+                    'reason': 'Introduced by DM.',
+                    'provenance': {'evidence_basis': ['Dwarf named Gundren']}
+                }
+            ]
+        }
+        compiled = compile_staged_memory_patch(memory_context, extracted, resolved)
+        entities = compiled.get('upsert_graph_entities', [])
+        self.assertEqual(len(entities), 1)
+        ent = entities[0]
+        self.assertEqual(ent['id'], 'gundren_rockseeker')
+        self.assertEqual(ent['name'], 'Gundren Rockseeker')
+        self.assertEqual(ent['type'], 'npc')
+        self.assertEqual(ent['summary'], 'A dwarf patron.')
+        self.assertEqual(ent['importance'], 4)
+        self.assertEqual(ent['certainty'], 'confirmed')
+        self.assertEqual(ent['visibility'], 'party_known')
+        self.assertEqual(ent['provenance']['evidence_basis'], ['Dwarf named Gundren'])
+
+    def test_staged_relation_valid_endpoints_survives(self):
+        # Entity already in KG
+        self.world.knowledge_graph = '{"entities":[{"id":"phandalin","type":"location","name":"Phandalin"}],"relations":[],"facts":[]}'
+        db.session.add(self.world)
+        db.session.commit()
+
+        memory_context = {'campaign_id': self.campaign.id}
+        extracted = {}
+        resolved = {
+            'upsert_graph_entities': [
+                {
+                    'id': 'stonehill_inn',
+                    'name': 'Stonehill Inn',
+                    'type': 'location'
+                }
+            ],
+            'upsert_graph_relations': [
+                {
+                    'type': 'located_in',
+                    'source_ref': 'stonehill_inn', # created in same patch
+                    'target_ref': 'phandalin',     # exists in campaign world
+                    'summary': 'The Inn is located in Phandalin.',
+                    'certainty': 'confirmed',
+                    'importance': 3,
+                    'provenance': {'evidence_basis': ['Located in Phandalin.']}
+                }
+            ]
+        }
+        compiled = compile_staged_memory_patch(memory_context, extracted, resolved)
+        relations = compiled.get('upsert_graph_relations', [])
+        self.assertEqual(len(relations), 1)
+        rel = relations[0]
+        self.assertEqual(rel['source_id'], 'stonehill_inn')
+        self.assertEqual(rel['target_id'], 'phandalin')
+        self.assertEqual(rel['type'], 'located_in')
+        self.assertEqual(rel['provenance']['evidence_basis'], ['Located in Phandalin.'])
+
+    def test_staged_relation_unresolved_endpoint_rejected(self):
+        memory_context = {'campaign_id': self.campaign.id}
+        extracted = {}
+        resolved = {
+            'upsert_graph_relations': [
+                {
+                    'type': 'located_in',
+                    'source_ref': 'unknown_inn',
+                    'target_ref': 'unknown_town',
+                    'provenance': {'evidence_basis': ['Some proof.']}
+                }
+            ]
+        }
+        compiled = compile_staged_memory_patch(memory_context, extracted, resolved)
+        self.assertEqual(len(compiled.get('upsert_graph_relations', [])), 0)
+        unresolved = compiled.get('unresolved_items', [])
+        self.assertEqual(len(unresolved), 1)
+        self.assertEqual(unresolved[0]['kind'], 'relation')
+        self.assertEqual(unresolved[0]['reason'], 'unresolved_relation_endpoints')
+        self.assertIn('unknown_inn', unresolved[0]['unresolved_endpoints'])
+
+    def test_staged_npc_update_valid_survives(self):
+        # Known NPC in DB
+        npc = NPCActor(campaign_id=self.campaign.id, actor_id='sildar_hallwinter', name='Sildar Hallwinter', public_summary='A human warrior.', dossier='{}')
+        db.session.add(npc)
+        db.session.commit()
+
+        # Check update to existing NPC, and check update to new NPC created in the same patch
+        memory_context = {'campaign_id': self.campaign.id}
+        extracted = {}
+        resolved = {
+            'upsert_graph_entities': [
+                {
+                    'id': 'gundren_rockseeker',
+                    'name': 'Gundren Rockseeker',
+                    'type': 'npc'
+                }
+            ],
+            'update_npc_actors': [
+                {
+                    'actor_ref': 'sildar_hallwinter',
+                    'role': 'Member of Lord\'s Alliance',
+                    'voice': 'Gruff'
+                },
+                {
+                    'actor_ref': 'gundren_rockseeker', # created in same patch
+                    'role': 'Patron dwarf'
+                }
+            ]
+        }
+        compiled = compile_staged_memory_patch(memory_context, extracted, resolved)
+        npcs = compiled.get('update_npc_actors', [])
+        self.assertEqual(len(npcs), 2)
+        sildar = next(n for n in npcs if n['id'] == 'sildar_hallwinter')
+        gundren = next(n for n in npcs if n['id'] == 'gundren_rockseeker')
+        self.assertEqual(sildar['role'], 'Member of Lord\'s Alliance')
+        self.assertEqual(sildar['voice'], 'Gruff')
+        self.assertEqual(gundren['role'], 'Patron dwarf')
+
+    def test_staged_npc_update_unknown_rejected(self):
+        memory_context = {'campaign_id': self.campaign.id}
+        extracted = {}
+        resolved = {
+            'update_npc_actors': [
+                {
+                    'actor_ref': 'unknown_npc_id',
+                    'role': 'Rogue'
+                }
+            ]
+        }
+        compiled = compile_staged_memory_patch(memory_context, extracted, resolved)
+        self.assertEqual(len(compiled.get('update_npc_actors', [])), 0)
+        unresolved = compiled.get('unresolved_items', [])
+        self.assertEqual(len(unresolved), 1)
+        self.assertEqual(unresolved[0]['kind'], 'npc_actor')
+        self.assertEqual(unresolved[0]['actor_id'], 'unknown_npc_id')
+
+    def test_staged_world_event_survives(self):
+        memory_context = {'campaign_id': self.campaign.id}
+        extracted = {}
+        resolved = {
+            'record_events': [
+                {
+                    'event_type': 'combat_started',
+                    'summary': 'The party engaged Goblins.',
+                    'payload': {'enemy': 'goblin', 'count': 4},
+                    'source_surface': 'visible_transcript',
+                    'intended_visibility': 'public'
+                }
+            ]
+        }
+        compiled = compile_staged_memory_patch(memory_context, extracted, resolved)
+        events = compiled.get('record_events', [])
+        self.assertEqual(len(events), 1)
+        ev = events[0]
+        self.assertEqual(ev['event_type'], 'combat_started')
+        self.assertEqual(ev['summary'], 'The party engaged Goblins.')
+        self.assertEqual(ev['payload'], {'enemy': 'goblin', 'count': 4})
+        self.assertEqual(ev['visibility'], 'public')
+        self.assertEqual(ev['provenance']['tool_name'], 'session_memory_record_event')
+
+    def test_missing_campaign_path_safe(self):
+        memory_context = {'campaign_id': None}
+        extracted = {'running_summary': 'No campaign summary'}
+        resolved = {}
+        compiled = compile_staged_memory_patch(memory_context, extracted, resolved)
+        self.assertEqual(compiled['running_summary'], 'No campaign summary')
+        self.assertEqual(len(compiled['unresolved_items']), 1)
+        self.assertEqual(compiled['unresolved_items'][0]['reason'], 'missing_campaign')
+
+    def test_persistence_applies_new_mutations(self):
+        # Known NPC in DB
+        npc = NPCActor(campaign_id=self.campaign.id, actor_id='sildar_hallwinter', name='Sildar Hallwinter', public_summary='A human warrior.', dossier='{}')
+        db.session.add(npc)
+        db.session.commit()
+
+        compiled_patch = {
+            'running_summary': 'New Summary',
+            'upsert_graph_entities': [
+                {
+                    'id': 'gundren_rockseeker',
+                    'name': 'Gundren Rockseeker',
+                    'type': 'npc',
+                    'summary': 'A dwarf patron.'
+                }
+            ],
+            'upsert_graph_relations': [
+                {
+                    'id': 'rel_gundren_sildar',
+                    'type': 'friends',
+                    'source_id': 'gundren_rockseeker',
+                    'target_id': 'sildar_hallwinter',
+                    'summary': 'They are friends.'
+                }
+            ],
+            'update_npc_actors': [
+                {
+                    'id': 'sildar_hallwinter',
+                    'role': 'Warrior member of Lord\'s Alliance'
+                }
+            ],
+            'record_events': [
+                {
+                    'event_type': 'story_beat',
+                    'summary': 'Gundren hired the party.',
+                    'payload': {'gold': 10}
+                }
+            ]
+        }
+        res = apply_memory_patch(self.campaign, self.session, compiled_patch)
+        self.assertTrue(res['running_summary_updated'])
+        self.assertEqual(len(res['graph_changes']), 2) # entity + relation
+        self.assertEqual(len(res['npc_changes']), 1)
+        self.assertEqual(len(res['world_event_ids']), 2) # NPC update records an event, and the manual event record
+
+        # Verify NPC got updated in DB
+        db.session.refresh(npc)
+        self.assertEqual(npc.role, 'Warrior member of Lord\'s Alliance')
+
+        # Verify entity got created in CampaignWorld KG
+        db.session.refresh(self.world)
+        import json
+        kg = json.loads(self.world.knowledge_graph)
+        self.assertTrue(any(e['id'] == 'gundren_rockseeker' for e in kg['entities']))
+        self.assertTrue(any(r['id'] == 'rel_gundren_sildar' for r in kg['relations']))
+
 if __name__ == '__main__':
     unittest.main()
