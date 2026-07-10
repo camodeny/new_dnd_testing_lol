@@ -636,6 +636,7 @@ select.input:focus,
 
 .campaigns-grid {
   display: grid;
+  grid-template-columns: minmax(0, 1fr);
   gap: 0;
   border-top: 1px solid var(--line);
 }
@@ -754,11 +755,15 @@ select.input:focus,
 .campaign-card-inner {
   display: grid;
   min-height: 118px;
-  grid-template-columns: minmax(220px, 0.9fr) minmax(240px, 1.4fr) auto;
+  grid-template-columns: minmax(220px, 0.9fr) minmax(0, 1.4fr) minmax(190px, auto);
   align-items: center;
   gap: 28px;
   padding: 22px 66px 22px 10px;
   color: inherit;
+}
+
+.campaign-card-inner > * {
+  min-width: 0;
 }
 
 .campaign-card-link:focus-visible {
@@ -818,11 +823,30 @@ select.input:focus,
 .campaign-footer {
   display: flex;
   align-items: center;
-  justify-content: flex-end;
+  justify-content: flex-start;
   gap: 12px;
   color: var(--ink-muted);
   font: 600 0.68rem/1.4 var(--mono);
   text-align: right;
+}
+
+.campaign-seed {
+  display: block;
+  min-width: 0;
+  max-width: 15rem;
+  overflow: hidden;
+  padding: 0;
+  border: 0;
+  background: transparent;
+  color: var(--ink-muted);
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.campaign-date {
+  flex: 0 0 auto;
+  margin-left: auto;
+  white-space: nowrap;
 }
 
 .campaign-card-delete-btn {
