@@ -25,7 +25,7 @@ def embeddings_enabled():
 
 
 def embedding_model():
-    return os.environ.get('GEMINI_EMBEDDING_MODEL', 'gemini-embedding-001').strip() or 'gemini-embedding-001'
+    return os.environ.get('GEMINI_EMBEDDING_MODEL', 'gemini-embedding-2').strip() or 'gemini-embedding-2'
 
 
 def embedding_dimensions():
@@ -182,6 +182,14 @@ def _embedding_values(response):
     return []
 
 
+def _embedding_payload(model, text):
+    return {
+        'model': f'models/{model}',
+        'content': {'parts': [{'text': text}]},
+        'outputDimensionality': embedding_dimensions(),
+    }
+
+
 def _post_embedding(text):
     if not embeddings_enabled():
         raise RuntimeError('Gemini embeddings are disabled')
@@ -190,13 +198,7 @@ def _post_embedding(text):
         raise RuntimeError('GEMINI_API_KEY is not set')
 
     model = embedding_model()
-    payload = {
-        'model': f'models/{model}',
-        'content': {'parts': [{'text': text}]},
-        'output_dimensionality': embedding_dimensions(),
-    }
-    if model == 'gemini-embedding-001':
-        payload['taskType'] = 'SEMANTIC_SIMILARITY'
+    payload = _embedding_payload(model, text)
     response = requests.post(
         f'{GEMINI_EMBEDDING_BASE_URL}/models/{model}:embedContent',
         headers={
@@ -211,6 +213,38 @@ def _post_embedding(text):
     if not vector:
         raise RuntimeError('Gemini embedding response did not include values')
     return vector
+
+
+def _post_embeddings(texts):
+    if not embeddings_enabled():
+        raise RuntimeError('Gemini embeddings are disabled')
+    api_key = _api_key()
+    if not api_key:
+        raise RuntimeError('GEMINI_API_KEY is not set')
+
+    cleaned = [clean_text(text, 8000) for text in (texts or [])]
+    if not cleaned or any(not text for text in cleaned):
+        raise RuntimeError('Batch embedding requests require non-empty text.')
+
+    model = embedding_model()
+    response = requests.post(
+        f'{GEMINI_EMBEDDING_BASE_URL}/models/{model}:batchEmbedContents',
+        headers={
+            'Content-Type': 'application/json',
+            'x-goog-api-key': api_key,
+        },
+        json={'requests': [_embedding_payload(model, text) for text in cleaned]},
+        timeout=30,
+    )
+    response.raise_for_status()
+    payload = response.json()
+    embeddings = payload.get('embeddings') if isinstance(payload, dict) else None
+    if not isinstance(embeddings, list) or len(embeddings) != len(cleaned):
+        raise RuntimeError('Gemini batch embedding response did not preserve request order.')
+    vectors = [_normalize_vector(item.get('values') if isinstance(item, dict) else []) for item in embeddings]
+    if any(not vector for vector in vectors):
+        raise RuntimeError('Gemini batch embedding response did not include values.')
+    return vectors
 
 
 def _log(campaign_id, event_type, summary, payload=None, audit_context=None):
@@ -265,6 +299,40 @@ def embedding_from_text(campaign_id, text, audit_context=None, reason='embedding
         }
 
 
+def embeddings_from_texts(campaign_id, texts, audit_context=None, reason='embedding_batch_request'):
+    model = embedding_model()
+    dimensions = embedding_dimensions()
+    try:
+        vectors = _post_embeddings(texts)
+        return {
+            'ok': True,
+            'vectors': vectors,
+            'model': model,
+            'dimensions': len(vectors[0]) if vectors else dimensions,
+        }
+    except Exception as err:
+        _log(
+            campaign_id,
+            'embedding_fallback',
+            'Gemini batch embedding request failed open.',
+            {
+                'reason': reason,
+                'model': model,
+                'configured_dimensions': dimensions,
+                'query_count': len(texts or []),
+                'error': repr(err),
+            },
+            audit_context,
+        )
+        return {
+            'ok': False,
+            'vectors': [],
+            'model': model,
+            'dimensions': dimensions,
+            'error': repr(err),
+        }
+
+
 def _load_vector(row):
     try:
         return json.loads(row.embedding_json)
@@ -276,9 +344,10 @@ def upsert_memory_embedding(campaign, item_type, item_id, value, audit_context=N
     canonical_text = canonical_text_for_item(item_type, value)
     if not canonical_text:
         return {'ok': False, 'reason': 'empty_canonical_text'}
+    wrapping_text = f'title: none | text: {canonical_text}'
     embedding = embedding_result or embedding_from_text(
         campaign.id,
-        canonical_text,
+        wrapping_text,
         audit_context=audit_context,
         reason=f'upsert_{item_type}',
     )
@@ -331,7 +400,7 @@ def find_duplicate_graph_item(campaign, item_type, candidate, audit_context=None
     canonical_text = canonical_text_for_item(item_type, candidate)
     embedding = embedding_from_text(
         campaign.id,
-        canonical_text,
+        f'title: none | text: {canonical_text}',
         audit_context=audit_context,
         reason=f'dedupe_{item_type}',
     )
@@ -379,7 +448,7 @@ def search_memory_embeddings(campaign, query, candidates, limit, audit_context=N
     query = clean_text(query, 800)
     embedding = embedding_from_text(
         campaign.id,
-        query,
+        f'task: search result | query: {query}' if query else query,
         audit_context=audit_context,
         reason='memory_search',
     )
@@ -422,3 +491,61 @@ def search_memory_embeddings(campaign, query, candidates, limit, audit_context=N
         audit_context,
     )
     return {'ok': True, 'scores': scores}
+
+
+def search_memory_embeddings_batch(campaign, queries, candidates, limit=20, audit_context=None):
+    """Return semantic scores for several retrieval queries from one provider request."""
+    normalized = {
+        str(name): clean_text(query, 800)
+        for name, query in (queries or {}).items()
+        if clean_text(query, 800)
+    }
+    if not normalized:
+        return {'ok': True, 'scores_by_query': {}}
+
+    embedding = embeddings_from_texts(
+        campaign.id,
+        [f'task: search result | query: {q}' for q in normalized.values()],
+        audit_context=audit_context,
+        reason='memory_search_batch',
+    )
+    if not embedding['ok']:
+        return {'ok': False, 'scores_by_query': {}, 'reason': embedding.get('error')}
+
+    candidate_keys = {
+        (str(candidate.get('kind')), str(candidate.get('item_id')))
+        for candidate in candidates
+        if candidate.get('item_id') is not None
+    }
+    rows = CampaignMemoryEmbedding.query.filter(
+        CampaignMemoryEmbedding.campaign_id == campaign.id,
+        CampaignMemoryEmbedding.embedding_model == embedding['model'],
+        CampaignMemoryEmbedding.embedding_dimensions == embedding['dimensions'],
+    ).all()
+    row_vectors = {
+        (row.item_type, row.item_id): _load_vector(row)
+        for row in rows
+        if (row.item_type, row.item_id) in candidate_keys
+    }
+    scores_by_query = {}
+    for name, vector in zip(normalized, embedding['vectors']):
+        scores_by_query[name] = {
+            key: cosine_similarity(vector, candidate_vector)
+            for key, candidate_vector in row_vectors.items()
+        }
+
+    _log(
+        campaign.id,
+        'embedding_batch_search',
+        'Searched campaign memory embeddings for several semantic memory queries.',
+        {
+            'model': embedding['model'],
+            'dimensions': embedding['dimensions'],
+            'query_names': list(normalized),
+            'candidate_count': len(candidates),
+            'matched_embedding_count': len(row_vectors),
+            'limit': limit,
+        },
+        audit_context,
+    )
+    return {'ok': True, 'scores_by_query': scores_by_query}

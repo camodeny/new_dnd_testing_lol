@@ -25,6 +25,7 @@ from models import (
     CampaignMonster,
     CampaignSession,
     SessionDmTurn,
+    SheetProposal,
     CampaignWorld,
     Character,
     CharacterCondition,
@@ -63,10 +64,19 @@ from services.dm_tools import (
     apply_memory_patch,
     build_session_hot_context,
     build_session_memory_context,
+    build_session_retrieval_packet,
     context_manifest,
     execute_dm_tool,
 )
-from services.embedding_service import canonical_text_for_item, cosine_similarity
+from services.dm_turn_commit import commit_accepted_dm_turn
+from services.embedding_service import (
+    canonical_text_for_item,
+    cosine_similarity,
+    embeddings_from_texts,
+    find_duplicate_graph_item,
+    search_memory_embeddings,
+    upsert_memory_embedding,
+)
 from services.encounter_map_service import create_labeled_grid_image, detect_grid_from_image
 
 
@@ -94,7 +104,7 @@ def dm_talk_tool_response(content):
                     'id': 'call_final',
                     'function': {
                         'name': 'talk_to_player',
-                        'arguments': json.dumps({'content': content}),
+                        'arguments': json.dumps({'content': content, 'commit_action_ids': []}),
                     },
                 }],
             },
@@ -1129,7 +1139,7 @@ class DmToolsTest(unittest.TestCase):
             def json(self):
                 return {'data': [{'b64_json': base64.b64encode(image_bytes).decode('ascii')}]}
 
-        def dm_response(_hot_context, _recent_messages, _tools, execute_tool, audit_context=None):
+        def dm_response(_hot_context, _recent_messages, _tools, execute_tool, audit_context=None, **kwargs):
             execute_tool(
                 'create_encounter_map',
                 {
@@ -1650,6 +1660,97 @@ class DmToolsTest(unittest.TestCase):
         self.assertIn('burned_symbol', fact_text)
         self.assertIn('confirmed', fact_text)
 
+    def test_embedding_2_uses_retrieval_query_and_document_formatting(self):
+        batch_response = Mock()
+        batch_response.json.return_value = {
+            'embeddings': [
+                {'values': [1.0, 0.0]},
+                {'values': [0.0, 1.0]},
+            ],
+        }
+        with patch.dict(os.environ, {
+            'GEMINI_EMBEDDINGS_ENABLED': 'true',
+            'GEMINI_API_KEY': 'test-key',
+            'GEMINI_EMBEDDING_MODEL': 'gemini-embedding-2',
+            'GEMINI_EMBEDDING_DIMENSIONS': '768',
+        }, clear=False), patch('services.embedding_service.requests.post', return_value=batch_response) as post:
+            result = embeddings_from_texts(self.campaign.id, ['first query', 'second query'])
+
+        self.assertTrue(result['ok'])
+        self.assertEqual(result['vectors'], [[1.0, 0.0], [0.0, 1.0]])
+        self.assertTrue(post.call_args.args[0].endswith('/models/gemini-embedding-2:batchEmbedContents'))
+        requests_payload = post.call_args.kwargs['json']['requests']
+        self.assertEqual([request['content']['parts'][0]['text'] for request in requests_payload], ['first query', 'second query'])
+        for request in requests_payload:
+            self.assertNotIn('taskType', request)
+            self.assertEqual(request['outputDimensionality'], 768)
+
+        single_response = Mock()
+        single_response.json.return_value = {
+            'embedding': {'values': [1.0, 0.0]},
+        }
+        with patch.dict(os.environ, {
+            'GEMINI_EMBEDDINGS_ENABLED': 'true',
+            'GEMINI_API_KEY': 'test-key',
+            'GEMINI_EMBEDDING_MODEL': 'gemini-embedding-2',
+            'GEMINI_EMBEDDING_DIMENSIONS': '768',
+        }, clear=False), patch('services.embedding_service.requests.post', return_value=single_response) as document_post:
+            stored = upsert_memory_embedding(
+                self.campaign,
+                'fact',
+                'new_embedding_fact',
+                {'id': 'new_embedding_fact', 'text': 'A newly documented fact.', 'visibility': 'party_known'},
+            )
+        self.assertTrue(stored['ok'])
+        self.assertNotIn('taskType', document_post.call_args.kwargs['json'])
+        sent_text = document_post.call_args.kwargs['json']['content']['parts'][0]['text']
+        self.assertIn('title: none | text:', sent_text)
+        self.assertIn('A newly documented fact.', sent_text)
+
+    def test_gemini_embedding_2_payload_contract(self):
+        """Provider-contract test: gemini-embedding-2 rejects taskType, requires formatted text."""
+        query_response = Mock()
+        query_response.json.return_value = {
+            'embedding': {'values': [0.5, 0.5]},
+        }
+        single_response = Mock()
+        single_response.json.return_value = {
+            'embedding': {'values': [0.5, 0.5]},
+        }
+        with patch.dict(os.environ, {
+            'GEMINI_EMBEDDINGS_ENABLED': 'true',
+            'GEMINI_API_KEY': 'test-key',
+            'GEMINI_EMBEDDING_MODEL': 'gemini-embedding-2',
+            'GEMINI_EMBEDDING_DIMENSIONS': '768',
+        }, clear=False), \
+                patch('services.embedding_service.requests.post', return_value=query_response) as post:
+            result = search_memory_embeddings(
+                self.campaign, 'Who is the Black Harbinger?',
+                candidates=[], limit=5,
+            )
+        self.assertTrue(result['ok'])
+        sent_text = post.call_args.kwargs['json']['content']['parts'][0]['text']
+        self.assertIn('task: search result | query:', sent_text)
+        self.assertIn('Who is the Black Harbinger?', sent_text)
+        self.assertNotIn('taskType', post.call_args.kwargs['json'])
+
+        with patch.dict(os.environ, {
+            'GEMINI_EMBEDDINGS_ENABLED': 'true',
+            'GEMINI_API_KEY': 'test-key',
+            'GEMINI_EMBEDDING_MODEL': 'gemini-embedding-2',
+            'GEMINI_EMBEDDING_DIMENSIONS': '768',
+        }, clear=False), \
+                patch('services.embedding_service.requests.post', return_value=single_response) as doc_post:
+            result = find_duplicate_graph_item(
+                self.campaign, 'entity',
+                {'id': 'dup_test', 'name': 'Test Entity', 'type': 'person', 'summary': 'A test entity.', 'visibility': 'public'},
+            )
+        self.assertTrue(result['ok'])
+        sent_text = doc_post.call_args.kwargs['json']['content']['parts'][0]['text']
+        self.assertIn('title: none | text:', sent_text)
+        self.assertIn('Test Entity', sent_text)
+        self.assertNotIn('taskType', doc_post.call_args.kwargs['json'])
+
     def test_party_known_clock_embedding_omits_private_completion_fields(self):
         clock_text = canonical_text_for_item('clock', {
             'clock_id': 'party_obligation',
@@ -2021,6 +2122,8 @@ class DmToolsTest(unittest.TestCase):
         self.assertEqual(result, {
             'mode': 'speak',
             'content': 'The rung shudders beneath you. The landing remains within reach, but the ladder is failing fast. What do you do?',
+            'commit_action_ids': [],
+            '_pending_actions': [],
         })
         repair_messages = post_chat.call_args_list[1].args[0]
         self.assertIn('repair unsafe visible Dungeon Master replies', repair_messages[0]['content'])
@@ -2368,6 +2471,8 @@ class DmToolsTest(unittest.TestCase):
         self.assertEqual(result, {
             'mode': 'speak',
             'content': 'The constable snaps her truncheon up as you rush in. Roll initiative.',
+            'commit_action_ids': [],
+            '_pending_actions': [],
         })
         retry_prompt = post_chat.call_args_list[1].args[0][-1]['content']
         self.assertIn('required D&D mechanics', retry_prompt)
@@ -2732,6 +2837,52 @@ class DmToolsTest(unittest.TestCase):
         self.assertEqual(post_chat.call_count, 1)
         self.assertEqual(post_chat.call_args.kwargs['tool_choice'], 'auto')
 
+    def test_plain_text_fallback_is_disabled_after_a_staged_action(self):
+        hot_context = {
+            'protected_player_characters': [],
+            'private_output_terms': [],
+            'private_spoiler_items': [],
+        }
+        staged_tool_call = {
+            'choices': [{
+                'message': {
+                    'content': '',
+                    'tool_calls': [{
+                        'id': 'call_stage',
+                        'function': {
+                            'name': 'record_world_event',
+                            'arguments': json.dumps({'event_type': 'clue', 'summary': 'Preview only.'}),
+                        },
+                    }],
+                },
+            }],
+        }
+
+        def stage_action(_name, _args, audit):
+            audit['pending_action_buffer']['actions'].append({
+                'id': 'pending_action_1',
+                'name': 'record_world_event',
+                'args': {'event_type': 'clue', 'summary': 'Preview only.'},
+            })
+            return {'pending_action_id': 'pending_action_1', 'pending': True}
+
+        with patch('openrouter._post_chat_response', side_effect=[
+            staged_tool_call,
+            {'choices': [{'message': {'content': 'Raw text must not escape after staging.'}}]},
+            {'choices': [{'message': {'content': 'Still raw text.'}}]},
+            {'choices': [{'message': {'content': 'Last raw text.'}}]},
+        ]):
+            result = get_session_dm_response_with_tools(
+                hot_context,
+                [],
+                [{'type': 'function', 'function': {'name': 'record_world_event'}}],
+                stage_action,
+                max_tool_rounds=2,
+            )
+
+        self.assertEqual(result['mode'], 'silent')
+        self.assertIn('valid finalizer', result['reason'])
+
     def test_finalizer_contract_retry_still_rewrites_ooc_label(self):
         hot_context = {
             'protected_player_characters': [],
@@ -2812,6 +2963,7 @@ class DmToolsTest(unittest.TestCase):
                             'name': 'talk_to_player',
                             'arguments': json.dumps({
                                 'content': '<npc target="Brenn">"Green lights by the old willow."</npc>',
+                                'commit_action_ids': [],
                             }),
                         },
                     }],
@@ -2836,6 +2988,39 @@ class DmToolsTest(unittest.TestCase):
             {'talk_to_player', 'stay_silent'},
         )
         execute_tool.assert_not_called()
+
+    def test_session_dm_rejects_finalizer_without_commit_action_ids(self):
+        hot_context = {
+            'protected_player_characters': [],
+            'private_output_terms': [],
+            'private_spoiler_items': [],
+        }
+        malformed_finalizer = {
+            'choices': [{
+                'message': {
+                    'content': '',
+                    'tool_calls': [{
+                        'id': 'call_final',
+                        'function': {
+                            'name': 'talk_to_player',
+                            'arguments': json.dumps({'content': 'This must not commit.'}),
+                        },
+                    }],
+                },
+            }],
+        }
+
+        with patch('openrouter._post_chat_response', return_value=malformed_finalizer):
+            result = get_session_dm_response_with_tools(
+                hot_context,
+                [],
+                [],
+                lambda *_args, **_kwargs: {},
+                max_tool_rounds=0,
+            )
+
+        self.assertEqual(result['mode'], 'silent')
+        self.assertIn('valid finalizer', result['reason'])
 
     def test_session_dm_accepts_stay_silent_finalizer_tool(self):
         hot_context = {
@@ -2919,7 +3104,12 @@ class DmToolsTest(unittest.TestCase):
                 max_tool_rounds=0,
             )
 
-        self.assertEqual(result, {'mode': 'speak', 'content': 'Rain slicks the old stones.'})
+        self.assertEqual(result, {
+            'mode': 'speak',
+            'content': 'Rain slicks the old stones.',
+            'commit_action_ids': [],
+            '_pending_actions': [],
+        })
         self.assertFalse(post_chat.call_args.kwargs['allow_thinking'])
 
     def test_session_preflight_thinking_off_upgrades_after_tool_call(self):
@@ -2958,7 +3148,12 @@ class DmToolsTest(unittest.TestCase):
                 max_tool_rounds=1,
             )
 
-        self.assertEqual(result, {'mode': 'speak', 'content': 'Your AC is 15.'})
+        self.assertEqual(result, {
+            'mode': 'speak',
+            'content': 'Your AC is 15.',
+            'commit_action_ids': [],
+            '_pending_actions': [],
+        })
         self.assertFalse(post_chat.call_args_list[0].kwargs['allow_thinking'])
         self.assertTrue(post_chat.call_args_list[1].kwargs['allow_thinking'])
 
@@ -4845,7 +5040,7 @@ class DmToolsTest(unittest.TestCase):
             visibility='party_known',
             canonical_text="Entity: Bram Truewood's Bookshop",
             text_hash='old',
-            embedding_model='gemini-embedding-001',
+            embedding_model='gemini-embedding-2',
             embedding_dimensions=2,
             embedding_json='[1.0, 0.0]',
         ))
@@ -4857,7 +5052,7 @@ class DmToolsTest(unittest.TestCase):
         }, clear=False), patch('services.embedding_service.embedding_from_text', return_value={
             'ok': True,
             'vector': [1.0, 0.0],
-            'model': 'gemini-embedding-001',
+            'model': 'gemini-embedding-2',
             'dimensions': 2,
         }):
             result = apply_memory_patch(
@@ -5167,7 +5362,7 @@ class DmToolsTest(unittest.TestCase):
             visibility='dm_private',
             canonical_text='Entity: Crimson Veil',
             text_hash='old',
-            embedding_model='gemini-embedding-001',
+            embedding_model='gemini-embedding-2',
             embedding_dimensions=2,
             embedding_json='[1.0, 0.0]',
         ))
@@ -5179,7 +5374,7 @@ class DmToolsTest(unittest.TestCase):
         }, clear=False), patch('services.embedding_service.embedding_from_text', return_value={
             'ok': True,
             'vector': [0.0, 1.0],
-            'model': 'gemini-embedding-001',
+            'model': 'gemini-embedding-2',
             'dimensions': 2,
         }):
             result = apply_memory_patch(
@@ -5252,7 +5447,7 @@ class DmToolsTest(unittest.TestCase):
             visibility='party_known',
             canonical_text='Fact: The door mark is an Infernal seal of scrutiny.',
             text_hash='fact',
-            embedding_model='gemini-embedding-001',
+            embedding_model='gemini-embedding-2',
             embedding_dimensions=2,
             embedding_json='[1.0, 0.0]',
         ))
@@ -5264,7 +5459,7 @@ class DmToolsTest(unittest.TestCase):
         }, clear=False), patch('services.embedding_service.embedding_from_text', return_value={
             'ok': True,
             'vector': [1.0, 0.0],
-            'model': 'gemini-embedding-001',
+            'model': 'gemini-embedding-2',
             'dimensions': 2,
         }):
             result = execute_dm_tool(
@@ -5308,6 +5503,258 @@ class DmToolsTest(unittest.TestCase):
 
         self.assertEqual(result['matches'][0]['item_id'], 'dock_warning_bell')
         self.assertGreater(result['matches'][0]['keyword_score'], 0)
+
+    def test_retrieval_packet_skips_safe_preflight_and_caps_each_lane(self):
+        hot_context = {
+            'recent_messages': [{'role': 'player', 'content': 'What did the bell mean at the Dock Ward?'}],
+        }
+        safe_packet = build_session_retrieval_packet(
+            self.campaign,
+            self.user,
+            hot_context,
+            {'dm_reply_mode': 'ooc_only', 'confidence': 'high'},
+        )
+        self.assertIsNone(safe_packet)
+
+        with patch('services.dm_tools.search_memory_embeddings_batch', return_value={
+            'ok': True,
+            'scores_by_query': {
+                'entities': {}, 'scene_events': {}, 'clocks_promises': {}, 'prior_facts': {},
+            },
+        }) as search_batch:
+            packet = build_session_retrieval_packet(
+                self.campaign,
+                self.user,
+                hot_context,
+                {
+                    'dm_reply_mode': 'narrative',
+                    'confidence': 'medium',
+                    'retrieval_queries': {
+                        'entities': 'Dock Ward people and places',
+                        'scene_events': 'recent bell events',
+                        'clocks_promises': 'active promises',
+                        'prior_facts': 'known bell facts',
+                    },
+                },
+            )
+
+        self.assertTrue(search_batch.called)
+        self.assertEqual(
+            [lane['lane'] for lane in packet['lanes']],
+            ['entities', 'scene_events', 'clocks_promises', 'prior_facts'],
+        )
+        self.assertTrue(all(len(lane['matches']) <= 2 for lane in packet['lanes']))
+        for lane in packet['lanes']:
+            for match in lane['matches']:
+                self.assertIn('item_id', match)
+                self.assertIn('score', match)
+                self.assertIn('visibility', match)
+                self.assertIn('certainty', match)
+                self.assertIn('internal_only', match)
+        selected_ids = [
+            (match['kind'], match['item_id'])
+            for lane in packet['lanes']
+            for match in lane['matches']
+        ]
+        self.assertEqual(len(selected_ids), len(set(selected_ids)))
+
+        with patch('services.dm_tools.search_memory_embeddings_batch', return_value={
+            'ok': False,
+            'scores_by_query': {},
+            'reason': 'provider unavailable',
+        }):
+            fallback_packet = build_session_retrieval_packet(
+                self.campaign,
+                self.user,
+                hot_context,
+                {'dm_reply_mode': 'narrative', 'confidence': 'low'},
+            )
+        self.assertFalse(fallback_packet['semantic_available'])
+        self.assertEqual(
+            [lane['lane'] for lane in fallback_packet['lanes']],
+            ['entities', 'scene_events', 'clocks_promises', 'prior_facts'],
+        )
+
+    def test_staged_narrative_actions_are_db_free_until_selected_commit(self):
+        before_events = WorldEvent.query.filter_by(campaign_id=self.campaign.id).count()
+        before_audits = CampaignAuditEvent.query.filter_by(campaign_id=self.campaign.id).count()
+        before_embeddings = CampaignMemoryEmbedding.query.filter_by(campaign_id=self.campaign.id).count()
+        action_buffer = {'actions': []}
+
+        preview = execute_dm_tool(
+            self.campaign,
+            self.session,
+            self.user,
+            'record_world_event',
+            {
+                'event_type': 'clue_found',
+                'summary': 'The Dock Ward bell rings twice from the north tower.',
+                'visibility': 'party_known',
+            },
+            {'pending_action_buffer': action_buffer},
+        )
+
+        self.assertEqual(preview['pending_action_id'], 'pending_action_1')
+        self.assertTrue(preview['event']['pending'])
+        self.assertEqual(WorldEvent.query.filter_by(campaign_id=self.campaign.id).count(), before_events)
+        self.assertEqual(CampaignAuditEvent.query.filter_by(campaign_id=self.campaign.id).count(), before_audits)
+        self.assertEqual(CampaignMemoryEmbedding.query.filter_by(campaign_id=self.campaign.id).count(), before_embeddings)
+
+        player_message = SessionMessage(
+            session_id=self.session.id,
+            user_id=self.user.id,
+            role='player',
+            content='I listen for the bell.',
+        )
+        db.session.add(player_message)
+        db.session.commit()
+        dm_message, _proposals, _results = commit_accepted_dm_turn(
+            self.campaign,
+            self.session,
+            self.user,
+            player_message.id,
+            'test:atomic:event',
+            'test atomic event',
+            'The bell answers from the north tower.',
+            ['pending_action_1'],
+            action_buffer,
+        )
+
+        self.assertIsNotNone(dm_message.id)
+        self.assertEqual(WorldEvent.query.filter_by(campaign_id=self.campaign.id).count(), before_events + 1)
+        self.assertEqual(
+            CampaignAuditEvent.query.filter_by(event_type='dm_staged_action_committed').count(),
+            1,
+        )
+
+    def test_unselected_staged_proposal_is_absent_and_old_pending_proposal_is_unlinked(self):
+        old_proposal = SheetProposal(
+            session_id=self.session.id,
+            character_id=self.character.id,
+            dm_user_id=self.user.id,
+            reason='Existing pending proposal.',
+            changes=[{'field': 'gp', 'operation': 'add', 'value': 1}],
+            status='pending',
+        )
+        db.session.add(old_proposal)
+        db.session.commit()
+        action_buffer = {'actions': []}
+        preview = execute_dm_tool(
+            self.campaign,
+            self.session,
+            self.user,
+            'propose_sheet_update',
+            {
+                'character_id': self.character.id,
+                'reason': 'The party found a small purse.',
+                'changes': [{'field': 'gp', 'operation': 'add', 'value': 5}],
+            },
+            {'pending_action_buffer': action_buffer},
+        )
+
+        self.assertEqual(preview['pending_action_id'], 'pending_action_1')
+        self.assertEqual(SheetProposal.query.count(), 1)
+
+        player_message = SessionMessage(
+            session_id=self.session.id,
+            user_id=self.user.id,
+            role='player',
+            content='I search the purse.',
+        )
+        db.session.add(player_message)
+        db.session.commit()
+        dm_message, proposals, _results = commit_accepted_dm_turn(
+            self.campaign,
+            self.session,
+            self.user,
+            player_message.id,
+            'test:atomic:none',
+            'test atomic none',
+            'You find a few loose coins.',
+            [],
+            action_buffer,
+        )
+
+        self.assertEqual(proposals, [])
+        self.assertEqual(SheetProposal.query.count(), 1)
+        self.assertIsNone(db.session.get(SheetProposal, old_proposal.id).message_id)
+        self.assertNotEqual(db.session.get(SheetProposal, old_proposal.id).message_id, dm_message.id)
+
+        selected_buffer = {'actions': []}
+        execute_dm_tool(
+            self.campaign,
+            self.session,
+            self.user,
+            'propose_sheet_update',
+            {
+                'character_id': self.character.id,
+                'reason': 'The party finds a second purse.',
+                'changes': [{'field': 'gp', 'operation': 'add', 'value': 3}],
+            },
+            {'pending_action_buffer': selected_buffer},
+        )
+        second_player_message = SessionMessage(
+            session_id=self.session.id,
+            user_id=self.user.id,
+            role='player',
+            content='I take the second purse.',
+        )
+        db.session.add(second_player_message)
+        db.session.commit()
+        selected_message, selected_proposals, _results = commit_accepted_dm_turn(
+            self.campaign,
+            self.session,
+            self.user,
+            second_player_message.id,
+            'test:atomic:selected-proposal',
+            'test selected proposal',
+            'The second purse contains a few more coins.',
+            ['pending_action_1'],
+            selected_buffer,
+        )
+        self.assertEqual(len(selected_proposals), 1)
+        self.assertEqual(selected_proposals[0].message_id, selected_message.id)
+        self.assertIsNone(db.session.get(SheetProposal, old_proposal.id).message_id)
+
+    def test_commit_failure_rolls_back_selected_staged_actions_and_records_only_turn_error(self):
+        action_buffer = {'actions': []}
+        execute_dm_tool(
+            self.campaign,
+            self.session,
+            self.user,
+            'record_world_event',
+            {'event_type': 'clue_found', 'summary': 'This event must never persist.'},
+            {'pending_action_buffer': action_buffer},
+        )
+        player_message = SessionMessage(
+            session_id=self.session.id,
+            user_id=self.user.id,
+            role='player',
+            content='I inspect the clue.',
+        )
+        db.session.add(player_message)
+        db.session.commit()
+
+        with patch('services.dm_turn_commit.apply_deferred_narrative_action', side_effect=RuntimeError('forced failure')):
+            with self.assertRaisesRegex(RuntimeError, 'forced failure'):
+                commit_accepted_dm_turn(
+                    self.campaign,
+                    self.session,
+                    self.user,
+                    player_message.id,
+                    'test:atomic:failure',
+                    'test atomic failure',
+                    'This reply must never persist.',
+                    ['pending_action_1'],
+                    action_buffer,
+                )
+
+        self.assertEqual(WorldEvent.query.filter_by(campaign_id=self.campaign.id).count(), 0)
+        self.assertEqual(SessionMessage.query.filter_by(session_id=self.session.id, role='dm').count(), 0)
+        self.assertEqual(CampaignMemoryEmbedding.query.filter_by(campaign_id=self.campaign.id).count(), 0)
+        self.assertEqual(CampaignAuditEvent.query.filter_by(event_type='dm_staged_action_committed').count(), 0)
+        turn = SessionDmTurn.query.filter_by(player_message_id=player_message.id).one()
+        self.assertEqual(turn.status, 'error')
 
     def test_advance_clock_is_not_a_dm_tool(self):
         # Regression: `advance_clock` used to be an inline DM tool, and its

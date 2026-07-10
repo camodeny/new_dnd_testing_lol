@@ -195,7 +195,12 @@ class StreamManagerTest(unittest.TestCase):
     @patch('services.stream_manager.get_session_dm_response_with_tools')
     @patch('services.stream_manager.SessionGeneratorWorker._run_dynamic_summarization')
     def test_execute_dm_turn_success(self, mock_summarize, mock_get_dm_response):
-        mock_get_dm_response.return_value = {"mode": "speak", "content": "Greetings traveller!"}
+        mock_get_dm_response.return_value = {
+            "mode": "speak",
+            "content": "Greetings traveller!",
+            "commit_action_ids": [],
+            "_pending_actions": [],
+        }
 
         player_msg = SessionMessage(
             session_id=self.session.id,

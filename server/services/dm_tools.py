@@ -21,6 +21,7 @@ from services.character_service import character_full_dict
 from services.embedding_service import (
     find_duplicate_graph_item,
     search_memory_embeddings,
+    search_memory_embeddings_batch,
     search_weight,
     upsert_memory_embedding,
 )
@@ -36,6 +37,13 @@ from openrouter import get_character_sheet_answer
 VALID_VISIBILITIES = {'public', 'party_known', 'dm_private'}
 ACTIVE_CLOCK_STATUSES = {'active', 'ticking', 'pending'}
 VALID_MEMORY_CERTAINTIES = {'confirmed', 'suspected', 'inferred', 'false', 'retconned'}
+DEFERRED_NARRATIVE_TOOL_NAMES = {
+    'record_world_event',
+    'update_current_scene',
+    'reveal_fact',
+    'propose_sheet_update',
+}
+RETRIEVAL_LANE_ORDER = ('entities', 'scene_events', 'clocks_promises', 'prior_facts')
 PRIVATE_VISIBILITY_TERMS = {
     'dm_private',
     'private',
@@ -2563,6 +2571,26 @@ def _tool_propose_sheet_update(campaign, current_user, args, session, audit_cont
     }
 
 
+def _prepare_sheet_proposal(campaign, current_user, args, session):
+    character_id = args.get('character_id')
+    reason = clean_text(args.get('reason', ''), 500)
+    raw_changes = args.get('changes', [])
+    if not character_id or not reason or not raw_changes:
+        return {'error': 'character_id, reason, and changes are required.'}
+    character = Character.query.filter_by(id=character_id, campaign_id=campaign.id).first()
+    if not character:
+        return {'error': 'Character not found.'}
+    changes = [result for change in raw_changes if (result := _compute_change(character, change))]
+    if not changes:
+        return {'error': 'No valid changes could be computed from the provided data.'}
+    return {
+        'character_id': character_id,
+        'reason': reason,
+        'changes': changes,
+        'status': 'pending',
+    }
+
+
 def _tool_get_current_scene(campaign, _current_user, args):
     include_private = args.get('include_private', True) is not False
     world, _graph, world_state, _private = _world_json(campaign)
@@ -2598,10 +2626,7 @@ def _candidate_key(item):
     return (str(item.get('kind')), str(item.get('item_id')))
 
 
-def _tool_search_campaign_memory(campaign, _current_user, args, audit_context=None):
-    query = clean_text(args.get('query'), 240).lower()
-    terms = [term for term in query.replace('_', ' ').split() if len(term) > 2]
-    limit = min(max(int(args.get('limit') or 8), 1), 20)
+def _campaign_memory_candidates(campaign):
     _world, graph, world_state, dm_private = _world_json(campaign)
     candidates = []
 
@@ -2617,11 +2642,12 @@ def _tool_search_campaign_memory(campaign, _current_user, args, audit_context=No
     candidates.append({'kind': 'world_state', 'item_id': 'current', 'value': world_state})
     candidates.append({'kind': 'dm_private', 'item_id': 'current', 'value': dm_private})
     candidates.append({'kind': 'planning_summary', 'item_id': 'current', 'value': summary_dict_for_read(campaign.id, include_private=True)})
+    return candidates
 
-    semantic = search_memory_embeddings(campaign, query, candidates, limit, audit_context=audit_context)
-    semantic_scores = semantic.get('scores') if semantic.get('ok') else {}
+
+def _rank_campaign_memory_candidates(query, candidates, semantic_scores):
+    terms = [term for term in query.replace('_', ' ').split() if len(term) > 2]
     weight = search_weight()
-
     scored = []
     for item in candidates:
         keyword_score = _match_score(terms, item['value'])
@@ -2634,8 +2660,116 @@ def _tool_search_campaign_memory(campaign, _current_user, args, audit_context=No
                 'keyword_score': keyword_score,
                 'embedding_score': semantic_score,
             })
-    scored.sort(key=lambda item: item['score'], reverse=True)
+    return sorted(scored, key=lambda item: item['score'], reverse=True)
+
+
+def _tool_search_campaign_memory(campaign, _current_user, args, audit_context=None):
+    query = clean_text(args.get('query'), 240).lower()
+    limit = min(max(int(args.get('limit') or 8), 1), 20)
+    candidates = _campaign_memory_candidates(campaign)
+
+    semantic = search_memory_embeddings(campaign, query, candidates, limit, audit_context=audit_context)
+    semantic_scores = semantic.get('scores') if semantic.get('ok') else {}
+    scored = _rank_campaign_memory_candidates(query, candidates, semantic_scores)
     return {'query': query, 'matches': scored[:limit]}
+
+
+def _retrieval_visibility(item):
+    value = item.get('value') if isinstance(item, dict) else {}
+    return clean_text(value.get('visibility') if isinstance(value, dict) else '', 40) or 'dm_private'
+
+
+def _retrieval_certainty(item):
+    value = item.get('value') if isinstance(item, dict) else {}
+    return clean_text(value.get('certainty') if isinstance(value, dict) else '', 40) or 'confirmed'
+
+
+def build_session_retrieval_packet(campaign, current_user, hot_context, preflight_decision, audit_context=None):
+    """Collect a small, lane-diverse evidence packet before visible DM generation."""
+    preflight_decision = preflight_decision or {}
+    mode = str(preflight_decision.get('dm_reply_mode') or '').strip().lower()
+    confidence = str(preflight_decision.get('confidence') or '').strip().lower()
+    safe_modes = {'silent', 'ooc_only', 'mechanics_only', 'clarification_only'}
+    if mode in safe_modes or (mode == 'simple_narrative' and confidence == 'high'):
+        return None
+
+    recent_messages = (hot_context or {}).get('recent_messages') or []
+    player_text = ''
+    for message in reversed(recent_messages):
+        if message.get('role') == 'player':
+            player_text = clean_text(message.get('content'), 240)
+            break
+    raw_queries = preflight_decision.get('retrieval_queries') if isinstance(preflight_decision.get('retrieval_queries'), dict) else {}
+    defaults = {
+        'entities': f'Named people, places, objects, and factions related to {player_text}',
+        'scene_events': f'Current scene and recent events relevant to {player_text}',
+        'clocks_promises': f'Active clocks, promises, and unresolved pressure relevant to {player_text}',
+        'prior_facts': f'Prior campaign facts relevant to {player_text}',
+    }
+    queries = {
+        lane: clean_text(raw_queries.get(lane), 240) or defaults[lane]
+        for lane in RETRIEVAL_LANE_ORDER
+    }
+    candidates = _campaign_memory_candidates(campaign)
+    semantic = search_memory_embeddings_batch(
+        campaign,
+        queries,
+        candidates,
+        audit_context=audit_context,
+    )
+    scores_by_query = semantic.get('scores_by_query') if semantic.get('ok') else {}
+    lane_rankings = {
+        lane: _rank_campaign_memory_candidates(queries[lane].lower(), candidates, scores_by_query.get(lane, {}))
+        for lane in RETRIEVAL_LANE_ORDER
+    }
+
+    choices = []
+    for lane_index, lane in enumerate(RETRIEVAL_LANE_ORDER):
+        for item in lane_rankings[lane]:
+            choices.append((item.get('score', 0.0), -lane_index, lane, item))
+    choices.sort(key=lambda entry: (entry[0], entry[1]), reverse=True)
+
+    selected = {lane: [] for lane in RETRIEVAL_LANE_ORDER}
+    seen = set()
+    for _score, _lane_priority, lane, item in choices:
+        key = _candidate_key(item)
+        if key in seen or len(selected[lane]) >= 2:
+            continue
+        seen.add(key)
+        visibility = _retrieval_visibility(item)
+        selected[lane].append({
+            'kind': item.get('kind'),
+            'item_id': item.get('item_id'),
+            'score': round(float(item.get('score') or 0), 4),
+            'visibility': visibility,
+            'certainty': _retrieval_certainty(item),
+            'internal_only': visibility == 'dm_private',
+            'memory': _compact_memory_search_value(item.get('kind'), item.get('value')),
+        })
+
+    packet = {
+        'queries': queries,
+        'lanes': [
+            {'lane': lane, 'matches': selected[lane]}
+            for lane in RETRIEVAL_LANE_ORDER
+        ],
+        'semantic_available': bool(semantic.get('ok')),
+    }
+    if campaign and audit_context:
+        log_audit_event(
+            campaign.id,
+            'session_retrieval_packet',
+            'Built focused pre-generation retrieval evidence packet.',
+            packet,
+            source='session_context',
+            actor='session_retrieval',
+            trace_id=audit_context.get('trace_id'),
+            parent_trace_id=audit_context.get('parent_trace_id'),
+            trace_label=audit_context.get('trace_label'),
+            audit_role='tools',
+            commit=False,
+        )
+    return packet
 
 
 def _record_event(campaign, event_type, summary, payload=None, visibility='dm_private'):
@@ -2760,6 +2894,106 @@ def _tool_reveal_fact(campaign, _current_user, args):
         visibility=visibility,
     )
     return {'item': target, 'affected_ids': {'world_id': world.id, 'world_event_ids': [event.id]}}
+
+
+def _stage_deferred_narrative_action(campaign, session, current_user, name, args, action_buffer):
+    """Validate a narrative mutation and return a preview without touching durable state."""
+    args = args if isinstance(args, dict) else {}
+    action_id = f'pending_action_{len(action_buffer["actions"]) + 1}'
+    preview = None
+    if name == 'record_world_event':
+        summary = clean_text(args.get('summary'), 1200)
+        if not summary:
+            return {'error': 'A world-event summary is required.'}
+        preview = {
+            'event': {
+                'id': action_id,
+                'event_type': clean_id(args.get('event_type'), 'world_event')[:80],
+                'summary': summary,
+                'visibility': args.get('visibility') if args.get('visibility') in VALID_VISIBILITIES else 'dm_private',
+                'pending': True,
+            },
+        }
+    elif name == 'update_current_scene':
+        world, _graph, world_state, _private = _world_json(campaign)
+        if not world:
+            return {'error': 'No world package exists.'}
+        scene_patch = args.get('scene_patch') if isinstance(args.get('scene_patch'), dict) else {}
+        preview_state = json_loads(json_dumps(world_state), {})
+        current_scene = preview_state.get('current_scene', {}) if isinstance(preview_state, dict) else {}
+        from services.scene_location_resolver import resolve_scene_location_patch
+        loc_patch = resolve_scene_location_patch(scene_patch, campaign, current_scene)
+        clean_scene_patch = {key: value for key, value in scene_patch.items() if key not in ('location_id', 'location_name')}
+        if loc_patch:
+            clean_scene_patch.update(loc_patch)
+        current_scene.update(clean_scene_patch)
+        preview_state['current_scene'] = current_scene
+        _sync_party_known_location(preview_state, current_scene)
+        preview = {'current_scene': current_scene, 'pending': True}
+    elif name == 'reveal_fact':
+        world, graph, _world_state, _private = _world_json(campaign)
+        if not world:
+            return {'error': 'No world package exists.'}
+        item_type = args.get('item_type')
+        plural = {'entity': 'entities', 'relation': 'relations', 'fact': 'facts'}.get(item_type)
+        item_id = clean_id(args.get('item_id'), '')
+        visibility = args.get('visibility') if args.get('visibility') in VALID_VISIBILITIES else 'party_known'
+        target = next((item for item in graph.get(plural, []) if item.get('id') == item_id), None) if plural else None
+        if not target:
+            return {'error': f'{item_type or "item"} not found: {item_id}'}
+        preview = {
+            'item': {
+                'id': item_id,
+                'item_type': item_type,
+                'from_visibility': target.get('visibility'),
+                'visibility': visibility,
+                'pending': True,
+            },
+        }
+    elif name == 'propose_sheet_update':
+        proposal = _prepare_sheet_proposal(campaign, current_user, args, session)
+        if proposal.get('error'):
+            return proposal
+        preview = {'proposal': {**proposal, 'proposal_id': action_id, 'pending': True}}
+    else:
+        return {'error': f'Unsupported deferred narrative tool: {name}'}
+
+    action = {'id': action_id, 'name': name, 'args': dict(args), 'preview': preview}
+    action_buffer['actions'].append(action)
+    return {**preview, 'pending_action_id': action_id}
+
+
+def apply_deferred_narrative_action(campaign, session, current_user, action):
+    """Apply a previously staged action inside the accepted-turn transaction."""
+    name = action.get('name')
+    args = action.get('args') if isinstance(action.get('args'), dict) else {}
+    if name == 'record_world_event':
+        return _tool_record_world_event(campaign, current_user, args), None
+    if name == 'update_current_scene':
+        return _tool_update_current_scene(campaign, current_user, args), None
+    if name == 'reveal_fact':
+        return _tool_reveal_fact(campaign, current_user, args), None
+    if name == 'propose_sheet_update':
+        prepared = _prepare_sheet_proposal(campaign, current_user, args, session)
+        if prepared.get('error'):
+            return prepared, None
+        proposal = SheetProposal(
+            session_id=session.id,
+            character_id=prepared['character_id'],
+            dm_user_id=current_user.id,
+            reason=prepared['reason'],
+            changes=prepared['changes'],
+            status='pending',
+        )
+        db.session.add(proposal)
+        return {
+            'proposal_id': None,
+            'character_id': proposal.character_id,
+            'reason': proposal.reason,
+            'changes': proposal.changes,
+            'status': proposal.status,
+        }, proposal
+    return {'error': f'Unsupported deferred narrative tool: {name}'}, None
 
 
 def _tool_generate_loot_box(campaign, current_user, args, session=None, audit_context=None):
@@ -4436,6 +4670,9 @@ TOOL_HANDLERS = {
 def execute_dm_tool(campaign, session, current_user, name, args, audit_context=None):
     audit_context = audit_context or {}
     args = args if isinstance(args, dict) else {}
+    action_buffer = audit_context.get('pending_action_buffer')
+    if isinstance(action_buffer, dict) and name in DEFERRED_NARRATIVE_TOOL_NAMES:
+        return _stage_deferred_narrative_action(campaign, session, current_user, name, args, action_buffer)
     handler = TOOL_HANDLERS.get(name)
     if not handler:
         result = {'error': f'Unknown DM tool: {name}'}
