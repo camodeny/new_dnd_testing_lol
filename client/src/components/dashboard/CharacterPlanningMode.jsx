@@ -914,7 +914,7 @@ export default function CharacterPlanningMode({
       <section className="planning-choice-panel">
         <div className="planning-choice-copy">
           <h2>Choose how you want to join</h2>
-          <p>Pick an existing character and wait for the table, or build a new sheet with the DM beside the form.</p>
+          <p>Pick an existing character and wait for the table, or build a new sheet with the AI DM beside the form.</p>
         </div>
         {selectedCharacter && !isReady && (
           <div className="planning-selected-character planning-selected-character-large">
@@ -943,7 +943,7 @@ export default function CharacterPlanningMode({
           <button className="planning-choice-card" onClick={() => setFlowMode('create')}>
             <i className="bi bi-plus-lg"></i>
             <span>Create New Character</span>
-            <small>Chat with the DM while filling out a new sheet.</small>
+            <small>Chat with the AI DM while filling out a new sheet.</small>
           </button>
         </div>
       </section>

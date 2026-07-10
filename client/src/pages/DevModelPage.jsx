@@ -77,7 +77,7 @@ export default function DevModelPage() {
     <div className="page dev-model-page">
       <div className="dev-model-header">
         <div>
-          <h2>Dev Model</h2>
+          <h1>Model settings</h1>
           <p>Change the configured model used for new DM responses without restarting the server.</p>
         </div>
         <div className={`dev-model-source dev-model-source-${settings?.source || 'env'}`}>

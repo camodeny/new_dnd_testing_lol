@@ -2,12 +2,16 @@ import { useEffect, useState } from 'react'
 import { apiFetch } from './api/client'
 import './Login.css'
 
+function getInitialAuthError() {
+  return new URLSearchParams(window.location.search).get('auth_error') || ''
+}
+
 function Login({ onLogin }) {
   const [isRegistering, setIsRegistering] = useState(false)
   const [username, setUsername] = useState('')
   const [email, setEmail] = useState('')
   const [password, setPassword] = useState('')
-  const [error, setError] = useState('')
+  const [error, setError] = useState(getInitialAuthError)
   const [loading, setLoading] = useState(false)
   const [ssoEnabled, setSsoEnabled] = useState(false)
 
@@ -29,7 +33,6 @@ function Login({ onLogin }) {
     const params = new URLSearchParams(window.location.search)
     const authError = params.get('auth_error')
     if (authError) {
-      setError(authError)
       params.delete('auth_error')
       const nextSearch = params.toString()
       const nextUrl = `${window.location.pathname}${nextSearch ? `?${nextSearch}` : ''}${window.location.hash}`
@@ -75,12 +78,22 @@ function Login({ onLogin }) {
 
   return (
     <div className="login-container">
-      <div className="login-illustration" aria-hidden="true"><span className="login-moon" /><span className="login-hill login-hill-one" /><span className="login-hill login-hill-two" /><span className="login-spark spark-one">✦</span><span className="login-spark spark-two">✧</span></div>
-      <div className="login-card">
-        <div className="login-brand"><span>✺</span> Campfire</div>
+      <section className="login-illustration" aria-label="Fireside">
+        <div className="login-visual-brand"><span aria-hidden="true">✦</span> Fireside</div>
+        <div className="login-visual-copy">
+          <span className="login-visual-kicker">THE TABLE IS OPEN</span>
+          <h2>Friends around the fire.<br />Adventure everywhere else.</h2>
+          <p>Gather your party, keep every chapter close, and follow the story wherever it leads.</p>
+        </div>
+        <div className="login-visual-note"><span aria-hidden="true">↗</span> Built for stories that remember</div>
+      </section>
+      <main className="login-panel">
+        <div className="login-card">
+        <div className="login-brand"><span aria-hidden="true">✦</span> Fireside</div>
+        <span className="login-kicker">YOUR CAMPAIGN WORKSPACE</span>
         <h1>{isRegistering ? 'Begin a story' : 'Welcome back'}</h1>
         <p className="login-subtitle">
-          {isRegistering ? 'Make a place at the table.' : 'Your next chapter is waiting.'}
+          {isRegistering ? 'Create an account and take your seat.' : 'Sign in to return to your campaigns.'}
         </p>
 
         {ssoEnabled && (
@@ -91,7 +104,8 @@ function Login({ onLogin }) {
               onClick={handleSsoLogin}
               disabled={loading}
             >
-              Continue with Pendergrass SSO
+              <span>Continue with Pendergrass SSO</span>
+              <i className="bi bi-arrow-up-right" aria-hidden="true" />
             </button>
             <div className="login-divider">or use a local account</div>
           </>
@@ -156,7 +170,9 @@ function Login({ onLogin }) {
             {isRegistering ? 'Sign In' : 'Create Account'}
           </button>
         </p>
-      </div>
+        </div>
+        <p className="login-footer">Private by default · Built for the AI-led table</p>
+      </main>
     </div>
   )
 }

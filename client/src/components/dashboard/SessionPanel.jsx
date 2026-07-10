@@ -529,16 +529,16 @@ export default function SessionPanel({
   const previousMessageCountRef = useRef(0)
   const rollIdRef = useRef(0)
 
-  const placements = encounterMap?.placements || []
   const groupedPlacements = useMemo(() => {
     const groups = { player: [], npc: [], monster: [] }
+    const placements = encounterMap?.placements || []
     placements.forEach((p) => {
       if (groups[p.actor_type]) {
         groups[p.actor_type].push(p)
       }
     })
     return groups
-  }, [placements])
+  }, [encounterMap?.placements])
 
   function getGridCoordinate(col, row) {
     if (typeof col !== 'number' || typeof row !== 'number') return ''
@@ -630,18 +630,6 @@ export default function SessionPanel({
       </div>
     )
   }
-
-  const filteredMessages = useMemo(() => {
-    return messages.filter(() => {
-      // TBD or Roster tab always contains 0 chats
-      if (activeChatTab === 'tbd' || activeChatTab === 'roster') {
-        return false;
-      }
-      
-      // Chat tab (default) contains all chats
-      return true;
-    });
-  }, [messages, activeChatTab])
 
   const [activeSlashCommand, setActiveSlashCommand] = useState(null)
   const [physicalLabel, setPhysicalLabel] = useState('')
@@ -1006,7 +994,6 @@ export default function SessionPanel({
             {encounterMap?.placements?.length > 0 && (
               <button className={`chat-tab-btn ${activeChatTab === 'roster' ? 'active' : ''}`} onClick={() => setActiveChatTab('roster')}>Roster</button>
             )}
-            <button className={`chat-tab-btn ${activeChatTab === 'tbd' ? 'active' : ''}`} onClick={() => setActiveChatTab('tbd')}>TBD</button>
           </div>
 
           {activeChatTab === 'roster' ? (
@@ -1027,12 +1014,12 @@ export default function SessionPanel({
                   </button>
                 </div>
               )}
-              {filteredMessages.length === 0 && (
+              {messages.length === 0 && (
                 <div className="session-empty-msg">
                   No messages to display in this tab.
                 </div>
               )}
-              {filteredMessages.map((msg) => (
+              {messages.map((msg) => (
                 <SessionMessageItem
                   key={msg.id}
                   msg={msg}

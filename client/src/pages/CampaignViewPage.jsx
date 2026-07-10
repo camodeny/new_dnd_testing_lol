@@ -190,24 +190,27 @@ export default function CampaignViewPage({ user }) {
   const [showWorldBuilding, setShowWorldBuilding] = useState(false)
   const [showLootStash, setShowLootStash] = useState(false)
   const [showShops, setShowShops] = useState(false)
-  const [elapsedTime, setElapsedTime] = useState('00:00:00')
+  const [elapsedTimer, setElapsedTimer] = useState({ sessionKey: null, value: '00:00:00' })
   const [activeTab, setActiveTab] = useState('chat')
+  const sessionTimerKey = session?.id || session?.created_at || session?.started_at || null
 
   useEffect(() => {
-    if (!session) {
-      setElapsedTime('00:00:00')
-      return
-    }
+    if (!session || !sessionTimerKey) return undefined
     const startTime = new Date(session.created_at || session.started_at || Date.now()).getTime()
-    const interval = setInterval(() => {
+    const updateTimer = () => {
       const diff = Date.now() - startTime
       const hrs = String(Math.floor(diff / 3600000)).padStart(2, '0')
       const mins = String(Math.floor((diff % 3600000) / 60000)).padStart(2, '0')
       const secs = String(Math.floor((diff % 60000) / 1000)).padStart(2, '0')
-      setElapsedTime(`${hrs}:${mins}:${secs}`)
-    }, 1000)
-    return () => clearInterval(interval)
-  }, [session])
+      setElapsedTimer({ sessionKey: sessionTimerKey, value: `${hrs}:${mins}:${secs}` })
+    }
+    const initialTick = setTimeout(updateTimer, 0)
+    const interval = setInterval(updateTimer, 1000)
+    return () => {
+      clearTimeout(initialTick)
+      clearInterval(interval)
+    }
+  }, [session, sessionTimerKey])
 
   const pendingMessageIdsRef = useRef(new Set())
 
@@ -285,12 +288,19 @@ export default function CampaignViewPage({ user }) {
   }, [applyStartedSession, id])
 
   useEffect(() => {
+    let active = true
     if (isEncounterActive && hasPlacements) {
-      setMapViewMode((prev) => {
-        if (prev !== 'collapsed') return prev
-        localStorage.setItem('encounter_map_view_mode', 'fullscreen')
-        return 'fullscreen'
+      Promise.resolve().then(() => {
+        if (!active) return
+        setMapViewMode((prev) => {
+          if (prev !== 'collapsed') return prev
+          localStorage.setItem('encounter_map_view_mode', 'fullscreen')
+          return 'fullscreen'
+        })
       })
+    }
+    return () => {
+      active = false
     }
   }, [isEncounterActive, hasPlacements])
 
@@ -667,7 +677,7 @@ export default function CampaignViewPage({ user }) {
       const url = URL.createObjectURL(blob)
       const a = document.createElement('a')
       a.href = url
-      a.download = `${campaign.name.replace(/[^\w\-]/g, '_')}_export.zip`
+      a.download = `${campaign.name.replace(/[^\w-]/g, '_')}_export.zip`
       document.body.appendChild(a)
       a.click()
       document.body.removeChild(a)
@@ -842,6 +852,7 @@ export default function CampaignViewPage({ user }) {
   if (showLobby) {
     return (
       <>
+        <ErrorMessage message={error} />
         <CampaignLobby
           campaign={campaign}
           currentUser={user}
@@ -857,6 +868,7 @@ export default function CampaignViewPage({ user }) {
   if (showPlanning && !session) {
     return (
       <>
+        <ErrorMessage message={error} />
         <CharacterPlanningMode
           campaign={campaign}
           currentUser={user}
@@ -872,6 +884,7 @@ export default function CampaignViewPage({ user }) {
   if (showWorldBuilding && !session) {
     return (
       <>
+        <ErrorMessage message={error} />
         <WorldBuildingMode
           campaign={campaign}
           onBegin={handleStartSession}
@@ -885,6 +898,7 @@ export default function CampaignViewPage({ user }) {
 
   return (
     <div className={`dashboard-page ${mapViewMode === 'fullscreen' && hasActiveMap ? 'map-fullscreen' : mapViewMode === 'semi' && hasActiveMap ? 'map-semi' : ''}`}>
+      <ErrorMessage message={error} />
       <div className={`dashboard-layout mobile-tab-${activeTab} ${mapViewMode === 'fullscreen' && hasActiveMap ? 'map-fullscreen' : mapViewMode === 'semi' && hasActiveMap ? 'map-semi' : ''}`}>
         <aside className="dashboard-left">
           <div className="campaign-logo-header">
@@ -903,7 +917,9 @@ export default function CampaignViewPage({ user }) {
             <div className="sidebar-nav">
               <div className="sidebar-nav-group">
                 <span className="sidebar-nav-label">Campaign</span>
-                <button className="sidebar-nav-item" onClick={() => setShowWorldBuilding(true)}><i className="bi bi-journal-bookmark"></i> World journal</button>
+                {!session && (
+                  <button className="sidebar-nav-item" onClick={() => setShowWorldBuilding(true)}><i className="bi bi-journal-bookmark"></i> World journal</button>
+                )}
                 <button className="sidebar-nav-item" onClick={() => navigate('/characters')}><i className="bi bi-person-badge"></i> Characters</button>
                 <button className="sidebar-nav-item" onClick={() => setShowSettings(true)}><i className="bi bi-gear"></i> Campaign settings</button>
               </div>
@@ -945,13 +961,16 @@ export default function CampaignViewPage({ user }) {
             <div className="session-progress-indicator">
               <span className="pulse-dot"></span>
               <span>{session ? 'SESSION IN PROGRESS' : 'TABLE READY'}</span>
-              {session && <span className="timer-text">{elapsedTime}</span>}
+              {session && (
+                <span className="timer-text">
+                  {elapsedTimer.sessionKey === sessionTimerKey ? elapsedTimer.value : '00:00:00'}
+                </span>
+              )}
             </div>
             
-            <div className="current-location-dropdown">
+            <div className="current-location-dropdown" role="group" aria-label={`Current location: ${locationName}`}>
               <span className="location-name">{locationName}</span>
               <span className="location-type">{session ? 'Exploration' : 'Awaiting players'}</span>
-              <i className="bi bi-chevron-down"></i>
             </div>
 
             <div className="header-actions">
@@ -1096,7 +1115,6 @@ export default function CampaignViewPage({ user }) {
               <div className="right-sidebar-widget recent-activity-panel">
                 <div className="widget-header">
                   <h3>Recent Activity</h3>
-                  <button className="view-all-link" style={{ background: 'none', border: 'none', cursor: 'pointer' }}>View All</button>
                 </div>
                 <div className="activity-list">
                   {displayLogs.length > 0 ? (
@@ -1264,24 +1282,48 @@ export default function CampaignViewPage({ user }) {
       )}
 
       {/* Mobile Bottom Navigation Bar */}
-      <nav className="mobile-bottom-nav">
-        <button className={`mobile-nav-item ${activeTab === 'chat' ? 'active' : ''}`} onClick={() => setActiveTab('chat')}>
+      <nav className="mobile-bottom-nav" aria-label="Campaign workspace views">
+        <button
+          type="button"
+          className={`mobile-nav-item ${activeTab === 'chat' ? 'active' : ''}`}
+          onClick={() => setActiveTab('chat')}
+          aria-label="Show session chat"
+          aria-pressed={activeTab === 'chat'}
+        >
           <i className="bi bi-chat-left-text-fill"></i>
           <span>Chat</span>
         </button>
         {hasActiveMap && (
-          <button className={`mobile-nav-item ${activeTab === 'map' ? 'active' : ''}`} onClick={() => setActiveTab('map')}>
+          <button
+            type="button"
+            className={`mobile-nav-item ${activeTab === 'map' ? 'active' : ''}`}
+            onClick={() => setActiveTab('map')}
+            aria-label="Show encounter map"
+            aria-pressed={activeTab === 'map'}
+          >
             <i className="bi bi-map-fill"></i>
             <span>Map</span>
           </button>
         )}
-        <button className={`mobile-nav-item ${activeTab === 'party' ? 'active' : ''}`} onClick={() => setActiveTab('party')}>
-          <i className="bi bi-people-fill"></i>
-          <span>Party</span>
-        </button>
-        <button className={`mobile-nav-item ${activeTab === 'menu' ? 'active' : ''}`} onClick={() => setActiveTab('menu')}>
+        <button
+          type="button"
+          className={`mobile-nav-item ${activeTab === 'menu' ? 'active' : ''}`}
+          onClick={() => setActiveTab('menu')}
+          aria-label="Show campaign and party navigation"
+          aria-pressed={activeTab === 'menu'}
+        >
           <i className="bi bi-grid-fill"></i>
-          <span>Menu</span>
+          <span>Campaign</span>
+        </button>
+        <button
+          type="button"
+          className={`mobile-nav-item ${activeTab === 'party' ? 'active' : ''}`}
+          onClick={() => setActiveTab('party')}
+          aria-label="Show activity and updates"
+          aria-pressed={activeTab === 'party'}
+        >
+          <i className="bi bi-activity"></i>
+          <span>Activity</span>
           {sheetProposals.length > 0 && (
             <span className="menu-badge">{sheetProposals.length}</span>
           )}

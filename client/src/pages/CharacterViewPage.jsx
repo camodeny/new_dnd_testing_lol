@@ -20,7 +20,10 @@ export default function CharacterViewPage() {
   }, [id])
 
   const handleDelete = async () => {
-    if (!window.confirm('Are you sure you want to delete this character?')) return
+    const confirmed = window.confirm(
+      `Delete ${character.name}? This permanently removes the character from your library and unassigns them from any campaigns.`,
+    )
+    if (!confirmed) return
     try {
       await deleteCharacter(id)
       navigate('/characters')

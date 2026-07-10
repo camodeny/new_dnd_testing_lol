@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useState } from 'react'
+import { useCallback, useEffect, useMemo, useState } from 'react'
 import { Link, useNavigate, useParams, useSearchParams } from 'react-router-dom'
 import {
   cleanupAutomationScenario,
@@ -33,8 +33,8 @@ export default function AutomationScenarioPage() {
   const [selectedRunIds, setSelectedRunIds] = useState([])
 
   const scenario = data?.scenario
-  const snapshots = data?.snapshots || []
-  const runs = data?.runs || []
+  const snapshots = useMemo(() => data?.snapshots || [], [data?.snapshots])
+  const runs = useMemo(() => data?.runs || [], [data?.runs])
   const latestTwoRuns = useMemo(() => runs.slice(0, 2), [runs])
   const baselineRunId = data?.baseline_run?.id || scenario?.baseline_run_id
 
@@ -48,25 +48,23 @@ export default function AutomationScenarioPage() {
 
   const autoCaptureSnapshot = searchParams.get('captureSnapshot') === '1'
 
-  const loadData = async () => {
+  const loadData = useCallback(async () => {
     try {
       const payload = await getAutomationScenario(scenarioId)
       setData(payload)
       setError('')
       const latestSnapshot = payload.snapshots?.[0]
-      if (latestSnapshot && !selectedSnapshotId) {
-        setSelectedSnapshotId(String(latestSnapshot.id))
-      }
+      setSelectedSnapshotId((current) => current || (latestSnapshot ? String(latestSnapshot.id) : ''))
     } catch (err) {
       setError(err.message)
     } finally {
       setLoading(false)
     }
-  }
+  }, [scenarioId])
 
   useEffect(() => {
-    loadData()
-  }, [scenarioId])
+    Promise.resolve().then(loadData)
+  }, [loadData])
 
   useEffect(() => {
     if (!autoCaptureSnapshot || !scenario || creatingSnapshot || snapshots.length > 0 || autoCaptureAttempted) return
@@ -172,6 +170,8 @@ export default function AutomationScenarioPage() {
   }
 
   const handleCleanup = async () => {
+    const confirmed = window.confirm('Remove clone campaigns created by this scenario? Runs and snapshots will remain available.')
+    if (!confirmed) return
     setCleaningUp(true)
     try {
       await cleanupAutomationScenario(scenarioId, {})
@@ -238,9 +238,6 @@ export default function AutomationScenarioPage() {
                 ))}
               </select>
             </label>
-            <button className="btn btn-primary" type="button" onClick={handleQueueRun} disabled={creatingRun}>
-              {creatingRun ? 'Queueing…' : 'Queue Run'}
-            </button>
             <label>
               Auditor mode
               <select value={auditorMode} onChange={(event) => setAuditorMode(event.target.value)}>
@@ -249,24 +246,28 @@ export default function AutomationScenarioPage() {
                 <option value="external">External CLI/API auditors</option>
               </select>
             </label>
-            <label>
-              Auditor model
-              <input
-                value={auditorModel}
-                onChange={(event) => setAuditorModel(event.target.value)}
-                placeholder="optional, e.g. opencode-go/deepseek-v4-flash"
-              />
-            </label>
-            <label>
-              Built-in auditor count
-              <input
-                type="number"
-                min="1"
-                max="8"
-                value={auditorCount}
-                onChange={(event) => setAuditorCount(event.target.value)}
-              />
-            </label>
+            {auditorMode !== 'manual' && (
+              <label>
+                Auditor model
+                <input
+                  value={auditorModel}
+                  onChange={(event) => setAuditorModel(event.target.value)}
+                  placeholder="optional, e.g. opencode-go/deepseek-v4-flash"
+                />
+              </label>
+            )}
+            {auditorMode === 'built_in' && (
+              <label>
+                Built-in auditor count
+                <input
+                  type="number"
+                  min="1"
+                  max="8"
+                  value={auditorCount}
+                  onChange={(event) => setAuditorCount(event.target.value)}
+                />
+              </label>
+            )}
             <label>
               Target audited cycles
               <input
@@ -278,14 +279,20 @@ export default function AutomationScenarioPage() {
                 placeholder="optional"
               />
             </label>
-            <label className="automation-checkbox-label">
-              <input
-                type="checkbox"
-                checked={auditorAutoContinue}
-                onChange={(event) => setAuditorAutoContinue(event.target.checked)}
-              />
-              Auto-continue after built-in audits
-            </label>
+            {auditorMode === 'built_in' && (
+              <label className="automation-checkbox-label">
+                <input
+                  type="checkbox"
+                  checked={auditorAutoContinue}
+                  onChange={(event) => setAuditorAutoContinue(event.target.checked)}
+                />
+                Auto-continue after built-in audits
+              </label>
+            )}
+            <button className="btn btn-primary" type="button" onClick={handleQueueRun} disabled={creatingRun}>
+              {creatingRun ? 'Queueing…' : 'Queue Run'}
+            </button>
+            <div className="automation-form-divider"><span>Or queue a model matrix</span></div>
             <label>
               Model matrix
               <input
@@ -323,7 +330,7 @@ export default function AutomationScenarioPage() {
         <div className="automation-section-header">
           <h2>Snapshots</h2>
           <button className="btn btn-secondary btn-small" onClick={handleCleanup} disabled={cleaningUp}>
-            {cleaningUp ? 'Cleaning…' : 'Cleanup Clones'}
+            {cleaningUp ? 'Removing…' : 'Remove clone campaigns'}
           </button>
         </div>
         {snapshots.length === 0 ? (

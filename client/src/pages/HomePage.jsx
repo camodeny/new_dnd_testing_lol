@@ -1,4 +1,4 @@
-import { useState, useEffect, useCallback } from 'react'
+import { useState, useEffect, useCallback, useRef } from 'react'
 import { useNavigate } from 'react-router-dom'
 import CampaignForm from '../CampaignForm'
 import CampaignCard from '../components/campaign/CampaignCard'
@@ -33,6 +33,14 @@ export default function HomePage({ user }) {
   const [deleteError, setDeleteError] = useState('')
   const [automationModalOpen, setAutomationModalOpen] = useState(false)
   const [automationAnimatingOut, setAutomationAnimatingOut] = useState(false)
+  const dialogRef = useRef(null)
+  const returnFocusRef = useRef(null)
+
+  const rememberDialogTrigger = (event) => {
+    returnFocusRef.current = event?.currentTarget instanceof HTMLElement
+      ? event.currentTarget
+      : document.activeElement
+  }
 
   useEffect(() => {
     const hasModalOpen = modalOpen || sandboxModalOpen || joinModalOpen || deleteModalOpen || automationModalOpen
@@ -42,20 +50,21 @@ export default function HomePage({ user }) {
     }
   }, [modalOpen, sandboxModalOpen, joinModalOpen, deleteModalOpen, automationModalOpen])
 
-  const openDeleteModal = (campaign) => {
+  const openDeleteModal = (campaign, event) => {
+    rememberDialogTrigger(event)
     setDeleteAnimatingOut(false)
     setDeleteError('')
     setCampaignToDelete(campaign)
     setDeleteModalOpen(true)
   }
 
-  const closeDeleteModal = () => {
+  const closeDeleteModal = useCallback(() => {
     setDeleteAnimatingOut(true)
     setTimeout(() => {
       setDeleteModalOpen(false)
       setCampaignToDelete(null)
     }, 250)
-  }
+  }, [])
 
   const handleConfirmDelete = async () => {
     if (!campaignToDelete) return
@@ -79,66 +88,150 @@ export default function HomePage({ user }) {
       .finally(() => setLoading(false))
   }, [])
 
-  const openModal = () => {
+  const openModal = (event) => {
+    rememberDialogTrigger(event)
     setAnimatingOut(false)
     setModalOpen(true)
   }
 
-  const openSandboxModal = () => {
+  const openSandboxModal = (event) => {
+    rememberDialogTrigger(event)
     setSandboxAnimatingOut(false)
     setSandboxModalOpen(true)
   }
 
-  const closeModal = () => {
+  const closeModal = useCallback(() => {
     setAnimatingOut(true)
     setTimeout(() => {
       setModalOpen(false)
     }, 250)
-  }
+  }, [])
 
-  const closeSandboxModal = () => {
+  const closeSandboxModal = useCallback(() => {
     setSandboxAnimatingOut(true)
     setTimeout(() => {
       setSandboxModalOpen(false)
     }, 250)
-  }
+  }, [])
 
   const handleCampaignCreated = useCallback((newCampaign) => {
     setCampaigns((prev) => [newCampaign, ...prev])
     closeModal()
-  }, [])
+  }, [closeModal])
 
   const handleSandboxCreated = useCallback((newCampaign) => {
     setCampaigns((prev) => [newCampaign, ...prev.filter((campaign) => campaign.id !== newCampaign.id)])
     closeSandboxModal()
     navigate(`/campaigns/${newCampaign.id}`)
-  }, [navigate])
+  }, [closeSandboxModal, navigate])
 
-  const openJoinModal = () => {
+  const openJoinModal = (event) => {
+    rememberDialogTrigger(event)
     setJoinAnimatingOut(false)
     setInviteCode('')
     setJoinError('')
     setJoinModalOpen(true)
   }
 
-  const closeJoinModal = () => {
+  const closeJoinModal = useCallback(() => {
     setJoinAnimatingOut(true)
     setTimeout(() => {
       setJoinModalOpen(false)
     }, 250)
-  }
+  }, [])
 
-  const openAutomationModal = () => {
+  const openAutomationModal = (event) => {
+    rememberDialogTrigger(event)
     setAutomationAnimatingOut(false)
     setAutomationModalOpen(true)
   }
 
-  const closeAutomationModal = () => {
+  const closeAutomationModal = useCallback(() => {
     setAutomationAnimatingOut(true)
     setTimeout(() => {
       setAutomationModalOpen(false)
     }, 250)
-  }
+  }, [])
+
+  const activeModal = modalOpen
+    ? 'campaign'
+    : sandboxModalOpen
+      ? 'sandbox'
+      : joinModalOpen
+        ? 'join'
+        : deleteModalOpen
+          ? 'delete'
+          : automationModalOpen
+            ? 'automation'
+            : null
+
+  useEffect(() => {
+    if (!activeModal) return undefined
+
+    const previouslyFocused = returnFocusRef.current || document.activeElement
+    const closeActiveModal = {
+      campaign: closeModal,
+      sandbox: closeSandboxModal,
+      join: closeJoinModal,
+      delete: closeDeleteModal,
+      automation: closeAutomationModal,
+    }[activeModal]
+    const focusableSelector = [
+      'a[href]',
+      'button:not([disabled])',
+      'input:not([disabled])',
+      'select:not([disabled])',
+      'textarea:not([disabled])',
+      '[tabindex]:not([tabindex="-1"])',
+    ].join(',')
+
+    const focusFrame = window.requestAnimationFrame(() => {
+      const dialog = dialogRef.current
+      const preferredTarget = dialog?.querySelector('[autofocus]')
+        || dialog?.querySelector('input:not([disabled]), select:not([disabled]), textarea:not([disabled])')
+        || dialog?.querySelector(focusableSelector)
+        || dialog
+      preferredTarget?.focus()
+    })
+
+    const handleDialogKeyDown = (event) => {
+      if (event.key === 'Escape') {
+        event.preventDefault()
+        closeActiveModal()
+        return
+      }
+
+      if (event.key !== 'Tab' || !dialogRef.current) return
+      const focusable = Array.from(dialogRef.current.querySelectorAll(focusableSelector))
+        .filter((element) => !element.hidden && element.getAttribute('aria-hidden') !== 'true')
+
+      if (focusable.length === 0) {
+        event.preventDefault()
+        dialogRef.current.focus()
+        return
+      }
+
+      const first = focusable[0]
+      const last = focusable[focusable.length - 1]
+      if (event.shiftKey && document.activeElement === first) {
+        event.preventDefault()
+        last.focus()
+      } else if (!event.shiftKey && document.activeElement === last) {
+        event.preventDefault()
+        first.focus()
+      }
+    }
+
+    document.addEventListener('keydown', handleDialogKeyDown)
+    return () => {
+      window.cancelAnimationFrame(focusFrame)
+      document.removeEventListener('keydown', handleDialogKeyDown)
+      if (previouslyFocused instanceof HTMLElement && previouslyFocused.isConnected) {
+        previouslyFocused.focus()
+      }
+      returnFocusRef.current = null
+    }
+  }, [activeModal, closeAutomationModal, closeDeleteModal, closeJoinModal, closeModal, closeSandboxModal])
 
   const handleJoinSubmit = async (e) => {
     e.preventDefault()
@@ -166,98 +259,69 @@ export default function HomePage({ user }) {
 
   return (
     <div className="home-page-v2">
-      <section className="wildwood-home-hero">
-        <div className="wildwood-home-copy">
-          <span className="wildwood-kicker">YOUR TABLE IS SET</span>
-          <h1>{hasCampaigns ? <>There’s a story<br />waiting for you.</> : <>Begin somewhere<br />worth remembering.</>}</h1>
-          <p>{hasCampaigns ? `${campaigns.length} adventure${campaigns.length !== 1 ? 's are' : ' is'} waiting for its next turn.` : 'Create a campaign, gather your party, and see what unfolds.'}</p>
-          <div className="wildwood-hero-actions">
-            <button className="btn btn-primary" onClick={openModal}><i className="bi bi-plus-lg" /> New campaign</button>
-            <button className="btn btn-secondary" onClick={openJoinModal}><i className="bi bi-key-fill" /> Join a campaign</button>
+      <section className="campaign-hero">
+        <div className="campaign-hero-copy">
+          <span className="section-kicker">WELCOME TO FIRESIDE</span>
+          <h1>Friends around the fire.<br />Adventure everywhere else.</h1>
+          <p>{hasCampaigns ? `${campaigns.length} campaign${campaigns.length === 1 ? ' is' : 's are'} ready when your table is.` : 'Create a campaign or join a table with an invite code.'}</p>
+          <div className="campaign-hero-actions">
+            <button className="btn btn-primary" onClick={openModal}><i className="bi bi-plus-lg" aria-hidden="true" /> New campaign</button>
+            <button className="btn btn-secondary" onClick={openJoinModal}><i className="bi bi-key" aria-hidden="true" /> Join with code</button>
           </div>
         </div>
-        <div className="wildwood-home-illustration" aria-hidden="true">
-          <span className="wildwood-story-halo" />
-          <span className="wildwood-story-portal">
-            <span className="wildwood-story-moon" />
-            <span className="wildwood-story-moon-mark moon-mark-one" /><span className="wildwood-story-moon-mark moon-mark-two" />
-            <span className="wildwood-story-ridge ridge-far" /><span className="wildwood-story-ridge ridge-near" />
-            <span className="wildwood-story-cairn"><i /><i /></span>
-            <span className="wildwood-story-path" />
-            <span className="wildwood-story-figure">♙</span>
-            <span className="wildwood-story-firefly firefly-one">✦</span><span className="wildwood-story-firefly firefly-two">·</span><span className="wildwood-story-firefly firefly-three">·</span>
-          </span>
-          <span className="wildwood-story-star story-star-one">✦</span><span className="wildwood-story-star story-star-two">✧</span>
-          <span className="wildwood-story-caption">A door into the next chapter</span>
+        <div className="campaign-hero-art" aria-hidden="true">
+          <span className="campaign-hero-grain" />
+          <div className="campaign-hero-caption">
+            <span className="campaign-hero-caption-mark">✦</span>
+            <span>Gather here. Go anywhere.</span>
+          </div>
         </div>
       </section>
 
-      <header className="campaigns-header">
-        <div>
-          <span className="wildwood-kicker">YOUR STORIES</span>
-          <h2 className="campaigns-title">{hasCampaigns ? 'Choose a world' : 'A quiet table, for now.'}</h2>
-        </div>
-        {hasCampaigns && (
-          <div className="campaigns-header-actions">
-            <button className="btn btn-secondary" onClick={() => navigate('/automation')}>
-              <i className="bi bi-activity"></i>
-              Automation
-            </button>
-            <button className="btn btn-secondary" onClick={openAutomationModal}>
-              <i className="bi bi-cpu"></i>
-              Automation Keys
-            </button>
-            <button className="btn btn-secondary join-btn-header" onClick={openJoinModal}>
-              <i className="bi bi-key-fill"></i>
-              Join with Code
-            </button>
-            <button className="btn btn-secondary" onClick={openSandboxModal}>
-              <i className="bi bi-bullseye"></i>
-              Combat Sandbox
-            </button>
-          </div>
-        )}
-      </header>
+      {hasCampaigns && (
+        <>
+          <header className="campaigns-header">
+            <div>
+              <span className="section-kicker">YOUR CAMPAIGNS</span>
+              <h2 className="campaigns-title">Return to the table</h2>
+            </div>
+          </header>
 
-      {hasCampaigns ? (
-        <div className="campaigns-grid">
-          {campaigns.map((campaign) => (
-            <CampaignCard
-              key={campaign.id}
-              campaign={campaign}
-              onClick={() => navigate(`/campaigns/${campaign.id}`)}
-              onDelete={user?.id === campaign.user_id ? () => openDeleteModal(campaign) : null}
-            />
-          ))}
-        </div>
-      ) : (
-        <div className="empty-state-v2">
-          <i className="bi bi-book empty-illustration"></i>
-          <h3>No campaigns yet</h3>
-          <p>Every great story starts with a single step. Create your first campaign or join one with a code.</p>
-          <div className="empty-state-actions">
-            <button className="btn btn-primary" onClick={openModal}>
-              <i className="bi bi-plus-lg"></i> New Campaign
-            </button>
-            <button className="btn btn-secondary" onClick={openJoinModal}>
-              <i className="bi bi-key-fill"></i> Join with Code
-            </button>
-            <button className="btn btn-secondary" onClick={openSandboxModal}>
-              <i className="bi bi-bullseye"></i> Combat Sandbox
-            </button>
+          <div className="campaigns-grid">
+            {campaigns.map((campaign) => (
+              <CampaignCard
+                key={campaign.id}
+                campaign={campaign}
+                onDelete={user?.id === campaign.user_id ? (event) => openDeleteModal(campaign, event) : null}
+              />
+            ))}
           </div>
-        </div>
+        </>
       )}
 
       <ErrorMessage message={error} />
+
+      <details className="home-utilities">
+        <summary>Utilities</summary>
+        <div className="home-utilities-menu">
+          <button type="button" onClick={openAutomationModal}>
+            <i className="bi bi-key" aria-hidden="true" />
+            <span><strong>API keys</strong><small>Manage automation access</small></span>
+          </button>
+          <button type="button" onClick={openSandboxModal}>
+            <i className="bi bi-crosshair" aria-hidden="true" />
+            <span><strong>Combat sandbox</strong><small>Test an encounter setup</small></span>
+          </button>
+        </div>
+      </details>
 
 
       {/* Modal */}
       {modalOpen && (
         <div className={`modal-overlay ${animatingOut ? 'fade-out' : 'fade-in'}`} onClick={closeModal}>
-          <div className={`modal-panel ${animatingOut ? 'slide-down' : 'slide-up'}`} onClick={(e) => e.stopPropagation()}>
+          <div ref={dialogRef} tabIndex="-1" className={`modal-panel ${animatingOut ? 'slide-down' : 'slide-up'}`} role="dialog" aria-modal="true" aria-labelledby="new-campaign-title" onClick={(e) => e.stopPropagation()}>
             <div className="modal-header">
-              <h2>New Campaign</h2>
+              <h2 id="new-campaign-title">New campaign</h2>
               <button className="modal-close" onClick={closeModal} aria-label="Close">
                 <i className="bi bi-x-lg"></i>
               </button>
@@ -269,9 +333,9 @@ export default function HomePage({ user }) {
 
       {sandboxModalOpen && (
         <div className={`modal-overlay ${sandboxAnimatingOut ? 'fade-out' : 'fade-in'}`} onClick={closeSandboxModal}>
-          <div className={`modal-panel ${sandboxAnimatingOut ? 'slide-down' : 'slide-up'}`} onClick={(e) => e.stopPropagation()}>
+          <div ref={dialogRef} tabIndex="-1" className={`modal-panel ${sandboxAnimatingOut ? 'slide-down' : 'slide-up'}`} role="dialog" aria-modal="true" aria-labelledby="combat-sandbox-title" onClick={(e) => e.stopPropagation()}>
             <div className="modal-header">
-              <h2>Combat Sandbox</h2>
+              <h2 id="combat-sandbox-title">Combat sandbox</h2>
               <button className="modal-close" onClick={closeSandboxModal} aria-label="Close">
                 <i className="bi bi-x-lg"></i>
               </button>
@@ -283,9 +347,9 @@ export default function HomePage({ user }) {
 
       {automationModalOpen && (
         <div className={`modal-overlay ${automationAnimatingOut ? 'fade-out' : 'fade-in'}`} onClick={closeAutomationModal}>
-          <div className={`modal-panel ${automationAnimatingOut ? 'slide-down' : 'slide-up'}`} onClick={(e) => e.stopPropagation()}>
+          <div ref={dialogRef} tabIndex="-1" className={`modal-panel ${automationAnimatingOut ? 'slide-down' : 'slide-up'}`} role="dialog" aria-modal="true" aria-labelledby="api-keys-title" onClick={(e) => e.stopPropagation()}>
             <div className="modal-header">
-              <h2>Automation Keys</h2>
+              <h2 id="api-keys-title">API keys</h2>
               <button className="modal-close" onClick={closeAutomationModal} aria-label="Close">
                 <i className="bi bi-x-lg"></i>
               </button>
@@ -298,9 +362,9 @@ export default function HomePage({ user }) {
       {/* Join Modal */}
       {joinModalOpen && (
         <div className={`modal-overlay ${joinAnimatingOut ? 'fade-out' : 'fade-in'}`} onClick={closeJoinModal}>
-          <div className={`modal-panel ${joinAnimatingOut ? 'slide-down' : 'slide-up'}`} onClick={(e) => e.stopPropagation()}>
+          <div ref={dialogRef} tabIndex="-1" className={`modal-panel ${joinAnimatingOut ? 'slide-down' : 'slide-up'}`} role="dialog" aria-modal="true" aria-labelledby="join-campaign-title" onClick={(e) => e.stopPropagation()}>
             <div className="modal-header">
-              <h2>Join Campaign</h2>
+              <h2 id="join-campaign-title">Join a campaign</h2>
               <button className="modal-close" onClick={closeJoinModal} aria-label="Close">
                 <i className="bi bi-x-lg"></i>
               </button>
@@ -347,9 +411,9 @@ export default function HomePage({ user }) {
       {/* Delete Confirmation Modal */}
       {deleteModalOpen && (
         <div className={`modal-overlay ${deleteAnimatingOut ? 'fade-out' : 'fade-in'}`} onClick={closeDeleteModal}>
-          <div className={`modal-panel ${deleteAnimatingOut ? 'slide-down' : 'slide-up'}`} onClick={(e) => e.stopPropagation()}>
+          <div ref={dialogRef} tabIndex="-1" className={`modal-panel ${deleteAnimatingOut ? 'slide-down' : 'slide-up'}`} role="alertdialog" aria-modal="true" aria-labelledby="delete-campaign-title" onClick={(e) => e.stopPropagation()}>
             <div className="modal-header">
-              <h2 style={{ color: 'var(--color-danger)' }}>Delete Campaign</h2>
+              <h2 id="delete-campaign-title" style={{ color: 'var(--color-danger)' }}>Delete campaign</h2>
               <button className="modal-close" onClick={closeDeleteModal} aria-label="Close">
                 <i className="bi bi-x-lg"></i>
               </button>
@@ -360,7 +424,7 @@ export default function HomePage({ user }) {
               </p>
               <p style={{ margin: 0, fontSize: '0.9rem', color: 'var(--color-danger)', fontWeight: '500' }}>
                 <i className="bi bi-exclamation-triangle-fill" style={{ marginRight: '8px' }}></i>
-                This action is permanent and will delete all associated sessions, characters, and campaign data.
+                This action is permanent and will delete its sessions and campaign data. Characters stay in your character library.
               </p>
               
               {deleteError && (
@@ -375,7 +439,7 @@ export default function HomePage({ user }) {
                   Cancel
                 </button>
                 <button type="button" className="btn btn-danger" onClick={handleConfirmDelete} disabled={deleteLoading}>
-                  {deleteLoading ? 'Deleting...' : 'Delete Campaign'}
+                  {deleteLoading ? 'Deleting...' : 'Delete campaign'}
                 </button>
               </div>
             </div>

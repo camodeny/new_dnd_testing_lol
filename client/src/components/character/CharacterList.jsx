@@ -1,5 +1,5 @@
 import { useEffect, useState } from 'react'
-import { useNavigate } from 'react-router-dom'
+import { Link, useNavigate } from 'react-router-dom'
 import { getCharacters, deleteCharacter } from '../../api/client'
 import Button from '../common/Button'
 import Loading from '../common/Loading'
@@ -31,11 +31,14 @@ export default function CharacterList() {
     }
   }, [])
 
-  const handleDelete = async (id) => {
-    if (!window.confirm('Are you sure you want to delete this character?')) return
+  const handleDelete = async (character) => {
+    const confirmed = window.confirm(
+      `Delete ${character.name}? This permanently removes the character from your library and unassigns them from any campaigns.`,
+    )
+    if (!confirmed) return
     try {
-      await deleteCharacter(id)
-      setCharacters((prev) => prev.filter((c) => c.id !== id))
+      await deleteCharacter(character.id)
+      setCharacters((prev) => prev.filter((c) => c.id !== character.id))
     } catch (err) {
       setError(err.message)
     }
@@ -67,16 +70,41 @@ export default function CharacterList() {
           <Button onClick={() => navigate('/characters/new')} variant="primary">Create your first character</Button>
         </div>
       ) : (
-        <div className="card-grid character-roster">
+        <div className="card-grid character-roster" role="list" aria-label="Characters">
           {characters.map((c) => (
-            <div key={c.id} className="card-wrapper">
+            <article
+              key={c.id}
+              className="card-wrapper"
+              role="listitem"
+              aria-labelledby={`character-${c.id}-name`}
+            >
               <CharacterCard character={c} />
               <div className="card-actions">
-                <Button onClick={() => navigate(`/characters/${c.id}`)} variant="secondary" className="small">View</Button>
-                <Button onClick={() => navigate(`/characters/${c.id}/edit`)} variant="secondary" className="small"><i className="bi bi-pencil" /></Button>
-                <Button onClick={() => handleDelete(c.id)} variant="danger" className="small"><i className="bi bi-trash" /></Button>
+                <Link
+                  to={`/characters/${c.id}`}
+                  className="btn btn-secondary small character-card-action character-card-view-link"
+                >
+                  View
+                </Link>
+                <Link
+                  to={`/characters/${c.id}/edit`}
+                  className="btn btn-secondary small character-card-action character-card-edit-link"
+                  aria-label={`Edit ${c.name}`}
+                  title={`Edit ${c.name}`}
+                >
+                  <i className="bi bi-pencil" aria-hidden="true" />
+                </Link>
+                <button
+                  type="button"
+                  className="btn btn-danger small character-card-action character-card-delete-button"
+                  onClick={() => handleDelete(c)}
+                  aria-label={`Delete ${c.name}`}
+                  title={`Delete ${c.name}`}
+                >
+                  <i className="bi bi-trash" aria-hidden="true" />
+                </button>
               </div>
-            </div>
+            </article>
           ))}
         </div>
       )}

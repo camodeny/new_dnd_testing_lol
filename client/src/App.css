@@ -7010,7 +7010,6 @@ select.input:focus {
   text-align: center;
   font-family: var(--mono);
   letter-spacing: 2px;
-  outline: none;
   transition: var(--transition-smooth);
   width: 100%;
   box-sizing: border-box;

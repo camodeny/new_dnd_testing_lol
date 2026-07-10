@@ -96,7 +96,7 @@ function CampaignForm({ onCampaignCreated, onCancel, className = '' }) {
     <form className={`campaign-form-compact ${className}`} onSubmit={handleSubmit}>
       {error && <div className="form-error-compact">{error}</div>}
       <div className="form-row">
-        <div className="form-field">
+        <div className="form-field campaign-name-field">
           <label htmlFor="campaign-name">Campaign Name *</label>
           <input
             id="campaign-name"
@@ -108,7 +108,7 @@ function CampaignForm({ onCampaignCreated, onCancel, className = '' }) {
             autoFocus
           />
         </div>
-        <div className="form-field">
+        <div className="form-field campaign-difficulty-field">
           <label htmlFor="campaign-difficulty">Difficulty</label>
           <select
             id="campaign-difficulty"
@@ -123,7 +123,7 @@ function CampaignForm({ onCampaignCreated, onCancel, className = '' }) {
             <option value="Deadly">Deadly</option>
           </select>
         </div>
-        <div className="form-field">
+        <div className="form-field campaign-players-field">
           <label htmlFor="campaign-players">Players</label>
           <select
             id="campaign-players"
@@ -136,7 +136,7 @@ function CampaignForm({ onCampaignCreated, onCancel, className = '' }) {
             ))}
           </select>
         </div>
-        <div className="form-field">
+        <div className="form-field campaign-loot-field">
           <label htmlFor="campaign-loot">Loot Mode</label>
           <select
             id="campaign-loot"

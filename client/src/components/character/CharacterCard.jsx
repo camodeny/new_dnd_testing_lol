@@ -1,14 +1,16 @@
-import Card from '../common/Card'
-import { useNavigate } from 'react-router-dom'
+import { Link } from 'react-router-dom'
 
 export default function CharacterCard({ character }) {
-  const navigate = useNavigate()
   const combat = character.combat || {}
   const abilityScores = character.ability_scores || {}
 
   return (
-    <Card className="character-card" onClick={() => navigate(`/characters/${character.id}`)}>
-      <h3>{character.name}</h3>
+    <Link
+      to={`/characters/${character.id}`}
+      className="card character-card character-card-link"
+      aria-label={`View character ${character.name}`}
+    >
+      <h3 id={`character-${character.id}-name`}>{character.name}</h3>
       <p className="card-subtitle">
         {character.race} &middot; Level {character.total_level} &middot; {character.alignment}
       </p>
@@ -28,6 +30,6 @@ export default function CharacterCard({ character }) {
           )
         })}
       </div>
-    </Card>
+    </Link>
   )
 }

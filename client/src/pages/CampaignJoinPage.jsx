@@ -75,8 +75,9 @@ export default function CampaignJoinPage() {
   return (
     <div className="join-page">
       {error && (
-        <div className="join-error-banner" onClick={() => setError('')}>
-          {error} <span className="join-error-dismiss">&times;</span>
+        <div className="join-error-banner" role="alert">
+          <span>{error}</span>
+          <button type="button" className="join-error-dismiss" onClick={() => setError('')} aria-label="Dismiss error">&times;</button>
         </div>
       )}
 
@@ -105,8 +106,9 @@ export default function CampaignJoinPage() {
             ) : (
               <>
                 <div className="join-input-group">
-                  <label className="join-input-label">Invite Code</label>
+                  <label className="join-input-label" htmlFor="campaign-invite-code">Invite code</label>
                   <input
+                    id="campaign-invite-code"
                     className="join-code-input"
                     type="text"
                     value={code}
@@ -133,7 +135,7 @@ export default function CampaignJoinPage() {
                   {joining ? (
                     'Joining...'
                   ) : (
-                    <><i className="bi bi-box-arrow-in-right"></i> Join Campaign</>
+                    <><i className="bi bi-box-arrow-in-right"></i> Join campaign</>
                   )}
                 </button>
               </>
@@ -142,7 +144,7 @@ export default function CampaignJoinPage() {
 
           <div className="join-footer">
             <button className="join-back-btn" onClick={() => navigate('/')}>
-              <i className="bi bi-arrow-left"></i> Back to Campaigns
+              <i className="bi bi-arrow-left"></i> Back to campaigns
             </button>
           </div>
         </div>

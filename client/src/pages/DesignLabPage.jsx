@@ -114,7 +114,7 @@ function WatchPreview() {
 function WildwoodPreview() {
   return (
     <section className="direction-preview wildwood-preview">
-      <nav className="wildwood-nav"><strong><i>✺</i> Campfire</strong><div><span>My stories</span><span>Characters</span><span>Discover</span></div><button>+ New story</button></nav>
+      <nav className="wildwood-nav"><strong><i>✺</i> Fireside</strong><div><span>My stories</span><span>Characters</span><span>Discover</span></div><button>+ New story</button></nav>
       <div className="wildwood-hero"><div className="wildwood-spark spark-one">✦</div><div className="wildwood-spark spark-two">✧</div><div className="wildwood-copy"><span>WELCOME BACK, ADELINE</span><h1>There’s a story<br />waiting for you.</h1><p>Tallowmere is paused at Bracken Pass, just before the rain.</p><button>Step back in <i className="bi bi-arrow-right" /></button></div><div className="wildwood-portal"><div className="wildwood-moon" /><div className="wildwood-trees" /><div className="wildwood-figure">♙</div></div></div>
       <div className="wildwood-shelf"><div><span>Your stories</span><h2>Choose a world</h2></div><div className="wildwood-story is-featured"><i>✺</i><strong>Tallowmere</strong><small>Chapter IV · Continue</small></div><div className="wildwood-story"><i>☾</i><strong>Blood &amp; Briar</strong><small>Chapter I · Paused</small></div><button className="wildwood-more">View all <i className="bi bi-arrow-right" /></button></div>
     </section>

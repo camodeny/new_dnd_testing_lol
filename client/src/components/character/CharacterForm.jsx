@@ -1,4 +1,4 @@
-import { useState } from 'react'
+import { useRef, useState } from 'react'
 import Button from '../common/Button'
 import ErrorMessage from '../common/ErrorMessage'
 import BasicInfoSection from './sections/BasicInfoSection'
@@ -12,7 +12,13 @@ import BackgroundSection from './sections/BackgroundSection'
 import ItemListEditor from './sections/ItemListEditor'
 import FormGroup from '../common/FormGroup'
 import NumberInput from '../common/NumberInput'
-import { ITEM_LIST_CONFIGS, flattenCharacter, mergeCharacterDraft, normalizeItemList } from './characterFormConfig'
+import {
+  CHARACTER_FORM_PAGES,
+  ITEM_LIST_CONFIGS,
+  flattenCharacter,
+  mergeCharacterDraft,
+  normalizeItemList,
+} from './characterFormConfig'
 
 const ITEM_CONFIG_BY_KEY = Object.fromEntries(ITEM_LIST_CONFIGS.map((config) => [config.key, config]))
 
@@ -134,11 +140,78 @@ export function CharacterFormBody({ character, setCharacter, sections, onFieldTo
 
 export default function CharacterForm({ initialCharacter, onSubmit, onCancel, submitLabel = 'Save Character' }) {
   const [character, setCharacter] = useState(() => mergeCharacterDraft(initialCharacter))
+  const [activePageIndex, setActivePageIndex] = useState(0)
   const [error, setError] = useState('')
   const [loading, setLoading] = useState(false)
+  const formRef = useRef(null)
+
+  const activePage = CHARACTER_FORM_PAGES[activePageIndex]
+  const isFirstPage = activePageIndex === 0
+  const isLastPage = activePageIndex === CHARACTER_FORM_PAGES.length - 1
+
+  const getPanel = (page) => formRef.current?.querySelector(`[data-character-form-panel="${page.key}"]`)
+
+  const getFirstInvalidControl = (container) => {
+    if (!container) return null
+    return [...container.querySelectorAll('input, select, textarea')]
+      .find((control) => control.willValidate && !control.validity.valid)
+  }
+
+  const focusPageHeading = (page) => {
+    window.requestAnimationFrame(() => {
+      getPanel(page)?.querySelector('[data-character-form-heading]')?.focus()
+    })
+  }
+
+  const showPage = (pageIndex, { focusHeading = true } = {}) => {
+    const boundedIndex = Math.min(Math.max(pageIndex, 0), CHARACTER_FORM_PAGES.length - 1)
+    const nextPage = CHARACTER_FORM_PAGES[boundedIndex]
+    setActivePageIndex(boundedIndex)
+    if (focusHeading) focusPageHeading(nextPage)
+  }
+
+  const validatePage = (page) => {
+    const invalidControl = getFirstInvalidControl(getPanel(page))
+    if (!invalidControl) return true
+    invalidControl.focus()
+    invalidControl.reportValidity()
+    return false
+  }
+
+  const handleNext = () => {
+    if (!validatePage(activePage)) return
+    showPage(activePageIndex + 1)
+  }
+
+  const handleBack = () => {
+    showPage(activePageIndex - 1)
+  }
 
   const handleSubmit = async (e) => {
     e.preventDefault()
+
+    if (!isLastPage) {
+      handleNext()
+      return
+    }
+
+    const invalidControl = getFirstInvalidControl(e.currentTarget)
+    if (invalidControl) {
+      const invalidPanel = invalidControl.closest('[data-character-form-panel]')
+      const invalidPageIndex = CHARACTER_FORM_PAGES.findIndex(
+        (page) => page.key === invalidPanel?.dataset.characterFormPanel,
+      )
+
+      if (invalidPageIndex >= 0) {
+        showPage(invalidPageIndex, { focusHeading: false })
+      }
+      window.requestAnimationFrame(() => {
+        invalidControl.focus()
+        invalidControl.reportValidity()
+      })
+      return
+    }
+
     setError('')
     setLoading(true)
     try {
@@ -152,35 +225,138 @@ export default function CharacterForm({ initialCharacter, onSubmit, onCancel, su
   }
 
   return (
-    <form className="character-form" onSubmit={handleSubmit}>
+    <form
+      ref={formRef}
+      className="character-form character-form-wizard"
+      data-character-form-wizard
+      data-active-step={activePage.key}
+      noValidate
+      onSubmit={handleSubmit}
+    >
       <ErrorMessage message={error} />
 
-      <CharacterFormBody
-        character={character}
-        setCharacter={setCharacter}
-        sections={[
-          'basic',
-          'ability_scores',
-          'combat',
-          'general',
-          'spellcasting',
-          'currency',
-          'personality',
-          'appearance',
-          'background_details',
-          ...ITEM_LIST_CONFIGS.map(({ key }) => key),
-        ]}
-      />
+      <nav className="character-form-wizard__step-nav" aria-label="Character form steps">
+        <ol className="character-form-wizard__step-list">
+          {CHARACTER_FORM_PAGES.map((page, pageIndex) => {
+            const isActive = pageIndex === activePageIndex
+            const position = isActive ? 'current' : pageIndex < activePageIndex ? 'before' : 'after'
+            const panelId = `character-form-panel-${page.key}`
 
-      <div className="form-actions">
-        <Button type="submit" variant="primary" disabled={loading}>
-          {loading ? 'Saving...' : submitLabel}
-        </Button>
-        {onCancel && (
-          <Button type="button" variant="secondary" onClick={onCancel}>
-            Cancel
+            return (
+              <li
+                key={page.key}
+                className={`character-form-wizard__step-item is-${position}`}
+                data-step-key={page.key}
+                data-step-index={pageIndex}
+                data-step-position={position}
+              >
+                <button
+                  type="button"
+                  className={`character-form-wizard__step-button ${isActive ? 'is-active' : ''}`}
+                  data-character-form-step={page.key}
+                  aria-current={isActive ? 'step' : undefined}
+                  aria-controls={panelId}
+                  aria-label={`Step ${pageIndex + 1} of ${CHARACTER_FORM_PAGES.length}: ${page.label}`}
+                  onClick={() => showPage(pageIndex)}
+                >
+                  <span className="character-form-wizard__step-number" aria-hidden="true">
+                    {pageIndex + 1}
+                  </span>
+                  <i className={`bi ${page.icon} character-form-wizard__step-icon`} aria-hidden="true" />
+                  <span className="character-form-wizard__step-label">{page.label}</span>
+                </button>
+              </li>
+            )
+          })}
+        </ol>
+      </nav>
+
+      <div className="character-form-wizard__panels">
+        {CHARACTER_FORM_PAGES.map((page, pageIndex) => {
+          const isActive = pageIndex === activePageIndex
+          const panelId = `character-form-panel-${page.key}`
+          const headingId = `character-form-heading-${page.key}`
+
+          return (
+            <section
+              key={page.key}
+              id={panelId}
+              className={`character-form-wizard__panel ${isActive ? 'is-active' : ''}`}
+              data-character-form-panel={page.key}
+              data-step-index={pageIndex}
+              data-active={isActive ? 'true' : 'false'}
+              aria-labelledby={headingId}
+              hidden={!isActive}
+            >
+              <header className="character-form-wizard__panel-header">
+                <p className="character-form-wizard__eyebrow">
+                  Step {pageIndex + 1} of {CHARACTER_FORM_PAGES.length}
+                </p>
+                <h2
+                  id={headingId}
+                  className="character-form-wizard__panel-title"
+                  data-character-form-heading
+                  tabIndex={-1}
+                >
+                  {page.label}
+                </h2>
+              </header>
+
+              <CharacterFormBody
+                character={character}
+                setCharacter={setCharacter}
+                sections={page.sections}
+              />
+            </section>
+          )
+        })}
+      </div>
+
+      <div className="form-actions character-form-wizard__actions" data-character-form-actions>
+        <div className="character-form-wizard__actions-start">
+          {onCancel && (
+            <Button
+              type="button"
+              variant="secondary"
+              className="character-form-wizard__cancel"
+              onClick={onCancel}
+            >
+              Cancel
+            </Button>
+          )}
+        </div>
+
+        <div className="character-form-wizard__actions-end">
+          <Button
+            type="button"
+            variant="secondary"
+            className="character-form-wizard__back"
+            disabled={isFirstPage}
+            onClick={handleBack}
+          >
+            <i className="bi bi-chevron-left" aria-hidden="true" /> Back
           </Button>
-        )}
+
+          {isLastPage ? (
+            <Button
+              type="submit"
+              variant="primary"
+              className="character-form-wizard__submit"
+              disabled={loading}
+            >
+              {loading ? 'Saving...' : submitLabel}
+            </Button>
+          ) : (
+            <Button
+              type="button"
+              variant="primary"
+              className="character-form-wizard__next"
+              onClick={handleNext}
+            >
+              Next <i className="bi bi-chevron-right" aria-hidden="true" />
+            </Button>
+          )}
+        </div>
       </div>
     </form>
   )

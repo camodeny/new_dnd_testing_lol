@@ -5,6 +5,10 @@ import NumberInput from '../../common/NumberInput'
 import TextArea from '../../common/TextArea'
 
 export default function ItemListEditor({ title, items, onChange, fields, emptyItem }) {
+  const singularTitle = {
+    Classes: 'Class',
+    Proficiencies: 'Proficiency',
+  }[title] || title.replace(/s$/, '')
   const [editingIndex, setEditingIndex] = useState(null)
   const [draft, setDraft] = useState(null)
 
@@ -348,7 +352,7 @@ export default function ItemListEditor({ title, items, onChange, fields, emptyIt
           </div>
         </div>
       ) : (
-        <Button onClick={startAdd} variant="primary" className="add-btn">Add {title.replace(/s$/, '')}</Button>
+        <Button onClick={startAdd} variant="primary" className="add-btn">Add {singularTitle}</Button>
       )}
     </div>
   )

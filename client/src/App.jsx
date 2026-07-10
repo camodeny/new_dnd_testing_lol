@@ -1,3 +1,4 @@
+import { useEffect } from 'react'
 import { BrowserRouter, Routes, Route, useLocation } from 'react-router-dom'
 import { useAuth } from './hooks/useAuth'
 import Login from './Login'
@@ -19,15 +20,41 @@ import AutomationComparePage from './pages/AutomationComparePage'
 import DesignLabPage from './pages/DesignLabPage'
 import NotFoundPage from './pages/NotFoundPage'
 import './App.css'
-import './WildwoodTheme.css'
+import './EmberLedgerTheme.css'
+
+const PAGE_TITLES = [
+  [/^\/$/, 'Campaigns'],
+  [/^\/characters(?:\/|$)/, 'Characters'],
+  [/^\/automation(?:\/|$)/, 'Automation'],
+  [/^\/campaigns\/[^/]+\/dev$/, 'Campaign tools'],
+  [/^\/campaigns\/[^/]+$/, 'Campaign'],
+  [/^\/join\/[^/]+$/, 'Join campaign'],
+  [/^\/design-lab$/, 'Design Lab'],
+  [/^\/dev\/model$/, 'Model settings'],
+]
 
 function AppRoutes() {
   const { user, setUser, loading, logout } = useAuth()
   const location = useLocation()
   const isCampaignView = /^\/campaigns\/[^/]+$/.test(location.pathname)
 
+  useEffect(() => {
+    if (!loading && !user) {
+      document.title = 'Sign in · Fireside'
+      return
+    }
+
+    const match = PAGE_TITLES.find(([pattern]) => pattern.test(location.pathname))
+    document.title = match ? `${match[1]} · Fireside` : 'Fireside'
+  }, [loading, location.pathname, user])
+
   if (loading) {
-    return <div className="loading">Loading...</div>
+    return (
+      <div className="app-loading-shell" role="status" aria-live="polite">
+        <span className="app-loading-mark" aria-hidden="true">✦</span>
+        <span>Opening Fireside…</span>
+      </div>
+    )
   }
 
   if (!user) {

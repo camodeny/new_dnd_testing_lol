@@ -273,21 +273,21 @@ export default function CampaignLobby({
 
                 const gradient = getGradientSeed(member.username || '')
                 const initials = getInitials(member.username)
-                const isDm = member.role === 'dm'
+                const isHost = member.user_id === campaign.user_id || member.role === 'dm'
                 const isSelf = member.user_id === currentUser?.id
 
                 return (
-                  <div key={member.user_id} className={`lobby-player-slot lobby-slot-filled ${isDm ? 'lobby-slot-dm' : ''}`}>
+                  <div key={member.user_id} className="lobby-player-slot lobby-slot-filled">
                     <div className="lobby-slot-circle" style={{ background: gradient }}>
                       {initials}
-                      {isDm && <span className="lobby-slot-crown"><i className="bi bi-star-fill"></i></span>}
+                      {isHost && <span className="lobby-slot-crown"><i className="bi bi-star-fill"></i></span>}
                     </div>
                     <span className="lobby-slot-name">
                       {member.username}
                       {isSelf && <span className="lobby-slot-you"> (you)</span>}
                     </span>
-                    <span className={`lobby-slot-role ${isDm ? 'lobby-slot-role-dm' : ''}`}>
-                      {isDm ? 'Dungeon Master' : 'Player'}
+                    <span className="lobby-slot-role">
+                      {isHost ? 'Host' : 'Player'}
                     </span>
                     {isOwner && !isSelf && (
                       <button

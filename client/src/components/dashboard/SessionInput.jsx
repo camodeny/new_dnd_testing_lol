@@ -224,6 +224,7 @@ export default function SessionInput({ value, onChange, onSubmit, onKeyDown, dis
           handleInput()
         }}
         role="textbox"
+        aria-label="Message the table"
         aria-multiline="true"
         aria-disabled={disabled}
         tabIndex={disabled ? -1 : 0}

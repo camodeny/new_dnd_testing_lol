@@ -1,4 +1,5 @@
 import { useMemo } from 'react'
+import { Link } from 'react-router-dom'
 
 const DIFFICULTY_COLORS = {
   easy: '#4ade80',
@@ -39,28 +40,20 @@ function getGradientSeed(str) {
   return `linear-gradient(135deg, hsl(${h1}, 60%, 55%), hsl(${h2}, 55%, 45%))`
 }
 
-export default function CampaignCard({ campaign, onClick, onDelete }) {
+export default function CampaignCard({ campaign, onDelete }) {
   const diffColor = useMemo(() => getDifficultyColor(campaign.difficulty), [campaign.difficulty])
   const initials = useMemo(() => getInitials(campaign.name), [campaign.name])
   const gradient = useMemo(() => getGradientSeed(campaign.name + (campaign.seed || '')), [campaign.name, campaign.seed])
 
   return (
-    <div className="campaign-card-v2" onClick={onClick}>
-      {onDelete && (
-        <button
-          className="campaign-card-delete-btn"
-          onClick={(e) => {
-            e.stopPropagation()
-            onDelete()
-          }}
-          aria-label="Delete campaign"
-        >
-          <i className="bi bi-trash"></i>
-        </button>
-      )}
-      <div className="campaign-card-inner">
+    <article className="campaign-card-v2">
+      <Link
+        to={`/campaigns/${campaign.id}`}
+        className="campaign-card-inner campaign-card-link"
+        aria-label={`Open campaign ${campaign.name}`}
+      >
         <div className="campaign-card-header">
-          <div className="campaign-avatar" style={{ background: gradient }}>
+          <div className="campaign-avatar" style={{ background: gradient }} aria-hidden="true">
             {initials}
           </div>
           <div className="campaign-meta">
@@ -82,7 +75,18 @@ export default function CampaignCard({ campaign, onClick, onDelete }) {
           {campaign.seed && <span className="campaign-seed">Seed: {campaign.seed}</span>}
           <span className="campaign-date">{formatDate(campaign.created_at)}</span>
         </div>
-      </div>
-    </div>
+      </Link>
+      {onDelete && (
+        <button
+          type="button"
+          className="campaign-card-delete-btn"
+          onClick={onDelete}
+          aria-label={`Delete campaign ${campaign.name}`}
+          title={`Delete ${campaign.name}`}
+        >
+          <i className="bi bi-trash" aria-hidden="true"></i>
+        </button>
+      )}
+    </article>
   )
 }
