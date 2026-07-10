@@ -1,5 +1,6 @@
 import os
 import sys
+import json
 import unittest
 import unittest.mock
 from datetime import datetime
@@ -652,6 +653,164 @@ class P1ImprovementsTest(unittest.TestCase):
         kg = json.loads(self.world.knowledge_graph)
         self.assertTrue(any(e['id'] == 'gundren_rockseeker' for e in kg['entities']))
         self.assertTrue(any(r['id'] == 'rel_gundren_sildar' for r in kg['relations']))
+
+    def test_relation_id_collision_across_patches(self):
+        # 1. First patch: Stonehill Inn located in Phandalin
+        self.world.knowledge_graph = '{"entities":[{"id":"stonehill_inn","type":"location","name":"Stonehill Inn"},{"id":"phandalin","type":"location","name":"Phandalin"}],"relations":[],"facts":[]}'
+        db.session.add(self.world)
+        db.session.commit()
+
+        compiled_patch_1 = {
+            'upsert_graph_relations': [
+                {
+                    'type': 'located_in',
+                    'source_id': 'stonehill_inn',
+                    'target_id': 'phandalin',
+                    'summary': 'The Inn is in Phandalin.'
+                }
+            ]
+        }
+        res1 = apply_memory_patch(self.campaign, self.session, compiled_patch_1)
+        self.assertEqual(len(res1['graph_changes']), 1)
+
+        # 2. Second patch: Gundren friends with Sildar
+        db.session.refresh(self.world)
+        kg1 = json.loads(self.world.knowledge_graph)
+        kg1['entities'].extend([
+            {'id': 'gundren', 'type': 'npc', 'name': 'Gundren'},
+            {'id': 'sildar', 'type': 'npc', 'name': 'Sildar'}
+        ])
+        self.world.knowledge_graph = json.dumps(kg1)
+        db.session.add(self.world)
+        db.session.commit()
+
+        compiled_patch_2 = {
+            'upsert_graph_relations': [
+                {
+                    'type': 'friends',
+                    'source_id': 'gundren',
+                    'target_id': 'sildar',
+                    'summary': 'They are friends.'
+                }
+            ]
+        }
+        res2 = apply_memory_patch(self.campaign, self.session, compiled_patch_2)
+        self.assertEqual(len(res2['graph_changes']), 1)
+
+        # Confirm both relations exist in DB
+        db.session.refresh(self.world)
+        kg2 = json.loads(self.world.knowledge_graph)
+        self.assertEqual(len(kg2['relations']), 2)
+        self.assertTrue(any(r['type'] == 'located_in' for r in kg2['relations']))
+        self.assertTrue(any(r['type'] == 'friends' for r in kg2['relations']))
+
+    def test_npc_metadata_completeness(self):
+        # Seed an NPC actor to update
+        npc = NPCActor(campaign_id=self.campaign.id, actor_id='gundren_rockseeker', name='Gundren', public_summary='Dwarf', dossier='{}')
+        db.session.add(npc)
+        db.session.commit()
+
+        memory_context = {'campaign_id': self.campaign.id}
+        extracted = {}
+        resolved = {
+            'update_npc_actors': [
+                {
+                    'id': 'gundren_rockseeker',
+                    'relationships': {'sildar_hallwinter': 'Friends'},
+                    'recent_offscreen_activity': ['Traveled to Phandalin'],
+                    'expires_or_retire_condition': 'Retires when campaign ends',
+                    'memory_type': 'npc'
+                }
+            ]
+        }
+        compiled = compile_staged_memory_patch(memory_context, extracted, resolved)
+        npcs = compiled.get('update_npc_actors', [])
+        self.assertEqual(len(npcs), 1)
+        self.assertEqual(npcs[0]['relationships'], {'sildar_hallwinter': 'Friends'})
+        self.assertEqual(npcs[0]['recent_offscreen_activity'], ['Traveled to Phandalin'])
+        self.assertEqual(npcs[0]['expires_or_retire_condition'], 'Retires when campaign ends')
+        self.assertEqual(npcs[0]['memory_type'], 'npc')
+
+        # Persist it
+        apply_memory_patch(self.campaign, self.session, compiled)
+        db.session.refresh(npc)
+        dossier = json.loads(npc.dossier)
+        self.assertEqual(dossier.get('relationships'), {'sildar_hallwinter': 'Friends'})
+        self.assertEqual(dossier.get('recent_offscreen_activity'), ['Traveled to Phandalin'])
+        self.assertEqual(dossier.get('expires_or_retire_condition'), 'Retires when campaign ends')
+        self.assertEqual(dossier.get('memory_type'), 'npc')
+
+    def test_party_known_event_visibility(self):
+        memory_context = {'campaign_id': self.campaign.id}
+        extracted = {}
+        resolved = {
+            'record_events': [
+                {
+                    'event_type': 'story_milestone',
+                    'summary': 'The party cleared Cragmaw Hideout.',
+                    'intended_visibility': 'party_known'
+                }
+            ]
+        }
+        compiled = compile_staged_memory_patch(memory_context, extracted, resolved)
+        events = compiled.get('record_events', [])
+        self.assertEqual(len(events), 1)
+        # Verify it normalized to party_known by defaulting to visible_transcript
+        self.assertEqual(events[0]['visibility'], 'party_known')
+
+    def test_npc_update_remapping_after_entity_dedupe(self):
+        # Sildar is already in the campaign knowledge graph
+        self.world.knowledge_graph = '{"entities":[{"id":"sildar_hallwinter_canonical","type":"npc","name":"Sildar Hallwinter"}],"relations":[],"facts":[]}'
+        db.session.add(self.world)
+        db.session.commit()
+
+        # Update NPC actor loop remaps temporary Same-Patch Entity IDs to their Deduplicated IDs
+        compiled_patch = {
+            'upsert_graph_entities': [
+                {
+                    'id': 'sildar_hallwinter_temp',
+                    'name': 'Sildar Hallwinter', # same name, will deduplicate to sildar_hallwinter_canonical
+                    'type': 'npc'
+                }
+            ],
+            'update_npc_actors': [
+                {
+                    'id': 'sildar_hallwinter_temp',
+                    'role': 'Warrior of Phandalin'
+                }
+            ]
+        }
+        
+        # Create an NPCActor under the canonical ID so it can be updated
+        npc = NPCActor(campaign_id=self.campaign.id, actor_id='sildar_hallwinter_canonical', name='Sildar', public_summary='Warrior', dossier='{}')
+        db.session.add(npc)
+        db.session.commit()
+
+        res = apply_memory_patch(self.campaign, self.session, compiled_patch)
+        self.assertEqual(len(res['npc_changes']), 1)
+        self.assertEqual(res['npc_changes'][0]['npc_actor']['actor_id'], 'sildar_hallwinter_canonical')
+        
+        # Verify the actual NPCActor was updated in DB
+        db.session.refresh(npc)
+        self.assertEqual(npc.role, 'Warrior of Phandalin')
+
+    def test_entity_id_trust(self):
+        memory_context = {'campaign_id': self.campaign.id}
+        extracted = {}
+        resolved = {
+            'upsert_graph_entities': [
+                {
+                    'id': 'invented_hallucinated_id',
+                    'name': 'Gundren Rockseeker',
+                    'type': 'npc'
+                }
+            ]
+        }
+        compiled = compile_staged_memory_patch(memory_context, extracted, resolved)
+        entities = compiled.get('upsert_graph_entities', [])
+        self.assertEqual(len(entities), 1)
+        # ID must be generated server-side from name rather than trusting the model-supplied unknown ID
+        self.assertEqual(entities[0]['id'], 'gundren_rockseeker')
 
 if __name__ == '__main__':
     unittest.main()
