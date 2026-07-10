@@ -39,6 +39,7 @@ from services.automation_auditor import (
 from services.audit_service import log_audit_event
 from services.automation_service import (
     AUTOMATION_ACTIVE_STATUSES,
+    CloneRetrievalPreflightError,
     append_run_event,
     append_workspace_event,
     baseline_run_for_scenario,
@@ -809,7 +810,18 @@ def claim_automation_run(current_user, run_id):
         if api_base:
             run.worker_api_base = api_base
         db.session.commit()
+    except CloneRetrievalPreflightError as exc:
+        db.session.rollback()
+        run = db.session.get(AutomationRun, run_id)
+        run.claim_failure_reason = str(exc)
+        db.session.commit()
+        return jsonify({
+            'error': str(exc),
+            'retrieval_preflight': exc.report,
+        }), 409
     except ValueError as exc:
+        db.session.rollback()
+        run = db.session.get(AutomationRun, run_id)
         run.claim_failure_reason = str(exc)
         db.session.commit()
         return jsonify({'error': str(exc)}), 409
@@ -825,6 +837,7 @@ def claim_automation_run(current_user, run_id):
             'derived_campaign_id': run.derived_campaign_id,
             'reclaimed': claim_data['reclaimed'],
             'attempt_count': run.attempt_count,
+            'retrieval_preflight': claim_data['retrieval_preflight'],
         },
         dedupe_key=f'run_claimed:{run.id}:attempt:{run.attempt_count}',
     )
@@ -844,6 +857,7 @@ def claim_automation_run(current_user, run_id):
         'latest_session': claim_data['latest_session'].to_dict() if claim_data['latest_session'] else None,
         'lease_token': run.lease_token,
         'reclaimed': claim_data['reclaimed'],
+        'retrieval_preflight': claim_data['retrieval_preflight'],
     }), 200
 
 

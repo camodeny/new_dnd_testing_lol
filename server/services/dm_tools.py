@@ -2656,9 +2656,13 @@ def _campaign_memory_candidates(campaign):
     _world, graph, world_state, dm_private = _world_json(campaign)
     candidates = []
 
-    for kind in ('entities', 'relations', 'facts'):
-        for item in graph.get(kind, []) if isinstance(graph, dict) else []:
-            candidates.append({'kind': kind[:-1], 'item_id': item.get('id'), 'value': item})
+    for plural_kind, item_type in (
+        ('entities', 'entity'),
+        ('relations', 'relation'),
+        ('facts', 'fact'),
+    ):
+        for item in graph.get(plural_kind, []) if isinstance(graph, dict) else []:
+            candidates.append({'kind': item_type, 'item_id': item.get('id'), 'value': item})
     for npc in NPCActor.query.filter_by(campaign_id=campaign.id).all():
         candidates.append({'kind': 'npc_actor', 'item_id': npc.actor_id, 'value': npc.to_dict(include_private=True)})
     for clock in CampaignClock.query.filter_by(campaign_id=campaign.id).all():
