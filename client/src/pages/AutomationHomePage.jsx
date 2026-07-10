@@ -167,8 +167,9 @@ export default function AutomationHomePage() {
     <div className="automation-page">
       <div className="automation-header">
         <div>
-          <h1 className="automation-title">Automation Workspace</h1>
-          <p className="automation-subtitle">Benchmark scenarios, reproducible snapshots, live runs, and historical comparisons.</p>
+          <span className="automation-eyebrow">RUN CONTROL</span>
+          <h1 className="automation-title">Automation</h1>
+          <p className="automation-subtitle">Create reproducible scenarios, observe live runs, and compare what changed.</p>
         </div>
         <div className="automation-stat-grid">
           <div className="automation-stat-card">
@@ -188,7 +189,7 @@ export default function AutomationHomePage() {
 
       <div className="automation-grid">
         <section className="automation-panel">
-          <h2>Create Scenario</h2>
+          <div className="automation-panel-heading"><div><span>NEW EXPERIMENT</span><h2>Create a scenario</h2></div><i className="bi bi-diagram-3" /></div>
           <form className="automation-form" onSubmit={handleCreateScenario}>
             <label>
               Source campaign
@@ -201,7 +202,7 @@ export default function AutomationHomePage() {
             </label>
             <label>
               Scenario name
-              <input value={scenarioName} onChange={(event) => setScenarioName(event.target.value)} placeholder="Optional override" />
+              <input value={scenarioName} onChange={(event) => setScenarioName(event.target.value)} placeholder="Name this scenario (optional)" />
             </label>
             <button className="btn btn-primary" type="submit" disabled={creating}>
               {creating ? 'Creating…' : 'Create Scenario'}
@@ -210,7 +211,7 @@ export default function AutomationHomePage() {
         </section>
 
         <section className="automation-panel">
-          <h2>Active Runs</h2>
+          <div className="automation-panel-heading"><div><span>LIVE QUEUE</span><h2>Active runs</h2></div><i className="bi bi-broadcast" /></div>
           {activeRuns.length === 0 ? (
             <div className="automation-empty">No queued or running automation jobs.</div>
           ) : (

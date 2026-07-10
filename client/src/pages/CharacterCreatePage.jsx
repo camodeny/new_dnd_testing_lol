@@ -23,7 +23,14 @@ export default function CharacterCreatePage() {
 
   return (
     <div className="page character-create-page">
-      <h2>{draft ? 'Review Character Draft' : 'Create Character'}</h2>
+      <header className="character-form-header">
+        <div>
+          <span className="wildwood-kicker">CHARACTER FOLIO</span>
+          <h1>{draft ? 'Review your character' : 'Create a character'}</h1>
+          <p>{draft ? 'Check the details before adding this companion to your story.' : 'Start with the essentials. You can refine every detail later.'}</p>
+        </div>
+        <button className="character-back-btn" onClick={() => navigate(returnTo)}><i className="bi bi-arrow-left" /> Back</button>
+      </header>
       <CharacterForm
         initialCharacter={initialCharacter}
         onSubmit={handleSubmit}

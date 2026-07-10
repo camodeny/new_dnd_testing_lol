@@ -91,7 +91,7 @@ export default function CampaignJoinPage() {
               <p className="join-desc">{campaign.description}</p>
             )}
             <p className="join-owner">
-              DM: <strong>{campaign.owner_username || 'Unknown'}</strong>
+              Campaign host: <strong>{campaign.owner_username || 'Unknown'}</strong>
             </p>
           </div>
 

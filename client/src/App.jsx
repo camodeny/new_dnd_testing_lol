@@ -16,8 +16,10 @@ import AutomationHomePage from './pages/AutomationHomePage'
 import AutomationScenarioPage from './pages/AutomationScenarioPage'
 import AutomationRunPage from './pages/AutomationRunPage'
 import AutomationComparePage from './pages/AutomationComparePage'
+import DesignLabPage from './pages/DesignLabPage'
 import NotFoundPage from './pages/NotFoundPage'
 import './App.css'
+import './WildwoodTheme.css'
 
 function AppRoutes() {
   const { user, setUser, loading, logout } = useAuth()
@@ -51,6 +53,7 @@ function AppRoutes() {
           <Route path="/automation/scenarios/:scenarioId" element={<AutomationScenarioPage />} />
           <Route path="/automation/runs/:runId" element={<AutomationRunPage />} />
           <Route path="/automation/compare" element={<AutomationComparePage />} />
+          <Route path="/design-lab" element={<DesignLabPage />} />
           <Route path="*" element={<NotFoundPage />} />
         </Routes>
       </main>

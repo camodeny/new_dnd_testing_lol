@@ -45,22 +45,36 @@ export default function CharacterList() {
 
   return (
     <div className="character-list">
-      <div className="list-header">
-        <h2>Your Characters</h2>
-        <Button onClick={() => navigate('/characters/new')} variant="primary">Create Character</Button>
-      </div>
+      <header className="character-library-header">
+        <div>
+          <span className="wildwood-kicker">YOUR COMPANIONS</span>
+          <h1>Your characters</h1>
+          <p>Keep the people who carry your stories close at hand.</p>
+        </div>
+        <Button onClick={() => navigate('/characters/new')} variant="primary"><i className="bi bi-plus-lg" /> Create character</Button>
+      </header>
+      {characters.length > 0 && (
+        <div className="character-roster-labels" aria-hidden="true">
+          <span>Character</span><span>Condition</span><span>Abilities</span><span />
+        </div>
+      )}
       <ErrorMessage message={error} />
       {characters.length === 0 ? (
-        <p className="empty-state">No characters yet. Create your first adventurer!</p>
+        <div className="character-empty-state">
+          <span className="character-empty-mark">✺</span>
+          <h2>Every party needs a first name.</h2>
+          <p>Create a character here, then bring them into any campaign you join.</p>
+          <Button onClick={() => navigate('/characters/new')} variant="primary">Create your first character</Button>
+        </div>
       ) : (
-        <div className="card-grid">
+        <div className="card-grid character-roster">
           {characters.map((c) => (
             <div key={c.id} className="card-wrapper">
               <CharacterCard character={c} />
               <div className="card-actions">
                 <Button onClick={() => navigate(`/characters/${c.id}`)} variant="secondary" className="small">View</Button>
-                <Button onClick={() => navigate(`/characters/${c.id}/edit`)} variant="secondary" className="small">Edit</Button>
-                <Button onClick={() => handleDelete(c.id)} variant="danger" className="small">Delete</Button>
+                <Button onClick={() => navigate(`/characters/${c.id}/edit`)} variant="secondary" className="small"><i className="bi bi-pencil" /></Button>
+                <Button onClick={() => handleDelete(c.id)} variant="danger" className="small"><i className="bi bi-trash" /></Button>
               </div>
             </div>
           ))}

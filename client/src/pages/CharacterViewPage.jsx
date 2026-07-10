@@ -34,6 +34,7 @@ export default function CharacterViewPage() {
 
   return (
     <div className="page character-view-page">
+      <button className="character-back-btn" onClick={() => navigate('/characters')}><i className="bi bi-arrow-left" /> All characters</button>
       <CharacterSheetView
         character={character}
         onEdit={() => navigate(`/characters/${id}/edit`)}

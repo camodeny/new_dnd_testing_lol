@@ -901,27 +901,18 @@ export default function CampaignViewPage({ user }) {
             <PartyRoster characters={characters} campaignId={id} onImport={openImport} />
             
             <div className="sidebar-nav">
-              <button className="sidebar-nav-item" onClick={() => setShowSettings(true)}>
-                <i className="bi bi-gear"></i> Campaign Settings
-              </button>
-              <button className="sidebar-nav-item" onClick={() => navigate(`/automation?sourceCampaignId=${id}`)}>
-                <i className="bi bi-activity"></i> Automation Workspace
-              </button>
-              <button className="sidebar-nav-item" onClick={() => navigate(`/automation?sourceCampaignId=${id}&autoCreateScenario=1`)}>
-                <i className="bi bi-diagram-3"></i> Create Automation Scenario
-              </button>
-              <button className="sidebar-nav-item" onClick={() => navigate(`/automation?sourceCampaignId=${id}&autoCreateScenario=1&captureSnapshot=1`)}>
-                <i className="bi bi-camera"></i> Capture Automation Snapshot
-              </button>
-              <button className="sidebar-nav-item" onClick={() => navigate('/characters')}>
-                <i className="bi bi-person-badge"></i> Characters
-              </button>
-              <button className="sidebar-nav-item" onClick={() => setShowWorldBuilding(true)}>
-                <i className="bi bi-journal-bookmark"></i> World Journal
-              </button>
-              <button className="sidebar-nav-item">
-                <i className="bi bi-clock-history"></i> Session History
-              </button>
+              <div className="sidebar-nav-group">
+                <span className="sidebar-nav-label">Campaign</span>
+                <button className="sidebar-nav-item" onClick={() => setShowWorldBuilding(true)}><i className="bi bi-journal-bookmark"></i> World journal</button>
+                <button className="sidebar-nav-item" onClick={() => navigate('/characters')}><i className="bi bi-person-badge"></i> Characters</button>
+                <button className="sidebar-nav-item" onClick={() => setShowSettings(true)}><i className="bi bi-gear"></i> Campaign settings</button>
+              </div>
+              <div className="sidebar-nav-group">
+                <span className="sidebar-nav-label">Automation</span>
+                <button className="sidebar-nav-item" onClick={() => navigate(`/automation?sourceCampaignId=${id}`)}><i className="bi bi-activity"></i> Run workspace</button>
+                <button className="sidebar-nav-item" onClick={() => navigate(`/automation?sourceCampaignId=${id}&autoCreateScenario=1`)}><i className="bi bi-diagram-3"></i> New scenario</button>
+                <button className="sidebar-nav-item" onClick={() => navigate(`/automation?sourceCampaignId=${id}&autoCreateScenario=1&captureSnapshot=1`)}><i className="bi bi-camera"></i> Snapshot &amp; run</button>
+              </div>
             </div>
           </div>
 
@@ -953,13 +944,13 @@ export default function CampaignViewPage({ user }) {
           <div className="dashboard-top-header">
             <div className="session-progress-indicator">
               <span className="pulse-dot"></span>
-              <span>SESSION IN PROGRESS</span>
-              <span className="timer-text">{elapsedTime}</span>
+              <span>{session ? 'SESSION IN PROGRESS' : 'TABLE READY'}</span>
+              {session && <span className="timer-text">{elapsedTime}</span>}
             </div>
             
             <div className="current-location-dropdown">
               <span className="location-name">{locationName}</span>
-              <span className="location-type">Exploration</span>
+              <span className="location-type">{session ? 'Exploration' : 'Awaiting players'}</span>
               <i className="bi bi-chevron-down"></i>
             </div>
 
@@ -968,7 +959,7 @@ export default function CampaignViewPage({ user }) {
                 <i className={`bi bi-${mapViewMode === 'collapsed' ? 'map' : mapViewMode === 'semi' ? 'layout-split' : 'fullscreen'}`}></i>
               </button>
               {session ? (
-                <button className="btn btn-primary end-session-btn" onClick={handleEndSession}>End Session</button>
+                <button className="btn btn-secondary end-session-btn" onClick={handleEndSession}>End Session</button>
               ) : (
                 <button className="btn btn-primary start-session-btn" onClick={handleStartSession}>Start Session</button>
               )}
@@ -1119,29 +1110,7 @@ export default function CampaignViewPage({ user }) {
                       </div>
                     ))
                   ) : (
-                    <>
-                      <div className="activity-row">
-                        <div className="activity-avatar">🎲</div>
-                        <div className="activity-details">
-                          <strong>Kael Thorn</strong> rolled Stealth 18
-                        </div>
-                        <span className="activity-time">2m ago</span>
-                      </div>
-                      <div className="activity-row">
-                        <div className="activity-avatar">🎲</div>
-                        <div className="activity-details">
-                          <strong>Pip Quickfoot</strong> rolled Perception 12
-                        </div>
-                        <span className="activity-time">5m ago</span>
-                      </div>
-                      <div className="activity-row">
-                        <div className="activity-avatar">👑</div>
-                        <div className="activity-details">
-                          <strong>Dungeon Master</strong> created encounter
-                        </div>
-                        <span className="activity-time">8m ago</span>
-                      </div>
-                    </>
+                    <div className="activity-empty">Rolls, sheet updates, and key table moments will appear here.</div>
                   )}
                 </div>
               </div>
