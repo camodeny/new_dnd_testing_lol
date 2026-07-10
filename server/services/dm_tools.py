@@ -410,11 +410,19 @@ def _normalize_memory_entity_patch(item, fallback_id):
 def _normalize_memory_relation_patch(item, fallback_id):
     if not isinstance(item, dict):
         return None
+    source_id = _coerce_patch_id(item.get('source_id') or item.get('source_ref'), '')
+    target_id = _coerce_patch_id(item.get('target_id') or item.get('target_ref'), '')
+    rel_type = _coerce_patch_id(item.get('type'), '')
+    
+    import hashlib
+    rel_key = f"{source_id}:{rel_type}:{target_id}".lower()
+    stable_rel_id = f"rel_{hashlib.md5(rel_key.encode('utf-8')).hexdigest()[:12]}"
+    
     clean_item = _normalize_graph_relation({
-        'id': _coerce_patch_id(item.get('id'), fallback_id),
-        'type': _coerce_patch_id(item.get('type'), ''),
-        'source_id': _coerce_patch_id(item.get('source_id'), ''),
-        'target_id': _coerce_patch_id(item.get('target_id'), ''),
+        'id': _coerce_patch_id(item.get('id'), stable_rel_id),
+        'type': rel_type,
+        'source_id': source_id,
+        'target_id': target_id,
     })
     summary = _coerce_patch_text(item.get('summary'), 500)
     if summary:
@@ -487,7 +495,25 @@ def _normalize_memory_npc_patch(item, fallback_id):
         values = _coerce_patch_text_list(item.get(field), max_items=max_items, max_length=limit)
         if values:
             clean_item[field] = values
-    return _apply_memory_item_metadata(clean_item, item, include_memory_type=False)
+            
+    # Support relationships mapping
+    rels = item.get('relationships')
+    if isinstance(rels, dict):
+        clean_rels = {}
+        for target, desc in rels.items():
+            t_id = _coerce_patch_id(target)
+            d_val = _coerce_patch_text(desc, 300)
+            if t_id and d_val:
+                clean_rels[t_id] = d_val
+        if clean_rels:
+            clean_item['relationships'] = clean_rels
+            
+    # Support recent offscreen activity
+    roa = _coerce_patch_text_list(item.get('recent_offscreen_activity'), max_items=10, max_length=300)
+    if roa:
+        clean_item['recent_offscreen_activity'] = roa
+        
+    return _apply_memory_item_metadata(clean_item, item, include_memory_type=True)
 
 
 def _normalize_memory_event_patch(item):
@@ -498,7 +524,7 @@ def _normalize_memory_event_patch(item):
         'summary': _coerce_patch_text(item.get('summary'), 1200, default='Session memory updated.'),
         'payload': item.get('payload') if isinstance(item.get('payload'), dict) else {},
     }
-    return _apply_memory_item_metadata(clean_item, item, include_memory_type=False)
+    return _apply_memory_item_metadata(clean_item, item, include_memory_type=True)
 
 
 def _normalize_memory_patch(patch):
@@ -4937,6 +4963,17 @@ def _apply_entity_id_remaps(kind, item, id_remaps):
         entity_ids = item.get('entity_ids', [])
         if isinstance(entity_ids, list):
             item['entity_ids'] = [id_remaps.get(entity_id, entity_id) for entity_id in entity_ids]
+    elif kind == 'npc':
+        original_id = item.get('id') or item.get('actor_id')
+        if original_id in id_remaps:
+            item['id'] = id_remaps[original_id]
+            item['actor_id'] = id_remaps[original_id]
+        rels = item.get('relationships')
+        if isinstance(rels, dict):
+            item['relationships'] = {
+                id_remaps.get(target, target): desc
+                for target, desc in rels.items()
+            }
     return item
 
 
@@ -5633,6 +5670,7 @@ def apply_memory_patch(campaign, session, patch, audit_context=None):
         )
 
     for item in patch.get('update_npc_actors', []) if isinstance(patch.get('update_npc_actors'), list) else []:
+        item = _apply_entity_id_remaps('npc', item, entity_id_remaps)
         actor_id = clean_id(item.get('id') or item.get('actor_id'), '')
         existing = NPCActor.query.filter_by(campaign_id=campaign.id, actor_id=actor_id).first() if actor_id else None
         before_val = existing.to_dict(include_private=True) if existing else None

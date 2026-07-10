@@ -267,13 +267,16 @@ SESSION_MEMORY_EXTRACTOR_SYSTEM_PROMPT = (
     "Write a fresh running_summary that cleanly replaces the old one. "
     "Do not append fragments to the prior summary. Rewrite the current durable state after the latest visible exchange in one compact paragraph. "
     "Additionally, extract or update the structured memory_anchors representing the current session state: current_goal (string or null), current_scene (string or null), open_clues (array of strings), unresolved_questions (array of strings), npc_observations (array of strings), and recent_offers_promises (array of strings). Do not append fragments; completely rewrite or prune these anchors to reflect the current state. "
-    "Extract only candidate scene updates and durable fact claims from the visible exchange. "
-    "Do not invent canonical ids. If a name is not already a known id in the prompt, preserve it as a raw label for later resolution. "
+    "Extract candidate scene updates, durable fact claims, entity upserts, relation upserts, NPC updates, and event records from the visible exchange. "
+    "Do not invent canonical ids. If a name is not already a known id in the prompt, preserve it as a raw label/ref for later resolution. "
     "Scene updates may include location_id, location_name, time_of_day, active_npc_ids, departed_npc_ids, and immediate_tension. "
-    "Fact claims must use source_surface of visible_transcript, hidden_state, or inferred. "
-    "When a fact was directly established in the latest visible exchange, set source_surface to visible_transcript and intended_visibility to party_known unless it is broadly public. "
-    "Return keys running_summary, memory_anchors, scene_patch, scene_reason, and fact_claims. "
-    "Each fact_claim must include text, entity_refs, source_surface, intended_visibility, certainty, importance, reason, expires_or_retire_condition, and memory_type."
+    "Claims must use source_surface of visible_transcript, hidden_state, or inferred. "
+    "Return keys running_summary, memory_anchors, scene_patch, scene_reason, fact_claims, entity_claims, relation_claims, npc_claims, and event_claims. "
+    "Each fact_claim must include text, entity_refs, source_surface, intended_visibility, certainty, importance, reason, expires_or_retire_condition, and memory_type. "
+    "Each entity_claim must include name, type, summary, tags, source_surface, intended_visibility, certainty, importance, reason, expires_or_retire_condition, and memory_type. "
+    "Each relation_claim must include type, source_ref, target_ref, summary, source_surface, intended_visibility, certainty, importance, reason, expires_or_retire_condition, and memory_type. "
+    "Each npc_claim must include actor_ref, name, role, public_summary, voice, background, wants, fears, secrets, relationships, recent_offscreen_activity, source_surface, intended_visibility, certainty, importance, reason, expires_or_retire_condition, and memory_type. "
+    "Each event_claim must include event_type, summary, payload, source_surface, intended_visibility, certainty, importance, reason, and expires_or_retire_condition."
 )
 
 SESSION_MEMORY_RESOLVER_SYSTEM_PROMPT = (
@@ -282,9 +285,13 @@ SESSION_MEMORY_RESOLVER_SYSTEM_PROMPT = (
     "Never invent ids. If you cannot resolve a reference with confidence, return it in unresolved_items instead of mutating memory. "
     "Prefer get_entity_candidates, get_scene_candidates, get_fact_candidates, and search_campaign_memory before broad raw-state tools. "
     "Use get_world_state, get_npcs, get_clocks, or transcript tools only when narrower tools are insufficient. "
-    "Final response must be exactly one JSON object with keys running_summary, memory_anchors, scene_patch, scene_reason, upsert_graph_facts, unresolved_items, evidence_basis, resolved_entity_refs, and resolved_location_refs. "
-    "Return the resolved/updated memory_anchors representing the current session state: current_goal (string or null), current_scene (string or null), open_clues (array of strings), unresolved_questions (array of strings), npc_observations (array of strings), and recent_offers_promises (array of strings)."
-    "Each upsert_graph_facts item must include text, entity_ids, id if reusing an existing fact, source_surface, intended_visibility, certainty, importance, reason, expires_or_retire_condition, and memory_type."
+    "Final response must be exactly one JSON object with keys running_summary, memory_anchors, scene_patch, scene_reason, upsert_graph_entities, upsert_graph_relations, upsert_graph_facts, update_npc_actors, record_events, unresolved_items, evidence_basis, resolved_entity_refs, and resolved_location_refs. "
+    "Return the resolved/updated memory_anchors representing the current session state: current_goal (string or null), current_scene (string or null), open_clues (array of strings), unresolved_questions (array of strings), npc_observations (array of strings), and recent_offers_promises (array of strings). "
+    "Each upsert_graph_entities item must include id (if reusing or resolving to a canonical id), name, type, summary, tags, source_surface, intended_visibility, certainty, importance, reason, expires_or_retire_condition, and memory_type. "
+    "Each upsert_graph_relations item must include id (if reusing/resolving), type, source_id (resolved entity/actor id), target_id (resolved entity/actor id), summary, source_surface, intended_visibility, certainty, importance, reason, expires_or_retire_condition, and memory_type. "
+    "Each upsert_graph_facts item must include text, entity_ids (resolved entity/actor ids), id if reusing an existing fact, source_surface, intended_visibility, certainty, importance, reason, expires_or_retire_condition, and memory_type. "
+    "Each update_npc_actors item must include id/actor_id (resolved NPC actor id), name, role, public_summary, voice, background, wants, fears, secrets, relationships, recent_offscreen_activity, source_surface, intended_visibility, certainty, importance, reason, expires_or_retire_condition, and memory_type. "
+    "Each record_events item must include event_type, summary, payload, source_surface, intended_visibility, certainty, importance, reason, and expires_or_retire_condition."
 )
 
 SESSION_CLOCK_ADJUDICATOR_SYSTEM_PROMPT = (
@@ -3935,6 +3942,74 @@ def build_session_memory_extractor_messages(memory_context):
                             'certainty': 'confirmed',
                             'importance': 3,
                             'reason': 'why this fact matters',
+                            'expires_or_retire_condition': None,
+                            'memory_type': 'fact',
+                        }
+                    ],
+                    'entity_claims': [
+                        {
+                            'id': 'optional canonical entity id if known',
+                            'name': 'entity name',
+                            'type': 'entity type (e.g. location, npc, item, faction, organization, other)',
+                            'summary': 'entity description/summary',
+                            'tags': ['list of tags'],
+                            'source_surface': 'visible_transcript',
+                            'intended_visibility': 'party_known',
+                            'certainty': 'confirmed',
+                            'importance': 3,
+                            'reason': 'why this entity exists/changes',
+                            'expires_or_retire_condition': None,
+                            'memory_type': 'entity',
+                        }
+                    ],
+                    'relation_claims': [
+                        {
+                            'id': 'optional canonical relation id if known',
+                            'type': 'relation type/verb',
+                            'source_ref': 'source entity name or id',
+                            'target_ref': 'target entity name or id',
+                            'summary': 'relationship description',
+                            'source_surface': 'visible_transcript',
+                            'intended_visibility': 'party_known',
+                            'certainty': 'confirmed',
+                            'importance': 3,
+                            'reason': 'why this relation exists/changes',
+                            'expires_or_retire_condition': None,
+                            'memory_type': 'relation',
+                        }
+                    ],
+                    'npc_claims': [
+                        {
+                            'actor_ref': 'NPC actor ID or name',
+                            'name': 'optional name',
+                            'role': 'optional role',
+                            'public_summary': 'optional public summary',
+                            'voice': 'optional voice description',
+                            'background': 'optional background story',
+                            'wants': ['optional list of wants'],
+                            'fears': ['optional list of fears'],
+                            'secrets': ['optional list of secrets'],
+                            'relationships': {'target_npc_id': 'relationship description'},
+                            'recent_offscreen_activity': ['activity description'],
+                            'source_surface': 'visible_transcript',
+                            'intended_visibility': 'party_known',
+                            'certainty': 'confirmed',
+                            'importance': 3,
+                            'reason': 'why this NPC is updated',
+                            'expires_or_retire_condition': None,
+                            'memory_type': 'npc',
+                        }
+                    ],
+                    'event_claims': [
+                        {
+                            'event_type': 'event type',
+                            'summary': 'event summary',
+                            'payload': {'key': 'value'},
+                            'source_surface': 'visible_transcript',
+                            'intended_visibility': 'party_known',
+                            'certainty': 'confirmed',
+                            'importance': 3,
+                            'reason': 'why this event is recorded',
                             'expires_or_retire_condition': None,
                             'memory_type': 'fact',
                         }
