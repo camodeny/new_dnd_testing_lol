@@ -615,6 +615,44 @@ def compile_staged_memory_patch(memory_context, extracted, resolved):
     # Track entity IDs created in this patch to resolve relations and NPC updates
     patch_created_entity_ids = set()
     patch_created_npc_ids = set()
+    patch_entity_id_remaps = {}
+
+    # Pre-populate map of name/ID to canonical ID for all existing entities, locations, NPCs, and characters
+    for name_lower, canonical_id in known.get('location_names', {}).items():
+        patch_entity_id_remaps[name_lower] = canonical_id
+
+    for npc in NPCActor.query.filter_by(campaign_id=campaign.id).all():
+        if npc.actor_id:
+            patch_entity_id_remaps[npc.actor_id.lower()] = npc.actor_id
+            if npc.name:
+                patch_entity_id_remaps[npc.name.lower()] = npc.actor_id
+
+    for character in Character.query.filter_by(campaign_id=campaign.id).all():
+        if character.name:
+            patch_entity_id_remaps[character.name.lower()] = clean_id(character.name, '')
+
+    world_payload = _world_payload(campaign)
+    graph = world_payload.get('knowledge_graph') if isinstance(world_payload.get('knowledge_graph'), dict) else {}
+    for entity in graph.get('entities', []):
+        ent_id = clean_id(entity.get('id'), '')
+        ent_name = clean_text(entity.get('name'), 160)
+        if ent_id:
+            patch_entity_id_remaps[ent_id.lower()] = ent_id
+            if ent_name:
+                patch_entity_id_remaps[ent_name.lower()] = ent_id
+
+    def resolve_ref(ref):
+        if not ref:
+            return ''
+        ref_cleaned = clean_id(ref, '')
+        if ref_cleaned in known['entity_ids']:
+            return ref_cleaned
+        if ref_cleaned in patch_entity_id_remaps:
+            return patch_entity_id_remaps[ref_cleaned]
+        ref_lower = str(ref).strip().lower()
+        if ref_lower in patch_entity_id_remaps:
+            return patch_entity_id_remaps[ref_lower]
+        return ''
 
     # 1. Compile Entity Upserts
     accepted_entities = []
@@ -625,16 +663,21 @@ def compile_staged_memory_patch(memory_context, extracted, resolved):
         name = clean_text(raw_entity.get('name'), 160)
         if not name:
             continue
-        entity_id = clean_id(raw_entity.get('id') or raw_entity.get('entity_id'), '')
+        raw_id = clean_id(raw_entity.get('id') or raw_entity.get('entity_id'), '')
         
-        is_known = entity_id in known['entity_ids']
-        if not entity_id or not is_known:
+        is_known = raw_id in known['entity_ids']
+        if not raw_id or not is_known:
             # New entity: generate server-side from validated name, do not trust model-supplied unknown ID
             entity_id = clean_id(name.lower().replace(' ', '_'), '') or f"entity_{index + 1}"
             resolution_mode = 'direct'
         else:
+            entity_id = raw_id
             resolution_mode = 'canonical'
             
+        if raw_id:
+            patch_entity_id_remaps[raw_id] = entity_id
+            patch_entity_id_remaps[raw_id.lower()] = entity_id
+        patch_entity_id_remaps[name.lower()] = entity_id
         patch_created_entity_ids.add(entity_id)
         
         entity_type = clean_text(raw_entity.get('type'), 40).lower() or 'other'
@@ -647,7 +690,7 @@ def compile_staged_memory_patch(memory_context, extracted, resolved):
             'type': entity_type,
             'summary': clean_text(raw_entity.get('summary'), 500) or None,
             'tags': [clean_text(t, 40) for t in raw_entity.get('tags') if clean_text(t, 40)] if isinstance(raw_entity.get('tags'), list) else [],
-            'visibility': _normalize_visibility(raw_entity.get('source_surface') or 'visible_transcript', raw_entity.get('intended_visibility')),
+            'visibility': _normalize_visibility(raw_entity.get('source_surface'), raw_entity.get('intended_visibility')),
             'certainty': _normalize_certainty(raw_entity.get('certainty')),
             'importance': _normalize_importance(raw_entity.get('importance')),
             'expires_or_retire_condition': clean_text(raw_entity.get('expires_or_retire_condition'), 520) or None,
@@ -664,8 +707,10 @@ def compile_staged_memory_patch(memory_context, extracted, resolved):
         if not isinstance(raw_rel, dict):
             continue
         rel_type = clean_id(raw_rel.get('type'), '')
-        source_id = clean_id(raw_rel.get('source_id') or raw_rel.get('source_ref'), '')
-        target_id = clean_id(raw_rel.get('target_id') or raw_rel.get('target_ref'), '')
+        raw_source = clean_id(raw_rel.get('source_id') or raw_rel.get('source_ref'), '')
+        raw_target = clean_id(raw_rel.get('target_id') or raw_rel.get('target_ref'), '')
+        source_id = resolve_ref(raw_source)
+        target_id = resolve_ref(raw_target)
         
         all_valid_entities = known['entity_ids'] | patch_created_entity_ids
         source_ok = source_id in all_valid_entities
@@ -674,9 +719,9 @@ def compile_staged_memory_patch(memory_context, extracted, resolved):
         if not source_id or not target_id or not rel_type or not source_ok or not target_ok:
             unresolved_endpoints = []
             if not source_ok:
-                unresolved_endpoints.append(source_id or 'missing_source')
+                unresolved_endpoints.append(raw_source or 'missing_source')
             if not target_ok:
-                unresolved_endpoints.append(target_id or 'missing_target')
+                unresolved_endpoints.append(raw_target or 'missing_target')
                 
             unresolved.append({
                 'kind': 'relation',
@@ -701,7 +746,7 @@ def compile_staged_memory_patch(memory_context, extracted, resolved):
             'source_id': source_id,
             'target_id': target_id,
             'summary': clean_text(raw_rel.get('summary'), 500) or None,
-            'visibility': _normalize_visibility(raw_rel.get('source_surface') or 'visible_transcript', raw_rel.get('intended_visibility')),
+            'visibility': _normalize_visibility(raw_rel.get('source_surface'), raw_rel.get('intended_visibility')),
             'certainty': _normalize_certainty(raw_rel.get('certainty')),
             'importance': _normalize_importance(raw_rel.get('importance')),
             'expires_or_retire_condition': clean_text(raw_rel.get('expires_or_retire_condition'), 520) or None,
@@ -717,13 +762,14 @@ def compile_staged_memory_patch(memory_context, extracted, resolved):
     for index, raw_npc in enumerate(raw_npc_updates):
         if not isinstance(raw_npc, dict):
             continue
-        actor_id = clean_id(raw_npc.get('id') or raw_npc.get('actor_id') or raw_npc.get('actor_ref'), '')
+        raw_actor_id = clean_id(raw_npc.get('id') or raw_npc.get('actor_id') or raw_npc.get('actor_ref'), '')
+        actor_id = resolve_ref(raw_actor_id)
         
         is_known = actor_id in known['npc_ids'] or actor_id in patch_created_npc_ids
         if not actor_id or not is_known:
             unresolved.append({
                 'kind': 'npc_actor',
-                'actor_id': actor_id or 'missing_actor_id',
+                'actor_id': raw_actor_id or 'missing_actor_id',
                 'reason': 'unknown_npc_id',
                 'provenance': make_provenance(raw_npc),
                 'resolution_mode': 'unresolved'
@@ -738,7 +784,7 @@ def compile_staged_memory_patch(memory_context, extracted, resolved):
             'public_summary': clean_text(raw_npc.get('public_summary'), 420) or None,
             'voice': clean_text(raw_npc.get('voice'), 240) or None,
             'background': clean_text(raw_npc.get('background'), 700) or None,
-            'visibility': _normalize_visibility(raw_npc.get('source_surface') or 'visible_transcript', raw_npc.get('intended_visibility')),
+            'visibility': _normalize_visibility(raw_npc.get('source_surface'), raw_npc.get('intended_visibility')),
             'certainty': _normalize_certainty(raw_npc.get('certainty')),
             'importance': _normalize_importance(raw_npc.get('importance')),
             'expires_or_retire_condition': clean_text(raw_npc.get('expires_or_retire_condition'), 520) or None,
@@ -756,14 +802,24 @@ def compile_staged_memory_patch(memory_context, extracted, resolved):
             if isinstance(values, list):
                 npc_data[field] = [clean_text(v, limit) for v in values if clean_text(v, limit)]
                 
-        # Support relationships mapping
+        # Support relationships mapping with target resolution
         rels = raw_npc.get('relationships')
         if isinstance(rels, dict):
-            npc_data['relationships'] = {
-                clean_id(target, ''): clean_text(desc, 300)
-                for target, desc in rels.items()
-                if clean_id(target, '') and clean_text(desc, 300)
-            }
+            npc_data['relationships'] = {}
+            for target, desc in rels.items():
+                resolved_target = resolve_ref(target)
+                is_target_known = resolved_target in (known['entity_ids'] | patch_created_entity_ids)
+                if resolved_target and is_target_known:
+                    npc_data['relationships'][resolved_target] = clean_text(desc, 300)
+                else:
+                    unresolved.append({
+                        'kind': 'npc_relationship_target',
+                        'npc_id': actor_id,
+                        'requested_target': target,
+                        'reason': 'unknown_relationship_target',
+                        'provenance': make_provenance(raw_npc),
+                        'resolution_mode': 'unresolved'
+                    })
             
         # Support recent offscreen activity
         roa = raw_npc.get('recent_offscreen_activity')
@@ -786,7 +842,7 @@ def compile_staged_memory_patch(memory_context, extracted, resolved):
             'event_type': clean_text(raw_event.get('event_type'), 80) or 'session_memory',
             'summary': summary,
             'payload': raw_event.get('payload') if isinstance(raw_event.get('payload'), dict) else {},
-            'visibility': _normalize_visibility(raw_event.get('source_surface') or 'visible_transcript', raw_event.get('intended_visibility')),
+            'visibility': _normalize_visibility(raw_event.get('source_surface'), raw_event.get('intended_visibility')),
             'certainty': _normalize_certainty(raw_event.get('certainty')),
             'importance': _normalize_importance(raw_event.get('importance')),
             'expires_or_retire_condition': clean_text(raw_event.get('expires_or_retire_condition'), 520) or None,
@@ -809,13 +865,12 @@ def compile_staged_memory_patch(memory_context, extracted, resolved):
         entity_ids = []
         unknown_entity_ids = []
         for raw_entity_id in raw_entity_ids:
-            entity_id = clean_id(raw_entity_id, '')
+            entity_id = resolve_ref(raw_entity_id)
             if not entity_id:
+                unknown_entity_ids.append(raw_entity_id)
                 continue
-            if (entity_id in known['entity_ids'] or entity_id in patch_created_entity_ids) and entity_id not in entity_ids:
+            if entity_id not in entity_ids:
                 entity_ids.append(entity_id)
-            else:
-                unknown_entity_ids.append(entity_id)
         if raw_entity_ids and not entity_ids:
             skipped_facts.append({
                 'index': index,

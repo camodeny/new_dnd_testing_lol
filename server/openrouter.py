@@ -275,7 +275,7 @@ SESSION_MEMORY_EXTRACTOR_SYSTEM_PROMPT = (
     "Each fact_claim must include text, entity_refs, source_surface, intended_visibility, certainty, importance, reason, expires_or_retire_condition, and memory_type. "
     "Each entity_claim must include name, type, summary, tags, source_surface, intended_visibility, certainty, importance, reason, expires_or_retire_condition, and memory_type. "
     "Each relation_claim must include type, source_ref, target_ref, summary, source_surface, intended_visibility, certainty, importance, reason, expires_or_retire_condition, and memory_type. "
-    "Each npc_claim must include actor_ref, name, role, public_summary, voice, background, wants, fears, secrets, relationships, recent_offscreen_activity, certainty, importance, reason, expires_or_retire_condition, and memory_type. "
+    "Each npc_claim must include actor_ref, name, role, public_summary, voice, background, wants, fears, secrets, relationships, recent_offscreen_activity, source_surface, intended_visibility, certainty, importance, reason, expires_or_retire_condition, and memory_type. "
     "Each event_claim must include event_type, summary, payload, source_surface, intended_visibility, certainty, importance, reason, and expires_or_retire_condition."
 )
 
@@ -290,7 +290,7 @@ SESSION_MEMORY_RESOLVER_SYSTEM_PROMPT = (
     "Each upsert_graph_entities item must include id (if reusing or resolving to a canonical id), name, type, summary, tags, source_surface, intended_visibility, certainty, importance, reason, expires_or_retire_condition, and memory_type. "
     "Each upsert_graph_relations item must include id (if reusing/resolving), type, source_id (resolved entity/actor id), target_id (resolved entity/actor id), summary, source_surface, intended_visibility, certainty, importance, reason, expires_or_retire_condition, and memory_type. "
     "Each upsert_graph_facts item must include text, entity_ids (resolved entity/actor ids), id if reusing an existing fact, source_surface, intended_visibility, certainty, importance, reason, expires_or_retire_condition, and memory_type. "
-    "Each update_npc_actors item must include id/actor_id (resolved NPC actor id), name, role, public_summary, voice, background, wants, fears, secrets, relationships, recent_offscreen_activity, certainty, importance, reason, expires_or_retire_condition, and memory_type. "
+    "Each update_npc_actors item must include id/actor_id (resolved NPC actor id), name, role, public_summary, voice, background, wants, fears, secrets, relationships, recent_offscreen_activity, source_surface, intended_visibility, certainty, importance, reason, expires_or_retire_condition, and memory_type. "
     "Each record_events item must include event_type, summary, payload, source_surface, intended_visibility, certainty, importance, reason, and expires_or_retire_condition."
 )
 
@@ -3991,6 +3991,8 @@ def build_session_memory_extractor_messages(memory_context):
                             'secrets': ['optional list of secrets'],
                             'relationships': {'target_npc_id': 'relationship description'},
                             'recent_offscreen_activity': ['activity description'],
+                            'source_surface': 'visible_transcript',
+                            'intended_visibility': 'party_known',
                             'certainty': 'confirmed',
                             'importance': 3,
                             'reason': 'why this NPC is updated',

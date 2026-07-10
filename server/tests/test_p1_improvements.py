@@ -708,6 +708,10 @@ class P1ImprovementsTest(unittest.TestCase):
         # Seed an NPC actor to update
         npc = NPCActor(campaign_id=self.campaign.id, actor_id='gundren_rockseeker', name='Gundren', public_summary='Dwarf', dossier='{}')
         db.session.add(npc)
+        
+        # Seed sildar so relationship validation passes
+        sildar = NPCActor(campaign_id=self.campaign.id, actor_id='sildar_hallwinter', name='Sildar', dossier='{}')
+        db.session.add(sildar)
         db.session.commit()
 
         memory_context = {'campaign_id': self.campaign.id}
@@ -748,6 +752,7 @@ class P1ImprovementsTest(unittest.TestCase):
                 {
                     'event_type': 'story_milestone',
                     'summary': 'The party cleared Cragmaw Hideout.',
+                    'source_surface': 'visible_transcript',
                     'intended_visibility': 'party_known'
                 }
             ]
@@ -755,8 +760,25 @@ class P1ImprovementsTest(unittest.TestCase):
         compiled = compile_staged_memory_patch(memory_context, extracted, resolved)
         events = compiled.get('record_events', [])
         self.assertEqual(len(events), 1)
-        # Verify it normalized to party_known by defaulting to visible_transcript
         self.assertEqual(events[0]['visibility'], 'party_known')
+
+    def test_visibility_fail_closed(self):
+        memory_context = {'campaign_id': self.campaign.id}
+        extracted = {}
+        resolved = {
+            'record_events': [
+                {
+                    'event_type': 'story_milestone',
+                    'summary': 'The party cleared Cragmaw Hideout.',
+                    'intended_visibility': 'party_known' # Omitted source_surface
+                }
+            ]
+        }
+        compiled = compile_staged_memory_patch(memory_context, extracted, resolved)
+        events = compiled.get('record_events', [])
+        self.assertEqual(len(events), 1)
+        # Without visible_transcript source_surface, it MUST fail closed to dm_private
+        self.assertEqual(events[0]['visibility'], 'dm_private')
 
     def test_npc_update_remapping_after_entity_dedupe(self):
         # Sildar is already in the campaign knowledge graph
@@ -794,7 +816,7 @@ class P1ImprovementsTest(unittest.TestCase):
         db.session.refresh(npc)
         self.assertEqual(npc.role, 'Warrior of Phandalin')
 
-    def test_entity_id_trust(self):
+    def test_entity_id_trust_and_same_patch_compilation_remapping(self):
         memory_context = {'campaign_id': self.campaign.id}
         extracted = {}
         resolved = {
@@ -804,13 +826,88 @@ class P1ImprovementsTest(unittest.TestCase):
                     'name': 'Gundren Rockseeker',
                     'type': 'npc'
                 }
+            ],
+            'update_npc_actors': [
+                {
+                    'id': 'invented_hallucinated_id',
+                    'role': 'Dwarf Patron'
+                }
+            ],
+            'upsert_graph_relations': [
+                {
+                    'type': 'allied_with',
+                    'source_ref': 'invented_hallucinated_id',
+                    'target_ref': 'sildar_hallwinter_canonical',
+                    'summary': 'Allied'
+                }
             ]
         }
+        
+        # Seed canonical sildar entity and NPCActor
+        self.world.knowledge_graph = '{"entities":[{"id":"sildar_hallwinter_canonical","type":"npc","name":"Sildar Hallwinter"}],"relations":[],"facts":[]}'
+        db.session.add(self.world)
+        sildar = NPCActor(campaign_id=self.campaign.id, actor_id='sildar_hallwinter_canonical', name='Sildar', public_summary='Warrior', dossier='{}')
+        db.session.add(sildar)
+        
+        # Seed NPCActor for the new gundren generated ID so persistence passes
+        gundren = NPCActor(campaign_id=self.campaign.id, actor_id='gundren_rockseeker', name='Gundren', public_summary='Dwarf', dossier='{}')
+        db.session.add(gundren)
+        db.session.commit()
+
         compiled = compile_staged_memory_patch(memory_context, extracted, resolved)
+        
+        # Verify compilation remapped the invented ID to gundren_rockseeker
         entities = compiled.get('upsert_graph_entities', [])
         self.assertEqual(len(entities), 1)
-        # ID must be generated server-side from name rather than trusting the model-supplied unknown ID
         self.assertEqual(entities[0]['id'], 'gundren_rockseeker')
+        
+        npcs = compiled.get('update_npc_actors', [])
+        self.assertEqual(len(npcs), 1)
+        self.assertEqual(npcs[0]['id'], 'gundren_rockseeker')
+        
+        rels = compiled.get('upsert_graph_relations', [])
+        self.assertEqual(len(rels), 1)
+        self.assertEqual(rels[0]['source_id'], 'gundren_rockseeker')
+        self.assertEqual(rels[0]['target_id'], 'sildar_hallwinter_canonical')
+
+        # Run persistence to verify it applies fully
+        res = apply_memory_patch(self.campaign, self.session, compiled)
+        self.assertEqual(len(res['npc_changes']), 1)
+        self.assertEqual(res['npc_changes'][0]['npc_actor']['actor_id'], 'gundren_rockseeker')
+
+    def test_npc_relationship_target_validation(self):
+        memory_context = {'campaign_id': self.campaign.id}
+        extracted = {}
+        resolved = {
+            'update_npc_actors': [
+                {
+                    'id': 'gundren_rockseeker',
+                    'relationships': {
+                        'sildar_hallwinter_canonical': 'Friends',
+                        'invented_non_existent_npc': 'Enemies' # Unknown target
+                    }
+                }
+            ]
+        }
+        
+        # Seed gundren and sildar
+        gundren = NPCActor(campaign_id=self.campaign.id, actor_id='gundren_rockseeker', name='Gundren', dossier='{}')
+        db.session.add(gundren)
+        sildar = NPCActor(campaign_id=self.campaign.id, actor_id='sildar_hallwinter_canonical', name='Sildar', dossier='{}')
+        db.session.add(sildar)
+        db.session.commit()
+
+        compiled = compile_staged_memory_patch(memory_context, extracted, resolved)
+        npcs = compiled.get('update_npc_actors', [])
+        self.assertEqual(len(npcs), 1)
+        # Canonical target should be kept
+        self.assertEqual(npcs[0]['relationships'].get('sildar_hallwinter_canonical'), 'Friends')
+        # Hallucinated non-existent target should be omitted
+        self.assertNotIn('invented_non_existent_npc', npcs[0]['relationships'])
+        
+        # Verified that the unresolved item was reported
+        unresolved = compiled.get('unresolved_items', [])
+        self.assertTrue(any(u.get('kind') == 'npc_relationship_target' for u in unresolved))
 
 if __name__ == '__main__':
     unittest.main()
