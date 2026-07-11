@@ -2705,6 +2705,47 @@ class AutomationRouteTest(unittest.TestCase):
         )
         self.assertEqual(resp.status_code, 200)
 
+    def test_events_route_rejects_status_completed_bypass(self):
+        run_id, token = self._claim_for_credential_tests()
+        resp = self.client.post(
+            f'/api/automation/runs/{run_id}/events',
+            headers=self.headers,
+            json={'event_type': 'custom', 'status': 'completed'},
+        )
+        self.assertEqual(resp.status_code, 409)
+
+    def test_events_route_rejects_status_queued_bypass(self):
+        run_id, token = self._claim_for_credential_tests()
+        resp = self.client.post(
+            f'/api/automation/runs/{run_id}/events',
+            headers=self.headers,
+            json={'event_type': 'custom', 'status': 'queued'},
+        )
+        self.assertEqual(resp.status_code, 409)
+
+    def test_post_completion_credential_free_mutations_rejected(self):
+        run_id, token = self._claim_for_credential_tests()
+        complete_resp = self.client.post(
+            f'/api/automation/runs/{run_id}/complete',
+            headers=self.headers,
+            json={'worker_id': 'cred-test-worker', 'lease_token': token},
+        )
+        self.assertEqual(complete_resp.status_code, 200)
+
+        events_resp = self.client.post(
+            f'/api/automation/runs/{run_id}/events',
+            headers=self.headers,
+            json={'event_type': 'custom'},
+        )
+        self.assertEqual(events_resp.status_code, 409)
+
+        pc_resp = self.client.post(
+            f'/api/automation/runs/{run_id}/provider-calls',
+            headers=self.headers,
+            json={'dedupe_key': 'pc-after-complete', 'phase': 'after_dm', 'request': {}, 'response': {}, 'parsed_output': {}},
+        )
+        self.assertEqual(pc_resp.status_code, 409)
+
     def test_summary_detects_missing_after_dm_when_no_dm_turn_status(self):
         """When a player_decision has an after_player audit cycle but no
         corresponding after_dm cycle and no dm_turn_status event was recorded,
