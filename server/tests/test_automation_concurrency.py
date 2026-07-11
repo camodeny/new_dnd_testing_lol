@@ -31,9 +31,11 @@ from services.automation_service import (
     CloneRetrievalPreflightError,
     claim_run_for_worker,
     create_snapshot_for_scenario,
+    ensure_worker_lease,
     reserve_run_lease,
     release_run_lease,
 )
+from services.automation_service import lease_is_expired
 from services.character_service import update_character_relations
 
 
@@ -139,8 +141,9 @@ class AutomationConcurrencyTest(unittest.TestCase):
             db.session.commit()
             return run_id
 
+    # ── Atomic-claim behaviour tests ──────────────────────────────
+
     def test_atomic_claim_first_wins_second_gets_409(self):
-        """First claim succeeds, second attempt gets 409."""
         run_id = self._create_scenario_and_run()
         with app.app_context():
             run_a = db.session.get(AutomationRun, run_id)
@@ -181,7 +184,7 @@ class AutomationConcurrencyTest(unittest.TestCase):
             self.assertEqual(result['run'].attempt_count, 2)
             self.assertTrue(result['reclaimed'])
 
-    def test_expired_lease_is_reclaimed_exactly_once_sequential(self):
+    def test_expired_lease_reclaimed_exactly_once_sequential(self):
         run_id = self._create_scenario_and_run()
         with app.app_context():
             run = db.session.get(AutomationRun, run_id)
@@ -275,7 +278,7 @@ class AutomationConcurrencyTest(unittest.TestCase):
             with self.assertRaises(ValueError):
                 reserve_run_lease(run_id, 'worker-a', utcnow())
 
-    def test_claim_normalizes_provisioning_lease_to_runtime_value(self):
+    def test_claim_normalizes_lease_to_runtime_value(self):
         run_id = self._create_scenario_and_run()
         with app.app_context():
             run = db.session.get(AutomationRun, run_id)
@@ -303,6 +306,132 @@ class AutomationConcurrencyTest(unittest.TestCase):
             self.assertIsNone(run.heartbeat_at)
             self.assertIsNone(run.lease_expires_at)
             self.assertIsNotNone(run.claim_failure_reason)
+
+    # ── Token safety tests ──────────────────────────────────────────
+
+    def test_ensure_worker_lease_requires_both_credentials(self):
+        with app.app_context():
+            run = AutomationRun(
+                status='running',
+                worker_id='w',
+                lease_token='tok',
+                lease_expires_at=utcnow() + timedelta(hours=1),
+            )
+            with self.assertRaisesRegex(ValueError, 'worker_id'):
+                ensure_worker_lease(run, worker_id=None, lease_token='tok')
+            with self.assertRaisesRegex(ValueError, 'lease_token'):
+                ensure_worker_lease(run, worker_id='w', lease_token=None)
+            with self.assertRaisesRegex(ValueError, 'worker_id'):
+                ensure_worker_lease(run, worker_id=None, lease_token=None)
+            ensure_worker_lease(run, worker_id='w', lease_token='tok')
+
+    def test_ensure_worker_lease_skips_credential_check_for_queued(self):
+        with app.app_context():
+            run = AutomationRun(status='queued')
+            ensure_worker_lease(run, worker_id=None, lease_token=None)
+
+    def test_ensure_worker_lease_rejects_wrong_worker_id(self):
+        with app.app_context():
+            run = AutomationRun(
+                status='running',
+                worker_id='worker-a',
+                lease_token='tok',
+                lease_expires_at=utcnow() + timedelta(hours=1),
+            )
+            with self.assertRaisesRegex(ValueError, 'leased by another worker'):
+                ensure_worker_lease(run, worker_id='worker-b', lease_token='tok')
+
+    def test_ensure_worker_lease_rejects_wrong_lease_token(self):
+        with app.app_context():
+            run = AutomationRun(
+                status='running',
+                worker_id='worker-a',
+                lease_token='tok-a',
+                lease_expires_at=utcnow() + timedelta(hours=1),
+            )
+            with self.assertRaisesRegex(ValueError, 'lease token'):
+                ensure_worker_lease(run, worker_id='worker-a', lease_token='tok-b')
+
+    # ── Lease-timestamp regression tests ───────────────────────────
+
+    def test_lease_refresh_after_materialization_uses_fresh_timestamp(self):
+        run_id = self._create_scenario_and_run()
+        stale_time = utcnow() - timedelta(seconds=120)
+        fresh_time = utcnow()
+        call_log = []
+
+        def fake_now():
+            call_log.append(len(call_log))
+            return stale_time if len(call_log) == 1 else fresh_time
+
+        with patch('services.automation_service._utcnow', side_effect=fake_now):
+            with app.app_context():
+                run = db.session.get(AutomationRun, run_id)
+                result = claim_run_for_worker(run, 'worker-a')
+                expires = result['run'].lease_expires_at
+                # The runtime lease expiry must be based on the fresh timestamp
+                self.assertGreater(
+                    expires,
+                    stale_time + timedelta(seconds=45),
+                )
+
+    def test_long_materialization_does_not_truncate_runtime_lease(self):
+        run_id = self._create_scenario_and_run()
+        start = utcnow()
+        end = start + timedelta(seconds=120)
+        counter = [0]
+
+        def fake_now():
+            counter[0] += 1
+            return start if counter[0] == 1 else end
+
+        with patch('services.automation_service._utcnow', side_effect=fake_now):
+            with app.app_context():
+                run = db.session.get(AutomationRun, run_id)
+                result = claim_run_for_worker(run, 'worker-a')
+                expires = result['run'].lease_expires_at
+                expected = end + timedelta(seconds=45)
+                self.assertAlmostEqual(expires.timestamp(), expected.timestamp(), delta=2)
+
+    # ── Lease-lost regression tests ────────────────────────────────
+
+    def test_lease_lost_after_expiry_does_not_commit_clone(self):
+        """A-expires / B-reclaims / A-finishes-late: A's stale lease update fails."""
+        run_id = self._create_scenario_and_run()
+        with app.app_context():
+            run = db.session.get(AutomationRun, run_id)
+            a_token = claim_run_for_worker(run, 'worker-a')['run'].lease_token
+
+            run = db.session.get(AutomationRun, run_id)
+            run.lease_expires_at = utcnow() - timedelta(seconds=5)
+            db.session.commit()
+
+            run = db.session.get(AutomationRun, run_id)
+            b_result = claim_run_for_worker(run, 'worker-b')
+            b_token = b_result['run'].lease_token
+
+            # A tries a stale lease update — must affect 0 rows
+            from sqlalchemy import update as sa_update
+            stmt = (
+                sa_update(AutomationRun)
+                .where(
+                    AutomationRun.id == run_id,
+                    AutomationRun.lease_token == a_token,
+                )
+                .values(status='claimed')
+            )
+            result = db.session.execute(stmt)
+            self.assertEqual(result.rowcount, 0)
+
+            run = db.session.get(AutomationRun, run_id)
+            self.assertEqual(run.worker_id, 'worker-b')
+            self.assertEqual(run.lease_token, b_token)
+
+            clones_for_run = Campaign.query.filter_by(
+                is_automation_clone=True,
+                automation_source_run_id=run_id,
+            ).all()
+            self.assertEqual(len(clones_for_run), 1)
 
 
 if __name__ == '__main__':

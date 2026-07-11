@@ -1652,7 +1652,7 @@ def provisioning_lease_seconds_for_run(run):
     return max(60, configured)
 
 
-from sqlalchemy import case as sa_case, update as sa_update
+from sqlalchemy import update as sa_update
 
 
 def reserve_run_lease(run_id, worker_id, now, provisioning=False):
@@ -1671,39 +1671,44 @@ def reserve_run_lease(run_id, worker_id, now, provisioning=False):
         provisioning_lease_seconds_for_run(run) if provisioning else 0,
     )
     lease_expires_at = now + timedelta(seconds=lease_seconds)
+    common_values = dict(
+        worker_id=worker_id,
+        lease_token=new_lease_token,
+        heartbeat_at=now,
+        lease_expires_at=lease_expires_at,
+        status='claimed',
+        attempt_count=AutomationRun.attempt_count + 1,
+        updated_at=now,
+    )
 
-    stmt = (
+    # Try fresh claim (was queued)
+    fresh_stmt = (
         sa_update(AutomationRun)
         .where(
             AutomationRun.id == run_id,
-            AutomationRun.status.in_(('queued', *CLAIMABLE_ACTIVE_STATUSES)),
+            AutomationRun.status == 'queued',
+        )
+        .values(claimed_at=now, reclaim_count=AutomationRun.reclaim_count, **common_values)
+    )
+    result = db.session.execute(fresh_stmt)
+    if result.rowcount == 1:
+        db.session.commit()
+        return run, new_lease_token, False
+
+    # Try reclaim (active status but expired lease)
+    reclaim_stmt = (
+        sa_update(AutomationRun)
+        .where(
+            AutomationRun.id == run_id,
+            AutomationRun.status.in_(tuple(CLAIMABLE_ACTIVE_STATUSES)),
             db.or_(
-                AutomationRun.status == 'queued',
                 AutomationRun.lease_expires_at == None,
                 AutomationRun.lease_expires_at <= now,
             ),
         )
-        .values(
-            worker_id=worker_id,
-            lease_token=new_lease_token,
-            heartbeat_at=now,
-            lease_expires_at=lease_expires_at,
-            claimed_at=sa_case(
-                (AutomationRun.claimed_at == None, now),
-                else_=AutomationRun.claimed_at,
-            ),
-            status='claimed',
-            attempt_count=AutomationRun.attempt_count + 1,
-            reclaim_count=sa_case(
-                (AutomationRun.status == 'queued', AutomationRun.reclaim_count),
-                else_=AutomationRun.reclaim_count + 1,
-            ),
-            updated_at=now,
-        )
+        .values(reclaim_count=AutomationRun.reclaim_count + 1, **common_values)
     )
-
-    result = db.session.execute(stmt)
-    db.session.flush()
+    result = db.session.execute(reclaim_stmt)
 
     if result.rowcount == 0:
         run = db.session.get(AutomationRun, run_id)
@@ -1712,11 +1717,7 @@ def reserve_run_lease(run_id, worker_id, now, provisioning=False):
         raise ValueError(f'Run is already claimed by another worker')
 
     db.session.commit()
-    run = db.session.get(AutomationRun, run_id)
-    if run.worker_id != worker_id or run.lease_token != new_lease_token:
-        raise ValueError('Run reservation verification failed')
-
-    return run, new_lease_token, is_reclaim
+    return run, new_lease_token, True
 
 
 def release_run_lease(run_id, lease_token, failure_reason):
@@ -1751,9 +1752,14 @@ def lease_is_expired(run, at=None):
 
 
 def ensure_worker_lease(run, *, worker_id=None, lease_token=None):
-    if worker_id and run.worker_id and run.worker_id != worker_id:
+    if run.status in {'claimed', 'running', 'stop_requested', 'awaiting_audit'}:
+        if not worker_id:
+            raise ValueError('worker_id is required for active runs')
+        if not lease_token:
+            raise ValueError('lease_token is required for active runs')
+    if run.worker_id and run.worker_id != worker_id:
         raise ValueError('Run is leased by another worker')
-    if lease_token and run.lease_token and run.lease_token != lease_token:
+    if run.lease_token and run.lease_token != lease_token:
         raise ValueError('Run lease token is no longer valid')
     if run.status in {'claimed', 'running', 'stop_requested', 'awaiting_audit'} and lease_is_expired(run):
         raise ValueError('Run lease has expired')

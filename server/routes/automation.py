@@ -947,6 +947,8 @@ def claim_automation_run(current_user, run_id):
             'gameplay_readiness': claim_data['gameplay_readiness'],
         },
         dedupe_key=f'run_claimed:{run.id}:attempt:{run.attempt_count}',
+        worker_id=run.worker_id,
+        lease_token=run.lease_token,
     )
 
     roster = []
