@@ -10,6 +10,8 @@ from llm_campaign_common import (
     api_get,
     api_post,
     default_api_base,
+    default_session_start_timeout,
+    start_session,
 )
 from provider_client import request_json_decision
 import run_autonomous_llm_campaign as autonomous
@@ -205,6 +207,39 @@ def submit_decision(api_base, owner_api_key, run_id, chosen_player, decision, de
 
 def active_session_from_run_payload(run_payload):
     return (run_payload.get('latest_session') or {}) if isinstance(run_payload.get('latest_session'), dict) else {}
+
+
+def ensure_campaign_initialized(args, claim_payload):
+    campaign_id = claim_payload['derived_campaign']['id']
+    session = active_session_from_run_payload(claim_payload)
+    bootstrapped = False
+    if not session:
+        session = start_session(
+            args.api_base,
+            campaign_id,
+            api_key=args.owner_api_key,
+            timeout=default_session_start_timeout(),
+        )
+        claim_payload['latest_session'] = session
+        bootstrapped = True
+
+    messages = session.get('messages') or []
+    if not session.get('id') or not session.get('is_active') or not messages:
+        raise RuntimeError('campaign_not_initialized')
+
+    gr = claim_payload.get('gameplay_readiness')
+    if gr and not bootstrapped:
+        if not gr.get('campaign_ready'):
+            raise RuntimeError('campaign_not_initialized')
+        world_payload = {'world': {'world_state': {}}}
+    else:
+        if not any(m.get('role') == 'dm' and m.get('content', '').strip() for m in messages):
+            raise RuntimeError('campaign_not_initialized')
+        world_payload = api_get(args.api_base, f'/api/campaigns/{campaign_id}/world', api_key=args.owner_api_key)
+        if not world_payload or world_payload.get('world') is None:
+            raise RuntimeError('campaign_not_initialized')
+
+    return session, world_payload
 
 
 def messages_fingerprint(session):
@@ -493,6 +528,20 @@ def execute_run(args, run_id):
     claim_payload = claim_run(args.api_base, args.owner_api_key, run_id, args.worker_id)
     run = claim_payload['run']
     lease_token = claim_payload['lease_token']
+    try:
+        session_on_start, _ = ensure_campaign_initialized(args, claim_payload)
+    except Exception as exc:
+        complete_run(
+            args.api_base,
+            args.owner_api_key,
+            run_id,
+            args.worker_id,
+            lease_token,
+            status='failed',
+            error_text='campaign_not_initialized',
+            dedupe_key=f'run_completed:{run_id}:init-failed',
+        )
+        raise exc
     manifest = build_manifest_for_run(args.api_base, args.owner_api_key, claim_payload)
     append_event(
         args.api_base,
@@ -523,7 +572,6 @@ def execute_run(args, run_id):
     run_config = runner_config(claim_payload)
     max_turns = run_config.get('max_turns') or run_config.get('max_cycles') or args.max_turns
 
-    session_on_start = active_session_from_run_payload(claim_payload)
     resume_dm_wait_message_id = None
     if session_on_start:
         latest_player_message_id = autonomous.find_latest_player_message_id(session_on_start.get('messages') or [])

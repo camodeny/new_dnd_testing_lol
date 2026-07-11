@@ -1246,16 +1246,6 @@ def materialize_run_campaign(run):
                 created_at=_parse_iso(proposal_data.get('created_at')) or _utcnow(),
                 applied_at=_parse_iso(proposal_data.get('applied_at')),
             ))
-    if not session_map:
-        new_session = CampaignSession(
-            campaign_id=clone.id,
-            started_at=_utcnow(),
-            is_active=True,
-        )
-        db.session.add(new_session)
-        db.session.flush()
-        session_map['active_fallback'] = new_session.id
-
     world_data = data.get('world')
     if world_data:
         db.session.add(CampaignWorld(
@@ -1733,6 +1723,35 @@ def record_worker_activity(worker_id, api_base=None, is_heartbeat=False):
     db.session.commit()
 
 
+def compute_gameplay_readiness(campaign):
+    if not campaign:
+        return {
+            'world_present': False,
+            'active_session_present': False,
+            'opening_dm_present': False,
+            'campaign_ready': False,
+        }
+
+    world_present = CampaignWorld.query.filter_by(campaign_id=campaign.id).first() is not None
+    active_session = CampaignSession.query.filter_by(campaign_id=campaign.id, is_active=True).first()
+    active_session_present = active_session is not None
+    opening_dm_present = False
+    if active_session:
+        opening_dm_present = any(
+            m.role == 'dm' and m.content and m.content.strip()
+            for m in active_session.messages
+        )
+
+    campaign_ready = bool(world_present and active_session_present and opening_dm_present)
+
+    return {
+        'world_present': world_present,
+        'active_session_present': active_session_present,
+        'opening_dm_present': opening_dm_present,
+        'campaign_ready': campaign_ready,
+    }
+
+
 def claim_run_for_worker(run, worker_id):
     now = _utcnow()
     reclaimed = run.status in {'claimed', 'running', 'stop_requested', 'awaiting_audit'} and lease_is_expired(run, at=now)
@@ -1771,6 +1790,8 @@ def claim_run_for_worker(run, worker_id):
     if latest_session is None:
         latest_session = CampaignSession.query.filter_by(campaign_id=clone_campaign.id).order_by(CampaignSession.started_at.desc(), CampaignSession.id.desc()).first()
 
+    gameplay_readiness = compute_gameplay_readiness(clone_campaign)
+
     db.session.commit()
     return {
         'run': run,
@@ -1779,6 +1800,7 @@ def claim_run_for_worker(run, worker_id):
         'latest_session': latest_session,
         'reclaimed': reclaimed,
         'retrieval_preflight': preflight_report,
+        'gameplay_readiness': gameplay_readiness,
     }
 
 
@@ -2187,6 +2209,10 @@ def refresh_run_scorecard(run):
     fail_count = sum(1 for check in results_payload if check['status'] == 'fail')
     warn_count = sum(1 for check in results_payload if check['status'] == 'warn')
     weighted_score = round((weighted_pass / weighted_total) if weighted_total else 0.0, 4)
+    assessment_present = bool(metrics.get('completed_turns') or metrics.get('audited_cycle_count'))
+    if not assessment_present:
+        weighted_score = None
+    overall_status = 'not_assessed' if not assessment_present else ('fail' if fail_count else ('warn' if warn_count else 'pass'))
 
     AutomationRunAuditResult.query.filter_by(run_id=run.id).delete()
     created_results = []
@@ -2212,6 +2238,7 @@ def refresh_run_scorecard(run):
         'error_count': metrics.get('error_count', 0),
         'audited_cycle_count': metrics.get('audited_cycle_count', 0),
         'weighted_score': weighted_score,
+        'overall_status': overall_status,
         'incidents': calculate_run_incidents(run, event_rows, audit_rows, provider_rows),
         'custom_scorecard_name': current_scorecard_template_for_run(run).get('name'),
     }

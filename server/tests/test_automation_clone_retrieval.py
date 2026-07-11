@@ -558,3 +558,38 @@ class AutomationCloneRetrievalTest(unittest.TestCase):
         self.assertIsNotNone(entity_match)
         self.assertIsNotNone(entity_match.get('embedding_score'))
         self.assertTrue(entity_match.get('embedding_score') > 0.0)
+
+    def test_claim_does_not_create_fallback_session_for_empty_snapshot(self):
+        source_campaign = Campaign(name='Empty Source Campaign', user_id=self.user.id)
+        db.session.add(source_campaign)
+        db.session.flush()
+        empty_scenario = AutomationScenario(
+            source_campaign_id=source_campaign.id,
+            user_id=self.user.id,
+            name='Empty Snapshot Scenario',
+        )
+        db.session.add(empty_scenario)
+        db.session.flush()
+        empty_snapshot = create_snapshot_for_scenario(
+            empty_scenario,
+            label='Empty Snapshot',
+        )
+        empty_run = AutomationRun(
+            scenario_id=empty_scenario.id,
+            snapshot_id=empty_snapshot.id,
+            user_id=self.user.id,
+            status='queued',
+        )
+        db.session.add(empty_run)
+        db.session.commit()
+
+        headers = {'Authorization': f'Bearer {self.token}'}
+        response = self.client.post(
+            f'/api/automation/runs/{empty_run.id}/claim',
+            headers=headers,
+            json={'worker_id': 'worker-empty'},
+        )
+        self.assertEqual(response.status_code, 200)
+        claim_data = response.get_json()
+        self.assertIsNone(claim_data['latest_session'])
+        self.assertIsNone(CampaignSession.query.filter_by(campaign_id=claim_data['derived_campaign']['id']).first())

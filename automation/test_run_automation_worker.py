@@ -132,10 +132,20 @@ class RunAutomationWorkerTests(unittest.TestCase):
             dm_response_timeout=60.0,
             model='opencode-go/deepseek-v4-flash',
         )
+        initial_session = {
+            'id': 4,
+            'is_active': True,
+            'started_at': '2026-07-01T15:58:50.044971',
+            'messages': [
+                {'id': 410, 'role': 'dm', 'content': 'Opening scene.', 'created_at': '2026-07-01T15:59:05.608343'},
+            ],
+        }
         claim_payload = {
             'run': {'id': 2, 'attempt_count': 1, 'runner_config': {'audit_pause_phases': ['after_dm']}},
             'lease_token': 'lease-1',
             'derived_campaign': {'id': 100003},
+            'latest_session': initial_session,
+            'gameplay_readiness': {'campaign_ready': True},
             'roster': [
                 {
                     'llm_player_id': 33,
@@ -144,14 +154,6 @@ class RunAutomationWorkerTests(unittest.TestCase):
                     'character_name': 'Kaelen Shadowstep',
                     'derived_character_id': 38,
                 },
-            ],
-        }
-        initial_session = {
-            'id': 4,
-            'is_active': True,
-            'started_at': '2026-07-01T15:58:50.044971',
-            'messages': [
-                {'id': 410, 'role': 'dm', 'content': 'Opening scene.', 'created_at': '2026-07-01T15:59:05.608343'},
             ],
         }
         stop_requested_run = {
@@ -236,6 +238,7 @@ class RunAutomationWorkerTests(unittest.TestCase):
             'lease_token': 'lease-1',
             'derived_campaign': {'id': 100003},
             'latest_session': initial_session,
+            'gameplay_readiness': {'campaign_ready': True},
             'roster': [],
         }
         run_payload_with_empty_cycles = {
@@ -296,6 +299,7 @@ class RunAutomationWorkerTests(unittest.TestCase):
             'lease_token': 'lease-1',
             'derived_campaign': {'id': 100003},
             'latest_session': initial_session,
+            'gameplay_readiness': {'campaign_ready': True},
             'roster': [],
         }
         run_payload_with_existing_cycle = {
@@ -358,6 +362,7 @@ class RunAutomationWorkerTests(unittest.TestCase):
             'lease_token': 'lease-1',
             'derived_campaign': {'id': 100003},
             'latest_session': initial_session,
+            'gameplay_readiness': {'campaign_ready': True},
             'roster': [],
         }
         run_payload_with_empty_cycles = {
@@ -417,6 +422,7 @@ class RunAutomationWorkerTests(unittest.TestCase):
             'lease_token': 'lease-1',
             'derived_campaign': {'id': 100003},
             'latest_session': initial_session,
+            'gameplay_readiness': {'campaign_ready': True},
             'roster': [],
         }
         run_payload_with_silent_cycle = {
@@ -476,6 +482,7 @@ class RunAutomationWorkerTests(unittest.TestCase):
             'lease_token': 'lease-1',
             'derived_campaign': {'id': 100003},
             'latest_session': initial_session,
+            'gameplay_readiness': {'campaign_ready': True},
             'roster': [],
         }
         run_payload_with_empty_cycles = {
@@ -541,6 +548,8 @@ class RunAutomationWorkerTests(unittest.TestCase):
             'run': {'id': 2, 'attempt_count': 1, 'runner_config': {'audit_pause_phases': ['after_dm', 'after_player']}},
             'lease_token': 'lease-1',
             'derived_campaign': {'id': 100003},
+            'latest_session': initial_session,
+            'gameplay_readiness': {'campaign_ready': True},
             'roster': [],
         }
         run_payload = {
@@ -594,10 +603,20 @@ class RunAutomationWorkerTests(unittest.TestCase):
             dm_response_timeout=60.0,
             model='test-model',
         )
+        initial_session = {
+            'id': 4,
+            'is_active': True,
+            'started_at': '2026-07-01T15:58:50.044971',
+            'messages': [
+                {'id': 410, 'role': 'dm', 'content': 'Opening scene.', 'created_at': '2026-07-01T15:59:05.608343'},
+            ],
+        }
         claim_payload = {
             'run': {'id': 2, 'attempt_count': 1, 'runner_config': {'audit_pause_phases': ['after_dm']}},
             'lease_token': 'lease-1',
             'derived_campaign': {'id': 100003},
+            'latest_session': initial_session,
+            'gameplay_readiness': {'campaign_ready': True},
             'roster': [
                 {
                     'llm_player_id': 33,
@@ -606,14 +625,6 @@ class RunAutomationWorkerTests(unittest.TestCase):
                     'character_name': 'Kaelen Shadowstep',
                     'derived_character_id': 38,
                 },
-            ],
-        }
-        initial_session = {
-            'id': 4,
-            'is_active': True,
-            'started_at': '2026-07-01T15:58:50.044971',
-            'messages': [
-                {'id': 410, 'role': 'dm', 'content': 'Opening scene.', 'created_at': '2026-07-01T15:59:05.608343'},
             ],
         }
 
@@ -652,6 +663,159 @@ class RunAutomationWorkerTests(unittest.TestCase):
         self.assertEqual(pause_mock.call_count, 2)
         complete_run_mock.assert_called_once()
         self.assertEqual(complete_run_mock.call_args.kwargs['status'], 'stopped')
+
+    def test_ensure_campaign_initialized_bootstraps_missing_session(self):
+        args = SimpleNamespace(
+            api_base='http://127.0.0.1:5889',
+            owner_api_key='owner-key',
+            worker_id='bootstrap-worker',
+        )
+        claim_payload = {
+            'derived_campaign': {'id': 100003},
+            'latest_session': None,
+        }
+        session = {
+            'id': 44,
+            'is_active': True,
+            'messages': [{'id': 101, 'role': 'dm', 'content': 'Opening scene.'}],
+        }
+
+        with patch.object(worker, 'start_session', return_value=session) as start_session, \
+                patch.object(worker, 'api_get', return_value={'world': {'world_state': {}}}) as api_get:
+            ensured_session, world_payload = worker.ensure_campaign_initialized(args, claim_payload)
+
+        self.assertEqual(ensured_session, session)
+        self.assertEqual(world_payload, {'world': {'world_state': {}}})
+        self.assertEqual(claim_payload['latest_session'], session)
+        start_session.assert_called_once()
+        api_get.assert_called_once()
+
+    def test_ensure_campaign_initialized_bootstraps_with_stale_gameplay_readiness(self):
+        args = SimpleNamespace(
+            api_base='http://127.0.0.1:5889',
+            owner_api_key='owner-key',
+            worker_id='bootstrap-worker',
+        )
+        claim_payload = {
+            'derived_campaign': {'id': 100003},
+            'latest_session': None,
+            'gameplay_readiness': {
+                'world_present': False,
+                'active_session_present': False,
+                'opening_dm_present': False,
+                'campaign_ready': False,
+            }
+        }
+        session = {
+            'id': 44,
+            'is_active': True,
+            'messages': [{'id': 101, 'role': 'dm', 'content': 'Opening scene.'}],
+        }
+
+        with patch.object(worker, 'start_session', return_value=session) as start_session, \
+                patch.object(worker, 'api_get', return_value={'world': {'world_state': {}}}) as api_get:
+            ensured_session, world_payload = worker.ensure_campaign_initialized(args, claim_payload)
+
+        self.assertEqual(ensured_session, session)
+        self.assertEqual(world_payload, {'world': {'world_state': {}}})
+        self.assertEqual(claim_payload['latest_session'], session)
+        start_session.assert_called_once()
+        api_get.assert_called_once()
+
+    def test_ensure_campaign_initialized_rejects_unplayable_session(self):
+        args = SimpleNamespace(
+            api_base='http://127.0.0.1:5889',
+            owner_api_key='owner-key',
+            worker_id='bootstrap-worker',
+        )
+        claim_payload = {
+            'derived_campaign': {'id': 100003},
+            'latest_session': {
+                'id': 44,
+                'is_active': True,
+                'messages': [],
+            },
+        }
+
+        with patch.object(worker, 'api_get', return_value={'world': {'world_state': {}}}):
+            with self.assertRaisesRegex(RuntimeError, 'campaign_not_initialized'):
+                worker.ensure_campaign_initialized(args, claim_payload)
+
+    def test_ensure_campaign_initialized_no_world(self):
+        args = SimpleNamespace(
+            api_base='http://127.0.0.1:5889',
+            owner_api_key='owner-key',
+            worker_id='bootstrap-worker',
+        )
+        claim_payload = {
+            'derived_campaign': {'id': 100003},
+            'latest_session': {
+                'id': 44,
+                'is_active': True,
+                'messages': [{'id': 101, 'role': 'dm', 'content': 'Opening scene.'}],
+            },
+        }
+        with patch.object(worker, 'api_get', return_value={}):
+            with self.assertRaisesRegex(RuntimeError, 'campaign_not_initialized'):
+                worker.ensure_campaign_initialized(args, claim_payload)
+
+    def test_ensure_campaign_initialized_no_dm_message(self):
+        args = SimpleNamespace(
+            api_base='http://127.0.0.1:5889',
+            owner_api_key='owner-key',
+            worker_id='bootstrap-worker',
+        )
+        claim_payload = {
+            'derived_campaign': {'id': 100003},
+            'latest_session': {
+                'id': 44,
+                'is_active': True,
+                'messages': [{'id': 101, 'role': 'player', 'content': 'I do something.'}],
+            },
+        }
+        with patch.object(worker, 'api_get', return_value={'world': {'world_state': {}}}):
+            with self.assertRaisesRegex(RuntimeError, 'campaign_not_initialized'):
+                worker.ensure_campaign_initialized(args, claim_payload)
+
+    def test_execute_run_initialization_failure(self):
+        args = SimpleNamespace(
+            api_base='http://127.0.0.1:5889',
+            owner_api_key='owner-key',
+            worker_id='test-worker',
+            max_turns=5,
+            max_minutes=1.0,
+            poll_interval=0.1,
+            idle_timeout=1.0,
+            heartbeat_interval=1.0,
+            dm_response_timeout=1.0,
+            message_window=10,
+        )
+        claim_payload = {
+            'run': {'id': 123, 'attempt_count': 1, 'completed_turns': 0},
+            'lease_token': 'lease-token-123',
+            'derived_campaign': {'id': 100003},
+            'latest_session': {
+                'id': 44,
+                'is_active': True,
+                'messages': [],
+            },
+        }
+        with patch.object(worker, 'claim_run', return_value=claim_payload) as mock_claim, \
+             patch.object(worker, 'api_get', return_value={'world': {'world_state': {}}}), \
+             patch.object(worker, 'complete_run') as mock_complete:
+            with self.assertRaises(RuntimeError):
+                worker.execute_run(args, 123)
+            
+            mock_complete.assert_called_once_with(
+                'http://127.0.0.1:5889',
+                'owner-key',
+                123,
+                'test-worker',
+                'lease-token-123',
+                status='failed',
+                error_text='campaign_not_initialized',
+                dedupe_key='run_completed:123:init-failed'
+            )
 
 
 if __name__ == '__main__':
