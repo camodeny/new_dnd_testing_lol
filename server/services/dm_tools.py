@@ -2667,7 +2667,13 @@ def _campaign_memory_candidates(campaign):
         candidates.append({'kind': 'npc_actor', 'item_id': npc.actor_id, 'value': npc.to_dict(include_private=True)})
     for clock in CampaignClock.query.filter_by(campaign_id=campaign.id).all():
         candidates.append({'kind': 'clock', 'item_id': clock.clock_id, 'value': clock.to_dict(include_private=True)})
-    for event in WorldEvent.query.filter_by(campaign_id=campaign.id).order_by(WorldEvent.created_at.desc()).limit(30).all():
+    for event in (
+        WorldEvent.query
+        .filter_by(campaign_id=campaign.id)
+        .order_by(WorldEvent.created_at.desc(), WorldEvent.id.desc())
+        .limit(30)
+        .all()
+    ):
         candidates.append({'kind': 'world_event', 'item_id': str(event.id), 'value': event.to_dict(include_private=True)})
     candidates.append({'kind': 'world_state', 'item_id': 'current', 'value': world_state})
     candidates.append({'kind': 'dm_private', 'item_id': 'current', 'value': dm_private})

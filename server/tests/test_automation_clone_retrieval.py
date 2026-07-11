@@ -504,6 +504,44 @@ class AutomationCloneRetrievalTest(unittest.TestCase):
         }
         self.assertEqual(snapshot_keys, production_keys)
 
+    def test_world_event_cutoff_stays_deterministic_for_tied_timestamps(self):
+        """Regression test: tied world-event timestamps should select the same 30 rows."""
+        tied_created_at = datetime(2026, 1, 15, 12, 0, 0)
+        self.event.created_at = tied_created_at
+        db.session.flush()
+
+        for index in range(30):
+            db.session.add(WorldEvent(
+                campaign_id=self.campaign.id,
+                event_type='world_event',
+                summary=f'Tied event {index + 1}',
+                payload='{}',
+                visibility='dm_private',
+                created_at=tied_created_at,
+            ))
+        db.session.commit()
+
+        helper_keys = _campaign_candidate_keys(self.campaign)
+        production_candidates = dm_tools._campaign_memory_candidates(self.campaign)
+        production_keys = {
+            (str(item['kind']), str(item['item_id']))
+            for item in production_candidates
+        }
+
+        helper_world_event_ids = {
+            item_id
+            for kind, item_id in helper_keys
+            if kind == 'world_event'
+        }
+        production_world_event_ids = {
+            str(item['item_id'])
+            for item in production_candidates
+            if item['kind'] == 'world_event'
+        }
+
+        self.assertEqual(helper_keys, production_keys)
+        self.assertEqual(helper_world_event_ids, production_world_event_ids)
+
     @patch('services.embedding_service._post_embedding', return_value=[0.1, 0.2, 0.3])
     def test_entity_embeddings_in_runtime_semantic_scores(self, mock_post):
         """Regression test: verify that entity embeddings are matched during runtime search"""
