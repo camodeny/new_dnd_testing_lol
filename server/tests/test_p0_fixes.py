@@ -168,6 +168,7 @@ class P0FixesTest(unittest.TestCase):
             'derived_campaign': {'id': 1},
             'api_base': 'http://127.0.0.1:5889',
             'owner': {'api_key': 'owner-key', 'token': 'owner-token'},
+            'gameplay_readiness': {'campaign_ready': True},
         }
         mock_manifest.return_value = {
             'api_base': 'http://127.0.0.1:5889',
@@ -258,6 +259,7 @@ class P0FixesTest(unittest.TestCase):
             'derived_campaign': {'id': 1},
             'api_base': 'http://127.0.0.1:5889',
             'owner': {'api_key': 'owner-key', 'token': 'owner-token'},
+            'gameplay_readiness': {'campaign_ready': True},
         }
         mock_manifest.return_value = {
             'api_base': 'http://127.0.0.1:5889',

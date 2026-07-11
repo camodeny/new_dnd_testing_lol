@@ -690,6 +690,38 @@ class RunAutomationWorkerTests(unittest.TestCase):
         start_session.assert_called_once()
         api_get.assert_called_once()
 
+    def test_ensure_campaign_initialized_bootstraps_with_stale_gameplay_readiness(self):
+        args = SimpleNamespace(
+            api_base='http://127.0.0.1:5889',
+            owner_api_key='owner-key',
+            worker_id='bootstrap-worker',
+        )
+        claim_payload = {
+            'derived_campaign': {'id': 100003},
+            'latest_session': None,
+            'gameplay_readiness': {
+                'world_present': False,
+                'active_session_present': False,
+                'opening_dm_present': False,
+                'campaign_ready': False,
+            }
+        }
+        session = {
+            'id': 44,
+            'is_active': True,
+            'messages': [{'id': 101, 'role': 'dm', 'content': 'Opening scene.'}],
+        }
+
+        with patch.object(worker, 'start_session', return_value=session) as start_session, \
+                patch.object(worker, 'api_get', return_value={'world': {'world_state': {}}}) as api_get:
+            ensured_session, world_payload = worker.ensure_campaign_initialized(args, claim_payload)
+
+        self.assertEqual(ensured_session, session)
+        self.assertEqual(world_payload, {'world': {'world_state': {}}})
+        self.assertEqual(claim_payload['latest_session'], session)
+        start_session.assert_called_once()
+        api_get.assert_called_once()
+
     def test_ensure_campaign_initialized_rejects_unplayable_session(self):
         args = SimpleNamespace(
             api_base='http://127.0.0.1:5889',

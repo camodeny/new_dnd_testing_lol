@@ -228,7 +228,7 @@ def ensure_campaign_initialized(args, claim_payload):
         raise RuntimeError('campaign_not_initialized')
 
     gr = claim_payload.get('gameplay_readiness')
-    if gr:
+    if gr and not bootstrapped:
         if not gr.get('campaign_ready'):
             raise RuntimeError('campaign_not_initialized')
         world_payload = {'world': {'world_state': {}}}
