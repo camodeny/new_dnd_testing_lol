@@ -1977,7 +1977,7 @@ class AppRouteTest(unittest.TestCase):
             self.assertEqual(monster_ids, ['guard-1'])
 
     def test_joining_combat_sandbox_auto_assigns_character_and_token(self):
-        from routes.encounter_maps import build_initial_encounter_state
+        from routes.encounter_maps import build_initial_encounter_state, check_and_start_turns
 
         with app.app_context():
             owner = User(username='sandboxhost', email='sandboxhost@example.com')
