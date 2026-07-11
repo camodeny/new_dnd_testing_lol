@@ -1,8 +1,10 @@
 #!/usr/bin/env python3
 import argparse
 import os
+import socket
 import sys
 import time
+import uuid
 from datetime import datetime, timezone
 
 from llm_campaign_common import (
@@ -23,7 +25,7 @@ def parse_args():
     parser.add_argument('--api-base', default=default_api_base(), help='Base app URL, for example http://127.0.0.1:5889')
     parser.add_argument('--owner-api-key', default=os.environ.get('DND_OWNER_API_KEY'), help='Owner automation API key')
     parser.add_argument('--run-id', type=int, help='Specific automation run id to claim and execute')
-    parser.add_argument('--worker-id', default=f'worker-{os.getpid()}')
+    parser.add_argument('--worker-id', default=None)
     parser.add_argument('--poll-interval', type=float, default=3.0)
     parser.add_argument('--max-turns', type=int, default=50)
     parser.add_argument('--max-minutes', type=float, default=None)
@@ -36,6 +38,19 @@ def parse_args():
     parser.add_argument('--opencode-password', default=None, help='Unused compatibility flag')
     parser.add_argument('--once', action='store_true', help='Claim and execute at most one run, then exit')
     return parser.parse_args()
+
+
+def default_worker_id():
+    return f'automation-{socket.gethostname()}-{os.getpid()}-{uuid.uuid4().hex[:8]}'
+
+
+def resolve_worker_id(cli_value, env_var='DND_AUTOMATION_WORKER_ID'):
+    if cli_value:
+        return cli_value
+    env_value = os.environ.get(env_var)
+    if env_value:
+        return env_value
+    return default_worker_id()
 
 
 def utc_now():
@@ -53,13 +68,15 @@ def workspace(api_base, owner_api_key, worker_id=None):
 def list_candidate_run_ids(api_base, owner_api_key, worker_id=None):
     data = workspace(api_base, owner_api_key, worker_id=worker_id)
     active_runs = data.get('active_runs') or []
-    queued = [run.get('id') for run in active_runs if run.get('status') == 'queued']
-    resumable = [
-        run.get('id')
-        for run in active_runs
-        if run.get('status') in {'claimed', 'running', 'stop_requested'}
+    claimable = [
+        run for run in active_runs
+        if run.get('claimable') and run.get('id') is not None
     ]
-    return [run_id for run_id in [*queued, *resumable] if run_id is not None]
+    queued = [run for run in claimable if run.get('status') == 'queued']
+    expired = [run for run in claimable if run.get('status') != 'queued']
+    queued.sort(key=lambda r: r.get('created_at') or '')
+    expired.sort(key=lambda r: r.get('lease_expires_at') or '')
+    return [r['id'] for r in [*queued, *expired]]
 
 
 def claim_run(api_base, owner_api_key, run_id, worker_id):
@@ -1174,6 +1191,8 @@ def main():
     args = parse_args()
     if not args.owner_api_key:
         raise SystemExit('DND_OWNER_API_KEY or --owner-api-key is required')
+    args.worker_id = resolve_worker_id(args.worker_id)
+    print(f'Worker ID: {args.worker_id}', file=sys.stderr)
 
     while True:
         candidate_ids = [args.run_id] if args.run_id else list_candidate_run_ids(args.api_base, args.owner_api_key, worker_id=args.worker_id)

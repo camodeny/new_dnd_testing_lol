@@ -70,8 +70,6 @@ services:
       - start
       - --api-base
       - http://app:5001
-      - --worker-id
-      - deployed-automation-worker
       - --poll-interval
       - "3"
       - --max-turns

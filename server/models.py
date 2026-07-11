@@ -1783,6 +1783,15 @@ class AutomationRun(db.Model):
                 if (e.payload_json or {}).get('decision', {}).get('action') != 'no_action'
             ])
 
+        claimable_active = {'claimed', 'running', 'stop_requested', 'awaiting_audit'}
+        now = utcnow()
+        is_claimable = (
+            self.status == 'queued'
+            or (self.status in claimable_active and (
+                self.lease_expires_at is None or now >= self.lease_expires_at
+            ))
+        )
+
         result = {
             'id': self.id,
             'scenario_id': self.scenario_id,
@@ -1790,6 +1799,7 @@ class AutomationRun(db.Model):
             'user_id': self.user_id,
             'derived_campaign_id': self.derived_campaign_id,
             'status': self.status,
+            'claimable': is_claimable,
             'worker_id': self.worker_id,
             'has_lease_token': bool(self.lease_token),
             'heartbeat_at': self.heartbeat_at.isoformat() if self.heartbeat_at else None,

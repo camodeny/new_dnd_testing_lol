@@ -339,14 +339,19 @@ class AutomationCloneRetrievalTest(unittest.TestCase):
             self.assertIn('retrieval_preflight', res_data)
             self.assertEqual(res_data['retrieval_preflight']['status'], 'fail')
 
-        # Verify total rollback
+        # Verify release: lease fields cleared, but claimed_at and attempt_count
+        # persist from the atomic reservation.
         db.session.expire_all()
         run = db.session.get(AutomationRun, self.run.id)
         self.assertEqual(run.status, 'queued')
         self.assertIsNone(run.worker_id)
         self.assertIsNone(run.lease_token)
-        self.assertIsNone(run.claimed_at)
-        self.assertEqual(run.attempt_count or 0, 0)
+        self.assertIsNone(run.heartbeat_at)
+        self.assertIsNone(run.lease_expires_at)
+        self.assertIsNotNone(run.claim_failure_reason)
+        # claimed_at is set by atomic reservation before materialization
+        self.assertIsNotNone(run.claimed_at)
+        self.assertEqual(run.attempt_count, 1)
         self.assertIsNone(run.derived_campaign_id)
 
         # Ensure no cloned campaign remains

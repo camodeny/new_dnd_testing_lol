@@ -909,15 +909,8 @@ def claim_automation_run(current_user, run_id):
 
     try:
         claim_data = claim_run_for_worker(run, worker_id)
-        run.claim_failure_reason = None
-        if api_base:
-            run.worker_api_base = api_base
-        db.session.commit()
     except CloneRetrievalPreflightError as exc:
-        db.session.rollback()
         run = db.session.get(AutomationRun, run_id)
-        run.claim_failure_reason = str(exc)
-        db.session.commit()
         return jsonify({
             'error': str(exc),
             'retrieval_preflight': exc.report,
@@ -929,11 +922,15 @@ def claim_automation_run(current_user, run_id):
             }
         }), 409
     except ValueError as exc:
-        db.session.rollback()
         run = db.session.get(AutomationRun, run_id)
-        run.claim_failure_reason = str(exc)
-        db.session.commit()
         return jsonify({'error': str(exc)}), 409
+
+    run = claim_data['run']
+    run.claim_failure_reason = None
+    if api_base:
+        run.worker_api_base = api_base
+    db.session.add(run)
+    db.session.commit()
 
     append_run_event(
         run,

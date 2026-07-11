@@ -107,6 +107,45 @@ CLIENT_ID=...
 CLIENT_SECRET=...
 ```
 
+## Automation worker scaling
+
+The automation worker service can be scaled horizontally by adjusting the Compose replica count:
+
+```bash
+docker compose up -d --scale worker=4
+```
+
+Each replica:
+
+- Receives a unique generated worker ID (container hostname + PID + random nonce), or one explicitly set via `--worker-id` or `DND_AUTOMATION_WORKER_ID`.
+- Executes one automation run at a time.
+- Four replicas can therefore process at most four independent runs concurrently.
+
+**Important contract:** One run is never intentionally shared by multiple workers. Each run is claimed atomically through a conditional database `UPDATE` that ensures exactly one worker wins the lease. Non-expired leases cannot be displaced; expired leases are reclaimable by a single winner.
+
+### Runtime lease semantics
+
+| Concept | Detail |
+|---|---|
+| Lease duration | Configured per-run via `runner_config.lease_seconds` (default 45 s). |
+| Provisioning lease | First-time materialization uses `max(lease_seconds, provisioning_lease_seconds)` (default 300 s) to protect clone creation. After materialization, the lease is replaced with the normal runtime value. |
+| Heartbeat | Workers heartbeat via `/api/automation/runs/{id}/heartbeat`, extending the runtime lease. |
+| Expiry | Expired leases can be claimed by any worker. |
+| Token safety | Every lease operation (heartbeat, event, completion) is gated by both `worker_id` and `lease_token` to prevent cross-worker interference. |
+
+### Operational inspection
+
+The workspace endpoint (`/api/automation`) surfaces:
+
+- `active_workers` — workers that have polled or heartbeated in the last 5 minutes.
+- `queue_length` — count of queued runs.
+- `active_runs` — each run includes `worker_id`, `heartbeat_at`, `lease_expires_at`, and `claimable` (server-computed flag).
+
+### Database guidance
+
+- **PostgreSQL** is recommended for sustained multi-worker throughput. Its row-level locking and MVCC handle concurrent claim `UPDATE` statements efficiently.
+- **SQLite** serializes all writes and may bottleneck under multiple worker replicas. It is appropriate only for small or local deployments even after claim correctness is fixed.
+
 ## Trigger
 
 - Pushes to `main` deploy with `docker-compose.yml`.
