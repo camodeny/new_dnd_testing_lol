@@ -434,14 +434,21 @@ def provision_campaign_roster(current_user, campaign_id):
                 raise ValueError(f"entries[{idx}].label is required")
 
             member_role = entry.get('member_role') or 'player'
-            if member_role not in ('player', 'spectator', 'dm'):
-                raise ValueError(f"entries[{idx}].member_role is invalid")
+            if member_role != 'player':
+                raise ValueError(f"entries[{idx}].member_role must be 'player' for automation players")
+
+            char_data = entry.get('character')
+            if not char_data or not isinstance(char_data, dict):
+                raise ValueError(f"entries[{idx}].character must be an object")
+            if not char_data.get('name'):
+                raise ValueError(f"entries[{idx}].character.name is required")
+            if not char_data.get('race'):
+                raise ValueError(f"entries[{idx}].character.race is required")
 
             # Create or resolve LLM player and user
             llm_user, llm_player, api_key = provision_automation_player(campaign, label)
 
             # Create character
-            char_data = entry.get('character') or {}
             character = Character(user_id=llm_user.id, campaign_id=campaign.id, player_name=label)
             build_character_from_data(character, char_data)
             character.player_name = label

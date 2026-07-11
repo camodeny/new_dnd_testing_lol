@@ -2639,6 +2639,43 @@ class AutomationRouteTest(unittest.TestCase):
             rolled_back_user = User.query.filter_by(username='Valid Label').first()
             self.assertIsNone(rolled_back_user)
 
+        # 4. Verify parameter validation checks
+        # Test: Invalid role (spectator)
+        resp = self.client.post(
+            f'/api/automation/source-campaigns/{self.campaign_id}/roster',
+            headers=self.headers,
+            json={'entries': [{'label': 'Spectator Label', 'member_role': 'spectator', 'character': {'name': 'Name', 'race': 'Elf'}}]}
+        )
+        self.assertEqual(resp.status_code, 400)
+        self.assertIn("must be 'player'", resp.get_json()['error'])
+
+        # Test: Missing character
+        resp = self.client.post(
+            f'/api/automation/source-campaigns/{self.campaign_id}/roster',
+            headers=self.headers,
+            json={'entries': [{'label': 'No Char Label'}]}
+        )
+        self.assertEqual(resp.status_code, 400)
+        self.assertIn("character must be an object", resp.get_json()['error'])
+
+        # Test: Missing character name
+        resp = self.client.post(
+            f'/api/automation/source-campaigns/{self.campaign_id}/roster',
+            headers=self.headers,
+            json={'entries': [{'label': 'No Name Label', 'character': {'race': 'Elf'}}]}
+        )
+        self.assertEqual(resp.status_code, 400)
+        self.assertIn("character.name is required", resp.get_json()['error'])
+
+        # Test: Missing character race
+        resp = self.client.post(
+            f'/api/automation/source-campaigns/{self.campaign_id}/roster',
+            headers=self.headers,
+            json={'entries': [{'label': 'No Race Label', 'character': {'name': 'ElfName'}}]}
+        )
+        self.assertEqual(resp.status_code, 400)
+        self.assertIn("character.race is required", resp.get_json()['error'])
+
     def test_explicit_roster_scenario_validation(self):
         # Provision a player
         provision_resp = self.client.post(
