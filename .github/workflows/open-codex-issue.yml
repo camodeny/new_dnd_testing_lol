@@ -19,7 +19,6 @@ jobs:
     timeout-minutes: 5
     env:
       CODEX_REPO_PATH: ${{ vars.CODEX_REPO_PATH }}
-      CONTROL_CHAT_URL: ${{ vars.CODEX_CONTROL_CHAT_URL }}
       ISSUE_NUMBER: ${{ github.event.issue.number }}
       ISSUE_TITLE: ${{ github.event.issue.title }}
       ISSUE_BODY: ${{ github.event.issue.body }}
@@ -29,7 +28,6 @@ jobs:
         run: |
           test -n "$CODEX_REPO_PATH"
           test -d "$CODEX_REPO_PATH"
-          test -n "$CONTROL_CHAT_URL"
           test -x "$HOME/Library/Application Support/CodexIssueLauncher/bin/codex_issue_launcher.py"
 
       - name: Create isolated worktree and open Codex
@@ -40,5 +38,4 @@ jobs:
             --repository "$GITHUB_REPOSITORY" \
             --issue-number "$ISSUE_NUMBER" \
             --issue-title "$ISSUE_TITLE" \
-            --issue-body "$ISSUE_BODY" \
-            --control-chat-url "$CONTROL_CHAT_URL"
+            --issue-body "$ISSUE_BODY"
