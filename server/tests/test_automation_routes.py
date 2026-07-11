@@ -344,6 +344,8 @@ class AutomationRouteTest(unittest.TestCase):
                     'llm_player_id': claim_data['roster'][0]['llm_player_id'] or claim_data['roster'][0]['user_id'],
                     'user_id': claim_data['roster'][0]['user_id'],
                     'decision': {'action': 'speak', 'content': 'Seraphina studies the sigil in silence.'},
+                    'worker_id': 'test-worker',
+                    'lease_token': claim_data['lease_token'],
                 },
             )
 
@@ -2537,6 +2539,171 @@ class AutomationRouteTest(unittest.TestCase):
         self.assertNotIn(expected_token, debug_serialized)
         self.assertNotIn('"lease_token"', debug_serialized)
 
+
+    # ── Route-level credential enforcement tests ──────────────────
+
+    def _claim_for_credential_tests(self):
+        scenario_id = self.client.post(
+            '/api/automation/scenarios',
+            headers=self.headers,
+            json={'source_campaign_id': self.campaign_id},
+        ).get_json()['scenario']['id']
+        snapshot_id = self.client.post(
+            f'/api/automation/scenarios/{scenario_id}/snapshots',
+            headers=self.headers,
+            json={},
+        ).get_json()['snapshot']['id']
+        run_id = self.client.post(
+            f'/api/automation/scenarios/{scenario_id}/runs',
+            headers=self.headers,
+            json={'snapshot_id': snapshot_id},
+        ).get_json()['run']['id']
+        claim = self.client.post(
+            f'/api/automation/runs/{run_id}/claim',
+            headers=self.headers,
+            json={'worker_id': 'cred-test-worker'},
+        ).get_json()
+        return run_id, claim['lease_token']
+
+    def test_events_route_rejects_missing_credentials(self):
+        run_id, token = self._claim_for_credential_tests()
+        resp = self.client.post(
+            f'/api/automation/runs/{run_id}/events',
+            headers=self.headers,
+            json={'event_type': 'custom_event', 'payload': {}},
+        )
+        self.assertEqual(resp.status_code, 409)
+
+    def test_events_route_rejects_wrong_worker_id(self):
+        run_id, token = self._claim_for_credential_tests()
+        resp = self.client.post(
+            f'/api/automation/runs/{run_id}/events',
+            headers=self.headers,
+            json={
+                'event_type': 'custom_event', 'payload': {},
+                'worker_id': 'wrong-worker', 'lease_token': token,
+            },
+        )
+        self.assertEqual(resp.status_code, 409)
+
+    def test_events_route_rejects_wrong_lease_token(self):
+        run_id, token = self._claim_for_credential_tests()
+        resp = self.client.post(
+            f'/api/automation/runs/{run_id}/events',
+            headers=self.headers,
+            json={
+                'event_type': 'custom_event', 'payload': {},
+                'worker_id': 'cred-test-worker', 'lease_token': 'bad-token',
+            },
+        )
+        self.assertEqual(resp.status_code, 409)
+
+    def test_events_route_accepts_valid_credentials(self):
+        run_id, token = self._claim_for_credential_tests()
+        resp = self.client.post(
+            f'/api/automation/runs/{run_id}/events',
+            headers=self.headers,
+            json={
+                'event_type': 'custom_event', 'payload': {},
+                'worker_id': 'cred-test-worker', 'lease_token': token,
+            },
+        )
+        self.assertIn(resp.status_code, {200, 201})
+
+    def test_provider_calls_route_rejects_missing_credentials(self):
+        run_id, token = self._claim_for_credential_tests()
+        resp = self.client.post(
+            f'/api/automation/runs/{run_id}/provider-calls',
+            headers=self.headers,
+            json={'dedupe_key': 'test-pc-cred', 'phase': 'after_dm', 'request': {}, 'response': {}, 'parsed_output': {}},
+        )
+        self.assertEqual(resp.status_code, 409)
+
+    def test_provider_calls_route_accepts_valid_credentials(self):
+        run_id, token = self._claim_for_credential_tests()
+        resp = self.client.post(
+            f'/api/automation/runs/{run_id}/provider-calls',
+            headers=self.headers,
+            json={
+                'dedupe_key': 'test-pc-cred-ok', 'phase': 'after_dm',
+                'request': {}, 'response': {}, 'parsed_output': {},
+                'worker_id': 'cred-test-worker', 'lease_token': token,
+            },
+        )
+        self.assertEqual(resp.status_code, 201)
+
+    def test_complete_route_rejects_missing_credentials(self):
+        run_id, token = self._claim_for_credential_tests()
+        resp = self.client.post(
+            f'/api/automation/runs/{run_id}/complete',
+            headers=self.headers,
+            json={},
+        )
+        self.assertEqual(resp.status_code, 409)
+
+    def test_complete_route_accepts_valid_credentials(self):
+        run_id, token = self._claim_for_credential_tests()
+        resp = self.client.post(
+            f'/api/automation/runs/{run_id}/complete',
+            headers=self.headers,
+            json={
+                'worker_id': 'cred-test-worker', 'lease_token': token,
+            },
+        )
+        self.assertEqual(resp.status_code, 200)
+
+    def test_decisions_route_rejects_missing_credentials(self):
+        run_id, token = self._claim_for_credential_tests()
+        resp = self.client.post(
+            f'/api/automation/runs/{run_id}/decisions',
+            headers=self.headers,
+            json={
+                'llm_player_id': 1,
+                'user_id': self.owner_id,
+                'decision': {'action': 'no_action'},
+                'dedupe_key': 'test-decision-cred-missing',
+            },
+        )
+        self.assertEqual(resp.status_code, 409)
+
+    def test_decisions_route_accepts_valid_credentials(self):
+        run_id, token = self._claim_for_credential_tests()
+        # Need a valid roster entry for the decision
+        scenario_id = self.client.post(
+            '/api/automation/scenarios',
+            headers=self.headers,
+            json={'source_campaign_id': self.campaign_id},
+        ).get_json()['scenario']['id']
+        snapshot_id = self.client.post(
+            f'/api/automation/scenarios/{scenario_id}/snapshots',
+            headers=self.headers,
+            json={},
+        ).get_json()['snapshot']['id']
+        run2_id = self.client.post(
+            f'/api/automation/scenarios/{scenario_id}/runs',
+            headers=self.headers,
+            json={'snapshot_id': snapshot_id},
+        ).get_json()['run']['id']
+        claim = self.client.post(
+            f'/api/automation/runs/{run2_id}/claim',
+            headers=self.headers,
+            json={'worker_id': 'cred-test-worker'},
+        ).get_json()
+        token2 = claim['lease_token']
+        roster_entry = claim['roster'][0]
+        resp = self.client.post(
+            f'/api/automation/runs/{run2_id}/decisions',
+            headers=self.headers,
+            json={
+                'llm_player_id': roster_entry.get('llm_player_id') or roster_entry['user_id'],
+                'user_id': roster_entry['user_id'],
+                'decision': {'action': 'no_action'},
+                'dedupe_key': 'test-decision-cred-ok',
+                'worker_id': 'cred-test-worker',
+                'lease_token': token2,
+            },
+        )
+        self.assertEqual(resp.status_code, 200)
 
     def test_summary_detects_missing_after_dm_when_no_dm_turn_status(self):
         """When a player_decision has an after_player audit cycle but no

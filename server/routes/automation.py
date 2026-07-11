@@ -1411,7 +1411,7 @@ def append_automation_run_event(current_user, run_id):
         run.status = 'running'
     if 'error_text' in data:
         run.error_text = data.get('error_text')
-    if data.get('worker_id') or data.get('lease_token'):
+    if run.status in {'claimed', 'running', 'stop_requested', 'awaiting_audit'}:
         try:
             heartbeat_run(run, worker_id=data.get('worker_id'), lease_token=data.get('lease_token'))
         except ValueError as exc:
@@ -1451,7 +1451,7 @@ def create_automation_run_provider_call(current_user, run_id):
     if not _run_owned_by_user(current_user, run):
         return jsonify({'error': 'Forbidden'}), 403
     data = request.get_json(silent=True) or {}
-    if data.get('worker_id') or data.get('lease_token'):
+    if run.status in {'claimed', 'running', 'stop_requested', 'awaiting_audit'}:
         try:
             ensure_worker_lease(run, worker_id=data.get('worker_id'), lease_token=data.get('lease_token'))
         except ValueError as exc:
@@ -1486,7 +1486,7 @@ def complete_automation_run(current_user, run_id):
         return jsonify({'error': 'Forbidden'}), 403
 
     data = request.get_json(silent=True) or {}
-    if data.get('worker_id') or data.get('lease_token'):
+    if run.status in {'claimed', 'running', 'stop_requested', 'awaiting_audit'}:
         try:
             ensure_worker_lease(run, worker_id=data.get('worker_id'), lease_token=data.get('lease_token'))
         except ValueError as exc:
@@ -1558,6 +1558,12 @@ def execute_automation_run_decision(current_user, run_id):
         return jsonify({'error': 'Run has no derived campaign'}), 400
 
     data = request.get_json(silent=True) or {}
+    if run.status in {'claimed', 'running', 'stop_requested', 'awaiting_audit'}:
+        try:
+            ensure_worker_lease(run, worker_id=data.get('worker_id'), lease_token=data.get('lease_token'))
+        except ValueError as exc:
+            return jsonify({'error': str(exc)}), 409
+
     dedupe_key = data.get('dedupe_key')
     if dedupe_key:
         existing = AutomationRunEvent.query.filter_by(run_id=run.id, dedupe_key=dedupe_key).first()

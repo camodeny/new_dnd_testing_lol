@@ -434,5 +434,178 @@ class AutomationConcurrencyTest(unittest.TestCase):
             self.assertEqual(len(clones_for_run), 1)
 
 
+
+# ── Concurrent contention tests (file-backed SQLite, threading barrier) ─────
+
+class AutomationConcurrentClaimTest(unittest.TestCase):
+    """True concurrent tests with separate app contexts/sessions and file-backed SQLite."""
+
+    def _setup_file_backed_app(self):
+        test_tmpdir = tempfile.mkdtemp()
+        db_path = os.path.join(test_tmpdir, 'concurrent.db')
+        from flask import Flask
+        test_app = Flask(__name__)
+        test_app.config['SQLALCHEMY_DATABASE_URI'] = f'sqlite:///{db_path}?timeout=30'
+        test_app.config['SQLALCHEMY_TRACK_MODIFICATIONS'] = False
+        test_app.secret_key = 'test-key'
+        test_app.root_path = test_tmpdir
+        db.init_app(test_app)
+        return test_app, test_tmpdir
+
+    def _setup_concurrent_data(self, test_app):
+        with test_app.app_context():
+            db.create_all()
+            owner = User(username='owner', email='owner@example.com')
+            owner.set_password('password')
+            db.session.add(owner)
+            db.session.flush()
+            owner_id = owner.id
+
+            campaign = Campaign(name='Concurrent Campaign', user_id=owner.id)
+            db.session.add(campaign)
+            db.session.flush()
+            campaign_id = campaign.id
+
+            character = Character(
+                user_id=owner.id, campaign_id=campaign.id,
+                name='Test', race='Human', background='Soldier',
+            )
+            db.session.add(character)
+            db.session.flush()
+            update_character_relations(character, {'classes': [{'class_name': 'Fighter', 'level': 3}]})
+
+            db.session.add(CampaignMember(
+                campaign_id=campaign.id, user_id=owner.id,
+                role='player', selected_character_id=character.id,
+            ))
+            session = CampaignSession(campaign_id=campaign.id, is_active=True)
+            db.session.add(session)
+            db.session.flush()
+            db.session.add(SessionMessage(session_id=session.id, user_id=owner.id, role='player', content='I look around.'))
+            db.session.add(SessionMessage(session_id=session.id, role='dm', content='The room is empty.'))
+
+            world = CampaignWorld(
+                campaign_id=campaign.id,
+                public_intro=json.dumps({}),
+                world_state=json.dumps({'location': 'foyer'}),
+                knowledge_graph=json.dumps({'entities': [], 'relations': [], 'facts': []}),
+                dm_private=json.dumps({}),
+            )
+            db.session.add(world)
+            db.session.commit()
+
+            scenario = AutomationScenario(
+                name='Concurrent Scenario',
+                source_campaign_id=campaign_id,
+                user_id=owner_id,
+                roster_json=[{
+                    'user_id': owner_id, 'character_id': character.id,
+                    'character_name': 'Test', 'label': 'Actor',
+                }],
+            )
+            db.session.add(scenario)
+            db.session.flush()
+            scenario_id = scenario.id
+            create_snapshot_for_scenario(scenario, label='Concurrent Snapshot')
+            snapshot = AutomationSnapshot.query.filter_by(scenario_id=scenario_id).order_by(AutomationSnapshot.id.desc()).first()
+            run = AutomationRun(
+                scenario_id=scenario_id, snapshot_id=snapshot.id,
+                user_id=owner_id, status='queued', runner_config_json={},
+            )
+            db.session.add(run)
+            db.session.commit()
+            return run.id, owner_id
+
+    def _teardown_file_backed_app(self, test_app, test_tmpdir):
+        with test_app.app_context():
+            db.drop_all()
+        engine_dict = db._app_engines.get(test_app)
+        if engine_dict:
+            for engine in engine_dict.values():
+                engine.dispose()
+            engine_dict.clear()
+        db._app_engines.pop(test_app, None)
+        import shutil
+        shutil.rmtree(test_tmpdir, ignore_errors=True)
+
+    def test_concurrent_queued_claim_exactly_one_wins(self):
+        test_app, tmpdir = self._setup_file_backed_app()
+        self.addCleanup(lambda: self._teardown_file_backed_app(test_app, tmpdir))
+        run_id, _ = self._setup_concurrent_data(test_app)
+
+        import threading
+        barrier = threading.Barrier(2)
+        results = []
+
+        def _claim(worker_id):
+            with test_app.app_context():
+                run = db.session.get(AutomationRun, run_id)
+                barrier.wait()
+                try:
+                    result = claim_run_for_worker(run, worker_id)
+                    results.append(('success', worker_id, result['run'].lease_token))
+                except ValueError as exc:
+                    results.append(('fail', worker_id, str(exc)))
+
+        threads = [threading.Thread(target=_claim, args=(f'worker-{i}',)) for i in range(2)]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join()
+
+        successes = [r for r in results if r[0] == 'success']
+        failures = [r for r in results if r[0] == 'fail']
+        self.assertEqual(len(successes), 1, f'Expected 1 winner, got {len(successes)}: {results}')
+        self.assertEqual(len(failures), 1, f'Expected 1 loser, got {len(failures)}: {results}')
+
+        with test_app.app_context():
+            run = db.session.get(AutomationRun, run_id)
+            self.assertEqual(run.status, 'claimed')
+            self.assertIsNotNone(run.worker_id)
+            self.assertIsNotNone(run.lease_token)
+            clones = Campaign.query.filter_by(
+                is_automation_clone=True, automation_source_run_id=run_id,
+            ).all()
+            self.assertEqual(len(clones), 1, 'Exactly one automation clone should exist')
+
+    def test_concurrent_expired_reclaim_exactly_one_wins(self):
+        test_app, tmpdir = self._setup_file_backed_app()
+        self.addCleanup(lambda: self._teardown_file_backed_app(test_app, tmpdir))
+        run_id, _ = self._setup_concurrent_data(test_app)
+
+        with test_app.app_context():
+            run = db.session.get(AutomationRun, run_id)
+            claim_run_for_worker(run, 'worker-a')
+            run = db.session.get(AutomationRun, run_id)
+            run.lease_expires_at = utcnow() - timedelta(seconds=5)
+            db.session.commit()
+
+        import threading
+        barrier = threading.Barrier(2)
+        results = []
+
+        def _reclaim(worker_id):
+            with test_app.app_context():
+                run = db.session.get(AutomationRun, run_id)
+                barrier.wait()
+                try:
+                    result = claim_run_for_worker(run, worker_id)
+                    results.append(('success', worker_id, result['run'].lease_token, result.get('reclaimed')))
+                except ValueError as exc:
+                    results.append(('fail', worker_id, str(exc)))
+
+        threads = [threading.Thread(target=_reclaim, args=(f'worker-b-{i}',)) for i in range(2)]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join()
+
+        successes = [r for r in results if r[0] == 'success']
+        failures = [r for r in results if r[0] == 'fail']
+        self.assertEqual(len(successes), 1, f'Expected 1 winner, got {len(successes)}: {results}')
+        self.assertEqual(len(failures), 1, f'Expected 1 loser, got {len(failures)}: {results}')
+        self.assertTrue(successes[0][3], 'Winner must be a reclaim')
+
+
 if __name__ == '__main__':
     unittest.main()

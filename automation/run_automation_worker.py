@@ -208,7 +208,7 @@ def select_chosen_player(roster_entry, campaign_characters):
     }
 
 
-def submit_decision(api_base, owner_api_key, run_id, chosen_player, decision, dedupe_key):
+def submit_decision(api_base, owner_api_key, run_id, chosen_player, decision, dedupe_key, worker_id, lease_token):
     return api_post(
         api_base,
         f'/api/automation/runs/{run_id}/decisions',
@@ -217,6 +217,8 @@ def submit_decision(api_base, owner_api_key, run_id, chosen_player, decision, de
             'user_id': chosen_player['llm_player']['user_id'],
             'decision': decision,
             'dedupe_key': dedupe_key,
+            'worker_id': worker_id,
+            'lease_token': lease_token,
         },
         api_key=owner_api_key,
     )
@@ -948,6 +950,8 @@ def execute_run(args, run_id):
                     chosen_player,
                     decision,
                     dedupe_key=f'player_message:{logical_key}:{chosen_player["llm_player"]["id"]}',
+                    worker_id=args.worker_id,
+                    lease_token=lease_token,
                 )
                 posted_message_id = (result.get('message') or {}).get('id')
                 append_event(
