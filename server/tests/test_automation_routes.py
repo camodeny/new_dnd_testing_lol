@@ -442,7 +442,7 @@ class AutomationRouteTest(unittest.TestCase):
         self.assertEqual(len(derived_messages), 1)
         self.assertEqual(derived_messages[0].content, 'I follow Mira deeper into the rail yard.')
 
-    def test_claim_from_empty_source_campaign_creates_active_run_session(self):
+    def test_claim_from_empty_source_campaign_does_not_create_fallback_session(self):
         with app.app_context():
             empty_campaign = Campaign(name='Empty Automation Source', user_id=self.owner_id)
             db.session.add(empty_campaign)
@@ -478,8 +478,40 @@ class AutomationRouteTest(unittest.TestCase):
 
         self.assertEqual(claim_response.status_code, 200)
         latest_session = claim_response.get_json()['latest_session']
-        self.assertIsNotNone(latest_session)
-        self.assertTrue(latest_session['is_active'])
+        self.assertIsNone(latest_session)
+        with app.app_context():
+            run = db.session.get(AutomationRun, run_id)
+            self.assertIsNone(CampaignSession.query.filter_by(campaign_id=run.derived_campaign_id).first())
+
+    def test_zero_turn_run_scorecard_is_not_assessed(self):
+        scenario_id = self.client.post(
+            '/api/automation/scenarios',
+            headers=self.headers,
+            json={'source_campaign_id': self.campaign_id},
+        ).get_json()['scenario']['id']
+        snapshot_id = self.client.post(
+            f'/api/automation/scenarios/{scenario_id}/snapshots',
+            headers=self.headers,
+            json={},
+        ).get_json()['snapshot']['id']
+        run_id = self.client.post(
+            f'/api/automation/scenarios/{scenario_id}/runs',
+            headers=self.headers,
+            json={'snapshot_id': snapshot_id},
+        ).get_json()['run']['id']
+        self.client.post(
+            f'/api/automation/runs/{run_id}/claim',
+            headers=self.headers,
+            json={'worker_id': 'scorecard-worker'},
+        )
+
+        scorecard_response = self.client.get(f'/api/automation/runs/{run_id}/scorecard', headers=self.headers)
+        self.assertEqual(scorecard_response.status_code, 200)
+        payload = scorecard_response.get_json()
+        self.assertEqual(payload['run']['scorecard_summary']['overall_status'], 'not_assessed')
+        self.assertIsNone(payload['run']['scorecard_summary']['weighted_score'])
+        self.assertEqual(payload['run']['scorecard_summary']['audited_cycle_count'], 0)
+        self.assertEqual(payload['run']['scorecard_summary']['completed_turns'], 0)
 
     def test_run_scorecard_and_compare(self):
         scenario_id = self.client.post(
