@@ -921,6 +921,12 @@ def claim_automation_run(current_user, run_id):
         return jsonify({
             'error': str(exc),
             'retrieval_preflight': exc.report,
+            'gameplay_readiness': {
+                'world_present': False,
+                'active_session_present': False,
+                'opening_dm_present': False,
+                'campaign_ready': False,
+            }
         }), 409
     except ValueError as exc:
         db.session.rollback()
@@ -941,6 +947,7 @@ def claim_automation_run(current_user, run_id):
             'reclaimed': claim_data['reclaimed'],
             'attempt_count': run.attempt_count,
             'retrieval_preflight': claim_data['retrieval_preflight'],
+            'gameplay_readiness': claim_data['gameplay_readiness'],
         },
         dedupe_key=f'run_claimed:{run.id}:attempt:{run.attempt_count}',
     )
@@ -961,6 +968,7 @@ def claim_automation_run(current_user, run_id):
         'lease_token': run.lease_token,
         'reclaimed': claim_data['reclaimed'],
         'retrieval_preflight': claim_data['retrieval_preflight'],
+        'gameplay_readiness': claim_data['gameplay_readiness'],
     }), 200
 
 

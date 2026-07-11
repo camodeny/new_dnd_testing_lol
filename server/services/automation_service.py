@@ -1723,6 +1723,35 @@ def record_worker_activity(worker_id, api_base=None, is_heartbeat=False):
     db.session.commit()
 
 
+def compute_gameplay_readiness(campaign):
+    if not campaign:
+        return {
+            'world_present': False,
+            'active_session_present': False,
+            'opening_dm_present': False,
+            'campaign_ready': False,
+        }
+
+    world_present = CampaignWorld.query.filter_by(campaign_id=campaign.id).first() is not None
+    active_session = CampaignSession.query.filter_by(campaign_id=campaign.id, is_active=True).first()
+    active_session_present = active_session is not None
+    opening_dm_present = False
+    if active_session:
+        opening_dm_present = any(
+            m.role == 'dm' and m.content and m.content.strip()
+            for m in active_session.messages
+        )
+
+    campaign_ready = bool(world_present and active_session_present and opening_dm_present)
+
+    return {
+        'world_present': world_present,
+        'active_session_present': active_session_present,
+        'opening_dm_present': opening_dm_present,
+        'campaign_ready': campaign_ready,
+    }
+
+
 def claim_run_for_worker(run, worker_id):
     now = _utcnow()
     reclaimed = run.status in {'claimed', 'running', 'stop_requested', 'awaiting_audit'} and lease_is_expired(run, at=now)
@@ -1761,6 +1790,8 @@ def claim_run_for_worker(run, worker_id):
     if latest_session is None:
         latest_session = CampaignSession.query.filter_by(campaign_id=clone_campaign.id).order_by(CampaignSession.started_at.desc(), CampaignSession.id.desc()).first()
 
+    gameplay_readiness = compute_gameplay_readiness(clone_campaign)
+
     db.session.commit()
     return {
         'run': run,
@@ -1769,6 +1800,7 @@ def claim_run_for_worker(run, worker_id):
         'latest_session': latest_session,
         'reclaimed': reclaimed,
         'retrieval_preflight': preflight_report,
+        'gameplay_readiness': gameplay_readiness,
     }
 
 

@@ -477,8 +477,18 @@ class AutomationRouteTest(unittest.TestCase):
         )
 
         self.assertEqual(claim_response.status_code, 200)
-        latest_session = claim_response.get_json()['latest_session']
+        res_data = claim_response.get_json()
+        latest_session = res_data['latest_session']
         self.assertIsNone(latest_session)
+        
+        # Verify separate gameplay readiness preflight reporting
+        gr = res_data.get('gameplay_readiness')
+        self.assertIsNotNone(gr)
+        self.assertFalse(gr['world_present'])
+        self.assertFalse(gr['active_session_present'])
+        self.assertFalse(gr['opening_dm_present'])
+        self.assertFalse(gr['campaign_ready'])
+
         with app.app_context():
             run = db.session.get(AutomationRun, run_id)
             self.assertIsNone(CampaignSession.query.filter_by(campaign_id=run.derived_campaign_id).first())
