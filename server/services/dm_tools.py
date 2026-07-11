@@ -2656,14 +2656,24 @@ def _campaign_memory_candidates(campaign):
     _world, graph, world_state, dm_private = _world_json(campaign)
     candidates = []
 
-    for kind in ('entities', 'relations', 'facts'):
-        for item in graph.get(kind, []) if isinstance(graph, dict) else []:
-            candidates.append({'kind': kind[:-1], 'item_id': item.get('id'), 'value': item})
+    for plural_kind, item_type in (
+        ('entities', 'entity'),
+        ('relations', 'relation'),
+        ('facts', 'fact'),
+    ):
+        for item in graph.get(plural_kind, []) if isinstance(graph, dict) else []:
+            candidates.append({'kind': item_type, 'item_id': item.get('id'), 'value': item})
     for npc in NPCActor.query.filter_by(campaign_id=campaign.id).all():
         candidates.append({'kind': 'npc_actor', 'item_id': npc.actor_id, 'value': npc.to_dict(include_private=True)})
     for clock in CampaignClock.query.filter_by(campaign_id=campaign.id).all():
         candidates.append({'kind': 'clock', 'item_id': clock.clock_id, 'value': clock.to_dict(include_private=True)})
-    for event in WorldEvent.query.filter_by(campaign_id=campaign.id).order_by(WorldEvent.created_at.desc()).limit(30).all():
+    for event in (
+        WorldEvent.query
+        .filter_by(campaign_id=campaign.id)
+        .order_by(WorldEvent.created_at.desc(), WorldEvent.id.desc())
+        .limit(30)
+        .all()
+    ):
         candidates.append({'kind': 'world_event', 'item_id': str(event.id), 'value': event.to_dict(include_private=True)})
     candidates.append({'kind': 'world_state', 'item_id': 'current', 'value': world_state})
     candidates.append({'kind': 'dm_private', 'item_id': 'current', 'value': dm_private})

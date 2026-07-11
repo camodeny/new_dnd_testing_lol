@@ -1,3 +1,4 @@
+import hashlib
 import json
 import secrets
 from collections import Counter
@@ -20,6 +21,7 @@ from models import (
     CampaignAuditEvent,
     CampaignClock,
     CampaignMember,
+    CampaignMemoryEmbedding,
     CampaignPlanningSummary,
     CampaignSession,
     CampaignShop,
@@ -35,12 +37,89 @@ from models import (
     SessionDmTurn,
     SessionMessage,
     SheetProposal,
+    WorldEvent,
     db,
 )
 from services.character_service import build_character_from_data, character_full_dict, update_character_relations
 
 
 AUTOMATION_ACTIVE_STATUSES = {'queued', 'claimed', 'running', 'stop_requested', 'awaiting_audit'}
+AUTOMATION_SNAPSHOT_SCHEMA_VERSION = 2
+CLONE_RETRIEVAL_PREFLIGHT_VERSION = 1
+
+
+class CloneRetrievalPreflightError(ValueError):
+    def __init__(self, message, report=None):
+        super().__init__(message)
+        self.report = report or {}
+
+
+def _normalize_memory_anchors(value):
+    anchors = value if isinstance(value, dict) else {}
+    return {
+        'current_goal': anchors.get('current_goal'),
+        'current_scene': anchors.get('current_scene'),
+        'open_clues': anchors.get('open_clues') if isinstance(anchors.get('open_clues'), list) else [],
+        'unresolved_questions': (
+            anchors.get('unresolved_questions')
+            if isinstance(anchors.get('unresolved_questions'), list)
+            else []
+        ),
+        'npc_observations': (
+            anchors.get('npc_observations')
+            if isinstance(anchors.get('npc_observations'), list)
+            else []
+        ),
+        'recent_offers_promises': (
+            anchors.get('recent_offers_promises')
+            if isinstance(anchors.get('recent_offers_promises'), list)
+            else []
+        ),
+    }
+
+
+def _serialize_memory_embedding(row):
+    try:
+        vector = json.loads(row.embedding_json)
+    except (TypeError, ValueError) as exc:
+        raise ValueError(
+            f'Embedding {row.item_type}:{row.item_id} contains invalid JSON'
+        ) from exc
+
+    if not isinstance(vector, list):
+        raise ValueError(
+            f'Embedding {row.item_type}:{row.item_id} vector must be a list'
+        )
+
+    if len(vector) != row.embedding_dimensions:
+        raise ValueError(
+            f'Embedding {row.item_type}:{row.item_id} has '
+            f'{len(vector)} values but declares {row.embedding_dimensions}'
+        )
+
+    return {
+        'item_type': row.item_type,
+        'item_id': str(row.item_id),
+        'visibility': row.visibility,
+        'canonical_text': row.canonical_text,
+        'text_hash': row.text_hash,
+        'embedding_model': row.embedding_model,
+        'embedding_dimensions': row.embedding_dimensions,
+        'embedding': vector,
+        'created_at': row.created_at.isoformat() if row.created_at else None,
+        'updated_at': row.updated_at.isoformat() if row.updated_at else None,
+    }
+
+
+def _vector_digest(vector):
+    canonical = json.dumps(
+        vector,
+        ensure_ascii=False,
+        separators=(',', ':'),
+        allow_nan=False,
+    )
+    return hashlib.sha256(canonical.encode('utf-8')).hexdigest()
+
 DEFAULT_LEASE_SECONDS = 45
 AUDIT_READY_STATUSES = {'audited', 'skipped'}
 CUSTOM_SCORECARD_STATUS_ORDER = ('pass', 'warn', 'fail', 'not_assessed')
@@ -394,6 +473,24 @@ def serialize_campaign_snapshot(campaign, source_session_id=None):
     encounter_maps = EncounterMap.query.filter_by(campaign_id=campaign.id).order_by(EncounterMap.created_at.asc(), EncounterMap.id.asc()).all()
     audit_events = CampaignAuditEvent.query.filter_by(campaign_id=campaign.id).order_by(CampaignAuditEvent.created_at.asc(), CampaignAuditEvent.id.asc()).all()
 
+    world_events = (
+        WorldEvent.query
+        .filter_by(campaign_id=campaign.id)
+        .order_by(WorldEvent.created_at.asc(), WorldEvent.id.asc())
+        .all()
+    )
+
+    memory_embeddings = (
+        CampaignMemoryEmbedding.query
+        .filter_by(campaign_id=campaign.id)
+        .order_by(
+            CampaignMemoryEmbedding.item_type.asc(),
+            CampaignMemoryEmbedding.item_id.asc(),
+            CampaignMemoryEmbedding.id.asc(),
+        )
+        .all()
+    )
+
     serialized_sessions = []
     for session in sessions:
         serialized_sessions.append({
@@ -411,6 +508,7 @@ def serialize_campaign_snapshot(campaign, source_session_id=None):
         })
 
     return {
+        'snapshot_schema_version': AUTOMATION_SNAPSHOT_SCHEMA_VERSION,
         'campaign': campaign.to_dict(),
         'members': [member.to_dict() for member in members],
         'characters': [character_full_dict(character) for character in characters],
@@ -432,6 +530,14 @@ def serialize_campaign_snapshot(campaign, source_session_id=None):
         'loot_boxes': [loot_box.to_dict(is_dm=True) for loot_box in loot_boxes],
         'encounter_maps': serialized_maps,
         'audit_events': [event.to_dict() for event in audit_events],
+        'world_events': [
+            event.to_dict(include_private=True)
+            for event in world_events
+        ],
+        'memory_embeddings': [
+            _serialize_memory_embedding(row)
+            for row in memory_embeddings
+        ],
         'captured_at': _utcnow().isoformat(),
     }
 
@@ -462,6 +568,19 @@ def create_snapshot_for_scenario(scenario, label=None, summary=None, source_sess
             'proposal_count': sum(len(session.get('sheet_proposals') or []) for session in payload['sessions']),
             'encounter_map_count': len(payload.get('encounter_maps') or []),
             'audit_event_count': len(payload.get('audit_events') or []),
+            'world_event_count': len(payload.get('world_events') or []),
+            'memory_embedding_count': len(payload.get('memory_embeddings') or []),
+            'memory_anchor_session_count': sum(
+                1
+                for session in payload.get('sessions') or []
+                if any(
+                    value not in (None, '', [])
+                    for value in _normalize_memory_anchors(
+                        session.get('memory_anchors')
+                    ).values()
+                )
+            ),
+            'snapshot_schema_version': payload.get('snapshot_schema_version'),
         },
     )
     db.session.add(snapshot)
@@ -486,12 +605,436 @@ def retention_policy_for_scenario(scenario):
     return policy
 
 
+def _copy_snapshot_world_events(data, clone):
+    event_map = {}
+
+    for event_data in data.get('world_events') or []:
+        source_event_id = str(event_data.get('id'))
+
+        if not source_event_id or source_event_id == 'None':
+            raise CloneRetrievalPreflightError(
+                'Snapshot world event is missing its source id'
+            )
+
+        if source_event_id in event_map:
+            raise CloneRetrievalPreflightError(
+                f'Duplicate source event ID detected in snapshot: {source_event_id}'
+            )
+
+        cloned_event = WorldEvent(
+            campaign_id=clone.id,
+            event_type=event_data.get('event_type') or 'world_event',
+            summary=event_data.get('summary') or '',
+            payload=json.dumps(
+                event_data.get('payload') or {},
+                ensure_ascii=False,
+            ),
+            visibility=event_data.get('visibility') or 'dm_private',
+            created_at=_parse_iso(event_data.get('created_at')) or _utcnow(),
+        )
+        db.session.add(cloned_event)
+        db.session.flush()
+
+        event_map[source_event_id] = str(cloned_event.id)
+
+    return event_map
+
+
+def _mapped_embedding_item_id(item_type, item_id, world_event_map):
+    item_id = str(item_id)
+
+    if item_type != 'world_event':
+        return item_id
+
+    mapped = world_event_map.get(item_id)
+    if mapped is None:
+        raise CloneRetrievalPreflightError(
+            f'World-event embedding {item_id} has no cloned event mapping'
+        )
+
+    return mapped
+
+
+def _copy_snapshot_embeddings(data, clone, world_event_map):
+    seen_keys = set()
+
+    for embedding_data in data.get('memory_embeddings') or []:
+        item_type = str(embedding_data.get('item_type') or '')
+        source_item_id = str(embedding_data.get('item_id') or '')
+        clone_item_id = _mapped_embedding_item_id(
+            item_type,
+            source_item_id,
+            world_event_map,
+        )
+
+        key = (item_type, clone_item_id)
+        if key in seen_keys:
+            raise CloneRetrievalPreflightError(
+                f'Duplicate cloned embedding key: {item_type}:{clone_item_id}'
+            )
+        seen_keys.add(key)
+
+        vector = embedding_data.get('embedding')
+        dimensions = embedding_data.get('embedding_dimensions')
+
+        if not isinstance(vector, list):
+            raise CloneRetrievalPreflightError(
+                f'Embedding {item_type}:{source_item_id} has no vector list'
+            )
+
+        if len(vector) != dimensions:
+            raise CloneRetrievalPreflightError(
+                f'Embedding {item_type}:{source_item_id} dimension mismatch'
+            )
+
+        row = CampaignMemoryEmbedding(
+            campaign_id=clone.id,
+            item_type=item_type,
+            item_id=clone_item_id,
+            visibility=embedding_data.get('visibility') or 'dm_private',
+            canonical_text=embedding_data.get('canonical_text') or '',
+            text_hash=embedding_data.get('text_hash') or '',
+            embedding_model=embedding_data.get('embedding_model') or '',
+            embedding_dimensions=dimensions,
+            embedding_json=json.dumps(
+                vector,
+                ensure_ascii=False,
+                separators=(',', ':'),
+                allow_nan=False,
+            ),
+            created_at=_parse_iso(embedding_data.get('created_at')) or _utcnow(),
+            updated_at=_parse_iso(embedding_data.get('updated_at')) or _utcnow(),
+        )
+        db.session.add(row)
+
+    db.session.flush()
+
+
+def _snapshot_candidate_keys(data, world_event_map):
+    keys = set()
+
+    world = data.get('world') or {}
+    graph = world.get('knowledge_graph') or {}
+
+    for item in graph.get('entities') or []:
+        keys.add(('entity', str(item.get('id'))))
+
+    for item in graph.get('relations') or []:
+        keys.add(('relation', str(item.get('id'))))
+
+    for item in graph.get('facts') or []:
+        keys.add(('fact', str(item.get('id'))))
+
+    for npc in data.get('npcs') or []:
+        keys.add(('npc_actor', str(npc.get('actor_id'))))
+
+    for clock in data.get('clocks') or []:
+        keys.add(('clock', str(clock.get('clock_id'))))
+
+    # Runtime retrieval uses only the latest 30 events.
+    events = sorted(
+        data.get('world_events') or [],
+        key=lambda event: (
+            event.get('created_at') or '',
+            int(event.get('id') or 0),
+        ),
+        reverse=True,
+    )[:30]
+
+    for event in events:
+        source_id = str(event.get('id'))
+        keys.add(('world_event', world_event_map[source_id]))
+
+    keys.add(('world_state', 'current'))
+    keys.add(('dm_private', 'current'))
+    keys.add(('planning_summary', 'current'))
+
+    return keys
+
+
+def _campaign_candidate_keys(campaign):
+    keys = set()
+    world = CampaignWorld.query.filter_by(campaign_id=campaign.id).first()
+    if world:
+        try:
+            graph = json.loads(world.knowledge_graph) if world.knowledge_graph else {}
+        except (TypeError, ValueError):
+            graph = {}
+        if isinstance(graph, dict):
+            for item in graph.get('entities') or []:
+                keys.add(('entity', str(item.get('id'))))
+            for item in graph.get('relations') or []:
+                keys.add(('relation', str(item.get('id'))))
+            for item in graph.get('facts') or []:
+                keys.add(('fact', str(item.get('id'))))
+
+    for npc in NPCActor.query.filter_by(campaign_id=campaign.id).all():
+        keys.add(('npc_actor', str(npc.actor_id)))
+
+    for clock in CampaignClock.query.filter_by(campaign_id=campaign.id).all():
+        keys.add(('clock', str(clock.clock_id)))
+
+    # Runtime retrieval uses only the latest 30 events. Order by created_at desc
+    events = (
+        WorldEvent.query
+        .filter_by(campaign_id=campaign.id)
+        .order_by(WorldEvent.created_at.desc(), WorldEvent.id.desc())
+        .limit(30)
+        .all()
+    )
+    for event in events:
+        keys.add(('world_event', str(event.id)))
+
+    keys.add(('world_state', 'current'))
+    keys.add(('dm_private', 'current'))
+    keys.add(('planning_summary', 'current'))
+
+    return keys
+
+
+def validate_clone_retrieval_equivalence(
+    *,
+    snapshot_data,
+    clone,
+    session_map,
+    world_event_map,
+):
+    mismatches = []
+
+    # 1. Compare candidate keys
+    snapshot_keys = _snapshot_candidate_keys(snapshot_data, world_event_map)
+    clone_keys = _campaign_candidate_keys(clone)
+
+    if snapshot_keys != clone_keys:
+        for k in snapshot_keys - clone_keys:
+            mismatches.append({'type': 'missing_candidate', 'key': list(k)})
+        for k in clone_keys - snapshot_keys:
+            mismatches.append({'type': 'unexpected_candidate', 'key': list(k)})
+
+    # 2. Compare semantic coverage
+    # Find expected embeddings from snapshot
+    expected_embeddings = {}
+    for embedding_data in snapshot_data.get('memory_embeddings') or []:
+        item_type = str(embedding_data.get('item_type') or '')
+        source_item_id = str(embedding_data.get('item_id') or '')
+        clone_item_id = _mapped_embedding_item_id(
+            item_type,
+            source_item_id,
+            world_event_map,
+        )
+        expected_embeddings[(item_type, clone_item_id)] = embedding_data
+
+    # Query actual embeddings from clone
+    actual_rows = CampaignMemoryEmbedding.query.filter_by(campaign_id=clone.id).all()
+    actual_embeddings = {
+        (row.item_type, str(row.item_id)): row
+        for row in actual_rows
+    }
+
+    # Semantic coverage: intersection of candidates & embeddings
+    snapshot_coverage = snapshot_keys & set(expected_embeddings.keys())
+    clone_coverage = clone_keys & set(actual_embeddings.keys())
+
+    if snapshot_coverage != clone_coverage:
+        for k in snapshot_coverage - clone_coverage:
+            mismatches.append({'type': 'missing_coverage', 'key': list(k)})
+        for k in clone_coverage - snapshot_coverage:
+            mismatches.append({'type': 'unexpected_coverage', 'key': list(k)})
+
+    # 3. Compare exact embedding content
+    for key, expected in expected_embeddings.items():
+        actual = actual_embeddings.get(key)
+        if actual is None:
+            mismatches.append({'type': 'missing_embedding', 'key': list(key)})
+            continue
+
+        # Compare fields
+        expected_visibility = expected.get('visibility') or 'dm_private'
+        actual_visibility = actual.visibility or 'dm_private'
+        if expected_visibility != actual_visibility:
+            mismatches.append({
+                'type': 'embedding_field_mismatch',
+                'key': list(key),
+                'field': 'visibility',
+                'expected': expected_visibility,
+                'actual': actual_visibility,
+            })
+
+        expected_text = expected.get('canonical_text') or ''
+        actual_text = actual.canonical_text or ''
+        if expected_text != actual_text:
+            mismatches.append({
+                'type': 'embedding_field_mismatch',
+                'key': list(key),
+                'field': 'canonical_text',
+                'expected': expected_text,
+                'actual': actual_text,
+            })
+
+        expected_hash = expected.get('text_hash') or ''
+        actual_hash = actual.text_hash or ''
+        if expected_hash != actual_hash:
+            mismatches.append({
+                'type': 'embedding_field_mismatch',
+                'key': list(key),
+                'field': 'text_hash',
+                'expected': expected_hash,
+                'actual': actual_hash,
+            })
+
+        expected_model = expected.get('embedding_model') or ''
+        actual_model = actual.embedding_model or ''
+        if expected_model != actual_model:
+            mismatches.append({
+                'type': 'embedding_field_mismatch',
+                'key': list(key),
+                'field': 'embedding_model',
+                'expected': expected_model,
+                'actual': actual_model,
+            })
+
+        expected_dim = expected.get('embedding_dimensions')
+        actual_dim = actual.embedding_dimensions
+        if expected_dim != actual_dim:
+            mismatches.append({
+                'type': 'embedding_field_mismatch',
+                'key': list(key),
+                'field': 'embedding_dimensions',
+                'expected': expected_dim,
+                'actual': actual_dim,
+            })
+
+        expected_vector = expected.get('embedding')
+        try:
+            actual_vector = json.loads(actual.embedding_json) if actual.embedding_json else []
+        except (TypeError, ValueError):
+            actual_vector = []
+
+        if len(expected_vector) != len(actual_vector):
+            mismatches.append({
+                'type': 'vector_mismatch',
+                'key': list(key),
+                'reason': 'length_mismatch',
+                'expected_length': len(expected_vector),
+                'actual_length': len(actual_vector),
+            })
+        else:
+            expected_digest = _vector_digest(expected_vector)
+            actual_digest = _vector_digest(actual_vector)
+            if expected_digest != actual_digest:
+                mismatches.append({
+                    'type': 'vector_mismatch',
+                    'key': list(key),
+                    'reason': 'fingerprint_mismatch',
+                })
+
+    for key in actual_embeddings.keys():
+        if key not in expected_embeddings:
+            mismatches.append({'type': 'unexpected_embedding', 'key': list(key)})
+
+    # 4. Compare anchors exactly
+    # session_map is source_session_id -> cloned_session_id
+    for source_session_data in snapshot_data.get('sessions') or []:
+        source_id = source_session_data.get('id')
+        clone_id = session_map.get(source_id)
+        if clone_id is None:
+            mismatches.append({
+                'type': 'missing_cloned_session',
+                'source_session_id': source_id,
+            })
+            continue
+
+        expected_anchors = _normalize_memory_anchors(source_session_data.get('memory_anchors'))
+        
+        # Query actual session to get anchors
+        clone_session = CampaignSession.query.get(clone_id)
+        actual_anchors = _normalize_memory_anchors(clone_session.memory_anchors if clone_session else None)
+
+        if expected_anchors != actual_anchors:
+            mismatches.append({
+                'type': 'anchor_mismatch',
+                'source_session_id': source_id,
+                'clone_session_id': clone_id,
+                'expected': expected_anchors,
+                'actual': actual_anchors,
+            })
+
+    anchored_session_count = sum(
+        1
+        for session in snapshot_data.get('sessions') or []
+        if any(
+            value not in (None, '', [])
+            for value in _normalize_memory_anchors(session.get('memory_anchors')).values()
+        )
+    )
+
+    report = {
+        'version': CLONE_RETRIEVAL_PREFLIGHT_VERSION,
+        'status': 'fail' if mismatches else 'pass',
+        'snapshot_schema_version': snapshot_data.get('snapshot_schema_version'),
+        'source_candidate_count': len(snapshot_keys),
+        'clone_candidate_count': len(clone_keys),
+        'source_embedding_count': len(expected_embeddings),
+        'clone_embedding_count': len(actual_embeddings),
+        'source_semantic_coverage_count': len(snapshot_coverage),
+        'clone_semantic_coverage_count': len(clone_coverage),
+        'session_count': len(snapshot_data.get('sessions') or []),
+        'anchored_session_count': anchored_session_count,
+        'world_event_count': len(snapshot_data.get('world_events') or []),
+        'world_event_id_map_count': len(world_event_map),
+        'mismatches': mismatches,
+    }
+
+    if mismatches:
+        raise CloneRetrievalPreflightError(
+            'Automation clone retrieval preflight failed',
+            report=report,
+        )
+
+    return report
+
+
 def materialize_run_campaign(run):
     if run.derived_campaign_id:
-        return db.session.get(Campaign, run.derived_campaign_id), {}
+        return db.session.get(Campaign, run.derived_campaign_id), {}, {
+            'version': CLONE_RETRIEVAL_PREFLIGHT_VERSION,
+            'status': 'not_repeated',
+            'reason': 'clone_already_materialized',
+        }
 
     snapshot = run.snapshot
     data = snapshot.snapshot_json or {}
+
+    if data.get('snapshot_schema_version') != AUTOMATION_SNAPSHOT_SCHEMA_VERSION:
+        raise CloneRetrievalPreflightError(
+            'Snapshot predates the retrieval-equivalent clone contract. '
+            'Create a new snapshot before queueing this run.',
+            report={
+                'status': 'fail',
+                'reason': 'legacy_snapshot_schema',
+                'expected_schema_version': AUTOMATION_SNAPSHOT_SCHEMA_VERSION,
+                'actual_schema_version': data.get('snapshot_schema_version'),
+            },
+        )
+
+    required_sections = {
+        'sessions',
+        'world_events',
+        'memory_embeddings',
+        'world',
+        'npcs',
+        'clocks',
+    }
+    for section in required_sections:
+        if section not in data:
+            raise CloneRetrievalPreflightError(
+                f'Snapshot is missing required section: {section}',
+                report={
+                    'status': 'fail',
+                    'reason': f'missing_{section}_section',
+                }
+            )
+
     source_campaign = data.get('campaign') or {}
     clone = Campaign(
         name=f'{source_campaign.get("name") or "Automation"} [Run {run.id}]',
@@ -534,10 +1077,18 @@ def materialize_run_campaign(run):
             recap=session_data.get('recap'),
             running_summary=session_data.get('running_summary'),
             is_active=bool(session_data.get('is_active')),
+            memory_anchors=_normalize_memory_anchors(
+                session_data.get('memory_anchors')
+            ),
         )
         db.session.add(session)
         db.session.flush()
-        session_map[session_data.get('id')] = session.id
+        
+        session_id = session_data.get('id')
+        if session_id is not None:
+            session_map[session_id] = session.id
+            session_map[str(session_id)] = session.id
+
         for message_data in session_data.get('messages') or []:
             db.session.add(SessionMessage(
                 session_id=session.id,
@@ -559,11 +1110,14 @@ def materialize_run_campaign(run):
                 applied_at=_parse_iso(proposal_data.get('applied_at')),
             ))
     if not session_map:
-        db.session.add(CampaignSession(
+        new_session = CampaignSession(
             campaign_id=clone.id,
             started_at=_utcnow(),
             is_active=True,
-        ))
+        )
+        db.session.add(new_session)
+        db.session.flush()
+        session_map['active_fallback'] = new_session.id
 
     world_data = data.get('world')
     if world_data:
@@ -690,17 +1244,29 @@ def materialize_run_campaign(run):
                 updated_at=_parse_iso(placement_data.get('updated_at')) or _utcnow(),
             ))
 
-    # Snapshot audit rows are historical telemetry, not campaign state. Replaying
-    # them into the clone can make fresh post-turn status checks match stale
-    # trace IDs from the source campaign.
+    # Copy world events and build ID map
+    world_event_map = _copy_snapshot_world_events(data, clone)
+
+    # Copy embeddings
+    _copy_snapshot_embeddings(data, clone, world_event_map)
+
+    db.session.flush()
+
+    # Preflight validator
+    preflight_report = validate_clone_retrieval_equivalence(
+        snapshot_data=data,
+        clone=clone,
+        session_map=session_map,
+        world_event_map=world_event_map,
+    )
 
     policy = retention_policy_for_scenario(run.scenario) if run.scenario else dict(DEFAULT_RETENTION_POLICY)
     retention_days = max(0, _safe_int(policy.get('retention_days'), DEFAULT_RETENTION_POLICY['retention_days']))
     run.derived_campaign_id = clone.id
     run.clone_retention_expires_at = _utcnow() + timedelta(days=retention_days) if retention_days else None
     run.updated_at = _utcnow()
-    db.session.commit()
-    return clone, character_map
+
+    return clone, character_map, preflight_report
 
 
 def append_workspace_event(user_id, event_type, payload, *, resource_type=None, resource_id=None, commit=True):
@@ -1038,6 +1604,22 @@ def claim_run_for_worker(run, worker_id):
     if run.status != 'queued' and not reclaimed and run.worker_id != worker_id:
         raise ValueError(f'Run is already leased by {run.worker_id or "another worker"}')
 
+    first_materialization = run.derived_campaign_id is None
+
+    if first_materialization:
+        clone_campaign, character_map, preflight_report = (
+            materialize_run_campaign(run)
+        )
+    else:
+        clone_campaign = db.session.get(Campaign, run.derived_campaign_id)
+        character_map = {}
+        preflight_report = {
+            'version': CLONE_RETRIEVAL_PREFLIGHT_VERSION,
+            'status': 'not_repeated',
+            'reason': 'clone_already_materialized',
+        }
+
+    # Only after successful first-materialization preflight:
     run.worker_id = worker_id
     run.lease_token = secrets.token_hex(16)
     run.heartbeat_at = now
@@ -1047,10 +1629,11 @@ def claim_run_for_worker(run, worker_id):
     run.attempt_count = (run.attempt_count or 0) + 1
     if reclaimed:
         run.reclaim_count = (run.reclaim_count or 0) + 1
-    clone_campaign, character_map = materialize_run_campaign(run)
+
     latest_session = CampaignSession.query.filter_by(campaign_id=clone_campaign.id, is_active=True).first()
     if latest_session is None:
         latest_session = CampaignSession.query.filter_by(campaign_id=clone_campaign.id).order_by(CampaignSession.started_at.desc(), CampaignSession.id.desc()).first()
+
     db.session.commit()
     return {
         'run': run,
@@ -1058,6 +1641,7 @@ def claim_run_for_worker(run, worker_id):
         'character_map': character_map,
         'latest_session': latest_session,
         'reclaimed': reclaimed,
+        'retrieval_preflight': preflight_report,
     }
 
 
