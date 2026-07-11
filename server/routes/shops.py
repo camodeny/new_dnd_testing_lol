@@ -1,9 +1,9 @@
 import json
-from datetime import datetime
 from flask import Blueprint, jsonify, request
 
 from auth import token_required
 from models import db, Campaign, CampaignSession, CampaignWorld, Character, CampaignShop, SessionMessage, CharacterEquipment
+from time_utils import utcnow
 from services.campaign_service import ensure_member, get_or_404
 
 shops_bp = Blueprint('shops', __name__)
@@ -123,7 +123,7 @@ def buy_item(current_user, shop_id):
         )
         db.session.add(equipment)
 
-    character.updated_at = datetime.utcnow()
+    character.updated_at = utcnow()
 
     active_session = CampaignSession.query.filter_by(campaign_id=campaign.id, is_active=True).first()
     if active_session:

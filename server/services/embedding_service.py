@@ -2,11 +2,11 @@ import hashlib
 import json
 import math
 import os
-from datetime import datetime
 
 import requests
 
 from models import CampaignMemoryEmbedding, db
+from time_utils import utcnow
 from services.audit_service import log_audit_event
 
 
@@ -378,7 +378,7 @@ def upsert_memory_embedding(campaign, item_type, item_id, value, audit_context=N
     row.embedding_model = embedding['model']
     row.embedding_dimensions = embedding['dimensions']
     row.embedding_json = json.dumps(embedding['vector'], ensure_ascii=False)
-    row.updated_at = datetime.utcnow()
+    row.updated_at = utcnow()
     db.session.flush()
     _log(
         campaign.id,

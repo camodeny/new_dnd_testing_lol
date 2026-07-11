@@ -13,6 +13,7 @@ from werkzeug.security import check_password_hash, generate_password_hash
 
 from models import AuthSession, LLMPlayer, User, UserAutomationKey, db
 from pendergrass_sso import PendergrassSSOClient, PendergrassSSOError
+from time_utils import utcnow
 
 auth_bp = Blueprint('auth', __name__)
 
@@ -96,7 +97,7 @@ def _create_auth_session(user=None, provider=None):
         session_token_hash=_hash_session_token(raw_session_token),
         user_id=user.id if user else None,
         provider=provider,
-        last_seen_at=datetime.utcnow(),
+        last_seen_at=utcnow(),
     )
     db.session.add(auth_session)
     db.session.commit()
@@ -123,7 +124,7 @@ def _finalize_auth_session(auth_session, user, *, provider=None, provider_subjec
     auth_session.user_id = user.id
     auth_session.provider = provider
     auth_session.provider_subject = provider_subject
-    auth_session.last_seen_at = datetime.utcnow()
+    auth_session.last_seen_at = utcnow()
     auth_session.pending_oauth_state = None
     auth_session.pending_oauth_state_expires_at = None
     auth_session.post_login_redirect = None
@@ -135,7 +136,7 @@ def _finalize_auth_session(auth_session, user, *, provider=None, provider_subjec
         auth_session.id_token = tokens.get('id_token')
         auth_session.scope = tokens.get('scope')
         auth_session.access_token_expires_at = (
-            datetime.utcnow() + timedelta(seconds=int(expires_in))
+            utcnow() + timedelta(seconds=int(expires_in))
             if expires_in is not None else None
         )
 
@@ -173,7 +174,7 @@ def _authenticate_api_key(api_key):
             current_user = llm_player.user
             if not current_user:
                 return None, jsonify({'error': 'User not found'}), 401
-            llm_player.last_used_at = datetime.utcnow()
+            llm_player.last_used_at = utcnow()
             db.session.commit()
             g.auth_mode = 'api_key'
             g.llm_player = llm_player
@@ -187,7 +188,7 @@ def _authenticate_api_key(api_key):
             current_user = automation_key.user
             if not current_user:
                 return None, jsonify({'error': 'User not found'}), 401
-            automation_key.last_used_at = datetime.utcnow()
+            automation_key.last_used_at = utcnow()
             db.session.commit()
             g.auth_mode = 'api_key'
             g.llm_player = None
@@ -207,7 +208,7 @@ def _authenticate_session_cookie(session_token):
     if not current_user:
         return None, jsonify({'error': 'User not found'}), 401
 
-    auth_session.last_seen_at = datetime.utcnow()
+    auth_session.last_seen_at = utcnow()
     db.session.commit()
     g.auth_mode = 'session'
     g.llm_player = None
@@ -434,7 +435,7 @@ def begin_sso_login():
     auth_session, session_token, _created = _ensure_auth_session()
     state = secrets.token_urlsafe(32)
     auth_session.pending_oauth_state = state
-    auth_session.pending_oauth_state_expires_at = datetime.utcnow() + timedelta(
+    auth_session.pending_oauth_state_expires_at = utcnow() + timedelta(
         minutes=current_app.config.get('OAUTH_STATE_LIFETIME_MINUTES', OAUTH_STATE_LIFETIME_MINUTES)
     )
     auth_session.post_login_redirect = _resolve_post_login_redirect('/')
@@ -475,7 +476,7 @@ def complete_sso_login():
         or auth_session.pending_oauth_state != state
         or (
             auth_session.pending_oauth_state_expires_at
-            and auth_session.pending_oauth_state_expires_at < datetime.utcnow()
+            and auth_session.pending_oauth_state_expires_at < utcnow()
         )
     ):
         return redirect(_build_redirect_target(fallback_redirect, {'auth_error': 'Invalid or expired login state.'}))

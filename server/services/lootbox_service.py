@@ -1,7 +1,7 @@
 import json
 import random
-from datetime import datetime
 from models import db, LootBox, Character, SheetProposal
+from time_utils import utcnow
 
 LOOT_RARITIES = ('common', 'uncommon', 'rare', 'very_rare')
 
@@ -255,7 +255,7 @@ def open_loot_box(loot_box, session, dm_user_id):
 
     loot_box.draw_results_json = json.dumps(draws)
     loot_box.status = 'opened'
-    loot_box.opened_at = datetime.utcnow()
+    loot_box.opened_at = utcnow()
     db.session.commit()
 
     return proposals

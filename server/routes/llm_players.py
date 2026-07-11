@@ -1,4 +1,3 @@
-from datetime import datetime
 import random
 import secrets
 
@@ -8,6 +7,7 @@ from werkzeug.security import generate_password_hash
 from auth import token_required
 from dev_data import DEV_CHARACTER_TEMPLATES
 from models import Campaign, CampaignMember, CampaignSession, Character, LLMPlayer, SheetProposal, User, db
+from time_utils import utcnow
 from services.campaign_service import get_or_404
 from services.character_service import build_character_from_data, character_full_dict, update_character_relations
 
@@ -129,7 +129,7 @@ def create_llm_player(current_user, campaign_id):
         user_id=llm_user.id,
         role='player',
         selected_character_id=character.id,
-        character_ready_at=datetime.utcnow(),
+        character_ready_at=utcnow(),
     )
     db.session.add(member)
 
@@ -191,7 +191,7 @@ def assign_existing_llm_player(current_user, campaign_id):
 
     llm_player.campaign_id = campaign.id
     source_member.campaign_id = campaign.id
-    source_member.character_ready_at = datetime.utcnow()
+    source_member.character_ready_at = utcnow()
     source_member.selected_character_id = character.id
     character.campaign_id = campaign.id
     character.player_name = llm_player.label

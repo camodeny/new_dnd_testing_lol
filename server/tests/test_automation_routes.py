@@ -3,7 +3,7 @@ import os
 import sys
 import tempfile
 import unittest
-from datetime import datetime, timedelta
+from datetime import timedelta
 from unittest.mock import patch
 
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), '..')))
@@ -11,13 +11,13 @@ os.environ['DATABASE_URL'] = 'sqlite:///:memory:'
 
 from app import app
 from auth import generate_token
+from time_utils import utcnow
 from models import (
     AutomationRun,
     AutomationRunAuditCycle,
     AutomationRunAuditorJob,
     AutomationRunEvent,
     AutomationRunProviderCall,
-    AutomationScorecardTemplate,
     Campaign,
     CampaignAuditEvent,
     EncounterMap,
@@ -655,7 +655,7 @@ class AutomationRouteTest(unittest.TestCase):
             run = db.session.get(AutomationRun, run_id)
             run.status = 'running'
             run.worker_id = 'worker-a'
-            run.lease_expires_at = datetime.utcnow() - timedelta(seconds=5)
+            run.lease_expires_at = utcnow() - timedelta(seconds=5)
             db.session.commit()
 
         reclaim_response = self.client.post(
@@ -1496,7 +1496,7 @@ class AutomationRouteTest(unittest.TestCase):
                 'response_text': '{"overall_status":"pass"}',
             })
             job.status = 'canceled'
-            job.finished_at = datetime.utcnow()
+            job.finished_at = utcnow()
             db.session.commit()
             return {
                 'provider': 'opencode_go',

@@ -1,8 +1,7 @@
 import json
 import random
 import re
-from datetime import datetime
-
+from time_utils import utcnow
 from models import (
     db,
     CampaignClock,
@@ -2852,7 +2851,7 @@ def _tool_update_current_scene(campaign, _current_user, args):
     world_state['current_scene'] = current_scene
     _sync_party_known_location(world_state, current_scene)
     world.world_state = json_dumps(world_state)
-    world.updated_at = datetime.utcnow()
+    world.updated_at = utcnow()
     upsert_memory_embedding(campaign, 'world_state', 'current', world_state)
     event = _record_event(
         campaign,
@@ -2880,7 +2879,7 @@ def _tool_advance_clock(campaign, _current_user, args):
         clock.status = 'completed'
     elif (clock.status or 'active') == 'completed' and clock.filled < (clock.segments or 4):
         clock.status = 'active'
-    clock.updated_at = datetime.utcnow()
+    clock.updated_at = utcnow()
     upsert_memory_embedding(campaign, 'clock', clock.clock_id, clock.to_dict(include_private=True))
     evidence = args.get('evidence') if isinstance(args.get('evidence'), list) else []
     event = _record_event(
@@ -2920,7 +2919,7 @@ def _tool_reveal_fact(campaign, _current_user, args):
     old_visibility = target.get('visibility')
     target['visibility'] = visibility
     world.knowledge_graph = json_dumps(graph)
-    world.updated_at = datetime.utcnow()
+    world.updated_at = utcnow()
     upsert_memory_embedding(campaign, item_type, item_id, target)
     event = _record_event(
         campaign,
@@ -4988,7 +4987,7 @@ def _apply_entity_id_remaps(kind, item, id_remaps):
 
 
 def _create_clock_from_patch(campaign, patch):
-    clock_id = clean_id(patch.get('id') or patch.get('clock_id'), f'clock_{datetime.utcnow().strftime("%Y%m%d%H%M%S")}')
+    clock_id = clean_id(patch.get('id') or patch.get('clock_id'), f'clock_{utcnow().strftime("%Y%m%d%H%M%S")}')
     existing = CampaignClock.query.filter_by(campaign_id=campaign.id, clock_id=clock_id).first()
     try:
         segments = min(max(int(patch.get('segments') or 4), 2), 12)
@@ -5008,7 +5007,7 @@ def _create_clock_from_patch(campaign, patch):
     clock.trigger = clean_text(patch.get('trigger'), 420)
     clock.on_complete = clean_text(patch.get('on_complete'), 520)
     clock.status = clean_text(patch.get('status'), 30) or 'active'
-    clock.updated_at = datetime.utcnow()
+    clock.updated_at = utcnow()
     if not existing:
         db.session.add(clock)
     db.session.flush()
@@ -5029,7 +5028,7 @@ def _retire_clock_from_patch(campaign, patch):
     if not clock:
         return {'error': f'Clock not found: {clock_id}'}
     clock.status = clean_text(patch.get('status'), 30) or 'resolved'
-    clock.updated_at = datetime.utcnow()
+    clock.updated_at = utcnow()
     upsert_memory_embedding(campaign, 'clock', clock.clock_id, clock.to_dict(include_private=True))
     event = _record_event(
         campaign,
@@ -5172,7 +5171,7 @@ def _update_npc_actor(campaign, patch):
     actor.role = clean_text(patch.get('role'), 200) or actor.role
     actor.public_summary = clean_text(patch.get('public_summary'), 420) or actor.public_summary
     actor.dossier = json_dumps(dossier)
-    actor.updated_at = datetime.utcnow()
+    actor.updated_at = utcnow()
     db.session.flush()
     upsert_memory_embedding(campaign, 'npc_actor', actor.actor_id, actor.to_dict(include_private=True))
     event = _record_event(
@@ -5616,7 +5615,7 @@ def apply_memory_patch(campaign, session, patch, audit_context=None):
 
         world.knowledge_graph = json_dumps(graph)
         world.world_state = json_dumps(world_state)
-        world.updated_at = datetime.utcnow()
+        world.updated_at = utcnow()
         if scene_patch and has_actual_scene_changes:
             upsert_memory_embedding(campaign, 'world_state', 'current', world_state, audit_context=audit_context)
 

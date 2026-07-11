@@ -1,6 +1,5 @@
-from datetime import datetime
-
 from models import SessionDmTurn
+from time_utils import utcnow
 
 
 def session_dm_trace_id(session_id, player_message_id):
@@ -10,7 +9,7 @@ def session_dm_trace_id(session_id, player_message_id):
 
 
 def _utcnow():
-    return datetime.utcnow()
+    return utcnow()
 
 
 def _duration_ms(started_at, finished_at):

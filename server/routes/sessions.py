@@ -1,4 +1,3 @@
-from datetime import datetime
 import json
 import queue
 
@@ -15,6 +14,7 @@ from models import (
     Character,
     User,
 )
+from time_utils import utcnow
 from openrouter import (
     get_opening_scene_response,
     get_session_clock_updates,
@@ -429,7 +429,7 @@ def start_session(current_user, campaign_id):
     session = CampaignSession(campaign_id=campaign_id)
     db.session.add(session)
     approve_world(world)
-    campaign.last_played_at = datetime.utcnow()
+    campaign.last_played_at = utcnow()
     db.session.flush()
     log_audit_event(
         campaign_id,
@@ -549,7 +549,7 @@ def end_session(current_user, session_id):
 
     data = request.get_json()
     session.is_active = False
-    session.ended_at = datetime.utcnow()
+    session.ended_at = utcnow()
     if data and 'recap' in data:
         session.recap = data['recap']
 
@@ -907,9 +907,9 @@ def _apply_sheet_proposal(current_user, session_id, proposal_id):
             else:
                 setattr(character, field, int(after))
 
-    character.updated_at = datetime.utcnow()
+    character.updated_at = utcnow()
     proposal.status = 'applied'
-    proposal.applied_at = datetime.utcnow()
+    proposal.applied_at = utcnow()
     db.session.commit()
 
     stream_manager.broadcast_event(session_id, {

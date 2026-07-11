@@ -10,6 +10,7 @@ os.environ['DATABASE_URL'] = 'sqlite:///:memory:'
 
 from app import app
 from auth import generate_token
+from time_utils import utcnow
 from models import (
     AutomationRun,
     AutomationRunEvent,
@@ -479,7 +480,7 @@ class AutomationCloneRetrievalTest(unittest.TestCase):
         db.session.flush()
 
         # Simulate lease expiration
-        run.lease_expires_at = datetime.utcnow() - timedelta(seconds=5)
+        run.lease_expires_at = utcnow() - timedelta(seconds=5)
         run.status = 'claimed'
         db.session.commit()
 

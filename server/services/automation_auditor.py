@@ -1,9 +1,9 @@
 import json
 from collections import Counter
-from datetime import datetime
 from uuid import uuid4
 
 from utils.redaction import redact_secrets, is_sensitive_key
+from time_utils import utcnow
 from models import (
     AutomationRun,
     AutomationRunAuditCycle,
@@ -284,7 +284,7 @@ AUDITOR_TOOL_DEFINITIONS = [
 
 
 def _utcnow():
-    return datetime.utcnow()
+    return utcnow()
 
 
 def _json_loads(value, fallback):
@@ -1554,7 +1554,7 @@ def run_builtin_auditors_for_current_cycle(run_id, *, rerun_failed=False):
         run,
         'auditor_jobs_updated',
         {'auditor_jobs': [job.to_dict() for job in jobs], 'cycle_id': cycle.id},
-        dedupe_key=f'auditor_jobs_started:{run.id}:{cycle.id}:{datetime.utcnow().isoformat()}',
+        dedupe_key=f'auditor_jobs_started:{run.id}:{cycle.id}:{utcnow().isoformat()}',
     )
     for job in jobs:
         db.session.refresh(job)
@@ -1626,7 +1626,7 @@ def run_builtin_auditors_for_current_cycle(run_id, *, rerun_failed=False):
             run,
             'auditor_jobs_updated',
             {'auditor_jobs': [job.to_dict() for job in jobs], 'cycle_id': cycle.id},
-            dedupe_key=f'auditor_jobs_incomplete:{run.id}:{cycle.id}:{datetime.utcnow().isoformat()}',
+            dedupe_key=f'auditor_jobs_incomplete:{run.id}:{cycle.id}:{utcnow().isoformat()}',
         )
         return {'run': run.to_dict(), 'audit_cycle': cycle.to_dict(), 'auditor_jobs': [job.to_dict() for job in jobs], 'completed': False}
 
@@ -1701,7 +1701,7 @@ def cancel_auditor_jobs_for_current_cycle(run):
         run,
         'auditor_jobs_updated',
         {'auditor_jobs': [job.to_dict() for job in jobs], 'cycle_id': cycle_id, 'canceled': True},
-        dedupe_key=f'auditor_jobs_canceled:{run.id}:{cycle_id}:{datetime.utcnow().isoformat()}',
+        dedupe_key=f'auditor_jobs_canceled:{run.id}:{cycle_id}:{utcnow().isoformat()}',
     )
     return jobs
 
