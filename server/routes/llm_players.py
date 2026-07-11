@@ -21,14 +21,11 @@ def _owner_campaign_or_403(current_user, campaign_id):
     return campaign, None
 
 
-def _unique_llm_username(label):
-    base = ' '.join((label or 'LLM Player').split())[:60] or 'LLM Player'
-    username = base
-    suffix = 2
-    while User.query.filter_by(username=username).first():
-        username = f'{base} {suffix}'
-        suffix += 1
-    return username
+from services.automation_service import (
+    unique_llm_username as _unique_llm_username,
+    generate_llm_api_key as _generate_llm_api_key,
+    next_safe_llm_user_id as _next_safe_llm_user_id,
+)
 
 
 def _build_llm_character(user_id, campaign_id, label):
@@ -40,17 +37,6 @@ def _build_llm_character(user_id, campaign_id, label):
     db.session.flush()
     update_character_relations(character, template)
     return character
-
-
-def _generate_llm_api_key():
-    api_key = f'dndllm_{secrets.token_urlsafe(32)}'
-    return api_key, generate_password_hash(api_key), api_key[:24]
-
-
-def _next_safe_llm_user_id():
-    max_user_id = db.session.query(db.func.max(User.id)).scalar() or 0
-    max_llm_user_id = db.session.query(db.func.max(LLMPlayer.user_id)).scalar() or 0
-    return max(max_user_id, max_llm_user_id) + 1
 
 
 def _serialize_llm_player(campaign, llm_player):

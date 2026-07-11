@@ -17,9 +17,11 @@ from models import (
     AutomationSnapshot,
     AutomationWorker,
     Campaign,
+    CampaignMember,
     Character,
     CharacterCondition,
     CharacterEquipment,
+    LLMPlayer,
     SessionMessage,
     SheetProposal,
     User,
@@ -63,6 +65,8 @@ from services.automation_service import (
     runner_config_from_request,
     scenario_roster_from_campaign,
     scorecard_template_snapshot,
+    provision_automation_player,
+    validate_and_normalize_roster,
     submit_audit_cycle_feedback,
     validate_scorecard_template_payload,
     visible_campaigns_for_user,
@@ -76,7 +80,7 @@ from services.automation_stream import (
     workspace_stream_cursor,
 )
 from services.campaign_service import ensure_member, get_or_404
-from services.character_service import character_full_dict
+from services.character_service import character_full_dict, build_character_from_data, update_character_relations
 from services.dm_tools import SHEET_SCALAR_FIELDS
 from services.stream_manager import stream_manager
 
@@ -410,6 +414,96 @@ def delete_automation_scorecard(current_user, scorecard_id):
     return jsonify({'ok': True}), 200
 
 
+@automation_bp.route('/api/automation/source-campaigns/<int:campaign_id>/roster', methods=['POST'])
+@token_required
+def provision_campaign_roster(current_user, campaign_id):
+    campaign = get_or_404(Campaign, campaign_id)
+    if campaign.is_automation_clone or campaign.user_id != current_user.id:
+        return jsonify({'error': 'Forbidden'}), 403
+
+    data = request.get_json(silent=True) or {}
+    entries = data.get('entries')
+    if not isinstance(entries, list) or not entries:
+        return jsonify({'error': 'entries must be a non-empty list'}), 400
+
+    resolved_entries = []
+    seen_labels = set()
+    try:
+        for idx, entry in enumerate(entries):
+            if not isinstance(entry, dict) or entry is None:
+                raise ValueError(f"entries[{idx}] must be an object")
+
+            label = entry.get('label')
+            if not isinstance(label, str) or not label.strip():
+                raise ValueError(f"entries[{idx}].label must be a non-empty string")
+            label = label.strip()
+
+            if label in seen_labels:
+                raise ValueError(f"entries[{idx}].label '{label}' is duplicated in request")
+            seen_labels.add(label)
+
+            member_role = entry.get('member_role') or 'player'
+            if member_role != 'player':
+                raise ValueError(f"entries[{idx}].member_role must be 'player' for automation players")
+
+            char_data = entry.get('character')
+            if not char_data or not isinstance(char_data, dict):
+                raise ValueError(f"entries[{idx}].character must be an object")
+            char_name = char_data.get('name')
+            if not isinstance(char_name, str) or not char_name.strip():
+                raise ValueError(f"entries[{idx}].character.name must be a non-empty string")
+            char_race = char_data.get('race')
+            if not isinstance(char_race, str) or not char_race.strip():
+                raise ValueError(f"entries[{idx}].character.race must be a non-empty string")
+
+            # Create or resolve LLM player and user
+            llm_user, llm_player, api_key = provision_automation_player(campaign, label)
+
+            # Create character
+            character = Character(user_id=llm_user.id, campaign_id=campaign.id, player_name=label)
+            build_character_from_data(character, char_data)
+            character.player_name = label
+            db.session.add(character)
+            db.session.flush()
+
+            update_character_relations(character, char_data)
+            db.session.flush()
+
+            # Create or update CampaignMember
+            member = CampaignMember.query.filter_by(campaign_id=campaign.id, user_id=llm_user.id).first()
+            if not member:
+                member = CampaignMember(
+                    campaign_id=campaign.id,
+                    user_id=llm_user.id,
+                    role=member_role,
+                )
+                db.session.add(member)
+            else:
+                member.role = member_role
+            member.selected_character_id = character.id
+            member.character_ready_at = utcnow()
+            db.session.flush()
+
+            res_entry = {
+                'user_id': llm_user.id,
+                'member_role': member_role,
+                'character_id': character.id,
+                'character_name': character.name,
+                'label': label,
+                'llm_player_id': llm_player.id,
+            }
+            if api_key:
+                res_entry['api_key'] = api_key
+            resolved_entries.append(res_entry)
+
+        db.session.commit()
+    except Exception as e:
+        db.session.rollback()
+        return jsonify({'error': str(e)}), 400
+
+    return jsonify({'entries': resolved_entries}), 201
+
+
 @automation_bp.route('/api/automation/scenarios', methods=['GET'])
 @token_required
 def list_automation_scenarios(current_user):
@@ -435,6 +529,15 @@ def create_automation_scenario(current_user):
         if scorecard_template.user_id != current_user.id:
             return jsonify({'error': 'Forbidden'}), 403
 
+    roster_data = data.get('roster')
+    if roster_data is not None:
+        try:
+            roster_json = validate_and_normalize_roster(campaign, roster_data)
+        except ValueError as e:
+            return jsonify({'error': str(e)}), 400
+    else:
+        roster_json = scenario_roster_from_campaign(campaign)
+
     scenario = AutomationScenario(
         user_id=current_user.id,
         source_campaign_id=campaign.id,
@@ -446,7 +549,7 @@ def create_automation_scenario(current_user):
         ),
         audit_config_json=data.get('audit_config') or {},
         retention_policy_json=data.get('retention_policy') or {},
-        roster_json=scenario_roster_from_campaign(campaign),
+        roster_json=roster_json,
     )
     db.session.add(scenario)
     db.session.commit()
