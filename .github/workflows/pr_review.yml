@@ -95,12 +95,14 @@ jobs:
           build_result=success
           if [ "$build_status" -ne 0 ]; then
             build_result=failure
-            exit "$build_status"
           fi
           {
             echo "lint_result=${lint_result}"
             echo "build_result=${build_result}"
           } >> "$GITHUB_OUTPUT"
+          if [ "$build_status" -ne 0 ]; then
+            exit "$build_status"
+          fi
 
       - name: Upload frontend review evidence
         if: always()
