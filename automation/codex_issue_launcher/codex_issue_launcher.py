@@ -8,12 +8,110 @@ import json
 import re
 import subprocess
 import sys
+import time
+from queue import Empty, Queue
+from threading import Thread
 from pathlib import Path
-from urllib.parse import urlencode
 
 
 class LauncherError(RuntimeError):
     """An expected, user-actionable launcher failure."""
+
+
+class AppServerClient:
+    """Small JSON-RPC client for a foreground Codex app-server process."""
+
+    def __init__(self) -> None:
+        self.process: subprocess.Popen[str] | None = None
+        self.messages: Queue[str | None] = Queue()
+        self.request_id = 0
+
+    def start(self) -> None:
+        self.process = subprocess.Popen(
+            ["codex", "app-server", "--stdio"],
+            stdin=subprocess.PIPE,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.DEVNULL,
+            text=True,
+            bufsize=1,
+        )
+        assert self.process.stdout is not None
+        Thread(target=self._read_stdout, args=(self.process.stdout,), daemon=True).start()
+        self.request(
+            "initialize",
+            {"clientInfo": {"name": "github-issue-launcher", "version": "1.0"}},
+            timeout_seconds=60,
+        )
+
+    def _read_stdout(self, stdout: object) -> None:
+        for line in stdout:  # type: ignore[union-attr]
+            self.messages.put(line)
+        self.messages.put(None)
+
+    def _next_message(self, timeout_seconds: float) -> dict:
+        try:
+            line = self.messages.get(timeout=timeout_seconds)
+        except Empty as error:
+            raise LauncherError("Codex app-server stopped responding") from error
+        if line is None:
+            raise LauncherError("Codex app-server exited before completing the request")
+        try:
+            return json.loads(line)
+        except json.JSONDecodeError:
+            return {}
+
+    def request(self, method: str, params: dict, timeout_seconds: float) -> dict:
+        if self.process is None or self.process.stdin is None:
+            raise LauncherError("Codex app-server is not running")
+        self.request_id += 1
+        request_id = self.request_id
+        self.process.stdin.write(
+            json.dumps(
+                {"jsonrpc": "2.0", "id": request_id, "method": method, "params": params}
+            )
+            + "\n"
+        )
+        self.process.stdin.flush()
+
+        deadline = time.monotonic() + timeout_seconds
+        while True:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                raise LauncherError(f"Codex app-server timed out while calling {method}")
+            message = self._next_message(remaining)
+            if message.get("id") != request_id:
+                continue
+            if "error" in message:
+                raise LauncherError(f"Codex app-server {method} failed: {message['error']}")
+            return message.get("result", {})
+
+    def wait_for_turn(self, thread_id: str, timeout_seconds: int) -> None:
+        deadline = time.monotonic() + timeout_seconds
+        while True:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                raise LauncherError(
+                    f"Codex task exceeded its {timeout_seconds}-second execution limit"
+                )
+            message = self._next_message(remaining)
+            if (
+                message.get("method") == "turn/completed"
+                and message.get("params", {}).get("threadId") == thread_id
+            ):
+                turn = message["params"]["turn"]
+                if turn.get("status") != "completed":
+                    raise LauncherError(f"Codex task failed: {turn.get('error') or turn}")
+                return
+
+    def close(self) -> None:
+        if self.process is None or self.process.poll() is not None:
+            return
+        self.process.terminate()
+        try:
+            self.process.wait(timeout=10)
+        except subprocess.TimeoutExpired:
+            self.process.kill()
+            self.process.wait(timeout=10)
 
 
 def run_git(repo: Path, *args: str, capture: bool = True) -> str:
@@ -112,6 +210,29 @@ def write_project_config(worktree: Path) -> None:
     )
 
 
+def run_codex_task(worktree: Path, prompt: str, timeout_seconds: int) -> str:
+    client = AppServerClient()
+    try:
+        client.start()
+        thread_result = client.request(
+            "thread/start", {"cwd": str(worktree)}, timeout_seconds=90
+        )
+        thread_id = thread_result["thread"]["id"]
+        client.request(
+            "turn/start",
+            {
+                "threadId": thread_id,
+                "input": [{"type": "text", "text": prompt}],
+            },
+            timeout_seconds=90,
+        )
+        print(f"Started Codex thread {thread_id} for {worktree}")
+        client.wait_for_turn(thread_id, timeout_seconds)
+        return thread_id
+    finally:
+        client.close()
+
+
 def create(args: argparse.Namespace) -> None:
     repo = repository_root(args.repo_path)
     if args.issue_number <= 0:
@@ -121,9 +242,6 @@ def create(args: argparse.Namespace) -> None:
     branch = f"codex/issue-{args.issue_number}"
     worktree = repo.parent / f"{repo.name}-codex-issues" / f"issue-{args.issue_number}"
     prompt = issue_prompt(args, worktree, chat_name)
-    deep_link = "codex://threads/new?" + urlencode(
-        {"workspace": str(worktree), "prompt": prompt}
-    )
     if args.dry_run:
         print(
             json.dumps(
@@ -131,7 +249,7 @@ def create(args: argparse.Namespace) -> None:
                     "branch": branch,
                     "worktree": str(worktree),
                     "control_chat_name": chat_name,
-                    "deep_link": deep_link,
+                    "prompt": prompt,
                 }
             )
         )
@@ -149,13 +267,13 @@ def create(args: argparse.Namespace) -> None:
     run_git(repo, "worktree", "add", "-b", branch, str(worktree), default_start_point(repo), capture=False)
     try:
         write_project_config(worktree)
-        subprocess.run(["open", deep_link], check=True)
+        thread_id = run_codex_task(worktree, prompt, args.max_turn_seconds)
     except Exception:
-        # Keep the branch but remove the incomplete worktree if the desktop task cannot be opened.
-        run_git(repo, "worktree", "remove", "--force", str(worktree), capture=False)
+        # The task may have produced useful state before failing, so preserve its worktree for review.
+        print(f"Codex task failed; preserving worktree {worktree}", file=sys.stderr)
         raise
 
-    print(f"Opened Codex task for issue #{args.issue_number} in {worktree}")
+    print(f"Completed Codex thread {thread_id} for issue #{args.issue_number} in {worktree}")
     print(f"Branch retained at {branch}")
 
 
@@ -193,6 +311,7 @@ def parser() -> argparse.ArgumentParser:
     create_parser.add_argument("--issue-number", required=True, type=int)
     create_parser.add_argument("--issue-title", required=True)
     create_parser.add_argument("--issue-body", default="")
+    create_parser.add_argument("--max-turn-seconds", type=int, default=10_800)
     create_parser.add_argument("--dry-run", action="store_true")
     commands.add_parser("cleanup", help="remove a clean issue worktree").add_argument(
         "--repo-path", required=True

@@ -1,8 +1,10 @@
 # GitHub issue to Codex task launcher
 
-Opening an issue as the `camodeny` repository owner starts the self-hosted runner. The runner creates a sibling worktree named `new_dnd_testing_lol-codex-issues/issue-<number>`, makes a `codex/issue-<number>` branch, and opens a Codex desktop task.
+Opening an issue as the `camodeny` repository owner starts the self-hosted runner. The runner creates a sibling worktree named `new_dnd_testing_lol-codex-issues/issue-<number>`, makes a `codex/issue-<number>` branch, and starts a Codex task through the local app-server protocol.
 
 The task prompt invokes `$github-issue-pr-review-loop`, resolves its durable approval conversation from the exact chat title in the issue, accepts only `MERGE_OK`, and never merges automatically.
+
+The workflow stays active while the task runs, for up to three hours. Only one issue task can run at a time so concurrent issues cannot compete for the local Codex and Chrome sessions.
 
 ## Installation
 
