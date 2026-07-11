@@ -519,6 +519,9 @@ def validate_and_normalize_roster(campaign, roster_data):
     normalized_roster = []
 
     for idx, entry in enumerate(roster_data):
+        if not isinstance(entry, dict) or entry is None:
+            raise ValueError(f"roster[{idx}] must be an object")
+
         user_id = entry.get('user_id')
         if not user_id:
             raise ValueError(f"roster[{idx}].user_id is required")

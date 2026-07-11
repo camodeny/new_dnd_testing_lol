@@ -2815,6 +2815,32 @@ class AutomationRouteTest(unittest.TestCase):
         self.assertEqual(mismatch_resp.status_code, 400)
         self.assertIn('does not belong to campaign', mismatch_resp.get_json()['error'])
 
+        # 4. Reject malformed explicit roster entries (non-dictionary)
+        malformed_resp = self.client.post(
+            '/api/automation/scenarios',
+            headers=self.headers,
+            json={
+                'name': 'Malformed Roster Scenario',
+                'source_campaign_id': self.campaign_id,
+                'roster': ["not-an-object"]
+            }
+        )
+        self.assertEqual(malformed_resp.status_code, 400)
+        self.assertIn('must be an object', malformed_resp.get_json()['error'])
+
+        # 5. Reject null/None roster entries
+        null_resp = self.client.post(
+            '/api/automation/scenarios',
+            headers=self.headers,
+            json={
+                'name': 'Null Roster Scenario',
+                'source_campaign_id': self.campaign_id,
+                'roster': [None]
+            }
+        )
+        self.assertEqual(null_resp.status_code, 400)
+        self.assertIn('must be an object', null_resp.get_json()['error'])
+
     def test_scenario_roster_immutability(self):
         # Provision a player
         provision_resp = self.client.post(
