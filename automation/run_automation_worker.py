@@ -223,6 +223,21 @@ def ensure_campaign_initialized(args, claim_payload):
         claim_payload['latest_session'] = session
         bootstrapped = True
 
+    # The claim response intentionally returns a compact session object, while
+    # the worker needs its opening DM message to safely choose the first turn.
+    # Hydrate the session before interpreting a missing messages list as an
+    # uninitialized clone.
+    if session.get('id') and 'messages' not in session:
+        session_payload = api_get(
+            args.api_base,
+            f"/api/sessions/{session['id']}",
+            api_key=args.owner_api_key,
+        )
+        hydrated_session = session_payload.get('session') if isinstance(session_payload, dict) else None
+        if isinstance(hydrated_session, dict):
+            session = hydrated_session
+            claim_payload['latest_session'] = session
+
     messages = session.get('messages') or []
     if not session.get('id') or not session.get('is_active') or not messages:
         raise RuntimeError('campaign_not_initialized')

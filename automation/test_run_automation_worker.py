@@ -741,6 +741,35 @@ class RunAutomationWorkerTests(unittest.TestCase):
             with self.assertRaisesRegex(RuntimeError, 'campaign_not_initialized'):
                 worker.ensure_campaign_initialized(args, claim_payload)
 
+    def test_ensure_campaign_initialized_hydrates_compact_claim_session(self):
+        args = SimpleNamespace(
+            api_base='http://127.0.0.1:5889',
+            owner_api_key='owner-key',
+            worker_id='bootstrap-worker',
+        )
+        claim_payload = {
+            'derived_campaign': {'id': 100003},
+            'latest_session': {'id': 44, 'is_active': True},
+            'gameplay_readiness': {'campaign_ready': True},
+        }
+        hydrated_session = {
+            'id': 44,
+            'is_active': True,
+            'messages': [{'id': 101, 'role': 'dm', 'content': 'Opening scene.'}],
+        }
+
+        with patch.object(worker, 'api_get', return_value={'session': hydrated_session}) as api_get:
+            ensured_session, world_payload = worker.ensure_campaign_initialized(args, claim_payload)
+
+        self.assertEqual(ensured_session, hydrated_session)
+        self.assertEqual(world_payload, {'world': {'world_state': {}}})
+        self.assertEqual(claim_payload['latest_session'], hydrated_session)
+        api_get.assert_called_once_with(
+            'http://127.0.0.1:5889',
+            '/api/sessions/44',
+            api_key='owner-key',
+        )
+
     def test_ensure_campaign_initialized_no_world(self):
         args = SimpleNamespace(
             api_base='http://127.0.0.1:5889',
