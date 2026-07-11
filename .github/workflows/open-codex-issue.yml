@@ -8,6 +8,10 @@ permissions:
   contents: read
   issues: read
 
+concurrency:
+  group: codex-issue-launcher
+  cancel-in-progress: false
+
 jobs:
   open-codex-task:
     # A self-hosted runner can execute on this Mac, so only the repository owner
@@ -16,7 +20,7 @@ jobs:
       github.event.issue.pull_request == null &&
       github.event.sender.login == github.repository_owner
     runs-on: [self-hosted, macOS, codex-desktop]
-    timeout-minutes: 5
+    timeout-minutes: 185
     env:
       CODEX_REPO_PATH: ${{ vars.CODEX_REPO_PATH }}
       ISSUE_NUMBER: ${{ github.event.issue.number }}
