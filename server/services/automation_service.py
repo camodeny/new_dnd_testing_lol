@@ -38,9 +38,11 @@ from models import (
     SessionDmTurn,
     SessionMessage,
     SheetProposal,
+    User,
     WorldEvent,
     db,
 )
+from werkzeug.security import generate_password_hash
 from services.character_service import build_character_from_data, character_full_dict, update_character_relations
 
 
@@ -456,6 +458,135 @@ def scenario_roster_from_campaign(campaign):
     return roster
 
 
+def unique_llm_username(label):
+    base = ' '.join((label or 'LLM Player').split())[:60] or 'LLM Player'
+    username = base
+    suffix = 2
+    while User.query.filter_by(username=username).first():
+        username = f'{base} {suffix}'
+        suffix += 1
+    return username
+
+
+def generate_llm_api_key():
+    api_key = f'dndllm_{secrets.token_urlsafe(32)}'
+    return api_key, generate_password_hash(api_key), api_key[:24]
+
+
+def next_safe_llm_user_id():
+    max_user_id = db.session.query(db.func.max(User.id)).scalar() or 0
+    max_llm_user_id = db.session.query(db.func.max(LLMPlayer.user_id)).scalar() or 0
+    return max(max_user_id, max_llm_user_id) + 1
+
+
+def provision_automation_player(campaign, label):
+    llm_player = LLMPlayer.query.filter_by(campaign_id=campaign.id, label=label).first()
+    if llm_player:
+        llm_user = User.query.get(llm_player.user_id)
+        return llm_user, llm_player, None
+
+    username = unique_llm_username(label)
+    email = f'llm-player-{campaign.id}-{secrets.token_hex(8)}@local.llm'
+    llm_user = User(id=next_safe_llm_user_id(), username=username, email=email)
+    llm_user.set_password(secrets.token_urlsafe(32))
+    db.session.add(llm_user)
+    db.session.flush()
+
+    api_key, api_key_hash, api_key_prefix = generate_llm_api_key()
+    llm_player = LLMPlayer(
+        campaign_id=campaign.id,
+        user_id=llm_user.id,
+        label=label,
+        api_key_hash=api_key_hash,
+        api_key_prefix=api_key_prefix,
+    )
+    db.session.add(llm_player)
+    db.session.flush()
+
+    return llm_user, llm_player, api_key
+
+
+def validate_and_normalize_roster(campaign, roster_data):
+    if not isinstance(roster_data, list):
+        raise ValueError("roster must be a list")
+
+    if not roster_data:
+        raise ValueError("roster must not be empty")
+
+    seen_users = set()
+    seen_characters = set()
+    seen_llm_players = set()
+    normalized_roster = []
+
+    for idx, entry in enumerate(roster_data):
+        user_id = entry.get('user_id')
+        if not user_id:
+            raise ValueError(f"roster[{idx}].user_id is required")
+
+        member = CampaignMember.query.filter_by(campaign_id=campaign.id, user_id=user_id).first()
+        if not member:
+            raise ValueError(f"roster[{idx}].user_id {user_id} is not a member of campaign {campaign.id}")
+
+        if member.role == 'spectator':
+            raise ValueError(f"roster[{idx}].user_id {user_id} is a spectator")
+
+        character_id = entry.get('character_id')
+        if not character_id:
+            raise ValueError(f"roster[{idx}].character_id is required")
+
+        character = Character.query.filter_by(id=character_id, campaign_id=campaign.id).first()
+        if not character:
+            raise ValueError(f"roster[{idx}].character_id {character_id} does not belong to campaign {campaign.id}")
+
+        if member.selected_character_id != character_id:
+            raise ValueError(f"roster[{idx}].character_id {character_id} is not the selected character for user_id {user_id}")
+
+        llm_player_id = entry.get('llm_player_id')
+        llm_player = None
+        if llm_player_id:
+            llm_player = LLMPlayer.query.filter_by(id=llm_player_id, campaign_id=campaign.id, user_id=user_id).first()
+            if not llm_player:
+                raise ValueError(f"roster[{idx}].llm_player_id {llm_player_id} does not belong to user {user_id} and campaign {campaign.id}")
+
+        if user_id in seen_users:
+            raise ValueError(f"roster[{idx}].user_id {user_id} is duplicated")
+        seen_users.add(user_id)
+
+        if character_id in seen_characters:
+            raise ValueError(f"roster[{idx}].character_id {character_id} is duplicated")
+        seen_characters.add(character_id)
+
+        if llm_player_id:
+            if llm_player_id in seen_llm_players:
+                raise ValueError(f"roster[{idx}].llm_player_id {llm_player_id} is duplicated")
+            seen_llm_players.add(llm_player_id)
+
+        if not llm_player:
+            llm_player = LLMPlayer.query.filter_by(campaign_id=campaign.id, user_id=user_id).first()
+
+        label = llm_player.label if llm_player else (member.user.username if member.user else f"User {user_id}")
+
+        normalized_roster.append({
+            'user_id': user_id,
+            'member_role': member.role,
+            'character_id': character.id,
+            'character_name': character.name,
+            'label': label,
+            'llm_player_id': llm_player.id if llm_player else None,
+        })
+
+    settings = json.loads(campaign.settings) if campaign.settings else {}
+    try:
+        required_players = max(1, int(settings.get('required_players', 1)))
+    except (TypeError, ValueError):
+        required_players = 1
+
+    if len(normalized_roster) < required_players:
+        raise ValueError(f"Roster has {len(normalized_roster)} entries, but campaign requires {required_players} players")
+
+    return normalized_roster
+
+
 def serialize_campaign_snapshot(campaign, source_session_id=None):
     members = CampaignMember.query.filter_by(campaign_id=campaign.id).order_by(CampaignMember.id.asc()).all()
     characters = Character.query.filter_by(campaign_id=campaign.id).order_by(Character.party_order.asc(), Character.id.asc()).all()
@@ -553,6 +684,8 @@ def create_snapshot_for_scenario(scenario, label=None, summary=None, source_sess
             if session_campaign is not None:
                 snapshot_campaign = session_campaign
     payload = serialize_campaign_snapshot(snapshot_campaign, source_session_id=source_session_id)
+    if scenario:
+        payload['roster'] = scenario.roster_json
     active_session = next((session for session in payload['sessions'] if session.get('is_active')), None)
     snapshot = AutomationSnapshot(
         scenario_id=scenario.id,

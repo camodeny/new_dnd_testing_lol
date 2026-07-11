@@ -18,6 +18,7 @@ from models import (
     AutomationRunAuditorJob,
     AutomationRunEvent,
     AutomationRunProviderCall,
+    AutomationSnapshot,
     Campaign,
     CampaignAuditEvent,
     EncounterMap,
@@ -2552,6 +2553,238 @@ class AutomationRouteTest(unittest.TestCase):
         self.assertEqual(len(after_dm_skipped), 1)
         self.assertEqual(after_dm_skipped[0]['message_id'], 410)
         self.assertIn('resumed player loop', after_dm_skipped[0]['reason'])
+
+    def test_roster_provisioning(self):
+        # 1. Provision a player roster entry
+        provision_resp = self.client.post(
+            f'/api/automation/source-campaigns/{self.campaign_id}/roster',
+            headers=self.headers,
+            json={
+                'entries': [
+                    {
+                        'label': 'Test Aria',
+                        'member_role': 'player',
+                        'character': {
+                            'name': 'Aria Stonepath',
+                            'race': 'Dwarf',
+                            'total_level': 3,
+                            'max_hp': 28,
+                            'current_hp': 28,
+                            'armor_class': 17,
+                        }
+                    }
+                ]
+            }
+        )
+        self.assertEqual(provision_resp.status_code, 201)
+        res_data = provision_resp.get_json()
+        self.assertEqual(len(res_data['entries']), 1)
+        entry = res_data['entries'][0]
+        self.assertEqual(entry['label'], 'Test Aria')
+        self.assertEqual(entry['member_role'], 'player')
+        self.assertEqual(entry['character_name'], 'Aria Stonepath')
+        self.assertIsNotNone(entry['user_id'])
+        self.assertIsNotNone(entry['llm_player_id'])
+        self.assertIsNotNone(entry['api_key'])
+
+        first_user_id = entry['user_id']
+        first_llm_id = entry['llm_player_id']
+
+        # 2. Provision again with the same label to verify it resolves/reuses the player identity (but does not return secret api_key again)
+        re_provision_resp = self.client.post(
+            f'/api/automation/source-campaigns/{self.campaign_id}/roster',
+            headers=self.headers,
+            json={
+                'entries': [
+                    {
+                        'label': 'Test Aria',
+                        'member_role': 'player',
+                        'character': {
+                            'name': 'Aria Stonepath V2',
+                            'race': 'Dwarf',
+                        }
+                    }
+                ]
+            }
+        )
+        self.assertEqual(re_provision_resp.status_code, 201)
+        res_data2 = re_provision_resp.get_json()
+        entry2 = res_data2['entries'][0]
+        self.assertEqual(entry2['user_id'], first_user_id)
+        self.assertEqual(entry2['llm_player_id'], first_llm_id)
+        self.assertEqual(entry2['character_name'], 'Aria Stonepath V2')
+        self.assertNotIn('api_key', entry2)
+
+        # 3. Verify validation rollback on invalid entry
+        rollback_resp = self.client.post(
+            f'/api/automation/source-campaigns/{self.campaign_id}/roster',
+            headers=self.headers,
+            json={
+                'entries': [
+                    {
+                        'label': 'Valid Label',
+                        'character': {'name': 'Rollback Char', 'race': 'Human'}
+                    },
+                    {
+                        # missing label, triggers ValueError
+                        'label': '',
+                        'character': {'name': 'Invalid Label', 'race': 'Human'}
+                    }
+                ]
+            }
+        )
+        self.assertEqual(rollback_resp.status_code, 400)
+        # Verify first entry was rolled back and not committed (Unique label check or User check)
+        with app.app_context():
+            rolled_back_user = User.query.filter_by(username='Valid Label').first()
+            self.assertIsNone(rolled_back_user)
+
+    def test_explicit_roster_scenario_validation(self):
+        # Provision a player
+        provision_resp = self.client.post(
+            f'/api/automation/source-campaigns/{self.campaign_id}/roster',
+            headers=self.headers,
+            json={
+                'entries': [
+                    {
+                        'label': 'Valeria',
+                        'member_role': 'player',
+                        'character': {'name': 'Valeria Shadow', 'race': 'Elf'}
+                    }
+                ]
+            }
+        ).get_json()
+        entry = provision_resp['entries'][0]
+
+        # 1. Create a scenario with valid explicit roster
+        scenario_resp = self.client.post(
+            '/api/automation/scenarios',
+            headers=self.headers,
+            json={
+                'name': 'Explicit Roster Scenario',
+                'source_campaign_id': self.campaign_id,
+                'roster': [
+                    {
+                        'user_id': entry['user_id'],
+                        'character_id': entry['character_id'],
+                        'llm_player_id': entry['llm_player_id']
+                    }
+                ]
+            }
+        )
+        self.assertEqual(scenario_resp.status_code, 201)
+        scenario_data = scenario_resp.get_json()['scenario']
+        self.assertEqual(len(scenario_data['roster']), 1)
+        self.assertEqual(scenario_data['roster'][0]['user_id'], entry['user_id'])
+        self.assertEqual(scenario_data['roster'][0]['character_id'], entry['character_id'])
+
+        # 2. Reject spectator entry
+        # Temporarily make the member a spectator
+        with app.app_context():
+            member = CampaignMember.query.filter_by(campaign_id=self.campaign_id, user_id=entry['user_id']).first()
+            member.role = 'spectator'
+            db.session.commit()
+
+        spectator_resp = self.client.post(
+            '/api/automation/scenarios',
+            headers=self.headers,
+            json={
+                'name': 'Spectator Rejected Scenario',
+                'source_campaign_id': self.campaign_id,
+                'roster': [
+                    {
+                        'user_id': entry['user_id'],
+                        'character_id': entry['character_id'],
+                        'llm_player_id': entry['llm_player_id']
+                    }
+                ]
+            }
+        )
+        self.assertEqual(spectator_resp.status_code, 400)
+        self.assertIn('is a spectator', spectator_resp.get_json()['error'])
+
+        # Restore role
+        with app.app_context():
+            member = CampaignMember.query.filter_by(campaign_id=self.campaign_id, user_id=entry['user_id']).first()
+            member.role = 'player'
+            db.session.commit()
+
+        # 3. Reject mismatching selected character
+        mismatch_resp = self.client.post(
+            '/api/automation/scenarios',
+            headers=self.headers,
+            json={
+                'name': 'Mismatch Character Scenario',
+                'source_campaign_id': self.campaign_id,
+                'roster': [
+                    {
+                        'user_id': entry['user_id'],
+                        'character_id': 99999, # invalid/mismatch
+                        'llm_player_id': entry['llm_player_id']
+                    }
+                ]
+            }
+        )
+        self.assertEqual(mismatch_resp.status_code, 400)
+        self.assertIn('does not belong to campaign', mismatch_resp.get_json()['error'])
+
+    def test_scenario_roster_immutability(self):
+        # Provision a player
+        provision_resp = self.client.post(
+            f'/api/automation/source-campaigns/{self.campaign_id}/roster',
+            headers=self.headers,
+            json={
+                'entries': [
+                    {
+                        'label': 'Immutable Test',
+                        'member_role': 'player',
+                        'character': {'name': 'Original Name', 'race': 'Elf'}
+                    }
+                ]
+            }
+        ).get_json()
+        entry = provision_resp['entries'][0]
+
+        # Create scenario
+        scenario_id = self.client.post(
+            '/api/automation/scenarios',
+            headers=self.headers,
+            json={
+                'name': 'Immutable Roster Scenario',
+                'source_campaign_id': self.campaign_id,
+                'roster': [
+                    {
+                        'user_id': entry['user_id'],
+                        'character_id': entry['character_id'],
+                        'llm_player_id': entry['llm_player_id']
+                    }
+                ]
+            }
+        ).get_json()['scenario']['id']
+
+        # Mutate the source character's name in db
+        with app.app_context():
+            char = Character.query.get(entry['character_id'])
+            char.name = 'Mutated Character Name'
+            db.session.commit()
+
+        # Get scenario and verify its roster still has "Original Name"
+        get_scenario = self.client.get(f'/api/automation/scenarios/{scenario_id}', headers=self.headers).get_json()['scenario']
+        self.assertEqual(get_scenario['roster'][0]['character_name'], 'Original Name')
+
+        # Capture snapshot for scenario
+        snapshot_resp = self.client.post(
+            f'/api/automation/scenarios/{scenario_id}/snapshots',
+            headers=self.headers,
+            json={}
+        )
+        self.assertEqual(snapshot_resp.status_code, 201)
+        snap_id = snapshot_resp.get_json()['snapshot']['id']
+
+        with app.app_context():
+            snapshot = db.session.get(AutomationSnapshot, snap_id)
+            snapshot_roster = snapshot.snapshot_json['roster']
+            self.assertEqual(snapshot_roster[0]['character_name'], 'Original Name')
 
 
 if __name__ == '__main__':
