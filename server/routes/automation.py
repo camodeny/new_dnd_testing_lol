@@ -423,15 +423,20 @@ def provision_campaign_roster(current_user, campaign_id):
 
     data = request.get_json(silent=True) or {}
     entries = data.get('entries')
-    if not isinstance(entries, list):
-        return jsonify({'error': 'entries must be a list'}), 400
+    if not isinstance(entries, list) or not entries:
+        return jsonify({'error': 'entries must be a non-empty list'}), 400
 
     resolved_entries = []
+    seen_labels = set()
     try:
         for idx, entry in enumerate(entries):
             label = entry.get('label')
             if not label:
                 raise ValueError(f"entries[{idx}].label is required")
+
+            if label in seen_labels:
+                raise ValueError(f"entries[{idx}].label '{label}' is duplicated in request")
+            seen_labels.add(label)
 
             member_role = entry.get('member_role') or 'player'
             if member_role != 'player':

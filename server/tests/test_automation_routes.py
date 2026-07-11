@@ -2676,6 +2676,29 @@ class AutomationRouteTest(unittest.TestCase):
         self.assertEqual(resp.status_code, 400)
         self.assertIn("character.race is required", resp.get_json()['error'])
 
+        # Test: Empty entries
+        resp = self.client.post(
+            f'/api/automation/source-campaigns/{self.campaign_id}/roster',
+            headers=self.headers,
+            json={'entries': []}
+        )
+        self.assertEqual(resp.status_code, 400)
+        self.assertIn("must be a non-empty list", resp.get_json()['error'])
+
+        # Test: Duplicate labels in request
+        resp = self.client.post(
+            f'/api/automation/source-campaigns/{self.campaign_id}/roster',
+            headers=self.headers,
+            json={
+                'entries': [
+                    {'label': 'DupLabel', 'character': {'name': 'Name 1', 'race': 'Elf'}},
+                    {'label': 'DupLabel', 'character': {'name': 'Name 2', 'race': 'Dwarf'}},
+                ]
+            }
+        )
+        self.assertEqual(resp.status_code, 400)
+        self.assertIn("is duplicated in request", resp.get_json()['error'])
+
     def test_explicit_roster_scenario_validation(self):
         # Provision a player
         provision_resp = self.client.post(
