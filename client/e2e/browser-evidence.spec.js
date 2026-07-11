@@ -1,86 +1,63 @@
-import { test, expect } from '@playwright/test';
+import { test } from '@playwright/test';
 import { setupBrowserEvidence } from './helpers.js';
+import { evidenceScenarios } from './evidence-scenarios.js';
 
-test.describe('PR Browser Evidence', () => {
+test.describe('PR Browser Evidence Scenarios', () => {
   let evidence;
 
-  test.beforeEach(async ({ page, baseURL }) => {
-    evidence = await setupBrowserEvidence(page, baseURL);
+  // Read scenario filter from environment variable if set (to support running specific scenario)
+  const filterScenariosEnv = process.env.PLAYWRIGHT_SCENARIOS || 'all';
+  const filterList = filterScenariosEnv === 'all'
+    ? []
+    : filterScenariosEnv.split(',').map(s => s.trim());
+
+  const activeScenarios = evidenceScenarios.filter(scenario => {
+    if (filterList.length === 0) return true;
+    return filterList.includes(scenario.id);
   });
 
-  test.afterEach(async () => {
-    if (evidence) {
+  for (const scenario of activeScenarios) {
+    test(scenario.description, async ({ page, baseURL }) => {
+      // Set PLAYWRIGHT_SCENARIO_ID for setupBrowserEvidence mock routing
+      process.env.PLAYWRIGHT_SCENARIO_ID = scenario.id;
+
+      // Handle viewport override
+      const viewportPreset = process.env.PLAYWRIGHT_VIEWPORT || scenario.viewport || 'desktop';
+      if (viewportPreset === 'mobile') {
+        await page.setViewportSize({ width: 375, height: 812 });
+      } else {
+        await page.setViewportSize({ width: 1280, height: 720 });
+      }
+
+      evidence = await setupBrowserEvidence(page, baseURL);
+      
+      // Inject map view mode to prevent map collapsing on page load
+      if (scenario.mapViewMode) {
+        await page.addInitScript((mode) => {
+          window.localStorage.setItem('encounter_map_view_mode', mode);
+        }, scenario.mapViewMode);
+      }
+
+      // Navigate to route
+      await page.goto(scenario.route);
+
+      // Run setup (clicks, interactive simulation, etc.)
+      if (scenario.setup) {
+        await scenario.setup({ page });
+      }
+
+      // Run validation assertions
+      await scenario.verify({ page });
+
+      // Take screenshots if requested
+      if (process.env.PLAYWRIGHT_CAPTURE_SCREENSHOTS !== 'false') {
+        for (const capture of scenario.captures) {
+          await evidence.takeScreenshot(capture.name, capture.locator);
+        }
+      }
+
+      // Verify no exceptions or unmocked API requests
       await evidence.verifyNoErrors();
-    }
-  });
-
-  test('should render Campaigns list correctly', async ({ page }) => {
-    await page.goto('/');
-
-    // Check title
-    await expect(page).toHaveTitle('Campaigns · Fireside');
-
-    // Confirm mocked campaign is visible
-    const campaignCard = page.locator('.campaign-card-link');
-    await expect(campaignCard).toBeVisible();
-    await expect(page.locator('text=E2E Mocked Campaign')).toBeVisible();
-
-    // Confirm it's not showing loading/error states
-    await expect(page.locator('text=Loading')).not.toBeVisible();
-    await expect(page.locator('text=error')).not.toBeVisible();
-
-    // Save screenshot
-    await evidence.takeScreenshot('campaigns.png');
-  });
-
-  test('should render Characters library correctly', async ({ page }) => {
-    await page.goto('/characters');
-
-    // Check title
-    await expect(page).toHaveTitle('Characters · Fireside');
-
-    // Confirm character library heading is visible
-    await expect(page.locator('h1:has-text("Your characters")')).toBeVisible();
-
-    // Confirm mocked character is visible
-    await expect(page.locator('text=E2E Mocked Character')).toBeVisible();
-
-    // Save screenshot
-    await evidence.takeScreenshot('characters.png');
-  });
-
-  test('should render Automation page correctly', async ({ page }) => {
-    await page.goto('/automation');
-
-    // Check title
-    await expect(page).toHaveTitle('Automation · Fireside');
-
-    // Confirm automation heading and workspace content render
-    await expect(page.locator('h1:has-text("Automation")')).toBeVisible();
-    await expect(page.locator('text=E2E Mocked Scenario')).toBeVisible();
-
-    // Save screenshot
-    await evidence.takeScreenshot('automation.png');
-  });
-
-  test('should render Design Lab and switch directions correctly', async ({ page }) => {
-    await page.goto('/design-lab');
-
-    // Check title
-    await expect(page).toHaveTitle('Design Lab · Fireside');
-
-    // Confirm design-direction tab list renders
-    await expect(page.locator('[role="tablist"]')).toBeVisible();
-
-    // Click at least one alternate direction
-    const chronicleTab = page.locator('button[role="tab"]:has-text("The Chronicle")');
-    await expect(chronicleTab).toBeVisible();
-    await chronicleTab.click();
-
-    // Verify selected panel changes
-    await expect(page.locator('.chronicle-preview')).toBeVisible();
-
-    // Save screenshot
-    await evidence.takeScreenshot('design-lab.png');
-  });
+    });
+  }
 });
