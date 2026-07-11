@@ -124,6 +124,8 @@ def _vector_digest(vector):
     return hashlib.sha256(canonical.encode('utf-8')).hexdigest()
 
 DEFAULT_LEASE_SECONDS = 45
+DEFAULT_PROVISIONING_LEASE_SECONDS = 300
+CLAIMABLE_ACTIVE_STATUSES = {'claimed', 'running', 'stop_requested', 'awaiting_audit'}
 AUDIT_READY_STATUSES = {'audited', 'skipped'}
 CUSTOM_SCORECARD_STATUS_ORDER = ('pass', 'warn', 'fail', 'not_assessed')
 DEFAULT_RETENTION_POLICY = {
@@ -1642,6 +1644,105 @@ def lease_seconds_for_run(run):
     return max(15, _safe_int((run.runner_config_json or {}).get('lease_seconds'), DEFAULT_LEASE_SECONDS))
 
 
+def provisioning_lease_seconds_for_run(run):
+    configured = _safe_int(
+        (run.runner_config_json or {}).get('provisioning_lease_seconds'),
+        DEFAULT_PROVISIONING_LEASE_SECONDS,
+    )
+    return max(60, configured)
+
+
+from sqlalchemy import update as sa_update
+
+
+def reserve_run_lease(run_id, worker_id, now, provisioning=False):
+    run = db.session.get(AutomationRun, run_id)
+    if run is None:
+        raise ValueError('Run not found')
+
+    old_status = run.status
+    is_reclaim = old_status != 'queued' and (
+        run.lease_expires_at is None or run.lease_expires_at <= now
+    )
+
+    new_lease_token = secrets.token_hex(16)
+    lease_seconds = max(
+        lease_seconds_for_run(run),
+        provisioning_lease_seconds_for_run(run) if provisioning else 0,
+    )
+    lease_expires_at = now + timedelta(seconds=lease_seconds)
+    common_values = dict(
+        worker_id=worker_id,
+        lease_token=new_lease_token,
+        heartbeat_at=now,
+        lease_expires_at=lease_expires_at,
+        status='claimed',
+        attempt_count=AutomationRun.attempt_count + 1,
+        updated_at=now,
+    )
+
+    # Try fresh claim (was queued)
+    fresh_stmt = (
+        sa_update(AutomationRun)
+        .where(
+            AutomationRun.id == run_id,
+            AutomationRun.status == 'queued',
+        )
+        .values(claimed_at=now, reclaim_count=AutomationRun.reclaim_count, **common_values)
+    )
+    result = db.session.execute(fresh_stmt)
+    if result.rowcount == 1:
+        db.session.commit()
+        return run, new_lease_token, False
+
+    # Try reclaim (active status but expired lease)
+    reclaim_stmt = (
+        sa_update(AutomationRun)
+        .where(
+            AutomationRun.id == run_id,
+            AutomationRun.status.in_(tuple(CLAIMABLE_ACTIVE_STATUSES)),
+            db.or_(
+                AutomationRun.lease_expires_at == None,
+                AutomationRun.lease_expires_at <= now,
+            ),
+        )
+        .values(reclaim_count=AutomationRun.reclaim_count + 1, **common_values)
+    )
+    result = db.session.execute(reclaim_stmt)
+
+    if result.rowcount == 0:
+        run = db.session.get(AutomationRun, run_id)
+        if run and run.status not in {'queued', *CLAIMABLE_ACTIVE_STATUSES}:
+            raise ValueError(f'Run is not claimable from status {run.status}')
+        raise ValueError(f'Run is already claimed by another worker')
+
+    db.session.commit()
+    return run, new_lease_token, True
+
+
+def release_run_lease(run_id, lease_token, failure_reason):
+    now = _utcnow()
+    stmt = (
+        sa_update(AutomationRun)
+        .where(
+            AutomationRun.id == run_id,
+            AutomationRun.lease_token == lease_token,
+        )
+        .values(
+            status='queued',
+            worker_id=None,
+            lease_token=None,
+            heartbeat_at=None,
+            lease_expires_at=None,
+            claim_failure_reason=failure_reason,
+            updated_at=now,
+        )
+    )
+    result = db.session.execute(stmt)
+    db.session.commit()
+    return result.rowcount > 0
+
+
 def lease_is_expired(run, at=None):
     if run.status == 'queued':
         return False
@@ -1651,9 +1752,14 @@ def lease_is_expired(run, at=None):
 
 
 def ensure_worker_lease(run, *, worker_id=None, lease_token=None):
-    if worker_id and run.worker_id and run.worker_id != worker_id:
+    if run.status in {'claimed', 'running', 'stop_requested', 'awaiting_audit'}:
+        if not worker_id:
+            raise ValueError('worker_id is required for active runs')
+        if not lease_token:
+            raise ValueError('lease_token is required for active runs')
+    if run.worker_id and run.worker_id != worker_id:
         raise ValueError('Run is leased by another worker')
-    if lease_token and run.lease_token and run.lease_token != lease_token:
+    if run.lease_token and run.lease_token != lease_token:
         raise ValueError('Run lease token is no longer valid')
     if run.status in {'claimed', 'running', 'stop_requested', 'awaiting_audit'} and lease_is_expired(run):
         raise ValueError('Run lease has expired')
@@ -1753,38 +1859,50 @@ def compute_gameplay_readiness(campaign):
 
 
 def claim_run_for_worker(run, worker_id):
-    now = _utcnow()
-    reclaimed = run.status in {'claimed', 'running', 'stop_requested', 'awaiting_audit'} and lease_is_expired(run, at=now)
-    if run.status not in {'queued', 'claimed', 'running', 'stop_requested', 'awaiting_audit'}:
-        raise ValueError(f'Run is not claimable from status {run.status}')
-    if run.status != 'queued' and not reclaimed and run.worker_id != worker_id:
-        raise ValueError(f'Run is already leased by {run.worker_id or "another worker"}')
-
     first_materialization = run.derived_campaign_id is None
 
-    if first_materialization:
-        clone_campaign, character_map, preflight_report = (
-            materialize_run_campaign(run)
-        )
-    else:
-        clone_campaign = db.session.get(Campaign, run.derived_campaign_id)
-        character_map = {}
-        preflight_report = {
-            'version': CLONE_RETRIEVAL_PREFLIGHT_VERSION,
-            'status': 'not_repeated',
-            'reason': 'clone_already_materialized',
-        }
+    # Step 1: Atomic reservation (with provisioning lease if first materialization)
+    run, lease_token, reclaimed = reserve_run_lease(
+        run.id, worker_id, _utcnow(), provisioning=first_materialization,
+    )
 
-    # Only after successful first-materialization preflight:
-    run.worker_id = worker_id
-    run.lease_token = secrets.token_hex(16)
-    run.heartbeat_at = now
-    run.lease_expires_at = now + timedelta(seconds=lease_seconds_for_run(run))
-    run.claimed_at = run.claimed_at or now
-    run.status = 'claimed'
-    run.attempt_count = (run.attempt_count or 0) + 1
-    if reclaimed:
-        run.reclaim_count = (run.reclaim_count or 0) + 1
+    try:
+        if first_materialization:
+            clone_campaign, character_map, preflight_report = materialize_run_campaign(run)
+        else:
+            clone_campaign = db.session.get(Campaign, run.derived_campaign_id)
+            character_map = {}
+            preflight_report = {
+                'version': CLONE_RETRIEVAL_PREFLIGHT_VERSION,
+                'status': 'not_repeated',
+                'reason': 'clone_already_materialized',
+            }
+
+        # Step 2: Replace provisioning lease with normal runtime lease.
+        # Use a fresh timestamp so a long materialization does not shrink the window.
+        now = _utcnow()
+        normal_expires = now + timedelta(seconds=lease_seconds_for_run(run))
+        stmt = (
+            sa_update(AutomationRun)
+            .where(
+                AutomationRun.id == run.id,
+                AutomationRun.lease_token == lease_token,
+            )
+            .values(
+                lease_expires_at=normal_expires,
+                updated_at=now,
+            )
+        )
+        result = db.session.execute(stmt)
+        if result.rowcount == 0:
+            raise ValueError('Run lease was lost during materialization')
+    except Exception as exc:
+        db.session.rollback()
+        release_run_lease(run.id, lease_token, str(exc))
+        raise
+
+    db.session.commit()
+    run = db.session.get(AutomationRun, run.id)
 
     latest_session = CampaignSession.query.filter_by(campaign_id=clone_campaign.id, is_active=True).first()
     if latest_session is None:
@@ -1792,7 +1910,6 @@ def claim_run_for_worker(run, worker_id):
 
     gameplay_readiness = compute_gameplay_readiness(clone_campaign)
 
-    db.session.commit()
     return {
         'run': run,
         'clone_campaign': clone_campaign,

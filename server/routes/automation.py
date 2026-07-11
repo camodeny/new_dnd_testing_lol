@@ -909,15 +909,8 @@ def claim_automation_run(current_user, run_id):
 
     try:
         claim_data = claim_run_for_worker(run, worker_id)
-        run.claim_failure_reason = None
-        if api_base:
-            run.worker_api_base = api_base
-        db.session.commit()
     except CloneRetrievalPreflightError as exc:
-        db.session.rollback()
         run = db.session.get(AutomationRun, run_id)
-        run.claim_failure_reason = str(exc)
-        db.session.commit()
         return jsonify({
             'error': str(exc),
             'retrieval_preflight': exc.report,
@@ -929,11 +922,15 @@ def claim_automation_run(current_user, run_id):
             }
         }), 409
     except ValueError as exc:
-        db.session.rollback()
         run = db.session.get(AutomationRun, run_id)
-        run.claim_failure_reason = str(exc)
-        db.session.commit()
         return jsonify({'error': str(exc)}), 409
+
+    run = claim_data['run']
+    run.claim_failure_reason = None
+    if api_base:
+        run.worker_api_base = api_base
+    db.session.add(run)
+    db.session.commit()
 
     append_run_event(
         run,
@@ -950,6 +947,8 @@ def claim_automation_run(current_user, run_id):
             'gameplay_readiness': claim_data['gameplay_readiness'],
         },
         dedupe_key=f'run_claimed:{run.id}:attempt:{run.attempt_count}',
+        worker_id=run.worker_id,
+        lease_token=run.lease_token,
     )
 
     roster = []
@@ -1405,6 +1404,15 @@ def append_automation_run_event(current_user, run_id):
     if not event_type:
         return jsonify({'error': 'event_type is required'}), 400
 
+    # Validate credentials for lease-owned runs before any caller-controlled mutation
+    if run.worker_id or run.lease_token:
+        try:
+            ensure_worker_lease(run, worker_id=data.get('worker_id'), lease_token=data.get('lease_token'))
+        except ValueError as exc:
+            return jsonify({'error': str(exc)}), 409
+    else:
+        db.session.commit()
+
     if data.get('status'):
         run.status = data['status']
     if event_type in {'run_started', 'started'} and run.started_at is None:
@@ -1412,13 +1420,6 @@ def append_automation_run_event(current_user, run_id):
         run.status = 'running'
     if 'error_text' in data:
         run.error_text = data.get('error_text')
-    if data.get('worker_id') or data.get('lease_token'):
-        try:
-            heartbeat_run(run, worker_id=data.get('worker_id'), lease_token=data.get('lease_token'))
-        except ValueError as exc:
-            return jsonify({'error': str(exc)}), 409
-    else:
-        db.session.commit()
 
     try:
         event_row, created = append_run_event(
@@ -1452,7 +1453,7 @@ def create_automation_run_provider_call(current_user, run_id):
     if not _run_owned_by_user(current_user, run):
         return jsonify({'error': 'Forbidden'}), 403
     data = request.get_json(silent=True) or {}
-    if data.get('worker_id') or data.get('lease_token'):
+    if run.worker_id or run.lease_token:
         try:
             ensure_worker_lease(run, worker_id=data.get('worker_id'), lease_token=data.get('lease_token'))
         except ValueError as exc:
@@ -1487,7 +1488,7 @@ def complete_automation_run(current_user, run_id):
         return jsonify({'error': 'Forbidden'}), 403
 
     data = request.get_json(silent=True) or {}
-    if data.get('worker_id') or data.get('lease_token'):
+    if run.worker_id or run.lease_token:
         try:
             ensure_worker_lease(run, worker_id=data.get('worker_id'), lease_token=data.get('lease_token'))
         except ValueError as exc:
@@ -1559,6 +1560,12 @@ def execute_automation_run_decision(current_user, run_id):
         return jsonify({'error': 'Run has no derived campaign'}), 400
 
     data = request.get_json(silent=True) or {}
+    if run.worker_id or run.lease_token:
+        try:
+            ensure_worker_lease(run, worker_id=data.get('worker_id'), lease_token=data.get('lease_token'))
+        except ValueError as exc:
+            return jsonify({'error': str(exc)}), 409
+
     dedupe_key = data.get('dedupe_key')
     if dedupe_key:
         existing = AutomationRunEvent.query.filter_by(run_id=run.id, dedupe_key=dedupe_key).first()

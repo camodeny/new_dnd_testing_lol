@@ -847,5 +847,35 @@ class RunAutomationWorkerTests(unittest.TestCase):
             )
 
 
+    def test_default_worker_id_includes_hostname_pid_and_nonce(self):
+        wid = worker.default_worker_id()
+        parts = wid.split('-')
+        self.assertGreaterEqual(len(parts), 3)
+        self.assertTrue(wid.startswith('automation-'))
+
+    def test_default_worker_ids_are_unique_with_same_pid(self):
+        with patch.object(os, 'getpid', return_value=12345):
+            w1 = worker.default_worker_id()
+            w2 = worker.default_worker_id()
+            self.assertNotEqual(w1, w2)
+
+    def test_resolve_worker_id_cli_overrides_env(self):
+        os.environ.pop('DND_AUTOMATION_WORKER_ID', None)
+        result = worker.resolve_worker_id('cli-worker', 'DND_AUTOMATION_WORKER_ID')
+        self.assertEqual(result, 'cli-worker')
+
+    def test_resolve_worker_id_env_overrides_generated(self):
+        os.environ['DND_AUTOMATION_WORKER_ID'] = 'env-worker'
+        result = worker.resolve_worker_id(None, 'DND_AUTOMATION_WORKER_ID')
+        self.assertEqual(result, 'env-worker')
+        del os.environ['DND_AUTOMATION_WORKER_ID']
+
+    def test_resolve_worker_id_generated_when_no_override(self):
+        os.environ.pop('DND_AUTOMATION_WORKER_ID', None)
+        result = worker.resolve_worker_id(None, 'DND_AUTOMATION_WORKER_ID')
+        self.assertTrue(result.startswith('automation-'))
+        self.assertNotEqual(result, '')
+
+
 if __name__ == '__main__':
     unittest.main()
