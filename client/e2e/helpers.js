@@ -119,6 +119,14 @@ export async function setupBrowserEvidence(page, baseURL) {
     }
   });
 
+  // Track same-origin HTTP response errors
+  page.on('response', (response) => {
+    const url = response.url();
+    if (url.startsWith(baseURL) && response.status() >= 400) {
+      failedRequests.push(`${url}: HTTP ${response.status()}`);
+    }
+  });
+
   return {
     async verifyNoErrors() {
       expect(unexpectedApiRequests).toEqual([]);
