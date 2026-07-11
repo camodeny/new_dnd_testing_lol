@@ -1,8 +1,7 @@
 name: Open Codex task for new issue
 
 on:
-  issues:
-    types: [opened]
+  workflow_dispatch:
 
 permissions:
   contents: read
