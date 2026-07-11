@@ -1853,12 +1853,11 @@ def compute_gameplay_readiness(campaign):
 
 
 def claim_run_for_worker(run, worker_id):
-    now = _utcnow()
     first_materialization = run.derived_campaign_id is None
 
     # Step 1: Atomic reservation (with provisioning lease if first materialization)
     run, lease_token, reclaimed = reserve_run_lease(
-        run.id, worker_id, now, provisioning=first_materialization,
+        run.id, worker_id, _utcnow(), provisioning=first_materialization,
     )
 
     try:
@@ -1873,7 +1872,9 @@ def claim_run_for_worker(run, worker_id):
                 'reason': 'clone_already_materialized',
             }
 
-        # Step 2: Replace provisioning lease with normal runtime lease
+        # Step 2: Replace provisioning lease with normal runtime lease.
+        # Use a fresh timestamp so a long materialization does not shrink the window.
+        now = _utcnow()
         normal_expires = now + timedelta(seconds=lease_seconds_for_run(run))
         stmt = (
             sa_update(AutomationRun)
@@ -1883,10 +1884,12 @@ def claim_run_for_worker(run, worker_id):
             )
             .values(
                 lease_expires_at=normal_expires,
-                updated_at=_utcnow(),
+                updated_at=now,
             )
         )
-        db.session.execute(stmt)
+        result = db.session.execute(stmt)
+        if result.rowcount == 0:
+            raise ValueError('Run lease was lost during materialization')
     except Exception as exc:
         db.session.rollback()
         release_run_lease(run.id, lease_token, str(exc))
