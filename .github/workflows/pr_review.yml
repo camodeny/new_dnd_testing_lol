@@ -59,6 +59,9 @@ jobs:
   frontend-checks:
     name: Frontend checks
     runs-on: ubuntu-latest
+    outputs:
+      lint_result: ${{ steps.frontend_checks.outputs.lint_result }}
+      build_result: ${{ steps.frontend_checks.outputs.build_result }}
     steps:
       - name: Check out repository
         uses: actions/checkout@v4
@@ -74,21 +77,30 @@ jobs:
         working-directory: client
         run: npm ci
 
-      - name: Run frontend lint
+      - name: Run frontend checks
+        id: frontend_checks
         working-directory: client
         run: |
           mkdir -p ../review-evidence
           set +e
           npm run lint 2>&1 | tee ../review-evidence/frontend-lint.log
           lint_status=${PIPESTATUS[0]}
+          lint_result=success
           if [ "$lint_status" -ne 0 ]; then
             echo "Frontend lint failed, but this workflow treats lint as advisory so review evidence is still uploaded."
+            lint_result=advisory_failure
           fi
           npm run build 2>&1 | tee ../review-evidence/frontend-build.log
           build_status=${PIPESTATUS[0]}
+          build_result=success
           if [ "$build_status" -ne 0 ]; then
+            build_result=failure
             exit "$build_status"
           fi
+          {
+            echo "lint_result=${lint_result}"
+            echo "build_result=${build_result}"
+          } >> "$GITHUB_OUTPUT"
 
       - name: Upload frontend review evidence
         if: always()
@@ -117,7 +129,9 @@ jobs:
           PR_NUMBER: ${{ github.event.pull_request.number }}
           COMMIT_SHA: ${{ github.event.pull_request.head.sha || github.sha }}
           BACKEND_RESULT: ${{ needs.backend-tests.result }}
-          FRONTEND_RESULT: ${{ needs.frontend-checks.result }}
+          FRONTEND_JOB_RESULT: ${{ needs.frontend-checks.result }}
+          FRONTEND_LINT_RESULT: ${{ needs.frontend-checks.outputs.lint_result }}
+          FRONTEND_BUILD_RESULT: ${{ needs.frontend-checks.outputs.build_result }}
         run: |
           mkdir -p review-evidence
           cat > review-evidence/summary.md <<EOF
@@ -126,7 +140,9 @@ jobs:
           - PR number: ${PR_NUMBER:-N/A}
           - Commit SHA: ${COMMIT_SHA}
           - Backend job result: ${BACKEND_RESULT}
-          - Frontend job result: ${FRONTEND_RESULT}
+          - Frontend job result: ${FRONTEND_JOB_RESULT}
+          - Frontend lint result: ${FRONTEND_LINT_RESULT:-unknown}
+          - Frontend build result: ${FRONTEND_BUILD_RESULT:-unknown}
           - Uploaded evidence artifacts:
             - backend-review-evidence
             - frontend-review-evidence
@@ -137,7 +153,9 @@ jobs:
             "pr_number": ${PR_NUMBER:-null},
             "commit_sha": "${COMMIT_SHA}",
             "backend_job_result": "${BACKEND_RESULT}",
-            "frontend_job_result": "${FRONTEND_RESULT}",
+            "frontend_job_result": "${FRONTEND_JOB_RESULT}",
+            "frontend_lint_result": "${FRONTEND_LINT_RESULT:-unknown}",
+            "frontend_build_result": "${FRONTEND_BUILD_RESULT:-unknown}",
             "uploaded_evidence_artifacts": [
               "backend-review-evidence",
               "frontend-review-evidence"
