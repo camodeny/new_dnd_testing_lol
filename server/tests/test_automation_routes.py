@@ -2877,7 +2877,7 @@ class AutomationRouteTest(unittest.TestCase):
 
         # Mutate the source character's name in db
         with app.app_context():
-            char = Character.query.get(entry['character_id'])
+            char = db.session.get(Character, entry['character_id'])
             char.name = 'Mutated Character Name'
             db.session.commit()
 

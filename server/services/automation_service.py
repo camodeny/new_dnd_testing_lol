@@ -482,7 +482,7 @@ def next_safe_llm_user_id():
 def provision_automation_player(campaign, label):
     llm_player = LLMPlayer.query.filter_by(campaign_id=campaign.id, label=label).first()
     if llm_player:
-        llm_user = User.query.get(llm_player.user_id)
+        llm_user = db.session.get(User, llm_player.user_id)
         return llm_user, llm_player, None
 
     username = unique_llm_username(label)
