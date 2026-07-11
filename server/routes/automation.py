@@ -430,9 +430,13 @@ def provision_campaign_roster(current_user, campaign_id):
     seen_labels = set()
     try:
         for idx, entry in enumerate(entries):
+            if not isinstance(entry, dict) or entry is None:
+                raise ValueError(f"entries[{idx}] must be an object")
+
             label = entry.get('label')
-            if not label:
-                raise ValueError(f"entries[{idx}].label is required")
+            if not isinstance(label, str) or not label.strip():
+                raise ValueError(f"entries[{idx}].label must be a non-empty string")
+            label = label.strip()
 
             if label in seen_labels:
                 raise ValueError(f"entries[{idx}].label '{label}' is duplicated in request")
@@ -445,10 +449,12 @@ def provision_campaign_roster(current_user, campaign_id):
             char_data = entry.get('character')
             if not char_data or not isinstance(char_data, dict):
                 raise ValueError(f"entries[{idx}].character must be an object")
-            if not char_data.get('name'):
-                raise ValueError(f"entries[{idx}].character.name is required")
-            if not char_data.get('race'):
-                raise ValueError(f"entries[{idx}].character.race is required")
+            char_name = char_data.get('name')
+            if not isinstance(char_name, str) or not char_name.strip():
+                raise ValueError(f"entries[{idx}].character.name must be a non-empty string")
+            char_race = char_data.get('race')
+            if not isinstance(char_race, str) or not char_race.strip():
+                raise ValueError(f"entries[{idx}].character.race must be a non-empty string")
 
             # Create or resolve LLM player and user
             llm_user, llm_player, api_key = provision_automation_player(campaign, label)

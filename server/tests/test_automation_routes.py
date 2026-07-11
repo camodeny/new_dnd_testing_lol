@@ -2665,7 +2665,7 @@ class AutomationRouteTest(unittest.TestCase):
             json={'entries': [{'label': 'No Name Label', 'character': {'race': 'Elf'}}]}
         )
         self.assertEqual(resp.status_code, 400)
-        self.assertIn("character.name is required", resp.get_json()['error'])
+        self.assertIn("character.name must be a non-empty string", resp.get_json()['error'])
 
         # Test: Missing character race
         resp = self.client.post(
@@ -2674,7 +2674,34 @@ class AutomationRouteTest(unittest.TestCase):
             json={'entries': [{'label': 'No Race Label', 'character': {'name': 'ElfName'}}]}
         )
         self.assertEqual(resp.status_code, 400)
-        self.assertIn("character.race is required", resp.get_json()['error'])
+        self.assertIn("character.race must be a non-empty string", resp.get_json()['error'])
+
+        # Test: Non-dict entry object
+        resp = self.client.post(
+            f'/api/automation/source-campaigns/{self.campaign_id}/roster',
+            headers=self.headers,
+            json={'entries': ["not-an-object"]}
+        )
+        self.assertEqual(resp.status_code, 400)
+        self.assertIn("must be an object", resp.get_json()['error'])
+
+        # Test: Non-string label
+        resp = self.client.post(
+            f'/api/automation/source-campaigns/{self.campaign_id}/roster',
+            headers=self.headers,
+            json={'entries': [{'label': 1234, 'character': {'name': 'Name', 'race': 'Elf'}}]}
+        )
+        self.assertEqual(resp.status_code, 400)
+        self.assertIn("label must be a non-empty string", resp.get_json()['error'])
+
+        # Test: Whitespace label
+        resp = self.client.post(
+            f'/api/automation/source-campaigns/{self.campaign_id}/roster',
+            headers=self.headers,
+            json={'entries': [{'label': '   ', 'character': {'name': 'Name', 'race': 'Elf'}}]}
+        )
+        self.assertEqual(resp.status_code, 400)
+        self.assertIn("label must be a non-empty string", resp.get_json()['error'])
 
         # Test: Empty entries
         resp = self.client.post(
