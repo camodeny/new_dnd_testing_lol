@@ -14,3 +14,7 @@ __pycache__/
 /automation/state/
 /automation/llm-campaign-*.json
 /automation/llm-campaign-*.runs.jsonl
+
+# Review evidence
+/review-evidence/
+
