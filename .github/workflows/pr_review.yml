@@ -1,0 +1,177 @@
+name: PR Review Checks
+
+on:
+  pull_request:
+    branches:
+      - main
+    types:
+      - opened
+      - synchronize
+      - reopened
+      - ready_for_review
+  workflow_dispatch:
+
+concurrency:
+  group: pr-review-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  backend-tests:
+    name: Backend tests
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python 3.12
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+          cache-dependency-path: server/requirements.txt
+
+      - name: Install backend dependencies
+        working-directory: server
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install -r requirements.txt
+
+      - name: Run backend tests
+        env:
+          PYTHONPATH: ${{ github.workspace }}/server
+        run: |
+          mkdir -p review-evidence
+          set -o pipefail
+          python -m unittest discover -s server/tests -p "test_*.py" 2>&1 | tee review-evidence/backend-tests.log
+
+      - name: Upload backend review evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: backend-review-evidence
+          path: review-evidence/backend-tests.log
+          if-no-files-found: error
+          retention-days: 14
+
+  frontend-checks:
+    name: Frontend checks
+    runs-on: ubuntu-latest
+    outputs:
+      lint_result: ${{ steps.frontend_checks.outputs.lint_result }}
+      build_result: ${{ steps.frontend_checks.outputs.build_result }}
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Set up Node.js 20
+        uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+          cache: npm
+          cache-dependency-path: client/package-lock.json
+
+      - name: Install frontend dependencies
+        working-directory: client
+        run: npm ci
+
+      - name: Run frontend checks
+        id: frontend_checks
+        working-directory: client
+        run: |
+          mkdir -p ../review-evidence
+          set +e
+          npm run lint 2>&1 | tee ../review-evidence/frontend-lint.log
+          lint_status=${PIPESTATUS[0]}
+          lint_result=success
+          if [ "$lint_status" -ne 0 ]; then
+            echo "Frontend lint failed, but this workflow treats lint as advisory so review evidence is still uploaded."
+            lint_result=advisory_failure
+          fi
+          npm run build 2>&1 | tee ../review-evidence/frontend-build.log
+          build_status=${PIPESTATUS[0]}
+          build_result=success
+          if [ "$build_status" -ne 0 ]; then
+            build_result=failure
+          fi
+          {
+            echo "lint_result=${lint_result}"
+            echo "build_result=${build_result}"
+          } >> "$GITHUB_OUTPUT"
+          if [ "$build_status" -ne 0 ]; then
+            exit "$build_status"
+          fi
+
+      - name: Upload frontend review evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: frontend-review-evidence
+          path: |
+            review-evidence/frontend-lint.log
+            review-evidence/frontend-build.log
+          if-no-files-found: error
+          retention-days: 14
+
+  summary:
+    name: Review summary
+    runs-on: ubuntu-latest
+    needs:
+      - backend-tests
+      - frontend-checks
+    if: always()
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Create summary files
+        env:
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+          COMMIT_SHA: ${{ github.event.pull_request.head.sha || github.sha }}
+          BACKEND_RESULT: ${{ needs.backend-tests.result }}
+          FRONTEND_JOB_RESULT: ${{ needs.frontend-checks.result }}
+          FRONTEND_LINT_RESULT: ${{ needs.frontend-checks.outputs.lint_result }}
+          FRONTEND_BUILD_RESULT: ${{ needs.frontend-checks.outputs.build_result }}
+        run: |
+          mkdir -p review-evidence
+          cat > review-evidence/summary.md <<EOF
+          # PR Review Summary
+
+          - PR number: ${PR_NUMBER:-N/A}
+          - Commit SHA: ${COMMIT_SHA}
+          - Backend job result: ${BACKEND_RESULT}
+          - Frontend job result: ${FRONTEND_JOB_RESULT}
+          - Frontend lint result: ${FRONTEND_LINT_RESULT:-unknown}
+          - Frontend build result: ${FRONTEND_BUILD_RESULT:-unknown}
+          - Uploaded evidence artifacts:
+            - backend-review-evidence
+            - frontend-review-evidence
+          EOF
+
+          cat > review-evidence/manifest.json <<EOF
+          {
+            "pr_number": ${PR_NUMBER:-null},
+            "commit_sha": "${COMMIT_SHA}",
+            "backend_job_result": "${BACKEND_RESULT}",
+            "frontend_job_result": "${FRONTEND_JOB_RESULT}",
+            "frontend_lint_result": "${FRONTEND_LINT_RESULT:-unknown}",
+            "frontend_build_result": "${FRONTEND_BUILD_RESULT:-unknown}",
+            "uploaded_evidence_artifacts": [
+              "backend-review-evidence",
+              "frontend-review-evidence"
+            ]
+          }
+          EOF
+
+      - name: Upload summary artifact
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: pr-review-summary
+          path: |
+            review-evidence/summary.md
+            review-evidence/manifest.json
+          if-no-files-found: error
+          retention-days: 14
