@@ -1,8 +1,8 @@
 import json
-from datetime import datetime
 
 from sqlalchemy.exc import IntegrityError
 
+from time_utils import utcnow
 from models import (
     db,
     CampaignAuditEvent,
@@ -83,7 +83,7 @@ def ensure_campaign_member_records(campaign):
             campaign_id=campaign.id,
             user_id=campaign.user_id,
             role='player',
-            joined_at=campaign.created_at or datetime.utcnow(),
+            joined_at=campaign.created_at or utcnow(),
         ))
         db.session.flush()
 
@@ -265,7 +265,7 @@ def recent_planning_messages(campaign_id, per_user=8):
             user_id=member.user_id,
         ).order_by(CharacterPlanningMessage.created_at.desc()).limit(per_user).all()
         result.extend(reversed(messages))
-    result.sort(key=lambda message: message.created_at or datetime.utcnow())
+    result.sort(key=lambda message: message.created_at or utcnow())
     return result
 
 
@@ -334,7 +334,7 @@ def merge_summary_update(summary, update):
                     existing[key].append(secret)
         summary.dm_private_secrets = json_dumps(existing)
 
-    summary.updated_at = datetime.utcnow()
+    summary.updated_at = utcnow()
 
 
 def apply_bond_suggestions(campaign_id, suggestions):

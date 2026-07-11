@@ -2,11 +2,11 @@ import io
 import json
 import re
 import zipfile
-from datetime import datetime
 
 from flask import Blueprint, jsonify, request, send_file
 
 from auth import token_required
+from time_utils import utcnow
 from models import (
     db,
     Campaign,
@@ -476,7 +476,7 @@ def export_campaign(current_user, campaign_id):
         # Manifest
         manifest = {
             'export_version': 1,
-            'exported_at': datetime.utcnow().isoformat(),
+            'exported_at': utcnow().isoformat(),
             'campaign_id': campaign_id,
             'campaign_name': campaign.name,
             'files': [
@@ -505,7 +505,7 @@ def export_campaign(current_user, campaign_id):
 
     # Build a safe filename
     safe_name = re.sub(r'[^\w\-]', '_', campaign.name)[:40].strip('_') or 'campaign'
-    timestamp = datetime.utcnow().strftime('%Y%m%d_%H%M%S')
+    timestamp = utcnow().strftime('%Y%m%d_%H%M%S')
     filename = f'{safe_name}_{timestamp}.zip'
 
     return send_file(

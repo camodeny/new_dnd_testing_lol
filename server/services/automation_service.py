@@ -6,6 +6,7 @@ from datetime import datetime, timedelta
 from statistics import median
 
 from utils.redaction import redact_secrets
+from time_utils import utcnow
 from models import (
     AutomationRun,
     AutomationRunAuditCycle,
@@ -218,7 +219,7 @@ def _aggregate_custom_scorecard_statuses(statuses, default='warn'):
 
 
 def _utcnow():
-    return datetime.utcnow()
+    return utcnow()
 
 
 def _parse_iso(value):
@@ -947,7 +948,7 @@ def validate_clone_retrieval_equivalence(
         expected_anchors = _normalize_memory_anchors(source_session_data.get('memory_anchors'))
         
         # Query actual session to get anchors
-        clone_session = CampaignSession.query.get(clone_id)
+        clone_session = db.session.get(CampaignSession, clone_id)
         actual_anchors = _normalize_memory_anchors(clone_session.memory_anchors if clone_session else None)
 
         if expected_anchors != actual_anchors:
@@ -1581,7 +1582,7 @@ def append_run_event(run, event_type, payload=None, *, dedupe_key=None, worker_i
 def record_worker_activity(worker_id, api_base=None, is_heartbeat=False):
     if not worker_id:
         return
-    now = datetime.utcnow()
+    now = utcnow()
     worker = AutomationWorker.query.filter_by(worker_id=worker_id).first()
     if not worker:
         worker = AutomationWorker(worker_id=worker_id)
@@ -2438,7 +2439,7 @@ def run_debug_summary(run_id):
         
     recent_workers = AutomationWorker.query.all()
     has_recent_poll = False
-    now = datetime.utcnow()
+    now = utcnow()
     for wk in recent_workers:
         if wk.last_poll_at and (now - wk.last_poll_at).total_seconds() < 300:
             has_recent_poll = True

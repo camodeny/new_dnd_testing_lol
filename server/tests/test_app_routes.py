@@ -17,6 +17,7 @@ os.environ['OPENROUTER_RUNTIME_MODEL_FILE'] = os.path.join(
 
 from app import app
 from auth import _resolve_sso_redirect_uri, generate_token
+from time_utils import utcnow
 from models import (
     AuthSession,
     db,
@@ -405,7 +406,7 @@ class AppRouteTest(unittest.TestCase):
                     user_id=llm_user.id,
                     role='player',
                     selected_character_id=character.id,
-                    character_ready_at=datetime.utcnow(),
+                    character_ready_at=utcnow(),
                 ))
                 db.session.add(LLMPlayer(
                     campaign_id=campaign.id,
@@ -430,6 +431,7 @@ class AppRouteTest(unittest.TestCase):
 
     def test_spa_routes_fall_back_to_index(self):
         response = self.client.get('/join/1?code=COWJVBID')
+        self.addCleanup(response.close)
 
         self.assertEqual(response.status_code, 200)
         self.assertIn('text/html', response.content_type)
@@ -437,6 +439,7 @@ class AppRouteTest(unittest.TestCase):
 
     def test_static_assets_are_served(self):
         response = self.client.get('/assets/app.js')
+        self.addCleanup(response.close)
 
         self.assertEqual(response.status_code, 200)
         self.assertIn('text/javascript', response.content_type)
@@ -528,6 +531,7 @@ class AppRouteTest(unittest.TestCase):
                 f'/api/encounter-maps/{map_id}/labeled-image',
                 headers={'Authorization': f'Bearer {owner_token}'},
             )
+            self.addCleanup(owner_labeled_image.close)
             outsider_labeled_image = self.client.get(
                 f'/api/encounter-maps/{map_id}/labeled-image',
                 headers={'Authorization': f'Bearer {outsider_token}'},
@@ -1921,7 +1925,7 @@ class AppRouteTest(unittest.TestCase):
 
             with app.app_context():
                 owner_member = CampaignMember.query.filter_by(campaign_id=campaign_id, user_id=owner.id).first()
-                owner_member.character_ready_at = datetime.utcnow()
+                owner_member.character_ready_at = utcnow()
                 guest_character = Character(
                     user_id=guest_id,
                     campaign_id=campaign_id,
@@ -1940,7 +1944,7 @@ class AppRouteTest(unittest.TestCase):
                     user_id=guest_id,
                     role='player',
                     selected_character_id=guest_character.id,
-                    character_ready_at=datetime.utcnow(),
+                    character_ready_at=utcnow(),
                 ))
                 db.session.commit()
 
@@ -1973,7 +1977,7 @@ class AppRouteTest(unittest.TestCase):
             self.assertEqual(monster_ids, ['guard-1'])
 
     def test_joining_combat_sandbox_auto_assigns_character_and_token(self):
-        from routes.encounter_maps import build_initial_encounter_state, check_and_start_turns
+        from routes.encounter_maps import build_initial_encounter_state
 
         with app.app_context():
             owner = User(username='sandboxhost', email='sandboxhost@example.com')
@@ -2011,13 +2015,13 @@ class AppRouteTest(unittest.TestCase):
                 user_id=owner.id,
                 role='player',
                 selected_character_id=owner_character.id,
-                character_ready_at=datetime.utcnow(),
+                character_ready_at=utcnow(),
             ))
             db.session.add(CampaignInvite(
                 campaign_id=campaign.id,
                 code='SANDBOX1',
                 created_by=owner.id,
-                expires_at=datetime.utcnow() + timedelta(days=7),
+                expires_at=utcnow() + timedelta(days=7),
                 is_used=False,
             ))
 
@@ -2134,7 +2138,7 @@ class AppRouteTest(unittest.TestCase):
                 campaign_id=campaign.id,
                 code='WAIT4IT',
                 created_by=owner.id,
-                expires_at=datetime.utcnow() + timedelta(days=7),
+                expires_at=utcnow() + timedelta(days=7),
                 is_used=False,
             ))
             db.session.commit()
@@ -2650,7 +2654,7 @@ class AppRouteTest(unittest.TestCase):
         self.assertEqual(proposals[0]['reason'], 'Valid pending proposal.')
 
     def test_encounter_combat_flow_and_movement_restrictions(self):
-        from routes.encounter_maps import build_initial_encounter_state, check_and_start_turns
+        from routes.encounter_maps import build_initial_encounter_state
         with app.app_context():
             owner = User(username='dm_user', email='dm@example.com')
             owner.set_password('password')

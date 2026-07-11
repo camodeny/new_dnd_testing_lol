@@ -1,8 +1,9 @@
-from datetime import datetime
 import json
 
 from flask_sqlalchemy import SQLAlchemy
 from werkzeug.security import generate_password_hash, check_password_hash
+
+from time_utils import utcnow
 
 db = SQLAlchemy()
 
@@ -15,7 +16,7 @@ class User(db.Model):
     email = db.Column(db.String(120), unique=True, nullable=False)
     password_hash = db.Column(db.String(256), nullable=False)
     sso_subject = db.Column(db.String(160), unique=True, nullable=True)
-    created_at = db.Column(db.DateTime, default=datetime.utcnow)
+    created_at = db.Column(db.DateTime, default=utcnow)
     campaigns = db.relationship('Campaign', backref='owner', lazy=True)
     characters = db.relationship('Character', backref='player', lazy=True)
     llm_player_profile = db.relationship('LLMPlayer', backref='user', uselist=False, lazy=True, cascade='all, delete-orphan')
@@ -57,9 +58,9 @@ class AuthSession(db.Model):
     pending_oauth_state = db.Column(db.String(120), nullable=True, index=True)
     pending_oauth_state_expires_at = db.Column(db.DateTime, nullable=True)
     post_login_redirect = db.Column(db.String(500), nullable=True)
-    created_at = db.Column(db.DateTime, default=datetime.utcnow, index=True)
-    updated_at = db.Column(db.DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
-    last_seen_at = db.Column(db.DateTime, default=datetime.utcnow, nullable=False)
+    created_at = db.Column(db.DateTime, default=utcnow, index=True)
+    updated_at = db.Column(db.DateTime, default=utcnow, onupdate=utcnow)
+    last_seen_at = db.Column(db.DateTime, default=utcnow, nullable=False)
 
 
 class UserAutomationKey(db.Model):
@@ -70,7 +71,7 @@ class UserAutomationKey(db.Model):
     label = db.Column(db.String(120), nullable=False)
     api_key_hash = db.Column(db.String(256), nullable=False)
     api_key_prefix = db.Column(db.String(24), nullable=False, index=True)
-    created_at = db.Column(db.DateTime, default=datetime.utcnow)
+    created_at = db.Column(db.DateTime, default=utcnow)
     last_used_at = db.Column(db.DateTime, nullable=True)
 
     def to_dict(self):
@@ -93,7 +94,7 @@ class Campaign(db.Model):
     difficulty = db.Column(db.String, nullable=True)
     seed = db.Column(db.String, nullable=True)
     user_id = db.Column(db.Integer, db.ForeignKey('users.id'), nullable=False)
-    created_at = db.Column(db.DateTime, default=datetime.utcnow)
+    created_at = db.Column(db.DateTime, default=utcnow)
     status = db.Column(db.String, default='active')
     last_played_at = db.Column(db.DateTime, nullable=True)
     settings = db.Column(db.Text, nullable=True)
@@ -242,8 +243,8 @@ class Character(db.Model):
     party_order = db.Column(db.Integer, default=0)
 
     # Timestamps
-    created_at = db.Column(db.DateTime, default=datetime.utcnow)
-    updated_at = db.Column(db.DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
+    created_at = db.Column(db.DateTime, default=utcnow)
+    updated_at = db.Column(db.DateTime, default=utcnow, onupdate=utcnow)
 
     # Relationships
     classes = db.relationship('CharacterClass', backref='character', lazy=True, cascade='all, delete-orphan')
@@ -547,8 +548,8 @@ class CharacterNote(db.Model):
     character_id = db.Column(db.Integer, db.ForeignKey('characters.id'), nullable=False)
     title = db.Column(db.String(200), nullable=True)
     content = db.Column(db.Text, nullable=True)
-    created_at = db.Column(db.DateTime, default=datetime.utcnow)
-    updated_at = db.Column(db.DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
+    created_at = db.Column(db.DateTime, default=utcnow)
+    updated_at = db.Column(db.DateTime, default=utcnow, onupdate=utcnow)
 
     def to_dict(self):
         return {
@@ -643,7 +644,7 @@ class CampaignSession(db.Model):
 
     id = db.Column(db.Integer, primary_key=True)
     campaign_id = db.Column(db.Integer, db.ForeignKey('campaign.id'), nullable=False)
-    started_at = db.Column(db.DateTime, default=datetime.utcnow)
+    started_at = db.Column(db.DateTime, default=utcnow)
     ended_at = db.Column(db.DateTime, nullable=True)
     recap = db.Column(db.Text, nullable=True)
     running_summary = db.Column(db.Text, nullable=True)
@@ -681,7 +682,7 @@ class SessionMessage(db.Model):
     user_id = db.Column(db.Integer, db.ForeignKey('users.id'), nullable=True)
     role = db.Column(db.String(20), nullable=False)
     content = db.Column(db.Text, nullable=False)
-    created_at = db.Column(db.DateTime, default=datetime.utcnow)
+    created_at = db.Column(db.DateTime, default=utcnow)
     user = db.relationship('User')
 
     def to_dict(self):
@@ -704,7 +705,7 @@ class CampaignMember(db.Model):
     campaign_id = db.Column(db.Integer, db.ForeignKey('campaign.id'), nullable=False)
     user_id = db.Column(db.Integer, db.ForeignKey('users.id'), nullable=False)
     role = db.Column(db.String(20), default='player')
-    joined_at = db.Column(db.DateTime, default=datetime.utcnow)
+    joined_at = db.Column(db.DateTime, default=utcnow)
     selected_character_id = db.Column(db.Integer, db.ForeignKey('characters.id'), nullable=True)
     character_ready_at = db.Column(db.DateTime, nullable=True)
     user = db.relationship('User')
@@ -736,7 +737,7 @@ class LLMPlayer(db.Model):
     label = db.Column(db.String(120), nullable=False)
     api_key_hash = db.Column(db.String(256), nullable=False)
     api_key_prefix = db.Column(db.String(24), nullable=False, index=True)
-    created_at = db.Column(db.DateTime, default=datetime.utcnow)
+    created_at = db.Column(db.DateTime, default=utcnow)
     last_used_at = db.Column(db.DateTime, nullable=True)
     campaign = db.relationship('Campaign')
 
@@ -782,7 +783,7 @@ class CharacterPlanningMessage(db.Model):
     user_id = db.Column(db.Integer, db.ForeignKey('users.id'), nullable=False)
     role = db.Column(db.String(20), nullable=False)
     content = db.Column(db.Text, nullable=False)
-    created_at = db.Column(db.DateTime, default=datetime.utcnow)
+    created_at = db.Column(db.DateTime, default=utcnow)
     campaign = db.relationship('Campaign')
     user = db.relationship('User')
 
@@ -808,7 +809,7 @@ class CampaignPlanningSummary(db.Model):
     explicit_player_points = db.Column(db.Text, nullable=True)
     unresolved_gaps = db.Column(db.Text, nullable=True)
     accepted_hooks = db.Column(db.Text, nullable=True)
-    updated_at = db.Column(db.DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
+    updated_at = db.Column(db.DateTime, default=utcnow, onupdate=utcnow)
     campaign = db.relationship('Campaign')
 
     def to_dict(self, include_private=False, current_user_id=None):
@@ -850,8 +851,8 @@ class PlanningBondProposal(db.Model):
     involved_user_ids = db.Column(db.Text, nullable=False)
     approval_states = db.Column(db.Text, nullable=True)
     status = db.Column(db.String(20), default='pending')
-    created_at = db.Column(db.DateTime, default=datetime.utcnow)
-    updated_at = db.Column(db.DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
+    created_at = db.Column(db.DateTime, default=utcnow)
+    updated_at = db.Column(db.DateTime, default=utcnow, onupdate=utcnow)
     campaign = db.relationship('Campaign')
 
     def to_dict(self):
@@ -888,8 +889,8 @@ class CampaignWorld(db.Model):
     world_state = db.Column(db.Text, nullable=False)
     dm_private = db.Column(db.Text, nullable=False)
     approved_at = db.Column(db.DateTime, nullable=True)
-    created_at = db.Column(db.DateTime, default=datetime.utcnow)
-    updated_at = db.Column(db.DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
+    created_at = db.Column(db.DateTime, default=utcnow)
+    updated_at = db.Column(db.DateTime, default=utcnow, onupdate=utcnow)
 
     def to_public_dict(self):
         import json
@@ -934,8 +935,8 @@ class NPCActor(db.Model):
     role = db.Column(db.String(200), nullable=True)
     public_summary = db.Column(db.Text, nullable=True)
     dossier = db.Column(db.Text, nullable=False)
-    created_at = db.Column(db.DateTime, default=datetime.utcnow)
-    updated_at = db.Column(db.DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
+    created_at = db.Column(db.DateTime, default=utcnow)
+    updated_at = db.Column(db.DateTime, default=utcnow, onupdate=utcnow)
 
     __table_args__ = (
         db.UniqueConstraint('campaign_id', 'actor_id', name='uq_npc_actor_campaign_actor'),
@@ -977,8 +978,8 @@ class CampaignClock(db.Model):
     trigger = db.Column(db.Text, nullable=True)
     on_complete = db.Column(db.Text, nullable=True)
     status = db.Column(db.String(30), default='active')
-    created_at = db.Column(db.DateTime, default=datetime.utcnow)
-    updated_at = db.Column(db.DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
+    created_at = db.Column(db.DateTime, default=utcnow)
+    updated_at = db.Column(db.DateTime, default=utcnow, onupdate=utcnow)
 
     __table_args__ = (
         db.UniqueConstraint('campaign_id', 'clock_id', name='uq_campaign_clock_campaign_clock'),
@@ -1014,7 +1015,7 @@ class WorldEvent(db.Model):
     summary = db.Column(db.Text, nullable=False)
     payload = db.Column(db.Text, nullable=True)
     visibility = db.Column(db.String(30), default='dm_private')
-    created_at = db.Column(db.DateTime, default=datetime.utcnow)
+    created_at = db.Column(db.DateTime, default=utcnow)
 
     def to_dict(self, include_private=False):
         import json
@@ -1046,8 +1047,8 @@ class CampaignMonster(db.Model):
     monster_id = db.Column(db.String(100), nullable=False)
     name = db.Column(db.String(200), nullable=False)
     stat_block = db.Column(db.Text, nullable=True)
-    created_at = db.Column(db.DateTime, default=datetime.utcnow)
-    updated_at = db.Column(db.DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
+    created_at = db.Column(db.DateTime, default=utcnow)
+    updated_at = db.Column(db.DateTime, default=utcnow, onupdate=utcnow)
 
     __table_args__ = (
         db.UniqueConstraint('campaign_id', 'monster_id', name='uq_campaign_monster_campaign_monster'),
@@ -1089,8 +1090,8 @@ class EncounterMap(db.Model):
     setup_error = db.Column(db.String(500), nullable=True)
     created_by_tool = db.Column(db.Boolean, default=True)
     is_archived = db.Column(db.Boolean, default=False, nullable=False)
-    created_at = db.Column(db.DateTime, default=datetime.utcnow)
-    updated_at = db.Column(db.DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
+    created_at = db.Column(db.DateTime, default=utcnow)
+    updated_at = db.Column(db.DateTime, default=utcnow, onupdate=utcnow)
     session = db.relationship('CampaignSession')
     placements = db.relationship(
         'EncounterMapPlacement',
@@ -1160,8 +1161,8 @@ class EncounterMapPlacement(db.Model):
     label = db.Column(db.String(200), nullable=False)
     grid_col = db.Column(db.Integer, nullable=False)
     grid_row = db.Column(db.Integer, nullable=False)
-    created_at = db.Column(db.DateTime, default=datetime.utcnow)
-    updated_at = db.Column(db.DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
+    created_at = db.Column(db.DateTime, default=utcnow)
+    updated_at = db.Column(db.DateTime, default=utcnow, onupdate=utcnow)
 
     __table_args__ = (
         db.UniqueConstraint('encounter_map_id', 'actor_type', 'actor_id', name='uq_encounter_map_actor_placement'),
@@ -1195,8 +1196,8 @@ class CampaignMemoryEmbedding(db.Model):
     embedding_model = db.Column(db.String(120), nullable=False)
     embedding_dimensions = db.Column(db.Integer, nullable=False)
     embedding_json = db.Column(db.Text, nullable=False)
-    created_at = db.Column(db.DateTime, default=datetime.utcnow)
-    updated_at = db.Column(db.DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
+    created_at = db.Column(db.DateTime, default=utcnow)
+    updated_at = db.Column(db.DateTime, default=utcnow, onupdate=utcnow)
 
     __table_args__ = (
         db.UniqueConstraint('campaign_id', 'item_type', 'item_id', name='uq_campaign_memory_embedding_item'),
@@ -1236,7 +1237,7 @@ class SheetProposal(db.Model):
     reason = db.Column(db.String(500), nullable=False)
     changes = db.Column(db.JSON, nullable=False)
     status = db.Column(db.String(20), default='pending')
-    created_at = db.Column(db.DateTime, default=datetime.utcnow)
+    created_at = db.Column(db.DateTime, default=utcnow)
     applied_at = db.Column(db.DateTime, nullable=True)
 
     def to_dict(self):
@@ -1267,7 +1268,7 @@ class LootBox(db.Model):
     draw_results_json = db.Column(db.Text, nullable=True)
     status = db.Column(db.String(20), default='unopened')
     created_by_session_tool = db.Column(db.Boolean, default=False)
-    created_at = db.Column(db.DateTime, default=datetime.utcnow)
+    created_at = db.Column(db.DateTime, default=utcnow)
     opened_at = db.Column(db.DateTime, nullable=True)
     campaign = db.relationship('Campaign')
     session = db.relationship('CampaignSession')
@@ -1334,7 +1335,7 @@ class CampaignAuditEvent(db.Model):
     audit_role = db.Column(db.String(20), nullable=True)
     summary = db.Column(db.Text, nullable=False)
     payload = db.Column(db.Text, nullable=True)
-    created_at = db.Column(db.DateTime, default=datetime.utcnow, index=True)
+    created_at = db.Column(db.DateTime, default=utcnow, index=True)
 
     def to_dict(self):
         import json
@@ -1376,15 +1377,15 @@ class SessionDmTurn(db.Model):
     clock_status = db.Column(db.String(20), nullable=False, default='pending')
     error_text = db.Column(db.Text, nullable=True)
 
-    started_at = db.Column(db.DateTime, nullable=False, default=datetime.utcnow, index=True)
+    started_at = db.Column(db.DateTime, nullable=False, default=utcnow, index=True)
     visible_completed_at = db.Column(db.DateTime, nullable=True)
     finished_at = db.Column(db.DateTime, nullable=True)
 
     generation_duration_ms = db.Column(db.Integer, nullable=True)
     full_duration_ms = db.Column(db.Integer, nullable=True)
 
-    created_at = db.Column(db.DateTime, default=datetime.utcnow, index=True)
-    updated_at = db.Column(db.DateTime, default=datetime.utcnow, onupdate=datetime.utcnow, index=True)
+    created_at = db.Column(db.DateTime, default=utcnow, index=True)
+    updated_at = db.Column(db.DateTime, default=utcnow, onupdate=utcnow, index=True)
 
     def to_dict(self):
         return {
@@ -1419,8 +1420,8 @@ class AutomationScorecardTemplate(db.Model):
     instructions = db.Column(db.Text, nullable=True)
     criteria_json = db.Column(db.JSON, nullable=False, default=list)
     defaults_json = db.Column(db.JSON, nullable=False, default=dict)
-    created_at = db.Column(db.DateTime, default=datetime.utcnow, index=True)
-    updated_at = db.Column(db.DateTime, default=datetime.utcnow, onupdate=datetime.utcnow, index=True)
+    created_at = db.Column(db.DateTime, default=utcnow, index=True)
+    updated_at = db.Column(db.DateTime, default=utcnow, onupdate=utcnow, index=True)
 
     owner = db.relationship('User')
 
@@ -1454,7 +1455,16 @@ class AutomationScenario(db.Model):
     id = db.Column(db.Integer, primary_key=True)
     user_id = db.Column(db.Integer, db.ForeignKey('users.id'), nullable=False, index=True)
     source_campaign_id = db.Column(db.Integer, db.ForeignKey('campaign.id'), nullable=False, index=True)
-    baseline_run_id = db.Column(db.Integer, db.ForeignKey('automation_runs.id'), nullable=True, index=True)
+    baseline_run_id = db.Column(
+        db.Integer,
+        db.ForeignKey(
+            'automation_runs.id',
+            use_alter=True,
+            name='fk_automation_scenarios_baseline_run',
+        ),
+        nullable=True,
+        index=True,
+    )
     scorecard_template_id = db.Column(db.Integer, db.ForeignKey('automation_scorecard_templates.id'), nullable=True, index=True)
     name = db.Column(db.String(200), nullable=False)
     description = db.Column(db.Text, nullable=True)
@@ -1462,8 +1472,8 @@ class AutomationScenario(db.Model):
     audit_config_json = db.Column(db.JSON, nullable=False, default=dict)
     retention_policy_json = db.Column(db.JSON, nullable=False, default=dict)
     roster_json = db.Column(db.JSON, nullable=False, default=list)
-    created_at = db.Column(db.DateTime, default=datetime.utcnow, index=True)
-    updated_at = db.Column(db.DateTime, default=datetime.utcnow, onupdate=datetime.utcnow, index=True)
+    created_at = db.Column(db.DateTime, default=utcnow, index=True)
+    updated_at = db.Column(db.DateTime, default=utcnow, onupdate=utcnow, index=True)
 
     owner = db.relationship('User')
     source_campaign = db.relationship('Campaign', foreign_keys=[source_campaign_id])
@@ -1500,7 +1510,7 @@ class AutomationSnapshot(db.Model):
     summary = db.Column(db.Text, nullable=True)
     snapshot_json = db.Column(db.JSON, nullable=False, default=dict)
     metadata_json = db.Column(db.JSON, nullable=False, default=dict)
-    created_at = db.Column(db.DateTime, default=datetime.utcnow, index=True)
+    created_at = db.Column(db.DateTime, default=utcnow, index=True)
 
     scenario = db.relationship('AutomationScenario')
     source_campaign = db.relationship('Campaign', foreign_keys=[source_campaign_id])
@@ -1529,8 +1539,8 @@ class AutomationWorker(db.Model):
     api_base = db.Column(db.String(200), nullable=True)
     last_heartbeat_at = db.Column(db.DateTime, nullable=True)
     last_poll_at = db.Column(db.DateTime, nullable=True)
-    created_at = db.Column(db.DateTime, default=datetime.utcnow)
-    updated_at = db.Column(db.DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
+    created_at = db.Column(db.DateTime, default=utcnow)
+    updated_at = db.Column(db.DateTime, default=utcnow, onupdate=utcnow)
 
     def to_dict(self):
         return {
@@ -1577,8 +1587,8 @@ class AutomationRun(db.Model):
     claimed_at = db.Column(db.DateTime, nullable=True)
     started_at = db.Column(db.DateTime, nullable=True)
     finished_at = db.Column(db.DateTime, nullable=True)
-    created_at = db.Column(db.DateTime, default=datetime.utcnow, index=True)
-    updated_at = db.Column(db.DateTime, default=datetime.utcnow, onupdate=datetime.utcnow, index=True)
+    created_at = db.Column(db.DateTime, default=utcnow, index=True)
+    updated_at = db.Column(db.DateTime, default=utcnow, onupdate=utcnow, index=True)
 
     # Added columns for P0 worker claiming
     last_claim_attempt_at = db.Column(db.DateTime, nullable=True)
@@ -1828,7 +1838,7 @@ class AutomationRunEvent(db.Model):
     attempt_number = db.Column(db.Integer, nullable=False, default=0, index=True)
     dedupe_key = db.Column(db.String(160), nullable=True, index=True)
     payload_json = db.Column(db.JSON, nullable=False, default=dict)
-    created_at = db.Column(db.DateTime, default=datetime.utcnow, index=True)
+    created_at = db.Column(db.DateTime, default=utcnow, index=True)
 
     __table_args__ = (
         db.UniqueConstraint('run_id', 'sequence_number', name='uq_automation_run_event_run_sequence'),
@@ -1866,8 +1876,8 @@ class AutomationRunAuditCycle(db.Model):
     scorecard_json = db.Column(db.JSON, nullable=False, default=dict)
     scorecard_summary_json = db.Column(db.JSON, nullable=False, default=dict)
     audited_at = db.Column(db.DateTime, nullable=True, index=True)
-    created_at = db.Column(db.DateTime, default=datetime.utcnow, index=True)
-    updated_at = db.Column(db.DateTime, default=datetime.utcnow, onupdate=datetime.utcnow, index=True)
+    created_at = db.Column(db.DateTime, default=utcnow, index=True)
+    updated_at = db.Column(db.DateTime, default=utcnow, onupdate=utcnow, index=True)
 
     __table_args__ = (
         db.UniqueConstraint('run_id', 'cycle_number', name='uq_automation_run_audit_cycle_run_cycle'),
@@ -1912,8 +1922,8 @@ class AutomationRunAuditorJob(db.Model):
     error_text = db.Column(db.Text, nullable=True)
     started_at = db.Column(db.DateTime, nullable=True, index=True)
     finished_at = db.Column(db.DateTime, nullable=True, index=True)
-    created_at = db.Column(db.DateTime, default=datetime.utcnow, index=True)
-    updated_at = db.Column(db.DateTime, default=datetime.utcnow, onupdate=datetime.utcnow, index=True)
+    created_at = db.Column(db.DateTime, default=utcnow, index=True)
+    updated_at = db.Column(db.DateTime, default=utcnow, onupdate=utcnow, index=True)
 
     __table_args__ = (
         db.UniqueConstraint('run_id', 'cycle_id', 'auditor_slot', name='uq_automation_auditor_job_run_cycle_slot'),
@@ -1953,7 +1963,7 @@ class AutomationWorkspaceEvent(db.Model):
     resource_type = db.Column(db.String(60), nullable=True, index=True)
     resource_id = db.Column(db.Integer, nullable=True, index=True)
     payload_json = db.Column(db.JSON, nullable=False, default=dict)
-    created_at = db.Column(db.DateTime, default=datetime.utcnow, index=True)
+    created_at = db.Column(db.DateTime, default=utcnow, index=True)
 
     owner = db.relationship('User')
 
@@ -1991,7 +2001,7 @@ class AutomationRunProviderCall(db.Model):
     response_json = db.Column(db.JSON, nullable=True)
     parsed_output_json = db.Column(db.JSON, nullable=True)
     response_text = db.Column(db.Text, nullable=True)
-    created_at = db.Column(db.DateTime, default=datetime.utcnow, index=True)
+    created_at = db.Column(db.DateTime, default=utcnow, index=True)
 
     __table_args__ = (
         db.UniqueConstraint('run_id', 'dedupe_key', name='uq_automation_provider_call_run_dedupe'),
@@ -2035,8 +2045,8 @@ class AutomationRunAuditResult(db.Model):
     status = db.Column(db.String(30), nullable=False)
     summary = db.Column(db.Text, nullable=True)
     details_json = db.Column(db.JSON, nullable=False, default=dict)
-    created_at = db.Column(db.DateTime, default=datetime.utcnow, index=True)
-    updated_at = db.Column(db.DateTime, default=datetime.utcnow, onupdate=datetime.utcnow, index=True)
+    created_at = db.Column(db.DateTime, default=utcnow, index=True)
+    updated_at = db.Column(db.DateTime, default=utcnow, onupdate=utcnow, index=True)
 
     __table_args__ = (
         db.UniqueConstraint('run_id', 'check_id', name='uq_automation_run_audit_result_run_check'),
@@ -2068,8 +2078,8 @@ class CampaignShop(db.Model):
     description = db.Column(db.Text, nullable=True)
     items_json = db.Column(db.Text, nullable=False)  # JSON array of shop items
     is_open = db.Column(db.Boolean, default=True, nullable=False)
-    created_at = db.Column(db.DateTime, default=datetime.utcnow)
-    updated_at = db.Column(db.DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
+    created_at = db.Column(db.DateTime, default=utcnow)
+    updated_at = db.Column(db.DateTime, default=utcnow, onupdate=utcnow)
 
     campaign = db.relationship('Campaign')
 
@@ -2109,7 +2119,7 @@ class CampaignMemoryRun(db.Model):
     response_chars = db.Column(db.Integer, nullable=True)
     context_breakdown_json = db.Column(db.JSON, nullable=True)
 
-    created_at = db.Column(db.DateTime, default=datetime.utcnow, index=True)
+    created_at = db.Column(db.DateTime, default=utcnow, index=True)
 
     def to_dict(self):
         return {
@@ -2164,7 +2174,7 @@ class CampaignMemoryLog(db.Model):
 
     error = db.Column(db.Text, nullable=True)
 
-    created_at = db.Column(db.DateTime, default=datetime.utcnow, index=True)
+    created_at = db.Column(db.DateTime, default=utcnow, index=True)
 
     __table_args__ = (
         db.Index('ix_campaign_memory_logs_campaign_created', 'campaign_id', 'created_at'),
@@ -2226,7 +2236,7 @@ class AutomationRunAuditAttempt(db.Model):
     raw_payload_json = db.Column(db.JSON, nullable=True)
     normalized_payload_json = db.Column(db.JSON, nullable=True)
 
-    created_at = db.Column(db.DateTime, default=datetime.utcnow, index=True)
+    created_at = db.Column(db.DateTime, default=utcnow, index=True)
 
     run = db.relationship("AutomationRun")
     cycle = db.relationship("AutomationRunAuditCycle")

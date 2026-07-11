@@ -1,9 +1,9 @@
-from datetime import datetime
 import threading
 
 from flask import Blueprint, current_app, jsonify, request, stream_with_context
 
 from auth import authenticate_request, token_required
+from time_utils import utcnow
 from models import (
     AutomationRun,
     AutomationRunAuditCycle,
@@ -151,8 +151,8 @@ def _workspace_payload(current_user):
     ).order_by(AutomationRun.updated_at.desc(), AutomationRun.id.desc()).limit(8).all()
 
     active_workers_query = AutomationWorker.query.filter(
-        (AutomationWorker.last_poll_at >= datetime.utcnow() - timedelta(minutes=5)) |
-        (AutomationWorker.last_heartbeat_at >= datetime.utcnow() - timedelta(minutes=5))
+        (AutomationWorker.last_poll_at >= utcnow() - timedelta(minutes=5)) |
+        (AutomationWorker.last_heartbeat_at >= utcnow() - timedelta(minutes=5))
     ).all()
     queue_length = AutomationRun.query.filter_by(status='queued').count()
 
@@ -269,9 +269,9 @@ def _apply_proposal_direct(proposal):
                 continue
             setattr(character, field, bool(after) if config['type'] == 'bool' else int(after))
 
-    character.updated_at = datetime.utcnow()
+    character.updated_at = utcnow()
     proposal.status = 'applied'
-    proposal.applied_at = datetime.utcnow()
+    proposal.applied_at = utcnow()
     db.session.commit()
     return character
 
@@ -518,7 +518,7 @@ def update_automation_scenario(current_user, scenario_id):
             if baseline_run.scenario_id != scenario.id:
                 return jsonify({'error': 'Baseline run must belong to the same scenario'}), 400
             scenario.baseline_run_id = baseline_run.id
-    scenario.updated_at = datetime.utcnow()
+    scenario.updated_at = utcnow()
     db.session.commit()
     append_workspace_event(
         current_user.id,
@@ -778,10 +778,10 @@ def stop_automation_run(current_user, run_id):
 
     if run.status == 'queued':
         run.status = 'stopped'
-        run.finished_at = datetime.utcnow()
+        run.finished_at = utcnow()
     else:
         run.status = 'stop_requested'
-        run.stop_requested_at = datetime.utcnow()
+        run.stop_requested_at = utcnow()
     db.session.commit()
     append_run_event(run, 'run_stop_requested', {'status': run.status}, dedupe_key=f'run_stop_requested:{run.id}:{run.status}')
     return jsonify({'run': run.to_dict()}), 200
@@ -798,7 +798,7 @@ def claim_automation_run(current_user, run_id):
     worker_id = data.get('worker_id') or f'worker-{current_user.id}'
     api_base = data.get('api_base')
 
-    run.last_claim_attempt_at = datetime.utcnow()
+    run.last_claim_attempt_at = utcnow()
     db.session.commit()
 
     if worker_id:
@@ -928,7 +928,7 @@ def pause_automation_run(current_user, run_id):
             run.status = 'awaiting_audit'
             run.awaiting_audit_cycle_id = existing.id
             run.awaiting_audit_phase = phase
-            run.updated_at = datetime.utcnow()
+            run.updated_at = utcnow()
             db.session.commit()
             return jsonify({
                 'run': run.to_dict(),
@@ -1120,7 +1120,7 @@ def start_automation_run_auditors(current_user, run_id):
         run,
         'auditor_jobs_updated',
         {'auditor_jobs': [job.to_dict() for job in jobs], 'cycle_id': cycle.id},
-        dedupe_key=f'auditor_jobs_requested:{run.id}:{cycle.id}:{datetime.utcnow().isoformat()}',
+        dedupe_key=f'auditor_jobs_requested:{run.id}:{cycle.id}:{utcnow().isoformat()}',
     )
     if data.get('sync'):
         try:
@@ -1189,7 +1189,7 @@ def apply_automation_player_repair(current_user, run_id):
             value = _coerce_sheet_scalar_value(field, data.get('value'))
             before = character_full_dict(character)
             setattr(character, field, value)
-            character.updated_at = datetime.utcnow()
+            character.updated_at = utcnow()
             db.session.commit()
             after = character_full_dict(character)
         elif action == 'set_condition':
@@ -1217,7 +1217,7 @@ def apply_automation_player_repair(current_user, run_id):
                     existing.duration_remaining = data.get('duration_remaining')
             elif existing is not None:
                 db.session.delete(existing)
-            character.updated_at = datetime.utcnow()
+            character.updated_at = utcnow()
             db.session.commit()
             after = character_full_dict(character)
         elif action == 'adjust_equipment':
@@ -1239,7 +1239,7 @@ def apply_automation_player_repair(current_user, run_id):
                     setattr(existing, field, data.get(field))
             if existing.quantity <= 0:
                 db.session.delete(existing)
-            character.updated_at = datetime.utcnow()
+            character.updated_at = utcnow()
             db.session.commit()
             after = character_full_dict(character)
         elif action in {'apply_proposal', 'dismiss_proposal'}:
@@ -1297,7 +1297,7 @@ def append_automation_run_event(current_user, run_id):
     if data.get('status'):
         run.status = data['status']
     if event_type in {'run_started', 'started'} and run.started_at is None:
-        run.started_at = datetime.utcnow()
+        run.started_at = utcnow()
         run.status = 'running'
     if 'error_text' in data:
         run.error_text = data.get('error_text')
@@ -1384,13 +1384,13 @@ def complete_automation_run(current_user, run_id):
 
     run.status = data.get('status') or 'completed'
     run.error_text = data.get('error_text')
-    run.finished_at = datetime.utcnow()
+    run.finished_at = utcnow()
     run.awaiting_audit_cycle_id = None
     run.awaiting_audit_phase = None
     if run.started_at is None:
         run.started_at = run.claimed_at or run.created_at
-    run.heartbeat_at = datetime.utcnow()
-    run.lease_expires_at = datetime.utcnow()
+    run.heartbeat_at = utcnow()
+    run.lease_expires_at = utcnow()
     db.session.commit()
     append_run_event(
         run,

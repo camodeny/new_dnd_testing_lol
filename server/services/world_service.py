@@ -1,8 +1,9 @@
 import json
-from datetime import datetime, timedelta
+from datetime import timedelta
 
 from sqlalchemy.exc import IntegrityError
 
+from time_utils import utcnow
 from models import (
     db,
     CampaignClock,
@@ -324,7 +325,7 @@ def world_generation_is_stale(world):
     updated_at = world.updated_at or world.created_at
     if not updated_at:
         return False
-    return datetime.utcnow() - updated_at > WORLD_GENERATION_STALE_AFTER
+    return utcnow() - updated_at > WORLD_GENERATION_STALE_AFTER
 
 
 def world_public_payload(campaign, clean_ready_states=True):
@@ -367,7 +368,7 @@ def persist_world_package(campaign, package):
     world.knowledge_graph = json_dumps(package['knowledge_graph'])
     world.world_state = json_dumps(package['world_state'])
     world.dm_private = json_dumps(package['dm_private'])
-    world.updated_at = datetime.utcnow()
+    world.updated_at = utcnow()
     db.session.flush()
     for entity in package['knowledge_graph'].get('entities', []):
         upsert_memory_embedding(campaign, 'entity', entity.get('id'), entity)
@@ -582,8 +583,8 @@ def ensure_world_generated(campaign, current_user):
 
 def approve_world(world):
     if world.approved_at is None:
-        world.approved_at = datetime.utcnow()
-        world.updated_at = datetime.utcnow()
+        world.approved_at = utcnow()
+        world.updated_at = utcnow()
 
 
 def dm_world_context(campaign, audit=False, reason='dm_world_context', audit_context=None):

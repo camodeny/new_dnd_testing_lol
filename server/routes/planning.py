@@ -1,4 +1,3 @@
-from datetime import datetime
 import json
 import queue
 
@@ -6,6 +5,7 @@ from flask import Blueprint, current_app, jsonify, request
 
 from auth import token_required
 from models import db, Campaign, Character, CharacterPlanningMessage, PlanningBondProposal, User
+from time_utils import utcnow
 from openrouter import (
     get_planning_dm_response,
     get_planning_summary_update,
@@ -318,7 +318,7 @@ def update_planning_ready(current_user, campaign_id):
             member.character_ready_at = None
             db.session.commit()
             return jsonify({'error': 'Selected character is no longer available'}), 400
-        member.character_ready_at = datetime.utcnow()
+        member.character_ready_at = utcnow()
     else:
         member.character_ready_at = None
 

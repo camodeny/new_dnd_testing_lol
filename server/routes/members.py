@@ -1,9 +1,10 @@
-from datetime import datetime, timedelta
+from datetime import timedelta
 
 from flask import Blueprint, jsonify, request
 
 from auth import token_required
 from models import db, Campaign, CampaignInvite, CampaignMember
+from time_utils import utcnow
 from services.campaign_service import (
     current_invite_for_campaign,
     ensure_member,
@@ -31,7 +32,7 @@ def lookup_invite_code(current_user):
     if not campaign:
         invite = CampaignInvite.query.filter_by(code=normalized, is_used=False).first()
         if invite:
-            campaign = Campaign.query.get(invite.campaign_id)
+            campaign = db.session.get(Campaign, invite.campaign_id)
 
     if not campaign:
         return jsonify({'error': 'Invalid invite code'}), 404
@@ -94,7 +95,7 @@ def create_invite(current_user, campaign_id):
         campaign_id=campaign_id,
         code=code,
         created_by=current_user.id,
-        expires_at=datetime.utcnow() + timedelta(days=7),
+        expires_at=utcnow() + timedelta(days=7),
     )
     db.session.add(invite)
     campaign.invite_code = code
