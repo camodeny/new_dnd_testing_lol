@@ -71,32 +71,32 @@ if (scenariosArg === 'all') {
     }
 
     if (file.startsWith('client/src/')) {
-      if (/encounter|map|token|combat|movement|grid|board/.test(file)) {
+      const lc = file.toLowerCase();
+      if (/encounter|map|token|combat|movement|grid|board/.test(lc)) {
         ['session-map-split', 'session-map-fullscreen', 'session-map-tactical', 'session-map-movement', 'session-roster'].forEach(id => changedScenarioIds.add(id));
       }
-      if (/session|chat|message|thinking|roll|proposal/.test(file)) {
+      if (/session|chat|message|thinking|roll|proposal/.test(lc)) {
         ['session-chat-mixed', 'session-chat-thinking', 'session-map-split', 'session-map-fullscreen', 'session-map-tactical', 'session-map-movement', 'session-roster'].forEach(id => changedScenarioIds.add(id));
       }
-      if (/campaign/.test(file)) {
+      // CampaignViewPage owns session+map behavior
+      if (/campaign/.test(lc) && /view|page/.test(lc)) {
+        ['session-chat-mixed', 'session-chat-thinking', 'session-map-split', 'session-map-fullscreen', 'session-map-tactical', 'session-map-movement', 'session-roster', 'campaigns-list', 'characters-list', 'automation-home', 'design-lab'].forEach(id => changedScenarioIds.add(id));
+      } else if (/campaign/.test(lc)) {
         ['campaigns-list', 'characters-list', 'automation-home', 'design-lab'].forEach(id => changedScenarioIds.add(id));
       }
-      if (/character/.test(file)) {
+      if (/character/.test(lc)) {
         ['characters-list'].forEach(id => changedScenarioIds.add(id));
       }
-      if (/automation/.test(file)) {
+      if (/automation/.test(lc)) {
         ['automation-home'].forEach(id => changedScenarioIds.add(id));
       }
-      if (/design|chronicle/.test(file)) {
+      if (/design|chronicle/.test(lc)) {
         ['design-lab'].forEach(id => changedScenarioIds.add(id));
       }
     }
   });
 
   selectedScenarios = [...changedScenarioIds];
-  if (selectedScenarios.length === 0) {
-    console.log('No scenarios appear changed by diff; nothing to run.');
-    process.exit(0);
-  }
   console.log(`Changed files (${changedFiles.length}):`);
   changedFiles.forEach(f => console.log(`  ${f}`));
 } else {
