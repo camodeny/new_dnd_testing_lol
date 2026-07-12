@@ -97,6 +97,13 @@ if (scenariosArg === 'all') {
   });
 
   selectedScenarios = [...changedScenarioIds];
+
+  const hasUnmatchedSrc = changedFiles.some(f => f.startsWith('client/src/'));
+  if (selectedScenarios.length === 0 && hasUnmatchedSrc) {
+    console.log('Unmatched source changes detected; running all scenarios as smoke.');
+    selectedScenarios = validIds;
+  }
+
   console.log(`Changed files (${changedFiles.length}):`);
   changedFiles.forEach(f => console.log(`  ${f}`));
 } else {
@@ -117,12 +124,39 @@ console.log('Viewport preset:', viewportArg);
 const requestedRef = process.env.EVIDENCE_REQUESTED_REF || runCmd('git rev-parse --abbrev-ref HEAD') || process.env.GITHUB_REF || 'unknown';
 const gitSha = runCmd('git rev-parse HEAD') || process.env.GITHUB_SHA || 'unknown';
 
+if (selectedScenarios.length === 0) {
+  console.log('No scenarios selected; nothing to run.');
+  const manifestDir = path.resolve(__dirname, '../../review-evidence');
+  if (!fs.existsSync(manifestDir)) {
+    fs.mkdirSync(manifestDir, { recursive: true });
+  }
+  const noopResult = 'skipped';
+  fs.writeFileSync(
+    path.join(manifestDir, 'browser-evidence-manifest.json'),
+    JSON.stringify({
+      requested_ref: requestedRef,
+      commit_sha: gitSha,
+      viewport: viewportArg,
+      requested_scenarios: scenariosArg === 'all' ? ['all'] : scenariosArg.split(','),
+      executed_scenarios: [],
+      screenshots: [],
+      result: noopResult
+    }, null, 2)
+  );
+  console.log(`Evidence manifest written to review-evidence/browser-evidence-manifest.json`);
+  process.exit(0);
+}
+
+// Normalize capture mode consistently with browser-evidence.spec.js
+const rawCaptureMode = process.env.PLAYWRIGHT_CAPTURE_SCREENSHOTS;
+const normalizedCaptureMode = rawCaptureMode === undefined || rawCaptureMode === 'true' || rawCaptureMode === '1' ? 'true' : 'false';
+
 // Run playwright tests
 const env = {
   ...process.env,
   PLAYWRIGHT_SCENARIOS: selectedScenarios.join(','),
   PLAYWRIGHT_VIEWPORT: viewportArg,
-  PLAYWRIGHT_CAPTURE_SCREENSHOTS: process.env.PLAYWRIGHT_CAPTURE_SCREENSHOTS !== undefined ? process.env.PLAYWRIGHT_CAPTURE_SCREENSHOTS : 'true',
+  PLAYWRIGHT_CAPTURE_SCREENSHOTS: normalizedCaptureMode,
 };
 
 let result = 'success';
@@ -141,10 +175,8 @@ const manifestDir = path.resolve(__dirname, '../../review-evidence');
 // Build the manifest info
 const executed = selectedScenarios;
 const screenshots = [];
-const captureMode = process.env.PLAYWRIGHT_CAPTURE_SCREENSHOTS;
-const isCapturing = captureMode === undefined || (captureMode !== 'false' && captureMode !== '0');
 
-if (result === 'success' && isCapturing) {
+if (normalizedCaptureMode === 'true') {
   executed.forEach(scenarioId => {
     const scenario = evidenceScenarios.find(s => s.id === scenarioId);
     if (scenario) {

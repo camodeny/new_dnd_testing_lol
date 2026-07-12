@@ -197,8 +197,9 @@ export const evidenceScenarios = [
     verify: async ({ page }) => {
       // When selected, reachable cells should show move overlay highlights
       await expect(page.locator('.encounter-map-move-cell').first()).toBeVisible();
-      // Ensure difficult terrain and blocked zones exist
-      await expect(page.locator('.encounter-map-area-overlay.difficult')).toBeVisible();
+      // Verify pathfinding marks difficult reachable cells
+      await expect(page.locator('.encounter-map-move-cell.difficult').first()).toBeVisible();
+      // Ensure blocked zones exist
       await expect(page.locator('.encounter-map-area-overlay.blocked')).toBeVisible();
     },
     captures: [
