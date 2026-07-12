@@ -18,6 +18,7 @@ import ErrorMessage from '../components/common/ErrorMessage'
 import PartyRoster from '../components/dashboard/PartyRoster'
 import SessionPanel from '../components/dashboard/SessionPanel'
 import LootBoxStash from '../components/lootbox/LootBoxStash'
+import ProductionStoryAtlasAdapter from '../components/story-atlas/ProductionStoryAtlasAdapter'
 import CampaignLobby from '../components/dashboard/CampaignLobby'
 import CampaignShops from '../components/shop/CampaignShops'
 import CharacterPlanningMode from '../components/dashboard/CharacterPlanningMode'
@@ -38,7 +39,7 @@ function formatTime(iso) {
   return d.toLocaleTimeString(undefined, { hour: '2-digit', minute: '2-digit' })
 }
 
-function getGradientSeed(str) {
+export function getGradientSeed(str) {
   let hash = 0
   for (let i = 0; i < str.length; i++) hash = str.charCodeAt(i) + ((hash << 5) - hash)
   const hues = [250, 270, 290, 310, 330, 200, 220, 180]
@@ -902,275 +903,35 @@ export default function CampaignViewPage({ user }) {
       </>
     )
   }
-  const hasActiveMap = isEncounterActive || Boolean(encounterMap)
 
   return (
-    <div className={`dashboard-page ${mapViewMode === 'fullscreen' && hasActiveMap ? 'map-fullscreen' : mapViewMode === 'semi' && hasActiveMap ? 'map-semi' : ''}`}>
+    <>
       <ErrorMessage message={error} />
-      <div className={`dashboard-layout mobile-tab-${activeTab} ${showContextRail ? '' : 'context-collapsed'} ${mapViewMode === 'fullscreen' && hasActiveMap ? 'map-fullscreen' : mapViewMode === 'semi' && hasActiveMap ? 'map-semi' : ''}`}>
-        <aside className="dashboard-left">
-          <div className="campaign-logo-header">
-            <div className="campaign-logo">
-              <i className="bi bi-hexagon-fill"></i>
-            </div>
-            <div className="campaign-logo-details">
-              <span className="campaign-logo-title">{campaign?.name || 'SALT & SONG'}</span>
-              <span className="campaign-logo-subtitle">{worldTitle}</span>
-            </div>
-          </div>
-
-          <div style={{ flex: 1, overflowY: 'auto', display: 'flex', flexDirection: 'column', gap: '20px' }}>
-            <PartyRoster characters={characters} campaignId={id} onImport={openImport} />
-            
-            <div className="sidebar-nav">
-              <div className="sidebar-nav-group">
-                <span className="sidebar-nav-label">Campaign</span>
-                {!session && (
-                  <button className="sidebar-nav-item" onClick={() => setShowWorldBuilding(true)}><i className="bi bi-journal-bookmark"></i> World journal</button>
-                )}
-                <button className="sidebar-nav-item" onClick={() => navigate('/characters')}><i className="bi bi-person-badge"></i> Characters</button>
-                <button className="sidebar-nav-item" onClick={() => setShowSettings(true)}><i className="bi bi-gear"></i> Campaign settings</button>
-              </div>
-              <div className="sidebar-nav-group">
-                <span className="sidebar-nav-label">Automation</span>
-                <button className="sidebar-nav-item" onClick={() => navigate(`/automation?sourceCampaignId=${id}`)}><i className="bi bi-activity"></i> Run workspace</button>
-                <button className="sidebar-nav-item" onClick={() => navigate(`/automation?sourceCampaignId=${id}&autoCreateScenario=1`)}><i className="bi bi-diagram-3"></i> New scenario</button>
-                <button className="sidebar-nav-item" onClick={() => navigate(`/automation?sourceCampaignId=${id}&autoCreateScenario=1&captureSnapshot=1`)}><i className="bi bi-camera"></i> Snapshot &amp; run</button>
-              </div>
-            </div>
-          </div>
-
-          <div className="sidebar-profile-card">
-            <div className="sidebar-profile-avatar">
-              {getInitials(user?.username || 'Player')}
-            </div>
-            <div className="sidebar-profile-info">
-              <span className="sidebar-profile-name">{user?.username || 'Guest'}</span>
-              <span className="sidebar-profile-role">{isOwner ? 'Host' : 'Player'}</span>
-            </div>
-            <div className="sidebar-profile-actions">
-              <button className="sidebar-profile-action-btn" onClick={() => setShowSettings(true)}>
-                <i className="bi bi-gear-fill"></i>
-              </button>
-              <button
-                className="sidebar-profile-action-btn"
-                onClick={() => navigate('/')}
-                title="Exit to campaigns"
-                aria-label="Exit to campaigns"
-              >
-                <i className="bi bi-door-open"></i>
-              </button>
-            </div>
-          </div>
-        </aside>
-
-        <main className={`dashboard-center ${mapViewMode === 'fullscreen' && hasActiveMap ? 'map-fullscreen' : mapViewMode === 'semi' && hasActiveMap ? 'map-semi' : ''}`}>
-          <div className="dashboard-top-header">
-            <div className="session-progress-indicator">
-              <span className="pulse-dot"></span>
-              <span>{session ? 'SESSION IN PROGRESS' : 'TABLE READY'}</span>
-              {session && (
-                <span className="timer-text">
-                  {elapsedTimer.sessionKey === sessionTimerKey ? elapsedTimer.value : '00:00:00'}
-                </span>
-              )}
-            </div>
-            
-            <div className="current-location-dropdown" role="group" aria-label={`Current location: ${locationName}`}>
-              <span className="location-name">{locationName}</span>
-              <span className="location-type">{session ? 'Exploration' : 'Awaiting players'}</span>
-            </div>
-
-            <div className="header-actions">
-              <button
-                className={`header-icon-btn ${showContextRail ? 'active' : ''}`}
-                onClick={toggleContextRail}
-                title={showContextRail ? 'Hide table context' : 'Show table context'}
-                aria-label={showContextRail ? 'Hide table context' : 'Show table context'}
-                aria-pressed={showContextRail}
-              >
-                <i className="bi bi-layout-sidebar-reverse"></i>
-              </button>
-              <button className="header-icon-btn" onClick={cycleMapViewMode} title={`Toggle Map View (Current: ${mapViewMode})`}>
-                <i className={`bi bi-${mapViewMode === 'collapsed' ? 'map' : mapViewMode === 'semi' ? 'layout-split' : 'fullscreen'}`}></i>
-              </button>
-              {session ? (
-                <button className="btn btn-secondary end-session-btn" onClick={handleEndSession}>End Session</button>
-              ) : (
-                <button className="btn btn-primary start-session-btn" onClick={handleStartSession}>Start Session</button>
-              )}
-            </div>
-          </div>
-
-          <div style={{ flex: 1, display: 'flex', flexDirection: (mapViewMode === 'fullscreen' && hasActiveMap) ? 'row' : 'column', minHeight: 0, overflow: 'hidden', position: 'relative' }}>
-            {hasActiveMap && (
-              <EncounterMapPanel
-                encounterMap={encounterMap}
-                loading={encounterMapLoading}
-                isOwner={isOwner}
-                currentUser={user}
-                currentCharacter={currentCharacter}
-                onEncounterMapChange={setEncounterMap}
-                mapViewMode={mapViewMode}
-                setMapViewMode={setMapViewMode}
-                onSendMessage={handleSendMessage}
-              />
-            )}
-        <SessionPanel
-          session={session}
-          messages={messages}
-          currentUser={user}
-          currentCharacter={currentCharacter}
-          canSendMessage={!isSpectator}
-          readOnlyReason={isSpectator ? 'Spectating only. You can read the table, but you cannot post messages.' : ''}
-          characters={characters}
-          onStartSession={handleStartSession}
-          onEndSession={handleEndSession}
-              onSendMessage={handleSendMessage}
-              hasOlderMessages={hasOlderMessages}
-              loadingOlderMessages={loadingOlderMessages}
-              onLoadOlderMessages={loadOlderMessages}
-              aiThinking={aiThinking}
-              aiThinkingStatus={aiThinkingStatus}
-              sheetProposals={sheetProposals}
-              onProposalApplied={handleProposalApplied}
-              onProposalDismissed={handleProposalDismissed}
-              onToggleLootStash={() => setShowLootStash(true)}
-              onToggleShops={() => setShowShops(true)}
-              encounterMap={encounterMap}
-            />
-          </div>
-        </main>
-
-        <aside className="dashboard-right">
-          <section className="session-context-overview" aria-label="Current table context">
-            <div className="session-context-kicker">Current scene</div>
-            <div className="session-context-heading">
-              <div>
-                <h2>{locationName}</h2>
-                <p>{session ? 'The table is live' : 'Ready for the next chapter'}</p>
-              </div>
-              <span className={`session-context-status ${session ? 'is-live' : ''}`}>
-                {session ? 'Live' : 'Ready'}
-              </span>
-            </div>
-            <div className="session-context-metrics">
-              <div><strong>{characters.length}</strong><span>at the table</span></div>
-              <div><strong>{hasActiveMap ? '1' : '—'}</strong><span>active map</span></div>
-              <div><strong>{sheetProposals.length || '—'}</strong><span>updates</span></div>
-            </div>
-          </section>
-          <LlmPlayerManager
-            campaignId={id}
-            enabled={showLlmTools}
-            isOwner={isOwner}
-            onAdded={handleLlmPlayerAdded}
-          />
-
-          {sheetProposals.length > 0 && (
-            <div className="right-sidebar-widget pending-updates-panel">
-              <div className="widget-header">
-                <h3>Pending Updates <span className="updates-count-badge">{sheetProposals.length}</span></h3>
-              </div>
-              <div className="updates-list">
-                {sheetProposals.map((proposal) => {
-                  const char = characters.find((c) => c.id === proposal.character_id)
-                  const charName = char ? char.name : 'Unknown Character'
-                  const cg = getGradientSeed(charName)
-                  const ci = getInitials(charName)
-                  return (
-                    <div key={proposal.id} className="update-row">
-                      <div className="update-avatar" style={{ background: cg }}>
-                        {ci}
-                      </div>
-                      <div className="update-details">
-                        <span className="update-char-name">{charName}</span>
-                        <span className="update-reason">{proposal.reason}</span>
-                      </div>
-                      <button className="btn btn-secondary small review-btn" onClick={() => setShowProposalPopup(true)}>
-                        Review
-                      </button>
-                    </div>
-                  )
-                })}
-                <button className="view-all-updates-row" onClick={() => setShowProposalPopup(true)}>
-                  <span>View all updates</span>
-                  <i className="bi bi-chevron-right"></i>
-                </button>
-              </div>
-            </div>
-          )}
-          
-          <LootBoxStash
-            campaignId={id}
-            isOwner={isOwner}
-            characters={characters}
-            onLootBoxOpened={handleLootBoxOpened}
-            onViewAll={() => setShowLootStash(true)}
-          />
-
-          {(() => {
-            const activityLogs = [];
-            messages.forEach(m => {
-              if (m.is_proposal) {
-                activityLogs.push({
-                  id: m.id,
-                  user: 'System',
-                  text: `Proposed update: ${m.proposal?.reason || 'Sheet changes'}`,
-                  time: m.created_at,
-                  avatar: '⚙️'
-                });
-              } else if (m.content && m.content.includes('[Roll:')) {
-                const rollMatch = m.content.match(/\[Roll:\s*([^\]]+)\]\s*total:\s*(-?\d+)/i);
-                const rollName = rollMatch ? rollMatch[1] : 'Dice Roll';
-                const total = rollMatch ? rollMatch[2] : '';
-                activityLogs.push({
-                  id: m.id,
-                  user: m.username || 'Player',
-                  text: `rolled ${rollName} ${total ? `(Total: ${total})` : ''}`,
-                  time: m.created_at,
-                  avatar: '🎲'
-                });
-              } else if (m.content && m.content.includes('[Turn Ended]')) {
-                const charName = m.content.replace('[Turn Ended]', '').trim();
-                activityLogs.push({
-                  id: m.id,
-                  user: charName,
-                  text: `ended turn`,
-                  time: m.created_at,
-                  avatar: '⏳'
-                });
-              }
-            });
-
-            const displayLogs = activityLogs.slice(-3).reverse();
-
-            return (
-              <div className="right-sidebar-widget recent-activity-panel">
-                <div className="widget-header">
-                  <h3>Recent Activity</h3>
-                </div>
-                <div className="activity-list">
-                  {displayLogs.length > 0 ? (
-                    displayLogs.map((log) => (
-                      <div key={log.id} className="activity-row">
-                        <div className="activity-avatar">{log.avatar}</div>
-                        <div className="activity-details">
-                          <strong>{log.user}</strong> {log.text}
-                        </div>
-                        <span className="activity-time">{formatTime(log.time)}</span>
-                      </div>
-                    ))
-                  ) : (
-                    <div className="activity-empty">Rolls, sheet updates, and key table moments will appear here.</div>
-                  )}
-                </div>
-              </div>
-            );
-          })()}
-        </aside>
-      </div>
-      {exportBtn}
+      <ProductionStoryAtlasAdapter
+        campaign={campaign}
+        party={characters}
+        currentScene={currentScene}
+        session={session}
+        messages={messages}
+        currentUser={user}
+        currentCharacter={currentCharacter}
+        encounterMap={encounterMap}
+        onStartSession={handleStartSession}
+        onEndSession={handleEndSession}
+        onSendMessage={handleSendMessage}
+        onProposalApplied={handleProposalApplied}
+        onProposalDismissed={handleProposalDismissed}
+        onNavigateCharacter={(charId) => navigate(`/characters`)}
+        onNavigateCharacters={() => navigate('/characters')}
+        onOpenSettings={() => setShowSettings(true)}
+        onExitToCampaigns={() => navigate('/')}
+        onEncounterMapChange={setEncounterMap}
+        onToggleWorldJournal={() => setShowWorldBuilding(true)}
+        onImportCharacter={openImport}
+        hasOlderMessages={hasOlderMessages}
+        loadingOlderMessages={loadingOlderMessages}
+        onLoadOlderMessages={loadOlderMessages}
+      />
 
       {showSettings && (
         <div className="modal-overlay" onClick={() => setShowSettings(false)}>
@@ -1363,6 +1124,6 @@ export default function CampaignViewPage({ user }) {
           )}
         </button>
       </nav>
-    </div>
+    </>
   )
 }

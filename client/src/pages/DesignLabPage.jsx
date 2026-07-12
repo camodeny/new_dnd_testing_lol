@@ -1,5 +1,6 @@
 import { useEffect, useMemo, useState } from 'react'
 import { getCampaigns, getCurrentEncounterMap, getEncounterMapImage } from '../api/client'
+import DesignLabStoryAtlasAdapter from '../components/story-atlas/DesignLabStoryAtlasAdapter'
 import './DesignLabPage.css'
 import './DesignLabDirections.css'
 
@@ -218,11 +219,13 @@ function CommandWorkspace({ scenario, map }) {
 }
 
 function WorkspacePreview({ direction, scenario, map }) {
-  if (direction === 'atlas') return <AtlasWorkspace scenario={scenario} map={map} />
+  if (direction === 'hearth' || direction === 'atlas') {
+    return <DesignLabStoryAtlasAdapter scenario={scenario} map={map} />
+  }
   if (direction === 'chronicle') return <ChronicleWorkspace scenario={scenario} map={map} />
   if (direction === 'theatre') return <TheatreWorkspace scenario={scenario} map={map} />
   if (direction === 'command') return <CommandWorkspace scenario={scenario} map={map} />
-  return <HearthWorkspace scenario={scenario} map={map} />
+  return <DesignLabStoryAtlasAdapter scenario={scenario} map={map} />
 }
 
 export default function DesignLabPage() {

@@ -421,7 +421,7 @@ function getInitials(name) {
   return name.split(' ').map((w) => w[0]).join('').slice(0, 2).toUpperCase()
 }
 
-const SessionMessageItem = memo(function SessionMessageItem({
+export const SessionMessageItem = memo(function SessionMessageItem({
   msg,
   currentUser,
   sessionId,
