@@ -179,7 +179,10 @@ export const evidenceScenarios = [
     fixture: 'session-map-movement',
     mapViewMode: 'semi',
     setup: async ({ page }) => {
-      // Hold-drag the player token to trigger persistent movement inspection
+      // Hold-drag the player token to trigger persistent movement inspection.
+      // Deliberately do NOT release the pointer: EncounterMapPanel clears dragState
+      // on pointer-up, so movement cells disappear. The pointer stays held through
+      // verify and capture, then Playwright resets the page automatically.
       const playerToken = page.locator('.encounter-map-token.player');
       await expect(playerToken).toBeVisible();
       const box = await playerToken.boundingBox();
@@ -188,8 +191,7 @@ export const evidenceScenarios = [
         const cy = box.y + box.height / 2;
         await page.mouse.move(cx, cy);
         await page.mouse.down();
-        await page.mouse.move(cx + 15, cy, { steps: 5 });
-        await page.mouse.up();
+        await page.mouse.move(cx + 2, cy, { steps: 3 });
       }
     },
     verify: async ({ page }) => {

@@ -39,30 +39,65 @@ if (scenariosArg === 'all') {
 } else if (scenariosArg === 'changed') {
   const defaultBranch = process.env.GITHUB_BASE_REF || 'main';
   runCmd(`git fetch origin ${defaultBranch} --depth=1`);
-  const diffOutput = runCmd(`git diff --name-only origin/${defaultBranch}...HEAD -- client/e2e/`);
+  const diffOutput = runCmd(`git diff --name-only origin/${defaultBranch}...HEAD -- client/e2e/ client/src/`);
   const changedFiles = diffOutput.split('\n').filter(Boolean);
   const changedScenarioIds = new Set();
 
-  const defsChanged = changedFiles.some(f => f.includes('evidence-scenarios'));
+  const fixtureToScenarios = {
+    campaigns: ['campaigns-list', 'characters-list', 'automation-home',
+      'session-chat-mixed', 'session-chat-thinking',
+      'session-map-split', 'session-map-fullscreen', 'session-map-tactical', 'session-map-movement', 'session-roster'],
+    characters: ['characters-list',
+      'session-chat-mixed', 'session-chat-thinking',
+      'session-map-split', 'session-map-fullscreen', 'session-map-tactical', 'session-map-movement', 'session-roster'],
+    sessions: ['session-chat-mixed', 'session-chat-thinking',
+      'session-map-split', 'session-map-fullscreen', 'session-map-tactical', 'session-map-movement', 'session-roster'],
+    messages: ['session-chat-mixed', 'session-chat-thinking'],
+    proposals: ['session-chat-mixed'],
+    'encounter-maps': ['session-map-split', 'session-map-fullscreen', 'session-map-tactical', 'session-map-movement', 'session-roster'],
+    'base-user': validIds,
+  };
+
   changedFiles.forEach(file => {
-    const match = file.match(/fixtures\/(.+)\.json$/);
-    if (match) {
-      const fixtureName = match[1];
-      evidenceScenarios.forEach(s => {
-        if (s.fixture === fixtureName) changedScenarioIds.add(s.id);
-      });
+    if (file.endsWith('evidence-scenarios.js') || file.endsWith('fixtures/index.js') || file.includes('helpers.js')) {
+      validIds.forEach(id => changedScenarioIds.add(id));
+      return;
+    }
+
+    const fixtureMatch = file.match(/fixtures\/(.+)\.js$/);
+    if (fixtureMatch && fixtureMatch[1] !== 'index' && fixtureToScenarios[fixtureMatch[1]]) {
+      fixtureToScenarios[fixtureMatch[1]].forEach(id => changedScenarioIds.add(id));
+      return;
+    }
+
+    if (file.startsWith('client/src/')) {
+      if (/encounter|map|token|combat|movement|grid|board/.test(file)) {
+        ['session-map-split', 'session-map-fullscreen', 'session-map-tactical', 'session-map-movement', 'session-roster'].forEach(id => changedScenarioIds.add(id));
+      }
+      if (/session|chat|message|thinking|roll|proposal/.test(file)) {
+        ['session-chat-mixed', 'session-chat-thinking', 'session-map-split', 'session-map-fullscreen', 'session-map-tactical', 'session-map-movement', 'session-roster'].forEach(id => changedScenarioIds.add(id));
+      }
+      if (/campaign/.test(file)) {
+        ['campaigns-list', 'characters-list', 'automation-home', 'design-lab'].forEach(id => changedScenarioIds.add(id));
+      }
+      if (/character/.test(file)) {
+        ['characters-list'].forEach(id => changedScenarioIds.add(id));
+      }
+      if (/automation/.test(file)) {
+        ['automation-home'].forEach(id => changedScenarioIds.add(id));
+      }
+      if (/design|chronicle/.test(file)) {
+        ['design-lab'].forEach(id => changedScenarioIds.add(id));
+      }
     }
   });
-  if (defsChanged) {
-    validIds.forEach(id => changedScenarioIds.add(id));
-  }
 
   selectedScenarios = [...changedScenarioIds];
   if (selectedScenarios.length === 0) {
-    console.warn('No changed scenarios detected from diff; running all as fallback.');
-    selectedScenarios = validIds;
+    console.log('No scenarios appear changed by diff; nothing to run.');
+    process.exit(0);
   }
-  console.log(`Changed files in e2e/: ${changedFiles.length}`);
+  console.log(`Changed files (${changedFiles.length}):`);
   changedFiles.forEach(f => console.log(`  ${f}`));
 } else {
   const requested = scenariosArg.split(',').map(s => s.trim());
@@ -79,7 +114,7 @@ console.log('Selected scenarios to run:', selectedScenarios.join(', '));
 console.log('Viewport preset:', viewportArg);
 
 // Get current git ref and sha from the actual checked-out HEAD
-const gitRef = runCmd('git rev-parse --abbrev-ref HEAD') || process.env.GITHUB_REF || 'unknown';
+const requestedRef = process.env.EVIDENCE_REQUESTED_REF || runCmd('git rev-parse --abbrev-ref HEAD') || process.env.GITHUB_REF || 'unknown';
 const gitSha = runCmd('git rev-parse HEAD') || process.env.GITHUB_SHA || 'unknown';
 
 // Run playwright tests
@@ -127,7 +162,7 @@ if (result === 'success' && isCapturing) {
 }
 
 const manifest = {
-  ref: gitRef,
+  requested_ref: requestedRef,
   commit_sha: gitSha,
   viewport: viewportArg,
   requested_scenarios: scenariosArg === 'all' ? ['all'] : scenariosArg.split(','),

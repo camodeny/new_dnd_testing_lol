@@ -50,6 +50,7 @@ jobs:
         env:
           SCENARIOS: ${{ github.event.inputs.scenarios }}
           VIEWPORT: ${{ github.event.inputs.viewport }}
+          EVIDENCE_REQUESTED_REF: ${{ github.event.inputs.ref }}
 
       - name: Upload browser evidence
         if: always()
