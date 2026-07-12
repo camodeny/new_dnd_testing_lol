@@ -15,7 +15,7 @@ export const mockEncounterMaps = {
       {
         id: 'p1',
         actor_type: 'player',
-        actor_id: 1,
+        actor_id: 'e2e-character',
         label: 'E2E Mocked Character',
         col: 2,
         row: 3
@@ -45,6 +45,34 @@ export const mockEncounterMaps = {
       terrain_zones: [],
       obstacles: [],
       tactical_notes: ['Pillars (Half Cover)', 'Wraith Spawn Area']
+    },
+    encounter_state: {
+      active: true,
+      round: 2,
+      active_turn_index: 0,
+      turn_order: [
+        {
+          actor_type: 'player',
+          actor_id: 'e2e-character',
+          placement_id: 'p1',
+          label: 'E2E Mocked Character',
+          initiative: 18
+        },
+        {
+          actor_type: 'npc',
+          actor_id: 'n1',
+          placement_id: 'p2',
+          label: 'Ally Guard',
+          initiative: 15
+        },
+        {
+          actor_type: 'monster',
+          actor_id: 'm1',
+          placement_id: 'p3',
+          label: 'Crypt Wraith',
+          initiative: 12
+        }
+      ]
     }
   },
 
@@ -64,7 +92,7 @@ export const mockEncounterMaps = {
       {
         id: 'p1',
         actor_type: 'player',
-        actor_id: 1,
+        actor_id: 'e2e-character',
         label: 'E2E Mocked Character',
         col: 2,
         row: 3
@@ -85,7 +113,7 @@ export const mockEncounterMaps = {
       turn_order: [
         {
           actor_type: 'player',
-          actor_id: 1,
+          actor_id: 'e2e-character',
           placement_id: 'p1',
           label: 'E2E Mocked Character',
           initiative: 18
@@ -126,7 +154,7 @@ export const mockEncounterMaps = {
       {
         id: 'p1',
         actor_type: 'player',
-        actor_id: 1,
+        actor_id: 'e2e-character',
         label: 'E2E Mocked Character',
         col: 2,
         row: 3
@@ -168,6 +196,20 @@ export const mockEncounterMaps = {
         }
       ],
       tactical_notes: ['Stone Pillar (Blocks movement & line of sight)', 'Deep Pool (Costs extra movement)']
+    },
+    encounter_state: {
+      active: true,
+      round: 2,
+      active_turn_index: 0,
+      turn_order: [
+        {
+          actor_type: 'player',
+          actor_id: 'e2e-character',
+          placement_id: 'p1',
+          label: 'E2E Mocked Character',
+          initiative: 18
+        }
+      ]
     }
   }
 };

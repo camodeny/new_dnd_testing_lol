@@ -6,6 +6,7 @@ import {
   rollPlayerInitiative,
   advanceEncounterTurn,
 } from '../../api/client'
+import EncounterMapBoard from './EncounterMapBoard'
 
 // Convert row/col to chess-style algebraic coordinates, e.g. A-1, B-5, etc.
 function getGridCoordinate(col, row) {
@@ -997,254 +998,22 @@ export default function EncounterMapPanel({
   }
 
   const renderMapBoard = (imagePadding = '18px') => {
-    if (loading) {
-      return (
-        <div className="encounter-map-placeholder">
-          <i className="bi bi-hourglass-split"></i>
-          <span>Loading Map State...</span>
-        </div>
-      )
-    }
-
-    if (encounterMap && imageUrl) {
-      const inspectorTags = inspectedCellDetails
-        ? Array.from(new Set(inspectedCellDetails.cellFeatures.features.flatMap((feature) => feature.categories)))
-        : []
-
-      return (
-        <div className="encounter-map-images" style={{ padding: imagePadding }}>
-          <figure className="encounter-map-frame">
-            <div
-              className="encounter-map-board"
-              style={{
-                aspectRatio: aspectRatio ? `${aspectRatio}` : 'auto',
-              }}
-              onPointerMove={handleBoardPointerMove}
-              onPointerLeave={handleBoardPointerLeave}
-              onClick={handleBoardClick}
-            >
-              <img
-                src={imageUrl}
-                alt={encounterMap.title || 'Encounter map'}
-                className="encounter-map-image"
-                onLoad={handleImageLoad}
-              />
-
-              {canOverlayPlacements && (
-                <div
-                  className="encounter-map-grid-overlay"
-                  style={{
-                    '--grid-cols': columns,
-                    '--grid-rows': rows,
-                    display: showGridLines ? 'block' : 'none',
-                    ...gridLayout,
-                  }}
-                />
-              )}
-
-              {canOverlayPlacements && (
-                <div className="encounter-map-area-layer" style={gridLayout}>
-                  {showTacticalOverlay && tacticalOverlayAreas.map((area) => (
-                    <div
-                      key={area.id}
-                      className={`encounter-map-area-overlay ${area.category} ${area.isDirectionalProvider ? 'directional-provider' : ''}`}
-                      style={area.style}
-                      title={area.label}
-                    />
-                  ))}
-                  {inspectedCell && (
-                    <div
-                      className={`encounter-map-cell-highlight ${selectedCell ? 'selected' : 'hovered'}`}
-                      style={{
-                        left: `${(inspectedCell.col / columns) * 100}%`,
-                        top: `${(inspectedCell.row / rows) * 100}%`,
-                        width: `${100 / columns}%`,
-                        height: `${100 / rows}%`,
-                      }}
-                    />
-                  )}
-                </div>
-              )}
-
-              {canOverlayPlacements && (
-                <div
-                  ref={tokenLayerRef}
-                  className="encounter-map-token-layer"
-                  aria-label="Placed combatants"
-                  style={gridLayout}
-                >
-                  {canMovePlayerToken && dragState && reachableMovementCells.map((cell) => {
-                    const isOrigin = cell.col === playerPlacement.col && cell.row === playerPlacement.row
-                    const isSelected = dragState?.col === cell.col && dragState?.row === cell.row
-                    return (
-                      <div
-                        key={`${cell.col},${cell.row}`}
-                        className={`encounter-map-move-cell ${cell.isDifficult ? 'difficult' : ''} ${isOrigin ? 'origin' : ''} ${isSelected ? 'selected' : ''}`}
-                        style={{
-                          left: `${(cell.col / columns) * 100}%`,
-                          top: `${(cell.row / rows) * 100}%`,
-                          width: `${100 / columns}%`,
-                          height: `${100 / rows}%`,
-                        }}
-                      />
-                    )
-                  })}
-                  {displayPlacements.map((placement) => {
-                    const isHighlighted = activeHoverId === placement.id
-                    const isDraggable = canDragPlacement(placement)
-                    const isDragging = dragState?.placementId === placement.id
-                    const directionalCoverForPlacement = (
-                      hoveredPlacement?.id === placement.id &&
-                      placement.id !== playerPlacement?.id &&
-                      directionalCoverPreview.coverType !== 'none'
-                    )
-                    const isActiveTurn = isEncounterActive &&
-                      encounterState?.active_turn_index !== null &&
-                      encounterState?.active_turn_index !== undefined &&
-                      encounterState?.turn_order?.[encounterState.active_turn_index]?.placement_id === placement.id
-
-                    return (
-                      <div
-                        key={placement.id}
-                        className={`encounter-map-token ${placement.actor_type} ${isHighlighted ? 'highlighted' : ''} ${isDraggable ? 'draggable' : ''} ${isDragging ? 'dragging' : ''} ${isActiveTurn ? 'active-turn' : ''} ${directionalCoverForPlacement ? `has-directional-cover cover-${directionalCoverPreview.coverType}` : ''}`}
-                        style={{
-                          left: `${((placement.col + 0.5) / columns) * 100}%`,
-                          top: `${((placement.row + 0.5) / rows) * 100}%`,
-                          width: `calc(0.8 * min(100cqw / ${columns}, 100cqh / ${rows}))`,
-                          height: `calc(0.8 * min(100cqw / ${columns}, 100cqh / ${rows}))`,
-                          aspectRatio: '1',
-                        }}
-                        onPointerDown={(event) => handleTokenPointerDown(event, placement)}
-                        onPointerMove={handleTokenPointerMove}
-                        onPointerUp={handleTokenPointerUp}
-                        onPointerCancel={handleTokenPointerCancel}
-                        onMouseEnter={() => setActiveHoverId(placement.id)}
-                        onMouseLeave={() => setActiveHoverId(null)}
-                      >
-                        <span className="token-initials">
-                          {placement.label?.slice(0, 2).toUpperCase() || '?'}
-                        </span>
-
-                        <div className="encounter-token-tooltip">
-                          <span className="tooltip-name">{placement.label}</span>
-                          <span className="tooltip-coord">
-                            Coordinate: {getGridCoordinate(placement.col, placement.row)}
-                          </span>
-                          {isDraggable && (
-                            <span className="tooltip-coord">
-                              Move: {dragState?.placementId === placement.id ? dragState.cost : 0}/{movementSquares} sq
-                            </span>
-                          )}
-                          {directionalCoverForPlacement && (
-                            <span className={`tooltip-cover cover-${directionalCoverPreview.coverType}`}>
-                              {directionalCoverPreview.coverType.replace('_', ' ')} cover from you
-                              {directionalCoverPreview.providers[0]?.label ? ` via ${directionalCoverPreview.providers[0].label}` : ''}
-                            </span>
-                          )}
-                          <span className="tooltip-alliance">{placement.actor_type}</span>
-                        </div>
-                      </div>
-                    )
-                  })}
-                </div>
-              )}
-
-              {canMovePlayerToken && (
-                <div className={`encounter-map-movement-hud ${moveError ? 'has-error' : ''}`}>
-                  <i className={isMovingToken ? 'bi bi-arrow-repeat' : 'bi bi-arrows-move'}></i>
-                  <span>
-                    {dragState
-                      ? `${dragState.cost}/${dragState.maxSquares} sq`
-                      : isMovingToken
-                        ? 'Saving move...'
-                        : `Move ${movementSquares} sq`}
-                  </span>
-                  {(moveError || movementMessage) && (
-                    <small>{moveError || movementMessage}</small>
-                  )}
-                </div>
-              )}
-
-              {hoveredPlacement && hoveredPlacement.id !== playerPlacement?.id && (
-                <div className={`encounter-map-cover-hud ${directionalCoverPreview.coverType !== 'none' ? `cover-${directionalCoverPreview.coverType}` : 'cover-none'}`}>
-                  <strong>{hoveredPlacement.label}</strong>
-                  <span>
-                    {directionalCoverPreview.coverType === 'none'
-                      ? 'No directional cover from your token.'
-                      : `${directionalCoverPreview.coverType.replace('_', ' ')} cover from ${directionalCoverPreview.providers.map((provider) => provider.label).join(', ')}.`}
-                  </span>
-                </div>
-              )}
-
-              {showCellInspector && inspectedCellDetails && (
-                <div className="encounter-map-cell-inspector">
-                  <div className="encounter-map-cell-inspector-header">
-                    <strong>{inspectedCellDetails.coordinate}</strong>
-                    <span>{selectedCell ? 'Pinned' : 'Hover'}</span>
-                  </div>
-                  <div className="encounter-map-cell-tags">
-                    {inspectorTags.length ? inspectorTags.map((tag) => (
-                      <span key={tag} className={`encounter-map-cell-tag ${tag}`}>
-                        {TACTICAL_FILTERS.find((item) => item.id === tag)?.label || tag}
-                      </span>
-                    )) : (
-                      <span className="encounter-map-cell-tag neutral">Open floor</span>
-                    )}
-                  </div>
-                  <div className="encounter-map-cell-stats">
-                    {inspectedCellDetails.reachableCell
-                      ? <span>Reachable in {inspectedCellDetails.reachableCell.cost} sq</span>
-                      : playerPlacement
-                        ? <span>{inspectedCellDetails.distanceFromPlayer} sq from you</span>
-                        : <span>Board reference</span>}
-                    {inspectedCellDetails.cellFeatures.blockedBy.length > 0 && (
-                      <span>Blocked by {inspectedCellDetails.cellFeatures.blockedBy[0]}</span>
-                    )}
-                    {inspectedCellDetails.cellFeatures.difficultBy.length > 0 && (
-                      <span>Difficult: {inspectedCellDetails.cellFeatures.difficultBy[0]}</span>
-                    )}
-                  </div>
-                  {inspectedCellDetails.cellFeatures.features.length > 0 && (
-                    <ul className="encounter-map-cell-feature-list">
-                      {inspectedCellDetails.cellFeatures.features.slice(0, 3).map((feature) => (
-                        <li key={`${feature.group}-${feature.label}`}>
-                          <strong>{feature.label}</strong>
-                          {feature.description ? `: ${feature.description}` : ''}
-                        </li>
-                      ))}
-                    </ul>
-                  )}
-                </div>
-              )}
-            </div>
-          </figure>
-        </div>
-      )
-    }
-
-    if (encounterMap && imageError) {
-      return (
-        <div className="encounter-map-placeholder">
-          <i className="bi bi-exclamation-triangle-fill"></i>
-          <span>{imageError}</span>
-        </div>
-      )
-    }
-
-    if (encounterMap) {
-      return (
-        <div className="encounter-map-placeholder">
-          <i className="bi bi-image"></i>
-          <span>Downloading map visual...</span>
-        </div>
-      )
-    }
-
     return (
-      <div className="encounter-map-placeholder">
-        <i className="bi bi-map"></i>
-        <span>The AI Dungeon Master will generate a tactical map when positioning matters.</span>
-      </div>
+      <EncounterMapBoard
+        encounterMap={encounterMap}
+        loading={loading}
+        isOwner={isOwner}
+        currentUser={currentUser}
+        currentCharacter={currentCharacter}
+        onEncounterMapChange={onEncounterMapChange}
+        onSendMessage={onSendMessage}
+        showGridLines={showGridLines}
+        showTacticalOverlay={showTacticalOverlay}
+        showCellInspector={showCellInspector}
+        activeHoverId={activeHoverId}
+        setActiveHoverId={setActiveHoverId}
+        imagePadding={imagePadding}
+      />
     )
   }
 

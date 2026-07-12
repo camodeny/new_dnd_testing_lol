@@ -10,7 +10,8 @@ export async function setupBrowserEvidence(page, baseURL) {
   const failedRequests = [];
 
   const scenarioId = process.env.PLAYWRIGHT_SCENARIO_ID || 'campaigns-list';
-  const profile = fixtureProfiles[scenarioId] || fixtureProfiles['campaigns-list'];
+  const fixtureKey = process.env.PLAYWRIGHT_SCENARIO_FIXTURE || scenarioId;
+  const profile = fixtureProfiles[fixtureKey] || fixtureProfiles['campaigns-list'];
 
   // Mock standard and custom endpoints based on the selected fixture profile
   await page.route(
@@ -48,7 +49,7 @@ export async function setupBrowserEvidence(page, baseURL) {
         await route.fulfill({
           status: 200,
           contentType: 'application/json',
-          body: JSON.stringify({ members: [{ id: 1, username: 'E2E Test User', role: 'player' }] }),
+          body: JSON.stringify({ members: profile.members || [{ user_id: 1, username: 'E2E Test User', role: 'player' }] }),
         });
       } else if (pathname.startsWith('/api/campaigns/') && pathname.endsWith('/encounter-maps/current')) {
         await route.fulfill({
@@ -171,6 +172,7 @@ export async function setupBrowserEvidence(page, baseURL) {
   // Track console errors
   page.on('console', (msg) => {
     if (msg.type() === 'error') {
+      console.error('BROWSER ERROR:', msg.text());
       consoleErrors.push(msg.text());
     }
   });
@@ -199,10 +201,12 @@ export async function setupBrowserEvidence(page, baseURL) {
       expect(failedRequests).toEqual([]);
     },
     async takeScreenshot(name, locator = null) {
+      const viewportPreset = process.env.PLAYWRIGHT_VIEWPORT || 'desktop';
+      const viewportSuffix = viewportPreset === 'mobile' ? '-mobile' : '';
       const screenshotPath = path.resolve(
         process.cwd(),
         '../review-evidence/browser-screenshots',
-        scenarioId,
+        scenarioId + viewportSuffix,
         name
       );
       const dir = path.dirname(screenshotPath);

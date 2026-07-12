@@ -96,5 +96,18 @@ export const fixtureProfiles = {
     session: mockSessions['e2e-session'],
     proposals: [],
     encounterMap: mockEncounterMaps.split // To show roster tab panel (which renders on split view in map panel)
+  },
+  'session-spectator-readonly': {
+    me: mockUser,
+    campaign: mockCampaigns[1],
+    characters: mockCharacters,
+    session: {
+      ...mockSessions['e2e-session'],
+      messages: mockMessages.mixed
+    },
+    proposals: mockProposals,
+    members: [
+      { user_id: mockUser.id, username: mockUser.name, role: 'spectator' }
+    ]
   }
 };

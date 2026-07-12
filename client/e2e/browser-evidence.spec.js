@@ -20,6 +20,7 @@ test.describe('PR Browser Evidence Scenarios', () => {
     test(scenario.description, async ({ page, baseURL }) => {
       // Set PLAYWRIGHT_SCENARIO_ID for setupBrowserEvidence mock routing
       process.env.PLAYWRIGHT_SCENARIO_ID = scenario.id;
+      process.env.PLAYWRIGHT_SCENARIO_FIXTURE = scenario.fixture || scenario.id;
 
       // Handle viewport override
       const viewportPreset = process.env.PLAYWRIGHT_VIEWPORT || scenario.viewport || 'desktop';
