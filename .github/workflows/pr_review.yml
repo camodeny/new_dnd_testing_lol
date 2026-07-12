@@ -129,7 +129,7 @@ jobs:
         run: |
           run_browser_tests=false
           capture_review_screenshots=false
-          scenario_ids="campaigns-list,characters-list,automation-home,design-lab"
+          scenario_ids="design-lab-story-atlas,session-chat-mixed,session-map-split"
           selection_reason="No relevant client changes detected."
 
           if [ "${{ github.event_name }}" != "pull_request" ]; then

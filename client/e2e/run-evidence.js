@@ -44,17 +44,20 @@ if (scenariosArg === 'all') {
   const changedScenarioIds = new Set();
 
   const fixtureToScenarios = {
-    campaigns: ['campaigns-list', 'characters-list', 'automation-home',
+    campaigns: [
       'session-chat-mixed', 'session-chat-thinking',
-      'session-map-split', 'session-map-fullscreen', 'session-map-tactical', 'session-map-movement', 'session-roster'],
-    characters: ['characters-list',
+      'session-map-split', 'session-map-fullscreen', 'session-map-tactical', 'session-map-movement',
+      'session-state-retention', 'session-spectator-readonly'],
+    characters: [
       'session-chat-mixed', 'session-chat-thinking',
-      'session-map-split', 'session-map-fullscreen', 'session-map-tactical', 'session-map-movement', 'session-roster'],
+      'session-map-split', 'session-map-fullscreen', 'session-map-tactical', 'session-map-movement',
+      'session-spectator-readonly'],
     sessions: ['session-chat-mixed', 'session-chat-thinking',
-      'session-map-split', 'session-map-fullscreen', 'session-map-tactical', 'session-map-movement', 'session-roster'],
+      'session-map-split', 'session-map-fullscreen', 'session-map-tactical', 'session-map-movement',
+      'session-state-retention', 'session-spectator-readonly'],
     messages: ['session-chat-mixed', 'session-chat-thinking'],
     proposals: ['session-chat-mixed'],
-    'encounter-maps': ['session-map-split', 'session-map-fullscreen', 'session-map-tactical', 'session-map-movement', 'session-roster'],
+    'encounter-maps': ['session-map-split', 'session-map-fullscreen', 'session-map-tactical', 'session-map-movement'],
     'base-user': validIds,
   };
 
@@ -73,25 +76,19 @@ if (scenariosArg === 'all') {
     if (file.startsWith('client/src/')) {
       const lc = file.toLowerCase();
       if (/encounter|map|token|combat|movement|grid|board/.test(lc)) {
-        ['session-map-split', 'session-map-fullscreen', 'session-map-tactical', 'session-map-movement', 'session-roster'].forEach(id => changedScenarioIds.add(id));
+        ['session-map-split', 'session-map-fullscreen', 'session-map-tactical', 'session-map-movement'].forEach(id => changedScenarioIds.add(id));
       }
       if (/session|chat|message|thinking|roll|proposal/.test(lc)) {
-        ['session-chat-mixed', 'session-chat-thinking', 'session-map-split', 'session-map-fullscreen', 'session-map-tactical', 'session-map-movement', 'session-roster'].forEach(id => changedScenarioIds.add(id));
+        ['session-chat-mixed', 'session-chat-thinking', 'session-map-split', 'session-map-fullscreen', 'session-map-tactical', 'session-map-movement'].forEach(id => changedScenarioIds.add(id));
       }
       // CampaignViewPage owns session+map behavior
       if (/campaign/.test(lc) && /view|page/.test(lc)) {
-        ['session-chat-mixed', 'session-chat-thinking', 'session-map-split', 'session-map-fullscreen', 'session-map-tactical', 'session-map-movement', 'session-roster', 'campaigns-list', 'characters-list', 'automation-home', 'design-lab'].forEach(id => changedScenarioIds.add(id));
+        ['session-chat-mixed', 'session-chat-thinking', 'session-map-split', 'session-map-fullscreen', 'session-map-tactical', 'session-map-movement', 'session-state-retention', 'session-spectator-readonly', 'design-lab-story-atlas'].forEach(id => changedScenarioIds.add(id));
       } else if (/campaign/.test(lc)) {
-        ['campaigns-list', 'characters-list', 'automation-home', 'design-lab'].forEach(id => changedScenarioIds.add(id));
-      }
-      if (/character/.test(lc)) {
-        ['characters-list'].forEach(id => changedScenarioIds.add(id));
-      }
-      if (/automation/.test(lc)) {
-        ['automation-home'].forEach(id => changedScenarioIds.add(id));
+        ['design-lab-story-atlas', 'session-chat-mixed', 'session-map-split'].forEach(id => changedScenarioIds.add(id));
       }
       if (/design|chronicle/.test(lc)) {
-        ['design-lab'].forEach(id => changedScenarioIds.add(id));
+        ['design-lab-story-atlas'].forEach(id => changedScenarioIds.add(id));
       }
     }
   });

@@ -10,7 +10,7 @@ on:
       scenarios:
         description: 'Comma-separated scenario IDs, all, or changed'
         required: true
-        default: 'campaigns-list'
+        default: 'session-chat-mixed'
       viewport:
         description: 'Viewport preset'
         type: choice
