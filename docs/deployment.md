@@ -48,6 +48,7 @@ Optional variables:
 - `AUTH_COOKIE_SECURE`: defaults to `false`. Keep it `false` while the app itself is served over plain HTTP, even if `SSO_URL` is HTTPS.
 - `DND_API_BASE`: defaults to `http://127.0.0.1:$PORT` inside the app container for host-driven automation CLI usage.
 - `GUNICORN_TIMEOUT`: defaults to `420` in Docker Compose to allow slower image generation requests.
+- `WORKER_REPLICAS`: defaults to `4`; the deploy workflow applies this count with Docker Compose on every deployment.
 - `LLM_CAMPAIGN_ENV_FILE`: defaults to `/app/data/automation/llm_campaign.env` so host-driven audit wrappers can source a persisted owner automation key.
 - `GUNICORN_WORKER_CLASS`: defaults to `gthread` for better handling of long-lived streaming requests.
 - `WEB_CONCURRENCY`: defaults to `3` Gunicorn workers.
@@ -109,11 +110,13 @@ CLIENT_SECRET=...
 
 ## Automation worker scaling
 
-The automation worker service can be scaled horizontally by adjusting the Compose replica count:
+The deploy workflow scales the automation worker service using the `WORKER_REPLICAS` GitHub variable, defaulting to four replicas. This makes the desired replica count persistent across deployments. For a one-off host-side adjustment, run:
 
 ```bash
-docker compose up -d --scale worker=4
+docker compose --env-file .deploy.env up -d --scale worker=4
 ```
+
+The next deployment restores the count configured by `WORKER_REPLICAS`.
 
 Each replica:
 
