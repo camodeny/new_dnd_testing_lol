@@ -74,13 +74,16 @@ export const evidenceScenarios = [
     fixture: 'session-map-split',
     setup: async ({ page }) => {
       // Toggle to Map tab
-      const mapTab = page.locator('nav.atlas-hybrid-tabs button:has-text("Map")').first();
+      const mapTab = page.locator('nav.atlas-hybrid-tabs button:has-text("Map"):visible, .mobile-bottom-nav button:has-text("Map"):visible').first();
       await expect(mapTab).toBeVisible();
       await mapTab.click();
     },
     verify: async ({ page }) => {
       await expect(page.locator('.sampler-map')).toBeVisible();
-      await expect(page.locator('.atlas-feed')).toBeVisible();
+      const isMobile = await page.evaluate(() => window.innerWidth <= 720);
+      if (!isMobile) {
+        await expect(page.locator('.atlas-feed')).toBeVisible();
+      }
       // Verify tokens
       await expect(page.locator('.encounter-map-token.player')).toBeVisible();
       await expect(page.locator('.encounter-map-token.npc')).toBeVisible();
@@ -98,7 +101,7 @@ export const evidenceScenarios = [
     fixture: 'session-map-fullscreen',
     setup: async ({ page }) => {
       // Toggle to Map tab
-      const mapTab = page.locator('nav.atlas-hybrid-tabs button:has-text("Map")').first();
+      const mapTab = page.locator('nav.atlas-hybrid-tabs button:has-text("Map"):visible, .mobile-bottom-nav button:has-text("Map"):visible').first();
       await expect(mapTab).toBeVisible();
       await mapTab.click();
     },
@@ -121,7 +124,7 @@ export const evidenceScenarios = [
     fixture: 'session-map-tactical',
     setup: async ({ page }) => {
       // Switch to Map tab
-      const mapTab = page.locator('nav.atlas-hybrid-tabs button:has-text("Map")').first();
+      const mapTab = page.locator('nav.atlas-hybrid-tabs button:has-text("Map"):visible, .mobile-bottom-nav button:has-text("Map"):visible').first();
       await expect(mapTab).toBeVisible();
       await mapTab.click();
       await page.waitForTimeout(500);
@@ -133,7 +136,7 @@ export const evidenceScenarios = [
       if (box) {
         const x = box.width * (1.5 / 12);
         const y = box.height * (1.5 / 12);
-        await board.click({ position: { x, y } });
+        await board.click({ position: { x, y }, force: true });
       }
     },
     verify: async ({ page }) => {
@@ -154,7 +157,7 @@ export const evidenceScenarios = [
     fixture: 'session-map-movement',
     setup: async ({ page }) => {
       // Switch to Map tab
-      const mapTab = page.locator('nav.atlas-hybrid-tabs button:has-text("Map")').first();
+      const mapTab = page.locator('nav.atlas-hybrid-tabs button:has-text("Map"):visible, .mobile-bottom-nav button:has-text("Map"):visible').first();
       await expect(mapTab).toBeVisible();
       await mapTab.click();
       await page.waitForTimeout(500);
@@ -162,11 +165,14 @@ export const evidenceScenarios = [
       // Hold-drag the player token to trigger persistent movement inspection.
       const playerToken = page.locator('.encounter-map-token.player');
       await expect(playerToken).toBeVisible();
-      await playerToken.hover();
-      await page.mouse.down();
-      const box = await playerToken.boundingBox();
+      await playerToken.dispatchEvent('pointerdown', { pointerId: 1, button: 0 });
+      await page.waitForTimeout(100);
+      const board = page.locator('.encounter-map-board');
+      const box = await board.boundingBox();
       if (box) {
-        await page.mouse.move(box.x + box.width / 2 + 100, box.y + box.height / 2 + 100, { steps: 10 });
+        const endX = box.width * (4.5 / 12);
+        const endY = box.height * (4.5 / 12);
+        await page.mouse.move(box.x + endX, box.y + endY, { steps: 10 });
       }
     },
     verify: async ({ page }) => {
@@ -189,7 +195,7 @@ export const evidenceScenarios = [
     fixture: 'session-map-split',
     setup: async ({ page }) => {
       // Switch to Story tab first (since it defaults to Map)
-      const storyTab = page.locator('.atlas-header nav.atlas-hybrid-tabs button:has-text("Story")').first();
+      const storyTab = page.locator('.atlas-header nav.atlas-hybrid-tabs button:has-text("Story"):visible, .mobile-bottom-nav button:has-text("Story"):visible').first();
       await expect(storyTab).toBeVisible();
       await storyTab.click();
       
@@ -199,12 +205,12 @@ export const evidenceScenarios = [
       await composerInput.fill('Transient state check');
       
       // Toggle to Map
-      const mapTab = page.locator('header.sampler-topbar nav button:has-text("Map")').first();
+      const mapTab = page.locator('header.sampler-topbar nav button:has-text("Map"):visible, .mobile-bottom-nav button:has-text("Map"):visible').first();
       await expect(mapTab).toBeVisible();
       await mapTab.click();
       
       // Switch back to Story
-      const storyTabBack = page.locator('.atlas-header nav.atlas-hybrid-tabs button:has-text("Story")').first();
+      const storyTabBack = page.locator('.atlas-header nav.atlas-hybrid-tabs button:has-text("Story"):visible, .mobile-bottom-nav button:has-text("Story"):visible').first();
       await expect(storyTabBack).toBeVisible();
       await storyTabBack.click();
     },

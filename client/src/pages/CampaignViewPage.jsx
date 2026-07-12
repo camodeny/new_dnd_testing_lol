@@ -195,7 +195,6 @@ export default function CampaignViewPage({ user }) {
   const [showLootStash, setShowLootStash] = useState(false)
   const [showShops, setShowShops] = useState(false)
   const [elapsedTimer, setElapsedTimer] = useState({ sessionKey: null, value: '00:00:00' })
-  const [activeTab, setActiveTab] = useState('chat')
   const [showContextRail, setShowContextRail] = useState(() => localStorage.getItem('campaign_context_rail') !== 'hidden')
   const sessionTimerKey = session?.id || session?.created_at || session?.started_at || null
 
@@ -938,7 +937,7 @@ export default function CampaignViewPage({ user }) {
         loadingOlderMessages={loadingOlderMessages}
         onLoadOlderMessages={loadOlderMessages}
         canSendMessage={!isSpectator}
-        readOnlyReason={isSpectator ? 'Spectating only. You can read the table, but you cannot post messages.' : ''}
+        readOnlyReason={isSpectator ? 'Spectator mode. You can read the table, but you cannot post messages.' : ''}
         aiThinking={aiThinking}
         aiThinkingStatus={aiThinkingStatus}
         showLlmTools={showLlmTools}
@@ -1092,54 +1091,6 @@ export default function CampaignViewPage({ user }) {
         />
       )}
 
-      {/* Mobile Bottom Navigation Bar */}
-      <nav className="mobile-bottom-nav" aria-label="Campaign workspace views">
-        <button
-          type="button"
-          className={`mobile-nav-item ${activeTab === 'chat' ? 'active' : ''}`}
-          onClick={() => setActiveTab('chat')}
-          aria-label="Show session chat"
-          aria-pressed={activeTab === 'chat'}
-        >
-          <i className="bi bi-chat-left-text-fill"></i>
-          <span>Chat</span>
-        </button>
-        {Boolean(encounterMap) && (
-          <button
-            type="button"
-            className={`mobile-nav-item ${activeTab === 'map' ? 'active' : ''}`}
-            onClick={() => setActiveTab('map')}
-            aria-label="Show encounter map"
-            aria-pressed={activeTab === 'map'}
-          >
-            <i className="bi bi-map-fill"></i>
-            <span>Map</span>
-          </button>
-        )}
-        <button
-          type="button"
-          className={`mobile-nav-item ${activeTab === 'menu' ? 'active' : ''}`}
-          onClick={() => setActiveTab('menu')}
-          aria-label="Show campaign and party navigation"
-          aria-pressed={activeTab === 'menu'}
-        >
-          <i className="bi bi-grid-fill"></i>
-          <span>Campaign</span>
-        </button>
-        <button
-          type="button"
-          className={`mobile-nav-item ${activeTab === 'party' ? 'active' : ''}`}
-          onClick={() => setActiveTab('party')}
-          aria-label="Show activity and updates"
-          aria-pressed={activeTab === 'party'}
-        >
-          <i className="bi bi-activity"></i>
-          <span>Activity</span>
-          {sheetProposals.length > 0 && (
-            <span className="menu-badge">{sheetProposals.length}</span>
-          )}
-        </button>
-      </nav>
     </>
   )
 }

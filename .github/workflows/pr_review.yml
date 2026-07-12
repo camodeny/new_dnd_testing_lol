@@ -128,8 +128,8 @@ jobs:
         id: plan
         run: |
           run_browser_tests=false
-          capture_review_screenshots=false
-          scenario_ids="design-lab-story-atlas,session-chat-mixed,session-map-split"
+          capture_review_screenshots=true
+          scenario_ids="design-lab-story-atlas,session-chat-mixed,session-chat-thinking,session-map-split,session-map-fullscreen,session-map-tactical,session-map-movement,session-state-retention,session-spectator-readonly"
           selection_reason="No relevant client changes detected."
 
           if [ "${{ github.event_name }}" != "pull_request" ]; then
@@ -178,10 +178,17 @@ jobs:
         working-directory: client
         run: npx playwright install --with-deps chromium
 
-      - name: Run browser evidence tests
+      - name: Run browser evidence tests (Desktop)
         if: steps.plan.outputs.run_browser_tests == 'true'
         working-directory: client
-        run: npm run evidence -- --scenarios "${{ steps.plan.outputs.scenario_ids }}"
+        run: npm run evidence -- --scenarios "${{ steps.plan.outputs.scenario_ids }}" --viewport desktop
+        env:
+          PLAYWRIGHT_CAPTURE_SCREENSHOTS: ${{ steps.plan.outputs.capture_review_screenshots }}
+
+      - name: Run browser evidence tests (Mobile)
+        if: steps.plan.outputs.run_browser_tests == 'true'
+        working-directory: client
+        run: npm run evidence -- --scenarios "${{ steps.plan.outputs.scenario_ids }}" --viewport mobile
         env:
           PLAYWRIGHT_CAPTURE_SCREENSHOTS: ${{ steps.plan.outputs.capture_review_screenshots }}
 

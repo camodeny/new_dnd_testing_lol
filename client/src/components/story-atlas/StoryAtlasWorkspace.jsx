@@ -1,4 +1,4 @@
-import { useState } from 'react'
+import { useState, useEffect } from 'react'
 import './StoryAtlas.css'
 import StoryAtlasPartyRail from './StoryAtlasPartyRail'
 import StoryAtlasHeader from './StoryAtlasHeader'
@@ -23,13 +23,32 @@ export default function StoryAtlasWorkspace({
   composerProps = {},
 }) {
   const [view, setView] = useState(() => encounter.hasActiveMap ? 'map' : 'story')
+  const [mobileTab, setMobileTab] = useState(() => encounter.hasActiveMap ? 'map' : 'story')
 
   const isMapModeActive = view === 'map' && encounter.hasActiveMap
 
+  // Keep mobileTab in sync when view changes
+  useEffect(() => {
+    if (view === 'map' && mobileTab !== 'map') {
+      setMobileTab('map')
+    } else if (view === 'story' && mobileTab === 'map') {
+      setMobileTab('story')
+    }
+  }, [view])
+
+  const handleMobileTabChange = (tab) => {
+    setMobileTab(tab)
+    if (tab === 'map') {
+      setView('map')
+    } else {
+      setView('story')
+    }
+  }
+
   return (
-    <div className="story-atlas-workspace-container" style={{ width: '100%', height: '100svh', position: 'relative', overflow: 'hidden' }}>
+    <div className={`story-atlas-workspace-container mobile-tab-${mobileTab} ${isMapModeActive ? 'is-map-active' : ''}`}>
       {/* Immersive Map view (AtlasWorkspace Mode) */}
-      <div style={{ display: isMapModeActive ? 'block' : 'none', width: '100%', height: '100%' }}>
+      <div className="map-view-wrapper">
         <StoryAtlasMapMode
           campaign={campaign}
           party={party}
@@ -47,10 +66,7 @@ export default function StoryAtlasWorkspace({
       </div>
 
       {/* Exploration view (HearthWorkspace Mode) */}
-      <div 
-        className="story-atlas-workspace" 
-        style={{ display: isMapModeActive ? 'none' : 'grid', width: '100%', height: '100%' }}
-      >
+      <div className="story-atlas-workspace">
         <StoryAtlasPartyRail
           campaign={campaign}
           party={party}
@@ -107,6 +123,48 @@ export default function StoryAtlasWorkspace({
           actions={actions}
         />
       </div>
+
+      {/* Mobile Bottom Navigation Bar */}
+      <nav className="mobile-bottom-nav" role="tablist">
+        <button
+          role="tab"
+          aria-selected={mobileTab === 'party'}
+          className={mobileTab === 'party' ? 'active' : ''}
+          onClick={() => handleMobileTabChange('party')}
+        >
+          <i className="bi bi-people" />
+          <span>Party</span>
+        </button>
+        <button
+          role="tab"
+          aria-selected={mobileTab === 'story'}
+          className={mobileTab === 'story' ? 'active' : ''}
+          onClick={() => handleMobileTabChange('story')}
+        >
+          <i className="bi bi-chat-square-text" />
+          <span>Story</span>
+        </button>
+        {encounter.hasActiveMap && (
+          <button
+            role="tab"
+            aria-selected={mobileTab === 'map'}
+            className={mobileTab === 'map' ? 'active' : ''}
+            onClick={() => handleMobileTabChange('map')}
+          >
+            <i className="bi bi-map" />
+            <span>Map</span>
+          </button>
+        )}
+        <button
+          role="tab"
+          aria-selected={mobileTab === 'activity'}
+          className={mobileTab === 'activity' ? 'active' : ''}
+          onClick={() => handleMobileTabChange('activity')}
+        >
+          <i className="bi bi-activity" />
+          <span>Activity</span>
+        </button>
+      </nav>
     </div>
   )
 }

@@ -435,7 +435,7 @@ export default function EncounterMapBoard({
 
   const isEncounterActive = Boolean(encounterState?.active)
   
-  const currentUserActorId = currentUser?.id != null ? String(currentUser.id) : ''
+  const currentUserActorId = currentCharacter?.id != null ? String(currentCharacter.id) : (currentUser?.id != null ? String(currentUser.id) : '')
 
   const placements = useMemo(() => {
     return encounterMap?.placements || []

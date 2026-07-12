@@ -122,11 +122,19 @@ export default function StoryAtlasMapMode({
           </small>
         </div>
 
-        <nav className="atlas-hybrid-tabs">
-          <button onClick={() => setView('story')}>
+        <nav className="atlas-hybrid-tabs" role="tablist">
+          <button
+            role="tab"
+            aria-selected={false}
+            onClick={() => setView('story')}
+          >
             <i className="bi bi-chat-square-text" /> Story
           </button>
-          <button className="active">
+          <button
+            role="tab"
+            aria-selected={true}
+            className="active"
+          >
             <i className="bi bi-map" /> Map
           </button>
         </nav>

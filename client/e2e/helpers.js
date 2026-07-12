@@ -172,6 +172,7 @@ export async function setupBrowserEvidence(page, baseURL) {
   // Track console errors
   page.on('console', (msg) => {
     if (msg.type() === 'error') {
+      console.error('BROWSER ERROR:', msg.text());
       consoleErrors.push(msg.text());
     }
   });
@@ -200,10 +201,12 @@ export async function setupBrowserEvidence(page, baseURL) {
       expect(failedRequests).toEqual([]);
     },
     async takeScreenshot(name, locator = null) {
+      const viewportPreset = process.env.PLAYWRIGHT_VIEWPORT || 'desktop';
+      const viewportSuffix = viewportPreset === 'mobile' ? '-mobile' : '';
       const screenshotPath = path.resolve(
         process.cwd(),
         '../review-evidence/browser-screenshots',
-        scenarioId,
+        scenarioId + viewportSuffix,
         name
       );
       const dir = path.dirname(screenshotPath);

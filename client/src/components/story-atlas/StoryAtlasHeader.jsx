@@ -30,8 +30,10 @@ export default function StoryAtlasHeader({
         <small>{isEncounterActive ? 'Combat' : 'Exploration'}</small>
       </div>
 
-      <nav>
+      <nav role="tablist" className="atlas-hybrid-tabs">
         <button
+          role="tab"
+          aria-selected={view === 'story'}
           className={view === 'story' ? 'active' : ''}
           onClick={() => setView('story')}
         >
@@ -39,6 +41,8 @@ export default function StoryAtlasHeader({
         </button>
         {isEncounterActive && (
           <button
+            role="tab"
+            aria-selected={view === 'map'}
             className={view === 'map' ? 'active' : ''}
             onClick={() => setView('map')}
           >
