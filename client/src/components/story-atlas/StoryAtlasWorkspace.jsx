@@ -22,7 +22,7 @@ export default function StoryAtlasWorkspace({
   // Hoisted states to satisfy no-reset/no-remount state preservation across layouts
   composerProps = {},
 }) {
-  const [view, setView] = useState('story')
+  const [view, setView] = useState(() => encounter.hasActiveMap ? 'map' : 'story')
 
   const isMapModeActive = view === 'map' && encounter.hasActiveMap
 
@@ -39,6 +39,7 @@ export default function StoryAtlasWorkspace({
           currentUser={currentUser}
           currentCharacter={currentCharacter}
           encounter={encounter}
+          view={view}
           setView={setView}
           actions={actions}
           composerProps={composerProps}
@@ -85,6 +86,7 @@ export default function StoryAtlasWorkspace({
             <footer style={{ background: '#0e1314' }}>
               <SessionComposer
                 {...composerProps}
+                active={view === 'story'}
                 currentUser={currentUser}
                 currentCharacter={currentCharacter}
                 onSendMessage={actions.onSendMessage}

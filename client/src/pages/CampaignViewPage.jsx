@@ -150,6 +150,7 @@ async function fetchCampaignPageData(id) {
       hasOlderMessages,
       sheetProposals,
       encounterMap,
+      world: worldData.world,
     }
   }
 
@@ -163,6 +164,7 @@ async function fetchCampaignPageData(id) {
     hasOlderMessages: false,
     sheetProposals,
     encounterMap,
+    world: worldData.world,
   }
 }
 
@@ -173,6 +175,7 @@ export default function CampaignViewPage({ user }) {
   const [campaign, setCampaign] = useState(null)
   const [members, setMembers] = useState([])
   const [currentScene, setCurrentScene] = useState(null)
+  const [world, setWorld] = useState(null)
   const [worldTitle, setWorldTitle] = useState('')
   const [characters, setCharacters] = useState([])
   const [loading, setLoading] = useState(true)
@@ -318,6 +321,7 @@ export default function CampaignViewPage({ user }) {
       const data = await fetchCampaignPageData(id)
       setCampaign(data.campaign)
       setCurrentScene(data.currentScene)
+      setWorld(data.world)
       setWorldTitle(data.worldTitle)
       setCharacters(data.characters)
       setSession(data.activeSession)
@@ -911,6 +915,7 @@ export default function CampaignViewPage({ user }) {
         campaign={campaign}
         party={characters}
         currentScene={currentScene}
+        world={world}
         session={session}
         messages={messages}
         currentUser={user}
@@ -931,6 +936,16 @@ export default function CampaignViewPage({ user }) {
         hasOlderMessages={hasOlderMessages}
         loadingOlderMessages={loadingOlderMessages}
         onLoadOlderMessages={loadOlderMessages}
+        canSendMessage={!isSpectator}
+        readOnlyReason={isSpectator ? 'Spectating only. You can read the table, but you cannot post messages.' : ''}
+        aiThinking={aiThinking}
+        aiThinkingStatus={aiThinkingStatus}
+        showLlmTools={showLlmTools}
+        isOwner={isOwner}
+        onLlmPlayerAdded={handleLlmPlayerAdded}
+        onToggleLootStash={() => setShowLootStash(true)}
+        onToggleShops={() => setShowShops(true)}
+        onNavigateAutomation={() => navigate(`/automation?sourceCampaignId=${id}`)}
       />
 
       {showSettings && (
@@ -1088,7 +1103,7 @@ export default function CampaignViewPage({ user }) {
           <i className="bi bi-chat-left-text-fill"></i>
           <span>Chat</span>
         </button>
-        {hasActiveMap && (
+        {Boolean(encounterMap) && (
           <button
             type="button"
             className={`mobile-nav-item ${activeTab === 'map' ? 'active' : ''}`}

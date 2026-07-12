@@ -435,11 +435,7 @@ export default function EncounterMapBoard({
 
   const isEncounterActive = Boolean(encounterState?.active)
   
-  const currentUserActorId = useMemo(() => {
-    if (currentCharacter?.id) return String(currentCharacter.id)
-    if (currentUser?.id) return String(currentUser.id)
-    return ''
-  }, [currentCharacter?.id, currentUser?.id])
+  const currentUserActorId = currentUser?.id != null ? String(currentUser.id) : ''
 
   const placements = useMemo(() => {
     return encounterMap?.placements || []
@@ -506,7 +502,7 @@ export default function EncounterMapBoard({
   }, [hoveredPlacement, playerPlacement, vttSetup])
 
   // Load map visual blobs
-  const imageUrl = imageState.mapId === encounterMap?.id ? imageState.url : ''
+  const imageUrl = imageState.mapId === encounterMap?.id ? imageState.url : (encounterMap?.url || '')
   const imageError = imageState.mapId === encounterMap?.id ? imageState.error : ''
 
   useEffect(() => {
@@ -944,10 +940,10 @@ export default function EncounterMapBoard({
                       ? <span>{inspectedCellDetails.distanceFromPlayer} sq from you</span>
                       : <span>Board reference</span>}
                   {inspectedCellDetails.cellFeatures.blockedBy.length > 0 && (
-                    <span>Blocked by {inspectedCellDetails.cellFeatures.blockedBy[0]}</span>
+                    <span>Blocked by <strong>{inspectedCellDetails.cellFeatures.blockedBy[0]}</strong></span>
                   )}
                   {inspectedCellDetails.cellFeatures.difficultBy.length > 0 && (
-                    <span>Difficult: {inspectedCellDetails.cellFeatures.difficultBy[0]}</span>
+                    <span>Difficult: <strong>{inspectedCellDetails.cellFeatures.difficultBy[0]}</strong></span>
                   )}
                 </div>
               </div>

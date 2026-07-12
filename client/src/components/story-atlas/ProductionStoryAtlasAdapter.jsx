@@ -5,6 +5,7 @@ export default function ProductionStoryAtlasAdapter({
   campaign,
   party,
   currentScene,
+  world,
   session,
   messages,
   currentUser,
@@ -24,6 +25,20 @@ export default function ProductionStoryAtlasAdapter({
   hasOlderMessages,
   loadingOlderMessages,
   onLoadOlderMessages,
+  // Read-only / Spectator & AI state
+  canSendMessage = true,
+  readOnlyReason = '',
+  aiThinking = false,
+  aiThinkingStatus = '',
+  // Action toggles and LLM details
+  showLlmTools = false,
+  isOwner = false,
+  onLlmPlayerAdded = () => {},
+  onToggleLootStash = () => {},
+  onToggleShops = () => {},
+  onNavigateAutomation = () => {},
+  onToggleWorldJournal = () => {},
+  onImportCharacter = () => {},
 }) {
   // Hoist all SessionComposer states here to satisfy the requirement:
   // "transient Story UI state (draft text, active slash commands, dice state, scroll position) is preserved across Map toggles."
@@ -42,12 +57,12 @@ export default function ProductionStoryAtlasAdapter({
   const [physicalModifier, setPhysicalModifier] = useState(0)
   const [physicalTotal, setPhysicalTotal] = useState(0)
 
-  // Compute active scene location & details
+  // Compute active scene location & details from world object
   const scene = useMemo(() => ({
-    location_name: currentScene?.location_name || campaign?.settings?.current_location || 'Exploration',
-    time_of_day: currentScene?.time_of_day || '',
-    immediate_tension: currentScene?.immediate_tension || '',
-  }), [currentScene, campaign])
+    location_name: world?.current_scene?.location_name || campaign?.settings?.current_location || 'Exploration',
+    time_of_day: world?.current_scene?.time_of_day || '',
+    immediate_tension: world?.current_scene?.immediate_tension || '',
+  }), [world, campaign])
 
   // Extract recent activity from messages to render on the context rail
   const activity = useMemo(() => {
@@ -72,9 +87,10 @@ export default function ProductionStoryAtlasAdapter({
     loading: false,
   }), [encounterMap])
 
+  // Pull threads from real world-state contract
   const worldState = useMemo(() => ({
-    open_threads: campaign?.settings?.open_threads || [],
-  }), [campaign])
+    open_threads: world?.open_threads || campaign?.settings?.open_threads || [],
+  }), [world, campaign])
 
   const actions = {
     onStartSession,
@@ -87,6 +103,14 @@ export default function ProductionStoryAtlasAdapter({
     onOpenSettings,
     onExitToCampaigns,
     onEncounterMapChange,
+    onToggleWorldJournal,
+    onImportCharacter,
+    onToggleLootStash,
+    onToggleShops,
+    onNavigateAutomation,
+    showLlmTools,
+    isOwner,
+    onLlmPlayerAdded,
   }
 
   const composerProps = {
@@ -107,6 +131,10 @@ export default function ProductionStoryAtlasAdapter({
     hasOlderMessages,
     loadingOlderMessages,
     onLoadOlderMessages,
+    canSendMessage,
+    readOnlyReason,
+    aiThinking,
+    aiThinkingStatus,
   }
 
   return (

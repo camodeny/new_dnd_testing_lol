@@ -1,3 +1,5 @@
+import LlmPlayerManager from '../dashboard/LlmPlayerManager'
+
 export default function StoryAtlasContextRail({
   campaign = {},
   scene = {},
@@ -21,6 +23,14 @@ export default function StoryAtlasContextRail({
 
   return (
     <aside className="sampler-context">
+      {actions.showLlmTools && (
+        <LlmPlayerManager
+          campaignId={campaign.id}
+          enabled={actions.showLlmTools}
+          isOwner={actions.isOwner}
+          onAdded={actions.onLlmPlayerAdded}
+        />
+      )}
       <section className="sampler-scene">
         <small>CURRENT SCENE</small>
         <h3>{scene.location_name || campaign.settings?.current_location || 'World Map'}</h3>

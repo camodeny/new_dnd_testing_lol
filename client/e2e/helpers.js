@@ -10,7 +10,8 @@ export async function setupBrowserEvidence(page, baseURL) {
   const failedRequests = [];
 
   const scenarioId = process.env.PLAYWRIGHT_SCENARIO_ID || 'campaigns-list';
-  const profile = fixtureProfiles[scenarioId] || fixtureProfiles['campaigns-list'];
+  const fixtureKey = process.env.PLAYWRIGHT_SCENARIO_FIXTURE || scenarioId;
+  const profile = fixtureProfiles[fixtureKey] || fixtureProfiles['campaigns-list'];
 
   // Mock standard and custom endpoints based on the selected fixture profile
   await page.route(

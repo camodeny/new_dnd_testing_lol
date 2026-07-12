@@ -133,6 +133,7 @@ function formatRollSummary(roll) {
 }
 
 export default function SessionComposer({
+  active = true,
   currentUser,
   currentCharacter,
   canSendMessage = true,
@@ -436,7 +437,7 @@ export default function SessionComposer({
 
   return (
     <div style={{ position: 'relative', width: '100%' }}>
-      {showDice && (
+      {showDice && active && (
         <div className="session-roll-bar" style={{ display: 'block' }}>
           <>
             {createPortal(
