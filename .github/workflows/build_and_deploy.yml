@@ -188,6 +188,7 @@ jobs:
           IMAGE_TAG: ${{ github.sha }}
           APP_PORT: ${{ vars.APP_PORT }}
           GUNICORN_TIMEOUT: ${{ vars.GUNICORN_TIMEOUT }}
+          WORKER_REPLICAS: ${{ vars.WORKER_REPLICAS }}
           FRONTEND_ORIGINS: ${{ vars.FRONTEND_ORIGINS }}
           PUBLIC_APP_BASE_URL: ${{ vars.PUBLIC_APP_BASE_URL }}
           DATABASE_URL: ${{ secrets.DATABASE_URL }}
@@ -229,6 +230,17 @@ jobs:
           DEPLOY_PATH="${DEPLOY_PATH:-/home/${DEPLOY_USER}/new_dnd_testing_lol}"
           APP_PORT="${APP_PORT:-5889}"
           GUNICORN_TIMEOUT="${GUNICORN_TIMEOUT:-420}"
+          WORKER_REPLICAS="${WORKER_REPLICAS:-4}"
+          case "${WORKER_REPLICAS}" in
+            ''|*[!0-9]*)
+              echo "WORKER_REPLICAS must be a positive integer" >&2
+              exit 1
+              ;;
+          esac
+          if [ "${WORKER_REPLICAS}" -lt 1 ]; then
+            echo "WORKER_REPLICAS must be at least 1" >&2
+            exit 1
+          fi
           FRONTEND_ORIGINS="${FRONTEND_ORIGINS:-http://localhost:${APP_PORT}}"
           PUBLIC_APP_BASE_URL="${PUBLIC_APP_BASE_URL:-http://localhost:${APP_PORT}}"
           JWT_EXPIRATION_HOURS="${JWT_EXPIRATION_HOURS:-24}"
@@ -299,7 +311,8 @@ jobs:
             cd '${DEPLOY_PATH}' && \
             docker build -t dnd-app:${IMAGE_TAG} . && \
             sed -i 's|image:[[:space:]]*dnd-app:.*|image: dnd-app:${IMAGE_TAG}|g' docker-compose.yml && \
-            docker compose --env-file .deploy.env up -d && \
+            docker compose --env-file .deploy.env up -d --scale worker=${WORKER_REPLICAS} && \
+            docker compose --env-file .deploy.env ps worker && \
             for attempt in \$(seq 1 30); do \
               if docker compose --env-file .deploy.env exec -T app python -c \"import urllib.request; print(urllib.request.urlopen('http://127.0.0.1:5001/api/health', timeout=5).read().decode())\"; then \
                 break; \
