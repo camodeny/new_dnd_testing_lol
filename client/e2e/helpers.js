@@ -49,7 +49,7 @@ export async function setupBrowserEvidence(page, baseURL) {
         await route.fulfill({
           status: 200,
           contentType: 'application/json',
-          body: JSON.stringify({ members: [{ id: 1, username: 'E2E Test User', role: 'player' }] }),
+          body: JSON.stringify({ members: profile.members || [{ user_id: 1, username: 'E2E Test User', role: 'player' }] }),
         });
       } else if (pathname.startsWith('/api/campaigns/') && pathname.endsWith('/encounter-maps/current')) {
         await route.fulfill({

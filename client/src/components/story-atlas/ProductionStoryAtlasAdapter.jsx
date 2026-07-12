@@ -11,6 +11,7 @@ export default function ProductionStoryAtlasAdapter({
   currentUser,
   currentCharacter,
   encounterMap,
+  isEncounterActive = false,
   onStartSession,
   onEndSession,
   onSendMessage,
@@ -57,12 +58,13 @@ export default function ProductionStoryAtlasAdapter({
   const [physicalModifier, setPhysicalModifier] = useState(0)
   const [physicalTotal, setPhysicalTotal] = useState(0)
 
-  // Compute active scene location & details from world object
+  // Compute active scene location & details — prefer live currentScene prop (updated via SSE),
+  // fall back to world.current_scene for the initial load
   const scene = useMemo(() => ({
-    location_name: world?.current_scene?.location_name || campaign?.settings?.current_location || 'Exploration',
-    time_of_day: world?.current_scene?.time_of_day || '',
-    immediate_tension: world?.current_scene?.immediate_tension || '',
-  }), [world, campaign])
+    location_name: currentScene?.location_name || world?.current_scene?.location_name || campaign?.settings?.current_location || 'Exploration',
+    time_of_day: currentScene?.time_of_day || world?.current_scene?.time_of_day || '',
+    immediate_tension: currentScene?.immediate_tension || world?.current_scene?.immediate_tension || '',
+  }), [currentScene, world, campaign])
 
   // Extract recent activity from messages to render on the context rail
   const activity = useMemo(() => {
@@ -81,11 +83,11 @@ export default function ProductionStoryAtlasAdapter({
   }, [messages])
 
   const encounter = useMemo(() => ({
-    hasActiveMap: Boolean(encounterMap),
+    hasActiveMap: isEncounterActive,
     encounterMap: encounterMap,
     encounterState: encounterMap?.encounter_state_json || encounterMap?.encounter_state || {},
     loading: false,
-  }), [encounterMap])
+  }), [isEncounterActive, encounterMap])
 
   // Pull threads from real world-state contract
   const worldState = useMemo(() => ({

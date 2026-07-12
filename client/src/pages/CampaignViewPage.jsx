@@ -921,6 +921,7 @@ export default function CampaignViewPage({ user }) {
         currentUser={user}
         currentCharacter={currentCharacter}
         encounterMap={encounterMap}
+        isEncounterActive={isEncounterActive}
         onStartSession={handleStartSession}
         onEndSession={handleEndSession}
         onSendMessage={handleSendMessage}

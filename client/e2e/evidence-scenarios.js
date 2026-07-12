@@ -3,17 +3,18 @@ import { expect } from '@playwright/test';
 export const evidenceScenarios = [
   {
     id: 'design-lab-story-atlas',
-    description: 'Design Lab Hearth and Story + Atlas reference workspaces',
+    description: 'Design Lab Story + Atlas workspace renders correctly',
     route: '/design-lab',
     fixture: 'design-lab',
     setup: async ({ page }) => {
-      const chronicleTab = page.locator('button[role="tab"]:has-text("The Chronicle")');
-      await expect(chronicleTab).toBeVisible();
-      await chronicleTab.click();
+      // Select Story + Atlas direction (default, but explicitly click to prove the UX works)
+      const storyAtlasTab = page.locator('button[role="tab"]:has-text("Story + Atlas")');
+      await expect(storyAtlasTab).toBeVisible();
+      await storyAtlasTab.click();
     },
     verify: async ({ page }) => {
       await expect(page).toHaveTitle('Design Lab · Fireside');
-      await expect(page.locator('.chronicle-workspace')).toBeVisible();
+      await expect(page.locator('.story-atlas-workspace-container')).toBeVisible();
     },
     captures: [
       { name: 'design-lab.png', locator: null, fullPage: true }
@@ -220,12 +221,12 @@ export const evidenceScenarios = [
     description: 'Verify spectator mode provides read-only state composer with warning message',
     route: '/campaigns/active-combat-campaign',
     fixture: 'session-spectator-readonly',
-    setup: async ({ page }) => {
-      // Simulate spectator by modifying user/member context if possible or checking the composer state
-    },
     verify: async ({ page }) => {
-      // In this setup, we verify composer exists
+      // Composer area should still render
       await expect(page.locator('.story-atlas-workspace .session-input-area')).toBeVisible();
+      // Should show the read-only banner instead of an editable input
+      await expect(page.locator('.story-atlas-workspace .session-spectator-banner')).toBeVisible();
+      await expect(page.locator('.story-atlas-workspace .session-spectator-banner')).toContainText('spectator', { ignoreCase: true });
     },
     captures: [
       { name: 'page.png', locator: null, fullPage: true }

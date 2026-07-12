@@ -32,7 +32,7 @@ export default function StoryAtlasMapMode({
   const [manualInitValues, setManualInitValues] = useState({})
   const [rollingInitId, setRollingInitId] = useState(null)
 
-  const currentUserActorId = currentUser?.id != null ? String(currentUser.id) : ''
+  const currentUserActorId = currentCharacter?.id != null ? String(currentCharacter.id) : (currentUser?.id != null ? String(currentUser.id) : '')
 
   const getInitials = (name) => {
     if (!name) return '?'
@@ -84,7 +84,7 @@ export default function StoryAtlasMapMode({
 
   const handleNextTurn = async () => {
     try {
-      const data = await advanceEncounterTurn(campaign.id)
+      const data = await advanceEncounterTurn(mapData.id)
       actions.onEncounterMapChange?.(data.encounter_map)
     } catch (err) {
       alert(`Failed to advance turn: ${err.message}`)
