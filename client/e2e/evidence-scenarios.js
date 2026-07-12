@@ -55,7 +55,7 @@ export const evidenceScenarios = [
     },
     verify: async ({ page }) => {
       await expect(page).toHaveTitle('Design Lab · Fireside');
-      await expect(page.locator('.chronicle-preview')).toBeVisible();
+      await expect(page.locator('.chronicle-workspace')).toBeVisible();
     },
     captures: [
       { name: 'design-lab.png', locator: null, fullPage: true }

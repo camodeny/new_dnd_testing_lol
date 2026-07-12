@@ -3478,6 +3478,11 @@ a.automation-list-item:focus-visible {
     display: block !important;
   }
 
+  /* Hide the context-rail toggle on mobile — the bottom tab nav already handles right-panel visibility */
+  .header-icon-btn:has(.bi-layout-sidebar-reverse) {
+    display: none !important;
+  }
+
   .dashboard-layout.mobile-tab-chat .dashboard-center,
   .dashboard-layout.mobile-tab-map .dashboard-center {
     display: flex !important;
