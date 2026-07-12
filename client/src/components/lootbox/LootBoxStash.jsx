@@ -76,7 +76,7 @@ export default function LootBoxStash({ campaignId, isOwner, onLootBoxOpened, cha
         <div className="loot-item-list">
           {boxes.length === 0 ? (
             <div className="loot-box-stash-empty-text" style={{ fontSize: '0.82rem', color: 'var(--text-muted)', lineHeight: '1.4' }}>
-              No loot boxes yet. The DM may drop one during the adventure.
+              No loot boxes yet. The AI Dungeon Master may award one during the adventure.
             </div>
           ) : (
             <div className="loot-box-stash-list" style={{ display: 'flex', flexDirection: 'column', gap: '10px' }}>

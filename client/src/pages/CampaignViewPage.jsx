@@ -192,13 +192,14 @@ export default function CampaignViewPage({ user }) {
   const [showShops, setShowShops] = useState(false)
   const [elapsedTimer, setElapsedTimer] = useState({ sessionKey: null, value: '00:00:00' })
   const [activeTab, setActiveTab] = useState('chat')
+  const [showContextRail, setShowContextRail] = useState(() => localStorage.getItem('campaign_context_rail') !== 'hidden')
   const sessionTimerKey = session?.id || session?.created_at || session?.started_at || null
 
   useEffect(() => {
     if (!session || !sessionTimerKey) return undefined
     const startTime = new Date(session.created_at || session.started_at || Date.now()).getTime()
     const updateTimer = () => {
-      const diff = Date.now() - startTime
+      const diff = Math.max(0, Date.now() - startTime)
       const hrs = String(Math.floor(diff / 3600000)).padStart(2, '0')
       const mins = String(Math.floor((diff % 3600000) / 60000)).padStart(2, '0')
       const secs = String(Math.floor((diff % 60000) / 1000)).padStart(2, '0')
@@ -239,6 +240,13 @@ export default function CampaignViewPage({ user }) {
       else next = 'collapsed'
       localStorage.setItem('encounter_map_view_mode', next)
       return next
+    })
+  }
+
+  const toggleContextRail = () => {
+    setShowContextRail((visible) => {
+      localStorage.setItem('campaign_context_rail', visible ? 'hidden' : 'visible')
+      return !visible
     })
   }
   const isEncounterActive = useMemo(() => {
@@ -899,7 +907,7 @@ export default function CampaignViewPage({ user }) {
   return (
     <div className={`dashboard-page ${mapViewMode === 'fullscreen' && hasActiveMap ? 'map-fullscreen' : mapViewMode === 'semi' && hasActiveMap ? 'map-semi' : ''}`}>
       <ErrorMessage message={error} />
-      <div className={`dashboard-layout mobile-tab-${activeTab} ${mapViewMode === 'fullscreen' && hasActiveMap ? 'map-fullscreen' : mapViewMode === 'semi' && hasActiveMap ? 'map-semi' : ''}`}>
+      <div className={`dashboard-layout mobile-tab-${activeTab} ${showContextRail ? '' : 'context-collapsed'} ${mapViewMode === 'fullscreen' && hasActiveMap ? 'map-fullscreen' : mapViewMode === 'semi' && hasActiveMap ? 'map-semi' : ''}`}>
         <aside className="dashboard-left">
           <div className="campaign-logo-header">
             <div className="campaign-logo">
@@ -974,6 +982,15 @@ export default function CampaignViewPage({ user }) {
             </div>
 
             <div className="header-actions">
+              <button
+                className={`header-icon-btn ${showContextRail ? 'active' : ''}`}
+                onClick={toggleContextRail}
+                title={showContextRail ? 'Hide table context' : 'Show table context'}
+                aria-label={showContextRail ? 'Hide table context' : 'Show table context'}
+                aria-pressed={showContextRail}
+              >
+                <i className="bi bi-layout-sidebar-reverse"></i>
+              </button>
               <button className="header-icon-btn" onClick={cycleMapViewMode} title={`Toggle Map View (Current: ${mapViewMode})`}>
                 <i className={`bi bi-${mapViewMode === 'collapsed' ? 'map' : mapViewMode === 'semi' ? 'layout-split' : 'fullscreen'}`}></i>
               </button>
@@ -1026,6 +1043,23 @@ export default function CampaignViewPage({ user }) {
         </main>
 
         <aside className="dashboard-right">
+          <section className="session-context-overview" aria-label="Current table context">
+            <div className="session-context-kicker">Current scene</div>
+            <div className="session-context-heading">
+              <div>
+                <h2>{locationName}</h2>
+                <p>{session ? 'The table is live' : 'Ready for the next chapter'}</p>
+              </div>
+              <span className={`session-context-status ${session ? 'is-live' : ''}`}>
+                {session ? 'Live' : 'Ready'}
+              </span>
+            </div>
+            <div className="session-context-metrics">
+              <div><strong>{characters.length}</strong><span>at the table</span></div>
+              <div><strong>{hasActiveMap ? '1' : '—'}</strong><span>active map</span></div>
+              <div><strong>{sheetProposals.length || '—'}</strong><span>updates</span></div>
+            </div>
+          </section>
           <LlmPlayerManager
             campaignId={id}
             enabled={showLlmTools}
