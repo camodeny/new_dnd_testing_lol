@@ -46,7 +46,10 @@ jobs:
 
       - name: Execute Evidence Scenarios
         working-directory: client
-        run: npm run evidence -- --scenarios "${{ github.event.inputs.scenarios }}" --viewport "${{ github.event.inputs.viewport }}"
+        run: npm run evidence -- --scenarios "$SCENARIOS" --viewport "$VIEWPORT"
+        env:
+          SCENARIOS: ${{ github.event.inputs.scenarios }}
+          VIEWPORT: ${{ github.event.inputs.viewport }}
 
       - name: Upload browser evidence
         if: always()

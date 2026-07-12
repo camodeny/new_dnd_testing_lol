@@ -36,6 +36,34 @@ const validIds = evidenceScenarios.map(s => s.id);
 let selectedScenarios = [];
 if (scenariosArg === 'all') {
   selectedScenarios = validIds;
+} else if (scenariosArg === 'changed') {
+  const defaultBranch = process.env.GITHUB_BASE_REF || 'main';
+  runCmd(`git fetch origin ${defaultBranch} --depth=1`);
+  const diffOutput = runCmd(`git diff --name-only origin/${defaultBranch}...HEAD -- client/e2e/`);
+  const changedFiles = diffOutput.split('\n').filter(Boolean);
+  const changedScenarioIds = new Set();
+
+  const defsChanged = changedFiles.some(f => f.includes('evidence-scenarios'));
+  changedFiles.forEach(file => {
+    const match = file.match(/fixtures\/(.+)\.json$/);
+    if (match) {
+      const fixtureName = match[1];
+      evidenceScenarios.forEach(s => {
+        if (s.fixture === fixtureName) changedScenarioIds.add(s.id);
+      });
+    }
+  });
+  if (defsChanged) {
+    validIds.forEach(id => changedScenarioIds.add(id));
+  }
+
+  selectedScenarios = [...changedScenarioIds];
+  if (selectedScenarios.length === 0) {
+    console.warn('No changed scenarios detected from diff; running all as fallback.');
+    selectedScenarios = validIds;
+  }
+  console.log(`Changed files in e2e/: ${changedFiles.length}`);
+  changedFiles.forEach(f => console.log(`  ${f}`));
 } else {
   const requested = scenariosArg.split(',').map(s => s.trim());
   const invalid = requested.filter(id => !validIds.includes(id));
@@ -50,9 +78,9 @@ if (scenariosArg === 'all') {
 console.log('Selected scenarios to run:', selectedScenarios.join(', '));
 console.log('Viewport preset:', viewportArg);
 
-// Get current git ref and sha
-const gitRef = process.env.GITHUB_REF || runCmd('git rev-parse --abbrev-ref HEAD') || 'unknown';
-const gitSha = process.env.GITHUB_SHA || runCmd('git rev-parse HEAD') || 'unknown';
+// Get current git ref and sha from the actual checked-out HEAD
+const gitRef = runCmd('git rev-parse --abbrev-ref HEAD') || process.env.GITHUB_REF || 'unknown';
+const gitSha = runCmd('git rev-parse HEAD') || process.env.GITHUB_SHA || 'unknown';
 
 // Run playwright tests
 const env = {
@@ -73,16 +101,26 @@ try {
   exitCode = error.status || 1;
 }
 
+const manifestDir = path.resolve(__dirname, '../../review-evidence');
+
 // Build the manifest info
 const executed = selectedScenarios;
 const screenshots = [];
+const captureMode = process.env.PLAYWRIGHT_CAPTURE_SCREENSHOTS;
+const isCapturing = captureMode === undefined || (captureMode !== 'false' && captureMode !== '0');
 
-if (result === 'success') {
+if (result === 'success' && isCapturing) {
   executed.forEach(scenarioId => {
     const scenario = evidenceScenarios.find(s => s.id === scenarioId);
     if (scenario) {
       scenario.captures.forEach(capture => {
-        screenshots.push(`browser-screenshots/${scenarioId}/${capture.name}`);
+        const screenshotPath = `browser-screenshots/${scenarioId}/${capture.name}`;
+        const fullPath = path.resolve(manifestDir, screenshotPath);
+        if (fs.existsSync(fullPath)) {
+          screenshots.push(screenshotPath);
+        } else {
+          console.warn(`Screenshot not found: ${screenshotPath}`);
+        }
       });
     }
   });
@@ -99,7 +137,6 @@ const manifest = {
 };
 
 // Write manifest file to review-evidence
-const manifestDir = path.resolve(__dirname, '../../review-evidence');
 if (!fs.existsSync(manifestDir)) {
   fs.mkdirSync(manifestDir, { recursive: true });
 }

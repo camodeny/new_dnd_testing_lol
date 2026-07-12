@@ -179,14 +179,22 @@ export const evidenceScenarios = [
     fixture: 'session-map-movement',
     mapViewMode: 'semi',
     setup: async ({ page }) => {
-      // Select the player token to trigger movement inspection
+      // Hold-drag the player token to trigger persistent movement inspection
       const playerToken = page.locator('.encounter-map-token.player');
       await expect(playerToken).toBeVisible();
-      await playerToken.click();
+      const box = await playerToken.boundingBox();
+      if (box) {
+        const cx = box.x + box.width / 2;
+        const cy = box.y + box.height / 2;
+        await page.mouse.move(cx, cy);
+        await page.mouse.down();
+        await page.mouse.move(cx + 15, cy, { steps: 5 });
+        await page.mouse.up();
+      }
     },
     verify: async ({ page }) => {
       // When selected, reachable cells should show move overlay highlights
-      await expect(page.locator('.encounter-map-move-cell')).toBeChecked({ checked: false, timeout: 2000 }).catch(() => {});
+      await expect(page.locator('.encounter-map-move-cell').first()).toBeVisible();
       // Ensure difficult terrain and blocked zones exist
       await expect(page.locator('.encounter-map-area-overlay.difficult')).toBeVisible();
       await expect(page.locator('.encounter-map-area-overlay.blocked')).toBeVisible();
