@@ -12,6 +12,7 @@ export default defineConfig({
   ],
   use: {
     baseURL: 'http://127.0.0.1:7824',
+    screenshot: 'only-on-failure',
     trace: 'retain-on-failure',
     video: 'retain-on-failure',
     viewport: { width: 1280, height: 720 },

@@ -121,8 +121,47 @@ jobs:
     steps:
       - name: Check out repository
         uses: actions/checkout@v4
+        with:
+          fetch-depth: 0 # Get all history for diffing
+
+      - name: Plan browser evidence run
+        id: plan
+        run: |
+          run_browser_tests=false
+          capture_review_screenshots=false
+          scenario_ids="campaigns-list,characters-list,automation-home,design-lab"
+          selection_reason="No relevant client changes detected."
+
+          if [ "${{ github.event_name }}" != "pull_request" ]; then
+            echo "Not a pull request. Running all smoke tests by default."
+            run_browser_tests=true
+          else
+            # Diff against the target branch (usually main)
+            git fetch origin main --depth=1
+            changed_files=$(git diff --name-only origin/main HEAD)
+            echo "Changed files in this PR:"
+            echo "$changed_files"
+
+            if echo "$changed_files" | grep -q "^client/"; then
+              run_browser_tests=true
+              if echo "$changed_files" | grep -E -q "^client/src/(App\.jsx|App\.css|index\.css|EmberLedgerTheme\.css|api/|components/layout/)"; then
+                selection_reason="Shared UI changes (routing, CSS, layout) detected. Running smoke scenarios."
+              else
+                selection_reason="Client changes under client/src/ detected. Running smoke scenarios."
+              fi
+            else
+              selection_reason="Backend-only, automation-only, or documentation-only changes detected. Skipping browser smoke tests."
+            fi
+          fi
+
+          echo "run_browser_tests=$run_browser_tests" >> "$GITHUB_OUTPUT"
+          echo "capture_review_screenshots=$capture_review_screenshots" >> "$GITHUB_OUTPUT"
+          echo "scenario_ids=$scenario_ids" >> "$GITHUB_OUTPUT"
+          echo "selection_reason=$selection_reason" >> "$GITHUB_OUTPUT"
+          echo "Plan result: run_browser_tests=$run_browser_tests, scenario_ids=$scenario_ids, reason: $selection_reason"
 
       - name: Set up Node.js 20
+        if: steps.plan.outputs.run_browser_tests == 'true'
         uses: actions/setup-node@v4
         with:
           node-version: "20"
@@ -130,27 +169,31 @@ jobs:
           cache-dependency-path: client/package-lock.json
 
       - name: Install frontend dependencies
+        if: steps.plan.outputs.run_browser_tests == 'true'
         working-directory: client
         run: npm ci
 
       - name: Install Playwright Chromium Browser
+        if: steps.plan.outputs.run_browser_tests == 'true'
         working-directory: client
         run: npx playwright install --with-deps chromium
 
       - name: Run browser evidence tests
+        if: steps.plan.outputs.run_browser_tests == 'true'
         working-directory: client
-        run: npm run test:e2e
+        run: npm run evidence -- --scenarios "${{ steps.plan.outputs.scenario_ids }}"
+        env:
+          PLAYWRIGHT_CAPTURE_SCREENSHOTS: ${{ steps.plan.outputs.capture_review_screenshots }}
 
       - name: Upload browser evidence
-        if: always()
+        if: always() && steps.plan.outputs.run_browser_tests == 'true'
         uses: actions/upload-artifact@v4
         with:
           name: frontend-browser-evidence
           path: |
             client/playwright-report/
             client/test-results/
-            review-evidence/browser-screenshots/*.png
-            review-evidence/playwright-junit.xml
+            review-evidence/
           if-no-files-found: warn
           retention-days: 14
 
