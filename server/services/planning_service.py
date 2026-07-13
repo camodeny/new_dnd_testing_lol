@@ -11,6 +11,7 @@ from models import (
     CharacterPlanningMessage,
     CampaignPlanningSummary,
     PlanningBondProposal,
+    AutomationRun,
 )
 from services.character_service import character_full_dict
 
@@ -224,16 +225,98 @@ def member_planning_dict(member, invalid_member_ids=None):
     return data
 
 
+def get_automation_roster_user_ids(campaign):
+    if not campaign.is_automation_clone:
+        return None
+
+    run_id = campaign.automation_source_run_id
+    if not run_id:
+        return []
+
+    run = db.session.get(AutomationRun, run_id)
+    if not run or not run.snapshot or not run.snapshot.snapshot_json:
+        return []
+
+    roster = run.snapshot.snapshot_json.get("roster")
+    if not isinstance(roster, list):
+        return []
+
+    user_ids = []
+    for entry in roster:
+        if isinstance(entry, dict) and entry.get("user_id") is not None:
+            user_ids.append(entry.get("user_id"))
+    return user_ids
+
+
+def resolve_readiness_party(campaign, members):
+    roster_user_ids = get_automation_roster_user_ids(campaign)
+    if roster_user_ids is None:
+        required = get_required_players(campaign)
+        relevant_members = active_party_members(members)[:required]
+        user_ids = [m.user_id for m in relevant_members]
+        return {
+            "mode": "interactive",
+            "required": required,
+            "user_ids": user_ids,
+            "members": relevant_members,
+            "missing_user_ids": [],
+        }
+    else:
+        raw_roster = []
+        if campaign.automation_source_run_id:
+            run = db.session.get(AutomationRun, campaign.automation_source_run_id)
+            if run and run.snapshot and run.snapshot.snapshot_json:
+                raw_roster = run.snapshot.snapshot_json.get("roster") or []
+
+        if not isinstance(raw_roster, list):
+            raw_roster = []
+
+        required = len(raw_roster)
+        expected_user_ids = []
+        for entry in raw_roster:
+            if isinstance(entry, dict) and entry.get("user_id") is not None:
+                expected_user_ids.append(entry.get("user_id"))
+
+        members_by_user = {m.user_id: m for m in members}
+        relevant_members = []
+        missing_user_ids = []
+
+        for uid in expected_user_ids:
+            member = members_by_user.get(uid)
+            if member is not None and (member.role or 'player') != 'spectator':
+                relevant_members.append(member)
+            else:
+                missing_user_ids.append(uid)
+
+        return {
+            "mode": "automation_roster",
+            "required": required,
+            "user_ids": [m.user_id for m in relevant_members],
+            "members": relevant_members,
+            "missing_user_ids": missing_user_ids,
+        }
+
+
 def party_is_full(campaign, members):
+    party = resolve_readiness_party(campaign, members)
+    if party["mode"] == "automation_roster":
+        return party["required"] > 0 and len(party["members"]) == party["required"]
     return len(active_party_members(members)) >= get_required_players(campaign)
 
 
 def all_members_ready(campaign, members, invalid_member_ids=None):
-    required = get_required_players(campaign)
-    relevant_members = active_party_members(members)[:required]
-    return len(relevant_members) >= required and all(
+    party = resolve_readiness_party(campaign, members)
+    if party["mode"] == "automation_roster":
+        if party["required"] <= 0 or len(party["members"]) < party["required"]:
+            return False
+        return all(
+            member_is_ready(member, invalid_member_ids)
+            for member in party["members"]
+        )
+    required = party["required"]
+    return len(party["members"]) >= required and all(
         member_is_ready(member, invalid_member_ids)
-        for member in relevant_members
+        for member in party["members"]
     )
 
 
@@ -244,16 +327,42 @@ def can_start_session(campaign, clean_ready_states=True):
         clear_invalid_ready_states(members)
     else:
         invalid_member_ids = invalid_ready_member_ids(members)
-    required = get_required_players(campaign)
-    return all_members_ready(campaign, members, invalid_member_ids), {
-        'required_players': required,
-        'ready_players': sum(
+
+    party = resolve_readiness_party(campaign, members)
+    if party["mode"] == "automation_roster":
+        required = party["required"]
+        ready_count = sum(
             1
-            for member in active_party_members(members)[:required]
+            for member in party["members"]
             if member_is_ready(member, invalid_member_ids)
-        ),
-        'members': [member_planning_dict(member, invalid_member_ids) for member in members],
-    }
+        )
+        ready = (
+            required > 0
+            and len(party["members"]) == required
+            and all(member_is_ready(member, invalid_member_ids) for member in party["members"])
+        )
+        diagnostics = {
+            'required_players': required,
+            'ready_players': ready_count,
+            'members': [member_planning_dict(member, invalid_member_ids) for member in members],
+            'readiness_mode': 'automation_roster',
+            'readiness_user_ids': party["user_ids"],
+            'missing_readiness_user_ids': party["missing_user_ids"],
+        }
+    else:
+        required = party["required"]
+        ready = all_members_ready(campaign, members, invalid_member_ids)
+        diagnostics = {
+            'required_players': required,
+            'ready_players': sum(
+                1
+                for member in party["members"]
+                if member_is_ready(member, invalid_member_ids)
+            ),
+            'members': [member_planning_dict(member, invalid_member_ids) for member in members],
+            'readiness_mode': 'interactive',
+        }
+    return ready, diagnostics
 
 
 def recent_planning_messages(campaign_id, per_user=8):
@@ -281,9 +390,12 @@ def planning_context(campaign, current_user=None, clean_ready_states=True):
         PlanningBondProposal.created_at.asc(),
     ).all()
 
+    party = resolve_readiness_party(campaign, members)
+    required = party["required"]
+
     context = {
         'campaign': campaign.to_dict(),
-        'required_players': get_required_players(campaign),
+        'required_players': required,
         'members': [member_planning_dict(member, invalid_member_ids) for member in members],
         'characters': [character_full_dict(character) for character in characters],
         'summary': summary_dict_for_read(campaign.id, include_private=True),
@@ -442,16 +554,25 @@ def visible_planning_payload(campaign, current_user, clean_ready_states=True):
         if current_user.id in data['involved_user_ids'] or bond.status == 'confirmed':
             user_bonds.append(data)
 
-    required = get_required_players(campaign)
+    party = resolve_readiness_party(campaign, members)
+    required = party["required"]
+    party_full = party_is_full(campaign, members)
+    all_ready = all_members_ready(campaign, members, invalid_member_ids)
+
     draft_patch, draft_patch_event_id = accumulated_planning_draft_patch(campaign.id, current_user.id)
-    return {
+    payload = {
         'required_players': required,
-        'party_full': party_is_full(campaign, members),
-        'all_ready': all_members_ready(campaign, members, invalid_member_ids),
+        'party_full': party_full,
+        'all_ready': all_ready,
         'members': [member_planning_dict(member, invalid_member_ids) for member in members],
         'summary': summary_dict_for_read(campaign.id, include_private=False, current_user_id=current_user.id),
         'messages': [message.to_dict() for message in messages],
         'bonds': user_bonds,
         'draft_patch': draft_patch,
         'draft_patch_event_id': draft_patch_event_id,
+        'readiness_mode': party["mode"],
     }
+    if party["mode"] == "automation_roster":
+        payload['readiness_user_ids'] = party["user_ids"]
+        payload['missing_readiness_user_ids'] = party["missing_user_ids"]
+    return payload

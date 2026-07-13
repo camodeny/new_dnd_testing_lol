@@ -565,6 +565,10 @@ def execute_run(args, run_id):
     try:
         session_on_start, _ = ensure_campaign_initialized(args, claim_payload)
     except Exception as exc:
+        details = str(exc).strip()
+        error_text = 'campaign_not_initialized'
+        if details and details != error_text:
+            error_text = f'{error_text}: {details}'
         complete_run(
             args.api_base,
             args.owner_api_key,
@@ -572,7 +576,7 @@ def execute_run(args, run_id):
             args.worker_id,
             lease_token,
             status='failed',
-            error_text='campaign_not_initialized',
+            error_text=error_text,
             dedupe_key=f'run_completed:{run_id}:init-failed',
         )
         raise exc

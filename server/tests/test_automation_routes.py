@@ -3150,5 +3150,195 @@ class AutomationRouteTest(unittest.TestCase):
             self.assertEqual(snapshot_roster[0]['character_name'], 'Original Name')
 
 
+    def test_automation_readiness_scenarios(self):
+        from models import Campaign, CampaignMember, Character, AutomationRun, AutomationSnapshot, User
+        from services.planning_service import can_start_session, all_members_ready, party_is_full
+
+        with app.app_context():
+            owner = db.session.get(User, self.owner_id)
+
+            # Test regular campaign behaves according to interactive rules
+            regular_campaign = Campaign(
+                name="Regular Campaign",
+                user_id=owner.id,
+                settings=json.dumps({'required_players': 2})
+            )
+            db.session.add(regular_campaign)
+            db.session.flush()
+
+            owner_member = CampaignMember(campaign_id=regular_campaign.id, user_id=owner.id, role='player')
+            db.session.add(owner_member)
+            db.session.flush()
+
+            self.assertFalse(party_is_full(regular_campaign, [owner_member]))
+            ready, details = can_start_session(regular_campaign)
+            self.assertFalse(ready)
+            self.assertEqual(details['readiness_mode'], 'interactive')
+
+            # Setup automation scenario players
+            u1 = User(username='auto_player_1', email='ap1@test.com')
+            u1.set_password('password')
+            u2 = User(username='auto_player_2', email='ap2@test.com')
+            u2.set_password('password')
+            db.session.add_all([u1, u2])
+            db.session.flush()
+
+            clone_campaign = Campaign(
+                name="Automation Campaign [Clone]",
+                user_id=owner.id,
+                is_automation_clone=True,
+                automation_source_run_id=9999,
+                settings=json.dumps({'required_players': 2})
+            )
+            db.session.add(clone_campaign)
+            db.session.flush()
+
+            c1 = Character(user_id=u1.id, name="Hero 1", race="Human", campaign_id=clone_campaign.id)
+            c2 = Character(user_id=u2.id, name="Hero 2", race="Elf", campaign_id=clone_campaign.id)
+            db.session.add_all([c1, c2])
+            db.session.flush()
+
+            frozen_roster = [
+                {'user_id': u1.id, 'character_id': c1.id, 'character_name': c1.name},
+                {'user_id': u2.id, 'character_id': c2.id, 'character_name': c2.name}
+            ]
+
+            snapshot = AutomationSnapshot(
+                scenario_id=1,
+                source_campaign_id=1,
+                label='test snapshot',
+                snapshot_json={'roster': frozen_roster}
+            )
+            db.session.add(snapshot)
+            db.session.flush()
+
+            run = AutomationRun(
+                scenario_id=1,
+                snapshot_id=snapshot.id,
+                user_id=owner.id,
+                status='queued'
+            )
+            db.session.add(run)
+            db.session.flush()
+
+            clone_campaign.automation_source_run_id = run.id
+            run.derived_campaign_id = clone_campaign.id
+
+            owner_cloned = CampaignMember(
+                campaign_id=clone_campaign.id,
+                user_id=owner.id,
+                role='player',
+                selected_character_id=None,
+                character_ready_at=None
+            )
+            m1 = CampaignMember(
+                campaign_id=clone_campaign.id,
+                user_id=u1.id,
+                role='player',
+                selected_character_id=c1.id,
+                character_ready_at=utcnow()
+            )
+            m2 = CampaignMember(
+                campaign_id=clone_campaign.id,
+                user_id=u2.id,
+                role='player',
+                selected_character_id=c2.id,
+                character_ready_at=utcnow()
+            )
+            db.session.add_all([owner_cloned, m1, m2])
+            db.session.commit()
+
+            # Case 1: Unready owner does not block (ready is True)
+            members = [owner_cloned, m1, m2]
+            self.assertTrue(party_is_full(clone_campaign, members))
+            self.assertTrue(all_members_ready(clone_campaign, members))
+            ready, details = can_start_session(clone_campaign)
+            self.assertTrue(ready)
+            self.assertEqual(details['readiness_mode'], 'automation_roster')
+            self.assertEqual(details['required_players'], 2)
+            self.assertEqual(details['ready_players'], 2)
+            self.assertEqual(details['readiness_user_ids'], [u1.id, u2.id])
+            self.assertEqual(details['missing_readiness_user_ids'], [])
+
+            # Case 2: Non-roster owner does not count
+            owner_cloned.selected_character_id = 999
+            owner_cloned.character_ready_at = utcnow()
+            m2.selected_character_id = None
+            m2.character_ready_at = None
+            db.session.commit()
+
+            ready, details = can_start_session(clone_campaign)
+            self.assertFalse(ready)
+            self.assertEqual(details['ready_players'], 1)
+
+            # Case 3: Unready roster member blocks
+            owner_cloned.selected_character_id = None
+            owner_cloned.character_ready_at = None
+            db.session.commit()
+            ready, details = can_start_session(clone_campaign)
+            self.assertFalse(ready)
+
+            # Case 4: Every roster member is required
+            u3 = User(username='auto_player_3', email='ap3@test.com')
+            u3.set_password('password')
+            db.session.add(u3)
+            db.session.flush()
+            m2.selected_character_id = c2.id
+            m2.character_ready_at = utcnow()
+            
+            frozen_roster_3 = [
+                {'user_id': u1.id, 'character_id': c1.id, 'character_name': c1.name},
+                {'user_id': u2.id, 'character_id': c2.id, 'character_name': c2.name},
+                {'user_id': u3.id, 'character_id': None, 'character_name': 'Hero 3'}
+            ]
+            snapshot.snapshot_json = {'roster': frozen_roster_3}
+            m3 = CampaignMember(
+                campaign_id=clone_campaign.id,
+                user_id=u3.id,
+                role='player',
+                selected_character_id=None,
+                character_ready_at=None
+            )
+            db.session.add(m3)
+            db.session.commit()
+
+            ready, details = can_start_session(clone_campaign)
+            self.assertFalse(ready)
+            self.assertEqual(details['required_players'], 3)
+            self.assertEqual(details['ready_players'], 2)
+
+            # Case 5: Missing cloned roster member fails closed
+            db.session.delete(m3)
+            db.session.commit()
+            self.assertFalse(party_is_full(clone_campaign, [owner_cloned, m1, m2]))
+            ready, details = can_start_session(clone_campaign)
+            self.assertFalse(ready)
+            self.assertIn(u3.id, details['missing_readiness_user_ids'])
+
+            # Case 6: Non-roster members are ignored
+            snapshot.snapshot_json = {'roster': frozen_roster}
+            extra_user = User(username='extra_player', email='ep@test.com')
+            extra_user.set_password('password')
+            db.session.add(extra_user)
+            db.session.flush()
+            m_extra = CampaignMember(
+                campaign_id=clone_campaign.id,
+                user_id=extra_user.id,
+                role='player',
+                selected_character_id=None,
+                character_ready_at=None
+            )
+            db.session.add(m_extra)
+            db.session.commit()
+
+            self.assertTrue(party_is_full(clone_campaign, [owner_cloned, m1, m2, m_extra]))
+            ready, details = can_start_session(clone_campaign)
+            self.assertTrue(ready)
+            self.assertEqual(details['required_players'], 2)
+            self.assertEqual(details['ready_players'], 2)
+            
+            db.session.rollback()
+
+
 if __name__ == '__main__':
     unittest.main()
