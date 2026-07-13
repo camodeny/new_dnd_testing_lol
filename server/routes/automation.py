@@ -984,11 +984,23 @@ def heartbeat_automation_run(current_user, run_id):
     if worker_id:
         record_worker_activity(worker_id, api_base=api_base, is_heartbeat=True)
 
+    lease_seconds = data.get('lease_seconds')
+    if lease_seconds is not None:
+        try:
+            lease_seconds = int(lease_seconds)
+        except (TypeError, ValueError):
+            return jsonify({'error': 'lease_seconds must be an integer'}), 400
+        if lease_seconds < 15:
+            lease_seconds = 15
+        elif lease_seconds > 3600:
+            lease_seconds = 3600
+
     try:
         heartbeat_run(
             run,
             worker_id=worker_id,
             lease_token=data.get('lease_token'),
+            lease_seconds=lease_seconds,
         )
         if api_base:
             run.worker_api_base = api_base
