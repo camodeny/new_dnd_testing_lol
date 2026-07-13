@@ -22,6 +22,10 @@ from routes.world import world_bp
 from routes.shops import shops_bp
 
 load_dotenv()
+llm_campaign_env = os.environ.get('LLM_CAMPAIGN_ENV_FILE')
+if llm_campaign_env and os.path.exists(llm_campaign_env):
+    load_dotenv(llm_campaign_env)
+
 
 
 def create_app():
@@ -91,8 +95,48 @@ def create_app():
     with app.app_context():
         db.create_all()
         ensure_lightweight_schema()
+        bootstrap_owner_api_key()
 
     return app
+
+
+def bootstrap_owner_api_key():
+    """Ensure that the DND_OWNER_API_KEY from environment is registered in the database on startup."""
+    owner_key = os.environ.get('DND_OWNER_API_KEY')
+    if not owner_key:
+        return
+
+    from models import User, UserAutomationKey
+    from werkzeug.security import generate_password_hash
+
+    prefix = owner_key[:24]
+    existing_key = UserAutomationKey.query.filter_by(api_key_prefix=prefix).first()
+    if existing_key:
+        return
+
+    # Check if we have an owner/admin user
+    username = 'owner'
+    owner_user = User.query.filter_by(username=username).first()
+    if not owner_user:
+        import secrets
+        owner_user = User(
+            username=username,
+            email='owner@pendergrass-sso.local',
+        )
+        owner_user.set_password(secrets.token_urlsafe(32))
+        db.session.add(owner_user)
+        db.session.flush()
+
+    # Register the automation key for this user
+    automation_key = UserAutomationKey(
+        user_id=owner_user.id,
+        label='deploy-host',
+        api_key_hash=generate_password_hash(owner_key),
+        api_key_prefix=prefix,
+    )
+    db.session.add(automation_key)
+    db.session.commit()
+    print(f"Bootstrapped owner API key prefix: {prefix} for user: {username}", flush=True)
 
 
 def ensure_lightweight_schema():
@@ -273,3 +317,6 @@ if __name__ == '__main__':
     port = int(os.environ.get('PORT', 5889))
     debug = os.environ.get('FLASK_DEBUG', 'true').lower() == 'true'
     app.run(debug=debug, host='0.0.0.0', port=port)
+
+
+
