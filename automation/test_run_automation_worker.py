@@ -847,6 +847,88 @@ class RunAutomationWorkerTests(unittest.TestCase):
             )
 
 
+    def test_execute_run_initialization_failure_with_api_error_details(self):
+        args = SimpleNamespace(
+            api_base='http://127.0.0.1:5889',
+            owner_api_key='owner-key',
+            worker_id='test-worker',
+            max_turns=5,
+            max_minutes=1.0,
+            poll_interval=0.1,
+            idle_timeout=1.0,
+            heartbeat_interval=1.0,
+            dm_response_timeout=1.0,
+            message_window=10,
+        )
+        claim_payload = {
+            'run': {'id': 123, 'attempt_count': 1, 'completed_turns': 0},
+            'lease_token': 'lease-token-123',
+            'derived_campaign': {'id': 100003},
+            'latest_session': {
+                'id': 44,
+                'is_active': True,
+                'messages': [],
+            },
+        }
+        from llm_campaign_common import ApiError
+        with patch.object(worker, 'claim_run', return_value=claim_payload) as mock_claim, \
+             patch.object(worker, 'ensure_campaign_initialized', side_effect=ApiError("POST /api/campaigns/4/sessions -> HTTP 400: Every party member must select and ready a character before starting a session")), \
+             patch.object(worker, 'complete_run') as mock_complete:
+            with self.assertRaises(ApiError):
+                worker.execute_run(args, 123)
+            
+            mock_complete.assert_called_once_with(
+                'http://127.0.0.1:5889',
+                'owner-key',
+                123,
+                'test-worker',
+                'lease-token-123',
+                status='failed',
+                error_text='campaign_not_initialized: POST /api/campaigns/4/sessions -> HTTP 400: Every party member must select and ready a character before starting a session',
+                dedupe_key='run_completed:123:init-failed'
+            )
+
+    def test_execute_run_initialization_failure_empty_details(self):
+        args = SimpleNamespace(
+            api_base='http://127.0.0.1:5889',
+            owner_api_key='owner-key',
+            worker_id='test-worker',
+            max_turns=5,
+            max_minutes=1.0,
+            poll_interval=0.1,
+            idle_timeout=1.0,
+            heartbeat_interval=1.0,
+            dm_response_timeout=1.0,
+            message_window=10,
+        )
+        claim_payload = {
+            'run': {'id': 123, 'attempt_count': 1, 'completed_turns': 0},
+            'lease_token': 'lease-token-123',
+            'derived_campaign': {'id': 100003},
+            'latest_session': {
+                'id': 44,
+                'is_active': True,
+                'messages': [],
+            },
+        }
+        with patch.object(worker, 'claim_run', return_value=claim_payload) as mock_claim, \
+             patch.object(worker, 'ensure_campaign_initialized', side_effect=RuntimeError("")), \
+             patch.object(worker, 'complete_run') as mock_complete:
+            with self.assertRaises(RuntimeError):
+                worker.execute_run(args, 123)
+            
+            mock_complete.assert_called_once_with(
+                'http://127.0.0.1:5889',
+                'owner-key',
+                123,
+                'test-worker',
+                'lease-token-123',
+                status='failed',
+                error_text='campaign_not_initialized',
+                dedupe_key='run_completed:123:init-failed'
+            )
+
+
     def test_default_worker_id_includes_hostname_pid_and_nonce(self):
         wid = worker.default_worker_id()
         parts = wid.split('-')
