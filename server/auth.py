@@ -9,6 +9,7 @@ from urllib.parse import parse_qsl, urlencode, urljoin, urlsplit, urlunsplit
 
 import jwt
 from flask import Blueprint, current_app, g, has_request_context, jsonify, redirect, request
+from sqlalchemy.exc import SQLAlchemyError
 from werkzeug.security import check_password_hash, generate_password_hash
 
 from models import AuthSession, LLMPlayer, User, UserAutomationKey, db
@@ -22,6 +23,7 @@ SESSION_LIFETIME_DAYS = 30
 OAUTH_STATE_LIFETIME_MINUTES = 10
 SSO_PROVIDER_NAME = 'pendergrass_sso'
 LOOPBACK_HOSTNAMES = {'localhost', '127.0.0.1', '::1'}
+API_KEY_LAST_USED_WRITE_INTERVAL_SECONDS = 300
 
 
 def generate_token(user_id):
@@ -42,6 +44,27 @@ def token_required(f):
 
         return f(current_user, *args, **kwargs)
     return decorated
+
+
+def _touch_api_key_last_used(key):
+    """Best-effort, throttled usage tracking that must never fail authentication."""
+    now = utcnow()
+    write_interval_seconds = current_app.config.get(
+        'API_KEY_LAST_USED_WRITE_INTERVAL_SECONDS',
+        API_KEY_LAST_USED_WRITE_INTERVAL_SECONDS,
+    )
+    if key.last_used_at and now - key.last_used_at < timedelta(seconds=write_interval_seconds):
+        return
+
+    key.last_used_at = now
+    try:
+        db.session.commit()
+    except SQLAlchemyError:
+        db.session.rollback()
+        current_app.logger.warning(
+            'Unable to update API key last_used_at; continuing authentication.',
+            exc_info=True,
+        )
 
 
 def _extract_bearer_token():
@@ -174,8 +197,7 @@ def _authenticate_api_key(api_key):
             current_user = llm_player.user
             if not current_user:
                 return None, jsonify({'error': 'User not found'}), 401
-            llm_player.last_used_at = utcnow()
-            db.session.commit()
+            _touch_api_key_last_used(llm_player)
             g.auth_mode = 'api_key'
             g.llm_player = llm_player
             g.automation_key = None
@@ -188,8 +210,7 @@ def _authenticate_api_key(api_key):
             current_user = automation_key.user
             if not current_user:
                 return None, jsonify({'error': 'User not found'}), 401
-            automation_key.last_used_at = utcnow()
-            db.session.commit()
+            _touch_api_key_last_used(automation_key)
             g.auth_mode = 'api_key'
             g.llm_player = None
             g.automation_key = automation_key
