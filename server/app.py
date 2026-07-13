@@ -108,6 +108,7 @@ def bootstrap_owner_api_key():
 
     from models import User, UserAutomationKey
     from werkzeug.security import generate_password_hash
+    from sqlalchemy.exc import IntegrityError
 
     prefix = owner_key[:24]
     existing_key = UserAutomationKey.query.filter_by(api_key_prefix=prefix).first()
@@ -125,7 +126,14 @@ def bootstrap_owner_api_key():
         )
         owner_user.set_password(secrets.token_urlsafe(32))
         db.session.add(owner_user)
-        db.session.flush()
+        try:
+            db.session.commit()
+        except IntegrityError:
+            db.session.rollback()
+            # If insert failed, another worker probably inserted it concurrently.
+            owner_user = User.query.filter_by(username=username).first()
+            if not owner_user:
+                return
 
     # Register the automation key for this user
     automation_key = UserAutomationKey(
@@ -135,8 +143,14 @@ def bootstrap_owner_api_key():
         api_key_prefix=prefix,
     )
     db.session.add(automation_key)
-    db.session.commit()
-    print(f"Bootstrapped owner API key prefix: {prefix} for user: {username}", flush=True)
+    try:
+        db.session.commit()
+        print(f"Bootstrapped owner API key prefix: {prefix} for user: {username}", flush=True)
+    except IntegrityError:
+        db.session.rollback()
+        # Key was already inserted by another worker
+        pass
+
 
 
 def ensure_lightweight_schema():
