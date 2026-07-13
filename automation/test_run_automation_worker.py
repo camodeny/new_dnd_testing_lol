@@ -1,5 +1,6 @@
 import os
 import sys
+import time
 import unittest
 from types import SimpleNamespace
 from unittest.mock import Mock, patch
@@ -179,6 +180,7 @@ class RunAutomationWorkerTests(unittest.TestCase):
             return next(monotonic_values, 500.2)
 
         with patch.object(worker, 'claim_run', return_value=claim_payload), \
+                patch.object(worker, 'heartbeat', return_value={'run': {'lease_token': 'lease-1'}}), \
                 patch.object(worker, 'build_manifest_for_run', return_value={'campaign': {'id': 100003}}), \
                 patch.object(worker, 'append_event'), \
                 patch.object(worker, 'request_overseer_decision', return_value={'action': 'choose_player', 'llm_player_id': 33}), \
@@ -632,6 +634,7 @@ class RunAutomationWorkerTests(unittest.TestCase):
         monotonic_iter = iter(monotonic_values)
 
         with patch.object(worker, 'claim_run', return_value=claim_payload), \
+                patch.object(worker, 'heartbeat', return_value={'run': {'lease_token': 'lease-1'}}), \
                 patch.object(worker, 'build_manifest_for_run', return_value={'campaign': {'id': 100003}}), \
                 patch.object(worker, 'append_event'), \
                 patch.object(worker, 'request_overseer_decision', return_value={'action': 'choose_player', 'llm_player_id': 33}), \
@@ -816,6 +819,7 @@ class RunAutomationWorkerTests(unittest.TestCase):
             poll_interval=0.1,
             idle_timeout=1.0,
             heartbeat_interval=1.0,
+            init_lease_seconds=900,
             dm_response_timeout=1.0,
             message_window=10,
         )
@@ -830,6 +834,7 @@ class RunAutomationWorkerTests(unittest.TestCase):
             },
         }
         with patch.object(worker, 'claim_run', return_value=claim_payload) as mock_claim, \
+             patch.object(worker, 'heartbeat', return_value={'run': {'lease_token': 'lease-token-123'}}), \
              patch.object(worker, 'api_get', return_value={'world': {'world_state': {}}}), \
              patch.object(worker, 'complete_run') as mock_complete:
             with self.assertRaises(RuntimeError):
@@ -857,6 +862,7 @@ class RunAutomationWorkerTests(unittest.TestCase):
             poll_interval=0.1,
             idle_timeout=1.0,
             heartbeat_interval=1.0,
+            init_lease_seconds=900,
             dm_response_timeout=1.0,
             message_window=10,
         )
@@ -872,6 +878,7 @@ class RunAutomationWorkerTests(unittest.TestCase):
         }
         from llm_campaign_common import ApiError
         with patch.object(worker, 'claim_run', return_value=claim_payload) as mock_claim, \
+             patch.object(worker, 'heartbeat', return_value={'run': {'lease_token': 'lease-token-123'}}), \
              patch.object(worker, 'ensure_campaign_initialized', side_effect=ApiError("POST /api/campaigns/4/sessions -> HTTP 400: Every party member must select and ready a character before starting a session")), \
              patch.object(worker, 'complete_run') as mock_complete:
             with self.assertRaises(ApiError):
@@ -898,6 +905,7 @@ class RunAutomationWorkerTests(unittest.TestCase):
             poll_interval=0.1,
             idle_timeout=1.0,
             heartbeat_interval=1.0,
+            init_lease_seconds=900,
             dm_response_timeout=1.0,
             message_window=10,
         )
@@ -912,6 +920,7 @@ class RunAutomationWorkerTests(unittest.TestCase):
             },
         }
         with patch.object(worker, 'claim_run', return_value=claim_payload) as mock_claim, \
+             patch.object(worker, 'heartbeat', return_value={'run': {'lease_token': 'lease-token-123'}}), \
              patch.object(worker, 'ensure_campaign_initialized', side_effect=RuntimeError("")), \
              patch.object(worker, 'complete_run') as mock_complete:
             with self.assertRaises(RuntimeError):
@@ -957,6 +966,230 @@ class RunAutomationWorkerTests(unittest.TestCase):
         result = worker.resolve_worker_id(None, 'DND_AUTOMATION_WORKER_ID')
         self.assertTrue(result.startswith('automation-'))
         self.assertNotEqual(result, '')
+
+
+    def test_execute_run_initialization_lease_covers_window_when_heartbeat_blocked(self):
+        args = SimpleNamespace(
+            api_base='http://127.0.0.1:5889',
+            owner_api_key='owner-key',
+            worker_id='test-worker',
+            max_turns=5,
+            max_minutes=1.0,
+            poll_interval=0.01,
+            idle_timeout=1.0,
+            heartbeat_interval=0.01,
+            init_lease_seconds=900,
+            dm_response_timeout=1.0,
+            message_window=10,
+        )
+        claim_payload = {
+            'run': {'id': 123, 'attempt_count': 1, 'completed_turns': 0},
+            'lease_token': 'lease-token-123',
+            'derived_campaign': {'id': 100003},
+            'latest_session': None,
+            'gameplay_readiness': {
+                'world_present': False,
+                'active_session_present': False,
+                'opening_dm_present': False,
+                'campaign_ready': False,
+            },
+        }
+
+        # The first call (initial long-lease heartbeat) succeeds.  Subsequent
+        # calls from the background thread (which carry lease_seconds) fail to
+        # model the single-threaded SQLite deployment where the server cannot
+        # service heartbeats during world generation.  Main-loop heartbeats
+        # (no lease_seconds) must succeed so the run loop can exit cleanly.
+        first_heartbeat = [True]
+        def heartbeat_side_effect(*a, **kw):
+            if first_heartbeat[0]:
+                first_heartbeat[0] = False
+                return {'run': {'lease_token': 'lease-token-123'}}
+            if kw.get('lease_seconds') is not None:
+                raise worker.ApiError('POST /heartbeat -> timed out')
+            return {'run': {'lease_token': 'lease-token-123'}}
+
+        init_delay = 0.15
+
+        def slow_ensure(args, claim_payload, **kw):
+            time.sleep(init_delay)
+            session = {
+                'id': 44,
+                'is_active': True,
+                'messages': [{'id': 101, 'role': 'dm', 'content': 'Opening scene.'}],
+            }
+            claim_payload['latest_session'] = session
+            return session, {'world': {'world_state': {}}}
+
+        with patch.object(worker, 'claim_run', return_value=claim_payload), \
+             patch.object(worker, 'heartbeat', side_effect=heartbeat_side_effect) as mock_heartbeat, \
+             patch.object(worker, 'ensure_campaign_initialized', side_effect=slow_ensure), \
+             patch.object(worker, 'build_manifest_for_run', return_value={'session': {'id': 44}, 'llm_players': [], 'campaign': {}, 'owner': {}, 'api_base': ''}), \
+             patch.object(worker, 'append_event'), \
+             patch.object(worker, 'fetch_run', return_value={'run': {'status': 'stop_requested'}}), \
+             patch.object(worker, 'complete_run') as mock_complete:
+            worker.execute_run(args, 123)
+
+        first_call_kwargs = mock_heartbeat.call_args_list[0][1]
+        self.assertEqual(
+            first_call_kwargs.get('lease_seconds'), 900,
+            'Initial heartbeat must carry lease_seconds=args.init_lease_seconds before initialization',
+        )
+        self.assertNotEqual(
+            mock_complete.call_args[1].get('status'),
+            'failed',
+            msg='Run must not fail when background heartbeats are blocked, '
+            'because the initial long lease covers the initialization window',
+        )
+
+    def test_start_session_polls_on_generation_in_progress(self):
+        from llm_campaign_common import start_session, ApiError
+
+        session = {'id': 55, 'is_active': True, 'messages': []}
+        get_call_count = [0]
+        world_check_count = [0]
+
+        def mock_get(base, path, **kwargs):
+            if '/sessions' in path and 'campaigns' in path:
+                get_call_count[0] += 1
+                if get_call_count[0] == 1:
+                    return {'sessions': []}
+                return {'sessions': [session]}
+            if '/world' in path:
+                world_check_count[0] += 1
+                return {'generation_in_progress': True}
+            return {}
+
+        def mock_post(base, path, payload=None, **kwargs):
+            raise ApiError(
+                'POST /api/campaigns/42/sessions -> HTTP 409: '
+                '{"error": "Campaign world generation is already in progress", '
+                '"generation_in_progress": true}'
+            )
+
+        with patch('llm_campaign_common.api_get', side_effect=mock_get), \
+             patch('llm_campaign_common.api_post', side_effect=mock_post), \
+             patch('llm_campaign_common.time.sleep'), \
+             patch('llm_campaign_common.default_session_start_timeout', return_value=5):
+            result = start_session(
+                'http://127.0.0.1:5889', 42, api_key='key',
+                timeout=5, poll_interval=0.01,
+            )
+
+        self.assertEqual(
+            result, session,
+            'Worker must poll for the active session when world generation is in progress, '
+            'rather than raising a terminal error',
+        )
+        self.assertGreaterEqual(
+            get_call_count[0], 2,
+            'Must make multiple GET calls to poll for session to appear',
+        )
+
+    def test_start_session_polls_and_retries_when_world_done_but_no_session(self):
+        from llm_campaign_common import start_session, ApiError
+
+        session = {'id': 66, 'is_active': True, 'messages': []}
+        call_plan = [
+            ('get', '/campaigns/42/sessions', {'sessions': []}),           # find_active_session (first)
+            ('post', '/campaigns/42/sessions', ApiError('HTTP 409: generation_in_progress')),  # POST fails
+            ('get', '/campaigns/42/sessions', {'sessions': []}),           # find_active_session (poll)
+            ('get', '/campaigns/42/world', {'generation_in_progress': False}),  # world done!
+            ('post', '/campaigns/42/sessions', {'session': session}),       # retry POST succeeds
+        ]
+        step = [0]
+
+        def mock_get(base, path, **kwargs):
+            while step[0] < len(call_plan):
+                kind, url_fragment, result = call_plan[step[0]]
+                if kind == 'get' and url_fragment in path:
+                    step[0] += 1
+                    return result
+                break
+            return {}
+
+        def mock_post(base, path, payload=None, **kwargs):
+            while step[0] < len(call_plan):
+                kind, url_fragment, result = call_plan[step[0]]
+                if kind == 'post' and url_fragment in path:
+                    step[0] += 1
+                    if isinstance(result, ApiError):
+                        raise result
+                    return result
+                break
+            raise ApiError('POST /campaigns/42/sessions -> unexpected call')
+
+        with patch('llm_campaign_common.api_get', side_effect=mock_get), \
+             patch('llm_campaign_common.api_post', side_effect=mock_post), \
+             patch('llm_campaign_common.time.sleep'), \
+             patch('llm_campaign_common.default_session_start_timeout', return_value=5):
+            result = start_session(
+                'http://127.0.0.1:5889', 42, api_key='key',
+                timeout=5, poll_interval=0.01,
+            )
+
+        self.assertEqual(
+            result, session,
+            'Worker must retry session creation when world generation completes '
+            'but no active session has appeared',
+        )
+
+
+    def test_start_session_reraises_unexpected_error_from_retry_post(self):
+        from llm_campaign_common import start_session, ApiError
+
+        call_plan = [
+            ('get', '/campaigns/42/sessions', {'sessions': []}),
+            ('post', '/campaigns/42/sessions', ApiError('HTTP 409: generation_in_progress')),
+            ('get', '/campaigns/42/sessions', {'sessions': []}),
+            ('get', '/campaigns/42/world', {'generation_in_progress': False}),
+            ('post', '/campaigns/42/sessions', ApiError('HTTP 500: Internal Server Error')),
+        ]
+        step = [0]
+
+        def mock_get(base, path, **kwargs):
+            while step[0] < len(call_plan):
+                kind, url_fragment, result = call_plan[step[0]]
+                if kind == 'get' and url_fragment in path:
+                    step[0] += 1
+                    return result
+                break
+            return {}
+
+        def mock_post(base, path, payload=None, **kwargs):
+            while step[0] < len(call_plan):
+                kind, url_fragment, result = call_plan[step[0]]
+                if kind == 'post' and url_fragment in path:
+                    step[0] += 1
+                    if isinstance(result, ApiError):
+                        raise result
+                    return result
+                break
+            raise ApiError('POST /campaigns/42/sessions -> unexpected call')
+
+        with patch('llm_campaign_common.api_get', side_effect=mock_get), \
+             patch('llm_campaign_common.api_post', side_effect=mock_post), \
+             patch('llm_campaign_common.time.sleep'), \
+             patch('llm_campaign_common.default_session_start_timeout', return_value=5):
+            with self.assertRaises(ApiError):
+                start_session(
+                    'http://127.0.0.1:5889', 42, api_key='key',
+                    timeout=5, poll_interval=0.01,
+                )
+
+    def test_world_generation_is_in_progress_passes_owner_token(self):
+        from llm_campaign_common import world_generation_is_in_progress
+
+        with patch('llm_campaign_common.api_get', return_value={'generation_in_progress': True}) as mock_get:
+            result = world_generation_is_in_progress(
+                'http://127.0.0.1:5889', 42, owner_token='owner-tok', api_key='key',
+            )
+
+        self.assertTrue(result)
+        mock_get.assert_called_once_with(
+            'http://127.0.0.1:5889', '/api/campaigns/42/world',
+            owner_token='owner-tok', api_key='key',
+        )
 
 
 if __name__ == '__main__':

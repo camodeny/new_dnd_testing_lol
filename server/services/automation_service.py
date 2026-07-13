@@ -1921,11 +1921,12 @@ def claim_run_for_worker(run, worker_id):
     }
 
 
-def heartbeat_run(run, *, worker_id=None, lease_token=None):
+def heartbeat_run(run, *, worker_id=None, lease_token=None, lease_seconds=None):
     ensure_worker_lease(run, worker_id=worker_id, lease_token=lease_token)
     now = _utcnow()
     run.heartbeat_at = now
-    run.lease_expires_at = now + timedelta(seconds=lease_seconds_for_run(run))
+    duration = lease_seconds if lease_seconds is not None else lease_seconds_for_run(run)
+    run.lease_expires_at = now + timedelta(seconds=duration)
     run.updated_at = now
     db.session.commit()
     return run

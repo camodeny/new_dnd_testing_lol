@@ -3,6 +3,7 @@ import argparse
 import os
 import socket
 import sys
+import threading
 import time
 import uuid
 from datetime import datetime, timezone
@@ -36,6 +37,8 @@ def parse_args():
     parser.add_argument('--model', default=os.environ.get('OPENCODE_GO_MODEL') or os.environ.get('OPENCODE_MODEL') or os.environ.get('OPENROUTER_MODEL') or '')
     parser.add_argument('--opencode-server', default=None, help='Unused compatibility flag')
     parser.add_argument('--opencode-password', default=None, help='Unused compatibility flag')
+    parser.add_argument('--init-lease-seconds', type=float, default=float(os.environ.get('DND_INIT_LEASE_SECONDS', '900')), help='Lease duration (seconds) used during campaign initialization before run_started is recorded')
+    parser.add_argument('--session-start-timeout', type=float, default=float(os.environ.get('DND_AUTO_SESSION_START_TIMEOUT', '900')), help='Timeout (seconds) for the session-start POST and subsequent polling during campaign initialization')
     parser.add_argument('--once', action='store_true', help='Claim and execute at most one run, then exit')
     return parser.parse_args()
 
@@ -88,11 +91,14 @@ def claim_run(api_base, owner_api_key, run_id, worker_id):
     )
 
 
-def heartbeat(api_base, owner_api_key, run_id, worker_id, lease_token):
+def heartbeat(api_base, owner_api_key, run_id, worker_id, lease_token, lease_seconds=None):
+    body = {'worker_id': worker_id, 'lease_token': lease_token, 'api_base': api_base}
+    if lease_seconds is not None:
+        body['lease_seconds'] = lease_seconds
     return api_post(
         api_base,
         f'/api/automation/runs/{run_id}/heartbeat',
-        {'worker_id': worker_id, 'lease_token': lease_token, 'api_base': api_base},
+        body,
         api_key=owner_api_key,
     )
 
@@ -228,7 +234,7 @@ def active_session_from_run_payload(run_payload):
     return (run_payload.get('latest_session') or {}) if isinstance(run_payload.get('latest_session'), dict) else {}
 
 
-def ensure_campaign_initialized(args, claim_payload):
+def ensure_campaign_initialized(args, claim_payload, session_start_timeout=None):
     campaign_id = claim_payload['derived_campaign']['id']
     session = active_session_from_run_payload(claim_payload)
     bootstrapped = False
@@ -237,7 +243,7 @@ def ensure_campaign_initialized(args, claim_payload):
             args.api_base,
             campaign_id,
             api_key=args.owner_api_key,
-            timeout=default_session_start_timeout(),
+            timeout=session_start_timeout or default_session_start_timeout(),
         )
         claim_payload['latest_session'] = session
         bootstrapped = True
@@ -562,9 +568,36 @@ def execute_run(args, run_id):
     claim_payload = claim_run(args.api_base, args.owner_api_key, run_id, args.worker_id)
     run = claim_payload['run']
     lease_token = claim_payload['lease_token']
+
+    # Extend lease to cover the entire initialization window before the first
+    # heartbeat can be serviced (world generation blocks the single request
+    # thread in SQLite deployments).  The background thread below then keeps
+    # it extended as defense-in-depth.
+    init_lease_seconds = getattr(args, 'init_lease_seconds', 900)
+    resp = heartbeat(args.api_base, args.owner_api_key, run_id, args.worker_id, lease_token, lease_seconds=init_lease_seconds)
+    lease_token = (resp.get('run') or {}).get('lease_token') or lease_token
+
+    _init_lease_token = [lease_token]
+    _init_hb_stop = threading.Event()
+
+    def _init_heartbeat_loop():
+        while not _init_hb_stop.is_set():
+            try:
+                resp = heartbeat(args.api_base, args.owner_api_key, run_id, args.worker_id, _init_lease_token[0], lease_seconds=init_lease_seconds)
+                _init_lease_token[0] = (resp.get('run') or {}).get('lease_token') or _init_lease_token[0]
+            except Exception:
+                pass
+            _init_hb_stop.wait(args.heartbeat_interval)
+
+    hb_thread = threading.Thread(target=_init_heartbeat_loop, daemon=True)
+    hb_thread.start()
+
     try:
-        session_on_start, _ = ensure_campaign_initialized(args, claim_payload)
+        session_on_start, _ = ensure_campaign_initialized(args, claim_payload, session_start_timeout=getattr(args, 'session_start_timeout', 900))
     except Exception as exc:
+        _init_hb_stop.set()
+        hb_thread.join(timeout=5)
+        lease_token = _init_lease_token[0]
         details = str(exc).strip()
         error_text = 'campaign_not_initialized'
         if details and details != error_text:
@@ -580,6 +613,10 @@ def execute_run(args, run_id):
             dedupe_key=f'run_completed:{run_id}:init-failed',
         )
         raise exc
+
+    _init_hb_stop.set()
+    hb_thread.join(timeout=5)
+    lease_token = _init_lease_token[0]
     manifest = build_manifest_for_run(args.api_base, args.owner_api_key, claim_payload)
     append_event(
         args.api_base,

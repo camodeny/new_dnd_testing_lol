@@ -134,6 +134,11 @@ def find_active_session(base, campaign_id, owner_token=None, api_key=None):
     return None
 
 
+def world_generation_is_in_progress(base, campaign_id, owner_token=None, api_key=None):
+    payload = api_get(base, f'/api/campaigns/{campaign_id}/world', owner_token=owner_token, api_key=api_key)
+    return payload.get('generation_in_progress', False)
+
+
 def start_session(base, campaign_id, owner_token=None, api_key=None, timeout=None, poll_interval=5):
     timeout = timeout if timeout is not None else default_session_start_timeout()
     active_session = find_active_session(
@@ -155,7 +160,8 @@ def start_session(base, campaign_id, owner_token=None, api_key=None, timeout=Non
             timeout=timeout,
         )['session']
     except ApiError as exc:
-        if 'timed out' not in str(exc):
+        err_str = str(exc)
+        if 'timed out' not in err_str and 'generation_in_progress' not in err_str:
             raise
 
     deadline = time.monotonic() + timeout
@@ -168,6 +174,34 @@ def start_session(base, campaign_id, owner_token=None, api_key=None, timeout=Non
         )
         if active_session:
             return active_session
+
+        # If world generation completed while we were waiting, retry the POST
+        # (the original worker may have died after finishing the world but
+        # before creating the session, leaving no session to discover).
+        if not world_generation_is_in_progress(base, campaign_id, owner_token=owner_token, api_key=api_key):
+            try:
+                return api_post(
+                    base,
+                    f'/api/campaigns/{campaign_id}/sessions',
+                    {},
+                    owner_token=owner_token,
+                    api_key=api_key,
+                    timeout=timeout,
+                )['session']
+            except ApiError as exc2:
+                err_str2 = str(exc2)
+                if 'active session already exists' in err_str2.lower():
+                    active_session = find_active_session(
+                        base,
+                        campaign_id,
+                        owner_token=owner_token,
+                        api_key=api_key,
+                    )
+                    if active_session:
+                        return active_session
+                elif 'generation_in_progress' not in err_str2:
+                    raise
+
         time.sleep(poll_interval)
 
     raise RuntimeError(
