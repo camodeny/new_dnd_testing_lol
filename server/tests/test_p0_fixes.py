@@ -181,7 +181,7 @@ class P0FixesTest(unittest.TestCase):
             'post_turn_status': 'complete',
             'dm_message_id': None,
             'turn_error': 'API limit exceeded',
-        }, False)
+        }, False, None)
 
         # Force immediate exit of loop by having stop_requested
         mock_fetch.side_effect = [
@@ -272,7 +272,7 @@ class P0FixesTest(unittest.TestCase):
             'post_turn_status': 'error',
             'dm_message_id': 411,
             'post_turn_error': 'Failed to compile memory patch',
-        }, False)
+        }, False, None)
 
         # Force immediate exit of loop by having stop_requested
         mock_fetch.side_effect = [

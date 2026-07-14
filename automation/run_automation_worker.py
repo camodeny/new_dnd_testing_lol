@@ -17,6 +17,7 @@ from llm_campaign_common import (
     start_session,
 )
 from provider_client import request_json_decision
+import dm_response_state
 import run_autonomous_llm_campaign as autonomous
 import run_llm_campaign_orchestrator as orchestrator
 
@@ -33,6 +34,10 @@ def parse_args():
     parser.add_argument('--idle-timeout', type=float, default=180.0)
     parser.add_argument('--heartbeat-interval', type=float, default=10.0)
     parser.add_argument('--dm-response-timeout', type=float, default=float(os.environ.get('DND_DM_RESPONSE_TIMEOUT', '300')))
+    _visible_env = os.environ.get('DND_DM_VISIBLE_RESPONSE_TIMEOUT')
+    _post_turn_env = os.environ.get('DND_DM_POST_TURN_TIMEOUT')
+    parser.add_argument('--dm-visible-response-timeout', type=float, default=float(_visible_env) if _visible_env else None)
+    parser.add_argument('--dm-post-turn-timeout', type=float, default=float(_post_turn_env) if _post_turn_env else None)
     parser.add_argument('--message-window', type=int, default=16)
     parser.add_argument('--model', default=os.environ.get('OPENCODE_GO_MODEL') or os.environ.get('OPENCODE_MODEL') or os.environ.get('OPENROUTER_MODEL') or '')
     parser.add_argument('--opencode-server', default=None, help='Unused compatibility flag')
@@ -476,24 +481,57 @@ def request_player_decision(args, manifest, claim_payload, campaign, world_paylo
     )
 
 
+def _check_late_completion(args, manifest, player_message_id, run_id, lease_token, timeout_phase, timeout_error):
+    if timeout_phase != 'post_turn':
+        return
+    try:
+        time.sleep(5.0)
+        final_status = autonomous.fetch_dm_turn_status(manifest, player_message_id)
+        if dm_response_state.dm_turn_post_turn_resolved(final_status):
+            late_evidence = {
+                'automation_run_id': run_id,
+                'player_message_id': player_message_id,
+                'dm_message_id': final_status.get('dm_message_id'),
+                'failure_timestamp': utc_now(),
+                'completion_timestamp': final_status.get('finished_at'),
+                'original_failure_classification': timeout_error,
+                'final_status': final_status.get('status'),
+                'final_post_turn_status': final_status.get('post_turn_status'),
+                'final_memory_status': final_status.get('memory_status'),
+                'final_clock_status': final_status.get('clock_status'),
+            }
+            append_event(
+                args.api_base,
+                args.owner_api_key,
+                run_id,
+                args.worker_id,
+                lease_token,
+                'dm_turn_late_completion',
+                late_evidence,
+                dedupe_key=f'dm_turn_late_completion:{run_id}:{player_message_id}',
+            )
+    except Exception:
+        pass
+
+
 def wait_for_dm_response(args, manifest, player_message_id, maybe_heartbeat_fn):
-    deadline = time.monotonic() + max(0.0, args.dm_response_timeout)
-    last_status = {'status': 'pending', 'player_message_id': player_message_id}
-    while True:
+    visible_timeout, post_turn_timeout = dm_response_state.resolve_dm_response_timeouts(args)
+
+    def fetch_status():
+        return autonomous.fetch_dm_turn_status(manifest, player_message_id)
+
+    def heartbeat_and_fetch():
         maybe_heartbeat_fn()
-        try:
-            last_status = autonomous.fetch_dm_turn_status(manifest, player_message_id)
-        except ApiError:
-            pass
+        return autonomous.fetch_dm_turn_status(manifest, player_message_id)
 
-        if autonomous.dm_turn_status_resolved(last_status):
-            return last_status, False
-        if time.monotonic() >= deadline:
-            return last_status, True
-
-        remaining = deadline - time.monotonic()
-        sleep_for = min(args.poll_interval, max(0.5, remaining))
-        time.sleep(sleep_for)
+    last_status, timed_out, timeout_phase = dm_response_state.wait_for_dm_response(
+        heartbeat_and_fetch,
+        maybe_heartbeat_fn,
+        visible_timeout,
+        post_turn_timeout,
+        args.poll_interval,
+    )
+    return last_status, timed_out, timeout_phase
 
 
 def pause_for_audit_if_needed(args, claim_payload, run_id, lease_token, phase, maybe_heartbeat_fn, **payload):
@@ -752,7 +790,7 @@ def execute_run(args, run_id):
             }
             logical_key = stage_key(turns_completed, session_for_prompt)
             last_change_at = time.monotonic()
-            dm_turn, dm_timed_out = wait_for_dm_response(args, manifest, posted_message_id, maybe_heartbeat)
+            dm_turn, dm_timed_out, timeout_phase = wait_for_dm_response(args, manifest, posted_message_id, maybe_heartbeat)
             append_event(
                 args.api_base,
                 args.owner_api_key,
@@ -802,6 +840,20 @@ def execute_run(args, run_id):
                 )
                 return True
             if dm_timed_out:
+                timeout_error = dm_response_state.classify_timeout(dm_turn, timeout_phase)
+                timeout_evidence = dm_response_state.build_timeout_evidence(dm_turn, timeout_phase)
+                timeout_evidence['timeout_phase'] = timeout_phase
+                append_event(
+                    args.api_base,
+                    args.owner_api_key,
+                    run_id,
+                    args.worker_id,
+                    lease_token,
+                    'dm_turn_timeout',
+                    timeout_evidence,
+                    dedupe_key=f'dm_turn_timeout:{logical_key}:{posted_message_id}:{timeout_phase}',
+                )
+                _check_late_completion(args, manifest, posted_message_id, run_id, lease_token, timeout_phase, timeout_error)
                 complete_run(
                     args.api_base,
                     args.owner_api_key,
@@ -809,8 +861,8 @@ def execute_run(args, run_id):
                     args.worker_id,
                     lease_token,
                     status='failed',
-                    error_text='dm_response_timeout',
-                    dedupe_key=f'run_completed:{run_id}:dm-timeout',
+                    error_text=timeout_error,
+                    dedupe_key=f'run_completed:{run_id}:dm-timeout:{timeout_phase}',
                 )
                 return True
             last_dm_turn = dm_turn if dm_turn.get('status') in {'silent', 'empty'} else None
@@ -1074,7 +1126,7 @@ def execute_run(args, run_id):
                         )
                         return True
                     last_change_at = time.monotonic()
-                    dm_turn, dm_timed_out = wait_for_dm_response(args, manifest, posted_message_id, maybe_heartbeat)
+                    dm_turn, dm_timed_out, timeout_phase = wait_for_dm_response(args, manifest, posted_message_id, maybe_heartbeat)
                     append_event(
                         args.api_base,
                         args.owner_api_key,
@@ -1124,6 +1176,20 @@ def execute_run(args, run_id):
                         )
                         return True
                     if dm_timed_out:
+                        timeout_error = dm_response_state.classify_timeout(dm_turn, timeout_phase)
+                        timeout_evidence = dm_response_state.build_timeout_evidence(dm_turn, timeout_phase)
+                        timeout_evidence['timeout_phase'] = timeout_phase
+                        append_event(
+                            args.api_base,
+                            args.owner_api_key,
+                            run_id,
+                            args.worker_id,
+                            lease_token,
+                            'dm_turn_timeout',
+                            timeout_evidence,
+                            dedupe_key=f'dm_turn_timeout:{logical_key}:{posted_message_id}:{timeout_phase}',
+                        )
+                        _check_late_completion(args, manifest, posted_message_id, run_id, lease_token, timeout_phase, timeout_error)
                         complete_run(
                             args.api_base,
                             args.owner_api_key,
@@ -1131,8 +1197,8 @@ def execute_run(args, run_id):
                             args.worker_id,
                             lease_token,
                             status='failed',
-                            error_text='dm_response_timeout',
-                            dedupe_key=f'run_completed:{run_id}:dm-timeout',
+                            error_text=timeout_error,
+                            dedupe_key=f'run_completed:{run_id}:dm-timeout:{timeout_phase}',
                         )
                         return True
                     last_dm_turn = dm_turn if dm_turn.get('status') in {'silent', 'empty'} else None
