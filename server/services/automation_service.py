@@ -7,6 +7,7 @@ from statistics import median
 
 from utils.redaction import redact_secrets
 from time_utils import utcnow
+from sqldb_config import retry_on_sqlite_lock
 from models import (
     AutomationRun,
     AutomationRunAuditCycle,
@@ -1814,19 +1815,32 @@ def append_run_event(run, event_type, payload=None, *, dedupe_key=None, worker_i
 def record_worker_activity(worker_id, api_base=None, is_heartbeat=False):
     if not worker_id:
         return
-    now = utcnow()
-    worker = AutomationWorker.query.filter_by(worker_id=worker_id).first()
-    if not worker:
-        worker = AutomationWorker(worker_id=worker_id)
-        db.session.add(worker)
-    if api_base:
-        worker.api_base = api_base
-    if is_heartbeat:
-        worker.last_heartbeat_at = now
-    else:
-        worker.last_poll_at = now
-    worker.updated_at = now
-    db.session.commit()
+
+    @retry_on_sqlite_lock(max_attempts=3, backoff_ms=100, category='worker_activity')
+    def _inner():
+        now = utcnow()
+        worker = AutomationWorker.query.filter_by(worker_id=worker_id).first()
+        if not worker:
+            worker = AutomationWorker(worker_id=worker_id)
+            db.session.add(worker)
+        if api_base:
+            worker.api_base = api_base
+        if is_heartbeat:
+            worker.last_heartbeat_at = now
+        else:
+            worker.last_poll_at = now
+        worker.updated_at = now
+        db.session.commit()
+
+    try:
+        _inner()
+    except Exception:
+        db.session.rollback()
+        import logging
+        logging.getLogger(__name__).warning(
+            'Unable to record worker activity for worker_id=%s; continuing.',
+            worker_id, exc_info=True,
+        )
 
 
 def compute_gameplay_readiness(campaign):
