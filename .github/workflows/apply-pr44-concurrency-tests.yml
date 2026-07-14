@@ -1,0 +1,35 @@
+name: Apply PR 44 concurrency tests
+
+on:
+  push:
+    branches:
+      - feature/sqlite-concurrency-hardening
+    paths:
+      - tools/apply_pr44_concurrency_tests.py
+      - .github/workflows/apply-pr44-concurrency-tests.yml
+
+permissions:
+  contents: write
+
+jobs:
+  apply:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: feature/sqlite-concurrency-hardening
+          fetch-depth: 0
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - run: python tools/apply_pr44_concurrency_tests.py
+      - run: python -m py_compile server/tests/test_sqlite_hardening.py
+      - name: Commit tests
+        run: |
+          rm tools/apply_pr44_concurrency_tests.py
+          rm .github/workflows/apply-pr44-concurrency-tests.yml
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add -A
+          git commit -m "Add real SQLite contention regression coverage"
+          git push origin HEAD:feature/sqlite-concurrency-hardening
