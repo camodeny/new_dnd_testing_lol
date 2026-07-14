@@ -788,6 +788,30 @@ def get_automation_run(current_user, run_id):
     return jsonify(run_watch_payload(run, current_user=current_user)), 200
 
 
+@automation_bp.route('/api/automation/runs/<int:run_id>', methods=['DELETE'])
+@token_required
+def delete_automation_run(current_user, run_id):
+    run = get_or_404(AutomationRun, run_id)
+    if not _run_owned_by_user(current_user, run):
+        return jsonify({'error': 'Forbidden'}), 403
+    scenario_id = run.scenario_id
+    AutomationRunAuditorJob.query.filter_by(run_id=run.id).delete(synchronize_session=False)
+    AutomationRunAuditCycle.query.filter_by(run_id=run.id).delete(synchronize_session=False)
+    AutomationRunProviderCall.query.filter_by(run_id=run.id).delete(synchronize_session=False)
+    AutomationRunAuditResult.query.filter_by(run_id=run.id).delete(synchronize_session=False)
+    AutomationRunEvent.query.filter_by(run_id=run.id).delete(synchronize_session=False)
+    db.session.delete(run)
+    db.session.commit()
+    append_workspace_event(
+        current_user.id,
+        'run_deleted',
+        {'type': 'run_deleted', 'run_id': run_id, 'scenario_id': scenario_id},
+        resource_type='run',
+        resource_id=run_id,
+    )
+    return jsonify({'ok': True}), 200
+
+
 @automation_bp.route('/api/automation/runs/<int:run_id>/stream', methods=['GET'])
 def stream_automation_run(run_id):
     current_user, error_response = _auth_stream_user()

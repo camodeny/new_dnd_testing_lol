@@ -151,6 +151,10 @@ export function updateAutomationScenario(scenarioId, payload) {
   return apiFetch(`/automation/scenarios/${scenarioId}`, { method: 'PUT', body: JSON.stringify(payload) })
 }
 
+export function deleteAutomationScenario(scenarioId) {
+  return apiFetch(`/automation/scenarios/${scenarioId}`, { method: 'DELETE' })
+}
+
 export function cleanupAutomationScenario(scenarioId, payload = {}) {
   return apiFetch(`/automation/scenarios/${scenarioId}/cleanup`, { method: 'POST', body: JSON.stringify(payload) })
 }
@@ -169,6 +173,10 @@ export function getAutomationRun(runId) {
 
 export function stopAutomationRun(runId) {
   return apiFetch(`/automation/runs/${runId}/stop`, { method: 'POST', body: JSON.stringify({}) })
+}
+
+export function deleteAutomationRun(runId) {
+  return apiFetch(`/automation/runs/${runId}`, { method: 'DELETE' })
 }
 
 export function continueAutomationRun(runId, payload = {}) {

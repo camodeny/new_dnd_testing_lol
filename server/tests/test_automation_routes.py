@@ -3339,6 +3339,50 @@ class AutomationRouteTest(unittest.TestCase):
             
             db.session.rollback()
 
+    def test_delete_scenario_and_run(self):
+        scenario_response = self.client.post(
+            '/api/automation/scenarios',
+            headers=self.headers,
+            json={'source_campaign_id': self.campaign_id, 'name': 'To Delete'},
+        )
+        self.assertEqual(scenario_response.status_code, 201)
+        scenario_id = scenario_response.get_json()['scenario']['id']
+
+        snapshot_id = self.client.post(
+            f'/api/automation/scenarios/{scenario_id}/snapshots',
+            headers=self.headers,
+            json={},
+        ).get_json()['snapshot']['id']
+        
+        run_id = self.client.post(
+            f'/api/automation/scenarios/{scenario_id}/runs',
+            headers=self.headers,
+            json={'snapshot_id': snapshot_id},
+        ).get_json()['run']['id']
+
+        run_response = self.client.get(f'/api/automation/runs/{run_id}', headers=self.headers)
+        self.assertEqual(run_response.status_code, 200)
+
+        delete_run_response = self.client.delete(f'/api/automation/runs/{run_id}', headers=self.headers)
+        self.assertEqual(delete_run_response.status_code, 200)
+        self.assertTrue(delete_run_response.get_json()['ok'])
+
+        run_response = self.client.get(f'/api/automation/runs/{run_id}', headers=self.headers)
+        self.assertEqual(run_response.status_code, 404)
+
+        run_id2 = self.client.post(
+            f'/api/automation/scenarios/{scenario_id}/runs',
+            headers=self.headers,
+            json={'snapshot_id': snapshot_id},
+        ).get_json()['run']['id']
+
+        delete_scenario_response = self.client.delete(f'/api/automation/scenarios/{scenario_id}', headers=self.headers)
+        self.assertEqual(delete_scenario_response.status_code, 200)
+        self.assertTrue(delete_scenario_response.get_json()['ok'])
+
+        self.assertEqual(self.client.get(f'/api/automation/scenarios/{scenario_id}', headers=self.headers).status_code, 404)
+        self.assertEqual(self.client.get(f'/api/automation/runs/{run_id2}', headers=self.headers).status_code, 404)
+
 
 if __name__ == '__main__':
     unittest.main()
