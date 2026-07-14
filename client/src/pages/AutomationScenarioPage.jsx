@@ -6,6 +6,8 @@ import {
   createAutomationSnapshot,
   getAutomationScenario,
   updateAutomationScenario,
+  deleteAutomationScenario,
+  deleteAutomationRun,
 } from '../api/client'
 import Loading from '../components/common/Loading'
 import ErrorMessage from '../components/common/ErrorMessage'
@@ -22,6 +24,7 @@ export default function AutomationScenarioPage() {
   const [creatingSnapshot, setCreatingSnapshot] = useState(false)
   const [creatingRun, setCreatingRun] = useState(false)
   const [cleaningUp, setCleaningUp] = useState(false)
+  const [deleting, setDeleting] = useState(false)
   const [selectedSnapshotId, setSelectedSnapshotId] = useState('')
   const [matrixModels, setMatrixModels] = useState('')
   const [auditorMode, setAuditorMode] = useState('manual')
@@ -183,6 +186,30 @@ export default function AutomationScenarioPage() {
     }
   }
 
+  const handleDeleteScenario = async () => {
+    const confirmed = window.confirm('Are you sure you want to permanently delete this scenario? This will also delete all runs and snapshots associated with it. This action cannot be undone.')
+    if (!confirmed) return
+    setDeleting(true)
+    try {
+      await deleteAutomationScenario(scenarioId)
+      navigate('/automation')
+    } catch (err) {
+      setError(err.message)
+      setDeleting(false)
+    }
+  }
+
+  const handleDeleteRun = async (runId) => {
+    const confirmed = window.confirm('Are you sure you want to permanently delete this run? This action cannot be undone.')
+    if (!confirmed) return
+    try {
+      await deleteAutomationRun(runId)
+      await loadData()
+    } catch (err) {
+      setError(err.message)
+    }
+  }
+
   if (loading) return <Loading message="Loading scenario..." />
   if (!scenario) return <ErrorMessage message={error || 'Scenario not found.'} />
 
@@ -190,7 +217,16 @@ export default function AutomationScenarioPage() {
     <div className="automation-page">
       <div className="automation-header">
         <div>
-          <Link className="automation-back-link" to="/automation">← Back to automation</Link>
+          <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', flexWrap: 'wrap', gap: '12px', marginBottom: '8px' }}>
+            <Link className="automation-back-link" style={{ marginBottom: 0 }} to="/automation">← Back to automation</Link>
+            <button
+              className="btn btn-danger btn-small"
+              onClick={handleDeleteScenario}
+              disabled={deleting}
+            >
+              {deleting ? 'Deleting…' : 'Delete Scenario'}
+            </button>
+          </div>
           <h1 className="automation-title">{scenario.name}</h1>
           <p className="automation-subtitle">{scenario.description || `Source campaign #${scenario.source_campaign_id}`}</p>
         </div>
@@ -403,6 +439,15 @@ export default function AutomationScenarioPage() {
                   </div>
                   <span>{run.id === baselineRunId ? 'Baseline' : `${run.scorecard_summary?.completed_turns || 0} turns`}</span>
                 </Link>
+                <button
+                  className="btn btn-danger btn-small"
+                  type="button"
+                  style={{ padding: '0.4rem 0.6rem', minWidth: 'auto', display: 'flex', alignItems: 'center', justifyContent: 'center' }}
+                  onClick={() => handleDeleteRun(run.id)}
+                  title="Delete this run"
+                >
+                  <i className="bi bi-trash"></i>
+                </button>
               </div>
             ))}
           </div>

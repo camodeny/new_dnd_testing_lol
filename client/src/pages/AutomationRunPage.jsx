@@ -1,5 +1,5 @@
 import { useEffect, useState } from 'react'
-import { Link, useParams } from 'react-router-dom'
+import { Link, useNavigate, useParams } from 'react-router-dom'
 import {
   continueAutomationRun,
   getAutomationRun,
@@ -9,6 +9,7 @@ import {
   stopAutomationRun,
   stopAutomationRunAuditors,
   submitAutomationRunAudit,
+  deleteAutomationRun,
 } from '../api/client'
 import Loading from '../components/common/Loading'
 import ErrorMessage from '../components/common/ErrorMessage'
@@ -73,6 +74,7 @@ function applyRunEvent(previous, payload) {
 
 export default function AutomationRunPage() {
   const { runId } = useParams()
+  const navigate = useNavigate()
   const [data, setData] = useState(null)
   const [loading, setLoading] = useState(true)
   const [providerCalls, setProviderCalls] = useState([])
@@ -107,6 +109,7 @@ export default function AutomationRunPage() {
   }, [activeTab, runId])
   const [error, setError] = useState('')
   const [stopping, setStopping] = useState(false)
+  const [deleting, setDeleting] = useState(false)
   const [continuing, setContinuing] = useState(false)
   const [savingAudit, setSavingAudit] = useState(false)
   const [startingAuditors, setStartingAuditors] = useState(false)
@@ -196,6 +199,20 @@ export default function AutomationRunPage() {
       setError(err.message)
     } finally {
       setStopping(false)
+    }
+  }
+
+  const handleDeleteRun = async () => {
+    const confirmed = window.confirm('Are you sure you want to permanently delete this run? This action cannot be undone.')
+    if (!confirmed) return
+    setDeleting(true)
+    try {
+      await deleteAutomationRun(runId)
+      const target = data?.run?.scenario_id ? `/automation/scenarios/${data.run.scenario_id}` : '/automation'
+      navigate(target)
+    } catch (err) {
+      setError(err.message)
+      setDeleting(false)
     }
   }
 
@@ -314,7 +331,16 @@ export default function AutomationRunPage() {
     <div className="automation-page">
       <div className="automation-header">
         <div>
-          <Link className="automation-back-link" to={compareLink}>← Back to scenario</Link>
+          <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', flexWrap: 'wrap', gap: '12px', marginBottom: '8px' }}>
+            <Link className="automation-back-link" style={{ marginBottom: 0 }} to={compareLink}>← Back to scenario</Link>
+            <button
+              className="btn btn-danger btn-small"
+              onClick={handleDeleteRun}
+              disabled={deleting}
+            >
+              {deleting ? 'Deleting…' : 'Delete Run'}
+            </button>
+          </div>
           <h1 className="automation-title">Run #{run.id}</h1>
           <p className="automation-subtitle">{scenario?.name || 'Automation run'} · {run.status}</p>
         </div>
