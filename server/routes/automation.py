@@ -633,6 +633,17 @@ def update_automation_scenario(current_user, scenario_id):
     return jsonify({'scenario': scenario.to_dict()}), 200
 
 
+def _delete_runs(run_ids):
+    if not run_ids:
+        return
+    AutomationRunAuditorJob.query.filter(AutomationRunAuditorJob.run_id.in_(run_ids)).delete(synchronize_session=False)
+    AutomationRunAuditCycle.query.filter(AutomationRunAuditCycle.run_id.in_(run_ids)).delete(synchronize_session=False)
+    AutomationRunProviderCall.query.filter(AutomationRunProviderCall.run_id.in_(run_ids)).delete(synchronize_session=False)
+    AutomationRunAuditResult.query.filter(AutomationRunAuditResult.run_id.in_(run_ids)).delete(synchronize_session=False)
+    AutomationRunEvent.query.filter(AutomationRunEvent.run_id.in_(run_ids)).delete(synchronize_session=False)
+    AutomationRun.query.filter(AutomationRun.id.in_(run_ids)).delete(synchronize_session=False)
+
+
 @automation_bp.route('/api/automation/scenarios/<int:scenario_id>', methods=['DELETE'])
 @token_required
 def delete_automation_scenario(current_user, scenario_id):
@@ -640,13 +651,7 @@ def delete_automation_scenario(current_user, scenario_id):
     if not _scenario_owned_by_user(current_user, scenario):
         return jsonify({'error': 'Forbidden'}), 403
     run_ids = [run.id for run in AutomationRun.query.filter_by(scenario_id=scenario.id).all()]
-    if run_ids:
-        AutomationRunAuditorJob.query.filter(AutomationRunAuditorJob.run_id.in_(run_ids)).delete(synchronize_session=False)
-        AutomationRunAuditCycle.query.filter(AutomationRunAuditCycle.run_id.in_(run_ids)).delete(synchronize_session=False)
-        AutomationRunProviderCall.query.filter(AutomationRunProviderCall.run_id.in_(run_ids)).delete(synchronize_session=False)
-        AutomationRunAuditResult.query.filter(AutomationRunAuditResult.run_id.in_(run_ids)).delete(synchronize_session=False)
-        AutomationRunEvent.query.filter(AutomationRunEvent.run_id.in_(run_ids)).delete(synchronize_session=False)
-        AutomationRun.query.filter(AutomationRun.id.in_(run_ids)).delete(synchronize_session=False)
+    _delete_runs(run_ids)
     AutomationSnapshot.query.filter_by(scenario_id=scenario.id).delete(synchronize_session=False)
     db.session.delete(scenario)
     db.session.commit()
@@ -795,12 +800,7 @@ def delete_automation_run(current_user, run_id):
     if not _run_owned_by_user(current_user, run):
         return jsonify({'error': 'Forbidden'}), 403
     scenario_id = run.scenario_id
-    AutomationRunAuditorJob.query.filter_by(run_id=run.id).delete(synchronize_session=False)
-    AutomationRunAuditCycle.query.filter_by(run_id=run.id).delete(synchronize_session=False)
-    AutomationRunProviderCall.query.filter_by(run_id=run.id).delete(synchronize_session=False)
-    AutomationRunAuditResult.query.filter_by(run_id=run.id).delete(synchronize_session=False)
-    AutomationRunEvent.query.filter_by(run_id=run.id).delete(synchronize_session=False)
-    db.session.delete(run)
+    _delete_runs([run.id])
     db.session.commit()
     append_workspace_event(
         current_user.id,
