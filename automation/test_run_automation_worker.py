@@ -24,7 +24,8 @@ class RunAutomationWorkerTests(unittest.TestCase):
         self.assertEqual(args.dm_response_timeout, 300.0)
 
     def test_wait_for_dm_response_waits_for_post_turn_completion(self):
-        args = SimpleNamespace(poll_interval=0.01, dm_response_timeout=5.0)
+        args = SimpleNamespace(poll_interval=0.01, dm_response_timeout=5.0,
+                               dm_visible_response_timeout=None, dm_post_turn_timeout=None)
         manifest = {'session': {'id': 4}}
         statuses = [
             {
@@ -45,12 +46,13 @@ class RunAutomationWorkerTests(unittest.TestCase):
 
         with patch.object(worker.autonomous, 'fetch_dm_turn_status', side_effect=statuses) as fetch_status, \
                 patch.object(worker.time, 'sleep') as sleep:
-            result, timed_out = worker.wait_for_dm_response(args, manifest, 411, lambda: None)
+            result, timed_out, timeout_phase = worker.wait_for_dm_response(args, manifest, 411, lambda: None)
 
         self.assertFalse(timed_out)
+        self.assertIsNone(timeout_phase)
         self.assertEqual(result, statuses[-1])
         self.assertEqual(fetch_status.call_count, 2)
-        sleep.assert_called_once()
+        sleep.assert_not_called()
 
     def test_wait_for_audit_resume_keeps_worker_alive_until_continue(self):
         args = SimpleNamespace(
@@ -197,6 +199,7 @@ class RunAutomationWorkerTests(unittest.TestCase):
                 patch.object(worker, 'wait_for_dm_response', return_value=(
                     {'status': 'speak', 'player_message_id': 411, 'dm_message_id': 412},
                     False,
+                    None,
                 )), \
                 patch.object(worker, 'pause_for_audit_if_needed', side_effect=[(False, 'lease-1'), (False, 'lease-1')]), \
                 patch.object(worker, 'fetch_run', side_effect=[
@@ -261,7 +264,7 @@ class RunAutomationWorkerTests(unittest.TestCase):
              patch.object(worker, 'append_event'), \
              patch.object(worker, 'fetch_run', return_value=run_payload_with_empty_cycles), \
              patch.object(worker.autonomous, 'fetch_dm_turn_status', return_value=dm_status), \
-             patch.object(worker, 'wait_for_dm_response', return_value=(dm_status, False)), \
+             patch.object(worker, 'wait_for_dm_response', return_value=(dm_status, False, None)), \
              patch.object(worker, 'heartbeat', return_value={'run': {'lease_token': 'lease-1'}}), \
              patch.object(worker, 'complete_run') as complete_mock, \
              patch.object(worker, 'pause_for_audit_if_needed', return_value=(True, 'lease-1')) as pause_mock:
@@ -385,7 +388,7 @@ class RunAutomationWorkerTests(unittest.TestCase):
              patch.object(worker, 'append_event'), \
              patch.object(worker, 'fetch_run', return_value=run_payload_with_empty_cycles), \
              patch.object(worker.autonomous, 'fetch_dm_turn_status', return_value=dm_status), \
-             patch.object(worker, 'wait_for_dm_response', return_value=(dm_status, False)), \
+             patch.object(worker, 'wait_for_dm_response', return_value=(dm_status, False, None)), \
              patch.object(worker, 'heartbeat', return_value={'run': {'lease_token': 'lease-1'}}), \
              patch.object(worker, 'pause_for_audit_if_needed', return_value=(True, 'lease-1')) as pause_mock, \
              patch.object(worker, 'complete_run') as complete_mock:
@@ -505,7 +508,7 @@ class RunAutomationWorkerTests(unittest.TestCase):
              patch.object(worker, 'append_event'), \
              patch.object(worker, 'fetch_run', return_value=run_payload_with_empty_cycles), \
              patch.object(worker.autonomous, 'fetch_dm_turn_status', return_value=dm_status), \
-             patch.object(worker, 'wait_for_dm_response', return_value=(dm_status, False)), \
+             patch.object(worker, 'wait_for_dm_response', return_value=(dm_status, False, None)), \
              patch.object(worker, 'heartbeat', return_value={'run': {'lease_token': 'lease-1'}}), \
              patch.object(worker, 'pause_for_audit_if_needed', return_value=(False, 'lease-1')) as pause_mock, \
              patch.object(worker, 'request_overseer_decision') as overseer_mock, \
@@ -574,7 +577,7 @@ class RunAutomationWorkerTests(unittest.TestCase):
              patch.object(worker, 'append_event'), \
              patch.object(worker, 'fetch_run', return_value=run_payload), \
              patch.object(worker.autonomous, 'fetch_dm_turn_status', return_value=dm_status), \
-             patch.object(worker, 'wait_for_dm_response', return_value=(dm_status, False)), \
+             patch.object(worker, 'wait_for_dm_response', return_value=(dm_status, False, None)), \
              patch.object(worker, 'heartbeat', return_value={'run': {'lease_token': 'lease-1'}}), \
              patch.object(worker, 'pause_for_audit_if_needed', return_value=(True, 'lease-1')) as pause_mock, \
              patch.object(worker, 'complete_run') as complete_mock, \
@@ -651,6 +654,7 @@ class RunAutomationWorkerTests(unittest.TestCase):
                 patch.object(worker, 'wait_for_dm_response', return_value=(
                     {'status': 'speak', 'player_message_id': 411, 'dm_message_id': 412},
                     False,
+                    None,
                 )), \
                 patch.object(worker, 'pause_for_audit_if_needed', side_effect=[(False, 'lease-1'), (True, 'lease-1')]) as pause_mock, \
                 patch.object(worker, 'fetch_run', side_effect=[
@@ -1190,6 +1194,48 @@ class RunAutomationWorkerTests(unittest.TestCase):
             'http://127.0.0.1:5889', '/api/campaigns/42/world',
             owner_token='owner-tok', api_key='key',
         )
+
+
+class LateCompletionReconciliationTest(unittest.TestCase):
+    def test_reconciliation_records_completion_after_multiple_polls(self):
+        args = SimpleNamespace(
+            api_base='http://127.0.0.1:5889',
+            owner_api_key='owner-key',
+            worker_id='worker-1',
+            poll_interval=3.0,
+            dm_late_completion_reconciliation_seconds=30.0,
+        )
+        statuses = [
+            {'status': 'speak', 'post_turn_status': 'pending', 'dm_message_id': 20},
+            {'status': 'speak', 'post_turn_status': 'pending', 'dm_message_id': 20},
+            {
+                'status': 'speak',
+                'post_turn_status': 'complete',
+                'dm_message_id': 20,
+                'memory_status': 'complete',
+                'clock_status': 'complete',
+                'finished_at': '2026-07-14T02:26:03Z',
+            },
+        ]
+
+        with patch.object(worker.autonomous, 'fetch_dm_turn_status', side_effect=statuses) as fetch,                 patch.object(worker.time, 'monotonic', return_value=0.0),                 patch.object(worker.time, 'sleep') as sleep,                 patch.object(worker, 'append_event') as append:
+            worker._reconcile_late_completion(
+                args,
+                {'session': {'id': 4}},
+                10,
+                5,
+                'lease-1',
+                'post_turn',
+                'dm_post_turn_timeout',
+                '2026-07-14T02:25:56Z',
+            )
+
+        self.assertEqual(fetch.call_count, 3)
+        self.assertEqual(sleep.call_count, 2)
+        payload = append.call_args[0][6]
+        self.assertEqual(append.call_args[0][5], 'dm_turn_late_completion')
+        self.assertEqual(payload['failure_timestamp'], '2026-07-14T02:25:56Z')
+        self.assertEqual(payload['final_post_turn_status'], 'complete')
 
 
 if __name__ == '__main__':

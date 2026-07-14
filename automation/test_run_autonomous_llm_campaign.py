@@ -174,7 +174,9 @@ class RunAutonomousLlmCampaignTests(unittest.TestCase):
         self.assertIsNone(autonomous.find_latest_player_message_id([]))
 
     def test_wait_for_dm_response_returns_status_when_dm_responds(self):
-        args = SimpleNamespace(poll_interval=0.01, dm_response_timeout=5)
+        args = SimpleNamespace(poll_interval=0.01, dm_response_timeout=5,
+                               dm_visible_response_timeout=None,
+                               dm_post_turn_timeout=None)
         manifest = {
             'api_base': 'http://127.0.0.1:5889',
             'owner': {'token': 'tok', 'api_key': None},
@@ -183,14 +185,17 @@ class RunAutonomousLlmCampaignTests(unittest.TestCase):
         dm_status = {'status': 'silent', 'player_message_id': 555, 'reason': 'let the scene breathe'}
 
         with patch.object(autonomous, 'fetch_dm_turn_status', return_value=dm_status) as fetch_status:
-            result, timed_out = autonomous.wait_for_dm_response(args, manifest, 555)
+            result, timed_out, timeout_phase = autonomous.wait_for_dm_response(args, manifest, 555)
 
         self.assertFalse(timed_out)
+        self.assertIsNone(timeout_phase)
         self.assertEqual(result, dm_status)
-        fetch_status.assert_called_once_with(manifest, 555)
+        self.assertEqual(fetch_status.call_count, 2)
 
     def test_wait_for_dm_response_waits_for_post_turn_completion(self):
-        args = SimpleNamespace(poll_interval=0.01, dm_response_timeout=5)
+        args = SimpleNamespace(poll_interval=0.01, dm_response_timeout=5,
+                               dm_visible_response_timeout=None,
+                               dm_post_turn_timeout=None)
         manifest = {
             'api_base': 'http://127.0.0.1:5889',
             'owner': {'token': 'tok', 'api_key': None},
@@ -215,15 +220,18 @@ class RunAutonomousLlmCampaignTests(unittest.TestCase):
 
         with patch.object(autonomous, 'fetch_dm_turn_status', side_effect=statuses) as fetch_status, \
                 patch.object(autonomous.time, 'sleep') as sleep:
-            result, timed_out = autonomous.wait_for_dm_response(args, manifest, 555)
+            result, timed_out, timeout_phase = autonomous.wait_for_dm_response(args, manifest, 555)
 
         self.assertFalse(timed_out)
+        self.assertIsNone(timeout_phase)
         self.assertEqual(result, statuses[-1])
         self.assertEqual(fetch_status.call_count, 2)
-        sleep.assert_called_once()
+        sleep.assert_not_called()
 
     def test_wait_for_dm_response_times_out_when_dm_never_responds(self):
-        args = SimpleNamespace(poll_interval=0.05, dm_response_timeout=0.0)
+        args = SimpleNamespace(poll_interval=0.05, dm_response_timeout=0.0,
+                               dm_visible_response_timeout=None,
+                               dm_post_turn_timeout=None)
         manifest = {
             'api_base': 'http://127.0.0.1:5889',
             'owner': {'token': 'tok', 'api_key': None},
@@ -232,9 +240,10 @@ class RunAutonomousLlmCampaignTests(unittest.TestCase):
         pending = {'status': 'pending', 'player_message_id': 555}
 
         with patch.object(autonomous, 'fetch_dm_turn_status', return_value=pending):
-            result, timed_out = autonomous.wait_for_dm_response(args, manifest, 555)
+            result, timed_out, timeout_phase = autonomous.wait_for_dm_response(args, manifest, 555)
 
         self.assertTrue(timed_out)
+        self.assertEqual(timeout_phase, 'visible')
         self.assertEqual(result, pending)
 
     def test_ensure_manifest_session_started_keeps_existing_session(self):

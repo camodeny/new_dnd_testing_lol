@@ -474,6 +474,9 @@ def handle_worker_start(args):
         ('idle_timeout', '--idle-timeout'),
         ('heartbeat_interval', '--heartbeat-interval'),
         ('dm_response_timeout', '--dm-response-timeout'),
+        ('dm_visible_response_timeout', '--dm-visible-response-timeout'),
+        ('dm_post_turn_timeout', '--dm-post-turn-timeout'),
+        ('dm_late_completion_reconciliation_seconds', '--dm-late-completion-reconciliation-seconds'),
         ('message_window', '--message-window'),
         ('model', '--model'),
         ('opencode_server', '--opencode-server'),
@@ -614,6 +617,9 @@ def build_parser():
     worker_start.add_argument('--idle-timeout', type=float)
     worker_start.add_argument('--heartbeat-interval', type=float)
     worker_start.add_argument('--dm-response-timeout', type=float)
+    worker_start.add_argument('--dm-visible-response-timeout', type=float)
+    worker_start.add_argument('--dm-post-turn-timeout', type=float)
+    worker_start.add_argument('--dm-late-completion-reconciliation-seconds', type=float)
     worker_start.add_argument('--message-window', type=int)
     worker_start.add_argument('--model')
     worker_start.add_argument('--opencode-server')

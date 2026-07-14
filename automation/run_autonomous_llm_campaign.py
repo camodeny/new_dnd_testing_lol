@@ -19,6 +19,7 @@ from llm_campaign_common import (
     start_session,
 )
 from provider_client import request_json_decision
+import dm_response_state
 
 
 ROOT = pathlib.Path(__file__).resolve().parents[1]
@@ -77,6 +78,10 @@ def parse_args():
         default=float(os.environ.get('DND_DM_RESPONSE_TIMEOUT', '300')),
         help='Stop the runner if the DM does not finish responding to the latest player message within this many seconds',
     )
+    _visible_env = os.environ.get('DND_DM_VISIBLE_RESPONSE_TIMEOUT')
+    _post_turn_env = os.environ.get('DND_DM_POST_TURN_TIMEOUT')
+    parser.add_argument('--dm-visible-response-timeout', type=float, default=float(_visible_env) if _visible_env else None)
+    parser.add_argument('--dm-post-turn-timeout', type=float, default=float(_post_turn_env) if _post_turn_env else None)
     parser.add_argument('--idle-timeout', type=float, default=180.0, help='Stop if the transcript stops changing for this many seconds')
     parser.add_argument('--max-turns', type=int, default=50, help='Maximum number of non-no_action orchestrator steps to run')
     parser.add_argument('--max-minutes', type=float, default=None, help='Maximum wall-clock runtime in minutes')
@@ -277,50 +282,37 @@ def fetch_dm_turn_status(manifest, player_message_id):
 
 
 def dm_turn_status_resolved(dm_turn_status):
-    status = (dm_turn_status or {}).get('status')
-    if status in {None, 'pending'}:
-        return False
-    if status in {'silent', 'empty'}:
-        return True
-
-    post_turn_status = str((dm_turn_status or {}).get('post_turn_status') or '').strip().lower()
-    if post_turn_status:
-        return post_turn_status in {'complete', 'error'}
-
-    if 'post_turn_complete' in (dm_turn_status or {}):
-        return bool((dm_turn_status or {}).get('post_turn_complete'))
-
-    # Backward compatibility for older servers that only report visible DM output state.
-    return True
+    return dm_response_state.dm_turn_fully_resolved(dm_turn_status)
 
 
 def wait_for_dm_response(args, manifest, player_message_id):
     """Poll the DM turn status until the visible turn and post-turn work have settled.
 
-    Returns (dm_turn_status_dict, timed_out: bool).
+    Returns (dm_turn_status_dict, timed_out: bool, timeout_phase: str or None).
     """
-    deadline = time.monotonic() + max(0.0, args.dm_response_timeout)
-    last_status = {'status': 'pending', 'player_message_id': player_message_id}
-    while True:
-        try:
-            last_status = fetch_dm_turn_status(manifest, player_message_id)
-        except ApiError as exc:
-            print_event({
-                'event': 'dm_turn_status_poll_error',
-                'timestamp': utc_now(),
-                'player_message_id': player_message_id,
-                'error': str(exc),
-            })
+    visible_timeout, post_turn_timeout = dm_response_state.resolve_dm_response_timeouts(args)
 
-        if dm_turn_status_resolved(last_status):
-            return last_status, False
+    def fetch_status():
+        return fetch_dm_turn_status(manifest, player_message_id)
 
-        if time.monotonic() >= deadline:
-            return last_status, True
+    def on_poll_error(exc, phase):
+        print_event({
+            'event': 'dm_turn_status_poll_error',
+            'timestamp': utc_now(),
+            'player_message_id': player_message_id,
+            'phase': phase,
+            'error': str(exc),
+        })
 
-        remaining = deadline - time.monotonic()
-        sleep_for = min(args.poll_interval, max(0.5, remaining))
-        time.sleep(sleep_for)
+    return dm_response_state.wait_for_dm_response(
+        fetch_status,
+        lambda: None,
+        visible_timeout,
+        post_turn_timeout,
+        args.poll_interval,
+        transient_error_types=(ApiError,),
+        on_poll_error_fn=on_poll_error,
+    )
 
 
 def run_bootstrap(args):
@@ -598,14 +590,16 @@ def main():
 
                 posted_player_message_id = find_latest_player_message_id(result.get('posted_messages') or [])
                 if posted_player_message_id is not None:
-                    dm_turn, dm_timed_out = wait_for_dm_response(args, manifest, posted_player_message_id)
+                    dm_turn, dm_timed_out, timeout_phase = wait_for_dm_response(args, manifest, posted_player_message_id)
                     if dm_timed_out:
+                        timeout_error = dm_response_state.classify_timeout(dm_turn, timeout_phase)
                         print_event({
                             'event': 'stop',
                             'timestamp': utc_now(),
-                            'reason': 'dm_response_timeout',
+                            'reason': timeout_error,
                             'player_message_id': posted_player_message_id,
                             'dm_turn': dm_turn,
+                            'timeout_phase': timeout_phase,
                             'turns_completed': turns_completed,
                             'errors': error_count,
                         })

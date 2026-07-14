@@ -181,7 +181,7 @@ class P0FixesTest(unittest.TestCase):
             'post_turn_status': 'complete',
             'dm_message_id': None,
             'turn_error': 'API limit exceeded',
-        }, False)
+        }, False, None)
 
         # Force immediate exit of loop by having stop_requested
         mock_fetch.side_effect = [
@@ -196,7 +196,8 @@ class P0FixesTest(unittest.TestCase):
         # Call worker logic
         with patch('run_automation_worker.active_session_from_run_payload') as mock_active, \
              patch.object(worker.autonomous, 'fetch_dm_turn_status') as mock_fetch_dm, \
-             patch.object(worker, 'heartbeat') as mock_heart:
+             patch.object(worker, 'heartbeat') as mock_heart, \
+             patch.object(worker, 'pause_for_audit_if_needed', return_value=(False, 'lease-1')) as pause_mock:
             mock_heart.return_value = {'run': {'lease_token': 'lease-1'}}
             mock_fetch_dm.return_value = {'status': 'pending'}
             mock_active.return_value = {
@@ -228,7 +229,8 @@ class P0FixesTest(unittest.TestCase):
         payload = failed_event_call[0][0][6]
         self.assertEqual(payload['status'], 'error')
         self.assertEqual(payload['turn_error'], 'API limit exceeded')
-        self.assertIn('dm_response_audit', payload['skipped_downstream_expectations'])
+        self.assertNotIn('dm_response_audit', payload['skipped_downstream_expectations'])
+        pause_mock.assert_called_once()
 
     @patch('run_automation_worker.fetch_run')
     @patch('run_automation_worker.claim_run')
@@ -272,7 +274,7 @@ class P0FixesTest(unittest.TestCase):
             'post_turn_status': 'error',
             'dm_message_id': 411,
             'post_turn_error': 'Failed to compile memory patch',
-        }, False)
+        }, False, None)
 
         # Force immediate exit of loop by having stop_requested
         mock_fetch.side_effect = [
@@ -287,7 +289,8 @@ class P0FixesTest(unittest.TestCase):
         # Call worker logic
         with patch('run_automation_worker.active_session_from_run_payload') as mock_active, \
              patch.object(worker.autonomous, 'fetch_dm_turn_status') as mock_fetch_dm, \
-             patch.object(worker, 'heartbeat') as mock_heart:
+             patch.object(worker, 'heartbeat') as mock_heart, \
+             patch.object(worker, 'pause_for_audit_if_needed', return_value=(False, 'lease-1')) as pause_mock:
             mock_heart.return_value = {'run': {'lease_token': 'lease-1'}}
             mock_fetch_dm.return_value = {'status': 'pending'}
             mock_active.return_value = {
@@ -305,7 +308,7 @@ class P0FixesTest(unittest.TestCase):
             'worker-test',
             'lease-1',
             status='failed',
-            error_text='Failed to compile memory patch',
+            error_text='dm_post_turn_error',
             dedupe_key='run_completed:2:dm-failure:410'
         )
 
@@ -319,3 +322,4 @@ class P0FixesTest(unittest.TestCase):
         self.assertEqual(payload['status'], 'speak')
         self.assertEqual(payload['post_turn_status'], 'error')
         self.assertEqual(payload['turn_error'], 'Failed to compile memory patch')
+        pause_mock.assert_called_once()
