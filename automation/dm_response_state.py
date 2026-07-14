@@ -1,4 +1,4 @@
-"""Shared phase-aware DM response polling state machine."""
+"""Shared phase-aware DM response polling with explicit transient-error handling."""
 
 import time
 
