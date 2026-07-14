@@ -1,4 +1,4 @@
-"""SQLite engine setup and bounded lock-retry helpers."""
+"""SQLite database setup and bounded lock-retry helpers."""
 
 import logging
 import os
