@@ -1,3 +1,5 @@
+"""SQLite engine setup and bounded lock-retry helpers."""
+
 import logging
 import os
 import re
