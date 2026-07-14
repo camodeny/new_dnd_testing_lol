@@ -1816,7 +1816,12 @@ def record_worker_activity(worker_id, api_base=None, is_heartbeat=False):
     if not worker_id:
         return
 
-    @retry_on_sqlite_lock(max_attempts=3, backoff_ms=100, category='worker_activity')
+    @retry_on_sqlite_lock(
+        max_attempts=3,
+        backoff_ms=100,
+        category='worker_activity',
+        rollback_fn=db.session.rollback,
+    )
     def _inner():
         now = utcnow()
         worker = AutomationWorker.query.filter_by(worker_id=worker_id).first()
@@ -1936,14 +1941,28 @@ def claim_run_for_worker(run, worker_id):
 
 
 def heartbeat_run(run, *, worker_id=None, lease_token=None, lease_seconds=None):
-    ensure_worker_lease(run, worker_id=worker_id, lease_token=lease_token)
-    now = _utcnow()
-    run.heartbeat_at = now
-    duration = lease_seconds if lease_seconds is not None else lease_seconds_for_run(run)
-    run.lease_expires_at = now + timedelta(seconds=duration)
-    run.updated_at = now
-    db.session.commit()
-    return run
+    run_id = run.id
+
+    @retry_on_sqlite_lock(
+        max_attempts=3,
+        backoff_ms=100,
+        category='run_heartbeat',
+        rollback_fn=db.session.rollback,
+    )
+    def _heartbeat_once():
+        current_run = db.session.get(AutomationRun, run_id)
+        if current_run is None:
+            raise ValueError('Run not found')
+        ensure_worker_lease(current_run, worker_id=worker_id, lease_token=lease_token)
+        now = _utcnow()
+        current_run.heartbeat_at = now
+        duration = lease_seconds if lease_seconds is not None else lease_seconds_for_run(current_run)
+        current_run.lease_expires_at = now + timedelta(seconds=duration)
+        current_run.updated_at = now
+        db.session.commit()
+        return current_run
+
+    return _heartbeat_once()
 
 
 def persist_provider_call(run, payload):

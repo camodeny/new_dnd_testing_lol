@@ -324,33 +324,31 @@ class AutomationLockRetryTest(unittest.TestCase):
             os.environ.pop('DATABASE_URL', None)
 
     def test_heartbeat_tolerates_lock_and_retries(self):
-        from models import db
+        from models import AutomationRun, db
         from services.automation_service import heartbeat_run
 
         with self.app.app_context():
-            from models import AutomationRun
-            run = db.session.get(AutomationRun, self.run_id)
+            original_commit = db.session.commit
+            commit_calls = [0]
 
-            call_count = [0]
-
-            def fake_commit():
-                call_count[0] += 1
-                if call_count[0] == 1:
+            def flaky_commit():
+                commit_calls[0] += 1
+                if commit_calls[0] == 1:
                     raise OperationalError('database is locked', {}, None)
-                return
+                return original_commit()
 
-            with patch.object(db.session, 'commit', side_effect=fake_commit):
-                try:
-                    heartbeat_run(
-                        run,
-                        worker_id='test-worker',
-                        lease_token='test-token',
-                        lease_seconds=45,
-                    )
-                except OperationalError:
-                    pass
+            with patch.object(db.session, 'commit', side_effect=flaky_commit),                     patch.object(db.session, 'rollback', wraps=db.session.rollback) as rollback:
+                run = db.session.get(AutomationRun, self.run_id)
+                result = heartbeat_run(
+                    run,
+                    worker_id='test-worker',
+                    lease_token='test-token',
+                    lease_seconds=45,
+                )
 
-            self.assertEqual(call_count[0], 1, 'Should have called commit once')
+            self.assertEqual(result.id, self.run_id)
+            self.assertEqual(commit_calls[0], 2)
+            rollback.assert_called_once_with()
 
     def test_worker_activity_retries_on_lock(self):
         from sqldb_config import retry_on_sqlite_lock
@@ -800,6 +798,52 @@ class TransactionBoundaryTest(unittest.TestCase):
                 os.environ['DATABASE_URL'] = old_db_url
             else:
                 os.environ.pop('DATABASE_URL', None)
+
+
+class SQLiteReviewFixRegressionTest(unittest.TestCase):
+    def test_engine_options_are_configured_before_init(self):
+        from flask import Flask
+        from sqldb_config import configure_sqlite_engine_options
+
+        app = Flask(__name__)
+        app.config['SQLALCHEMY_DATABASE_URI'] = 'sqlite:////tmp/review-fix.db'
+        with patch.dict(os.environ, {'DND_SQLITE_BUSY_TIMEOUT_MS': '31000'}):
+            configured = configure_sqlite_engine_options(app)
+
+        self.assertTrue(configured)
+        self.assertEqual(
+            app.config['SQLALCHEMY_ENGINE_OPTIONS']['connect_args']['timeout'],
+            31.0,
+        )
+
+    def test_retry_rolls_back_before_second_attempt(self):
+        from sqldb_config import retry_on_sqlite_lock
+
+        events = []
+
+        def operation():
+            events.append('attempt')
+            if events.count('attempt') == 1:
+                raise OperationalError('database is locked', {}, None)
+            return 'ok'
+
+        decorated = retry_on_sqlite_lock(
+            max_attempts=2,
+            backoff_ms=0,
+            category='test',
+            rollback_fn=lambda: events.append('rollback'),
+        )(operation)
+
+        self.assertEqual(decorated(), 'ok')
+        self.assertEqual(events, ['attempt', 'rollback', 'attempt'])
+
+    def test_wal_pragma_is_not_registered_on_every_connection(self):
+        source = Path(__file__).resolve().parents[1].joinpath('sqldb_config.py').read_text(encoding='utf-8')
+        listener_body = source.split("@event.listens_for(engine, 'connect')", 1)[1].split(
+            "engine._dnd_sqlite_pragmas_installed", 1
+        )[0]
+        self.assertIn('PRAGMA busy_timeout', listener_body)
+        self.assertNotIn('journal_mode', listener_body)
 
 
 if __name__ == '__main__':

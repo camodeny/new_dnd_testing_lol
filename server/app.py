@@ -20,7 +20,7 @@ from routes.lootboxes import lootboxes_bp
 from routes.llm_players import llm_players_bp
 from routes.world import world_bp
 from routes.shops import shops_bp
-from sqldb_config import configure_sqlite_engine
+from sqldb_config import configure_sqlite_engine_options, install_sqlite_pragmas
 
 load_dotenv()
 llm_campaign_env = os.environ.get('LLM_CAMPAIGN_ENV_FILE')
@@ -59,9 +59,9 @@ def create_app():
         os.environ.get('API_KEY_LAST_USED_WRITE_INTERVAL_SECONDS', '300')
     )
 
+    configure_sqlite_engine_options(app)
     db.init_app(app)
-
-    configure_sqlite_engine(db, app)
+    install_sqlite_pragmas(db, app)
 
     app.register_blueprint(auth_bp)
     app.register_blueprint(automation_bp)
