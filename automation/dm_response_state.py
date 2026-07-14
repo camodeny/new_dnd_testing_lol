@@ -1,16 +1,4 @@
-"""
-Shared DM response polling state machine used by both the automation worker
-and the standalone autonomous LLM campaign runner.
-
-Splits the original combined deadline into two phases:
-
-  Phase 1 – visible DM output (speak / silent / empty)
-  Phase 2 – post-turn memory + clock processing
-
-Each phase has its own configurable timeout and performs a final
-authoritative status read before recording a timeout to close
-polling-boundary races.
-"""
+"""Shared phase-aware DM response polling state machine."""
 
 import time
 
@@ -18,60 +6,51 @@ import time
 def dm_turn_has_visible_output(status_dict):
     if not isinstance(status_dict, dict):
         return False
-    status = status_dict.get('status')
-    if status in {'speak', 'silent', 'empty'}:
+    status = str(status_dict.get('status') or '').strip().lower()
+    if status in {'speak', 'silent', 'empty', 'error'}:
         return True
-    if status_dict.get('dm_message_id') is not None:
-        return True
-    return False
+    return status_dict.get('dm_message_id') is not None
 
 
 def dm_turn_post_turn_resolved(status_dict):
     if not isinstance(status_dict, dict):
         return False
-    status = status_dict.get('status')
-    if status in {'silent', 'empty'}:
+    status = str(status_dict.get('status') or '').strip().lower()
+    if status in {'silent', 'empty', 'error'}:
         return True
+
     post_turn = str(status_dict.get('post_turn_status') or '').strip().lower()
     if post_turn in {'complete', 'error'}:
         return True
-    if status_dict.get('post_turn_complete'):
-        return True
-    return False
+
+    if 'post_turn_complete' in status_dict:
+        return bool(status_dict.get('post_turn_complete'))
+
+    # Backward compatibility for servers that only report visible output state.
+    return status == 'speak'
 
 
 def dm_turn_fully_resolved(status_dict):
-    """Backward-compatible check that the whole turn is complete."""
     if not isinstance(status_dict, dict):
         return False
-    status = (status_dict or {}).get('status')
-    if status in {None, 'pending'}:
+    status = str(status_dict.get('status') or '').strip().lower()
+    if not status or status == 'pending':
         return False
-    if status in {'silent', 'empty'}:
-        return True
-
-    post_turn_status = str((status_dict or {}).get('post_turn_status') or '').strip().lower()
-    if post_turn_status:
-        return post_turn_status in {'complete', 'error'}
-
-    if 'post_turn_complete' in (status_dict or {}):
-        return bool((status_dict or {}).get('post_turn_complete'))
-
-    return True
+    return dm_turn_post_turn_resolved(status_dict)
 
 
 def classify_timeout(status_dict, phase):
     if phase == 'visible':
         return 'dm_visible_response_timeout'
     if phase == 'post_turn':
-        post_turn_status = str(status_dict.get('post_turn_status') or '').strip().lower()
-        if post_turn_status == 'error':
+        if str(status_dict.get('post_turn_status') or '').strip().lower() == 'error':
             return 'dm_post_turn_error'
         return 'dm_post_turn_timeout'
     return 'dm_response_timeout'
 
 
 def build_timeout_evidence(status_dict, phase):
+    del phase
     return {
         'player_message_id': status_dict.get('player_message_id'),
         'dm_message_id': status_dict.get('dm_message_id'),
@@ -88,94 +67,94 @@ def build_timeout_evidence(status_dict, phase):
 
 
 def resolve_dm_response_timeouts(args):
-    """
-    Return (visible_response_timeout, post_turn_timeout) from parsed args.
-    Falls back to the old combined timeout when the new env vars are not set.
-    """
     visible = getattr(args, 'dm_visible_response_timeout', None)
     post_turn = getattr(args, 'dm_post_turn_timeout', None)
     legacy = getattr(args, 'dm_response_timeout', None)
 
     if visible is not None and post_turn is not None:
         return float(visible), float(post_turn)
-
     if visible is not None:
         return float(visible), 180.0
-
     if post_turn is not None:
         return 300.0, float(post_turn)
-
     if legacy is not None:
         return float(legacy), 180.0
-
     return 300.0, 180.0
 
 
-def wait_for_dm_response(fetch_status_fn, maybe_heartbeat_fn, visible_timeout, post_turn_timeout, poll_interval):
-    """
-    Phase-aware DM response polling.
+def _fetch_status(fetch_status_fn, last_status, phase, transient_error_types, on_poll_error_fn):
+    try:
+        return fetch_status_fn()
+    except transient_error_types as exc:
+        if on_poll_error_fn is not None:
+            on_poll_error_fn(exc, phase)
+        return last_status
 
-    Parameters:
-        fetch_status_fn: callable() -> status dict
-        maybe_heartbeat_fn: callable() for lease extension (can be no-op)
-        visible_timeout: seconds to wait for visible DM output
-        post_turn_timeout: seconds to wait for post-turn processing
-        poll_interval: base sleep between polls
 
-    Returns:
-        (status_dict, timed_out: bool, timeout_phase: str or None)
-    """
+def wait_for_dm_response(
+    fetch_status_fn,
+    maybe_heartbeat_fn,
+    visible_timeout,
+    post_turn_timeout,
+    poll_interval,
+    *,
+    transient_error_types=(Exception,),
+    on_poll_error_fn=None,
+):
+    """Poll through visible-output and post-turn phases with separate deadlines."""
     monotonic = time.monotonic
+    sleep_interval = max(0.05, float(poll_interval))
 
-    # --- Phase 1: wait for visible DM output ---
-    phase1_deadline = monotonic() + max(0.0, visible_timeout)
+    visible_deadline = monotonic() + max(0.0, float(visible_timeout))
     last_status = {'status': 'pending'}
 
     while True:
         maybe_heartbeat_fn()
-        try:
-            last_status = fetch_status_fn()
-        except Exception:
-            pass
-
+        last_status = _fetch_status(
+            fetch_status_fn,
+            last_status,
+            'visible',
+            transient_error_types,
+            on_poll_error_fn,
+        )
         if dm_turn_has_visible_output(last_status):
             break
-
-        if monotonic() >= phase1_deadline:
-            try:
-                final = fetch_status_fn()
-                last_status = final
-            except Exception:
-                pass
+        if monotonic() >= visible_deadline:
+            last_status = _fetch_status(
+                fetch_status_fn,
+                last_status,
+                'visible_final',
+                transient_error_types,
+                on_poll_error_fn,
+            )
             if dm_turn_has_visible_output(last_status):
                 break
             return last_status, True, 'visible'
+        remaining = visible_deadline - monotonic()
+        time.sleep(min(sleep_interval, max(0.05, remaining)))
 
-        remaining = phase1_deadline - monotonic()
-        time.sleep(min(poll_interval, max(0.5, remaining)))
-
-    # --- Phase 2: wait for post-turn completion ---
-    phase2_deadline = monotonic() + max(0.0, post_turn_timeout)
-
+    post_turn_deadline = monotonic() + max(0.0, float(post_turn_timeout))
     while True:
         maybe_heartbeat_fn()
-        try:
-            last_status = fetch_status_fn()
-        except Exception:
-            pass
-
+        last_status = _fetch_status(
+            fetch_status_fn,
+            last_status,
+            'post_turn',
+            transient_error_types,
+            on_poll_error_fn,
+        )
         if dm_turn_post_turn_resolved(last_status):
             return last_status, False, None
-
-        if monotonic() >= phase2_deadline:
-            try:
-                final = fetch_status_fn()
-                last_status = final
-            except Exception:
-                pass
+        if monotonic() >= post_turn_deadline:
+            last_status = _fetch_status(
+                fetch_status_fn,
+                last_status,
+                'post_turn_final',
+                transient_error_types,
+                on_poll_error_fn,
+            )
             if dm_turn_post_turn_resolved(last_status):
                 return last_status, False, None
             return last_status, True, 'post_turn'
-
-        remaining = phase2_deadline - monotonic()
-        time.sleep(min(poll_interval, max(0.5, remaining)))
+        remaining = post_turn_deadline - monotonic()
+        time.sleep(min(sleep_interval, max(0.05, remaining)))

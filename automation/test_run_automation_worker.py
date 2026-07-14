@@ -1196,5 +1196,47 @@ class RunAutomationWorkerTests(unittest.TestCase):
         )
 
 
+class LateCompletionReconciliationTest(unittest.TestCase):
+    def test_reconciliation_records_completion_after_multiple_polls(self):
+        args = SimpleNamespace(
+            api_base='http://127.0.0.1:5889',
+            owner_api_key='owner-key',
+            worker_id='worker-1',
+            poll_interval=3.0,
+            dm_late_completion_reconciliation_seconds=30.0,
+        )
+        statuses = [
+            {'status': 'speak', 'post_turn_status': 'pending', 'dm_message_id': 20},
+            {'status': 'speak', 'post_turn_status': 'pending', 'dm_message_id': 20},
+            {
+                'status': 'speak',
+                'post_turn_status': 'complete',
+                'dm_message_id': 20,
+                'memory_status': 'complete',
+                'clock_status': 'complete',
+                'finished_at': '2026-07-14T02:26:03Z',
+            },
+        ]
+
+        with patch.object(worker.autonomous, 'fetch_dm_turn_status', side_effect=statuses) as fetch,                 patch.object(worker.time, 'monotonic', return_value=0.0),                 patch.object(worker.time, 'sleep') as sleep,                 patch.object(worker, 'append_event') as append:
+            worker._reconcile_late_completion(
+                args,
+                {'session': {'id': 4}},
+                10,
+                5,
+                'lease-1',
+                'post_turn',
+                'dm_post_turn_timeout',
+                '2026-07-14T02:25:56Z',
+            )
+
+        self.assertEqual(fetch.call_count, 3)
+        self.assertEqual(sleep.call_count, 2)
+        payload = append.call_args[0][6]
+        self.assertEqual(append.call_args[0][5], 'dm_turn_late_completion')
+        self.assertEqual(payload['failure_timestamp'], '2026-07-14T02:25:56Z')
+        self.assertEqual(payload['final_post_turn_status'], 'complete')
+
+
 if __name__ == '__main__':
     unittest.main()

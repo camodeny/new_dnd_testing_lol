@@ -295,14 +295,24 @@ def wait_for_dm_response(args, manifest, player_message_id):
     def fetch_status():
         return fetch_dm_turn_status(manifest, player_message_id)
 
-    last_status, timed_out, timeout_phase = dm_response_state.wait_for_dm_response(
+    def on_poll_error(exc, phase):
+        print_event({
+            'event': 'dm_turn_status_poll_error',
+            'timestamp': utc_now(),
+            'player_message_id': player_message_id,
+            'phase': phase,
+            'error': str(exc),
+        })
+
+    return dm_response_state.wait_for_dm_response(
         fetch_status,
         lambda: None,
         visible_timeout,
         post_turn_timeout,
         args.poll_interval,
+        transient_error_types=(ApiError,),
+        on_poll_error_fn=on_poll_error,
     )
-    return last_status, timed_out, timeout_phase
 
 
 def run_bootstrap(args):

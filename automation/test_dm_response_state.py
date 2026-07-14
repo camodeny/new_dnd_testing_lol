@@ -58,7 +58,7 @@ class DmResponseStateUnitTests(unittest.TestCase):
         ))
 
     def test_dm_turn_post_turn_resolved_no_post_turn_info(self):
-        self.assertFalse(dm_response_state.dm_turn_post_turn_resolved({'status': 'speak'}))
+        self.assertTrue(dm_response_state.dm_turn_post_turn_resolved({'status': 'speak'}))
 
     def test_dm_turn_post_turn_resolved_none(self):
         self.assertFalse(dm_response_state.dm_turn_post_turn_resolved(None))
@@ -416,6 +416,61 @@ class DmResponseStatePhasedTests(unittest.TestCase):
             )
 
         self.assertGreaterEqual(len(heartbeat_calls), 2)
+
+
+class DmResponseStateReviewRegressionTests(unittest.TestCase):
+    def test_generation_error_is_terminal_without_waiting_for_timeout(self):
+        status = {'status': 'error', 'turn_error': 'provider failed'}
+        result, timed_out, phase = dm_response_state.wait_for_dm_response(
+            lambda: status,
+            lambda: None,
+            300,
+            180,
+            1,
+        )
+        self.assertFalse(timed_out)
+        self.assertIsNone(phase)
+        self.assertEqual(result, status)
+
+    def test_non_transient_programming_error_propagates(self):
+        with self.assertRaises(ValueError):
+            dm_response_state.wait_for_dm_response(
+                lambda: (_ for _ in ()).throw(ValueError('bug')),
+                lambda: None,
+                300,
+                180,
+                1,
+                transient_error_types=(RuntimeError,),
+            )
+
+    def test_transient_error_is_reported_with_phase(self):
+        statuses = iter([
+            RuntimeError('temporary'),
+            {'status': 'speak', 'post_turn_status': 'complete'},
+        ])
+        reported = []
+
+        def fetch():
+            item = next(statuses)
+            if isinstance(item, Exception):
+                raise item
+            return item
+
+        with patch.object(time, 'sleep'):
+            result, timed_out, phase = dm_response_state.wait_for_dm_response(
+                fetch,
+                lambda: None,
+                300,
+                180,
+                1,
+                transient_error_types=(RuntimeError,),
+                on_poll_error_fn=lambda exc, poll_phase: reported.append((str(exc), poll_phase)),
+            )
+
+        self.assertFalse(timed_out)
+        self.assertIsNone(phase)
+        self.assertEqual(result['post_turn_status'], 'complete')
+        self.assertEqual(reported, [('temporary', 'visible')])
 
 
 if __name__ == '__main__':
