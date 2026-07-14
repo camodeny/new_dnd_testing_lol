@@ -98,12 +98,15 @@ def create_app():
 
         return jsonify({'status': 'ok', 'message': 'API server is running'}), 200
 
+    return app
+
+
+def initialize_database(app):
     with app.app_context():
         db.create_all()
         ensure_lightweight_schema()
         bootstrap_owner_api_key()
-
-    return app
+        print("Database initialization completed.", flush=True)
 
 
 def bootstrap_owner_api_key():
@@ -334,6 +337,7 @@ app = create_app()
 
 
 if __name__ == '__main__':
+    initialize_database(app)
     port = int(os.environ.get('PORT', 5889))
     debug = os.environ.get('FLASK_DEBUG', 'true').lower() == 'true'
     app.run(debug=debug, host='0.0.0.0', port=port)
