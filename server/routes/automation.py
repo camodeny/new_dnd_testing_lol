@@ -1020,7 +1020,7 @@ def heartbeat_automation_run(current_user, run_id):
             lease_seconds = 3600
 
     try:
-        heartbeat_run(
+        run = heartbeat_run(
             run,
             worker_id=worker_id,
             lease_token=data.get('lease_token'),

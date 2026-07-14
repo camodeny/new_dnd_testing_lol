@@ -20,6 +20,7 @@ from routes.lootboxes import lootboxes_bp
 from routes.llm_players import llm_players_bp
 from routes.world import world_bp
 from routes.shops import shops_bp
+from sqldb_config import configure_sqlite_engine_options, install_sqlite_pragmas
 
 load_dotenv()
 llm_campaign_env = os.environ.get('LLM_CAMPAIGN_ENV_FILE')
@@ -54,8 +55,13 @@ def create_app():
     app.config['AUTH_SESSION_LIFETIME_DAYS'] = int(os.environ.get('AUTH_SESSION_LIFETIME_DAYS', 30))
     app.config['OAUTH_STATE_LIFETIME_MINUTES'] = int(os.environ.get('OAUTH_STATE_LIFETIME_MINUTES', 10))
     app.config['AUTH_COOKIE_SECURE'] = os.environ.get('AUTH_COOKIE_SECURE', 'false').lower() == 'true'
+    app.config['API_KEY_LAST_USED_WRITE_INTERVAL_SECONDS'] = int(
+        os.environ.get('API_KEY_LAST_USED_WRITE_INTERVAL_SECONDS', '300')
+    )
 
+    configure_sqlite_engine_options(app)
     db.init_app(app)
+    install_sqlite_pragmas(db, app)
 
     app.register_blueprint(auth_bp)
     app.register_blueprint(automation_bp)
