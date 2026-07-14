@@ -3,6 +3,8 @@ set -eu
 
 mkdir -p /app/data
 
+python -c "from app import app, initialize_database; initialize_database(app)"
+
 worker_class="${GUNICORN_WORKER_CLASS:-gthread}"
 web_concurrency="${WEB_CONCURRENCY:-3}"
 web_threads="${WEB_THREADS:-12}"

@@ -98,12 +98,15 @@ def create_app():
 
         return jsonify({'status': 'ok', 'message': 'API server is running'}), 200
 
+    return app
+
+
+def initialize_database(app):
     with app.app_context():
         db.create_all()
         ensure_lightweight_schema()
         bootstrap_owner_api_key()
-
-    return app
+        print("Database initialization completed.", flush=True)
 
 
 def bootstrap_owner_api_key():
