@@ -654,7 +654,8 @@ def _delete_runs(run_ids):
     if derived_campaign_ids:
         from models import (
             Character, CharacterPlanningMessage, CampaignPlanningSummary, PlanningBondProposal, CampaignAuditEvent,
-            LLMPlayer, LootBox, SessionDmTurn, CampaignShop, CampaignMemoryRun, CampaignMemoryLog
+            LLMPlayer, LootBox, SessionDmTurn, CampaignShop, CampaignMemoryRun, CampaignMemoryLog,
+            CampaignSession, SheetProposal
         )
         Character.query.filter(Character.campaign_id.in_(derived_campaign_ids)).update({Character.campaign_id: None}, synchronize_session=False)
         CharacterPlanningMessage.query.filter(CharacterPlanningMessage.campaign_id.in_(derived_campaign_ids)).delete(synchronize_session=False)
@@ -670,6 +671,11 @@ def _delete_runs(run_ids):
         CampaignMemoryRun.query.filter(CampaignMemoryRun.campaign_id.in_(derived_campaign_ids)).delete(synchronize_session=False)
         CampaignMemoryLog.query.filter(CampaignMemoryLog.campaign_id.in_(derived_campaign_ids)).delete(synchronize_session=False)
         
+        # Delete SheetProposals associated with the sessions of these campaign clones
+        session_ids = [s.id for s in CampaignSession.query.filter(CampaignSession.campaign_id.in_(derived_campaign_ids)).all()]
+        if session_ids:
+            SheetProposal.query.filter(SheetProposal.session_id.in_(session_ids)).delete(synchronize_session=False)
+            
         # Nullify source campaign references on other campaigns
         Campaign.query.filter(Campaign.automation_source_campaign_id.in_(derived_campaign_ids)).update({'automation_source_campaign_id': None}, synchronize_session=False)
         

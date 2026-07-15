@@ -3426,7 +3426,7 @@ class AutomationRouteTest(unittest.TestCase):
             from models import (
                 AutomationScenario, AutomationRunAuditCycle, AutomationRunAuditAttempt, Campaign, AutomationRun, db,
                 LLMPlayer, LootBox, SessionDmTurn, CampaignShop, CampaignMemoryRun, CampaignMemoryLog,
-                CampaignSession, SessionMessage, User
+                CampaignSession, SessionMessage, User, Character, SheetProposal
             )
             import secrets
             scen = db.session.get(AutomationScenario, scenario_id)
@@ -3472,9 +3472,30 @@ class AutomationRouteTest(unittest.TestCase):
             session = CampaignSession(campaign_id=clone_campaign_id)
             db.session.add(session)
             db.session.flush()
+            session_id_val = session.id
             
             msg = SessionMessage(session_id=session.id, role='player', content='hello')
             db.session.add(msg)
+            db.session.flush()
+            
+            character = Character(
+                user_id=test_user.id,
+                campaign_id=clone_campaign_id,
+                name="Test Character",
+                race="Human",
+                player_name="Test LLM",
+            )
+            db.session.add(character)
+            db.session.flush()
+            
+            proposal = SheetProposal(
+                session_id=session.id,
+                character_id=character.id,
+                message_id=msg.id,
+                reason="Level up",
+                changes={"strength": 12},
+            )
+            db.session.add(proposal)
             db.session.flush()
             
             dm_turn = SessionDmTurn(
@@ -3534,7 +3555,7 @@ class AutomationRouteTest(unittest.TestCase):
         with app.app_context():
             from models import (
                 AutomationSnapshot, AutomationRun, AutomationScenario, AutomationRunAuditCycle, AutomationRunAuditAttempt, Campaign,
-                LLMPlayer, LootBox, SessionDmTurn, CampaignShop, CampaignMemoryRun, CampaignMemoryLog
+                LLMPlayer, LootBox, SessionDmTurn, CampaignShop, CampaignMemoryRun, CampaignMemoryLog, SheetProposal
             )
             self.assertIsNone(db.session.get(AutomationSnapshot, snapshot_id))
             self.assertIsNone(db.session.get(AutomationRun, run_id))
@@ -3551,6 +3572,7 @@ class AutomationRouteTest(unittest.TestCase):
             self.assertEqual(CampaignShop.query.filter_by(campaign_id=clone_campaign_id).count(), 0)
             self.assertEqual(CampaignMemoryRun.query.filter_by(campaign_id=clone_campaign_id).count(), 0)
             self.assertEqual(CampaignMemoryLog.query.filter_by(campaign_id=clone_campaign_id).count(), 0)
+            self.assertEqual(SheetProposal.query.filter_by(session_id=session_id_val).count(), 0)
 
 
 if __name__ == '__main__':
