@@ -638,6 +638,8 @@ def _delete_runs(run_ids):
     if not run_ids:
         return
     Campaign.query.filter(Campaign.automation_source_run_id.in_(run_ids)).update({'automation_source_run_id': None}, synchronize_session=False)
+    AutomationScenario.query.filter(AutomationScenario.baseline_run_id.in_(run_ids)).update({'baseline_run_id': None}, synchronize_session=False)
+    AutomationRunAuditAttempt.query.filter(AutomationRunAuditAttempt.run_id.in_(run_ids)).delete(synchronize_session=False)
     AutomationRunAuditorJob.query.filter(AutomationRunAuditorJob.run_id.in_(run_ids)).delete(synchronize_session=False)
     AutomationRunAuditCycle.query.filter(AutomationRunAuditCycle.run_id.in_(run_ids)).delete(synchronize_session=False)
     AutomationRunProviderCall.query.filter(AutomationRunProviderCall.run_id.in_(run_ids)).delete(synchronize_session=False)

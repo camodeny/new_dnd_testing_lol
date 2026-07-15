@@ -3421,16 +3421,48 @@ class AutomationRouteTest(unittest.TestCase):
             json={'snapshot_id': snapshot_id},
         ).get_json()['run']['id']
 
+        # Setup baseline audited run database rows
+        with app.app_context():
+            from models import AutomationScenario, AutomationRunAuditCycle, AutomationRunAuditAttempt, db
+            scen = db.session.get(AutomationScenario, scenario_id)
+            scen.baseline_run_id = run_id
+            
+            cycle = AutomationRunAuditCycle(
+                run_id=run_id,
+                cycle_number=1,
+                phase='after_dm',
+                status='audited',
+                summary='Test cycle',
+            )
+            db.session.add(cycle)
+            db.session.flush()
+            
+            attempt = AutomationRunAuditAttempt(
+                run_id=run_id,
+                cycle_id=cycle.id,
+                cycle_number=1,
+                phase='after_dm',
+                status='success',
+            )
+            db.session.add(attempt)
+            db.session.commit()
+
         # Delete the snapshot
         delete_snapshot_response = self.client.delete(f'/api/automation/snapshots/{snapshot_id}', headers=self.headers)
         self.assertEqual(delete_snapshot_response.status_code, 200)
         self.assertTrue(delete_snapshot_response.get_json()['ok'])
 
-        # Verify snapshot and associated runs are deleted
+        # Verify snapshot, runs, scenarios, cycles, attempts, and references are resolved
         with app.app_context():
-            from models import AutomationSnapshot, AutomationRun
+            from models import AutomationSnapshot, AutomationRun, AutomationScenario, AutomationRunAuditCycle, AutomationRunAuditAttempt
             self.assertIsNone(db.session.get(AutomationSnapshot, snapshot_id))
             self.assertIsNone(db.session.get(AutomationRun, run_id))
+            
+            scen = db.session.get(AutomationScenario, scenario_id)
+            self.assertIsNone(scen.baseline_run_id)
+            
+            self.assertEqual(AutomationRunAuditCycle.query.filter_by(run_id=run_id).count(), 0)
+            self.assertEqual(AutomationRunAuditAttempt.query.filter_by(run_id=run_id).count(), 0)
 
 
 if __name__ == '__main__':
