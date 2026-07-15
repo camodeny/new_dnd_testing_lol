@@ -639,6 +639,10 @@ def _delete_runs(run_ids):
         return
     Campaign.query.filter(Campaign.automation_source_run_id.in_(run_ids)).update({'automation_source_run_id': None}, synchronize_session=False)
     AutomationScenario.query.filter(AutomationScenario.baseline_run_id.in_(run_ids)).update({'baseline_run_id': None}, synchronize_session=False)
+    
+    # Find any derived campaigns of these runs before deleting the runs
+    derived_campaign_ids = [run.derived_campaign_id for run in AutomationRun.query.filter(AutomationRun.id.in_(run_ids)).all() if run.derived_campaign_id is not None]
+    
     AutomationRunAuditAttempt.query.filter(AutomationRunAuditAttempt.run_id.in_(run_ids)).delete(synchronize_session=False)
     AutomationRunAuditorJob.query.filter(AutomationRunAuditorJob.run_id.in_(run_ids)).delete(synchronize_session=False)
     AutomationRunAuditCycle.query.filter(AutomationRunAuditCycle.run_id.in_(run_ids)).delete(synchronize_session=False)
@@ -646,6 +650,18 @@ def _delete_runs(run_ids):
     AutomationRunAuditResult.query.filter(AutomationRunAuditResult.run_id.in_(run_ids)).delete(synchronize_session=False)
     AutomationRunEvent.query.filter(AutomationRunEvent.run_id.in_(run_ids)).delete(synchronize_session=False)
     AutomationRun.query.filter(AutomationRun.id.in_(run_ids)).delete(synchronize_session=False)
+
+    if derived_campaign_ids:
+        from models import Character, CharacterPlanningMessage, CampaignPlanningSummary, PlanningBondProposal, CampaignAuditEvent
+        Character.query.filter(Character.campaign_id.in_(derived_campaign_ids)).update({Character.campaign_id: None}, synchronize_session=False)
+        CharacterPlanningMessage.query.filter(CharacterPlanningMessage.campaign_id.in_(derived_campaign_ids)).delete(synchronize_session=False)
+        CampaignPlanningSummary.query.filter(CampaignPlanningSummary.campaign_id.in_(derived_campaign_ids)).delete(synchronize_session=False)
+        PlanningBondProposal.query.filter(PlanningBondProposal.campaign_id.in_(derived_campaign_ids)).delete(synchronize_session=False)
+        CampaignAuditEvent.query.filter(CampaignAuditEvent.campaign_id.in_(derived_campaign_ids)).delete(synchronize_session=False)
+        
+        campaigns = Campaign.query.filter(Campaign.id.in_(derived_campaign_ids)).all()
+        for campaign in campaigns:
+            db.session.delete(campaign)
 
 
 @automation_bp.route('/api/automation/scenarios/<int:scenario_id>', methods=['DELETE'])

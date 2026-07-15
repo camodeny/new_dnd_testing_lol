@@ -3421,11 +3421,22 @@ class AutomationRouteTest(unittest.TestCase):
             json={'snapshot_id': snapshot_id},
         ).get_json()['run']['id']
 
-        # Setup baseline audited run database rows
+        # Setup baseline audited run database rows and a campaign clone
         with app.app_context():
-            from models import AutomationScenario, AutomationRunAuditCycle, AutomationRunAuditAttempt, db
+            from models import AutomationScenario, AutomationRunAuditCycle, AutomationRunAuditAttempt, Campaign, AutomationRun, db
             scen = db.session.get(AutomationScenario, scenario_id)
             scen.baseline_run_id = run_id
+            
+            run = db.session.get(AutomationRun, run_id)
+            clone_campaign = Campaign(
+                name="Cloned Campaign",
+                user_id=scen.user_id,
+                is_automation_clone=True,
+            )
+            db.session.add(clone_campaign)
+            db.session.flush()
+            clone_campaign_id = clone_campaign.id
+            run.derived_campaign_id = clone_campaign_id
             
             cycle = AutomationRunAuditCycle(
                 run_id=run_id,
@@ -3452,11 +3463,12 @@ class AutomationRouteTest(unittest.TestCase):
         self.assertEqual(delete_snapshot_response.status_code, 200)
         self.assertTrue(delete_snapshot_response.get_json()['ok'])
 
-        # Verify snapshot, runs, scenarios, cycles, attempts, and references are resolved
+        # Verify snapshot, runs, scenarios, cycles, attempts, campaign clones, and references are resolved
         with app.app_context():
-            from models import AutomationSnapshot, AutomationRun, AutomationScenario, AutomationRunAuditCycle, AutomationRunAuditAttempt
+            from models import AutomationSnapshot, AutomationRun, AutomationScenario, AutomationRunAuditCycle, AutomationRunAuditAttempt, Campaign
             self.assertIsNone(db.session.get(AutomationSnapshot, snapshot_id))
             self.assertIsNone(db.session.get(AutomationRun, run_id))
+            self.assertIsNone(db.session.get(Campaign, clone_campaign_id))
             
             scen = db.session.get(AutomationScenario, scenario_id)
             self.assertIsNone(scen.baseline_run_id)
