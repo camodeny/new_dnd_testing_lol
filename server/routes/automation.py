@@ -635,53 +635,8 @@ def update_automation_scenario(current_user, scenario_id):
 
 
 def _delete_runs(run_ids):
-    if not run_ids:
-        return
-    Campaign.query.filter(Campaign.automation_source_run_id.in_(run_ids)).update({'automation_source_run_id': None}, synchronize_session=False)
-    AutomationScenario.query.filter(AutomationScenario.baseline_run_id.in_(run_ids)).update({'baseline_run_id': None}, synchronize_session=False)
-    
-    # Find any derived campaigns of these runs before deleting the runs
-    derived_campaign_ids = [run.derived_campaign_id for run in AutomationRun.query.filter(AutomationRun.id.in_(run_ids)).all() if run.derived_campaign_id is not None]
-    
-    AutomationRunAuditAttempt.query.filter(AutomationRunAuditAttempt.run_id.in_(run_ids)).delete(synchronize_session=False)
-    AutomationRunAuditorJob.query.filter(AutomationRunAuditorJob.run_id.in_(run_ids)).delete(synchronize_session=False)
-    AutomationRunAuditCycle.query.filter(AutomationRunAuditCycle.run_id.in_(run_ids)).delete(synchronize_session=False)
-    AutomationRunProviderCall.query.filter(AutomationRunProviderCall.run_id.in_(run_ids)).delete(synchronize_session=False)
-    AutomationRunAuditResult.query.filter(AutomationRunAuditResult.run_id.in_(run_ids)).delete(synchronize_session=False)
-    AutomationRunEvent.query.filter(AutomationRunEvent.run_id.in_(run_ids)).delete(synchronize_session=False)
-    AutomationRun.query.filter(AutomationRun.id.in_(run_ids)).delete(synchronize_session=False)
-
-    if derived_campaign_ids:
-        from models import (
-            Character, CharacterPlanningMessage, CampaignPlanningSummary, PlanningBondProposal, CampaignAuditEvent,
-            LLMPlayer, LootBox, SessionDmTurn, CampaignShop, CampaignMemoryRun, CampaignMemoryLog,
-            CampaignSession, SheetProposal
-        )
-        Character.query.filter(Character.campaign_id.in_(derived_campaign_ids)).update({Character.campaign_id: None}, synchronize_session=False)
-        CharacterPlanningMessage.query.filter(CharacterPlanningMessage.campaign_id.in_(derived_campaign_ids)).delete(synchronize_session=False)
-        CampaignPlanningSummary.query.filter(CampaignPlanningSummary.campaign_id.in_(derived_campaign_ids)).delete(synchronize_session=False)
-        PlanningBondProposal.query.filter(PlanningBondProposal.campaign_id.in_(derived_campaign_ids)).delete(synchronize_session=False)
-        CampaignAuditEvent.query.filter(CampaignAuditEvent.campaign_id.in_(derived_campaign_ids)).delete(synchronize_session=False)
-        
-        # Additional tables populated by a run campaign
-        LLMPlayer.query.filter(LLMPlayer.campaign_id.in_(derived_campaign_ids)).delete(synchronize_session=False)
-        LootBox.query.filter(LootBox.campaign_id.in_(derived_campaign_ids)).delete(synchronize_session=False)
-        SessionDmTurn.query.filter(SessionDmTurn.campaign_id.in_(derived_campaign_ids)).delete(synchronize_session=False)
-        CampaignShop.query.filter(CampaignShop.campaign_id.in_(derived_campaign_ids)).delete(synchronize_session=False)
-        CampaignMemoryRun.query.filter(CampaignMemoryRun.campaign_id.in_(derived_campaign_ids)).delete(synchronize_session=False)
-        CampaignMemoryLog.query.filter(CampaignMemoryLog.campaign_id.in_(derived_campaign_ids)).delete(synchronize_session=False)
-        
-        # Delete SheetProposals associated with the sessions of these campaign clones
-        session_ids = [s.id for s in CampaignSession.query.filter(CampaignSession.campaign_id.in_(derived_campaign_ids)).all()]
-        if session_ids:
-            SheetProposal.query.filter(SheetProposal.session_id.in_(session_ids)).delete(synchronize_session=False)
-            
-        # Nullify source campaign references on other campaigns
-        Campaign.query.filter(Campaign.automation_source_campaign_id.in_(derived_campaign_ids)).update({'automation_source_campaign_id': None}, synchronize_session=False)
-        
-        campaigns = Campaign.query.filter(Campaign.id.in_(derived_campaign_ids)).all()
-        for campaign in campaigns:
-            db.session.delete(campaign)
+    from services.campaign_cleanup import delete_run_graph
+    delete_run_graph(run_ids)
 
 
 @automation_bp.route('/api/automation/scenarios/<int:scenario_id>', methods=['DELETE'])
@@ -691,7 +646,14 @@ def delete_automation_scenario(current_user, scenario_id):
     if not _scenario_owned_by_user(current_user, scenario):
         return jsonify({'error': 'Forbidden'}), 403
     run_ids = [run.id for run in AutomationRun.query.filter_by(scenario_id=scenario.id).all()]
-    _delete_runs(run_ids)
+    snapshot_ids = [snap.id for snap in AutomationSnapshot.query.filter_by(scenario_id=scenario.id).all()]
+    
+    from services.campaign_cleanup import delete_run_graph
+    try:
+        delete_run_graph(run_ids, ignore_snapshot_ids=snapshot_ids)
+    except ValueError as e:
+        return jsonify({'error': str(e)}), 400
+        
     AutomationSnapshot.query.filter_by(scenario_id=scenario.id).delete(synchronize_session=False)
     db.session.delete(scenario)
     db.session.commit()
@@ -840,8 +802,12 @@ def delete_automation_run(current_user, run_id):
     if not _run_owned_by_user(current_user, run):
         return jsonify({'error': 'Forbidden'}), 403
     scenario_id = run.scenario_id
-    _delete_runs([run.id])
-    db.session.commit()
+    try:
+        _delete_runs([run.id])
+        db.session.commit()
+    except ValueError as e:
+        db.session.rollback()
+        return jsonify({'error': str(e)}), 400
     append_workspace_event(
         current_user.id,
         'run_deleted',
@@ -865,7 +831,11 @@ def delete_automation_snapshot(current_user, snapshot_id):
     
     # Delete runs referencing this snapshot
     run_ids = [run.id for run in AutomationRun.query.filter_by(snapshot_id=snapshot.id).all()]
-    _delete_runs(run_ids)
+    from services.campaign_cleanup import delete_run_graph
+    try:
+        delete_run_graph(run_ids, ignore_snapshot_ids=[snapshot.id])
+    except ValueError as e:
+        return jsonify({'error': str(e)}), 400
     
     db.session.delete(snapshot)
     db.session.commit()

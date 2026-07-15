@@ -151,17 +151,14 @@ def delete_campaign(current_user, campaign_id):
     if campaign.user_id != current_user.id:
         return jsonify({'error': 'Forbidden'}), 403
 
-    Character.query.filter_by(campaign_id=campaign_id).update(
-        {Character.campaign_id: None},
-        synchronize_session=False,
-    )
-    CharacterPlanningMessage.query.filter_by(campaign_id=campaign_id).delete(synchronize_session=False)
-    CampaignPlanningSummary.query.filter_by(campaign_id=campaign_id).delete(synchronize_session=False)
-    PlanningBondProposal.query.filter_by(campaign_id=campaign_id).delete(synchronize_session=False)
-    CampaignAuditEvent.query.filter_by(campaign_id=campaign_id).delete(synchronize_session=False)
+    from services.campaign_cleanup import delete_campaign_graph
+    try:
+        delete_campaign_graph([campaign_id], character_policy='detach')
+        db.session.commit()
+    except ValueError as e:
+        db.session.rollback()
+        return jsonify({'error': str(e)}), 400
 
-    db.session.delete(campaign)
-    db.session.commit()
     return jsonify({'message': 'Campaign deleted'}), 200
 
 

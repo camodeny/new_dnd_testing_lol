@@ -685,10 +685,29 @@ def create_snapshot_for_scenario(scenario, label=None, summary=None, source_sess
     snapshot_campaign = campaign
     if source_session_id is not None:
         source_session = db.session.get(CampaignSession, source_session_id)
-        if source_session is not None:
-            session_campaign = db.session.get(Campaign, source_session.campaign_id)
-            if session_campaign is not None:
-                snapshot_campaign = session_campaign
+        if source_session is None:
+            raise ValueError("source_session_id does not exist")
+        session_campaign = db.session.get(Campaign, source_session.campaign_id)
+        if session_campaign is None:
+            raise ValueError("source_session campaign does not exist")
+            
+        is_valid = False
+        if session_campaign.id == scenario.source_campaign_id:
+            is_valid = True
+        else:
+            run_ids = [run.id for run in AutomationRun.query.filter_by(scenario_id=scenario.id).all()]
+            if run_ids:
+                derived_campaign_exists = AutomationRun.query.filter(
+                    AutomationRun.id.in_(run_ids),
+                    AutomationRun.derived_campaign_id == session_campaign.id
+                ).first() is not None
+                if derived_campaign_exists:
+                    is_valid = True
+                    
+        if not is_valid:
+            raise ValueError("source_session_id must belong to the scenario's source campaign or a derived campaign of one of its runs")
+            
+        snapshot_campaign = session_campaign
     payload = serialize_campaign_snapshot(snapshot_campaign, source_session_id=source_session_id)
     if scenario:
         payload['roster'] = scenario.roster_json
@@ -2586,7 +2605,8 @@ def cleanup_hidden_clone_campaigns(scenario, *, action=None, older_than_days=Non
     for run in targets:
         campaign = db.session.get(Campaign, run.derived_campaign_id) if run.derived_campaign_id else None
         if action == 'delete' and campaign is not None:
-            db.session.delete(campaign)
+            from services.campaign_cleanup import delete_campaign_graph
+            delete_campaign_graph([campaign.id], character_policy='delete')
             run.clone_retention_status = 'deleted'
             run.derived_campaign_id = None
             deleted.append(run.id)
