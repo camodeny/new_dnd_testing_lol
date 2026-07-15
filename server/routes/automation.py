@@ -652,12 +652,26 @@ def _delete_runs(run_ids):
     AutomationRun.query.filter(AutomationRun.id.in_(run_ids)).delete(synchronize_session=False)
 
     if derived_campaign_ids:
-        from models import Character, CharacterPlanningMessage, CampaignPlanningSummary, PlanningBondProposal, CampaignAuditEvent
+        from models import (
+            Character, CharacterPlanningMessage, CampaignPlanningSummary, PlanningBondProposal, CampaignAuditEvent,
+            LLMPlayer, LootBox, SessionDmTurn, CampaignShop, CampaignMemoryRun, CampaignMemoryLog
+        )
         Character.query.filter(Character.campaign_id.in_(derived_campaign_ids)).update({Character.campaign_id: None}, synchronize_session=False)
         CharacterPlanningMessage.query.filter(CharacterPlanningMessage.campaign_id.in_(derived_campaign_ids)).delete(synchronize_session=False)
         CampaignPlanningSummary.query.filter(CampaignPlanningSummary.campaign_id.in_(derived_campaign_ids)).delete(synchronize_session=False)
         PlanningBondProposal.query.filter(PlanningBondProposal.campaign_id.in_(derived_campaign_ids)).delete(synchronize_session=False)
         CampaignAuditEvent.query.filter(CampaignAuditEvent.campaign_id.in_(derived_campaign_ids)).delete(synchronize_session=False)
+        
+        # Additional tables populated by a run campaign
+        LLMPlayer.query.filter(LLMPlayer.campaign_id.in_(derived_campaign_ids)).delete(synchronize_session=False)
+        LootBox.query.filter(LootBox.campaign_id.in_(derived_campaign_ids)).delete(synchronize_session=False)
+        SessionDmTurn.query.filter(SessionDmTurn.campaign_id.in_(derived_campaign_ids)).delete(synchronize_session=False)
+        CampaignShop.query.filter(CampaignShop.campaign_id.in_(derived_campaign_ids)).delete(synchronize_session=False)
+        CampaignMemoryRun.query.filter(CampaignMemoryRun.campaign_id.in_(derived_campaign_ids)).delete(synchronize_session=False)
+        CampaignMemoryLog.query.filter(CampaignMemoryLog.campaign_id.in_(derived_campaign_ids)).delete(synchronize_session=False)
+        
+        # Nullify source campaign references on other campaigns
+        Campaign.query.filter(Campaign.automation_source_campaign_id.in_(derived_campaign_ids)).update({'automation_source_campaign_id': None}, synchronize_session=False)
         
         campaigns = Campaign.query.filter(Campaign.id.in_(derived_campaign_ids)).all()
         for campaign in campaigns:

@@ -3421,9 +3421,14 @@ class AutomationRouteTest(unittest.TestCase):
             json={'snapshot_id': snapshot_id},
         ).get_json()['run']['id']
 
-        # Setup baseline audited run database rows and a campaign clone
+        # Setup baseline audited run database rows and a campaign clone with all child/dependent rows
         with app.app_context():
-            from models import AutomationScenario, AutomationRunAuditCycle, AutomationRunAuditAttempt, Campaign, AutomationRun, db
+            from models import (
+                AutomationScenario, AutomationRunAuditCycle, AutomationRunAuditAttempt, Campaign, AutomationRun, db,
+                LLMPlayer, LootBox, SessionDmTurn, CampaignShop, CampaignMemoryRun, CampaignMemoryLog,
+                CampaignSession, SessionMessage, User
+            )
+            import secrets
             scen = db.session.get(AutomationScenario, scenario_id)
             scen.baseline_run_id = run_id
             
@@ -3437,6 +3442,68 @@ class AutomationRouteTest(unittest.TestCase):
             db.session.flush()
             clone_campaign_id = clone_campaign.id
             run.derived_campaign_id = clone_campaign_id
+            
+            # Create dependent entities
+            test_user = User(
+                username=f"test_llm_{secrets.token_hex(4)}",
+                email=f"test_llm_{secrets.token_hex(4)}@example.com",
+                password_hash="hash"
+            )
+            db.session.add(test_user)
+            db.session.flush()
+            
+            llm_player = LLMPlayer(
+                campaign_id=clone_campaign_id,
+                user_id=test_user.id,
+                label="Test LLM",
+                api_key_hash="hash",
+                api_key_prefix="pref",
+            )
+            db.session.add(llm_player)
+            
+            loot_box = LootBox(
+                campaign_id=clone_campaign_id,
+                name="Test Box",
+                items_json="[]",
+                currency_json="{}",
+            )
+            db.session.add(loot_box)
+            
+            session = CampaignSession(campaign_id=clone_campaign_id)
+            db.session.add(session)
+            db.session.flush()
+            
+            msg = SessionMessage(session_id=session.id, role='player', content='hello')
+            db.session.add(msg)
+            db.session.flush()
+            
+            dm_turn = SessionDmTurn(
+                campaign_id=clone_campaign_id,
+                session_id=session.id,
+                player_message_id=msg.id,
+                status='pending',
+            )
+            db.session.add(dm_turn)
+            
+            shop = CampaignShop(
+                campaign_id=clone_campaign_id,
+                name="Test Shop",
+                items_json="[]",
+            )
+            db.session.add(shop)
+            
+            mem_run = CampaignMemoryRun(
+                memory_run_id=f"run-{secrets.token_hex(4)}",
+                campaign_id=clone_campaign_id,
+            )
+            db.session.add(mem_run)
+            
+            mem_log = CampaignMemoryLog(
+                campaign_id=clone_campaign_id,
+                memory_run_id="run-1",
+                operation="create",
+            )
+            db.session.add(mem_log)
             
             cycle = AutomationRunAuditCycle(
                 run_id=run_id,
@@ -3465,7 +3532,10 @@ class AutomationRouteTest(unittest.TestCase):
 
         # Verify snapshot, runs, scenarios, cycles, attempts, campaign clones, and references are resolved
         with app.app_context():
-            from models import AutomationSnapshot, AutomationRun, AutomationScenario, AutomationRunAuditCycle, AutomationRunAuditAttempt, Campaign
+            from models import (
+                AutomationSnapshot, AutomationRun, AutomationScenario, AutomationRunAuditCycle, AutomationRunAuditAttempt, Campaign,
+                LLMPlayer, LootBox, SessionDmTurn, CampaignShop, CampaignMemoryRun, CampaignMemoryLog
+            )
             self.assertIsNone(db.session.get(AutomationSnapshot, snapshot_id))
             self.assertIsNone(db.session.get(AutomationRun, run_id))
             self.assertIsNone(db.session.get(Campaign, clone_campaign_id))
@@ -3475,6 +3545,12 @@ class AutomationRouteTest(unittest.TestCase):
             
             self.assertEqual(AutomationRunAuditCycle.query.filter_by(run_id=run_id).count(), 0)
             self.assertEqual(AutomationRunAuditAttempt.query.filter_by(run_id=run_id).count(), 0)
+            self.assertEqual(LLMPlayer.query.filter_by(campaign_id=clone_campaign_id).count(), 0)
+            self.assertEqual(LootBox.query.filter_by(campaign_id=clone_campaign_id).count(), 0)
+            self.assertEqual(SessionDmTurn.query.filter_by(campaign_id=clone_campaign_id).count(), 0)
+            self.assertEqual(CampaignShop.query.filter_by(campaign_id=clone_campaign_id).count(), 0)
+            self.assertEqual(CampaignMemoryRun.query.filter_by(campaign_id=clone_campaign_id).count(), 0)
+            self.assertEqual(CampaignMemoryLog.query.filter_by(campaign_id=clone_campaign_id).count(), 0)
 
 
 if __name__ == '__main__':
