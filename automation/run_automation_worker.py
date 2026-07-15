@@ -582,6 +582,9 @@ def pause_for_audit_if_needed(args, claim_payload, run_id, lease_token, phase, m
     if not paused:
         return False, lease_token
 
+    if response.get('worker_released'):
+        return True, None
+
     cycle = response.get('audit_cycle') or {}
     cycle_id = cycle.get('id')
     append_event(
@@ -847,6 +850,8 @@ def execute_run(args, run_id):
                     dedupe_key=f'audit_pause:after_dm:{logical_key}:{posted_message_id}',
                 )
                 if should_stop:
+                    if lease_token is None:
+                        return False
                     complete_run(
                         args.api_base,
                         args.owner_api_key,
@@ -957,6 +962,8 @@ def execute_run(args, run_id):
                 dedupe_key=f'audit_pause:after_dm:{logical_key}:{posted_message_id}',
             )
             if should_stop:
+                if lease_token is None:
+                    return False
                 complete_run(
                     args.api_base,
                     args.owner_api_key,
@@ -1185,6 +1192,8 @@ def execute_run(args, run_id):
                         dedupe_key=f'audit_pause:after_player:{logical_key}:{posted_message_id}',
                     )
                     if should_stop:
+                        if lease_token is None:
+                            return False
                         complete_run(
                             args.api_base,
                             args.owner_api_key,
@@ -1226,6 +1235,8 @@ def execute_run(args, run_id):
                             dedupe_key=f'audit_pause:after_dm:{logical_key}:{posted_message_id}',
                         )
                         if should_stop:
+                            if lease_token is None:
+                                return False
                             complete_run(
                                 args.api_base,
                                 args.owner_api_key,
@@ -1336,6 +1347,8 @@ def execute_run(args, run_id):
                         dedupe_key=f'audit_pause:after_dm:{logical_key}:{posted_message_id}',
                     )
                     if should_stop:
+                        if lease_token is None:
+                            return False
                         complete_run(
                             args.api_base,
                             args.owner_api_key,

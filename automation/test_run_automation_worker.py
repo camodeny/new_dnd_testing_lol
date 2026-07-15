@@ -122,6 +122,37 @@ class RunAutomationWorkerTests(unittest.TestCase):
             ['worker_waiting_for_audit_resume', 'worker_resumed_after_audit'],
         )
 
+    def test_pause_for_audit_returns_worker_to_queue_when_backend_releases_lease(self):
+        args = SimpleNamespace(
+            api_base='http://127.0.0.1:5889',
+            owner_api_key='owner-key',
+            worker_id='audit-worker',
+            poll_interval=0.01,
+        )
+        claim_payload = {'run': {'runner_config': {'audit_pause_phases': ['after_dm']}}}
+
+        with patch.object(worker, 'pause_run', return_value={
+            'run': {'status': 'awaiting_audit', 'has_lease_token': False},
+            'paused': True,
+            'worker_released': True,
+            'audit_cycle': {'id': 17},
+        }), patch.object(worker, 'wait_for_audit_resume') as wait_for_resume, \
+                patch.object(worker, 'append_event') as append_event:
+            should_yield, lease_token = worker.pause_for_audit_if_needed(
+                args,
+                claim_payload,
+                run_id=7,
+                lease_token='lease-1',
+                phase='after_dm',
+                maybe_heartbeat_fn=Mock(),
+                summary='Paused after DM response.',
+            )
+
+        self.assertTrue(should_yield)
+        self.assertIsNone(lease_token)
+        wait_for_resume.assert_not_called()
+        append_event.assert_not_called()
+
     def test_execute_run_resets_idle_timer_after_after_dm_audit_resume(self):
         args = SimpleNamespace(
             api_base='http://127.0.0.1:5889',

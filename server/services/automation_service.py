@@ -126,7 +126,7 @@ def _vector_digest(vector):
 
 DEFAULT_LEASE_SECONDS = 45
 DEFAULT_PROVISIONING_LEASE_SECONDS = 300
-CLAIMABLE_ACTIVE_STATUSES = {'claimed', 'running', 'stop_requested', 'awaiting_audit'}
+CLAIMABLE_ACTIVE_STATUSES = {'claimed', 'running', 'stop_requested'}
 AUDIT_READY_STATUSES = {'audited', 'skipped'}
 CUSTOM_SCORECARD_STATUS_ORDER = ('pass', 'warn', 'fail', 'not_assessed')
 DEFAULT_RETENTION_POLICY = {
@@ -1632,7 +1632,14 @@ def continue_audit_run(run, *, force=False):
             raise ValueError('Current audit cycle must be audited before continuing')
         cycle.status = 'skipped'
         cycle.audited_at = cycle.audited_at or _utcnow()
-    run.status = 'running'
+    # Audit checkpoints are durable queue boundaries. The worker that reached
+    # the checkpoint releases its lease, and a free worker resumes the run.
+    run.status = 'queued'
+    run.worker_id = None
+    run.lease_token = None
+    run.heartbeat_at = None
+    run.lease_expires_at = None
+    run.worker_api_base = None
     run.awaiting_audit_phase = None
     run.awaiting_audit_cycle_id = None
     run.audit_resumed_at = _utcnow()
@@ -1736,6 +1743,30 @@ def release_run_lease(run_id, lease_token, failure_reason):
             heartbeat_at=None,
             lease_expires_at=None,
             claim_failure_reason=failure_reason,
+            updated_at=now,
+        )
+    )
+    result = db.session.execute(stmt)
+    db.session.commit()
+    return result.rowcount > 0
+
+
+def release_run_for_audit(run_id, lease_token):
+    """Release worker capacity while preserving an awaiting-audit checkpoint."""
+    now = _utcnow()
+    stmt = (
+        sa_update(AutomationRun)
+        .where(
+            AutomationRun.id == run_id,
+            AutomationRun.status == 'awaiting_audit',
+            AutomationRun.lease_token == lease_token,
+        )
+        .values(
+            worker_id=None,
+            lease_token=None,
+            heartbeat_at=None,
+            lease_expires_at=None,
+            worker_api_base=None,
             updated_at=now,
         )
     )

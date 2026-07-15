@@ -58,6 +58,7 @@ from services.automation_service import (
     merged_runner_config_for_scenario,
     persist_provider_call,
     record_worker_activity,
+    release_run_for_audit,
     provider_call_for_replay,
     refresh_run_scorecard,
     run_debug_summary,
@@ -903,9 +904,13 @@ def stop_automation_run(current_user, run_id):
     if run.status in {'completed', 'failed', 'stopped'}:
         return jsonify({'run': run.to_dict()}), 200
 
-    if run.status == 'queued':
+    if run.status in {'queued', 'awaiting_audit'}:
         run.status = 'stopped'
         run.finished_at = utcnow()
+        run.worker_id = None
+        run.lease_token = None
+        run.heartbeat_at = None
+        run.lease_expires_at = None
     else:
         run.status = 'stop_requested'
         run.stop_requested_at = utcnow()
@@ -1045,13 +1050,36 @@ def pause_automation_run(current_user, run_id):
     phase = (data.get('phase') or '').strip().lower()
     if phase not in {'after_player', 'after_dm'}:
         return jsonify({'error': 'phase must be after_player or after_dm'}), 400
+
+    player_message_id = data.get('player_message_id')
+    dm_message_id = data.get('dm_message_id')
+
+    # A successful pause releases the lease before replying. Treat a retried
+    # request for that exact durable checkpoint as an idempotent success.
+    if run.status == 'awaiting_audit' and not run.worker_id and not run.lease_token:
+        cycle = db.session.get(AutomationRunAuditCycle, run.awaiting_audit_cycle_id)
+        matches = bool(cycle and cycle.phase == phase)
+        if matches and phase == 'after_player' and player_message_id is not None:
+            matches = cycle.player_message_id == player_message_id
+        elif matches and phase == 'after_dm':
+            if dm_message_id is not None:
+                matches = cycle.dm_message_id == dm_message_id
+            elif player_message_id is not None:
+                matches = cycle.player_message_id == player_message_id
+        if matches:
+            return jsonify({
+                'run': run.to_dict(),
+                'audit_cycle': cycle.to_dict(),
+                'paused': True,
+                'created': False,
+                'worker_released': True,
+            }), 200
+        return jsonify({'error': 'Run is already awaiting a different audit cycle'}), 409
+
     try:
         ensure_worker_lease(run, worker_id=data.get('worker_id'), lease_token=data.get('lease_token'))
     except ValueError as exc:
         return jsonify({'error': str(exc)}), 409
-
-    player_message_id = data.get('player_message_id')
-    dm_message_id = data.get('dm_message_id')
 
     # Idempotency check
     existing = None
@@ -1076,11 +1104,14 @@ def pause_automation_run(current_user, run_id):
             run.awaiting_audit_phase = phase
             run.updated_at = utcnow()
             db.session.commit()
+            worker_released = release_run_for_audit(run.id, data.get('lease_token'))
+            run = db.session.get(AutomationRun, run.id)
             return jsonify({
                 'run': run.to_dict(),
                 'audit_cycle': existing.to_dict(),
                 'paused': True,
                 'created': False,
+                'worker_released': worker_released,
             }), 200
         return jsonify({
             'run': run.to_dict(),
@@ -1101,7 +1132,14 @@ def pause_automation_run(current_user, run_id):
                 elif player_message_id is not None:
                     matches_msg = (cycle.player_message_id == player_message_id)
             if matches_msg:
-                return jsonify({'run': run.to_dict(), 'audit_cycle': cycle.to_dict(), 'paused': True}), 200
+                worker_released = release_run_for_audit(run.id, data.get('lease_token'))
+                run = db.session.get(AutomationRun, run.id)
+                return jsonify({
+                    'run': run.to_dict(),
+                    'audit_cycle': cycle.to_dict(),
+                    'paused': True,
+                    'worker_released': worker_released,
+                }), 200
         return jsonify({'error': 'Run is already awaiting a different audit cycle'}), 409
 
     cycle = create_audit_cycle(
@@ -1115,7 +1153,14 @@ def pause_automation_run(current_user, run_id):
         worker_id=data.get('worker_id'),
         lease_token=data.get('lease_token'),
     )
-    return jsonify({'run': run.to_dict(), 'audit_cycle': cycle.to_dict(), 'paused': True}), 200
+    worker_released = release_run_for_audit(run.id, data.get('lease_token'))
+    run = db.session.get(AutomationRun, run.id)
+    return jsonify({
+        'run': run.to_dict(),
+        'audit_cycle': cycle.to_dict(),
+        'paused': True,
+        'worker_released': worker_released,
+    }), 200
 
 
 @automation_bp.route('/api/automation/runs/<int:run_id>/audit-cycles/<int:cycle_id>/audit', methods=['POST'])

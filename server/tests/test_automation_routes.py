@@ -977,8 +977,12 @@ class AutomationRouteTest(unittest.TestCase):
             },
         )
         self.assertEqual(pause_response.status_code, 200)
-        cycle_id = pause_response.get_json()['audit_cycle']['id']
-        self.assertEqual(pause_response.get_json()['run']['status'], 'awaiting_audit')
+        pause_payload = pause_response.get_json()
+        cycle_id = pause_payload['audit_cycle']['id']
+        self.assertEqual(pause_payload['run']['status'], 'awaiting_audit')
+        self.assertTrue(pause_payload['worker_released'])
+        self.assertFalse(pause_payload['run']['has_lease_token'])
+        self.assertFalse(pause_payload['run']['claimable'])
 
         continue_before_audit = self.client.post(
             f'/api/automation/runs/{run_id}/continue',
@@ -1012,7 +1016,8 @@ class AutomationRouteTest(unittest.TestCase):
             json={},
         )
         self.assertEqual(continue_response.status_code, 200)
-        self.assertEqual(continue_response.get_json()['run']['status'], 'running')
+        self.assertEqual(continue_response.get_json()['run']['status'], 'queued')
+        self.assertTrue(continue_response.get_json()['run']['claimable'])
 
         scorecard_response = self.client.get(f'/api/automation/runs/{run_id}/scorecard', headers=self.headers)
         self.assertEqual(scorecard_response.status_code, 200)
@@ -1885,6 +1890,9 @@ class AutomationRouteTest(unittest.TestCase):
             r.status = 'running'
             r.awaiting_audit_cycle_id = None
             r.awaiting_audit_phase = None
+            r.worker_id = 'worker-pauser'
+            r.lease_token = claim['lease_token']
+            r.lease_expires_at = utcnow() + timedelta(minutes=5)
             db.session.commit()
 
         # 2. Duplicate after_dm pause with same dm_message_id
@@ -1924,6 +1932,9 @@ class AutomationRouteTest(unittest.TestCase):
             r.status = 'running'
             r.awaiting_audit_cycle_id = None
             r.awaiting_audit_phase = None
+            r.worker_id = 'worker-pauser'
+            r.lease_token = claim['lease_token']
+            r.lease_expires_at = utcnow() + timedelta(minutes=5)
             db.session.commit()
 
         # 3. Duplicate after_dm pause with same player_message_id but no dm_message_id (silent/empty)
@@ -1961,6 +1972,9 @@ class AutomationRouteTest(unittest.TestCase):
             r.status = 'running'
             r.awaiting_audit_cycle_id = None
             r.awaiting_audit_phase = None
+            r.worker_id = 'worker-pauser'
+            r.lease_token = claim['lease_token']
+            r.lease_expires_at = utcnow() + timedelta(minutes=5)
             db.session.commit()
 
         # 4. Existing audited/skipped cycle does NOT force run back into awaiting_audit
@@ -1972,6 +1986,9 @@ class AutomationRouteTest(unittest.TestCase):
             r.status = 'running'
             r.awaiting_audit_cycle_id = None
             r.awaiting_audit_phase = None
+            r.worker_id = 'worker-pauser'
+            r.lease_token = claim['lease_token']
+            r.lease_expires_at = utcnow() + timedelta(minutes=5)
             db.session.commit()
 
         pause_7_resp = self.client.post(
@@ -2170,7 +2187,7 @@ class AutomationRouteTest(unittest.TestCase):
         summary = debug_resp.get_json()
         self.assertEqual(summary['run_id'], run_id)
         self.assertIn('stuck_reasons', summary)
-        self.assertTrue(summary['lease']['has_lease_token'])
+        self.assertFalse(summary['lease']['has_lease_token'])
         self.assertNotIn('lease_token', summary['lease'])
 
         # Test applicability parsing string booleans
