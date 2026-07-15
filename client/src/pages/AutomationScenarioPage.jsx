@@ -4,6 +4,7 @@ import {
   cleanupAutomationScenario,
   createAutomationRun,
   createAutomationSnapshot,
+  deleteAutomationSnapshot,
   getAutomationScenario,
   updateAutomationScenario,
   deleteAutomationScenario,
@@ -210,6 +211,20 @@ export default function AutomationScenarioPage() {
     }
   }
 
+  const handleDeleteSnapshot = async (snapshotId) => {
+    const confirmed = window.confirm('Are you sure you want to permanently delete this snapshot? All runs associated with this snapshot will also be deleted. This action cannot be undone.')
+    if (!confirmed) return
+    try {
+      await deleteAutomationSnapshot(snapshotId)
+      if (String(selectedSnapshotId) === String(snapshotId)) {
+        setSelectedSnapshotId('')
+      }
+      await loadData()
+    } catch (err) {
+      setError(err.message)
+    }
+  }
+
   if (loading) return <Loading message="Loading scenario..." />
   if (!scenario) return <ErrorMessage message={error || 'Scenario not found.'} />
 
@@ -374,12 +389,23 @@ export default function AutomationScenarioPage() {
         ) : (
           <div className="automation-list">
             {snapshots.map((snapshot) => (
-              <div key={snapshot.id} className="automation-list-item automation-list-static">
-                <div>
-                  <strong>{snapshot.label}</strong>
-                  <span>{snapshot.summary || snapshot.metadata?.campaign_name}</span>
+              <div key={snapshot.id} className="automation-run-list-row">
+                <div className="automation-list-item automation-list-static" style={{ flex: 1 }}>
+                  <div>
+                    <strong>{snapshot.label}</strong>
+                    <span>{snapshot.summary || snapshot.metadata?.campaign_name}</span>
+                  </div>
+                  <span>{snapshot.created_at?.slice(0, 19).replace('T', ' ')}</span>
                 </div>
-                <span>{snapshot.created_at?.slice(0, 19).replace('T', ' ')}</span>
+                <button
+                  className="btn btn-danger btn-small"
+                  type="button"
+                  style={{ padding: '0.4rem 0.6rem', minWidth: 'auto', display: 'flex', alignItems: 'center', justifyContent: 'center' }}
+                  onClick={() => handleDeleteSnapshot(snapshot.id)}
+                  title="Delete this snapshot"
+                >
+                  <i className="bi bi-trash"></i>
+                </button>
               </div>
             ))}
           </div>

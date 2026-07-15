@@ -3400,6 +3400,38 @@ class AutomationRouteTest(unittest.TestCase):
         self.assertEqual(self.client.get(f'/api/automation/scenarios/{scenario_id}', headers=self.headers).status_code, 404)
         self.assertEqual(self.client.get(f'/api/automation/runs/{run_id2}', headers=self.headers).status_code, 404)
 
+    def test_delete_snapshot(self):
+        scenario_response = self.client.post(
+            '/api/automation/scenarios',
+            headers=self.headers,
+            json={'source_campaign_id': self.campaign_id, 'name': 'To Delete Snapshot'},
+        )
+        self.assertEqual(scenario_response.status_code, 201)
+        scenario_id = scenario_response.get_json()['scenario']['id']
+
+        snapshot_id = self.client.post(
+            f'/api/automation/scenarios/{scenario_id}/snapshots',
+            headers=self.headers,
+            json={},
+        ).get_json()['snapshot']['id']
+        
+        run_id = self.client.post(
+            f'/api/automation/scenarios/{scenario_id}/runs',
+            headers=self.headers,
+            json={'snapshot_id': snapshot_id},
+        ).get_json()['run']['id']
+
+        # Delete the snapshot
+        delete_snapshot_response = self.client.delete(f'/api/automation/snapshots/{snapshot_id}', headers=self.headers)
+        self.assertEqual(delete_snapshot_response.status_code, 200)
+        self.assertTrue(delete_snapshot_response.get_json()['ok'])
+
+        # Verify snapshot and associated runs are deleted
+        with app.app_context():
+            from models import AutomationSnapshot, AutomationRun
+            self.assertIsNone(db.session.get(AutomationSnapshot, snapshot_id))
+            self.assertIsNone(db.session.get(AutomationRun, run_id))
+
 
 if __name__ == '__main__':
     unittest.main()

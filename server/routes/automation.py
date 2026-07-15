@@ -637,6 +637,7 @@ def update_automation_scenario(current_user, scenario_id):
 def _delete_runs(run_ids):
     if not run_ids:
         return
+    Campaign.query.filter(Campaign.automation_source_run_id.in_(run_ids)).update({'automation_source_run_id': None}, synchronize_session=False)
     AutomationRunAuditorJob.query.filter(AutomationRunAuditorJob.run_id.in_(run_ids)).delete(synchronize_session=False)
     AutomationRunAuditCycle.query.filter(AutomationRunAuditCycle.run_id.in_(run_ids)).delete(synchronize_session=False)
     AutomationRunProviderCall.query.filter(AutomationRunProviderCall.run_id.in_(run_ids)).delete(synchronize_session=False)
@@ -809,6 +810,34 @@ def delete_automation_run(current_user, run_id):
         {'type': 'run_deleted', 'run_id': run_id, 'scenario_id': scenario_id},
         resource_type='run',
         resource_id=run_id,
+    )
+    return jsonify({'ok': True}), 200
+
+
+@automation_bp.route('/api/automation/snapshots/<int:snapshot_id>', methods=['DELETE'])
+@token_required
+def delete_automation_snapshot(current_user, snapshot_id):
+    snapshot = get_or_404(AutomationSnapshot, snapshot_id)
+    if not _scenario_owned_by_user(current_user, snapshot.scenario):
+        return jsonify({'error': 'Forbidden'}), 403
+    
+    scenario_id = snapshot.scenario_id
+    # Nullify any campaigns referencing this snapshot
+    Campaign.query.filter_by(automation_source_snapshot_id=snapshot.id).update({'automation_source_snapshot_id': None}, synchronize_session=False)
+    
+    # Delete runs referencing this snapshot
+    run_ids = [run.id for run in AutomationRun.query.filter_by(snapshot_id=snapshot.id).all()]
+    _delete_runs(run_ids)
+    
+    db.session.delete(snapshot)
+    db.session.commit()
+    
+    append_workspace_event(
+        current_user.id,
+        'snapshot_deleted',
+        {'type': 'snapshot_deleted', 'snapshot_id': snapshot_id, 'scenario_id': scenario_id},
+        resource_type='snapshot',
+        resource_id=snapshot_id,
     )
     return jsonify({'ok': True}), 200
 

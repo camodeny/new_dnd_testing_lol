@@ -163,6 +163,10 @@ export function createAutomationSnapshot(scenarioId, payload = {}) {
   return apiFetch(`/automation/scenarios/${scenarioId}/snapshots`, { method: 'POST', body: JSON.stringify(payload) })
 }
 
+export function deleteAutomationSnapshot(snapshotId) {
+  return apiFetch(`/automation/snapshots/${snapshotId}`, { method: 'DELETE' })
+}
+
 export function createAutomationRun(scenarioId, payload = {}) {
   return apiFetch(`/automation/scenarios/${scenarioId}/runs`, { method: 'POST', body: JSON.stringify(payload) })
 }
