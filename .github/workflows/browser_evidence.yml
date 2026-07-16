@@ -42,7 +42,7 @@ jobs:
 
       - name: Install Playwright Chromium Browser
         working-directory: client
-        run: npx playwright install --with-deps chromium
+        run: npx playwright install chromium
 
       - name: Execute Evidence Scenarios
         working-directory: client

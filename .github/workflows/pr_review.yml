@@ -177,7 +177,7 @@ jobs:
       - name: Install Playwright Chromium Browser
         if: steps.plan.outputs.run_browser_tests == 'true'
         working-directory: client
-        run: npx playwright install --with-deps chromium
+        run: npx playwright install chromium
 
       - name: Run browser evidence tests (Desktop)
         if: steps.plan.outputs.run_browser_tests == 'true'
