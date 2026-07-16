@@ -22,7 +22,7 @@ on:
 jobs:
   run-evidence:
     name: Run Browser Evidence
-    runs-on: ubuntu-latest
+    runs-on: [self-hosted, Linux, ARM64, raspone-ci]
     steps:
       - name: Check out repository
         uses: actions/checkout@v4
@@ -42,7 +42,7 @@ jobs:
 
       - name: Install Playwright Chromium Browser
         working-directory: client
-        run: npx playwright install --with-deps chromium
+        run: npx playwright install chromium
 
       - name: Execute Evidence Scenarios
         working-directory: client
