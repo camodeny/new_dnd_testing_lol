@@ -1,6 +1,5 @@
 """Shared phase-aware DM response polling with explicit transient-error handling."""
 
-import sys
 import time
 
 
@@ -73,21 +72,14 @@ def resolve_dm_response_timeouts(args):
     legacy = getattr(args, 'dm_response_timeout', None)
 
     if visible is not None and post_turn is not None:
-        resolved = (float(visible), float(post_turn))
-    elif visible is not None:
-        resolved = (float(visible), 720.0)
-    elif post_turn is not None:
-        resolved = (720.0, float(post_turn))
-    elif legacy is not None:
-        resolved = (float(legacy), 720.0)
-    else:
-        resolved = (720.0, 720.0)
-
-    print(
-        f'dm_response_timeouts visible={resolved[0]}s post_turn={resolved[1]}s',
-        file=sys.stderr,
-    )
-    return resolved
+        return float(visible), float(post_turn)
+    if visible is not None:
+        return float(visible), 720.0
+    if post_turn is not None:
+        return float(legacy) if legacy is not None else 720.0, float(post_turn)
+    if legacy is not None:
+        return float(legacy), 720.0
+    return 720.0, 720.0
 
 
 def _fetch_status(fetch_status_fn, last_status, phase, transient_error_types, on_poll_error_fn):
