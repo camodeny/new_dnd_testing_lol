@@ -235,6 +235,8 @@ def _run_session_memory_update(
         mark_session_dm_turn_post_turn_complete(
             player_message_id,
             dm_message_id=dm_message_id,
+            memory_status='complete' if memory_complete else 'skipped',
+            clock_status='complete' if clock_complete else 'error',
         )
         db.session.commit()
 
@@ -750,6 +752,7 @@ def send_message(current_user, session_id):
         ai_text = ai_turn.get('content') or ''
 
         if ai_turn.get('mode') == 'speak' and ai_text:
+            resolver_packet = ai_result.get('resolver_packet') if isinstance(ai_result, dict) else None
             try:
                 ai_msg, pending_proposals, _action_results = commit_accepted_dm_turn(
                     campaign,
@@ -768,6 +771,21 @@ def send_message(current_user, session_id):
                 return jsonify({'error': repr(err), 'messages': result_messages}), 500
             result_messages.append(ai_msg.to_dict())
 
+            if isinstance(resolver_packet, dict):
+                try:
+                    from models import CampaignResolverPacket
+                    packet_record = CampaignResolverPacket(
+                        campaign_id=campaign.id,
+                        session_id=session_id,
+                        dm_message_id=ai_msg.id,
+                        turn_id=trace_id,
+                        packet_json=resolver_packet,
+                        status='committed',
+                    )
+                    db.session.add(packet_record)
+                except Exception:
+                    pass
+
             # Synchronous memory update
             _run_session_memory_update(
                 campaign.id,
@@ -779,6 +797,7 @@ def send_message(current_user, session_id):
                 hot_context,
                 trace_id,
                 dm_message_id=ai_msg.id,
+                resolver_packet=resolver_packet,
             )
         elif ai_turn.get('mode') == 'silent':
             log_audit_event(

@@ -114,6 +114,11 @@ DIAGNOSTICS_TEMPLATE = {
     "substitutions": [],
 }
 
+
+def make_diagnostics():
+    import json
+    return json.loads(json.dumps(DIAGNOSTICS_TEMPLATE))
+
 # ── Valid Evidence Sources ────────────────────────────────────────────
 EVIDENCE_SOURCES = {
     "memory_resolver_packet",

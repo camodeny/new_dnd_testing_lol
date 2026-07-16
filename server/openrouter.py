@@ -4850,7 +4850,11 @@ def get_session_dm_response_with_tools(
                     'reason': 'The DM response would have semantically exposed DM-private information.',
                 }
             if base_audit.get('operation') == 'session_dm_response':
-                return {**decision, '_pending_actions': list(action_buffer['actions'])}
+                return {
+                    **decision,
+                    '_pending_actions': list(action_buffer['actions']),
+                    'resolver_packet': decision.get('resolver_packet'),
+                }
             # Preserve the direct helper's historical public return shape; production callers
             # receive the action IDs through the session-DM operation result above.
             return {key: value for key, value in decision.items() if key != 'commit_action_ids'}

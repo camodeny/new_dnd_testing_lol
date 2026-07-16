@@ -330,6 +330,93 @@ def ensure_lightweight_schema():
         db.session.execute(text('CREATE INDEX ix_automation_run_audit_attempts_auditor_job_id ON automation_run_audit_attempts (auditor_job_id)'))
         db.session.execute(text('CREATE INDEX ix_automation_run_audit_attempts_created_at ON automation_run_audit_attempts (created_at)'))
 
+    # --- campaign_worlds ---
+    campaign_world_columns = table_columns('campaign_worlds')
+    if 'memory_revision' not in campaign_world_columns:
+        db.session.execute(text('ALTER TABLE campaign_worlds ADD COLUMN memory_revision INTEGER DEFAULT 0 NOT NULL'))
+
+    # --- New tables for session memory integrity ---
+    resolver_packet_columns = table_columns('campaign_resolver_packets')
+    if not resolver_packet_columns:
+        db.session.execute(text('''
+            CREATE TABLE campaign_resolver_packets (
+                id INTEGER NOT NULL PRIMARY KEY AUTOINCREMENT,
+                campaign_id INTEGER NOT NULL,
+                session_id INTEGER,
+                dm_message_id INTEGER,
+                turn_id VARCHAR(100),
+                packet_json JSON NOT NULL,
+                status VARCHAR(30) NOT NULL DEFAULT 'committed',
+                accepted_at DATETIME NOT NULL,
+                FOREIGN KEY(campaign_id) REFERENCES campaign (id),
+                FOREIGN KEY(session_id) REFERENCES campaign_sessions (id),
+                FOREIGN KEY(dm_message_id) REFERENCES session_messages (id)
+            )
+        '''))
+        db.session.execute(text('CREATE INDEX ix_campaign_resolver_packets_campaign_id ON campaign_resolver_packets (campaign_id)'))
+        db.session.execute(text('CREATE INDEX ix_campaign_resolver_packets_dm_message_id ON campaign_resolver_packets (dm_message_id)'))
+
+    clarification_columns = table_columns('campaign_clarifications')
+    if not clarification_columns:
+        db.session.execute(text('''
+            CREATE TABLE campaign_clarifications (
+                id INTEGER NOT NULL PRIMARY KEY AUTOINCREMENT,
+                campaign_id INTEGER NOT NULL,
+                clarification_id VARCHAR(200) UNIQUE NOT NULL,
+                idempotency_key VARCHAR(500) UNIQUE NOT NULL,
+                kind VARCHAR(60) NOT NULL,
+                mention_ref VARCHAR(200) NOT NULL,
+                mention_entity_id VARCHAR(200),
+                question TEXT NOT NULL,
+                candidate_ids JSON,
+                blocking_scope JSON,
+                status VARCHAR(30) NOT NULL DEFAULT 'pending',
+                answer TEXT,
+                resolved_canonical_id VARCHAR(200),
+                resolution_action VARCHAR(40),
+                resolution_patch_json JSON,
+                answered_by VARCHAR(200),
+                answered_at DATETIME,
+                dismissed_at DATETIME,
+                obsoleted_by_clarification_id VARCHAR(200),
+                source_memory_run_id VARCHAR(100),
+                source_turn_id VARCHAR(100),
+                source_trace_id VARCHAR(100),
+                created_at DATETIME,
+                updated_at DATETIME,
+                FOREIGN KEY(campaign_id) REFERENCES campaign (id)
+            )
+        '''))
+        db.session.execute(text('CREATE INDEX ix_campaign_clarifications_campaign_id ON campaign_clarifications (campaign_id)'))
+        db.session.execute(text('CREATE INDEX ix_campaign_clarifications_status ON campaign_clarifications (status)'))
+        db.session.execute(text('CREATE INDEX ix_campaign_clarifications_idempotency ON campaign_clarifications (idempotency_key)'))
+
+    identity_res_columns = table_columns('campaign_identity_resolutions')
+    if not identity_res_columns:
+        db.session.execute(text('''
+            CREATE TABLE campaign_identity_resolutions (
+                id INTEGER NOT NULL PRIMARY KEY AUTOINCREMENT,
+                campaign_id INTEGER NOT NULL,
+                resolution_id VARCHAR(200) UNIQUE NOT NULL,
+                mention_entity_id VARCHAR(200) NOT NULL,
+                mention_name VARCHAR(400),
+                resolution_action VARCHAR(40) NOT NULL,
+                canonical_id VARCHAR(200) NOT NULL,
+                canonical_name VARCHAR(400),
+                visibility VARCHAR(30) NOT NULL DEFAULT 'dm_private',
+                resolved_by VARCHAR(120),
+                source_clarification_id VARCHAR(200),
+                source_turn_id VARCHAR(100),
+                source_trace_id VARCHAR(100),
+                evidence_json JSON,
+                created_at DATETIME,
+                FOREIGN KEY(campaign_id) REFERENCES campaign (id)
+            )
+        '''))
+        db.session.execute(text('CREATE INDEX ix_campaign_identity_resolutions_campaign_id ON campaign_identity_resolutions (campaign_id)'))
+        db.session.execute(text('CREATE INDEX ix_campaign_identity_resolutions_mention_entity ON campaign_identity_resolutions (mention_entity_id)'))
+        db.session.execute(text('CREATE INDEX ix_campaign_identity_resolutions_canonical ON campaign_identity_resolutions (canonical_id)'))
+
     db.session.commit()
 
 

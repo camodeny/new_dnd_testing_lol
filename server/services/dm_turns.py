@@ -76,7 +76,7 @@ def mark_session_dm_turn_visible(
     return turn
 
 
-def mark_session_dm_turn_post_turn_complete(player_message_id, dm_message_id=None, finished_at=None):
+def mark_session_dm_turn_post_turn_complete(player_message_id, dm_message_id=None, finished_at=None, memory_status=None, clock_status=None):
     turn = _get_turn(player_message_id)
     if turn is None:
         return None
@@ -86,8 +86,8 @@ def mark_session_dm_turn_post_turn_complete(player_message_id, dm_message_id=Non
     turn.finished_at = finished_at
     turn.full_duration_ms = _duration_ms(turn.started_at, finished_at)
     turn.post_turn_status = 'complete'
-    turn.memory_status = 'complete'
-    turn.clock_status = 'complete'
+    turn.memory_status = memory_status or 'complete'
+    turn.clock_status = clock_status or 'complete'
     if turn.status == 'pending':
         turn.status = 'speak'
     return turn

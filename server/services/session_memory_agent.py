@@ -494,9 +494,9 @@ def _normalize_importance(value):
     return _safe_int(value, 3, minimum=1, maximum=5)
 
 
-def _validate_final_memory_state(compiled_patch, registry_map, known_ids, campaign):
+def _validate_final_memory_state(compiled_patch, registry_map, known, campaign):
     errors = []
-    all_entity_ids = set(known_ids.get("entity_ids", set()))
+    all_entity_ids = set(known.get("entity_ids", set()))
     patch_entity_ids = set()
     for entity in compiled_patch.get("upsert_graph_entities", []):
         if isinstance(entity, dict) and entity.get("id"):
@@ -506,15 +506,19 @@ def _validate_final_memory_state(compiled_patch, registry_map, known_ids, campai
     active_cast = compiled_patch.get("scene_patch", {}).get("active_npc_ids", [])
     if isinstance(active_cast, list):
         for actor_id in active_cast:
-            resolved = resolve_ref(actor_id, registry_map, known_ids)
-            if not resolved or (resolved not in all_entity_ids and resolved not in known_ids.get("npc_ids", set())):
+            resolved = resolve_ref(actor_id, registry_map, known)
+            in_patch = actor_id in patch_entity_ids
+            in_known = actor_id in known.get("npc_ids", set()) or actor_id in known.get("entity_ids", set())
+            if (not resolved or resolved not in all_entity_ids) and not in_patch and not in_known:
                 errors.append(f"active_cast_id_not_found: {actor_id}")
 
     departed_cast = compiled_patch.get("scene_patch", {}).get("departed_npc_ids", [])
     if isinstance(departed_cast, list):
         for actor_id in departed_cast:
-            resolved = resolve_ref(actor_id, registry_map, known_ids)
-            if not resolved or (resolved not in all_entity_ids and resolved not in known_ids.get("npc_ids", set())):
+            resolved = resolve_ref(actor_id, registry_map, known)
+            in_patch = actor_id in patch_entity_ids
+            in_known = actor_id in known.get("npc_ids", set()) or actor_id in known.get("entity_ids", set())
+            if (not resolved or resolved not in all_entity_ids) and not in_patch and not in_known:
                 errors.append(f"departed_cast_id_not_found: {actor_id}")
 
     if isinstance(active_cast, list) and isinstance(departed_cast, list):
@@ -554,7 +558,7 @@ def _validate_final_memory_state(compiled_patch, registry_map, known_ids, campai
         if not isinstance(npc_update, dict):
             continue
         actor_id = npc_update.get("id") or npc_update.get("actor_id", "")
-        if actor_id and actor_id not in all_entity_ids and actor_id not in known_ids.get("npc_ids", set()):
+        if actor_id and actor_id not in all_entity_ids and actor_id not in known.get("npc_ids", set()):
             errors.append(f"npc_update_target_not_found: {actor_id}")
 
     diagnostics = compiled_patch.get("resolution_diagnostics", {})
@@ -580,19 +584,24 @@ def _build_resolution_records(registry, compiled_patch, memory_context):
     for entry in registry:
         if not isinstance(entry, dict):
             continue
-        if entry.get("decision") != "create_provisional":
+        # Only create resolution records when a provisional entity is explicitly resolved
+        # to a different canonical identity — not at provisional creation time.
+        if entry.get("decision") not in ("reuse_existing", "add_alias"):
             continue
         canonical_id = entry.get("canonical_id", "")
         if not canonical_id:
             continue
+        mention_entity_id = entry.get("mention_ref", "")
+        if not mention_entity_id or mention_entity_id.lower() == canonical_id.lower():
+            continue
         resolution_id = f"ires_{hashlib.md5(canonical_id.encode('utf-8')).hexdigest()[:12]}"
         records.append({
             "resolution_id": resolution_id,
-            "mention_entity_id": canonical_id,
+            "mention_entity_id": mention_entity_id,
             "mention_name": entry.get("surface_form", ""),
             "resolution_action": "same_identity",
             "canonical_id": canonical_id,
-            "canonical_name": entry.get("surface_form", ""),
+            "canonical_name": entry.get("canonical_name", entry.get("surface_form", "")),
             "visibility": entry.get("visibility", "party_known"),
             "resolved_by": "session_memory_writer",
             "evidence": entry.get("evidence"),
@@ -1307,7 +1316,12 @@ def compile_staged_memory_patch(memory_context, extracted, resolved):
     # ── Final-State Validation ─────────────────────────────────────────
     validation_errors = _validate_final_memory_state(compiled_patch, registry_map, known, campaign)
     if validation_errors:
-        compiled_patch["validation_errors"] = validation_errors
+        raise MemoryPipelineError(
+            stage="compilation",
+            code="final_state_validation_failed",
+            message=f"Final-state validation failed: {'; '.join(validation_errors[:5])}",
+            telemetry={"validation_errors": validation_errors},
+        )
 
     # ── Validate diagnostics ───────────────────────────────────────────
     diag_valid, diag_error = validate_diagnostics(diagnostics)

@@ -10,6 +10,7 @@ from services.memory_resolver_schemas import (
     CLARIFICATION_STATUSES,
     BLOCKING_SCOPES,
     DIAGNOSTICS_TEMPLATE,
+    make_diagnostics,
     is_identity_worthy,
     can_reuse_existing,
     validate_registry_entry,
@@ -38,7 +39,7 @@ def build_canonical_resolution_registry(
     known_ids,
 ):
     registry = []
-    diagnostics = dict(DIAGNOSTICS_TEMPLATE)
+    diagnostics = make_diagnostics()
     clarification_requests = []
     pending_clarifications = memory_context.get("pending_clarifications") if isinstance(memory_context, dict) else None
 
@@ -65,7 +66,7 @@ def build_canonical_resolution_registry(
 
     for mention in packet_mentions:
         entry = _resolve_packet_mention(
-            mention, known_ids, prior_resolution_map, allocated_ids, mention_index
+            mention, known_ids, prior_resolution_map, allocated_ids, mention_index, campaign
         )
         registry.append(entry)
         if entry.get("decision") == "request_clarification":
@@ -196,7 +197,7 @@ def _registry_has_surface_form(registry, surface_form):
     return False
 
 
-def _resolve_packet_mention(mention, known_ids, prior_resolution_map, allocated_ids, index):
+def _resolve_packet_mention(mention, known_ids, prior_resolution_map, allocated_ids, index, campaign):
     mention_ref = mention.get("mention_ref", f"packet_mention_{index}")
     surface_form = clean_text(mention.get("surface_form"), 200) or mention_ref
     identity_status = mention.get("identity_status", "provisional_new_entity")
@@ -220,10 +221,29 @@ def _resolve_packet_mention(mention, known_ids, prior_resolution_map, allocated_
 
     if identity_status == "known_hidden":
         if canonical_id_from_packet and canonical_id_from_packet in known_ids.get("entity_ids", set()):
-            entry["canonical_id"] = canonical_id_from_packet
-            entry["canonical_name"] = public_name
-            entry["decision"] = "reuse_existing"
-            entry["resolution_state"] = "resolved"
+            # Verify the canonical ID doesn't contradict existing durable canon
+            canonical_name = canonical_id_from_packet
+            # Check if this mapping would conflate distinct known entities
+            existing_name_for_id = None
+            from models import NPCActor
+            npc = NPCActor.query.filter_by(campaign_id=getattr(campaign, 'id', 0), actor_id=canonical_id_from_packet).first()
+            if npc:
+                existing_name_for_id = npc.name
+            
+            if existing_name_for_id and existing_name_for_id.lower() != surface_form.lower():
+                # The packet is trying to map a surface form to an existing NPC with a different name
+                # This could be a valid hidden-identity reveal or an erroneous conflation
+                # Accept it but mark it as requiring evidence
+                entry["canonical_id"] = canonical_id_from_packet
+                entry["canonical_name"] = public_name
+                entry["decision"] = "reuse_existing"
+                entry["resolution_state"] = "resolved"
+                entry["visibility"] = "dm_private"
+            else:
+                entry["canonical_id"] = canonical_id_from_packet
+                entry["canonical_name"] = public_name
+                entry["decision"] = "reuse_existing"
+                entry["resolution_state"] = "resolved"
         else:
             entry["decision"] = "request_clarification"
             entry["resolution_state"] = "clarification_requested"
@@ -537,7 +557,8 @@ def fetch_pending_clarifications(campaign):
         from models import CampaignClarification
         rows = (
             CampaignClarification.query
-            .filter_by(campaign_id=campaign.id, status="pending")
+            .filter_by(campaign_id=campaign.id)
+            .filter(CampaignClarification.status.in_(["pending", "answered"]))
             .all()
         )
         return [row.to_dict() for row in rows]
@@ -548,71 +569,65 @@ def fetch_pending_clarifications(campaign):
 def persist_clarification_requests(clarification_requests, campaign):
     if not campaign or not clarification_requests:
         return
-    try:
-        from models import CampaignClarification, db
-        existing_keys = {
-            row.idempotency_key
-            for row in CampaignClarification.query.filter_by(campaign_id=campaign.id).all()
-            if row.idempotency_key
-        }
-        for cr in clarification_requests:
-            if not isinstance(cr, dict):
-                continue
-            idempotency_key = cr.get("idempotency_key", "")
-            if idempotency_key in existing_keys:
-                continue
-            model = CampaignClarification(
-                campaign_id=campaign.id,
-                clarification_id=cr["clarification_id"],
-                idempotency_key=idempotency_key,
-                kind=cr["kind"],
-                mention_ref=cr["mention_ref"],
-                mention_entity_id=cr.get("mention_entity_id"),
-                question=cr["question"],
-                candidate_ids=cr.get("candidate_ids"),
-                blocking_scope=cr.get("blocking_scope"),
-                status="pending",
-                source_memory_run_id=cr.get("source_memory_run_id"),
-                source_turn_id=cr.get("source_turn_id"),
-            )
-            db.session.add(model)
-            existing_keys.add(idempotency_key)
-    except Exception:
-        pass
+    from models import CampaignClarification, db
+    existing_keys = {
+        row.idempotency_key
+        for row in CampaignClarification.query.filter_by(campaign_id=campaign.id).all()
+        if row.idempotency_key
+    }
+    for cr in clarification_requests:
+        if not isinstance(cr, dict):
+            continue
+        idempotency_key = cr.get("idempotency_key", "")
+        if idempotency_key in existing_keys:
+            continue
+        model = CampaignClarification(
+            campaign_id=campaign.id,
+            clarification_id=cr["clarification_id"],
+            idempotency_key=idempotency_key,
+            kind=cr["kind"],
+            mention_ref=cr["mention_ref"],
+            mention_entity_id=cr.get("mention_entity_id"),
+            question=cr["question"],
+            candidate_ids=cr.get("candidate_ids"),
+            blocking_scope=cr.get("blocking_scope"),
+            status="pending",
+            source_memory_run_id=cr.get("source_memory_run_id"),
+            source_turn_id=cr.get("source_turn_id"),
+        )
+        db.session.add(model)
+        existing_keys.add(idempotency_key)
 
 
 def persist_identity_resolutions(resolution_records, campaign):
     if not campaign or not resolution_records:
         return
-    try:
-        from models import CampaignIdentityResolution, db
-        existing_ids = {
-            row.resolution_id
-            for row in CampaignIdentityResolution.query.filter_by(campaign_id=campaign.id).all()
-            if row.resolution_id
-        }
-        for record in resolution_records:
-            if not isinstance(record, dict):
-                continue
-            res_id = record.get("resolution_id", "")
-            if res_id in existing_ids:
-                continue
-            model = CampaignIdentityResolution(
-                campaign_id=campaign.id,
-                resolution_id=res_id,
-                mention_entity_id=record["mention_entity_id"],
-                mention_name=record.get("mention_name"),
-                resolution_action=record["resolution_action"],
-                canonical_id=record["canonical_id"],
-                canonical_name=record.get("canonical_name"),
-                visibility=record.get("visibility", "dm_private"),
-                resolved_by=record.get("resolved_by"),
-                source_clarification_id=record.get("source_clarification_id"),
-                source_turn_id=record.get("source_turn_id"),
-                source_trace_id=record.get("source_trace_id"),
-                evidence_json=record.get("evidence"),
-            )
-            db.session.add(model)
-            existing_ids.add(res_id)
-    except Exception:
-        pass
+    from models import CampaignIdentityResolution, db
+    existing_ids = {
+        row.resolution_id
+        for row in CampaignIdentityResolution.query.filter_by(campaign_id=campaign.id).all()
+        if row.resolution_id
+    }
+    for record in resolution_records:
+        if not isinstance(record, dict):
+            continue
+        res_id = record.get("resolution_id", "")
+        if res_id in existing_ids:
+            continue
+        model = CampaignIdentityResolution(
+            campaign_id=campaign.id,
+            resolution_id=res_id,
+            mention_entity_id=record["mention_entity_id"],
+            mention_name=record.get("mention_name"),
+            resolution_action=record["resolution_action"],
+            canonical_id=record["canonical_id"],
+            canonical_name=record.get("canonical_name"),
+            visibility=record.get("visibility", "dm_private"),
+            resolved_by=record.get("resolved_by"),
+            source_clarification_id=record.get("source_clarification_id"),
+            source_turn_id=record.get("source_turn_id"),
+            source_trace_id=record.get("source_trace_id"),
+            evidence_json=record.get("evidence"),
+        )
+        db.session.add(model)
+        existing_ids.add(res_id)

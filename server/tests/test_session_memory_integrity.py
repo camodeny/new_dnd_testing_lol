@@ -334,7 +334,7 @@ class SessionMemoryIntegrityTest(unittest.TestCase):
         guard_entries = [e for e in registry if 'guard' in e.get('surface_form', '').lower()]
         self.assertEqual(len(guard_entries), 1)
 
-    def test_provisional_entity_creates_resolution_record(self):
+    def test_provisional_entity_does_not_create_resolution_record(self):
         memory_context = self._base_context()
         extracted = {
             'entity_claims': [{'name': 'the ferryman', 'type': 'npc'}],
@@ -342,7 +342,8 @@ class SessionMemoryIntegrityTest(unittest.TestCase):
         resolved = {}
         compiled = compile_staged_memory_patch(memory_context, extracted, resolved)
         records = compiled.get('resolution_records', [])
-        self.assertTrue(len(records) >= 1)
+        # Provisional entities should NOT create resolution records at creation time
+        self.assertEqual(len(records), 0)
 
     def test_diagnostics_substitutions_empty(self):
         memory_context = self._base_context()
@@ -387,12 +388,9 @@ class SessionMemoryIntegrityTest(unittest.TestCase):
                 'departed_npc_ids': ['toren'],
             },
         }
-        compiled = compile_staged_memory_patch(memory_context, extracted, resolved)
-        active = set(compiled['scene_patch'].get('active_npc_ids', []))
-        departed = set(compiled['scene_patch'].get('departed_npc_ids', []))
-        # Validation errors should flag the overlap
-        validation_errors = compiled.get('validation_errors', [])
-        self.assertTrue(any('overlap' in e.lower() for e in validation_errors))
+        # Final-state validation is now blocking — overlapping cast sets raise MemoryPipelineError
+        with self.assertRaises(MemoryPipelineError):
+            compile_staged_memory_patch(memory_context, extracted, resolved)
 
     def test_identity_worthy_heuristic(self):
         self.assertTrue(is_identity_worthy('the grey-cloaked figure'))

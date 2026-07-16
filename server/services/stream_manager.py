@@ -299,6 +299,7 @@ class SessionGeneratorWorker:
         result_messages = [player_msg.to_dict()] if player_msg else []
 
         if ai_turn.get('mode') == 'speak' and ai_text:
+            resolver_packet = ai_result.get('resolver_packet') if isinstance(ai_result, dict) else None
             ai_msg, pending_proposals, _action_results = commit_accepted_dm_turn(
                 campaign,
                 session,
@@ -315,6 +316,21 @@ class SessionGeneratorWorker:
             result_messages.append(ai_msg.to_dict())
             sheet_proposals = [p.to_dict() for p in pending_proposals]
 
+            if isinstance(resolver_packet, dict):
+                try:
+                    from models import CampaignResolverPacket, db as db_models
+                    packet_record = CampaignResolverPacket(
+                        campaign_id=campaign.id,
+                        session_id=session.id,
+                        dm_message_id=ai_msg.id,
+                        turn_id=trace_id,
+                        packet_json=resolver_packet,
+                        status='committed',
+                    )
+                    db_models.session.add(packet_record)
+                except Exception:
+                    pass
+
             self.finish_success(result_messages, sheet_proposals)
             from routes.sessions import _run_session_memory_update
             _run_session_memory_update(
@@ -327,6 +343,7 @@ class SessionGeneratorWorker:
                 hot_context,
                 trace_id,
                 dm_message_id=ai_msg.id,
+                resolver_packet=resolver_packet,
             )
             return
         elif ai_turn.get('mode') == 'silent':
