@@ -221,29 +221,29 @@ def _resolve_packet_mention(mention, known_ids, prior_resolution_map, allocated_
 
     if identity_status == "known_hidden":
         if canonical_id_from_packet and canonical_id_from_packet in known_ids.get("entity_ids", set()):
-            # Verify the canonical ID doesn't contradict existing durable canon
-            canonical_name = canonical_id_from_packet
-            # Check if this mapping would conflate distinct known entities
-            existing_name_for_id = None
-            from models import NPCActor
-            npc = NPCActor.query.filter_by(campaign_id=getattr(campaign, 'id', 0), actor_id=canonical_id_from_packet).first()
-            if npc:
-                existing_name_for_id = npc.name
-            
-            if existing_name_for_id and existing_name_for_id.lower() != surface_form.lower():
-                # The packet is trying to map a surface form to an existing NPC with a different name
-                # This could be a valid hidden-identity reveal or an erroneous conflation
-                # Accept it but mark it as requiring evidence
-                entry["canonical_id"] = canonical_id_from_packet
-                entry["canonical_name"] = public_name
-                entry["decision"] = "reuse_existing"
-                entry["resolution_state"] = "resolved"
-                entry["visibility"] = "dm_private"
-            else:
-                entry["canonical_id"] = canonical_id_from_packet
-                entry["canonical_name"] = public_name
-                entry["decision"] = "reuse_existing"
-                entry["resolution_state"] = "resolved"
+            # Check if the surface_form matches a DIFFERENT known entity (name collision)
+            surface_lower = surface_form.strip().lower()
+            for npc_id, npc_name in known_ids.get("npc_names", {}).items():
+                if npc_name.lower() == surface_lower and npc_id.lower() != canonical_id_from_packet.lower():
+                    # The surface form is the proper name of a different NPC — reject this mapping
+                    entry["decision"] = "reject"
+                    entry["resolution_state"] = "rejected"
+                    entry["canonical_id"] = None
+                    entry["blocked_operations"] = ["identity_merge", "npc_update", "hidden_identity_reveal"]
+                    return entry
+
+            for ent_id, ent_name in known_ids.get("entity_names", {}).items():
+                if ent_name.lower() == surface_lower and ent_id.lower() != canonical_id_from_packet.lower():
+                    entry["decision"] = "reject"
+                    entry["resolution_state"] = "rejected"
+                    entry["canonical_id"] = None
+                    entry["blocked_operations"] = ["identity_merge", "npc_update", "hidden_identity_reveal"]
+                    return entry
+
+            entry["canonical_id"] = canonical_id_from_packet
+            entry["canonical_name"] = public_name
+            entry["decision"] = "reuse_existing"
+            entry["resolution_state"] = "resolved"
         else:
             entry["decision"] = "request_clarification"
             entry["resolution_state"] = "clarification_requested"

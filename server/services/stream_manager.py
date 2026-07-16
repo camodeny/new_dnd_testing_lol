@@ -299,7 +299,7 @@ class SessionGeneratorWorker:
         result_messages = [player_msg.to_dict()] if player_msg else []
 
         if ai_turn.get('mode') == 'speak' and ai_text:
-            resolver_packet = ai_result.get('resolver_packet') if isinstance(ai_result, dict) else None
+            resolver_packet = ai_turn.get('resolver_packet') if isinstance(ai_turn, dict) else None
             ai_msg, pending_proposals, _action_results = commit_accepted_dm_turn(
                 campaign,
                 session,
@@ -312,24 +312,10 @@ class SessionGeneratorWorker:
                 {'actions': ai_result.get('_pending_actions')}
                 if isinstance(ai_result, dict) and isinstance(ai_result.get('_pending_actions'), list)
                 else None,
+                resolver_packet=resolver_packet,
             )
             result_messages.append(ai_msg.to_dict())
             sheet_proposals = [p.to_dict() for p in pending_proposals]
-
-            if isinstance(resolver_packet, dict):
-                try:
-                    from models import CampaignResolverPacket, db as db_models
-                    packet_record = CampaignResolverPacket(
-                        campaign_id=campaign.id,
-                        session_id=session.id,
-                        dm_message_id=ai_msg.id,
-                        turn_id=trace_id,
-                        packet_json=resolver_packet,
-                        status='committed',
-                    )
-                    db_models.session.add(packet_record)
-                except Exception:
-                    pass
 
             self.finish_success(result_messages, sheet_proposals)
             from routes.sessions import _run_session_memory_update
@@ -411,11 +397,15 @@ def _session_dm_turn_decision(raw_result):
             'content': '',
             'reason': decision.get('reason') or 'The DM intentionally stayed silent.',
         }
-    return {
+    result = {
         'mode': 'speak',
         'content': decision.get('content') or '',
         'commit_action_ids': decision.get('commit_action_ids'),
     }
+    rp = decision.get('resolver_packet')
+    if isinstance(rp, dict):
+        result['resolver_packet'] = rp
+    return result
 
 class SessionStreamManager:
     DONE_WORKER_TTL_SECONDS = 60

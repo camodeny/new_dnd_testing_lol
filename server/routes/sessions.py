@@ -93,11 +93,15 @@ def _session_dm_turn_decision(raw_result):
             'content': '',
             'reason': decision.get('reason') or 'The DM intentionally stayed silent.',
         }
-    return {
+    result = {
         'mode': 'speak',
         'content': decision.get('content') or '',
         'commit_action_ids': decision.get('commit_action_ids'),
     }
+    rp = decision.get('resolver_packet')
+    if isinstance(rp, dict):
+        result['resolver_packet'] = rp
+    return result
 
 
 def _member_record(campaign_id, user_id):
@@ -175,11 +179,11 @@ def _run_session_memory_update(
                     audit_context=memory_audit_context,
                 )
             else:
-                apply_memory_patch(
-                    campaign,
-                    session,
-                    memory_patch,
-                    audit_context=memory_audit_context,
+                from services.session_memory_agent import MemoryPipelineError
+                raise MemoryPipelineError(
+                    stage="validation",
+                    code="invalid_contract",
+                    message=f"Memory patch missing required source_contract 'compiled_session_memory_v2'. Got: {source_contract!r}",
                 )
             memory_complete = True
 
@@ -752,7 +756,7 @@ def send_message(current_user, session_id):
         ai_text = ai_turn.get('content') or ''
 
         if ai_turn.get('mode') == 'speak' and ai_text:
-            resolver_packet = ai_result.get('resolver_packet') if isinstance(ai_result, dict) else None
+            resolver_packet = ai_turn.get('resolver_packet') if isinstance(ai_turn, dict) else None
             try:
                 ai_msg, pending_proposals, _action_results = commit_accepted_dm_turn(
                     campaign,
@@ -766,25 +770,11 @@ def send_message(current_user, session_id):
                     {'actions': ai_result.get('_pending_actions')}
                     if isinstance(ai_result, dict) and isinstance(ai_result.get('_pending_actions'), list)
                     else None,
+                    resolver_packet=resolver_packet,
                 )
             except Exception as err:
                 return jsonify({'error': repr(err), 'messages': result_messages}), 500
             result_messages.append(ai_msg.to_dict())
-
-            if isinstance(resolver_packet, dict):
-                try:
-                    from models import CampaignResolverPacket
-                    packet_record = CampaignResolverPacket(
-                        campaign_id=campaign.id,
-                        session_id=session_id,
-                        dm_message_id=ai_msg.id,
-                        turn_id=trace_id,
-                        packet_json=resolver_packet,
-                        status='committed',
-                    )
-                    db.session.add(packet_record)
-                except Exception:
-                    pass
 
             # Synchronous memory update
             _run_session_memory_update(

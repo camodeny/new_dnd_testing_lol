@@ -2498,6 +2498,7 @@ class AppRouteTest(unittest.TestCase):
                 'content': 'You reach the harbor by dusk.',
             }),
             patch('routes.sessions.get_session_memory_patch', return_value={
+                'source_contract': 'compiled_session_memory_v2',
                 'scene_patch': {
                     'location_id': 'harbor',
                     'location_name': 'Blackwater Harbor',

@@ -472,6 +472,16 @@ def _known_ids(campaign):
             and clean_text(entity.get('name'), 160)
             and clean_id(entity.get('id'), '')
         },
+        'npc_names': {
+            clean_id(npc.actor_id, ''): npc.name or ''
+            for npc in NPCActor.query.filter_by(campaign_id=campaign.id).all()
+            if clean_id(npc.actor_id, '') and npc.name
+        },
+        'entity_names': {
+            clean_id(entity.get('id'), ''): clean_text(entity.get('name'), 160) or ''
+            for entity in graph.get('entities', [])
+            if isinstance(entity, dict) and clean_id(entity.get('id'), '') and clean_text(entity.get('name'), 160)
+        },
     }
 
 
@@ -1231,6 +1241,24 @@ def compile_staged_memory_patch(memory_context, extracted, resolved):
                 "resolution_mode": "unresolved",
             })
             continue
+        if unknown_entity_ids:
+            skipped_facts.append({
+                "index": index,
+                "text": text,
+                "reason": "partial_entity_ids_unresolved",
+                "requested_entity_ids": [clean_id(item, "") for item in raw_entity_ids if clean_id(item, "")],
+                "unknown_entity_ids": unknown_entity_ids,
+            })
+            unresolved.append({
+                "kind": "fact",
+                "text": text,
+                "reason": "partial_entity_ids_unresolved",
+                "requested_entity_ids": [clean_id(item, "") for item in raw_entity_ids if clean_id(item, "")],
+                "unknown_entity_ids": unknown_entity_ids,
+                "provenance": make_provenance(raw_fact),
+                "resolution_mode": "unresolved",
+            })
+            continue
         fact_id = clean_id(raw_fact.get("id"), "")
         if fact_id and fact_id not in known["fact_ids"]:
             fact_id = ""
@@ -1248,14 +1276,8 @@ def compile_staged_memory_patch(memory_context, extracted, resolved):
             "resolution_mode": raw_fact.get("resolution_mode") or ("canonical" if entity_ids else "direct"),
         })
         if unknown_entity_ids:
-            unresolved.append({
-                "kind": "fact_entity_refs",
-                "text": text,
-                "reason": "partial_entity_resolution",
-                "unknown_entity_ids": unknown_entity_ids,
-                "provenance": make_provenance(raw_fact),
-                "resolution_mode": "unresolved",
-            })
+            # Already skipped above via continue
+            pass
 
     # ── Compile Clocks ─────────────────────────────────────────────────
     create_clocks = []
