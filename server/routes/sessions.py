@@ -50,6 +50,7 @@ from services.dm_turns import (
 )
 from services.dev_combat_sandbox import is_combat_sandbox_campaign, start_combat_sandbox_session
 from services.planning_service import can_start_session, planning_context
+from services.session_memory_agent import MemoryPipelineError
 from services.world_service import approve_world, dm_world_context, ensure_world_generated, world_public_payload
 
 sessions_bp = Blueprint('sessions', __name__)
@@ -215,6 +216,45 @@ def _run_session_memory_update(
                 'type': 'scene_updated',
                 'current_scene': current_scene_after,
             })
+    except MemoryPipelineError as err:
+        db.session.rollback()
+        telemetry = err.telemetry or {}
+        telemetry.update({
+            'pipeline_mode': 'staged_memory_writer',
+            'pipeline_error_stage': err.stage,
+            'pipeline_error_code': err.code,
+            'error_type': type(err).__name__,
+        })
+        log_audit_event(
+            campaign_id,
+            'memory_update_error',
+            f'Post-turn memory update failed at stage {err.stage}: {err.code}',
+            {
+                'session_id': session_id,
+                'error': repr(err),
+                'stage': err.stage,
+                'code': err.code,
+                'telemetry': telemetry,
+            },
+            source='session_memory',
+            actor='session_memory_writer',
+            trace_id=memory_trace_id,
+            parent_trace_id=parent_trace_id,
+            trace_label=trace_label,
+            audit_role='tools',
+            commit=True,
+        )
+        mark_session_dm_turn_error(
+            campaign_id,
+            session_id,
+            player_message_id,
+            parent_trace_id,
+            str(err),
+            dm_message_id=dm_message_id,
+            memory_status='error',
+            clock_status='skipped',
+        )
+        db.session.commit()
     except Exception as err:
         db.session.rollback()
         telemetry = memory_audit_context.get('telemetry') if 'memory_audit_context' in locals() else None

@@ -6,6 +6,15 @@ from services.dm_tools import _tool_search_campaign_memory
 from services.world_service import clean_id, clean_text, get_campaign_world, json_loads
 
 
+class MemoryPipelineError(Exception):
+    def __init__(self, stage, code, message, cause=None, telemetry=None):
+        super().__init__(message)
+        self.stage = stage
+        self.code = code
+        self.cause = cause
+        self.telemetry = telemetry or {}
+
+
 SESSION_MEMORY_TOOL_DEFINITIONS = [
     {
         'type': 'function',
@@ -471,32 +480,12 @@ def _normalize_importance(value):
 def compile_staged_memory_patch(memory_context, extracted, resolved):
     campaign = _memory_context_campaign(memory_context)
     if campaign is None:
-        prior_anchors = memory_context.get('prior_memory_anchors') if isinstance(memory_context.get('prior_memory_anchors'), dict) else {}
-        extracted_anchors = (extracted or {}).get('memory_anchors') if isinstance(extracted or {}, dict) else None
-        anchors = extracted_anchors or prior_anchors
-        compiled_anchors = {
-            "current_goal": anchors.get("current_goal"),
-            "current_scene": anchors.get("current_scene"),
-            "open_clues": anchors.get("open_clues") if isinstance(anchors.get("open_clues"), list) else [],
-            "unresolved_questions": anchors.get("unresolved_questions") if isinstance(anchors.get("unresolved_questions"), list) else [],
-            "npc_observations": anchors.get("npc_observations") if isinstance(anchors.get("npc_observations"), list) else [],
-            "recent_offers_promises": anchors.get("recent_offers_promises") if isinstance(anchors.get("recent_offers_promises"), list) else []
-        }
-        return {
-            'running_summary': clean_text((extracted or {}).get('running_summary'), 4000),
-            'memory_anchors': compiled_anchors,
-            'scene_patch': {},
-            'scene_reason': None,
-            'upsert_graph_facts': [],
-            'create_clocks': [],
-            'retire_clocks': [],
-            'update_npc_actors': [],
-            'upsert_graph_entities': [],
-            'upsert_graph_relations': [],
-            'record_events': [],
-            'unresolved_items': [{'kind': 'context', 'reason': 'missing_campaign'}],
-            'compile_summary': {'accepted_fact_count': 0, 'skipped_fact_count': 0},
-        }
+        raise MemoryPipelineError(
+            stage='compilation',
+            code='missing_campaign',
+            message='Cannot compile staged memory patch: campaign is missing from memory context.',
+            telemetry={'campaign_id': _safe_int((memory_context or {}).get('campaign_id'), 0, minimum=0)},
+        )
 
     extracted = extracted if isinstance(extracted, dict) else {}
     resolved = resolved if isinstance(resolved, dict) else {}

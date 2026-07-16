@@ -23,8 +23,6 @@ from openrouter import (
     build_session_clock_adjudication_messages,
     build_session_dm_tool_messages,
     build_session_memory_clocks_messages,
-    build_session_memory_facts_messages,
-    build_session_memory_summary_scene_messages,
     build_session_preflight_messages,
     check_session_spoilers_with_llm,
     get_character_sheet_answer,
@@ -37,412 +35,11 @@ from openrouter import (
     get_world_genesis_package,
     normalize_session_preflight_decision,
     normalize_session_spoiler_check,
-    _fallback_scene_patch,
 )
+from services.session_memory_agent import MemoryPipelineError, compile_staged_memory_patch
 
 
 class OpenRouterJsonRepairTest(unittest.TestCase):
-    def test_session_memory_patch_uses_bounded_best_effort_request(self):
-        with patch('openrouter.get_llm_provider', return_value='openrouter'), patch(
-            'openrouter._post_chat',
-            return_value='{"running_summary":"Mortimer saw a dark figure near the vault.","scene_patch":{}}',
-        ) as post_chat:
-            patch_data = get_session_memory_patch({
-                'latest_player_message': 'What did Mortimer see?',
-                'latest_dm_response': 'He saw a dark figure near the vault.',
-            })
-
-        self.assertIn('_telemetry', patch_data)
-        self.assertFalse(post_chat.call_args.kwargs['allow_thinking'])
-        self.assertEqual(post_chat.call_args.kwargs['timeout_seconds'], SESSION_MEMORY_TIMEOUT_SECONDS)
-        self.assertEqual(post_chat.call_args.kwargs['max_attempts'], SESSION_MEMORY_MAX_ATTEMPTS)
-        self.assertEqual(post_chat.call_args.kwargs['max_tokens'], SESSION_MEMORY_MAX_TOKENS)
-
-    def test_session_memory_patch_retries_blank_response_before_fallback(self):
-        with patch('openrouter.get_llm_provider', return_value='openrouter'), patch('openrouter._post_chat', side_effect=[
-            '',
-            '{"running_summary":"The dockhand pointed toward the south jetty.","scene_patch":{"location_id":"south_jetty"}}',
-        ]) as post_chat:
-            patch_data = get_session_memory_patch({
-                'latest_player_message': 'What did the dockhand say?',
-                'latest_dm_message': 'He pointed toward the south jetty.',
-            })
-
-        self.assertNotIn('_fallback', patch_data)
-        self.assertEqual(patch_data['running_summary'], 'The dockhand pointed toward the south jetty.')
-        self.assertEqual(patch_data['scene_patch']['location_id'], 'south_jetty')
-        self.assertEqual(post_chat.call_count, 2)
-        self.assertEqual(
-            post_chat.call_args_list[1].kwargs['audit_context']['operation'],
-            'session_memory_update_blank_retry',
-        )
-
-    def test_session_memory_patch_returns_fallback_for_empty_response(self):
-        with patch('openrouter.get_llm_provider', return_value='openrouter'), patch('openrouter._post_chat', return_value=''):
-            patch_data = get_session_memory_patch({
-                'latest_player_message': 'What did the dockhand say?',
-                'latest_dm_message': 'He pointed toward the south jetty.',
-                'hot_context': {
-                    'current_scene': {
-                        'location_id': 'south_jetty',
-                        'location_name': 'South Jetty',
-                    },
-                },
-            })
-
-        self.assertEqual(patch_data['_fallback']['reason'], 'empty_memory_writer_response')
-        self.assertIn('dockhand', patch_data['running_summary'])
-        self.assertEqual(patch_data['scene_patch']['location_id'], 'south_jetty')
-
-    def test_session_memory_patch_retries_empty_patch_before_fallback(self):
-        with patch('openrouter.get_llm_provider', return_value='openrouter'), patch('openrouter._post_chat', side_effect=[
-            '{}',
-            '{"running_summary":"Renn described a limping figure with a scar.","scene_patch":{"active_npc_ids":["renn"]}}',
-        ]) as post_chat:
-            patch_data = get_session_memory_patch({
-                'latest_player_message': 'Tell me about the limp.',
-                'latest_dm_message': 'Renn describes a limping figure with a scar.',
-            })
-
-        self.assertNotIn('_fallback', patch_data)
-        self.assertEqual(patch_data['running_summary'], 'Renn described a limping figure with a scar.')
-        self.assertEqual(patch_data['scene_patch']['active_npc_ids'], ['renn'])
-        self.assertEqual(post_chat.call_count, 2)
-        self.assertEqual(
-            post_chat.call_args_list[1].kwargs['audit_context']['operation'],
-            'session_memory_update_empty_patch_retry',
-        )
-
-    def test_fallback_scene_patch_unions_spoken_npcs_with_current(self):
-        memory_context = {
-            'latest_player_message': 'Brixby keeps his eyes on the watcher.',
-            'latest_dm_message': (
-                'Kaine watches the square. '
-                '<npc target="Scarred Watcher">A scarred figure steps forward.</npc>'
-            ),
-            'hot_context': {
-                'current_scene': {
-                    'location_id': 'tidewall_square',
-                    'location_name': 'Tidewall Square',
-                    'time_of_day': 'late afternoon',
-                    'active_npc_ids': ['kaine', 'saltbeard'],
-                    'immediate_tension': 'The signing is poised.',
-                },
-            },
-        }
-        patch = _fallback_scene_patch(memory_context)
-        self.assertEqual(
-            patch['active_npc_ids'],
-            ['kaine', 'saltbeard', 'scarred_watcher'],
-        )
-        self.assertEqual(patch['location_id'], 'tidewall_square')
-        self.assertEqual(patch['time_of_day'], 'late afternoon')
-
-    def test_fallback_scene_patch_preserves_current_when_no_npc_tags(self):
-        memory_context = {
-            'latest_player_message': 'We wait.',
-            'latest_dm_message': 'The square holds its breath. Nothing moves.',
-            'hot_context': {
-                'current_scene': {
-                    'active_npc_ids': ['kaine', 'saltbeard'],
-                },
-            },
-        }
-        patch = _fallback_scene_patch(memory_context)
-        self.assertEqual(patch['active_npc_ids'], ['kaine', 'saltbeard'])
-
-    def test_split_memory_builders_use_specialized_contexts(self):
-        memory_context = {
-            'latest_player_message': 'Aldric knocks on the door.',
-            'latest_dm_message': 'A floorboard creaks inside and a shadow retreats.',
-            'hot_context': {
-                'current_scene': {
-                    'location_id': 'lake_ward_hale_residence',
-                    'location_name': 'Hale Residence, Lake Ward',
-                    'active_npc_ids': ['renn'],
-                },
-                'active_clocks': [
-                    {
-                        'clock_id': 'lysander_confession_clock',
-                        'name': "Lysander's Courage Wanes",
-                        'filled': 0,
-                        'segments': 4,
-                        'status': 'active',
-                        'summary': 'Lysander may confess if cornered.',
-                    }
-                ],
-            },
-            'relevant_memory': {
-                'query': 'floorboard shadow hale residence',
-                'matches': [
-                    {
-                        'kind': 'fact',
-                        'item_id': 'hale_residence_hidden_watcher',
-                        'score': 0.91,
-                        'memory': {
-                            'entity_ids': ['lake_ward_hale_residence'],
-                            'text': 'Someone watches from inside the Hale residence.',
-                            'visibility': 'party_known',
-                        },
-                    },
-                    {
-                        'kind': 'entity',
-                        'item_id': 'lake_ward_hale_residence',
-                        'score': 0.84,
-                        'memory': {
-                            'name': 'Hale Residence, Lake Ward',
-                            'type': 'location',
-                        },
-                    },
-                ],
-            },
-            'active_clock_count': 1,
-            'all_active_clocks_completed': False,
-        }
-
-        summary_payload = json.loads(build_session_memory_summary_scene_messages(memory_context)[1]['content'])
-        facts_payload = json.loads(build_session_memory_facts_messages(memory_context)[1]['content'])
-        clocks_payload = json.loads(build_session_memory_clocks_messages(memory_context)[1]['content'])
-
-        self.assertIn('current_scene', summary_payload)
-        self.assertNotIn('active_clocks', summary_payload)
-        self.assertEqual(summary_payload['latest_player_message'], 'Aldric knocks on the door.')
-
-        self.assertIn('current_scene', facts_payload)
-        self.assertNotIn('active_clocks', facts_payload)
-        self.assertEqual(
-            facts_payload['relevant_memory']['matches'][0]['item_id'],
-            'hale_residence_hidden_watcher',
-        )
-        self.assertIn('Reuse a relevant_memory match item_id', facts_payload['identity_rules'][0])
-        self.assertEqual(
-            facts_payload['latest_dm_message'],
-            'A floorboard creaks inside and a shadow retreats.',
-        )
-
-        self.assertIn('active_clocks', clocks_payload)
-        self.assertEqual(clocks_payload['active_clocks'][0]['clock_id'], 'lysander_confession_clock')
-
-    def test_clock_adjudication_builder_includes_before_after_and_active_clocks(self):
-        clock_context = {
-            'current_scene_before': {
-                'location_id': 'docks',
-                'location_name': 'Ferry Docks Market',
-            },
-            'current_scene_after': {
-                'location_id': 'crypt_road',
-                'location_name': 'Road to the Crypts',
-            },
-            'latest_player_message': 'We run after the grave robbers toward the crypt road.',
-            'latest_dm_message': 'The chase spills out of the market and onto the crypt road.',
-            'active_clocks': [
-                {
-                    'clock_id': 'race_to_crypts',
-                    'name': 'Race to the Crypts',
-                    'filled': 0,
-                    'segments': 4,
-                    'status': 'active',
-                }
-            ],
-        }
-
-        payload = json.loads(build_session_clock_adjudication_messages(clock_context)[1]['content'])
-        self.assertEqual(payload['current_scene_before']['location_id'], 'docks')
-        self.assertEqual(payload['current_scene_after']['location_id'], 'crypt_road')
-        self.assertEqual(payload['active_clocks'][0]['clock_id'], 'race_to_crypts')
-        self.assertEqual(payload['latest_player_message'], clock_context['latest_player_message'])
-
-    def test_clock_adjudicator_returns_advance_clocks_payload(self):
-        with patch('openrouter.get_llm_provider', return_value='openrouter'), patch(
-            'openrouter._post_chat',
-            return_value=json.dumps({
-                'create_clocks': [],
-                'advance_clocks': [
-                    {
-                        'clock_id': 'race_to_crypts',
-                        'delta': 1,
-                        'reason': 'The pursuit visibly moved onto the crypt road.',
-                        'evidence': [
-                            'The player pursued the robbers toward the crypts.',
-                            'The DM confirmed the chase left the market for the crypt road.',
-                        ],
-                    }
-                ],
-                'retire_clocks': [],
-                'no_change_explanations': [],
-            }),
-        ) as post_chat:
-            updates = get_session_clock_updates({
-                'current_scene_before': {'location_id': 'docks'},
-                'current_scene_after': {'location_id': 'crypt_road'},
-                'latest_player_message': 'We chase them toward the crypts.',
-                'latest_dm_message': 'You break into a run toward the crypt road.',
-                'active_clocks': [{'clock_id': 'race_to_crypts', 'filled': 0, 'segments': 4, 'status': 'active'}],
-            })
-
-        self.assertEqual(updates['create_clocks'], [])
-        self.assertEqual(updates['advance_clocks'][0]['clock_id'], 'race_to_crypts')
-        self.assertEqual(updates['advance_clocks'][0]['delta'], 1)
-        self.assertEqual(
-            post_chat.call_args.kwargs['audit_context']['operation'],
-            'session_clock_adjudication',
-        )
-
-    def test_session_memory_patch_opencode_go_uses_split_memory_passes(self):
-        with patch('openrouter.get_llm_provider', return_value='opencode_go'), patch(
-            'openrouter._post_chat',
-            side_effect=[
-                '{"turn_summary":"Thorin pays Renn and the party leans harder toward noble involvement.","scene_patch":{"location_id":"ferry_guild_depot","active_npc_ids":["renn"]}}',
-                '{"upsert_graph_facts":[]}',
-                '{"create_clocks":[],"retire_clocks":[]}',
-            ],
-        ) as post_chat:
-            patch_data = get_session_memory_patch({
-                'prior_running_summary': 'The party questioned Renn about the suspect.',
-                'latest_player_message': 'Thorin pays Renn a copper.',
-                'latest_dm_message': 'Renn pockets the coin and stays nearby.',
-                'hot_context': {
-                    'current_scene': {
-                        'location_id': 'ferry_guild_depot',
-                        'location_name': 'Ferry Guild depot',
-                        'active_npc_ids': ['renn'],
-                    },
-                    'active_clocks': [
-                        {
-                            'clock_id': 'glassmere_truce',
-                            'name': 'Glassmere truce frays',
-                            'filled': 2,
-                            'segments': 4,
-                            'status': 'active',
-                            'summary': 'The accusation threatens the city truce.',
-                        }
-                    ],
-                },
-                'active_clock_count': 1,
-                'all_active_clocks_completed': False,
-            })
-
-        self.assertEqual(post_chat.call_count, 3)
-        self.assertIn('Thorin pays Renn', patch_data['running_summary'])
-        self.assertEqual(patch_data['scene_patch']['location_id'], 'ferry_guild_depot')
-        self.assertEqual(patch_data['upsert_graph_facts'], [])
-        self.assertEqual(patch_data['create_clocks'], [])
-        self.assertEqual(patch_data['retire_clocks'], [])
-        self.assertEqual(patch_data['_telemetry']['mode'], 'split_opencode_go_memory_writer')
-        self.assertEqual(
-            [call.kwargs['audit_context']['operation'] for call in post_chat.call_args_list],
-            [
-                'session_memory_update_summary_scene',
-                'session_memory_update_facts',
-                'session_memory_update_clocks',
-            ],
-        )
-        self.assertTrue(
-            all(call.kwargs['timeout_seconds'] == SESSION_MEMORY_TIMEOUT_SECONDS for call in post_chat.call_args_list)
-        )
-        self.assertTrue(
-            all(call.kwargs['max_tokens'] == SESSION_MEMORY_MAX_TOKENS for call in post_chat.call_args_list)
-        )
-
-    def test_session_memory_patch_opencode_go_falls_back_when_summary_scene_is_blank(self):
-        with patch('openrouter.get_llm_provider', return_value='opencode_go'), patch(
-            'openrouter._post_chat',
-            return_value='',
-        ):
-            patch_data = get_session_memory_patch({
-                'latest_player_message': 'What did the dockhand say?',
-                'latest_dm_message': 'He pointed toward the south jetty.',
-                'hot_context': {
-                    'current_scene': {
-                        'location_id': 'south_jetty',
-                        'location_name': 'South Jetty',
-                    },
-                },
-            })
-
-        self.assertEqual(patch_data['_fallback']['reason'], 'empty_memory_writer_response')
-        self.assertEqual(
-            patch_data['_telemetry']['summary_scene_error'],
-            'blank_or_invalid_summary_scene',
-        )
-
-    def test_session_memory_patch_filters_player_characters_from_active_npc_ids(self):
-        with patch('openrouter.get_llm_provider', return_value='opencode_go'), patch(
-            'openrouter._post_chat',
-            side_effect=[
-                '{"turn_summary":"The party reaches the villa.","scene_patch":{"location_id":"lake_ward_hale_residence","active_npc_ids":["renn","elara","thorin_ironbeard"]}}',
-                '{"upsert_graph_facts":[]}',
-                '{"create_clocks":[],"retire_clocks":[]}',
-            ],
-        ):
-            patch_data = get_session_memory_patch({
-                'latest_player_message': 'We follow the trail south.',
-                'latest_dm_message': 'The trail leads to the Hale Residence.',
-                'hot_context': {
-                    'current_scene': {
-                        'location_id': 'lake_ward_street',
-                        'location_name': 'Lake Ward Street',
-                        'active_npc_ids': ['renn', 'elara'],
-                    },
-                    'protected_player_characters': [
-                        {'name': 'Elara'},
-                        {'name': 'Thorin Ironbeard'},
-                    ],
-                },
-            })
-
-        self.assertEqual(
-            patch_data['scene_patch']['active_npc_ids'],
-            ['renn'],
-        )
-
-    def test_session_memory_patch_fallback_infers_updated_scene_from_dm_reply(self):
-        with patch('openrouter.get_llm_provider', return_value='openrouter'), patch('openrouter._post_chat', return_value=''):
-            patch_data = get_session_memory_patch({
-                'latest_player_message': 'We head to the harbor.',
-                'latest_dm_response': (
-                    'You reach Blackwater Harbor by dusk. '
-                    '<npc target="Maren Ashworth">"Keep your voices down."</npc> '
-                    '<npc target="Lysander Hale">"The crate is under the tarpaulin."</npc>'
-                ),
-                'hot_context': {
-                    'current_scene': {
-                        'location_id': 'crossroads',
-                        'location_name': 'Crossroads',
-                        'time_of_day': 'dawn',
-                        'active_npc_ids': [],
-                        'immediate_tension': 'Travelers gather.',
-                    },
-                },
-            })
-
-        self.assertEqual(patch_data['_fallback']['reason'], 'empty_memory_writer_response')
-        self.assertEqual(patch_data['scene_patch']['location_id'], 'crossroads')
-        self.assertEqual(patch_data['scene_patch']['location_name'], 'Crossroads')
-        self.assertEqual(patch_data['scene_patch']['time_of_day'], 'dawn')
-        self.assertEqual(
-            patch_data['scene_patch']['active_npc_ids'],
-            ['maren_ashworth', 'lysander_hale'],
-        )
-        self.assertIn('Blackwater Harbor', patch_data['scene_patch']['immediate_tension'])
-
-    def test_session_memory_patch_still_calls_llm_for_large_prompt(self):
-        large_text = 'x' * 30000
-        with patch('openrouter.get_llm_provider', return_value='openrouter'), patch(
-            'openrouter._post_chat',
-            return_value='{"running_summary":"The dockhand pointed toward the south jetty.","scene_patch":{"location_id":"south_jetty"}}',
-        ) as post_chat:
-            patch_data = get_session_memory_patch({
-                'latest_player_message': 'What did the dockhand say?',
-                'latest_dm_response': 'He pointed toward the south jetty.',
-                'hot_context': {'current_scene': {'location_id': 'south_jetty'}},
-                'relevant_memory': large_text,
-            })
-
-        self.assertEqual(patch_data['running_summary'], 'The dockhand pointed toward the south jetty.')
-        self.assertGreater(patch_data['_telemetry']['prompt_tokens_estimate'], 6000)
-        post_chat.assert_called_once()
-
     def test_json_error_excerpt_marks_the_bad_line(self):
         malformed = '{\n  "items": [\n    {"id": "one"},\n      "id": "two"\n  ]\n}'
 
@@ -531,6 +128,217 @@ class OpenRouterJsonRepairTest(unittest.TestCase):
         knowledge_graph_messages = post_chat.call_args_list[2].args[0]
         self.assertIn('"public_intro": {"title": "Test"}', knowledge_graph_messages[-2]['content'])
         self.assertIn('"section": "knowledge_graph"', knowledge_graph_messages[-1]['content'])
+
+
+class MemoryPipelineErrorTest(unittest.TestCase):
+    def test_missing_context_raises_memory_pipeline_error(self):
+        with self.assertRaises(MemoryPipelineError) as ctx:
+            get_session_memory_patch({})
+        self.assertEqual(ctx.exception.stage, 'context')
+        self.assertEqual(ctx.exception.code, 'missing_context')
+
+    def test_missing_campaign_id_raises_context_error(self):
+        with self.assertRaises(MemoryPipelineError) as ctx:
+            get_session_memory_patch({'session_id': 1})
+        self.assertEqual(ctx.exception.stage, 'context')
+
+    def test_missing_session_id_raises_context_error(self):
+        with self.assertRaises(MemoryPipelineError) as ctx:
+            get_session_memory_patch({'campaign_id': 1})
+        self.assertEqual(ctx.exception.stage, 'context')
+
+    def test_compile_missing_campaign_raises_compilation_error(self):
+        with self.assertRaises(MemoryPipelineError) as ctx:
+            compile_staged_memory_patch({}, {}, {})
+        self.assertEqual(ctx.exception.stage, 'compilation')
+        self.assertEqual(ctx.exception.code, 'missing_campaign')
+
+    def test_telemetry_includes_pipeline_mode_and_build_sha(self):
+        with patch('openrouter.SESSION_MEMORY_MODE', 'staged'), \
+                patch('openrouter._get_cached_build_sha', return_value='abc12345'), \
+                patch('openrouter.get_llm_provider', return_value='test_provider'), \
+                patch('openrouter.get_llm_model', return_value='test_model'):
+            try:
+                get_session_memory_patch({'campaign_id': 1, 'session_id': 1})
+            except Exception:
+                pass
+
+    def test_extraction_blank_response_raises_error(self):
+        from openrouter import _get_session_memory_patch_staged
+        with patch('openrouter.build_session_memory_extractor_messages', return_value=[]), \
+                patch('openrouter._request_session_memory_json', return_value=(None, 0)):
+            with self.assertRaises(MemoryPipelineError) as ctx:
+                _get_session_memory_patch_staged(
+                    {'campaign_id': 1, 'session_id': 1},
+                    {},
+                    {},
+                )
+            self.assertEqual(ctx.exception.stage, 'extraction')
+
+    def test_extraction_provider_exception_raises_error(self):
+        from openrouter import _get_session_memory_patch_staged
+        with patch('openrouter.build_session_memory_extractor_messages', return_value=[]), \
+                patch('openrouter._request_session_memory_json', side_effect=Exception('provider down')):
+            with self.assertRaises(MemoryPipelineError) as ctx:
+                _get_session_memory_patch_staged(
+                    {'campaign_id': 1, 'session_id': 1},
+                    {},
+                    {},
+                )
+            self.assertEqual(ctx.exception.stage, 'extraction')
+            self.assertEqual(ctx.exception.code, 'extractor_provider_error')
+
+    def test_resolver_malformed_output_raises_error(self):
+        from openrouter import _get_session_memory_patch_staged, _choice_message
+        with patch('openrouter.build_session_memory_extractor_messages', return_value=[]), \
+                patch('openrouter._request_session_memory_json', return_value=(
+                    {'running_summary': 'test'}, 100,
+                )), \
+                patch('openrouter.build_session_memory_resolver_messages', return_value=[]), \
+                patch('openrouter._post_chat_response', return_value={'choices': [{
+                    'message': {'content': 'not valid json}}}', 'tool_calls': None},
+                    'finish_reason': 'stop',
+                }]}):
+            with self.assertRaises(MemoryPipelineError) as ctx:
+                _get_session_memory_patch_staged(
+                    {'campaign_id': 1, 'session_id': 1},
+                    {},
+                    {},
+                )
+            self.assertEqual(ctx.exception.stage, 'resolution')
+
+    def test_clock_generation_invalid_output_raises_error(self):
+        from openrouter import _get_session_memory_patch_staged
+        fake_compiled = {
+            'running_summary': 'test',
+            'memory_anchors': {},
+            'scene_patch': {},
+            'upsert_graph_entities': [],
+            'upsert_graph_relations': [],
+            'upsert_graph_facts': [],
+            'create_clocks': [],
+            'retire_clocks': [],
+            'update_npc_actors': [],
+            'record_events': [],
+            'unresolved_items': [],
+            'compile_summary': {},
+        }
+        with patch('openrouter.build_session_memory_extractor_messages', return_value=[]), \
+                patch('openrouter._request_session_memory_json') as mock_req, \
+                patch('openrouter.build_session_memory_resolver_messages', return_value=[]), \
+                patch('openrouter._post_chat_response', return_value={'choices': [{
+                    'message': {'content': '{"running_summary":"test"}', 'tool_calls': None},
+                    'finish_reason': 'stop',
+                }]}), \
+                patch('services.session_memory_agent.compile_staged_memory_patch', return_value=fake_compiled):
+            mock_req.side_effect = [
+                ({'running_summary': 'test'}, 100),
+                Exception('clock provider error'),
+            ]
+            with self.assertRaises(MemoryPipelineError) as ctx:
+                _get_session_memory_patch_staged(
+                    {'campaign_id': 1, 'session_id': 1},
+                    {},
+                    {},
+                )
+            self.assertEqual(ctx.exception.stage, 'clock_generation')
+
+    def test_both_providers_use_same_staged_pipeline(self):
+        for provider in ('openrouter', 'opencode_go'):
+            with patch('openrouter.SESSION_MEMORY_MODE', 'staged'), \
+                    patch('openrouter.get_llm_provider', return_value=provider), \
+                    patch('openrouter.get_llm_model', return_value='test-model'), \
+                    patch('openrouter._get_cached_build_sha', return_value='test_sha'), \
+                    patch('openrouter.log_audit_event') as log_mock, \
+                    patch('openrouter._get_session_memory_patch_staged') as staged_mock:
+                staged_mock.return_value = {
+                    'running_summary': 'test',
+                    'memory_anchors': {},
+                    'scene_patch': {},
+                    'upsert_graph_entities': [],
+                    'upsert_graph_relations': [],
+                    'upsert_graph_facts': [],
+                    'create_clocks': [],
+                    'retire_clocks': [],
+                    'update_npc_actors': [],
+                    'record_events': [],
+                }
+                patch_data = get_session_memory_patch(
+                    {'campaign_id': 1, 'session_id': 1},
+                    audit_context={'campaign_id': 1, 'trace_id': f'test_{provider}'},
+                )
+                self.assertIsNotNone(patch_data)
+                self.assertEqual(patch_data['_telemetry']['pipeline_mode'], 'staged_memory_writer')
+                self.assertEqual(patch_data['_telemetry']['provider'], provider)
+                self.assertEqual(patch_data['_telemetry']['build_sha'], 'test_sha')
+                staged_mock.assert_called_once()
+
+
+class ClockAdjudicatorTest(unittest.TestCase):
+    def test_clock_adjudication_builder_includes_before_after_and_active_clocks(self):
+        clock_context = {
+            'current_scene_before': {
+                'location_id': 'docks',
+                'location_name': 'Ferry Docks Market',
+            },
+            'current_scene_after': {
+                'location_id': 'crypt_road',
+                'location_name': 'Road to the Crypts',
+            },
+            'latest_player_message': 'We run after the grave robbers toward the crypt road.',
+            'latest_dm_message': 'The chase spills out of the market and onto the crypt road.',
+            'active_clocks': [
+                {
+                    'clock_id': 'race_to_crypts',
+                    'name': 'Race to the Crypts',
+                    'filled': 0,
+                    'segments': 4,
+                    'status': 'active',
+                }
+            ],
+        }
+
+        payload = json.loads(build_session_clock_adjudication_messages(clock_context)[1]['content'])
+        self.assertEqual(payload['current_scene_before']['location_id'], 'docks')
+        self.assertEqual(payload['current_scene_after']['location_id'], 'crypt_road')
+        self.assertEqual(payload['active_clocks'][0]['clock_id'], 'race_to_crypts')
+        self.assertEqual(payload['latest_player_message'], clock_context['latest_player_message'])
+
+    def test_clock_adjudicator_returns_advance_clocks_payload(self):
+        with patch('openrouter.get_llm_provider', return_value='openrouter'), patch(
+            'openrouter._post_chat',
+            return_value=json.dumps({
+                'create_clocks': [],
+                'advance_clocks': [
+                    {
+                        'clock_id': 'race_to_crypts',
+                        'delta': 1,
+                        'reason': 'The pursuit visibly moved onto the crypt road.',
+                        'evidence': [
+                            'The player pursued the robbers toward the crypts.',
+                            'The DM confirmed the chase left the market for the crypt road.',
+                        ],
+                    }
+                ],
+                'retire_clocks': [],
+                'no_change_explanations': [],
+            }),
+        ) as post_chat:
+            updates = get_session_clock_updates({
+                'current_scene_before': {'location_id': 'docks'},
+                'current_scene_after': {'location_id': 'crypt_road'},
+                'latest_player_message': 'We chase them toward the crypts.',
+                'latest_dm_message': 'You break into a run toward the crypt road.',
+                'active_clocks': [{'clock_id': 'race_to_crypts', 'filled': 0, 'segments': 4, 'status': 'active'}],
+            })
+
+        self.assertEqual(updates['create_clocks'], [])
+        self.assertEqual(updates['advance_clocks'][0]['clock_id'], 'race_to_crypts')
+        self.assertEqual(updates['advance_clocks'][0]['delta'], 1)
+        self.assertEqual(
+            post_chat.call_args.kwargs['audit_context']['operation'],
+            'session_clock_adjudication',
+        )
 
 
 class PlanningDmResponseTest(unittest.TestCase):

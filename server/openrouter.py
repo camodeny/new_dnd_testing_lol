@@ -66,6 +66,52 @@ SESSION_MEMORY_MAX_TOKENS = max(
     int(os.environ.get('SESSION_MEMORY_MAX_TOKENS', '8192')),
 )
 SESSION_MEMORY_MODE = os.environ.get('SESSION_MEMORY_MODE', 'staged').strip().lower() or 'staged'
+if SESSION_MEMORY_MODE not in ('staged', ''):
+    raise ValueError(
+        f"SESSION_MEMORY_MODE={SESSION_MEMORY_MODE!r} is not supported. "
+        "Only 'staged' (or unset) is allowed. "
+        "Legacy split and generic memory flows have been removed."
+    )
+
+_BUILD_SHA_CACHE = None
+
+
+def _get_cached_build_sha():
+    global _BUILD_SHA_CACHE
+    if _BUILD_SHA_CACHE is not None:
+        return _BUILD_SHA_CACHE
+    for var in ('DEPLOY_COMMIT_SHA', 'COMMIT_SHA', 'GITHUB_SHA'):
+        value = os.environ.get(var, '').strip()
+        if value:
+            _BUILD_SHA_CACHE = value
+            return _BUILD_SHA_CACHE
+    build_info_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'static', 'build-info.json')
+    try:
+        with open(build_info_path, 'r') as fh:
+            info = json.loads(fh.read())
+        sha = str(info.get('sha') or '').strip()
+        if sha:
+            _BUILD_SHA_CACHE = sha
+            return _BUILD_SHA_CACHE
+    except Exception:
+        pass
+    try:
+        import subprocess
+        result = subprocess.run(
+            ['git', 'rev-parse', 'HEAD'],
+            capture_output=True,
+            text=True,
+            timeout=5,
+        )
+        sha = result.stdout.strip()
+        if sha:
+            _BUILD_SHA_CACHE = sha
+            return _BUILD_SHA_CACHE
+    except Exception:
+        pass
+    _BUILD_SHA_CACHE = 'unknown'
+    return _BUILD_SHA_CACHE
+
 
 PC_CONTROL_POLICY = (
     "Player-character control policy: NPCs may speak and act. Player characters are protected. "
@@ -5350,6 +5396,7 @@ def _memory_tool_result_message(tool_call, tool_name, result):
 def _get_session_memory_patch_staged(memory_context, audit_context, telemetry):
     from services.session_memory_agent import (
         SESSION_MEMORY_TOOL_DEFINITIONS,
+        MemoryPipelineError,
         compile_staged_memory_patch,
         execute_memory_tool,
     )
@@ -5368,12 +5415,22 @@ def _get_session_memory_patch_staged(memory_context, audit_context, telemetry):
             timeout_seconds=SESSION_MEMORY_TIMEOUT_SECONDS,
         )
     except Exception as err:
-        telemetry['staged_extractor_error'] = repr(err)
-        return None
+        raise MemoryPipelineError(
+            stage='extraction',
+            code='extractor_provider_error',
+            message=f'Staged memory extraction failed: {err}',
+            cause=err,
+            telemetry=telemetry,
+        ) from err
     if not isinstance(extracted, dict) or not str(extracted.get('running_summary') or '').strip():
         telemetry['staged_extractor_error'] = 'blank_or_invalid_extractor'
         telemetry['staged_extractor_response_chars'] = extractor_chars
-        return None
+        raise MemoryPipelineError(
+            stage='extraction',
+            code='blank_response',
+            message='Staged memory extraction returned blank or invalid response.',
+            telemetry=telemetry,
+        )
     telemetry['staged_extractor_response_chars'] = extractor_chars
     if campaign_id:
         log_audit_event(
@@ -5396,19 +5453,28 @@ def _get_session_memory_patch_staged(memory_context, audit_context, telemetry):
     max_tool_rounds = 6
     final_payload = None
     for tool_round in range(max_tool_rounds + 1):
-        data = _post_chat_response(
-            messages,
-            json_mode=False,
-            audit_context={
-                **audit_context,
-                'operation': 'session_memory_resolve',
-                'full_world_graph_included': False,
-            },
-            tools=SESSION_MEMORY_TOOL_DEFINITIONS,
-            tool_choice='auto',
-            parallel_tool_calls=False,
-            allow_thinking=False,
-        )
+        try:
+            data = _post_chat_response(
+                messages,
+                json_mode=False,
+                audit_context={
+                    **audit_context,
+                    'operation': 'session_memory_resolve',
+                    'full_world_graph_included': False,
+                },
+                tools=SESSION_MEMORY_TOOL_DEFINITIONS,
+                tool_choice='auto',
+                parallel_tool_calls=False,
+                allow_thinking=False,
+            )
+        except Exception as err:
+            raise MemoryPipelineError(
+                stage='resolution',
+                code='resolver_provider_error',
+                message=f'Staged memory resolver call failed: {err}',
+                cause=err,
+                telemetry=telemetry,
+            ) from err
         response_chain.append(data)
         message, _finish_reason = _choice_message(data)
         tool_calls = message.get('tool_calls') or []
@@ -5445,13 +5511,35 @@ def _get_session_memory_patch_staged(memory_context, audit_context, telemetry):
             final_payload = _json_object_from_text(content)
         except Exception as err:
             telemetry['staged_resolver_error'] = repr(err)
-            return None
+            raise MemoryPipelineError(
+                stage='resolution',
+                code='malformed_output',
+                message=f'Staged memory resolver returned malformed output: {err}',
+                cause=err,
+                telemetry=telemetry,
+            ) from err
         break
     if final_payload is None:
         telemetry['staged_resolver_error'] = 'max_tool_rounds_exceeded'
-        return None
+        raise MemoryPipelineError(
+            stage='resolution',
+            code='max_tool_rounds_exceeded',
+            message='Staged memory resolver exceeded max tool call rounds without producing a payload.',
+            telemetry=telemetry,
+        )
 
-    compiled = compile_staged_memory_patch(memory_context, extracted, final_payload)
+    try:
+        compiled = compile_staged_memory_patch(memory_context, extracted, final_payload)
+    except MemoryPipelineError:
+        raise
+    except Exception as err:
+        raise MemoryPipelineError(
+            stage='compilation',
+            code='compile_error',
+            message=f'Staged memory compilation failed: {err}',
+            cause=err,
+            telemetry=telemetry,
+        ) from err
     telemetry['mode'] = 'staged_memory_writer'
     telemetry['staged_tool_call_count'] = len(tool_trace)
     telemetry['staged_resolver_response_count'] = len(response_chain)
@@ -5484,13 +5572,42 @@ def _get_session_memory_patch_staged(memory_context, audit_context, telemetry):
             timeout_seconds=SESSION_MEMORY_TIMEOUT_SECONDS,
         )
     except Exception as err:
-        clocks_data = None
-        clocks_chars = 0
         telemetry['clocks_error'] = repr(err)
+        raise MemoryPipelineError(
+            stage='clock_generation',
+            code='clock_provider_error',
+            message=f'Staged clock generation failed: {err}',
+            cause=err,
+            telemetry=telemetry,
+        ) from err
     telemetry['clocks_response_chars'] = clocks_chars
-    if isinstance(clocks_data, dict):
-        compiled['create_clocks'] = clocks_data.get('create_clocks') if isinstance(clocks_data.get('create_clocks'), list) else []
-        compiled['retire_clocks'] = clocks_data.get('retire_clocks') if isinstance(clocks_data.get('retire_clocks'), list) else []
+    if not isinstance(clocks_data, dict):
+        raise MemoryPipelineError(
+            stage='clock_generation',
+            code='malformed_output',
+            message='Staged clock generation returned invalid output.',
+            telemetry=telemetry,
+        )
+    create_clocks = clocks_data.get('create_clocks')
+    retire_clocks = clocks_data.get('retire_clocks')
+    if create_clocks is not None and not isinstance(create_clocks, list):
+        raise MemoryPipelineError(
+            stage='clock_generation',
+            code='malformed_output',
+            message='Staged clock generation returned invalid create_clocks shape.',
+            telemetry=telemetry,
+        )
+    if retire_clocks is not None and not isinstance(retire_clocks, list):
+        raise MemoryPipelineError(
+            stage='clock_generation',
+            code='malformed_output',
+            message='Staged clock generation returned invalid retire_clocks shape.',
+            telemetry=telemetry,
+        )
+    if isinstance(create_clocks, list):
+        compiled['create_clocks'] = create_clocks
+    if isinstance(retire_clocks, list):
+        compiled['retire_clocks'] = retire_clocks
     return compiled
 
 
@@ -5764,31 +5881,44 @@ def _compile_telemetry_summary(telemetry, audit_context):
 
 
 def get_session_memory_patch(memory_context, audit_context=None):
-    messages = build_session_memory_messages(memory_context)
+    from services.session_memory_agent import MemoryPipelineError
+
     if not isinstance(audit_context, dict):
         audit_context = {}
-    tracker = {
-        'status': 'success',
-        'provider_retries': 0,
-        'parse_repairs': 0,
-        'guard_retries': 0,
-        'fallback_active': False,
-        'failure_category': None,
-        'warnings': {
-            'scene_mutation_rejected': 0,
-            'unresolved_scene_references': 0
-        }
-    }
-    audit_context['telemetry_tracker'] = tracker
-
     provider = get_llm_provider()
+    model = get_llm_model()
     campaign_id = audit_context.get('campaign_id')
     trace_id = audit_context.get('trace_id') or f"session_memory_writer:memory_update:{uuid4().hex[:10]}"
     trace_label = audit_context.get('trace_label') or 'session_memory_writer: memory_update'
+    build_sha = _get_cached_build_sha()
+    memory_run_id = audit_context.get('memory_run_id') or f"memrun_{uuid4().hex[:12]}"
 
-    prompt_str = json.dumps(messages, ensure_ascii=False)
-    prompt_chars = len(prompt_str)
-    prompt_tokens_estimate = prompt_chars // 4
+    telemetry = {
+        'pipeline_mode': 'staged_memory_writer',
+        'provider': provider,
+        'model': model,
+        'build_sha': build_sha,
+        'trace_id': trace_id,
+        'memory_run_id': memory_run_id,
+        'campaign_id': campaign_id,
+    }
+
+    if not isinstance(memory_context, dict):
+        raise MemoryPipelineError(
+            stage='context',
+            code='missing_context',
+            message='memory_context is not a dict.',
+            telemetry=telemetry,
+        )
+    context_campaign_id = memory_context.get('campaign_id')
+    context_session_id = memory_context.get('session_id')
+    if not context_campaign_id or not context_session_id:
+        raise MemoryPipelineError(
+            stage='context',
+            code='missing_context',
+            message='memory_context is missing campaign_id or session_id.',
+            telemetry=telemetry,
+        )
 
     context_breakdown = {}
     if isinstance(memory_context, dict):
@@ -5798,12 +5928,18 @@ def get_session_memory_patch(memory_context, audit_context=None):
             except Exception:
                 context_breakdown[k] = 0
 
+    telemetry.update({
+        'prompt_chars': 0,
+        'prompt_tokens_estimate': 0,
+        'context_breakdown': context_breakdown,
+    })
+
     if campaign_id:
         log_audit_event(
             campaign_id,
             'memory_writer_request',
             'Requested post-turn session memory update.',
-            {'context': memory_context, 'messages': messages},
+            {'context': memory_context, 'telemetry': telemetry},
             source=provider,
             actor='session_memory_writer',
             trace_id=trace_id,
@@ -5812,275 +5948,51 @@ def get_session_memory_patch(memory_context, audit_context=None):
             audit_role='tools',
             commit=True,
         )
-    if _should_use_staged_session_memory(memory_context):
-        telemetry = {
-            'prompt_chars': prompt_chars,
-            'prompt_tokens_estimate': prompt_tokens_estimate,
-            'context_breakdown': context_breakdown,
-        }
-        patch = _get_session_memory_patch_staged(
-            memory_context,
-            {
-                **audit_context,
-                'trace_id': trace_id,
-                'trace_label': trace_label,
-                'actor': 'session_memory_writer',
-                'full_world_graph_included': False,
-            },
-            telemetry,
-        )
-        if patch and campaign_id:
-            log_audit_event(
-                campaign_id,
-                'memory_writer_response',
-                'Received staged post-turn session memory patch.',
-                {'patch': patch},
-                source=provider,
-                actor='session_memory_writer',
-                trace_id=trace_id,
-                parent_trace_id=audit_context.get('parent_trace_id'),
-                trace_label=trace_label,
-                audit_role='agent',
-                commit=True,
-            )
-        if patch:
-            patch['_telemetry'] = {**telemetry, **(patch.get('_telemetry') or {})}
-            _compile_telemetry_summary(patch['_telemetry'], audit_context)
-            return patch
-    if provider == 'opencode_go':
-        telemetry = {
-            'prompt_chars': prompt_chars,
-            'prompt_tokens_estimate': prompt_tokens_estimate,
-            'context_breakdown': context_breakdown,
-            'mode': 'split_opencode_go_memory_writer',
-        }
-        patch = _get_session_memory_patch_opencode_go(
-            memory_context,
-            {
-                **audit_context,
-                'trace_id': trace_id,
-                'trace_label': trace_label,
-                'actor': 'session_memory_writer',
-                'full_world_graph_included': False,
-            },
-            telemetry,
-        )
-        if campaign_id:
-            log_audit_event(
-                campaign_id,
-                'memory_writer_response',
-                'Received post-turn session memory patch.',
-                {'patch': patch},
-                source=provider,
-                actor='session_memory_writer',
-                trace_id=trace_id,
-                parent_trace_id=audit_context.get('parent_trace_id'),
-                trace_label=trace_label,
-                audit_role='agent',
-                commit=True,
-            )
-        if patch:
-            patch['_telemetry'] = {**telemetry, **(patch.get('_telemetry') or {})}
-            _compile_telemetry_summary(patch['_telemetry'], audit_context)
-        return patch
+
+    staged_audit = {
+        **audit_context,
+        'trace_id': trace_id,
+        'trace_label': trace_label,
+        'actor': 'session_memory_writer',
+        'full_world_graph_included': False,
+    }
     try:
-        base_operation = audit_context.get('operation') or 'session_memory_update'
-        request_audit_context = {
-            **audit_context,
-            'trace_id': trace_id,
-            'trace_label': trace_label,
-            'operation': base_operation,
-            'actor': 'session_memory_writer',
-            'full_world_graph_included': False,
-        }
-
-        def request_patch_text(request_messages, operation_suffix=None):
-            request_context = dict(request_audit_context)
-            if operation_suffix:
-                request_context['operation'] = f'{base_operation}_{operation_suffix}'
-            response_text = _post_chat(
-                request_messages,
-                json_mode=True,
-                audit_context=request_context,
-                allow_thinking=False,
-                timeout_seconds=SESSION_MEMORY_TIMEOUT_SECONDS,
-                max_attempts=SESSION_MEMORY_MAX_ATTEMPTS,
-                max_tokens=SESSION_MEMORY_MAX_TOKENS,
-            )
-            return response_text, len(response_text) if response_text else 0
-
-        retry_suffix = None
-        text, response_chars = request_patch_text(messages)
-        if not text or not text.strip():
-            retry_suffix = 'blank_retry'
-            text, response_chars = request_patch_text(
-                _session_memory_retry_messages(messages, 'blank_response'),
-                operation_suffix=retry_suffix,
-            )
-        if not text or not text.strip():
-            telemetry = {
-                'prompt_chars': prompt_chars,
-                'prompt_tokens_estimate': prompt_tokens_estimate,
-                'response_chars': response_chars,
-                'context_breakdown': context_breakdown,
-                'error': 'empty_response',
-                'retry_suffix': retry_suffix,
-            }
-            if campaign_id:
-                log_audit_event(
-                    campaign_id,
-                    'memory_writer_empty',
-                    'Post-turn session memory writer returned an empty patch.',
-                    {'_telemetry': telemetry},
-                    source=provider,
-                    actor='session_memory_writer',
-                    trace_id=trace_id,
-                    parent_trace_id=audit_context.get('parent_trace_id'),
-                    trace_label=trace_label,
-                    audit_role='tools',
-                    commit=True,
-                )
-            fallback_patch = _fallback_session_memory_patch(memory_context, telemetry)
-            if campaign_id:
-                log_audit_event(
-                    campaign_id,
-                    'memory_writer_fallback',
-                    'Applied deterministic summary-only fallback after empty memory writer response.',
-                    {'patch': fallback_patch},
-                    source=provider,
-                    actor='session_memory_writer',
-                    trace_id=trace_id,
-                    parent_trace_id=audit_context.get('parent_trace_id'),
-                    trace_label=trace_label,
-                    audit_role='tools',
-                    commit=True,
-                )
-            tracker = audit_context.get("telemetry_tracker")
-            if isinstance(tracker, dict):
-                tracker["fallback_active"] = True
-            telemetry["fallback_active"] = True
-            fallback_patch['_telemetry'] = {**telemetry, **(fallback_patch.get('_telemetry') or {})}
-            _compile_telemetry_summary(fallback_patch['_telemetry'], audit_context)
-            return fallback_patch
-        data = _json_loads_with_repair(text, audit_context=request_audit_context)
-        if not isinstance(data, dict):
-            data = {}
-        if isinstance(data.get('scene_patch'), dict):
-            data['scene_patch'] = _sanitize_scene_patch(data['scene_patch'], memory_context)
-
-        if not _session_memory_patch_has_substance(data):
-            retry_suffix = 'empty_patch_retry'
-            tracker = audit_context.get('telemetry_tracker')
-            if isinstance(tracker, dict):
-                tracker['guard_retries'] = tracker.get('guard_retries', 0) + 1
-            retry_text, retry_response_chars = request_patch_text(
-                _session_memory_retry_messages(messages, 'empty_patch'),
-                operation_suffix=retry_suffix,
-            )
-            if retry_text and retry_text.strip():
-                text = retry_text
-                response_chars = retry_response_chars
-                data = _json_loads_with_repair(
-                    text,
-                    audit_context={
-                        **request_audit_context,
-                        'operation': f'{base_operation}_{retry_suffix}',
-                    },
-                )
-                if not isinstance(data, dict):
-                    data = {}
-                if isinstance(data.get('scene_patch'), dict):
-                    data['scene_patch'] = _sanitize_scene_patch(data['scene_patch'], memory_context)
-
-        if not _session_memory_patch_has_substance(data):
-            telemetry = {
-                'prompt_chars': prompt_chars,
-                'prompt_tokens_estimate': prompt_tokens_estimate,
-                'response_chars': response_chars,
-                'context_breakdown': context_breakdown,
-                'error': 'empty_patch',
-                'retry_suffix': retry_suffix,
-                'patch_preview': data,
-            }
-            if campaign_id:
-                log_audit_event(
-                    campaign_id,
-                    'memory_writer_empty_patch',
-                    'Post-turn session memory writer returned an empty or no-op patch.',
-                    {'patch': data, '_telemetry': telemetry},
-                    source=provider,
-                    actor='session_memory_writer',
-                    trace_id=trace_id,
-                    parent_trace_id=audit_context.get('parent_trace_id'),
-                    trace_label=trace_label,
-                    audit_role='tools',
-                    commit=True,
-                )
-            fallback_patch = _fallback_session_memory_patch(memory_context, telemetry)
-            if campaign_id:
-                log_audit_event(
-                    campaign_id,
-                    'memory_writer_fallback',
-                    'Applied deterministic summary-only fallback after empty or no-op memory writer patch.',
-                    {'patch': fallback_patch},
-                    source=provider,
-                    actor='session_memory_writer',
-                    trace_id=trace_id,
-                    parent_trace_id=audit_context.get('parent_trace_id'),
-                    trace_label=trace_label,
-                    audit_role='tools',
-                    commit=True,
-                )
-            tracker = audit_context.get("telemetry_tracker")
-            if isinstance(tracker, dict):
-                tracker["fallback_active"] = True
-            telemetry["fallback_active"] = True
-            fallback_patch['_telemetry'] = {**telemetry, **(fallback_patch.get('_telemetry') or {})}
-            _compile_telemetry_summary(fallback_patch['_telemetry'], audit_context)
-            return fallback_patch
-
-        data['_telemetry'] = {
-            'prompt_chars': prompt_chars,
-            'prompt_tokens_estimate': prompt_tokens_estimate,
-            'response_chars': response_chars,
-            'context_breakdown': context_breakdown,
-            'retry_suffix': retry_suffix,
-        }
-
+        patch = _get_session_memory_patch_staged(memory_context, staged_audit, telemetry)
+    except MemoryPipelineError:
         if campaign_id:
             log_audit_event(
                 campaign_id,
-                'memory_writer_response',
-                'Received post-turn session memory patch.',
-                {'patch': data},
+                'memory_writer_error',
+                f'Post-turn session memory writer failed at stage: {telemetry.get("pipeline_error_stage")}',
+                {'_telemetry': telemetry},
                 source=provider,
                 actor='session_memory_writer',
                 trace_id=trace_id,
                 parent_trace_id=audit_context.get('parent_trace_id'),
                 trace_label=trace_label,
-                audit_role='agent',
+                audit_role='tools',
                 commit=True,
             )
-        _compile_telemetry_summary(data['_telemetry'], audit_context)
-        return data
-    except Exception as e:
-        print(f'[openrouter] Session memory writer error: {e}')
-        telemetry = {
-            'prompt_chars': prompt_chars,
-            'prompt_tokens_estimate': prompt_tokens_estimate,
-            'response_chars': 0,
-            'context_breakdown': context_breakdown,
-            'error': str(e),
-        }
-        fallback_patch = _fallback_session_memory_patch(memory_context, telemetry)
-        fallback_patch['_fallback']['reason'] = 'memory_writer_model_error'
-        tracker = audit_context.get("telemetry_tracker")
-        if isinstance(tracker, dict):
-            tracker["fallback_active"] = True
-        telemetry["fallback_active"] = True
-        fallback_patch['_telemetry'] = {**telemetry, **(fallback_patch.get('_telemetry') or {})}
-        _compile_telemetry_summary(fallback_patch['_telemetry'], audit_context)
-        return fallback_patch
+        raise
+
+    if patch and campaign_id:
+        log_audit_event(
+            campaign_id,
+            'memory_writer_response',
+            'Received staged post-turn session memory patch.',
+            {'patch': patch},
+            source=provider,
+            actor='session_memory_writer',
+            trace_id=trace_id,
+            parent_trace_id=audit_context.get('parent_trace_id'),
+            trace_label=trace_label,
+            audit_role='agent',
+            commit=True,
+        )
+    if patch:
+        telemetry['pipeline_status'] = 'success'
+        patch['_telemetry'] = {**telemetry, **(patch.get('_telemetry') or {})}
+    return patch
 
 
 def get_session_clock_updates(clock_context, audit_context=None):

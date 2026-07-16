@@ -13,7 +13,6 @@ from services.scene_location_resolver import resolve_scene_location_patch
 from services.session_memory_agent import compile_staged_memory_patch
 from services.dm_tools import _validate_memory_scene_patch, apply_memory_patch
 import run_automation_worker as worker
-from openrouter import _fallback_scene_patch
 
 class P0FixesTest(unittest.TestCase):
     def setUp(self):
@@ -44,24 +43,6 @@ class P0FixesTest(unittest.TestCase):
         db.session.rollback()
         db.drop_all()
         self.ctx.pop()
-
-    # 1. Fallback scene patch preserves existing location when model JSON parsing fails
-    # 2. Fallback scene patch does not infer a new location from DM prose
-    def test_fallback_scene_patch_preserves_location_and_does_not_infer_from_prose(self):
-        memory_context = {
-            'hot_context': {
-                'current_scene': {
-                    'location_id': 'waterdeep',
-                    'location_name': 'Waterdeep',
-                    'active_npc_ids': []
-                }
-            },
-            'latest_dm_message': 'You walk into the Yawning Portal in Neverwinter.'
-        }
-        patch_result = _fallback_scene_patch(memory_context)
-        # Should NOT change location fields to neverwinter or yawning_portal
-        self.assertEqual(patch_result.get('location_id'), 'waterdeep')
-        self.assertEqual(patch_result.get('location_name'), 'Waterdeep')
 
     # 3. compile_staged_memory_patch rejects location_name-only updates when unresolved
     def test_compile_staged_memory_patch_rejects_unresolved_name_only(self):
