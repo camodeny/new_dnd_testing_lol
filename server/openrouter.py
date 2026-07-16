@@ -66,6 +66,52 @@ SESSION_MEMORY_MAX_TOKENS = max(
     int(os.environ.get('SESSION_MEMORY_MAX_TOKENS', '8192')),
 )
 SESSION_MEMORY_MODE = os.environ.get('SESSION_MEMORY_MODE', 'staged').strip().lower() or 'staged'
+if SESSION_MEMORY_MODE not in ('staged', ''):
+    raise ValueError(
+        f"SESSION_MEMORY_MODE={SESSION_MEMORY_MODE!r} is not supported. "
+        "Only 'staged' (or unset) is allowed. "
+        "Legacy split and generic memory flows have been removed."
+    )
+
+_BUILD_SHA_CACHE = None
+
+
+def _get_cached_build_sha():
+    global _BUILD_SHA_CACHE
+    if _BUILD_SHA_CACHE is not None:
+        return _BUILD_SHA_CACHE
+    for var in ('DEPLOY_COMMIT_SHA', 'COMMIT_SHA', 'GITHUB_SHA'):
+        value = os.environ.get(var, '').strip()
+        if value:
+            _BUILD_SHA_CACHE = value
+            return _BUILD_SHA_CACHE
+    build_info_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'static', 'build-info.json')
+    try:
+        with open(build_info_path, 'r') as fh:
+            info = json.loads(fh.read())
+        sha = str(info.get('sha') or '').strip()
+        if sha:
+            _BUILD_SHA_CACHE = sha
+            return _BUILD_SHA_CACHE
+    except Exception:
+        pass
+    try:
+        import subprocess
+        result = subprocess.run(
+            ['git', 'rev-parse', 'HEAD'],
+            capture_output=True,
+            text=True,
+            timeout=5,
+        )
+        sha = result.stdout.strip()
+        if sha:
+            _BUILD_SHA_CACHE = sha
+            return _BUILD_SHA_CACHE
+    except Exception:
+        pass
+    _BUILD_SHA_CACHE = 'unknown'
+    return _BUILD_SHA_CACHE
+
 
 PC_CONTROL_POLICY = (
     "Player-character control policy: NPCs may speak and act. Player characters are protected. "
@@ -202,56 +248,6 @@ WORLD_GENESIS_SYSTEM_PROMPT = (
     "visibility set to dm_private where appropriate. Build around the party's confirmed characters, "
     "accepted hooks, planning summary, campaign seed, description, and tone. Create a playable opening "
     "situation with active pressures, not a complete railroad."
-)
-
-SESSION_MEMORY_SYSTEM_PROMPT = (
-    "You update durable D&D campaign memory after a visible DM turn. Return only valid JSON. "
-    "Emit the JSON object immediately; keep internal reasoning minimal and do not spend output budget on planning. "
-    "Extract durable changes from the latest player message and visible DM reply. Create new clocks "
-    "when new pressure, deadlines, mysteries, faction moves, or consequences emerge, especially if all "
-    "existing active clocks are completed. Retire completed or resolved clocks instead of deleting them. "
-    "Update knowledge graph entities, relations, and facts without duplicating existing ids. Preserve "
-    "existing entity, relation, and fact ids from context or relevant_memory whenever a patch updates the same "
-    "durable concept; create new ids only for distinct concepts not already represented. Preserve "
-    "visibility as dm_private, party_known, or public. Use party_known for facts established in the latest "
-    "visible player/DM exchange; use public only for broadly public world facts; use dm_private only for "
-    "unrevealed secrets, hidden causes, off-screen actions, or DM-only pressure. Do not invent large new lore unless it follows "
-    "from the exchange. Only write graph facts for durable truths that should remain useful after the "
-    "current scene changes. Put current location, occupants, and tension in scene_patch instead. "
-    "Prefer explicit proper nouns over pronouns, and preserve named ownership. "
-    "For every memory item created, updated, or retired (in graph entities, relations, facts, clocks, "
-    "NPC actors, or events), you must include these metadata fields: "
-    "1. 'certainty': 'confirmed | suspected | inferred | false | retconned' "
-    "2. 'importance': 1-5 (where 5 is campaign-defining and 1 is a minor detail) "
-    "3. 'expires_or_retire_condition': concise description of when this memory expires or should be retired, or null "
-    "4. 'reason': concise 1-sentence reason why this change or new memory is warranted "
-    "5. 'memory_type': 'npc | fact | relation | clock | location | quest | inventory | money'"
-)
-
-SESSION_MEMORY_SUMMARY_SCENE_SYSTEM_PROMPT = (
-    "You update only the compact session summary and current scene after a visible DM turn. "
-    "Return only valid JSON with keys turn_summary and scene_patch. "
-    "turn_summary must be one concise durable summary of what materially changed in the latest exchange. "
-    "scene_patch may include only location_id, location_name, time_of_day, active_npc_ids, departed_npc_ids, and immediate_tension. "
-    "time_of_day must match the value shown in current_scene unless the visible exchange explicitly describes a time transition. "
-    "active_npc_ids is the NPC ids currently on stage. Listing an NPC is encouraged but not required: "
-    "NPCs already on stage stay on stage unless you also list them in departed_npc_ids. "
-    "departed_npc_ids is the NPC ids who actually left the scene this turn (walked out, fled, were escorted away, "
-    "or otherwise exited). Do not infer departure from omission. "
-    "Do not include markdown, commentary, or any other keys."
-)
-
-SESSION_MEMORY_FACTS_SYSTEM_PROMPT = (
-    "You extract only durable campaign facts from the latest visible exchange. "
-    "Return only valid JSON with key upsert_graph_facts. "
-    "Use an empty array unless the exchange created or clarified a durable fact worth remembering after the scene moves on. "
-    "Each fact must include id, entity_ids, text, certainty, visibility, importance, expires_or_retire_condition, reason, and memory_type. "
-    "Visibility policy: facts directly established by latest_player_message or latest_dm_message are party_known unless they are broadly public; "
-    "public means generally known beyond the party; dm_private is only for unrevealed secrets, hidden causes, off-screen actions, or DM-only pressure. "
-    "When relevant_memory includes a matching fact item_id, reuse that id and update/clarify the fact instead of creating a sibling. "
-    "When relevant_memory includes matching entity item_ids, use those ids in entity_ids instead of inventing new ids. "
-    "Only create a new fact id when no existing relevant_memory fact represents the same durable truth. "
-    "Do not include scene-transient occupancy, immediate tension, or repeated facts already obvious from the current scene."
 )
 
 SESSION_MEMORY_CLOCKS_SYSTEM_PROMPT = (
@@ -1231,39 +1227,6 @@ def _planning_blank_retry_messages(messages):
                 'player-visible message string, an active_page value from identity, scores, combat, '
                 'magic_gear, story, or null, and a form_patch object. Do not return whitespace, an empty '
                 'JSON object, markdown fences, hidden reasoning, or commentary outside the JSON object.'
-            ),
-        },
-    ]
-
-
-def _session_memory_retry_messages(messages, failure_kind):
-    issue = (
-        'blank or invalid'
-        if failure_kind == 'blank_response'
-        else 'an empty or no-op JSON object'
-    )
-    minimal_shape = {
-        'running_summary': 'non-empty compact summary of the latest visible state',
-        'scene_patch': {},
-        'scene_reason': 'brief reason or null',
-        'upsert_graph_entities': [],
-        'upsert_graph_relations': [],
-        'upsert_graph_facts': [],
-        'create_clocks': [],
-        'retire_clocks': [],
-        'update_npc_actors': [],
-        'record_events': [],
-    }
-    return [
-        *messages,
-        {
-            'role': 'user',
-            'content': (
-                f'Your previous response was {issue}. Return exactly one valid JSON object now, matching the '
-                'original return shape. If there are no durable graph or clock updates, you must still return a '
-                'non-empty running_summary and any current scene_patch you can confirm, while leaving unchanged '
-                'sections as empty arrays. Do not return whitespace, null, an empty object, markdown fences, or '
-                f'commentary outside the JSON object.\n\nMinimal valid shape:\n{json.dumps(minimal_shape, ensure_ascii=False)}'
             ),
         },
     ]
@@ -3716,175 +3679,6 @@ def _coerce_world_genesis_section(section_name, data):
     raise ValueError(f'World genesis section {section_name} returned invalid JSON')
 
 
-def build_session_memory_messages(memory_context):
-    return [
-        {'role': 'system', 'content': SESSION_MEMORY_SYSTEM_PROMPT},
-        {
-            'role': 'user',
-            'content': json.dumps({
-                'context': memory_context,
-                'return_shape': {
-                    'running_summary': 'compact updated session summary, replacing prior summary',
-                    'scene_patch': {
-                        'location_id': 'optional current scene location id; use for temporary location state',
-                        'location_name': 'optional current scene location name',
-                        'time_of_day': 'must match current_scene.time_of_day unless the exchange explicitly describes a time transition',
-                        'active_npc_ids': ['npc ids currently present or active in the scene; use this instead of graph facts for occupants. Listing an NPC is optional; NPCs already on stage are retained unless you also list them in departed_npc_ids.'],
-                        'departed_npc_ids': ['npc ids who actually left the scene this turn (walked out, fled, were escorted away, or otherwise exited). Do not infer departure from omission.'],
-                        'immediate_tension': 'optional current scene tension; use for transient pressure visible right now',
-                    },
-                    'scene_reason': 'why scene changed',
-                    'upsert_graph_entities': [
-                        {
-                            'id': 'stable_id',
-                            'type': 'npc | location | faction | item | event | threat | concept',
-                            'name': 'display name',
-                            'summary': 'durable summary',
-                            'visibility': 'public | party_known | dm_private',
-                            'tags': [],
-                            'certainty': 'confirmed | suspected | inferred | false | retconned',
-                            'importance': 3,
-                            'expires_or_retire_condition': 'optional description or null',
-                            'reason': 'why created/updated',
-                            'memory_type': 'npc | location | fact'
-                        }
-                    ],
-                    'upsert_graph_relations': [
-                        {
-                            'id': 'stable_id',
-                            'source_id': 'entity id',
-                            'target_id': 'entity id',
-                            'type': 'relationship type',
-                            'summary': 'durable summary',
-                            'visibility': 'public | party_known | dm_private',
-                            'certainty': 'confirmed | suspected | inferred | false | retconned',
-                            'importance': 3,
-                            'expires_or_retire_condition': 'optional description or null',
-                            'reason': 'why created/updated',
-                            'memory_type': 'relation'
-                        }
-                    ],
-                    'upsert_graph_facts': [
-                        {
-                            'id': 'stable_id',
-                            'entity_ids': ['all directly relevant entity ids'],
-                            'text': 'durable fact',
-                            'certainty': 'confirmed | suspected | inferred | false | retconned',
-                            'visibility': 'public | party_known | dm_private',
-                            'importance': 3,
-                            'expires_or_retire_condition': 'optional description or null',
-                            'reason': 'why created/updated',
-                            'memory_type': 'fact | quest | inventory | money'
-                        }
-                    ],
-                    'create_clocks': [
-                        {
-                            'id': 'stable_clock_id',
-                            'name': 'Clock name',
-                            'segments': 4,
-                            'filled': 0,
-                            'pressure_type': 'faction | danger | mystery | environment | personal | story',
-                            'visibility': 'public | party_known | dm_private',
-                            'summary': 'pressure summary',
-                            'trigger': 'when it advances',
-                            'on_complete': 'what happens',
-                            'status': 'active',
-                            'reason': 'why this clock now exists',
-                            'certainty': 'confirmed | suspected | inferred | false | retconned',
-                            'importance': 3,
-                            'expires_or_retire_condition': 'optional description or null',
-                            'memory_type': 'clock'
-                        }
-                    ],
-                    'retire_clocks': [
-                        {
-                            'clock_id': 'existing_clock_id',
-                            'status': 'completed | resolved | inactive',
-                            'reason': 'why retired',
-                            'certainty': 'confirmed | suspected | inferred | false | retconned',
-                            'importance': 3,
-                            'expires_or_retire_condition': 'optional description or null',
-                            'memory_type': 'clock'
-                        }
-                    ],
-                    'update_npc_actors': [
-                        {
-                            'id': 'npc_stable_id',
-                            'name': 'NPC name',
-                            'role': 'story role',
-                            'public_summary': 'public summary',
-                            'wants': [],
-                            'fears': [],
-                            'secrets': [],
-                            'relationships': {},
-                            'recent_offscreen_activity': [],
-                            'reason': 'why updated',
-                            'certainty': 'confirmed | suspected | inferred | false | retconned',
-                            'importance': 3,
-                            'expires_or_retire_condition': 'optional description or null',
-                            'memory_type': 'npc'
-                        }
-                    ],
-                    'record_events': [
-                        {
-                            'event_type': 'short_type',
-                            'summary': 'durable event summary',
-                            'payload': {},
-                            'visibility': 'public | party_known | dm_private',
-                            'certainty': 'confirmed | suspected | inferred | false | retconned',
-                            'importance': 3,
-                            'expires_or_retire_condition': 'optional description or null',
-                            'reason': 'why created',
-                            'memory_type': 'fact'
-                        }
-                    ],
-                },
-            }, ensure_ascii=False),
-        },
-    ]
-
-
-def build_session_memory_summary_scene_messages(memory_context):
-    compact = _session_memory_compact_context(memory_context)
-    return [
-        {'role': 'system', 'content': SESSION_MEMORY_SUMMARY_SCENE_SYSTEM_PROMPT},
-        {
-            'role': 'user',
-            'content': json.dumps({
-                'current_scene': compact.get('current_scene'),
-                'latest_player_message': compact.get('latest_player_message'),
-                'latest_dm_message': compact.get('latest_dm_message'),
-            }, ensure_ascii=False),
-        },
-    ]
-
-
-def build_session_memory_facts_messages(memory_context):
-    compact = _session_memory_compact_context(memory_context)
-    return [
-        {'role': 'system', 'content': SESSION_MEMORY_FACTS_SYSTEM_PROMPT},
-        {
-            'role': 'user',
-            'content': json.dumps({
-                'current_scene': compact.get('current_scene'),
-                'relevant_memory': compact.get('relevant_memory'),
-                'identity_rules': [
-                    'Reuse a relevant_memory match item_id when the latest exchange updates the same fact.',
-                    'Use relevant_memory entity item_id values in entity_ids for known entities.',
-                    'Create a new fact id only for a distinct durable truth not represented by relevant_memory.',
-                ],
-                'visibility_policy': {
-                    'party_known': 'Use for facts established in latest_player_message or latest_dm_message.',
-                    'public': 'Use only for facts generally known outside the party.',
-                    'dm_private': 'Use only for unrevealed secrets, hidden causes, off-screen actions, or DM-only pressure.',
-                },
-                'latest_player_message': compact.get('latest_player_message'),
-                'latest_dm_message': compact.get('latest_dm_message'),
-            }, ensure_ascii=False),
-        },
-    ]
-
-
 def build_session_memory_clocks_messages(memory_context):
     compact = _session_memory_compact_context(memory_context)
     return [
@@ -4062,20 +3856,6 @@ def build_session_clock_adjudication_messages(clock_context):
                 'latest_dm_message': clock_context.get('latest_dm_message'),
                 'recent_events': clock_context.get('recent_events') or [],
             }, ensure_ascii=False),
-        },
-    ]
-
-
-def _session_memory_summary_scene_retry_messages(messages):
-    return [
-        *messages,
-        {
-            'role': 'user',
-            'content': (
-                'Your previous response was blank or invalid. Return exactly one valid JSON object now with a '
-                'non-empty turn_summary string and a scene_patch object. Do not return whitespace, null, an '
-                'empty object, markdown fences, or commentary outside the JSON object.'
-            ),
         },
     ]
 
@@ -5321,23 +5101,6 @@ def _session_memory_compact_context(memory_context):
     }
 
 
-def _merge_session_running_summary(prior_summary, turn_summary, limit=1800):
-    prior_text = _memory_fallback_text(prior_summary, 1000)
-    turn_text = _memory_fallback_text(turn_summary, 900)
-    running_summary = ' '.join(part for part in [prior_text, turn_text] if part).strip()
-    if len(running_summary) > limit:
-        running_summary = running_summary[-limit:].lstrip()
-    return running_summary
-
-
-def _should_use_staged_session_memory(memory_context):
-    if SESSION_MEMORY_MODE != 'staged':
-        return False
-    if not isinstance(memory_context, dict):
-        return False
-    return bool(memory_context.get('campaign_id') and memory_context.get('session_id'))
-
-
 def _memory_tool_result_message(tool_call, tool_name, result):
     return {
         'role': 'tool',
@@ -5350,6 +5113,7 @@ def _memory_tool_result_message(tool_call, tool_name, result):
 def _get_session_memory_patch_staged(memory_context, audit_context, telemetry):
     from services.session_memory_agent import (
         SESSION_MEMORY_TOOL_DEFINITIONS,
+        MemoryPipelineError,
         compile_staged_memory_patch,
         execute_memory_tool,
     )
@@ -5368,12 +5132,22 @@ def _get_session_memory_patch_staged(memory_context, audit_context, telemetry):
             timeout_seconds=SESSION_MEMORY_TIMEOUT_SECONDS,
         )
     except Exception as err:
-        telemetry['staged_extractor_error'] = repr(err)
-        return None
+        raise MemoryPipelineError(
+            stage='extraction',
+            code='extractor_provider_error',
+            message=f'Staged memory extraction failed: {err}',
+            cause=err,
+            telemetry=telemetry,
+        ) from err
     if not isinstance(extracted, dict) or not str(extracted.get('running_summary') or '').strip():
         telemetry['staged_extractor_error'] = 'blank_or_invalid_extractor'
         telemetry['staged_extractor_response_chars'] = extractor_chars
-        return None
+        raise MemoryPipelineError(
+            stage='extraction',
+            code='blank_response',
+            message='Staged memory extraction returned blank or invalid response.',
+            telemetry=telemetry,
+        )
     telemetry['staged_extractor_response_chars'] = extractor_chars
     if campaign_id:
         log_audit_event(
@@ -5396,19 +5170,28 @@ def _get_session_memory_patch_staged(memory_context, audit_context, telemetry):
     max_tool_rounds = 6
     final_payload = None
     for tool_round in range(max_tool_rounds + 1):
-        data = _post_chat_response(
-            messages,
-            json_mode=False,
-            audit_context={
-                **audit_context,
-                'operation': 'session_memory_resolve',
-                'full_world_graph_included': False,
-            },
-            tools=SESSION_MEMORY_TOOL_DEFINITIONS,
-            tool_choice='auto',
-            parallel_tool_calls=False,
-            allow_thinking=False,
-        )
+        try:
+            data = _post_chat_response(
+                messages,
+                json_mode=False,
+                audit_context={
+                    **audit_context,
+                    'operation': 'session_memory_resolve',
+                    'full_world_graph_included': False,
+                },
+                tools=SESSION_MEMORY_TOOL_DEFINITIONS,
+                tool_choice='auto',
+                parallel_tool_calls=False,
+                allow_thinking=False,
+            )
+        except Exception as err:
+            raise MemoryPipelineError(
+                stage='resolution',
+                code='resolver_provider_error',
+                message=f'Staged memory resolver call failed: {err}',
+                cause=err,
+                telemetry=telemetry,
+            ) from err
         response_chain.append(data)
         message, _finish_reason = _choice_message(data)
         tool_calls = message.get('tool_calls') or []
@@ -5418,7 +5201,16 @@ def _get_session_memory_patch_staged(memory_context, audit_context, telemetry):
                 function = tool_call.get('function') if isinstance(tool_call, dict) else {}
                 tool_name = function.get('name') if isinstance(function, dict) else None
                 tool_args = _parse_tool_arguments(function.get('arguments') if isinstance(function, dict) else None)
-                result = execute_memory_tool(memory_context, tool_name, tool_args)
+                try:
+                    result = execute_memory_tool(memory_context, tool_name, tool_args)
+                except Exception as err:
+                    raise MemoryPipelineError(
+                        stage='resolution',
+                        code='tool_execution_error',
+                        message=f'Staged memory resolver tool {tool_name} failed: {err}',
+                        cause=err,
+                        telemetry=telemetry,
+                    ) from err
                 tool_trace.append({
                     'tool_name': tool_name,
                     'args': tool_args,
@@ -5445,13 +5237,38 @@ def _get_session_memory_patch_staged(memory_context, audit_context, telemetry):
             final_payload = _json_object_from_text(content)
         except Exception as err:
             telemetry['staged_resolver_error'] = repr(err)
-            return None
+            raise MemoryPipelineError(
+                stage='resolution',
+                code='malformed_output',
+                message=f'Staged memory resolver returned malformed output: {err}',
+                cause=err,
+                telemetry=telemetry,
+            ) from err
         break
     if final_payload is None:
         telemetry['staged_resolver_error'] = 'max_tool_rounds_exceeded'
-        return None
+        raise MemoryPipelineError(
+            stage='resolution',
+            code='max_tool_rounds_exceeded',
+            message='Staged memory resolver exceeded max tool call rounds without producing a payload.',
+            telemetry=telemetry,
+        )
 
-    compiled = compile_staged_memory_patch(memory_context, extracted, final_payload)
+    try:
+        compiled = compile_staged_memory_patch(memory_context, extracted, final_payload)
+    except MemoryPipelineError as err:
+        base = dict(telemetry)
+        base.update(err.telemetry or {})
+        err.telemetry = base
+        raise
+    except Exception as err:
+        raise MemoryPipelineError(
+            stage='compilation',
+            code='compile_error',
+            message=f'Staged memory compilation failed: {err}',
+            cause=err,
+            telemetry=telemetry,
+        ) from err
     telemetry['mode'] = 'staged_memory_writer'
     telemetry['staged_tool_call_count'] = len(tool_trace)
     telemetry['staged_resolver_response_count'] = len(response_chain)
@@ -5484,93 +5301,43 @@ def _get_session_memory_patch_staged(memory_context, audit_context, telemetry):
             timeout_seconds=SESSION_MEMORY_TIMEOUT_SECONDS,
         )
     except Exception as err:
-        clocks_data = None
-        clocks_chars = 0
         telemetry['clocks_error'] = repr(err)
+        raise MemoryPipelineError(
+            stage='clock_generation',
+            code='clock_provider_error',
+            message=f'Staged clock generation failed: {err}',
+            cause=err,
+            telemetry=telemetry,
+        ) from err
     telemetry['clocks_response_chars'] = clocks_chars
-    if isinstance(clocks_data, dict):
-        compiled['create_clocks'] = clocks_data.get('create_clocks') if isinstance(clocks_data.get('create_clocks'), list) else []
-        compiled['retire_clocks'] = clocks_data.get('retire_clocks') if isinstance(clocks_data.get('retire_clocks'), list) else []
+    if not isinstance(clocks_data, dict):
+        raise MemoryPipelineError(
+            stage='clock_generation',
+            code='malformed_output',
+            message='Staged clock generation returned invalid output.',
+            telemetry=telemetry,
+        )
+    create_clocks = clocks_data.get('create_clocks')
+    retire_clocks = clocks_data.get('retire_clocks')
+    if create_clocks is not None and not isinstance(create_clocks, list):
+        raise MemoryPipelineError(
+            stage='clock_generation',
+            code='malformed_output',
+            message='Staged clock generation returned invalid create_clocks shape.',
+            telemetry=telemetry,
+        )
+    if retire_clocks is not None and not isinstance(retire_clocks, list):
+        raise MemoryPipelineError(
+            stage='clock_generation',
+            code='malformed_output',
+            message='Staged clock generation returned invalid retire_clocks shape.',
+            telemetry=telemetry,
+        )
+    if isinstance(create_clocks, list):
+        compiled['create_clocks'] = create_clocks
+    if isinstance(retire_clocks, list):
+        compiled['retire_clocks'] = retire_clocks
     return compiled
-
-
-def _fallback_session_memory_patch(memory_context, telemetry):
-    memory_context = memory_context or {}
-    prior_summary = _memory_fallback_text(memory_context.get('prior_running_summary'), 1000)
-    latest_player = _memory_fallback_text(
-        _memory_context_lookup(memory_context, 'latest_player_message'),
-        350,
-    )
-    latest_dm = _memory_fallback_text(
-        _memory_context_lookup(memory_context, 'latest_dm_message', 'latest_dm_response'),
-        900,
-    )
-    latest_parts = []
-    if latest_player:
-        latest_parts.append(f'Player: {latest_player}')
-    if latest_dm:
-        latest_parts.append(f'DM: {latest_dm}')
-    latest_summary = ' '.join(latest_parts)
-    running_summary = ' '.join(part for part in [prior_summary, latest_summary] if part).strip()
-    if len(running_summary) > 1800:
-        running_summary = running_summary[-1800:].lstrip()
-
-    prior_anchors = memory_context.get('prior_memory_anchors') if isinstance(memory_context.get('prior_memory_anchors'), dict) else {}
-    normalized_anchors = {
-        "current_goal": prior_anchors.get("current_goal"),
-        "current_scene": prior_anchors.get("current_scene"),
-        "open_clues": prior_anchors.get("open_clues") if isinstance(prior_anchors.get("open_clues"), list) else [],
-        "unresolved_questions": prior_anchors.get("unresolved_questions") if isinstance(prior_anchors.get("unresolved_questions"), list) else [],
-        "npc_observations": prior_anchors.get("npc_observations") if isinstance(prior_anchors.get("npc_observations"), list) else [],
-        "recent_offers_promises": prior_anchors.get("recent_offers_promises") if isinstance(prior_anchors.get("recent_offers_promises"), list) else []
-    }
-
-    return {
-        'running_summary': running_summary,
-        'memory_anchors': normalized_anchors,
-        'scene_patch': _fallback_scene_patch(memory_context),
-        'scene_reason': 'Fallback summary applied because the memory writer returned no visible JSON.',
-        'upsert_graph_entities': [],
-        'upsert_graph_relations': [],
-        'upsert_graph_facts': [],
-        'create_clocks': [],
-        'retire_clocks': [],
-        'update_npc_actors': [],
-        'record_events': [],
-        '_fallback': {
-            'reason': 'empty_memory_writer_response',
-            'mode': 'summary_and_scene_only',
-        },
-        '_telemetry': telemetry,
-    }
-
-
-def _session_memory_patch_has_substance(data):
-    if not isinstance(data, dict):
-        return False
-    if str(data.get('running_summary') or '').strip():
-        return True
-    scene_patch = data.get('scene_patch')
-    if isinstance(scene_patch, dict) and any(value not in (None, '', [], {}) for value in scene_patch.values()):
-        return True
-    anchors = data.get("memory_anchors")
-    if isinstance(anchors, dict) and any(
-        value not in (None, "", [], {}) for value in anchors.values()
-    ):
-        return True
-    for key in (
-        'upsert_graph_entities',
-        'upsert_graph_relations',
-        'upsert_graph_facts',
-        'create_clocks',
-        'retire_clocks',
-        'update_npc_actors',
-        'record_events',
-    ):
-        value = data.get(key)
-        if isinstance(value, list) and value:
-            return True
-    return False
 
 
 def _request_session_memory_json(messages, audit_context, operation, max_tokens, timeout_seconds):
@@ -5600,195 +5367,45 @@ def _request_session_memory_json(messages, audit_context, operation, max_tokens,
     return data, len(text)
 
 
-def _mark_memory_fallback_active(telemetry, audit_context):
-    tracker = audit_context.get("telemetry_tracker") if isinstance(audit_context, dict) else None
-    if isinstance(tracker, dict):
-        tracker["fallback_active"] = True
-    if isinstance(telemetry, dict):
-        telemetry["fallback_active"] = True
-
-
-def _get_session_memory_patch_opencode_go(memory_context, audit_context, telemetry):
-    timeout_seconds = SESSION_MEMORY_TIMEOUT_SECONDS
-    max_tokens = SESSION_MEMORY_MAX_TOKENS
-    summary_messages = build_session_memory_summary_scene_messages(memory_context)
-
-    try:
-        summary_data, summary_chars = _request_session_memory_json(
-            summary_messages,
-            audit_context,
-            'session_memory_update_summary_scene',
-            max_tokens=max_tokens,
-            timeout_seconds=timeout_seconds,
-        )
-    except Exception as err:
-        telemetry['summary_scene_error'] = repr(err)
-        _mark_memory_fallback_active(telemetry, audit_context)
-        fallback_patch = _fallback_session_memory_patch(memory_context, telemetry)
-        fallback_patch['_telemetry'] = {**telemetry, **(fallback_patch.get('_telemetry') or {})}
-        _compile_telemetry_summary(fallback_patch['_telemetry'], audit_context)
-        return fallback_patch
-
-    if not isinstance(summary_data, dict) or not str(summary_data.get('turn_summary') or '').strip():
-        try:
-            summary_data, summary_chars = _request_session_memory_json(
-                _session_memory_summary_scene_retry_messages(summary_messages),
-                audit_context,
-                'session_memory_update_summary_scene_retry',
-                max_tokens=max_tokens,
-                timeout_seconds=timeout_seconds,
-            )
-            telemetry['summary_scene_retry'] = True
-        except Exception as err:
-            telemetry['summary_scene_retry_error'] = repr(err)
-
-    if not isinstance(summary_data, dict) or not str(summary_data.get('turn_summary') or '').strip():
-        telemetry['summary_scene_error'] = 'blank_or_invalid_summary_scene'
-        telemetry['summary_scene_response_chars'] = summary_chars
-        _mark_memory_fallback_active(telemetry, audit_context)
-        fallback_patch = _fallback_session_memory_patch(memory_context, telemetry)
-        fallback_patch['_telemetry'] = {**telemetry, **(fallback_patch.get('_telemetry') or {})}
-        _compile_telemetry_summary(fallback_patch['_telemetry'], audit_context)
-        return fallback_patch
-
-    telemetry['summary_scene_response_chars'] = summary_chars
-    scene_patch = _sanitize_scene_patch(
-        summary_data.get('scene_patch') if isinstance(summary_data.get('scene_patch'), dict) else {},
-        memory_context,
-    )
-
-    try:
-        facts_data, facts_chars = _request_session_memory_json(
-            build_session_memory_facts_messages(memory_context),
-            audit_context,
-            'session_memory_update_facts',
-            max_tokens=max_tokens,
-            timeout_seconds=timeout_seconds,
-        )
-    except Exception as err:
-        facts_data = None
-        facts_chars = 0
-        telemetry['facts_error'] = repr(err)
-
-    try:
-        clocks_data, clocks_chars = _request_session_memory_json(
-            build_session_memory_clocks_messages(memory_context),
-            audit_context,
-            'session_memory_update_clocks',
-            max_tokens=max_tokens,
-            timeout_seconds=timeout_seconds,
-        )
-    except Exception as err:
-        clocks_data = None
-        clocks_chars = 0
-        telemetry['clocks_error'] = repr(err)
-
-    telemetry['facts_response_chars'] = facts_chars
-    telemetry['clocks_response_chars'] = clocks_chars
-
-    facts = facts_data.get('upsert_graph_facts') if isinstance(facts_data, dict) and isinstance(facts_data.get('upsert_graph_facts'), list) else []
-    create_clocks = clocks_data.get('create_clocks') if isinstance(clocks_data, dict) and isinstance(clocks_data.get('create_clocks'), list) else []
-    retire_clocks = clocks_data.get('retire_clocks') if isinstance(clocks_data, dict) and isinstance(clocks_data.get('retire_clocks'), list) else []
-
-    return {
-        'running_summary': _merge_session_running_summary(
-            memory_context.get('prior_running_summary'),
-            summary_data.get('turn_summary'),
-        ),
-        'scene_patch': scene_patch,
-        'scene_reason': 'Session memory summary/scene pass updated the active scene state.',
-        'upsert_graph_entities': [],
-        'upsert_graph_relations': [],
-        'upsert_graph_facts': facts,
-        'create_clocks': create_clocks,
-        'retire_clocks': retire_clocks,
-        'update_npc_actors': [],
-        'record_events': [],
-        '_telemetry': telemetry,
-    }
-
-
-def _compile_telemetry_summary(telemetry, audit_context):
-    tracker = audit_context.get('telemetry_tracker') if isinstance(audit_context, dict) else None
-    if not isinstance(tracker, dict):
-        tracker = {
-            'status': 'success',
-            'provider_retries': 0,
-            'parse_repairs': 0,
-            'guard_retries': 0,
-            'fallback_active': False,
-            'failure_category': None,
-            'warnings': {
-                'scene_mutation_rejected': 0,
-                'unresolved_scene_references': 0
-            }
-        }
-
-    # If telemetry has any errors, override status/failure_category
-    err_str = ""
-    for k in ('error', 'staged_extractor_error', 'staged_resolver_error', 'summary_scene_error', 'clocks_error'):
-        if telemetry.get(k):
-            err_str = str(telemetry.get(k))
-            break
-
-    if err_str:
-        if 'JSONDecodeError' in err_str or 'blank_or_invalid' in err_str:
-            tracker['status'] = 'parser_failure'
-            tracker['failure_category'] = 'parser'
-        elif 'empty_response' in err_str or 'empty_patch' in err_str:
-            tracker['status'] = 'model_output_failure'
-            tracker['failure_category'] = 'model'
-        else:
-            tracker['status'] = 'provider_failure'
-            tracker['failure_category'] = 'provider'
-
-    if telemetry.get('fallback_active') or tracker.get('fallback_active'):
-        tracker['fallback_active'] = True
-        if tracker.get('status', 'success') == 'success':
-            tracker['status'] = 'partial_fallback'
-
-    telemetry_summary = {
-        'status': tracker.get('status', 'success'),
-        'provider_retries': tracker.get('provider_retries', 0),
-        'parse_repairs': tracker.get('parse_repairs', 0),
-        'guard_retries': tracker.get('guard_retries', 0),
-        'fallback_active': tracker.get('fallback_active', False),
-        'failure_category': tracker.get('failure_category'),
-        'warnings': tracker.get('warnings', {
-            'scene_mutation_rejected': 0,
-            'unresolved_scene_references': 0
-        })
-    }
-    telemetry['telemetry_summary'] = telemetry_summary
-    return telemetry_summary
-
-
 def get_session_memory_patch(memory_context, audit_context=None):
-    messages = build_session_memory_messages(memory_context)
+    from services.session_memory_agent import MemoryPipelineError
+
     if not isinstance(audit_context, dict):
         audit_context = {}
-    tracker = {
-        'status': 'success',
-        'provider_retries': 0,
-        'parse_repairs': 0,
-        'guard_retries': 0,
-        'fallback_active': False,
-        'failure_category': None,
-        'warnings': {
-            'scene_mutation_rejected': 0,
-            'unresolved_scene_references': 0
-        }
-    }
-    audit_context['telemetry_tracker'] = tracker
-
     provider = get_llm_provider()
+    model = get_llm_model()
     campaign_id = audit_context.get('campaign_id')
     trace_id = audit_context.get('trace_id') or f"session_memory_writer:memory_update:{uuid4().hex[:10]}"
     trace_label = audit_context.get('trace_label') or 'session_memory_writer: memory_update'
+    build_sha = _get_cached_build_sha()
+    memory_run_id = audit_context.get('memory_run_id') or f"memrun_{uuid4().hex[:12]}"
 
-    prompt_str = json.dumps(messages, ensure_ascii=False)
-    prompt_chars = len(prompt_str)
-    prompt_tokens_estimate = prompt_chars // 4
+    telemetry = {
+        'pipeline_mode': 'staged_memory_writer',
+        'provider': provider,
+        'model': model,
+        'build_sha': build_sha,
+        'trace_id': trace_id,
+        'memory_run_id': memory_run_id,
+        'campaign_id': campaign_id,
+    }
+
+    if not isinstance(memory_context, dict):
+        raise MemoryPipelineError(
+            stage='context',
+            code='missing_context',
+            message='memory_context is not a dict.',
+            telemetry=telemetry,
+        )
+    context_campaign_id = memory_context.get('campaign_id')
+    context_session_id = memory_context.get('session_id')
+    if not context_campaign_id or not context_session_id:
+        raise MemoryPipelineError(
+            stage='context',
+            code='missing_context',
+            message='memory_context is missing campaign_id or session_id.',
+            telemetry=telemetry,
+        )
 
     context_breakdown = {}
     if isinstance(memory_context, dict):
@@ -5798,12 +5415,18 @@ def get_session_memory_patch(memory_context, audit_context=None):
             except Exception:
                 context_breakdown[k] = 0
 
+    telemetry.update({
+        'prompt_chars': 0,
+        'prompt_tokens_estimate': 0,
+        'context_breakdown': context_breakdown,
+    })
+
     if campaign_id:
         log_audit_event(
             campaign_id,
             'memory_writer_request',
             'Requested post-turn session memory update.',
-            {'context': memory_context, 'messages': messages},
+            {'context': memory_context, 'telemetry': telemetry},
             source=provider,
             actor='session_memory_writer',
             trace_id=trace_id,
@@ -5812,275 +5435,60 @@ def get_session_memory_patch(memory_context, audit_context=None):
             audit_role='tools',
             commit=True,
         )
-    if _should_use_staged_session_memory(memory_context):
-        telemetry = {
-            'prompt_chars': prompt_chars,
-            'prompt_tokens_estimate': prompt_tokens_estimate,
-            'context_breakdown': context_breakdown,
-        }
-        patch = _get_session_memory_patch_staged(
-            memory_context,
-            {
-                **audit_context,
-                'trace_id': trace_id,
-                'trace_label': trace_label,
-                'actor': 'session_memory_writer',
-                'full_world_graph_included': False,
-            },
-            telemetry,
-        )
-        if patch and campaign_id:
-            log_audit_event(
-                campaign_id,
-                'memory_writer_response',
-                'Received staged post-turn session memory patch.',
-                {'patch': patch},
-                source=provider,
-                actor='session_memory_writer',
-                trace_id=trace_id,
-                parent_trace_id=audit_context.get('parent_trace_id'),
-                trace_label=trace_label,
-                audit_role='agent',
-                commit=True,
-            )
-        if patch:
-            patch['_telemetry'] = {**telemetry, **(patch.get('_telemetry') or {})}
-            _compile_telemetry_summary(patch['_telemetry'], audit_context)
-            return patch
-    if provider == 'opencode_go':
-        telemetry = {
-            'prompt_chars': prompt_chars,
-            'prompt_tokens_estimate': prompt_tokens_estimate,
-            'context_breakdown': context_breakdown,
-            'mode': 'split_opencode_go_memory_writer',
-        }
-        patch = _get_session_memory_patch_opencode_go(
-            memory_context,
-            {
-                **audit_context,
-                'trace_id': trace_id,
-                'trace_label': trace_label,
-                'actor': 'session_memory_writer',
-                'full_world_graph_included': False,
-            },
-            telemetry,
-        )
-        if campaign_id:
-            log_audit_event(
-                campaign_id,
-                'memory_writer_response',
-                'Received post-turn session memory patch.',
-                {'patch': patch},
-                source=provider,
-                actor='session_memory_writer',
-                trace_id=trace_id,
-                parent_trace_id=audit_context.get('parent_trace_id'),
-                trace_label=trace_label,
-                audit_role='agent',
-                commit=True,
-            )
-        if patch:
-            patch['_telemetry'] = {**telemetry, **(patch.get('_telemetry') or {})}
-            _compile_telemetry_summary(patch['_telemetry'], audit_context)
-        return patch
+
+    staged_audit = {
+        **audit_context,
+        'trace_id': trace_id,
+        'trace_label': trace_label,
+        'actor': 'session_memory_writer',
+        'full_world_graph_included': False,
+    }
     try:
-        base_operation = audit_context.get('operation') or 'session_memory_update'
-        request_audit_context = {
-            **audit_context,
-            'trace_id': trace_id,
-            'trace_label': trace_label,
-            'operation': base_operation,
-            'actor': 'session_memory_writer',
-            'full_world_graph_included': False,
-        }
-
-        def request_patch_text(request_messages, operation_suffix=None):
-            request_context = dict(request_audit_context)
-            if operation_suffix:
-                request_context['operation'] = f'{base_operation}_{operation_suffix}'
-            response_text = _post_chat(
-                request_messages,
-                json_mode=True,
-                audit_context=request_context,
-                allow_thinking=False,
-                timeout_seconds=SESSION_MEMORY_TIMEOUT_SECONDS,
-                max_attempts=SESSION_MEMORY_MAX_ATTEMPTS,
-                max_tokens=SESSION_MEMORY_MAX_TOKENS,
-            )
-            return response_text, len(response_text) if response_text else 0
-
-        retry_suffix = None
-        text, response_chars = request_patch_text(messages)
-        if not text or not text.strip():
-            retry_suffix = 'blank_retry'
-            text, response_chars = request_patch_text(
-                _session_memory_retry_messages(messages, 'blank_response'),
-                operation_suffix=retry_suffix,
-            )
-        if not text or not text.strip():
-            telemetry = {
-                'prompt_chars': prompt_chars,
-                'prompt_tokens_estimate': prompt_tokens_estimate,
-                'response_chars': response_chars,
-                'context_breakdown': context_breakdown,
-                'error': 'empty_response',
-                'retry_suffix': retry_suffix,
-            }
-            if campaign_id:
-                log_audit_event(
-                    campaign_id,
-                    'memory_writer_empty',
-                    'Post-turn session memory writer returned an empty patch.',
-                    {'_telemetry': telemetry},
-                    source=provider,
-                    actor='session_memory_writer',
-                    trace_id=trace_id,
-                    parent_trace_id=audit_context.get('parent_trace_id'),
-                    trace_label=trace_label,
-                    audit_role='tools',
-                    commit=True,
-                )
-            fallback_patch = _fallback_session_memory_patch(memory_context, telemetry)
-            if campaign_id:
-                log_audit_event(
-                    campaign_id,
-                    'memory_writer_fallback',
-                    'Applied deterministic summary-only fallback after empty memory writer response.',
-                    {'patch': fallback_patch},
-                    source=provider,
-                    actor='session_memory_writer',
-                    trace_id=trace_id,
-                    parent_trace_id=audit_context.get('parent_trace_id'),
-                    trace_label=trace_label,
-                    audit_role='tools',
-                    commit=True,
-                )
-            tracker = audit_context.get("telemetry_tracker")
-            if isinstance(tracker, dict):
-                tracker["fallback_active"] = True
-            telemetry["fallback_active"] = True
-            fallback_patch['_telemetry'] = {**telemetry, **(fallback_patch.get('_telemetry') or {})}
-            _compile_telemetry_summary(fallback_patch['_telemetry'], audit_context)
-            return fallback_patch
-        data = _json_loads_with_repair(text, audit_context=request_audit_context)
-        if not isinstance(data, dict):
-            data = {}
-        if isinstance(data.get('scene_patch'), dict):
-            data['scene_patch'] = _sanitize_scene_patch(data['scene_patch'], memory_context)
-
-        if not _session_memory_patch_has_substance(data):
-            retry_suffix = 'empty_patch_retry'
-            tracker = audit_context.get('telemetry_tracker')
-            if isinstance(tracker, dict):
-                tracker['guard_retries'] = tracker.get('guard_retries', 0) + 1
-            retry_text, retry_response_chars = request_patch_text(
-                _session_memory_retry_messages(messages, 'empty_patch'),
-                operation_suffix=retry_suffix,
-            )
-            if retry_text and retry_text.strip():
-                text = retry_text
-                response_chars = retry_response_chars
-                data = _json_loads_with_repair(
-                    text,
-                    audit_context={
-                        **request_audit_context,
-                        'operation': f'{base_operation}_{retry_suffix}',
-                    },
-                )
-                if not isinstance(data, dict):
-                    data = {}
-                if isinstance(data.get('scene_patch'), dict):
-                    data['scene_patch'] = _sanitize_scene_patch(data['scene_patch'], memory_context)
-
-        if not _session_memory_patch_has_substance(data):
-            telemetry = {
-                'prompt_chars': prompt_chars,
-                'prompt_tokens_estimate': prompt_tokens_estimate,
-                'response_chars': response_chars,
-                'context_breakdown': context_breakdown,
-                'error': 'empty_patch',
-                'retry_suffix': retry_suffix,
-                'patch_preview': data,
-            }
-            if campaign_id:
-                log_audit_event(
-                    campaign_id,
-                    'memory_writer_empty_patch',
-                    'Post-turn session memory writer returned an empty or no-op patch.',
-                    {'patch': data, '_telemetry': telemetry},
-                    source=provider,
-                    actor='session_memory_writer',
-                    trace_id=trace_id,
-                    parent_trace_id=audit_context.get('parent_trace_id'),
-                    trace_label=trace_label,
-                    audit_role='tools',
-                    commit=True,
-                )
-            fallback_patch = _fallback_session_memory_patch(memory_context, telemetry)
-            if campaign_id:
-                log_audit_event(
-                    campaign_id,
-                    'memory_writer_fallback',
-                    'Applied deterministic summary-only fallback after empty or no-op memory writer patch.',
-                    {'patch': fallback_patch},
-                    source=provider,
-                    actor='session_memory_writer',
-                    trace_id=trace_id,
-                    parent_trace_id=audit_context.get('parent_trace_id'),
-                    trace_label=trace_label,
-                    audit_role='tools',
-                    commit=True,
-                )
-            tracker = audit_context.get("telemetry_tracker")
-            if isinstance(tracker, dict):
-                tracker["fallback_active"] = True
-            telemetry["fallback_active"] = True
-            fallback_patch['_telemetry'] = {**telemetry, **(fallback_patch.get('_telemetry') or {})}
-            _compile_telemetry_summary(fallback_patch['_telemetry'], audit_context)
-            return fallback_patch
-
-        data['_telemetry'] = {
-            'prompt_chars': prompt_chars,
-            'prompt_tokens_estimate': prompt_tokens_estimate,
-            'response_chars': response_chars,
-            'context_breakdown': context_breakdown,
-            'retry_suffix': retry_suffix,
-        }
-
+        patch = _get_session_memory_patch_staged(memory_context, staged_audit, telemetry)
+    except MemoryPipelineError as err:
+        telemetry['pipeline_error_stage'] = err.stage
+        telemetry['pipeline_error_code'] = err.code
+        if err.telemetry:
+            base = dict(telemetry)
+            base.update(err.telemetry)
+            err.telemetry = base
+        else:
+            err.telemetry = dict(telemetry)
+        telemetry.update(err.telemetry)
         if campaign_id:
             log_audit_event(
                 campaign_id,
-                'memory_writer_response',
-                'Received post-turn session memory patch.',
-                {'patch': data},
+                'memory_writer_error',
+                f'Post-turn session memory writer failed at stage {err.stage}: {err.code}',
+                {'_telemetry': telemetry, 'stage': err.stage, 'code': err.code},
                 source=provider,
                 actor='session_memory_writer',
                 trace_id=trace_id,
                 parent_trace_id=audit_context.get('parent_trace_id'),
                 trace_label=trace_label,
-                audit_role='agent',
+                audit_role='tools',
                 commit=True,
             )
-        _compile_telemetry_summary(data['_telemetry'], audit_context)
-        return data
-    except Exception as e:
-        print(f'[openrouter] Session memory writer error: {e}')
-        telemetry = {
-            'prompt_chars': prompt_chars,
-            'prompt_tokens_estimate': prompt_tokens_estimate,
-            'response_chars': 0,
-            'context_breakdown': context_breakdown,
-            'error': str(e),
-        }
-        fallback_patch = _fallback_session_memory_patch(memory_context, telemetry)
-        fallback_patch['_fallback']['reason'] = 'memory_writer_model_error'
-        tracker = audit_context.get("telemetry_tracker")
-        if isinstance(tracker, dict):
-            tracker["fallback_active"] = True
-        telemetry["fallback_active"] = True
-        fallback_patch['_telemetry'] = {**telemetry, **(fallback_patch.get('_telemetry') or {})}
-        _compile_telemetry_summary(fallback_patch['_telemetry'], audit_context)
-        return fallback_patch
+        raise
+
+    if patch and campaign_id:
+        log_audit_event(
+            campaign_id,
+            'memory_writer_response',
+            'Received staged post-turn session memory patch.',
+            {'patch': patch},
+            source=provider,
+            actor='session_memory_writer',
+            trace_id=trace_id,
+            parent_trace_id=audit_context.get('parent_trace_id'),
+            trace_label=trace_label,
+            audit_role='agent',
+            commit=True,
+        )
+    if patch:
+        telemetry['pipeline_status'] = 'success'
+        patch['_telemetry'] = {**telemetry, **(patch.get('_telemetry') or {})}
+    return patch
 
 
 def get_session_clock_updates(clock_context, audit_context=None):

@@ -590,13 +590,14 @@ class P1ImprovementsTest(unittest.TestCase):
         self.assertEqual(ev['provenance']['tool_name'], 'session_memory_record_event')
 
     def test_missing_campaign_path_safe(self):
+        from services.session_memory_agent import MemoryPipelineError
         memory_context = {'campaign_id': None}
         extracted = {'running_summary': 'No campaign summary'}
         resolved = {}
-        compiled = compile_staged_memory_patch(memory_context, extracted, resolved)
-        self.assertEqual(compiled['running_summary'], 'No campaign summary')
-        self.assertEqual(len(compiled['unresolved_items']), 1)
-        self.assertEqual(compiled['unresolved_items'][0]['reason'], 'missing_campaign')
+        with self.assertRaises(MemoryPipelineError) as ctx:
+            compile_staged_memory_patch(memory_context, extracted, resolved)
+        self.assertEqual(ctx.exception.stage, 'compilation')
+        self.assertEqual(ctx.exception.code, 'missing_campaign')
 
     def test_persistence_applies_new_mutations(self):
         # Known NPC in DB

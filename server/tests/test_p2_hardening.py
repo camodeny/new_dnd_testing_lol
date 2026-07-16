@@ -17,8 +17,7 @@ from models import (
     CampaignWorld
 )
 from services.dm_tools import apply_memory_patch, _validate_memory_scene_patch
-from services.session_memory_agent import compile_staged_memory_patch
-from openrouter import _fallback_session_memory_patch, _compile_telemetry_summary
+from services.session_memory_agent import MemoryPipelineError, compile_staged_memory_patch
 
 class P2HardeningTest(unittest.TestCase):
     def setUp(self):
@@ -69,7 +68,6 @@ class P2HardeningTest(unittest.TestCase):
         self.ctx.pop()
 
     def test_memory_anchors_persistence(self):
-        # 1. memory_anchors persists on CampaignSession
         anchors = {
             "current_goal": "Find the lost mine",
             "current_scene": "Inside the tavern",
@@ -89,8 +87,6 @@ class P2HardeningTest(unittest.TestCase):
         self.assertEqual(session_db.memory_anchors, anchors)
 
     def test_to_dict_returns_normalized_anchor_shape(self):
-        # 2. CampaignSession.to_dict() returns the normalized anchor shape
-        # Test case: memory_anchors is None
         self.session.memory_anchors = None
         db.session.commit()
         
@@ -99,35 +95,14 @@ class P2HardeningTest(unittest.TestCase):
         self.assertEqual(d['memory_anchors']['current_goal'], None)
         self.assertEqual(d['memory_anchors']['open_clues'], [])
 
-        # Test case: memory_anchors is partial
         self.session.memory_anchors = {"current_goal": "Goal"}
         db.session.commit()
         d2 = self.session.to_dict()
         self.assertEqual(d2['memory_anchors']['current_goal'], "Goal")
         self.assertEqual(d2['memory_anchors']['open_clues'], [])
 
-    def test_memory_writer_fallback_preserves_scene_location(self):
-        # 3. memory_writer fallback preserves existing scene location
-        memory_context = {
-            'prior_running_summary': 'Old summary',
-            'prior_memory_anchors': {'current_goal': 'Existing Goal'},
-            'hot_context': {
-                'current_scene': {
-                    'location_id': 'waterdeep',
-                    'location_name': 'Waterdeep'
-                }
-            }
-        }
-        telemetry = {}
-        fallback = _fallback_session_memory_patch(memory_context, telemetry)
-        self.assertEqual(fallback['scene_patch']['location_id'], 'waterdeep')
-        self.assertEqual(fallback['scene_patch']['location_name'], 'Waterdeep')
-        self.assertEqual(fallback['memory_anchors']['current_goal'], 'Existing Goal')
-
     def test_unresolved_scene_location_does_not_overwrite_current_scene(self):
-        # 4. unresolved scene-location proposals do not overwrite the current scene
         current_scene = {'location_id': 'waterdeep', 'location_name': 'Waterdeep'}
-        # proposed location is unknown (not in CampaignWorld list)
         patch = {'location_id': 'baldurs_gate', 'location_name': 'Baldur\'s Gate'}
         validated, skipped = _validate_memory_scene_patch(self.campaign, current_scene, patch, {})
         
@@ -136,15 +111,12 @@ class P2HardeningTest(unittest.TestCase):
         self.assertEqual(skipped['location_id'], 'baldurs_gate')
 
     def test_scene_mutation_warnings(self):
-        # 5. rejected/unresolved/repaired scene mutations emit warning/audit artifacts
-        # We perform apply_memory_patch with unresolved location
         patch = {
             'scene_patch': {
                 'location_id': 'baldurs_gate',
                 'location_name': 'Baldur\'s Gate'
             }
         }
-        # Clear existing logs/events
         CampaignMemoryLog.query.delete()
         CampaignAuditEvent.query.delete()
         db.session.commit()
@@ -152,7 +124,6 @@ class P2HardeningTest(unittest.TestCase):
         apply_memory_patch(self.campaign, self.session, patch)
         db.session.commit()
 
-        # Should log scene_mutation_warning for unresolved location change
         log = CampaignMemoryLog.query.filter_by(operation='warning').first()
         self.assertIsNotNone(log)
         self.assertEqual(log.error, 'scene_location_unresolved')
@@ -162,45 +133,6 @@ class P2HardeningTest(unittest.TestCase):
         self.assertIsNotNone(event)
         payload_data = json.loads(event.payload)
         self.assertEqual(payload_data['warning_type'], 'scene_location_unresolved')
-
-    def test_telemetry_summary_classification(self):
-        # 6. telemetry summary correctly classifies provider retry, parse repair, etc.
-        # Test Case A: Parser Failure
-        telemetry_a = {'error': 'JSONDecodeError: Expecting value'}
-        audit_context_a = {'telemetry_tracker': {}}
-        summary_a = _compile_telemetry_summary(telemetry_a, audit_context_a)
-        self.assertEqual(summary_a['status'], 'parser_failure')
-        self.assertEqual(summary_a['failure_category'], 'parser')
-
-        # Test Case B: Success with retries and repairs
-        telemetry_b = {}
-        audit_context_b = {
-            'telemetry_tracker': {
-                'provider_retries': 2,
-                'parse_repairs': 1,
-                'guard_retries': 0,
-                'fallback_active': False
-            }
-        }
-        summary_b = _compile_telemetry_summary(telemetry_b, audit_context_b)
-        self.assertEqual(summary_b['status'], 'success')
-        self.assertEqual(summary_b['provider_retries'], 2)
-        self.assertEqual(summary_b['parse_repairs'], 1)
-
-        # Test Case C: Partial Fallback
-        telemetry_c = {'fallback_active': True}
-        audit_context_c = {'telemetry_tracker': {'fallback_active': True}}
-        summary_c = _compile_telemetry_summary(telemetry_c, audit_context_c)
-        self.assertEqual(summary_c['status'], 'partial_fallback')
-        self.assertEqual(summary_c['fallback_active'], True)
-
-    def test_substance_check_includes_anchors(self):
-        from openrouter import _session_memory_patch_has_substance
-        # Patch with empty anchors has no substance
-        self.assertFalse(_session_memory_patch_has_substance({'memory_anchors': {}}))
-        self.assertFalse(_session_memory_patch_has_substance({'memory_anchors': {'current_goal': None}}))
-        # Patch with non-empty anchors has substance
-        self.assertTrue(_session_memory_patch_has_substance({'memory_anchors': {'current_goal': 'Find the lost mine'}}))
 
     def test_staged_unresolved_scene_location_emits_warning(self):
         patch = {
@@ -211,7 +143,6 @@ class P2HardeningTest(unittest.TestCase):
                 'reason': 'unresolved_scene_location'
             }]
         }
-        # Clear existing logs/events
         CampaignMemoryLog.query.delete()
         CampaignAuditEvent.query.delete()
         db.session.commit()
@@ -219,7 +150,6 @@ class P2HardeningTest(unittest.TestCase):
         apply_memory_patch(self.campaign, self.session, patch)
         db.session.commit()
 
-        # Should log scene_mutation_warning for staged unresolved location change
         log = CampaignMemoryLog.query.filter_by(operation='warning').first()
         self.assertIsNotNone(log)
         self.assertEqual(log.error, 'scene_location_unresolved')
@@ -230,55 +160,100 @@ class P2HardeningTest(unittest.TestCase):
         payload_data = json.loads(event.payload)
         self.assertEqual(payload_data['warning_type'], 'scene_location_unresolved')
 
-    def test_compile_telemetry_summary_classifies_empty_patch_as_model_failure(self):
-        telemetry = {'error': 'empty_patch'}
-        audit_context = {'telemetry_tracker': {}}
-        summary = _compile_telemetry_summary(telemetry, audit_context)
-        self.assertEqual(summary['status'], 'model_output_failure')
-        self.assertEqual(summary['failure_category'], 'model')
+    def test_compile_missing_campaign_raises_error(self):
+        with self.assertRaises(MemoryPipelineError) as ctx:
+            compile_staged_memory_patch({}, {}, {})
+        self.assertEqual(ctx.exception.stage, 'compilation')
+        self.assertEqual(ctx.exception.code, 'missing_campaign')
 
-    def test_opencode_go_summary_scene_fallback_marks_fallback_active(self):
-        from unittest.mock import patch as mock_patch
-        from openrouter import _get_session_memory_patch_opencode_go
-        
-        memory_context = {
-            'prior_running_summary': 'Prior summary',
-            'prior_memory_anchors': {},
-            'hot_context': {
-                'current_scene': {
-                    'location_id': 'waterdeep',
-                    'location_name': 'Waterdeep'
-                }
-            }
-        }
-        telemetry = {}
-        audit_context = {'telemetry_tracker': {}}
-        
-        # When _get_session_memory_patch_opencode_go hits an exception, it should trigger fallback and set fallback_active
-        with mock_patch('openrouter._request_session_memory_json', side_effect=Exception("Forced LLM exception")):
-            patch = _get_session_memory_patch_opencode_go(memory_context, audit_context, telemetry)
-        
-        self.assertTrue(patch['_telemetry']['fallback_active'])
-        self.assertTrue(patch['_telemetry']['telemetry_summary']['fallback_active'])
-        self.assertIn(patch['_telemetry']['telemetry_summary']['status'], {
-            "partial_fallback",
-            "parser_failure",
-            "model_output_failure",
-            "provider_failure",
-        })
-
-    def test_early_persistence_telemetry_attachment(self):
-        # Create a trace context and check if telemetry is attached to audit_context on failure midway
-        audit_context = {}
+    def test_apply_memory_patch_raises_validation_error_on_invalid_visibility(self):
         patch = {
-            '_telemetry': {'status': 'testing_early_telemetry'},
-            'memory_anchors': 'invalid_anchors_type_causes_type_error_in_apply'  # will fail apply_memory_patch
+            'upsert_graph_entities': [
+                {
+                    'id': 'test_entity',
+                    'name': 'test entity',
+                    'type': 'other',
+                    'visibility': 'invalid_visibility',
+                }
+            ]
         }
-        
-        try:
-            apply_memory_patch(object(), self.session, patch, audit_context=audit_context)
-        except Exception:
-            pass
-        
-        self.assertIsNotNone(audit_context.get('telemetry'))
-        self.assertEqual(audit_context['telemetry']['status'], 'testing_early_telemetry')
+        with self.assertRaises(MemoryPipelineError) as ctx:
+            apply_memory_patch(self.campaign, self.session, patch)
+        self.assertEqual(ctx.exception.stage, 'validation')
+        self.assertEqual(ctx.exception.code, 'validation_error')
+
+    def test_apply_memory_patch_raises_validation_error_on_invalid_certainty(self):
+        patch = {
+            'upsert_graph_entities': [
+                {
+                    'id': 'test_entity',
+                    'name': 'test entity',
+                    'type': 'other',
+                    'certainty': 'invalid_certainty',
+                }
+            ]
+        }
+        with self.assertRaises(MemoryPipelineError) as ctx:
+            apply_memory_patch(self.campaign, self.session, patch)
+        self.assertEqual(ctx.exception.stage, 'validation')
+        self.assertEqual(ctx.exception.code, 'validation_error')
+
+    def test_apply_memory_patch_raises_application_error_on_persistence_failure(self):
+        from unittest.mock import patch as mock_patch
+        test_patch = {
+            'running_summary': 'summary',
+            'memory_anchors': {'current_goal': 'test'},
+        }
+        with mock_patch('services.dm_tools._world_json', side_effect=RuntimeError('db error')):
+            with self.assertRaises(MemoryPipelineError) as ctx:
+                apply_memory_patch(self.campaign, self.session, test_patch)
+        self.assertEqual(ctx.exception.stage, 'application')
+        self.assertEqual(ctx.exception.code, 'persistence_error')
+
+    def test_apply_memory_patch_accepted_with_valid_visibilities(self):
+        patch = {
+            'upsert_graph_entities': [
+                {
+                    'id': 'test_entity',
+                    'name': 'test entity',
+                    'type': 'other',
+                    'visibility': 'party_known',
+                    'certainty': 'confirmed',
+                    'source_surface': 'visible_transcript',
+                    'intended_visibility': 'party_known',
+                }
+            ],
+            'upsert_graph_relations': [],
+            'upsert_graph_facts': [],
+            'update_npc_actors': [],
+            'record_events': [],
+            'create_clocks': [],
+            'retire_clocks': [],
+        }
+        result = apply_memory_patch(self.campaign, self.session, patch)
+        self.assertIn('graph_changes', result)
+
+    def test_non_dict_patch_raises_validation_error(self):
+        with self.assertRaises(MemoryPipelineError) as ctx:
+            apply_memory_patch(self.campaign, self.session, 'not_a_dict')
+        self.assertEqual(ctx.exception.stage, 'validation')
+
+    def test_non_list_collection_raises_validation_error(self):
+        patch = {
+            'upsert_graph_entities': 'not_a_list',
+        }
+        with self.assertRaises(MemoryPipelineError) as ctx:
+            apply_memory_patch(self.campaign, self.session, patch)
+        self.assertEqual(ctx.exception.stage, 'validation')
+
+    def test_non_dict_entry_raises_validation_error(self):
+        patch = {
+            'upsert_graph_entities': ['not_a_dict'],
+        }
+        with self.assertRaises(MemoryPipelineError) as ctx:
+            apply_memory_patch(self.campaign, self.session, patch)
+        self.assertEqual(ctx.exception.stage, 'validation')
+
+
+if __name__ == '__main__':
+    unittest.main()

@@ -5186,6 +5186,7 @@ def _update_npc_actor(campaign, patch):
 def apply_memory_patch(campaign, session, patch, audit_context=None):
     from models import CampaignMemoryRun, CampaignMemoryLog, CampaignClock, NPCActor, db
     from services.audit_service import log_audit_event
+    from services.session_memory_agent import MemoryPipelineError, VALID_MEMORY_VISIBILITIES, VALID_MEMORY_CERTAINTIES
     import uuid
 
     if audit_context is None:
@@ -5194,9 +5195,63 @@ def apply_memory_patch(campaign, session, patch, audit_context=None):
     telemetry = raw_patch.pop('_telemetry', None) if isinstance(patch, dict) else None
     if isinstance(audit_context, dict):
         audit_context['telemetry'] = telemetry
+
+    if not isinstance(patch, dict):
+        raise MemoryPipelineError(
+            stage='validation',
+            code='validation_error',
+            message='Memory patch is not a dict.',
+            telemetry=telemetry,
+        )
+
+    contract_collections = (
+        'upsert_graph_entities',
+        'upsert_graph_relations',
+        'upsert_graph_facts',
+        'update_npc_actors',
+        'record_events',
+        'create_clocks',
+        'retire_clocks',
+    )
+    for collection_key in contract_collections:
+        items = patch.get(collection_key)
+        if items is not None and not isinstance(items, list):
+            raise MemoryPipelineError(
+                stage='validation',
+                code='validation_error',
+                message=f'{collection_key} is not a list.',
+                telemetry=telemetry,
+            )
+        if isinstance(items, list):
+            for item in items:
+                if not isinstance(item, dict):
+                    raise MemoryPipelineError(
+                        stage='validation',
+                        code='validation_error',
+                        message=f'Entry in {collection_key} is not a dict.',
+                        telemetry=telemetry,
+                    )
+                vis = item.get('visibility')
+                if isinstance(vis, str) and vis not in VALID_MEMORY_VISIBILITIES:
+                    raise MemoryPipelineError(
+                        stage='validation',
+                        code='validation_error',
+                        message=f'Invalid visibility {vis!r} in {collection_key}.',
+                        telemetry=telemetry,
+                    )
+                cert = item.get('certainty')
+                if isinstance(cert, str) and cert not in VALID_MEMORY_CERTAINTIES:
+                    raise MemoryPipelineError(
+                        stage='validation',
+                        code='validation_error',
+                        message=f'Invalid certainty {cert!r} in {collection_key}.',
+                        telemetry=telemetry,
+                    )
+
     unresolved_items = raw_patch.get('unresolved_items') if isinstance(raw_patch.get('unresolved_items'), list) else []
     compile_summary = raw_patch.get('compile_summary') if isinstance(raw_patch.get('compile_summary'), dict) else None
     evidence_basis = raw_patch.get('evidence_basis') if isinstance(raw_patch.get('evidence_basis'), list) else []
+
     patch = _normalize_memory_patch(patch)
     patch = _apply_memory_visibility_policy(campaign, patch, audit_context)
 
@@ -5290,538 +5345,548 @@ def apply_memory_patch(campaign, session, patch, audit_context=None):
         db.session.add(log_entry)
         logs_written += 1
 
-    if compile_summary or unresolved_items or evidence_basis:
-        log_change(
-            memory_id='staged_memory_compile',
-            target_table='campaign_memory_runs',
-            target_id=memory_run_id,
-            operation='compile',
-            status='skipped_unresolved' if unresolved_items else 'applied',
-            memory_type='fact',
-            visibility='dm_private',
-            certainty='confirmed',
-            importance=2,
-            reason='Staged memory resolver compiled the final patch before persistence.',
-            before_json=None,
-            after_json=None,
-            patch_json={
-                'compile_summary': compile_summary,
-                'unresolved_items': unresolved_items,
-                'evidence_basis': evidence_basis[:12],
-            },
-            error='unresolved_references_present' if unresolved_items else None,
-        )
-
-    world, graph, world_state, _private = _world_json(campaign)
-    result = {
-        'graph_changes': [],
-        'clock_changes': [],
-        'npc_changes': [],
-        'world_event_ids': [],
-        'running_summary_updated': False,
-    }
-
-    before_entities = {}
-    before_relations = {}
-    before_facts = {}
-    if graph:
-        before_entities = {e.get('id'): dict(e) for e in graph.get('entities', []) if isinstance(e, dict) and e.get('id')}
-        before_relations = {r.get('id'): dict(r) for r in graph.get('relations', []) if isinstance(r, dict) and r.get('id')}
-        before_facts = {f.get('id'): dict(f) for f in graph.get('facts', []) if isinstance(f, dict) and f.get('id')}
-
-    if world:
-        entity_id_remaps = {}
-        for kind, key, fallback in (
-            ('entity', 'upsert_graph_entities', 'entity'),
-            ('relation', 'upsert_graph_relations', 'relation'),
-            ('fact', 'upsert_graph_facts', 'fact'),
-        ):
-            plural = {'entity': 'entities', 'relation': 'relations', 'fact': 'facts'}[kind]
-            graph.setdefault(plural, [])
-            items = patch.get(key) if isinstance(patch.get(key), list) else []
-            for index, item in enumerate(items):
-                item = _apply_entity_id_remaps(kind, item, entity_id_remaps)
-                item_id = item.get('id')
-
-                # Fetch before snapshot
-                before_val = None
-                if kind == 'entity':
-                    before_val = before_entities.get(item_id)
-                elif kind == 'relation':
-                    before_val = before_relations.get(item_id)
-                elif kind == 'fact':
-                    before_val = before_facts.get(item_id)
-
-                item, action, embedding_dedupe = _upsert_graph_item(
-                    campaign,
-                    kind,
-                    graph[plural],
-                    item,
-                    f'{fallback}_{index + 1}',
-                    audit_context=audit_context,
-                )
-                result['graph_changes'].append({
-                    'kind': kind,
-                    'action': action,
-                    'id': item.get('id'),
-                    'embedding_dedupe': embedding_dedupe,
-                })
-                if before_val is None:
-                    if kind == 'entity':
-                        before_val = before_entities.get(item.get('id'))
-                    elif kind == 'relation':
-                        before_val = before_relations.get(item.get('id'))
-                    elif kind == 'fact':
-                        before_val = before_facts.get(item.get('id'))
-
-                # Fetch after snapshot
-                after_val = next((x for x in graph[plural] if x.get('id') == item.get('id')), None)
-
-                # Determine memory type
-                mtype = kind
-                if kind == 'entity':
-                    if item.get('type') == 'location':
-                        mtype = 'location'
-                    elif item.get('type') == 'npc':
-                        mtype = 'npc'
-                    else:
-                        mtype = item.get('memory_type') or 'fact'
-
-                log_change(
-                    memory_id=item.get('id'),
-                    target_table='campaign_worlds',
-                    target_id=str(world.id),
-                    operation='update' if action == 'updated' else 'create',
-                    status='applied',
-                    memory_type=mtype,
-                    visibility=item.get('visibility'),
-                    certainty=item.get('certainty'),
-                    importance=item.get('importance'),
-                    reason=item.get('reason'),
-                    expires_or_retire_condition=item.get('expires_or_retire_condition'),
-                    before_json=before_val,
-                    after_json=after_val,
-                    patch_json=item
-                )
-
-                if (
-                    kind == 'entity'
-                    and embedding_dedupe.get('dedupe_match_id')
-                    and embedding_dedupe.get('requested_id') != item.get('id')
-                ):
-                    entity_id_remaps[embedding_dedupe['requested_id']] = item.get('id')
-
-        scene_patch = patch.get('scene_patch') if isinstance(patch.get('scene_patch'), dict) else {}
-        current_scene = world_state.get('current_scene', {}) if isinstance(world_state, dict) else {}
-
-        # Check for unresolved scene locations from the staged pipeline
-        for item in (raw_patch.get('unresolved_items') or []):
-            if isinstance(item, dict) and item.get('kind') == 'scene_location':
-                proposed_id = item.get('location_id')
-                proposed_name = item.get('location_name')
-                current_id = current_scene.get('location_id')
-                current_name = current_scene.get('location_name')
-                
-                warning_type = "scene_location_unresolved"
-                warnings_scene_unresolved += 1
-                warning_payload = {
-                    "warning_type": warning_type,
-                    "previous_location": {
-                        "location_id": current_id,
-                        "location_name": current_name
-                    },
-                    "proposed_location": {
-                        "location_id": proposed_id,
-                        "location_name": proposed_name
-                    },
-                    "resolved_location": None,
-                    "source_player_message_id": player_message_id,
-                    "source_dm_message_id": dm_message_id,
-                    "resolver_output": None,
-                    "unresolved_items": [f"Could not resolve proposed location: id={proposed_id}, name={proposed_name}"]
-                }
-                log_change(
-                    memory_id='scene_mutation_warning',
-                    target_table='campaign_worlds',
-                    target_id=str(world.id) if 'world' in locals() and world else str(campaign.id),
-                    operation='warning',
-                    status='warning',
-                    memory_type='location',
-                    visibility='dm_private',
-                    certainty='confirmed',
-                    importance=3,
-                    reason=f"Scene mutation warning: {warning_type}",
-                    patch_json=warning_payload,
-                    error=warning_type
-                )
-                log_audit_event(
-                    campaign_id=campaign.id,
-                    event_type='scene_mutation_warning',
-                    summary=f"Scene mutation warning: {warning_type}",
-                    payload=warning_payload,
-                    actor='system',
-                    trace_id=trace_id,
-                    parent_trace_id=audit_context.get('parent_trace_id') if isinstance(audit_context, dict) else None,
-                    trace_label=audit_context.get('trace_label') if isinstance(audit_context, dict) else None,
-                    commit=False
-                )
-
-        if scene_patch:
-            raw_scene_patch = dict(scene_patch)
-            scene_patch, skipped_scene_patch = _validate_memory_scene_patch(
-                campaign,
-                current_scene,
-                scene_patch,
-                audit_context,
+    try:
+        if compile_summary or unresolved_items or evidence_basis:
+            log_change(
+                memory_id='staged_memory_compile',
+                target_table='campaign_memory_runs',
+                target_id=memory_run_id,
+                operation='compile',
+                status='skipped_unresolved' if unresolved_items else 'applied',
+                memory_type='fact',
+                visibility='dm_private',
+                certainty='confirmed',
+                importance=2,
+                reason='Staged memory resolver compiled the final patch before persistence.',
+                before_json=None,
+                after_json=None,
+                patch_json={
+                    'compile_summary': compile_summary,
+                    'unresolved_items': unresolved_items,
+                    'evidence_basis': evidence_basis[:12],
+                },
+                error='unresolved_references_present' if unresolved_items else None,
             )
 
-            # Scene-mutation warning checks (unresolved, rejected, repaired)
-            proposed_id = raw_scene_patch.get('location_id')
-            proposed_name = raw_scene_patch.get('location_name')
-            if proposed_id is not None or proposed_name is not None:
-                current_id = current_scene.get('location_id')
-                current_name = current_scene.get('location_name')
-                if proposed_id != current_id or proposed_name != current_name:
-                    from services.scene_location_resolver import resolve_scene_location_patch
-                    resolved_loc = resolve_scene_location_patch(raw_scene_patch, campaign, current_scene)
-                    warning_type = None
-                    unresolved_items = []
-                    if resolved_loc is None:
-                        warning_type = "scene_location_unresolved"
-                        warnings_scene_unresolved += 1
-                        unresolved_items = [f"Could not resolve proposed location: id={proposed_id}, name={proposed_name}"]
-                    else:
-                        skipped_id = skipped_scene_patch.get('location_id') if isinstance(skipped_scene_patch, dict) else None
-                        skipped_name = skipped_scene_patch.get('location_name') if isinstance(skipped_scene_patch, dict) else None
-                        if skipped_id is not None or skipped_name is not None:
-                            warning_type = "scene_location_rejected"
-                            warnings_scene_rejected += 1
-                            unresolved_items = [f"Proposed location change rejected (unsupported by transcript): id={proposed_id}, name={proposed_name}"]
-                        else:
-                            is_repaired = False
-                            if proposed_id is not None and proposed_id != resolved_loc.get('location_id'):
-                                is_repaired = True
-                            if proposed_name is not None and proposed_name != resolved_loc.get('location_name'):
-                                is_repaired = True
-                            if is_repaired:
-                                warning_type = "scene_location_repaired"
-                    if warning_type:
-                        warning_payload = {
-                            "warning_type": warning_type,
-                            "previous_location": {
-                                "location_id": current_id,
-                                "location_name": current_name
-                            },
-                            "proposed_location": {
-                                "location_id": proposed_id,
-                                "location_name": proposed_name
-                            },
-                            "resolved_location": {
-                                "location_id": resolved_loc.get('location_id'),
-                                "location_name": resolved_loc.get('location_name')
-                            } if resolved_loc else None,
-                            "source_player_message_id": player_message_id,
-                            "source_dm_message_id": dm_message_id,
-                            "resolver_output": resolved_loc,
-                            "unresolved_items": unresolved_items
-                        }
-                        log_change(
-                            memory_id='scene_mutation_warning',
-                            target_table='campaign_worlds',
-                            target_id=str(world.id) if 'world' in locals() and world else str(campaign.id),
-                            operation='warning',
-                            status='warning',
-                            memory_type='location',
-                            visibility='dm_private',
-                            certainty='confirmed',
-                            importance=3,
-                            reason=f"Scene mutation warning: {warning_type}",
-                            patch_json=warning_payload,
-                            error=warning_type
-                        )
-                        from services.audit_service import log_audit_event
-                        log_audit_event(
-                            campaign_id=campaign.id,
-                            event_type='scene_mutation_warning',
-                            summary=f"Scene mutation warning: {warning_type}",
-                            payload=warning_payload,
-                            actor='system',
-                            trace_id=trace_id,
-                            parent_trace_id=audit_context.get('parent_trace_id') if isinstance(audit_context, dict) else None,
-                            trace_label=audit_context.get('trace_label') if isinstance(audit_context, dict) else None,
-                            commit=False
-                        )
+        world, graph, world_state, _private = _world_json(campaign)
+        result = {
+            'graph_changes': [],
+            'clock_changes': [],
+            'npc_changes': [],
+            'world_event_ids': [],
+            'running_summary_updated': False,
+        }
 
-            if skipped_scene_patch:
+        before_entities = {}
+        before_relations = {}
+        before_facts = {}
+        if graph:
+            before_entities = {e.get('id'): dict(e) for e in graph.get('entities', []) if isinstance(e, dict) and e.get('id')}
+            before_relations = {r.get('id'): dict(r) for r in graph.get('relations', []) if isinstance(r, dict) and r.get('id')}
+            before_facts = {f.get('id'): dict(f) for f in graph.get('facts', []) if isinstance(f, dict) and f.get('id')}
+
+        if world:
+            entity_id_remaps = {}
+            for kind, key, fallback in (
+                ('entity', 'upsert_graph_entities', 'entity'),
+                ('relation', 'upsert_graph_relations', 'relation'),
+                ('fact', 'upsert_graph_facts', 'fact'),
+            ):
+                plural = {'entity': 'entities', 'relation': 'relations', 'fact': 'facts'}[kind]
+                graph.setdefault(plural, [])
+                items = patch.get(key) if isinstance(patch.get(key), list) else []
+                for index, item in enumerate(items):
+                    item = _apply_entity_id_remaps(kind, item, entity_id_remaps)
+                    item_id = item.get('id')
+
+                    # Fetch before snapshot
+                    before_val = None
+                    if kind == 'entity':
+                        before_val = before_entities.get(item_id)
+                    elif kind == 'relation':
+                        before_val = before_relations.get(item_id)
+                    elif kind == 'fact':
+                        before_val = before_facts.get(item_id)
+
+                    item, action, embedding_dedupe = _upsert_graph_item(
+                        campaign,
+                        kind,
+                        graph[plural],
+                        item,
+                        f'{fallback}_{index + 1}',
+                        audit_context=audit_context,
+                    )
+                    result['graph_changes'].append({
+                        'kind': kind,
+                        'action': action,
+                        'id': item.get('id'),
+                        'embedding_dedupe': embedding_dedupe,
+                    })
+                    if before_val is None:
+                        if kind == 'entity':
+                            before_val = before_entities.get(item.get('id'))
+                        elif kind == 'relation':
+                            before_val = before_relations.get(item.get('id'))
+                        elif kind == 'fact':
+                            before_val = before_facts.get(item.get('id'))
+
+                    # Fetch after snapshot
+                    after_val = next((x for x in graph[plural] if x.get('id') == item.get('id')), None)
+
+                    # Determine memory type
+                    mtype = kind
+                    if kind == 'entity':
+                        if item.get('type') == 'location':
+                            mtype = 'location'
+                        elif item.get('type') == 'npc':
+                            mtype = 'npc'
+                        else:
+                            mtype = item.get('memory_type') or 'fact'
+
+                    log_change(
+                        memory_id=item.get('id'),
+                        target_table='campaign_worlds',
+                        target_id=str(world.id),
+                        operation='update' if action == 'updated' else 'create',
+                        status='applied',
+                        memory_type=mtype,
+                        visibility=item.get('visibility'),
+                        certainty=item.get('certainty'),
+                        importance=item.get('importance'),
+                        reason=item.get('reason'),
+                        expires_or_retire_condition=item.get('expires_or_retire_condition'),
+                        before_json=before_val,
+                        after_json=after_val,
+                        patch_json=item
+                    )
+
+                    if (
+                        kind == 'entity'
+                        and embedding_dedupe.get('dedupe_match_id')
+                        and embedding_dedupe.get('requested_id') != item.get('id')
+                    ):
+                        entity_id_remaps[embedding_dedupe['requested_id']] = item.get('id')
+
+            scene_patch = patch.get('scene_patch') if isinstance(patch.get('scene_patch'), dict) else {}
+            current_scene = world_state.get('current_scene', {}) if isinstance(world_state, dict) else {}
+
+            # Check for unresolved scene locations from the staged pipeline
+            for item in (raw_patch.get('unresolved_items') or []):
+                if isinstance(item, dict) and item.get('kind') == 'scene_location':
+                    proposed_id = item.get('location_id')
+                    proposed_name = item.get('location_name')
+                    current_id = current_scene.get('location_id')
+                    current_name = current_scene.get('location_name')
+                
+                    warning_type = "scene_location_unresolved"
+                    warnings_scene_unresolved += 1
+                    warning_payload = {
+                        "warning_type": warning_type,
+                        "previous_location": {
+                            "location_id": current_id,
+                            "location_name": current_name
+                        },
+                        "proposed_location": {
+                            "location_id": proposed_id,
+                            "location_name": proposed_name
+                        },
+                        "resolved_location": None,
+                        "source_player_message_id": player_message_id,
+                        "source_dm_message_id": dm_message_id,
+                        "resolver_output": None,
+                        "unresolved_items": [f"Could not resolve proposed location: id={proposed_id}, name={proposed_name}"]
+                    }
+                    log_change(
+                        memory_id='scene_mutation_warning',
+                        target_table='campaign_worlds',
+                        target_id=str(world.id) if 'world' in locals() and world else str(campaign.id),
+                        operation='warning',
+                        status='warning',
+                        memory_type='location',
+                        visibility='dm_private',
+                        certainty='confirmed',
+                        importance=3,
+                        reason=f"Scene mutation warning: {warning_type}",
+                        patch_json=warning_payload,
+                        error=warning_type
+                    )
+                    log_audit_event(
+                        campaign_id=campaign.id,
+                        event_type='scene_mutation_warning',
+                        summary=f"Scene mutation warning: {warning_type}",
+                        payload=warning_payload,
+                        actor='system',
+                        trace_id=trace_id,
+                        parent_trace_id=audit_context.get('parent_trace_id') if isinstance(audit_context, dict) else None,
+                        trace_label=audit_context.get('trace_label') if isinstance(audit_context, dict) else None,
+                        commit=False
+                    )
+
+            if scene_patch:
+                raw_scene_patch = dict(scene_patch)
+                scene_patch, skipped_scene_patch = _validate_memory_scene_patch(
+                    campaign,
+                    current_scene,
+                    scene_patch,
+                    audit_context,
+                )
+
+                # Scene-mutation warning checks (unresolved, rejected, repaired)
+                proposed_id = raw_scene_patch.get('location_id')
+                proposed_name = raw_scene_patch.get('location_name')
+                if proposed_id is not None or proposed_name is not None:
+                    current_id = current_scene.get('location_id')
+                    current_name = current_scene.get('location_name')
+                    if proposed_id != current_id or proposed_name != current_name:
+                        from services.scene_location_resolver import resolve_scene_location_patch
+                        resolved_loc = resolve_scene_location_patch(raw_scene_patch, campaign, current_scene)
+                        warning_type = None
+                        unresolved_items = []
+                        if resolved_loc is None:
+                            warning_type = "scene_location_unresolved"
+                            warnings_scene_unresolved += 1
+                            unresolved_items = [f"Could not resolve proposed location: id={proposed_id}, name={proposed_name}"]
+                        else:
+                            skipped_id = skipped_scene_patch.get('location_id') if isinstance(skipped_scene_patch, dict) else None
+                            skipped_name = skipped_scene_patch.get('location_name') if isinstance(skipped_scene_patch, dict) else None
+                            if skipped_id is not None or skipped_name is not None:
+                                warning_type = "scene_location_rejected"
+                                warnings_scene_rejected += 1
+                                unresolved_items = [f"Proposed location change rejected (unsupported by transcript): id={proposed_id}, name={proposed_name}"]
+                            else:
+                                is_repaired = False
+                                if proposed_id is not None and proposed_id != resolved_loc.get('location_id'):
+                                    is_repaired = True
+                                if proposed_name is not None and proposed_name != resolved_loc.get('location_name'):
+                                    is_repaired = True
+                                if is_repaired:
+                                    warning_type = "scene_location_repaired"
+                        if warning_type:
+                            warning_payload = {
+                                "warning_type": warning_type,
+                                "previous_location": {
+                                    "location_id": current_id,
+                                    "location_name": current_name
+                                },
+                                "proposed_location": {
+                                    "location_id": proposed_id,
+                                    "location_name": proposed_name
+                                },
+                                "resolved_location": {
+                                    "location_id": resolved_loc.get('location_id'),
+                                    "location_name": resolved_loc.get('location_name')
+                                } if resolved_loc else None,
+                                "source_player_message_id": player_message_id,
+                                "source_dm_message_id": dm_message_id,
+                                "resolver_output": resolved_loc,
+                                "unresolved_items": unresolved_items
+                            }
+                            log_change(
+                                memory_id='scene_mutation_warning',
+                                target_table='campaign_worlds',
+                                target_id=str(world.id) if 'world' in locals() and world else str(campaign.id),
+                                operation='warning',
+                                status='warning',
+                                memory_type='location',
+                                visibility='dm_private',
+                                certainty='confirmed',
+                                importance=3,
+                                reason=f"Scene mutation warning: {warning_type}",
+                                patch_json=warning_payload,
+                                error=warning_type
+                            )
+                            from services.audit_service import log_audit_event
+                            log_audit_event(
+                                campaign_id=campaign.id,
+                                event_type='scene_mutation_warning',
+                                summary=f"Scene mutation warning: {warning_type}",
+                                payload=warning_payload,
+                                actor='system',
+                                trace_id=trace_id,
+                                parent_trace_id=audit_context.get('parent_trace_id') if isinstance(audit_context, dict) else None,
+                                trace_label=audit_context.get('trace_label') if isinstance(audit_context, dict) else None,
+                                commit=False
+                            )
+
+                if skipped_scene_patch:
+                    log_change(
+                        memory_id='current_scene',
+                        target_table='campaign_worlds',
+                        target_id=str(world.id),
+                        operation='update',
+                        status='validation_failed',
+                        memory_type='location',
+                        visibility='party_known',
+                        certainty='suspected',
+                        importance=3,
+                        reason='Scene patch fields lacked support in the latest visible exchange.',
+                        before_json={'current_scene': dict(current_scene)},
+                        after_json={'current_scene': dict(current_scene)},
+                        patch_json={
+                            'scene_patch': raw_scene_patch,
+                            'skipped_scene_patch': skipped_scene_patch,
+                        },
+                        error='scene_patch_field_not_evidenced',
+                    )
+                if not scene_patch:
+                    scene_patch = {}
+            # Check if the scene patch actually contains state keys
+            SCENE_STATE_KEYS = {'location_id', 'location_name', 'time_of_day', 'active_npc_ids', 'departed_npc_ids', 'immediate_tension'}
+            has_actual_scene_changes = any(k in scene_patch for k in SCENE_STATE_KEYS)
+
+            if scene_patch and has_actual_scene_changes:
+                current_scene = world_state.get('current_scene', {}) if isinstance(world_state, dict) else {}
+                before_scene = dict(current_scene)
+            
+                # Update only actual scene state keys in durable current_scene, NOT metadata
+                clean_scene_state = {k: v for k, v in scene_patch.items() if k in SCENE_STATE_KEYS}
+                current_scene.update(clean_scene_state)
+                world_state['current_scene'] = current_scene
+            
+                _sync_party_known_location(world_state, current_scene)
+                event = _record_event(
+                    campaign,
+                    'scene_updated',
+                    patch.get('scene_reason') or 'Scene updated by memory writer.',
+                    {'scene_patch': scene_patch},
+                    visibility='party_known',
+                )
+                result['world_event_ids'].append(event.id)
+
                 log_change(
                     memory_id='current_scene',
                     target_table='campaign_worlds',
                     target_id=str(world.id),
                     operation='update',
-                    status='validation_failed',
+                    status='applied',
                     memory_type='location',
                     visibility='party_known',
-                    certainty='suspected',
+                    certainty='confirmed',
                     importance=3,
-                    reason='Scene patch fields lacked support in the latest visible exchange.',
-                    before_json={'current_scene': dict(current_scene)},
-                    after_json={'current_scene': dict(current_scene)},
-                    patch_json={
-                        'scene_patch': raw_scene_patch,
-                        'skipped_scene_patch': skipped_scene_patch,
-                    },
-                    error='scene_patch_field_not_evidenced',
+                    reason=patch.get('scene_reason') or 'Scene transition/patch',
+                    before_json={'current_scene': before_scene},
+                    after_json={'current_scene': current_scene},
+                    patch_json=scene_patch
                 )
-            if not scene_patch:
-                scene_patch = {}
-        # Check if the scene patch actually contains state keys
-        SCENE_STATE_KEYS = {'location_id', 'location_name', 'time_of_day', 'active_npc_ids', 'departed_npc_ids', 'immediate_tension'}
-        has_actual_scene_changes = any(k in scene_patch for k in SCENE_STATE_KEYS)
 
-        if scene_patch and has_actual_scene_changes:
-            current_scene = world_state.get('current_scene', {}) if isinstance(world_state, dict) else {}
-            before_scene = dict(current_scene)
-            
-            # Update only actual scene state keys in durable current_scene, NOT metadata
-            clean_scene_state = {k: v for k, v in scene_patch.items() if k in SCENE_STATE_KEYS}
-            current_scene.update(clean_scene_state)
-            world_state['current_scene'] = current_scene
-            
-            _sync_party_known_location(world_state, current_scene)
+            world.knowledge_graph = json_dumps(graph)
+            world.world_state = json_dumps(world_state)
+            world.updated_at = utcnow()
+            if scene_patch and has_actual_scene_changes:
+                upsert_memory_embedding(campaign, 'world_state', 'current', world_state, audit_context=audit_context)
+
+        for item in patch.get('create_clocks', []) if isinstance(patch.get('create_clocks'), list) else []:
+            clock_id = clean_id(item.get('id') or item.get('clock_id'), '')
+            existing = CampaignClock.query.filter_by(campaign_id=campaign.id, clock_id=clock_id).first() if clock_id else None
+            before_val = existing.to_dict(include_private=True) if existing else None
+
+            change = _create_clock_from_patch(campaign, item)
+            result['clock_changes'].append(change)
+            if change.get('event_id'):
+                result['world_event_ids'].append(change['event_id'])
+
+            after_val = change.get('clock')
+            action = change.get('action')
+
+            log_change(
+                memory_id=clock_id,
+                target_table='campaign_clocks',
+                target_id=str(after_val.get('id')) if after_val else None,
+                operation='update' if action == 'updated' else 'create',
+                status='applied',
+                memory_type='clock',
+                visibility=item.get('visibility') or (after_val.get('visibility') if after_val else None),
+                certainty=item.get('certainty'),
+                importance=item.get('importance'),
+                reason=item.get('reason'),
+                expires_or_retire_condition=item.get('expires_or_retire_condition'),
+                before_json=before_val,
+                after_json=after_val,
+                patch_json=item
+            )
+
+        for item in patch.get('retire_clocks', []) if isinstance(patch.get('retire_clocks'), list) else []:
+            clock_id = clean_id(item.get('clock_id') or item.get('id'), '')
+            existing = CampaignClock.query.filter_by(campaign_id=campaign.id, clock_id=clock_id).first() if clock_id else None
+            before_val = existing.to_dict(include_private=True) if existing else None
+
+            change = _retire_clock_from_patch(campaign, item)
+            result['clock_changes'].append(change)
+            if change.get('event_id'):
+                result['world_event_ids'].append(change['event_id'])
+
+            after_val = change.get('clock')
+
+            log_change(
+                memory_id=clock_id,
+                target_table='campaign_clocks',
+                target_id=str(after_val.get('id')) if after_val else None,
+                operation='retire',
+                status='applied',
+                memory_type='clock',
+                visibility=item.get('visibility') or (after_val.get('visibility') if after_val else None),
+                certainty=item.get('certainty'),
+                importance=item.get('importance'),
+                reason=item.get('reason'),
+                expires_or_retire_condition=item.get('expires_or_retire_condition'),
+                before_json=before_val,
+                after_json=after_val,
+                patch_json=item
+            )
+
+        for item in patch.get('update_npc_actors', []) if isinstance(patch.get('update_npc_actors'), list) else []:
+            item = _apply_entity_id_remaps('npc', item, entity_id_remaps)
+            actor_id = clean_id(item.get('id') or item.get('actor_id'), '')
+            existing = NPCActor.query.filter_by(campaign_id=campaign.id, actor_id=actor_id).first() if actor_id else None
+            before_val = existing.to_dict(include_private=True) if existing else None
+
+            change = _update_npc_actor(campaign, item)
+            result['npc_changes'].append(change)
+            if change.get('event_id'):
+                result['world_event_ids'].append(change['event_id'])
+
+            after_val = change.get('npc_actor')
+            action = change.get('action')
+
+            log_change(
+                memory_id=actor_id,
+                target_table='npc_actors',
+                target_id=str(after_val.get('id')) if after_val else None,
+                operation='update' if action == 'updated' else 'create',
+                status='applied',
+                memory_type='npc',
+                visibility=item.get('visibility') or (after_val.get('visibility') if after_val else None),
+                certainty=item.get('certainty'),
+                importance=item.get('importance'),
+                reason=item.get('reason'),
+                expires_or_retire_condition=item.get('expires_or_retire_condition'),
+                before_json=before_val,
+                after_json=after_val,
+                patch_json=item
+            )
+
+        for event_patch in patch.get('record_events', []) if isinstance(patch.get('record_events'), list) else []:
             event = _record_event(
                 campaign,
-                'scene_updated',
-                patch.get('scene_reason') or 'Scene updated by memory writer.',
-                {'scene_patch': scene_patch},
-                visibility='party_known',
+                event_patch.get('event_type') or 'session_memory',
+                event_patch.get('summary') or 'Session memory updated.',
+                event_patch.get('payload') if isinstance(event_patch.get('payload'), dict) else {},
+                event_patch.get('visibility') or 'dm_private',
             )
             result['world_event_ids'].append(event.id)
 
             log_change(
-                memory_id='current_scene',
-                target_table='campaign_worlds',
-                target_id=str(world.id),
-                operation='update',
+                memory_id=f"event_{event.id}",
+                target_table='world_events',
+                target_id=str(event.id),
+                operation='create',
                 status='applied',
-                memory_type='location',
-                visibility='party_known',
-                certainty='confirmed',
-                importance=3,
-                reason=patch.get('scene_reason') or 'Scene transition/patch',
-                before_json={'current_scene': before_scene},
-                after_json={'current_scene': current_scene},
-                patch_json=scene_patch
+                memory_type='fact',
+                visibility=event_patch.get('visibility'),
+                certainty=event_patch.get('certainty'),
+                importance=event_patch.get('importance'),
+                reason=event_patch.get('reason'),
+                expires_or_retire_condition=event_patch.get('expires_or_retire_condition'),
+                before_json=None,
+                after_json=event.to_dict(include_private=True),
+                patch_json=event_patch
             )
 
-        world.knowledge_graph = json_dumps(graph)
-        world.world_state = json_dumps(world_state)
-        world.updated_at = utcnow()
-        if scene_patch and has_actual_scene_changes:
-            upsert_memory_embedding(campaign, 'world_state', 'current', world_state, audit_context=audit_context)
+        summary = clean_text(patch.get('running_summary'), 4000)
+        if summary:
+            before_summary = session.running_summary if session else None
+            if session:
+                session.running_summary = summary
+            result['running_summary_updated'] = True
 
-    for item in patch.get('create_clocks', []) if isinstance(patch.get('create_clocks'), list) else []:
-        clock_id = clean_id(item.get('id') or item.get('clock_id'), '')
-        existing = CampaignClock.query.filter_by(campaign_id=campaign.id, clock_id=clock_id).first() if clock_id else None
-        before_val = existing.to_dict(include_private=True) if existing else None
+            log_change(
+                memory_id='running_summary',
+                target_table='campaign_sessions',
+                target_id=str(session.id) if session else None,
+                operation='update',
+                status='applied',
+                memory_type='fact',
+                visibility='dm_private',
+                certainty='confirmed',
+                importance=4,
+                reason='Running summary revised by LLM memory pass',
+                before_json={'running_summary': before_summary},
+                after_json={'running_summary': summary},
+                patch_json={'running_summary': summary}
+            )
 
-        change = _create_clock_from_patch(campaign, item)
-        result['clock_changes'].append(change)
-        if change.get('event_id'):
-            result['world_event_ids'].append(change['event_id'])
+        anchors = patch.get('memory_anchors')
+        if isinstance(anchors, dict):
+            before_anchors = session.memory_anchors if session else None
+            if session:
+                session.memory_anchors = anchors
+            result['memory_anchors_updated'] = True
 
-        after_val = change.get('clock')
-        action = change.get('action')
+            log_change(
+                memory_id='memory_anchors',
+                target_table='campaign_sessions',
+                target_id=str(session.id) if session else None,
+                operation='update',
+                status='applied',
+                memory_type='fact',
+                visibility='dm_private',
+                certainty='confirmed',
+                importance=4,
+                reason='Memory anchors updated by LLM memory pass',
+                before_json={'memory_anchors': before_anchors},
+                after_json={'memory_anchors': anchors},
+                patch_json={'memory_anchors': anchors}
+            )
 
-        log_change(
-            memory_id=clock_id,
-            target_table='campaign_clocks',
-            target_id=str(after_val.get('id')) if after_val else None,
-            operation='update' if action == 'updated' else 'create',
-            status='applied',
-            memory_type='clock',
-            visibility=item.get('visibility') or (after_val.get('visibility') if after_val else None),
-            certainty=item.get('certainty'),
-            importance=item.get('importance'),
-            reason=item.get('reason'),
-            expires_or_retire_condition=item.get('expires_or_retire_condition'),
-            before_json=before_val,
-            after_json=after_val,
-            patch_json=item
+        # Log fallback no-op if no logs were written
+        if logs_written == 0:
+            log_change(
+                memory_id=None,
+                target_table=None,
+                target_id=None,
+                operation='no-op',
+                status='no_op',
+                memory_type=None,
+                visibility=None,
+                certainty=None,
+                importance=None,
+                reason='No memory write operations were requested or applied by the memory writer.',
+                before_json=None,
+                after_json=None,
+                patch_json=None
+            )
+
+        log_audit_event(
+            campaign.id,
+            'memory_patch_applied',
+            'Applied post-turn session memory patch.',
+            {'session_id': session.id, 'patch': patch, 'result': result},
+            source='dm_tools.memory',
+            actor='session_memory_writer',
+            trace_id=trace_id,
+            parent_trace_id=audit_context.get('parent_trace_id'),
+            trace_label=audit_context.get('trace_label'),
+            audit_role='tools',
+            commit=False,
         )
 
-    for item in patch.get('retire_clocks', []) if isinstance(patch.get('retire_clocks'), list) else []:
-        clock_id = clean_id(item.get('clock_id') or item.get('id'), '')
-        existing = CampaignClock.query.filter_by(campaign_id=campaign.id, clock_id=clock_id).first() if clock_id else None
-        before_val = existing.to_dict(include_private=True) if existing else None
+        if isinstance(telemetry, dict) and 'telemetry_summary' in telemetry:
+            summary_obj = telemetry['telemetry_summary']
+            if isinstance(summary_obj, dict):
+                if 'warnings' not in summary_obj:
+                    summary_obj['warnings'] = {}
+                summary_obj['warnings']['scene_mutation_rejected'] = warnings_scene_rejected
+                summary_obj['warnings']['unresolved_scene_references'] = warnings_scene_unresolved
+        if isinstance(audit_context, dict):
+            audit_context['telemetry'] = telemetry
 
-        change = _retire_clock_from_patch(campaign, item)
-        result['clock_changes'].append(change)
-        if change.get('event_id'):
-            result['world_event_ids'].append(change['event_id'])
+        return result
 
-        after_val = change.get('clock')
-
-        log_change(
-            memory_id=clock_id,
-            target_table='campaign_clocks',
-            target_id=str(after_val.get('id')) if after_val else None,
-            operation='retire',
-            status='applied',
-            memory_type='clock',
-            visibility=item.get('visibility') or (after_val.get('visibility') if after_val else None),
-            certainty=item.get('certainty'),
-            importance=item.get('importance'),
-            reason=item.get('reason'),
-            expires_or_retire_condition=item.get('expires_or_retire_condition'),
-            before_json=before_val,
-            after_json=after_val,
-            patch_json=item
-        )
-
-    for item in patch.get('update_npc_actors', []) if isinstance(patch.get('update_npc_actors'), list) else []:
-        item = _apply_entity_id_remaps('npc', item, entity_id_remaps)
-        actor_id = clean_id(item.get('id') or item.get('actor_id'), '')
-        existing = NPCActor.query.filter_by(campaign_id=campaign.id, actor_id=actor_id).first() if actor_id else None
-        before_val = existing.to_dict(include_private=True) if existing else None
-
-        change = _update_npc_actor(campaign, item)
-        result['npc_changes'].append(change)
-        if change.get('event_id'):
-            result['world_event_ids'].append(change['event_id'])
-
-        after_val = change.get('npc_actor')
-        action = change.get('action')
-
-        log_change(
-            memory_id=actor_id,
-            target_table='npc_actors',
-            target_id=str(after_val.get('id')) if after_val else None,
-            operation='update' if action == 'updated' else 'create',
-            status='applied',
-            memory_type='npc',
-            visibility=item.get('visibility') or (after_val.get('visibility') if after_val else None),
-            certainty=item.get('certainty'),
-            importance=item.get('importance'),
-            reason=item.get('reason'),
-            expires_or_retire_condition=item.get('expires_or_retire_condition'),
-            before_json=before_val,
-            after_json=after_val,
-            patch_json=item
-        )
-
-    for event_patch in patch.get('record_events', []) if isinstance(patch.get('record_events'), list) else []:
-        event = _record_event(
-            campaign,
-            event_patch.get('event_type') or 'session_memory',
-            event_patch.get('summary') or 'Session memory updated.',
-            event_patch.get('payload') if isinstance(event_patch.get('payload'), dict) else {},
-            event_patch.get('visibility') or 'dm_private',
-        )
-        result['world_event_ids'].append(event.id)
-
-        log_change(
-            memory_id=f"event_{event.id}",
-            target_table='world_events',
-            target_id=str(event.id),
-            operation='create',
-            status='applied',
-            memory_type='fact',
-            visibility=event_patch.get('visibility'),
-            certainty=event_patch.get('certainty'),
-            importance=event_patch.get('importance'),
-            reason=event_patch.get('reason'),
-            expires_or_retire_condition=event_patch.get('expires_or_retire_condition'),
-            before_json=None,
-            after_json=event.to_dict(include_private=True),
-            patch_json=event_patch
-        )
-
-    summary = clean_text(patch.get('running_summary'), 4000)
-    if summary:
-        before_summary = session.running_summary if session else None
-        if session:
-            session.running_summary = summary
-        result['running_summary_updated'] = True
-
-        log_change(
-            memory_id='running_summary',
-            target_table='campaign_sessions',
-            target_id=str(session.id) if session else None,
-            operation='update',
-            status='applied',
-            memory_type='fact',
-            visibility='dm_private',
-            certainty='confirmed',
-            importance=4,
-            reason='Running summary revised by LLM memory pass',
-            before_json={'running_summary': before_summary},
-            after_json={'running_summary': summary},
-            patch_json={'running_summary': summary}
-        )
-
-    anchors = patch.get('memory_anchors')
-    if isinstance(anchors, dict):
-        before_anchors = session.memory_anchors if session else None
-        if session:
-            session.memory_anchors = anchors
-        result['memory_anchors_updated'] = True
-
-        log_change(
-            memory_id='memory_anchors',
-            target_table='campaign_sessions',
-            target_id=str(session.id) if session else None,
-            operation='update',
-            status='applied',
-            memory_type='fact',
-            visibility='dm_private',
-            certainty='confirmed',
-            importance=4,
-            reason='Memory anchors updated by LLM memory pass',
-            before_json={'memory_anchors': before_anchors},
-            after_json={'memory_anchors': anchors},
-            patch_json={'memory_anchors': anchors}
-        )
-
-    # Log fallback no-op if no logs were written
-    if logs_written == 0:
-        log_change(
-            memory_id=None,
-            target_table=None,
-            target_id=None,
-            operation='no-op',
-            status='no_op',
-            memory_type=None,
-            visibility=None,
-            certainty=None,
-            importance=None,
-            reason='No memory write operations were requested or applied by the memory writer.',
-            before_json=None,
-            after_json=None,
-            patch_json=None
-        )
-
-    log_audit_event(
-        campaign.id,
-        'memory_patch_applied',
-        'Applied post-turn session memory patch.',
-        {'session_id': session.id, 'patch': patch, 'result': result},
-        source='dm_tools.memory',
-        actor='session_memory_writer',
-        trace_id=trace_id,
-        parent_trace_id=audit_context.get('parent_trace_id'),
-        trace_label=audit_context.get('trace_label'),
-        audit_role='tools',
-        commit=False,
-    )
-
-    if isinstance(telemetry, dict) and 'telemetry_summary' in telemetry:
-        summary_obj = telemetry['telemetry_summary']
-        if isinstance(summary_obj, dict):
-            if 'warnings' not in summary_obj:
-                summary_obj['warnings'] = {}
-            summary_obj['warnings']['scene_mutation_rejected'] = warnings_scene_rejected
-            summary_obj['warnings']['unresolved_scene_references'] = warnings_scene_unresolved
-    if isinstance(audit_context, dict):
-        audit_context['telemetry'] = telemetry
-
-    return result
+    except Exception as err:
+        raise MemoryPipelineError(
+            stage="application",
+            code="persistence_error",
+            message=f"Failed to apply memory patch: {err}",
+            cause=err,
+            telemetry=telemetry,
+        ) from err
