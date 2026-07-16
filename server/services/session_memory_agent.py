@@ -659,13 +659,14 @@ def _build_resolution_records(registry, compiled_patch, memory_context):
         campaign_id = _safe_int((memory_context or {}).get("campaign_id"), 0, minimum=0) if isinstance(memory_context, dict) else 0
         source_turn_id = (memory_context or {}).get("hot_context", {}).get("turn_id", "") if isinstance(memory_context, dict) else ""
 
-        key_raw = f"{campaign_id}:{mention_entity_id}:{canonical_id}:{source_turn_id}"
+        resolution_action = "same_identity" if entry.get("decision") != "add_alias" else "add_alias"
+        key_raw = f"{campaign_id}:{mention_entity_id}:{canonical_id}:{source_turn_id}:{resolution_action}"
         resolution_id = f"ires_{hashlib.md5(key_raw.encode('utf-8')).hexdigest()[:16]}"
         records.append({
             "resolution_id": resolution_id,
             "mention_entity_id": mention_entity_id,
             "mention_name": entry.get("surface_form", ""),
-            "resolution_action": "same_identity" if entry.get("decision") != "add_alias" else "add_alias",
+            "resolution_action": resolution_action,
             "canonical_id": canonical_id,
             "canonical_name": entry.get("canonical_name", entry.get("surface_form", "")),
             "visibility": entry.get("visibility", "party_known"),
@@ -913,17 +914,6 @@ def compile_staged_memory_patch(memory_context, extracted, resolved):
     prior_resolutions = fetch_prior_resolutions(campaign)
     pending_clarifications = fetch_pending_clarifications(campaign)
 
-    # Merge resolution patches from answered clarifications
-    consumed_clarification_ids = []
-    if isinstance(pending_clarifications, list):
-        for pc in pending_clarifications:
-            if isinstance(pc, dict) and pc.get("status") == "answered":
-                patch_json = pc.get("resolution_patch_json") or pc.get("resolution_patch")
-                if patch_json:
-                    merge_resolution_patch(resolved, patch_json)
-                if pc.get("clarification_id"):
-                    consumed_clarification_ids.append(pc["clarification_id"])
-
     memory_context_with_clarifications = dict(memory_context if isinstance(memory_context, dict) else {})
     memory_context_with_clarifications["pending_clarifications"] = pending_clarifications
 
@@ -935,6 +925,27 @@ def compile_staged_memory_patch(memory_context, extracted, resolved):
         prior_resolutions,
         known,
     )
+
+    # Compile-time validation: check which answered clarifications actually resolved in the registry
+    valid_consumed_ids = set()
+    for entry in registry:
+        for ev in entry.get("evidence", []):
+            if isinstance(ev, dict) and ev.get("source") == "clarification_answer":
+                c_id = ev.get("clarification_id")
+                if c_id:
+                    valid_consumed_ids.add(c_id)
+
+    # Merge resolution patches from validly answered clarifications
+    consumed_clarification_ids = []
+    if isinstance(pending_clarifications, list):
+        for pc in pending_clarifications:
+            if isinstance(pc, dict) and pc.get("status") == "answered":
+                clar_id = pc.get("clarification_id")
+                if clar_id and clar_id in valid_consumed_ids:
+                    patch_json = pc.get("resolution_patch_json") or pc.get("resolution_patch")
+                    if patch_json:
+                        merge_resolution_patch(resolved, patch_json)
+                    consumed_clarification_ids.append(clar_id)
 
     # Also process resolved claims through the registry (entities and NPCs from resolver output)
     resolved_entities = resolved.get("upsert_graph_entities") if isinstance(resolved.get("upsert_graph_entities"), list) else []

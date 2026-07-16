@@ -27,6 +27,7 @@ from services.session_memory_agent import (
     MemoryPipelineError,
     _validate_final_memory_state,
     _known_ids,
+    _build_resolution_records,
 )
 from services.resolution_registry import (
     build_canonical_resolution_registry,
@@ -715,6 +716,8 @@ class SessionMemoryIntegrityTest(unittest.TestCase):
         db.session.add(clar)
         db.session.commit()
 
+
+
         from routes.sessions import sessions_bp
         self.app.register_blueprint(sessions_bp)
 
@@ -740,6 +743,19 @@ class SessionMemoryIntegrityTest(unittest.TestCase):
         self.assertEqual(len(clars), 1)
         self.assertEqual(clars[0]['clarification_id'], 'clar_test_1')
 
+        # Verify invalid resolved_canonical_id is rejected by endpoint validation
+        bad_answer_res = client.post(
+            f'/api/campaigns/{self.campaign.id}/clarifications/clar_test_1/answer',
+            headers={'Authorization': f'Bearer {token}'},
+            json={
+                'answer': 'Yes, it is nonexistent.',
+                'resolved_canonical_id': 'nonexistent_id_lol',
+                'resolution_action': 'same_identity'
+            }
+        )
+        self.assertEqual(bad_answer_res.status_code, 400)
+
+        # Answer successfully with valid resolved_canonical_id 'mira'
         answer_res = client.post(
             f'/api/campaigns/{self.campaign.id}/clarifications/clar_test_1/answer',
             headers={'Authorization': f'Bearer {token}'},
@@ -765,13 +781,111 @@ class SessionMemoryIntegrityTest(unittest.TestCase):
 
         self.assertIn('clar_test_1', compiled.get('consumed_clarification_ids', []))
         npcs = compiled.get('update_npc_actors', [])
-        self.assertTrue(any(n['id'] == 'mira' and n['role'] == 'Chief Guard' for n in npcs))
+        # The canonical name 'Mira' must be preserved and NOT overwritten by resolved_canonical_id 'mira'
+        self.assertTrue(any(n['id'] == 'mira' and n['role'] == 'Chief Guard' and n['name'] == 'Mira' for n in npcs))
 
         from services.dm_tools import apply_compiled_session_memory_patch
         apply_compiled_session_memory_patch(self.campaign, self.session, compiled)
 
         clar_final = CampaignClarification.query.filter_by(clarification_id='clar_test_1').first()
         self.assertEqual(clar_final.status, 'resolved')
+
+    def test_extractor_path_slug_collision_does_not_reuse_entity(self):
+        from models import CampaignWorld
+        # Seed an entity with ID 'ferrymasters_hall' and name "Ferrymaster's Hall"
+        self.world.knowledge_graph = '{"entities":[{"id":"ferrymasters_hall","type":"location","name":"Ferrymaster\'s Hall"}],"relations":[],"facts":[]}'
+        db.session.add(self.world)
+        db.session.commit()
+
+        known_ids = _known_ids(self.campaign)
+        registry = []
+        prior_res = {}
+        allocated_ids = {'ferrymasters_hall'}
+
+        from services.resolution_registry import _resolve_entity_claim
+        entry = _resolve_entity_claim(
+            {'name': 'Ferrymasters Hall'},
+            known_ids,
+            prior_res,
+            allocated_ids,
+            1
+        )
+        # Must be created as a new provisional entity instead of reusing since it is not an exact canonical match
+        self.assertEqual(entry['decision'], 'create_provisional')
+        self.assertNotEqual(entry['canonical_id'], 'ferrymasters_hall')
+
+    def test_clarification_reopen_and_replacement_semantics(self):
+        from models import CampaignClarification
+        # 1. Create a resolved clarification for 'figure' in turn_1
+        clar_old = CampaignClarification(
+            campaign_id=self.campaign.id,
+            clarification_id="clar_old",
+            idempotency_key="key_old",
+            kind="identity",
+            mention_ref="figure",
+            mention_entity_id="figure",
+            question="Who is figure?",
+            status="resolved",
+        )
+        db.session.add(clar_old)
+        db.session.commit()
+
+        # 2. In turn_2, the registry builder requests clarification again for the same mention_ref 'figure'
+        # Since the old one is resolved, it should create a new pending clarification rather than skipping
+        memory_context = self._base_context()
+        memory_context['hot_context']['turn_id'] = 'turn_2'
+
+        from services.resolution_registry import _build_clarification_record, persist_clarification_requests
+        entry = {
+            "mention_ref": "figure",
+            "surface_form": "the figure",
+            "decision": "request_clarification",
+            "blocked_operations": ["npc_update"]
+        }
+        cr = _build_clarification_record(entry, self.campaign, memory_context)
+        self.assertIsNotNone(cr)
+        self.assertEqual(cr["status"], "pending")
+
+        persist_clarification_requests([cr], self.campaign)
+
+        all_clars = CampaignClarification.query.filter_by(campaign_id=self.campaign.id, mention_ref="figure").all()
+        self.assertEqual(len(all_clars), 2)
+        self.assertTrue(any(c.status == "resolved" for c in all_clars))
+        self.assertTrue(any(c.status == "pending" for c in all_clars))
+
+    def test_two_turn_resolution_record_persistence(self):
+        memory_context_t1 = self._base_context()
+        memory_context_t1['hot_context']['turn_id'] = 'turn_1'
+
+        registry_t1 = [{
+            "mention_ref": "stranger",
+            "surface_form": "the stranger",
+            "canonical_id": "aldric",
+            "canonical_name": "Aldric",
+            "decision": "reuse_existing",
+            "visibility": "party_known"
+        }]
+        records_t1 = _build_resolution_records(registry_t1, {}, memory_context_t1)
+        self.assertEqual(len(records_t1), 1)
+        res_id_t1 = records_t1[0]['resolution_id']
+
+        memory_context_t2 = self._base_context()
+        memory_context_t2['hot_context']['turn_id'] = 'turn_2'
+
+        registry_t2 = [{
+            "mention_ref": "stranger",
+            "surface_form": "the stranger",
+            "canonical_id": "aldric",
+            "canonical_name": "Aldric",
+            "decision": "reuse_existing",
+            "visibility": "party_known"
+        }]
+        records_t2 = _build_resolution_records(registry_t2, {}, memory_context_t2)
+        self.assertEqual(len(records_t2), 1)
+        res_id_t2 = records_t2[0]['resolution_id']
+
+        # The resolution IDs must be different because they occurred in different turns!
+        self.assertNotEqual(res_id_t1, res_id_t2)
 
 
 if __name__ == '__main__':

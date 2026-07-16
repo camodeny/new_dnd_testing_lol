@@ -845,13 +845,13 @@ class P1ImprovementsTest(unittest.TestCase):
         }
         
         # Seed canonical sildar entity and NPCActor
-        self.world.knowledge_graph = '{"entities":[{"id":"sildar_hallwinter_canonical","type":"npc","name":"Sildar Hallwinter"}],"relations":[],"facts":[]}'
+        self.world.knowledge_graph = '{"entities":[{"id":"sildar_hallwinter_canonical","type":"npc","name":"Sildar Hallwinter"},{"id":"gundren_rockseeker","type":"npc","name":"Gundren Rockseeker"}],"relations":[],"facts":[]}'
         db.session.add(self.world)
         sildar = NPCActor(campaign_id=self.campaign.id, actor_id='sildar_hallwinter_canonical', name='Sildar', public_summary='Warrior', dossier='{}')
         db.session.add(sildar)
         
         # Seed NPCActor for the new gundren generated ID so persistence passes
-        gundren = NPCActor(campaign_id=self.campaign.id, actor_id='gundren_rockseeker', name='Gundren', public_summary='Dwarf', dossier='{}')
+        gundren = NPCActor(campaign_id=self.campaign.id, actor_id='gundren_rockseeker', name='Gundren Rockseeker', public_summary='Dwarf', dossier='{}')
         db.session.add(gundren)
         db.session.commit()
 
@@ -937,13 +937,13 @@ class P1ImprovementsTest(unittest.TestCase):
         }
 
         # Seed canonical sildar entity and NPCActor
-        self.world.knowledge_graph = '{"entities":[{"id":"sildar_hallwinter_canonical","type":"npc","name":"Sildar Hallwinter"}],"relations":[],"facts":[]}'
+        self.world.knowledge_graph = '{"entities":[{"id":"sildar_hallwinter_canonical","type":"npc","name":"Sildar Hallwinter"},{"id":"gundren_rockseeker","type":"npc","name":"Gundren Rockseeker"}],"relations":[],"facts":[]}'
         db.session.add(self.world)
         sildar = NPCActor(campaign_id=self.campaign.id, actor_id='sildar_hallwinter_canonical', name='Sildar', public_summary='Warrior', dossier='{}')
         db.session.add(sildar)
 
         # Seed NPCActor for the new gundren generated ID so persistence passes
-        gundren = NPCActor(campaign_id=self.campaign.id, actor_id='gundren_rockseeker', name='Gundren', public_summary='Dwarf', dossier='{}')
+        gundren = NPCActor(campaign_id=self.campaign.id, actor_id='gundren_rockseeker', name='Gundren Rockseeker', public_summary='Dwarf', dossier='{}')
         db.session.add(gundren)
         db.session.commit()
 

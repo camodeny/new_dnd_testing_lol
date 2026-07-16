@@ -51,7 +51,7 @@ from services.dm_turns import (
 )
 from services.dev_combat_sandbox import is_combat_sandbox_campaign, start_combat_sandbox_session
 from services.planning_service import can_start_session, planning_context
-from services.session_memory_agent import MemoryPipelineError
+from services.session_memory_agent import MemoryPipelineError, _known_ids
 from services.world_service import approve_world, dm_world_context, ensure_world_generated, world_public_payload
 
 sessions_bp = Blueprint('sessions', __name__)
@@ -131,6 +131,9 @@ def _run_session_memory_update(
     memory_complete = False
     clock_complete = False
     try:
+        hot_context = dict(hot_context if isinstance(hot_context, dict) else {})
+        hot_context['turn_id'] = f"turn_{player_message_id}"
+
         campaign = db.session.get(Campaign, campaign_id)
         session = db.session.get(CampaignSession, session_id)
         current_user = db.session.get(User, user_id)
@@ -1152,6 +1155,19 @@ def _answer_campaign_clarification(current_user, campaign_id, clarification_id):
     resolved_canonical_id = data.get("resolved_canonical_id")
     resolution_action = data.get("resolution_action")
     resolution_patch = data.get("resolution_patch")
+
+    if not resolution_action or resolution_action not in ("same_identity", "new_entity", "ignore"):
+        return jsonify({'error': 'Invalid resolution action.'}), 400
+
+    if resolution_action == "same_identity":
+        if not resolved_canonical_id:
+            return jsonify({'error': 'resolved_canonical_id is required for same_identity.'}), 400
+        known = _known_ids(campaign)
+        if resolved_canonical_id not in known.get("entity_ids", set()):
+            return jsonify({'error': f'Canonical ID {resolved_canonical_id} does not exist in this campaign.'}), 400
+
+    if resolution_patch is not None and not isinstance(resolution_patch, dict):
+        return jsonify({'error': 'resolution_patch must be a JSON object.'}), 400
 
     clar.status = "answered"
     clar.answer = answer

@@ -94,6 +94,11 @@ def build_canonical_resolution_registry(
             claim, known_ids, prior_resolution_map, allocated_ids, mention_index
         )
         registry.append(entry)
+        if entry.get("decision") == "request_clarification":
+            cr = _build_clarification_record(entry, campaign, memory_context)
+            if cr:
+                clarification_requests.append(cr)
+                diagnostics["clarification_requests"].append(cr)
         if entry["canonical_id"]:
             allocated_ids.add(entry["canonical_id"])
         _track_diagnostics(entry, diagnostics)
@@ -114,6 +119,11 @@ def build_canonical_resolution_registry(
             claim, known_ids, prior_resolution_map, allocated_ids, mention_index
         )
         registry.append(entry)
+        if entry.get("decision") == "request_clarification":
+            cr = _build_clarification_record(entry, campaign, memory_context)
+            if cr:
+                clarification_requests.append(cr)
+                diagnostics["clarification_requests"].append(cr)
         if entry["canonical_id"]:
             allocated_ids.add(entry["canonical_id"])
         _track_diagnostics(entry, diagnostics)
@@ -199,6 +209,37 @@ def _registry_has_surface_form(registry, surface_form):
     return False
 
 
+def find_all_matching_candidates(name, known_ids, prior_resolutions):
+    candidates = set()
+    name_lower = name.strip().lower()
+
+    # Check NPC names
+    for npc_id, npc_name in known_ids.get("npc_names", {}).items():
+        if npc_name.strip().lower() == name_lower:
+            candidates.add(("npc", npc_id))
+
+    # Check entity names
+    for ent_id, ent_name in known_ids.get("entity_names", {}).items():
+        if ent_name.strip().lower() == name_lower:
+            candidates.add(("entity", ent_id))
+
+    # Check prior resolutions (aliases)
+    if isinstance(prior_resolutions, list):
+        for res in prior_resolutions:
+            if not isinstance(res, dict):
+                continue
+            if res.get("resolution_action") == "add_alias":
+                res_name = res.get("mention_name", "")
+                if res_name and res_name.strip().lower() == name_lower:
+                    can_id = res.get("canonical_id")
+                    if can_id:
+                        if can_id in known_ids.get("npc_ids", set()):
+                            candidates.add(("npc", can_id))
+                        elif can_id in known_ids.get("entity_ids", set()):
+                            candidates.add(("entity", can_id))
+    return candidates
+
+
 def _resolve_packet_mention(mention, known_ids, prior_resolution_map, allocated_ids, index, campaign):
     mention_ref = mention.get("mention_ref", f"packet_mention_{index}")
     surface_form = clean_text(mention.get("surface_form"), 200) or mention_ref
@@ -243,7 +284,8 @@ def _resolve_packet_mention(mention, known_ids, prior_resolution_map, allocated_
                     return entry
 
             entry["canonical_id"] = canonical_id_from_packet
-            entry["canonical_name"] = public_name
+            existing_name = known_ids.get("npc_names", {}).get(canonical_id_from_packet) or known_ids.get("entity_names", {}).get(canonical_id_from_packet)
+            entry["canonical_name"] = existing_name or public_name
             entry["decision"] = "reuse_existing"
             entry["resolution_state"] = "resolved"
         else:
@@ -269,7 +311,8 @@ def _resolve_packet_mention(mention, known_ids, prior_resolution_map, allocated_
                     entry["blocked_operations"] = ["identity_merge", "npc_update"]
                     return entry
             entry["canonical_id"] = canonical_id_from_packet
-            entry["canonical_name"] = public_name
+            existing_name = known_ids.get("npc_names", {}).get(canonical_id_from_packet) or known_ids.get("entity_names", {}).get(canonical_id_from_packet)
+            entry["canonical_name"] = existing_name or public_name
             entry["decision"] = "reuse_existing"
             entry["resolution_state"] = "resolved"
             entry["visibility"] = "public"
@@ -297,15 +340,10 @@ def _resolve_packet_mention(mention, known_ids, prior_resolution_map, allocated_
         entry["resolution_state"] = "resolved"
 
     elif identity_status == "candidate_existing_entity":
-        if canonical_id_from_packet and canonical_id_from_packet in known_ids.get("entity_ids", set()):
-            entry["canonical_id"] = canonical_id_from_packet
-            entry["canonical_name"] = public_name
-            entry["decision"] = "reuse_existing"
-            entry["resolution_state"] = "resolved"
-        else:
-            entry["decision"] = "request_clarification"
-            entry["resolution_state"] = "clarification_requested"
-            entry["blocked_operations"] = ["identity_merge", "npc_update"]
+        # Candidate status is not a confirmed identity — always request clarification
+        entry["decision"] = "request_clarification"
+        entry["resolution_state"] = "clarification_requested"
+        entry["blocked_operations"] = ["identity_merge", "npc_update"]
 
     else:
         entry["decision"] = "create_provisional"
@@ -342,37 +380,44 @@ def _resolve_entity_claim(claim, known_ids, prior_resolution_map, allocated_ids,
         canonical_name = clean_text(prior.get("canonical_name"), 200)
         if canonical_id and canonical_id in known_ids.get("entity_ids", set()):
             entry["canonical_id"] = canonical_id
-            entry["canonical_name"] = canonical_name or name
+            existing_name = known_ids.get("entity_names", {}).get(canonical_id) or known_ids.get("npc_names", {}).get(canonical_id)
+            entry["canonical_name"] = existing_name or canonical_name or name
             entry["decision"] = "reuse_existing"
             entry["resolution_state"] = "resolved"
             entry["identity_status"] = prior.get("visibility", "") == "dm_private" and "known_hidden" or "known_public"
             entry["evidence"].append({"source": "prior_durable_memory", "field": "identity_resolution_record"})
             return entry
 
-    name_lower = name.lower()
-    name_clean = clean_id(name_lower, "")
-    for existing_id in known_ids.get("entity_ids", set()):
-        if existing_id.lower() == name_clean:
-            entry["canonical_id"] = existing_id
-            entry["canonical_name"] = name
-            entry["decision"] = "reuse_existing"
-            entry["resolution_state"] = "resolved"
-            entry["identity_status"] = "known_public"
-            entry["evidence"].append({"source": "prior_durable_memory", "field": "entity_id_match"})
-            return entry
-
-    if is_identity_worthy(name):
-        new_id = allocate_durable_id(name, allocated_ids)
-        entry["canonical_id"] = new_id
-        entry["canonical_name"] = name
-        entry["decision"] = "create_provisional"
-        entry["resolution_state"] = "provisional"
-        entry["evidence"].append({"source": "visible_transcript", "field": "surface_form_claim"})
+    prior_res_list = list(prior_resolution_map.values()) if isinstance(prior_resolution_map, dict) else prior_resolution_map
+    candidates = find_all_matching_candidates(name, known_ids, prior_res_list)
+    if len(candidates) > 1:
+        entry["decision"] = "request_clarification"
+        entry["resolution_state"] = "clarification_requested"
+        entry["blocked_operations"] = ["identity_merge", "npc_update"]
+        return entry
+    elif len(candidates) == 1:
+        can_type, can_id = list(candidates)[0]
+        entry["canonical_id"] = can_id
+        existing_name = known_ids.get("entity_names", {}).get(can_id) or known_ids.get("npc_names", {}).get(can_id)
+        entry["canonical_name"] = existing_name or name
+        entry["decision"] = "reuse_existing"
+        entry["resolution_state"] = "resolved"
+        entry["identity_status"] = "known_public"
+        entry["evidence"].append({"source": "prior_durable_memory", "field": "entity_name_match"})
+        return entry
     else:
-        entry["decision"] = "reject"
-        entry["resolution_state"] = "rejected"
+        if is_identity_worthy(name):
+            new_id = allocate_durable_id(name, allocated_ids)
+            entry["canonical_id"] = new_id
+            entry["canonical_name"] = name
+            entry["decision"] = "create_provisional"
+            entry["resolution_state"] = "provisional"
+            entry["evidence"].append({"source": "visible_transcript", "field": "surface_form_claim"})
+        else:
+            entry["decision"] = "reject"
+            entry["resolution_state"] = "rejected"
 
-    return entry
+        return entry
 
 
 def _resolve_npc_claim(claim, known_ids, prior_resolution_map, allocated_ids, index):
@@ -408,8 +453,9 @@ def _resolve_npc_claim(claim, known_ids, prior_resolution_map, allocated_ids, in
                         entry["resolution_state"] = "rejected"
                         entry["blocked_operations"] = ["identity_merge", "npc_update"]
                         return entry
+        existing_name = known_ids.get("npc_names", {}).get(proposed_id, "")
         entry["canonical_id"] = proposed_id
-        entry["canonical_name"] = name
+        entry["canonical_name"] = existing_name or name
         entry["decision"] = "reuse_existing"
         entry["resolution_state"] = "resolved"
         entry["identity_status"] = "known_public"
@@ -419,27 +465,47 @@ def _resolve_npc_claim(claim, known_ids, prior_resolution_map, allocated_ids, in
     prior = prior_resolution_map.get(mention_ref) or prior_resolution_map.get(name.lower())
     if prior and isinstance(prior, dict):
         canonical_id = clean_id(prior.get("canonical_id"), "")
-        if canonical_id and canonical_id in known_ids.get("entity_ids", set()):
+        canonical_name = clean_text(prior.get("canonical_name"), 200)
+        if canonical_id and canonical_id in known_ids.get("npc_ids", set()):
             entry["canonical_id"] = canonical_id
-            entry["canonical_name"] = clean_text(prior.get("canonical_name"), 200) or name
+            existing_name = known_ids.get("npc_names", {}).get(canonical_id) or known_ids.get("entity_names", {}).get(canonical_id)
+            entry["canonical_name"] = existing_name or canonical_name or name
             entry["decision"] = "reuse_existing"
             entry["resolution_state"] = "resolved"
             entry["identity_status"] = prior.get("visibility", "") == "dm_private" and "known_hidden" or "known_public"
             entry["evidence"].append({"source": "prior_durable_memory", "field": "identity_resolution_record"})
             return entry
 
-    if is_identity_worthy(name):
-        new_id = allocate_durable_id(name, allocated_ids)
-        entry["canonical_id"] = new_id
-        entry["canonical_name"] = name
-        entry["decision"] = "create_provisional"
-        entry["resolution_state"] = "provisional"
-        entry["evidence"].append({"source": "visible_transcript", "field": "surface_form_claim"})
+    prior_res_list = list(prior_resolution_map.values()) if isinstance(prior_resolution_map, dict) else prior_resolution_map
+    candidates = find_all_matching_candidates(name, known_ids, prior_res_list)
+    if len(candidates) > 1:
+        entry["decision"] = "request_clarification"
+        entry["resolution_state"] = "clarification_requested"
+        entry["blocked_operations"] = ["identity_merge", "npc_update"]
+        return entry
+    elif len(candidates) == 1:
+        can_type, can_id = list(candidates)[0]
+        entry["canonical_id"] = can_id
+        existing_name = known_ids.get("npc_names", {}).get(can_id) or known_ids.get("entity_names", {}).get(can_id)
+        entry["canonical_name"] = existing_name or name
+        entry["decision"] = "reuse_existing"
+        entry["resolution_state"] = "resolved"
+        entry["identity_status"] = "known_public"
+        entry["evidence"].append({"source": "prior_durable_memory", "field": "npc_name_match"})
+        return entry
     else:
-        entry["decision"] = "reject"
-        entry["resolution_state"] = "rejected"
+        if is_identity_worthy(name):
+            new_id = allocate_durable_id(name, allocated_ids)
+            entry["canonical_id"] = new_id
+            entry["canonical_name"] = name
+            entry["decision"] = "create_provisional"
+            entry["resolution_state"] = "provisional"
+            entry["evidence"].append({"source": "visible_transcript", "field": "surface_form_claim"})
+        else:
+            entry["decision"] = "reject"
+            entry["resolution_state"] = "rejected"
 
-    return entry
+        return entry
 
 
 def _apply_clarification_answer(pending_clarification, known_ids, allocated_ids):
@@ -459,6 +525,7 @@ def _apply_clarification_answer(pending_clarification, known_ids, allocated_ids)
     if resolution_action == "same_identity" and resolved_canonical_id:
         if resolved_canonical_id not in known_ids.get("entity_ids", set()):
             return None
+        existing_name = known_ids.get("npc_names", {}).get(resolved_canonical_id) or known_ids.get("entity_names", {}).get(resolved_canonical_id)
         return {
             "mention_ref": mention_ref,
             "surface_form": pending_clarification.get("mention_entity_id", mention_ref),
@@ -470,7 +537,7 @@ def _apply_clarification_answer(pending_clarification, known_ids, allocated_ids)
                 "clarification_id": pending_clarification.get("clarification_id")
             }],
             "canonical_id": resolved_canonical_id,
-            "canonical_name": resolved_canonical_id,
+            "canonical_name": existing_name or pending_clarification.get("mention_entity_id", resolved_canonical_id),
             "decision": "reuse_existing",
             "blocked_operations": [],
             "resolution_state": "resolved",
@@ -508,7 +575,8 @@ def _build_clarification_record(entry, campaign, memory_context):
     surface_form = entry["surface_form"]
     campaign_id = getattr(campaign, "id", 0) if campaign else 0
 
-    idempotency_key_raw = f"{campaign_id}:{mention_ref}:identity:{','.join(sorted(entry.get('blocked_operations', [])))}"
+    turn_id = (memory_context or {}).get("hot_context", {}).get("turn_id", "")
+    idempotency_key_raw = f"{campaign_id}:{mention_ref}:{turn_id}:identity:{','.join(sorted(entry.get('blocked_operations', [])))}"
     idempotency_key = hashlib.sha256(idempotency_key_raw.encode("utf-8")).hexdigest()[:64]
     clar_id = f"clar_{hashlib.md5(idempotency_key_raw.encode('utf-8')).hexdigest()[:12]}"
 
@@ -522,6 +590,7 @@ def _build_clarification_record(entry, campaign, memory_context):
         "candidate_ids": [],
         "blocking_scope": entry.get("blocked_operations", []),
         "status": "pending",
+        "source_turn_id": turn_id,
     }
 
 
@@ -610,7 +679,7 @@ def persist_clarification_requests(clarification_requests, campaign):
     existing_keys = {
         row.idempotency_key
         for row in existing
-        if row.idempotency_key
+        if row.idempotency_key and row.status in ("pending", "answered")
     }
     for cr in clarification_requests:
         if not isinstance(cr, dict):
