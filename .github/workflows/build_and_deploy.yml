@@ -146,11 +146,16 @@ jobs:
           echo "Deployment configuration is present."
 
       - name: Join tailnet
+        if: ${{ runner.environment != 'self-hosted' }}
         uses: tailscale/github-action@v4
         with:
           oauth-client-id: ${{ secrets.TS_OAUTH_CLIENT_ID }}
           oauth-secret: ${{ secrets.TS_OAUTH_SECRET }}
           tags: tag:ci
+
+      - name: Verify existing tailnet connection
+        if: ${{ runner.environment == 'self-hosted' }}
+        run: tailscale status --json >/dev/null
 
       - name: Load SSH key
         uses: webfactory/ssh-agent@v0.9.0
