@@ -31,12 +31,14 @@ jobs:
           CI_PYTHON="$HOME/.local/share/uv/python/cpython-3.12-linux-aarch64-gnu/bin/python3.12"
           test -x "$CI_PYTHON"
           echo "CI_PYTHON=$CI_PYTHON" >> "$GITHUB_ENV"
+          echo "CI_VENV=$RUNNER_TEMP/dnd-ci-venv" >> "$GITHUB_ENV"
 
       - name: Install backend dependencies
         working-directory: server
         run: |
-          "$CI_PYTHON" -m pip install --upgrade pip
-          "$CI_PYTHON" -m pip install -r requirements-dev.txt
+          "$CI_PYTHON" -m venv "$CI_VENV"
+          "$CI_VENV/bin/python" -m pip install --upgrade pip
+          "$CI_VENV/bin/python" -m pip install -r requirements-dev.txt
 
       - name: Run backend tests
         env:
@@ -44,7 +46,7 @@ jobs:
         run: |
           mkdir -p review-evidence
           set -o pipefail
-          "$CI_PYTHON" -m pytest server/tests -q -W error 2>&1 | tee review-evidence/backend-tests.log
+          "$CI_VENV/bin/python" -m pytest server/tests -q -W error 2>&1 | tee review-evidence/backend-tests.log
 
       - name: Upload backend review evidence
         if: always()
