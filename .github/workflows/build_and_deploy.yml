@@ -12,7 +12,7 @@ permissions:
 jobs:
   tests:
     name: Build and test
-    runs-on: ubuntu-latest
+    runs-on: [self-hosted, Linux, ARM64, raspone-ci]
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
@@ -65,7 +65,7 @@ jobs:
 
   deploy:
     name: Deploy
-    runs-on: ubuntu-latest
+    runs-on: [self-hosted, Linux, ARM64, raspone-ci]
     needs: tests
     if: github.ref == 'refs/heads/main'
     steps:
