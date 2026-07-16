@@ -347,9 +347,13 @@ Use this after running the same scenario with the same scorecard template to tra
 
 ### DM timeout tuning
 
-- The default worker `--dm-response-timeout` is `60` seconds.
-- Complex DM turns that hit guard, repair, memory, or clock-adjudication passes may need a larger value such as `120` or `180`.
-- If a run fails with `dm_response_timeout`, inspect `campaign_audit_events` to see whether the DM was still progressing through repair or post-turn persistence when the worker gave up.
+- The default visible-response timeout (`--dm-visible-response-timeout` / `DND_DM_VISIBLE_RESPONSE_TIMEOUT`) is **720** seconds (12 minutes).
+- The default post-turn timeout (`--dm-post-turn-timeout` / `DND_DM_POST_TURN_TIMEOUT`) is **720** seconds (12 minutes).
+- These values are a **temporary internal-testing configuration**, not a permanent performance target. Timeout reduction and performance tuning will be handled separately after memory reliability improves.
+- Complex DM turns that hit guard, repair, memory, or clock-adjudication passes may need a larger value such as `120` or `180` seconds above the default; the current defaults should accommodate most such turns.
+- If a run fails with `dm_response_timeout`, `dm_visible_response_timeout`, or `dm_post_turn_timeout`, inspect `campaign_audit_events` to see whether the DM was still progressing through repair or post-turn persistence when the worker gave up.
+- The two values may be configured independently. Setting only one will leave the other at its 720-second default.
+- The legacy combined `DND_DM_RESPONSE_TIMEOUT` / `--dm-response-timeout` sets only the visible timeout; the post-turn timeout defaults to 720 seconds when the legacy option is used alone.
 
 ### Audit submission flow
 

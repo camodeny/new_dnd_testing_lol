@@ -75,7 +75,7 @@ def parse_args():
     parser.add_argument(
         '--dm-response-timeout',
         type=float,
-        default=float(os.environ.get('DND_DM_RESPONSE_TIMEOUT', '300')),
+        default=float(os.environ.get('DND_DM_RESPONSE_TIMEOUT', '720')),
         help='Stop the runner if the DM does not finish responding to the latest player message within this many seconds',
     )
     _visible_env = os.environ.get('DND_DM_VISIBLE_RESPONSE_TIMEOUT')
@@ -503,6 +503,8 @@ def main():
         same_fingerprint_no_action_retries = 0
         last_dm_turn = None
 
+        visible_timeout, post_turn_timeout = dm_response_state.resolve_dm_response_timeouts(args)
+
         print_event({
             'event': 'campaign_ready',
             'timestamp': utc_now(),
@@ -511,6 +513,8 @@ def main():
             'campaign_name': manifest['campaign']['name'],
             'session_id': manifest['session']['id'],
             'api_base': manifest['api_base'],
+            'dm_visible_response_timeout': visible_timeout,
+            'dm_post_turn_timeout': post_turn_timeout,
         })
 
         while True:

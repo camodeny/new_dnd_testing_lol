@@ -74,12 +74,12 @@ def resolve_dm_response_timeouts(args):
     if visible is not None and post_turn is not None:
         return float(visible), float(post_turn)
     if visible is not None:
-        return float(visible), 180.0
+        return float(visible), 720.0
     if post_turn is not None:
-        return 300.0, float(post_turn)
+        return float(legacy) if legacy is not None else 720.0, float(post_turn)
     if legacy is not None:
-        return float(legacy), 180.0
-    return 300.0, 180.0
+        return float(legacy), 720.0
+    return 720.0, 720.0
 
 
 def _fetch_status(fetch_status_fn, last_status, phase, transient_error_types, on_poll_error_fn):

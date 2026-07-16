@@ -47,6 +47,13 @@ x-app-environment: &app-environment
       GEMINI_EMBEDDING_DIMENSIONS: ${GEMINI_EMBEDDING_DIMENSIONS:-768}
       MEMORY_EMBEDDING_DEDUPE_THRESHOLD: ${MEMORY_EMBEDDING_DEDUPE_THRESHOLD:-0.90}
       MEMORY_EMBEDDING_SEARCH_WEIGHT: ${MEMORY_EMBEDDING_SEARCH_WEIGHT:-0.70}
+      # DM response timeout configuration
+      # Temporary internal-testing values; timeout reduction will be handled separately
+      # after memory reliability improves. Defaults are in seconds.
+      DND_DM_VISIBLE_RESPONSE_TIMEOUT: ${DND_DM_VISIBLE_RESPONSE_TIMEOUT:-720}
+      DND_DM_POST_TURN_TIMEOUT: ${DND_DM_POST_TURN_TIMEOUT:-720}
+      DND_DM_RESPONSE_TIMEOUT: ${DND_DM_RESPONSE_TIMEOUT:-720}
+      DND_DM_LATE_COMPLETION_RECONCILIATION_SECONDS: ${DND_DM_LATE_COMPLETION_RECONCILIATION_SECONDS:-30}
 
 services:
   app:
