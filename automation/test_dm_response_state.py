@@ -159,7 +159,7 @@ class DmResponseStateUnitTests(unittest.TestCase):
         )
         visible, post_turn = dm_response_state.resolve_dm_response_timeouts(args)
         self.assertEqual(visible, 200.0)
-        self.assertEqual(post_turn, 180.0)
+        self.assertEqual(post_turn, 720.0)
 
     def test_resolve_dm_response_timeouts_only_post_turn(self):
         args = SimpleNamespace(
@@ -168,7 +168,7 @@ class DmResponseStateUnitTests(unittest.TestCase):
             dm_response_timeout=300.0,
         )
         visible, post_turn = dm_response_state.resolve_dm_response_timeouts(args)
-        self.assertEqual(visible, 300.0)
+        self.assertEqual(visible, 720.0)
         self.assertEqual(post_turn, 100.0)
 
     def test_resolve_dm_response_timeouts_legacy_fallback(self):
@@ -179,7 +179,7 @@ class DmResponseStateUnitTests(unittest.TestCase):
         )
         visible, post_turn = dm_response_state.resolve_dm_response_timeouts(args)
         self.assertEqual(visible, 120.0)
-        self.assertEqual(post_turn, 180.0)
+        self.assertEqual(post_turn, 720.0)
 
     def test_resolve_dm_response_timeouts_all_none_defaults(self):
         args = SimpleNamespace(
@@ -188,8 +188,38 @@ class DmResponseStateUnitTests(unittest.TestCase):
             dm_response_timeout=None,
         )
         visible, post_turn = dm_response_state.resolve_dm_response_timeouts(args)
-        self.assertEqual(visible, 300.0)
-        self.assertEqual(post_turn, 180.0)
+        self.assertEqual(visible, 720.0)
+        self.assertEqual(post_turn, 720.0)
+
+    def test_resolve_dm_response_timeouts_both_specified_via_env_overrides(self):
+        args = SimpleNamespace(
+            dm_visible_response_timeout=720.0,
+            dm_post_turn_timeout=720.0,
+            dm_response_timeout=300.0,
+        )
+        visible, post_turn = dm_response_state.resolve_dm_response_timeouts(args)
+        self.assertEqual(visible, 720.0)
+        self.assertEqual(post_turn, 720.0)
+
+    def test_resolve_dm_response_timeouts_visible_override_post_turn_defaults(self):
+        args = SimpleNamespace(
+            dm_visible_response_timeout=600.0,
+            dm_post_turn_timeout=None,
+            dm_response_timeout=None,
+        )
+        visible, post_turn = dm_response_state.resolve_dm_response_timeouts(args)
+        self.assertEqual(visible, 600.0)
+        self.assertEqual(post_turn, 720.0)
+
+    def test_resolve_dm_response_timeouts_post_turn_override_visible_defaults(self):
+        args = SimpleNamespace(
+            dm_visible_response_timeout=None,
+            dm_post_turn_timeout=600.0,
+            dm_response_timeout=None,
+        )
+        visible, post_turn = dm_response_state.resolve_dm_response_timeouts(args)
+        self.assertEqual(visible, 720.0)
+        self.assertEqual(post_turn, 600.0)
 
 
 class DmResponseStatePhasedTests(unittest.TestCase):

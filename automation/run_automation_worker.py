@@ -33,7 +33,7 @@ def parse_args():
     parser.add_argument('--max-minutes', type=float, default=None)
     parser.add_argument('--idle-timeout', type=float, default=180.0)
     parser.add_argument('--heartbeat-interval', type=float, default=10.0)
-    parser.add_argument('--dm-response-timeout', type=float, default=float(os.environ.get('DND_DM_RESPONSE_TIMEOUT', '300')))
+    parser.add_argument('--dm-response-timeout', type=float, default=float(os.environ.get('DND_DM_RESPONSE_TIMEOUT', '720')))
     _visible_env = os.environ.get('DND_DM_VISIBLE_RESPONSE_TIMEOUT')
     _post_turn_env = os.environ.get('DND_DM_POST_TURN_TIMEOUT')
     parser.add_argument('--dm-visible-response-timeout', type=float, default=float(_visible_env) if _visible_env else None)
@@ -686,6 +686,7 @@ def execute_run(args, run_id):
     hb_thread.join(timeout=5)
     lease_token = _init_lease_token[0]
     manifest = build_manifest_for_run(args.api_base, args.owner_api_key, claim_payload)
+    visible_timeout, post_turn_timeout = dm_response_state.resolve_dm_response_timeouts(args)
     append_event(
         args.api_base,
         args.owner_api_key,
@@ -693,7 +694,12 @@ def execute_run(args, run_id):
         args.worker_id,
         lease_token,
         'run_started',
-        {'worker_id': args.worker_id, 'reclaimed': claim_payload.get('reclaimed', False)},
+        {
+            'worker_id': args.worker_id,
+            'reclaimed': claim_payload.get('reclaimed', False),
+            'dm_visible_response_timeout': visible_timeout,
+            'dm_post_turn_timeout': post_turn_timeout,
+        },
         status='running',
         dedupe_key=f'run_started:{run_id}:attempt:{run.get("attempt_count")}',
     )
