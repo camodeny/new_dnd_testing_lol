@@ -887,6 +887,210 @@ class SessionMemoryIntegrityTest(unittest.TestCase):
         # The resolution IDs must be different because they occurred in different turns!
         self.assertNotEqual(res_id_t1, res_id_t2)
 
+    def test_alias_only_name_preservation(self):
+        from services.resolution_registry import find_all_matching_candidates
+        from services.session_memory_agent import _augment_registry_from_resolved
+        known = {
+            "npc_ids": {"aldric"},
+            "npc_names": {"aldric": "Aldric"},
+            "entity_ids": set(),
+            "entity_names": {}
+        }
+        prior = [{
+            "canonical_id": "aldric",
+            "canonical_name": "Aldric",
+            "mention_name": "the stranger",
+            "resolution_action": "add_alias"
+        }]
+
+        candidates = find_all_matching_candidates("the stranger", known, prior, expected_type="npc")
+        self.assertIn("aldric", candidates)
+
+        registry = []
+        _augment_registry_from_resolved(
+            registry,
+            [],
+            [{"name": "the stranger"}],
+            known,
+            prior_resolutions=prior,
+            allocated_ids=set()
+        )
+        self.assertEqual(len(registry), 1)
+        self.assertEqual(registry[0]["decision"], "add_alias")
+        self.assertEqual(registry[0]["canonical_name"], "Aldric")
+
+    def test_duplicate_and_cross_type_candidate_filtering(self):
+        from services.resolution_registry import find_all_matching_candidates
+        # Enforce type compatibility: location "Aldric" is not a candidate for NPC "Aldric"
+        known_cross = {
+            "npc_ids": set(),
+            "npc_names": {},
+            "entity_ids": {"aldric_location"},
+            "entity_names": {"aldric_location": "Aldric"}
+        }
+        npc_candidates = find_all_matching_candidates("Aldric", known_cross, [], expected_type="npc")
+        self.assertEqual(len(npc_candidates), 0)
+
+        # Deduplicate: NPC is present in both NPC list and graph entities, count once
+        known_dup = {
+            "npc_ids": {"aldric"},
+            "npc_names": {"aldric": "Aldric"},
+            "entity_ids": {"aldric"},
+            "entity_names": {"aldric": "Aldric"}
+        }
+        npc_dup_candidates = find_all_matching_candidates("Aldric", known_dup, [], expected_type="npc")
+        self.assertEqual(len(npc_dup_candidates), 1)
+        self.assertEqual(list(npc_dup_candidates.keys())[0], "aldric")
+
+    def test_ignore_clarification_completion(self):
+        from models import CampaignClarification
+        clar = CampaignClarification(
+            campaign_id=self.campaign.id,
+            clarification_id="clar_ignore",
+            idempotency_key="key_ignore",
+            kind="identity",
+            mention_ref="test_ignore_ref",
+            mention_entity_id="test_ignore_entity",
+            question="Is ignore?",
+            status="answered",
+            resolution_action="ignore"
+        )
+        db.session.add(clar)
+        db.session.commit()
+
+        memory_context = self._base_context()
+        extracted = {}
+        resolved = {}
+        compiled = compile_staged_memory_patch(memory_context, extracted, resolved)
+
+        self.assertIn("clar_ignore", compiled.get("consumed_clarification_ids", []))
+
+    def test_illegal_status_transitions_rejected(self):
+        from routes.sessions import sessions_bp
+        try:
+            self.app.register_blueprint(sessions_bp)
+        except AssertionError:
+            pass
+
+        from models import CampaignClarification
+        clar = CampaignClarification(
+            campaign_id=self.campaign.id,
+            clarification_id="clar_illegal",
+            idempotency_key="key_illegal",
+            kind="identity",
+            mention_ref="ref",
+            question="Is ref?",
+            status="resolved",
+        )
+        db.session.add(clar)
+        db.session.commit()
+
+        dm_user = User(username='dm_user_test_2', email='dm_test_2@example.com')
+        dm_user.set_password('password')
+        db.session.add(dm_user)
+        db.session.commit()
+        self.campaign.user_id = dm_user.id
+        db.session.commit()
+
+        from auth import generate_token
+        token = generate_token(dm_user.id)
+        client = self.app.test_client()
+
+        res = client.post(
+            f'/api/campaigns/{self.campaign.id}/clarifications/clar_illegal/answer',
+            headers={'Authorization': f'Bearer {token}'},
+            json={
+                'answer': 'Yes',
+                'resolution_action': 'ignore'
+            }
+        )
+        self.assertEqual(res.status_code, 400)
+
+    def test_new_entity_naming_from_surface_form(self):
+        from models import CampaignClarification
+        clar = CampaignClarification(
+            campaign_id=self.campaign.id,
+            clarification_id="clar_new_ent",
+            idempotency_key="key_new_ent",
+            kind="identity",
+            mention_ref="grey_figure_1",
+            mention_entity_id="grey_figure_1",
+            surface_form="The Grey Figure",
+            question="Who is grey_figure_1?",
+            status="answered",
+            resolution_action="new_entity"
+        )
+        db.session.add(clar)
+        db.session.commit()
+
+        memory_context = self._base_context()
+        extracted = {}
+        resolved = {}
+        compiled = compile_staged_memory_patch(memory_context, extracted, resolved)
+
+        self.assertIn("clar_new_ent", compiled.get("consumed_clarification_ids", []))
+
+    def test_unrelated_patch_targets_rejected(self):
+        from routes.sessions import sessions_bp
+        try:
+            self.app.register_blueprint(sessions_bp)
+        except AssertionError:
+            pass
+
+        from models import CampaignClarification
+        clar = CampaignClarification(
+            campaign_id=self.campaign.id,
+            clarification_id="clar_patch_val",
+            idempotency_key="key_patch_val",
+            kind="identity",
+            mention_ref="test_ref",
+            mention_entity_id="test_entity",
+            question="Is test_ref Mira?",
+            status="pending",
+            blocking_scope=["npc_update"]
+        )
+        db.session.add(clar)
+        db.session.commit()
+
+        dm_user = User(username='dm_user_test_3', email='dm_test_3@example.com')
+        dm_user.set_password('password')
+        db.session.add(dm_user)
+        db.session.commit()
+        self.campaign.user_id = dm_user.id
+        db.session.commit()
+
+        from auth import generate_token
+        token = generate_token(dm_user.id)
+        client = self.app.test_client()
+
+        res_bad_id = client.post(
+            f'/api/campaigns/{self.campaign.id}/clarifications/clar_patch_val/answer',
+            headers={'Authorization': f'Bearer {token}'},
+            json={
+                'answer': 'Yes, it is Mira.',
+                'resolved_canonical_id': 'mira',
+                'resolution_action': 'same_identity',
+                'resolution_patch': {
+                    'update_npc_actors': [{'id': 'aldric', 'role': 'Chief Guard'}]
+                }
+            }
+        )
+        self.assertEqual(res_bad_id.status_code, 400)
+
+        res_bad_scope = client.post(
+            f'/api/campaigns/{self.campaign.id}/clarifications/clar_patch_val/answer',
+            headers={'Authorization': f'Bearer {token}'},
+            json={
+                'answer': 'Yes, it is Mira.',
+                'resolved_canonical_id': 'mira',
+                'resolution_action': 'same_identity',
+                'resolution_patch': {
+                    'upsert_graph_entities': [{'id': 'mira', 'type': 'location'}]
+                }
+            }
+        )
+        self.assertEqual(res_bad_scope.status_code, 400)
+
 
 if __name__ == '__main__':
     unittest.main()

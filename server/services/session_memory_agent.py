@@ -1,6 +1,7 @@
 import json
 import re
 import hashlib
+import copy
 
 from models import Campaign, CampaignClock, CampaignSession, CampaignWorld, Character, NPCActor, SessionMessage, User, WorldEvent, db
 from services.dm_tools import _tool_search_campaign_memory
@@ -739,11 +740,18 @@ def _augment_registry_from_resolved(registry, resolved_entities, resolved_npcs, 
             matched_id = find_matching_known_entity(name, known, prior_resolutions)
             if matched_id:
                 new_id = matched_id
-                decision = "reuse_existing"
+                existing_name = known.get("entity_names", {}).get(matched_id, "")
+                if existing_name and name.lower() != existing_name.lower():
+                    decision = "add_alias"
+                    canonical_name = existing_name
+                else:
+                    decision = "reuse_existing"
+                    canonical_name = existing_name or name
                 identity_status = "known_public"
             else:
                 new_id = allocate_durable_id(name, allocated_ids)
                 decision = "create_new"
+                canonical_name = name
                 identity_status = "provisional_new_entity"
             allocated_ids.add(new_id)
             registry.append({
@@ -753,7 +761,7 @@ def _augment_registry_from_resolved(registry, resolved_entities, resolved_npcs, 
                 "visibility": "party_known",
                 "evidence": [{"source": "resolver_output", "field": "upsert_graph_entities"}],
                 "canonical_id": new_id,
-                "canonical_name": name,
+                "canonical_name": canonical_name,
                 "decision": decision,
                 "blocked_operations": [],
                 "resolution_state": "resolved",
@@ -809,11 +817,18 @@ def _augment_registry_from_resolved(registry, resolved_entities, resolved_npcs, 
                 matched_id = find_matching_known_npc(name, known, prior_resolutions)
                 if matched_id:
                     new_id = matched_id
-                    decision = "reuse_existing"
+                    existing_name = known.get("npc_names", {}).get(matched_id, "")
+                    if existing_name and name.lower() != existing_name.lower():
+                        decision = "add_alias"
+                        canonical_name = existing_name
+                    else:
+                        decision = "reuse_existing"
+                        canonical_name = existing_name or name
                     identity_status = "known_public"
                 else:
                     new_id = allocate_durable_id(name, allocated_ids)
                     decision = "create_new"
+                    canonical_name = name
                     identity_status = "provisional_new_entity"
                 allocated_ids.add(new_id)
                 registry.append({
@@ -823,7 +838,7 @@ def _augment_registry_from_resolved(registry, resolved_entities, resolved_npcs, 
                     "visibility": "party_known",
                     "evidence": [{"source": "resolver_output", "field": "update_npc_actors"}],
                     "canonical_id": new_id,
-                    "canonical_name": name,
+                    "canonical_name": canonical_name,
                     "decision": decision,
                     "blocked_operations": [],
                     "resolution_state": "resolved",
@@ -944,6 +959,25 @@ def compile_staged_memory_patch(memory_context, extracted, resolved):
                 if clar_id and clar_id in valid_consumed_ids:
                     patch_json = pc.get("resolution_patch_json") or pc.get("resolution_patch")
                     if patch_json:
+                        patch_json = copy.deepcopy(patch_json)
+                        if pc.get("resolution_action") == "new_entity":
+                            # Find the new allocated canonical ID in registry
+                            allocated_canonical_id = None
+                            for entry in registry:
+                                for ev in entry.get("evidence", []):
+                                    if isinstance(ev, dict) and ev.get("source") == "clarification_answer" and ev.get("clarification_id") == clar_id:
+                                        allocated_canonical_id = entry.get("canonical_id")
+                                        break
+                            if allocated_canonical_id:
+                                old_target_id = pc.get("mention_entity_id")
+                                if "update_npc_actors" in patch_json:
+                                    for item in patch_json["update_npc_actors"]:
+                                        if isinstance(item, dict) and item.get("id") == old_target_id:
+                                            item["id"] = allocated_canonical_id
+                                if "upsert_graph_entities" in patch_json:
+                                    for item in patch_json["upsert_graph_entities"]:
+                                        if isinstance(item, dict) and item.get("id") == old_target_id:
+                                            item["id"] = allocated_canonical_id
                         merge_resolution_patch(resolved, patch_json)
                     consumed_clarification_ids.append(clar_id)
 

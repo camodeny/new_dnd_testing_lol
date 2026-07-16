@@ -1150,6 +1150,9 @@ def _answer_campaign_clarification(current_user, campaign_id, clarification_id):
     if not clar:
         return jsonify({'error': 'Clarification not found.'}), 404
 
+    if clar.status not in ("pending", "answered"):
+        return jsonify({'error': f'Cannot answer clarification in status {clar.status}'}), 400
+
     data = request.get_json() or {}
     answer = data.get("answer", "")
     resolved_canonical_id = data.get("resolved_canonical_id")
@@ -1166,8 +1169,46 @@ def _answer_campaign_clarification(current_user, campaign_id, clarification_id):
         if resolved_canonical_id not in known.get("entity_ids", set()):
             return jsonify({'error': f'Canonical ID {resolved_canonical_id} does not exist in this campaign.'}), 400
 
-    if resolution_patch is not None and not isinstance(resolution_patch, dict):
-        return jsonify({'error': 'resolution_patch must be a JSON object.'}), 400
+    if resolution_patch is not None:
+        if not isinstance(resolution_patch, dict):
+            return jsonify({'error': 'resolution_patch must be a JSON object.'}), 400
+        allowed_keys = {"update_npc_actors", "upsert_graph_entities"}
+        for k in resolution_patch.keys():
+            if k not in allowed_keys:
+                return jsonify({'error': f'Key {k} is not allowed in resolution_patch.'}), 400
+
+        # Scope validation: check allowed keys against blocking_scope
+        blocking_scope = clar.blocking_scope or []
+        if blocking_scope:
+            if "update_npc_actors" in resolution_patch:
+                if not any(op in blocking_scope for op in ("npc_update", "identity_merge", "entity_merge")):
+                    return jsonify({'error': 'update_npc_actors not allowed by blocking scope.'}), 400
+            if "upsert_graph_entities" in resolution_patch:
+                if not any(op in blocking_scope for op in ("entity_merge", "identity_merge")):
+                    return jsonify({'error': 'upsert_graph_entities not allowed by blocking scope.'}), 400
+
+        # Validate target IDs
+        if resolution_action == "same_identity":
+            target_id = resolved_canonical_id
+        elif resolution_action == "new_entity":
+            target_id = clar.mention_entity_id
+        else:
+            target_id = None
+
+        if "update_npc_actors" in resolution_patch:
+            items = resolution_patch["update_npc_actors"]
+            if not isinstance(items, list):
+                return jsonify({'error': 'update_npc_actors must be a list.'}), 400
+            for item in items:
+                if not isinstance(item, dict) or item.get("id") != target_id:
+                    return jsonify({'error': f'Target ID in update_npc_actors must match {target_id}.'}), 400
+        if "upsert_graph_entities" in resolution_patch:
+            items = resolution_patch["upsert_graph_entities"]
+            if not isinstance(items, list):
+                return jsonify({'error': 'upsert_graph_entities must be a list.'}), 400
+            for item in items:
+                if not isinstance(item, dict) or item.get("id") != target_id:
+                    return jsonify({'error': f'Target ID in upsert_graph_entities must match {target_id}.'}), 400
 
     clar.status = "answered"
     clar.answer = answer
@@ -1198,6 +1239,9 @@ def _dismiss_campaign_clarification(current_user, campaign_id, clarification_id)
     if not clar:
         return jsonify({'error': 'Clarification not found.'}), 404
 
+    if clar.status not in ("pending", "answered"):
+        return jsonify({'error': f'Cannot dismiss clarification in status {clar.status}'}), 400
+
     clar.status = "dismissed"
     clar.dismissed_at = utcnow()
 
@@ -1221,6 +1265,9 @@ def _obsolete_campaign_clarification(current_user, campaign_id, clarification_id
     ).first()
     if not clar:
         return jsonify({'error': 'Clarification not found.'}), 404
+
+    if clar.status not in ("pending", "answered"):
+        return jsonify({'error': f'Cannot obsolete clarification in status {clar.status}'}), 400
 
     clar.status = "obsolete"
 

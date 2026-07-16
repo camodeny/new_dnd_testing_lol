@@ -2319,6 +2319,7 @@ class CampaignClarification(db.Model):
     kind = db.Column(db.String(60), nullable=False)
     mention_ref = db.Column(db.String(200), nullable=False)
     mention_entity_id = db.Column(db.String(200), nullable=True, index=True)
+    surface_form = db.Column(db.Text, nullable=True)
 
     question = db.Column(db.Text, nullable=False)
     candidate_ids = db.Column(db.JSON, nullable=True)
@@ -2353,6 +2354,7 @@ class CampaignClarification(db.Model):
             "kind": self.kind,
             "mention_ref": self.mention_ref,
             "mention_entity_id": self.mention_entity_id,
+            "surface_form": self.surface_form,
             "question": self.question,
             "candidate_ids": self.candidate_ids,
             "blocking_scope": self.blocking_scope,
