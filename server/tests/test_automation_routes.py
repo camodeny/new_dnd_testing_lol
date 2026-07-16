@@ -48,6 +48,7 @@ class AutomationRouteTest(unittest.TestCase):
         app.root_path = self.temp_dir.name
 
         with app.app_context():
+            db.session.execute(db.text("PRAGMA foreign_keys=OFF"))
             db.drop_all()
             db.create_all()
 
@@ -363,6 +364,18 @@ class AutomationRouteTest(unittest.TestCase):
         ).get_json()['scenario']['id']
 
         with app.app_context():
+            # Create dummy snapshot for run FK constraint
+            from models import AutomationSnapshot, AutomationRun
+            dummy_snap = AutomationSnapshot(
+                scenario_id=scenario_id,
+                source_campaign_id=self.campaign_id,
+                label="Dummy",
+                summary="Dummy",
+                snapshot_json={},
+            )
+            db.session.add(dummy_snap)
+            db.session.flush()
+
             clone_campaign = Campaign(
                 name='Automation Source [Run 9]',
                 user_id=self.owner_id,
@@ -372,6 +385,16 @@ class AutomationRouteTest(unittest.TestCase):
             )
             db.session.add(clone_campaign)
             db.session.flush()
+
+            # Create mock run referencing the clone campaign
+            mock_run = AutomationRun(
+                scenario_id=scenario_id,
+                snapshot_id=dummy_snap.id,
+                user_id=self.owner_id,
+                status='success',
+                derived_campaign_id=clone_campaign.id
+            )
+            db.session.add(mock_run)
 
             clone_character = Character(
                 user_id=self.owner_id,
@@ -3399,6 +3422,327 @@ class AutomationRouteTest(unittest.TestCase):
 
         self.assertEqual(self.client.get(f'/api/automation/scenarios/{scenario_id}', headers=self.headers).status_code, 404)
         self.assertEqual(self.client.get(f'/api/automation/runs/{run_id2}', headers=self.headers).status_code, 404)
+
+    def test_delete_snapshot(self):
+        # Enable SQLite foreign key constraints explicitly for this test
+        with app.app_context():
+            db.session.execute(db.text("PRAGMA foreign_keys=ON"))
+
+        scenario_response = self.client.post(
+            '/api/automation/scenarios',
+            headers=self.headers,
+            json={'source_campaign_id': self.campaign_id, 'name': 'To Delete Snapshot'},
+        )
+        self.assertEqual(scenario_response.status_code, 201)
+        scenario_id = scenario_response.get_json()['scenario']['id']
+
+        try:
+            # Seed the source campaign with standard child rows before snapshotting
+            with app.app_context():
+                from models import (
+                    LootBox, CampaignShop, CampaignMemoryEmbedding, NPCActor, CampaignClock, WorldEvent, Campaign
+                )
+                # Add world event
+                db.session.add(WorldEvent(
+                    campaign_id=self.campaign_id,
+                    event_type='test',
+                    summary='A test world event',
+                    payload='{}',
+                ))
+                # Add memory embedding
+                db.session.add(CampaignMemoryEmbedding(
+                    campaign_id=self.campaign_id,
+                    item_type='note',
+                    item_id='note-1',
+                    canonical_text='Some text content',
+                    text_hash='hash',
+                    embedding_model='text-embedding-ada-002',
+                    embedding_dimensions=2,
+                    embedding_json='[0.1, 0.2]',
+                ))
+                # Add npc, clock, shop, lootbox
+                db.session.add(NPCActor(campaign_id=self.campaign_id, actor_id='npc-1', name='NPC Actor', dossier='Test dossier'))
+                db.session.add(CampaignClock(campaign_id=self.campaign_id, clock_id='clock-1', name='Clock', segments=8, filled=4))
+                db.session.add(CampaignShop(campaign_id=self.campaign_id, name='Shop', items_json='[]'))
+                db.session.add(LootBox(campaign_id=self.campaign_id, name='LootBox', items_json='[]', currency_json='{}'))
+                db.session.commit()
+
+            # Create the snapshot
+            snapshot_response = self.client.post(
+                f'/api/automation/scenarios/{scenario_id}/snapshots',
+                headers=self.headers,
+                json={},
+            )
+            self.assertEqual(snapshot_response.status_code, 201)
+            snapshot_id = snapshot_response.get_json()['snapshot']['id']
+            
+            # Create the run
+            run_response = self.client.post(
+                f'/api/automation/scenarios/{scenario_id}/runs',
+                headers=self.headers,
+                json={'snapshot_id': snapshot_id},
+            )
+            self.assertEqual(run_response.status_code, 201)
+            run_id = run_response.get_json()['run']['id']
+
+            # Seed scenario baseline run, cycle, and audit attempt
+            with app.app_context():
+                from models import AutomationScenario, AutomationRunAuditCycle, AutomationRunAuditAttempt
+                scen = db.session.get(AutomationScenario, scenario_id)
+                scen.baseline_run_id = run_id
+                
+                cycle = AutomationRunAuditCycle(
+                    run_id=run_id,
+                    cycle_number=1,
+                    phase='after_dm',
+                    status='audited',
+                    summary='Test cycle',
+                )
+                db.session.add(cycle)
+                db.session.flush()
+                
+                attempt = AutomationRunAuditAttempt(
+                    run_id=run_id,
+                    cycle_id=cycle.id,
+                    cycle_number=1,
+                    phase='after_dm',
+                    status='success',
+                )
+                db.session.add(attempt)
+                db.session.commit()
+
+            # Setup physical map files in the instance/encounter_maps directory
+            from services.encounter_map_service import encounter_map_storage_dir
+            storage_dir = encounter_map_storage_dir()
+            storage_dir.mkdir(parents=True, exist_ok=True)
+            
+            shared_map_file = storage_dir / 'mirror-dock.png'
+            shared_map_labeled = storage_dir / 'mirror-dock-labeled.png'
+            clone_only_file = storage_dir / 'clone-only.png'
+            
+            shared_map_file.write_text('shared')
+            shared_map_labeled.write_text('shared_labeled')
+            clone_only_file.write_text('clone_only')
+
+            # Materialize run campaign
+            with app.app_context():
+                from services.automation_service import materialize_run_campaign
+                from models import (
+                    AutomationRun, Campaign, CampaignMonster, CampaignAuditEvent,
+                    SessionDmTurn, CampaignMemoryRun, CampaignMemoryLog, EncounterMap
+                )
+                run = db.session.get(AutomationRun, run_id)
+                clone_campaign, character_map, preflight = materialize_run_campaign(run)
+                db.session.commit()
+                
+                clone_campaign_id = clone_campaign.id
+                
+                # Setup clone-only encounter map image
+                clone_map = EncounterMap.query.filter_by(campaign_id=clone_campaign_id).first()
+                if clone_map:
+                    clone_map.image_filename = 'clone-only.png'
+                
+                # Seed runtime-only rows
+                db.session.add(CampaignMonster(
+                    campaign_id=clone_campaign_id,
+                    monster_id="monster-1",
+                    name="Campaign Monster",
+                    stat_block="{}",
+                ))
+                db.session.add(CampaignAuditEvent(
+                    campaign_id=clone_campaign_id,
+                    event_type='dm_silence_chosen',
+                    source='session_messages',
+                    actor='session_dm',
+                    summary='Clone audit event',
+                ))
+                
+                clone_session = clone_campaign.sessions[0]
+                clone_session_id = clone_session.id
+                clone_msg = clone_session.messages[0]
+                
+                db.session.add(SessionDmTurn(
+                    campaign_id=clone_campaign_id,
+                    session_id=clone_session.id,
+                    player_message_id=clone_msg.id,
+                    status='pending',
+                ))
+                db.session.add(CampaignMemoryRun(
+                    memory_run_id='run-clone-1',
+                    campaign_id=clone_campaign_id,
+                ))
+                db.session.add(CampaignMemoryLog(
+                    campaign_id=clone_campaign_id,
+                    memory_run_id='run-clone-1',
+                    operation='create',
+                ))
+                db.session.commit()
+
+            # Delete the snapshot
+            delete_snapshot_response = self.client.delete(f'/api/automation/snapshots/{snapshot_id}', headers=self.headers)
+            self.assertEqual(delete_snapshot_response.status_code, 200)
+            self.assertTrue(delete_snapshot_response.get_json()['ok'])
+        finally:
+            with app.app_context():
+                db.session.execute(db.text("PRAGMA foreign_keys=OFF"))
+
+        # Verify all cascade-deleted tables are clean
+        with app.app_context():
+            from models import (
+                AutomationSnapshot, AutomationRun, AutomationScenario, AutomationRunAuditCycle, AutomationRunAuditAttempt, Campaign,
+                LLMPlayer, LootBox, SessionDmTurn, CampaignShop, CampaignMemoryRun, CampaignMemoryLog, SheetProposal,
+                Character, CharacterClass, CharacterSkill, CharacterSavingThrow, CharacterProficiency, CharacterFeature,
+                CharacterWeapon, CharacterEquipment, CharacterSpell, CharacterNote, CharacterResource, CharacterCompanion, CharacterCondition,
+                CampaignMonster, CampaignAuditEvent, EncounterMap
+            )
+            # Run-owned rows are gone
+            self.assertIsNone(db.session.get(AutomationSnapshot, snapshot_id))
+            self.assertIsNone(db.session.get(AutomationRun, run_id))
+            
+            # Clone-owned campaigns are gone
+            self.assertIsNone(db.session.get(Campaign, clone_campaign_id))
+            
+            # Baseline reference is nullified on scenario
+            scen = db.session.get(AutomationScenario, scenario_id)
+            self.assertIsNone(scen.baseline_run_id)
+            
+            # Derived campaign runtime-only table checks
+            self.assertEqual(CampaignMonster.query.filter_by(campaign_id=clone_campaign_id).count(), 0)
+            self.assertEqual(CampaignAuditEvent.query.filter_by(campaign_id=clone_campaign_id).count(), 0)
+            self.assertEqual(SessionDmTurn.query.filter_by(campaign_id=clone_campaign_id).count(), 0)
+            self.assertEqual(CampaignMemoryRun.query.filter_by(campaign_id=clone_campaign_id).count(), 0)
+            self.assertEqual(CampaignMemoryLog.query.filter_by(campaign_id=clone_campaign_id).count(), 0)
+            self.assertEqual(SheetProposal.query.filter_by(session_id=clone_session_id).count(), 0)
+            self.assertEqual(AutomationRunAuditCycle.query.filter_by(run_id=run_id).count(), 0)
+            self.assertEqual(AutomationRunAuditAttempt.query.filter_by(run_id=run_id).count(), 0)
+            
+            # Cloned characters and their classes/skills/saving throws sub-relations are gone
+            cloned_character_ids = [k for k in character_map.values()]
+            if cloned_character_ids:
+                self.assertEqual(Character.query.filter(Character.id.in_(cloned_character_ids)).count(), 0)
+                self.assertEqual(CharacterClass.query.filter(CharacterClass.character_id.in_(cloned_character_ids)).count(), 0)
+                self.assertEqual(CharacterSkill.query.filter(CharacterSkill.character_id.in_(cloned_character_ids)).count(), 0)
+                self.assertEqual(CharacterSavingThrow.query.filter(CharacterSavingThrow.character_id.in_(cloned_character_ids)).count(), 0)
+
+            # Source campaign and characters still exist
+            self.assertIsNotNone(db.session.get(Campaign, self.campaign_id))
+            source_char = Character.query.filter_by(campaign_id=self.campaign_id).first()
+            self.assertIsNotNone(source_char)
+            self.assertEqual(CharacterClass.query.filter_by(character_id=source_char.id).count(), 1)
+            
+            # Files verification
+            self.assertTrue(shared_map_file.exists())
+            self.assertTrue(shared_map_labeled.exists())
+            self.assertFalse(clone_only_file.exists())
+
+    def test_cleanup_scenario_retention_delete(self):
+        with app.app_context():
+            db.session.execute(db.text("PRAGMA foreign_keys=ON"))
+        try:
+            scenario_response = self.client.post(
+                '/api/automation/scenarios',
+                headers=self.headers,
+                json={'source_campaign_id': self.campaign_id, 'name': 'To Clean Scenario'},
+            )
+            scenario_id = scenario_response.get_json()['scenario']['id']
+
+            snapshot_id = self.client.post(
+                f'/api/automation/scenarios/{scenario_id}/snapshots',
+                headers=self.headers,
+                json={},
+            ).get_json()['snapshot']['id']
+            
+            run_response = self.client.post(
+                f'/api/automation/scenarios/{scenario_id}/runs',
+                headers=self.headers,
+                json={'snapshot_id': snapshot_id},
+            )
+            run_id = run_response.get_json()['run']['id']
+
+            # Materialize clone
+            with app.app_context():
+                from services.automation_service import materialize_run_campaign
+                from models import AutomationRun, Campaign
+                from datetime import datetime, UTC
+                run = db.session.get(AutomationRun, run_id)
+                run.status = 'completed'
+                run.finished_at = datetime.now(UTC)
+                clone, _, _ = materialize_run_campaign(run)
+                db.session.commit()
+                clone_id = clone.id
+
+            # Perform retention delete via cleanup endpoint
+            cleanup_response = self.client.post(
+                f'/api/automation/scenarios/{scenario_id}/cleanup',
+                headers=self.headers,
+                json={'action': 'delete', 'older_than_days': 0, 'keep_recent_runs': 0},
+            )
+            self.assertEqual(cleanup_response.status_code, 200)
+
+            # Verify database was cleaned up
+            with app.app_context():
+                self.assertIsNone(db.session.get(Campaign, clone_id))
+        finally:
+            with app.app_context():
+                db.session.execute(db.text("PRAGMA foreign_keys=OFF"))
+
+    def test_delete_source_campaign_with_scenario_fails(self):
+        # Create scenario referencing self.campaign_id
+        self.client.post(
+            '/api/automation/scenarios',
+            headers=self.headers,
+            json={'source_campaign_id': self.campaign_id, 'name': 'Referencing Scenario'},
+        )
+
+        # Deleting source campaign should fail with 400 because scenario references it
+        delete_response = self.client.delete(f'/api/campaigns/{self.campaign_id}', headers=self.headers)
+        self.assertEqual(delete_response.status_code, 400)
+        self.assertIn('references it', delete_response.get_json()['error'])
+
+    def test_delete_campaign_clone_directly_nullifies_run_reference(self):
+        with app.app_context():
+            db.session.execute(db.text("PRAGMA foreign_keys=ON"))
+        try:
+            scenario_response = self.client.post(
+                '/api/automation/scenarios',
+                headers=self.headers,
+                json={'source_campaign_id': self.campaign_id, 'name': 'To Clean Scenario'},
+            )
+            scenario_id = scenario_response.get_json()['scenario']['id']
+
+            snapshot_id = self.client.post(
+                f'/api/automation/scenarios/{scenario_id}/snapshots',
+                headers=self.headers,
+                json={},
+            ).get_json()['snapshot']['id']
+            
+            run_response = self.client.post(
+                f'/api/automation/scenarios/{scenario_id}/runs',
+                headers=self.headers,
+                json={'snapshot_id': snapshot_id},
+            )
+            run_id = run_response.get_json()['run']['id']
+
+            # Materialize clone
+            with app.app_context():
+                from services.automation_service import materialize_run_campaign
+                from models import AutomationRun, Campaign
+                from services.campaign_cleanup import delete_campaign_graph
+                run = db.session.get(AutomationRun, run_id)
+                clone, _, _ = materialize_run_campaign(run)
+                db.session.commit()
+                clone_id = clone.id
+
+                # Delete the campaign clone directly using delete_campaign_graph helper
+                delete_campaign_graph([clone_id], character_policy='delete')
+                db.session.commit()
+
+                # Verify run's derived campaign ID is nullified
+                run = db.session.get(AutomationRun, run_id)
+                self.assertIsNone(run.derived_campaign_id)
+        finally:
+            with app.app_context():
+                db.session.execute(db.text("PRAGMA foreign_keys=OFF"))
 
 
 if __name__ == '__main__':

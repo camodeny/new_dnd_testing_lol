@@ -635,14 +635,8 @@ def update_automation_scenario(current_user, scenario_id):
 
 
 def _delete_runs(run_ids):
-    if not run_ids:
-        return
-    AutomationRunAuditorJob.query.filter(AutomationRunAuditorJob.run_id.in_(run_ids)).delete(synchronize_session=False)
-    AutomationRunAuditCycle.query.filter(AutomationRunAuditCycle.run_id.in_(run_ids)).delete(synchronize_session=False)
-    AutomationRunProviderCall.query.filter(AutomationRunProviderCall.run_id.in_(run_ids)).delete(synchronize_session=False)
-    AutomationRunAuditResult.query.filter(AutomationRunAuditResult.run_id.in_(run_ids)).delete(synchronize_session=False)
-    AutomationRunEvent.query.filter(AutomationRunEvent.run_id.in_(run_ids)).delete(synchronize_session=False)
-    AutomationRun.query.filter(AutomationRun.id.in_(run_ids)).delete(synchronize_session=False)
+    from services.campaign_cleanup import delete_run_graph
+    delete_run_graph(run_ids)
 
 
 @automation_bp.route('/api/automation/scenarios/<int:scenario_id>', methods=['DELETE'])
@@ -652,7 +646,14 @@ def delete_automation_scenario(current_user, scenario_id):
     if not _scenario_owned_by_user(current_user, scenario):
         return jsonify({'error': 'Forbidden'}), 403
     run_ids = [run.id for run in AutomationRun.query.filter_by(scenario_id=scenario.id).all()]
-    _delete_runs(run_ids)
+    snapshot_ids = [snap.id for snap in AutomationSnapshot.query.filter_by(scenario_id=scenario.id).all()]
+    
+    from services.campaign_cleanup import delete_run_graph
+    try:
+        delete_run_graph(run_ids, ignore_snapshot_ids=snapshot_ids)
+    except ValueError as e:
+        return jsonify({'error': str(e)}), 400
+        
     AutomationSnapshot.query.filter_by(scenario_id=scenario.id).delete(synchronize_session=False)
     db.session.delete(scenario)
     db.session.commit()
@@ -683,12 +684,18 @@ def create_automation_snapshot(current_user, scenario_id):
     if not _scenario_owned_by_user(current_user, scenario):
         return jsonify({'error': 'Forbidden'}), 403
     data = request.get_json(silent=True) or {}
-    snapshot = create_snapshot_for_scenario(
-        scenario,
-        label=data.get('label'),
-        summary=data.get('summary'),
-        source_session_id=data.get('source_session_id'),
-    )
+    try:
+        snapshot = create_snapshot_for_scenario(
+            scenario,
+            label=data.get('label'),
+            summary=data.get('summary'),
+            source_session_id=data.get('source_session_id'),
+        )
+        db.session.commit()
+    except ValueError as e:
+        db.session.rollback()
+        return jsonify({'error': str(e)}), 400
+        
     append_workspace_event(
         current_user.id,
         'snapshot_created',
@@ -706,12 +713,18 @@ def cleanup_automation_scenario(current_user, scenario_id):
     if not _scenario_owned_by_user(current_user, scenario):
         return jsonify({'error': 'Forbidden'}), 403
     data = request.get_json(silent=True) or {}
-    result = cleanup_hidden_clone_campaigns(
-        scenario,
-        action=data.get('action'),
-        older_than_days=data.get('older_than_days'),
-        keep_recent_runs=data.get('keep_recent_runs'),
-    )
+    try:
+        result = cleanup_hidden_clone_campaigns(
+            scenario,
+            action=data.get('action'),
+            older_than_days=data.get('older_than_days'),
+            keep_recent_runs=data.get('keep_recent_runs'),
+        )
+        db.session.commit()
+    except ValueError as e:
+        db.session.rollback()
+        return jsonify({'error': str(e)}), 400
+        
     append_workspace_event(
         current_user.id,
         'scenario_cleanup',
@@ -801,14 +814,50 @@ def delete_automation_run(current_user, run_id):
     if not _run_owned_by_user(current_user, run):
         return jsonify({'error': 'Forbidden'}), 403
     scenario_id = run.scenario_id
-    _delete_runs([run.id])
-    db.session.commit()
+    try:
+        _delete_runs([run.id])
+        db.session.commit()
+    except ValueError as e:
+        db.session.rollback()
+        return jsonify({'error': str(e)}), 400
     append_workspace_event(
         current_user.id,
         'run_deleted',
         {'type': 'run_deleted', 'run_id': run_id, 'scenario_id': scenario_id},
         resource_type='run',
         resource_id=run_id,
+    )
+    return jsonify({'ok': True}), 200
+
+
+@automation_bp.route('/api/automation/snapshots/<int:snapshot_id>', methods=['DELETE'])
+@token_required
+def delete_automation_snapshot(current_user, snapshot_id):
+    snapshot = get_or_404(AutomationSnapshot, snapshot_id)
+    if not _scenario_owned_by_user(current_user, snapshot.scenario):
+        return jsonify({'error': 'Forbidden'}), 403
+    
+    scenario_id = snapshot.scenario_id
+    # Nullify any campaigns referencing this snapshot
+    Campaign.query.filter_by(automation_source_snapshot_id=snapshot.id).update({'automation_source_snapshot_id': None}, synchronize_session=False)
+    
+    # Delete runs referencing this snapshot
+    run_ids = [run.id for run in AutomationRun.query.filter_by(snapshot_id=snapshot.id).all()]
+    from services.campaign_cleanup import delete_run_graph
+    try:
+        delete_run_graph(run_ids, ignore_snapshot_ids=[snapshot.id])
+    except ValueError as e:
+        return jsonify({'error': str(e)}), 400
+    
+    db.session.delete(snapshot)
+    db.session.commit()
+    
+    append_workspace_event(
+        current_user.id,
+        'snapshot_deleted',
+        {'type': 'snapshot_deleted', 'snapshot_id': snapshot_id, 'scenario_id': scenario_id},
+        resource_type='snapshot',
+        resource_id=snapshot_id,
     )
     return jsonify({'ok': True}), 200
 
