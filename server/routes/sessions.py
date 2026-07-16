@@ -179,7 +179,6 @@ def _run_session_memory_update(
                     audit_context=memory_audit_context,
                 )
             else:
-                from services.session_memory_agent import MemoryPipelineError
                 raise MemoryPipelineError(
                     stage="validation",
                     code="invalid_contract",
