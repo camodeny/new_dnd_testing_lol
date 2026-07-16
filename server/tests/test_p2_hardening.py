@@ -233,6 +233,27 @@ class P2HardeningTest(unittest.TestCase):
         result = apply_memory_patch(self.campaign, self.session, patch)
         self.assertIn('graph_changes', result)
 
+    def test_non_dict_patch_raises_validation_error(self):
+        with self.assertRaises(MemoryPipelineError) as ctx:
+            apply_memory_patch(self.campaign, self.session, 'not_a_dict')
+        self.assertEqual(ctx.exception.stage, 'validation')
+
+    def test_non_list_collection_raises_validation_error(self):
+        patch = {
+            'upsert_graph_entities': 'not_a_list',
+        }
+        with self.assertRaises(MemoryPipelineError) as ctx:
+            apply_memory_patch(self.campaign, self.session, patch)
+        self.assertEqual(ctx.exception.stage, 'validation')
+
+    def test_non_dict_entry_raises_validation_error(self):
+        patch = {
+            'upsert_graph_entities': ['not_a_dict'],
+        }
+        with self.assertRaises(MemoryPipelineError) as ctx:
+            apply_memory_patch(self.campaign, self.session, patch)
+        self.assertEqual(ctx.exception.stage, 'validation')
+
 
 if __name__ == '__main__':
     unittest.main()

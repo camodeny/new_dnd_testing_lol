@@ -154,14 +154,55 @@ class MemoryPipelineErrorTest(unittest.TestCase):
         self.assertEqual(ctx.exception.code, 'missing_campaign')
 
     def test_telemetry_includes_pipeline_mode_and_build_sha(self):
+        fake_compiled = {
+            'running_summary': 'summary',
+            'memory_anchors': {'current_goal': 'goal'},
+            'scene_patch': {'location_id': 'loc1'},
+            'upsert_graph_entities': [{'id': 'e1', 'name': 'test entity', 'type': 'other'}],
+            'upsert_graph_relations': [{'id': 'r1', 'type': 'knows', 'source_id': 'e1', 'target_id': 'e2'}],
+            'upsert_graph_facts': [{'id': 'f1', 'text': 'a fact', 'entity_ids': ['e1']}],
+            'create_clocks': [{'id': 'c1', 'name': 'clock', 'segments': 4, 'filled': 0}],
+            'retire_clocks': [],
+            'update_npc_actors': [{'id': 'npc1', 'name': 'npc'}],
+            'record_events': [{'event_type': 'test_event', 'summary': 'an event'}],
+            'unresolved_items': [],
+            'compile_summary': {},
+        }
         with patch('openrouter.SESSION_MEMORY_MODE', 'staged'), \
                 patch('openrouter._get_cached_build_sha', return_value='abc12345'), \
                 patch('openrouter.get_llm_provider', return_value='test_provider'), \
-                patch('openrouter.get_llm_model', return_value='test_model'):
+                patch('openrouter.get_llm_model', return_value='test_model'), \
+                patch('openrouter._get_session_memory_patch_staged', return_value=fake_compiled), \
+                patch('openrouter.log_audit_event') as log_mock:
+            patch_data = get_session_memory_patch(
+                {'campaign_id': 1, 'session_id': 1},
+                audit_context={'campaign_id': 1},
+            )
+            self.assertIsNotNone(patch_data)
+            self.assertEqual(patch_data['_telemetry']['pipeline_mode'], 'staged_memory_writer')
+            self.assertEqual(patch_data['_telemetry']['provider'], 'test_provider')
+            self.assertEqual(patch_data['_telemetry']['model'], 'test_model')
+            self.assertEqual(patch_data['_telemetry']['build_sha'], 'abc12345')
+            self.assertEqual(patch_data['_telemetry']['pipeline_status'], 'success')
+
+    def test_failure_telemetry_includes_stage_and_code(self):
+        from openrouter import _get_session_memory_patch_staged
+        with patch('openrouter.build_session_memory_extractor_messages', return_value=[]), \
+                patch('openrouter._request_session_memory_json', side_effect=Exception('down')), \
+                patch('openrouter.get_llm_provider', return_value='test_p'), \
+                patch('openrouter.log_audit_event') as log_mock:
             try:
-                get_session_memory_patch({'campaign_id': 1, 'session_id': 1})
-            except Exception:
-                pass
+                _get_session_memory_patch_staged(
+                    {'campaign_id': 1, 'session_id': 1},
+                    {},
+                    {'some_existing_key': 'value'},
+                )
+            except MemoryPipelineError as err:
+                self.assertEqual(err.stage, 'extraction')
+                self.assertEqual(err.code, 'extractor_provider_error')
+                self.assertEqual(err.telemetry.get('some_existing_key'), 'value')
+            else:
+                self.fail('Expected MemoryPipelineError')
 
     def test_extraction_blank_response_raises_error(self):
         from openrouter import _get_session_memory_patch_staged
@@ -244,25 +285,43 @@ class MemoryPipelineErrorTest(unittest.TestCase):
             self.assertEqual(ctx.exception.stage, 'clock_generation')
 
     def test_both_providers_use_same_staged_pipeline(self):
+        non_empty_patch = {
+            'running_summary': 'summary text',
+            'memory_anchors': {'current_goal': 'find the relic'},
+            'scene_patch': {'location_id': 'temple', 'location_name': 'The Temple'},
+            'upsert_graph_entities': [
+                {'id': 'entity1', 'name': 'Test Entity', 'type': 'other',
+                 'visibility': 'party_known', 'certainty': 'confirmed'},
+            ],
+            'upsert_graph_relations': [
+                {'id': 'rel1', 'type': 'knows', 'source_id': 'entity1', 'target_id': 'entity2',
+                 'visibility': 'dm_private', 'certainty': 'suspected'},
+            ],
+            'upsert_graph_facts': [
+                {'id': 'fact1', 'text': 'A fact was discovered.', 'entity_ids': ['entity1'],
+                 'visibility': 'public', 'certainty': 'confirmed'},
+            ],
+            'create_clocks': [{'id': 'clock1', 'name': 'Clock', 'segments': 4, 'filled': 0}],
+            'retire_clocks': [],
+            'update_npc_actors': [
+                {'id': 'npc1', 'name': 'NPC Name', 'role': 'witness',
+                 'visibility': 'party_known', 'certainty': 'confirmed'},
+            ],
+            'record_events': [
+                {'event_type': 'discovery', 'summary': 'Something was discovered.',
+                 'visibility': 'party_known', 'certainty': 'confirmed'},
+            ],
+            'unresolved_items': [],
+            'compile_summary': {'accepted_fact_count': 1, 'skipped_fact_count': 0},
+        }
         for provider in ('openrouter', 'opencode_go'):
             with patch('openrouter.SESSION_MEMORY_MODE', 'staged'), \
                     patch('openrouter.get_llm_provider', return_value=provider), \
                     patch('openrouter.get_llm_model', return_value='test-model'), \
                     patch('openrouter._get_cached_build_sha', return_value='test_sha'), \
-                    patch('openrouter.log_audit_event') as log_mock, \
+                    patch('openrouter.log_audit_event'), \
                     patch('openrouter._get_session_memory_patch_staged') as staged_mock:
-                staged_mock.return_value = {
-                    'running_summary': 'test',
-                    'memory_anchors': {},
-                    'scene_patch': {},
-                    'upsert_graph_entities': [],
-                    'upsert_graph_relations': [],
-                    'upsert_graph_facts': [],
-                    'create_clocks': [],
-                    'retire_clocks': [],
-                    'update_npc_actors': [],
-                    'record_events': [],
-                }
+                staged_mock.return_value = dict(non_empty_patch)
                 patch_data = get_session_memory_patch(
                     {'campaign_id': 1, 'session_id': 1},
                     audit_context={'campaign_id': 1, 'trace_id': f'test_{provider}'},
@@ -271,7 +330,86 @@ class MemoryPipelineErrorTest(unittest.TestCase):
                 self.assertEqual(patch_data['_telemetry']['pipeline_mode'], 'staged_memory_writer')
                 self.assertEqual(patch_data['_telemetry']['provider'], provider)
                 self.assertEqual(patch_data['_telemetry']['build_sha'], 'test_sha')
+                self.assertEqual(patch_data['running_summary'], 'summary text')
+                self.assertEqual(len(patch_data['upsert_graph_entities']), 1)
+                self.assertEqual(len(patch_data['upsert_graph_relations']), 1)
+                self.assertEqual(len(patch_data['upsert_graph_facts']), 1)
+                self.assertEqual(len(patch_data['update_npc_actors']), 1)
+                self.assertEqual(len(patch_data['record_events']), 1)
                 staged_mock.assert_called_once()
+
+    def test_invalid_session_memory_mode_fails_startup(self):
+        import subprocess
+        server_dir = os.path.dirname(os.path.dirname(__file__))
+        proc = subprocess.run(
+            [sys.executable, '-c', 'import openrouter'],
+            capture_output=True,
+            text=True,
+            timeout=10,
+            cwd=server_dir,
+            env={**os.environ, 'SESSION_MEMORY_MODE': 'legacy', 'PYTHONPATH': '.'},
+        )
+        combined = proc.stderr + proc.stdout
+        self.assertNotEqual(proc.returncode, 0)
+        self.assertIn('SESSION_MEMORY_MODE', combined)
+        self.assertIn('not supported', combined)
+
+    def test_no_legacy_symbols_importable(self):
+        legacy_names = [
+            '_should_use_staged_session_memory',
+            '_fallback_session_memory_patch',
+            '_session_memory_patch_has_substance',
+            '_mark_memory_fallback_active',
+            '_get_session_memory_patch_opencode_go',
+            '_compile_telemetry_summary',
+            'build_session_memory_messages',
+            '_session_memory_retry_messages',
+            '_session_memory_summary_scene_retry_messages',
+            'build_session_memory_summary_scene_messages',
+            'build_session_memory_facts_messages',
+            '_merge_session_running_summary',
+        ]
+        import openrouter
+        for name in legacy_names:
+            self.assertFalse(
+                hasattr(openrouter, name),
+                f'Legacy symbol {name} should not be importable from openrouter',
+            )
+
+    def test_success_audit_includes_pipeline_mode_and_build_sha(self):
+        fake_compiled = {
+            'running_summary': 'summary',
+            'memory_anchors': {},
+            'scene_patch': {},
+            'upsert_graph_entities': [],
+            'upsert_graph_relations': [],
+            'upsert_graph_facts': [],
+            'create_clocks': [],
+            'retire_clocks': [],
+            'update_npc_actors': [],
+            'record_events': [],
+            'unresolved_items': [],
+            'compile_summary': {},
+        }
+        with patch('openrouter.SESSION_MEMORY_MODE', 'staged'), \
+                patch('openrouter._get_cached_build_sha', return_value='buildabc'), \
+                patch('openrouter.get_llm_provider', return_value='my_provider'), \
+                patch('openrouter.get_llm_model', return_value='my_model'), \
+                patch('openrouter._get_session_memory_patch_staged', return_value=fake_compiled), \
+                patch('openrouter.log_audit_event') as log_mock:
+            get_session_memory_patch(
+                {'campaign_id': 1, 'session_id': 1},
+                audit_context={'campaign_id': 1, 'trace_id': 'tr1'},
+            )
+            request_calls = [
+                call for call in log_mock.call_args_list
+                if call[0][1] == 'memory_writer_request'
+            ]
+            self.assertEqual(len(request_calls), 1)
+            telemetry = request_calls[0][0][3].get('telemetry', {})
+            self.assertEqual(telemetry.get('pipeline_mode'), 'staged_memory_writer')
+            self.assertEqual(telemetry.get('provider'), 'my_provider')
+            self.assertEqual(telemetry.get('build_sha'), 'buildabc')
 
 
 class ClockAdjudicatorTest(unittest.TestCase):

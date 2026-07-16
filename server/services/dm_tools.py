@@ -5195,11 +5195,16 @@ def apply_memory_patch(campaign, session, patch, audit_context=None):
     telemetry = raw_patch.pop('_telemetry', None) if isinstance(patch, dict) else None
     if isinstance(audit_context, dict):
         audit_context['telemetry'] = telemetry
-    unresolved_items = raw_patch.get('unresolved_items') if isinstance(raw_patch.get('unresolved_items'), list) else []
-    compile_summary = raw_patch.get('compile_summary') if isinstance(raw_patch.get('compile_summary'), dict) else None
-    evidence_basis = raw_patch.get('evidence_basis') if isinstance(raw_patch.get('evidence_basis'), list) else []
 
-    for collection_key in (
+    if not isinstance(patch, dict):
+        raise MemoryPipelineError(
+            stage='validation',
+            code='validation_error',
+            message='Memory patch is not a dict.',
+            telemetry=telemetry,
+        )
+
+    contract_collections = (
         'upsert_graph_entities',
         'upsert_graph_relations',
         'upsert_graph_facts',
@@ -5207,40 +5212,48 @@ def apply_memory_patch(campaign, session, patch, audit_context=None):
         'record_events',
         'create_clocks',
         'retire_clocks',
-    ):
-        items = raw_patch.get(collection_key)
-        if not isinstance(items, list):
-            continue
-        for item in items:
-            if not isinstance(item, dict):
-                continue
-            vis = item.get('visibility')
-            if isinstance(vis, str) and vis not in VALID_MEMORY_VISIBILITIES:
-                raise MemoryPipelineError(
-                    stage='validation',
-                    code='validation_error',
-                    message=f'Invalid visibility {vis!r} in {collection_key}.',
-                    telemetry=telemetry,
-                )
-            cert = item.get('certainty')
-            if isinstance(cert, str) and cert not in VALID_MEMORY_CERTAINTIES:
-                raise MemoryPipelineError(
-                    stage='validation',
-                    code='validation_error',
-                    message=f'Invalid certainty {cert!r} in {collection_key}.',
-                    telemetry=telemetry,
-                )
+    )
+    for collection_key in contract_collections:
+        items = patch.get(collection_key)
+        if items is not None and not isinstance(items, list):
+            raise MemoryPipelineError(
+                stage='validation',
+                code='validation_error',
+                message=f'{collection_key} is not a list.',
+                telemetry=telemetry,
+            )
+        if isinstance(items, list):
+            for item in items:
+                if not isinstance(item, dict):
+                    raise MemoryPipelineError(
+                        stage='validation',
+                        code='validation_error',
+                        message=f'Entry in {collection_key} is not a dict.',
+                        telemetry=telemetry,
+                    )
+                vis = item.get('visibility')
+                if isinstance(vis, str) and vis not in VALID_MEMORY_VISIBILITIES:
+                    raise MemoryPipelineError(
+                        stage='validation',
+                        code='validation_error',
+                        message=f'Invalid visibility {vis!r} in {collection_key}.',
+                        telemetry=telemetry,
+                    )
+                cert = item.get('certainty')
+                if isinstance(cert, str) and cert not in VALID_MEMORY_CERTAINTIES:
+                    raise MemoryPipelineError(
+                        stage='validation',
+                        code='validation_error',
+                        message=f'Invalid certainty {cert!r} in {collection_key}.',
+                        telemetry=telemetry,
+                    )
+
+    unresolved_items = raw_patch.get('unresolved_items') if isinstance(raw_patch.get('unresolved_items'), list) else []
+    compile_summary = raw_patch.get('compile_summary') if isinstance(raw_patch.get('compile_summary'), dict) else None
+    evidence_basis = raw_patch.get('evidence_basis') if isinstance(raw_patch.get('evidence_basis'), list) else []
 
     patch = _normalize_memory_patch(patch)
     patch = _apply_memory_visibility_policy(campaign, patch, audit_context)
-
-    if not isinstance(patch, dict):
-        raise MemoryPipelineError(
-            stage='validation',
-            code='validation_error',
-            message='Memory patch is not a dict after normalization.',
-            telemetry=telemetry,
-        )
 
     # Initialize memory run ID and turn ID tracking
     memory_run_id = audit_context.get('memory_run_id') or f"memrun_{uuid.uuid4().hex[:12]}"
