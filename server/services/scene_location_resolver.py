@@ -60,9 +60,42 @@ def resolve_scene_location_patch(scene_patch, campaign, current_scene):
         }
 
     if proposed_id == current_id and proposed_name and proposed_name != current_name:
+        # Same location ID but proposed a different name.
+        # Check if the proposed name matches a DIFFERENT known location.
+        for loc in canonical_locations:
+            if loc.get("name", "").lower() == proposed_name.lower() and loc["id"] != current_id:
+                return {
+                    "status": "unresolved",
+                    "location_id": proposed_id,
+                    "location_name": proposed_name,
+                }
+        # Not a conflict — treat as direct (name update for same location)
         return {
             "status": "direct",
             "location_id": current_id,
+            "location_name": proposed_name,
+        }
+
+    if proposed_id and proposed_name:
+        # Check if this ID already exists but with a different name
+        for loc in canonical_locations:
+            if loc["id"] == proposed_id and loc.get("name", "").lower() != proposed_name.lower():
+                return {
+                    "status": "unresolved",
+                    "location_id": proposed_id,
+                    "location_name": proposed_name,
+                }
+        # Check if this name matches a different existing location
+        for loc in canonical_locations:
+            if loc.get("name", "").lower() == proposed_name.lower() and loc["id"] != proposed_id:
+                return {
+                    "status": "unresolved",
+                    "location_id": proposed_id,
+                    "location_name": proposed_name,
+                }
+        return {
+            "status": "new",
+            "location_id": proposed_id,
             "location_name": proposed_name,
         }
 
@@ -74,13 +107,6 @@ def resolve_scene_location_patch(scene_patch, campaign, current_scene):
         return {
             "status": "new",
             "location_id": proposed_id or clean_id(proposed_name.lower().replace(" ", "_"), ""),
-            "location_name": proposed_name,
-        }
-
-    if proposed_id and proposed_name:
-        return {
-            "status": "new",
-            "location_id": proposed_id,
             "location_name": proposed_name,
         }
 

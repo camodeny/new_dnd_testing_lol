@@ -148,10 +148,8 @@ def _run_session_memory_update(
             ai_text,
             hot_context,
         )
-        if isinstance(resolver_packet, dict):
-            memory_context['resolver_packet'] = resolver_packet
-        elif dm_message_id:
-            # Try to load committed packet from storage for replay/retry
+        # Load committed packet from storage — this is the canonical source
+        if dm_message_id:
             try:
                 from models import CampaignResolverPacket
                 stored = CampaignResolverPacket.query.filter_by(
@@ -163,6 +161,9 @@ def _run_session_memory_update(
                     memory_context['resolver_packet'] = stored.packet_json
             except Exception:
                 pass
+        # Fall back to transient argument only if storage had nothing
+        if 'resolver_packet' not in memory_context and isinstance(resolver_packet, dict):
+            memory_context['resolver_packet'] = resolver_packet
 
         memory_audit_context = {
             'campaign_id': campaign.id,
