@@ -6089,6 +6089,15 @@ def apply_compiled_session_memory_patch(campaign, session, patch, audit_context=
     if isinstance(clarification_requests, list):
         persist_clarification_requests(clarification_requests, campaign)
 
+    consumed_clarification_ids = patch.get("consumed_clarification_ids")
+    if isinstance(consumed_clarification_ids, list) and consumed_clarification_ids:
+        clars = CampaignClarification.query.filter(
+            CampaignClarification.campaign_id == campaign.id,
+            CampaignClarification.clarification_id.in_(consumed_clarification_ids),
+        ).all()
+        for clar in clars:
+            clar.status = "resolved"
+
     resolution_records = patch.get("resolution_records")
     if isinstance(resolution_records, list):
         persist_identity_resolutions(resolution_records, campaign)

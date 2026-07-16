@@ -58,6 +58,7 @@ CLARIFICATION_STATUSES = {
     "answered",
     "dismissed",
     "obsolete",
+    "resolved",
 }
 
 # ── Memory Run Statuses ───────────────────────────────────────────────
@@ -224,7 +225,7 @@ def validate_identity_resolution(record):
     for field in required:
         if field not in record:
             return False, f"missing required field: {field}"
-    if record["resolution_action"] not in ("same_identity", "distinct_identity", "retconned"):
+    if record["resolution_action"] not in ("same_identity", "distinct_identity", "retconned", "add_alias"):
         return False, f"invalid resolution_action: {record['resolution_action']!r}"
     return True, None
 

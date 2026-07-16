@@ -167,9 +167,11 @@ def _index_prior_resolutions(prior_resolutions):
         if mention_entity_id:
             result[mention_entity_id] = res
             result[mention_entity_id.lower()] = res
-        mention_name = clean_text(res.get("mention_name"), 400)
-        if mention_name:
-            result[mention_name.lower()] = res
+        # Only index by mention_name globally if it's an explicit alias (resolution_action == "add_alias")
+        if res.get("resolution_action") == "add_alias":
+            mention_name = clean_text(res.get("mention_name"), 400)
+            if mention_name:
+                result[mention_name.lower()] = res
     return result
 
 
@@ -296,15 +298,14 @@ def _resolve_packet_mention(mention, known_ids, prior_resolution_map, allocated_
 
     elif identity_status == "candidate_existing_entity":
         if canonical_id_from_packet and canonical_id_from_packet in known_ids.get("entity_ids", set()):
-            entry["decision"] = "defer_resolution"
-            entry["resolution_state"] = "deferred_resolution"
-            entry["canonical_id"] = None
-            entry["blocked_operations"] = ["identity_merge", "npc_update"]
+            entry["canonical_id"] = canonical_id_from_packet
+            entry["canonical_name"] = public_name
+            entry["decision"] = "reuse_existing"
+            entry["resolution_state"] = "resolved"
         else:
-            entry["canonical_id"] = allocate_durable_id(surface_form, allocated_ids)
-            entry["canonical_name"] = surface_form
-            entry["decision"] = "create_provisional"
-            entry["resolution_state"] = "provisional"
+            entry["decision"] = "request_clarification"
+            entry["resolution_state"] = "clarification_requested"
+            entry["blocked_operations"] = ["identity_merge", "npc_update"]
 
     else:
         entry["decision"] = "create_provisional"
@@ -463,7 +464,11 @@ def _apply_clarification_answer(pending_clarification, known_ids, allocated_ids)
             "surface_form": pending_clarification.get("mention_entity_id", mention_ref),
             "identity_status": "known_hidden",
             "visibility": "dm_private",
-            "evidence": [{"source": "clarification_answer", "field": "resolved_canonical_id"}],
+            "evidence": [{
+                "source": "clarification_answer",
+                "field": "resolved_canonical_id",
+                "clarification_id": pending_clarification.get("clarification_id")
+            }],
             "canonical_id": resolved_canonical_id,
             "canonical_name": resolved_canonical_id,
             "decision": "reuse_existing",
@@ -480,7 +485,11 @@ def _apply_clarification_answer(pending_clarification, known_ids, allocated_ids)
             "surface_form": pending_clarification.get("mention_entity_id", mention_ref),
             "identity_status": "provisional_new_entity",
             "visibility": "party_known",
-            "evidence": [{"source": "clarification_answer", "field": "new_entity"}],
+            "evidence": [{
+                "source": "clarification_answer",
+                "field": "new_entity",
+                "clarification_id": pending_clarification.get("clarification_id")
+            }],
             "canonical_id": new_id,
             "canonical_name": pending_clarification.get("mention_entity_id", ""),
             "decision": "create_new",
@@ -597,9 +606,10 @@ def persist_clarification_requests(clarification_requests, campaign):
     if not campaign or not clarification_requests:
         return
     from models import CampaignClarification, db
+    existing = CampaignClarification.query.filter_by(campaign_id=campaign.id).all()
     existing_keys = {
         row.idempotency_key
-        for row in CampaignClarification.query.filter_by(campaign_id=campaign.id).all()
+        for row in existing
         if row.idempotency_key
     }
     for cr in clarification_requests:
@@ -608,12 +618,19 @@ def persist_clarification_requests(clarification_requests, campaign):
         idempotency_key = cr.get("idempotency_key", "")
         if idempotency_key in existing_keys:
             continue
+        new_id = cr["clarification_id"]
+        mention_ref = cr["mention_ref"]
+        # Obsolete older pending clarifications for the same mention_ref
+        for row in existing:
+            if row.mention_ref == mention_ref and row.status == "pending" and row.clarification_id != new_id:
+                row.status = "obsolete"
+                row.obsoleted_by_clarification_id = new_id
         model = CampaignClarification(
             campaign_id=campaign.id,
-            clarification_id=cr["clarification_id"],
+            clarification_id=new_id,
             idempotency_key=idempotency_key,
             kind=cr["kind"],
-            mention_ref=cr["mention_ref"],
+            mention_ref=mention_ref,
             mention_entity_id=cr.get("mention_entity_id"),
             question=cr["question"],
             candidate_ids=cr.get("candidate_ids"),

@@ -149,21 +149,60 @@ def _run_session_memory_update(
             hot_context,
         )
         # Load committed packet from storage — this is the canonical source
+        # Load committed packet from storage — this is the canonical source
         if dm_message_id:
+            from models import CampaignResolverPacket
             try:
-                from models import CampaignResolverPacket
                 stored = CampaignResolverPacket.query.filter_by(
                     campaign_id=campaign.id,
                     dm_message_id=dm_message_id,
                     status='committed',
                 ).order_by(CampaignResolverPacket.id.desc()).first()
-                if stored and isinstance(stored.packet_json, dict):
-                    memory_context['resolver_packet'] = stored.packet_json
-            except Exception:
-                pass
-        # Fall back to transient argument only if storage had nothing
-        if 'resolver_packet' not in memory_context and isinstance(resolver_packet, dict):
-            memory_context['resolver_packet'] = resolver_packet
+            except Exception as e:
+                # database read failure fails the run
+                raise MemoryPipelineError(
+                    stage="ingest_resolver_packet",
+                    code="packet_storage_read_error",
+                    message=f"Failed to read committed resolver packet from database: {e}",
+                    telemetry={"dm_message_id": dm_message_id, "error": str(e)},
+                )
+
+            if stored:
+                if not isinstance(stored.packet_json, dict):
+                    raise MemoryPipelineError(
+                        stage="ingest_resolver_packet",
+                        code="malformed_stored_packet",
+                        message="Stored resolver packet is not a valid JSON dictionary.",
+                        telemetry={"dm_message_id": dm_message_id},
+                    )
+                memory_context['resolver_packet'] = stored.packet_json
+
+                # Check for transient/stored mismatch
+                if isinstance(resolver_packet, dict) and resolver_packet:
+                    if stored.packet_json != resolver_packet:
+                        raise MemoryPipelineError(
+                            stage="ingest_resolver_packet",
+                            code="packet_mismatch",
+                            message="Transient resolver packet does not match the canonical stored packet.",
+                            telemetry={
+                                "dm_message_id": dm_message_id,
+                                "stored": stored.packet_json,
+                                "transient": resolver_packet,
+                            },
+                        )
+            else:
+                # No stored packet in database. If transient packet is provided and non-empty, we have a mismatch
+                if isinstance(resolver_packet, dict) and resolver_packet:
+                    raise MemoryPipelineError(
+                        stage="ingest_resolver_packet",
+                        code="packet_missing_in_storage",
+                        message="Resolver packet was provided transiently but is missing from storage.",
+                        telemetry={"dm_message_id": dm_message_id, "transient": resolver_packet},
+                    )
+        else:
+            # Fall back to transient argument only if there is definitively no committed packet
+            if isinstance(resolver_packet, dict):
+                memory_context['resolver_packet'] = resolver_packet
 
         memory_audit_context = {
             'campaign_id': campaign.id,
@@ -1072,5 +1111,124 @@ sessions_bp.add_url_rule(
 sessions_bp.add_url_rule(
     '/api/sessions/<int:session_id>/proposals/<int:proposal_id>/dismiss',
     view_func=_dismiss_sheet_proposal,
+    methods=['POST'],
+)
+
+
+@token_required
+def _get_campaign_clarifications(current_user, campaign_id):
+    from models import CampaignClarification
+    campaign = db.session.get(Campaign, campaign_id)
+    if not campaign:
+        return jsonify({'error': 'Campaign not found.'}), 404
+
+    is_dm = campaign.user_id == current_user.id
+    if not is_dm:
+        return jsonify({'error': 'Forbidden'}), 403
+
+    clarifications = CampaignClarification.query.filter_by(campaign_id=campaign_id).all()
+    return jsonify([c.to_dict() for c in clarifications]), 200
+
+
+@token_required
+def _answer_campaign_clarification(current_user, campaign_id, clarification_id):
+    from models import CampaignClarification
+    campaign = db.session.get(Campaign, campaign_id)
+    if not campaign:
+        return jsonify({'error': 'Campaign not found.'}), 404
+
+    is_dm = campaign.user_id == current_user.id
+    if not is_dm:
+        return jsonify({'error': 'Forbidden'}), 403
+
+    clar = CampaignClarification.query.filter_by(
+        campaign_id=campaign_id, clarification_id=clarification_id
+    ).first()
+    if not clar:
+        return jsonify({'error': 'Clarification not found.'}), 404
+
+    data = request.get_json() or {}
+    answer = data.get("answer", "")
+    resolved_canonical_id = data.get("resolved_canonical_id")
+    resolution_action = data.get("resolution_action")
+    resolution_patch = data.get("resolution_patch")
+
+    clar.status = "answered"
+    clar.answer = answer
+    clar.resolved_canonical_id = resolved_canonical_id
+    clar.resolution_action = resolution_action
+    clar.resolution_patch_json = resolution_patch
+    clar.answered_by = current_user.username
+    clar.answered_at = utcnow()
+
+    db.session.commit()
+    return jsonify(clar.to_dict()), 200
+
+
+@token_required
+def _dismiss_campaign_clarification(current_user, campaign_id, clarification_id):
+    from models import CampaignClarification
+    campaign = db.session.get(Campaign, campaign_id)
+    if not campaign:
+        return jsonify({'error': 'Campaign not found.'}), 404
+
+    is_dm = campaign.user_id == current_user.id
+    if not is_dm:
+        return jsonify({'error': 'Forbidden'}), 403
+
+    clar = CampaignClarification.query.filter_by(
+        campaign_id=campaign_id, clarification_id=clarification_id
+    ).first()
+    if not clar:
+        return jsonify({'error': 'Clarification not found.'}), 404
+
+    clar.status = "dismissed"
+    clar.dismissed_at = utcnow()
+
+    db.session.commit()
+    return jsonify(clar.to_dict()), 200
+
+
+@token_required
+def _obsolete_campaign_clarification(current_user, campaign_id, clarification_id):
+    from models import CampaignClarification
+    campaign = db.session.get(Campaign, campaign_id)
+    if not campaign:
+        return jsonify({'error': 'Campaign not found.'}), 404
+
+    is_dm = campaign.user_id == current_user.id
+    if not is_dm:
+        return jsonify({'error': 'Forbidden'}), 403
+
+    clar = CampaignClarification.query.filter_by(
+        campaign_id=campaign_id, clarification_id=clarification_id
+    ).first()
+    if not clar:
+        return jsonify({'error': 'Clarification not found.'}), 404
+
+    clar.status = "obsolete"
+
+    db.session.commit()
+    return jsonify(clar.to_dict()), 200
+
+
+sessions_bp.add_url_rule(
+    '/api/campaigns/<int:campaign_id>/clarifications',
+    view_func=_get_campaign_clarifications,
+    methods=['GET'],
+)
+sessions_bp.add_url_rule(
+    '/api/campaigns/<int:campaign_id>/clarifications/<clarification_id>/answer',
+    view_func=_answer_campaign_clarification,
+    methods=['POST'],
+)
+sessions_bp.add_url_rule(
+    '/api/campaigns/<int:campaign_id>/clarifications/<clarification_id>/dismiss',
+    view_func=_dismiss_campaign_clarification,
+    methods=['POST'],
+)
+sessions_bp.add_url_rule(
+    '/api/campaigns/<int:campaign_id>/clarifications/<clarification_id>/obsolete',
+    view_func=_obsolete_campaign_clarification,
     methods=['POST'],
 )

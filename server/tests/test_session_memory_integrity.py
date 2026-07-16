@@ -45,15 +45,21 @@ class SessionMemoryIntegrityTest(unittest.TestCase):
         self.app = Flask(__name__)
         self.app.config['SQLALCHEMY_DATABASE_URI'] = 'sqlite:///:memory:'
         self.app.config['SECRET_KEY'] = 'test-secret'
+        self.app.config['JWT_EXPIRATION_HOURS'] = 24
         self.app.config['SQLALCHEMY_TRACK_MODIFICATIONS'] = False
         db.init_app(self.app)
         self.ctx = self.app.app_context()
         self.ctx.push()
         db.create_all()
 
-        self.campaign = Campaign(name='Integrity Test', description='Test', user_id=1)
+        usr = User(username='dm_user', email='dm@example.com')
+        usr.set_password('password')
+        db.session.add(usr)
+        db.session.commit()
+
+        self.campaign = Campaign(name='Integrity Test', description='Test', user_id=usr.id)
         db.session.add(self.campaign)
-        db.session.flush()
+        db.session.commit()
 
         self.world = CampaignWorld(
             campaign_id=self.campaign.id,
@@ -593,6 +599,179 @@ class SessionMemoryIntegrityTest(unittest.TestCase):
 
         ok, err = validate_resolver_packet({'entity_mentions': [{'mention_ref': 'good_1', 'surface_form': 'the stranger', 'identity_status': 'known_hidden', 'visibility': 'dm_private'}]})
         self.assertTrue(ok)
+
+    def test_alias_does_not_rename_canonical_data(self):
+        memory_context = self._base_context()
+        extracted = {}
+        resolved = {
+            'update_npc_actors': [
+                {'id': 'aldric', 'name': 'the archivist', 'role': 'Archivist'},
+            ],
+        }
+        compiled = compile_staged_memory_patch(memory_context, extracted, resolved)
+        npcs = compiled.get('update_npc_actors', [])
+        self.assertEqual(len(npcs), 1)
+        self.assertEqual(npcs[0]['name'], 'Aldric')
+        records = compiled.get('resolution_records', [])
+        alias_record = next((r for r in records if r.get('resolution_action') == 'add_alias'), None)
+        self.assertIsNotNone(alias_record)
+        self.assertEqual(alias_record['mention_name'], 'the archivist')
+        self.assertEqual(alias_record['canonical_name'], 'Aldric')
+
+    def test_slug_collision_does_not_reuse_entity(self):
+        from services.session_memory_agent import _augment_registry_from_resolved
+        known_ids = {
+            'entity_ids': {'archivist'},
+            'entity_names': {'archivist': 'The Great Archivist'},
+            'npc_ids': set(),
+            'npc_names': {},
+        }
+        registry = []
+        _augment_registry_from_resolved(
+            registry,
+            [{'name': 'Archivist'}],
+            [],
+            known_ids,
+            prior_resolutions=[],
+        )
+        entry = next((e for e in registry if e.get('surface_form') == 'Archivist'), None)
+        self.assertIsNotNone(entry)
+        self.assertEqual(entry['decision'], 'create_new')
+        self.assertNotEqual(entry['canonical_id'], 'archivist')
+
+    def test_current_location_id_with_different_name_rejected(self):
+        scene_patch = {
+            'location_id': 'drowned_lantern',
+            'location_name': 'Black Anchor',
+        }
+        res = resolve_scene_location_patch(scene_patch, self.campaign, {'location_id': 'drowned_lantern', 'location_name': 'Drowned Lantern'})
+        self.assertEqual(res['status'], 'unresolved')
+
+        scene_patch_rename = {
+            'location_id': 'drowned_lantern',
+            'location_name': 'Black Anchor',
+            'rename_existing': True,
+        }
+        res_rename = resolve_scene_location_patch(scene_patch_rename, self.campaign, {'location_id': 'drowned_lantern', 'location_name': 'Drowned Lantern'})
+        self.assertEqual(res_rename['status'], 'direct')
+
+    def test_identical_descriptors_different_turns_not_shared(self):
+        from services.resolution_registry import _index_prior_resolutions
+        prior_same = [{
+            'mention_entity_id': 'grey_figure',
+            'mention_name': 'the grey-cloaked figure',
+            'canonical_id': 'aldric',
+            'resolution_action': 'same_identity',
+        }]
+        idx_same = _index_prior_resolutions(prior_same)
+        self.assertNotIn('the grey-cloaked figure', idx_same)
+
+        prior_alias = [{
+            'mention_entity_id': 'grey_figure',
+            'mention_name': 'the grey-cloaked figure',
+            'canonical_id': 'aldric',
+            'resolution_action': 'add_alias',
+        }]
+        idx_alias = _index_prior_resolutions(prior_alias)
+        self.assertIn('the grey-cloaked figure', idx_alias)
+
+    def test_committed_packet_read_errors_fail_closed(self):
+        from routes.sessions import _run_session_memory_update
+        from unittest.mock import patch
+        from models import CampaignAuditEvent
+        with patch('models.CampaignResolverPacket') as mock_packet_class:
+            mock_packet_class.query.filter_by.side_effect = Exception("DB Connection Refused")
+            _run_session_memory_update(
+                campaign_id=self.campaign.id,
+                session_id=self.session.id,
+                user_id=1,
+                player_message_id=10,
+                player_content="Hello",
+                ai_text="Hi",
+                hot_context={},
+                parent_trace_id="trace-123",
+                dm_message_id=99,
+            )
+            events = CampaignAuditEvent.query.filter_by(
+                campaign_id=self.campaign.id,
+                event_type='memory_update_error'
+            ).all()
+            self.assertEqual(len(events), 1)
+            payload = json.loads(events[0].payload) if events[0].payload else {}
+            self.assertEqual(payload.get('code'), 'packet_storage_read_error')
+
+    def test_clarification_answered_and_consumed_workflow(self):
+        from models import CampaignClarification
+        clar = CampaignClarification(
+            campaign_id=self.campaign.id,
+            clarification_id="clar_test_1",
+            idempotency_key="key_1",
+            kind="identity",
+            mention_ref="test_ref",
+            mention_entity_id="test_entity",
+            question="Is test_ref Mira?",
+            status="pending",
+        )
+        db.session.add(clar)
+        db.session.commit()
+
+        from routes.sessions import sessions_bp
+        self.app.register_blueprint(sessions_bp)
+
+        dm_user = User(username='dm_user_test', email='dm_test@example.com')
+        dm_user.set_password('password')
+        db.session.add(dm_user)
+        db.session.commit()
+
+        self.campaign.user_id = dm_user.id
+        db.session.commit()
+
+        from auth import generate_token
+        token = generate_token(dm_user.id)
+
+        client = self.app.test_client()
+
+        get_res = client.get(
+            f'/api/campaigns/{self.campaign.id}/clarifications',
+            headers={'Authorization': f'Bearer {token}'},
+        )
+        self.assertEqual(get_res.status_code, 200)
+        clars = json.loads(get_res.data.decode('utf-8'))
+        self.assertEqual(len(clars), 1)
+        self.assertEqual(clars[0]['clarification_id'], 'clar_test_1')
+
+        answer_res = client.post(
+            f'/api/campaigns/{self.campaign.id}/clarifications/clar_test_1/answer',
+            headers={'Authorization': f'Bearer {token}'},
+            json={
+                'answer': 'Yes, it is Mira.',
+                'resolved_canonical_id': 'mira',
+                'resolution_action': 'same_identity',
+                'resolution_patch': {
+                    'update_npc_actors': [{'id': 'mira', 'role': 'Chief Guard'}]
+                }
+            }
+        )
+        self.assertEqual(answer_res.status_code, 200)
+
+        clar_db = CampaignClarification.query.filter_by(clarification_id='clar_test_1').first()
+        self.assertEqual(clar_db.status, 'answered')
+        self.assertEqual(clar_db.answer, 'Yes, it is Mira.')
+
+        memory_context = self._base_context()
+        extracted = {}
+        resolved = {}
+        compiled = compile_staged_memory_patch(memory_context, extracted, resolved)
+
+        self.assertIn('clar_test_1', compiled.get('consumed_clarification_ids', []))
+        npcs = compiled.get('update_npc_actors', [])
+        self.assertTrue(any(n['id'] == 'mira' and n['role'] == 'Chief Guard' for n in npcs))
+
+        from services.dm_tools import apply_compiled_session_memory_patch
+        apply_compiled_session_memory_patch(self.campaign, self.session, compiled)
+
+        clar_final = CampaignClarification.query.filter_by(clarification_id='clar_test_1').first()
+        self.assertEqual(clar_final.status, 'resolved')
 
 
 if __name__ == '__main__':
