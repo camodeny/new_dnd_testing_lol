@@ -684,12 +684,18 @@ def create_automation_snapshot(current_user, scenario_id):
     if not _scenario_owned_by_user(current_user, scenario):
         return jsonify({'error': 'Forbidden'}), 403
     data = request.get_json(silent=True) or {}
-    snapshot = create_snapshot_for_scenario(
-        scenario,
-        label=data.get('label'),
-        summary=data.get('summary'),
-        source_session_id=data.get('source_session_id'),
-    )
+    try:
+        snapshot = create_snapshot_for_scenario(
+            scenario,
+            label=data.get('label'),
+            summary=data.get('summary'),
+            source_session_id=data.get('source_session_id'),
+        )
+        db.session.commit()
+    except ValueError as e:
+        db.session.rollback()
+        return jsonify({'error': str(e)}), 400
+        
     append_workspace_event(
         current_user.id,
         'snapshot_created',
@@ -707,12 +713,18 @@ def cleanup_automation_scenario(current_user, scenario_id):
     if not _scenario_owned_by_user(current_user, scenario):
         return jsonify({'error': 'Forbidden'}), 403
     data = request.get_json(silent=True) or {}
-    result = cleanup_hidden_clone_campaigns(
-        scenario,
-        action=data.get('action'),
-        older_than_days=data.get('older_than_days'),
-        keep_recent_runs=data.get('keep_recent_runs'),
-    )
+    try:
+        result = cleanup_hidden_clone_campaigns(
+            scenario,
+            action=data.get('action'),
+            older_than_days=data.get('older_than_days'),
+            keep_recent_runs=data.get('keep_recent_runs'),
+        )
+        db.session.commit()
+    except ValueError as e:
+        db.session.rollback()
+        return jsonify({'error': str(e)}), 400
+        
     append_workspace_event(
         current_user.id,
         'scenario_cleanup',

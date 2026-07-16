@@ -23,6 +23,11 @@ def delete_campaign_graph(campaign_ids, character_policy='delete', ignore_snapsh
     if not campaign_ids:
         return
 
+    # Check if there are any scenarios referencing this campaign as source_campaign_id
+    referencing_scenarios = AutomationScenario.query.filter(AutomationScenario.source_campaign_id.in_(campaign_ids)).first()
+    if referencing_scenarios:
+        raise ValueError(f"Cannot delete campaign because scenario '{referencing_scenarios.name}' (ID {referencing_scenarios.id}) references it as its source campaign.")
+
     # Check for any external snapshot references pointing to the sessions or campaigns being deleted
     session_ids = [s.id for s in CampaignSession.query.filter(CampaignSession.campaign_id.in_(campaign_ids)).all()]
     
@@ -108,11 +113,12 @@ def delete_campaign_graph(campaign_ids, character_policy='delete', ignore_snapsh
     # Flush session to sync DB state before unlinking files
     db.session.flush()
 
-    # Unlink map image files safely
+    # Queue map image files to be unlinked safely after commit
     if filenames_to_cleanup:
         from services.encounter_map_service import encounter_map_storage_dir
         storage_dir = encounter_map_storage_dir()
         
+        paths_to_delete = []
         for filename in filenames_to_cleanup:
             # Check if any remaining EncounterMap references this filename
             still_referenced = EncounterMap.query.filter(
@@ -122,11 +128,34 @@ def delete_campaign_graph(campaign_ids, character_policy='delete', ignore_snapsh
             
             if not still_referenced:
                 filepath = storage_dir / filename
-                if filepath.exists():
+                paths_to_delete.append(filepath)
+                
+        if paths_to_delete:
+            if 'encounter_maps_to_cleanup' not in db.session.info:
+                db.session.info['encounter_maps_to_cleanup'] = set()
+            db.session.info['encounter_maps_to_cleanup'].update(paths_to_delete)
+
+
+from sqlalchemy import event
+
+@event.listens_for(db.session, 'after_commit')
+def _cleanup_files_after_commit(session):
+    paths = session.info.pop('encounter_maps_to_cleanup', None)
+    if paths:
+        for path in paths:
+            if path.exists():
+                try:
+                    path.unlink()
+                except Exception as e:
                     try:
-                        filepath.unlink()
-                    except Exception as e:
-                        current_app.logger.warning(f"Failed to delete encounter map file {filename}: {e}")
+                        current_app.logger.warning(f"Failed to delete encounter map file {path}: {e}")
+                    except Exception:
+                        pass
+
+
+@event.listens_for(db.session, 'after_rollback')
+def _clear_cleanup_files_after_rollback(session):
+    session.info.pop('encounter_maps_to_cleanup', None)
 
 
 def delete_run_graph(run_ids, ignore_snapshot_ids=None):
