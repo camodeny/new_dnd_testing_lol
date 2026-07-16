@@ -31,6 +31,7 @@ from services.dm_tools import (
     get_dm_tool_definitions,
     SHEET_SCALAR_FIELDS,
     apply_clock_adjudication,
+    apply_compiled_session_memory_patch,
     apply_memory_patch,
     build_session_hot_context,
     build_session_clock_context,
@@ -115,6 +116,7 @@ def _run_session_memory_update(
     hot_context,
     parent_trace_id,
     dm_message_id=None,
+    resolver_packet=None,
 ):
     from uuid import uuid4
     memory_run_id = f"memrun_{uuid4().hex[:12]}"
@@ -142,6 +144,9 @@ def _run_session_memory_update(
             ai_text,
             hot_context,
         )
+        if isinstance(resolver_packet, dict):
+            memory_context['resolver_packet'] = resolver_packet
+
         memory_audit_context = {
             'campaign_id': campaign.id,
             'operation': 'session_memory_update',
@@ -161,47 +166,71 @@ def _run_session_memory_update(
             audit_context=memory_audit_context,
         )
         if memory_patch:
-            apply_memory_patch(
-                campaign,
-                session,
-                memory_patch,
-                audit_context=memory_audit_context,
-            )
+            source_contract = memory_patch.get('source_contract', '') if isinstance(memory_patch, dict) else ''
+            if source_contract == 'compiled_session_memory_v2':
+                apply_compiled_session_memory_patch(
+                    campaign,
+                    session,
+                    memory_patch,
+                    audit_context=memory_audit_context,
+                )
+            else:
+                apply_memory_patch(
+                    campaign,
+                    session,
+                    memory_patch,
+                    audit_context=memory_audit_context,
+                )
             memory_complete = True
+
+        # Commit memory transaction independently
+        try:
+            db.session.commit()
+        except Exception as mem_err:
+            db.session.rollback()
+            raise
+
         world_after_memory = world_public_payload(campaign).get('world') or {}
         current_scene_after_memory = world_after_memory.get('current_scene')
-        clock_context = build_session_clock_context(
-            campaign,
-            session,
-            current_user,
-            player_content,
-            ai_text,
-            current_scene_before,
-            current_scene_after_memory,
-        )
-        clock_updates = get_session_clock_updates(
-            clock_context,
-            audit_context={
-                'campaign_id': campaign.id,
-                'operation': 'session_clock_adjudication',
-                'actor': 'session_clock_adjudicator',
-                'trace_id': clock_trace_id,
-                'parent_trace_id': parent_trace_id,
-                'trace_label': clock_trace_label,
-            },
-        )
-        if clock_updates:
-            apply_clock_adjudication(
+
+        # Clock adjudication in a separate transaction
+        clock_complete = False
+        try:
+            clock_context = build_session_clock_context(
                 campaign,
-                clock_updates,
+                session,
+                current_user,
+                player_content,
+                ai_text,
+                current_scene_before,
+                current_scene_after_memory,
+            )
+            clock_updates = get_session_clock_updates(
+                clock_context,
                 audit_context={
+                    'campaign_id': campaign.id,
+                    'operation': 'session_clock_adjudication',
+                    'actor': 'session_clock_adjudicator',
                     'trace_id': clock_trace_id,
                     'parent_trace_id': parent_trace_id,
                     'trace_label': clock_trace_label,
                 },
             )
-            clock_complete = True
-        db.session.commit()
+            if clock_updates:
+                apply_clock_adjudication(
+                    campaign,
+                    clock_updates,
+                    audit_context={
+                        'trace_id': clock_trace_id,
+                        'parent_trace_id': parent_trace_id,
+                        'trace_label': clock_trace_label,
+                    },
+                )
+                clock_complete = True
+            db.session.commit()
+        except Exception:
+            db.session.rollback()
+            clock_complete = False
 
         mark_session_dm_turn_post_turn_complete(
             player_message_id,

@@ -891,6 +891,7 @@ class CampaignWorld(db.Model):
     approved_at = db.Column(db.DateTime, nullable=True)
     created_at = db.Column(db.DateTime, default=utcnow)
     updated_at = db.Column(db.DateTime, default=utcnow, onupdate=utcnow)
+    memory_revision = db.Column(db.Integer, default=0, nullable=False)
 
     def to_public_dict(self):
         import json
@@ -2272,5 +2273,146 @@ class AutomationRunAuditAttempt(db.Model):
             "error_message": self.error_message,
             "raw_payload_json": self.raw_payload_json,
             "normalized_payload_json": self.normalized_payload_json,
+            "created_at": self.created_at.isoformat() if self.created_at else None,
+        }
+
+
+class CampaignResolverPacket(db.Model):
+    __tablename__ = "campaign_resolver_packets"
+
+    id = db.Column(db.Integer, primary_key=True)
+    campaign_id = db.Column(db.Integer, db.ForeignKey("campaign.id"), nullable=False, index=True)
+    session_id = db.Column(db.Integer, db.ForeignKey("campaign_sessions.id"), nullable=True, index=True)
+    dm_message_id = db.Column(db.Integer, db.ForeignKey("session_messages.id"), nullable=True, index=True)
+    turn_id = db.Column(db.String(100), nullable=True, index=True)
+
+    packet_json = db.Column(db.JSON, nullable=False)
+
+    status = db.Column(db.String(30), nullable=False, default="committed")
+    accepted_at = db.Column(db.DateTime, default=utcnow, nullable=False)
+
+    campaign = db.relationship("Campaign")
+    session = db.relationship("CampaignSession")
+    dm_message = db.relationship("SessionMessage", foreign_keys=[dm_message_id])
+
+    def to_dict(self):
+        return {
+            "id": self.id,
+            "campaign_id": self.campaign_id,
+            "session_id": self.session_id,
+            "dm_message_id": self.dm_message_id,
+            "turn_id": self.turn_id,
+            "packet": self.packet_json,
+            "status": self.status,
+            "accepted_at": self.accepted_at.isoformat() if self.accepted_at else None,
+        }
+
+
+class CampaignClarification(db.Model):
+    __tablename__ = "campaign_clarifications"
+
+    id = db.Column(db.Integer, primary_key=True)
+    campaign_id = db.Column(db.Integer, db.ForeignKey("campaign.id"), nullable=False, index=True)
+    clarification_id = db.Column(db.String(200), unique=True, nullable=False, index=True)
+    idempotency_key = db.Column(db.String(500), unique=True, nullable=False, index=True)
+
+    kind = db.Column(db.String(60), nullable=False)
+    mention_ref = db.Column(db.String(200), nullable=False)
+    mention_entity_id = db.Column(db.String(200), nullable=True, index=True)
+
+    question = db.Column(db.Text, nullable=False)
+    candidate_ids = db.Column(db.JSON, nullable=True)
+    blocking_scope = db.Column(db.JSON, nullable=True)
+
+    status = db.Column(db.String(30), nullable=False, default="pending")
+    answer = db.Column(db.Text, nullable=True)
+    resolved_canonical_id = db.Column(db.String(200), nullable=True)
+    resolution_action = db.Column(db.String(40), nullable=True)
+    resolution_patch_json = db.Column(db.JSON, nullable=True)
+
+    answered_by = db.Column(db.String(200), nullable=True)
+    answered_at = db.Column(db.DateTime, nullable=True)
+    dismissed_at = db.Column(db.DateTime, nullable=True)
+    obsoleted_by_clarification_id = db.Column(db.String(200), nullable=True)
+
+    source_memory_run_id = db.Column(db.String(100), nullable=True, index=True)
+    source_turn_id = db.Column(db.String(100), nullable=True)
+    source_trace_id = db.Column(db.String(100), nullable=True)
+
+    created_at = db.Column(db.DateTime, default=utcnow, index=True)
+    updated_at = db.Column(db.DateTime, default=utcnow, onupdate=utcnow)
+
+    campaign = db.relationship("Campaign")
+
+    def to_dict(self):
+        return {
+            "id": self.id,
+            "campaign_id": self.campaign_id,
+            "clarification_id": self.clarification_id,
+            "idempotency_key": self.idempotency_key,
+            "kind": self.kind,
+            "mention_ref": self.mention_ref,
+            "mention_entity_id": self.mention_entity_id,
+            "question": self.question,
+            "candidate_ids": self.candidate_ids,
+            "blocking_scope": self.blocking_scope,
+            "status": self.status,
+            "answer": self.answer,
+            "resolved_canonical_id": self.resolved_canonical_id,
+            "resolution_action": self.resolution_action,
+            "resolution_patch_json": self.resolution_patch_json,
+            "answered_by": self.answered_by,
+            "answered_at": self.answered_at.isoformat() if self.answered_at else None,
+            "dismissed_at": self.dismissed_at.isoformat() if self.dismissed_at else None,
+            "obsoleted_by_clarification_id": self.obsoleted_by_clarification_id,
+            "source_memory_run_id": self.source_memory_run_id,
+            "source_turn_id": self.source_turn_id,
+            "source_trace_id": self.source_trace_id,
+            "created_at": self.created_at.isoformat() if self.created_at else None,
+            "updated_at": self.updated_at.isoformat() if self.updated_at else None,
+        }
+
+
+class CampaignIdentityResolution(db.Model):
+    __tablename__ = "campaign_identity_resolutions"
+
+    id = db.Column(db.Integer, primary_key=True)
+    campaign_id = db.Column(db.Integer, db.ForeignKey("campaign.id"), nullable=False, index=True)
+    resolution_id = db.Column(db.String(200), unique=True, nullable=False, index=True)
+
+    mention_entity_id = db.Column(db.String(200), nullable=False, index=True)
+    mention_name = db.Column(db.String(400), nullable=True)
+
+    resolution_action = db.Column(db.String(40), nullable=False)
+    canonical_id = db.Column(db.String(200), nullable=False, index=True)
+    canonical_name = db.Column(db.String(400), nullable=True)
+
+    visibility = db.Column(db.String(30), nullable=False, default="dm_private")
+    resolved_by = db.Column(db.String(120), nullable=True)
+    source_clarification_id = db.Column(db.String(200), nullable=True, index=True)
+    source_turn_id = db.Column(db.String(100), nullable=True)
+    source_trace_id = db.Column(db.String(100), nullable=True)
+
+    evidence_json = db.Column(db.JSON, nullable=True)
+    created_at = db.Column(db.DateTime, default=utcnow, index=True)
+
+    campaign = db.relationship("Campaign")
+
+    def to_dict(self):
+        return {
+            "id": self.id,
+            "campaign_id": self.campaign_id,
+            "resolution_id": self.resolution_id,
+            "mention_entity_id": self.mention_entity_id,
+            "mention_name": self.mention_name,
+            "resolution_action": self.resolution_action,
+            "canonical_id": self.canonical_id,
+            "canonical_name": self.canonical_name,
+            "visibility": self.visibility,
+            "resolved_by": self.resolved_by,
+            "source_clarification_id": self.source_clarification_id,
+            "source_turn_id": self.source_turn_id,
+            "source_trace_id": self.source_trace_id,
+            "evidence_json": self.evidence_json,
             "created_at": self.created_at.isoformat() if self.created_at else None,
         }

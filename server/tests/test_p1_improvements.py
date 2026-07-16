@@ -379,11 +379,11 @@ class P1ImprovementsTest(unittest.TestCase):
         compiled_canonical = compile_staged_memory_patch(memory_context, extracted, resolved)
         self.assertEqual(compiled_canonical['scene_patch']['resolution_mode'], 'canonical')
 
-        # Case B: Unknown location (unresolved)
+        # Case B: Unknown location (now treated as 'new' — creating a new location)
         extracted_unresolved = {'scene_patch': {'location_name': 'Neverwinter Wood'}}
         resolved_unresolved = {'scene_patch': {'location_name': 'Neverwinter Wood'}}
         compiled_unresolved = compile_staged_memory_patch(memory_context, extracted_unresolved, resolved_unresolved)
-        self.assertEqual(compiled_unresolved['unresolved_items'][0]['resolution_mode'], 'unresolved')
+        self.assertEqual(compiled_unresolved['scene_patch']['resolution_mode'], 'new')
 
     def test_boundary_with_zero_excludes_all_future_provider_calls(self):
         # Create cycle when there are absolutely NO provider calls
