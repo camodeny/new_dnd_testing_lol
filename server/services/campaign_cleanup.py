@@ -79,6 +79,9 @@ def delete_campaign_graph(campaign_ids, character_policy='delete', ignore_snapsh
     # Nullify source campaign references on other campaigns
     Campaign.query.filter(Campaign.automation_source_campaign_id.in_(campaign_ids)).update({'automation_source_campaign_id': None}, synchronize_session=False)
 
+    # Nullify derived campaign references on automation runs
+    AutomationRun.query.filter(AutomationRun.derived_campaign_id.in_(campaign_ids)).update({'derived_campaign_id': None}, synchronize_session=False)
+
     # Clean characters based on policy
     if character_ids:
         if character_policy == 'delete':

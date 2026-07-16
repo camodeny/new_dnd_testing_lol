@@ -3699,6 +3699,51 @@ class AutomationRouteTest(unittest.TestCase):
         self.assertEqual(delete_response.status_code, 400)
         self.assertIn('references it', delete_response.get_json()['error'])
 
+    def test_delete_campaign_clone_directly_nullifies_run_reference(self):
+        with app.app_context():
+            db.session.execute(db.text("PRAGMA foreign_keys=ON"))
+        try:
+            scenario_response = self.client.post(
+                '/api/automation/scenarios',
+                headers=self.headers,
+                json={'source_campaign_id': self.campaign_id, 'name': 'To Clean Scenario'},
+            )
+            scenario_id = scenario_response.get_json()['scenario']['id']
+
+            snapshot_id = self.client.post(
+                f'/api/automation/scenarios/{scenario_id}/snapshots',
+                headers=self.headers,
+                json={},
+            ).get_json()['snapshot']['id']
+            
+            run_response = self.client.post(
+                f'/api/automation/scenarios/{scenario_id}/runs',
+                headers=self.headers,
+                json={'snapshot_id': snapshot_id},
+            )
+            run_id = run_response.get_json()['run']['id']
+
+            # Materialize clone
+            with app.app_context():
+                from services.automation_service import materialize_run_campaign
+                from models import AutomationRun, Campaign
+                from services.campaign_cleanup import delete_campaign_graph
+                run = db.session.get(AutomationRun, run_id)
+                clone, _, _ = materialize_run_campaign(run)
+                db.session.commit()
+                clone_id = clone.id
+
+                # Delete the campaign clone directly using delete_campaign_graph helper
+                delete_campaign_graph([clone_id], character_policy='delete')
+                db.session.commit()
+
+                # Verify run's derived campaign ID is nullified
+                run = db.session.get(AutomationRun, run_id)
+                self.assertIsNone(run.derived_campaign_id)
+        finally:
+            with app.app_context():
+                db.session.execute(db.text("PRAGMA foreign_keys=OFF"))
+
 
 if __name__ == '__main__':
     unittest.main()
