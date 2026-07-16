@@ -2606,9 +2606,10 @@ def cleanup_hidden_clone_campaigns(scenario, *, action=None, older_than_days=Non
         campaign = db.session.get(Campaign, run.derived_campaign_id) if run.derived_campaign_id else None
         if action == 'delete' and campaign is not None:
             from services.campaign_cleanup import delete_campaign_graph
-            delete_campaign_graph([campaign.id], character_policy='delete')
-            run.clone_retention_status = 'deleted'
+            campaign_id = campaign.id
             run.derived_campaign_id = None
+            run.clone_retention_status = 'deleted'
+            delete_campaign_graph([campaign_id], character_policy='delete')
             deleted.append(run.id)
         else:
             if campaign is not None:

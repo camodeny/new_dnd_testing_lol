@@ -3636,49 +3636,55 @@ class AutomationRouteTest(unittest.TestCase):
             self.assertFalse(clone_only_file.exists())
 
     def test_cleanup_scenario_retention_delete(self):
-        scenario_response = self.client.post(
-            '/api/automation/scenarios',
-            headers=self.headers,
-            json={'source_campaign_id': self.campaign_id, 'name': 'To Clean Scenario'},
-        )
-        scenario_id = scenario_response.get_json()['scenario']['id']
-
-        snapshot_id = self.client.post(
-            f'/api/automation/scenarios/{scenario_id}/snapshots',
-            headers=self.headers,
-            json={},
-        ).get_json()['snapshot']['id']
-        
-        run_response = self.client.post(
-            f'/api/automation/scenarios/{scenario_id}/runs',
-            headers=self.headers,
-            json={'snapshot_id': snapshot_id},
-        )
-        run_id = run_response.get_json()['run']['id']
-
-        # Materialize clone
         with app.app_context():
-            from services.automation_service import materialize_run_campaign
-            from models import AutomationRun, Campaign
-            from datetime import datetime, UTC
-            run = db.session.get(AutomationRun, run_id)
-            run.status = 'completed'
-            run.finished_at = datetime.now(UTC)
-            clone, _, _ = materialize_run_campaign(run)
-            db.session.commit()
-            clone_id = clone.id
+            db.session.execute(db.text("PRAGMA foreign_keys=ON"))
+        try:
+            scenario_response = self.client.post(
+                '/api/automation/scenarios',
+                headers=self.headers,
+                json={'source_campaign_id': self.campaign_id, 'name': 'To Clean Scenario'},
+            )
+            scenario_id = scenario_response.get_json()['scenario']['id']
 
-        # Perform retention delete via cleanup endpoint
-        cleanup_response = self.client.post(
-            f'/api/automation/scenarios/{scenario_id}/cleanup',
-            headers=self.headers,
-            json={'action': 'delete', 'older_than_days': 0, 'keep_recent_runs': 0},
-        )
-        self.assertEqual(cleanup_response.status_code, 200)
+            snapshot_id = self.client.post(
+                f'/api/automation/scenarios/{scenario_id}/snapshots',
+                headers=self.headers,
+                json={},
+            ).get_json()['snapshot']['id']
+            
+            run_response = self.client.post(
+                f'/api/automation/scenarios/{scenario_id}/runs',
+                headers=self.headers,
+                json={'snapshot_id': snapshot_id},
+            )
+            run_id = run_response.get_json()['run']['id']
 
-        # Verify database was cleaned up
-        with app.app_context():
-            self.assertIsNone(db.session.get(Campaign, clone_id))
+            # Materialize clone
+            with app.app_context():
+                from services.automation_service import materialize_run_campaign
+                from models import AutomationRun, Campaign
+                from datetime import datetime, UTC
+                run = db.session.get(AutomationRun, run_id)
+                run.status = 'completed'
+                run.finished_at = datetime.now(UTC)
+                clone, _, _ = materialize_run_campaign(run)
+                db.session.commit()
+                clone_id = clone.id
+
+            # Perform retention delete via cleanup endpoint
+            cleanup_response = self.client.post(
+                f'/api/automation/scenarios/{scenario_id}/cleanup',
+                headers=self.headers,
+                json={'action': 'delete', 'older_than_days': 0, 'keep_recent_runs': 0},
+            )
+            self.assertEqual(cleanup_response.status_code, 200)
+
+            # Verify database was cleaned up
+            with app.app_context():
+                self.assertIsNone(db.session.get(Campaign, clone_id))
+        finally:
+            with app.app_context():
+                db.session.execute(db.text("PRAGMA foreign_keys=OFF"))
 
     def test_delete_source_campaign_with_scenario_fails(self):
         # Create scenario referencing self.campaign_id
