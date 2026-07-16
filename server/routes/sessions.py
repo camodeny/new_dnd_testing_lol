@@ -150,6 +150,19 @@ def _run_session_memory_update(
         )
         if isinstance(resolver_packet, dict):
             memory_context['resolver_packet'] = resolver_packet
+        elif dm_message_id:
+            # Try to load committed packet from storage for replay/retry
+            try:
+                from models import CampaignResolverPacket
+                stored = CampaignResolverPacket.query.filter_by(
+                    campaign_id=campaign.id,
+                    dm_message_id=dm_message_id,
+                    status='committed',
+                ).order_by(CampaignResolverPacket.id.desc()).first()
+                if stored and isinstance(stored.packet_json, dict):
+                    memory_context['resolver_packet'] = stored.packet_json
+            except Exception:
+                pass
 
         memory_audit_context = {
             'campaign_id': campaign.id,
@@ -229,7 +242,7 @@ def _run_session_memory_update(
                         'trace_label': clock_trace_label,
                     },
                 )
-                clock_complete = True
+            clock_complete = True
             db.session.commit()
         except Exception:
             db.session.rollback()

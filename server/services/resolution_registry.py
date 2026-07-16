@@ -251,6 +251,21 @@ def _resolve_packet_mention(mention, known_ids, prior_resolution_map, allocated_
 
     elif identity_status == "known_public":
         if canonical_id_from_packet and canonical_id_from_packet in known_ids.get("entity_ids", set()):
+            surface_lower = surface_form.strip().lower()
+            for npc_id, npc_name in known_ids.get("npc_names", {}).items():
+                if npc_name.lower() == surface_lower and npc_id.lower() != canonical_id_from_packet.lower():
+                    entry["decision"] = "reject"
+                    entry["resolution_state"] = "rejected"
+                    entry["canonical_id"] = None
+                    entry["blocked_operations"] = ["identity_merge", "npc_update"]
+                    return entry
+            for ent_id, ent_name in known_ids.get("entity_names", {}).items():
+                if ent_name.lower() == surface_lower and ent_id.lower() != canonical_id_from_packet.lower():
+                    entry["decision"] = "reject"
+                    entry["resolution_state"] = "rejected"
+                    entry["canonical_id"] = None
+                    entry["blocked_operations"] = ["identity_merge", "npc_update"]
+                    return entry
             entry["canonical_id"] = canonical_id_from_packet
             entry["canonical_name"] = public_name
             entry["decision"] = "reuse_existing"
@@ -380,6 +395,18 @@ def _resolve_npc_claim(claim, known_ids, prior_resolution_map, allocated_ids, in
     }
 
     if proposed_id and proposed_id in known_ids.get("npc_ids", set()):
+        # Check for name collision: does the proposed name match a DIFFERENT known NPC?
+        if name:
+            existing_name = known_ids.get("npc_names", {}).get(proposed_id, "")
+            name_lower = name.strip().lower()
+            if existing_name and existing_name.lower() != name_lower:
+                # Check if the supplied name matches a DIFFERENT known entity
+                for other_id, other_name in known_ids.get("npc_names", {}).items():
+                    if other_name.lower() == name_lower and other_id != proposed_id:
+                        entry["decision"] = "reject"
+                        entry["resolution_state"] = "rejected"
+                        entry["blocked_operations"] = ["identity_merge", "npc_update"]
+                        return entry
         entry["canonical_id"] = proposed_id
         entry["canonical_name"] = name
         entry["decision"] = "reuse_existing"

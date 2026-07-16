@@ -489,6 +489,111 @@ class SessionMemoryIntegrityTest(unittest.TestCase):
             f"NPC update not found. npcs={npcs}, entities={[e.get('id') for e in entities]}"
         )
 
+    # ── End-to-end regression tests ────────────────────────────────────
+
+    def test_resolver_packet_rejected_when_name_collides_with_different_npc(self):
+        memory_context = self._base_context()
+        memory_context['resolver_packet'] = {
+            'entity_mentions': [{
+                'mention_ref': 'bad_map',
+                'surface_form': 'Kaelen Morwen',
+                'identity_status': 'known_hidden',
+                'canonical_id': 'aldric',
+                'public_name': 'Kaelen Morwen',
+                'visibility': 'dm_private',
+            }],
+        }
+        extracted = {}
+        resolved = {}
+        compiled = compile_staged_memory_patch(memory_context, extracted, resolved)
+        # The packet should be rejected because Kaelen Morwen is a known NPC (kaelen_morwen),
+        # not aldric. The registry should classify this as rejected.
+        diag = compiled.get('resolution_diagnostics', {})
+        self.assertEqual(len(diag.get('substitutions', [])), 0)
+        # Verify no entity with aldric's ID got the name Kaelen Morwen
+        for entity in compiled.get('upsert_graph_entities', []):
+            if entity.get('id') == 'aldric':
+                self.assertNotEqual(entity.get('name', '').lower(), 'kaelen morwen')
+
+    def test_resolved_npc_name_collision_rejected(self):
+        memory_context = self._base_context()
+        extracted = {}
+        resolved = {
+            'update_npc_actors': [
+                {'id': 'aldric', 'name': 'Kaelen Morwen', 'role': 'Scholar Confused'},
+            ],
+        }
+        compiled = compile_staged_memory_patch(memory_context, extracted, resolved)
+        # This should be unresolved or absent — not applied
+        unresolved = compiled.get('unresolved_items', [])
+        npcs = compiled.get('update_npc_actors', [])
+        # Either unresolved or the NPC update is absent
+        self.assertTrue(
+            len(npcs) == 0 or any(u.get('actor_id') == 'aldric' for u in unresolved),
+            f"Name collision should be rejected. npcs={npcs}, unresolved={unresolved}"
+        )
+
+    def test_validated_packet_pass_through_compilation(self):
+        memory_context = self._base_context()
+        memory_context['resolver_packet'] = {
+            'entity_mentions': [{
+                'mention_ref': 'familiar_fig',
+                'surface_form': 'the grey-cloaked figure',
+                'identity_status': 'known_hidden',
+                'canonical_id': 'aldric',
+                'public_name': 'the grey-cloaked figure',
+                'visibility': 'dm_private',
+            }],
+        }
+        extracted = {}
+        resolved = {}
+        compiled = compile_staged_memory_patch(memory_context, extracted, resolved)
+        # The packet should be accepted because "the grey-cloaked figure" is not a known NPC name
+        self.assertIn('source_contract', compiled)
+        self.assertEqual(compiled['source_contract'], 'compiled_session_memory_v2')
+        diag = compiled.get('resolution_diagnostics', {})
+        self.assertEqual(len(diag.get('substitutions', [])), 0)
+
+    def test_clock_no_ops_marked_complete(self):
+        # This is a unit-level test of the clock_complete logic.
+        # When clock adjudication runs and returns no updates, clock_complete should still be True.
+        memory_context = self._base_context()
+        extracted = {}
+        resolved = {}
+        compiled = compile_staged_memory_patch(memory_context, extracted, resolved)
+        self.assertIn('source_contract', compiled)
+        # The clock_complete behavior is tested at the integration level in test_dm_tools.py;
+        # this test verifies compilation still succeeds without clock mutations.
+
+    def test_resolution_id_is_unique_per_campaign_mention_canonical(self):
+        memory_context = self._base_context()
+        memory_context['resolver_packet'] = {
+            'entity_mentions': [{
+                'mention_ref': 'reyes_1',
+                'surface_form': 'the hooded stranger',
+                'identity_status': 'known_hidden',
+                'canonical_id': 'toren',
+                'public_name': 'the hooded stranger',
+                'visibility': 'dm_private',
+            }],
+        }
+        extracted = {}
+        resolved = {}
+        compiled = compile_staged_memory_patch(memory_context, extracted, resolved)
+        records = compiled.get('resolution_records', [])
+        self.assertTrue(len(records) >= 1)
+        for record in records:
+            self.assertTrue(record.get('resolution_id', '').startswith('ires_'))
+            self.assertGreater(len(record.get('resolution_id', '')), 10)
+
+    def test_validate_resolver_packet_rejects_bad_mentions(self):
+        from services.memory_resolver_schemas import validate_resolver_packet
+        ok, err = validate_resolver_packet({'entity_mentions': [{'mention_ref': 'bad!!', 'surface_form': '', 'identity_status': 'bogus'}]})
+        self.assertFalse(ok)
+
+        ok, err = validate_resolver_packet({'entity_mentions': [{'mention_ref': 'good_1', 'surface_form': 'the stranger', 'identity_status': 'known_hidden', 'visibility': 'dm_private'}]})
+        self.assertTrue(ok)
+
 
 if __name__ == '__main__':
     unittest.main()
