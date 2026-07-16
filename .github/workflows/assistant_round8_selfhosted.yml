@@ -1,0 +1,66 @@
+name: Assistant Round 8 Self-Hosted Fix
+
+on:
+  pull_request:
+    types: [synchronize]
+    paths:
+      - '.github/scripts/apply_round8_fixes.py'
+      - '.github/workflows/assistant_round8_selfhosted.yml'
+
+permissions:
+  contents: write
+
+jobs:
+  patch-test-push:
+    if: github.event.pull_request.head.ref == 'fix/session-memory-integrity-49'
+    runs-on: self-hosted
+    steps:
+      - name: Check out PR branch
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.pull_request.head.ref }}
+          repository: ${{ github.event.pull_request.head.repo.full_name }}
+          fetch-depth: 0
+
+      - name: Apply patch and run tests
+        shell: bash
+        env:
+          PYTHONPATH: ${{ github.workspace }}/server
+        run: |
+          set +e
+          log_file="$RUNNER_TEMP/round8.log"
+          : > "$log_file"
+
+          run_stage() {
+            stage="$1"
+            shift
+            echo "=== $stage ===" | tee -a "$log_file"
+            "$@" >> "$log_file" 2>&1
+            rc=$?
+            if [ "$rc" -ne 0 ]; then
+              echo "FAILED_STAGE=$stage" | tee -a "$log_file"
+              cat "$log_file"
+              cp "$log_file" .assistant_round8_status.txt
+              git config user.name "OpenAI Assistant"
+              git config user.email "assistant@users.noreply.github.com"
+              git add .assistant_round8_status.txt
+              git commit -m "chore: record round 8 failure [round8-status]" || true
+              git push origin HEAD:${{ github.event.pull_request.head.ref }} || true
+              exit "$rc"
+            fi
+          }
+
+          run_stage patch python3 .github/scripts/apply_round8_fixes.py
+          run_stage install python3 -m pip install -r server/requirements-dev.txt
+          run_stage focused python3 -m pytest server/tests/test_session_memory_integrity.py -q -W error
+          run_stage backend python3 -m pytest server/tests -q -W error
+
+          rm -f .assistant_round8_status.txt
+          rm -f .github/scripts/apply_round8_fixes.py
+          rm -f .github/workflows/assistant_round8_selfhosted.yml
+
+          git config user.name "OpenAI Assistant"
+          git config user.email "assistant@users.noreply.github.com"
+          git add -A
+          git commit -m "Fix remaining session-memory identity integrity gaps"
+          git push origin HEAD:${{ github.event.pull_request.head.ref }}
