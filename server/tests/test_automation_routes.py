@@ -4324,6 +4324,183 @@ class AutomationRouteTest(unittest.TestCase):
         self.assertEqual(bundle_api_data['run']['scorecard_summary']['weighted_score'], expected_weighted)
         self.assertEqual(bundle_api_data['run']['scorecard_summary']['category_breakdown'], expected_breakdown)
 
+    def test_builtin_auditor_omitted_criterion_is_not_assessed(self):
+        scorecard_id = self.client.post(
+            '/api/automation/scorecards',
+            headers=self.headers,
+            json={
+                'name': 'Partial Auditor Scorecard',
+                'criteria': [
+                    {'id': 'criterion_a', 'label': 'Criterion A', 'weight': 2},
+                    {'id': 'criterion_b', 'label': 'Criterion B', 'weight': 3},
+                ],
+            },
+        ).get_json()['scorecard']['id']
+        scenario_id = self.client.post(
+            '/api/automation/scenarios',
+            headers=self.headers,
+            json={'source_campaign_id': self.campaign_id, 'scorecard_template_id': scorecard_id},
+        ).get_json()['scenario']['id']
+        snapshot_id = self.client.post(
+            f'/api/automation/scenarios/{scenario_id}/snapshots',
+            headers=self.headers,
+            json={},
+        ).get_json()['snapshot']['id']
+        run_id = self.client.post(
+            f'/api/automation/scenarios/{scenario_id}/runs',
+            headers=self.headers,
+            json={'snapshot_id': snapshot_id},
+        ).get_json()['run']['id']
+        claim = self.client.post(
+            f'/api/automation/runs/{run_id}/claim',
+            headers=self.headers,
+            json={'worker_id': 'worker-a'},
+        ).get_json()
+        cycle_id = self.client.post(
+            f'/api/automation/runs/{run_id}/pause',
+            headers=self.headers,
+            json={
+                'worker_id': 'worker-a',
+                'lease_token': claim['lease_token'],
+                'phase': 'after_dm',
+                'summary': 'Pause after DM turn',
+                'payload': {'turns_completed': 1},
+            },
+        ).get_json()['audit_cycle']['id']
+
+        with app.app_context():
+            from services.automation_auditor import _normalize_final_scorecard
+            from services.automation_service import refresh_run_scorecard, submit_audit_cycle_feedback
+            run = db.session.get(AutomationRun, run_id)
+            cycle = db.session.get(AutomationRunAuditCycle, cycle_id)
+
+            # The auditor's final JSON only covers one of the two template criteria.
+            normalized = _normalize_final_scorecard(
+                {
+                    'overall_summary': 'Partial audit.',
+                    'criteria': [
+                        {'criterion_id': 'criterion_a', 'status': 'pass', 'summary': 'Stable.', 'evidence': 'Transcript.'},
+                    ],
+                },
+                run,
+            )
+            normalized_statuses = {item['criterion_id']: item['status'] for item in normalized['criteria']}
+            self.assertEqual(normalized_statuses['criterion_a'], 'pass')
+            # Missing results use not_assessed (excluded from weighting), not half-credit warn.
+            self.assertEqual(normalized_statuses['criterion_b'], 'not_assessed')
+
+            # The aggregate path applies the same rule to a job scorecard missing the criterion.
+            job = AutomationRunAuditorJob(
+                run_id=run_id,
+                cycle_id=cycle_id,
+                auditor_slot=1,
+                status='completed',
+                submitted_scorecard_json={
+                    'overall_status': 'pass',
+                    'overall_summary': 'Partial audit.',
+                    'criteria': [{'criterion_id': 'criterion_a', 'status': 'pass', 'summary': 'Stable.', 'evidence': 'Transcript.'}],
+                    'tool_calls_used': ['get_transcript'],
+                },
+            )
+            db.session.add(job)
+            db.session.commit()
+            aggregate = aggregate_completed_auditor_jobs(run, cycle, [job])
+            aggregate_statuses = {item['criterion_id']: item['status'] for item in aggregate['criteria']}
+            self.assertEqual(aggregate_statuses['criterion_b'], 'not_assessed')
+
+            submit_audit_cycle_feedback(cycle, summary='Built-in aggregate', scorecard=aggregate)
+            results = refresh_run_scorecard(run)
+            by_id = {row['check_id']: row for row in results}
+            self.assertEqual(by_id['custom:criterion_a']['status'], 'pass')
+            self.assertEqual(by_id['custom:criterion_b']['status'], 'not_assessed')
+
+            # criterion_b (weight 3) must be excluded from the weighted score: recompute
+            # from pass/warn/fail rows only and compare against the persisted summary.
+            weighted_total = 0
+            weighted_pass = 0
+            for row in results:
+                status = row['status']
+                weight = row['details']['weight']
+                if status == 'pass':
+                    weighted_total += weight
+                    weighted_pass += weight
+                elif status == 'warn':
+                    weighted_total += weight
+                    weighted_pass += 0.5 * weight
+                elif status == 'fail':
+                    weighted_total += weight
+            self.assertEqual(
+                run.scorecard_summary_json['weighted_score'],
+                round(weighted_pass / weighted_total, 4),
+            )
+
+    def test_category_status_ignores_not_assessed_criteria(self):
+        scorecard_id = self.client.post(
+            '/api/automation/scorecards',
+            headers=self.headers,
+            json={
+                'name': 'Category Precedence Scorecard',
+                'criteria': [
+                    {'id': 'narrative_done', 'label': 'Narrative Done', 'weight': 2, 'category': 'narrative quality'},
+                    {'id': 'narrative_pending', 'label': 'Narrative Pending', 'weight': 3, 'category': 'narrative quality'},
+                ],
+            },
+        ).get_json()['scorecard']['id']
+        scenario_id = self.client.post(
+            '/api/automation/scenarios',
+            headers=self.headers,
+            json={'source_campaign_id': self.campaign_id, 'scorecard_template_id': scorecard_id},
+        ).get_json()['scenario']['id']
+        snapshot_id = self.client.post(
+            f'/api/automation/scenarios/{scenario_id}/snapshots',
+            headers=self.headers,
+            json={},
+        ).get_json()['snapshot']['id']
+        run_id = self.client.post(
+            f'/api/automation/scenarios/{scenario_id}/runs',
+            headers=self.headers,
+            json={'snapshot_id': snapshot_id},
+        ).get_json()['run']['id']
+        claim = self.client.post(
+            f'/api/automation/runs/{run_id}/claim',
+            headers=self.headers,
+            json={'worker_id': 'worker-a'},
+        ).get_json()
+        cycle_id = self.client.post(
+            f'/api/automation/runs/{run_id}/pause',
+            headers=self.headers,
+            json={
+                'worker_id': 'worker-a',
+                'lease_token': claim['lease_token'],
+                'phase': 'after_dm',
+                'summary': 'Pause after DM turn',
+                'payload': {'turns_completed': 1},
+            },
+        ).get_json()['audit_cycle']['id']
+        audit_resp = self.client.post(
+            f'/api/automation/runs/{run_id}/audit-cycles/{cycle_id}/audit',
+            headers=self.headers,
+            json={
+                'scorecard': {
+                    'summary': 'Partial manual audit',
+                    'criteria': [
+                        {'id': 'narrative_done', 'status': 'pass', 'applicability': {'applicable': True}},
+                    ],
+                },
+            },
+        )
+        self.assertEqual(audit_resp.status_code, 200)
+
+        with app.app_context():
+            from services.automation_service import refresh_run_scorecard
+            run = db.session.get(AutomationRun, run_id)
+            refresh_run_scorecard(run)
+            # One pass plus one still-unassessed criterion in the same category: not_assessed
+            # is excluded from both the category status and its weighted score.
+            narrative = run.scorecard_summary_json['category_breakdown']['narrative quality']
+            self.assertEqual(narrative['status'], 'pass')
+            self.assertEqual(narrative['score'], 1.0)
+
 
 if __name__ == '__main__':
     unittest.main()

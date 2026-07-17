@@ -334,7 +334,7 @@ Both built-in and custom scorecard criteria follow the same execution and aggreg
 - **`pass`**: Counts as `1.0 * weight`.
 - **`warn`**: Counts as `0.5 * weight` (half credit).
 - **`fail`**: Counts as `0.0 * weight` (no credit).
-- **`not_assessed`**: Excluded from the weighted total score calculation. This is the default status for custom criteria that have not yet had any cycle feedback recorded, or built-in checks with missing metrics (represented as `None`).
+- **`not_assessed`**: Excluded from the weighted total score calculation. This is the default status for custom criteria that have not yet had any cycle feedback recorded, built-in checks with missing metrics (represented as `None`), and template criteria that a built-in auditor omitted from its final scorecard.
 - **`not_applicable`**: Excluded from the weighted total score calculation. A custom criterion is marked `not_applicable` if it is explicitly submitted with `status: "not_applicable"`, if its applicability is false, or if all cycle assessments for that criterion are non-applicable.
 
 ### 2. Category Breakdowns
@@ -345,12 +345,18 @@ Scorecard results (built-in and custom) are mapped to 5 canonical categories:
 - `retrieval or memory use`
 - `safety/private-information handling`
 
-If a category contains no applicable criteria, its status is set to `not_applicable` with a `None` score. Otherwise, its status matches the worst status of the category's applicable criteria, and its category score is the weighted average of the applicable criteria in that category. Any criterion that cannot be mapped to these categories is kept uncategorized and excluded from these 5 named category breakdown cards (but still counts towards the overall score).
+If a category contains no applicable criteria, its status is set to `not_applicable` with a `None` score. Otherwise, its status is the worst status among the category's *assessed* criteria (`fail` < `warn` < `pass`); consistent with their exclusion from weighting, `not_assessed` and `not_applicable` criteria do not lower a category's status, so a category with one `pass` and one still-unassessed criterion reports `pass`. A category reports `not_assessed` only when it has applicable criteria but none of them have been assessed, and `not_applicable` when all of its criteria are not applicable. Its category score is the weighted average of the assessed (pass/warn/fail) criteria in that category. Any criterion that cannot be mapped to these categories is kept uncategorized and excluded from these 5 named category breakdown cards (but still counts towards the overall score).
 
 ### 3. Score Precision and UI Safeguards
 - Overall and category scores are rounded to 4 decimal places.
 - To prevent false perfect aggregate scores, if any warning or failure exists in the applicable criteria, the score will never round to `1.0` or display as `100.0%` in the UI (it is capped at a maximum value of `0.9999` and renders as `99.9%` in the UI).
 - Criteria weights are bounded/clamped between `1` and `100` during template creation.
+
+### 4. Weight Defaults, Legacy Snapshots, and Category Inference
+- **Default weight**: a custom criterion with no stored `weight` defaults to `2`. This applies both at template creation (missing or non-integer weights are normalized to `2`) and at scoring time for older template/run snapshots that predate the weight field.
+- **Weight bounds**: template creation and update clamp weights into `1`–`100`. At scoring time, stored weights are only lower-bounded at `1`; values above `100` can only exist in legacy snapshots written before the clamp was introduced.
+- **Legacy snapshots**: runs store a snapshot of the scorecard template, so later template edits do not rewrite historical audits. Snapshot criteria lacking `weight` or `category` are interpreted with the defaults above and the category inference below; no migration is required.
+- **Category inference** (`get_criterion_category()`): an explicit `category` value is first normalized case-insensitively against known aliases — `operational/runtime reliability` (`operational_reliability`, `operational`), `narrative quality` (`narrative_quality`, `narrative`), `durable state correctness` (`durable_state_correctness`, `state_correctness`, `state`), `retrieval or memory use` (`retrieval_memory_use`, `retrieval`, `memory`), `safety/private-information handling` (`safety_private_info`, `safety`). If the explicit category is missing or matches no alias, the criterion's id/metric/label is keyword-matched in this order: operational (`completion`, `error`, `turn`, `retry`, `status`, `reliability`, `perf`, `run`), durable state (`state`, `durable`, `db`, `entity`, `relation`, `save`, `progress`), retrieval/memory (`memory`, `retrieval`, `context`, `history`, `anchor`, `recall`), safety (`safety`, `private`, `secure`, `moderation`, `policy`, `leak`, `spoiler`), narrative (`narrative`, `story`, `quality`, `silence`, `empty`, `dialog`, `dialogue`, `rp`, `play`). If nothing matches, the criterion stays uncategorized: it is excluded from the 5 named category breakdown cards but still counts towards the overall weighted score.
 
 
 ## Troubleshooting

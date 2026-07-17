@@ -1238,7 +1238,7 @@ def _normalize_final_scorecard(parsed, run):
             existing = by_id.get(criterion['id'])
             criteria.append(existing or {
                 'criterion_id': criterion['id'],
-                'status': 'warn',
+                'status': 'not_assessed',
                 'summary': 'Auditor did not submit a finding for this criterion.',
                 'primary_evidence': None,
                 'evidence': 'Missing criterion in auditor final JSON.',
@@ -1491,7 +1491,7 @@ def aggregate_completed_auditor_jobs(run, cycle, jobs):
         if not findings:
             criteria.append({
                 'criterion_id': criterion_id,
-                'status': 'warn',
+                'status': 'not_assessed',
                 'summary': 'No built-in auditor submitted a finding for this criterion.',
                 'evidence': 'Missing criterion across completed built-in auditor jobs.',
             })
