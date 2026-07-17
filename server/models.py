@@ -2182,6 +2182,9 @@ class CampaignMemoryLog(db.Model):
     reason = db.Column(db.Text, nullable=True)
     expires_or_retire_condition = db.Column(db.Text, nullable=True)
 
+    evidence_status = db.Column(db.String(50), nullable=True)
+    provenance_json = db.Column(db.JSON, nullable=True)
+
     before_json = db.Column(db.JSON, nullable=True)
     after_json = db.Column(db.JSON, nullable=True)
     patch_json = db.Column(db.JSON, nullable=True)
@@ -2215,6 +2218,8 @@ class CampaignMemoryLog(db.Model):
             'visibility': self.visibility,
             'certainty': self.certainty,
             'importance': self.importance,
+            'evidence_status': self.evidence_status,
+            'provenance': self.provenance_json,
             'reason': self.reason,
             'expires_or_retire_condition': self.expires_or_retire_condition,
             'before_json': self.before_json,

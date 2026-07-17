@@ -8,10 +8,15 @@ from services.dm_tools import _tool_search_campaign_memory
 from services.memory_resolver_schemas import (
     AUTHORITY_PRECEDENCE,
     DIAGNOSTICS_TEMPLATE,
+    EVIDENCE_SOURCE_TYPES,
     FINAL_STATE_INVARIANTS,
     MEMORY_RUN_STATUSES,
     SOURCE_CONTRACT_COMPILED_V2,
+    determine_evidence_status,
     is_identity_worthy,
+    make_evidence_source,
+    make_provenance_record,
+    normalize_evidence_status,
     validate_diagnostics,
 )
 from services.resolution_registry import (
@@ -1017,23 +1022,92 @@ def compile_staged_memory_patch(memory_context, extracted, resolved):
     hot_context = memory_context.get("hot_context") if isinstance(memory_context.get("hot_context"), dict) else {}
     source_player_message_id = memory_context.get("latest_player_message_id") or memory_context.get("source_player_message_id") or hot_context.get("player_message_id") or hot_context.get("source_player_message_id")
     source_dm_message_id = memory_context.get("latest_dm_message_id") or memory_context.get("source_dm_message_id") or hot_context.get("dm_message_id") or hot_context.get("source_dm_message_id")
+    trace_id = memory_context.get("trace_id") or hot_context.get("trace_id")
+
+    def _resolve_evidence_sources(item_raw):
+        evidence = item_raw.get("evidence")
+        if isinstance(evidence, list):
+            sources = []
+            for ev in evidence:
+                if isinstance(ev, dict):
+                    src_type = ev.get("source") or ev.get("source_type", "resolver_output")
+                    if src_type in EVIDENCE_SOURCE_TYPES:
+                        sources.append(make_evidence_source(
+                            src_type,
+                            ev.get("source_id") or ev.get("field") or ev.get("clarification_id"),
+                            description=ev.get("description"),
+                            confidence=ev.get("confidence"),
+                            ambiguity=ev.get("ambiguity"),
+                        ))
+                    else:
+                        sources.append(make_evidence_source(
+                            "resolver_output",
+                            src_type,
+                            description=json.dumps(ev, ensure_ascii=False) if ev else None,
+                        ))
+                elif ev:
+                    sources.append(make_evidence_source(
+                        "resolver_output",
+                        str(ev),
+                        description=str(ev),
+                    ))
+            return sources
+        if evidence and isinstance(evidence, (str, int)):
+            return [make_evidence_source("resolver_output", str(evidence), description=str(evidence))]
+        raw_prov = item_raw.get("provenance") if isinstance(item_raw.get("provenance"), dict) else {}
+        raw_sources = raw_prov.get("evidence_sources")
+        if isinstance(raw_sources, list):
+            return raw_sources
+        basis = raw_prov.get("evidence_basis") or item_raw.get("evidence_basis") if isinstance(item_raw.get("evidence_basis"), list) else []
+        if basis:
+            return [make_evidence_source("resolver_output", b if isinstance(b, str) else str(b)) for b in basis if b]
+        return []
+
+    def _resolve_pipeline_stage(item_raw, default_stage="applied"):
+        raw_prov = item_raw.get("provenance") if isinstance(item_raw.get("provenance"), dict) else {}
+        stage = raw_prov.get("pipeline_stage") or item_raw.get("pipeline_stage") or default_stage
+        return stage
+
+    def _resolve_evidence_status(item_raw, evidence_sources):
+        raw_prov = item_raw.get("provenance") if isinstance(item_raw.get("provenance"), dict) else {}
+        raw_status = raw_prov.get("evidence_status") or item_raw.get("evidence_status")
+        normalized = normalize_evidence_status(raw_status)
+        if normalized:
+            return normalized
+        if raw_prov.get("evidence_basis") and not evidence_sources:
+            basis = raw_prov["evidence_basis"]
+            if isinstance(basis, list) and basis:
+                return determine_evidence_status(
+                    [make_evidence_source("resolver_output", str(b)) for b in basis if b],
+                )
+            return "insufficiently_supported"
+        return determine_evidence_status(evidence_sources)
 
     def make_provenance(item_raw, default_tool=None):
         raw_prov = item_raw.get("provenance") if isinstance(item_raw.get("provenance"), dict) else {}
-        evidence = item_raw.get("evidence")
-        if not isinstance(evidence, list):
-            evidence = [evidence] if evidence else []
-        basis = raw_prov.get("evidence_basis") or item_raw.get("evidence_basis") or evidence
-        if not isinstance(basis, list):
-            basis = [basis] if basis else []
-        basis = [str(b).strip() for b in basis if str(b).strip()]
-        return {
-            "source_player_message_id": raw_prov.get("source_player_message_id") or source_player_message_id,
-            "source_dm_message_id": raw_prov.get("source_dm_message_id") or source_dm_message_id,
-            "tool_name": raw_prov.get("tool_name") or default_tool,
-            "tool_result_id": raw_prov.get("tool_result_id"),
-            "evidence_basis": basis,
-        }
+        evidence_sources = _resolve_evidence_sources(item_raw)
+        record = make_provenance_record(
+            source_player_message_id=raw_prov.get("source_player_message_id") or source_player_message_id,
+            source_dm_message_id=raw_prov.get("source_dm_message_id") or source_dm_message_id,
+            prior_memory_record_ids=raw_prov.get("prior_memory_record_ids"),
+            world_event_ids=raw_prov.get("world_event_ids"),
+            clock_trigger_id=raw_prov.get("clock_trigger_id"),
+            tool_name=raw_prov.get("tool_name") or default_tool,
+            tool_result_id=raw_prov.get("tool_result_id"),
+            evidence_sources=evidence_sources or None,
+            evidence_status=_resolve_evidence_status(item_raw, evidence_sources),
+            pipeline_stage=_resolve_pipeline_stage(item_raw),
+            resolution_confidence=raw_prov.get("resolution_confidence"),
+            ambiguity_status=raw_prov.get("ambiguity_status"),
+            trace_id=raw_prov.get("trace_id") or trace_id,
+            parent_trace_id=raw_prov.get("parent_trace_id"),
+        )
+        raw_basis = raw_prov.get("evidence_basis") or item_raw.get("evidence_basis")
+        if isinstance(raw_basis, list):
+            record["evidence_basis"] = [str(b).strip() for b in raw_basis if str(b).strip()]
+        elif raw_basis:
+            record["evidence_basis"] = [str(raw_basis).strip()]
+        return record
 
     allocated_entity_ids = set(known["entity_ids"])
     for entry in registry:

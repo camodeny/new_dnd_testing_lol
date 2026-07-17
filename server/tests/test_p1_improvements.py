@@ -968,5 +968,399 @@ class P1ImprovementsTest(unittest.TestCase):
         self.assertEqual(len(res['npc_changes']), 1)
         self.assertEqual(res['npc_changes'][0]['npc_actor']['actor_id'], 'gundren_rockseeker')
 
+    def test_evidence_status_determination(self):
+        from services.memory_resolver_schemas import determine_evidence_status, make_evidence_source
+
+        self.assertEqual(
+            determine_evidence_status([], is_rule_derived=False),
+            'insufficiently_supported'
+        )
+        self.assertEqual(
+            determine_evidence_status([], is_rule_derived=True),
+            'supported_by_rules'
+        )
+        self.assertEqual(
+            determine_evidence_status([
+                make_evidence_source('prior_durable_memory', 'ent_123')
+            ]),
+            'supported_by_evidence'
+        )
+        self.assertEqual(
+            determine_evidence_status([
+                make_evidence_source('transcript_message', 'msg_1', confidence=0.8)
+            ]),
+            'supported_by_evidence'
+        )
+        self.assertEqual(
+            determine_evidence_status([
+                make_evidence_source('transcript_message', 'msg_1', confidence=0.2)
+            ]),
+            'insufficiently_supported'
+        )
+
+    def test_make_provenance_record(self):
+        from services.memory_resolver_schemas import make_provenance_record
+
+        record = make_provenance_record(
+            source_player_message_id=42,
+            source_dm_message_id=43,
+            prior_memory_record_ids=['mem_1', 'mem_2'],
+            world_event_ids=['evt_1'],
+            clock_trigger_id='clock_guard_spotted',
+            tool_name='resolution_registry',
+            evidence_sources=[{'source_type': 'transcript_message', 'source_id': 'msg_99'}],
+            evidence_status='supported_by_evidence',
+            pipeline_stage='applied',
+            resolution_confidence=0.9,
+            ambiguity_status=False,
+            trace_id='tr_abc',
+        )
+        self.assertEqual(record['source_player_message_id'], 42)
+        self.assertEqual(record['source_dm_message_id'], 43)
+        self.assertEqual(record['prior_memory_record_ids'], ['mem_1', 'mem_2'])
+        self.assertEqual(record['world_event_ids'], ['evt_1'])
+        self.assertEqual(record['clock_trigger_id'], 'clock_guard_spotted')
+        self.assertEqual(record['tool_name'], 'resolution_registry')
+        self.assertEqual(record['evidence_status'], 'supported_by_evidence')
+        self.assertEqual(record['pipeline_stage'], 'applied')
+        self.assertEqual(record['resolution_confidence'], 0.9)
+        self.assertFalse(record['ambiguity_status'])
+        self.assertEqual(record['trace_id'], 'tr_abc')
+
+    def test_compiled_patch_includes_enhanced_provenance(self):
+        memory_context = {
+            'campaign_id': self.campaign.id,
+            'source_player_message_id': 100,
+            'source_dm_message_id': 200,
+            'trace_id': 'trace_test',
+        }
+        resolved = {
+            'upsert_graph_entities': [
+                {
+                    'id': 'gundren_rockseeker',
+                    'name': 'Gundren Rockseeker',
+                    'type': 'npc',
+                    'summary': 'A dwarf patron.',
+                    'intended_visibility': 'party_known',
+                    'source_surface': 'visible_transcript',
+                    'provenance': {
+                        'evidence_sources': [
+                            {'source_type': 'transcript_message', 'source_id': 'msg_200'}
+                        ],
+                        'evidence_status': 'supported_by_evidence',
+                        'pipeline_stage': 'resolved',
+                        'resolution_confidence': 0.95,
+                    },
+                }
+            ],
+            'upsert_graph_facts': [
+                {
+                    'text': 'The red dragon sleeps.',
+                    'evidence': [
+                        {'source': 'visible_transcript', 'field': 'DM said the dragon sleeps.'}
+                    ],
+                }
+            ],
+            'upsert_graph_relations': [
+                {
+                    'type': 'allied_with',
+                    'source_id': 'gundren_rockseeker',
+                    'target_id': 'sildar_hallwinter',
+                    'provenance': {
+                        'evidence_status': 'insufficiently_supported',
+                        'ambiguity_status': True,
+                    },
+                }
+            ],
+            'create_clocks': [
+                {
+                    'id': 'clock_danger',
+                    'name': 'Danger Clock',
+                    'segments': 4,
+                    'provenance': {
+                        'evidence_sources': [
+                            {'source_type': 'transcript_message', 'source_id': 'msg_200'}
+                        ],
+                        'evidence_status': 'supported_by_evidence',
+                    },
+                }
+            ],
+        }
+
+        self.world.knowledge_graph = '{"entities":[{"id":"gundren_rockseeker","type":"npc","name":"Gundren Rockseeker"},{"id":"sildar_hallwinter","type":"npc","name":"Sildar Hallwinter"}],"relations":[],"facts":[]}'
+        gundren = NPCActor(campaign_id=self.campaign.id, actor_id='gundren_rockseeker', name='Gundren Rockseeker', public_summary='Dwarf', dossier='{}')
+        sildar = NPCActor(campaign_id=self.campaign.id, actor_id='sildar_hallwinter', name='Sildar Hallwinter', public_summary='Warrior', dossier='{}')
+        db.session.add(gundren)
+        db.session.add(sildar)
+        db.session.commit()
+
+        compiled = compile_staged_memory_patch(memory_context, {}, resolved)
+
+        entities = compiled.get('upsert_graph_entities', [])
+        self.assertEqual(len(entities), 1)
+        self.assertIn('evidence_status', entities[0]['provenance'])
+        self.assertEqual(entities[0]['provenance']['evidence_status'], 'supported_by_evidence')
+        self.assertIn('pipeline_stage', entities[0]['provenance'])
+        self.assertEqual(entities[0]['provenance']['resolution_confidence'], 0.95)
+
+        facts = compiled.get('upsert_graph_facts', [])
+        self.assertEqual(len(facts), 1)
+        self.assertIn('provenance', facts[0])
+        self.assertIn('evidence_sources', facts[0]['provenance'])
+
+        rels = compiled.get('upsert_graph_relations', [])
+        self.assertEqual(len(rels), 1)
+        self.assertEqual(rels[0]['provenance']['evidence_status'], 'insufficiently_supported')
+        self.assertTrue(rels[0]['provenance']['ambiguity_status'])
+
+        clocks = compiled.get('create_clocks', [])
+        self.assertEqual(len(clocks), 1)
+        self.assertEqual(clocks[0]['provenance']['evidence_status'], 'supported_by_evidence')
+        self.assertIn('evidence_sources', clocks[0]['provenance'])
+
+    def test_memory_log_persistence_stores_provenance(self):
+        from models import CampaignMemoryLog, CampaignClock
+
+        patch = {
+            'create_clocks': [
+                {
+                    'id': 'clock_prov_test',
+                    'name': 'Provenance Test Clock',
+                    'segments': 4,
+                    'filled': 1,
+                    'visibility': 'party_known',
+                    'provenance': {
+                        'source_player_message_id': 300,
+                        'source_dm_message_id': 400,
+                        'tool_name': 'test_tool',
+                        'evidence_sources': [
+                            {'source_type': 'transcript_message', 'source_id': 'msg_400'}
+                        ],
+                        'evidence_status': 'supported_by_evidence',
+                        'pipeline_stage': 'applied',
+                    },
+                }
+            ],
+        }
+
+        apply_memory_patch(self.campaign, self.session, patch)
+
+        logs = CampaignMemoryLog.query.filter_by(
+            campaign_id=self.campaign.id,
+            target_table='campaign_clocks',
+            memory_id='clock_prov_test',
+        ).all()
+        self.assertGreaterEqual(len(logs), 1)
+
+        log = logs[0]
+        self.assertEqual(log.evidence_status, 'supported_by_evidence')
+        self.assertIsNotNone(log.provenance_json)
+        self.assertEqual(log.provenance_json.get('tool_name'), 'test_tool')
+        self.assertEqual(log.provenance_json.get('source_player_message_id'), 300)
+        self.assertEqual(log.provenance_json.get('pipeline_stage'), 'applied')
+        self.assertIn('evidence_sources', log.provenance_json)
+
+        clock = CampaignClock.query.filter_by(campaign_id=self.campaign.id, clock_id='clock_prov_test').first()
+        self.assertIsNotNone(clock)
+        self.assertEqual(clock.name, 'Provenance Test Clock')
+
+    def test_clock_advance_records_provenance(self):
+        from models import CampaignClock, WorldEvent
+        from services.dm_tools import _tool_advance_clock
+
+        clock = CampaignClock(
+            campaign_id=self.campaign.id,
+            clock_id='clock_advance_test',
+            name='Advance Test Clock',
+            segments=6,
+            filled=0,
+            visibility='party_known',
+        )
+        db.session.add(clock)
+        db.session.commit()
+
+        result = _tool_advance_clock(self.campaign, None, {
+            'clock_id': 'clock_advance_test',
+            'delta': 2,
+            'reason': 'Test advance',
+            'evidence': ['Transcript evidence'],
+        })
+
+        self.assertNotIn('error', result)
+        self.assertEqual(result['clock']['filled'], 2)
+
+        event = WorldEvent.query.filter_by(
+            campaign_id=self.campaign.id,
+            event_type='clock_advanced',
+        ).order_by(WorldEvent.id.desc()).first()
+        self.assertIsNotNone(event)
+        payload = json.loads(event.payload) if event.payload else {}
+        self.assertIn('provenance', payload)
+        self.assertEqual(payload['provenance']['tool_name'], 'session_dm_advance_clock')
+        self.assertIn('evidence_sources', payload['provenance'])
+        self.assertEqual(payload['provenance']['delta'], 2)
+
+    def test_clock_create_and_retire_record_provenance(self):
+        from models import CampaignClock, WorldEvent
+        from services.dm_tools import _create_clock_from_patch, _retire_clock_from_patch
+
+        result = _create_clock_from_patch(self.campaign, {
+            'id': 'clock_create_test',
+            'name': 'Create Test Clock',
+            'segments': 6,
+            'filled': 0,
+            'visibility': 'party_known',
+            'provenance': {
+                'tool_name': 'test_create',
+                'evidence_status': 'supported_by_evidence',
+                'pipeline_stage': 'proposed',
+            },
+        })
+        self.assertNotIn('error', result)
+        clock = CampaignClock.query.filter_by(campaign_id=self.campaign.id, clock_id='clock_create_test').first()
+        self.assertIsNotNone(clock)
+
+        create_event = WorldEvent.query.filter_by(
+            campaign_id=self.campaign.id,
+            event_type='clock_created',
+        ).order_by(WorldEvent.id.desc()).first()
+        self.assertIsNotNone(create_event)
+        create_payload = json.loads(create_event.payload) if create_event.payload else {}
+        self.assertIn('provenance', create_payload)
+        self.assertEqual(create_payload['provenance']['tool_name'], 'test_create')
+
+        retire_result = _retire_clock_from_patch(self.campaign, {
+            'clock_id': 'clock_create_test',
+            'reason': 'Test retire',
+            'provenance': {
+                'tool_name': 'test_retire',
+                'evidence_status': 'supported_by_evidence',
+                'pipeline_stage': 'applied',
+            },
+        })
+        self.assertNotIn('error', retire_result)
+
+        retire_event = WorldEvent.query.filter_by(
+            campaign_id=self.campaign.id,
+            event_type='clock_retired',
+        ).order_by(WorldEvent.id.desc()).first()
+        self.assertIsNotNone(retire_event)
+        retire_payload = json.loads(retire_event.payload) if retire_event.payload else {}
+        self.assertIn('provenance', retire_payload)
+        self.assertEqual(retire_payload['provenance']['tool_name'], 'test_retire')
+
+    def test_provenance_survives_roundtrip_in_memory_log(self):
+        from models import CampaignMemoryLog
+
+        patch = {
+            'update_npc_actors': [
+                {
+                    'id': 'test_npc_prov',
+                    'name': 'Test NPC',
+                    'role': 'Test',
+                    'provenance': {
+                        'source_player_message_id': 888,
+                        'tool_name': 'test_resolver',
+                        'evidence_sources': [
+                            {'source_type': 'prior_memory_record', 'source_id': 'mem_abc'}
+                        ],
+                        'evidence_status': 'supported_by_evidence',
+                        'pipeline_stage': 'applied',
+                        'resolution_confidence': 0.85,
+                    },
+                }
+            ],
+        }
+        result = apply_memory_patch(self.campaign, self.session, patch)
+        self.assertEqual(len(result['npc_changes']), 1)
+
+        logs = CampaignMemoryLog.query.filter_by(
+            campaign_id=self.campaign.id,
+            target_table='npc_actors',
+        ).all()
+        log = next((log_entry for log_entry in logs if log_entry.memory_id == 'test_npc_prov'), None)
+        self.assertIsNotNone(log, 'Memory log should exist for test NPC')
+        self.assertEqual(log.evidence_status, 'supported_by_evidence')
+        self.assertIsNotNone(log.provenance_json)
+        self.assertEqual(log.provenance_json.get('tool_name'), 'test_resolver')
+        self.assertEqual(log.provenance_json.get('source_player_message_id'), 888)
+        self.assertEqual(log.provenance_json.get('pipeline_stage'), 'applied')
+        self.assertEqual(log.provenance_json.get('resolution_confidence'), 0.85)
+
+    def test_identity_resolution_provenance_in_resolution_records(self):
+        memory_context = {
+            'campaign_id': self.campaign.id,
+            'source_player_message_id': 1,
+            'source_dm_message_id': 2,
+        }
+        self.world.knowledge_graph = '{"entities":[{"id":"existing_entity","type":"npc","name":"Existing Entity"}],"relations":[],"facts":[]}'
+        db.session.add(self.world)
+        existing_npc = NPCActor(campaign_id=self.campaign.id, actor_id='existing_entity', name='Existing Entity', public_summary='Known NPC', dossier='{}')
+        db.session.add(existing_npc)
+        db.session.commit()
+
+        resolved = {
+            'upsert_graph_entities': [
+                {
+                    'id': 'existing_entity',
+                    'name': 'Existing Entity',
+                    'type': 'npc',
+                    'intended_visibility': 'party_known',
+                    'source_surface': 'visible_transcript',
+                    'provenance': {
+                        'evidence_sources': [
+                            {'source_type': 'prior_memory_record', 'source_id': 'existing_entity'}
+                        ],
+                        'evidence_status': 'supported_by_evidence',
+                    },
+                }
+            ],
+        }
+        compiled = compile_staged_memory_patch(memory_context, {}, resolved)
+        registry_entries = compiled.get('registry', [])
+        self.assertTrue(any(
+            e.get('evidence') is not None
+            for e in registry_entries
+        ), 'Registry entries should preserve evidence')
+
+    def test_evidence_status_unsupported_vs_supported(self):
+        memory_context = {
+            'campaign_id': self.campaign.id,
+            'source_player_message_id': 1,
+        }
+        self.world.knowledge_graph = '{"entities":[{"id":"phandalin","type":"location","name":"Phandalin"}],"relations":[],"facts":[]}'
+        db.session.add(self.world)
+        db.session.commit()
+
+        resolved_unsupported = {
+            'upsert_graph_facts': [
+                {
+                    'text': 'An unverified claim.',
+                    'provenance': {
+                        'evidence_basis': [],
+                        'evidence_status': 'insufficiently_supported',
+                    },
+                }
+            ],
+        }
+        compiled_unsupported = compile_staged_memory_patch(memory_context, {}, resolved_unsupported)
+        fact_unsupported = compiled_unsupported['upsert_graph_facts'][0]
+        self.assertEqual(fact_unsupported['provenance']['evidence_status'], 'insufficiently_supported')
+
+        resolved_supported = {
+            'upsert_graph_facts': [
+                {
+                    'text': 'A verified claim.',
+                    'provenance': {
+                        'evidence_basis': ['Transcript says verified claim.'],
+                        'evidence_status': 'supported_by_evidence',
+                    },
+                }
+            ],
+        }
+        compiled_supported = compile_staged_memory_patch(memory_context, {}, resolved_supported)
+        fact_supported = compiled_supported['upsert_graph_facts'][0]
+        self.assertEqual(fact_supported['provenance']['evidence_status'], 'supported_by_evidence')
+
 if __name__ == '__main__':
     unittest.main()

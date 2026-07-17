@@ -2901,6 +2901,20 @@ def _tool_advance_clock(campaign, _current_user, args):
     clock.updated_at = utcnow()
     upsert_memory_embedding(campaign, 'clock', clock.clock_id, clock.to_dict(include_private=True))
     evidence = args.get('evidence') if isinstance(args.get('evidence'), list) else []
+    evidence_sources = []
+    for ev in evidence:
+        if isinstance(ev, dict) and ev.get('source_type'):
+            evidence_sources.append(dict(ev))
+        elif ev:
+            evidence_sources.append({'source_type': 'resolver_output', 'source_id': str(ev)})
+    from services.audit_service import log_audit_event as _log_audit
+    provenance = {
+        'tool_name': 'session_dm_advance_clock',
+        'pipeline_stage': 'applied',
+        'evidence_sources': evidence_sources or None,
+        'clock_trigger_id': clock.clock_id,
+        'delta': delta,
+    }
     event = _record_event(
         campaign,
         'clock_advanced',
@@ -2912,8 +2926,25 @@ def _tool_advance_clock(campaign, _current_user, args):
             'delta': delta,
             'status': clock.status,
             'evidence': [clean_text(item, 240) for item in evidence if clean_text(item, 240)],
+            'provenance': provenance,
         },
         visibility=clock.visibility or 'dm_private',
+    )
+    _log_audit(
+        campaign.id,
+        'clock_advanced',
+        f'Clock "{clock.name}" advanced by {delta}',
+        {
+            'clock_id': clock.clock_id,
+            'from': old_filled,
+            'to': clock.filled,
+            'delta': delta,
+            'status': clock.status,
+            'provenance': provenance,
+        },
+        source='tools',
+        actor='session_dm',
+        audit_role='tools',
     )
     return {'clock': clock.to_dict(include_private=True), 'affected_ids': {'clock_ids': [clock.id], 'world_event_ids': [event.id]}}
 
@@ -5032,14 +5063,31 @@ def _create_clock_from_patch(campaign, patch):
         db.session.add(clock)
     db.session.flush()
     upsert_memory_embedding(campaign, 'clock', clock.clock_id, clock.to_dict(include_private=True))
+    provenance = patch.get('provenance')
+    if isinstance(provenance, dict):
+        provenance = dict(provenance)
+    else:
+        provenance = {
+            'tool_name': 'session_memory_update_clocks',
+            'pipeline_stage': 'applied',
+            'clock_trigger_id': clock.clock_id,
+        }
     event = _record_event(
         campaign,
         'clock_created' if not existing else 'clock_updated',
         patch.get('reason') or f'Clock {clock.name} {"created" if not existing else "updated"}.',
-        {'clock': clock.to_dict(include_private=True)},
+        {
+            'clock': clock.to_dict(include_private=True),
+            'provenance': provenance,
+        },
         visibility=clock.visibility,
     )
-    return {'clock': clock.to_dict(include_private=True), 'event_id': event.id, 'action': 'created' if not existing else 'updated'}
+    return {
+        'clock': clock.to_dict(include_private=True),
+        'event_id': event.id,
+        'action': 'created' if not existing else 'updated',
+        'provenance': provenance,
+    }
 
 
 def _retire_clock_from_patch(campaign, patch):
@@ -5050,11 +5098,24 @@ def _retire_clock_from_patch(campaign, patch):
     clock.status = clean_text(patch.get('status'), 30) or 'resolved'
     clock.updated_at = utcnow()
     upsert_memory_embedding(campaign, 'clock', clock.clock_id, clock.to_dict(include_private=True))
+    provenance = patch.get('provenance')
+    if isinstance(provenance, dict):
+        provenance = dict(provenance)
+    else:
+        provenance = {
+            'tool_name': 'session_memory_update_clocks',
+            'pipeline_stage': 'applied',
+            'clock_trigger_id': clock.clock_id,
+        }
     event = _record_event(
         campaign,
         'clock_retired',
         patch.get('reason') or f'Clock {clock.name} retired as {clock.status}.',
-        {'clock_id': clock.clock_id, 'status': clock.status},
+        {
+            'clock_id': clock.clock_id,
+            'status': clock.status,
+            'provenance': provenance,
+        },
         visibility=clock.visibility or 'dm_private',
     )
     return {'clock': clock.to_dict(include_private=True), 'event_id': event.id, 'action': 'retired'}
@@ -5124,6 +5185,7 @@ def apply_clock_adjudication(campaign, updates, audit_context=None):
             'reason': clean_text(item.get('reason'), 420),
             'status': clean_text(item.get('status'), 30),
             'evidence': item.get('evidence') if isinstance(item.get('evidence'), list) else [],
+            'provenance': item.get('provenance'),
         })
         if change.get('error'):
             result['errors'].append(change['error'])
@@ -5321,7 +5383,8 @@ def apply_memory_patch(campaign, session, patch, audit_context=None):
     def log_change(memory_id, target_table, target_id, operation, status='applied',
                    memory_type=None, visibility=None, certainty=None, importance=None,
                    reason=None, expires_or_retire_condition=None,
-                   before_json=None, after_json=None, patch_json=None, error=None):
+                   before_json=None, after_json=None, patch_json=None, error=None,
+                   evidence_status=None, provenance=None):
         nonlocal logs_written
         # Normalize certainty
         cert_val = _coerce_patch_certainty(certainty, default='confirmed')
@@ -5357,6 +5420,8 @@ def apply_memory_patch(campaign, session, patch, audit_context=None):
             importance=imp_val,
             reason=_coerce_patch_text(reason, 420) or None,
             expires_or_retire_condition=_coerce_patch_text(expires_or_retire_condition, 520) or None,
+            evidence_status=_coerce_patch_text(evidence_status, 50) if evidence_status else None,
+            provenance_json=provenance if isinstance(provenance, dict) else None,
             before_json=before_json,
             after_json=after_json,
             patch_json=patch_json,
@@ -5708,6 +5773,19 @@ def apply_memory_patch(campaign, session, patch, audit_context=None):
 
             after_val = change.get('clock')
             action = change.get('action')
+            provenance = item.get('provenance')
+            if isinstance(provenance, dict):
+                provenance = dict(provenance)
+                provenance.setdefault('pipeline_stage', 'applied')
+            elif after_val:
+                provenance = {
+                    'tool_name': 'session_memory_update_clocks',
+                    'pipeline_stage': 'applied',
+                    'source_player_message_id': player_message_id,
+                    'source_dm_message_id': dm_message_id,
+                    'trace_id': trace_id,
+                }
+            evidence_status = (item.get('provenance') or {}).get('evidence_status') if isinstance(item.get('provenance'), dict) else None
 
             log_change(
                 memory_id=clock_id,
@@ -5723,7 +5801,9 @@ def apply_memory_patch(campaign, session, patch, audit_context=None):
                 expires_or_retire_condition=item.get('expires_or_retire_condition'),
                 before_json=before_val,
                 after_json=after_val,
-                patch_json=item
+                patch_json=item,
+                evidence_status=evidence_status,
+                provenance=provenance,
             )
 
         for item in patch.get('retire_clocks', []) if isinstance(patch.get('retire_clocks'), list) else []:
@@ -5737,6 +5817,19 @@ def apply_memory_patch(campaign, session, patch, audit_context=None):
                 result['world_event_ids'].append(change['event_id'])
 
             after_val = change.get('clock')
+            provenance = item.get('provenance')
+            if isinstance(provenance, dict):
+                provenance = dict(provenance)
+                provenance.setdefault('pipeline_stage', 'applied')
+            elif after_val:
+                provenance = {
+                    'tool_name': 'session_memory_update_clocks',
+                    'pipeline_stage': 'applied',
+                    'source_player_message_id': player_message_id,
+                    'source_dm_message_id': dm_message_id,
+                    'trace_id': trace_id,
+                }
+            evidence_status = (item.get('provenance') or {}).get('evidence_status') if isinstance(item.get('provenance'), dict) else None
 
             log_change(
                 memory_id=clock_id,
@@ -5752,7 +5845,9 @@ def apply_memory_patch(campaign, session, patch, audit_context=None):
                 expires_or_retire_condition=item.get('expires_or_retire_condition'),
                 before_json=before_val,
                 after_json=after_val,
-                patch_json=item
+                patch_json=item,
+                evidence_status=evidence_status,
+                provenance=provenance,
             )
 
         for item in patch.get('update_npc_actors', []) if isinstance(patch.get('update_npc_actors'), list) else []:
@@ -5769,6 +5864,20 @@ def apply_memory_patch(campaign, session, patch, audit_context=None):
             after_val = change.get('npc_actor')
             action = change.get('action')
 
+            provenance = item.get('provenance')
+            if isinstance(provenance, dict):
+                provenance = dict(provenance)
+                provenance.setdefault('pipeline_stage', 'applied')
+            elif after_val:
+                provenance = {
+                    'tool_name': 'resolution_registry',
+                    'pipeline_stage': 'applied',
+                    'source_player_message_id': player_message_id,
+                    'source_dm_message_id': dm_message_id,
+                    'trace_id': trace_id,
+                }
+            evidence_status = (item.get('provenance') or {}).get('evidence_status') if isinstance(item.get('provenance'), dict) else None
+
             log_change(
                 memory_id=actor_id,
                 target_table='npc_actors',
@@ -5783,7 +5892,9 @@ def apply_memory_patch(campaign, session, patch, audit_context=None):
                 expires_or_retire_condition=item.get('expires_or_retire_condition'),
                 before_json=before_val,
                 after_json=after_val,
-                patch_json=item
+                patch_json=item,
+                evidence_status=evidence_status,
+                provenance=provenance,
             )
 
         for event_patch in patch.get('record_events', []) if isinstance(patch.get('record_events'), list) else []:
@@ -5795,6 +5906,20 @@ def apply_memory_patch(campaign, session, patch, audit_context=None):
                 event_patch.get('visibility') or 'dm_private',
             )
             result['world_event_ids'].append(event.id)
+
+            provenance = event_patch.get('provenance')
+            if isinstance(provenance, dict):
+                provenance = dict(provenance)
+                provenance.setdefault('pipeline_stage', 'applied')
+            else:
+                provenance = {
+                    'tool_name': 'session_memory_record_event',
+                    'pipeline_stage': 'applied',
+                    'source_player_message_id': player_message_id,
+                    'source_dm_message_id': dm_message_id,
+                    'trace_id': trace_id,
+                }
+            evidence_status = (event_patch.get('provenance') or {}).get('evidence_status') if isinstance(event_patch.get('provenance'), dict) else None
 
             log_change(
                 memory_id=f"event_{event.id}",
@@ -5810,7 +5935,9 @@ def apply_memory_patch(campaign, session, patch, audit_context=None):
                 expires_or_retire_condition=event_patch.get('expires_or_retire_condition'),
                 before_json=None,
                 after_json=event.to_dict(include_private=True),
-                patch_json=event_patch
+                patch_json=event_patch,
+                evidence_status=evidence_status,
+                provenance=provenance,
             )
 
         summary = clean_text(patch.get('running_summary'), 4000)

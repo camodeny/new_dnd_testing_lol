@@ -349,3 +349,120 @@ FINAL_STATE_INVARIANTS = [
     "cast_sets_no_overlap",
     "substitutions_empty",
 ]
+
+
+# ── Evidence Status Model ─────────────────────────────────────────────
+
+EVIDENCE_STATUSES = {
+    "contradicted",
+    "insufficiently_supported",
+    "supported_by_evidence",
+    "supported_by_rules",
+}
+
+EVIDENCE_SOURCE_TYPES = {
+    "transcript_message",
+    "prior_memory_record",
+    "world_event",
+    "clock_rule",
+    "resolver_output",
+    "clarification_answer",
+    "deterministic_rule",
+}
+
+PIPELINE_STAGES = {
+    "proposed",
+    "resolved",
+    "validated",
+    "applied",
+    "rejected",
+    "unresolved",
+}
+
+
+def make_evidence_source(source_type, source_id, description=None, confidence=None, ambiguity=None):
+    source = {
+        "source_type": source_type,
+        "source_id": source_id,
+    }
+    if description:
+        source["description"] = description
+    if confidence is not None:
+        source["confidence"] = confidence
+    if ambiguity is not None:
+        source["ambiguity"] = ambiguity
+    return source
+
+
+def determine_evidence_status(evidence_sources, is_rule_derived=False):
+    if not isinstance(evidence_sources, list):
+        evidence_sources = []
+    if is_rule_derived:
+        return "supported_by_rules"
+    if not evidence_sources:
+        return "insufficiently_supported"
+    for ev in evidence_sources:
+        if isinstance(ev, dict):
+            src_type = ev.get("source_type") or ev.get("source")
+            if src_type in ("memory_resolver_packet", "prior_durable_memory", "clarification_answer"):
+                return "supported_by_evidence"
+            if src_type in ("visible_transcript", "resolver_output", "transcript_message", "deterministic_rule"):
+                if ev.get("confidence") in (None, 1.0) or ev.get("confidence", 0) > 0.3:
+                    return "supported_by_evidence"
+    return "insufficiently_supported"
+
+
+def normalize_evidence_status(value):
+    status = str(value or "").strip().lower()
+    return status if status in EVIDENCE_STATUSES else None
+
+
+def make_provenance_record(
+    source_player_message_id=None,
+    source_dm_message_id=None,
+    prior_memory_record_ids=None,
+    world_event_ids=None,
+    clock_trigger_id=None,
+    tool_name=None,
+    tool_result_id=None,
+    evidence_sources=None,
+    evidence_status=None,
+    pipeline_stage=None,
+    resolution_confidence=None,
+    ambiguity_status=None,
+    trace_id=None,
+    parent_trace_id=None,
+    build_sha=None,
+):
+    record = {}
+    if source_player_message_id is not None:
+        record["source_player_message_id"] = source_player_message_id
+    if source_dm_message_id is not None:
+        record["source_dm_message_id"] = source_dm_message_id
+    if prior_memory_record_ids:
+        record["prior_memory_record_ids"] = prior_memory_record_ids if isinstance(prior_memory_record_ids, list) else [prior_memory_record_ids]
+    if world_event_ids:
+        record["world_event_ids"] = world_event_ids if isinstance(world_event_ids, list) else [world_event_ids]
+    if clock_trigger_id:
+        record["clock_trigger_id"] = clock_trigger_id
+    if tool_name:
+        record["tool_name"] = tool_name
+    if tool_result_id:
+        record["tool_result_id"] = tool_result_id
+    if evidence_sources:
+        record["evidence_sources"] = evidence_sources if isinstance(evidence_sources, list) else [evidence_sources]
+    if evidence_status:
+        record["evidence_status"] = evidence_status
+    if pipeline_stage:
+        record["pipeline_stage"] = pipeline_stage
+    if resolution_confidence is not None:
+        record["resolution_confidence"] = resolution_confidence
+    if ambiguity_status is not None:
+        record["ambiguity_status"] = ambiguity_status
+    if trace_id:
+        record["trace_id"] = trace_id
+    if parent_trace_id:
+        record["parent_trace_id"] = parent_trace_id
+    if build_sha:
+        record["build_sha"] = build_sha
+    return record
