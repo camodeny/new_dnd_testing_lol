@@ -102,7 +102,10 @@ def find_all_matching_candidates(name, known_ids, prior_resolutions, expected_ty
                 not alias_name
                 or alias_name.strip().lower() != name_lower
                 or not canonical_id
-                or canonical_id not in known_ids.get("entity_ids", set())
+                or (
+                    canonical_id not in known_ids.get("entity_ids", set())
+                    and canonical_id not in known_ids.get("npc_ids", set())
+                )
             ):
                 continue
             candidate_type = _canonical_entity_type(known_ids, canonical_id)
