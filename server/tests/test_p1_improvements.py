@@ -1491,7 +1491,7 @@ class P1ImprovementsTest(unittest.TestCase):
         self.assertEqual(a_log.provenance_json.get('pipeline_stage'), 'applied')
 
     def test_pipeline_stage_enforced_at_write_boundary(self):
-        from models import CampaignMemoryLog
+        from models import CampaignMemoryLog, WorldEvent
 
         patch = {
             'create_clocks': [
@@ -1536,6 +1536,60 @@ class P1ImprovementsTest(unittest.TestCase):
         self.assertIsNotNone(npc_log, 'NPC log should exist')
         self.assertEqual(npc_log.provenance_json.get('pipeline_stage'), 'applied',
                          'NPC pipeline_stage must be enforced to applied')
+
+        clock_event = WorldEvent.query.filter_by(
+            campaign_id=self.campaign.id,
+            event_type='clock_created',
+        ).order_by(WorldEvent.id.desc()).first()
+        self.assertIsNotNone(clock_event)
+        clock_event_prov = json.loads(clock_event.payload)['provenance']
+        self.assertEqual(clock_event_prov.get('pipeline_stage'), 'applied')
+        self.assertEqual(clock_event_prov.get('source_pipeline_stage'), 'proposed')
+
+    def test_clock_event_provenance_normalizes_empty_and_falsey_values(self):
+        from models import WorldEvent
+
+        create_patch = {
+            'create_clocks': [{
+                'id': 'clock_empty_provenance',
+                'name': 'Empty Provenance Clock',
+                'segments': 4,
+                'provenance': {
+                    'tool_name': None,
+                    'pipeline_stage': 'resolved',
+                    'evidence_status': None,
+                    'build_sha': None,
+                },
+            }],
+        }
+        apply_memory_patch(self.campaign, self.session, create_patch)
+        create_event = WorldEvent.query.filter_by(
+            campaign_id=self.campaign.id,
+            event_type='clock_created',
+        ).order_by(WorldEvent.id.desc()).first()
+        create_prov = json.loads(create_event.payload)['provenance']
+        self.assertEqual(create_prov['pipeline_stage'], 'applied')
+        self.assertEqual(create_prov['source_pipeline_stage'], 'resolved')
+        self.assertEqual(create_prov['tool_name'], 'session_memory_update_clocks')
+        self.assertEqual(create_prov['evidence_status'], 'insufficiently_supported')
+        self.assertTrue(create_prov['build_sha'])
+
+        retire_patch = {
+            'retire_clocks': [{
+                'clock_id': 'clock_empty_provenance',
+                'provenance': {},
+            }],
+        }
+        apply_memory_patch(self.campaign, self.session, retire_patch)
+        retire_event = WorldEvent.query.filter_by(
+            campaign_id=self.campaign.id,
+            event_type='clock_retired',
+        ).order_by(WorldEvent.id.desc()).first()
+        retire_prov = json.loads(retire_event.payload)['provenance']
+        self.assertEqual(retire_prov['pipeline_stage'], 'applied')
+        self.assertEqual(retire_prov['tool_name'], 'session_memory_update_clocks')
+        self.assertEqual(retire_prov['evidence_status'], 'insufficiently_supported')
+        self.assertTrue(retire_prov['build_sha'])
 
     def test_contradicted_evidence_status_in_provenance(self):
         memory_context = {
@@ -1834,6 +1888,40 @@ class P1ImprovementsTest(unittest.TestCase):
         self.assertIsNotNone(anchor_log.provenance_json)
         self.assertIn('build_sha', anchor_log.provenance_json)
         self.assertIn('evidence_status', anchor_log.provenance_json)
+
+    def test_compiled_summary_and_anchor_provenance_uses_transcript_sources(self):
+        from models import CampaignMemoryLog
+
+        memory_context = {
+            'campaign': self.campaign,
+            'campaign_id': self.campaign.id,
+            'source_player_message_id': 123,
+            'source_dm_message_id': 456,
+        }
+        compiled = compile_staged_memory_patch(
+            memory_context,
+            {'running_summary': 'The party reached the keep.'},
+            {'memory_anchors': {'current_goal': 'Enter the keep'}},
+        )
+        for key in ('running_summary_provenance', 'memory_anchors_provenance'):
+            provenance = compiled[key]
+            self.assertEqual(provenance['evidence_status'], 'supported_by_evidence')
+            self.assertEqual(
+                {source['source_id'] for source in provenance['evidence_sources']},
+                {'123', '456'},
+            )
+
+        apply_memory_patch(self.campaign, self.session, compiled)
+        for memory_id in ('running_summary', 'memory_anchors'):
+            log = CampaignMemoryLog.query.filter_by(
+                campaign_id=self.campaign.id,
+                memory_id=memory_id,
+            ).order_by(CampaignMemoryLog.id.desc()).first()
+            self.assertEqual(log.evidence_status, 'supported_by_evidence')
+            self.assertEqual(
+                {source['source_id'] for source in log.provenance_json['evidence_sources']},
+                {'123', '456'},
+            )
 
     def test_compact_memory_log_does_not_expose_raw_evidence_text(self):
         from services.automation_auditor import _compact_memory_log

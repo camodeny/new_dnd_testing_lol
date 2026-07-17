@@ -1115,6 +1115,37 @@ def compile_staged_memory_patch(memory_context, extracted, resolved):
             record["evidence_basis"] = [str(raw_basis).strip()]
         return record
 
+    def _context_evidence_sources():
+        """Return the transcript records actually available to this memory pass."""
+        sources = []
+        seen_ids = set()
+        for message_id in (source_player_message_id, source_dm_message_id):
+            if message_id is None or str(message_id) in seen_ids:
+                continue
+            seen_ids.add(str(message_id))
+            sources.append(make_evidence_source("transcript_message", str(message_id)))
+        return sources
+
+    def _summary_provenance(raw_provenance, default_tool):
+        """Compile provenance for derived context without treating model output as evidence."""
+        provenance = dict(raw_provenance) if isinstance(raw_provenance, dict) else {}
+        if not provenance.get("evidence_sources"):
+            transcript_sources = _context_evidence_sources()
+            if transcript_sources:
+                provenance["evidence_sources"] = transcript_sources
+        return make_provenance({"provenance": provenance}, default_tool=default_tool)
+
+    summary_source = resolved if resolved.get("running_summary") else extracted
+    anchors_source = resolved if resolved_anchors is not None else extracted if extracted_anchors is not None else {}
+    compiled_summary_provenance = _summary_provenance(
+        summary_source.get("running_summary_provenance"),
+        "session_memory_writer",
+    )
+    compiled_anchor_provenance = _summary_provenance(
+        anchors_source.get("memory_anchors_provenance"),
+        "session_memory_writer",
+    )
+
     allocated_entity_ids = set(known["entity_ids"])
     for entry in registry:
         if entry.get("canonical_id"):
@@ -1624,7 +1655,9 @@ def compile_staged_memory_patch(memory_context, extracted, resolved):
     # ── Build Compiled Patch ───────────────────────────────────────────
     compiled_patch = {
         "running_summary": running_summary,
+        "running_summary_provenance": compiled_summary_provenance,
         "memory_anchors": compiled_anchors,
+        "memory_anchors_provenance": compiled_anchor_provenance,
         "scene_patch": compiled_scene,
         "scene_reason": clean_text(
             resolved.get("scene_reason") or extracted.get("scene_reason"),

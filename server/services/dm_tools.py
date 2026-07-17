@@ -560,6 +560,8 @@ def _normalize_memory_patch(patch):
     running_summary = _coerce_patch_text(patch.get('running_summary'), 4000)
     if running_summary:
         normalized['running_summary'] = running_summary
+        if isinstance(patch.get('running_summary_provenance'), dict):
+            normalized['running_summary_provenance'] = dict(patch['running_summary_provenance'])
 
     anchors = patch.get('memory_anchors')
     if isinstance(anchors, dict):
@@ -583,6 +585,8 @@ def _normalize_memory_patch(patch):
                 if isinstance(p, str) and p.strip()
             ] if isinstance(anchors.get("recent_offers_promises"), list) else []
         }
+        if isinstance(patch.get('memory_anchors_provenance'), dict):
+            normalized['memory_anchors_provenance'] = dict(patch['memory_anchors_provenance'])
 
     scene_patch = _normalize_memory_scene_patch(patch.get('scene_patch'))
     if scene_patch:
@@ -5076,15 +5080,7 @@ def _create_clock_from_patch(campaign, patch):
     db.session.flush()
     upsert_memory_embedding(campaign, 'clock', clock.clock_id, clock.to_dict(include_private=True))
     from openrouter import _get_cached_build_sha
-    provenance = patch.get('provenance')
-    if isinstance(provenance, dict):
-        provenance = dict(provenance)
-    else:
-        provenance = {}
-    provenance.setdefault('tool_name', 'session_memory_update_clocks')
-    provenance.setdefault('pipeline_stage', 'applied')
-    provenance.setdefault('evidence_status', 'insufficiently_supported')
-    provenance.setdefault('build_sha', _get_cached_build_sha())
+    provenance = _applied_clock_provenance(patch.get('provenance'), _get_cached_build_sha())
     event = _record_event(
         campaign,
         'clock_created' if not existing else 'clock_updated',
@@ -5112,15 +5108,7 @@ def _retire_clock_from_patch(campaign, patch):
     clock.updated_at = utcnow()
     upsert_memory_embedding(campaign, 'clock', clock.clock_id, clock.to_dict(include_private=True))
     from openrouter import _get_cached_build_sha
-    provenance = patch.get('provenance')
-    if isinstance(provenance, dict):
-        provenance = dict(provenance)
-    else:
-        provenance = {}
-    provenance.setdefault('tool_name', 'session_memory_update_clocks')
-    provenance.setdefault('pipeline_stage', 'applied')
-    provenance.setdefault('evidence_status', 'insufficiently_supported')
-    provenance.setdefault('build_sha', _get_cached_build_sha())
+    provenance = _applied_clock_provenance(patch.get('provenance'), _get_cached_build_sha())
     event = _record_event(
         campaign,
         'clock_retired',
@@ -5133,6 +5121,20 @@ def _retire_clock_from_patch(campaign, patch):
         visibility=clock.visibility or 'dm_private',
     )
     return {'clock': clock.to_dict(include_private=True), 'event_id': event.id, 'action': 'retired'}
+
+
+def _applied_clock_provenance(raw_provenance, build_sha):
+    """Normalize clock provenance at the durable event write boundary."""
+    provenance = dict(raw_provenance) if isinstance(raw_provenance, dict) else {}
+    prior_stage = provenance.get('pipeline_stage')
+    if prior_stage and prior_stage != 'applied':
+        provenance['source_pipeline_stage'] = prior_stage
+    provenance['pipeline_stage'] = 'applied'
+    provenance['tool_name'] = provenance.get('tool_name') or 'session_memory_update_clocks'
+    evidence_sources = provenance.get('evidence_sources')
+    provenance['evidence_status'] = provenance.get('evidence_status') or determine_evidence_status(evidence_sources)
+    provenance['build_sha'] = provenance.get('build_sha') or build_sha
+    return provenance
 
 
 def apply_clock_adjudication(campaign, updates, audit_context=None):
@@ -5468,6 +5470,7 @@ def apply_memory_patch(campaign, session, patch, audit_context=None):
                 evidence_status_val = determine_evidence_status(raw_prov["evidence_sources"])
             else:
                 evidence_status_val = "insufficiently_supported"
+        prov["evidence_status"] = evidence_status_val
         return prov, evidence_status_val
 
     try:
@@ -6010,17 +6013,10 @@ def apply_memory_patch(campaign, session, patch, audit_context=None):
                 session.running_summary = summary
             result['running_summary_updated'] = True
 
-            from openrouter import _get_cached_build_sha
-            summary_evidence_status = 'insufficiently_supported'
-            sum_prov = {
-                'tool_name': 'session_memory_writer',
-                'pipeline_stage': 'applied',
-                'source_player_message_id': player_message_id,
-                'source_dm_message_id': dm_message_id,
-                'trace_id': trace_id,
-                'build_sha': _get_cached_build_sha(),
-                'evidence_status': summary_evidence_status,
-            }
+            sum_prov, summary_evidence_status = _applied_provenance(
+                {'provenance': patch.get('running_summary_provenance')},
+                default_tool='session_memory_writer',
+            )
             log_change(
                 memory_id='running_summary',
                 target_table='campaign_sessions',
@@ -6034,7 +6030,10 @@ def apply_memory_patch(campaign, session, patch, audit_context=None):
                 reason='Running summary revised by LLM memory pass',
                 before_json={'running_summary': before_summary},
                 after_json={'running_summary': summary},
-                patch_json={'running_summary': summary},
+                patch_json={
+                    'running_summary': summary,
+                    'provenance': patch.get('running_summary_provenance'),
+                },
                 evidence_status=summary_evidence_status,
                 provenance=sum_prov,
             )
@@ -6046,16 +6045,10 @@ def apply_memory_patch(campaign, session, patch, audit_context=None):
                 session.memory_anchors = anchors
             result['memory_anchors_updated'] = True
 
-            anchor_evidence_status = 'insufficiently_supported'
-            anchor_prov = {
-                'tool_name': 'session_memory_writer',
-                'pipeline_stage': 'applied',
-                'source_player_message_id': player_message_id,
-                'source_dm_message_id': dm_message_id,
-                'trace_id': trace_id,
-                'build_sha': _get_cached_build_sha(),
-                'evidence_status': anchor_evidence_status,
-            }
+            anchor_prov, anchor_evidence_status = _applied_provenance(
+                {'provenance': patch.get('memory_anchors_provenance')},
+                default_tool='session_memory_writer',
+            )
             log_change(
                 memory_id='memory_anchors',
                 target_table='campaign_sessions',
@@ -6069,7 +6062,10 @@ def apply_memory_patch(campaign, session, patch, audit_context=None):
                 reason='Memory anchors updated by LLM memory pass',
                 before_json={'memory_anchors': before_anchors},
                 after_json={'memory_anchors': anchors},
-                patch_json={'memory_anchors': anchors},
+                patch_json={
+                    'memory_anchors': anchors,
+                    'provenance': patch.get('memory_anchors_provenance'),
+                },
                 evidence_status=anchor_evidence_status,
                 provenance=anchor_prov,
             )
