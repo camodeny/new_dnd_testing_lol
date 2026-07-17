@@ -38,7 +38,7 @@ from services.character_service import character_full_dict
 
 AUDITOR_PROMPT_VERSION = 'automation_auditor_tool_loop_v4'
 AUDITOR_STATUS_RANK = {'pass': 2, 'warn': 1, 'fail': 0}
-AUDITOR_VALID_STATUSES = set(AUDITOR_STATUS_RANK) | {'not_assessed'}
+AUDITOR_VALID_STATUSES = set(AUDITOR_STATUS_RANK) | {'not_assessed', 'not_applicable'}
 AUDITOR_TERMINAL_JOB_STATUSES = {'completed', 'failed', 'canceled'}
 DEFAULT_AUDITOR_CONFIG = {
     'mode': 'manual',
@@ -931,6 +931,7 @@ def _cycle_evidence_packet(run, cycle, args):
             'derived_campaign_id': run.derived_campaign_id,
             'scenario_id': run.scenario_id,
             'awaiting_audit_phase': run.awaiting_audit_phase,
+            'scorecard_summary': run.scorecard_summary_json or {},
         },
         'audit_cycle': {
             'id': cycle.id,
@@ -1204,6 +1205,8 @@ def _aggregate_auditor_statuses(statuses, default='warn'):
         return min(assessed, key=lambda item: AUDITOR_STATUS_RANK[item])
     if any(status == 'not_assessed' for status in normalized):
         return 'not_assessed'
+    if any(status == 'not_applicable' for status in normalized):
+        return 'not_applicable'
     return default
 
 
@@ -2063,7 +2066,8 @@ def get_current_audit_bundle_data(run):
             'awaiting_audit_cycle_id': run.awaiting_audit_cycle_id,
             'awaiting_audit_phase': run.awaiting_audit_phase,
             'derived_campaign_id': run.derived_campaign_id,
-            'worker_id': run.worker_id
+            'worker_id': run.worker_id,
+            'scorecard_summary': run.scorecard_summary_json or {},
         },
         'audit_cycle': {
             'id': cycle.id,

@@ -241,7 +241,7 @@ def get_criterion_category(crit):
     if any(k in identifier for k in ('narrative', 'story', 'quality', 'silence', 'empty', 'dialog', 'dialogue', 'rp', 'play')):
         return "narrative quality"
         
-    return "narrative quality" # default fallback
+    return None # default fallback
 
 
 def _normalize_custom_scorecard_status(value, default='warn'):
@@ -1651,7 +1651,7 @@ def submit_audit_cycle_feedback(cycle, *, summary=None, notes=None, scorecard=No
     if criteria_results:
         applicable_results = [
             item for item in criteria_results
-            if item.get('applicability', {}).get('applicable', True)
+            if item.get('status') != 'not_applicable' and item.get('applicability', {}).get('applicable', True)
         ]
         overall_status = (
             _aggregate_custom_scorecard_statuses([item.get('status') for item in applicable_results], default='warn')
@@ -1662,7 +1662,10 @@ def submit_audit_cycle_feedback(cycle, *, summary=None, notes=None, scorecard=No
         overall_status = _normalize_custom_scorecard_status(scorecard_payload.get('overall_status')) or 'warn'
     criteria_assessed_count = sum(1 for item in criteria_results if item.get('status') in {'pass', 'warn', 'fail'})
     criteria_not_assessed_count = sum(1 for item in criteria_results if item.get('status') == 'not_assessed' and item.get('applicability', {}).get('applicable', True))
-    criteria_not_applicable_count = sum(1 for item in criteria_results if item.get('status') == 'not_assessed' and not item.get('applicability', {}).get('applicable', True))
+    criteria_not_applicable_count = sum(
+        1 for item in criteria_results
+        if item.get('status') == 'not_applicable' or not item.get('applicability', {}).get('applicable', True)
+    )
     
     cycle.scorecard_json = {
         'template': template,
@@ -2235,6 +2238,8 @@ def _matches_condition(value, condition):
 
 
 def _evaluate_check(metric_value, check):
+    if metric_value is None:
+        return 'not_assessed'
     kind = check.get('kind') or 'number'
     if kind == 'enum':
         if metric_value in (check.get('fail_values') or []):
@@ -2319,11 +2324,14 @@ def custom_scorecard_results(run, cycle_rows):
         else:
             applicable_assessments = [
                 item for item in assessments
-                if item.get('applicability', {}).get('applicable', True)
+                if item.get('status') != 'not_applicable' and item.get('applicability', {}).get('applicable', True)
             ]
             
             counts = Counter(item['status'] for item in assessments if item.get('status') in CUSTOM_SCORECARD_STATUS_ORDER)
-            na_count = sum(1 for item in assessments if item.get('status') == 'not_assessed' and not item.get('applicability', {}).get('applicable', True))
+            na_count = sum(
+                1 for item in assessments
+                if item.get('status') == 'not_applicable' or (item.get('status') == 'not_assessed' and not item.get('applicability', {}).get('applicable', True))
+            )
             not_assessed_applicable_count = sum(1 for item in assessments if item.get('status') == 'not_assessed' and item.get('applicability', {}).get('applicable', True))
             
             exercised_count = counts.get('pass', 0) + counts.get('warn', 0) + counts.get('fail', 0)

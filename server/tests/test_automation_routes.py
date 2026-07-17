@@ -3891,6 +3891,60 @@ class AutomationRouteTest(unittest.TestCase):
             
             self.assertAlmostEqual(run.scorecard_summary_json['weighted_score'], pass_w / total_w, places=4)
 
+        # 4. Verify route-level / cross-surface consistency
+        run_api_resp = self.client.get(f'/api/automation/runs/{run_id}', headers=self.headers)
+        self.assertEqual(run_api_resp.status_code, 200)
+        run_api_data = run_api_resp.get_json()['run']
+        with app.app_context():
+            from models import AutomationRun
+            from services.automation_service import refresh_run_scorecard
+            run = db.session.get(AutomationRun, run_id)
+            self.assertEqual(run_api_data['scorecard_summary']['weighted_score'], run.scorecard_summary_json['weighted_score'])
+            self.assertEqual(run_api_data['scorecard_summary']['category_breakdown'], run.scorecard_summary_json['category_breakdown'])
+
+        scorecard_api_resp = self.client.get(f'/api/automation/runs/{run_id}/scorecard', headers=self.headers)
+        self.assertEqual(scorecard_api_resp.status_code, 200)
+        scorecard_api_data = scorecard_api_resp.get_json()
+        self.assertEqual(scorecard_api_data['run']['scorecard_summary']['weighted_score'], run.scorecard_summary_json['weighted_score'])
+        self.assertEqual(scorecard_api_data['run']['scorecard_summary']['category_breakdown'], run.scorecard_summary_json['category_breakdown'])
+
+        bundle_api_resp = self.client.get(f'/api/automation/runs/{run_id}/audit-bundle', headers=self.headers)
+        self.assertEqual(bundle_api_resp.status_code, 200)
+        bundle_api_data = bundle_api_resp.get_json()
+        self.assertEqual(bundle_api_data['run']['scorecard_summary']['weighted_score'], run.scorecard_summary_json['weighted_score'])
+        self.assertEqual(bundle_api_data['run']['scorecard_summary']['category_breakdown'], run.scorecard_summary_json['category_breakdown'])
+
+        # 5. Verify unclassified/unknown category criterion is excluded from breakdowns but included in score
+        scorecard_id2 = self.client.post(
+            '/api/automation/scorecards',
+            headers=self.headers,
+            json={
+                'name': 'Unknown category scorecard',
+                'criteria': [
+                    {'id': 'unclassified_crit', 'label': 'Unclassified', 'weight': 2, 'category': 'unknown-cat-name-xyz'},
+                ],
+            },
+        ).get_json()['scorecard']['id']
+        
+        with app.app_context():
+            from models import AutomationScorecardTemplate
+            run = db.session.get(AutomationRun, run_id)
+            run.scorecard_template_json = db.session.get(AutomationScorecardTemplate, scorecard_id2).snapshot()
+            db.session.commit()
+            
+            res2 = refresh_run_scorecard(run)
+            bd2 = run.scorecard_summary_json['category_breakdown']
+            # "unknown-cat-name-xyz" should not be in the breakdown keys (only the 5 named categories)
+            self.assertNotIn('unknown-cat-name-xyz', bd2)
+            # Make sure it didn't fallback to narrative quality
+            self.assertEqual(bd2['narrative quality']['status'], 'pass')
+
+        # 6. Verify missing built-in metric (value is None) evaluates to not_assessed
+        with app.app_context():
+            from services.automation_service import _evaluate_check
+            self.assertEqual(_evaluate_check(None, {'id': 'test_none', 'kind': 'number'}), 'not_assessed')
+            self.assertEqual(_evaluate_check(None, {'id': 'test_none_enum', 'kind': 'enum'}), 'not_assessed')
+
 
 if __name__ == '__main__':
     unittest.main()
