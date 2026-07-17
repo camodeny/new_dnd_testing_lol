@@ -2911,22 +2911,22 @@ def _tool_advance_clock(campaign, _current_user, args):
             evidence_sources.append({'source_type': 'resolver_output', 'source_id': str(ev)})
     from services.audit_service import log_audit_event as _log_audit
     from openrouter import _get_cached_build_sha
-    trigger_identifier = clock.trigger or args.get('reason') or 'manual_advance'
     upstream = args.get('provenance') if isinstance(args.get('provenance'), dict) else {}
     provenance = {
         'tool_name': upstream.get('tool_name') or 'session_dm_advance_clock',
         'pipeline_stage': 'applied',
         'evidence_sources': upstream.get('evidence_sources') or evidence_sources or None,
-        'evidence_status': upstream.get('evidence_status'),
+        'evidence_status': upstream.get('evidence_status') or (determine_evidence_status(evidence_sources) if evidence_sources else 'insufficiently_supported'),
         'resolution_confidence': upstream.get('resolution_confidence'),
         'ambiguity_status': upstream.get('ambiguity_status'),
-        'clock_trigger_rule_id': upstream.get('clock_trigger_rule_id') or trigger_identifier,
         'delta': delta,
         'source_player_message_id': upstream.get('source_player_message_id'),
         'source_dm_message_id': upstream.get('source_dm_message_id'),
         'trace_id': upstream.get('trace_id'),
         'build_sha': upstream.get('build_sha') or _get_cached_build_sha(),
     }
+    if upstream.get('clock_trigger_rule_id'):
+        provenance['clock_trigger_rule_id'] = upstream['clock_trigger_rule_id']
     event = _record_event(
         campaign,
         'clock_advanced',
@@ -5082,7 +5082,6 @@ def _create_clock_from_patch(campaign, patch):
         provenance = {
             'tool_name': 'session_memory_update_clocks',
             'pipeline_stage': 'applied',
-            'clock_trigger_id': clock.clock_id,
         }
     event = _record_event(
         campaign,
@@ -5117,7 +5116,6 @@ def _retire_clock_from_patch(campaign, patch):
         provenance = {
             'tool_name': 'session_memory_update_clocks',
             'pipeline_stage': 'applied',
-            'clock_trigger_id': clock.clock_id,
         }
     event = _record_event(
         campaign,
@@ -5644,6 +5642,7 @@ def apply_memory_patch(campaign, session, patch, audit_context=None):
                         reason=f"Scene mutation warning: {warning_type}",
                         patch_json=warning_payload,
                         error=warning_type,
+                        evidence_status=item_prov.get('evidence_status'),
                         provenance=scene_warn_prov,
                     )
                     log_audit_event(
@@ -5719,6 +5718,7 @@ def apply_memory_patch(campaign, session, patch, audit_context=None):
                                 "unresolved_items": unresolved_items
                             }
                             raw_scene_prov = raw_scene_patch.get('provenance')
+                            rej_ev_status = raw_scene_prov.get('evidence_status') if isinstance(raw_scene_prov, dict) else None
                             rej_prov = {
                                 'pipeline_stage': 'rejected',
                                 'rejection_reason': warning_type,
@@ -5728,7 +5728,7 @@ def apply_memory_patch(campaign, session, patch, audit_context=None):
                             }
                             if isinstance(raw_scene_prov, dict):
                                 rej_prov['tool_name'] = raw_scene_prov.get('tool_name', 'resolve_scene_location_patch')
-                                rej_prov['evidence_status'] = raw_scene_prov.get('evidence_status')
+                                rej_prov['evidence_status'] = rej_ev_status
                                 rej_prov['evidence_sources'] = raw_scene_prov.get('evidence_sources')
                                 rej_prov['build_sha'] = raw_scene_prov.get('build_sha', _get_cached_build_sha())
                             else:
@@ -5747,6 +5747,7 @@ def apply_memory_patch(campaign, session, patch, audit_context=None):
                                 reason=f"Scene mutation warning: {warning_type}",
                                 patch_json=warning_payload,
                                 error=warning_type,
+                                evidence_status=rej_ev_status,
                                 provenance=rej_prov,
                             )
                             from services.audit_service import log_audit_event
@@ -5793,6 +5794,7 @@ def apply_memory_patch(campaign, session, patch, audit_context=None):
                             'skipped_scene_patch': skipped_scene_patch,
                         },
                         error='scene_patch_field_not_evidenced',
+                        evidence_status=raw_scene_prov.get('evidence_status'),
                         provenance=skip_prov,
                     )
                 if not scene_patch:
@@ -6000,9 +6002,7 @@ def apply_memory_patch(campaign, session, patch, audit_context=None):
             result['running_summary_updated'] = True
 
             from openrouter import _get_cached_build_sha
-            summary_evidence_status = determine_evidence_status(
-                [make_evidence_source('resolver_output', 'running_summary')],
-            )
+            summary_evidence_status = 'insufficiently_supported'
             sum_prov = {
                 'tool_name': 'session_memory_writer',
                 'pipeline_stage': 'applied',
@@ -6037,9 +6037,7 @@ def apply_memory_patch(campaign, session, patch, audit_context=None):
                 session.memory_anchors = anchors
             result['memory_anchors_updated'] = True
 
-            anchor_evidence_status = determine_evidence_status(
-                [make_evidence_source('resolver_output', 'memory_anchors')],
-            )
+            anchor_evidence_status = 'insufficiently_supported'
             anchor_prov = {
                 'tool_name': 'session_memory_writer',
                 'pipeline_stage': 'applied',

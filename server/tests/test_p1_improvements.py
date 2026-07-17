@@ -1759,10 +1759,10 @@ class P1ImprovementsTest(unittest.TestCase):
         self.assertIsNotNone(event)
         payload = json.loads(event.payload) if event.payload else {}
         prov = payload.get('provenance', {})
-        self.assertEqual(
-            prov.get('clock_trigger_rule_id'),
-            'Guard patrol spots the party',
-            'clock_trigger_rule_id should use clock.trigger, not clock_id or arbitrary reason',
+        self.assertNotIn(
+            'clock_trigger_rule_id',
+            prov,
+            'clock_trigger_rule_id should only be set from upstream, not from clock.trigger or reason text',
         )
 
     def test_clock_adjudication_preserves_upstream_provenance(self):
