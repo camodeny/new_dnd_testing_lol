@@ -2164,7 +2164,7 @@ class AutomationRouteTest(unittest.TestCase):
             from services.automation_service import refresh_run_scorecard
             scorecard_res = refresh_run_scorecard(run)
             crit_b_res = next(r for r in scorecard_res if r['check_id'] == 'custom:criterion_b')
-            self.assertEqual(crit_b_res['status'], 'not_assessed')
+            self.assertEqual(crit_b_res['status'], 'not_applicable')
             self.assertEqual(crit_b_res['details']['not_applicable_cycle_count'], 1)
 
         # Test get_private_candidates works when there is no CampaignWorld
@@ -3743,6 +3743,153 @@ class AutomationRouteTest(unittest.TestCase):
         finally:
             with app.app_context():
                 db.session.execute(db.text("PRAGMA foreign_keys=OFF"))
+
+    def test_custom_criteria_scorecard_and_category_breakdowns(self):
+        scorecard_id = self.client.post(
+            '/api/automation/scorecards',
+            headers=self.headers,
+            json={
+                'name': 'Category breakdown scorecard',
+                'criteria': [
+                    {'id': 'memory_quality', 'label': 'Memory Quality', 'weight': 3, 'category': 'retrieval or memory use'},
+                    {'id': 'story_consistency', 'label': 'Story Consistency', 'weight': 2, 'category': 'narrative quality'},
+                    {'id': 'state_correctness', 'label': 'State Correctness', 'weight': 1, 'category': 'durable state correctness'},
+                ],
+            },
+        ).get_json()['scorecard']['id']
+        scenario_id = self.client.post(
+            '/api/automation/scenarios',
+            headers=self.headers,
+            json={
+                'source_campaign_id': self.campaign_id,
+                'scorecard_template_id': scorecard_id,
+            },
+        ).get_json()['scenario']['id']
+        snapshot_id = self.client.post(
+            f'/api/automation/scenarios/{scenario_id}/snapshots',
+            headers=self.headers,
+            json={},
+        ).get_json()['snapshot']['id']
+        run_id = self.client.post(
+            f'/api/automation/scenarios/{scenario_id}/runs',
+            headers=self.headers,
+            json={'snapshot_id': snapshot_id},
+        ).get_json()['run']['id']
+        claim = self.client.post(
+            f'/api/automation/runs/{run_id}/claim',
+            headers=self.headers,
+            json={'worker_id': 'worker-a'},
+        ).get_json()
+        cycle_id = self.client.post(
+            f'/api/automation/runs/{run_id}/pause',
+            headers=self.headers,
+            json={
+                'worker_id': 'worker-a',
+                'lease_token': claim['lease_token'],
+                'phase': 'after_dm',
+                'summary': 'Pause after DM turn',
+                'dm_message_id': 99,
+                'payload': {'turns_completed': 1},
+            },
+        ).get_json()['audit_cycle']['id']
+
+        # 1. Before submitting audit, refresh run scorecard. Missing results should be not_assessed.
+        with app.app_context():
+            from models import AutomationRun
+            from services.automation_service import refresh_run_scorecard
+            run = db.session.get(AutomationRun, run_id)
+            res = refresh_run_scorecard(run)
+            crit_mem = next(c for c in res if c['check_id'] == 'custom:memory_quality')
+            self.assertEqual(crit_mem['status'], 'not_assessed')
+            self.assertEqual(crit_mem['details']['weight'], 3)
+            self.assertEqual(crit_mem['details']['category'], 'retrieval or memory use')
+
+            # Aggregate score should exclude not_assessed
+            self.assertIsNone(run.scorecard_summary_json['weighted_score'])
+            
+            # The category breakdown for custom categories without assessments should be not_assessed or not_applicable
+            bd = run.scorecard_summary_json['category_breakdown']
+            self.assertEqual(bd['retrieval or memory use']['status'], 'not_assessed')
+            self.assertIsNone(bd['retrieval or memory use']['score'])
+            self.assertEqual(bd['safety/private-information handling']['status'], 'not_applicable')
+            self.assertIsNone(bd['safety/private-information handling']['score'])
+
+        # 2. Submit audit cycle scorecard with custom ratings
+        self.client.post(
+            f'/api/automation/runs/{run_id}/audit-cycles/{cycle_id}/audit',
+            headers=self.headers,
+            json={
+                'scorecard': {
+                    'summary': 'Done audit',
+                    'notes': 'Good notes',
+                    'criteria': [
+                        {
+                            'id': 'memory_quality',
+                            'status': 'pass',
+                            'evidence_refs': [],
+                            'applicability': {'applicable': True, 'reason': 'ok'}
+                        },
+                        {
+                            'id': 'story_consistency',
+                            'status': 'warn',
+                            'evidence_refs': [],
+                            'applicability': {'applicable': True, 'reason': 'ok'}
+                        },
+                        {
+                            'id': 'state_correctness',
+                            'status': 'fail',
+                            'evidence_refs': [],
+                            'applicability': {'applicable': True, 'reason': 'ok'}
+                        }
+                    ]
+                }
+            }
+        )
+
+        # 3. Refresh and verify scoring and breakdowns
+        with app.app_context():
+            run = db.session.get(AutomationRun, run_id)
+            res = refresh_run_scorecard(run)
+            
+            # Assert overall status is fail because of state_correctness fail
+            self.assertEqual(run.scorecard_summary_json['overall_status'], 'fail')
+
+            # Category breakdowns
+            bd = run.scorecard_summary_json['category_breakdown']
+            
+            # memory quality: pass (weight 3) -> 100%
+            self.assertEqual(bd['retrieval or memory use']['status'], 'pass')
+            self.assertEqual(bd['retrieval or memory use']['score'], 1.0)
+            
+            # story consistency: warn (weight 2) -> 50%
+            self.assertEqual(bd['narrative quality']['status'], 'warn')
+            self.assertEqual(bd['narrative quality']['score'], 0.75)
+            
+            # state correctness: fail (weight 1) -> 0%
+            self.assertEqual(bd['durable state correctness']['status'], 'fail')
+            self.assertEqual(bd['durable state correctness']['score'], 0.0)
+
+            # safety: not_applicable
+            self.assertEqual(bd['safety/private-information handling']['status'], 'not_applicable')
+            self.assertIsNone(bd['safety/private-information handling']['score'])
+
+            # Verify that total weighted score calculation matches
+            total_w = 0
+            pass_w = 0
+            for c in res:
+                s = c['status']
+                w = c['details']['weight']
+                if s == 'pass':
+                    total_w += w
+                    pass_w += w
+                elif s == 'warn':
+                    total_w += w
+                    pass_w += 0.5 * w
+                elif s == 'fail':
+                    total_w += w
+                    pass_w += 0.0 * w
+            
+            self.assertAlmostEqual(run.scorecard_summary_json['weighted_score'], pass_w / total_w, places=4)
 
 
 if __name__ == '__main__':
