@@ -1624,6 +1624,18 @@ def complete_automation_run(current_user, run_id):
         except ValueError as exc:
             return jsonify({'error': str(exc)}), 409
 
+    if run.status in {'completed', 'failed', 'stopped'}:
+        # Fence stale completion writes: a terminal run can only be re-completed
+        # by an idempotent retry carrying the original run_completed dedupe key.
+        recorded = AutomationRunEvent.query.filter_by(
+            run_id=run.id,
+            event_type='run_completed',
+        ).order_by(AutomationRunEvent.sequence_number.desc()).first()
+        expected_dedupe = data.get('dedupe_key') or f'run_completed:{run.id}:attempt:{run.attempt_count}'
+        if recorded is not None and recorded.dedupe_key == expected_dedupe:
+            return jsonify({'run': run.to_dict()}), 200
+        return jsonify({'error': 'Run is already in a terminal state'}), 409
+
     run.status = data.get('status') or 'completed'
     run.error_text = data.get('error_text')
     run.finished_at = utcnow()

@@ -47,7 +47,7 @@ from werkzeug.security import generate_password_hash
 from services.character_service import build_character_from_data, character_full_dict, update_character_relations
 
 
-AUTOMATION_ACTIVE_STATUSES = {'queued', 'claimed', 'running', 'stop_requested', 'awaiting_audit'}
+AUTOMATION_ACTIVE_STATUSES = {'queued', 'claimed', 'running', 'stop_requested', 'awaiting_audit', 'reconciling'}
 AUTOMATION_SNAPSHOT_SCHEMA_VERSION = 2
 CLONE_RETRIEVAL_PREFLIGHT_VERSION = 1
 
@@ -126,7 +126,7 @@ def _vector_digest(vector):
 
 DEFAULT_LEASE_SECONDS = 45
 DEFAULT_PROVISIONING_LEASE_SECONDS = 300
-CLAIMABLE_ACTIVE_STATUSES = {'claimed', 'running', 'stop_requested'}
+CLAIMABLE_ACTIVE_STATUSES = {'claimed', 'running', 'stop_requested', 'reconciling'}
 AUDIT_READY_STATUSES = {'audited', 'skipped'}
 CUSTOM_SCORECARD_STATUS_ORDER = ('pass', 'warn', 'fail', 'not_assessed', 'not_applicable')
 DEFAULT_RETENTION_POLICY = {
@@ -1853,12 +1853,12 @@ def lease_is_expired(run, at=None):
     if run.status == 'queued':
         return False
     if not run.lease_expires_at:
-        return run.status in {'claimed', 'running', 'stop_requested', 'awaiting_audit'}
+        return run.status in {'claimed', 'running', 'stop_requested', 'awaiting_audit', 'reconciling'}
     return (at or _utcnow()) >= run.lease_expires_at
 
 
 def ensure_worker_lease(run, *, worker_id=None, lease_token=None):
-    if run.status in {'claimed', 'running', 'stop_requested', 'awaiting_audit'}:
+    if run.status in {'claimed', 'running', 'stop_requested', 'awaiting_audit', 'reconciling'}:
         if not worker_id:
             raise ValueError('worker_id is required for active runs')
         if not lease_token:
@@ -1867,7 +1867,7 @@ def ensure_worker_lease(run, *, worker_id=None, lease_token=None):
         raise ValueError('Run is leased by another worker')
     if run.lease_token and run.lease_token != lease_token:
         raise ValueError('Run lease token is no longer valid')
-    if run.status in {'claimed', 'running', 'stop_requested', 'awaiting_audit'} and lease_is_expired(run):
+    if run.status in {'claimed', 'running', 'stop_requested', 'awaiting_audit', 'reconciling'} and lease_is_expired(run):
         raise ValueError('Run lease has expired')
 
 

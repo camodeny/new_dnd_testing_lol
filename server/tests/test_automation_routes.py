@@ -2692,6 +2692,67 @@ class AutomationRouteTest(unittest.TestCase):
         )
         self.assertEqual(resp.status_code, 200)
 
+    def test_complete_route_rejects_stale_completion_on_terminal_run(self):
+        run_id, token = self._claim_for_credential_tests()
+        first = self.client.post(
+            f'/api/automation/runs/{run_id}/complete',
+            headers=self.headers,
+            json={
+                'worker_id': 'cred-test-worker', 'lease_token': token,
+                'status': 'failed',
+                'dedupe_key': f'run_completed:{run_id}:dm-timeout:post_turn',
+            },
+        )
+        self.assertEqual(first.status_code, 200)
+
+        second = self.client.post(
+            f'/api/automation/runs/{run_id}/complete',
+            headers=self.headers,
+            json={
+                'worker_id': 'cred-test-worker', 'lease_token': token,
+                'status': 'completed',
+                'dedupe_key': f'run_completed:{run_id}:late-write',
+            },
+        )
+        self.assertEqual(second.status_code, 409)
+
+        with app.app_context():
+            run = db.session.get(AutomationRun, run_id)
+            self.assertEqual(run.status, 'failed')
+            completions = AutomationRunEvent.query.filter_by(run_id=run_id, event_type='run_completed').all()
+            self.assertEqual(len(completions), 1)
+
+    def test_complete_route_allows_idempotent_retry_with_same_dedupe_key(self):
+        run_id, token = self._claim_for_credential_tests()
+        dedupe_key = f'run_completed:{run_id}:dm-timeout:post_turn'
+        first = self.client.post(
+            f'/api/automation/runs/{run_id}/complete',
+            headers=self.headers,
+            json={
+                'worker_id': 'cred-test-worker', 'lease_token': token,
+                'status': 'failed',
+                'dedupe_key': dedupe_key,
+            },
+        )
+        self.assertEqual(first.status_code, 200)
+
+        retry = self.client.post(
+            f'/api/automation/runs/{run_id}/complete',
+            headers=self.headers,
+            json={
+                'worker_id': 'cred-test-worker', 'lease_token': token,
+                'status': 'failed',
+                'dedupe_key': dedupe_key,
+            },
+        )
+        self.assertEqual(retry.status_code, 200)
+
+        with app.app_context():
+            run = db.session.get(AutomationRun, run_id)
+            self.assertEqual(run.status, 'failed')
+            completions = AutomationRunEvent.query.filter_by(run_id=run_id, event_type='run_completed').all()
+            self.assertEqual(len(completions), 1)
+
     def test_decisions_route_rejects_missing_credentials(self):
         run_id, token = self._claim_for_credential_tests()
         resp = self.client.post(

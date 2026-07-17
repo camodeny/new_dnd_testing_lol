@@ -1787,7 +1787,7 @@ class AutomationRun(db.Model):
                 if (e.payload_json or {}).get('decision', {}).get('action') != 'no_action'
             ])
 
-        claimable_active = {'claimed', 'running', 'stop_requested'}
+        claimable_active = {'claimed', 'running', 'stop_requested', 'reconciling'}
         now = utcnow()
         is_claimable = (
             self.status == 'queued'

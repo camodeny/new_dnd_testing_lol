@@ -80,7 +80,7 @@ Optional variables:
 - `DND_DM_VISIBLE_RESPONSE_TIMEOUT`: visible-response phase timeout in seconds; defaults to `720` (12 minutes). **Temporary internal-testing configuration** -- timeout reduction and performance tuning will be handled separately after memory reliability improves.
 - `DND_DM_POST_TURN_TIMEOUT`: post-turn (memory, clock) phase timeout in seconds; defaults to `720` (12 minutes). Same caveat as above.
 - `DND_DM_RESPONSE_TIMEOUT`: legacy combined timeout in seconds; defaults to `720`. When used alone, sets only the visible phase timeout; the post-turn timeout defaults to 720 seconds independently.
-- `DND_DM_LATE_COMPLETION_RECONCILIATION_SECONDS`: extra polling window after a post-turn timeout to catch late completions; defaults to `30`.
+- `DND_DM_LATE_COMPLETION_RECONCILIATION_SECONDS`: bounded pre-failure reconciliation window in seconds for DM-turn timeouts (visible or post-turn phase). After a timeout the run enters a non-terminal `reconciling` state and is only finalized as failed once this window elapses without the turn completing; defaults to `30`.
 
 ## Provider examples
 
