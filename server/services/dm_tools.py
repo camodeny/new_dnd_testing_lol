@@ -5619,13 +5619,17 @@ def apply_memory_patch(campaign, session, patch, audit_context=None):
                         "resolver_output": None,
                         "unresolved_items": [f"Could not resolve proposed location: id={proposed_id}, name={proposed_name}"]
                     }
+                    item_prov = item.get('provenance') if isinstance(item.get('provenance'), dict) else {}
                     scene_warn_prov = {
-                        'tool_name': 'resolve_scene_location_patch',
+                        'tool_name': item_prov.get('tool_name', 'resolve_scene_location_patch'),
                         'pipeline_stage': 'rejected',
-                        'source_player_message_id': player_message_id,
-                        'source_dm_message_id': dm_message_id,
-                        'trace_id': trace_id,
+                        'source_player_message_id': item_prov.get('source_player_message_id', player_message_id),
+                        'source_dm_message_id': item_prov.get('source_dm_message_id', dm_message_id),
+                        'trace_id': item_prov.get('trace_id', trace_id),
                         'rejection_reason': warning_type,
+                        'evidence_status': item_prov.get('evidence_status'),
+                        'evidence_sources': item_prov.get('evidence_sources'),
+                        'build_sha': item_prov.get('build_sha', _get_cached_build_sha()),
                     }
                     log_change(
                         memory_id='scene_mutation_warning',
@@ -5759,12 +5763,17 @@ def apply_memory_patch(campaign, session, patch, audit_context=None):
                             )
 
                 if skipped_scene_patch:
+                    raw_scene_prov = raw_scene_patch.get('provenance') if isinstance(raw_scene_patch.get('provenance'), dict) else {}
                     skip_prov = {
-                        'tool_name': 'resolve_scene_location_patch',
+                        'tool_name': raw_scene_prov.get('tool_name', 'resolve_scene_location_patch'),
                         'pipeline_stage': 'rejected',
-                        'source_player_message_id': player_message_id,
-                        'source_dm_message_id': dm_message_id,
-                        'trace_id': trace_id,
+                        'source_player_message_id': raw_scene_prov.get('source_player_message_id', player_message_id),
+                        'source_dm_message_id': raw_scene_prov.get('source_dm_message_id', dm_message_id),
+                        'trace_id': raw_scene_prov.get('trace_id', trace_id),
+                        'evidence_status': raw_scene_prov.get('evidence_status'),
+                        'evidence_sources': raw_scene_prov.get('evidence_sources'),
+                        'rejection_reason': 'scene_patch_field_not_evidenced',
+                        'build_sha': raw_scene_prov.get('build_sha', _get_cached_build_sha()),
                     }
                     log_change(
                         memory_id='current_scene',
@@ -5991,6 +6000,9 @@ def apply_memory_patch(campaign, session, patch, audit_context=None):
             result['running_summary_updated'] = True
 
             from openrouter import _get_cached_build_sha
+            summary_evidence_status = determine_evidence_status(
+                [make_evidence_source('resolver_output', 'running_summary')],
+            )
             sum_prov = {
                 'tool_name': 'session_memory_writer',
                 'pipeline_stage': 'applied',
@@ -5998,9 +6010,7 @@ def apply_memory_patch(campaign, session, patch, audit_context=None):
                 'source_dm_message_id': dm_message_id,
                 'trace_id': trace_id,
                 'build_sha': _get_cached_build_sha(),
-                'evidence_status': determine_evidence_status(
-                    [make_evidence_source('resolver_output', 'running_summary')],
-                ),
+                'evidence_status': summary_evidence_status,
             }
             log_change(
                 memory_id='running_summary',
@@ -6016,6 +6026,7 @@ def apply_memory_patch(campaign, session, patch, audit_context=None):
                 before_json={'running_summary': before_summary},
                 after_json={'running_summary': summary},
                 patch_json={'running_summary': summary},
+                evidence_status=summary_evidence_status,
                 provenance=sum_prov,
             )
 
@@ -6026,6 +6037,9 @@ def apply_memory_patch(campaign, session, patch, audit_context=None):
                 session.memory_anchors = anchors
             result['memory_anchors_updated'] = True
 
+            anchor_evidence_status = determine_evidence_status(
+                [make_evidence_source('resolver_output', 'memory_anchors')],
+            )
             anchor_prov = {
                 'tool_name': 'session_memory_writer',
                 'pipeline_stage': 'applied',
@@ -6033,9 +6047,7 @@ def apply_memory_patch(campaign, session, patch, audit_context=None):
                 'source_dm_message_id': dm_message_id,
                 'trace_id': trace_id,
                 'build_sha': _get_cached_build_sha(),
-                'evidence_status': determine_evidence_status(
-                    [make_evidence_source('resolver_output', 'memory_anchors')],
-                ),
+                'evidence_status': anchor_evidence_status,
             }
             log_change(
                 memory_id='memory_anchors',
@@ -6051,6 +6063,7 @@ def apply_memory_patch(campaign, session, patch, audit_context=None):
                 before_json={'memory_anchors': before_anchors},
                 after_json={'memory_anchors': anchors},
                 patch_json={'memory_anchors': anchors},
+                evidence_status=anchor_evidence_status,
                 provenance=anchor_prov,
             )
 

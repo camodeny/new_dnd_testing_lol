@@ -409,7 +409,11 @@ _WEAK_EVIDENCE_SOURCES = frozenset({
     "resolver_output",
     "resolver_tool_result",
     "world_event",
+})
+
+_RULE_DERIVED_SOURCES = frozenset({
     "clock_rule",
+    "deterministic_rule",
 })
 
 
@@ -423,6 +427,8 @@ def determine_evidence_status(evidence_sources, is_rule_derived=False):
     for ev in evidence_sources:
         if isinstance(ev, dict):
             src_type = ev.get("source_type") or ev.get("source", "")
+            if src_type in _RULE_DERIVED_SOURCES:
+                return "supported_by_rules"
             if src_type in _STRONG_EVIDENCE_SOURCES:
                 return "supported_by_evidence"
             if src_type in _WEAK_EVIDENCE_SOURCES:

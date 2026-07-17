@@ -1894,27 +1894,33 @@ class P1ImprovementsTest(unittest.TestCase):
                 },
             },
         }
-        apply_memory_patch(self.campaign, self.session, patch)
+        audit_context = {
+            'latest_player_message': 'We explore the town of Phandalin.',
+            'latest_dm_message': msg.content,
+            'source_player_message_id': msg.id,
+            'source_dm_message_id': msg.id,
+        }
+        apply_memory_patch(self.campaign, self.session, patch, audit_context=audit_context)
 
         warning_logs = CampaignMemoryLog.query.filter_by(
             campaign_id=self.campaign.id,
             memory_id='scene_mutation_warning',
         ).all()
-        if warning_logs:
-            wl = warning_logs[0]
-            self.assertIsNotNone(wl.provenance_json)
-            self.assertEqual(wl.provenance_json.get('pipeline_stage'), 'rejected')
-            self.assertIn('rejection_reason', wl.provenance_json)
+        self.assertGreater(len(warning_logs), 0, 'A scene_mutation_warning log should be produced for unsupported scene change')
+        wl = warning_logs[0]
+        self.assertIsNotNone(wl.provenance_json)
+        self.assertEqual(wl.provenance_json.get('pipeline_stage'), 'rejected')
+        self.assertIn('rejection_reason', wl.provenance_json)
 
         skip_logs = CampaignMemoryLog.query.filter_by(
             campaign_id=self.campaign.id,
             memory_id='current_scene',
+            status='validation_failed',
         ).order_by(CampaignMemoryLog.id.desc()).all()
-        if skip_logs:
-            last_log = skip_logs[0]
-            if last_log.status == 'validation_failed':
-                self.assertIsNotNone(last_log.provenance_json)
-                self.assertEqual(last_log.provenance_json.get('pipeline_stage'), 'rejected')
+        self.assertGreater(len(skip_logs), 0, 'A current_scene validation_failed log should be produced for unsupported scene change')
+        last_log = skip_logs[0]
+        self.assertIsNotNone(last_log.provenance_json)
+        self.assertEqual(last_log.provenance_json.get('pipeline_stage'), 'rejected')
 
 if __name__ == '__main__':
     unittest.main()
