@@ -670,6 +670,29 @@ def _compact_run_event(row, *, include_payload=False):
 
 
 def _compact_memory_log(row):
+    prov = row.provenance_json if isinstance(row.provenance_json, dict) else {}
+    safe_provenance = {}
+    if prov:
+        safe_fields = (
+            'pipeline_stage', 'evidence_status', 'tool_name',
+            'resolution_confidence', 'ambiguity_status',
+            'source_player_message_id', 'source_dm_message_id',
+            'trace_id', 'clock_trigger_rule_id', 'build_sha',
+            'rejection_reason',
+        )
+        for key in safe_fields:
+            if key in prov and prov[key] is not None:
+                safe_provenance[key] = prov[key]
+        if 'evidence_sources' in prov and isinstance(prov['evidence_sources'], list):
+            safe_provenance['evidence_source_count'] = len(prov['evidence_sources'])
+            safe_provenance['evidence_source_types'] = sorted(set(
+                s.get('source_type') or s.get('source', '')
+                for s in prov['evidence_sources'] if isinstance(s, dict)
+            ))
+        if 'evidence_basis' in prov and isinstance(prov['evidence_basis'], list):
+            safe_provenance['evidence_basis_preview'] = [
+                _truncate_text(b, 120) for b in prov['evidence_basis'][:3]
+            ]
     return {
         'id': row.id,
         'memory_run_id': row.memory_run_id,
@@ -684,7 +707,8 @@ def _compact_memory_log(row):
         'reason': _truncate_text(row.reason, 320) if row.reason else None,
         'error': _truncate_text(row.error, 320) if row.error else None,
         'created_at': row.created_at.isoformat() if row.created_at else None,
-        'has_provenance': bool(row.provenance_json),
+        'has_provenance': bool(prov),
+        'provenance': safe_provenance if safe_provenance else None,
     }
 
 

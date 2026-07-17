@@ -1631,5 +1631,139 @@ class P1ImprovementsTest(unittest.TestCase):
         self.assertGreater(len(packet['recent_memory_logs']), 0)
         self.assertGreater(packet['memory_log_summary']['total_returned'], 0)
 
+    def test_rule_derived_evidence_classified_as_supported_by_rules(self):
+        memory_context = {
+            'campaign_id': self.campaign.id,
+            'source_player_message_id': 1,
+        }
+        resolved = {
+            'upsert_graph_facts': [
+                {
+                    'text': 'Rule-derived: damage reduces HP by 5.',
+                    'provenance': {
+                        'is_rule_derived': True,
+                        'evidence_sources': [
+                            {'source_type': 'deterministic_rule', 'source_id': 'dnd_damage_rules'}
+                        ],
+                    },
+                }
+            ],
+        }
+        compiled = compile_staged_memory_patch(memory_context, {}, resolved)
+        fact = compiled['upsert_graph_facts'][0]
+        self.assertEqual(fact['provenance']['evidence_status'], 'supported_by_rules')
+
+    def test_scene_location_change_provenance_in_memory_log(self):
+        from models import CampaignMemoryLog, SessionMessage
+
+        msg = SessionMessage(session_id=self.session.id, user_id=self.user.id, role='dm', content='You arrive at Neverwinter.')
+        db.session.add(msg)
+        db.session.flush()
+
+        self.world.knowledge_graph = '{"entities":[],"relations":[],"facts":[]}'
+        db.session.add(self.world)
+        db.session.commit()
+
+        patch = {
+            'scene_patch': {
+                'location_name': 'Neverwinter',
+                'provenance': {
+                    'tool_name': 'resolve_scene_location_patch',
+                    'evidence_status': 'supported_by_evidence',
+                    'pipeline_stage': 'resolved',
+                },
+            },
+        }
+        result = apply_memory_patch(self.campaign, self.session, patch)
+
+        logs = CampaignMemoryLog.query.filter_by(
+            campaign_id=self.campaign.id,
+            memory_id='current_scene',
+        ).order_by(CampaignMemoryLog.id.desc()).all()
+        self.assertGreaterEqual(len(logs), 1, 'Scene log should exist')
+        applied_log = next((l for l in logs if l.status == 'applied'), None)
+        if applied_log:
+            self.assertIsNotNone(applied_log.provenance_json, 'Applied scene must carry provenance')
+            self.assertEqual(applied_log.provenance_json.get('pipeline_stage'), 'applied')
+            self.assertEqual(applied_log.evidence_status, 'supported_by_evidence')
+
+    def test_compact_memory_log_includes_redacted_provenance(self):
+        from services.automation_auditor import _compact_memory_log
+        from models import CampaignMemoryLog
+
+        patch = {
+            'create_clocks': [
+                {
+                    'id': 'clock_compact_test',
+                    'name': 'Compact Export Test Clock',
+                    'segments': 4,
+                    'visibility': 'party_known',
+                    'provenance': {
+                        'tool_name': 'test_tool',
+                        'evidence_status': 'supported_by_evidence',
+                        'pipeline_stage': 'applied',
+                        'evidence_sources': [
+                            {'source_type': 'transcript_message', 'source_id': 'msg_1'},
+                            {'source_type': 'prior_memory_record', 'source_id': 'rec_2'},
+                        ],
+                        'build_sha': 'abc12345',
+                    },
+                }
+            ],
+        }
+        apply_memory_patch(self.campaign, self.session, patch)
+
+        log = CampaignMemoryLog.query.filter_by(
+            campaign_id=self.campaign.id,
+            memory_id='clock_compact_test',
+        ).first()
+        self.assertIsNotNone(log)
+
+        compact = _compact_memory_log(log)
+        self.assertTrue(compact['has_provenance'])
+        self.assertIsNotNone(compact['provenance'])
+        self.assertEqual(compact['provenance'].get('pipeline_stage'), 'applied')
+        self.assertEqual(compact['provenance'].get('evidence_status'), 'supported_by_evidence')
+        self.assertEqual(compact['provenance'].get('build_sha'), 'abc12345')
+        self.assertEqual(compact['provenance'].get('evidence_source_count'), 2)
+        self.assertIn('transcript_message', compact['provenance'].get('evidence_source_types', []))
+        self.assertIn('prior_memory_record', compact['provenance'].get('evidence_source_types', []))
+
+    def test_clock_advance_uses_clock_trigger_not_own_id(self):
+        from models import CampaignClock, WorldEvent
+        from services.dm_tools import _tool_advance_clock
+
+        clock = CampaignClock(
+            campaign_id=self.campaign.id,
+            clock_id='clock_trigger_rule_test',
+            name='Trigger Rule Clock',
+            segments=6,
+            filled=0,
+            visibility='party_known',
+            trigger='Guard patrol spots the party',
+        )
+        db.session.add(clock)
+        db.session.commit()
+
+        result = _tool_advance_clock(self.campaign, None, {
+            'clock_id': 'clock_trigger_rule_test',
+            'delta': 1,
+            'reason': 'Guards noticed',
+        })
+
+        self.assertNotIn('error', result)
+        event = WorldEvent.query.filter_by(
+            campaign_id=self.campaign.id,
+            event_type='clock_advanced',
+        ).order_by(WorldEvent.id.desc()).first()
+        self.assertIsNotNone(event)
+        payload = json.loads(event.payload) if event.payload else {}
+        prov = payload.get('provenance', {})
+        self.assertEqual(
+            prov.get('clock_trigger_rule_id'),
+            'Guard patrol spots the party',
+            'clock_trigger_rule_id should use clock.trigger, not clock_id or arbitrary reason',
+        )
+
 if __name__ == '__main__':
     unittest.main()

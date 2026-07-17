@@ -2908,7 +2908,7 @@ def _tool_advance_clock(campaign, _current_user, args):
         elif ev:
             evidence_sources.append({'source_type': 'resolver_output', 'source_id': str(ev)})
     from services.audit_service import log_audit_event as _log_audit
-    trigger_identifier = (args.get('reason') or 'manual_advance')
+    trigger_identifier = clock.trigger or args.get('reason') or 'manual_advance'
     provenance = {
         'tool_name': 'session_dm_advance_clock',
         'pipeline_stage': 'applied',
@@ -5607,6 +5607,14 @@ def apply_memory_patch(campaign, session, patch, audit_context=None):
                         "resolver_output": None,
                         "unresolved_items": [f"Could not resolve proposed location: id={proposed_id}, name={proposed_name}"]
                     }
+                    scene_warn_prov = {
+                        'tool_name': 'resolve_scene_location_patch',
+                        'pipeline_stage': 'rejected',
+                        'source_player_message_id': player_message_id,
+                        'source_dm_message_id': dm_message_id,
+                        'trace_id': trace_id,
+                        'rejection_reason': warning_type,
+                    }
                     log_change(
                         memory_id='scene_mutation_warning',
                         target_table='campaign_worlds',
@@ -5619,7 +5627,8 @@ def apply_memory_patch(campaign, session, patch, audit_context=None):
                         importance=3,
                         reason=f"Scene mutation warning: {warning_type}",
                         patch_json=warning_payload,
-                        error=warning_type
+                        error=warning_type,
+                        provenance=scene_warn_prov,
                     )
                     log_audit_event(
                         campaign_id=campaign.id,
@@ -5693,6 +5702,14 @@ def apply_memory_patch(campaign, session, patch, audit_context=None):
                                 "resolver_output": resolved_loc,
                                 "unresolved_items": unresolved_items
                             }
+                            rej_prov = {
+                                'tool_name': 'resolve_scene_location_patch',
+                                'pipeline_stage': 'rejected',
+                                'source_player_message_id': player_message_id,
+                                'source_dm_message_id': dm_message_id,
+                                'trace_id': trace_id,
+                                'rejection_reason': warning_type,
+                            }
                             log_change(
                                 memory_id='scene_mutation_warning',
                                 target_table='campaign_worlds',
@@ -5705,7 +5722,8 @@ def apply_memory_patch(campaign, session, patch, audit_context=None):
                                 importance=3,
                                 reason=f"Scene mutation warning: {warning_type}",
                                 patch_json=warning_payload,
-                                error=warning_type
+                                error=warning_type,
+                                provenance=rej_prov,
                             )
                             from services.audit_service import log_audit_event
                             log_audit_event(
@@ -5721,6 +5739,13 @@ def apply_memory_patch(campaign, session, patch, audit_context=None):
                             )
 
                 if skipped_scene_patch:
+                    skip_prov = {
+                        'tool_name': 'resolve_scene_location_patch',
+                        'pipeline_stage': 'rejected',
+                        'source_player_message_id': player_message_id,
+                        'source_dm_message_id': dm_message_id,
+                        'trace_id': trace_id,
+                    }
                     log_change(
                         memory_id='current_scene',
                         target_table='campaign_worlds',
@@ -5739,6 +5764,7 @@ def apply_memory_patch(campaign, session, patch, audit_context=None):
                             'skipped_scene_patch': skipped_scene_patch,
                         },
                         error='scene_patch_field_not_evidenced',
+                        provenance=skip_prov,
                     )
                 if not scene_patch:
                     scene_patch = {}
@@ -5765,6 +5791,23 @@ def apply_memory_patch(campaign, session, patch, audit_context=None):
                 )
                 result['world_event_ids'].append(event.id)
 
+                scene_prov = scene_patch.get('provenance')
+                if isinstance(scene_prov, dict):
+                    scene_prov = dict(scene_prov)
+                    scene_prov['pipeline_stage'] = 'applied'
+                    scene_prov.setdefault('source_player_message_id', player_message_id)
+                    scene_prov.setdefault('source_dm_message_id', dm_message_id)
+                    scene_prov.setdefault('trace_id', trace_id)
+                else:
+                    scene_prov = {
+                        'tool_name': 'resolve_scene_location_patch',
+                        'pipeline_stage': 'applied',
+                        'source_player_message_id': player_message_id,
+                        'source_dm_message_id': dm_message_id,
+                        'trace_id': trace_id,
+                    }
+                scene_ev_status = (scene_patch.get('provenance') or {}).get('evidence_status') if isinstance(scene_patch.get('provenance'), dict) else None
+
                 log_change(
                     memory_id='current_scene',
                     target_table='campaign_worlds',
@@ -5778,7 +5821,9 @@ def apply_memory_patch(campaign, session, patch, audit_context=None):
                     reason=patch.get('scene_reason') or 'Scene transition/patch',
                     before_json={'current_scene': before_scene},
                     after_json={'current_scene': current_scene},
-                    patch_json=scene_patch
+                    patch_json=scene_patch,
+                    evidence_status=scene_ev_status,
+                    provenance=scene_prov,
                 )
 
             world.knowledge_graph = json_dumps(graph)

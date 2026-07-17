@@ -1075,6 +1075,10 @@ def compile_staged_memory_patch(memory_context, extracted, resolved):
         normalized = normalize_evidence_status(raw_status)
         if normalized:
             return normalized
+        is_rule = raw_prov.get("is_rule_derived") or item_raw.get("is_rule_derived")
+        rule_sources = [s for s in evidence_sources if isinstance(s, dict) and s.get("source_type") == "deterministic_rule"]
+        if is_rule or rule_sources:
+            return "supported_by_rules"
         if raw_prov.get("evidence_basis") and not evidence_sources:
             basis = raw_prov["evidence_basis"]
             if isinstance(basis, list) and basis:
