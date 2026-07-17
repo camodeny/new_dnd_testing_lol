@@ -2908,11 +2908,12 @@ def _tool_advance_clock(campaign, _current_user, args):
         elif ev:
             evidence_sources.append({'source_type': 'resolver_output', 'source_id': str(ev)})
     from services.audit_service import log_audit_event as _log_audit
+    trigger_identifier = (args.get('reason') or 'manual_advance')
     provenance = {
         'tool_name': 'session_dm_advance_clock',
         'pipeline_stage': 'applied',
         'evidence_sources': evidence_sources or None,
-        'clock_trigger_id': clock.clock_id,
+        'clock_trigger_rule_id': trigger_identifier,
         'delta': delta,
     }
     event = _record_event(
@@ -5430,6 +5431,28 @@ def apply_memory_patch(campaign, session, patch, audit_context=None):
         db.session.add(log_entry)
         logs_written += 1
 
+    def _applied_provenance(item, default_tool=None):
+        """Extract provenance from a patch item and enforce applied stage."""
+        raw_prov = item.get("provenance") if isinstance(item.get("provenance"), dict) else {}
+        if raw_prov:
+            prov = dict(raw_prov)
+            prov["pipeline_stage"] = "applied"
+            prov.setdefault("source_player_message_id", player_message_id)
+            prov.setdefault("source_dm_message_id", dm_message_id)
+            prov.setdefault("trace_id", trace_id)
+        else:
+            prov = {
+                "tool_name": default_tool,
+                "pipeline_stage": "applied",
+                "source_player_message_id": player_message_id,
+                "source_dm_message_id": dm_message_id,
+                "trace_id": trace_id,
+            }
+        from openrouter import _get_cached_build_sha
+        prov.setdefault("build_sha", _get_cached_build_sha())
+        evidence_status_val = raw_prov.get("evidence_status")
+        return prov, evidence_status_val
+
     try:
         if compile_summary or unresolved_items or evidence_basis:
             log_change(
@@ -5528,6 +5551,7 @@ def apply_memory_patch(campaign, session, patch, audit_context=None):
                         else:
                             mtype = item.get('memory_type') or 'fact'
 
+                    graph_prov, graph_ev_status = _applied_provenance(item, default_tool="resolution_registry")
                     log_change(
                         memory_id=item.get('id'),
                         target_table='campaign_worlds',
@@ -5542,7 +5566,9 @@ def apply_memory_patch(campaign, session, patch, audit_context=None):
                         expires_or_retire_condition=item.get('expires_or_retire_condition'),
                         before_json=before_val,
                         after_json=after_val,
-                        patch_json=item
+                        patch_json=item,
+                        evidence_status=graph_ev_status,
+                        provenance=graph_prov,
                     )
 
                     if (
@@ -5773,19 +5799,7 @@ def apply_memory_patch(campaign, session, patch, audit_context=None):
 
             after_val = change.get('clock')
             action = change.get('action')
-            provenance = item.get('provenance')
-            if isinstance(provenance, dict):
-                provenance = dict(provenance)
-                provenance.setdefault('pipeline_stage', 'applied')
-            elif after_val:
-                provenance = {
-                    'tool_name': 'session_memory_update_clocks',
-                    'pipeline_stage': 'applied',
-                    'source_player_message_id': player_message_id,
-                    'source_dm_message_id': dm_message_id,
-                    'trace_id': trace_id,
-                }
-            evidence_status = (item.get('provenance') or {}).get('evidence_status') if isinstance(item.get('provenance'), dict) else None
+            clock_prov, clock_ev_status = _applied_provenance(item, default_tool="session_memory_update_clocks")
 
             log_change(
                 memory_id=clock_id,
@@ -5802,8 +5816,8 @@ def apply_memory_patch(campaign, session, patch, audit_context=None):
                 before_json=before_val,
                 after_json=after_val,
                 patch_json=item,
-                evidence_status=evidence_status,
-                provenance=provenance,
+                evidence_status=clock_ev_status,
+                provenance=clock_prov,
             )
 
         for item in patch.get('retire_clocks', []) if isinstance(patch.get('retire_clocks'), list) else []:
@@ -5817,19 +5831,7 @@ def apply_memory_patch(campaign, session, patch, audit_context=None):
                 result['world_event_ids'].append(change['event_id'])
 
             after_val = change.get('clock')
-            provenance = item.get('provenance')
-            if isinstance(provenance, dict):
-                provenance = dict(provenance)
-                provenance.setdefault('pipeline_stage', 'applied')
-            elif after_val:
-                provenance = {
-                    'tool_name': 'session_memory_update_clocks',
-                    'pipeline_stage': 'applied',
-                    'source_player_message_id': player_message_id,
-                    'source_dm_message_id': dm_message_id,
-                    'trace_id': trace_id,
-                }
-            evidence_status = (item.get('provenance') or {}).get('evidence_status') if isinstance(item.get('provenance'), dict) else None
+            ret_prov, ret_ev_status = _applied_provenance(item, default_tool="session_memory_update_clocks")
 
             log_change(
                 memory_id=clock_id,
@@ -5846,8 +5848,8 @@ def apply_memory_patch(campaign, session, patch, audit_context=None):
                 before_json=before_val,
                 after_json=after_val,
                 patch_json=item,
-                evidence_status=evidence_status,
-                provenance=provenance,
+                evidence_status=ret_ev_status,
+                provenance=ret_prov,
             )
 
         for item in patch.get('update_npc_actors', []) if isinstance(patch.get('update_npc_actors'), list) else []:
@@ -5864,19 +5866,7 @@ def apply_memory_patch(campaign, session, patch, audit_context=None):
             after_val = change.get('npc_actor')
             action = change.get('action')
 
-            provenance = item.get('provenance')
-            if isinstance(provenance, dict):
-                provenance = dict(provenance)
-                provenance.setdefault('pipeline_stage', 'applied')
-            elif after_val:
-                provenance = {
-                    'tool_name': 'resolution_registry',
-                    'pipeline_stage': 'applied',
-                    'source_player_message_id': player_message_id,
-                    'source_dm_message_id': dm_message_id,
-                    'trace_id': trace_id,
-                }
-            evidence_status = (item.get('provenance') or {}).get('evidence_status') if isinstance(item.get('provenance'), dict) else None
+            npc_prov, npc_ev_status = _applied_provenance(item, default_tool="resolution_registry")
 
             log_change(
                 memory_id=actor_id,
@@ -5893,8 +5883,8 @@ def apply_memory_patch(campaign, session, patch, audit_context=None):
                 before_json=before_val,
                 after_json=after_val,
                 patch_json=item,
-                evidence_status=evidence_status,
-                provenance=provenance,
+                evidence_status=npc_ev_status,
+                provenance=npc_prov,
             )
 
         for event_patch in patch.get('record_events', []) if isinstance(patch.get('record_events'), list) else []:
@@ -5907,19 +5897,7 @@ def apply_memory_patch(campaign, session, patch, audit_context=None):
             )
             result['world_event_ids'].append(event.id)
 
-            provenance = event_patch.get('provenance')
-            if isinstance(provenance, dict):
-                provenance = dict(provenance)
-                provenance.setdefault('pipeline_stage', 'applied')
-            else:
-                provenance = {
-                    'tool_name': 'session_memory_record_event',
-                    'pipeline_stage': 'applied',
-                    'source_player_message_id': player_message_id,
-                    'source_dm_message_id': dm_message_id,
-                    'trace_id': trace_id,
-                }
-            evidence_status = (event_patch.get('provenance') or {}).get('evidence_status') if isinstance(event_patch.get('provenance'), dict) else None
+            evt_prov, evt_ev_status = _applied_provenance(event_patch, default_tool="session_memory_record_event")
 
             log_change(
                 memory_id=f"event_{event.id}",
@@ -5936,8 +5914,8 @@ def apply_memory_patch(campaign, session, patch, audit_context=None):
                 before_json=None,
                 after_json=event.to_dict(include_private=True),
                 patch_json=event_patch,
-                evidence_status=evidence_status,
-                provenance=provenance,
+                evidence_status=evt_ev_status,
+                provenance=evt_prov,
             )
 
         summary = clean_text(patch.get('running_summary'), 4000)
@@ -5947,6 +5925,13 @@ def apply_memory_patch(campaign, session, patch, audit_context=None):
                 session.running_summary = summary
             result['running_summary_updated'] = True
 
+            sum_prov = {
+                'tool_name': 'session_memory_writer',
+                'pipeline_stage': 'applied',
+                'source_player_message_id': player_message_id,
+                'source_dm_message_id': dm_message_id,
+                'trace_id': trace_id,
+            }
             log_change(
                 memory_id='running_summary',
                 target_table='campaign_sessions',
@@ -5960,7 +5945,8 @@ def apply_memory_patch(campaign, session, patch, audit_context=None):
                 reason='Running summary revised by LLM memory pass',
                 before_json={'running_summary': before_summary},
                 after_json={'running_summary': summary},
-                patch_json={'running_summary': summary}
+                patch_json={'running_summary': summary},
+                provenance=sum_prov,
             )
 
         anchors = patch.get('memory_anchors')
@@ -5970,6 +5956,13 @@ def apply_memory_patch(campaign, session, patch, audit_context=None):
                 session.memory_anchors = anchors
             result['memory_anchors_updated'] = True
 
+            anchor_prov = {
+                'tool_name': 'session_memory_writer',
+                'pipeline_stage': 'applied',
+                'source_player_message_id': player_message_id,
+                'source_dm_message_id': dm_message_id,
+                'trace_id': trace_id,
+            }
             log_change(
                 memory_id='memory_anchors',
                 target_table='campaign_sessions',
@@ -5983,7 +5976,8 @@ def apply_memory_patch(campaign, session, patch, audit_context=None):
                 reason='Memory anchors updated by LLM memory pass',
                 before_json={'memory_anchors': before_anchors},
                 after_json={'memory_anchors': anchors},
-                patch_json={'memory_anchors': anchors}
+                patch_json={'memory_anchors': anchors},
+                provenance=anchor_prov,
             )
 
         # Log fallback no-op if no logs were written

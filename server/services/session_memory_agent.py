@@ -27,6 +27,7 @@ from services.resolution_registry import (
     resolve_ref,
 )
 from services.world_service import clean_id, clean_text, get_campaign_world, json_loads
+from openrouter import _get_cached_build_sha
 
 
 class MemoryPipelineError(Exception):
@@ -1101,6 +1102,7 @@ def compile_staged_memory_patch(memory_context, extracted, resolved):
             ambiguity_status=raw_prov.get("ambiguity_status"),
             trace_id=raw_prov.get("trace_id") or trace_id,
             parent_trace_id=raw_prov.get("parent_trace_id"),
+            build_sha=raw_prov.get("build_sha") or _get_cached_build_sha(),
         )
         raw_basis = raw_prov.get("evidence_basis") or item_raw.get("evidence_basis")
         if isinstance(raw_basis, list):

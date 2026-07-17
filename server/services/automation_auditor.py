@@ -14,6 +14,7 @@ from models import (
     CampaignAuditEvent,
     CampaignClock,
     CampaignMemoryEmbedding,
+    CampaignMemoryLog,
     CampaignWorld,
     Character,
     NPCActor,
@@ -668,6 +669,25 @@ def _compact_run_event(row, *, include_payload=False):
     return compact
 
 
+def _compact_memory_log(row):
+    return {
+        'id': row.id,
+        'memory_run_id': row.memory_run_id,
+        'memory_id': row.memory_id,
+        'operation': row.operation,
+        'status': row.status,
+        'memory_type': row.memory_type,
+        'visibility': row.visibility,
+        'certainty': row.certainty,
+        'importance': row.importance,
+        'evidence_status': row.evidence_status,
+        'reason': _truncate_text(row.reason, 320) if row.reason else None,
+        'error': _truncate_text(row.error, 320) if row.error else None,
+        'created_at': row.created_at.isoformat() if row.created_at else None,
+        'has_provenance': bool(row.provenance_json),
+    }
+
+
 def _selected_audit_event_detail(row, paths):
     redacted_data = redact_secrets(row.to_dict())
     return {
@@ -924,6 +944,19 @@ def _cycle_evidence_packet(run, cycle, args):
 
     clock_rows = CampaignClock.query.filter_by(campaign_id=campaign.id).order_by(CampaignClock.id.asc()).all() if campaign else []
     npc_rows = NPCActor.query.filter_by(campaign_id=campaign.id).order_by(NPCActor.id.asc()).all() if campaign else []
+
+    memory_log_limit = _limit_arg({'limit': (args or {}).get('memory_log_limit')}, 20, 60)
+    memory_log_rows = []
+    if campaign:
+        log_query = CampaignMemoryLog.query.filter_by(campaign_id=campaign.id)
+        if boundaries.get("message_id") is not None:
+            log_query = log_query.filter(
+                (CampaignMemoryLog.source_player_message_id <= boundaries["message_id"])
+                | (CampaignMemoryLog.source_player_message_id.is_(None))
+                | (CampaignMemoryLog.source_dm_message_id.is_(None))
+            )
+        memory_log_rows = log_query.order_by(CampaignMemoryLog.id.desc()).limit(memory_log_limit).all()
+
     return {
         'run': {
             'id': run.id,
@@ -948,6 +981,15 @@ def _cycle_evidence_packet(run, cycle, args):
         'running_summary': latest_session.running_summary if latest_session else None,
         'clock_summaries': [_compact_clock(row) for row in clock_rows],
         'active_npc_summaries': [_compact_npc(row) for row in npc_rows],
+        'recent_memory_logs': [_compact_memory_log(row) for row in reversed(memory_log_rows)],
+        'memory_log_summary': {
+            'total_returned': len(memory_log_rows),
+            'has_provenance': sum(1 for r in memory_log_rows if r.provenance_json),
+            'has_evidence_status': sum(1 for r in memory_log_rows if r.evidence_status),
+            'evidence_status_counts': dict(Counter(
+                m.evidence_status for m in memory_log_rows if m.evidence_status
+            )),
+        },
         'recent_audit_events': [_compact_audit_event(row, include_payload=False) for row in reversed(audit_rows)],
         'recent_provider_calls': [_compact_provider_call(row, include_artifacts=False) for row in reversed(provider_rows)],
         'recent_run_events': [_compact_run_event(row, include_payload=False) for row in reversed(run_event_rows)],

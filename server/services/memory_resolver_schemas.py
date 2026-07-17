@@ -394,6 +394,25 @@ def make_evidence_source(source_type, source_id, description=None, confidence=No
     return source
 
 
+_STRONG_EVIDENCE_SOURCES = frozenset({
+    "memory_resolver_packet",
+    "prior_durable_memory",
+    "prior_memory_record",
+    "clarification_answer",
+    "existing_alias",
+    "prior_scene_cast",
+})
+
+_WEAK_EVIDENCE_SOURCES = frozenset({
+    "visible_transcript",
+    "transcript_message",
+    "resolver_output",
+    "resolver_tool_result",
+    "world_event",
+    "clock_rule",
+})
+
+
 def determine_evidence_status(evidence_sources, is_rule_derived=False):
     if not isinstance(evidence_sources, list):
         evidence_sources = []
@@ -403,12 +422,16 @@ def determine_evidence_status(evidence_sources, is_rule_derived=False):
         return "insufficiently_supported"
     for ev in evidence_sources:
         if isinstance(ev, dict):
-            src_type = ev.get("source_type") or ev.get("source")
-            if src_type in ("memory_resolver_packet", "prior_durable_memory", "clarification_answer"):
+            src_type = ev.get("source_type") or ev.get("source", "")
+            if src_type in _STRONG_EVIDENCE_SOURCES:
                 return "supported_by_evidence"
-            if src_type in ("visible_transcript", "resolver_output", "transcript_message", "deterministic_rule"):
-                if ev.get("confidence") in (None, 1.0) or ev.get("confidence", 0) > 0.3:
+            if src_type in _WEAK_EVIDENCE_SOURCES:
+                conf = ev.get("confidence")
+                if conf is None or conf >= 0.3:
                     return "supported_by_evidence"
+    for ev in evidence_sources:
+        if isinstance(ev, (str, int)):
+            return "supported_by_evidence"
     return "insufficiently_supported"
 
 
