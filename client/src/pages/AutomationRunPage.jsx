@@ -314,6 +314,7 @@ export default function AutomationRunPage() {
   const scorecard = data.scorecard || []
   const messages = latestSession?.messages || []
   const incidents = data.incidents || run.scorecard_summary?.incidents || []
+  const categoryBreakdown = run.scorecard_summary?.category_breakdown || {}
   const encounterMap = data.encounter_map
   const auditCycles = data.audit_cycles || []
   const auditorJobs = data.auditor_jobs || []
@@ -424,6 +425,7 @@ export default function AutomationRunPage() {
                   </div>
                   <div className="automation-meta-grid">
                     <div><strong>Status</strong><span>{run.status}</span></div>
+                    <div><strong>Weighted score</strong><span>{run.scorecard_summary?.weighted_score !== undefined && run.scorecard_summary?.weighted_score !== null ? `${run.scorecard_summary.weighted_score < 1.0 ? Math.min(99.9, run.scorecard_summary.weighted_score * 100).toFixed(1) : '100.0'}%` : 'N/A'}</span></div>
                     <div><strong>Created</strong><span>{formatTime(run.created_at)}</span></div>
                     <div><strong>Started</strong><span>{formatTime(run.started_at)}</span></div>
                     <div><strong>Finished</strong><span>{formatTime(run.finished_at)}</span></div>
@@ -436,6 +438,31 @@ export default function AutomationRunPage() {
 
                 <section className="automation-panel">
                   <h2>Scorecard</h2>
+                  {categoryBreakdown && Object.keys(categoryBreakdown).length > 0 && (
+                    <div className="automation-category-breakdown" style={{ marginBottom: '20px', padding: '15px', borderRadius: '8px', background: 'var(--card-bg-subtle, rgba(255, 255, 255, 0.03))', border: '1px solid var(--border-color, rgba(255, 255, 255, 0.08))' }}>
+                      <h3 style={{ marginTop: 0, marginBottom: '12px', fontSize: '1.1rem', color: 'var(--text-bright, #fff)' }}>Category Breakdown</h3>
+                      <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fill, minmax(220px, 1fr))', gap: '12px' }}>
+                        {Object.entries(categoryBreakdown).map(([catName, data]) => {
+                          const hasScore = data.score !== null && data.score !== undefined;
+                          const formattedScore = hasScore ? `${data.score < 1.0 ? Math.min(99.9, data.score * 100).toFixed(1) : '100.0'}%` : 'N/A';
+                          return (
+                            <div key={catName} className={`category-card status-${data.status}`} style={{ padding: '10px 12px', borderRadius: '6px', background: 'var(--card-bg, rgba(255, 255, 255, 0.05))', borderLeft: `4px solid ${data.status === 'pass' ? '#10b981' : data.status === 'warn' ? '#f59e0b' : data.status === 'fail' ? '#ef4444' : '#6b7280'}` }}>
+                              <div style={{ fontSize: '0.8rem', color: 'var(--text-muted, #9ca3af)', textTransform: 'capitalize', whiteSpace: 'nowrap', overflow: 'hidden', textOverflow: 'ellipsis' }} title={catName}>
+                                {catName}
+                              </div>
+                              <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', marginTop: '4px' }}>
+                                <strong style={{ fontSize: '1.2rem', color: 'var(--text-bright, #fff)' }}>{formattedScore}</strong>
+                                <span className={`status-badge ${data.status}`} style={{ fontSize: '0.7rem', padding: '2px 6px', borderRadius: '4px', background: 'rgba(255, 255, 255, 0.1)', textTransform: 'uppercase' }}>
+                                  {data.status}
+                                </span>
+                              </div>
+                            </div>
+                          );
+                        })}
+                      </div>
+                    </div>
+                  )}
+
                   {scorecard.length === 0 ? (
                     <div className="automation-empty">No scorecard results yet.</div>
                   ) : (
@@ -498,6 +525,7 @@ export default function AutomationRunPage() {
                           <option value="warn">warn</option>
                           <option value="fail">fail</option>
                           <option value="not_assessed">not_assessed</option>
+                          <option value="not_applicable">not_applicable</option>
                         </select>
                       </label>
                       <label>
@@ -520,6 +548,7 @@ export default function AutomationRunPage() {
                                     <option value="warn">warn</option>
                                     <option value="fail">fail</option>
                                     <option value="not_assessed">not_assessed</option>
+                                    <option value="not_applicable">not_applicable</option>
                                   </select>
                                 </label>
                                 <label>

@@ -128,7 +128,7 @@ DEFAULT_LEASE_SECONDS = 45
 DEFAULT_PROVISIONING_LEASE_SECONDS = 300
 CLAIMABLE_ACTIVE_STATUSES = {'claimed', 'running', 'stop_requested'}
 AUDIT_READY_STATUSES = {'audited', 'skipped'}
-CUSTOM_SCORECARD_STATUS_ORDER = ('pass', 'warn', 'fail', 'not_assessed')
+CUSTOM_SCORECARD_STATUS_ORDER = ('pass', 'warn', 'fail', 'not_assessed', 'not_applicable')
 DEFAULT_RETENTION_POLICY = {
     'retention_days': 14,
     'keep_recent_runs': 5,
@@ -199,7 +199,49 @@ DEFAULT_AUDIT_CONFIG = {
         },
     ],
 }
-STATUS_RANK = {'fail': 0, 'warn': 1, 'not_assessed': 1, 'pass': 2}
+STATUS_RANK = {'fail': 0, 'warn': 1, 'not_assessed': 1, 'not_applicable': 1, 'pass': 2}
+
+CANONICAL_CATEGORIES = {
+    "operational/runtime reliability": "operational/runtime reliability",
+    "operational_reliability": "operational/runtime reliability",
+    "operational": "operational/runtime reliability",
+    "narrative quality": "narrative quality",
+    "narrative_quality": "narrative quality",
+    "narrative": "narrative quality",
+    "durable state correctness": "durable state correctness",
+    "durable_state_correctness": "durable state correctness",
+    "state_correctness": "durable state correctness",
+    "state": "durable state correctness",
+    "retrieval or memory use": "retrieval or memory use",
+    "retrieval_memory_use": "retrieval or memory use",
+    "retrieval": "retrieval or memory use",
+    "memory": "retrieval or memory use",
+    "safety/private-information handling": "safety/private-information handling",
+    "safety_private_info": "safety/private-information handling",
+    "safety": "safety/private-information handling",
+}
+
+def get_criterion_category(crit):
+    cat = crit.get('category')
+    if cat:
+        normalized = CANONICAL_CATEGORIES.get(str(cat).strip().lower())
+        if normalized:
+            return normalized
+            
+    # Try by substring match on ID, metric, or label
+    identifier = (str(crit.get('id') or crit.get('metric') or '') + ' ' + str(crit.get('label') or '')).lower()
+    if any(k in identifier for k in ('completion', 'error', 'turn', 'retry', 'status', 'reliability', 'perf', 'run')):
+        return "operational/runtime reliability"
+    if any(k in identifier for k in ('state', 'durable', 'db', 'entity', 'relation', 'save', 'progress')):
+        return "durable state correctness"
+    if any(k in identifier for k in ('memory', 'retrieval', 'context', 'history', 'anchor', 'recall')):
+        return "retrieval or memory use"
+    if any(k in identifier for k in ('safety', 'private', 'secure', 'moderation', 'policy', 'leak', 'spoiler')):
+        return "safety/private-information handling"
+    if any(k in identifier for k in ('narrative', 'story', 'quality', 'silence', 'empty', 'dialog', 'dialogue', 'rp', 'play')):
+        return "narrative quality"
+        
+    return None # default fallback
 
 
 def _normalize_custom_scorecard_status(value, default='warn'):
@@ -211,15 +253,18 @@ def _aggregate_custom_scorecard_statuses(statuses, default='warn'):
     normalized = [_normalize_custom_scorecard_status(status, default='warn') for status in statuses if status]
     if not normalized:
         return default
-    assessed = [status for status in normalized if status in {'pass', 'warn', 'fail'}]
-    if assessed:
-        if 'fail' in assessed:
-            return 'fail'
-        if 'warn' in assessed:
-            return 'warn'
+    
+    if 'fail' in normalized:
+        return 'fail'
+    if 'warn' in normalized:
+        return 'warn'
+    if 'pass' in normalized:
         return 'pass'
-    if any(status == 'not_assessed' for status in normalized):
+    if 'not_assessed' in normalized:
         return 'not_assessed'
+    if 'not_applicable' in normalized:
+        return 'not_applicable'
+        
     return default
 
 
@@ -350,6 +395,8 @@ def validate_scorecard_template_payload(data):
             'description': (raw.get('description') or '').strip() or None,
             'better_direction': (raw.get('better_direction') or 'higher').strip().lower(),
             'evidence_requirements': evidence_requirements,
+            'weight': max(1, min(100, _safe_int(raw.get('weight'), 2))),
+            'category': (raw.get('category') or '').strip() or None,
         })
 
     defaults = _json_object(data.get('defaults'), {})
@@ -1590,6 +1637,11 @@ def submit_audit_cycle_feedback(cycle, *, summary=None, notes=None, scorecard=No
             'phase': str(applicability.get('phase') or '').strip() or None,
         }
 
+        # Normalize to one canonical representation
+        if status == 'not_applicable' or not applicability['applicable']:
+            status = 'not_applicable'
+            applicability['applicable'] = False
+
         criteria_results.append({
             'criterion_id': criterion_id,
             'label': template_row.get('label') or raw.get('label') or criterion_id,
@@ -1604,7 +1656,7 @@ def submit_audit_cycle_feedback(cycle, *, summary=None, notes=None, scorecard=No
     if criteria_results:
         applicable_results = [
             item for item in criteria_results
-            if item.get('applicability', {}).get('applicable', True)
+            if item.get('status') != 'not_applicable' and item.get('applicability', {}).get('applicable', True)
         ]
         overall_status = (
             _aggregate_custom_scorecard_statuses([item.get('status') for item in applicable_results], default='warn')
@@ -1615,7 +1667,10 @@ def submit_audit_cycle_feedback(cycle, *, summary=None, notes=None, scorecard=No
         overall_status = _normalize_custom_scorecard_status(scorecard_payload.get('overall_status')) or 'warn'
     criteria_assessed_count = sum(1 for item in criteria_results if item.get('status') in {'pass', 'warn', 'fail'})
     criteria_not_assessed_count = sum(1 for item in criteria_results if item.get('status') == 'not_assessed' and item.get('applicability', {}).get('applicable', True))
-    criteria_not_applicable_count = sum(1 for item in criteria_results if item.get('status') == 'not_assessed' and not item.get('applicability', {}).get('applicable', True))
+    criteria_not_applicable_count = sum(
+        1 for item in criteria_results
+        if item.get('status') == 'not_applicable' or not item.get('applicability', {}).get('applicable', True)
+    )
     
     cycle.scorecard_json = {
         'template': template,
@@ -2188,6 +2243,8 @@ def _matches_condition(value, condition):
 
 
 def _evaluate_check(metric_value, check):
+    if metric_value is None:
+        return 'not_assessed'
     kind = check.get('kind') or 'number'
     if kind == 'enum':
         if metric_value in (check.get('fail_values') or []):
@@ -2259,10 +2316,11 @@ def custom_scorecard_results(run, cycle_rows):
     for criterion in criteria:
         criterion_id = criterion['id']
         assessments = by_criterion.get(criterion_id) or []
+        weight = max(1, _safe_int(criterion.get('weight'), 2))
         
-        # If there are no assessments, it defaults to warn
+        # If there are no assessments, it defaults to not_assessed
         if not assessments:
-            status = 'warn'
+            status = 'not_assessed'
             summary = 'No custom audit feedback recorded for this criterion.'
             counts = {'pass': 0, 'warn': 0, 'fail': 0, 'not_assessed': 0, 'not_applicable': 0}
             exercised_count = 0
@@ -2271,18 +2329,21 @@ def custom_scorecard_results(run, cycle_rows):
         else:
             applicable_assessments = [
                 item for item in assessments
-                if item.get('applicability', {}).get('applicable', True)
+                if item.get('status') != 'not_applicable' and item.get('applicability', {}).get('applicable', True)
             ]
             
             counts = Counter(item['status'] for item in assessments if item.get('status') in CUSTOM_SCORECARD_STATUS_ORDER)
-            na_count = sum(1 for item in assessments if item.get('status') == 'not_assessed' and not item.get('applicability', {}).get('applicable', True))
+            na_count = sum(
+                1 for item in assessments
+                if item.get('status') == 'not_applicable' or (item.get('status') == 'not_assessed' and not item.get('applicability', {}).get('applicable', True))
+            )
             not_assessed_applicable_count = sum(1 for item in assessments if item.get('status') == 'not_assessed' and item.get('applicability', {}).get('applicable', True))
             
             exercised_count = counts.get('pass', 0) + counts.get('warn', 0) + counts.get('fail', 0)
             
             # If there are only N/A assessments for this criterion across cycles:
             if not applicable_assessments:
-                status = 'not_assessed'
+                status = 'not_applicable'
             else:
                 status = _aggregate_custom_scorecard_statuses([item.get('status') for item in applicable_assessments], default='warn')
                 
@@ -2302,7 +2363,7 @@ def custom_scorecard_results(run, cycle_rows):
             'details': {
                 'metric': f'custom:{criterion_id}',
                 'metric_value': STATUS_RANK.get(status, 0),
-                'weight': 2,
+                'weight': weight,
                 'thresholds': {},
                 'better_direction': criterion.get('better_direction') or 'higher',
                 'criterion': criterion,
@@ -2374,16 +2435,12 @@ def refresh_run_scorecard(run):
     checks = config.get('checks') or DEFAULT_AUDIT_CONFIG['checks']
 
     results_payload = []
-    weighted_total = 0
-    weighted_pass = 0
     for check in checks:
         metric_key = check.get('metric')
         metric_value = metrics.get(metric_key)
         status = _evaluate_check(metric_value, check)
         weight = max(1, _safe_int(check.get('weight'), 1))
-        weighted_total += weight
-        if status == 'pass':
-            weighted_pass += weight
+        check_category = get_criterion_category(check)
         summary_template = check.get('summary_template') or '{id}: {value}'
         results_payload.append({
             'check_id': check.get('id') or metric_key,
@@ -2393,6 +2450,7 @@ def refresh_run_scorecard(run):
                 'metric': metric_key,
                 'metric_value': metric_value,
                 'weight': weight,
+                'category': check_category,
                 'thresholds': {
                     'pass_if': check.get('pass_if'),
                     'warn_if': check.get('warn_if'),
@@ -2405,15 +2463,102 @@ def refresh_run_scorecard(run):
             },
         })
 
-    results_payload.extend(custom_scorecard_results(run, cycle_rows))
+    custom_results = custom_scorecard_results(run, cycle_rows)
+    for row in custom_results:
+        crit = row['details']['criterion']
+        check_category = get_criterion_category(crit)
+        row['details']['category'] = check_category
+        
+    results_payload.extend(custom_results)
 
     fail_count = sum(1 for check in results_payload if check['status'] == 'fail')
     warn_count = sum(1 for check in results_payload if check['status'] == 'warn')
-    weighted_score = round((weighted_pass / weighted_total) if weighted_total else 0.0, 4)
+    pass_count = sum(1 for check in results_payload if check['status'] == 'pass')
+    not_assessed_count = sum(1 for check in results_payload if check['status'] == 'not_assessed')
+    not_applicable_count = sum(1 for check in results_payload if check['status'] == 'not_applicable')
+
+    weighted_total = 0
+    weighted_pass = 0
+    for check in results_payload:
+        status = check['status']
+        weight = max(1, _safe_int(check['details'].get('weight'), 1))
+        if status == 'pass':
+            weighted_total += weight
+            weighted_pass += weight
+        elif status == 'warn':
+            weighted_total += weight
+            weighted_pass += 0.5 * weight
+        elif status == 'fail':
+            weighted_total += weight
+            weighted_pass += 0.0 * weight
+
     assessment_present = bool(metrics.get('completed_turns') or metrics.get('audited_cycle_count'))
-    if not assessment_present:
+    if not assessment_present or weighted_total == 0:
         weighted_score = None
-    overall_status = 'not_assessed' if not assessment_present else ('fail' if fail_count else ('warn' if warn_count else 'pass'))
+    else:
+        weighted_score = round(weighted_pass / weighted_total, 4)
+        if weighted_pass < weighted_total and weighted_score >= 1.0:
+            weighted_score = 0.9999
+
+    if not assessment_present:
+        overall_status = 'not_assessed'
+    else:
+        if fail_count > 0:
+            overall_status = 'fail'
+        elif warn_count > 0:
+            overall_status = 'warn'
+        elif pass_count > 0:
+            overall_status = 'pass'
+        elif not_assessed_count > 0:
+            overall_status = 'not_assessed'
+        else:
+            overall_status = 'not_applicable'
+
+    CATEGORIES_TO_BREAKDOWN = [
+        "operational/runtime reliability",
+        "narrative quality",
+        "durable state correctness",
+        "retrieval or memory use",
+        "safety/private-information handling"
+    ]
+    category_breakdown = {}
+    for cat in CATEGORIES_TO_BREAKDOWN:
+        cat_checks = [c for c in results_payload if c['details'].get('category') == cat]
+        if not cat_checks:
+            category_breakdown[cat] = {
+                'status': 'not_applicable',
+                'score': None
+            }
+        else:
+            cat_statuses = [c['status'] for c in cat_checks]
+            cat_status = _aggregate_custom_scorecard_statuses(cat_statuses, default='not_assessed')
+            
+            w_total_cat = 0
+            w_pass_cat = 0
+            for c in cat_checks:
+                status = c['status']
+                weight = max(1, _safe_int(c['details'].get('weight'), 1))
+                if status == 'pass':
+                    w_total_cat += weight
+                    w_pass_cat += weight
+                elif status == 'warn':
+                    w_total_cat += weight
+                    w_pass_cat += 0.5 * weight
+                elif status == 'fail':
+                    w_total_cat += weight
+                    w_pass_cat += 0.0 * weight
+                    
+            if w_total_cat > 0:
+                cat_score = round(w_pass_cat / w_total_cat, 4)
+                if w_pass_cat < w_total_cat and cat_score >= 1.0:
+                    cat_score = 0.9999
+            else:
+                cat_score = None
+                
+            category_breakdown[cat] = {
+                'status': cat_status,
+                'score': cat_score
+            }
 
     AutomationRunAuditResult.query.filter_by(run_id=run.id).delete()
     created_results = []
@@ -2442,6 +2587,7 @@ def refresh_run_scorecard(run):
         'overall_status': overall_status,
         'incidents': calculate_run_incidents(run, event_rows, audit_rows, provider_rows),
         'custom_scorecard_name': current_scorecard_template_for_run(run).get('name'),
+        'category_breakdown': category_breakdown,
     }
     db.session.commit()
     return results_payload
