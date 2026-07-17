@@ -395,7 +395,7 @@ def validate_scorecard_template_payload(data):
             'description': (raw.get('description') or '').strip() or None,
             'better_direction': (raw.get('better_direction') or 'higher').strip().lower(),
             'evidence_requirements': evidence_requirements,
-            'weight': max(1, _safe_int(raw.get('weight'), 2)),
+            'weight': max(1, min(100, _safe_int(raw.get('weight'), 2))),
             'category': (raw.get('category') or '').strip() or None,
         })
 
@@ -1637,6 +1637,11 @@ def submit_audit_cycle_feedback(cycle, *, summary=None, notes=None, scorecard=No
             'phase': str(applicability.get('phase') or '').strip() or None,
         }
 
+        # Normalize to one canonical representation
+        if status == 'not_applicable' or not applicability['applicable']:
+            status = 'not_applicable'
+            applicability['applicable'] = False
+
         criteria_results.append({
             'criterion_id': criterion_id,
             'label': template_row.get('label') or raw.get('label') or criterion_id,
@@ -2492,6 +2497,8 @@ def refresh_run_scorecard(run):
         weighted_score = None
     else:
         weighted_score = round(weighted_pass / weighted_total, 4)
+        if weighted_pass < weighted_total and weighted_score >= 1.0:
+            weighted_score = 0.9999
 
     if not assessment_present:
         overall_status = 'not_assessed'
@@ -2543,6 +2550,8 @@ def refresh_run_scorecard(run):
                     
             if w_total_cat > 0:
                 cat_score = round(w_pass_cat / w_total_cat, 4)
+                if w_pass_cat < w_total_cat and cat_score >= 1.0:
+                    cat_score = 0.9999
             else:
                 cat_score = None
                 

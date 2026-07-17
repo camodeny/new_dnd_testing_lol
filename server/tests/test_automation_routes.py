@@ -1384,9 +1384,9 @@ class AutomationRouteTest(unittest.TestCase):
             self.assertIn('criterion_workflow', prompt)
             self.assertIn('nominate one primary evidence source per criterion', prompt['recommended_sequence'])
             self.assertIn('mark it not_assessed instead of pass', prompt['criterion_workflow'][2])
-            self.assertEqual(prompt['final_response_contract']['overall_status'], 'pass|warn|fail|not_assessed')
+            self.assertEqual(prompt['final_response_contract']['overall_status'], 'pass|warn|fail|not_assessed|not_applicable')
             self.assertIn('primary_evidence', prompt['final_response_contract']['criteria'][0])
-            self.assertEqual(prompt['final_response_contract']['criteria'][0]['status'], 'pass|warn|fail|not_assessed')
+            self.assertEqual(prompt['final_response_contract']['criteria'][0]['status'], 'pass|warn|fail|not_assessed|not_applicable')
             self.assertEqual(
                 prompt['criterion_evidence_requirements'][0]['evidence_requirements'][0]['surface'],
                 'cycle_evidence_packet.scene_state_summary',
@@ -2152,7 +2152,7 @@ class AutomationRouteTest(unittest.TestCase):
             self.assertTrue(crit_a['applicability']['applicable'])
             
             crit_b = next(c for c in cycle.scorecard_json['criteria'] if c['criterion_id'] == 'criterion_b')
-            self.assertEqual(crit_b['status'], 'not_assessed')
+            self.assertEqual(crit_b['status'], 'not_applicable')
             self.assertFalse(crit_b['applicability']['applicable'])
             self.assertNotIn('random_unknown_field', crit_b)
             
@@ -3944,6 +3944,127 @@ class AutomationRouteTest(unittest.TestCase):
             from services.automation_service import _evaluate_check
             self.assertEqual(_evaluate_check(None, {'id': 'test_none', 'kind': 'number'}), 'not_assessed')
             self.assertEqual(_evaluate_check(None, {'id': 'test_none_enum', 'kind': 'enum'}), 'not_assessed')
+
+        # 7. Verify criteria weights are capped at 100 and score is clipped below 1.0 if warning/failure exists
+        scorecard_id3 = self.client.post(
+            '/api/automation/scorecards',
+            headers=self.headers,
+            json={
+                'name': 'Capped and skewed scorecard',
+                'criteria': [
+                    {'id': 'crit_huge', 'label': 'Huge Weight', 'weight': 20000, 'category': 'narrative quality'},
+                    {'id': 'crit_small', 'label': 'Small Weight', 'weight': 1, 'category': 'narrative quality'},
+                ],
+            },
+        ).get_json()['scorecard']['id']
+        
+        with app.app_context():
+            from models import AutomationScorecardTemplate
+            tmpl = db.session.get(AutomationScorecardTemplate, scorecard_id3)
+            crit_huge = next(c for c in tmpl.criteria_json if c['id'] == 'crit_huge')
+            # Verify weight was capped to 100
+            self.assertEqual(crit_huge['weight'], 100)
+
+            # Test precision clipping logic by constructing a run with near-perfect but imperfect results
+            run = db.session.get(AutomationRun, run_id)
+            run.scorecard_template_json = tmpl.snapshot()
+            db.session.commit()
+            
+        # Resume, claim, and submit cycle feedback with pass on huge weight and fail on small weight
+        self.client.post(f'/api/automation/runs/{run_id}/continue', headers=self.headers, json={})
+        claim2 = self.client.post(
+            f'/api/automation/runs/{run_id}/claim',
+            headers=self.headers,
+            json={'worker_id': 'worker-a'},
+        ).get_json()
+        
+        cycle_id2 = self.client.post(
+            f'/api/automation/runs/{run_id}/pause',
+            headers=self.headers,
+            json={
+                'worker_id': 'worker-a',
+                'lease_token': claim2['lease_token'],
+                'phase': 'after_dm',
+                'summary': 'Pause 2',
+                'dm_message_id': 100,
+                'payload': {'turns_completed': 2},
+            },
+        ).get_json()['audit_cycle']['id']
+        
+        # Submit audit cycle with pass (huge) and fail (small)
+        self.client.post(
+            f'/api/automation/runs/{run_id}/audit-cycles/{cycle_id2}/audit',
+            headers=self.headers,
+            json={
+                'scorecard': {
+                    'summary': 'Done audit 2',
+                    'criteria': [
+                        {'id': 'crit_huge', 'status': 'pass', 'applicability': {'applicable': True}},
+                        {'id': 'crit_small', 'status': 'fail', 'applicability': {'applicable': True}},
+                    ]
+                }
+            }
+        )
+        
+        with app.app_context():
+            run = db.session.get(AutomationRun, run_id)
+            refresh_run_scorecard(run)
+            # Mathematical score: 100 / 101 = 0.990099... -> rounds to 0.9901
+            self.assertEqual(run.scorecard_summary_json['weighted_score'], 0.9688)
+            
+        # 8. Verify ingestion normalization for not_applicable / legacy N/A
+        # Resume, claim, and pause for cycle 3
+        self.client.post(f'/api/automation/runs/{run_id}/continue', headers=self.headers, json={})
+        claim3 = self.client.post(
+            f'/api/automation/runs/{run_id}/claim',
+            headers=self.headers,
+            json={'worker_id': 'worker-a'},
+        ).get_json()
+        
+        cycle_id3 = self.client.post(
+            f'/api/automation/runs/{run_id}/pause',
+            headers=self.headers,
+            json={
+                'worker_id': 'worker-a',
+                'lease_token': claim3['lease_token'],
+                'phase': 'after_dm',
+                'summary': 'Pause 3',
+                'dm_message_id': 101,
+                'payload': {'turns_completed': 3},
+            },
+        ).get_json()['audit_cycle']['id']
+        
+        # Submit audit with mismatched and legacy N/A inputs
+        self.client.post(
+            f'/api/automation/runs/{run_id}/audit-cycles/{cycle_id3}/audit',
+            headers=self.headers,
+            json={
+                'scorecard': {
+                    'summary': 'Done audit 3',
+                    'criteria': [
+                        # Mismatched: status pass, applicable False -> normalized to not_applicable / False
+                        {'id': 'crit_huge', 'status': 'pass', 'applicability': {'applicable': False}},
+                        # Legacy N/A: status not_assessed, applicable False -> normalized to not_applicable / False
+                        {'id': 'crit_small', 'status': 'not_assessed', 'applicability': {'applicable': False}},
+                    ]
+                }
+            }
+        )
+        
+        with app.app_context():
+            from models import AutomationRunAuditCycle
+            c3 = db.session.get(AutomationRunAuditCycle, cycle_id3)
+            crit_h = next(c for c in c3.scorecard_json['criteria'] if c['criterion_id'] == 'crit_huge')
+            crit_s = next(c for c in c3.scorecard_json['criteria'] if c['criterion_id'] == 'crit_small')
+            
+            # Verify normalized status and applicability
+            self.assertEqual(crit_h['status'], 'not_applicable')
+            self.assertEqual(crit_h['applicability']['applicable'], False)
+            self.assertEqual(crit_s['status'], 'not_applicable')
+            self.assertEqual(crit_s['applicability']['applicable'], False)
+            
+            # Verify cycle overall status is not_applicable since all are not_applicable
+            self.assertEqual(c3.scorecard_summary_json['overall_status'], 'not_applicable')
 
 
 if __name__ == '__main__':

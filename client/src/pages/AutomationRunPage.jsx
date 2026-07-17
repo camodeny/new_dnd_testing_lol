@@ -425,7 +425,7 @@ export default function AutomationRunPage() {
                   </div>
                   <div className="automation-meta-grid">
                     <div><strong>Status</strong><span>{run.status}</span></div>
-                    <div><strong>Weighted score</strong><span>{run.scorecard_summary?.weighted_score !== undefined && run.scorecard_summary?.weighted_score !== null ? `${(run.scorecard_summary.weighted_score * 100).toFixed(1)}%` : 'N/A'}</span></div>
+                    <div><strong>Weighted score</strong><span>{run.scorecard_summary?.weighted_score !== undefined && run.scorecard_summary?.weighted_score !== null ? `${run.scorecard_summary.weighted_score < 1.0 ? Math.min(99.9, run.scorecard_summary.weighted_score * 100).toFixed(1) : '100.0'}%` : 'N/A'}</span></div>
                     <div><strong>Created</strong><span>{formatTime(run.created_at)}</span></div>
                     <div><strong>Started</strong><span>{formatTime(run.started_at)}</span></div>
                     <div><strong>Finished</strong><span>{formatTime(run.finished_at)}</span></div>
@@ -444,7 +444,7 @@ export default function AutomationRunPage() {
                       <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fill, minmax(220px, 1fr))', gap: '12px' }}>
                         {Object.entries(categoryBreakdown).map(([catName, data]) => {
                           const hasScore = data.score !== null && data.score !== undefined;
-                          const formattedScore = hasScore ? `${(data.score * 100).toFixed(1)}%` : 'N/A';
+                          const formattedScore = hasScore ? `${data.score < 1.0 ? Math.min(99.9, data.score * 100).toFixed(1) : '100.0'}%` : 'N/A';
                           return (
                             <div key={catName} className={`category-card status-${data.status}`} style={{ padding: '10px 12px', borderRadius: '6px', background: 'var(--card-bg, rgba(255, 255, 255, 0.05))', borderLeft: `4px solid ${data.status === 'pass' ? '#10b981' : data.status === 'warn' ? '#f59e0b' : data.status === 'fail' ? '#ef4444' : '#6b7280'}` }}>
                               <div style={{ fontSize: '0.8rem', color: 'var(--text-muted, #9ca3af)', textTransform: 'capitalize', whiteSpace: 'nowrap', overflow: 'hidden', textOverflow: 'ellipsis' }} title={catName}>
@@ -525,6 +525,7 @@ export default function AutomationRunPage() {
                           <option value="warn">warn</option>
                           <option value="fail">fail</option>
                           <option value="not_assessed">not_assessed</option>
+                          <option value="not_applicable">not_applicable</option>
                         </select>
                       </label>
                       <label>
@@ -547,6 +548,7 @@ export default function AutomationRunPage() {
                                     <option value="warn">warn</option>
                                     <option value="fail">fail</option>
                                     <option value="not_assessed">not_assessed</option>
+                                    <option value="not_applicable">not_applicable</option>
                                   </select>
                                 </label>
                                 <label>

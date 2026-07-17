@@ -326,6 +326,33 @@ Custom criteria are written as checks like:
 
 Use this after running the same scenario with the same scorecard template to track improvements over time.
 
+## Scorecard Weighting and Applicability Policy
+
+Both built-in and custom scorecard criteria follow the same execution and aggregation rules:
+
+### 1. Scorecard Status and Weight Values
+- **`pass`**: Counts as `1.0 * weight`.
+- **`warn`**: Counts as `0.5 * weight` (half credit).
+- **`fail`**: Counts as `0.0 * weight` (no credit).
+- **`not_assessed`**: Excluded from the weighted total score calculation. This is the default status for custom criteria that have not yet had any cycle feedback recorded, or built-in checks with missing metrics (represented as `None`).
+- **`not_applicable`**: Excluded from the weighted total score calculation. A custom criterion is marked `not_applicable` if it is explicitly submitted with `status: "not_applicable"`, if its applicability is false, or if all cycle assessments for that criterion are non-applicable.
+
+### 2. Category Breakdowns
+Scorecard results (built-in and custom) are mapped to 5 canonical categories:
+- `operational/runtime reliability`
+- `narrative quality`
+- `durable state correctness`
+- `retrieval or memory use`
+- `safety/private-information handling`
+
+If a category contains no applicable criteria, its status is set to `not_applicable` with a `None` score. Otherwise, its status matches the worst status of the category's applicable criteria, and its category score is the weighted average of the applicable criteria in that category. Any criterion that cannot be mapped to these categories is kept uncategorized and excluded from these 5 named category breakdown cards (but still counts towards the overall score).
+
+### 3. Score Precision and UI Safeguards
+- Overall and category scores are rounded to 4 decimal places.
+- To prevent false perfect aggregate scores, if any warning or failure exists in the applicable criteria, the score will never round to `1.0` or display as `100.0%` in the UI (it is capped at a maximum value of `0.9999` and renders as `99.9%` in the UI).
+- Criteria weights are bounded/clamped between `1` and `100` during template creation.
+
+
 ## Troubleshooting
 
 ### Worker environment
@@ -363,8 +390,8 @@ Use this after running the same scenario with the same scorecard template to tra
 
 ### Pre-audit scorecard rows
 
-- Before the first audited cycle is saved, custom scorecard checks will show `warn` with `No custom audit feedback recorded for this criterion.`
-- That is placeholder state, not a real failed grade.
+- Before the first audited cycle is saved, custom scorecard checks will show `not_assessed` with `No custom audit feedback recorded for this criterion.`
+- They are excluded from score weighting until assessments are recorded.
 
 ## Recommended Agent Behavior
 

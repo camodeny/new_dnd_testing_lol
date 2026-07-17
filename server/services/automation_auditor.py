@@ -1328,13 +1328,13 @@ def _auditor_user_prompt(run, cycle, slot, config):
         'criterion_evidence_requirements': criterion_evidence_requirements,
         'scorecard_template': template,
         'final_response_contract': {
-            'overall_status': 'pass|warn|fail|not_assessed',
+            'overall_status': 'pass|warn|fail|not_assessed|not_applicable',
             'overall_summary': 'short verdict',
             'notes': 'runtime-truth notes',
             'criteria': [
                 {
                     'criterion_id': 'scorecard criterion id',
-                    'status': 'pass|warn|fail|not_assessed',
+                    'status': 'pass|warn|fail|not_assessed|not_applicable',
                     'summary': 'short finding',
                     'primary_evidence': 'main evidence source or tool/result that anchored the status decision',
                     'evidence': 'specific transcript, audit-event, world-state, clock, provider-call, or run-event evidence',
