@@ -5075,6 +5075,7 @@ def _create_clock_from_patch(campaign, patch):
         db.session.add(clock)
     db.session.flush()
     upsert_memory_embedding(campaign, 'clock', clock.clock_id, clock.to_dict(include_private=True))
+    from openrouter import _get_cached_build_sha
     provenance = patch.get('provenance')
     if isinstance(provenance, dict):
         provenance = dict(provenance)
@@ -5082,6 +5083,8 @@ def _create_clock_from_patch(campaign, patch):
         provenance = {
             'tool_name': 'session_memory_update_clocks',
             'pipeline_stage': 'applied',
+            'evidence_status': 'insufficiently_supported',
+            'build_sha': _get_cached_build_sha(),
         }
     event = _record_event(
         campaign,
@@ -5109,6 +5112,7 @@ def _retire_clock_from_patch(campaign, patch):
     clock.status = clean_text(patch.get('status'), 30) or 'resolved'
     clock.updated_at = utcnow()
     upsert_memory_embedding(campaign, 'clock', clock.clock_id, clock.to_dict(include_private=True))
+    from openrouter import _get_cached_build_sha
     provenance = patch.get('provenance')
     if isinstance(provenance, dict):
         provenance = dict(provenance)
@@ -5116,6 +5120,8 @@ def _retire_clock_from_patch(campaign, patch):
         provenance = {
             'tool_name': 'session_memory_update_clocks',
             'pipeline_stage': 'applied',
+            'evidence_status': 'insufficiently_supported',
+            'build_sha': _get_cached_build_sha(),
         }
     event = _record_event(
         campaign,
@@ -5459,6 +5465,11 @@ def apply_memory_patch(campaign, session, patch, audit_context=None):
             }
         prov.setdefault("build_sha", _get_cached_build_sha())
         evidence_status_val = raw_prov.get("evidence_status")
+        if not evidence_status_val:
+            if raw_prov and raw_prov.get("evidence_sources"):
+                evidence_status_val = determine_evidence_status(raw_prov["evidence_sources"])
+            else:
+                evidence_status_val = "insufficiently_supported"
         return prov, evidence_status_val
 
     try:
