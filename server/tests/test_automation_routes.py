@@ -4066,6 +4066,264 @@ class AutomationRouteTest(unittest.TestCase):
             # Verify cycle overall status is not_applicable since all are not_applicable
             self.assertEqual(c3.scorecard_summary_json['overall_status'], 'not_applicable')
 
+    def test_builtin_auditor_not_applicable_canonical_flow(self):
+        scorecard_id = self.client.post(
+            '/api/automation/scorecards',
+            headers=self.headers,
+            json={
+                'name': 'Built-In Auditor N/A Scorecard',
+                'criteria': [
+                    {'id': 'memory_quality', 'label': 'Memory Quality', 'weight': 2, 'category': 'retrieval or memory use'},
+                    {'id': 'scene_mood', 'label': 'Scene Mood', 'weight': 3, 'category': 'narrative quality'},
+                ],
+            },
+        ).get_json()['scorecard']['id']
+        scenario_id = self.client.post(
+            '/api/automation/scenarios',
+            headers=self.headers,
+            json={
+                'source_campaign_id': self.campaign_id,
+                'scorecard_template_id': scorecard_id,
+                'runner_config': {
+                    'audit_pause_phases': ['after_dm'],
+                    'auditor_config': {'mode': 'built_in', 'count': 1, 'auto_continue': False},
+                },
+            },
+        ).get_json()['scenario']['id']
+        snapshot_id = self.client.post(
+            f'/api/automation/scenarios/{scenario_id}/snapshots',
+            headers=self.headers,
+            json={},
+        ).get_json()['snapshot']['id']
+        run_id = self.client.post(
+            f'/api/automation/scenarios/{scenario_id}/runs',
+            headers=self.headers,
+            json={'snapshot_id': snapshot_id},
+        ).get_json()['run']['id']
+        claim = self.client.post(
+            f'/api/automation/runs/{run_id}/claim',
+            headers=self.headers,
+            json={'worker_id': 'worker-a'},
+        ).get_json()
+        cycle_id = self.client.post(
+            f'/api/automation/runs/{run_id}/pause',
+            headers=self.headers,
+            json={
+                'worker_id': 'worker-a',
+                'lease_token': claim['lease_token'],
+                'phase': 'after_dm',
+                'summary': 'Pause after DM turn',
+                'payload': {'turns_completed': 1},
+            },
+        ).get_json()['audit_cycle']['id']
+
+        def fake_auditor_decision(run, cycle, job, config, **_kwargs):
+            from services.automation_service import persist_provider_call
+
+            provider_call, _created = persist_provider_call(run, {
+                'dedupe_key': f'auditor:{cycle.id}:slot:{job.auditor_slot}',
+                'phase': 'auditor_decision',
+                'prompt_version_id': 'test',
+                'provider': 'opencode_go',
+                'model': 'deepseek-v4-flash',
+                'request': {'messages': []},
+                'response': {'id': 'test-response'},
+                'parsed_output': {'overall_status': 'pass'},
+                'response_text': '{"overall_status":"pass"}',
+            })
+            return {
+                'provider': 'opencode_go',
+                'model': 'deepseek-v4-flash',
+                'provider_call': provider_call,
+                'tool_call_count': 1,
+                'tool_trace': [{'tool_name': 'get_transcript'}],
+                'scorecard': {
+                    'overall_status': 'pass',
+                    'overall_summary': 'Memory held; scene mood not applicable this phase.',
+                    'criteria': [
+                        {'criterion_id': 'memory_quality', 'status': 'pass', 'summary': 'Memory held.', 'evidence': 'Transcript and world state agree.'},
+                        {'criterion_id': 'scene_mood', 'status': 'not_applicable', 'summary': 'No mood beats this phase.', 'evidence': 'Phase exposes no mood signal.'},
+                    ],
+                    'tool_calls_used': ['get_transcript'],
+                    'unresolved_evidence_gaps': [],
+                },
+            }
+
+        with patch('services.automation_auditor.request_auditor_decision_with_tools', side_effect=fake_auditor_decision):
+            response = self.client.post(
+                f'/api/automation/runs/{run_id}/auditors/start',
+                headers=self.headers,
+                json={'sync': True},
+            )
+        self.assertEqual(response.status_code, 200)
+        self.assertTrue(response.get_json()['completed'])
+
+        with app.app_context():
+            cycle = db.session.get(AutomationRunAuditCycle, cycle_id)
+            self.assertEqual(cycle.status, 'audited')
+            crit_na = next(c for c in cycle.scorecard_json['criteria'] if c['criterion_id'] == 'scene_mood')
+            # The built-in auditor's not_applicable status must survive normalization and be
+            # canonicalized exactly like the manual path (status + applicability agree).
+            self.assertEqual(crit_na['status'], 'not_applicable')
+            self.assertFalse(crit_na['applicability']['applicable'])
+            self.assertEqual(cycle.scorecard_summary_json['criteria_assessed_count'], 1)
+            self.assertEqual(cycle.scorecard_summary_json['criteria_not_applicable_count'], 1)
+            self.assertEqual(cycle.scorecard_summary_json['criteria_not_assessed_count'], 0)
+
+        scorecard_response = self.client.get(f'/api/automation/runs/{run_id}/scorecard', headers=self.headers)
+        self.assertEqual(scorecard_response.status_code, 200)
+        scorecard_payload = scorecard_response.get_json()
+        rows = {row['check_id']: row for row in scorecard_payload['scorecard']}
+        self.assertEqual(rows['custom:scene_mood']['status'], 'not_applicable')
+        self.assertEqual(rows['custom:scene_mood']['details']['not_applicable_cycle_count'], 1)
+        self.assertEqual(rows['custom:memory_quality']['status'], 'pass')
+
+        # The not_applicable criterion must be excluded from weighting: recompute the
+        # expected weighted score from pass/warn/fail rows only and compare.
+        weighted_total = 0
+        weighted_pass = 0
+        for row in scorecard_payload['scorecard']:
+            status = row['status']
+            weight = row['details']['weight']
+            if status == 'pass':
+                weighted_total += weight
+                weighted_pass += weight
+            elif status == 'warn':
+                weighted_total += weight
+                weighted_pass += 0.5 * weight
+            elif status == 'fail':
+                weighted_total += weight
+        expected_score = round(weighted_pass / weighted_total, 4)
+        self.assertEqual(scorecard_payload['run']['scorecard_summary']['weighted_score'], expected_score)
+        # scene_mood (weight 3) counted as fail/warn would drag the score below this value.
+        # The narrative category also contains the built-in dm_silence/dm_empty checks (both
+        # pass here); scene_mood must be excluded from the category weighting, so the
+        # category score stays a perfect 1.0 instead of dropping below it.
+        self.assertEqual(scorecard_payload['run']['scorecard_summary']['category_breakdown']['narrative quality']['status'], 'pass')
+        self.assertEqual(scorecard_payload['run']['scorecard_summary']['category_breakdown']['narrative quality']['score'], 1.0)
+
+    def test_missing_builtin_metric_and_uncategorized_custom_mixed_scorecard(self):
+        scorecard_id = self.client.post(
+            '/api/automation/scorecards',
+            headers=self.headers,
+            json={
+                'name': 'Mixed Missing Metric Scorecard',
+                'criteria': [
+                    {'id': 'narrative_probe', 'label': 'Narrative Probe', 'weight': 2, 'category': 'narrative quality'},
+                    {'id': 'uncategorized_probe', 'label': 'Uncategorized Probe', 'weight': 2},
+                ],
+            },
+        ).get_json()['scorecard']['id']
+        scenario_id = self.client.post(
+            '/api/automation/scenarios',
+            headers=self.headers,
+            json={
+                'source_campaign_id': self.campaign_id,
+                'scorecard_template_id': scorecard_id,
+                'audit_config': {
+                    'checks': [
+                        {'id': 'known_errors', 'metric': 'error_count', 'kind': 'number', 'pass_if': {'lte': 0}, 'fail_if': {'gt': 0}, 'weight': 2, 'better_direction': 'lower'},
+                        {'id': 'missing_numeric', 'metric': 'nonexistent_numeric_metric', 'kind': 'number', 'pass_if': {'lte': 0}, 'fail_if': {'gt': 0}, 'weight': 7},
+                        {'id': 'missing_enum', 'metric': 'nonexistent_enum_metric', 'kind': 'enum', 'pass_values': ['ok'], 'fail_values': ['bad'], 'weight': 5},
+                    ],
+                },
+            },
+        ).get_json()['scenario']['id']
+        snapshot_id = self.client.post(
+            f'/api/automation/scenarios/{scenario_id}/snapshots',
+            headers=self.headers,
+            json={},
+        ).get_json()['snapshot']['id']
+        run_id = self.client.post(
+            f'/api/automation/scenarios/{scenario_id}/runs',
+            headers=self.headers,
+            json={'snapshot_id': snapshot_id},
+        ).get_json()['run']['id']
+        claim = self.client.post(
+            f'/api/automation/runs/{run_id}/claim',
+            headers=self.headers,
+            json={'worker_id': 'worker-a'},
+        ).get_json()
+        cycle_id = self.client.post(
+            f'/api/automation/runs/{run_id}/pause',
+            headers=self.headers,
+            json={
+                'worker_id': 'worker-a',
+                'lease_token': claim['lease_token'],
+                'phase': 'after_dm',
+                'summary': 'Pause after DM turn',
+                'payload': {'turns_completed': 1},
+            },
+        ).get_json()['audit_cycle']['id']
+        audit_resp = self.client.post(
+            f'/api/automation/runs/{run_id}/audit-cycles/{cycle_id}/audit',
+            headers=self.headers,
+            json={
+                'scorecard': {
+                    'summary': 'Mixed audit',
+                    'criteria': [
+                        {'id': 'narrative_probe', 'status': 'pass', 'applicability': {'applicable': True}},
+                        {'id': 'uncategorized_probe', 'status': 'warn', 'applicability': {'applicable': True}},
+                    ],
+                },
+            },
+        )
+        self.assertEqual(audit_resp.status_code, 200)
+
+        with app.app_context():
+            from services.automation_service import refresh_run_scorecard
+            run = db.session.get(AutomationRun, run_id)
+            results = refresh_run_scorecard(run)
+            by_id = {row['check_id']: row for row in results}
+
+            # Missing built-in metrics follow the same rule as missing custom results:
+            # explicit not_assessed, no TypeError, no invented warning.
+            self.assertEqual(by_id['missing_numeric']['status'], 'not_assessed')
+            self.assertEqual(by_id['missing_enum']['status'], 'not_assessed')
+            self.assertEqual(by_id['known_errors']['status'], 'pass')
+
+            # The uncategorized custom criterion stays uncategorized (no narrative fallback).
+            self.assertIsNone(by_id['custom:uncategorized_probe']['details']['category'])
+            self.assertEqual(by_id['custom:uncategorized_probe']['status'], 'warn')
+
+            # Weighted score excludes not_assessed rows (weights 7 and 5) and counts only
+            # known_errors (pass, w2), narrative_probe (pass, w2), uncategorized_probe (warn, w2).
+            self.assertEqual(run.scorecard_summary_json['weighted_score'], round(5 / 6, 4))
+
+            breakdown = run.scorecard_summary_json['category_breakdown']
+            self.assertEqual(sorted(breakdown.keys()), sorted([
+                'operational/runtime reliability',
+                'narrative quality',
+                'durable state correctness',
+                'retrieval or memory use',
+                'safety/private-information handling',
+            ]))
+            # Narrative category contains only narrative_probe; if the uncategorized warn had
+            # leaked in, the score would be 0.75 instead of 1.0.
+            self.assertEqual(breakdown['narrative quality']['status'], 'pass')
+            self.assertEqual(breakdown['narrative quality']['score'], 1.0)
+            self.assertEqual(breakdown['operational/runtime reliability']['status'], 'pass')
+            self.assertEqual(breakdown['operational/runtime reliability']['score'], 1.0)
+            self.assertEqual(breakdown['safety/private-information handling']['status'], 'not_applicable')
+            self.assertIsNone(breakdown['safety/private-information handling']['score'])
+
+            expected_weighted = run.scorecard_summary_json['weighted_score']
+            expected_breakdown = run.scorecard_summary_json['category_breakdown']
+
+        # Cross-surface consistency: run API (UI watch payload), scorecard endpoint, and
+        # audit bundle all expose the same weighted score and category breakdown.
+        run_api_data = self.client.get(f'/api/automation/runs/{run_id}', headers=self.headers).get_json()
+        self.assertEqual(run_api_data['run']['scorecard_summary']['weighted_score'], expected_weighted)
+        self.assertEqual(run_api_data['run']['scorecard_summary']['category_breakdown'], expected_breakdown)
+
+        scorecard_api_data = self.client.get(f'/api/automation/runs/{run_id}/scorecard', headers=self.headers).get_json()
+        self.assertEqual(scorecard_api_data['run']['scorecard_summary']['weighted_score'], expected_weighted)
+        self.assertEqual(scorecard_api_data['run']['scorecard_summary']['category_breakdown'], expected_breakdown)
+
+        bundle_api_data = self.client.get(f'/api/automation/runs/{run_id}/audit-bundle', headers=self.headers).get_json()
+        self.assertEqual(bundle_api_data['run']['scorecard_summary']['weighted_score'], expected_weighted)
+        self.assertEqual(bundle_api_data['run']['scorecard_summary']['category_breakdown'], expected_breakdown)
+
 
 if __name__ == '__main__':
     unittest.main()
