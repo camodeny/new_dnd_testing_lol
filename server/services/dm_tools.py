@@ -32,6 +32,8 @@ from services.shop_generation_service import clean_shop_items, generate_scene_sh
 from services.world_service import clean_id, clean_text, get_campaign_world, json_dumps, json_loads
 from services.memory_resolver_schemas import (
     SOURCE_CONTRACT_COMPILED_V2,
+    determine_evidence_status,
+    make_evidence_source,
     validate_diagnostics,
 )
 from openrouter import get_character_sheet_answer
@@ -2908,13 +2910,22 @@ def _tool_advance_clock(campaign, _current_user, args):
         elif ev:
             evidence_sources.append({'source_type': 'resolver_output', 'source_id': str(ev)})
     from services.audit_service import log_audit_event as _log_audit
+    from openrouter import _get_cached_build_sha
     trigger_identifier = clock.trigger or args.get('reason') or 'manual_advance'
+    upstream = args.get('provenance') if isinstance(args.get('provenance'), dict) else {}
     provenance = {
-        'tool_name': 'session_dm_advance_clock',
+        'tool_name': upstream.get('tool_name') or 'session_dm_advance_clock',
         'pipeline_stage': 'applied',
-        'evidence_sources': evidence_sources or None,
-        'clock_trigger_rule_id': trigger_identifier,
+        'evidence_sources': upstream.get('evidence_sources') or evidence_sources or None,
+        'evidence_status': upstream.get('evidence_status'),
+        'resolution_confidence': upstream.get('resolution_confidence'),
+        'ambiguity_status': upstream.get('ambiguity_status'),
+        'clock_trigger_rule_id': upstream.get('clock_trigger_rule_id') or trigger_identifier,
         'delta': delta,
+        'source_player_message_id': upstream.get('source_player_message_id'),
+        'source_dm_message_id': upstream.get('source_dm_message_id'),
+        'trace_id': upstream.get('trace_id'),
+        'build_sha': upstream.get('build_sha') or _get_cached_build_sha(),
     }
     event = _record_event(
         campaign,
@@ -5448,12 +5459,13 @@ def apply_memory_patch(campaign, session, patch, audit_context=None):
                 "source_dm_message_id": dm_message_id,
                 "trace_id": trace_id,
             }
-        from openrouter import _get_cached_build_sha
         prov.setdefault("build_sha", _get_cached_build_sha())
         evidence_status_val = raw_prov.get("evidence_status")
         return prov, evidence_status_val
 
     try:
+        from openrouter import _get_cached_build_sha
+
         if compile_summary or unresolved_items or evidence_basis:
             log_change(
                 memory_id='staged_memory_compile',
@@ -5702,14 +5714,22 @@ def apply_memory_patch(campaign, session, patch, audit_context=None):
                                 "resolver_output": resolved_loc,
                                 "unresolved_items": unresolved_items
                             }
+                            raw_scene_prov = raw_scene_patch.get('provenance')
                             rej_prov = {
-                                'tool_name': 'resolve_scene_location_patch',
                                 'pipeline_stage': 'rejected',
-                                'source_player_message_id': player_message_id,
-                                'source_dm_message_id': dm_message_id,
-                                'trace_id': trace_id,
                                 'rejection_reason': warning_type,
+                                'source_player_message_id': raw_scene_prov.get('source_player_message_id', player_message_id) if isinstance(raw_scene_prov, dict) else player_message_id,
+                                'source_dm_message_id': raw_scene_prov.get('source_dm_message_id', dm_message_id) if isinstance(raw_scene_prov, dict) else dm_message_id,
+                                'trace_id': raw_scene_prov.get('trace_id', trace_id) if isinstance(raw_scene_prov, dict) else trace_id,
                             }
+                            if isinstance(raw_scene_prov, dict):
+                                rej_prov['tool_name'] = raw_scene_prov.get('tool_name', 'resolve_scene_location_patch')
+                                rej_prov['evidence_status'] = raw_scene_prov.get('evidence_status')
+                                rej_prov['evidence_sources'] = raw_scene_prov.get('evidence_sources')
+                                rej_prov['build_sha'] = raw_scene_prov.get('build_sha', _get_cached_build_sha())
+                            else:
+                                rej_prov['tool_name'] = 'resolve_scene_location_patch'
+                                rej_prov['build_sha'] = _get_cached_build_sha()
                             log_change(
                                 memory_id='scene_mutation_warning',
                                 target_table='campaign_worlds',
@@ -5970,12 +5990,17 @@ def apply_memory_patch(campaign, session, patch, audit_context=None):
                 session.running_summary = summary
             result['running_summary_updated'] = True
 
+            from openrouter import _get_cached_build_sha
             sum_prov = {
                 'tool_name': 'session_memory_writer',
                 'pipeline_stage': 'applied',
                 'source_player_message_id': player_message_id,
                 'source_dm_message_id': dm_message_id,
                 'trace_id': trace_id,
+                'build_sha': _get_cached_build_sha(),
+                'evidence_status': determine_evidence_status(
+                    [make_evidence_source('resolver_output', 'running_summary')],
+                ),
             }
             log_change(
                 memory_id='running_summary',
@@ -6007,6 +6032,10 @@ def apply_memory_patch(campaign, session, patch, audit_context=None):
                 'source_player_message_id': player_message_id,
                 'source_dm_message_id': dm_message_id,
                 'trace_id': trace_id,
+                'build_sha': _get_cached_build_sha(),
+                'evidence_status': determine_evidence_status(
+                    [make_evidence_source('resolver_output', 'memory_anchors')],
+                ),
             }
             log_change(
                 memory_id='memory_anchors',

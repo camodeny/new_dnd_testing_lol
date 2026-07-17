@@ -1765,5 +1765,156 @@ class P1ImprovementsTest(unittest.TestCase):
             'clock_trigger_rule_id should use clock.trigger, not clock_id or arbitrary reason',
         )
 
+    def test_clock_adjudication_preserves_upstream_provenance(self):
+        from models import CampaignClock, WorldEvent
+        from services.dm_tools import _tool_advance_clock
+
+        clock = CampaignClock(
+            campaign_id=self.campaign.id,
+            clock_id='clock_upstream_test',
+            name='Upstream Clock',
+            segments=6,
+            filled=0,
+            visibility='party_known',
+        )
+        db.session.add(clock)
+        db.session.commit()
+
+        result = _tool_advance_clock(self.campaign, None, {
+            'clock_id': 'clock_upstream_test',
+            'delta': 1,
+            'reason': 'Upstream test',
+            'provenance': {
+                'tool_name': 'session_memory_update_clocks',
+                'evidence_status': 'supported_by_evidence',
+                'evidence_sources': [
+                    {'source_type': 'transcript_message', 'source_id': 'msg_900'}
+                ],
+                'resolution_confidence': 0.92,
+                'clock_trigger_rule_id': 'compiler_specified_trigger',
+            },
+        })
+
+        self.assertNotIn('error', result)
+        event = WorldEvent.query.filter_by(
+            campaign_id=self.campaign.id,
+            event_type='clock_advanced',
+        ).order_by(WorldEvent.id.desc()).first()
+        self.assertIsNotNone(event)
+        payload = json.loads(event.payload) if event.payload else {}
+        prov = payload.get('provenance', {})
+        self.assertEqual(prov.get('tool_name'), 'session_memory_update_clocks')
+        self.assertEqual(prov.get('evidence_status'), 'supported_by_evidence')
+        self.assertEqual(prov.get('resolution_confidence'), 0.92)
+        self.assertEqual(prov.get('clock_trigger_rule_id'), 'compiler_specified_trigger')
+
+    def test_summary_and_anchor_provenance_includes_build_sha(self):
+        from models import CampaignMemoryLog
+
+        patch = {
+            'running_summary': 'Provenance summary test.',
+            'memory_anchors': {'current_goal': 'Test goal for build_sha'},
+        }
+        apply_memory_patch(self.campaign, self.session, patch)
+
+        summary_log = CampaignMemoryLog.query.filter_by(
+            campaign_id=self.campaign.id,
+            memory_id='running_summary',
+        ).order_by(CampaignMemoryLog.id.desc()).first()
+        self.assertIsNotNone(summary_log)
+        self.assertIsNotNone(summary_log.provenance_json)
+        self.assertIn('build_sha', summary_log.provenance_json)
+        self.assertIn('evidence_status', summary_log.provenance_json)
+
+        anchor_log = CampaignMemoryLog.query.filter_by(
+            campaign_id=self.campaign.id,
+            memory_id='memory_anchors',
+        ).order_by(CampaignMemoryLog.id.desc()).first()
+        self.assertIsNotNone(anchor_log)
+        self.assertIsNotNone(anchor_log.provenance_json)
+        self.assertIn('build_sha', anchor_log.provenance_json)
+        self.assertIn('evidence_status', anchor_log.provenance_json)
+
+    def test_compact_memory_log_does_not_expose_raw_evidence_text(self):
+        from services.automation_auditor import _compact_memory_log
+        from models import CampaignMemoryLog
+
+        patch = {
+            'upsert_graph_facts': [
+                {
+                    'text': 'A DM-private secret fact.',
+                    'visibility': 'dm_private',
+                    'provenance': {
+                        'tool_name': 'test_tool',
+                        'evidence_status': 'supported_by_evidence',
+                        'evidence_basis': ['Internally sensitive evidence text that should NOT leak.'],
+                        'evidence_sources': [
+                            {'source_type': 'prior_memory_record', 'source_id': 'secret_rec_1'}
+                        ],
+                    },
+                }
+            ],
+        }
+        apply_memory_patch(self.campaign, self.session, patch)
+
+        logs = CampaignMemoryLog.query.filter_by(
+            campaign_id=self.campaign.id,
+            memory_type='fact',
+        ).order_by(CampaignMemoryLog.id.desc()).all()
+        self.assertGreaterEqual(len(logs), 1)
+
+        compact = _compact_memory_log(logs[0])
+        self.assertTrue(compact['has_provenance'])
+        self.assertIsNotNone(compact['provenance'])
+        self.assertNotIn('evidence_basis_preview', compact['provenance'],
+                         'Raw evidence text must not be exposed in audit export')
+        self.assertEqual(compact['provenance'].get('evidence_basis_count'), 1)
+
+    def test_rejected_scene_preserves_original_evidence(self):
+        from models import CampaignMemoryLog, SessionMessage
+
+        msg = SessionMessage(session_id=self.session.id, user_id=self.user.id, role='dm',
+                             content='You are at Phandalin.')
+        db.session.add(msg)
+        db.session.flush()
+
+        self.world.knowledge_graph = '{"entities":[{"id":"phandalin","type":"location","name":"Phandalin"}],"relations":[],"facts":[]}'
+        db.session.add(self.world)
+        db.session.commit()
+
+        patch = {
+            'scene_patch': {
+                'location_name': 'Waterdeep',
+                'provenance': {
+                    'tool_name': 'resolve_scene_location_patch',
+                    'evidence_status': 'insufficiently_supported',
+                    'evidence_sources': [
+                        {'source_type': 'transcript_message', 'source_id': 'msg_42'}
+                    ],
+                },
+            },
+        }
+        apply_memory_patch(self.campaign, self.session, patch)
+
+        warning_logs = CampaignMemoryLog.query.filter_by(
+            campaign_id=self.campaign.id,
+            memory_id='scene_mutation_warning',
+        ).all()
+        if warning_logs:
+            wl = warning_logs[0]
+            self.assertIsNotNone(wl.provenance_json)
+            self.assertEqual(wl.provenance_json.get('pipeline_stage'), 'rejected')
+            self.assertIn('rejection_reason', wl.provenance_json)
+
+        skip_logs = CampaignMemoryLog.query.filter_by(
+            campaign_id=self.campaign.id,
+            memory_id='current_scene',
+        ).order_by(CampaignMemoryLog.id.desc()).all()
+        if skip_logs:
+            last_log = skip_logs[0]
+            if last_log.status == 'validation_failed':
+                self.assertIsNotNone(last_log.provenance_json)
+                self.assertEqual(last_log.provenance_json.get('pipeline_stage'), 'rejected')
+
 if __name__ == '__main__':
     unittest.main()

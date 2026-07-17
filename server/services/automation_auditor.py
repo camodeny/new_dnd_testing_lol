@@ -690,9 +690,7 @@ def _compact_memory_log(row):
                 for s in prov['evidence_sources'] if isinstance(s, dict)
             ))
         if 'evidence_basis' in prov and isinstance(prov['evidence_basis'], list):
-            safe_provenance['evidence_basis_preview'] = [
-                _truncate_text(b, 120) for b in prov['evidence_basis'][:3]
-            ]
+            safe_provenance['evidence_basis_count'] = len(prov['evidence_basis'])
     return {
         'id': row.id,
         'memory_run_id': row.memory_run_id,
