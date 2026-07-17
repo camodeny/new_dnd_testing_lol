@@ -5080,12 +5080,11 @@ def _create_clock_from_patch(campaign, patch):
     if isinstance(provenance, dict):
         provenance = dict(provenance)
     else:
-        provenance = {
-            'tool_name': 'session_memory_update_clocks',
-            'pipeline_stage': 'applied',
-            'evidence_status': 'insufficiently_supported',
-            'build_sha': _get_cached_build_sha(),
-        }
+        provenance = {}
+    provenance.setdefault('tool_name', 'session_memory_update_clocks')
+    provenance.setdefault('pipeline_stage', 'applied')
+    provenance.setdefault('evidence_status', 'insufficiently_supported')
+    provenance.setdefault('build_sha', _get_cached_build_sha())
     event = _record_event(
         campaign,
         'clock_created' if not existing else 'clock_updated',
@@ -5117,12 +5116,11 @@ def _retire_clock_from_patch(campaign, patch):
     if isinstance(provenance, dict):
         provenance = dict(provenance)
     else:
-        provenance = {
-            'tool_name': 'session_memory_update_clocks',
-            'pipeline_stage': 'applied',
-            'evidence_status': 'insufficiently_supported',
-            'build_sha': _get_cached_build_sha(),
-        }
+        provenance = {}
+    provenance.setdefault('tool_name', 'session_memory_update_clocks')
+    provenance.setdefault('pipeline_stage', 'applied')
+    provenance.setdefault('evidence_status', 'insufficiently_supported')
+    provenance.setdefault('build_sha', _get_cached_build_sha())
     event = _record_event(
         campaign,
         'clock_retired',
