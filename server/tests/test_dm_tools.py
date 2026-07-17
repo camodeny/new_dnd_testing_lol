@@ -5894,6 +5894,7 @@ class DmToolsTest(unittest.TestCase):
 
         with patch('routes.sessions.get_session_dm_response_with_tools', return_value='You break into a run toward the crypt road.'), \
                 patch('routes.sessions.get_session_memory_patch', return_value={
+                    'source_contract': 'compiled_session_memory_v2',
                     'running_summary': 'The party pursued the robbers onto the crypt road.',
                     'scene_patch': {
                         'location_id': 'crypt_road',
@@ -5963,6 +5964,7 @@ class DmToolsTest(unittest.TestCase):
         }, clear=False), patch('services.embedding_service._post_embedding', side_effect=RuntimeError('timeout')), \
                 patch('routes.sessions.get_session_dm_response_with_tools', return_value='A bell rings across the docks.'), \
                 patch('routes.sessions.get_session_memory_patch', return_value={
+                    'source_contract': 'compiled_session_memory_v2',
                     'running_summary': 'A bell rang across the docks.',
                     'upsert_graph_facts': [
                         {
@@ -6016,6 +6018,7 @@ class DmToolsTest(unittest.TestCase):
 
         with patch('routes.sessions.get_session_dm_response_with_tools', return_value='The alley falls quiet.'), \
                 patch('routes.sessions.get_session_memory_patch', return_value={
+                    'source_contract': 'compiled_session_memory_v2',
                     'running_summary': 'The alley fell quiet.',
                     'scene_patch': {},
                     'upsert_graph_entities': [],

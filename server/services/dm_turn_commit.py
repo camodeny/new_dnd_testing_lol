@@ -1,9 +1,10 @@
 """Atomic persistence for an accepted visible DM turn and its staged narrative actions."""
 
-from models import db, SessionMessage
+from models import db, SessionMessage, CampaignResolverPacket
 from services.audit_service import log_audit_event
 from services.dm_tools import apply_deferred_narrative_action
 from services.dm_turns import mark_session_dm_turn_error, mark_session_dm_turn_visible
+from services.memory_resolver_schemas import validate_resolver_packet
 
 
 def _selected_actions(action_buffer, commit_action_ids):
@@ -31,6 +32,7 @@ def commit_accepted_dm_turn(
     content,
     commit_action_ids,
     action_buffer,
+    resolver_packet=None,
 ):
     """Commit selected staged actions and the visible message as one transaction.
 
@@ -54,6 +56,20 @@ def commit_accepted_dm_turn(
         db.session.flush()
         for proposal in created_proposals:
             proposal.message_id = ai_msg.id
+
+        if isinstance(resolver_packet, dict):
+            ok, err = validate_resolver_packet(resolver_packet)
+            if not ok:
+                raise ValueError(f"Invalid resolver_packet in accepted DM turn: {err}")
+            packet_record = CampaignResolverPacket(
+                campaign_id=campaign.id,
+                session_id=session.id,
+                dm_message_id=ai_msg.id,
+                turn_id=trace_id,
+                packet_json=resolver_packet,
+                status='committed',
+            )
+            db.session.add(packet_record)
 
         for action_result in action_results:
             log_audit_event(

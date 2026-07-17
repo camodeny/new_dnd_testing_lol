@@ -31,6 +31,7 @@ from services.dm_tools import (
     get_dm_tool_definitions,
     SHEET_SCALAR_FIELDS,
     apply_clock_adjudication,
+    apply_compiled_session_memory_patch,
     apply_memory_patch,
     build_session_hot_context,
     build_session_clock_context,
@@ -50,7 +51,7 @@ from services.dm_turns import (
 )
 from services.dev_combat_sandbox import is_combat_sandbox_campaign, start_combat_sandbox_session
 from services.planning_service import can_start_session, planning_context
-from services.session_memory_agent import MemoryPipelineError
+from services.session_memory_agent import MemoryPipelineError, _known_ids
 from services.world_service import approve_world, dm_world_context, ensure_world_generated, world_public_payload
 
 sessions_bp = Blueprint('sessions', __name__)
@@ -92,11 +93,15 @@ def _session_dm_turn_decision(raw_result):
             'content': '',
             'reason': decision.get('reason') or 'The DM intentionally stayed silent.',
         }
-    return {
+    result = {
         'mode': 'speak',
         'content': decision.get('content') or '',
         'commit_action_ids': decision.get('commit_action_ids'),
     }
+    rp = decision.get('resolver_packet')
+    if isinstance(rp, dict):
+        result['resolver_packet'] = rp
+    return result
 
 
 def _member_record(campaign_id, user_id):
@@ -115,6 +120,7 @@ def _run_session_memory_update(
     hot_context,
     parent_trace_id,
     dm_message_id=None,
+    resolver_packet=None,
 ):
     from uuid import uuid4
     memory_run_id = f"memrun_{uuid4().hex[:12]}"
@@ -125,6 +131,9 @@ def _run_session_memory_update(
     memory_complete = False
     clock_complete = False
     try:
+        hot_context = dict(hot_context if isinstance(hot_context, dict) else {})
+        hot_context['turn_id'] = f"turn_{player_message_id}"
+
         campaign = db.session.get(Campaign, campaign_id)
         session = db.session.get(CampaignSession, session_id)
         current_user = db.session.get(User, user_id)
@@ -142,6 +151,62 @@ def _run_session_memory_update(
             ai_text,
             hot_context,
         )
+        # Load committed packet from storage — this is the canonical source
+        # Load committed packet from storage — this is the canonical source
+        if dm_message_id:
+            from models import CampaignResolverPacket
+            try:
+                stored = CampaignResolverPacket.query.filter_by(
+                    campaign_id=campaign.id,
+                    dm_message_id=dm_message_id,
+                    status='committed',
+                ).order_by(CampaignResolverPacket.id.desc()).first()
+            except Exception as e:
+                # database read failure fails the run
+                raise MemoryPipelineError(
+                    stage="ingest_resolver_packet",
+                    code="packet_storage_read_error",
+                    message=f"Failed to read committed resolver packet from database: {e}",
+                    telemetry={"dm_message_id": dm_message_id, "error": str(e)},
+                )
+
+            if stored:
+                if not isinstance(stored.packet_json, dict):
+                    raise MemoryPipelineError(
+                        stage="ingest_resolver_packet",
+                        code="malformed_stored_packet",
+                        message="Stored resolver packet is not a valid JSON dictionary.",
+                        telemetry={"dm_message_id": dm_message_id},
+                    )
+                memory_context['resolver_packet'] = stored.packet_json
+
+                # Check for transient/stored mismatch
+                if isinstance(resolver_packet, dict) and resolver_packet:
+                    if stored.packet_json != resolver_packet:
+                        raise MemoryPipelineError(
+                            stage="ingest_resolver_packet",
+                            code="packet_mismatch",
+                            message="Transient resolver packet does not match the canonical stored packet.",
+                            telemetry={
+                                "dm_message_id": dm_message_id,
+                                "stored": stored.packet_json,
+                                "transient": resolver_packet,
+                            },
+                        )
+            else:
+                # No stored packet in database. If transient packet is provided and non-empty, we have a mismatch
+                if isinstance(resolver_packet, dict) and resolver_packet:
+                    raise MemoryPipelineError(
+                        stage="ingest_resolver_packet",
+                        code="packet_missing_in_storage",
+                        message="Resolver packet was provided transiently but is missing from storage.",
+                        telemetry={"dm_message_id": dm_message_id, "transient": resolver_packet},
+                    )
+        else:
+            # Fall back to transient argument only if there is definitively no committed packet
+            if isinstance(resolver_packet, dict):
+                memory_context['resolver_packet'] = resolver_packet
+
         memory_audit_context = {
             'campaign_id': campaign.id,
             'operation': 'session_memory_update',
@@ -161,51 +226,76 @@ def _run_session_memory_update(
             audit_context=memory_audit_context,
         )
         if memory_patch:
-            apply_memory_patch(
-                campaign,
-                session,
-                memory_patch,
-                audit_context=memory_audit_context,
-            )
+            source_contract = memory_patch.get('source_contract', '') if isinstance(memory_patch, dict) else ''
+            if source_contract == 'compiled_session_memory_v2':
+                apply_compiled_session_memory_patch(
+                    campaign,
+                    session,
+                    memory_patch,
+                    audit_context=memory_audit_context,
+                )
+            else:
+                raise MemoryPipelineError(
+                    stage="validation",
+                    code="invalid_contract",
+                    message=f"Memory patch missing required source_contract 'compiled_session_memory_v2'. Got: {source_contract!r}",
+                )
             memory_complete = True
+
+        # Commit memory transaction independently
+        try:
+            db.session.commit()
+        except Exception as mem_err:
+            db.session.rollback()
+            raise
+
         world_after_memory = world_public_payload(campaign).get('world') or {}
         current_scene_after_memory = world_after_memory.get('current_scene')
-        clock_context = build_session_clock_context(
-            campaign,
-            session,
-            current_user,
-            player_content,
-            ai_text,
-            current_scene_before,
-            current_scene_after_memory,
-        )
-        clock_updates = get_session_clock_updates(
-            clock_context,
-            audit_context={
-                'campaign_id': campaign.id,
-                'operation': 'session_clock_adjudication',
-                'actor': 'session_clock_adjudicator',
-                'trace_id': clock_trace_id,
-                'parent_trace_id': parent_trace_id,
-                'trace_label': clock_trace_label,
-            },
-        )
-        if clock_updates:
-            apply_clock_adjudication(
+
+        # Clock adjudication in a separate transaction
+        clock_complete = False
+        try:
+            clock_context = build_session_clock_context(
                 campaign,
-                clock_updates,
+                session,
+                current_user,
+                player_content,
+                ai_text,
+                current_scene_before,
+                current_scene_after_memory,
+            )
+            clock_updates = get_session_clock_updates(
+                clock_context,
                 audit_context={
+                    'campaign_id': campaign.id,
+                    'operation': 'session_clock_adjudication',
+                    'actor': 'session_clock_adjudicator',
                     'trace_id': clock_trace_id,
                     'parent_trace_id': parent_trace_id,
                     'trace_label': clock_trace_label,
                 },
             )
+            if clock_updates:
+                apply_clock_adjudication(
+                    campaign,
+                    clock_updates,
+                    audit_context={
+                        'trace_id': clock_trace_id,
+                        'parent_trace_id': parent_trace_id,
+                        'trace_label': clock_trace_label,
+                    },
+                )
             clock_complete = True
-        db.session.commit()
+            db.session.commit()
+        except Exception:
+            db.session.rollback()
+            clock_complete = False
 
         mark_session_dm_turn_post_turn_complete(
             player_message_id,
             dm_message_id=dm_message_id,
+            memory_status='complete' if memory_complete else 'skipped',
+            clock_status='complete' if clock_complete else 'error',
         )
         db.session.commit()
 
@@ -721,6 +811,7 @@ def send_message(current_user, session_id):
         ai_text = ai_turn.get('content') or ''
 
         if ai_turn.get('mode') == 'speak' and ai_text:
+            resolver_packet = ai_turn.get('resolver_packet') if isinstance(ai_turn, dict) else None
             try:
                 ai_msg, pending_proposals, _action_results = commit_accepted_dm_turn(
                     campaign,
@@ -734,6 +825,7 @@ def send_message(current_user, session_id):
                     {'actions': ai_result.get('_pending_actions')}
                     if isinstance(ai_result, dict) and isinstance(ai_result.get('_pending_actions'), list)
                     else None,
+                    resolver_packet=resolver_packet,
                 )
             except Exception as err:
                 return jsonify({'error': repr(err), 'messages': result_messages}), 500
@@ -750,6 +842,7 @@ def send_message(current_user, session_id):
                 hot_context,
                 trace_id,
                 dm_message_id=ai_msg.id,
+                resolver_packet=resolver_packet,
             )
         elif ai_turn.get('mode') == 'silent':
             log_audit_event(
@@ -1021,5 +1114,184 @@ sessions_bp.add_url_rule(
 sessions_bp.add_url_rule(
     '/api/sessions/<int:session_id>/proposals/<int:proposal_id>/dismiss',
     view_func=_dismiss_sheet_proposal,
+    methods=['POST'],
+)
+
+
+@token_required
+def _get_campaign_clarifications(current_user, campaign_id):
+    from models import CampaignClarification
+    campaign = db.session.get(Campaign, campaign_id)
+    if not campaign:
+        return jsonify({'error': 'Campaign not found.'}), 404
+
+    is_dm = campaign.user_id == current_user.id
+    if not is_dm:
+        return jsonify({'error': 'Forbidden'}), 403
+
+    clarifications = CampaignClarification.query.filter_by(campaign_id=campaign_id).all()
+    return jsonify([c.to_dict() for c in clarifications]), 200
+
+
+@token_required
+def _answer_campaign_clarification(current_user, campaign_id, clarification_id):
+    from models import CampaignClarification
+    campaign = db.session.get(Campaign, campaign_id)
+    if not campaign:
+        return jsonify({'error': 'Campaign not found.'}), 404
+
+    is_dm = campaign.user_id == current_user.id
+    if not is_dm:
+        return jsonify({'error': 'Forbidden'}), 403
+
+    clar = CampaignClarification.query.filter_by(
+        campaign_id=campaign_id, clarification_id=clarification_id
+    ).first()
+    if not clar:
+        return jsonify({'error': 'Clarification not found.'}), 404
+
+    if clar.status not in ("pending", "answered"):
+        return jsonify({'error': f'Cannot answer clarification in status {clar.status}'}), 400
+
+    data = request.get_json() or {}
+    answer = data.get("answer", "")
+    resolved_canonical_id = data.get("resolved_canonical_id")
+    resolution_action = data.get("resolution_action")
+    resolution_patch = data.get("resolution_patch")
+
+    if not resolution_action or resolution_action not in ("same_identity", "new_entity", "ignore"):
+        return jsonify({'error': 'Invalid resolution action.'}), 400
+
+    if resolution_action == "same_identity":
+        if not resolved_canonical_id:
+            return jsonify({'error': 'resolved_canonical_id is required for same_identity.'}), 400
+        known = _known_ids(campaign)
+        if resolved_canonical_id not in known.get("entity_ids", set()):
+            return jsonify({'error': f'Canonical ID {resolved_canonical_id} does not exist in this campaign.'}), 400
+
+    if resolution_patch is not None:
+        if not isinstance(resolution_patch, dict):
+            return jsonify({'error': 'resolution_patch must be a JSON object.'}), 400
+        allowed_keys = {"update_npc_actors", "upsert_graph_entities"}
+        for k in resolution_patch.keys():
+            if k not in allowed_keys:
+                return jsonify({'error': f'Key {k} is not allowed in resolution_patch.'}), 400
+
+        # Scope validation: check allowed keys against blocking_scope
+        blocking_scope = clar.blocking_scope or []
+        if blocking_scope:
+            if "update_npc_actors" in resolution_patch:
+                if not any(op in blocking_scope for op in ("npc_update", "identity_merge", "entity_merge")):
+                    return jsonify({'error': 'update_npc_actors not allowed by blocking scope.'}), 400
+            if "upsert_graph_entities" in resolution_patch:
+                if not any(op in blocking_scope for op in ("entity_merge", "identity_merge")):
+                    return jsonify({'error': 'upsert_graph_entities not allowed by blocking scope.'}), 400
+
+        # Validate target IDs
+        if resolution_action == "same_identity":
+            target_id = resolved_canonical_id
+        elif resolution_action == "new_entity":
+            target_id = clar.mention_entity_id
+        else:
+            target_id = None
+
+        if "update_npc_actors" in resolution_patch:
+            items = resolution_patch["update_npc_actors"]
+            if not isinstance(items, list):
+                return jsonify({'error': 'update_npc_actors must be a list.'}), 400
+            for item in items:
+                if not isinstance(item, dict) or item.get("id") != target_id:
+                    return jsonify({'error': f'Target ID in update_npc_actors must match {target_id}.'}), 400
+        if "upsert_graph_entities" in resolution_patch:
+            items = resolution_patch["upsert_graph_entities"]
+            if not isinstance(items, list):
+                return jsonify({'error': 'upsert_graph_entities must be a list.'}), 400
+            for item in items:
+                if not isinstance(item, dict) or item.get("id") != target_id:
+                    return jsonify({'error': f'Target ID in upsert_graph_entities must match {target_id}.'}), 400
+
+    clar.status = "answered"
+    clar.answer = answer
+    clar.resolved_canonical_id = resolved_canonical_id
+    clar.resolution_action = resolution_action
+    clar.resolution_patch_json = resolution_patch
+    clar.answered_by = current_user.username
+    clar.answered_at = utcnow()
+
+    db.session.commit()
+    return jsonify(clar.to_dict()), 200
+
+
+@token_required
+def _dismiss_campaign_clarification(current_user, campaign_id, clarification_id):
+    from models import CampaignClarification
+    campaign = db.session.get(Campaign, campaign_id)
+    if not campaign:
+        return jsonify({'error': 'Campaign not found.'}), 404
+
+    is_dm = campaign.user_id == current_user.id
+    if not is_dm:
+        return jsonify({'error': 'Forbidden'}), 403
+
+    clar = CampaignClarification.query.filter_by(
+        campaign_id=campaign_id, clarification_id=clarification_id
+    ).first()
+    if not clar:
+        return jsonify({'error': 'Clarification not found.'}), 404
+
+    if clar.status not in ("pending", "answered"):
+        return jsonify({'error': f'Cannot dismiss clarification in status {clar.status}'}), 400
+
+    clar.status = "dismissed"
+    clar.dismissed_at = utcnow()
+
+    db.session.commit()
+    return jsonify(clar.to_dict()), 200
+
+
+@token_required
+def _obsolete_campaign_clarification(current_user, campaign_id, clarification_id):
+    from models import CampaignClarification
+    campaign = db.session.get(Campaign, campaign_id)
+    if not campaign:
+        return jsonify({'error': 'Campaign not found.'}), 404
+
+    is_dm = campaign.user_id == current_user.id
+    if not is_dm:
+        return jsonify({'error': 'Forbidden'}), 403
+
+    clar = CampaignClarification.query.filter_by(
+        campaign_id=campaign_id, clarification_id=clarification_id
+    ).first()
+    if not clar:
+        return jsonify({'error': 'Clarification not found.'}), 404
+
+    if clar.status not in ("pending", "answered"):
+        return jsonify({'error': f'Cannot obsolete clarification in status {clar.status}'}), 400
+
+    clar.status = "obsolete"
+
+    db.session.commit()
+    return jsonify(clar.to_dict()), 200
+
+
+sessions_bp.add_url_rule(
+    '/api/campaigns/<int:campaign_id>/clarifications',
+    view_func=_get_campaign_clarifications,
+    methods=['GET'],
+)
+sessions_bp.add_url_rule(
+    '/api/campaigns/<int:campaign_id>/clarifications/<clarification_id>/answer',
+    view_func=_answer_campaign_clarification,
+    methods=['POST'],
+)
+sessions_bp.add_url_rule(
+    '/api/campaigns/<int:campaign_id>/clarifications/<clarification_id>/dismiss',
+    view_func=_dismiss_campaign_clarification,
+    methods=['POST'],
+)
+sessions_bp.add_url_rule(
+    '/api/campaigns/<int:campaign_id>/clarifications/<clarification_id>/obsolete',
+    view_func=_obsolete_campaign_clarification,
     methods=['POST'],
 )

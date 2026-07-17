@@ -1275,11 +1275,15 @@ def normalize_session_dm_turn_decision(raw_decision):
         content = data.get('message')
     if content is None:
         content = data.get('visible_message')
-    return {
+    result = {
         'mode': 'speak',
         'content': str(content or '').strip(),
         'commit_action_ids': data.get('commit_action_ids') if isinstance(data.get('commit_action_ids'), list) else None,
     }
+    rp = data.get('resolver_packet')
+    if isinstance(rp, dict):
+        result['resolver_packet'] = rp
+    return result
 
 
 SESSION_DM_FINALIZER_TOOL_NAMES = {'talk_to_player', 'stay_silent'}
@@ -1288,7 +1292,7 @@ SESSION_DM_FINALIZER_TOOLS = [
         'type': 'function',
         'function': {
             'name': 'talk_to_player',
-            'description': 'Finalize the DM turn by sending one player-visible reply. Put only player-facing visible content in content and explicitly select which pending narrative actions should commit.',
+            'description': 'Finalize the DM turn by sending one player-visible reply. Put only player-facing visible content in content and explicitly select which pending narrative actions should commit. When the DM has deliberately established hidden-canon identity for a described entity, include a resolver_packet with entity_mentions.',
             'parameters': {
                 'type': 'object',
                 'required': ['content', 'commit_action_ids'],
@@ -1301,6 +1305,17 @@ SESSION_DM_FINALIZER_TOOLS = [
                         'type': 'array',
                         'items': {'type': 'string'},
                         'description': 'Pending action IDs to commit with this reply. Use [] when no pending action should commit.',
+                    },
+                    'resolver_packet': {
+                        'type': 'object',
+                        'description': 'Optional. When the DM has deliberately established a hidden-canon identity, include entity_mentions with mention_ref, surface_form, identity_status, canonical_id, public_name, and visibility.',
+                        'properties': {
+                            'entity_mentions': {
+                                'type': 'array',
+                                'items': {'type': 'object'},
+                                'description': 'List of entity identity resolutions the DM is intentionally committing as hidden canon.',
+                            },
+                        },
                     },
                 },
             },
@@ -1356,11 +1371,15 @@ def _session_dm_finalizer_decision_from_tool_calls(tool_calls):
                 'kind': 'missing_commit_action_ids',
                 'detail': 'talk_to_player must include commit_action_ids, using [] when no pending action should commit.',
             }
-        return {
+        decision = {
             'mode': 'speak',
             'content': str(args.get('content') or '').strip(),
             'commit_action_ids': args.get('commit_action_ids'),
-        }, None
+        }
+        rp = args.get('resolver_packet')
+        if isinstance(rp, dict) and isinstance(rp.get('entity_mentions'), list):
+            decision['resolver_packet'] = rp
+        return decision, None
     return {
         'mode': 'silent',
         'reason': str(args.get('reason') or 'The DM intentionally stayed silent.').strip(),
@@ -4850,7 +4869,11 @@ def get_session_dm_response_with_tools(
                     'reason': 'The DM response would have semantically exposed DM-private information.',
                 }
             if base_audit.get('operation') == 'session_dm_response':
-                return {**decision, '_pending_actions': list(action_buffer['actions'])}
+                result = {**decision, '_pending_actions': list(action_buffer['actions'])}
+                rp = decision.get('resolver_packet')
+                if rp is not None:
+                    result['resolver_packet'] = rp
+                return result
             # Preserve the direct helper's historical public return shape; production callers
             # receive the action IDs through the session-DM operation result above.
             return {key: value for key, value in decision.items() if key != 'commit_action_ids'}

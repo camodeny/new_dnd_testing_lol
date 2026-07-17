@@ -379,11 +379,11 @@ class P1ImprovementsTest(unittest.TestCase):
         compiled_canonical = compile_staged_memory_patch(memory_context, extracted, resolved)
         self.assertEqual(compiled_canonical['scene_patch']['resolution_mode'], 'canonical')
 
-        # Case B: Unknown location (unresolved)
+        # Case B: Unknown location (now treated as 'new' — creating a new location)
         extracted_unresolved = {'scene_patch': {'location_name': 'Neverwinter Wood'}}
         resolved_unresolved = {'scene_patch': {'location_name': 'Neverwinter Wood'}}
         compiled_unresolved = compile_staged_memory_patch(memory_context, extracted_unresolved, resolved_unresolved)
-        self.assertEqual(compiled_unresolved['unresolved_items'][0]['resolution_mode'], 'unresolved')
+        self.assertEqual(compiled_unresolved['scene_patch']['resolution_mode'], 'new')
 
     def test_boundary_with_zero_excludes_all_future_provider_calls(self):
         # Create cycle when there are absolutely NO provider calls
@@ -845,13 +845,13 @@ class P1ImprovementsTest(unittest.TestCase):
         }
         
         # Seed canonical sildar entity and NPCActor
-        self.world.knowledge_graph = '{"entities":[{"id":"sildar_hallwinter_canonical","type":"npc","name":"Sildar Hallwinter"}],"relations":[],"facts":[]}'
+        self.world.knowledge_graph = '{"entities":[{"id":"sildar_hallwinter_canonical","type":"npc","name":"Sildar Hallwinter"},{"id":"gundren_rockseeker","type":"npc","name":"Gundren Rockseeker"}],"relations":[],"facts":[]}'
         db.session.add(self.world)
         sildar = NPCActor(campaign_id=self.campaign.id, actor_id='sildar_hallwinter_canonical', name='Sildar', public_summary='Warrior', dossier='{}')
         db.session.add(sildar)
         
         # Seed NPCActor for the new gundren generated ID so persistence passes
-        gundren = NPCActor(campaign_id=self.campaign.id, actor_id='gundren_rockseeker', name='Gundren', public_summary='Dwarf', dossier='{}')
+        gundren = NPCActor(campaign_id=self.campaign.id, actor_id='gundren_rockseeker', name='Gundren Rockseeker', public_summary='Dwarf', dossier='{}')
         db.session.add(gundren)
         db.session.commit()
 
@@ -937,13 +937,13 @@ class P1ImprovementsTest(unittest.TestCase):
         }
 
         # Seed canonical sildar entity and NPCActor
-        self.world.knowledge_graph = '{"entities":[{"id":"sildar_hallwinter_canonical","type":"npc","name":"Sildar Hallwinter"}],"relations":[],"facts":[]}'
+        self.world.knowledge_graph = '{"entities":[{"id":"sildar_hallwinter_canonical","type":"npc","name":"Sildar Hallwinter"},{"id":"gundren_rockseeker","type":"npc","name":"Gundren Rockseeker"}],"relations":[],"facts":[]}'
         db.session.add(self.world)
         sildar = NPCActor(campaign_id=self.campaign.id, actor_id='sildar_hallwinter_canonical', name='Sildar', public_summary='Warrior', dossier='{}')
         db.session.add(sildar)
 
         # Seed NPCActor for the new gundren generated ID so persistence passes
-        gundren = NPCActor(campaign_id=self.campaign.id, actor_id='gundren_rockseeker', name='Gundren', public_summary='Dwarf', dossier='{}')
+        gundren = NPCActor(campaign_id=self.campaign.id, actor_id='gundren_rockseeker', name='Gundren Rockseeker', public_summary='Dwarf', dossier='{}')
         db.session.add(gundren)
         db.session.commit()
 

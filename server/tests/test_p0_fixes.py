@@ -44,8 +44,8 @@ class P0FixesTest(unittest.TestCase):
         db.drop_all()
         self.ctx.pop()
 
-    # 3. compile_staged_memory_patch rejects location_name-only updates when unresolved
-    def test_compile_staged_memory_patch_rejects_unresolved_name_only(self):
+    # 3. compile_staged_memory_patch creates new location for name-only proposals
+    def test_compile_staged_memory_patch_creates_new_location_for_unknown(self):
         memory_context = {
             'campaign_id': self.campaign.id,
             'hot_context': {
@@ -58,12 +58,12 @@ class P0FixesTest(unittest.TestCase):
         extracted = {'scene_patch': {'location_name': 'Baldur\'s Gate'}}
         resolved = {'scene_patch': {'location_name': 'Baldur\'s Gate'}}
         compiled = compile_staged_memory_patch(memory_context, extracted, resolved)
-        self.assertNotIn('location_id', compiled['scene_patch'])
-        self.assertNotIn('location_name', compiled['scene_patch'])
-        self.assertTrue(any(item['kind'] == 'scene_location' for item in compiled['unresolved_items']))
+        self.assertIn('location_id', compiled['scene_patch'])
+        self.assertIn('location_name', compiled['scene_patch'])
+        self.assertEqual(compiled['scene_patch']['resolution_mode'], 'new')
 
-    # 4. compile_staged_memory_patch rejects unknown location_id plus plausible location_name
-    def test_compile_staged_memory_patch_rejects_unknown_id_and_plausible_name(self):
+    # 4. compile_staged_memory_patch creates new location for unknown id + plausible name
+    def test_compile_staged_memory_patch_creates_new_location_for_unknown_id_and_name(self):
         memory_context = {
             'campaign_id': self.campaign.id,
             'hot_context': {
@@ -76,9 +76,9 @@ class P0FixesTest(unittest.TestCase):
         extracted = {'scene_patch': {'location_id': 'baldurs_gate', 'location_name': 'Baldur\'s Gate'}}
         resolved = {'scene_patch': {'location_id': 'baldurs_gate', 'location_name': 'Baldur\'s Gate'}}
         compiled = compile_staged_memory_patch(memory_context, extracted, resolved)
-        self.assertNotIn('location_id', compiled['scene_patch'])
-        self.assertNotIn('location_name', compiled['scene_patch'])
-        self.assertTrue(any(item['kind'] == 'scene_location' for item in compiled['unresolved_items']))
+        self.assertIn('location_id', compiled['scene_patch'])
+        self.assertIn('location_name', compiled['scene_patch'])
+        self.assertEqual(compiled['scene_patch']['resolution_mode'], 'new')
 
     # 5. compile_staged_memory_patch resolves known location name to canonical ID/name pair
     def test_compile_staged_memory_patch_resolves_known_location_name(self):
@@ -98,20 +98,16 @@ class P0FixesTest(unittest.TestCase):
         self.assertEqual(compiled['scene_patch']['location_name'], 'Neverwinter')
 
     # 6. apply_memory_patch never persists only one of location_id or location_name
-    # 7. Direct scene update validation rejects partial/unresolved location changes
-    def test_validate_memory_scene_patch_rejects_partial_or_unresolved_changes(self):
+    # 7. Direct scene update validation accepts new locations when name is supported by visible text
+    def test_validate_memory_scene_patch_accepts_new_location_when_supported(self):
         current_scene = {'location_id': 'waterdeep', 'location_name': 'Waterdeep'}
         audit_context = {'latest_player_message': 'Let\'s go to Neverwinter or Baldur\'s Gate.'}
         
-        # Test case: Unresolved change (Baldur's Gate is not in knowledge graph)
         patch = {'location_id': 'baldurs_gate', 'location_name': 'Baldur\'s Gate'}
         validated, skipped = _validate_memory_scene_patch(self.campaign, current_scene, patch, audit_context)
-        self.assertNotIn('location_id', validated)
-        self.assertNotIn('location_name', validated)
-        self.assertEqual(skipped.get('location_id'), 'baldurs_gate')
-        self.assertEqual(skipped.get('location_name'), 'Baldur\'s Gate')
-
-        # Test case: Resolved change and supported by visible text
+        # New location is in visible terms, so it should be validated
+        self.assertEqual(validated.get('location_id'), 'baldurs_gate')
+        self.assertEqual(validated.get('location_name'), 'Baldur\'s Gate')
         patch = {'location_name': 'Neverwinter'}
         validated, skipped = _validate_memory_scene_patch(self.campaign, current_scene, patch, audit_context)
         self.assertEqual(validated.get('location_id'), 'neverwinter')

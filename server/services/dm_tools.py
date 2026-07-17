@@ -30,6 +30,10 @@ from services.lootbox_service import generate_loot_box as do_generate_loot_box
 from services.planning_service import summary_dict_for_read
 from services.shop_generation_service import clean_shop_items, generate_scene_shops, upsert_shop
 from services.world_service import clean_id, clean_text, get_campaign_world, json_dumps, json_loads
+from services.memory_resolver_schemas import (
+    SOURCE_CONTRACT_COMPILED_V2,
+    validate_diagnostics,
+)
 from openrouter import get_character_sheet_answer
 
 
@@ -283,12 +287,13 @@ def _validate_memory_scene_patch(campaign, current_scene, scene_patch, audit_con
         from services.scene_location_resolver import resolve_scene_location_patch
         resolved_loc = resolve_scene_location_patch(scene_patch, campaign, current_scene)
         safe_patch = dict(scene_patch)
-        if resolved_loc is None:
+        loc_status = resolved_loc.get("status", "unresolved") if isinstance(resolved_loc, dict) else "unresolved"
+        if loc_status == "unresolved":
             safe_patch.pop('location_id', None)
             safe_patch.pop('location_name', None)
             skipped = {k: v for k, v in scene_patch.items() if k in ('location_id', 'location_name')}
             return safe_patch, skipped
-        elif resolved_loc:
+        elif loc_status in ("canonical", "direct", "new"):
             safe_patch['location_id'] = resolved_loc['location_id']
             safe_patch['location_name'] = resolved_loc['location_name']
             return safe_patch, {}
@@ -309,15 +314,28 @@ def _validate_memory_scene_patch(campaign, current_scene, scene_patch, audit_con
     resolved_loc = resolve_scene_location_patch(scene_patch, campaign, current_scene)
     location_changed = False
 
-    if resolved_loc is None:
+    loc_status = resolved_loc.get("status", "unresolved") if isinstance(resolved_loc, dict) else "unresolved"
+
+    if loc_status == "unresolved":
         if 'location_id' in scene_patch:
             skipped['location_id'] = scene_patch['location_id']
         if 'location_name' in scene_patch:
             skipped['location_name'] = scene_patch['location_name']
-    elif resolved_loc:
+    elif loc_status in ("canonical", "direct"):
         id_supported = _scene_value_supported(resolved_loc['location_id'], visible_terms)
         name_supported = _scene_value_supported(resolved_loc['location_name'], visible_terms)
         if id_supported or name_supported:
+            validated['location_id'] = resolved_loc['location_id']
+            validated['location_name'] = resolved_loc['location_name']
+            location_changed = True
+        else:
+            if 'location_id' in scene_patch:
+                skipped['location_id'] = scene_patch['location_id']
+            if 'location_name' in scene_patch:
+                skipped['location_name'] = scene_patch['location_name']
+    elif loc_status == "new":
+        name_supported = _scene_value_supported(resolved_loc['location_name'], visible_terms)
+        if name_supported:
             validated['location_id'] = resolved_loc['location_id']
             validated['location_name'] = resolved_loc['location_name']
             location_changed = True
@@ -2844,8 +2862,9 @@ def _tool_update_current_scene(campaign, _current_user, args):
     
     # Enforce resolver or omission
     clean_scene_patch = {k: v for k, v in scene_patch.items() if k not in ('location_id', 'location_name')}
-    if loc_patch:
-        clean_scene_patch.update(loc_patch)
+    loc_status = loc_patch.get("status", "unresolved") if isinstance(loc_patch, dict) else "unresolved"
+    if loc_status in ("canonical", "direct", "new"):
+        clean_scene_patch.update({"location_id": loc_patch["location_id"], "location_name": loc_patch["location_name"]})
         
     current_scene.update(clean_scene_patch)
     world_state['current_scene'] = current_scene
@@ -2959,8 +2978,9 @@ def _stage_deferred_narrative_action(campaign, session, current_user, name, args
         from services.scene_location_resolver import resolve_scene_location_patch
         loc_patch = resolve_scene_location_patch(scene_patch, campaign, current_scene)
         clean_scene_patch = {key: value for key, value in scene_patch.items() if key not in ('location_id', 'location_name')}
-        if loc_patch:
-            clean_scene_patch.update(loc_patch)
+        loc_status = loc_patch.get("status", "unresolved") if isinstance(loc_patch, dict) else "unresolved"
+        if loc_status in ("canonical", "direct", "new"):
+            clean_scene_patch.update({"location_id": loc_patch["location_id"], "location_name": loc_patch["location_name"]})
         current_scene.update(clean_scene_patch)
         preview_state['current_scene'] = current_scene
         _sync_party_known_location(preview_state, current_scene)
@@ -5542,7 +5562,8 @@ def apply_memory_patch(campaign, session, patch, audit_context=None):
                         resolved_loc = resolve_scene_location_patch(raw_scene_patch, campaign, current_scene)
                         warning_type = None
                         unresolved_items = []
-                        if resolved_loc is None:
+                        loc_status = resolved_loc.get("status", "unresolved") if isinstance(resolved_loc, dict) else "unresolved"
+                        if loc_status == "unresolved":
                             warning_type = "scene_location_unresolved"
                             warnings_scene_unresolved += 1
                             unresolved_items = [f"Could not resolve proposed location: id={proposed_id}, name={proposed_name}"]
@@ -5890,3 +5911,223 @@ def apply_memory_patch(campaign, session, patch, audit_context=None):
             cause=err,
             telemetry=telemetry,
         ) from err
+
+
+def apply_compiled_session_memory_patch(campaign, session, patch, audit_context=None):
+    from models import CampaignMemoryRun, CampaignMemoryLog, CampaignWorld, CampaignClarification, CampaignIdentityResolution, db
+    from services.audit_service import log_audit_event
+    from services.resolution_registry import (
+        persist_clarification_requests,
+        persist_identity_resolutions,
+    )
+    from services.session_memory_agent import MemoryPipelineError
+    import uuid
+
+    if audit_context is None:
+        audit_context = {}
+
+    if not isinstance(patch, dict):
+        raise MemoryPipelineError(
+            stage="validation",
+            code="validation_error",
+            message="Compiled session memory patch is not a dict.",
+        )
+
+    source_contract = patch.get("source_contract", "")
+    if source_contract != SOURCE_CONTRACT_COMPILED_V2:
+        raise MemoryPipelineError(
+            stage="validation",
+            code="invalid_contract",
+            message=f"Expected source_contract={SOURCE_CONTRACT_COMPILED_V2}, got {source_contract!r}.",
+        )
+
+    diagnostics = patch.get("resolution_diagnostics")
+    if isinstance(diagnostics, dict):
+        diag_valid, diag_error = validate_diagnostics(diagnostics)
+        if not diag_valid:
+            raise MemoryPipelineError(
+                stage="validation",
+                code="diagnostics_validation_failed",
+                message=f"Diagnostics validation failed: {diag_error}",
+            )
+
+    base_revision = patch.get("base_memory_revision", 0)
+    world = CampaignWorld.query.filter_by(campaign_id=campaign.id).first()
+    current_revision = world.memory_revision if world else 0
+    if base_revision is not None and current_revision != base_revision:
+        raise MemoryPipelineError(
+            stage="validation",
+            code="stale_base_revision",
+            message=f"Base memory revision {base_revision} does not match current {current_revision}. Patch is stale.",
+            telemetry={"base_revision": base_revision, "current_revision": current_revision},
+        )
+
+    telemetry = patch.pop("_telemetry", None) if isinstance(patch, dict) else None
+    memory_run_id = audit_context.get("memory_run_id") or f"memrun_{uuid.uuid4().hex[:12]}"
+    trace_id = audit_context.get("trace_id")
+    player_message_id = audit_context.get("source_player_message_id") or audit_context.get("player_message_id")
+    dm_message_id = audit_context.get("source_dm_message_id") or audit_context.get("dm_message_id")
+    turn_id = audit_context.get("turn_id")
+    if not turn_id and session:
+        turn_id = f"session_{session.id}_msg_{player_message_id or 'none'}"
+
+    run_record = CampaignMemoryRun(
+        memory_run_id=memory_run_id,
+        campaign_id=campaign.id,
+        session_id=session.id if session else None,
+        source_player_message_id=player_message_id,
+        source_dm_message_id=dm_message_id,
+        trace_id=trace_id,
+        prompt_chars=telemetry.get("prompt_chars") if isinstance(telemetry, dict) else None,
+        prompt_tokens_estimate=telemetry.get("prompt_tokens_estimate") if isinstance(telemetry, dict) else None,
+        response_chars=telemetry.get("response_chars") if isinstance(telemetry, dict) else None,
+        context_breakdown_json=telemetry if isinstance(telemetry, dict) else None,
+    )
+    db.session.add(run_record)
+
+    world, graph, world_state, _private = _world_json(campaign)
+    result = {
+        "graph_changes": [],
+        "npc_changes": [],
+        "world_event_ids": [],
+        "running_summary_updated": False,
+        "memory_anchors_updated": False,
+    }
+
+    for entity in patch.get("upsert_graph_entities") if isinstance(patch.get("upsert_graph_entities"), list) else []:
+        entity = entity if isinstance(entity, dict) else {}
+        entity_id = entity.get("id", "")
+        if not entity_id:
+            continue
+
+        existing_ids = {e.get("id") for e in graph.get("entities", []) if isinstance(e, dict) and e.get("id")}
+        if entity_id in existing_ids:
+            collisions = [e for e in graph.get("entities", []) if isinstance(e, dict) and e.get("id") == entity_id]
+            for collision in collisions:
+                existing_type = clean_text(collision.get("type"), 40).lower()
+                new_type = clean_text(entity.get("type"), 40).lower()
+                if existing_type and new_type and existing_type != new_type and existing_type != "other" and new_type != "other":
+                    raise MemoryPipelineError(
+                        stage="validation",
+                        code="exact_id_collision",
+                        message=f"Entity ID {entity_id!r} already exists with incompatible type {existing_type!r} vs {new_type!r}.",
+                    )
+
+        merged, action = _upsert_by_id_strict(graph.setdefault("entities", []), entity)
+        result["graph_changes"].append({"kind": "entity", "action": action, "id": entity_id})
+
+    for relation in patch.get("upsert_graph_relations") if isinstance(patch.get("upsert_graph_relations"), list) else []:
+        relation = relation if isinstance(relation, dict) else {}
+        source_id = relation.get("source_id", "")
+        target_id = relation.get("target_id", "")
+        all_ids = {e.get("id") for e in graph.get("entities", []) if isinstance(e, dict) and e.get("id")}
+        if source_id and source_id not in all_ids:
+            raise MemoryPipelineError(
+                stage="validation",
+                code="missing_relation_endpoint",
+                message=f"Relation source {source_id!r} not found in graph entities.",
+            )
+        if target_id and target_id not in all_ids:
+            raise MemoryPipelineError(
+                stage="validation",
+                code="missing_relation_endpoint",
+                message=f"Relation target {target_id!r} not found in graph entities.",
+            )
+
+        merged, action = _upsert_by_id_strict(graph.setdefault("relations", []), relation)
+        result["graph_changes"].append({"kind": "relation", "action": action, "id": relation.get("id", "")})
+
+    for fact in patch.get("upsert_graph_facts") if isinstance(patch.get("upsert_graph_facts"), list) else []:
+        fact = fact if isinstance(fact, dict) else {}
+        merged, action = _upsert_by_id_strict(graph.setdefault("facts", []), fact)
+        result["graph_changes"].append({"kind": "fact", "action": action, "id": fact.get("id", "")})
+
+    scene_patch = patch.get("scene_patch") if isinstance(patch.get("scene_patch"), dict) else {}
+    SCENE_STATE_KEYS = {"location_id", "location_name", "time_of_day", "active_npc_ids", "departed_npc_ids", "immediate_tension"}
+    has_scene_changes = any(k in scene_patch for k in SCENE_STATE_KEYS)
+    if scene_patch and has_scene_changes:
+        current_scene = world_state.get("current_scene", {}) if isinstance(world_state, dict) else {}
+        clean_scene_state = {k: v for k, v in scene_patch.items() if k in SCENE_STATE_KEYS}
+        current_scene.update(clean_scene_state)
+        world_state["current_scene"] = current_scene
+        _sync_party_known_location(world_state, current_scene)
+
+    world.knowledge_graph = json_dumps(graph)
+    world.world_state = json_dumps(world_state)
+    world.memory_revision = (world.memory_revision or 0) + 1
+    world.updated_at = utcnow()
+
+    for npc_item in patch.get("update_npc_actors") if isinstance(patch.get("update_npc_actors"), list) else []:
+        npc_item = npc_item if isinstance(npc_item, dict) else {}
+        change = _update_npc_actor(campaign, npc_item)
+        result["npc_changes"].append(change)
+        if change.get("event_id"):
+            result["world_event_ids"].append(change["event_id"])
+
+    for event_patch in patch.get("record_events") if isinstance(patch.get("record_events"), list) else []:
+        event_patch = event_patch if isinstance(event_patch, dict) else {}
+        event = _record_event(
+            campaign,
+            event_patch.get("event_type") or "session_memory",
+            event_patch.get("summary") or "Session memory updated.",
+            event_patch.get("payload") if isinstance(event_patch.get("payload"), dict) else {},
+            event_patch.get("visibility") or "dm_private",
+        )
+        result["world_event_ids"].append(event.id)
+
+    summary = clean_text(patch.get("running_summary"), 4000)
+    if summary and session:
+        session.running_summary = summary
+        result["running_summary_updated"] = True
+
+    anchors = patch.get("memory_anchors")
+    if isinstance(anchors, dict) and session:
+        session.memory_anchors = anchors
+        result["memory_anchors_updated"] = True
+
+    clarification_requests = patch.get("clarification_requests")
+    if isinstance(clarification_requests, list):
+        persist_clarification_requests(clarification_requests, campaign)
+
+    consumed_clarification_ids = patch.get("consumed_clarification_ids")
+    if isinstance(consumed_clarification_ids, list) and consumed_clarification_ids:
+        clars = CampaignClarification.query.filter(
+            CampaignClarification.campaign_id == campaign.id,
+            CampaignClarification.clarification_id.in_(consumed_clarification_ids),
+        ).all()
+        for clar in clars:
+            clar.status = "resolved"
+
+    resolution_records = patch.get("resolution_records")
+    if isinstance(resolution_records, list):
+        persist_identity_resolutions(resolution_records, campaign)
+
+    log_audit_event(
+        campaign.id,
+        "memory_patch_applied_v2",
+        "Applied compiled session memory patch (v2 trusted path).",
+        {"session_id": session.id if session else None, "result": result},
+        source="dm_tools.memory_v2",
+        actor="session_memory_writer",
+        trace_id=trace_id,
+        parent_trace_id=audit_context.get("parent_trace_id"),
+        trace_label=audit_context.get("trace_label"),
+        commit=False,
+    )
+
+    return result
+
+
+def _upsert_by_id_strict(items, item):
+    item = item if isinstance(item, dict) else {}
+    item_id = clean_id(item.get("id"), "")
+    if not item_id:
+        return item, "no-op"
+    for index, existing in enumerate(items):
+        if existing.get("id") == item_id:
+            merged = dict(existing)
+            merged.update({key: value for key, value in item.items() if value not in (None, "", [])})
+            items[index] = merged
+            return merged, "updated"
+    items.append(dict(item))
+    return item, "created"

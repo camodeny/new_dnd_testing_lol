@@ -1,8 +1,26 @@
 import json
 import re
+import hashlib
+import copy
 
-from models import Campaign, CampaignClock, CampaignSession, Character, NPCActor, SessionMessage, User, WorldEvent, db
+from models import Campaign, CampaignClock, CampaignSession, CampaignWorld, Character, NPCActor, SessionMessage, User, WorldEvent, db
 from services.dm_tools import _tool_search_campaign_memory
+from services.memory_resolver_schemas import (
+    AUTHORITY_PRECEDENCE,
+    DIAGNOSTICS_TEMPLATE,
+    FINAL_STATE_INVARIANTS,
+    MEMORY_RUN_STATUSES,
+    SOURCE_CONTRACT_COMPILED_V2,
+    is_identity_worthy,
+    validate_diagnostics,
+)
+from services.resolution_registry import (
+    allocate_durable_id,
+    build_canonical_resolution_registry,
+    fetch_prior_resolutions,
+    fetch_pending_clarifications,
+    resolve_ref,
+)
 from services.world_service import clean_id, clean_text, get_campaign_world, json_loads
 
 
@@ -455,6 +473,16 @@ def _known_ids(campaign):
             and clean_text(entity.get('name'), 160)
             and clean_id(entity.get('id'), '')
         },
+        'npc_names': {
+            clean_id(npc.actor_id, ''): npc.name or ''
+            for npc in NPCActor.query.filter_by(campaign_id=campaign.id).all()
+            if clean_id(npc.actor_id, '') and npc.name
+        },
+        'entity_names': {
+            clean_id(entity.get('id'), ''): clean_text(entity.get('name'), 160) or ''
+            for entity in graph.get('entities', [])
+            if isinstance(entity, dict) and clean_id(entity.get('id'), '') and clean_text(entity.get('name'), 160)
+        },
     }
 
 
@@ -477,29 +505,505 @@ def _normalize_importance(value):
     return _safe_int(value, 3, minimum=1, maximum=5)
 
 
+def _validate_final_memory_state(compiled_patch, registry_map, known, campaign):
+    errors = []
+    all_entity_ids = set(known.get("entity_ids", set()))
+    patch_entity_ids = set()
+    for entity in compiled_patch.get("upsert_graph_entities", []):
+        if isinstance(entity, dict) and entity.get("id"):
+            patch_entity_ids.add(entity["id"])
+    all_entity_ids |= patch_entity_ids
+
+    active_cast = compiled_patch.get("scene_patch", {}).get("active_npc_ids", [])
+    if isinstance(active_cast, list):
+        for actor_id in active_cast:
+            resolved = resolve_ref(actor_id, registry_map, known)
+            in_patch = actor_id in patch_entity_ids
+            in_known = actor_id in known.get("npc_ids", set()) or actor_id in known.get("entity_ids", set())
+            if (not resolved or resolved not in all_entity_ids) and not in_patch and not in_known:
+                errors.append(f"active_cast_id_not_found: {actor_id}")
+
+    departed_cast = compiled_patch.get("scene_patch", {}).get("departed_npc_ids", [])
+    if isinstance(departed_cast, list):
+        for actor_id in departed_cast:
+            resolved = resolve_ref(actor_id, registry_map, known)
+            in_patch = actor_id in patch_entity_ids
+            in_known = actor_id in known.get("npc_ids", set()) or actor_id in known.get("entity_ids", set())
+            if (not resolved or resolved not in all_entity_ids) and not in_patch and not in_known:
+                errors.append(f"departed_cast_id_not_found: {actor_id}")
+
+    if isinstance(active_cast, list) and isinstance(departed_cast, list):
+        active_set = set(active_cast)
+        departed_set = set(departed_cast)
+        overlap = active_set & departed_set
+        if overlap:
+            errors.append(f"cast_sets_overlap: {overlap}")
+
+    for rel in compiled_patch.get("upsert_graph_relations", []):
+        if not isinstance(rel, dict):
+            continue
+        source_id = rel.get("source_id", "")
+        if source_id and source_id not in all_entity_ids:
+            errors.append(f"relation_source_not_found: {source_id}")
+        target_id = rel.get("target_id", "")
+        if target_id and target_id not in all_entity_ids:
+            errors.append(f"relation_target_not_found: {target_id}")
+
+    for fact in compiled_patch.get("upsert_graph_facts", []):
+        if not isinstance(fact, dict):
+            continue
+        for eid in fact.get("entity_ids", []) if isinstance(fact.get("entity_ids"), list) else []:
+            if eid and eid not in all_entity_ids:
+                errors.append(f"fact_entity_ref_not_found: {eid}")
+
+    scene_location_id = compiled_patch.get("scene_patch", {}).get("location_id", "")
+    if scene_location_id and scene_location_id not in all_entity_ids:
+        location_exists = any(
+            isinstance(e, dict) and e.get("id") == scene_location_id
+            for e in compiled_patch.get("upsert_graph_entities", [])
+        )
+        if not location_exists:
+            errors.append(f"scene_location_not_found: {scene_location_id}")
+
+    for npc_update in compiled_patch.get("update_npc_actors", []):
+        if not isinstance(npc_update, dict):
+            continue
+        actor_id = npc_update.get("id") or npc_update.get("actor_id", "")
+        if actor_id and actor_id not in all_entity_ids and actor_id not in known.get("npc_ids", set()):
+            errors.append(f"npc_update_target_not_found: {actor_id}")
+
+    diagnostics = compiled_patch.get("resolution_diagnostics", {})
+    if isinstance(diagnostics, dict):
+        substitutions = diagnostics.get("substitutions", [])
+        if isinstance(substitutions, list) and len(substitutions) > 0:
+            errors.append("substitutions_not_empty")
+
+    return errors
+
+
+def _get_memory_revision(campaign):
+    if not campaign:
+        return 0
+    world = CampaignWorld.query.filter_by(campaign_id=campaign.id).first()
+    if not world:
+        return 0
+    return world.memory_revision or 0
+
+
+def find_matching_known_entity(name, known, prior_resolutions):
+    name_lower = name.strip().lower()
+    for ent_id, ent_name in known.get("entity_names", {}).items():
+        if ent_name.strip().lower() == name_lower:
+            return ent_id
+    if isinstance(prior_resolutions, list):
+        for res in prior_resolutions:
+            if not isinstance(res, dict):
+                continue
+            if res.get("resolution_action") == "add_alias":
+                res_name = res.get("mention_name", "")
+                if res_name and res_name.strip().lower() == name_lower:
+                    can_id = res.get("canonical_id")
+                    if can_id and can_id in known.get("entity_ids", set()):
+                        return can_id
+    return None
+
+
+def find_matching_known_npc(name, known, prior_resolutions):
+    name_lower = name.strip().lower()
+    for npc_id, npc_name in known.get("npc_names", {}).items():
+        if npc_name.strip().lower() == name_lower:
+            return npc_id
+    if isinstance(prior_resolutions, list):
+        for res in prior_resolutions:
+            if not isinstance(res, dict):
+                continue
+            if res.get("resolution_action") == "add_alias":
+                res_name = res.get("mention_name", "")
+                if res_name and res_name.strip().lower() == name_lower:
+                    can_id = res.get("canonical_id")
+                    if can_id and can_id in known.get("npc_ids", set()):
+                        return can_id
+    return None
+
+
+def _build_resolution_records(registry, compiled_patch, memory_context):
+    records = []
+    for entry in registry:
+        if not isinstance(entry, dict):
+            continue
+        # Only create resolution records when a provisional entity is explicitly resolved
+        # to a different canonical identity — not at provisional creation time.
+        if entry.get("decision") not in ("reuse_existing", "add_alias"):
+            continue
+        canonical_id = entry.get("canonical_id", "")
+        if not canonical_id:
+            continue
+        mention_ref = entry.get("mention_ref", "")
+        if not mention_ref or mention_ref.lower() == canonical_id.lower():
+            continue
+
+        # Check if mention_ref is turn-local
+        is_turn_local = False
+        for prefix in ("resolved_entity_", "resolved_npc_", "packet_mention_", "entity_", "npc_"):
+            if mention_ref.startswith(prefix):
+                suffix = mention_ref[len(prefix):]
+                if suffix.isdigit():
+                    is_turn_local = True
+                    break
+
+        if is_turn_local:
+            # Derive durable provisional ID from surface_form
+            mention_entity_id = clean_id(entry.get("surface_form", "").lower().replace(" ", "_"), "") or "provisional_unknown"
+        else:
+            mention_entity_id = mention_ref
+
+        campaign_id = _safe_int((memory_context or {}).get("campaign_id"), 0, minimum=0) if isinstance(memory_context, dict) else 0
+        source_turn_id = (memory_context or {}).get("hot_context", {}).get("turn_id", "") if isinstance(memory_context, dict) else ""
+
+        resolution_action = "same_identity" if entry.get("decision") != "add_alias" else "add_alias"
+        key_raw = f"{campaign_id}:{mention_entity_id}:{canonical_id}:{source_turn_id}:{resolution_action}"
+        resolution_id = f"ires_{hashlib.md5(key_raw.encode('utf-8')).hexdigest()[:16]}"
+        records.append({
+            "resolution_id": resolution_id,
+            "mention_entity_id": mention_entity_id,
+            "mention_name": entry.get("surface_form", ""),
+            "resolution_action": resolution_action,
+            "canonical_id": canonical_id,
+            "canonical_name": entry.get("canonical_name", entry.get("surface_form", "")),
+            "visibility": entry.get("visibility", "party_known"),
+            "resolved_by": "session_memory_writer",
+            "source_turn_id": source_turn_id,
+            "evidence": entry.get("evidence"),
+        })
+    return records
+
+
+def _augment_registry_from_resolved(registry, resolved_entities, resolved_npcs, known, prior_resolutions=None, allocated_ids=None):
+    if allocated_ids is None:
+        allocated_ids = set()
+    allocated_ids |= known.get("entity_ids", set())
+    existing_forms = {entry.get("surface_form", "").strip().lower() for entry in registry}
+    index = len(registry)
+
+    for item in resolved_entities:
+        if not isinstance(item, dict):
+            continue
+        name = clean_text(item.get("name"), 200)
+        if not name:
+            continue
+        if name.lower() in existing_forms:
+            continue
+        existing_forms.add(name.lower())
+
+        entity_type = clean_text(item.get("type"), 40).lower() or "other"
+        proposed_id = clean_id(item.get("id") or item.get("entity_id"), "")
+        mention_ref = f"resolved_entity_{index}"
+
+        skip = False
+        if proposed_id and proposed_id in known.get("entity_ids", set()):
+            existing_name = known.get("entity_names", {}).get(proposed_id, "")
+            if existing_name and name.lower() != existing_name.lower():
+                # Name differs from canonical — check for conflict with another entity
+                for other_id, other_name in known.get("entity_names", {}).items():
+                    if other_name.lower() == name.lower() and other_id != proposed_id:
+                        skip = True
+                        break
+                if skip:
+                    index += 1
+                    continue
+                # Require explicit rename/retcon action
+                item_action = item.get("action") or item.get("decision")
+                if item_action in ("rename_existing", "retcon", "rename_existing_entity"):
+                    decision = "rename_existing"
+                    canonical_name = name
+                else:
+                    decision = "add_alias"
+                    canonical_name = existing_name
+            else:
+                decision = "reuse_existing"
+                canonical_name = existing_name or name
+            registry.append({
+                "mention_ref": mention_ref,
+                "surface_form": name,
+                "identity_status": "known_public",
+                "visibility": "party_known",
+                "evidence": [{"source": "resolver_output", "field": "upsert_graph_entities"}],
+                "canonical_id": proposed_id,
+                "canonical_name": canonical_name,
+                "decision": decision,
+                "blocked_operations": [],
+                "resolution_state": "resolved",
+                "entity_type": entity_type,
+            })
+        else:
+            # Look up matching known entity by canonical name or alias (not slug)
+            matched_id = find_matching_known_entity(name, known, prior_resolutions)
+            if matched_id:
+                new_id = matched_id
+                existing_name = known.get("entity_names", {}).get(matched_id, "")
+                if existing_name and name.lower() != existing_name.lower():
+                    decision = "add_alias"
+                    canonical_name = existing_name
+                else:
+                    decision = "reuse_existing"
+                    canonical_name = existing_name or name
+                identity_status = "known_public"
+            else:
+                new_id = allocate_durable_id(name, allocated_ids)
+                decision = "create_new"
+                canonical_name = name
+                identity_status = "provisional_new_entity"
+            allocated_ids.add(new_id)
+            registry.append({
+                "mention_ref": mention_ref,
+                "surface_form": name,
+                "identity_status": identity_status,
+                "visibility": "party_known",
+                "evidence": [{"source": "resolver_output", "field": "upsert_graph_entities"}],
+                "canonical_id": new_id,
+                "canonical_name": canonical_name,
+                "decision": decision,
+                "blocked_operations": [],
+                "resolution_state": "resolved",
+                "entity_type": entity_type,
+            })
+        index += 1
+
+    for item in resolved_npcs:
+        if not isinstance(item, dict):
+            continue
+        name = clean_text(item.get("name"), 200)
+        proposed_id = clean_id(item.get("id") or item.get("actor_id") or item.get("actor_ref"), "")
+        if name and name.lower() not in existing_forms:
+            existing_forms.add(name.lower())
+            mention_ref = f"resolved_npc_{index}"
+            entity_type = "npc"
+            skip = False
+            if proposed_id and proposed_id in known.get("npc_ids", set()):
+                existing_name = known.get("npc_names", {}).get(proposed_id, "")
+                if existing_name and name.lower() != existing_name.lower():
+                    for other_id, other_name in known.get("npc_names", {}).items():
+                        if other_name.lower() == name.lower() and other_id != proposed_id:
+                            skip = True
+                            break
+                    if skip:
+                        index += 1
+                        continue
+                    # Require explicit rename/retcon action
+                    item_action = item.get("action") or item.get("decision")
+                    if item_action in ("rename_existing", "retcon", "rename_existing_npc"):
+                        decision = "rename_existing"
+                        canonical_name = name
+                    else:
+                        decision = "add_alias"
+                        canonical_name = existing_name
+                else:
+                    decision = "reuse_existing"
+                    canonical_name = existing_name or name
+                registry.append({
+                    "mention_ref": mention_ref,
+                    "surface_form": name,
+                    "identity_status": "known_public",
+                    "visibility": "party_known",
+                    "evidence": [{"source": "resolver_output", "field": "update_npc_actors"}],
+                    "canonical_id": proposed_id,
+                    "canonical_name": canonical_name,
+                    "decision": decision,
+                    "blocked_operations": [],
+                    "resolution_state": "resolved",
+                    "entity_type": entity_type,
+                })
+            else:
+                matched_id = find_matching_known_npc(name, known, prior_resolutions)
+                if matched_id:
+                    new_id = matched_id
+                    existing_name = known.get("npc_names", {}).get(matched_id, "")
+                    if existing_name and name.lower() != existing_name.lower():
+                        decision = "add_alias"
+                        canonical_name = existing_name
+                    else:
+                        decision = "reuse_existing"
+                        canonical_name = existing_name or name
+                    identity_status = "known_public"
+                else:
+                    new_id = allocate_durable_id(name, allocated_ids)
+                    decision = "create_new"
+                    canonical_name = name
+                    identity_status = "provisional_new_entity"
+                allocated_ids.add(new_id)
+                registry.append({
+                    "mention_ref": mention_ref,
+                    "surface_form": name,
+                    "identity_status": identity_status,
+                    "visibility": "party_known",
+                    "evidence": [{"source": "resolver_output", "field": "update_npc_actors"}],
+                    "canonical_id": new_id,
+                    "canonical_name": canonical_name,
+                    "decision": decision,
+                    "blocked_operations": [],
+                    "resolution_state": "resolved",
+                    "entity_type": entity_type,
+                })
+            index += 1
+    records = []
+    for entry in registry:
+        if not isinstance(entry, dict):
+            continue
+        if entry.get("decision") != "create_provisional":
+            continue
+        canonical_id = entry.get("canonical_id", "")
+        if not canonical_id:
+            continue
+        resolution_id = f"ires_{hashlib.md5(canonical_id.encode('utf-8')).hexdigest()[:12]}"
+        records.append({
+            "resolution_id": resolution_id,
+            "mention_entity_id": canonical_id,
+            "mention_name": entry.get("surface_form", ""),
+            "resolution_action": "same_identity",
+            "canonical_id": canonical_id,
+            "canonical_name": entry.get("surface_form", ""),
+            "visibility": entry.get("visibility", "party_known"),
+            "resolved_by": "session_memory_writer",
+            "evidence": entry.get("evidence"),
+        })
+    return records
+
+
+def merge_resolution_patch(resolved, patch_json):
+    if not isinstance(patch_json, dict):
+        return
+    for key, val in patch_json.items():
+        if isinstance(val, list):
+            existing = resolved.get(key)
+            if not isinstance(existing, list):
+                existing = []
+                resolved[key] = existing
+            for item in val:
+                if not isinstance(item, dict):
+                    continue
+                item_id = item.get("id") or item.get("actor_id") or item.get("entity_id")
+                if item_id:
+                    duplicate = False
+                    for ex_item in existing:
+                        if isinstance(ex_item, dict) and (
+                            ex_item.get("id") == item_id
+                            or ex_item.get("actor_id") == item_id
+                            or ex_item.get("entity_id") == item_id
+                        ):
+                            ex_item.update(item)
+                            duplicate = True
+                            break
+                    if not duplicate:
+                        existing.append(item)
+                else:
+                    existing.append(item)
+        elif isinstance(val, dict):
+            existing = resolved.get(key)
+            if not isinstance(existing, dict):
+                existing = {}
+                resolved[key] = existing
+            existing.update(val)
+        else:
+            resolved[key] = val
+
+
 def compile_staged_memory_patch(memory_context, extracted, resolved):
     campaign = _memory_context_campaign(memory_context)
     if campaign is None:
         raise MemoryPipelineError(
-            stage='compilation',
-            code='missing_campaign',
-            message='Cannot compile staged memory patch: campaign is missing from memory context.',
-            telemetry={'campaign_id': _safe_int((memory_context or {}).get('campaign_id'), 0, minimum=0)},
+            stage="compilation",
+            code="missing_campaign",
+            message="Cannot compile staged memory patch: campaign is missing from memory context.",
+            telemetry={"campaign_id": _safe_int((memory_context or {}).get("campaign_id"), 0, minimum=0)},
         )
 
     extracted = extracted if isinstance(extracted, dict) else {}
     resolved = resolved if isinstance(resolved, dict) else {}
     known = _known_ids(campaign)
-    unresolved = list(resolved.get('unresolved_items') if isinstance(resolved.get('unresolved_items'), list) else [])
+    unresolved = list(resolved.get("unresolved_items") if isinstance(resolved.get("unresolved_items"), list) else [])
+
+    resolver_packet = memory_context.get("resolver_packet") if isinstance(memory_context, dict) else None
+    if isinstance(resolver_packet, dict) and not isinstance(resolver_packet.get("entity_mentions"), list):
+        resolver_packet = None
+
+    prior_resolutions = fetch_prior_resolutions(campaign)
+    pending_clarifications = fetch_pending_clarifications(campaign)
+
+    memory_context_with_clarifications = dict(memory_context if isinstance(memory_context, dict) else {})
+    memory_context_with_clarifications["pending_clarifications"] = pending_clarifications
+
+    registry, registry_map, clarification_requests, diagnostics = build_canonical_resolution_registry(
+        campaign,
+        memory_context_with_clarifications,
+        extracted,
+        resolver_packet,
+        prior_resolutions,
+        known,
+    )
+
+    # Compile-time validation: check which answered clarifications actually resolved in the registry
+    valid_consumed_ids = set()
+    for entry in registry:
+        for ev in entry.get("evidence", []):
+            if isinstance(ev, dict) and ev.get("source") == "clarification_answer":
+                c_id = ev.get("clarification_id")
+                if c_id:
+                    valid_consumed_ids.add(c_id)
+
+    # Merge resolution patches from validly answered clarifications
+    consumed_clarification_ids = []
+    if isinstance(pending_clarifications, list):
+        for pc in pending_clarifications:
+            if isinstance(pc, dict) and pc.get("status") == "answered":
+                clar_id = pc.get("clarification_id")
+                if clar_id and clar_id in valid_consumed_ids:
+                    patch_json = pc.get("resolution_patch_json") or pc.get("resolution_patch")
+                    if patch_json:
+                        patch_json = copy.deepcopy(patch_json)
+                        if pc.get("resolution_action") == "new_entity":
+                            # Find the new allocated canonical ID in registry
+                            allocated_canonical_id = None
+                            for entry in registry:
+                                for ev in entry.get("evidence", []):
+                                    if isinstance(ev, dict) and ev.get("source") == "clarification_answer" and ev.get("clarification_id") == clar_id:
+                                        allocated_canonical_id = entry.get("canonical_id")
+                                        break
+                            if allocated_canonical_id:
+                                old_target_id = pc.get("mention_entity_id")
+                                if "update_npc_actors" in patch_json:
+                                    for item in patch_json["update_npc_actors"]:
+                                        if isinstance(item, dict) and item.get("id") == old_target_id:
+                                            item["id"] = allocated_canonical_id
+                                if "upsert_graph_entities" in patch_json:
+                                    for item in patch_json["upsert_graph_entities"]:
+                                        if isinstance(item, dict) and item.get("id") == old_target_id:
+                                            item["id"] = allocated_canonical_id
+                        merge_resolution_patch(resolved, patch_json)
+                    consumed_clarification_ids.append(clar_id)
+
+    # Also process resolved claims through the registry (entities and NPCs from resolver output)
+    resolved_entities = resolved.get("upsert_graph_entities") if isinstance(resolved.get("upsert_graph_entities"), list) else []
+    resolved_npcs = resolved.get("update_npc_actors") if isinstance(resolved.get("update_npc_actors"), list) else []
+    _augment_registry_from_resolved(
+        registry,
+        resolved_entities,
+        resolved_npcs,
+        known,
+        prior_resolutions=prior_resolutions,
+        allocated_ids={e.get("canonical_id") for e in registry if e.get("canonical_id")},
+    )
+    registry_map = {entry["mention_ref"]: entry for entry in registry}
+
+    resolution_records = _build_resolution_records(registry, {}, memory_context)
 
     running_summary = clean_text(
-        resolved.get('running_summary') or extracted.get('running_summary'),
+        resolved.get("running_summary") or extracted.get("running_summary"),
         4000,
     )
 
-    prior_anchors = memory_context.get('prior_memory_anchors') if isinstance(memory_context.get('prior_memory_anchors'), dict) else {}
-    resolved_anchors = resolved.get('memory_anchors') if isinstance(resolved.get('memory_anchors'), dict) else None
-    extracted_anchors = extracted.get('memory_anchors') if isinstance(extracted.get('memory_anchors'), dict) else None
+    prior_anchors = memory_context.get("prior_memory_anchors") if isinstance(memory_context.get("prior_memory_anchors"), dict) else {}
+    resolved_anchors = resolved.get("memory_anchors") if isinstance(resolved.get("memory_anchors"), dict) else None
+    extracted_anchors = extracted.get("memory_anchors") if isinstance(extracted.get("memory_anchors"), dict) else None
     anchors = resolved_anchors or extracted_anchors or prior_anchors
     compiled_anchors = {
         "current_goal": anchors.get("current_goal"),
@@ -507,357 +1011,458 @@ def compile_staged_memory_patch(memory_context, extracted, resolved):
         "open_clues": anchors.get("open_clues") if isinstance(anchors.get("open_clues"), list) else [],
         "unresolved_questions": anchors.get("unresolved_questions") if isinstance(anchors.get("unresolved_questions"), list) else [],
         "npc_observations": anchors.get("npc_observations") if isinstance(anchors.get("npc_observations"), list) else [],
-        "recent_offers_promises": anchors.get("recent_offers_promises") if isinstance(anchors.get("recent_offers_promises"), list) else []
+        "recent_offers_promises": anchors.get("recent_offers_promises") if isinstance(anchors.get("recent_offers_promises"), list) else [],
     }
 
-    hot_context = memory_context.get('hot_context') if isinstance(memory_context.get('hot_context'), dict) else {}
-    source_player_message_id = memory_context.get('latest_player_message_id') or memory_context.get('source_player_message_id') or hot_context.get('player_message_id') or hot_context.get('source_player_message_id')
-    source_dm_message_id = memory_context.get('latest_dm_message_id') or memory_context.get('source_dm_message_id') or hot_context.get('dm_message_id') or hot_context.get('source_dm_message_id')
+    hot_context = memory_context.get("hot_context") if isinstance(memory_context.get("hot_context"), dict) else {}
+    source_player_message_id = memory_context.get("latest_player_message_id") or memory_context.get("source_player_message_id") or hot_context.get("player_message_id") or hot_context.get("source_player_message_id")
+    source_dm_message_id = memory_context.get("latest_dm_message_id") or memory_context.get("source_dm_message_id") or hot_context.get("dm_message_id") or hot_context.get("source_dm_message_id")
 
     def make_provenance(item_raw, default_tool=None):
-        raw_prov = item_raw.get('provenance') if isinstance(item_raw.get('provenance'), dict) else {}
-        evidence = item_raw.get('evidence')
+        raw_prov = item_raw.get("provenance") if isinstance(item_raw.get("provenance"), dict) else {}
+        evidence = item_raw.get("evidence")
         if not isinstance(evidence, list):
             evidence = [evidence] if evidence else []
-        basis = raw_prov.get('evidence_basis') or item_raw.get('evidence_basis') or evidence
+        basis = raw_prov.get("evidence_basis") or item_raw.get("evidence_basis") or evidence
         if not isinstance(basis, list):
             basis = [basis] if basis else []
         basis = [str(b).strip() for b in basis if str(b).strip()]
         return {
-            'source_player_message_id': raw_prov.get('source_player_message_id') or source_player_message_id,
-            'source_dm_message_id': raw_prov.get('source_dm_message_id') or source_dm_message_id,
-            'tool_name': raw_prov.get('tool_name') or default_tool,
-            'tool_result_id': raw_prov.get('tool_result_id'),
-            'evidence_basis': basis
+            "source_player_message_id": raw_prov.get("source_player_message_id") or source_player_message_id,
+            "source_dm_message_id": raw_prov.get("source_dm_message_id") or source_dm_message_id,
+            "tool_name": raw_prov.get("tool_name") or default_tool,
+            "tool_result_id": raw_prov.get("tool_result_id"),
+            "evidence_basis": basis,
         }
 
-    scene_patch = resolved.get('scene_patch') if isinstance(resolved.get('scene_patch'), dict) else {}
+    allocated_entity_ids = set(known["entity_ids"])
+    for entry in registry:
+        if entry.get("canonical_id"):
+            allocated_entity_ids.add(entry["canonical_id"])
+
+    # ── Compile Entities from Registry ────────────────────────────────
+    accepted_entities = []
+    patch_created_entity_ids = set()
+    patch_created_npc_ids = set()
+    seen_entity_ids = set()
+
+    for entry in registry:
+        if entry.get("decision") in ("reject", "request_clarification"):
+            continue
+        if entry.get("decision") == "create_provisional" and not entry.get("canonical_id"):
+            continue
+
+        entity_id = entry.get("canonical_id")
+        if not entity_id:
+            continue
+        if entity_id in seen_entity_ids:
+            continue
+
+        entity_type = entry.get("entity_type", "other")
+        if entity_type in ("npc", "person"):
+            patch_created_npc_ids.add(entity_id)
+        patch_created_entity_ids.add(entity_id)
+        seen_entity_ids.add(entity_id)
+
+        is_new = entry.get("decision") in ("create_new", "create_provisional")
+        in_resolved = any(
+            isinstance(ri, dict) and (
+                clean_id(ri.get("id") or ri.get("entity_id"), "") == entity_id
+                or clean_text(ri.get("name"), 200).lower() == entry.get("surface_form", "").lower()
+            )
+            for ri in resolved_entities
+        )
+        if is_new or entity_id not in known["entity_ids"] or in_resolved:
+            # Merge resolved entity fields if available
+            resolved_item = None
+            for ri in resolved_entities:
+                if isinstance(ri, dict) and clean_id(ri.get("id") or ri.get("entity_id"), "") == entity_id:
+                    resolved_item = ri
+                    break
+                if isinstance(ri, dict) and clean_text(ri.get("name"), 200).lower() == entry.get("surface_form", "").lower():
+                    resolved_item = ri
+                    break
+
+            accepted_entities.append({
+                "id": entity_id,
+                "name": entry.get("canonical_name") or entry.get("surface_form", ""),
+                "type": entity_type,
+                "summary": clean_text(
+                    (resolved_item or {}).get("summary") or entry.get("surface_form"),
+                    500,
+                ) or None,
+                "tags": [
+                    clean_text(t, 40) for t in (resolved_item or {}).get("tags", [])
+                    if clean_text(t, 40)
+                ] if isinstance((resolved_item or {}).get("tags"), list) else [],
+                "visibility": (resolved_item or {}).get("intended_visibility") if (resolved_item or {}).get("intended_visibility") in VALID_MEMORY_VISIBILITIES else _normalize_visibility(
+                    (resolved_item or {}).get("source_surface"), (resolved_item or {}).get("intended_visibility"),
+                ) or entry.get("visibility", "party_known"),
+                "certainty": _normalize_certainty((resolved_item or {}).get("certainty")) if resolved_item else "confirmed",
+                "importance": _normalize_importance((resolved_item or {}).get("importance")) if resolved_item else 3,
+                "expires_or_retire_condition": clean_text((resolved_item or {}).get("expires_or_retire_condition"), 520) or None,
+                "reason": clean_text((resolved_item or {}).get("reason"), 420) or f"Resolved by registry: {entry.get('decision')}.",
+                "memory_type": "entity",
+                "provenance": make_provenance(resolved_item or entry, default_tool="resolution_registry"),
+                "resolution_mode": entry.get("decision"),
+            })
+
+    # Build name-based remap for entity name → canonical ID to support old-style reference resolution
+    entity_name_to_id = {}
+    for entity in accepted_entities:
+        name = clean_text(entity.get("name"), 200)
+        if name:
+            entity_name_to_id[name.lower()] = entity["id"]
+            name_slug = clean_id(name.lower(), "")
+            if name_slug:
+                entity_name_to_id[name_slug] = entity["id"]
+
+    # Also map proposed IDs from resolved entities to their canonical IDs
+    for item in resolved_entities:
+        if not isinstance(item, dict):
+            continue
+        name = clean_text(item.get("name"), 200)
+        proposed_id = clean_id(item.get("id") or item.get("entity_id"), "")
+        if name and proposed_id:
+            canonical_id = entity_name_to_id.get(name.lower())
+            if canonical_id:
+                entity_name_to_id[proposed_id] = canonical_id
+                entity_name_to_id[proposed_id.lower()] = canonical_id
+    for item in resolved_npcs:
+        if not isinstance(item, dict):
+            continue
+        name = clean_text(item.get("name"), 200)
+        proposed_id = clean_id(item.get("id") or item.get("actor_id") or item.get("actor_ref"), "")
+        if name and proposed_id:
+            canonical_id = entity_name_to_id.get(name.lower())
+            if canonical_id:
+                entity_name_to_id[proposed_id] = canonical_id
+                entity_name_to_id[proposed_id.lower()] = canonical_id
+
+    def resolve_ref_with_names(ref):
+        resolved = resolve_ref(ref, registry_map, known)
+        if resolved:
+            return resolved
+        ref_lower = str(ref).strip().lower()
+        if ref_lower in entity_name_to_id:
+            return entity_name_to_id[ref_lower]
+        for name, cid in entity_name_to_id.items():
+            if clean_id(name, "") == clean_id(ref_lower, ""):
+                return cid
+        return ""
+
+    # ── Compile Scene Location via Registry ────────────────────────────
+    scene_patch = resolved.get("scene_patch") if isinstance(resolved.get("scene_patch"), dict) else {}
     if not scene_patch:
-        scene_patch = extracted.get('scene_patch') if isinstance(extracted.get('scene_patch'), dict) else {}
+        scene_patch = extracted.get("scene_patch") if isinstance(extracted.get("scene_patch"), dict) else {}
     compiled_scene = {}
     from services.scene_location_resolver import resolve_scene_location_patch
-    current_scene = hot_context.get('current_scene') if isinstance(hot_context.get('current_scene'), dict) else {}
+    current_scene = hot_context.get("current_scene") if isinstance(hot_context.get("current_scene"), dict) else {}
+    scene_resolution_mode = "inferred"
 
-    scene_resolution_mode = 'inferred'
     resolved_loc = resolve_scene_location_patch(scene_patch, campaign, current_scene)
-    if resolved_loc is None:
-        proposed_id = clean_id(scene_patch.get('location_id'), '')
-        proposed_name = clean_text(scene_patch.get('location_name'), 160)
-        unresolved.append({
-            'kind': 'scene_location',
-            'location_id': proposed_id,
-            'location_name': proposed_name,
-            'reason': 'unresolved_scene_location',
-            'provenance': make_provenance(scene_patch, default_tool='resolve_scene_location_patch'),
-            'resolution_mode': 'unresolved'
+    loc_status = resolved_loc.get("status", "unresolved") if isinstance(resolved_loc, dict) else "unresolved"
+
+    if loc_status == "canonical" or loc_status == "direct":
+        compiled_scene["location_id"] = resolved_loc["location_id"]
+        compiled_scene["location_name"] = resolved_loc["location_name"]
+        scene_resolution_mode = "canonical" if loc_status == "canonical" else "direct"
+
+    elif loc_status == "new":
+        new_loc_id = resolved_loc.get("location_id") or allocate_durable_id(
+            resolved_loc.get("location_name", "unknown_location"),
+            allocated_entity_ids,
+            prefix="location",
+        )
+        new_loc_name = resolved_loc.get("location_name", "Unknown Location")
+        allocated_entity_ids.add(new_loc_id)
+        patch_created_entity_ids.add(new_loc_id)
+
+        compiled_scene["location_id"] = new_loc_id
+        compiled_scene["location_name"] = new_loc_name
+        scene_resolution_mode = "new"
+
+        accepted_entities.append({
+            "id": new_loc_id,
+            "name": new_loc_name,
+            "type": "location",
+            "summary": clean_text(scene_patch.get("summary"), 500) or new_loc_name,
+            "tags": [],
+            "visibility": "party_known",
+            "certainty": "confirmed",
+            "importance": 3,
+            "expires_or_retire_condition": None,
+            "reason": "New location created from scene patch.",
+            "memory_type": "location",
+            "provenance": make_provenance(scene_patch, default_tool="resolve_scene_location_patch"),
+            "resolution_mode": "create_new",
         })
-    elif resolved_loc:
-        if resolved_loc.get('location_id'):
-            compiled_scene['location_id'] = resolved_loc['location_id']
-            compiled_scene['location_name'] = resolved_loc['location_name']
-            scene_resolution_mode = 'canonical'
-        else:
-            # Resolved to current (direct)
-            compiled_scene['location_id'] = current_scene.get('location_id')
-            compiled_scene['location_name'] = current_scene.get('location_name')
-            scene_resolution_mode = 'direct'
 
-    compiled_scene['provenance'] = make_provenance(scene_patch, default_tool='resolve_scene_location_patch')
-    compiled_scene['resolution_mode'] = scene_resolution_mode
+    elif loc_status == "unresolved":
+        proposed_id = clean_id(scene_patch.get("location_id"), "")
+        proposed_name = clean_text(scene_patch.get("location_name"), 160)
+        unresolved.append({
+            "kind": "scene_location",
+            "location_id": proposed_id,
+            "location_name": proposed_name,
+            "reason": "unresolved_scene_location",
+            "provenance": make_provenance(scene_patch, default_tool="resolve_scene_location_patch"),
+            "resolution_mode": "unresolved",
+        })
 
-    for field, limit in (('time_of_day', 80), ('immediate_tension', 420)):
+    compiled_scene["provenance"] = make_provenance(scene_patch, default_tool="resolve_scene_location_patch")
+    compiled_scene["resolution_mode"] = scene_resolution_mode
+
+    for field, limit in (("time_of_day", 80), ("immediate_tension", 420)):
         value = clean_text(scene_patch.get(field), limit)
         if value:
             compiled_scene[field] = value
 
+    # ── Compile Active/Departed Cast via Registry ──────────────────────
     active_npc_ids = []
-    for raw_id in scene_patch.get('active_npc_ids') if isinstance(scene_patch.get('active_npc_ids'), list) else []:
-        actor_id = clean_id(raw_id, '')
-        if actor_id and actor_id in known['npc_ids'] and actor_id not in active_npc_ids:
-            active_npc_ids.append(actor_id)
+    for raw_id in scene_patch.get("active_npc_ids") if isinstance(scene_patch.get("active_npc_ids"), list) else []:
+        actor_id = clean_id(raw_id, "")
+        resolved_id = resolve_ref_with_names(actor_id)
+        if resolved_id:
+            if resolved_id in known["npc_ids"] or resolved_id in patch_created_npc_ids or resolved_id in patch_created_entity_ids:
+                if resolved_id not in active_npc_ids:
+                    active_npc_ids.append(resolved_id)
+            else:
+                pass
         elif actor_id:
-            unresolved.append({
-                'kind': 'active_npc',
-                'actor_id': actor_id,
-                'reason': 'unknown_npc_id',
-                'provenance': make_provenance(scene_patch),
-                'resolution_mode': 'unresolved'
-            })
+            if actor_id in patch_created_npc_ids or actor_id in patch_created_entity_ids:
+                if actor_id not in active_npc_ids:
+                    active_npc_ids.append(actor_id)
+            else:
+                unresolved.append({
+                    "kind": "active_npc",
+                    "actor_id": actor_id,
+                    "reason": "unknown_npc_id",
+                    "provenance": make_provenance(scene_patch),
+                    "resolution_mode": "unresolved",
+                })
+
     if active_npc_ids:
-        compiled_scene['active_npc_ids'] = active_npc_ids
+        compiled_scene["active_npc_ids"] = active_npc_ids
+
     departed_npc_ids = []
-    for raw_id in scene_patch.get('departed_npc_ids') if isinstance(scene_patch.get('departed_npc_ids'), list) else []:
-        actor_id = clean_id(raw_id, '')
-        if actor_id and actor_id in known['npc_ids'] and actor_id not in departed_npc_ids:
-            departed_npc_ids.append(actor_id)
+    for raw_id in scene_patch.get("departed_npc_ids") if isinstance(scene_patch.get("departed_npc_ids"), list) else []:
+        actor_id = clean_id(raw_id, "")
+        resolved_id = resolve_ref_with_names(actor_id)
+        if resolved_id:
+            if resolved_id in known["npc_ids"] or resolved_id in patch_created_npc_ids or resolved_id in patch_created_entity_ids:
+                if resolved_id not in departed_npc_ids:
+                    departed_npc_ids.append(resolved_id)
+            else:
+                pass
         elif actor_id:
-            unresolved.append({
-                'kind': 'departed_npc',
-                'actor_id': actor_id,
-                'reason': 'unknown_npc_id',
-                'provenance': make_provenance(scene_patch),
-                'resolution_mode': 'unresolved'
-            })
+            if actor_id in patch_created_npc_ids or actor_id in patch_created_entity_ids:
+                if actor_id not in departed_npc_ids:
+                    departed_npc_ids.append(actor_id)
+            else:
+                unresolved.append({
+                    "kind": "departed_npc",
+                    "actor_id": actor_id,
+                    "reason": "unknown_npc_id",
+                    "provenance": make_provenance(scene_patch),
+                    "resolution_mode": "unresolved",
+                })
+
     if departed_npc_ids:
-        compiled_scene['departed_npc_ids'] = departed_npc_ids
+        compiled_scene["departed_npc_ids"] = departed_npc_ids
 
-    # Track entity IDs created in this patch to resolve relations and NPC updates
-    patch_created_entity_ids = set()
-    patch_created_npc_ids = set()
-    patch_entity_id_remaps = {}
-
-    # Pre-populate map of name/ID to canonical ID for all existing entities, locations, NPCs, and characters
-    for name_lower, canonical_id in known.get('location_names', {}).items():
-        patch_entity_id_remaps[name_lower] = canonical_id
-
-    for npc in NPCActor.query.filter_by(campaign_id=campaign.id).all():
-        if npc.actor_id:
-            patch_entity_id_remaps[npc.actor_id.lower()] = npc.actor_id
-            if npc.name:
-                patch_entity_id_remaps[npc.name.lower()] = npc.actor_id
-
-    for character in Character.query.filter_by(campaign_id=campaign.id).all():
-        if character.name:
-            patch_entity_id_remaps[character.name.lower()] = clean_id(character.name, '')
-
-    world_payload = _world_payload(campaign)
-    graph = world_payload.get('knowledge_graph') if isinstance(world_payload.get('knowledge_graph'), dict) else {}
-    for entity in graph.get('entities', []):
-        ent_id = clean_id(entity.get('id'), '')
-        ent_name = clean_text(entity.get('name'), 160)
-        if ent_id:
-            patch_entity_id_remaps[ent_id.lower()] = ent_id
-            if ent_name:
-                patch_entity_id_remaps[ent_name.lower()] = ent_id
-
-    def resolve_ref(ref):
-        if not ref:
-            return ''
-        ref_cleaned = clean_id(ref, '')
-        if ref_cleaned in known['entity_ids']:
-            return ref_cleaned
-        if ref_cleaned in patch_entity_id_remaps:
-            return patch_entity_id_remaps[ref_cleaned]
-        ref_lower = str(ref).strip().lower()
-        if ref_lower in patch_entity_id_remaps:
-            return patch_entity_id_remaps[ref_lower]
-        return ''
-
-    # 1. Compile Entity Upserts
-    accepted_entities = []
-    raw_entities = resolved.get('upsert_graph_entities') if isinstance(resolved.get('upsert_graph_entities'), list) else []
-    for index, raw_entity in enumerate(raw_entities):
-        if not isinstance(raw_entity, dict):
-            continue
-        name = clean_text(raw_entity.get('name'), 160)
-        if not name:
-            continue
-        raw_id = clean_id(raw_entity.get('id') or raw_entity.get('entity_id'), '')
-        
-        is_known = raw_id in known['entity_ids']
-        if not raw_id or not is_known:
-            # New entity: generate server-side from validated name, do not trust model-supplied unknown ID
-            entity_id = clean_id(name.lower().replace(' ', '_'), '') or f"entity_{index + 1}"
-            resolution_mode = 'direct'
-        else:
-            entity_id = raw_id
-            resolution_mode = 'canonical'
-            
-        if raw_id:
-            patch_entity_id_remaps[raw_id] = entity_id
-            patch_entity_id_remaps[raw_id.lower()] = entity_id
-        patch_entity_id_remaps[entity_id] = entity_id
-        patch_entity_id_remaps[clean_id(name, '')] = entity_id
-        patch_entity_id_remaps[name.lower()] = entity_id
-        patch_created_entity_ids.add(entity_id)
-        
-        entity_type = clean_text(raw_entity.get('type'), 40).lower() or 'other'
-        if entity_type in ('npc', 'person'):
-            patch_created_npc_ids.add(entity_id)
-
-        accepted_entities.append({
-            'id': entity_id,
-            'name': name,
-            'type': entity_type,
-            'summary': clean_text(raw_entity.get('summary'), 500) or None,
-            'tags': [clean_text(t, 40) for t in raw_entity.get('tags') if clean_text(t, 40)] if isinstance(raw_entity.get('tags'), list) else [],
-            'visibility': _normalize_visibility(raw_entity.get('source_surface'), raw_entity.get('intended_visibility')),
-            'certainty': _normalize_certainty(raw_entity.get('certainty')),
-            'importance': _normalize_importance(raw_entity.get('importance')),
-            'expires_or_retire_condition': clean_text(raw_entity.get('expires_or_retire_condition'), 520) or None,
-            'reason': clean_text(raw_entity.get('reason'), 420) or 'Resolved staged memory entity.',
-            'memory_type': 'entity',
-            'provenance': make_provenance(raw_entity, default_tool='get_entity_candidates'),
-            'resolution_mode': raw_entity.get('resolution_mode') or resolution_mode
-        })
-
-    # 2. Compile Relation Upserts
+    # ── Compile Relations via Registry ─────────────────────────────────
     accepted_relations = []
-    raw_relations = resolved.get('upsert_graph_relations') if isinstance(resolved.get('upsert_graph_relations'), list) else []
+    raw_relations = resolved.get("upsert_graph_relations") if isinstance(resolved.get("upsert_graph_relations"), list) else []
     for index, raw_rel in enumerate(raw_relations):
         if not isinstance(raw_rel, dict):
             continue
-        rel_type = clean_id(raw_rel.get('type'), '')
-        raw_source = raw_rel.get('source_id') or raw_rel.get('source_ref') or ''
-        raw_target = raw_rel.get('target_id') or raw_rel.get('target_ref') or ''
-        source_id = resolve_ref(raw_source)
-        target_id = resolve_ref(raw_target)
-        
-        all_valid_entities = known['entity_ids'] | patch_created_entity_ids
-        source_ok = source_id in all_valid_entities
-        target_ok = target_id in all_valid_entities
-        
-        if not source_id or not target_id or not rel_type or not source_ok or not target_ok:
+        rel_type = clean_id(raw_rel.get("type"), "")
+        raw_source = raw_rel.get("source_id") or raw_rel.get("source_ref") or ""
+        raw_target = raw_rel.get("target_id") or raw_rel.get("target_ref") or ""
+        source_id = resolve_ref_with_names(raw_source)
+        target_id = resolve_ref_with_names(raw_target)
+
+        if not source_id or not target_id or not rel_type:
             unresolved_endpoints = []
-            if not source_ok:
-                unresolved_endpoints.append(raw_source or 'missing_source')
-            if not target_ok:
-                unresolved_endpoints.append(raw_target or 'missing_target')
-                
+            if not source_id:
+                unresolved_endpoints.append(raw_source or "missing_source")
+            if not target_id:
+                unresolved_endpoints.append(raw_target or "missing_target")
             unresolved.append({
-                'kind': 'relation',
-                'type': rel_type,
-                'source_id': source_id,
-                'target_id': target_id,
-                'reason': 'unresolved_relation_endpoints',
-                'unresolved_endpoints': unresolved_endpoints,
-                'provenance': make_provenance(raw_rel),
-                'resolution_mode': 'unresolved'
+                "kind": "relation",
+                "type": rel_type,
+                "source_id": source_id or raw_source,
+                "target_id": target_id or raw_target,
+                "reason": "unresolved_relation_endpoints",
+                "unresolved_endpoints": unresolved_endpoints,
+                "provenance": make_provenance(raw_rel),
+                "resolution_mode": "unresolved",
             })
             continue
-            
-        # Use stable hash-based relation ID from type + source_id + target_id to prevent collision/overwrites
-        import hashlib
+
+        all_valid = known["entity_ids"] | patch_created_entity_ids
+        if source_id not in all_valid or target_id not in all_valid:
+            unresolved_endpoints = []
+            if source_id not in all_valid:
+                unresolved_endpoints.append(raw_source or source_id)
+            if target_id not in all_valid:
+                unresolved_endpoints.append(raw_target or target_id)
+            unresolved.append({
+                "kind": "relation",
+                "type": rel_type,
+                "source_id": source_id,
+                "target_id": target_id,
+                "reason": "unresolved_relation_endpoints",
+                "unresolved_endpoints": unresolved_endpoints,
+                "provenance": make_provenance(raw_rel),
+                "resolution_mode": "unresolved",
+            })
+            continue
+
         rel_key = f"{source_id}:{rel_type}:{target_id}".lower()
         stable_rel_id = f"rel_{hashlib.md5(rel_key.encode('utf-8')).hexdigest()[:12]}"
-        
+
         accepted_relations.append({
-            'id': stable_rel_id,
-            'type': rel_type,
-            'source_id': source_id,
-            'target_id': target_id,
-            'summary': clean_text(raw_rel.get('summary'), 500) or None,
-            'visibility': _normalize_visibility(raw_rel.get('source_surface'), raw_rel.get('intended_visibility')),
-            'certainty': _normalize_certainty(raw_rel.get('certainty')),
-            'importance': _normalize_importance(raw_rel.get('importance')),
-            'expires_or_retire_condition': clean_text(raw_rel.get('expires_or_retire_condition'), 520) or None,
-            'reason': clean_text(raw_rel.get('reason'), 420) or 'Resolved staged memory relation.',
-            'memory_type': 'relation',
-            'provenance': make_provenance(raw_rel, default_tool='get_entity_candidates'),
-            'resolution_mode': raw_rel.get('resolution_mode') or 'canonical'
+            "id": stable_rel_id,
+            "type": rel_type,
+            "source_id": source_id,
+            "target_id": target_id,
+            "summary": clean_text(raw_rel.get("summary"), 500) or None,
+            "visibility": _normalize_visibility(raw_rel.get("source_surface"), raw_rel.get("intended_visibility")),
+            "certainty": _normalize_certainty(raw_rel.get("certainty")),
+            "importance": _normalize_importance(raw_rel.get("importance")),
+            "expires_or_retire_condition": clean_text(raw_rel.get("expires_or_retire_condition"), 520) or None,
+            "reason": clean_text(raw_rel.get("reason"), 420) or "Resolved staged memory relation.",
+            "memory_type": "relation",
+            "provenance": make_provenance(raw_rel, default_tool="resolution_registry"),
+            "resolution_mode": raw_rel.get("resolution_mode") or "canonical",
         })
 
-    # 3. Compile NPC Actor Updates
+    # ── Compile NPC Updates via Registry ───────────────────────────────
     accepted_npc_updates = []
-    raw_npc_updates = resolved.get('update_npc_actors') if isinstance(resolved.get('update_npc_actors'), list) else []
+    raw_npc_updates = resolved.get("update_npc_actors") if isinstance(resolved.get("update_npc_actors"), list) else []
     for index, raw_npc in enumerate(raw_npc_updates):
         if not isinstance(raw_npc, dict):
             continue
-        raw_actor_id = raw_npc.get('id') or raw_npc.get('actor_id') or raw_npc.get('actor_ref') or ''
-        actor_id = resolve_ref(raw_actor_id)
-        
-        is_known = actor_id in known['npc_ids'] or actor_id in patch_created_npc_ids
+        raw_actor_id = raw_npc.get("id") or raw_npc.get("actor_id") or raw_npc.get("actor_ref") or ""
+        actor_id = resolve_ref_with_names(raw_actor_id)
+
+        is_known = actor_id in known["npc_ids"] or actor_id in patch_created_npc_ids
         if not actor_id or not is_known:
             unresolved.append({
-                'kind': 'npc_actor',
-                'actor_id': raw_actor_id or 'missing_actor_id',
-                'reason': 'unknown_npc_id',
-                'provenance': make_provenance(raw_npc),
-                'resolution_mode': 'unresolved'
+                "kind": "npc_actor",
+                "actor_id": raw_actor_id or "missing_actor_id",
+                "reason": "unknown_npc_id",
+                "provenance": make_provenance(raw_npc),
+                "resolution_mode": "unresolved",
             })
             continue
-            
+
+        supplied_name = clean_text(raw_npc.get("name"), 200)
+        name_collision = False
+        if supplied_name and actor_id in known["npc_ids"]:
+            existing_name = known.get("npc_names", {}).get(actor_id, "")
+            if existing_name and supplied_name.lower() != existing_name.lower():
+                for other_id, other_name in known.get("npc_names", {}).items():
+                    if other_name.lower() == supplied_name.lower() and other_id != actor_id:
+                        name_collision = True
+                        break
+        if name_collision:
+            unresolved.append({
+                "kind": "npc_actor",
+                "actor_id": actor_id,
+                "reason": "name_collision_with_different_npc",
+                "provenance": make_provenance(raw_npc),
+                "resolution_mode": "unresolved",
+            })
+            continue
+
+        reg_entry = next((e for e in registry if e.get("canonical_id") == actor_id), None)
+        canonical_name_from_registry = reg_entry.get("canonical_name") if reg_entry else None
+
         npc_data = {
-            'id': actor_id,
-            'actor_id': actor_id,
-            'name': clean_text(raw_npc.get('name'), 200) or None,
-            'role': clean_text(raw_npc.get('role'), 200) or None,
-            'public_summary': clean_text(raw_npc.get('public_summary'), 420) or None,
-            'voice': clean_text(raw_npc.get('voice'), 240) or None,
-            'background': clean_text(raw_npc.get('background'), 700) or None,
-            'visibility': _normalize_visibility(raw_npc.get('source_surface'), raw_npc.get('intended_visibility')),
-            'certainty': _normalize_certainty(raw_npc.get('certainty')),
-            'importance': _normalize_importance(raw_npc.get('importance')),
-            'expires_or_retire_condition': clean_text(raw_npc.get('expires_or_retire_condition'), 520) or None,
-            'reason': clean_text(raw_npc.get('reason'), 420) or 'Resolved staged NPC actor update.',
-            'memory_type': clean_text(raw_npc.get('memory_type'), 40).lower() or 'npc',
-            'provenance': make_provenance(raw_npc, default_tool='get_npcs'),
-            'resolution_mode': raw_npc.get('resolution_mode') or 'canonical'
+            "id": actor_id,
+            "actor_id": actor_id,
+            "name": canonical_name_from_registry or clean_text(raw_npc.get("name"), 200) or None,
+            "role": clean_text(raw_npc.get("role"), 200) or None,
+            "public_summary": clean_text(raw_npc.get("public_summary"), 420) or None,
+            "voice": clean_text(raw_npc.get("voice"), 240) or None,
+            "background": clean_text(raw_npc.get("background"), 700) or None,
+            "visibility": _normalize_visibility(raw_npc.get("source_surface"), raw_npc.get("intended_visibility")),
+            "certainty": _normalize_certainty(raw_npc.get("certainty")),
+            "importance": _normalize_importance(raw_npc.get("importance")),
+            "expires_or_retire_condition": clean_text(raw_npc.get("expires_or_retire_condition"), 520) or None,
+            "reason": clean_text(raw_npc.get("reason"), 420) or "Resolved staged NPC actor update.",
+            "memory_type": clean_text(raw_npc.get("memory_type"), 40).lower() or "npc",
+            "provenance": make_provenance(raw_npc, default_tool="resolution_registry"),
+            "resolution_mode": raw_npc.get("resolution_mode") or "canonical",
         }
-        for field, max_items, limit in (
-            ('wants', 6, 180),
-            ('fears', 6, 180),
-            ('secrets', 8, 240),
-        ):
+        for field, max_items, limit in (("wants", 6, 180), ("fears", 6, 180), ("secrets", 8, 240)):
             values = raw_npc.get(field)
             if isinstance(values, list):
                 npc_data[field] = [clean_text(v, limit) for v in values if clean_text(v, limit)]
-                
-        # Support relationships mapping with target resolution
-        rels = raw_npc.get('relationships')
+
+        rels = raw_npc.get("relationships")
         if isinstance(rels, dict):
-            npc_data['relationships'] = {}
+            npc_data["relationships"] = {}
             for target, desc in rels.items():
-                resolved_target = resolve_ref(target)
-                is_target_known = resolved_target in (known['entity_ids'] | patch_created_entity_ids)
-                if resolved_target and is_target_known:
-                    npc_data['relationships'][resolved_target] = clean_text(desc, 300)
+                resolved_target = resolve_ref_with_names(target)
+                if resolved_target and resolved_target in (known["entity_ids"] | patch_created_entity_ids):
+                    npc_data["relationships"][resolved_target] = clean_text(desc, 300)
                 else:
                     unresolved.append({
-                        'kind': 'npc_relationship_target',
-                        'npc_id': actor_id,
-                        'requested_target': target,
-                        'reason': 'unknown_relationship_target',
-                        'provenance': make_provenance(raw_npc),
-                        'resolution_mode': 'unresolved'
+                        "kind": "npc_relationship_target",
+                        "npc_id": actor_id,
+                        "requested_target": target,
+                        "reason": "unknown_relationship_target",
+                        "provenance": make_provenance(raw_npc),
+                        "resolution_mode": "unresolved",
                     })
-            
-        # Support recent offscreen activity
-        roa = raw_npc.get('recent_offscreen_activity')
+
+        roa = raw_npc.get("recent_offscreen_activity")
         if isinstance(roa, list):
-            npc_data['recent_offscreen_activity'] = [
-                clean_text(v, 300) for v in roa if clean_text(v, 300)
-            ]
-        
+            npc_data["recent_offscreen_activity"] = [clean_text(v, 300) for v in roa if clean_text(v, 300)]
+
         npc_data = {k: v for k, v in npc_data.items() if v is not None}
         accepted_npc_updates.append(npc_data)
 
-    # 4. Compile World Event Records
+    # ── Compile World Events ───────────────────────────────────────────
     accepted_events = []
-    raw_events = resolved.get('record_events') if isinstance(resolved.get('record_events'), list) else []
+    raw_events = resolved.get("record_events") if isinstance(resolved.get("record_events"), list) else []
     for raw_event in raw_events:
         if not isinstance(raw_event, dict):
             continue
-        summary = clean_text(raw_event.get('summary'), 1200) or 'Session memory updated.'
+        summary = clean_text(raw_event.get("summary"), 1200) or "Session memory updated."
         accepted_events.append({
-            'event_type': clean_text(raw_event.get('event_type'), 80) or 'session_memory',
-            'summary': summary,
-            'payload': raw_event.get('payload') if isinstance(raw_event.get('payload'), dict) else {},
-            'visibility': _normalize_visibility(raw_event.get('source_surface'), raw_event.get('intended_visibility')),
-            'certainty': _normalize_certainty(raw_event.get('certainty')),
-            'importance': _normalize_importance(raw_event.get('importance')),
-            'expires_or_retire_condition': clean_text(raw_event.get('expires_or_retire_condition'), 520) or None,
-            'reason': clean_text(raw_event.get('reason'), 420) or 'Resolved staged event record.',
-            'memory_type': 'fact',
-            'provenance': make_provenance(raw_event, default_tool='session_memory_record_event'),
-            'resolution_mode': raw_event.get('resolution_mode') or 'direct'
+            "event_type": clean_text(raw_event.get("event_type"), 80) or "session_memory",
+            "summary": summary,
+            "payload": raw_event.get("payload") if isinstance(raw_event.get("payload"), dict) else {},
+            "visibility": _normalize_visibility(raw_event.get("source_surface"), raw_event.get("intended_visibility")),
+            "certainty": _normalize_certainty(raw_event.get("certainty")),
+            "importance": _normalize_importance(raw_event.get("importance")),
+            "expires_or_retire_condition": clean_text(raw_event.get("expires_or_retire_condition"), 520) or None,
+            "reason": clean_text(raw_event.get("reason"), 420) or "Resolved staged event record.",
+            "memory_type": "fact",
+            "provenance": make_provenance(raw_event, default_tool="session_memory_record_event"),
+            "resolution_mode": raw_event.get("resolution_mode") or "direct",
         })
 
-    # 5. Compile Facts
+    # ── Compile Facts via Registry ─────────────────────────────────────
     accepted_facts = []
     skipped_facts = []
-    raw_facts = resolved.get('upsert_graph_facts') if isinstance(resolved.get('upsert_graph_facts'), list) else []
+    raw_facts = resolved.get("upsert_graph_facts") if isinstance(resolved.get("upsert_graph_facts"), list) else []
     for index, raw_fact in enumerate(raw_facts):
         if not isinstance(raw_fact, dict):
             continue
-        text = clean_text(raw_fact.get('text'), 700)
+        text = clean_text(raw_fact.get("text"), 700)
         if not text:
             continue
-        raw_entity_ids = raw_fact.get('entity_ids') if isinstance(raw_fact.get('entity_ids'), list) else []
+        raw_entity_ids = raw_fact.get("entity_ids") if isinstance(raw_fact.get("entity_ids"), list) else []
         entity_ids = []
         unknown_entity_ids = []
         for raw_entity_id in raw_entity_ids:
-            entity_id = resolve_ref(raw_entity_id)
+            entity_id = resolve_ref_with_names(raw_entity_id)
             if not entity_id:
                 unknown_entity_ids.append(raw_entity_id)
                 continue
@@ -865,88 +1470,128 @@ def compile_staged_memory_patch(memory_context, extracted, resolved):
                 entity_ids.append(entity_id)
         if raw_entity_ids and not entity_ids:
             skipped_facts.append({
-                'index': index,
-                'text': text,
-                'reason': 'all_entity_ids_unresolved',
-                'requested_entity_ids': [clean_id(item, '') for item in raw_entity_ids if clean_id(item, '')],
+                "index": index,
+                "text": text,
+                "reason": "all_entity_ids_unresolved",
+                "requested_entity_ids": [clean_id(item, "") for item in raw_entity_ids if clean_id(item, "")],
             })
             unresolved.append({
-                'kind': 'fact',
-                'text': text,
-                'reason': 'all_entity_ids_unresolved',
-                'requested_entity_ids': [clean_id(item, '') for item in raw_entity_ids if clean_id(item, '')],
-                'provenance': make_provenance(raw_fact),
-                'resolution_mode': 'unresolved'
+                "kind": "fact",
+                "text": text,
+                "reason": "all_entity_ids_unresolved",
+                "requested_entity_ids": [clean_id(item, "") for item in raw_entity_ids if clean_id(item, "")],
+                "provenance": make_provenance(raw_fact),
+                "resolution_mode": "unresolved",
             })
             continue
-        fact_id = clean_id(raw_fact.get('id'), '')
-        if fact_id and fact_id not in known['fact_ids']:
-            fact_id = ''
+        if unknown_entity_ids:
+            skipped_facts.append({
+                "index": index,
+                "text": text,
+                "reason": "partial_entity_ids_unresolved",
+                "requested_entity_ids": [clean_id(item, "") for item in raw_entity_ids if clean_id(item, "")],
+                "unknown_entity_ids": unknown_entity_ids,
+            })
+            unresolved.append({
+                "kind": "fact",
+                "text": text,
+                "reason": "partial_entity_ids_unresolved",
+                "requested_entity_ids": [clean_id(item, "") for item in raw_entity_ids if clean_id(item, "")],
+                "unknown_entity_ids": unknown_entity_ids,
+                "provenance": make_provenance(raw_fact),
+                "resolution_mode": "unresolved",
+            })
+            continue
+        fact_id = clean_id(raw_fact.get("id"), "")
+        if fact_id and fact_id not in known["fact_ids"]:
+            fact_id = ""
         accepted_facts.append({
-            'id': fact_id or f'fact_{index + 1}',
-            'entity_ids': entity_ids,
-            'text': text,
-            'visibility': _normalize_visibility(raw_fact.get('source_surface'), raw_fact.get('intended_visibility')),
-            'certainty': _normalize_certainty(raw_fact.get('certainty')),
-            'importance': _normalize_importance(raw_fact.get('importance')),
-            'expires_or_retire_condition': clean_text(raw_fact.get('expires_or_retire_condition'), 520) or None,
-            'reason': clean_text(raw_fact.get('reason'), 420) or 'Resolved staged memory fact.',
-            'memory_type': clean_text(raw_fact.get('memory_type'), 40).lower() or 'fact',
-            'provenance': make_provenance(raw_fact, default_tool='get_entity_candidates'),
-            'resolution_mode': raw_fact.get('resolution_mode') or ('canonical' if entity_ids else 'direct')
+            "id": fact_id or f"fact_{index + 1}",
+            "entity_ids": entity_ids,
+            "text": text,
+            "visibility": _normalize_visibility(raw_fact.get("source_surface"), raw_fact.get("intended_visibility")),
+            "certainty": _normalize_certainty(raw_fact.get("certainty")),
+            "importance": _normalize_importance(raw_fact.get("importance")),
+            "expires_or_retire_condition": clean_text(raw_fact.get("expires_or_retire_condition"), 520) or None,
+            "reason": clean_text(raw_fact.get("reason"), 420) or "Resolved staged memory fact.",
+            "memory_type": clean_text(raw_fact.get("memory_type"), 40).lower() or "fact",
+            "provenance": make_provenance(raw_fact, default_tool="resolution_registry"),
+            "resolution_mode": raw_fact.get("resolution_mode") or ("canonical" if entity_ids else "direct"),
         })
         if unknown_entity_ids:
-            unresolved.append({
-                'kind': 'fact_entity_refs',
-                'text': text,
-                'reason': 'partial_entity_resolution',
-                'unknown_entity_ids': unknown_entity_ids,
-                'provenance': make_provenance(raw_fact),
-                'resolution_mode': 'unresolved'
-            })
+            # Already skipped above via continue
+            pass
 
-    # Preserve any incoming create_clocks or retire_clocks if present, populating their metadata
+    # ── Compile Clocks ─────────────────────────────────────────────────
     create_clocks = []
-    for raw_clock in resolved.get('create_clocks') or []:
+    for raw_clock in resolved.get("create_clocks") or []:
         if isinstance(raw_clock, dict):
             create_clocks.append({
                 **raw_clock,
-                'provenance': make_provenance(raw_clock, default_tool='session_memory_update_clocks'),
-                'resolution_mode': raw_clock.get('resolution_mode') or 'inferred'
+                "provenance": make_provenance(raw_clock, default_tool="session_memory_update_clocks"),
+                "resolution_mode": raw_clock.get("resolution_mode") or "inferred",
             })
 
     retire_clocks = []
-    for raw_clock in resolved.get('retire_clocks') or []:
+    for raw_clock in resolved.get("retire_clocks") or []:
         if isinstance(raw_clock, dict):
             retire_clocks.append({
                 **raw_clock,
-                'provenance': make_provenance(raw_clock, default_tool='session_memory_update_clocks'),
-                'resolution_mode': raw_clock.get('resolution_mode') or 'inferred'
+                "provenance": make_provenance(raw_clock, default_tool="session_memory_update_clocks"),
+                "resolution_mode": raw_clock.get("resolution_mode") or "inferred",
             })
 
-    return {
-        'running_summary': running_summary,
-        'memory_anchors': compiled_anchors,
-        'scene_patch': compiled_scene,
-        'scene_reason': clean_text(
-            resolved.get('scene_reason') or extracted.get('scene_reason'),
+    # ── Build Compiled Patch ───────────────────────────────────────────
+    compiled_patch = {
+        "running_summary": running_summary,
+        "memory_anchors": compiled_anchors,
+        "scene_patch": compiled_scene,
+        "scene_reason": clean_text(
+            resolved.get("scene_reason") or extracted.get("scene_reason"),
             420,
         ) or None,
-        'upsert_graph_entities': accepted_entities,
-        'upsert_graph_relations': accepted_relations,
-        'upsert_graph_facts': accepted_facts,
-        'create_clocks': create_clocks,
-        'retire_clocks': retire_clocks,
-        'update_npc_actors': accepted_npc_updates,
-        'record_events': accepted_events,
-        'unresolved_items': unresolved,
-        'compile_summary': {
-            'accepted_fact_count': len(accepted_facts),
-            'skipped_fact_count': len(skipped_facts),
-            'resolved_entity_ref_count': len(resolved.get('resolved_entity_refs') if isinstance(resolved.get('resolved_entity_refs'), list) else []),
-            'resolved_location_ref_count': len(resolved.get('resolved_location_refs') if isinstance(resolved.get('resolved_location_refs'), list) else []),
+        "upsert_graph_entities": accepted_entities,
+        "upsert_graph_relations": accepted_relations,
+        "upsert_graph_facts": accepted_facts,
+        "create_clocks": create_clocks,
+        "retire_clocks": retire_clocks,
+        "update_npc_actors": accepted_npc_updates,
+        "record_events": accepted_events,
+        "unresolved_items": unresolved,
+        "compile_summary": {
+            "accepted_fact_count": len(accepted_facts),
+            "skipped_fact_count": len(skipped_facts),
+            "accepted_entity_count": len(accepted_entities),
+            "accepted_relation_count": len(accepted_relations),
+            "accepted_npc_count": len(accepted_npc_updates),
+            "registry_size": len(registry),
+            "clarification_count": len(clarification_requests),
         },
-        'evidence_basis': resolved.get('evidence_basis') if isinstance(resolved.get('evidence_basis'), list) else [],
-        'resolved_entity_refs': resolved.get('resolved_entity_refs') if isinstance(resolved.get('resolved_entity_refs'), list) else [],
-        'resolved_location_refs': resolved.get('resolved_location_refs') if isinstance(resolved.get('resolved_location_refs'), list) else [],
+        "resolution_diagnostics": diagnostics,
+        "resolution_records": resolution_records,
+        "clarification_requests": clarification_requests,
+        "registry": registry,
+        "source_contract": SOURCE_CONTRACT_COMPILED_V2,
+        "base_memory_revision": _get_memory_revision(campaign),
+        "evidence_basis": resolved.get("evidence_basis") if isinstance(resolved.get("evidence_basis"), list) else [],
+        "resolved_entity_refs": resolved.get("resolved_entity_refs") if isinstance(resolved.get("resolved_entity_refs"), list) else [],
+        "resolved_location_refs": resolved.get("resolved_location_refs") if isinstance(resolved.get("resolved_location_refs"), list) else [],
+        "consumed_clarification_ids": consumed_clarification_ids,
     }
+
+    # ── Final-State Validation ─────────────────────────────────────────
+    validation_errors = _validate_final_memory_state(compiled_patch, registry_map, known, campaign)
+    if validation_errors:
+        raise MemoryPipelineError(
+            stage="compilation",
+            code="final_state_validation_failed",
+            message=f"Final-state validation failed: {'; '.join(validation_errors[:5])}",
+            telemetry={"validation_errors": validation_errors},
+        )
+
+    # ── Validate diagnostics ───────────────────────────────────────────
+    diag_valid, diag_error = validate_diagnostics(diagnostics)
+    if not diag_valid:
+        compiled_patch["diagnostics_error"] = diag_error
+
+    return compiled_patch
