@@ -816,6 +816,24 @@ def execute_run(args, run_id):
     hb_thread.join(timeout=5)
     lease_token = _init_lease_token[0]
     manifest = build_manifest_for_run(args.api_base, args.owner_api_key, claim_payload)
+
+    resume_dm_wait_message_id = None
+    resume_reconciliation_active = False
+    reconciliation_player_message_id = run.get('reconciliation_player_message_id')
+    reconciliation_deadline_str = run.get('reconciliation_deadline')
+    reconciliation_started_at_str = run.get('reconciliation_started_at')
+    reconciliation_timeout_phase = run.get('reconciliation_timeout_phase')
+    reconciliation_timeout_error_str = run.get('reconciliation_timeout_error')
+    reconciliation_deadline_utc = None
+    reconciliation_started_at_utc = None
+
+    if reconciliation_player_message_id and reconciliation_deadline_str:
+        reconciliation_deadline_utc = parse_utc_iso(reconciliation_deadline_str)
+        reconciliation_started_at_utc = parse_utc_iso(reconciliation_started_at_str)
+        if reconciliation_deadline_utc:
+            resume_reconciliation_active = True
+            resume_dm_wait_message_id = reconciliation_player_message_id
+
     visible_timeout, post_turn_timeout = dm_response_state.resolve_dm_response_timeouts(args)
     append_event(
         args.api_base,
@@ -832,6 +850,11 @@ def execute_run(args, run_id):
         },
         status='running',
         dedupe_key=f'run_started:{run_id}:attempt:{run.get("attempt_count")}',
+        reconciliation_player_message_id=reconciliation_player_message_id if resume_reconciliation_active else None,
+        reconciliation_timeout_phase=reconciliation_timeout_phase if resume_reconciliation_active else None,
+        reconciliation_timeout_error=reconciliation_timeout_error_str if resume_reconciliation_active else None,
+        reconciliation_started_at=reconciliation_started_at_str if resume_reconciliation_active else None,
+        reconciliation_deadline=reconciliation_deadline_str if resume_reconciliation_active else None,
     )
 
     start_time = time.monotonic()
@@ -850,21 +873,6 @@ def execute_run(args, run_id):
 
     run_config = runner_config(claim_payload)
     max_turns = run_config.get('max_turns') or run_config.get('max_cycles') or args.max_turns
-
-    resume_dm_wait_message_id = None
-    resume_reconciliation_active = False
-    reconciliation_player_message_id = run.get('reconciliation_player_message_id')
-    reconciliation_deadline_str = run.get('reconciliation_deadline')
-    reconciliation_started_at_str = run.get('reconciliation_started_at')
-    reconciliation_deadline_utc = None
-    reconciliation_started_at_utc = None
-
-    if reconciliation_player_message_id and reconciliation_deadline_str:
-        reconciliation_deadline_utc = parse_utc_iso(reconciliation_deadline_str)
-        reconciliation_started_at_utc = parse_utc_iso(reconciliation_started_at_str)
-        if reconciliation_deadline_utc:
-            resume_reconciliation_active = True
-            resume_dm_wait_message_id = reconciliation_player_message_id
 
     if session_on_start and not resume_reconciliation_active:
         latest_player_message_id = autonomous.find_latest_player_message_id(session_on_start.get('messages') or [])

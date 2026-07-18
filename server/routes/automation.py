@@ -1570,12 +1570,16 @@ def append_automation_run_event(current_user, run_id):
         if data.get('reconciliation_deadline'):
             run.reconciliation_deadline = datetime.fromisoformat(data['reconciliation_deadline'].replace('Z', '+00:00')).replace(tzinfo=None)
     elif run.status in {'running', 'completed', 'failed', 'stopped'}:
-        # Clear reconciliation state once recovered, failed, completed, or stopped
-        run.reconciliation_player_message_id = None
-        run.reconciliation_timeout_phase = None
-        run.reconciliation_timeout_error = None
-        run.reconciliation_started_at = None
-        run.reconciliation_deadline = None
+        has_explicit_reconciliation = (
+            data.get('reconciliation_player_message_id') is not None
+            or data.get('reconciliation_deadline') is not None
+        )
+        if not has_explicit_reconciliation:
+            run.reconciliation_player_message_id = None
+            run.reconciliation_timeout_phase = None
+            run.reconciliation_timeout_error = None
+            run.reconciliation_started_at = None
+            run.reconciliation_deadline = None
 
     try:
         event_row, created = append_run_event(
