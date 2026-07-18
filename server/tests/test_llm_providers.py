@@ -415,21 +415,26 @@ class CrossProviderWorkflowParityTest(unittest.TestCase):
         self.assertIn('session_dm_response', operations)
         self.assertTrue(any(c['has_tools'] for c in baselines['openrouter']))
 
-    def test_dm_loop_accepts_explicit_adapter_without_workflow_changes(self):
+    def test_dm_loop_binds_explicit_adapter_for_all_subcalls(self):
+        """DMExecutionLoop(adapter) must use that adapter for preflight,
+        guards, and the main generation — not just the main call."""
         import openrouter
 
-        seen = {}
+        calls = []
 
-        def fake_post_chat_response(messages, **kwargs):
-            seen['provider'] = kwargs.get('provider')
-            seen['model'] = kwargs.get('model')
-            return _finalizer_speak_response()
+        def fake_execute_chat(adapter, request, hooks=None):
+            calls.append((adapter.name, request.model, bool(request.tools)))
+            if request.tools:
+                return adapter.parse_response(_finalizer_speak_response())
+            return adapter.parse_response({'choices': [{'message': {'content': (
+                '{"dm_reply_mode": "unknown", "skip_spoiler_check": true,'
+                ' "main_call_thinking": false, "confidence": "low", "reason": "test"}'
+            )}}]})
 
-        with patch.dict(os.environ, {'FAKE_MODEL': 'fake-model'}), \
+        with patch.dict(os.environ, {'FAKE_API_KEY': 'fake-key', 'FAKE_MODEL': 'fake-model'}), \
                 patch('openrouter.get_llm_provider', return_value='openrouter'), \
-                patch('openrouter.get_llm_model', return_value='test-model'), \
-                patch('openrouter.get_session_preflight_decision', return_value={'main_call_thinking': True}), \
-                patch('openrouter._post_chat_response', side_effect=fake_post_chat_response):
+                patch('openrouter.get_llm_model', return_value='global-model'), \
+                patch('openrouter.execute_chat', side_effect=fake_execute_chat):
             decision = openrouter.DMExecutionLoop(provider_registry.get('fake')).run(
                 {},
                 [],
@@ -437,8 +442,13 @@ class CrossProviderWorkflowParityTest(unittest.TestCase):
                 lambda *args, **kwargs: {},
                 audit_context={'operation': 'session_dm_response'},
             )
+
         self.assertEqual(decision['mode'], 'speak')
-        self.assertEqual(seen, {'provider': 'fake', 'model': 'fake-model'})
+        # Preflight (json subcall), the main tool call, and any guard subcalls
+        # must all have gone through the fake adapter — never the global one.
+        self.assertTrue(any(has_tools for _, _, has_tools in calls))
+        self.assertTrue(any(not has_tools for _, _, has_tools in calls))
+        self.assertEqual({(name, model) for name, model, _ in calls}, {('fake', 'fake-model')})
 
     def _run_staged_memory_with_recorder(self, provider):
         import openrouter
@@ -489,6 +499,149 @@ class CrossProviderWorkflowParityTest(unittest.TestCase):
             baselines[provider] = stages
         self.assertEqual(baselines['openrouter'], baselines['opencode_go'])
         self.assertEqual(baselines['openrouter'], baselines['fake'])
+
+
+class CapabilityGatingTest(unittest.TestCase):
+    """Declared capabilities must be authoritative: an adapter that declares a
+    feature unsupported must not receive its payload fields."""
+
+    class LimitedAdapter(LLMProviderAdapter):
+        name = 'limited'
+        env_prefix = 'LIMITED'
+        default_base_url = 'https://limited.example/chat'
+
+        def capabilities_for(self, model):
+            from llm_providers import ProviderCapabilities
+            return ProviderCapabilities(
+                supports_json_mode=False,
+                supports_parallel_tool_calls=False,
+            )
+
+    def test_parallel_tool_calls_omitted_when_unsupported(self):
+        adapter = self.LimitedAdapter()
+        request = ProviderRequest(
+            messages=[{'role': 'user', 'content': 'hi'}],
+            model='m',
+            tools=[{'type': 'function', 'function': {'name': 'talk'}}],
+            tool_choice='auto',
+            parallel_tool_calls=False,
+        )
+        payload = adapter.build_payload(request)
+        self.assertNotIn('parallel_tool_calls', payload)
+        self.assertEqual(payload['tool_choice'], 'auto')
+
+    def test_json_mode_rejected_when_unsupported(self):
+        adapter = self.LimitedAdapter()
+        request = ProviderRequest(messages=[], model='m', json_mode=True)
+        with self.assertRaises(ProviderError) as ctx:
+            adapter.build_payload(request)
+        self.assertEqual(ctx.exception.kind, 'unsupported_feature')
+        self.assertFalse(ctx.exception.retryable)
+
+    def test_openrouter_declares_and_sends_both(self):
+        adapter = OpenRouterAdapter()
+        request = ProviderRequest(
+            messages=[], model='m', json_mode=True,
+            tools=[{'type': 'function', 'function': {'name': 'talk'}}],
+            parallel_tool_calls=False,
+        )
+        payload = adapter.build_payload(request)
+        self.assertEqual(payload['response_format'], {'type': 'json_object'})
+        self.assertEqual(payload['parallel_tool_calls'], False)
+
+
+class MessageViewTest(unittest.TestCase):
+    def test_message_view_built_from_normalized_fields(self):
+        adapter = OpenRouterAdapter()
+        data = {
+            'choices': [{
+                'message': {
+                    'content': None,
+                    'reasoning_content': 'thinking',
+                    'tool_calls': [{
+                        'id': 'call_1',
+                        'type': 'function',
+                        'function': {'name': 'get_clock', 'arguments': '{"a": 1}'},
+                    }],
+                },
+                'finish_reason': 'tool_calls',
+            }],
+        }
+        view = adapter.parse_response(data).message_view()
+        self.assertEqual(view['content'], '')
+        self.assertEqual(view['reasoning_content'], 'thinking')
+        self.assertEqual(view['tool_calls'], [{
+            'id': 'call_1',
+            'type': 'function',
+            'function': {'name': 'get_clock', 'arguments': '{"a": 1}'},
+        }])
+        # The view must not alias the provider's native structures.
+        self.assertIsNot(view['tool_calls'][0], data['choices'][0]['message']['tool_calls'][0])
+
+
+class StreamRetryTest(unittest.TestCase):
+    def test_stream_retries_pre_emission_transient_failure(self):
+        adapter = OpenRouterAdapter()
+        retries = []
+
+        class Hooks:
+            def on_retry(self, attempt, max_attempts, delay_seconds, error):
+                retries.append(attempt)
+
+            def on_error(self, error):
+                raise AssertionError('on_error should not fire')
+
+        lines = ['data: {"choices": [{"delta": {"content": "ok"}}]}', 'data: [DONE]']
+        with patch.dict(os.environ, {'OPENROUTER_API_KEY': 'k'}), \
+                patch('llm_providers.requests.post', side_effect=[FakeResponse(429), FakeResponse(200, lines=lines)]) as post, \
+                patch('llm_providers.time.sleep'):
+            events = list(stream_chat(adapter, ProviderRequest(messages=[], model='m'), hooks=Hooks()))
+        self.assertEqual(post.call_count, 2)
+        self.assertEqual(retries, [1])
+        self.assertEqual([e.text for e in events if e.kind == 'token'], ['ok'])
+
+    def test_stream_does_not_retry_permanent_failure(self):
+        adapter = OpenRouterAdapter()
+        errors = []
+
+        class Hooks:
+            def on_retry(self, *args):
+                raise AssertionError('on_retry should not fire')
+
+            def on_error(self, error):
+                errors.append(repr(error))
+
+        with patch.dict(os.environ, {'OPENROUTER_API_KEY': 'k'}), \
+                patch('llm_providers.requests.post', return_value=FakeResponse(400)) as post, \
+                patch('llm_providers.time.sleep'):
+            with self.assertRaises(requests.HTTPError):
+                list(stream_chat(adapter, ProviderRequest(messages=[], model='m'), hooks=Hooks()))
+        self.assertEqual(post.call_count, 1)
+        self.assertEqual(len(errors), 1)
+
+    def test_stream_mid_stream_failure_not_retried(self):
+        adapter = OpenRouterAdapter()
+        errors = []
+
+        class Hooks:
+            def on_retry(self, *args):
+                raise AssertionError('mid-stream failures must not retry')
+
+            def on_error(self, error):
+                errors.append(repr(error))
+
+        class BrokenStream(FakeResponse):
+            def iter_lines(self, decode_unicode=True):
+                yield 'data: {"choices": [{"delta": {"content": "partial"}}]}'
+                raise requests.ConnectionError('stream dropped')
+
+        with patch.dict(os.environ, {'OPENROUTER_API_KEY': 'k'}), \
+                patch('llm_providers.requests.post', return_value=BrokenStream(200)) as post, \
+                patch('llm_providers.time.sleep'):
+            with self.assertRaises(requests.ConnectionError):
+                list(stream_chat(adapter, ProviderRequest(messages=[], model='m'), hooks=Hooks()))
+        self.assertEqual(post.call_count, 1)
+        self.assertEqual(len(errors), 1)
 
 
 if __name__ == '__main__':

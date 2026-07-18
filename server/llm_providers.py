@@ -100,6 +100,29 @@ class NormalizedChatResponse:
     reasoning_details: object
     raw: dict
 
+    def message_view(self):
+        """Canonical assistant-message payload for workflow consumption.
+
+        Built solely from normalized fields, so workflows never need to index
+        the provider's native response shape. ``raw`` remains available for
+        audit/debugging only.
+        """
+        message = {'content': self.content}
+        if self.tool_calls:
+            message['tool_calls'] = [
+                {
+                    'id': tool_call.id,
+                    'type': 'function',
+                    'function': {'name': tool_call.name, 'arguments': tool_call.arguments},
+                }
+                for tool_call in self.tool_calls
+            ]
+        if self.reasoning:
+            message['reasoning_content'] = self.reasoning
+        if self.reasoning_details is not None:
+            message['reasoning_details'] = self.reasoning_details
+        return message
+
 
 @dataclass
 class NormalizedStreamEvent:
@@ -112,7 +135,7 @@ class ProviderError(Exception):
 
     ``retryable`` distinguishes transient transport failures from permanent
     ones; ``kind`` is one of 'http', 'connection', 'timeout', 'malformed',
-    'config'.
+    'config', 'unsupported_feature'.
     """
 
     def __init__(self, message, *, provider=None, status_code=None, retryable=False, kind='http', original=None):
@@ -188,6 +211,12 @@ class LLMProviderAdapter:
         return options
 
     def build_payload(self, request):
+        capabilities = self.capabilities_for(request.model)
+        if request.json_mode and not capabilities.supports_json_mode:
+            raise ProviderError(
+                f'Provider {self.name} does not support JSON mode for model {request.model!r}',
+                provider=self.name, kind='unsupported_feature',
+            )
         options = self.payload_options(
             request.model,
             request.tools,
@@ -205,7 +234,7 @@ class LLMProviderAdapter:
             payload['tools'] = request.tools
         if options.get('tool_choice') is not None:
             payload['tool_choice'] = options['tool_choice']
-        if options.get('parallel_tool_calls') is not None:
+        if options.get('parallel_tool_calls') is not None and capabilities.supports_parallel_tool_calls:
             payload['parallel_tool_calls'] = options['parallel_tool_calls']
         if options.get('thinking_enabled'):
             payload['thinking'] = options['thinking']
@@ -431,15 +460,43 @@ def execute_chat(adapter, request, *, hooks=None):
 
 
 def stream_chat(adapter, request, *, hooks=None):
-    """POST a streaming chat completion and yield NormalizedStreamEvents."""
+    """POST a streaming chat completion and yield NormalizedStreamEvents.
+
+    Connection/HTTP failures before any token is emitted are classified and
+    retried like ``execute_chat``. Failures after emission has begun are not
+    retried (the stream is not resumable); they are reported through the hooks
+    and re-raised.
+    """
     adapter.require_config(request.model)
     request.stream = True
-    response = requests.post(
-        adapter.base_url(),
-        headers=adapter.build_headers(),
-        json=adapter.build_payload(request),
-        timeout=request.timeout_seconds,
-        stream=True,
-    )
-    response.raise_for_status()
-    yield from adapter.iter_stream_events(response)
+    payload = adapter.build_payload(request)
+    attempt_limit = max(1, int(request.max_attempts or default_max_attempts()))
+    response = None
+    for attempt in range(1, attempt_limit + 1):
+        try:
+            response = requests.post(
+                adapter.base_url(),
+                headers=adapter.build_headers(),
+                json=payload,
+                timeout=request.timeout_seconds,
+                stream=True,
+            )
+            response.raise_for_status()
+            break
+        except Exception as error:
+            classified = adapter.classify_error(error)
+            if attempt < attempt_limit and classified.retryable:
+                delay_seconds = retry_delay_seconds(attempt)
+                if hooks is not None:
+                    hooks.on_retry(attempt, attempt_limit, delay_seconds, error)
+                time.sleep(delay_seconds)
+                continue
+            if hooks is not None:
+                hooks.on_error(error)
+            raise
+    try:
+        yield from adapter.iter_stream_events(response)
+    except Exception as error:
+        if hooks is not None:
+            hooks.on_error(error)
+        raise

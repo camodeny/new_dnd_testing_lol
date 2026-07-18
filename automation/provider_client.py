@@ -14,15 +14,11 @@ _SERVER_DIR = os.path.abspath(os.path.join(os.path.dirname(__file__), '..', 'ser
 if _SERVER_DIR not in sys.path:
     sys.path.insert(0, _SERVER_DIR)
 
-from llm_providers import LLMProviderAdapter, ProviderRequest, execute_chat, provider_registry  # noqa: E402
+from llm_providers import ProviderRequest, execute_chat, provider_registry  # noqa: E402
 
 
 def resolve_provider_and_model(model=None):
     return provider_registry.resolve_provider_and_model(model)
-
-
-def _extract_text(response_json):
-    return LLMProviderAdapter.extract_text(response_json)
 
 
 def _json_object_from_text(text):
@@ -53,6 +49,8 @@ def post_chat_completion(messages, *, model=None, json_mode=False, timeout_secon
     return {
         'provider': provider,
         'model': resolved_model,
+        'content': normalized.content,
+        # Raw provider payload is kept only for persistence/audit records.
         'response': normalized.raw,
     }
 
@@ -84,7 +82,7 @@ def request_json_decision(system_prompt, prompt, *, model=None, timeout_seconds=
             allow_thinking=allow_thinking,
         )
         response_json = result['response']
-        response_text = _extract_text(response_json)
+        response_text = result['content']
         last_text = response_text
         try:
             decision = _json_object_from_text(response_text)

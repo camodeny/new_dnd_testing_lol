@@ -23,8 +23,8 @@ from models import (
     WorldEvent,
     db,
 )
-from llm_providers import provider_registry
-from openrouter import _post_chat_response, get_llm_model, get_llm_provider
+from llm_providers import ProviderError, provider_registry
+from openrouter import _normalize_workflow_response, _post_chat_response, get_llm_model, get_llm_provider
 from services.automation_service import (
     append_run_event,
     continue_audit_run,
@@ -1457,7 +1457,13 @@ def request_auditor_decision_with_tools(run, cycle, job, config, *, max_tool_rou
             },
         )
         responses.append(data)
-        message, _finish_reason = _choice_message(data)
+        try:
+            message = _normalize_workflow_response(data, provider=provider, model=model).message_view()
+        except ProviderError as err:
+            if err.kind != 'malformed':
+                raise
+            # Choice-less responses flow into the final-JSON repair loop below.
+            message = {}
         tool_calls = message.get('tool_calls') or []
         if tool_calls and tool_round < max_tool_rounds:
             messages.append(_assistant_tool_message(message))
