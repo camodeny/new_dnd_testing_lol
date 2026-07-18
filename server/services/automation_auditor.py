@@ -23,6 +23,7 @@ from models import (
     WorldEvent,
     db,
 )
+from llm_providers import provider_registry
 from openrouter import _post_chat_response, get_llm_model, get_llm_provider
 from services.automation_service import (
     append_run_event,
@@ -50,7 +51,6 @@ DEFAULT_AUDITOR_CONFIG = {
     'required_tools': 'runtime_truth_full',
 }
 SUPPORTED_AUDITOR_MODES = {'manual', 'built_in', 'external'}
-SUPPORTED_PROVIDER_HINTS = {'openrouter', 'opencode_go'}
 
 
 AUDITOR_TOOL_DEFINITIONS = [
@@ -317,16 +317,14 @@ def _safe_int(value, default=0, minimum=None, maximum=None):
     return number
 
 
-def _normalize_provider_hint(value):
-    clean = str(value or '').strip().lower().replace('-', '_')
-    return clean if clean in SUPPORTED_PROVIDER_HINTS else None
-
-
 def resolve_auditor_provider_model(model_hint=None):
     raw = str(model_hint or '').strip()
     if '/' in raw:
         provider_hint, maybe_model = raw.split('/', 1)
-        provider = _normalize_provider_hint(provider_hint)
+        try:
+            provider = provider_registry.get(provider_hint).name
+        except RuntimeError:
+            provider = None
         if provider:
             return provider, maybe_model.strip()
     return get_llm_provider(), raw or get_llm_model()

@@ -541,13 +541,13 @@ class OpenRouterRetryTest(unittest.TestCase):
             'choices': [{'message': {'content': 'ok'}}],
         }
 
-        with patch('openrouter.OPENROUTER_API_KEY', 'test-key'), \
-                patch('openrouter.get_llm_provider', return_value='openrouter'), \
+        with patch('openrouter.get_llm_provider', return_value='openrouter'), \
                 patch('openrouter.get_llm_model', return_value='test-model'), \
-                patch('openrouter.requests.post', side_effect=[
+                patch.dict(os.environ, {'OPENROUTER_API_KEY': 'test-key'}), \
+                patch('llm_providers.requests.post', side_effect=[
                     FakeResponse(404),
                     FakeResponse(200, success),
-                ]) as post, patch('openrouter.time.sleep') as sleep:
+                ]) as post, patch('llm_providers.time.sleep') as sleep:
             result = _post_chat_response([{'role': 'user', 'content': 'hello'}])
 
         self.assertEqual(result, success)
@@ -555,11 +555,11 @@ class OpenRouterRetryTest(unittest.TestCase):
         sleep.assert_called_once_with(1)
 
     def test_post_chat_response_does_not_retry_permanent_400(self):
-        with patch('openrouter.OPENROUTER_API_KEY', 'test-key'), \
-                patch('openrouter.get_llm_provider', return_value='openrouter'), \
+        with patch('openrouter.get_llm_provider', return_value='openrouter'), \
                 patch('openrouter.get_llm_model', return_value='test-model'), \
-                patch('openrouter.requests.post', return_value=FakeResponse(400)) as post, \
-                patch('openrouter.time.sleep') as sleep:
+                patch.dict(os.environ, {'OPENROUTER_API_KEY': 'test-key'}), \
+                patch('llm_providers.requests.post', return_value=FakeResponse(400)) as post, \
+                patch('llm_providers.time.sleep') as sleep:
             with self.assertRaises(requests.HTTPError):
                 _post_chat_response([{'role': 'user', 'content': 'hello'}])
 
@@ -569,8 +569,7 @@ class OpenRouterRetryTest(unittest.TestCase):
 
 class ProviderCompatibilityTest(unittest.TestCase):
     def test_deepseek_thinking_mode_omits_unsupported_tool_controls(self):
-        with patch('openrouter.OPENCODE_GO_THINKING', 'enabled'), \
-                patch('openrouter.OPENCODE_GO_REASONING_EFFORT', 'max'):
+        with patch.dict(os.environ, {'OPENCODE_GO_THINKING': 'enabled', 'OPENCODE_GO_REASONING_EFFORT': 'max'}):
             options = _provider_request_payload_options(
                 'opencode_go',
                 'deepseek-v4-flash',
@@ -619,12 +618,14 @@ class ProviderCompatibilityTest(unittest.TestCase):
             'choices': [{'message': {'content': 'ok'}}],
         }
 
-        with patch('openrouter.OPENCODE_GO_API_KEY', 'go-key'), \
-                patch('openrouter.OPENCODE_GO_THINKING', 'enabled'), \
-                patch('openrouter.OPENCODE_GO_REASONING_EFFORT', 'high'), \
+        with patch.dict(os.environ, {
+                'OPENCODE_GO_API_KEY': 'go-key',
+                'OPENCODE_GO_THINKING': 'enabled',
+                'OPENCODE_GO_REASONING_EFFORT': 'high',
+        }), \
                 patch('openrouter.get_llm_provider', return_value='opencode_go'), \
                 patch('openrouter.get_llm_model', return_value='deepseek-v4-flash'), \
-                patch('openrouter.requests.post', return_value=FakeResponse(200, success)) as post:
+                patch('llm_providers.requests.post', return_value=FakeResponse(200, success)) as post:
             result = _post_chat_response(
                 [{'role': 'user', 'content': 'hello'}],
                 tools=[{'type': 'function', 'function': {'name': 'get_clock'}}],
@@ -646,11 +647,13 @@ class ProviderCompatibilityTest(unittest.TestCase):
             'choices': [{'message': {'content': 'ok'}}],
         }
 
-        with patch('openrouter.OPENCODE_GO_API_KEY', 'go-key'), \
-                patch('openrouter.OPENCODE_GO_THINKING', 'enabled'), \
+        with patch.dict(os.environ, {
+                'OPENCODE_GO_API_KEY': 'go-key',
+                'OPENCODE_GO_THINKING': 'enabled',
+        }), \
                 patch('openrouter.get_llm_provider', return_value='opencode_go'), \
                 patch('openrouter.get_llm_model', return_value='deepseek-v4-flash'), \
-                patch('openrouter.requests.post', return_value=FakeResponse(200, success)) as post:
+                patch('llm_providers.requests.post', return_value=FakeResponse(200, success)) as post:
             result = _post_chat_response(
                 [{'role': 'user', 'content': 'hello'}],
                 allow_thinking=False,
