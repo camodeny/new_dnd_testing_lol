@@ -1599,6 +1599,13 @@ class AutomationRun(db.Model):
     claim_failure_reason = db.Column(db.Text, nullable=True)
     worker_api_base = db.Column(db.String(200), nullable=True)
 
+    # Added columns for durable timeout reconciliation
+    reconciliation_player_message_id = db.Column(db.String(120), nullable=True)
+    reconciliation_timeout_phase = db.Column(db.String(40), nullable=True)
+    reconciliation_timeout_error = db.Column(db.Text, nullable=True)
+    reconciliation_started_at = db.Column(db.DateTime, nullable=True)
+    reconciliation_deadline = db.Column(db.DateTime, nullable=True)
+
     scenario = db.relationship('AutomationScenario', foreign_keys=[scenario_id])
     snapshot = db.relationship('AutomationSnapshot', foreign_keys=[snapshot_id])
     owner = db.relationship('User')
@@ -1833,6 +1840,11 @@ class AutomationRun(db.Model):
             'last_claim_attempt_at': self.last_claim_attempt_at.isoformat() if self.last_claim_attempt_at else None,
             'claim_failure_reason': self.claim_failure_reason,
             'worker_api_base': self.worker_api_base,
+            'reconciliation_player_message_id': self.reconciliation_player_message_id,
+            'reconciliation_timeout_phase': self.reconciliation_timeout_phase,
+            'reconciliation_timeout_error': self.reconciliation_timeout_error,
+            'reconciliation_started_at': self.reconciliation_started_at.isoformat() if self.reconciliation_started_at else None,
+            'reconciliation_deadline': self.reconciliation_deadline.isoformat() if self.reconciliation_deadline else None,
             'completed_turns': completed_turns_count,
             'turn_count': completed_turns_count,
             'audit_pause_summary': self.get_audit_pause_summary(),

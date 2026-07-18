@@ -4562,6 +4562,56 @@ class AutomationRouteTest(unittest.TestCase):
             self.assertEqual(narrative['status'], 'pass')
             self.assertEqual(narrative['score'], 1.0)
 
+    def test_reconciliation_lease_expiry_and_reclaim(self):
+        run_id, token = self._claim_for_credential_tests()
+        start_time = utcnow()
+        deadline = start_time + timedelta(seconds=30)
+
+        resp = self.client.post(
+            f'/api/automation/runs/{run_id}/events',
+            headers=self.headers,
+            json={
+                'worker_id': 'cred-test-worker',
+                'lease_token': token,
+                'event_type': 'dm_turn_reconciliation_started',
+                'status': 'reconciling',
+                'reconciliation_player_message_id': 'msg-123',
+                'reconciliation_timeout_phase': 'post_turn',
+                'reconciliation_timeout_error': 'dm_post_turn_timeout',
+                'reconciliation_started_at': start_time.isoformat(),
+                'reconciliation_deadline': deadline.isoformat(),
+            }
+        )
+        self.assertEqual(resp.status_code, 201)
+
+        with app.app_context():
+            run = db.session.get(AutomationRun, run_id)
+            self.assertEqual(run.status, 'reconciling')
+            self.assertEqual(run.reconciliation_player_message_id, 'msg-123')
+            self.assertEqual(run.reconciliation_timeout_phase, 'post_turn')
+            self.assertEqual(run.reconciliation_timeout_error, 'dm_post_turn_timeout')
+            self.assertEqual(run.reconciliation_started_at, start_time)
+            self.assertEqual(run.reconciliation_deadline, deadline)
+
+            # Expire lease
+            run.lease_expires_at = utcnow() - timedelta(seconds=5)
+            db.session.commit()
+
+        reclaim_resp = self.client.post(
+            f'/api/automation/runs/{run_id}/claim',
+            headers=self.headers,
+            json={'worker_id': 'new-worker-id'},
+        )
+        self.assertEqual(reclaim_resp.status_code, 200)
+
+        reclaim_json = reclaim_resp.get_json()
+        reclaim_run = reclaim_json['run']
+        self.assertEqual(reclaim_run['status'], 'claimed')
+        self.assertEqual(reclaim_run['reconciliation_player_message_id'], 'msg-123')
+        self.assertEqual(reclaim_run['reconciliation_timeout_phase'], 'post_turn')
+        self.assertEqual(reclaim_run['reconciliation_timeout_error'], 'dm_post_turn_timeout')
+        self.assertEqual(reclaim_run['reconciliation_deadline'], deadline.isoformat())
+
 
 if __name__ == '__main__':
     unittest.main()

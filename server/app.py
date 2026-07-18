@@ -293,6 +293,16 @@ def ensure_lightweight_schema():
             db.session.execute(text('ALTER TABLE automation_runs ADD COLUMN claim_failure_reason TEXT'))
         if 'worker_api_base' not in automation_run_columns:
             db.session.execute(text('ALTER TABLE automation_runs ADD COLUMN worker_api_base VARCHAR(200)'))
+        if 'reconciliation_player_message_id' not in automation_run_columns:
+            db.session.execute(text('ALTER TABLE automation_runs ADD COLUMN reconciliation_player_message_id VARCHAR(120)'))
+        if 'reconciliation_timeout_phase' not in automation_run_columns:
+            db.session.execute(text('ALTER TABLE automation_runs ADD COLUMN reconciliation_timeout_phase VARCHAR(40)'))
+        if 'reconciliation_timeout_error' not in automation_run_columns:
+            db.session.execute(text('ALTER TABLE automation_runs ADD COLUMN reconciliation_timeout_error TEXT'))
+        if 'reconciliation_started_at' not in automation_run_columns:
+            db.session.execute(text('ALTER TABLE automation_runs ADD COLUMN reconciliation_started_at DATETIME'))
+        if 'reconciliation_deadline' not in automation_run_columns:
+            db.session.execute(text('ALTER TABLE automation_runs ADD COLUMN reconciliation_deadline DATETIME'))
 
     automation_event_columns = table_columns('automation_run_events')
     if automation_event_columns:

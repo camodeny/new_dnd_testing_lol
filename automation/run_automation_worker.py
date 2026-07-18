@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
 import argparse
+from datetime import datetime, timedelta
 import os
 import socket
 import sys
@@ -109,7 +110,23 @@ def heartbeat(api_base, owner_api_key, run_id, worker_id, lease_token, lease_sec
     )
 
 
-def append_event(api_base, owner_api_key, run_id, worker_id, lease_token, event_type, payload=None, status=None, error_text=None, dedupe_key=None):
+def append_event(
+    api_base,
+    owner_api_key,
+    run_id,
+    worker_id,
+    lease_token,
+    event_type,
+    payload=None,
+    status=None,
+    error_text=None,
+    dedupe_key=None,
+    reconciliation_player_message_id=None,
+    reconciliation_timeout_phase=None,
+    reconciliation_timeout_error=None,
+    reconciliation_started_at=None,
+    reconciliation_deadline=None,
+):
     body = {
         'event_type': event_type,
         'payload': payload or {},
@@ -121,6 +138,16 @@ def append_event(api_base, owner_api_key, run_id, worker_id, lease_token, event_
         body['status'] = status
     if error_text is not None:
         body['error_text'] = error_text
+    if reconciliation_player_message_id is not None:
+        body['reconciliation_player_message_id'] = reconciliation_player_message_id
+    if reconciliation_timeout_phase is not None:
+        body['reconciliation_timeout_phase'] = reconciliation_timeout_phase
+    if reconciliation_timeout_error is not None:
+        body['reconciliation_timeout_error'] = reconciliation_timeout_error
+    if reconciliation_started_at is not None:
+        body['reconciliation_started_at'] = reconciliation_started_at
+    if reconciliation_deadline is not None:
+        body['reconciliation_deadline'] = reconciliation_deadline
     return api_post(api_base, f'/api/automation/runs/{run_id}/events', body, api_key=owner_api_key)
 
 
@@ -494,14 +521,16 @@ def _reconcile_dm_turn_timeout(
     timeout_error,
     timeout_evidence,
     maybe_heartbeat_fn,
+    resumed_deadline_utc=None,
+    resumed_started_at_utc=None,
 ):
     """Give a timed-out DM turn a bounded window to finish before failing the run.
 
-    Returns (recovered_status, stop_state, terminal_error):
+    Returns (recovered_status, stop_action, terminal_error):
     - recovered: (status_dict, None, None) — the turn finished inside the window;
       the caller should continue the normal after-DM flow with this status.
-    - external stop: (None, run_state, None) — the run was stopped/terminated
-      externally during reconciliation; the caller should stop, not fail.
+    - external stop: (None, 'stop_requested' | 'already_terminal', None) — the run
+      was stopped/terminated externally; the caller should exit cleanly.
     - exhausted: (None, None, error_text) — the window elapsed or the turn
       errored; the caller should finalize the run as failed with error_text.
     """
@@ -511,8 +540,20 @@ def _reconcile_dm_turn_timeout(
         float(getattr(args, 'dm_late_completion_reconciliation_seconds', 30.0)),
     )
     claim_run_state = (claim_payload.get('run') or {}) if isinstance(claim_payload, dict) else {}
-    started_monotonic = time.monotonic()
-    deadline = started_monotonic + reconciliation_seconds
+    
+    now_utc = datetime.utcnow()
+    if resumed_deadline_utc is not None:
+        started_utc = resumed_started_at_utc or now_utc
+        deadline_utc = resumed_deadline_utc
+        remaining_seconds = (deadline_utc - now_utc).total_seconds()
+        started_monotonic = time.monotonic() - (now_utc - started_utc).total_seconds()
+        deadline = time.monotonic() + remaining_seconds
+    else:
+        started_utc = now_utc
+        deadline_utc = started_utc + timedelta(seconds=reconciliation_seconds)
+        started_monotonic = time.monotonic()
+        deadline = started_monotonic + reconciliation_seconds
+
     append_event(
         args.api_base,
         args.owner_api_key,
@@ -533,6 +574,11 @@ def _reconcile_dm_turn_timeout(
         },
         status='reconciling',
         dedupe_key=f'dm_turn_reconciliation_started:{logical_key}:{player_message_id}:{timeout_phase}',
+        reconciliation_player_message_id=player_message_id,
+        reconciliation_timeout_phase=timeout_phase,
+        reconciliation_timeout_error=timeout_error,
+        reconciliation_started_at=started_utc.isoformat(),
+        reconciliation_deadline=deadline_utc.isoformat(),
     )
 
     def _exhausted_event(terminal_reason, last_status):
@@ -566,6 +612,7 @@ def _reconcile_dm_turn_timeout(
         external_status = str(run_state.get('status') or '').strip().lower()
         if external_status in {'stop_requested', 'stopped', 'failed', 'completed'}:
             return None, run_state, None
+
         try:
             last_status = autonomous.fetch_dm_turn_status(manifest, player_message_id)
         except ApiError:
@@ -702,6 +749,19 @@ def wait_for_audit_resume(args, run_id, lease_token, maybe_heartbeat_fn):
         time.sleep(args.poll_interval)
 
 
+def parse_utc_iso(iso_str):
+    if not iso_str:
+        return None
+    if iso_str.endswith('Z'):
+        iso_str = iso_str[:-1]
+    if '+' in iso_str:
+        iso_str = iso_str.split('+')[0]
+    try:
+        return datetime.fromisoformat(iso_str)
+    except ValueError:
+        return None
+
+
 def execute_run(args, run_id):
     claim_payload = claim_run(args.api_base, args.owner_api_key, run_id, args.worker_id)
     run = claim_payload['run']
@@ -792,7 +852,21 @@ def execute_run(args, run_id):
     max_turns = run_config.get('max_turns') or run_config.get('max_cycles') or args.max_turns
 
     resume_dm_wait_message_id = None
-    if session_on_start:
+    resume_reconciliation_active = False
+    reconciliation_player_message_id = run.get('reconciliation_player_message_id')
+    reconciliation_deadline_str = run.get('reconciliation_deadline')
+    reconciliation_started_at_str = run.get('reconciliation_started_at')
+    reconciliation_deadline_utc = None
+    reconciliation_started_at_utc = None
+
+    if reconciliation_player_message_id and reconciliation_deadline_str:
+        reconciliation_deadline_utc = parse_utc_iso(reconciliation_deadline_str)
+        reconciliation_started_at_utc = parse_utc_iso(reconciliation_started_at_str)
+        if reconciliation_deadline_utc:
+            resume_reconciliation_active = True
+            resume_dm_wait_message_id = reconciliation_player_message_id
+
+    if session_on_start and not resume_reconciliation_active:
         latest_player_message_id = autonomous.find_latest_player_message_id(session_on_start.get('messages') or [])
         if latest_player_message_id is not None:
             try:
@@ -896,7 +970,16 @@ def execute_run(args, run_id):
             }
             logical_key = stage_key(turns_completed, session_for_prompt)
             last_change_at = time.monotonic()
-            dm_turn, dm_timed_out, timeout_phase = wait_for_dm_response(args, manifest, posted_message_id, maybe_heartbeat)
+            if resume_reconciliation_active:
+                resume_reconciliation_active = False
+                dm_timed_out = True
+                timeout_phase = run.get('reconciliation_timeout_phase') or 'post_turn'
+                dm_turn = {
+                    'status': 'speak',
+                    'post_turn_status': 'pending',
+                }
+            else:
+                dm_turn, dm_timed_out, timeout_phase = wait_for_dm_response(args, manifest, posted_message_id, maybe_heartbeat)
             append_event(
                 args.api_base,
                 args.owner_api_key,
@@ -999,6 +1082,7 @@ def execute_run(args, run_id):
                     timeout_evidence,
                     dedupe_key=f'dm_turn_timeout:{logical_key}:{posted_message_id}:{timeout_phase}',
                 )
+                is_resuming = (reconciliation_deadline_utc is not None)
                 recovered_turn, stop_state, terminal_error = _reconcile_dm_turn_timeout(
                     args,
                     manifest,
@@ -1011,19 +1095,27 @@ def execute_run(args, run_id):
                     timeout_error,
                     timeout_evidence,
                     maybe_heartbeat,
+                    resumed_deadline_utc=reconciliation_deadline_utc if is_resuming else None,
+                    resumed_started_at_utc=reconciliation_started_at_utc if is_resuming else None,
                 )
+                reconciliation_deadline_utc = None
+                reconciliation_started_at_utc = None
+
                 if stop_state is not None:
-                    complete_run(
-                        args.api_base,
-                        args.owner_api_key,
-                        run_id,
-                        args.worker_id,
-                        lease_token,
-                        status='stopped',
-                        error_text=stop_state.get('error_text'),
-                        dedupe_key=f'run_completed:{run_id}:external-stop',
-                    )
-                    return True
+                    if stop_state.get('status') == 'stop_requested':
+                        complete_run(
+                            args.api_base,
+                            args.owner_api_key,
+                            run_id,
+                            args.worker_id,
+                            lease_token,
+                            status='stopped',
+                            error_text=stop_state.get('error_text'),
+                            dedupe_key=f'run_completed:{run_id}:external-stop',
+                        )
+                        return True
+                    else:
+                        return True
                 if recovered_turn is None:
                     complete_run(
                         args.api_base,
@@ -1405,6 +1497,7 @@ def execute_run(args, run_id):
                             timeout_evidence,
                             dedupe_key=f'dm_turn_timeout:{logical_key}:{posted_message_id}:{timeout_phase}',
                         )
+                        is_resuming = (reconciliation_deadline_utc is not None)
                         recovered_turn, stop_state, terminal_error = _reconcile_dm_turn_timeout(
                             args,
                             manifest,
@@ -1417,19 +1510,27 @@ def execute_run(args, run_id):
                             timeout_error,
                             timeout_evidence,
                             maybe_heartbeat,
+                            resumed_deadline_utc=reconciliation_deadline_utc if is_resuming else None,
+                            resumed_started_at_utc=reconciliation_started_at_utc if is_resuming else None,
                         )
+                        reconciliation_deadline_utc = None
+                        reconciliation_started_at_utc = None
+
                         if stop_state is not None:
-                            complete_run(
-                                args.api_base,
-                                args.owner_api_key,
-                                run_id,
-                                args.worker_id,
-                                lease_token,
-                                status='stopped',
-                                error_text=stop_state.get('error_text'),
-                                dedupe_key=f'run_completed:{run_id}:external-stop',
-                            )
-                            return True
+                            if stop_state.get('status') == 'stop_requested':
+                                complete_run(
+                                    args.api_base,
+                                    args.owner_api_key,
+                                    run_id,
+                                    args.worker_id,
+                                    lease_token,
+                                    status='stopped',
+                                    error_text=stop_state.get('error_text'),
+                                    dedupe_key=f'run_completed:{run_id}:external-stop',
+                                )
+                                return True
+                            else:
+                                return True
                         if recovered_turn is None:
                             complete_run(
                                 args.api_base,

@@ -445,11 +445,18 @@ class AutomationConcurrentClaimTest(unittest.TestCase):
         db_path = os.path.join(test_tmpdir, 'concurrent.db')
         from flask import Flask
         test_app = Flask(__name__)
+        test_app.config.update(app.config)
         test_app.config['SQLALCHEMY_DATABASE_URI'] = f'sqlite:///{db_path}?timeout=30'
         test_app.config['SQLALCHEMY_TRACK_MODIFICATIONS'] = False
         test_app.secret_key = 'test-key'
         test_app.root_path = test_tmpdir
         db.init_app(test_app)
+
+        from auth import auth_bp
+        from routes.automation import automation_bp
+        test_app.register_blueprint(auth_bp)
+        test_app.register_blueprint(automation_bp)
+
         return test_app, test_tmpdir
 
     def _setup_concurrent_data(self, test_app):
@@ -605,6 +612,59 @@ class AutomationConcurrentClaimTest(unittest.TestCase):
         self.assertEqual(len(successes), 1, f'Expected 1 winner, got {len(successes)}: {results}')
         self.assertEqual(len(failures), 1, f'Expected 1 loser, got {len(failures)}: {results}')
         self.assertTrue(successes[0][3], 'Winner must be a reclaim')
+
+    def test_concurrent_completion_exactly_one_wins(self):
+        test_app, tmpdir = self._setup_file_backed_app()
+        self.addCleanup(lambda: self._teardown_file_backed_app(test_app, tmpdir))
+        run_id, owner_id = self._setup_concurrent_data(test_app)
+
+        with test_app.app_context():
+            run = db.session.get(AutomationRun, run_id)
+            claim_run_for_worker(run, 'worker-a')
+            run = db.session.get(AutomationRun, run_id)
+            lease_token = run.lease_token
+
+        import threading
+        barrier = threading.Barrier(2)
+        results = []
+
+        def _complete(worker_id):
+            with test_app.app_context():
+                token_bytes = generate_token(owner_id)
+                token = token_bytes.decode('utf-8') if isinstance(token_bytes, bytes) else token_bytes
+
+            with test_app.test_client() as client:
+                headers = {'Authorization': f'Bearer {token}'}
+                barrier.wait()
+                try:
+                    resp = client.post(
+                        f'/api/automation/runs/{run_id}/complete',
+                        headers=headers,
+                        json={
+                            'worker_id': 'worker-a',
+                            'lease_token': lease_token,
+                            'status': 'completed',
+                            'dedupe_key': f'run_completed:{run_id}:attempt:{worker_id}',
+                        }
+                    )
+                    results.append((resp.status_code, worker_id))
+                except Exception as exc:
+                    results.append(('error', worker_id, str(exc)))
+
+        threads = [threading.Thread(target=_complete, args=(f'worker-t-{i}',)) for i in range(2)]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join()
+
+        successes = [r for r in results if r[0] == 200]
+        conflicts = [r for r in results if r[0] == 409]
+        self.assertEqual(len(successes), 1, f'Expected exactly 1 success, got {len(successes)}: {results}')
+        self.assertEqual(len(conflicts), 1, f'Expected exactly 1 conflict (409), got {len(conflicts)}: {results}')
+
+        with test_app.app_context():
+            run = db.session.get(AutomationRun, run_id)
+            self.assertEqual(run.status, 'completed')
 
 
 if __name__ == '__main__':
