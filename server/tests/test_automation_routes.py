@@ -2692,6 +2692,67 @@ class AutomationRouteTest(unittest.TestCase):
         )
         self.assertEqual(resp.status_code, 200)
 
+    def test_complete_route_rejects_stale_completion_on_terminal_run(self):
+        run_id, token = self._claim_for_credential_tests()
+        first = self.client.post(
+            f'/api/automation/runs/{run_id}/complete',
+            headers=self.headers,
+            json={
+                'worker_id': 'cred-test-worker', 'lease_token': token,
+                'status': 'failed',
+                'dedupe_key': f'run_completed:{run_id}:dm-timeout:post_turn',
+            },
+        )
+        self.assertEqual(first.status_code, 200)
+
+        second = self.client.post(
+            f'/api/automation/runs/{run_id}/complete',
+            headers=self.headers,
+            json={
+                'worker_id': 'cred-test-worker', 'lease_token': token,
+                'status': 'completed',
+                'dedupe_key': f'run_completed:{run_id}:late-write',
+            },
+        )
+        self.assertEqual(second.status_code, 409)
+
+        with app.app_context():
+            run = db.session.get(AutomationRun, run_id)
+            self.assertEqual(run.status, 'failed')
+            completions = AutomationRunEvent.query.filter_by(run_id=run_id, event_type='run_completed').all()
+            self.assertEqual(len(completions), 1)
+
+    def test_complete_route_allows_idempotent_retry_with_same_dedupe_key(self):
+        run_id, token = self._claim_for_credential_tests()
+        dedupe_key = f'run_completed:{run_id}:dm-timeout:post_turn'
+        first = self.client.post(
+            f'/api/automation/runs/{run_id}/complete',
+            headers=self.headers,
+            json={
+                'worker_id': 'cred-test-worker', 'lease_token': token,
+                'status': 'failed',
+                'dedupe_key': dedupe_key,
+            },
+        )
+        self.assertEqual(first.status_code, 200)
+
+        retry = self.client.post(
+            f'/api/automation/runs/{run_id}/complete',
+            headers=self.headers,
+            json={
+                'worker_id': 'cred-test-worker', 'lease_token': token,
+                'status': 'failed',
+                'dedupe_key': dedupe_key,
+            },
+        )
+        self.assertEqual(retry.status_code, 200)
+
+        with app.app_context():
+            run = db.session.get(AutomationRun, run_id)
+            self.assertEqual(run.status, 'failed')
+            completions = AutomationRunEvent.query.filter_by(run_id=run_id, event_type='run_completed').all()
+            self.assertEqual(len(completions), 1)
+
     def test_decisions_route_rejects_missing_credentials(self):
         run_id, token = self._claim_for_credential_tests()
         resp = self.client.post(
@@ -4500,6 +4561,145 @@ class AutomationRouteTest(unittest.TestCase):
             narrative = run.scorecard_summary_json['category_breakdown']['narrative quality']
             self.assertEqual(narrative['status'], 'pass')
             self.assertEqual(narrative['score'], 1.0)
+
+    def test_reconciliation_lease_expiry_and_reclaim(self):
+        run_id, token = self._claim_for_credential_tests()
+        start_time = utcnow()
+        deadline = start_time + timedelta(seconds=30)
+
+        resp = self.client.post(
+            f'/api/automation/runs/{run_id}/events',
+            headers=self.headers,
+            json={
+                'worker_id': 'cred-test-worker',
+                'lease_token': token,
+                'event_type': 'dm_turn_reconciliation_started',
+                'status': 'reconciling',
+                'reconciliation_player_message_id': 'msg-123',
+                'reconciliation_timeout_phase': 'post_turn',
+                'reconciliation_timeout_error': 'dm_post_turn_timeout',
+                'reconciliation_started_at': start_time.isoformat(),
+                'reconciliation_deadline': deadline.isoformat(),
+            }
+        )
+        self.assertEqual(resp.status_code, 201)
+
+        with app.app_context():
+            run = db.session.get(AutomationRun, run_id)
+            self.assertEqual(run.status, 'reconciling')
+            self.assertEqual(run.reconciliation_player_message_id, 'msg-123')
+            self.assertEqual(run.reconciliation_timeout_phase, 'post_turn')
+            self.assertEqual(run.reconciliation_timeout_error, 'dm_post_turn_timeout')
+            self.assertEqual(run.reconciliation_started_at, start_time)
+            self.assertEqual(run.reconciliation_deadline, deadline)
+
+            # Expire lease
+            run.lease_expires_at = utcnow() - timedelta(seconds=5)
+            db.session.commit()
+
+        reclaim_resp = self.client.post(
+            f'/api/automation/runs/{run_id}/claim',
+            headers=self.headers,
+            json={'worker_id': 'new-worker-id'},
+        )
+        self.assertEqual(reclaim_resp.status_code, 200)
+
+        reclaim_json = reclaim_resp.get_json()
+        reclaim_run = reclaim_json['run']
+        self.assertEqual(reclaim_run['status'], 'claimed')
+        self.assertEqual(reclaim_run['reconciliation_player_message_id'], 'msg-123')
+        self.assertEqual(reclaim_run['reconciliation_timeout_phase'], 'post_turn')
+        self.assertEqual(reclaim_run['reconciliation_timeout_error'], 'dm_post_turn_timeout')
+        self.assertEqual(reclaim_run['reconciliation_deadline'], deadline.isoformat())
+
+    def test_reconciliation_deadline_survives_repeated_reclaim_after_run_started(self):
+        run_id, token = self._claim_for_credential_tests()
+        start_time = utcnow()
+        deadline = start_time + timedelta(seconds=30)
+
+        resp = self.client.post(
+            f'/api/automation/runs/{run_id}/events',
+            headers=self.headers,
+            json={
+                'worker_id': 'cred-test-worker',
+                'lease_token': token,
+                'event_type': 'dm_turn_reconciliation_started',
+                'status': 'reconciling',
+                'reconciliation_player_message_id': 'msg-456',
+                'reconciliation_timeout_phase': 'visible',
+                'reconciliation_timeout_error': 'dm_visible_response_timeout',
+                'reconciliation_started_at': start_time.isoformat(),
+                'reconciliation_deadline': deadline.isoformat(),
+            }
+        )
+        self.assertEqual(resp.status_code, 201)
+
+        with app.app_context():
+            run = db.session.get(AutomationRun, run_id)
+            run.lease_expires_at = utcnow() - timedelta(seconds=5)
+            db.session.commit()
+
+        reclaim_resp = self.client.post(
+            f'/api/automation/runs/{run_id}/claim',
+            headers=self.headers,
+            json={'worker_id': 'worker-a'},
+        )
+        self.assertEqual(reclaim_resp.status_code, 200)
+        reclaim_json = reclaim_resp.get_json()
+        new_token = reclaim_json['lease_token']
+
+        run_started_resp = self.client.post(
+            f'/api/automation/runs/{run_id}/events',
+            headers=self.headers,
+            json={
+                'worker_id': 'worker-a',
+                'lease_token': new_token,
+                'event_type': 'run_started',
+                'status': 'running',
+                'reconciliation_player_message_id': 'msg-456',
+                'reconciliation_timeout_phase': 'visible',
+                'reconciliation_timeout_error': 'dm_visible_response_timeout',
+                'reconciliation_started_at': start_time.isoformat(),
+                'reconciliation_deadline': deadline.isoformat(),
+            }
+        )
+        self.assertEqual(run_started_resp.status_code, 201)
+
+        with app.app_context():
+            run = db.session.get(AutomationRun, run_id)
+            self.assertEqual(run.status, 'running')
+            self.assertEqual(run.reconciliation_player_message_id, 'msg-456')
+            self.assertEqual(run.reconciliation_deadline, deadline)
+            self.assertEqual(run.reconciliation_started_at, start_time)
+
+            run.lease_expires_at = utcnow() - timedelta(seconds=5)
+            db.session.commit()
+
+        reclaim2_resp = self.client.post(
+            f'/api/automation/runs/{run_id}/claim',
+            headers=self.headers,
+            json={'worker_id': 'worker-b'},
+        )
+        self.assertEqual(reclaim2_resp.status_code, 200)
+        reclaim2_run = reclaim2_resp.get_json()['run']
+        self.assertEqual(reclaim2_run['status'], 'claimed')
+        self.assertEqual(reclaim2_run['reconciliation_player_message_id'], 'msg-456')
+        self.assertEqual(reclaim2_run['reconciliation_timeout_phase'], 'visible')
+        self.assertEqual(reclaim2_run['reconciliation_deadline'], deadline.isoformat())
+
+        with app.app_context():
+            run = db.session.get(AutomationRun, run_id)
+            run.lease_expires_at = utcnow() - timedelta(seconds=5)
+            db.session.commit()
+
+        reclaim3_resp = self.client.post(
+            f'/api/automation/runs/{run_id}/claim',
+            headers=self.headers,
+            json={'worker_id': 'worker-c'},
+        )
+        self.assertEqual(reclaim3_resp.status_code, 200)
+        reclaim3_run = reclaim3_resp.get_json()['run']
+        self.assertEqual(reclaim3_run['reconciliation_deadline'], deadline.isoformat())
 
 
 if __name__ == '__main__':

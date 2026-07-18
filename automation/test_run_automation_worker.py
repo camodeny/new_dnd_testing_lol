@@ -1227,20 +1227,42 @@ class RunAutomationWorkerTests(unittest.TestCase):
         )
 
 
-class LateCompletionReconciliationTest(unittest.TestCase):
-    def test_reconciliation_records_completion_after_multiple_polls(self):
-        args = SimpleNamespace(
+class DmTurnTimeoutReconciliationTest(unittest.TestCase):
+    def _args(self, reconciliation_seconds=30.0):
+        return SimpleNamespace(
             api_base='http://127.0.0.1:5889',
             owner_api_key='owner-key',
             worker_id='worker-1',
             poll_interval=3.0,
-            dm_late_completion_reconciliation_seconds=30.0,
+            dm_late_completion_reconciliation_seconds=reconciliation_seconds,
+            dm_visible_response_timeout=None,
+            dm_post_turn_timeout=None,
+            dm_response_timeout=None,
         )
+
+    def _run_reconcile(self, args, timeout_phase='post_turn', timeout_error='dm_post_turn_timeout'):
+        return worker._reconcile_dm_turn_timeout(
+            args,
+            {'session': {'id': 4}},
+            {'run': {'attempt_count': 2}},
+            5,
+            'lease-1',
+            411,
+            'stage-0',
+            timeout_phase,
+            timeout_error,
+            {'status': 'speak', 'post_turn_status': 'pending'},
+            lambda: None,
+        )
+
+    def test_reconciliation_recovers_when_post_turn_completes(self):
+        args = self._args()
         statuses = [
-            {'status': 'speak', 'post_turn_status': 'pending', 'dm_message_id': 20},
-            {'status': 'speak', 'post_turn_status': 'pending', 'dm_message_id': 20},
+            {'status': 'speak', 'post_turn_complete': False, 'post_turn_status': 'pending', 'dm_message_id': 20},
+            {'status': 'speak', 'post_turn_complete': False, 'post_turn_status': 'pending', 'dm_message_id': 20},
             {
                 'status': 'speak',
+                'post_turn_complete': True,
                 'post_turn_status': 'complete',
                 'dm_message_id': 20,
                 'memory_status': 'complete',
@@ -1249,24 +1271,118 @@ class LateCompletionReconciliationTest(unittest.TestCase):
             },
         ]
 
-        with patch.object(worker.autonomous, 'fetch_dm_turn_status', side_effect=statuses) as fetch,                 patch.object(worker.time, 'monotonic', return_value=0.0),                 patch.object(worker.time, 'sleep') as sleep,                 patch.object(worker, 'append_event') as append:
-            worker._reconcile_late_completion(
-                args,
-                {'session': {'id': 4}},
-                10,
-                5,
-                'lease-1',
-                'post_turn',
-                'dm_post_turn_timeout',
-                '2026-07-14T02:25:56Z',
-            )
+        with patch.object(worker.autonomous, 'fetch_dm_turn_status', side_effect=statuses) as fetch, \
+                patch.object(worker, 'fetch_run', return_value={'run': {'status': 'reconciling'}}), \
+                patch.object(worker.time, 'monotonic', return_value=0.0), \
+                patch.object(worker.time, 'sleep') as sleep, \
+                patch.object(worker, 'append_event') as append:
+            recovered, stop_state, terminal_error = self._run_reconcile(args)
 
+        self.assertEqual(recovered, statuses[-1])
+        self.assertIsNone(stop_state)
+        self.assertIsNone(terminal_error)
         self.assertEqual(fetch.call_count, 3)
         self.assertEqual(sleep.call_count, 2)
-        payload = append.call_args[0][6]
-        self.assertEqual(append.call_args[0][5], 'dm_turn_late_completion')
-        self.assertEqual(payload['failure_timestamp'], '2026-07-14T02:25:56Z')
-        self.assertEqual(payload['final_post_turn_status'], 'complete')
+        started = append.call_args_list[0]
+        self.assertEqual(started[0][5], 'dm_turn_reconciliation_started')
+        self.assertEqual(started[1]['status'], 'reconciling')
+        self.assertEqual(started[0][6]['reconciliation_window_seconds'], 30.0)
+        self.assertEqual(started[0][6]['timeout_phase'], 'post_turn')
+        self.assertEqual(started[0][6]['attempt_count'], 2)
+        recovered_call = append.call_args_list[1]
+        self.assertEqual(recovered_call[0][5], 'dm_turn_reconciliation_recovered')
+        self.assertEqual(recovered_call[1]['status'], 'running')
+        self.assertEqual(recovered_call[0][6]['final_post_turn_status'], 'complete')
+        self.assertEqual(recovered_call[0][6]['reconciliation_outcome'], 'recovered')
+        self.assertEqual(append.call_count, 2)
+
+    def test_reconciliation_recovers_visible_phase_timeout(self):
+        args = self._args()
+        statuses = [
+            {
+                'status': 'speak',
+                'post_turn_status': 'complete',
+                'dm_message_id': 20,
+                'memory_status': 'complete',
+                'clock_status': 'complete',
+            },
+        ]
+
+        with patch.object(worker.autonomous, 'fetch_dm_turn_status', side_effect=statuses), \
+                patch.object(worker, 'fetch_run', return_value={'run': {'status': 'reconciling'}}), \
+                patch.object(worker.time, 'monotonic', return_value=0.0), \
+                patch.object(worker.time, 'sleep'), \
+                patch.object(worker, 'append_event') as append:
+            recovered, stop_state, terminal_error = self._run_reconcile(
+                args,
+                timeout_phase='visible',
+                timeout_error='dm_visible_response_timeout',
+            )
+
+        self.assertEqual(recovered, statuses[-1])
+        self.assertIsNone(stop_state)
+        self.assertIsNone(terminal_error)
+        self.assertEqual(append.call_args_list[0][0][6]['timeout_phase'], 'visible')
+        self.assertEqual(append.call_args_list[1][0][5], 'dm_turn_reconciliation_recovered')
+
+    def test_reconciliation_exhausts_window_and_returns_terminal_error(self):
+        args = self._args(reconciliation_seconds=0.0)
+        statuses = [
+            {'status': 'speak', 'post_turn_complete': False, 'post_turn_status': 'pending', 'dm_message_id': 20},
+        ]
+
+        with patch.object(worker.autonomous, 'fetch_dm_turn_status', side_effect=statuses), \
+                patch.object(worker, 'fetch_run', return_value={'run': {'status': 'reconciling'}}), \
+                patch.object(worker.time, 'monotonic', return_value=0.0), \
+                patch.object(worker.time, 'sleep'), \
+                patch.object(worker, 'append_event') as append:
+            recovered, stop_state, terminal_error = self._run_reconcile(args)
+
+        self.assertIsNone(recovered)
+        self.assertIsNone(stop_state)
+        self.assertEqual(terminal_error, 'dm_post_turn_timeout')
+        exhausted = append.call_args_list[1]
+        self.assertEqual(exhausted[0][5], 'dm_turn_reconciliation_exhausted')
+        self.assertEqual(exhausted[0][6]['terminal_reason'], 'window_exhausted')
+        self.assertEqual(exhausted[0][6]['timeout_classification'], 'dm_post_turn_timeout')
+
+    def test_reconciliation_reports_turn_error_during_window(self):
+        args = self._args()
+        statuses = [
+            {'status': 'speak', 'post_turn_status': 'error', 'dm_message_id': 20, 'error_text': 'memory failed'},
+        ]
+
+        with patch.object(worker.autonomous, 'fetch_dm_turn_status', side_effect=statuses), \
+                patch.object(worker, 'fetch_run', return_value={'run': {'status': 'reconciling'}}), \
+                patch.object(worker.time, 'monotonic', return_value=0.0), \
+                patch.object(worker.time, 'sleep'), \
+                patch.object(worker, 'append_event') as append:
+            recovered, stop_state, terminal_error = self._run_reconcile(args)
+
+        self.assertIsNone(recovered)
+        self.assertIsNone(stop_state)
+        self.assertEqual(terminal_error, 'memory failed')
+        exhausted = append.call_args_list[1]
+        self.assertEqual(exhausted[0][5], 'dm_turn_reconciliation_exhausted')
+        self.assertEqual(exhausted[0][6]['terminal_reason'], 'dm_turn_error')
+
+    def test_reconciliation_stops_on_external_stop_request(self):
+        args = self._args()
+        stop_run = {'status': 'stop_requested', 'error_text': None}
+
+        with patch.object(worker.autonomous, 'fetch_dm_turn_status') as fetch, \
+                patch.object(worker, 'fetch_run', return_value={'run': stop_run}), \
+                patch.object(worker.time, 'monotonic', return_value=0.0), \
+                patch.object(worker.time, 'sleep'), \
+                patch.object(worker, 'append_event') as append:
+            recovered, stop_state, terminal_error = self._run_reconcile(args)
+
+        self.assertIsNone(recovered)
+        self.assertEqual(stop_state, stop_run)
+        self.assertIsNone(terminal_error)
+        fetch.assert_not_called()
+        self.assertEqual(append.call_count, 1)
+        self.assertEqual(append.call_args_list[0][0][5], 'dm_turn_reconciliation_started')
 
 
 if __name__ == '__main__':

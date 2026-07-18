@@ -1,4 +1,5 @@
 import threading
+from datetime import datetime
 
 from flask import Blueprint, current_app, jsonify, request, stream_with_context
 
@@ -1543,13 +1544,42 @@ def append_automation_run_event(current_user, run_id):
     else:
         db.session.commit()
 
-    if data.get('status'):
-        run.status = data['status']
+    target_status = data.get('status')
+    if target_status:
+        # Refuse to transition from stop_requested or terminal back to active/non-terminal statuses
+        if run.status in {'stop_requested', 'completed', 'failed', 'stopped'} and target_status not in {'completed', 'failed', 'stopped'}:
+            pass
+        else:
+            run.status = target_status
+
     if event_type in {'run_started', 'started'} and run.started_at is None:
         run.started_at = utcnow()
-        run.status = 'running'
+        if run.status not in {'stop_requested', 'completed', 'failed', 'stopped'}:
+            run.status = 'running'
+
     if 'error_text' in data:
         run.error_text = data.get('error_text')
+
+    # Handle reconciliation state persistence
+    if run.status == 'reconciling':
+        run.reconciliation_player_message_id = data.get('reconciliation_player_message_id')
+        run.reconciliation_timeout_phase = data.get('reconciliation_timeout_phase')
+        run.reconciliation_timeout_error = data.get('reconciliation_timeout_error')
+        if data.get('reconciliation_started_at'):
+            run.reconciliation_started_at = datetime.fromisoformat(data['reconciliation_started_at'].replace('Z', '+00:00')).replace(tzinfo=None)
+        if data.get('reconciliation_deadline'):
+            run.reconciliation_deadline = datetime.fromisoformat(data['reconciliation_deadline'].replace('Z', '+00:00')).replace(tzinfo=None)
+    elif run.status in {'running', 'completed', 'failed', 'stopped'}:
+        has_explicit_reconciliation = (
+            data.get('reconciliation_player_message_id') is not None
+            or data.get('reconciliation_deadline') is not None
+        )
+        if not has_explicit_reconciliation:
+            run.reconciliation_player_message_id = None
+            run.reconciliation_timeout_phase = None
+            run.reconciliation_timeout_error = None
+            run.reconciliation_started_at = None
+            run.reconciliation_deadline = None
 
     try:
         event_row, created = append_run_event(
@@ -1624,16 +1654,80 @@ def complete_automation_run(current_user, run_id):
         except ValueError as exc:
             return jsonify({'error': str(exc)}), 409
 
-    run.status = data.get('status') or 'completed'
-    run.error_text = data.get('error_text')
-    run.finished_at = utcnow()
-    run.awaiting_audit_cycle_id = None
-    run.awaiting_audit_phase = None
-    if run.started_at is None:
-        run.started_at = run.claimed_at or run.created_at
-    run.heartbeat_at = utcnow()
-    run.lease_expires_at = utcnow()
+    if run.status in {'completed', 'failed', 'stopped'}:
+        # Fence stale completion writes: a terminal run can only be re-completed
+        # by an idempotent retry carrying the original run_completed dedupe key.
+        recorded = AutomationRunEvent.query.filter_by(
+            run_id=run.id,
+            event_type='run_completed',
+        ).order_by(AutomationRunEvent.sequence_number.desc()).first()
+        expected_dedupe = data.get('dedupe_key') or f'run_completed:{run.id}:attempt:{run.attempt_count}'
+        if recorded is not None and recorded.dedupe_key == expected_dedupe:
+            return jsonify({'run': run.to_dict()}), 200
+        return jsonify({'error': 'Run is already in a terminal state'}), 409
+
+    target_status = data.get('status') or 'completed'
+    error_text = data.get('error_text')
+    now = utcnow()
+
+    current_attempt = run.attempt_count
+    current_lease_token = run.lease_token
+    active_statuses = {'claimed', 'running', 'stop_requested', 'awaiting_audit', 'reconciling'}
+
+    from sqlalchemy import update, case
+
+    stmt = (
+        update(AutomationRun)
+        .where(
+            AutomationRun.id == run.id,
+            AutomationRun.status.in_(active_statuses),
+        )
+    )
+    if current_lease_token:
+        stmt = stmt.where(AutomationRun.lease_token == data.get('lease_token'))
+    if current_attempt is not None:
+        stmt = stmt.where(AutomationRun.attempt_count == current_attempt)
+
+    stmt = stmt.values(
+        status=target_status,
+        error_text=error_text,
+        finished_at=now,
+        awaiting_audit_cycle_id=None,
+        awaiting_audit_phase=None,
+        started_at=case(
+            (AutomationRun.started_at == None, db.func.coalesce(AutomationRun.claimed_at, AutomationRun.created_at)),
+            else_=AutomationRun.started_at
+        ),
+        heartbeat_at=now,
+        lease_expires_at=now,
+        updated_at=now,
+        reconciliation_player_message_id=None,
+        reconciliation_timeout_phase=None,
+        reconciliation_timeout_error=None,
+        reconciliation_started_at=None,
+        reconciliation_deadline=None
+    )
+
+    result = db.session.execute(stmt)
+    if result.rowcount == 0:
+        db.session.rollback()
+        # Reload
+        run = db.session.get(AutomationRun, run.id)
+        if run.status in {'completed', 'failed', 'stopped'}:
+            recorded = AutomationRunEvent.query.filter_by(
+                run_id=run.id,
+                event_type='run_completed',
+            ).order_by(AutomationRunEvent.sequence_number.desc()).first()
+            expected_dedupe = data.get('dedupe_key') or f'run_completed:{run.id}:attempt:{run.attempt_count}'
+            if recorded is not None and recorded.dedupe_key == expected_dedupe:
+                return jsonify({'run': run.to_dict()}), 200
+            return jsonify({'error': 'Run is already in a terminal state'}), 409
+        return jsonify({'error': 'State transition failed or lease was lost'}), 409
+
     db.session.commit()
+    # Reload fresh state
+    run = db.session.get(AutomationRun, run.id)
+
     append_run_event(
         run,
         'run_completed',

@@ -326,7 +326,7 @@ export default function AutomationRunPage() {
   const canStartBuiltInAuditors = run.status === 'awaiting_audit' && currentAuditCycle && auditorConfig.mode === 'built_in'
   const scorecardTemplate = data.scorecard_template || {}
   const compareLink = scenario ? `/automation/scenarios/${scenario.id}` : '/automation'
-  const canStop = ['queued', 'claimed', 'running', 'awaiting_audit'].includes(run.status)
+  const canStop = ['queued', 'claimed', 'running', 'awaiting_audit', 'reconciling'].includes(run.status)
 
   return (
     <div className="automation-page">
