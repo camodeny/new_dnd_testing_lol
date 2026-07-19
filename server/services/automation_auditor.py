@@ -23,7 +23,8 @@ from models import (
     WorldEvent,
     db,
 )
-from openrouter import _post_chat_response, get_llm_model, get_llm_provider
+from llm_providers import ProviderError, provider_registry
+from openrouter import _post_chat_normalized, get_llm_model, get_llm_provider
 from services.automation_service import (
     append_run_event,
     continue_audit_run,
@@ -50,7 +51,6 @@ DEFAULT_AUDITOR_CONFIG = {
     'required_tools': 'runtime_truth_full',
 }
 SUPPORTED_AUDITOR_MODES = {'manual', 'built_in', 'external'}
-SUPPORTED_PROVIDER_HINTS = {'openrouter', 'opencode_go'}
 
 
 AUDITOR_TOOL_DEFINITIONS = [
@@ -317,16 +317,14 @@ def _safe_int(value, default=0, minimum=None, maximum=None):
     return number
 
 
-def _normalize_provider_hint(value):
-    clean = str(value or '').strip().lower().replace('-', '_')
-    return clean if clean in SUPPORTED_PROVIDER_HINTS else None
-
-
 def resolve_auditor_provider_model(model_hint=None):
     raw = str(model_hint or '').strip()
     if '/' in raw:
         provider_hint, maybe_model = raw.split('/', 1)
-        provider = _normalize_provider_hint(provider_hint)
+        try:
+            provider = provider_registry.get(provider_hint).name
+        except RuntimeError:
+            provider = None
         if provider:
             return provider, maybe_model.strip()
     return get_llm_provider(), raw or get_llm_model()
@@ -1243,10 +1241,9 @@ def _tool_result_message(tool_call, tool_name, result):
     }
 
 
-def _usage_total(responses):
+def _usage_total(usages):
     total = Counter()
-    for response in responses:
-        usage = response.get('usage') if isinstance(response, dict) else {}
+    for usage in usages:
         if not isinstance(usage, dict):
             continue
         total['prompt_tokens'] += _safe_int(usage.get('prompt_tokens') or usage.get('input_tokens'))
@@ -1431,6 +1428,7 @@ def request_auditor_decision_with_tools(run, cycle, job, config, *, max_tool_rou
     ]
     tool_trace = []
     responses = []
+    usages = []
     parse_repair_attempts = 0
     final_response = {}
     final_text = ''
@@ -1439,27 +1437,33 @@ def request_auditor_decision_with_tools(run, cycle, job, config, *, max_tool_rou
     campaign = _campaign_for_run(run)
     campaign_id = campaign.id if campaign else None
     for tool_round in range(max_tool_rounds + 3):
-        data = _post_chat_response(
-            messages,
-            json_mode=False,
-            tools=AUDITOR_TOOL_DEFINITIONS,
-            tool_choice='auto',
-            parallel_tool_calls=False,
-            allow_thinking=True,
-            timeout_seconds=180,
-            max_attempts=2,
-            provider=provider,
-            model=model,
-            audit_context={
-                'campaign_id': campaign_id,
-                'operation': 'automation_auditor_tool_loop',
-                'actor': 'automation_auditor',
-                'trace_id': trace_id,
-                'trace_label': f'automation_auditor run {run.id} cycle {cycle.id} slot {job.auditor_slot}',
-            },
-        )
-        responses.append(data)
-        message, _finish_reason = _choice_message(data)
+        try:
+            normalized = _post_chat_normalized(
+                messages,
+                json_mode=False,
+                tools=AUDITOR_TOOL_DEFINITIONS,
+                tool_choice='auto',
+                parallel_tool_calls=False,
+                allow_thinking=True,
+                timeout_seconds=180,
+                max_attempts=2,
+                provider=provider,
+                model=model,
+                audit_context={
+                    'campaign_id': campaign_id,
+                    'operation': 'automation_auditor_tool_loop',
+                    'actor': 'automation_auditor',
+                    'trace_id': trace_id,
+                    'trace_label': f'automation_auditor run {run.id} cycle {cycle.id} slot {job.auditor_slot}',
+                },
+            )
+        except ProviderError as err:
+            if err.kind != 'malformed':
+                raise
+            normalized = None
+        responses.append(normalized.raw if normalized is not None else {})
+        usages.append(normalized.usage if normalized is not None else {})
+        message = normalized.message_view() if normalized is not None else {}
         tool_calls = message.get('tool_calls') or []
         if tool_calls and tool_round < max_tool_rounds:
             messages.append(_assistant_tool_message(message))
@@ -1506,7 +1510,7 @@ def request_auditor_decision_with_tools(run, cycle, job, config, *, max_tool_rou
         'provider': provider,
         'model': model,
         'provider_response_id': (responses[-1].get('id') if responses and isinstance(responses[-1], dict) else None),
-        'usage': _usage_total(responses),
+        'usage': _usage_total(usages),
         'parse_repair_attempts': parse_repair_attempts,
         'request': {
             'messages': messages,

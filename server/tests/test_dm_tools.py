@@ -80,6 +80,12 @@ from services.embedding_service import (
 from services.encounter_map_service import create_labeled_grid_image, detect_grid_from_image
 
 
+
+from llm_providers import OpenRouterAdapter as _OpenRouterAdapter
+
+def _normalized_from_raw(raw_dict):
+    return _OpenRouterAdapter().parse_response(raw_dict)
+
 def synthetic_grid_png(size=256, cell=32, offset=0, blank=False):
     image = Image.new('RGB', (size, size), 'white')
     if not blank:
@@ -1358,8 +1364,7 @@ class DmToolsTest(unittest.TestCase):
                     }),
                     json.dumps({'create_clocks': [], 'retire_clocks': []}),
                 ]), \
-                patch('openrouter._post_chat_response', side_effect=[
-                    {
+                patch('openrouter._post_chat_normalized', side_effect=[_normalized_from_raw({
                         'choices': [{
                             'message': {
                                 'content': '',
@@ -1372,8 +1377,7 @@ class DmToolsTest(unittest.TestCase):
                                 }],
                             },
                         }],
-                    },
-                    {
+                    }), _normalized_from_raw({
                         'choices': [{
                             'message': {
                                 'content': json.dumps({
@@ -1405,8 +1409,7 @@ class DmToolsTest(unittest.TestCase):
                                 }),
                             },
                         }],
-                    },
-                ]):
+                    })]):
             patch_data = get_session_memory_patch(
                 memory_context,
                 audit_context={
@@ -1476,7 +1479,7 @@ class DmToolsTest(unittest.TestCase):
                     }),
                     json.dumps({'create_clocks': [], 'retire_clocks': []}),
                 ]), \
-                patch('openrouter._post_chat_response', return_value={
+                patch('openrouter._post_chat_normalized', return_value=_normalized_from_raw({
                     'choices': [{
                         'message': {
                             'content': json.dumps({
@@ -1503,7 +1506,7 @@ class DmToolsTest(unittest.TestCase):
                             }),
                         },
                     }],
-                }):
+                })):
             patch_data = get_session_memory_patch(
                 memory_context,
                 audit_context={
@@ -2088,10 +2091,7 @@ class DmToolsTest(unittest.TestCase):
             'main_call_thinking': True,
             'confidence': 'high',
             'reason': 'The player is in an immediate hazard.',
-        }), patch('openrouter._post_chat_response', side_effect=[
-            dm_talk_tool_response('You decide to retreat up the ladder and try a safer approach.'),
-            dm_talk_tool_response('The rung shudders beneath you. The landing remains within reach, but the ladder is failing fast. What do you do?'),
-        ]) as post_chat, patch('openrouter._post_chat', side_effect=[
+        }), patch('openrouter._post_chat_normalized', side_effect=[_normalized_from_raw(dm_talk_tool_response('You decide to retreat up the ladder and try a safer approach.')), _normalized_from_raw(dm_talk_tool_response('The rung shudders beneath you. The landing remains within reach, but the ladder is failing fast. What do you do?'))]) as post_chat, patch('openrouter._post_chat', side_effect=[
             json.dumps({
                 'safe': False,
                 'violations': [{
@@ -2447,10 +2447,7 @@ class DmToolsTest(unittest.TestCase):
             'required_mechanic': 'initiative',
             'confidence': 'high',
             'reason': 'The player is starting a fight.',
-        }), patch('openrouter._post_chat_response', side_effect=[
-            dm_talk_tool_response('The blow catches you across the ribs and knocks you down.'),
-            dm_talk_tool_response('The constable snaps her truncheon up as you rush in. Roll initiative.'),
-        ]) as post_chat, patch('openrouter._post_chat', side_effect=[
+        }), patch('openrouter._post_chat_normalized', side_effect=[_normalized_from_raw(dm_talk_tool_response('The blow catches you across the ribs and knocks you down.')), _normalized_from_raw(dm_talk_tool_response('The constable snaps her truncheon up as you rush in. Roll initiative.'))]) as post_chat, patch('openrouter._post_chat', side_effect=[
             json.dumps({
                 'safe': False,
                 'violations': ['The blow catches you across the ribs and knocks you down.'],
@@ -2486,10 +2483,7 @@ class DmToolsTest(unittest.TestCase):
             'private_spoiler_items': [],
         }
 
-        with patch('openrouter._post_chat_response', side_effect=[
-            dm_talk_tool_response('<npc target="Bram Truewood">"The candle is always lit."</p>'),
-            dm_talk_tool_response('<npc target="Bram Truewood">"The candle is always lit."</npc>'),
-        ]) as post_chat:
+        with patch('openrouter._post_chat_normalized', side_effect=[_normalized_from_raw(dm_talk_tool_response('<npc target="Bram Truewood">"The candle is always lit."</p>')), _normalized_from_raw(dm_talk_tool_response('<npc target="Bram Truewood">"The candle is always lit."</npc>'))]) as post_chat:
             result = get_session_dm_response_with_tools(
                 hot_context,
                 [],
@@ -2518,11 +2512,7 @@ class DmToolsTest(unittest.TestCase):
             'private_spoiler_items': [],
         }
 
-        with patch('openrouter._post_chat_response', side_effect=[
-            dm_talk_tool_response('<dramatis personae="elderly dockhand">"Tide turns."</dramatis personae>'),
-            dm_talk_tool_response('The elderly dockhand squints. "Tide turns."'),
-            dm_talk_tool_response('<npc target="elderly dockhand">"Tide turns."</npc>'),
-        ]), patch('openrouter._post_chat', side_effect=[
+        with patch('openrouter._post_chat_normalized', side_effect=[_normalized_from_raw(dm_talk_tool_response('<dramatis personae="elderly dockhand">"Tide turns."</dramatis personae>')), _normalized_from_raw(dm_talk_tool_response('The elderly dockhand squints. "Tide turns."')), _normalized_from_raw(dm_talk_tool_response('<npc target="elderly dockhand">"Tide turns."</npc>'))]), patch('openrouter._post_chat', side_effect=[
             json.dumps({
                 'requires_npc_tag': True,
                 'speaker': 'elderly dockhand',
@@ -2557,17 +2547,14 @@ class DmToolsTest(unittest.TestCase):
             'private_spoiler_items': [],
         }
 
-        with patch('openrouter._post_chat_response', side_effect=[
-            dm_talk_tool_response(
+        with patch('openrouter._post_chat_normalized', side_effect=[_normalized_from_raw(dm_talk_tool_response(
                 'Dee watches you for a long moment, reading your resolve. He does not argue. '
                 'Instead, he gives a single, slow nod. **"Alright. Lock the creds down first."**'
-            ),
-            dm_talk_tool_response(
+            )), _normalized_from_raw(dm_talk_tool_response(
                 'Dee watches you for a long moment, reading your resolve. He does not argue. '
                 'Instead, he gives a single, slow nod.\n\n'
                 '<npc target="Dee">"Alright. Lock the creds down first."</npc>'
-            ),
-        ]) as post_chat, patch('openrouter._post_chat', side_effect=[
+            ))]) as post_chat, patch('openrouter._post_chat', side_effect=[
             json.dumps({
                 'requires_npc_tag': True,
                 'speaker': 'Dee',
@@ -2613,12 +2600,10 @@ class DmToolsTest(unittest.TestCase):
             }],
         }
 
-        with patch('openrouter._post_chat_response', side_effect=[
-            dm_talk_tool_response(
+        with patch('openrouter._post_chat_normalized', side_effect=[_normalized_from_raw(dm_talk_tool_response(
                 'Father Aldric leans close. "The canal door was left unbarred." '
                 'He glances toward Brother Silas. "Find the flooded crypts first."'
-            ),
-            {
+            )), _normalized_from_raw({
                 'choices': [{
                     'message': {
                         'content': '',
@@ -2626,8 +2611,7 @@ class DmToolsTest(unittest.TestCase):
                     },
                     'finish_reason': 'length',
                 }],
-            },
-            {
+            }), _normalized_from_raw({
                 'choices': [{
                     'message': {
                         'content': '',
@@ -2635,8 +2619,7 @@ class DmToolsTest(unittest.TestCase):
                     },
                     'finish_reason': 'length',
                 }],
-            },
-            {
+            }), _normalized_from_raw({
                 'choices': [{
                     'message': {
                         'content': '',
@@ -2644,8 +2627,7 @@ class DmToolsTest(unittest.TestCase):
                     },
                     'finish_reason': 'length',
                 }],
-            },
-        ]) as post_chat, patch('openrouter._post_chat', return_value=json.dumps({
+            })]) as post_chat, patch('openrouter._post_chat', return_value=json.dumps({
             'requires_npc_tag': True,
             'speaker': 'Father Aldric',
             'evidence': ['"The canal door was left unbarred."'],
@@ -2675,16 +2657,13 @@ class DmToolsTest(unittest.TestCase):
             'private_spoiler_items': [],
         }
 
-        with patch('openrouter._post_chat_response', side_effect=[
-            dm_talk_tool_response(
+        with patch('openrouter._post_chat_normalized', side_effect=[_normalized_from_raw(dm_talk_tool_response(
                 'Sheriff Coldharbour spins toward Brixby, her eyes narrowing. '
                 '"You there-pointing fingers will not help."'
-            ),
-            dm_talk_tool_response(
+            )), _normalized_from_raw(dm_talk_tool_response(
                 'Sheriff Coldharbour spins toward Brixby, her eyes narrowing.\n\n'
                 '<npc target="Sheriff Coldharbour">"You there-pointing fingers will not help."</npc>'
-            ),
-        ]) as post_chat_response, patch('openrouter._post_chat', side_effect=[
+            ))]) as post_chat_response, patch('openrouter._post_chat', side_effect=[
             json.dumps({
                 'requires_npc_tag': True,
                 'speaker': 'Sheriff Coldharbour',
@@ -2743,10 +2722,7 @@ class DmToolsTest(unittest.TestCase):
             'private_spoiler_items': [],
         }
 
-        with patch('openrouter._post_chat_response', side_effect=[
-            dm_talk_tool_response('<ic>"Green lights."</ic>'),
-            {'choices': [{'message': {'content': '<npc target="Brenn">"Green lights by the old willow."</npc>'}}]},
-        ]) as post_chat:
+        with patch('openrouter._post_chat_normalized', side_effect=[_normalized_from_raw(dm_talk_tool_response('<ic>"Green lights."</ic>')), _normalized_from_raw({'choices': [{'message': {'content': '<npc target="Brenn">"Green lights by the old willow."</npc>'}}]})]) as post_chat:
             result = get_session_dm_response_with_tools(
                 hot_context,
                 [],
@@ -2777,9 +2753,9 @@ class DmToolsTest(unittest.TestCase):
             'The startup sequence now reads **70 seconds**.'
         )
 
-        with patch('openrouter._post_chat_response', return_value={
+        with patch('openrouter._post_chat_normalized', return_value=_normalized_from_raw({
             'choices': [{'message': {'content': draft}}],
-        }) as post_chat:
+        })) as post_chat:
             result = get_session_dm_response_with_tools(
                 hot_context,
                 [],
@@ -2800,10 +2776,7 @@ class DmToolsTest(unittest.TestCase):
         draft = '<｜｜DSML｜｜tool_calls>\n<｜｜DSML｜｜invoke name="talk_to_player"></｜｜DSML｜｜invoke>'
         stale = 'Dee leans back, the vinyl creaking under him.'
 
-        with patch('openrouter._post_chat_response', side_effect=[
-            {'choices': [{'message': {'content': draft}}]},
-            dm_talk_tool_response(stale),
-        ]) as post_chat:
+        with patch('openrouter._post_chat_normalized', side_effect=[_normalized_from_raw({'choices': [{'message': {'content': draft}}]}), _normalized_from_raw(dm_talk_tool_response(stale))]) as post_chat:
             result = get_session_dm_response_with_tools(
                 hot_context,
                 [],
@@ -2822,9 +2795,9 @@ class DmToolsTest(unittest.TestCase):
             'private_spoiler_items': [],
         }
 
-        with patch('openrouter._post_chat_response', return_value={
+        with patch('openrouter._post_chat_normalized', return_value=_normalized_from_raw({
             'choices': [{'message': {'content': 'Plain text draft only.'}}],
-        }) as post_chat:
+        })) as post_chat:
             result = get_session_dm_response_with_tools(
                 hot_context,
                 [],
@@ -2866,12 +2839,7 @@ class DmToolsTest(unittest.TestCase):
             })
             return {'pending_action_id': 'pending_action_1', 'pending': True}
 
-        with patch('openrouter._post_chat_response', side_effect=[
-            staged_tool_call,
-            {'choices': [{'message': {'content': 'Raw text must not escape after staging.'}}]},
-            {'choices': [{'message': {'content': 'Still raw text.'}}]},
-            {'choices': [{'message': {'content': 'Last raw text.'}}]},
-        ]):
+        with patch('openrouter._post_chat_normalized', side_effect=[_normalized_from_raw(staged_tool_call), _normalized_from_raw({'choices': [{'message': {'content': 'Raw text must not escape after staging.'}}]}), _normalized_from_raw({'choices': [{'message': {'content': 'Still raw text.'}}]}), _normalized_from_raw({'choices': [{'message': {'content': 'Last raw text.'}}]})]):
             result = get_session_dm_response_with_tools(
                 hot_context,
                 [],
@@ -2891,10 +2859,7 @@ class DmToolsTest(unittest.TestCase):
         }
         draft = '*OOC*: Make a Technology check.'
 
-        with patch('openrouter._post_chat_response', side_effect=[
-            {'choices': [{'message': {'content': draft}}]},
-            dm_talk_tool_response('Make a Technology check.'),
-        ]) as post_chat:
+        with patch('openrouter._post_chat_normalized', side_effect=[_normalized_from_raw({'choices': [{'message': {'content': draft}}]}), _normalized_from_raw(dm_talk_tool_response('Make a Technology check.'))]) as post_chat:
             result = get_session_dm_response_with_tools(
                 hot_context,
                 [],
@@ -2924,10 +2889,7 @@ class DmToolsTest(unittest.TestCase):
             '</｜｜DSML｜｜tool_calls>'
         )
 
-        with patch('openrouter._post_chat_response', side_effect=[
-            {'choices': [{'message': {'content': dsml}}]},
-            dm_talk_tool_response("The Broker's instructions are clear: keep the crate sealed and deliver it intact."),
-        ]) as post_chat:
+        with patch('openrouter._post_chat_normalized', side_effect=[_normalized_from_raw({'choices': [{'message': {'content': dsml}}]}), _normalized_from_raw(dm_talk_tool_response("The Broker's instructions are clear: keep the crate sealed and deliver it intact."))]) as post_chat:
             result = get_session_dm_response_with_tools(
                 hot_context,
                 [],
@@ -2953,7 +2915,7 @@ class DmToolsTest(unittest.TestCase):
         }
         execute_tool = Mock(return_value={})
 
-        with patch('openrouter._post_chat_response', return_value={
+        with patch('openrouter._post_chat_normalized', return_value=_normalized_from_raw({
             'choices': [{
                 'message': {
                     'content': '',
@@ -2969,7 +2931,7 @@ class DmToolsTest(unittest.TestCase):
                     }],
                 },
             }],
-        }) as post_chat:
+        })) as post_chat:
             result = get_session_dm_response_with_tools(
                 hot_context,
                 [],
@@ -3010,7 +2972,7 @@ class DmToolsTest(unittest.TestCase):
             }],
         }
 
-        with patch('openrouter._post_chat_response', return_value=malformed_finalizer):
+        with patch('openrouter._post_chat_normalized', return_value=_normalized_from_raw(malformed_finalizer)):
             result = get_session_dm_response_with_tools(
                 hot_context,
                 [],
@@ -3029,7 +2991,7 @@ class DmToolsTest(unittest.TestCase):
             'private_spoiler_items': [],
         }
 
-        with patch('openrouter._post_chat_response', return_value={
+        with patch('openrouter._post_chat_normalized', return_value=_normalized_from_raw({
             'choices': [{
                 'message': {
                     'content': '',
@@ -3044,7 +3006,7 @@ class DmToolsTest(unittest.TestCase):
                     }],
                 },
             }],
-        }):
+        })):
             result = get_session_dm_response_with_tools(
                 hot_context,
                 [],
@@ -3066,9 +3028,9 @@ class DmToolsTest(unittest.TestCase):
             'private_spoiler_items': [{'id': 'fact_trap', 'kind': 'fact', 'text': 'The note is a trap.'}],
         }
 
-        with patch('openrouter._post_chat_response', return_value={
+        with patch('openrouter._post_chat_normalized', return_value=_normalized_from_raw({
             'choices': [{'message': dm_talk_tool_response('Jara watches the door.')['choices'][0]['message']}],
-        }), patch('openrouter.check_session_spoilers_with_llm', return_value={
+        })), patch('openrouter.check_session_spoilers_with_llm', return_value={
             'safe': True,
             'leaked_item_ids': [],
             'evidence': [],
@@ -3092,9 +3054,9 @@ class DmToolsTest(unittest.TestCase):
             'main_call_thinking': False,
             'confidence': 'high',
             'reason': 'Simple public narration.',
-        }), patch('openrouter._post_chat_response', return_value={
+        }), patch('openrouter._post_chat_normalized', return_value=_normalized_from_raw({
             'choices': [{'message': dm_talk_tool_response('Rain slicks the old stones.')['choices'][0]['message']}],
-        }) as post_chat:
+        })) as post_chat:
             result = get_session_dm_response_with_tools(
                 hot_context,
                 [],
@@ -3126,8 +3088,7 @@ class DmToolsTest(unittest.TestCase):
             'main_call_thinking': False,
             'confidence': 'high',
             'reason': 'Simple mechanics lookup.',
-        }), patch('openrouter._post_chat_response', side_effect=[
-            {'choices': [{'message': {
+        }), patch('openrouter._post_chat_normalized', side_effect=[_normalized_from_raw({'choices': [{'message': {
                 'content': '',
                 'tool_calls': [{
                     'id': 'call_sheet',
@@ -3136,9 +3097,7 @@ class DmToolsTest(unittest.TestCase):
                         'arguments': '{"question":"What is my AC?"}',
                     },
                 }],
-            }}]},
-            dm_talk_tool_response('Your AC is 15.'),
-        ]) as post_chat:
+            }}]}), _normalized_from_raw(dm_talk_tool_response('Your AC is 15.'))]) as post_chat:
             result = get_session_dm_response_with_tools(
                 hot_context,
                 [],
@@ -3243,18 +3202,13 @@ class DmToolsTest(unittest.TestCase):
                 'encounter_state': next_states[next_index],
             }
 
-        with patch('openrouter._post_chat_response', side_effect=[
-            {'choices': [{'message': {'content': '', 'tool_calls': [
+        with patch('openrouter._post_chat_normalized', side_effect=[_normalized_from_raw({'choices': [{'message': {'content': '', 'tool_calls': [
                 {'id': 'call_1', 'function': {'name': 'update_combatant_actions', 'arguments': '{"placement_id":7,"actions":{"action":false,"bonus_action":false,"movement_remaining":10}}'}},
                 {'id': 'call_2', 'function': {'name': 'next_combat_turn', 'arguments': '{}'}},
-            ]}}]},
-            dm_talk_tool_response('The skirmisher withdraws along the ledge.'),
-            {'choices': [{'message': {'content': '', 'tool_calls': [
+            ]}}]}), _normalized_from_raw(dm_talk_tool_response('The skirmisher withdraws along the ledge.')), _normalized_from_raw({'choices': [{'message': {'content': '', 'tool_calls': [
                 {'id': 'call_3', 'function': {'name': 'update_combatant_actions', 'arguments': '{"placement_id":9,"actions":{"action":false,"bonus_action":false,"movement_remaining":0}}'}},
                 {'id': 'call_4', 'function': {'name': 'next_combat_turn', 'arguments': '{}'}},
-            ]}}]},
-            dm_talk_tool_response('The skirmisher falls back and the brute stomps into position. Seraphina, you are up.'),
-        ]) as post_chat:
+            ]}}]}), _normalized_from_raw(dm_talk_tool_response('The skirmisher falls back and the brute stomps into position. Seraphina, you are up.'))]) as post_chat:
             result = get_session_dm_response_with_tools(
                 hot_context,
                 [],
@@ -3368,19 +3322,13 @@ class DmToolsTest(unittest.TestCase):
                 },
             }
 
-        with patch('openrouter._post_chat_response', side_effect=[
-            {'choices': [{'message': {'content': '', 'tool_calls': [
+        with patch('openrouter._post_chat_normalized', side_effect=[_normalized_from_raw({'choices': [{'message': {'content': '', 'tool_calls': [
                 {'id': 'call_1', 'function': {'name': 'update_combatant_actions', 'arguments': '{"placement_id":7,"actions":{"action":false,"bonus_action":false,"movement_remaining":0}}'}},
                 {'id': 'call_2', 'function': {'name': 'next_combat_turn', 'arguments': '{}'}},
-            ]}}]},
-            {'choices': [{'message': {'content': 'The skirmisher falls back.'}}]},
-            {'choices': [{'message': {'content': 'The skirmisher falls back.'}}]},
-            {'choices': [{'message': {'content': '', 'tool_calls': [
+            ]}}]}), _normalized_from_raw({'choices': [{'message': {'content': 'The skirmisher falls back.'}}]}), _normalized_from_raw({'choices': [{'message': {'content': 'The skirmisher falls back.'}}]}), _normalized_from_raw({'choices': [{'message': {'content': '', 'tool_calls': [
                 {'id': 'call_3', 'function': {'name': 'update_combatant_actions', 'arguments': '{"placement_id":9,"actions":{"action":false,"bonus_action":false,"movement_remaining":0}}'}},
                 {'id': 'call_4', 'function': {'name': 'next_combat_turn', 'arguments': '{}'}},
-            ]}}]},
-            dm_talk_tool_response('The skirmisher fades back and the brute gives ground. Seraphina, you are up.'),
-        ]):
+            ]}}]}), _normalized_from_raw(dm_talk_tool_response('The skirmisher fades back and the brute gives ground. Seraphina, you are up.'))]):
             result = get_session_dm_response_with_tools(
                 hot_context,
                 [],
@@ -3430,10 +3378,7 @@ class DmToolsTest(unittest.TestCase):
             executed.append((name, args))
             return {'message': 'unexpected'}
 
-        with patch('openrouter._post_chat_response', side_effect=[
-            {'choices': [{'message': {'content': '', 'tool_calls': [{'id': 'call_1', 'function': {'name': 'search_campaign_memory', 'arguments': '{"query":"training skirmisher"}'}}]}}]},
-            dm_talk_tool_response('The skirmisher gauges the field from the high ledge.'),
-        ]):
+        with patch('openrouter._post_chat_normalized', side_effect=[_normalized_from_raw({'choices': [{'message': {'content': '', 'tool_calls': [{'id': 'call_1', 'function': {'name': 'search_campaign_memory', 'arguments': '{"query":"training skirmisher"}'}}]}}]}), _normalized_from_raw(dm_talk_tool_response('The skirmisher gauges the field from the high ledge.'))]):
             result = get_session_dm_response_with_tools(
                 hot_context,
                 [],
@@ -3505,14 +3450,10 @@ class DmToolsTest(unittest.TestCase):
                 },
             }
 
-        with patch('openrouter._post_chat_response', side_effect=[
-            {'choices': [{'message': {'content': '', 'tool_calls': [
+        with patch('openrouter._post_chat_normalized', side_effect=[_normalized_from_raw({'choices': [{'message': {'content': '', 'tool_calls': [
                 {'id': 'call_1', 'function': {'name': 'update_combatant_actions', 'arguments': '{"placement_id":7,"actions":{"action":false,"bonus_action":false,"movement_remaining":0}}'}},
                 {'id': 'call_2', 'function': {'name': 'next_combat_turn', 'arguments': '{}'}},
-            ]}}]},
-            {'choices': [{'message': {'content': '', 'tool_calls': [{'id': 'call_3', 'function': {'name': 'set_combat_turn', 'arguments': '{"active_turn_index":0}'}}]}}]},
-            dm_talk_tool_response('The skirmisher scuttles back into cover. Seraphina, your turn.'),
-        ]):
+            ]}}]}), _normalized_from_raw({'choices': [{'message': {'content': '', 'tool_calls': [{'id': 'call_3', 'function': {'name': 'set_combat_turn', 'arguments': '{"active_turn_index":0}'}}]}}]}), _normalized_from_raw(dm_talk_tool_response('The skirmisher scuttles back into cover. Seraphina, your turn.'))]):
             result = get_session_dm_response_with_tools(
                 hot_context,
                 [],
@@ -3589,14 +3530,10 @@ class DmToolsTest(unittest.TestCase):
                 },
             }
 
-        with patch('openrouter._post_chat_response', side_effect=[
-            {'choices': [{'message': {'content': '', 'tool_calls': [
+        with patch('openrouter._post_chat_normalized', side_effect=[_normalized_from_raw({'choices': [{'message': {'content': '', 'tool_calls': [
                 {'id': 'call_1', 'function': {'name': 'update_combatant_actions', 'arguments': '{"placement_id":7,"actions":{"action":false,"bonus_action":false,"movement_remaining":0}}'}},
                 {'id': 'call_2', 'function': {'name': 'next_combat_turn', 'arguments': '{}'}},
-            ]}}]},
-            dm_talk_tool_response('The skirmisher ducks behind the gear housing. Now let me advance to Seraphina.'),
-            dm_talk_tool_response('The skirmisher ducks behind the gear housing. Seraphina, you are up.'),
-        ]) as post_chat:
+            ]}}]}), _normalized_from_raw(dm_talk_tool_response('The skirmisher ducks behind the gear housing. Now let me advance to Seraphina.')), _normalized_from_raw(dm_talk_tool_response('The skirmisher ducks behind the gear housing. Seraphina, you are up.'))]) as post_chat:
             result = get_session_dm_response_with_tools(
                 hot_context,
                 [],
@@ -3666,12 +3603,7 @@ class DmToolsTest(unittest.TestCase):
         def execute_tool(name, args, _audit):
             return execute_dm_tool(self.campaign, self.session, self.user, name, args)
 
-        with patch('openrouter._post_chat_response', side_effect=[
-            {'choices': [{'message': {'content': '', 'tool_calls': [{'id': 'call_1', 'function': {'name': 'next_combat_turn', 'arguments': '{}'}}]}}]},
-            {'choices': [{'message': {'content': ''}}]},
-            {'choices': [{'message': {'content': ''}}]},
-            {'choices': [{'message': {'content': ''}}]},
-        ]):
+        with patch('openrouter._post_chat_normalized', side_effect=[_normalized_from_raw({'choices': [{'message': {'content': '', 'tool_calls': [{'id': 'call_1', 'function': {'name': 'next_combat_turn', 'arguments': '{}'}}]}}]}), _normalized_from_raw({'choices': [{'message': {'content': ''}}]}), _normalized_from_raw({'choices': [{'message': {'content': ''}}]}), _normalized_from_raw({'choices': [{'message': {'content': ''}}]})]):
             result = get_session_dm_response_with_tools(
                 hot_context,
                 [],
@@ -3699,10 +3631,7 @@ class DmToolsTest(unittest.TestCase):
             'private_spoiler_items': [{'id': 'fact_trap', 'kind': 'fact', 'text': 'The note is a trap.'}],
         }
 
-        with patch('openrouter._post_chat_response', side_effect=[
-            dm_talk_tool_response('The trap closes around you.'),
-            dm_talk_tool_response('The air feels tense as you leave.'),
-        ]) as post_chat, patch('openrouter.check_session_spoilers_with_llm', side_effect=[
+        with patch('openrouter._post_chat_normalized', side_effect=[_normalized_from_raw(dm_talk_tool_response('The trap closes around you.')), _normalized_from_raw(dm_talk_tool_response('The air feels tense as you leave.'))]) as post_chat, patch('openrouter.check_session_spoilers_with_llm', side_effect=[
             {'safe': False, 'leaked_item_ids': ['fact_trap'], 'evidence': ['The trap closes'], 'reason': 'Directly implies the hidden truth.'},
             {'safe': True, 'leaked_item_ids': [], 'evidence': [], 'reason': ''},
         ]):
@@ -3748,10 +3677,7 @@ class DmToolsTest(unittest.TestCase):
             'visible_naming_constraints': [],
         }
 
-        with patch('openrouter._post_chat_response', side_effect=[
-            dm_talk_tool_response('<npc target="Harl">"That was Orrin Vane, all right."</npc>'),
-            dm_talk_tool_response('<npc target="Harl">"That is a very specific description. If it is true, someone important is missing."</npc>'),
-        ]) as post_chat, patch('openrouter.check_session_canon_discipline_with_llm', side_effect=[
+        with patch('openrouter._post_chat_normalized', side_effect=[_normalized_from_raw(dm_talk_tool_response('<npc target="Harl">"That was Orrin Vane, all right."</npc>')), _normalized_from_raw(dm_talk_tool_response('<npc target="Harl">"That is a very specific description. If it is true, someone important is missing."</npc>'))]) as post_chat, patch('openrouter.check_session_canon_discipline_with_llm', side_effect=[
             {
                 'safe': False,
                 'unsupported_confirmations': [{
@@ -3827,11 +3753,7 @@ class DmToolsTest(unittest.TestCase):
             }],
         }
 
-        with patch('openrouter._post_chat_response', side_effect=[
-            dm_talk_tool_response('<npc target="Baronessa Rina Vex">"Half now, as promised."</npc> She holds out the pouch again.'),
-            truncated_repair,
-            dm_talk_tool_response('<npc target="Baronessa Rina Vex">"The well is dry. Stay low in the west ditch and you can reach it unseen."</npc>'),
-        ]) as post_chat, patch('openrouter.check_session_canon_discipline_with_llm', side_effect=[
+        with patch('openrouter._post_chat_normalized', side_effect=[_normalized_from_raw(dm_talk_tool_response('<npc target="Baronessa Rina Vex">"Half now, as promised."</npc> She holds out the pouch again.')), _normalized_from_raw(truncated_repair), _normalized_from_raw(dm_talk_tool_response('<npc target="Baronessa Rina Vex">"The well is dry. Stay low in the west ditch and you can reach it unseen."</npc>'))]) as post_chat, patch('openrouter.check_session_canon_discipline_with_llm', side_effect=[
             {
                 'safe': False,
                 'unsupported_confirmations': [],
@@ -3891,13 +3813,7 @@ class DmToolsTest(unittest.TestCase):
             'visible_naming_constraints': [],
         }
 
-        with patch('openrouter._post_chat_response', side_effect=[
-            dm_talk_tool_response('The tower was never important. The grove is the true heart of the whole operation.'),
-            dm_talk_tool_response('Forget the tower. Everything that matters is in the grove.'),
-            dm_talk_tool_response('The tower lead is dead. The grove is the only real answer.'),
-            dm_talk_tool_response('You can ignore the tower now. It was a false trail from the start.'),
-            dm_talk_tool_response('The grove is what matters. The tower never did.'),
-        ]), patch('openrouter.check_session_canon_discipline_with_llm', side_effect=[
+        with patch('openrouter._post_chat_normalized', side_effect=[_normalized_from_raw(dm_talk_tool_response('The tower was never important. The grove is the true heart of the whole operation.')), _normalized_from_raw(dm_talk_tool_response('Forget the tower. Everything that matters is in the grove.')), _normalized_from_raw(dm_talk_tool_response('The tower lead is dead. The grove is the only real answer.')), _normalized_from_raw(dm_talk_tool_response('You can ignore the tower now. It was a false trail from the start.')), _normalized_from_raw(dm_talk_tool_response('The grove is what matters. The tower never did.'))]), patch('openrouter.check_session_canon_discipline_with_llm', side_effect=[
             {
                 'safe': False,
                 'unsupported_confirmations': [],
@@ -4035,10 +3951,7 @@ class DmToolsTest(unittest.TestCase):
         }
         trace_id = 'session_dm:session_2:message_15'
 
-        with patch('openrouter._post_chat_response', side_effect=[
-            dm_talk_tool_response('The Crimson Veil watches you.'),
-            dm_talk_tool_response('Someone watches from the dark.'),
-        ]):
+        with patch('openrouter._post_chat_normalized', side_effect=[_normalized_from_raw(dm_talk_tool_response('The Crimson Veil watches you.')), _normalized_from_raw(dm_talk_tool_response('Someone watches from the dark.'))]):
             result = get_session_dm_response_with_tools(
                 hot_context,
                 [],
@@ -4068,12 +3981,7 @@ class DmToolsTest(unittest.TestCase):
         trace_id = 'session_dm:session_2:message_16'
         safe_pc_check = {'safe': True, 'violations': [], 'confidence': 'high', 'reason': ''}
 
-        with patch('openrouter._post_chat_response', side_effect=[
-            dm_talk_tool_response('The Crimson Veil watches you.'),
-            dm_talk_tool_response('The watcher is gone.'),
-            dm_talk_tool_response('The Crimson Veil still watches.'),
-            dm_talk_tool_response('Someone watches from the dark.'),
-        ]), patch('openrouter.check_session_pc_control_with_llm', side_effect=[
+        with patch('openrouter._post_chat_normalized', side_effect=[_normalized_from_raw(dm_talk_tool_response('The Crimson Veil watches you.')), _normalized_from_raw(dm_talk_tool_response('The watcher is gone.')), _normalized_from_raw(dm_talk_tool_response('The Crimson Veil still watches.')), _normalized_from_raw(dm_talk_tool_response('Someone watches from the dark.'))]), patch('openrouter.check_session_pc_control_with_llm', side_effect=[
             safe_pc_check,
             {
                 'safe': False,
@@ -4119,9 +4027,7 @@ class DmToolsTest(unittest.TestCase):
             executed.append((name, args))
             return {'matches': [{'text': 'The symbol appears infernal.'}]}
 
-        with patch('openrouter._post_chat_response', side_effect=[
-            dm_talk_tool_response('Your Fiendish Patron stirs.'),
-            {'choices': [{'message': {
+        with patch('openrouter._post_chat_normalized', side_effect=[_normalized_from_raw(dm_talk_tool_response('Your Fiendish Patron stirs.')), _normalized_from_raw({'choices': [{'message': {
                 'content': '',
                 'tool_calls': [{
                     'id': 'call_retry_search',
@@ -4130,9 +4036,7 @@ class DmToolsTest(unittest.TestCase):
                         'arguments': '{"query":"burned symbol infernal"}',
                     },
                 }],
-            }}]},
-            dm_talk_tool_response('The symbol appears infernal, but you do not know who left it.'),
-        ]):
+            }}]}), _normalized_from_raw(dm_talk_tool_response('The symbol appears infernal, but you do not know who left it.'))]):
             result = get_session_dm_response_with_tools(
                 hot_context,
                 [],
@@ -4154,13 +4058,7 @@ class DmToolsTest(unittest.TestCase):
             'private_spoiler_items': [{'id': 'fact_trap', 'kind': 'fact', 'text': 'The note is a trap.'}],
         }
 
-        with patch('openrouter._post_chat_response', side_effect=[
-            dm_talk_tool_response('The trap closes around you.'),
-            dm_talk_tool_response('A hidden trap closes around you.'),
-            dm_talk_tool_response('The ambush was a trap all along.'),
-            dm_talk_tool_response('This confirms the note was a trap.'),
-            dm_talk_tool_response('You can feel that something is wrong here.'),
-        ]), patch('openrouter.check_session_spoilers_with_llm', side_effect=[
+        with patch('openrouter._post_chat_normalized', side_effect=[_normalized_from_raw(dm_talk_tool_response('The trap closes around you.')), _normalized_from_raw(dm_talk_tool_response('A hidden trap closes around you.')), _normalized_from_raw(dm_talk_tool_response('The ambush was a trap all along.')), _normalized_from_raw(dm_talk_tool_response('This confirms the note was a trap.')), _normalized_from_raw(dm_talk_tool_response('You can feel that something is wrong here.'))]), patch('openrouter.check_session_spoilers_with_llm', side_effect=[
             {'safe': False, 'leaked_item_ids': ['fact_trap'], 'evidence': ['The trap closes'], 'reason': 'Directly implies the hidden truth.'},
             {'safe': False, 'leaked_item_ids': ['fact_trap'], 'evidence': ['hidden trap'], 'reason': 'Still implies the hidden truth.'},
             {'safe': False, 'leaked_item_ids': ['fact_trap'], 'evidence': ['trap all along'], 'reason': 'Still implies the hidden truth.'},
@@ -4181,11 +4079,7 @@ class DmToolsTest(unittest.TestCase):
             'private_spoiler_items': [{'id': 'fact_trap', 'kind': 'fact', 'text': 'The note is a trap.'}],
         }
 
-        with patch('openrouter._post_chat_response', side_effect=[
-            dm_talk_tool_response('The trap closes around you.'),
-            dm_talk_tool_response('A hidden trap closes around you.'),
-            dm_talk_tool_response('The corridor ahead is quiet and cold.'),
-        ]), patch('openrouter.check_session_spoilers_with_llm', side_effect=[
+        with patch('openrouter._post_chat_normalized', side_effect=[_normalized_from_raw(dm_talk_tool_response('The trap closes around you.')), _normalized_from_raw(dm_talk_tool_response('A hidden trap closes around you.')), _normalized_from_raw(dm_talk_tool_response('The corridor ahead is quiet and cold.'))]), patch('openrouter.check_session_spoilers_with_llm', side_effect=[
             {'safe': False, 'leaked_item_ids': ['fact_trap'], 'evidence': ['The trap closes'], 'reason': 'Directly implies the hidden truth.'},
             {'safe': False, 'leaked_item_ids': ['fact_trap'], 'evidence': ['hidden trap'], 'reason': 'Still implies the hidden truth.'},
             {'safe': True, 'leaked_item_ids': [], 'evidence': [], 'reason': ''},
@@ -4222,11 +4116,7 @@ class DmToolsTest(unittest.TestCase):
             ],
         }
 
-        with patch('openrouter._post_chat_response', side_effect=[
-            dm_talk_tool_response('Aria nods once. "I will take the left passage."'),
-            dm_talk_tool_response('The left passage yawns ahead. Aria looks to you for the call.'),
-            dm_talk_tool_response('The left passage yawns ahead. Aria looks to you for the call.'),
-        ]) as post_chat, patch('openrouter.check_session_pc_control_with_llm', side_effect=[
+        with patch('openrouter._post_chat_normalized', side_effect=[_normalized_from_raw(dm_talk_tool_response('Aria nods once. "I will take the left passage."')), _normalized_from_raw(dm_talk_tool_response('The left passage yawns ahead. Aria looks to you for the call.')), _normalized_from_raw(dm_talk_tool_response('The left passage yawns ahead. Aria looks to you for the call.'))]) as post_chat, patch('openrouter.check_session_pc_control_with_llm', side_effect=[
             {
                 'safe': False,
                 'violations': [{

@@ -1797,7 +1797,9 @@ class AutomationRouteTest(unittest.TestCase):
             },
         ).get_json()['audit_cycle']['id']
 
-        tool_response = {
+        from llm_providers import OpenRouterAdapter
+
+        tool_response = OpenRouterAdapter().parse_response({
             'id': 'resp-tool',
             'choices': [{
                 'message': {
@@ -1810,8 +1812,8 @@ class AutomationRouteTest(unittest.TestCase):
                 'finish_reason': 'tool_calls',
             }],
             'usage': {'prompt_tokens': 10, 'completion_tokens': 5, 'total_tokens': 15},
-        }
-        final_response = {
+        })
+        final_response = OpenRouterAdapter().parse_response({
             'id': 'resp-final',
             'choices': [{
                 'message': {
@@ -1831,7 +1833,7 @@ class AutomationRouteTest(unittest.TestCase):
                 'finish_reason': 'stop',
             }],
             'usage': {'prompt_tokens': 20, 'completion_tokens': 10, 'total_tokens': 30},
-        }
+        })
 
         with app.app_context():
             run = db.session.get(AutomationRun, run_id)
@@ -1840,7 +1842,7 @@ class AutomationRouteTest(unittest.TestCase):
             db.session.add(job)
             db.session.commit()
 
-            with patch('services.automation_auditor._post_chat_response', side_effect=[tool_response, final_response]):
+            with patch('services.automation_auditor._post_chat_normalized', side_effect=[tool_response, final_response]):
                 result = request_auditor_decision_with_tools(
                     run,
                     cycle,

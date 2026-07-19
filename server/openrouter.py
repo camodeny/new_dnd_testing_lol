@@ -2,32 +2,29 @@ import os
 import json
 import re
 import tempfile
-import time
+from contextvars import ContextVar
 from threading import Lock
 from pathlib import Path
 from uuid import uuid4
-import requests
 from dotenv import load_dotenv
 
+import llm_providers
+from llm_providers import LLMProviderAdapter, ProviderError, ProviderRequest, execute_chat, provider_registry, stream_chat
 from services.audit_service import log_audit_event, log_model_error, log_model_request, log_model_response
 
 load_dotenv()
 
-OPENROUTER_API_KEY = os.environ.get('OPENROUTER_API_KEY', '')
-OPENROUTER_MODEL = os.environ.get('OPENROUTER_MODEL', '')
-OPENROUTER_BASE_URL = os.environ.get('OPENROUTER_BASE_URL', 'https://openrouter.ai/api/v1/chat/completions')
+# When a workflow (e.g. DMExecutionLoop constructed with an explicit adapter)
+# binds a provider-bound transport, every LLM sub-call it makes — preflight,
+# guards, repairs, the main generation — resolves through this override
+# instead of the process-global provider configuration.
+_TRANSPORT_OVERRIDE = ContextVar('llm_transport_override', default=None)
 
-OPENCODE_GO_API_KEY = os.environ.get('OPENCODE_GO_API_KEY', '')
-OPENCODE_GO_MODEL = os.environ.get('OPENCODE_GO_MODEL', '')
-OPENCODE_GO_BASE_URL = os.environ.get(
-    'OPENCODE_GO_BASE_URL',
-    'https://opencode.ai/zen/go/v1/chat/completions',
-)
-OPENCODE_GO_THINKING = os.environ.get('OPENCODE_GO_THINKING', 'disabled')
-OPENCODE_GO_REASONING_EFFORT = os.environ.get('OPENCODE_GO_REASONING_EFFORT', 'high')
-
+# Provider credentials, base URLs, env models, and provider-specific payload
+# quirks are owned by the adapters in llm_providers.py (resolved from env at
+# request time). Only the provider selector remains here.
 LLM_PROVIDER = os.environ.get('LLM_PROVIDER', 'openrouter').strip().lower() or 'openrouter'
-SUPPORTED_LLM_PROVIDERS = {'openrouter', 'opencode_go'}
+SUPPORTED_LLM_PROVIDERS = provider_registry.names()
 _LLM_MODEL_LOCK = Lock()
 LLM_RUNTIME_MODEL_FILE = Path(os.environ.get(
     'LLM_RUNTIME_MODEL_FILE',
@@ -445,16 +442,20 @@ SHOP_MENU_GENERATION_SYSTEM_PROMPT = (
 )
 
 
+def _adapter_for_provider(provider):
+    return provider_registry.get(provider)
+
+
 def _env_model_for_provider(provider):
-    return OPENCODE_GO_MODEL if provider == 'opencode_go' else OPENROUTER_MODEL
+    return _adapter_for_provider(provider).env_model()
 
 
 def _api_key_for_provider(provider):
-    return OPENCODE_GO_API_KEY if provider == 'opencode_go' else OPENROUTER_API_KEY
+    return _adapter_for_provider(provider).api_key()
 
 
 def _api_url_for_provider(provider):
-    return OPENCODE_GO_BASE_URL if provider == 'opencode_go' else OPENROUTER_BASE_URL
+    return _adapter_for_provider(provider).base_url()
 
 
 def get_llm_provider():
@@ -472,9 +473,10 @@ def get_llm_model():
 
 def get_llm_settings():
     provider = get_llm_provider()
+    adapter = _adapter_for_provider(provider)
     with _LLM_MODEL_LOCK:
         override = _read_runtime_model_override()
-    env_model = _env_model_for_provider(provider)
+    env_model = adapter.env_model()
     model = override or env_model
     return {
         'provider': provider,
@@ -482,9 +484,9 @@ def get_llm_settings():
         'env_model': env_model,
         'source': 'runtime' if override else 'env',
         'is_overridden': bool(override),
-        'api_key_configured': bool(_api_key_for_provider(provider)),
-        'thinking_enabled': _deepseek_thinking_enabled(provider, model),
-        'reasoning_effort': OPENCODE_GO_REASONING_EFFORT if provider == 'opencode_go' else None,
+        'api_key_configured': bool(adapter.api_key()),
+        'thinking_enabled': adapter.capabilities_for(model).supports_thinking,
+        'reasoning_effort': adapter.configured_reasoning_effort(),
     }
 
 
@@ -543,11 +545,7 @@ def _write_runtime_model_override(model):
 
 def _require_llm_config(provider=None, model=None):
     provider = provider or get_llm_provider()
-    env_prefix = 'OPENCODE_GO' if provider == 'opencode_go' else 'OPENROUTER'
-    if not _api_key_for_provider(provider):
-        raise RuntimeError(f'{env_prefix}_API_KEY is not set')
-    if not (model if model is not None else get_llm_model()):
-        raise RuntimeError(f'{env_prefix}_MODEL is not set')
+    _adapter_for_provider(provider).require_config(model if model is not None else get_llm_model())
 
 
 def _estimate_tokens(value):
@@ -556,18 +554,11 @@ def _estimate_tokens(value):
 
 
 def _retry_delay_seconds(failed_attempt):
-    return min(
-        LLM_RETRY_BASE_DELAY_SECONDS * (2 ** max(failed_attempt - 1, 0)),
-        LLM_RETRY_MAX_DELAY_SECONDS,
-    )
+    return llm_providers.retry_delay_seconds(failed_attempt)
 
 
 def _is_retriable_llm_error(error):
-    if isinstance(error, requests.HTTPError):
-        response = getattr(error, 'response', None)
-        status_code = getattr(response, 'status_code', None)
-        return status_code in {404, 408, 409, 425, 429} or (status_code is not None and status_code >= 500)
-    return isinstance(error, (requests.ConnectionError, requests.Timeout))
+    return LLMProviderAdapter().classify_error(error).retryable
 
 
 def _enabled(value):
@@ -575,39 +566,88 @@ def _enabled(value):
 
 
 def _deepseek_thinking_enabled(provider, model):
-    return (
-        provider == 'opencode_go'
-        and str(model or '').strip().lower().startswith('deepseek-v4-')
-        and _enabled(OPENCODE_GO_THINKING)
-    )
+    return _adapter_for_provider(provider).capabilities_for(model).supports_thinking
 
 
 def _provider_request_payload_options(provider, model, tools, tool_choice, parallel_tool_calls, allow_thinking=True):
-    thinking_enabled = bool(allow_thinking) and _deepseek_thinking_enabled(provider, model)
-    options = {
-        'thinking_enabled': thinking_enabled,
-        'tool_choice': tool_choice,
-        'parallel_tool_calls': parallel_tool_calls,
-    }
-    if thinking_enabled:
-        options['thinking'] = {'type': 'enabled'}
-        effort = (OPENCODE_GO_REASONING_EFFORT or 'high').strip().lower()
-        options['reasoning_effort'] = effort if effort in {'high', 'max'} else 'high'
-        if tools:
-            # DeepSeek thinking mode rejects tool_choice and does not document parallel_tool_calls.
-            options['tool_choice'] = None
-            options['parallel_tool_calls'] = None
-    elif (
-        tools
-        and provider == 'opencode_go'
-        and str(model or '').strip().lower().startswith('deepseek-v4-')
-        and tool_choice == 'required'
-    ):
-        options['tool_choice'] = None
-    return options
+    return _adapter_for_provider(provider).payload_options(
+        model,
+        tools,
+        tool_choice,
+        parallel_tool_calls,
+        allow_thinking=allow_thinking,
+    )
 
 
-def _post_chat_response(
+def _resolve_transport_provider_model(provider, model):
+    override = _TRANSPORT_OVERRIDE.get()
+    override_provider = None
+    if override:
+        provider = provider or override.get('provider')
+        model = model or override.get('model')
+        override_provider = override.get('provider')
+    provider = provider or get_llm_provider()
+    if model is None:
+        # When an override set the provider, resolve model from that
+        # provider's env to avoid crossing provider boundaries (e.g. the
+        # fake adapter's missing model should not fall back to the global
+        # OpenRouter model). Without an override, use the normal resolution
+        # that respects runtime overrides.
+        if override_provider:
+            model = _env_model_for_provider(provider)
+        else:
+            model = get_llm_model()
+    return provider, model
+
+
+def _make_audit_hooks(campaign_id, operation, actor, provider, trace_id, parent_trace_id, trace_label, audit_context):
+    """Transport hooks emitting the standard model_retry/model_error audit events."""
+
+    class _AuditHooks:
+        def on_retry(self, attempt, max_attempts_, delay_seconds, error):
+            tracker = audit_context.get('telemetry_tracker') if isinstance(audit_context, dict) else None
+            if isinstance(tracker, dict):
+                tracker['provider_retries'] = tracker.get('provider_retries', 0) + 1
+            if campaign_id:
+                log_audit_event(
+                    campaign_id,
+                    'model_retry',
+                    f'{actor} retrying: {operation}',
+                    {
+                        'operation': operation,
+                        'attempt': attempt,
+                        'next_attempt': attempt + 1,
+                        'max_attempts': max_attempts_,
+                        'delay_seconds': delay_seconds,
+                        'error': repr(error),
+                    },
+                    source=provider,
+                    actor=actor,
+                    trace_id=trace_id,
+                    parent_trace_id=parent_trace_id,
+                    trace_label=trace_label,
+                    audit_role='tools',
+                    commit=True,
+                )
+
+        def on_error(self, error):
+            if campaign_id:
+                log_model_error(
+                    campaign_id,
+                    operation,
+                    actor,
+                    error,
+                    commit=True,
+                    trace_id=trace_id,
+                    parent_trace_id=parent_trace_id,
+                    trace_label=trace_label,
+                    provider=provider,
+                )
+
+    return _AuditHooks()
+
+
+def _post_chat_normalized(
     messages,
     json_mode=False,
     audit_context=None,
@@ -629,8 +669,7 @@ def _post_chat_response(
     parent_trace_id = audit_context.get('parent_trace_id')
     trace_label = audit_context.get('trace_label') or f'{actor}: {operation}'
 
-    provider = provider or get_llm_provider()
-    model = model or get_llm_model()
+    provider, model = _resolve_transport_provider_model(provider, model)
     try:
         _require_llm_config(provider, model)
     except Exception as err:
@@ -656,23 +695,6 @@ def _post_chat_response(
         parallel_tool_calls,
         allow_thinking=allow_thinking,
     )
-    payload = {
-        'model': model,
-        'messages': messages,
-    }
-    if max_tokens is not None:
-        payload['max_tokens'] = max_tokens
-    if tools:
-        payload['tools'] = tools
-    if provider_options.get('tool_choice') is not None:
-        payload['tool_choice'] = provider_options['tool_choice']
-    if provider_options.get('parallel_tool_calls') is not None:
-        payload['parallel_tool_calls'] = provider_options['parallel_tool_calls']
-    if provider_options.get('thinking_enabled'):
-        payload['thinking'] = provider_options['thinking']
-        payload['reasoning_effort'] = provider_options['reasoning_effort']
-    if json_mode:
-        payload['response_format'] = {'type': 'json_object'}
 
     if campaign_id:
         log_model_request(
@@ -705,77 +727,46 @@ def _post_chat_response(
         )
 
     attempt_limit = max(1, int(max_attempts or LLM_MAX_ATTEMPTS))
-    for attempt in range(1, attempt_limit + 1):
-        if attempt > 1:
-            tracker = audit_context.get('telemetry_tracker') if isinstance(audit_context, dict) else None
-            if isinstance(tracker, dict):
-                tracker['provider_retries'] = tracker.get('provider_retries', 0) + 1
-        try:
-            resp = requests.post(
-                _api_url_for_provider(provider),
-                headers={
-                    'Authorization': f'Bearer {_api_key_for_provider(provider)}',
-                    'Content-Type': 'application/json',
-                },
-                json=payload,
-                timeout=timeout_seconds,
-            )
-            resp.raise_for_status()
-            data = resp.json()
-            if campaign_id:
-                log_model_response(
-                    campaign_id,
-                    operation,
-                    actor,
-                    data,
-                    commit=True,
-                    trace_id=trace_id,
-                    parent_trace_id=parent_trace_id,
-                    trace_label=trace_label,
-                    provider=provider,
-                )
-            return data
-        except Exception as err:
-            can_retry = attempt < attempt_limit and _is_retriable_llm_error(err)
-            if can_retry:
-                delay_seconds = _retry_delay_seconds(attempt)
-                if campaign_id:
-                    log_audit_event(
-                        campaign_id,
-                        'model_retry',
-                        f'{actor} retrying: {operation}',
-                        {
-                            'operation': operation,
-                            'attempt': attempt,
-                            'next_attempt': attempt + 1,
-                            'max_attempts': attempt_limit,
-                            'delay_seconds': delay_seconds,
-                            'error': repr(err),
-                        },
-                        source=provider,
-                        actor=actor,
-                        trace_id=trace_id,
-                        parent_trace_id=parent_trace_id,
-                        trace_label=trace_label,
-                        audit_role='tools',
-                        commit=True,
-                    )
-                time.sleep(delay_seconds)
-                continue
 
-            if campaign_id:
-                log_model_error(
-                    campaign_id,
-                    operation,
-                    actor,
-                    err,
-                    commit=True,
-                    trace_id=trace_id,
-                    parent_trace_id=parent_trace_id,
-                    trace_label=trace_label,
-                    provider=provider,
-                )
-            raise
+    hooks = _make_audit_hooks(campaign_id, operation, actor, provider, trace_id, parent_trace_id, trace_label, audit_context)
+    request = ProviderRequest(
+        messages=messages,
+        model=model,
+        json_mode=json_mode,
+        tools=tools,
+        tool_choice=tool_choice,
+        parallel_tool_calls=parallel_tool_calls,
+        allow_thinking=allow_thinking,
+        timeout_seconds=timeout_seconds,
+        max_attempts=attempt_limit,
+        max_tokens=max_tokens,
+    )
+    normalized = execute_chat(_adapter_for_provider(provider), request, hooks=hooks)
+    if campaign_id:
+        audit_payload = {
+            'model': normalized.model,
+            'choices': [{
+                'message': normalized.message_view(),
+                'finish_reason': normalized.finish_reason,
+            }],
+            'usage': normalized.usage,
+            '_raw': normalized.raw,
+        }
+        log_model_response(
+            campaign_id,
+            operation,
+            actor,
+            audit_payload,
+            commit=True,
+            trace_id=trace_id,
+            parent_trace_id=parent_trace_id,
+            trace_label=trace_label,
+            provider=provider,
+        )
+    return normalized
+
+
+
 
 
 def _post_chat(
@@ -787,7 +778,7 @@ def _post_chat(
     max_attempts=None,
     max_tokens=None,
 ):
-    data = _post_chat_response(
+    return _post_chat_normalized(
         messages,
         json_mode=json_mode,
         audit_context=audit_context,
@@ -795,8 +786,7 @@ def _post_chat(
         timeout_seconds=timeout_seconds,
         max_attempts=max_attempts,
         max_tokens=max_tokens,
-    )
-    return data['choices'][0]['message']['content']
+    ).content
 
 
 def _post_chat_stream(
@@ -819,23 +809,9 @@ def _post_chat_stream(
     parent_trace_id = audit_context.get('parent_trace_id')
     trace_label = audit_context.get('trace_label') or f'{actor}: {operation}'
 
-    provider = get_llm_provider()
-    model = get_llm_model()
+    provider, model = _resolve_transport_provider_model(None, None)
+    adapter = _adapter_for_provider(provider)
     _require_llm_config(provider, model)
-
-    provider_options = _provider_request_payload_options(
-        provider, model, None, None, None, allow_thinking=allow_thinking,
-    )
-    payload = {
-        'model': model,
-        'messages': messages,
-        'stream': True,
-    }
-    if provider_options.get('thinking_enabled'):
-        payload['thinking'] = provider_options['thinking']
-        payload['reasoning_effort'] = provider_options['reasoning_effort']
-    if json_mode:
-        payload['response_format'] = {'type': 'json_object'}
 
     if campaign_id:
         log_model_request(
@@ -845,36 +821,22 @@ def _post_chat_stream(
             trace_label=trace_label, provider=provider,
         )
 
-    resp = requests.post(
-        _api_url_for_provider(provider),
-        headers={
-            'Authorization': f'Bearer {_api_key_for_provider(provider)}',
-            'Content-Type': 'application/json',
-        },
-        json=payload,
-        timeout=timeout_seconds,
+    request = ProviderRequest(
+        messages=messages,
+        model=model,
+        json_mode=json_mode,
+        allow_thinking=allow_thinking,
+        timeout_seconds=timeout_seconds,
         stream=True,
     )
-    resp.raise_for_status()
-
+    hooks = _make_audit_hooks(campaign_id, operation, actor, provider, trace_id, parent_trace_id, trace_label, audit_context)
     accumulated = []
-    for line in resp.iter_lines(decode_unicode=True):
-        if not line:
+    for event in stream_chat(adapter, request, hooks=hooks):
+        if event.kind != 'token':
             continue
-        if line.startswith('data: '):
-            data_str = line[6:]
-            if data_str.strip() == '[DONE]':
-                break
-            try:
-                chunk = json.loads(data_str)
-                delta = (chunk.get('choices') or [{}])[0].get('delta') or {}
-                content = delta.get('content') or ''
-                if content:
-                    accumulated.append(content)
-                    if on_token:
-                        on_token(content)
-            except (json.JSONDecodeError, IndexError, KeyError):
-                continue
+        accumulated.append(event.text)
+        if on_token:
+            on_token(event.text)
 
     full_text = ''.join(accumulated)
 
@@ -890,9 +852,8 @@ def _post_chat_stream(
     return full_text
 
 
-def _opening_scene_text_from_response(data):
-    message, _finish_reason = _choice_message(data)
-    content = message.get('content') or ''
+def _opening_scene_text_from_response(normalized):
+    content = normalized.content or ''
     if str(content).strip():
         return str(content).strip()
 
@@ -3078,15 +3039,22 @@ def _repair_session_dm_visible_reply(content, guard_name, details, hot_context, 
                 guard_operation,
                 f'{guard_operation}: visible reply repair retry {attempt_index}',
             )
-        data = _post_chat_response(
-            _build_session_guard_repair_messages(content, guard_name, details, hot_context),
-            json_mode=False,
-            audit_context=repair_audit,
-            tools=None,
-            allow_thinking=False,
-            max_tokens=max_tokens,
-        )
-        message, finish_reason = _choice_message(data)
+        try:
+            normalized = _post_chat_normalized(
+                _build_session_guard_repair_messages(content, guard_name, details, hot_context),
+                json_mode=False,
+                audit_context=repair_audit,
+                tools=None,
+                allow_thinking=False,
+                max_tokens=max_tokens,
+            )
+        except ProviderError as err:
+            if err.kind != 'malformed':
+                raise
+            # Choice-less repair output is unusable; try the next token budget.
+            continue
+        message = normalized.message_view()
+        finish_reason = normalized.finish_reason
         finish_reason = str(finish_reason or '').strip().lower()
         if finish_reason == 'length':
             continue
@@ -3898,14 +3866,6 @@ def build_character_sheet_agent_messages(question, scope, character_sheets):
     ]
 
 
-def _choice_message(data):
-    choices = data.get('choices') if isinstance(data, dict) else []
-    if not choices or not isinstance(choices[0], dict):
-        return {}, None
-    message = choices[0].get('message') or {}
-    return message if isinstance(message, dict) else {}, choices[0].get('finish_reason')
-
-
 def _json_object_from_text(text):
     raw = str(text or '').strip()
     if not raw:
@@ -3957,7 +3917,65 @@ def _session_dm_tool_result_for_prompt(result, hot_context):
     return payload
 
 
-def get_session_dm_response_with_tools(
+class DMExecutionLoop:
+    """Named, provider-independent session-DM execution loop.
+
+    Orchestrates preflight → retrieval packet → tool rounds → finalizer
+    contract → guards → tool execution → decision. Provider choice affects
+    only the transport adapter (and its declared capabilities); the workflow
+    itself never branches on provider name.
+    """
+
+    def __init__(self, provider=None, model=None):
+        # provider: optional LLMProviderAdapter. When omitted, the registry's
+        # current provider is resolved at request time.
+        self.provider = provider
+        self.model = model
+
+    def run(
+        self,
+        hot_context,
+        recent_messages,
+        tools,
+        execute_tool,
+        audit_context=None,
+        max_tool_rounds=30,
+        on_status_change=None,
+        build_retrieval_packet=None,
+    ):
+        if self.provider is None:
+            return _run_session_dm_loop(
+                hot_context,
+                recent_messages,
+                tools,
+                execute_tool,
+                audit_context=audit_context,
+                max_tool_rounds=max_tool_rounds,
+                on_status_change=on_status_change,
+                build_retrieval_packet=build_retrieval_packet,
+            )
+        # Bind this adapter for the whole run so preflight, guards, repairs,
+        # and the main generation all use the same provider transport.
+        token = _TRANSPORT_OVERRIDE.set({
+            'provider': self.provider.name,
+            'model': self.model or self.provider.env_model() or None,
+        })
+        try:
+            return _run_session_dm_loop(
+                hot_context,
+                recent_messages,
+                tools,
+                execute_tool,
+                audit_context=audit_context,
+                max_tool_rounds=max_tool_rounds,
+                on_status_change=on_status_change,
+                build_retrieval_packet=build_retrieval_packet,
+            )
+        finally:
+            _TRANSPORT_OVERRIDE.reset(token)
+
+
+def _run_session_dm_loop(
     hot_context,
     recent_messages,
     tools,
@@ -4130,22 +4148,30 @@ def get_session_dm_response_with_tools(
             'token_estimate': base_audit.get('token_estimate'),
             'full_world_graph_included': False,
         }
-        data = _post_chat_response(
-            messages,
-            # Keep session DM finalization in plain chat mode and enforce the finalizer-tool
-            # contract in the guard loop instead of relying on provider JSON mode.
-            json_mode=False,
-            audit_context=loop_audit,
-            tools=active_tools,
-            tool_choice=active_tool_choice,
-            parallel_tool_calls=False if active_tools else None,
-            allow_thinking=(
-                False
-                if retrying_visible_answer
-                else preflight_decision.get('main_call_thinking') is not False or tool_round > 0
-            ),
-        )
-        message, finish_reason = _choice_message(data)
+        try:
+            normalized = _post_chat_normalized(
+                messages,
+                # Keep session DM finalization in plain chat mode and enforce the finalizer-tool
+                # contract in the guard loop instead of relying on provider JSON mode.
+                json_mode=False,
+                audit_context=loop_audit,
+                tools=active_tools,
+                tool_choice=active_tool_choice,
+                parallel_tool_calls=False if active_tools else None,
+                allow_thinking=(
+                    False
+                    if retrying_visible_answer
+                    else preflight_decision.get('main_call_thinking') is not False or tool_round > 0
+                ),
+            )
+        except ProviderError as err:
+            if err.kind != 'malformed':
+                raise
+            # Preserve the historical soft-degrade for choice-less responses:
+            # treat as an empty assistant message and let the finalizer
+            # contract retry/resolve it.
+            normalized = None
+        message = normalized.message_view() if normalized is not None else {}
 
         # If the LLM returned a reasoning field, let's extract it and feed it to status
         reasoning_val = message.get("reasoning_content") or message.get("reasoning")
@@ -4940,12 +4966,34 @@ def get_session_dm_response_with_tools(
         tool_round += 1
 
 
+def get_session_dm_response_with_tools(
+    hot_context,
+    recent_messages,
+    tools,
+    execute_tool,
+    audit_context=None,
+    max_tool_rounds=30,
+    on_status_change=None,
+    build_retrieval_packet=None,
+):
+    return DMExecutionLoop().run(
+        hot_context,
+        recent_messages,
+        tools,
+        execute_tool,
+        audit_context=audit_context,
+        max_tool_rounds=max_tool_rounds,
+        on_status_change=on_status_change,
+        build_retrieval_packet=build_retrieval_packet,
+    )
+
+
 def get_opening_scene_response(context, world_context, audit_context=None):
     messages = build_opening_scene_messages(context, world_context)
 
     try:
-        data = _post_chat_response(messages, audit_context=audit_context)
-        opening_text = _opening_scene_text_from_response(data)
+        normalized = _post_chat_normalized(messages, audit_context=audit_context)
+        opening_text = _opening_scene_text_from_response(normalized)
         if opening_text:
             return opening_text
 
@@ -4953,11 +5001,11 @@ def get_opening_scene_response(context, world_context, audit_context=None):
             **(audit_context or {}),
             'operation': 'opening_scene_format_retry',
         }
-        data = _post_chat_response(
+        normalized = _post_chat_normalized(
             _opening_scene_format_retry_messages(messages),
             audit_context=retry_audit_context,
         )
-        return _opening_scene_text_from_response(data)
+        return _opening_scene_text_from_response(normalized)
     except Exception as e:
         print(f'[openrouter] Opening scene error: {e}')
         return None
@@ -5194,7 +5242,7 @@ def _get_session_memory_patch_staged(memory_context, audit_context, telemetry):
     final_payload = None
     for tool_round in range(max_tool_rounds + 1):
         try:
-            data = _post_chat_response(
+            normalized = _post_chat_normalized(
                 messages,
                 json_mode=False,
                 audit_context={
@@ -5207,6 +5255,19 @@ def _get_session_memory_patch_staged(memory_context, audit_context, telemetry):
                 parallel_tool_calls=False,
                 allow_thinking=False,
             )
+        except ProviderError as err:
+            if err.kind != 'malformed':
+                raise MemoryPipelineError(
+                    stage='resolution',
+                    code='resolver_provider_error',
+                    message=f'Staged memory resolver call failed: {err}',
+                    cause=err,
+                    telemetry=telemetry,
+                ) from err
+            # Preserve the historical handling of choice-less responses: they
+            # flow into the malformed-output path below instead of being
+            # classified as provider errors.
+            normalized = None
         except Exception as err:
             raise MemoryPipelineError(
                 stage='resolution',
@@ -5215,8 +5276,8 @@ def _get_session_memory_patch_staged(memory_context, audit_context, telemetry):
                 cause=err,
                 telemetry=telemetry,
             ) from err
-        response_chain.append(data)
-        message, _finish_reason = _choice_message(data)
+        response_chain.append(normalized.raw if normalized is not None else {})
+        message = normalized.message_view() if normalized is not None else {}
         tool_calls = message.get('tool_calls') or []
         if tool_calls and tool_round < max_tool_rounds:
             messages.append(_assistant_tool_message(message))
@@ -5546,34 +5607,13 @@ def get_session_clock_updates(clock_context, audit_context=None):
     }
 
     try:
-        if provider == 'opencode_go':
-            data, _response_chars = _request_session_memory_json(
-                messages,
-                request_audit,
-                'session_clock_adjudication',
-                max_tokens=SESSION_MEMORY_MAX_TOKENS,
-                timeout_seconds=SESSION_MEMORY_TIMEOUT_SECONDS,
-            )
-        else:
-            text = _post_chat(
-                messages,
-                json_mode=True,
-                audit_context={
-                    **request_audit,
-                    'operation': 'session_clock_adjudication',
-                },
-                allow_thinking=False,
-                timeout_seconds=SESSION_MEMORY_TIMEOUT_SECONDS,
-                max_attempts=1,
-                max_tokens=SESSION_MEMORY_MAX_TOKENS,
-            )
-            data = _json_loads_with_repair(
-                text,
-                audit_context={
-                    **request_audit,
-                    'operation': 'session_clock_adjudication',
-                },
-            ) if text else None
+        data, _response_chars = _request_session_memory_json(
+            messages,
+            request_audit,
+            'session_clock_adjudication',
+            max_tokens=SESSION_MEMORY_MAX_TOKENS,
+            timeout_seconds=SESSION_MEMORY_TIMEOUT_SECONDS,
+        )
     except Exception as err:
         if campaign_id:
             log_audit_event(
