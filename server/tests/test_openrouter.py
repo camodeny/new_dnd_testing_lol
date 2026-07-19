@@ -14,7 +14,8 @@ from openrouter import (
     _json_error_excerpt,
     _json_loads_with_error,
     _json_loads_with_repair,
-    _post_chat_response,
+    _adapter_for_provider,
+    _post_chat_normalized,
     SESSION_MEMORY_MAX_ATTEMPTS,
     SESSION_MEMORY_MAX_TOKENS,
     SESSION_MEMORY_TIMEOUT_SECONDS,
@@ -37,6 +38,11 @@ from openrouter import (
     normalize_session_spoiler_check,
 )
 from services.session_memory_agent import MemoryPipelineError, compile_staged_memory_patch
+from llm_providers import OpenRouterAdapter
+
+
+def _normalized_from_raw(raw_dict):
+    return OpenRouterAdapter().parse_response(raw_dict)
 
 
 class OpenRouterJsonRepairTest(unittest.TestCase):
@@ -230,16 +236,17 @@ class MemoryPipelineErrorTest(unittest.TestCase):
             self.assertEqual(ctx.exception.code, 'extractor_provider_error')
 
     def test_resolver_malformed_output_raises_error(self):
-        from openrouter import _get_session_memory_patch_staged, _choice_message
+        from openrouter import _get_session_memory_patch_staged
         with patch('openrouter.build_session_memory_extractor_messages', return_value=[]), \
                 patch('openrouter._request_session_memory_json', return_value=(
                     {'running_summary': 'test'}, 100,
                 )), \
                 patch('openrouter.build_session_memory_resolver_messages', return_value=[]), \
-                patch('openrouter._post_chat_response', return_value={'choices': [{
-                    'message': {'content': 'not valid json}}}', 'tool_calls': None},
-                    'finish_reason': 'stop',
-                }]}):
+                patch('openrouter._post_chat_normalized', return_value=_normalized_from_raw({
+                    'choices': [{
+                        'message': {'content': 'not valid json}}}', 'tool_calls': None},
+                        'finish_reason': 'stop',
+                    }]})):
             with self.assertRaises(MemoryPipelineError) as ctx:
                 _get_session_memory_patch_staged(
                     {'campaign_id': 1, 'session_id': 1},
@@ -267,10 +274,12 @@ class MemoryPipelineErrorTest(unittest.TestCase):
         with patch('openrouter.build_session_memory_extractor_messages', return_value=[]), \
                 patch('openrouter._request_session_memory_json') as mock_req, \
                 patch('openrouter.build_session_memory_resolver_messages', return_value=[]), \
-                patch('openrouter._post_chat_response', return_value={'choices': [{
-                    'message': {'content': '{"running_summary":"test"}', 'tool_calls': None},
-                    'finish_reason': 'stop',
-                }]}), \
+                patch('openrouter._post_chat_normalized', return_value=_normalized_from_raw({
+                    'choices': [{
+                        'message': {'content': '{"running_summary":"test"}', 'tool_calls': None},
+                        'finish_reason': 'stop',
+                    }]
+                })), \
                 patch('services.session_memory_agent.compile_staged_memory_patch', return_value=fake_compiled):
             mock_req.side_effect = [
                 ({'running_summary': 'test'}, 100),
@@ -548,9 +557,9 @@ class OpenRouterRetryTest(unittest.TestCase):
                     FakeResponse(404),
                     FakeResponse(200, success),
                 ]) as post, patch('llm_providers.time.sleep') as sleep:
-            result = _post_chat_response([{'role': 'user', 'content': 'hello'}])
+            result = _post_chat_normalized([{'role': 'user', 'content': 'hello'}])
 
-        self.assertEqual(result, success)
+        self.assertEqual(result.content, 'ok')
         self.assertEqual(post.call_count, 2)
         sleep.assert_called_once_with(1)
 
@@ -561,7 +570,7 @@ class OpenRouterRetryTest(unittest.TestCase):
                 patch('llm_providers.requests.post', return_value=FakeResponse(400)) as post, \
                 patch('llm_providers.time.sleep') as sleep:
             with self.assertRaises(requests.HTTPError):
-                _post_chat_response([{'role': 'user', 'content': 'hello'}])
+                _post_chat_normalized([{'role': 'user', 'content': 'hello'}])
 
         self.assertEqual(post.call_count, 1)
         sleep.assert_not_called()
@@ -626,14 +635,14 @@ class ProviderCompatibilityTest(unittest.TestCase):
                 patch('openrouter.get_llm_provider', return_value='opencode_go'), \
                 patch('openrouter.get_llm_model', return_value='deepseek-v4-flash'), \
                 patch('llm_providers.requests.post', return_value=FakeResponse(200, success)) as post:
-            result = _post_chat_response(
+            result = _post_chat_normalized(
                 [{'role': 'user', 'content': 'hello'}],
                 tools=[{'type': 'function', 'function': {'name': 'get_clock'}}],
                 tool_choice='auto',
                 parallel_tool_calls=False,
             )
 
-        self.assertEqual(result, success)
+        self.assertEqual(result.content, 'ok')
         request = post.call_args
         self.assertEqual(request.args[0], 'https://opencode.ai/zen/go/v1/chat/completions')
         self.assertEqual(request.kwargs['headers']['Authorization'], 'Bearer go-key')
@@ -654,12 +663,12 @@ class ProviderCompatibilityTest(unittest.TestCase):
                 patch('openrouter.get_llm_provider', return_value='opencode_go'), \
                 patch('openrouter.get_llm_model', return_value='deepseek-v4-flash'), \
                 patch('llm_providers.requests.post', return_value=FakeResponse(200, success)) as post:
-            result = _post_chat_response(
+            result = _post_chat_normalized(
                 [{'role': 'user', 'content': 'hello'}],
                 allow_thinking=False,
             )
 
-        self.assertEqual(result, success)
+        self.assertEqual(result.content, 'ok')
         self.assertNotIn('thinking', post.call_args.kwargs['json'])
         self.assertNotIn('reasoning_effort', post.call_args.kwargs['json'])
 
@@ -682,7 +691,7 @@ class ProviderCompatibilityTest(unittest.TestCase):
             }],
         }
 
-        with patch('openrouter._post_chat_response', side_effect=[empty_response, retry_response]) as post_chat:
+        with patch('openrouter._post_chat_normalized', side_effect=[_normalized_from_raw(empty_response), _normalized_from_raw(retry_response)]) as post_chat:
             result = get_opening_scene_response({}, {})
 
         self.assertEqual(result, 'The town square waits in uneasy silence.\n\nWhat do you do?')
@@ -704,7 +713,7 @@ class ProviderCompatibilityTest(unittest.TestCase):
             }],
         }
 
-        with patch('openrouter._post_chat_response', return_value=response) as post_chat:
+        with patch('openrouter._post_chat_normalized', return_value=_normalized_from_raw(response)) as post_chat:
             result = get_opening_scene_response({}, {})
 
         self.assertIsNone(result)

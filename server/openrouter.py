@@ -581,11 +581,22 @@ def _provider_request_payload_options(provider, model, tools, tool_choice, paral
 
 def _resolve_transport_provider_model(provider, model):
     override = _TRANSPORT_OVERRIDE.get()
+    override_provider = None
     if override:
         provider = provider or override.get('provider')
         model = model or override.get('model')
+        override_provider = override.get('provider')
     provider = provider or get_llm_provider()
-    model = model or get_llm_model()
+    if model is None:
+        # When an override set the provider, resolve model from that
+        # provider's env to avoid crossing provider boundaries (e.g. the
+        # fake adapter's missing model should not fall back to the global
+        # OpenRouter model). Without an override, use the normal resolution
+        # that respects runtime overrides.
+        if override_provider:
+            model = _env_model_for_provider(provider)
+        else:
+            model = get_llm_model()
     return provider, model
 
 
@@ -732,11 +743,20 @@ def _post_chat_normalized(
     )
     normalized = execute_chat(_adapter_for_provider(provider), request, hooks=hooks)
     if campaign_id:
+        audit_payload = {
+            'model': normalized.model,
+            'choices': [{
+                'message': normalized.message_view(),
+                'finish_reason': normalized.finish_reason,
+            }],
+            'usage': normalized.usage,
+            '_raw': normalized.raw,
+        }
         log_model_response(
             campaign_id,
             operation,
             actor,
-            normalized.raw,
+            audit_payload,
             commit=True,
             trace_id=trace_id,
             parent_trace_id=parent_trace_id,
@@ -746,52 +766,7 @@ def _post_chat_normalized(
     return normalized
 
 
-def _post_chat_response(
-    messages,
-    json_mode=False,
-    audit_context=None,
-    tools=None,
-    tool_choice=None,
-    parallel_tool_calls=None,
-    allow_thinking=True,
-    timeout_seconds=60,
-    max_attempts=None,
-    max_tokens=None,
-    provider=None,
-    model=None,
-):
-    """Transport seam returning the provider's raw payload.
 
-    Workflows must not index the raw shape directly; normalize it at the
-    boundary with `_normalize_workflow_response` (or use
-    `_post_chat_normalized`) and consume the NormalizedChatResponse.
-    """
-    return _post_chat_normalized(
-        messages,
-        json_mode=json_mode,
-        audit_context=audit_context,
-        tools=tools,
-        tool_choice=tool_choice,
-        parallel_tool_calls=parallel_tool_calls,
-        allow_thinking=allow_thinking,
-        timeout_seconds=timeout_seconds,
-        max_attempts=max_attempts,
-        max_tokens=max_tokens,
-        provider=provider,
-        model=model,
-    ).raw
-
-
-def _normalize_workflow_response(data, provider=None, model=None):
-    """Normalize a raw transport payload through the resolved provider adapter.
-
-    This is the only raw-shape access workflow code is allowed to make: the
-    adapter owns the provider's native response shape, so a provider with a
-    non-OpenAI response is added by implementing its adapter's
-    ``parse_response`` — no workflow changes.
-    """
-    provider, _model = _resolve_transport_provider_model(provider, model)
-    return _adapter_for_provider(provider).parse_response(data)
 
 
 def _post_chat(
@@ -803,7 +778,7 @@ def _post_chat(
     max_attempts=None,
     max_tokens=None,
 ):
-    data = _post_chat_response(
+    return _post_chat_normalized(
         messages,
         json_mode=json_mode,
         audit_context=audit_context,
@@ -811,8 +786,7 @@ def _post_chat(
         timeout_seconds=timeout_seconds,
         max_attempts=max_attempts,
         max_tokens=max_tokens,
-    )
-    return _normalize_workflow_response(data).content
+    ).content
 
 
 def _post_chat_stream(
@@ -3066,14 +3040,14 @@ def _repair_session_dm_visible_reply(content, guard_name, details, hot_context, 
                 f'{guard_operation}: visible reply repair retry {attempt_index}',
             )
         try:
-            normalized = _normalize_workflow_response(_post_chat_response(
+            normalized = _post_chat_normalized(
                 _build_session_guard_repair_messages(content, guard_name, details, hot_context),
                 json_mode=False,
                 audit_context=repair_audit,
                 tools=None,
                 allow_thinking=False,
                 max_tokens=max_tokens,
-            ))
+            )
         except ProviderError as err:
             if err.kind != 'malformed':
                 raise
@@ -3892,14 +3866,6 @@ def build_character_sheet_agent_messages(question, scope, character_sheets):
     ]
 
 
-def _choice_message(data):
-    choices = data.get('choices') if isinstance(data, dict) else []
-    if not choices or not isinstance(choices[0], dict):
-        return {}, None
-    message = choices[0].get('message') or {}
-    return message if isinstance(message, dict) else {}, choices[0].get('finish_reason')
-
-
 def _json_object_from_text(text):
     raw = str(text or '').strip()
     if not raw:
@@ -4183,7 +4149,7 @@ def _run_session_dm_loop(
             'full_world_graph_included': False,
         }
         try:
-            normalized = _normalize_workflow_response(_post_chat_response(
+            normalized = _post_chat_normalized(
                 messages,
                 # Keep session DM finalization in plain chat mode and enforce the finalizer-tool
                 # contract in the guard loop instead of relying on provider JSON mode.
@@ -4197,7 +4163,7 @@ def _run_session_dm_loop(
                     if retrying_visible_answer
                     else preflight_decision.get('main_call_thinking') is not False or tool_round > 0
                 ),
-            ))
+            )
         except ProviderError as err:
             if err.kind != 'malformed':
                 raise
@@ -5026,7 +4992,7 @@ def get_opening_scene_response(context, world_context, audit_context=None):
     messages = build_opening_scene_messages(context, world_context)
 
     try:
-        normalized = _normalize_workflow_response(_post_chat_response(messages, audit_context=audit_context))
+        normalized = _post_chat_normalized(messages, audit_context=audit_context)
         opening_text = _opening_scene_text_from_response(normalized)
         if opening_text:
             return opening_text
@@ -5035,10 +5001,10 @@ def get_opening_scene_response(context, world_context, audit_context=None):
             **(audit_context or {}),
             'operation': 'opening_scene_format_retry',
         }
-        normalized = _normalize_workflow_response(_post_chat_response(
+        normalized = _post_chat_normalized(
             _opening_scene_format_retry_messages(messages),
             audit_context=retry_audit_context,
-        ))
+        )
         return _opening_scene_text_from_response(normalized)
     except Exception as e:
         print(f'[openrouter] Opening scene error: {e}')
@@ -5276,7 +5242,7 @@ def _get_session_memory_patch_staged(memory_context, audit_context, telemetry):
     final_payload = None
     for tool_round in range(max_tool_rounds + 1):
         try:
-            normalized = _normalize_workflow_response(_post_chat_response(
+            normalized = _post_chat_normalized(
                 messages,
                 json_mode=False,
                 audit_context={
@@ -5288,7 +5254,7 @@ def _get_session_memory_patch_staged(memory_context, audit_context, telemetry):
                 tool_choice='auto',
                 parallel_tool_calls=False,
                 allow_thinking=False,
-            ))
+            )
         except ProviderError as err:
             if err.kind != 'malformed':
                 raise MemoryPipelineError(

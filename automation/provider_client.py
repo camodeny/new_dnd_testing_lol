@@ -50,6 +50,7 @@ def post_chat_completion(messages, *, model=None, json_mode=False, timeout_secon
         'provider': provider,
         'model': resolved_model,
         'content': normalized.content,
+        'usage': normalized.usage,
         # Raw provider payload is kept only for persistence/audit records.
         'response': normalized.raw,
     }
@@ -93,7 +94,7 @@ def request_json_decision(system_prompt, prompt, *, model=None, timeout_seconds=
                 'json_retry_count': json_retry_count,
                 'provider': result['provider'],
                 'model': result['model'],
-                'usage': response_json.get('usage') if isinstance(response_json, dict) else {},
+                'usage': result.get('usage', {}),
             }
         except Exception as error:
             last_error = error

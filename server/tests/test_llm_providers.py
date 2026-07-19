@@ -378,9 +378,10 @@ class CrossProviderWorkflowParityTest(unittest.TestCase):
                 'json_mode': kwargs.get('json_mode'),
                 'has_tools': bool(kwargs.get('tools')),
             })
+            adapter = provider_registry.get(provider)
             if kwargs.get('tools'):
-                return _finalizer_speak_response()
-            return {'choices': [{'message': {'content': '{"safe": true}'}}]}
+                return adapter.parse_response(_finalizer_speak_response())
+            return adapter.parse_response({'choices': [{'message': {'content': '{"safe": true}'}}]})
 
         preflight = {
             'dm_reply_mode': 'unknown',
@@ -392,7 +393,7 @@ class CrossProviderWorkflowParityTest(unittest.TestCase):
         with patch('openrouter.get_llm_provider', return_value=provider), \
                 patch('openrouter.get_llm_model', return_value='test-model'), \
                 patch('openrouter.get_session_preflight_decision', return_value=preflight), \
-                patch('openrouter._post_chat_response', side_effect=fake_post_chat_response):
+                patch('openrouter._post_chat_normalized', side_effect=fake_post_chat_response):
             decision = openrouter.DMExecutionLoop().run(
                 {},
                 [],
@@ -465,8 +466,9 @@ class CrossProviderWorkflowParityTest(unittest.TestCase):
 
         def fake_resolve(messages, **kwargs):
             stages.append('resolution')
+            adapter = provider_registry.get(provider)
             payload = json.dumps({'running_summary': 'summary', 'resolved_facts': []})
-            return {'choices': [{'message': {'content': payload}}]}
+            return adapter.parse_response({'choices': [{'message': {'content': payload}}]})
 
         def fake_compile(memory_context, extracted, final_payload):
             stages.append('compilation')
@@ -475,7 +477,7 @@ class CrossProviderWorkflowParityTest(unittest.TestCase):
         with patch('openrouter.get_llm_provider', return_value=provider), \
                 patch('openrouter.get_llm_model', return_value='test-model'), \
                 patch('openrouter._request_session_memory_json', side_effect=fake_request_json), \
-                patch('openrouter._post_chat_response', side_effect=fake_resolve), \
+                patch('openrouter._post_chat_normalized', side_effect=fake_resolve), \
                 patch('services.session_memory_agent.compile_staged_memory_patch', side_effect=fake_compile):
             compiled = openrouter._get_session_memory_patch_staged(
                 {'campaign_id': 1, 'session_id': 1},

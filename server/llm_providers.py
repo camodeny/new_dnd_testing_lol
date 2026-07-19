@@ -494,9 +494,46 @@ def stream_chat(adapter, request, *, hooks=None):
             if hooks is not None:
                 hooks.on_error(error)
             raise
+    emitted = False
     try:
-        yield from adapter.iter_stream_events(response)
+        for event in adapter.iter_stream_events(response):
+            if event.kind == 'token':
+                emitted = True
+            yield event
     except Exception as error:
+        if not emitted:
+            classified = adapter.classify_error(error)
+            if classified.retryable and attempt < attempt_limit:
+                delay_seconds = retry_delay_seconds(attempt)
+                if hooks is not None:
+                    hooks.on_retry(attempt, attempt_limit, delay_seconds, error)
+                time.sleep(delay_seconds)
+                for inner_attempt in range(attempt + 1, attempt_limit + 1):
+                    try:
+                        response = requests.post(
+                            adapter.base_url(),
+                            headers=adapter.build_headers(),
+                            json=payload,
+                            timeout=request.timeout_seconds,
+                            stream=True,
+                        )
+                        response.raise_for_status()
+                        for event in adapter.iter_stream_events(response):
+                            if event.kind == 'token':
+                                emitted = True
+                            yield event
+                        return
+                    except Exception as inner_error:
+                        classified = adapter.classify_error(inner_error)
+                        if inner_attempt < attempt_limit and classified.retryable:
+                            delay_seconds = retry_delay_seconds(inner_attempt)
+                            if hooks is not None:
+                                hooks.on_retry(inner_attempt, attempt_limit, delay_seconds, inner_error)
+                            time.sleep(delay_seconds)
+                            continue
+                        if hooks is not None:
+                            hooks.on_error(inner_error)
+                        raise
         if hooks is not None:
             hooks.on_error(error)
         raise
