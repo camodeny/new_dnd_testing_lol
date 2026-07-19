@@ -645,6 +645,38 @@ class StreamRetryTest(unittest.TestCase):
         self.assertEqual(post.call_count, 1)
         self.assertEqual(len(errors), 1)
 
+    def test_stream_retries_before_but_not_after_first_token(self):
+        """Attempt 1 fails POST (transient), attempt 2 yields a token then
+        disconnects. The partial token is delivered once; there is no
+        attempt 3 because emission already began."""
+        adapter = OpenRouterAdapter()
+        events = []
+        errors = []
+
+        class Hooks:
+            def on_retry(self, attempt, max_attempts, delay_seconds, error):
+                pass
+
+            def on_error(self, error):
+                errors.append(repr(error))
+
+        class PartialThenBroken(FakeResponse):
+            def iter_lines(self, decode_unicode=True):
+                yield 'data: {"choices": [{"delta": {"content": "partial"}}]}'
+                raise requests.ConnectionError('stream dropped after token')
+
+        with patch.dict(os.environ, {'OPENROUTER_API_KEY': 'k'}), \
+                patch('llm_providers.requests.post',
+                      side_effect=[FakeResponse(429), PartialThenBroken(200)]) as post, \
+                patch('llm_providers.time.sleep'):
+            with self.assertRaises(requests.ConnectionError):
+                for ev in stream_chat(adapter, ProviderRequest(messages=[], model='m'), hooks=Hooks()):
+                    events.append(ev)
+
+        self.assertEqual(post.call_count, 2)
+        self.assertEqual([e.text for e in events if e.kind == 'token'], ['partial'])
+        self.assertEqual(len(errors), 1)
+
 
 if __name__ == '__main__':
     unittest.main()
