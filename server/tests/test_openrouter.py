@@ -255,6 +255,73 @@ class MemoryPipelineErrorTest(unittest.TestCase):
                 )
             self.assertEqual(ctx.exception.stage, 'resolution')
 
+    def test_resolver_empty_response_recovers_with_contract_only_json_request(self):
+        from openrouter import _get_session_memory_patch_staged
+        fake_compiled = {
+            'running_summary': 'Recovered summary',
+            'memory_anchors': {},
+            'scene_patch': {},
+            'upsert_graph_entities': [],
+            'upsert_graph_relations': [],
+            'upsert_graph_facts': [],
+            'create_clocks': [],
+            'retire_clocks': [],
+            'update_npc_actors': [],
+            'record_events': [],
+            'unresolved_items': [],
+            'compile_summary': {},
+        }
+        empty_resolver = _normalized_from_raw({
+            'choices': [{
+                'message': {'content': '', 'tool_calls': None},
+                'finish_reason': 'stop',
+            }],
+        })
+        with patch('openrouter.build_session_memory_extractor_messages', return_value=[]), \
+                patch('openrouter._request_session_memory_json') as request_mock, \
+                patch('openrouter.build_session_memory_resolver_messages', return_value=[]), \
+                patch('openrouter._post_chat_normalized', return_value=empty_resolver), \
+                patch('services.session_memory_agent.compile_staged_memory_patch', return_value=fake_compiled):
+            request_mock.side_effect = [
+                ({'running_summary': 'Extracted summary'}, 100),
+                ({'running_summary': 'Recovered summary'}, 80),
+                ({'create_clocks': [], 'retire_clocks': []}, 30),
+            ]
+            telemetry = {}
+            result = _get_session_memory_patch_staged(
+                {'campaign_id': 1, 'session_id': 1},
+                {},
+                telemetry,
+            )
+
+        self.assertEqual(result['running_summary'], 'Recovered summary')
+        self.assertEqual(telemetry['staged_resolver_recovery_reason'], 'empty_terminal_response')
+        self.assertTrue(telemetry['staged_resolver_recovery_succeeded'])
+        self.assertEqual(request_mock.call_args_list[1].args[2], 'session_memory_resolve_recovery')
+
+    def test_resolver_uses_configured_memory_retry_limit(self):
+        from openrouter import _get_session_memory_patch_staged
+        resolver_raw = {
+            'choices': [{
+                'message': {'content': '{"running_summary":"test"}', 'tool_calls': None},
+                'finish_reason': 'stop',
+            }],
+        }
+        fake_compiled = {
+            'running_summary': 'test', 'memory_anchors': {}, 'scene_patch': {},
+            'upsert_graph_entities': [], 'upsert_graph_relations': [], 'upsert_graph_facts': [],
+            'create_clocks': [], 'retire_clocks': [], 'update_npc_actors': [],
+            'record_events': [], 'unresolved_items': [], 'compile_summary': {},
+        }
+        with patch('openrouter.build_session_memory_extractor_messages', return_value=[]), \
+                patch('openrouter._request_session_memory_json', side_effect=[({'running_summary': 'test'}, 10), ({}, 2)]), \
+                patch('openrouter.build_session_memory_resolver_messages', return_value=[]), \
+                patch('openrouter._post_chat_normalized', return_value=_normalized_from_raw(resolver_raw)) as resolver_mock, \
+                patch('services.session_memory_agent.compile_staged_memory_patch', return_value=fake_compiled):
+            _get_session_memory_patch_staged({'campaign_id': 1, 'session_id': 1}, {}, {})
+
+        self.assertEqual(resolver_mock.call_args.kwargs['max_attempts'], SESSION_MEMORY_MAX_ATTEMPTS)
+
     def test_clock_generation_invalid_output_raises_error(self):
         from openrouter import _get_session_memory_patch_staged
         fake_compiled = {

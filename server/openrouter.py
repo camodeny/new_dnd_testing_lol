@@ -56,7 +56,7 @@ SESSION_MEMORY_TIMEOUT_SECONDS = max(
 )
 SESSION_MEMORY_MAX_ATTEMPTS = max(
     1,
-    int(os.environ.get('SESSION_MEMORY_MAX_ATTEMPTS', '1')),
+    int(os.environ.get('SESSION_MEMORY_MAX_ATTEMPTS', '2')),
 )
 SESSION_MEMORY_MAX_TOKENS = max(
     256,
@@ -5240,6 +5240,45 @@ def _get_session_memory_patch_staged(memory_context, audit_context, telemetry):
     response_chain = []
     max_tool_rounds = 6
     final_payload = None
+    def recover_final_payload(reason):
+        """Ask once for the final contract when the tool loop ends without one."""
+        telemetry['staged_resolver_recovery_reason'] = reason
+        recovery_messages = list(messages)
+        recovery_messages.append({
+            'role': 'user',
+            'content': (
+                'Return the required final JSON object now. Do not call any more tools, do not add prose, '
+                'and use the tool results already in this conversation. If a reference remains unresolved, '
+                'put it in unresolved_items instead of omitting the final JSON object.'
+            ),
+        })
+        try:
+            recovered, response_chars = _request_session_memory_json(
+                recovery_messages,
+                audit_context,
+                'session_memory_resolve_recovery',
+                max_tokens=SESSION_MEMORY_MAX_TOKENS,
+                timeout_seconds=SESSION_MEMORY_TIMEOUT_SECONDS,
+            )
+        except Exception as err:
+            raise MemoryPipelineError(
+                stage='resolution',
+                code='resolver_recovery_provider_error',
+                message=f'Staged memory resolver recovery failed: {err}',
+                cause=err,
+                telemetry=telemetry,
+            ) from err
+        telemetry['staged_resolver_recovery_response_chars'] = response_chars
+        if not isinstance(recovered, dict):
+            raise MemoryPipelineError(
+                stage='resolution',
+                code='malformed_output',
+                message='Staged memory resolver returned no valid final payload after recovery.',
+                telemetry=telemetry,
+            )
+        telemetry['staged_resolver_recovery_succeeded'] = True
+        return recovered
+
     for tool_round in range(max_tool_rounds + 1):
         try:
             normalized = _post_chat_normalized(
@@ -5255,6 +5294,7 @@ def _get_session_memory_patch_staged(memory_context, audit_context, telemetry):
                 parallel_tool_calls=False,
                 allow_thinking=False,
                 timeout_seconds=SESSION_MEMORY_TIMEOUT_SECONDS,
+                max_attempts=SESSION_MEMORY_MAX_ATTEMPTS,
             )
         except ProviderError as err:
             if err.kind != 'malformed':
@@ -5317,7 +5357,20 @@ def _get_session_memory_patch_staged(memory_context, audit_context, telemetry):
                     )
                 messages.append(_memory_tool_result_message(tool_call, tool_name, result))
             continue
+        if tool_calls:
+            # The model used its final allowed turn on another tool request.  The
+            # tool results already obtained are sufficient context for one
+            # constrained, tool-free request for the required JSON contract.
+            final_payload = recover_final_payload('max_tool_rounds_with_tool_calls')
+            break
+
         content = message.get('content') or ''
+        if not content.strip():
+            # Some providers occasionally return an empty terminal response
+            # after successfully completing memory lookups.  Do not discard an
+            # otherwise valid turn without giving them one contract-only retry.
+            final_payload = recover_final_payload('empty_terminal_response')
+            break
         try:
             final_payload = _json_object_from_text(content)
         except Exception as err:
@@ -5435,7 +5488,7 @@ def _request_session_memory_json(messages, audit_context, operation, max_tokens,
         },
         allow_thinking=False,
         timeout_seconds=timeout_seconds,
-        max_attempts=1,
+        max_attempts=SESSION_MEMORY_MAX_ATTEMPTS,
         max_tokens=max_tokens,
     )
     if not isinstance(text, str) or not text.strip():
