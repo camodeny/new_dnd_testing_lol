@@ -420,6 +420,75 @@ class MemoryPipelineErrorTest(unittest.TestCase):
             self.assertEqual(telemetry.get('provider'), 'my_provider')
             self.assertEqual(telemetry.get('build_sha'), 'buildabc')
 
+    def test_session_memory_timeout_default_is_180_seconds(self):
+        self.assertEqual(SESSION_MEMORY_TIMEOUT_SECONDS, 180.0)
+
+    def test_session_memory_timeout_env_override_still_works(self):
+        import importlib
+        import openrouter
+        old_value = os.environ.get('SESSION_MEMORY_TIMEOUT_SECONDS')
+        os.environ['SESSION_MEMORY_TIMEOUT_SECONDS'] = '240'
+        try:
+            importlib.reload(openrouter)
+            self.assertEqual(openrouter.SESSION_MEMORY_TIMEOUT_SECONDS, 240.0)
+        finally:
+            if old_value is None:
+                os.environ.pop('SESSION_MEMORY_TIMEOUT_SECONDS', None)
+            else:
+                os.environ['SESSION_MEMORY_TIMEOUT_SECONDS'] = old_value
+            importlib.reload(openrouter)
+        self.assertEqual(openrouter.SESSION_MEMORY_TIMEOUT_SECONDS, 180.0)
+
+    def test_staged_pipeline_uses_memory_timeout_for_all_requests(self):
+        from openrouter import _get_session_memory_patch_staged
+        fake_compiled = {
+            'running_summary': 'test',
+            'memory_anchors': {},
+            'scene_patch': {},
+            'upsert_graph_entities': [],
+            'upsert_graph_relations': [],
+            'upsert_graph_facts': [],
+            'create_clocks': [],
+            'retire_clocks': [],
+            'update_npc_actors': [],
+            'record_events': [],
+            'unresolved_items': [],
+            'compile_summary': {},
+        }
+        resolver_raw = {
+            'choices': [{
+                'message': {'content': '{"running_summary":"test"}', 'tool_calls': None},
+                'finish_reason': 'stop',
+            }],
+        }
+        with patch('openrouter.build_session_memory_extractor_messages', return_value=[]), \
+                patch('openrouter._request_session_memory_json') as mock_req, \
+                patch('openrouter.build_session_memory_resolver_messages', return_value=[]), \
+                patch('openrouter._post_chat_normalized', return_value=_normalized_from_raw(resolver_raw)) as mock_resolver, \
+                patch('openrouter.build_session_memory_clocks_messages', return_value=[]), \
+                patch('services.session_memory_agent.compile_staged_memory_patch', return_value=fake_compiled):
+            mock_req.side_effect = [
+                ({'running_summary': 'test'}, 100),
+                ({'create_clocks': [], 'retire_clocks': []}, 50),
+            ]
+            result = _get_session_memory_patch_staged(
+                {'campaign_id': 1, 'session_id': 1},
+                {},
+                {},
+            )
+
+        self.assertEqual(result['running_summary'], 'test')
+        self.assertEqual(mock_req.call_count, 2)
+        operations = [call.args[2] for call in mock_req.call_args_list]
+        self.assertEqual(operations, ['session_memory_extract', 'session_memory_update_clocks'])
+        for call in mock_req.call_args_list:
+            self.assertEqual(call.kwargs['timeout_seconds'], SESSION_MEMORY_TIMEOUT_SECONDS)
+        mock_resolver.assert_called_once()
+        self.assertEqual(
+            mock_resolver.call_args.kwargs['timeout_seconds'],
+            SESSION_MEMORY_TIMEOUT_SECONDS,
+        )
+
 
 class ClockAdjudicatorTest(unittest.TestCase):
     def test_clock_adjudication_builder_includes_before_after_and_active_clocks(self):
@@ -485,6 +554,29 @@ class ClockAdjudicatorTest(unittest.TestCase):
         self.assertEqual(
             post_chat.call_args.kwargs['audit_context']['operation'],
             'session_clock_adjudication',
+        )
+
+    def test_clock_adjudicator_uses_memory_timeout(self):
+        with patch('openrouter.get_llm_provider', return_value='openrouter'), patch(
+            'openrouter._post_chat',
+            return_value=json.dumps({
+                'create_clocks': [],
+                'advance_clocks': [],
+                'retire_clocks': [],
+                'no_change_explanations': [],
+            }),
+        ) as post_chat:
+            get_session_clock_updates({
+                'current_scene_before': {'location_id': 'docks'},
+                'current_scene_after': {'location_id': 'crypt_road'},
+                'latest_player_message': 'We chase them toward the crypts.',
+                'latest_dm_message': 'You break into a run toward the crypt road.',
+                'active_clocks': [],
+            })
+
+        self.assertEqual(
+            post_chat.call_args.kwargs['timeout_seconds'],
+            SESSION_MEMORY_TIMEOUT_SECONDS,
         )
 
 

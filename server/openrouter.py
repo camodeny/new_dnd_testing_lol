@@ -52,7 +52,7 @@ SESSION_PREFLIGHT_MAX_TOKENS = max(
 )
 SESSION_MEMORY_TIMEOUT_SECONDS = max(
     5.0,
-    float(os.environ.get('SESSION_MEMORY_TIMEOUT_SECONDS', '45')),
+    float(os.environ.get('SESSION_MEMORY_TIMEOUT_SECONDS', '180')),
 )
 SESSION_MEMORY_MAX_ATTEMPTS = max(
     1,
@@ -5254,6 +5254,7 @@ def _get_session_memory_patch_staged(memory_context, audit_context, telemetry):
                 tool_choice='auto',
                 parallel_tool_calls=False,
                 allow_thinking=False,
+                timeout_seconds=SESSION_MEMORY_TIMEOUT_SECONDS,
             )
         except ProviderError as err:
             if err.kind != 'malformed':
