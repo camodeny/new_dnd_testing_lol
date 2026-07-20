@@ -299,6 +299,43 @@ class MemoryPipelineErrorTest(unittest.TestCase):
         self.assertTrue(telemetry['staged_resolver_recovery_succeeded'])
         self.assertEqual(request_mock.call_args_list[1].args[2], 'session_memory_resolve_recovery')
 
+    def test_resolver_executes_final_tool_call_before_recovery(self):
+        from openrouter import _get_session_memory_patch_staged
+        final_tool_call = {
+            'id': 'call-final',
+            'type': 'function',
+            'function': {'name': 'get_scene_candidates', 'arguments': '{"query":"lock house"}'},
+        }
+        tool_only_response = _normalized_from_raw({
+            'choices': [{
+                'message': {'content': '', 'tool_calls': [final_tool_call]},
+                'finish_reason': 'tool_calls',
+            }],
+        })
+        fake_compiled = {
+            'running_summary': 'Recovered summary', 'memory_anchors': {}, 'scene_patch': {},
+            'upsert_graph_entities': [], 'upsert_graph_relations': [], 'upsert_graph_facts': [],
+            'create_clocks': [], 'retire_clocks': [], 'update_npc_actors': [],
+            'record_events': [], 'unresolved_items': [], 'compile_summary': {},
+        }
+        with patch('openrouter.build_session_memory_extractor_messages', return_value=[]), \
+                patch('openrouter._request_session_memory_json') as request_mock, \
+                patch('openrouter.build_session_memory_resolver_messages', return_value=[]), \
+                patch('openrouter._post_chat_normalized', side_effect=[tool_only_response] * 7), \
+                patch('services.session_memory_agent.execute_memory_tool', return_value={'matches': ['lock-house']}) as tool_mock, \
+                patch('services.session_memory_agent.compile_staged_memory_patch', return_value=fake_compiled):
+            request_mock.side_effect = [
+                ({'running_summary': 'Extracted summary'}, 100),
+                ({'running_summary': 'Recovered summary'}, 80),
+                ({'create_clocks': [], 'retire_clocks': []}, 30),
+            ]
+            _get_session_memory_patch_staged({'campaign_id': 1, 'session_id': 1}, {}, {})
+
+        self.assertEqual(tool_mock.call_count, 7)
+        recovery_messages = request_mock.call_args_list[1].args[0]
+        self.assertEqual(recovery_messages[-2]['role'], 'tool')
+        self.assertIn('lock-house', recovery_messages[-2]['content'])
+
     def test_resolver_uses_configured_memory_retry_limit(self):
         from openrouter import _get_session_memory_patch_staged
         resolver_raw = {

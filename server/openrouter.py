@@ -5279,6 +5279,44 @@ def _get_session_memory_patch_staged(memory_context, audit_context, telemetry):
         telemetry['staged_resolver_recovery_succeeded'] = True
         return recovered
 
+    def append_tool_results(message, tool_calls):
+        """Execute read-only resolver lookups and retain their full conversation trace."""
+        messages.append(_assistant_tool_message(message))
+        for tool_call in tool_calls:
+            function = tool_call.get('function') if isinstance(tool_call, dict) else {}
+            tool_name = function.get('name') if isinstance(function, dict) else None
+            tool_args = _parse_tool_arguments(function.get('arguments') if isinstance(function, dict) else None)
+            try:
+                result = execute_memory_tool(memory_context, tool_name, tool_args)
+            except Exception as err:
+                raise MemoryPipelineError(
+                    stage='resolution',
+                    code='tool_execution_error',
+                    message=f'Staged memory resolver tool {tool_name} failed: {err}',
+                    cause=err,
+                    telemetry=telemetry,
+                ) from err
+            tool_trace.append({
+                'tool_name': tool_name,
+                'args': tool_args,
+                'result': result,
+            })
+            if campaign_id:
+                log_audit_event(
+                    campaign_id,
+                    'memory_writer_tool_call',
+                    f'Staged memory resolver called {tool_name}.',
+                    {'tool_name': tool_name, 'args': tool_args, 'result': result},
+                    source='session_memory_writer.tool',
+                    actor='session_memory_writer',
+                    trace_id=trace_id,
+                    parent_trace_id=audit_context.get('parent_trace_id'),
+                    trace_label=trace_label,
+                    audit_role='tools',
+                    commit=True,
+                )
+            messages.append(_memory_tool_result_message(tool_call, tool_name, result))
+
     for tool_round in range(max_tool_rounds + 1):
         try:
             normalized = _post_chat_normalized(
@@ -5320,47 +5358,13 @@ def _get_session_memory_patch_staged(memory_context, audit_context, telemetry):
         response_chain.append(normalized.raw if normalized is not None else {})
         message = normalized.message_view() if normalized is not None else {}
         tool_calls = message.get('tool_calls') or []
+        if tool_calls:
+            append_tool_results(message, tool_calls)
         if tool_calls and tool_round < max_tool_rounds:
-            messages.append(_assistant_tool_message(message))
-            for tool_call in tool_calls:
-                function = tool_call.get('function') if isinstance(tool_call, dict) else {}
-                tool_name = function.get('name') if isinstance(function, dict) else None
-                tool_args = _parse_tool_arguments(function.get('arguments') if isinstance(function, dict) else None)
-                try:
-                    result = execute_memory_tool(memory_context, tool_name, tool_args)
-                except Exception as err:
-                    raise MemoryPipelineError(
-                        stage='resolution',
-                        code='tool_execution_error',
-                        message=f'Staged memory resolver tool {tool_name} failed: {err}',
-                        cause=err,
-                        telemetry=telemetry,
-                    ) from err
-                tool_trace.append({
-                    'tool_name': tool_name,
-                    'args': tool_args,
-                    'result': result,
-                })
-                if campaign_id:
-                    log_audit_event(
-                        campaign_id,
-                        'memory_writer_tool_call',
-                        f'Staged memory resolver called {tool_name}.',
-                        {'tool_name': tool_name, 'args': tool_args, 'result': result},
-                        source='session_memory_writer.tool',
-                        actor='session_memory_writer',
-                        trace_id=trace_id,
-                        parent_trace_id=audit_context.get('parent_trace_id'),
-                        trace_label=trace_label,
-                        audit_role='tools',
-                        commit=True,
-                    )
-                messages.append(_memory_tool_result_message(tool_call, tool_name, result))
             continue
         if tool_calls:
-            # The model used its final allowed turn on another tool request.  The
-            # tool results already obtained are sufficient context for one
-            # constrained, tool-free request for the required JSON contract.
+            # Preserve the final requested lookup before asking for a
+            # constrained, tool-free response that satisfies the JSON contract.
             final_payload = recover_final_payload('max_tool_rounds_with_tool_calls')
             break
 
