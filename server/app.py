@@ -105,8 +105,39 @@ def initialize_database(app):
     with app.app_context():
         db.create_all()
         ensure_lightweight_schema()
+        verify_required_schema()
+        reconcile_stale_awaiting_audit_runs()
         bootstrap_owner_api_key()
         print("Database initialization completed.", flush=True)
+
+
+def verify_required_schema():
+    """Fail startup loudly if the database is missing model-required columns."""
+    missing = []
+    for table in db.metadata.sorted_tables:
+        existing = {
+            row[1]
+            for row in db.session.execute(text(f'PRAGMA table_info({table.name})')).fetchall()
+        }
+        if not existing:
+            missing.append(f'{table.name} (table missing)')
+            continue
+        for column in table.columns:
+            if column.name not in existing:
+                missing.append(f'{table.name}.{column.name}')
+    if missing:
+        raise RuntimeError(
+            'Database schema is incompatible with the application models; '
+            'missing required tables/columns: ' + ', '.join(sorted(missing))
+        )
+
+
+def reconcile_stale_awaiting_audit_runs():
+    """Continue runs stuck in awaiting_audit whose audit cycle is already audited."""
+    from services.automation_service import reconcile_stale_awaiting_audit_runs as reconcile
+    reconciled = reconcile()
+    if reconciled:
+        print(f"Reconciled {reconciled} stale awaiting_audit run(s).", flush=True)
 
 
 def bootstrap_owner_api_key():
@@ -344,6 +375,14 @@ def ensure_lightweight_schema():
     campaign_world_columns = table_columns('campaign_worlds')
     if 'memory_revision' not in campaign_world_columns:
         db.session.execute(text('ALTER TABLE campaign_worlds ADD COLUMN memory_revision INTEGER DEFAULT 0 NOT NULL'))
+
+    # --- campaign_memory_logs ---
+    memory_log_columns = table_columns('campaign_memory_logs')
+    if memory_log_columns:
+        if 'evidence_status' not in memory_log_columns:
+            db.session.execute(text('ALTER TABLE campaign_memory_logs ADD COLUMN evidence_status VARCHAR(50)'))
+        if 'provenance_json' not in memory_log_columns:
+            db.session.execute(text('ALTER TABLE campaign_memory_logs ADD COLUMN provenance_json JSON'))
 
     # --- New tables for session memory integrity ---
     resolver_packet_columns = table_columns('campaign_resolver_packets')
