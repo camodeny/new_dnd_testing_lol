@@ -1722,6 +1722,23 @@ def continue_audit_run(run, *, force=False):
     return cycle
 
 
+def reconcile_stale_awaiting_audit_runs():
+    """Advance runs stuck in awaiting_audit whose audit cycle is already audited.
+
+    Uses the normal audited-cycle continuation path so repaired runs resume
+    through the standard queue rather than direct state edits.
+    """
+    stale_runs = AutomationRun.query.filter_by(status='awaiting_audit').all()
+    reconciled = 0
+    for run in stale_runs:
+        cycle = db.session.get(AutomationRunAuditCycle, run.awaiting_audit_cycle_id) if run.awaiting_audit_cycle_id else None
+        if cycle is None or cycle.status not in AUDIT_READY_STATUSES:
+            continue
+        continue_audit_run(run)
+        reconciled += 1
+    return reconciled
+
+
 def lease_seconds_for_run(run):
     return max(15, _safe_int((run.runner_config_json or {}).get('lease_seconds'), DEFAULT_LEASE_SECONDS))
 

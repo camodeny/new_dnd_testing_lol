@@ -2,6 +2,7 @@ import threading
 from datetime import datetime
 
 from flask import Blueprint, current_app, jsonify, request, stream_with_context
+from sqlalchemy.exc import SQLAlchemyError
 
 from auth import authenticate_request, token_required
 from time_utils import utcnow
@@ -1403,7 +1404,14 @@ def execute_automation_auditor_tool(current_user, run_id, tool_name):
 
     data = request.get_json(silent=True) or {}
     args = data.get('args') if isinstance(data.get('args'), dict) else {}
-    result = execute_auditor_tool(run, tool_name, args)
+    try:
+        result = execute_auditor_tool(run, tool_name, args)
+    except SQLAlchemyError as exc:
+        db.session.rollback()
+        return jsonify({
+            'error': f'Database error while executing auditor tool: {tool_name}',
+            'error_class': type(exc).__name__,
+        }), 500
     return jsonify({'run_id': run.id, 'tool_name': tool_name, 'result': result}), 200
 
 
@@ -1868,7 +1876,14 @@ def get_automation_run_audit_bundle(current_user, run_id):
     run = get_or_404(AutomationRun, run_id)
     if not _run_visible_to_user(current_user, run):
         return jsonify({'error': 'Forbidden'}), 403
-    bundle = get_current_audit_bundle_data(run)
+    try:
+        bundle = get_current_audit_bundle_data(run)
+    except SQLAlchemyError as exc:
+        db.session.rollback()
+        return jsonify({
+            'error': 'Database error while building the audit bundle.',
+            'error_class': type(exc).__name__,
+        }), 500
     return jsonify(bundle), 200
 
 
