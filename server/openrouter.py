@@ -56,7 +56,7 @@ SESSION_MEMORY_TIMEOUT_SECONDS = max(
 )
 SESSION_MEMORY_MAX_ATTEMPTS = max(
     1,
-    int(os.environ.get('SESSION_MEMORY_MAX_ATTEMPTS', '1')),
+    int(os.environ.get('SESSION_MEMORY_MAX_ATTEMPTS', '2')),
 )
 SESSION_MEMORY_MAX_TOKENS = max(
     256,
@@ -5360,6 +5360,94 @@ def _get_session_memory_patch_staged(memory_context, audit_context, telemetry):
     response_chain = []
     max_tool_rounds = 6
     final_payload = None
+    def recover_final_payload(reason):
+        """Ask once for the final contract when the tool loop ends without one."""
+        telemetry['staged_resolver_recovery_reason'] = reason
+        recovery_messages = list(messages)
+        recovery_messages.append({
+            'role': 'user',
+            'content': (
+                'Call submit_resolved_memory now. Do not call any retrieval tools or add prose. '
+                'Use the tool results already in this conversation. If a reference remains unresolved, '
+                'put it in unresolved_items instead of omitting the final payload.'
+            ),
+        })
+        try:
+            normalized = _post_chat_normalized(
+                recovery_messages,
+                json_mode=False,
+                audit_context={
+                    **audit_context,
+                    'operation': 'session_memory_resolve_recovery',
+                    'full_world_graph_included': False,
+                },
+                tools=[SESSION_MEMORY_RESOLVER_FINALIZER_TOOL],
+                tool_choice='auto',
+                parallel_tool_calls=False,
+                allow_thinking=False,
+                max_tokens=SESSION_MEMORY_MAX_TOKENS,
+                timeout_seconds=SESSION_MEMORY_TIMEOUT_SECONDS,
+            )
+        except Exception as err:
+            raise MemoryPipelineError(
+                stage='resolution',
+                code='resolver_recovery_provider_error',
+                message=f'Staged memory resolver recovery failed: {err}',
+                cause=err,
+                telemetry=telemetry,
+            ) from err
+        recovery_message = normalized.message_view() if normalized is not None else {}
+        recovered = _parse_session_memory_resolver_tool_calls(recovery_message.get('tool_calls'))
+        response_chars = len(str(normalized.content or '') if normalized is not None else '')
+        telemetry['staged_resolver_recovery_response_chars'] = response_chars
+        if not isinstance(recovered, dict):
+            raise MemoryPipelineError(
+                stage='resolution',
+                code='malformed_output',
+                message='Staged memory resolver returned no valid final payload after recovery.',
+                telemetry=telemetry,
+            )
+        telemetry['staged_resolver_recovery_succeeded'] = True
+        return recovered
+
+    def append_tool_results(message, tool_calls):
+        """Execute read-only resolver lookups and retain their full conversation trace."""
+        messages.append(_assistant_tool_message(message))
+        for tool_call in tool_calls:
+            function = tool_call.get('function') if isinstance(tool_call, dict) else {}
+            tool_name = function.get('name') if isinstance(function, dict) else None
+            tool_args = _parse_tool_arguments(function.get('arguments') if isinstance(function, dict) else None)
+            try:
+                result = execute_memory_tool(memory_context, tool_name, tool_args)
+            except Exception as err:
+                raise MemoryPipelineError(
+                    stage='resolution',
+                    code='tool_execution_error',
+                    message=f'Staged memory resolver tool {tool_name} failed: {err}',
+                    cause=err,
+                    telemetry=telemetry,
+                ) from err
+            tool_trace.append({
+                'tool_name': tool_name,
+                'args': tool_args,
+                'result': result,
+            })
+            if campaign_id:
+                log_audit_event(
+                    campaign_id,
+                    'memory_writer_tool_call',
+                    f'Staged memory resolver called {tool_name}.',
+                    {'tool_name': tool_name, 'args': tool_args, 'result': result},
+                    source='session_memory_writer.tool',
+                    actor='session_memory_writer',
+                    trace_id=trace_id,
+                    parent_trace_id=audit_context.get('parent_trace_id'),
+                    trace_label=trace_label,
+                    audit_role='tools',
+                    commit=True,
+                )
+            messages.append(_memory_tool_result_message(tool_call, tool_name, result))
+
     for tool_round in range(max_tool_rounds + 1):
         try:
             normalized = _post_chat_normalized(
@@ -5375,6 +5463,7 @@ def _get_session_memory_patch_staged(memory_context, audit_context, telemetry):
                 parallel_tool_calls=False,
                 allow_thinking=False,
                 timeout_seconds=SESSION_MEMORY_TIMEOUT_SECONDS,
+                max_attempts=SESSION_MEMORY_MAX_ATTEMPTS,
             )
         except ProviderError as err:
             if err.kind != 'malformed':
@@ -5397,7 +5486,6 @@ def _get_session_memory_patch_staged(memory_context, audit_context, telemetry):
         response_chain.append(normalized.raw if normalized is not None else {})
         message = normalized.message_view() if normalized is not None else {}
         tool_calls = message.get('tool_calls') or []
-
         final_payload = _parse_session_memory_resolver_tool_calls(tool_calls)
         if final_payload is not None:
             break
@@ -5413,60 +5501,20 @@ def _get_session_memory_patch_staged(memory_context, audit_context, telemetry):
                 message='Staged memory resolver must finalize with exactly one submit_resolved_memory tool call.',
                 telemetry=telemetry,
             )
-
-        retrieval_calls = [
-            tc for tc in tool_calls
-            if (tc.get('function') if isinstance(tc, dict) else {}).get('name') != SESSION_MEMORY_RESOLVER_FINALIZER_TOOL_NAME
-        ]
-        if retrieval_calls and tool_round < max_tool_rounds:
-            messages.append(_assistant_tool_message(message))
-            for tool_call in retrieval_calls:
-                function = tool_call.get('function') if isinstance(tool_call, dict) else {}
-                tool_name = function.get('name') if isinstance(function, dict) else None
-                tool_args = _parse_tool_arguments(function.get('arguments') if isinstance(function, dict) else None)
-                try:
-                    result = execute_memory_tool(memory_context, tool_name, tool_args)
-                except Exception as err:
-                    raise MemoryPipelineError(
-                        stage='resolution',
-                        code='tool_execution_error',
-                        message=f'Staged memory resolver tool {tool_name} failed: {err}',
-                        cause=err,
-                        telemetry=telemetry,
-                    ) from err
-                tool_trace.append({
-                    'tool_name': tool_name,
-                    'args': tool_args,
-                    'result': result,
-                })
-                if campaign_id:
-                    log_audit_event(
-                        campaign_id,
-                        'memory_writer_tool_call',
-                        f'Staged memory resolver called {tool_name}.',
-                        {'tool_name': tool_name, 'args': tool_args, 'result': result},
-                        source='session_memory_writer.tool',
-                        actor='session_memory_writer',
-                        trace_id=trace_id,
-                        parent_trace_id=audit_context.get('parent_trace_id'),
-                        trace_label=trace_label,
-                        audit_role='tools',
-                        commit=True,
-                    )
-                messages.append(_memory_tool_result_message(tool_call, tool_name, result))
+        if tool_calls:
+            append_tool_results(message, tool_calls)
+        if tool_calls and tool_round < max_tool_rounds:
             continue
+        if tool_calls:
+            # Preserve the final requested lookup before asking for a
+            # constrained, tool-free response that satisfies the JSON contract.
+            final_payload = recover_final_payload('max_tool_rounds_with_tool_calls')
+            break
 
         content = message.get('content') or ''
-        if content.strip():
-            telemetry['staged_resolver_error'] = 'plain_text_response'
-        else:
-            telemetry['staged_resolver_error'] = 'no_valid_tool_calls'
-        raise MemoryPipelineError(
-            stage='resolution',
-            code='malformed_output',
-            message='Staged memory resolver did not call submit_resolved_memory.',
-            telemetry=telemetry,
-        )
+        recovery_reason = 'plain_text_terminal_response' if content.strip() else 'empty_terminal_response'
+        final_payload = recover_final_payload(recovery_reason)
+        break
     if final_payload is None:
         telemetry['staged_resolver_error'] = 'max_tool_rounds_exceeded'
         raise MemoryPipelineError(
@@ -5584,7 +5632,7 @@ def _request_session_memory_json(messages, audit_context, operation, max_tokens,
         },
         allow_thinking=False,
         timeout_seconds=timeout_seconds,
-        max_attempts=1,
+        max_attempts=SESSION_MEMORY_MAX_ATTEMPTS,
         max_tokens=max_tokens,
     )
     if not isinstance(text, str) or not text.strip():

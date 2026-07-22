@@ -271,6 +271,118 @@ class MemoryPipelineErrorTest(unittest.TestCase):
                 )
             self.assertEqual(ctx.exception.stage, 'resolution')
 
+    def test_resolver_empty_response_recovers_with_finalizer_tool(self):
+        from openrouter import _get_session_memory_patch_staged
+        fake_compiled = {
+            'running_summary': 'Recovered summary',
+            'memory_anchors': {},
+            'scene_patch': {},
+            'upsert_graph_entities': [],
+            'upsert_graph_relations': [],
+            'upsert_graph_facts': [],
+            'create_clocks': [],
+            'retire_clocks': [],
+            'update_npc_actors': [],
+            'record_events': [],
+            'unresolved_items': [],
+            'compile_summary': {},
+        }
+        empty_resolver = _normalized_from_raw({
+            'choices': [{
+                'message': {'content': '', 'tool_calls': None},
+                'finish_reason': 'stop',
+            }],
+        })
+        extractor_response = _normalized_from_raw({
+            'choices': [{'message': {'content': '', 'tool_calls': [{'id': 'extract', 'type': 'function', 'function': {'name': 'submit_extraction', 'arguments': json.dumps({'running_summary': 'Extracted summary'})}}]}}],
+        })
+        recovery_response = _normalized_from_raw({
+            'choices': [{'message': {'content': '', 'tool_calls': [{'id': 'recover', 'type': 'function', 'function': {'name': 'submit_resolved_memory', 'arguments': json.dumps({'running_summary': 'Recovered summary'})}}]}}],
+        })
+        clocks_response = _normalized_from_raw({
+            'choices': [{'message': {'content': '', 'tool_calls': [{'id': 'clocks', 'type': 'function', 'function': {'name': 'submit_clock_updates', 'arguments': json.dumps({'create_clocks': [], 'retire_clocks': []})}}]}}],
+        })
+        with patch('openrouter.build_session_memory_extractor_messages', return_value=[]), \
+                patch('openrouter.build_session_memory_resolver_messages', return_value=[]), \
+                patch('openrouter._post_chat_normalized', side_effect=[extractor_response, empty_resolver, recovery_response, clocks_response]) as chat_mock, \
+                patch('services.session_memory_agent.compile_staged_memory_patch', return_value=fake_compiled):
+            telemetry = {}
+            result = _get_session_memory_patch_staged(
+                {'campaign_id': 1, 'session_id': 1},
+                {},
+                telemetry,
+            )
+
+        self.assertEqual(result['running_summary'], 'Recovered summary')
+        self.assertEqual(telemetry['staged_resolver_recovery_reason'], 'empty_terminal_response')
+        self.assertTrue(telemetry['staged_resolver_recovery_succeeded'])
+        self.assertEqual(chat_mock.call_args_list[2].kwargs['audit_context']['operation'], 'session_memory_resolve_recovery')
+
+    def test_resolver_executes_final_tool_call_before_recovery(self):
+        from openrouter import _get_session_memory_patch_staged
+        final_tool_call = {
+            'id': 'call-final',
+            'type': 'function',
+            'function': {'name': 'get_scene_candidates', 'arguments': '{"query":"lock house"}'},
+        }
+        tool_only_response = _normalized_from_raw({
+            'choices': [{
+                'message': {'content': '', 'tool_calls': [final_tool_call]},
+                'finish_reason': 'tool_calls',
+            }],
+        })
+        extractor_response = _normalized_from_raw({
+            'choices': [{'message': {'content': '', 'tool_calls': [{'id': 'extract', 'type': 'function', 'function': {'name': 'submit_extraction', 'arguments': json.dumps({'running_summary': 'Extracted summary'})}}]}}],
+        })
+        recovery_response = _normalized_from_raw({
+            'choices': [{'message': {'content': '', 'tool_calls': [{'id': 'recover', 'type': 'function', 'function': {'name': 'submit_resolved_memory', 'arguments': json.dumps({'running_summary': 'Recovered summary'})}}]}}],
+        })
+        clocks_response = _normalized_from_raw({
+            'choices': [{'message': {'content': '', 'tool_calls': [{'id': 'clocks', 'type': 'function', 'function': {'name': 'submit_clock_updates', 'arguments': json.dumps({'create_clocks': [], 'retire_clocks': []})}}]}}],
+        })
+        fake_compiled = {
+            'running_summary': 'Recovered summary', 'memory_anchors': {}, 'scene_patch': {},
+            'upsert_graph_entities': [], 'upsert_graph_relations': [], 'upsert_graph_facts': [],
+            'create_clocks': [], 'retire_clocks': [], 'update_npc_actors': [],
+            'record_events': [], 'unresolved_items': [], 'compile_summary': {},
+        }
+        with patch('openrouter.build_session_memory_extractor_messages', return_value=[]), \
+                patch('openrouter.build_session_memory_resolver_messages', return_value=[]), \
+                patch('openrouter._post_chat_normalized', side_effect=[extractor_response, *([tool_only_response] * 7), recovery_response, clocks_response]) as chat_mock, \
+                patch('services.session_memory_agent.execute_memory_tool', return_value={'matches': ['lock-house']}) as tool_mock, \
+                patch('services.session_memory_agent.compile_staged_memory_patch', return_value=fake_compiled):
+            _get_session_memory_patch_staged({'campaign_id': 1, 'session_id': 1}, {}, {})
+
+        self.assertEqual(tool_mock.call_count, 7)
+        recovery_messages = chat_mock.call_args_list[8].args[0]
+        self.assertEqual(recovery_messages[-2]['role'], 'tool')
+        self.assertIn('lock-house', recovery_messages[-2]['content'])
+
+    def test_resolver_uses_configured_memory_retry_limit(self):
+        from openrouter import _get_session_memory_patch_staged
+        extractor_response = _normalized_from_raw({
+            'choices': [{'message': {'content': '', 'tool_calls': [{'id': 'extract', 'type': 'function', 'function': {'name': 'submit_extraction', 'arguments': json.dumps({'running_summary': 'test'})}}]}}],
+        })
+        resolver_response = _normalized_from_raw({
+            'choices': [{'message': {'content': '', 'tool_calls': [{'id': 'resolve', 'type': 'function', 'function': {'name': 'submit_resolved_memory', 'arguments': json.dumps({'running_summary': 'test'})}}]}}],
+        })
+        clocks_response = _normalized_from_raw({
+            'choices': [{'message': {'content': '', 'tool_calls': [{'id': 'clocks', 'type': 'function', 'function': {'name': 'submit_clock_updates', 'arguments': json.dumps({'create_clocks': [], 'retire_clocks': []})}}]}}],
+        })
+        fake_compiled = {
+            'running_summary': 'test', 'memory_anchors': {}, 'scene_patch': {},
+            'upsert_graph_entities': [], 'upsert_graph_relations': [], 'upsert_graph_facts': [],
+            'create_clocks': [], 'retire_clocks': [], 'update_npc_actors': [],
+            'record_events': [], 'unresolved_items': [], 'compile_summary': {},
+        }
+        with patch('openrouter.build_session_memory_extractor_messages', return_value=[]), \
+                patch('openrouter.build_session_memory_resolver_messages', return_value=[]), \
+                patch('openrouter._post_chat_normalized', side_effect=[extractor_response, resolver_response, clocks_response]) as resolver_mock, \
+                patch('services.session_memory_agent.compile_staged_memory_patch', return_value=fake_compiled):
+            _get_session_memory_patch_staged({'campaign_id': 1, 'session_id': 1}, {}, {})
+
+        self.assertEqual(resolver_mock.call_args_list[1].kwargs['max_attempts'], SESSION_MEMORY_MAX_ATTEMPTS)
+
     def test_clock_generation_invalid_output_raises_error(self):
         from openrouter import _get_session_memory_patch_staged
         fake_compiled = {
