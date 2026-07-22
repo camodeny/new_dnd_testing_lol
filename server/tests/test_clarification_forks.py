@@ -1,6 +1,7 @@
 import os
 import sys
 import unittest
+import json
 from unittest.mock import patch
 
 from flask import Flask
@@ -10,13 +11,18 @@ sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), '..')
 from models import (
     db,
     Campaign,
+    CampaignClarification,
     CampaignClarificationFork,
     CampaignClarificationForkMessage,
+    CampaignClock,
+    CampaignMemoryLog,
     CampaignResolverPacket,
     CampaignSession,
     CampaignWorld,
+    NPCActor,
     SessionMessage,
     User,
+    WorldEvent,
 )
 from services.clarification_forks import (
     _canonical_messages,
@@ -177,3 +183,86 @@ class ClarificationForkTest(unittest.TestCase):
         reconstructed = _canonical_messages(refreshed)
         self.assertEqual(reconstructed[-1].id, anchor.id)
         self.assertNotEqual(reconstructed[-1].content, 'This later canonical message must not enter the fork.')
+
+    @patch('services.clarification_forks._generate_reply', return_value='The private evidence distinguishes the candidates.')
+    def test_fork_freezes_private_candidate_evidence(self, _generate_reply):
+        self.world.knowledge_graph = json.dumps({
+            'entities': [
+                {'id': 'watcher_a', 'type': 'npc', 'name': 'Watcher A', 'summary': 'A hooded observer.', 'visibility': 'dm_private'},
+                {'id': 'watcher_b', 'type': 'npc', 'name': 'Watcher B', 'summary': 'Another hooded observer.', 'visibility': 'dm_private'},
+            ],
+            'relations': [
+                {'id': 'rel_a', 'type': 'serves', 'source_id': 'watcher_a', 'target_id': 'guild', 'summary': 'Watcher A serves the guild.', 'visibility': 'dm_private'},
+            ],
+            'facts': [
+                {'id': 'fact_a', 'entity_ids': ['watcher_a'], 'text': 'Watcher A carries the brass key.', 'certainty': 'confirmed', 'visibility': 'dm_private'},
+            ],
+        })
+        db.session.add_all([
+            NPCActor(
+                campaign_id=self.campaign.id,
+                actor_id='watcher_a',
+                name='Watcher A',
+                role='informant',
+                dossier=json.dumps({'secrets': ['Carries the brass key.'], 'background': 'A former guild courier.'}),
+            ),
+            CampaignClock(
+                campaign_id=self.campaign.id,
+                clock_id='guild_alarm',
+                name='Guild Alarm',
+                visibility='dm_private',
+                trigger='The watcher reports to the guild.',
+            ),
+            CampaignMemoryLog(
+                campaign_id=self.campaign.id,
+                memory_run_id='memory_run',
+                target_id='watcher_a',
+                operation='create',
+                memory_type='npc',
+                reason='Recorded the watcher key evidence.',
+                provenance_json={'evidence_sources': [{'source': 'transcript', 'source_id': 'hidden'}]},
+            ),
+            WorldEvent(
+                campaign_id=self.campaign.id,
+                event_type='watcher_seen',
+                summary='Watcher A delivered a report to the guild.',
+                payload=json.dumps({'actor_id': 'watcher_a'}),
+                visibility='dm_private',
+            ),
+        ])
+        clarification = CampaignClarification(
+            campaign_id=self.campaign.id,
+            clarification_id='clar_watcher',
+            idempotency_key='clar_watcher_key',
+            kind='identity',
+            mention_ref='hooded_watcher',
+            mention_entity_id='watcher_a',
+            surface_form='hooded watcher',
+            question='Which watcher carries the brass key?',
+            candidate_ids=['watcher_a', 'watcher_b'],
+            status='pending',
+        )
+        db.session.add(clarification)
+        db.session.commit()
+
+        fork = create_fork(
+            self.campaign,
+            self.session,
+            self.user,
+            'Which watcher is the guild informant?',
+            anchor_message_id=self.anchor.id,
+            clarification_id=clarification.clarification_id,
+        )
+        bundle = fork.snapshot_json['evidence_bundle']
+        watcher = bundle['candidates']['watcher_a']
+        self.assertIn('Carries the brass key.', watcher['npc_dossier']['secrets'])
+        self.assertEqual(watcher['graph_relations'][0]['type'], 'serves')
+        self.assertIn('brass key', watcher['graph_facts'][0]['text'])
+        self.assertIn('key evidence', watcher['memory_logs'][0]['reason'])
+        self.assertEqual(watcher['world_events'][0]['event_type'], 'watcher_seen')
+        self.assertEqual(bundle['clocks'][0]['clock_id'], 'guild_alarm')
+
+        npc = NPCActor.query.filter_by(campaign_id=self.campaign.id, actor_id='watcher_a').first()
+        npc.dossier = json.dumps({'secrets': ['Changed after fork creation.']})
+        db.session.commit()
+        self.assertIn('Carries the brass key.', db.session.get(CampaignClarificationFork, fork.id).snapshot_json['evidence_bundle']['candidates']['watcher_a']['npc_dossier']['secrets'])

@@ -8,8 +8,12 @@ from models import (
     CampaignClarification,
     CampaignClarificationFork,
     CampaignClarificationForkMessage,
+    CampaignClock,
+    CampaignMemoryLog,
     CampaignWorld,
+    NPCActor,
     SessionMessage,
+    WorldEvent,
 )
 from openrouter import _post_chat_normalized
 from services.dm_tools import build_session_hot_context
@@ -21,6 +25,13 @@ MAX_CANONICAL_CHARS = 12000
 KEEP_FORK_DELTA_MESSAGES = 8
 COMPACT_FORK_DELTA_AFTER = 12
 MAX_COMPACTED_SUMMARY_CHARS = 6000
+MAX_EVIDENCE_CANDIDATES = 8
+MAX_EVIDENCE_RELATIONS = 12
+MAX_EVIDENCE_FACTS = 12
+MAX_EVIDENCE_MEMORY_LOGS = 8
+MAX_EVIDENCE_EVENTS = 4
+MAX_EVIDENCE_CLOCKS = 8
+MAX_EVIDENCE_TEXT = 1200
 FROZEN_CONTEXT_KEYS = (
     "campaign",
     "session",
@@ -64,6 +75,138 @@ def _canonical_message_window(session_id, anchor_message_id):
     return list(reversed(selected))
 
 
+def _compact_text(value, limit=MAX_EVIDENCE_TEXT):
+    text = str(value or "")
+    return text if len(text) <= limit else text[:limit].rstrip() + "..."
+
+
+def _json_object(value):
+    if isinstance(value, dict):
+        return value
+    try:
+        parsed = json.loads(value or "{}")
+    except (TypeError, ValueError):
+        parsed = {}
+    return parsed if isinstance(parsed, dict) else {}
+
+
+def _event_mentions_candidate(event, candidate_id):
+    payload = _json_object(event.payload)
+    return candidate_id in json.dumps(payload, ensure_ascii=True) or candidate_id in (event.summary or "")
+
+
+def _build_evidence_bundle(campaign, clarification, world):
+    if not clarification:
+        return None
+    graph = _json_object(world.knowledge_graph if world else None)
+    entities = [item for item in graph.get("entities", []) if isinstance(item, dict)]
+    relations = [item for item in graph.get("relations", []) if isinstance(item, dict)]
+    facts = [item for item in graph.get("facts", []) if isinstance(item, dict)]
+    candidate_ids = []
+    for raw_id in [clarification.mention_entity_id, *(clarification.candidate_ids or [])]:
+        candidate_id = str(raw_id or "").strip()
+        if candidate_id and candidate_id not in candidate_ids:
+            candidate_ids.append(candidate_id)
+    surface_form = str(clarification.surface_form or "").strip().lower()
+    if surface_form:
+        for entity in entities:
+            if str(entity.get("name") or "").strip().lower() == surface_form:
+                candidate_id = str(entity.get("id") or "").strip()
+                if candidate_id and candidate_id not in candidate_ids:
+                    candidate_ids.append(candidate_id)
+    candidate_ids = candidate_ids[:MAX_EVIDENCE_CANDIDATES]
+    npcs = {
+        npc.actor_id: npc
+        for npc in NPCActor.query.filter_by(campaign_id=campaign.id).all()
+    }
+    events = WorldEvent.query.filter_by(campaign_id=campaign.id).order_by(WorldEvent.id.desc()).limit(50).all()
+    bundle = {
+        "schema_version": "1.0",
+        "mention_entity_id": clarification.mention_entity_id,
+        "mention_surface_form": clarification.surface_form,
+        "candidates": {},
+        "clocks": [
+            clock.to_dict(include_private=True)
+            for clock in CampaignClock.query.filter_by(campaign_id=campaign.id).order_by(CampaignClock.id.desc()).limit(MAX_EVIDENCE_CLOCKS).all()
+        ],
+    }
+    for candidate_id in candidate_ids:
+        npc = npcs.get(candidate_id)
+        entity = next((item for item in entities if item.get("id") == candidate_id), None)
+        candidate_relations = [
+            {
+                "id": item.get("id"),
+                "type": item.get("type"),
+                "source_id": item.get("source_id"),
+                "target_id": item.get("target_id"),
+                "summary": _compact_text(item.get("summary")),
+                "visibility": item.get("visibility"),
+            }
+            for item in relations
+            if candidate_id in (item.get("source_id"), item.get("target_id"))
+        ][:MAX_EVIDENCE_RELATIONS]
+        candidate_facts = [
+            {
+                "id": item.get("id"),
+                "text": _compact_text(item.get("text")),
+                "certainty": item.get("certainty"),
+                "visibility": item.get("visibility"),
+            }
+            for item in facts
+            if candidate_id in (item.get("entity_ids") or [])
+        ][:MAX_EVIDENCE_FACTS]
+        logs = CampaignMemoryLog.query.filter_by(
+            campaign_id=campaign.id,
+            target_id=candidate_id,
+        ).order_by(CampaignMemoryLog.id.desc()).limit(MAX_EVIDENCE_MEMORY_LOGS).all()
+        candidate_events = [event for event in events if _event_mentions_candidate(event, candidate_id)][:MAX_EVIDENCE_EVENTS]
+        dossier = _json_object(npc.dossier) if npc else {}
+        bundle["candidates"][candidate_id] = {
+            "graph_entity": {
+                "id": candidate_id,
+                "type": entity.get("type") if entity else "npc" if npc else None,
+                "name": entity.get("name") if entity else npc.name if npc else None,
+                "summary": _compact_text(entity.get("summary")) if entity else _compact_text(npc.public_summary) if npc else None,
+                "visibility": entity.get("visibility") if entity else "dm_private" if npc else None,
+                "tags": entity.get("tags") if entity else [],
+            },
+            "npc_dossier": {
+                "role": npc.role if npc else None,
+                "voice": _compact_text(dossier.get("voice")),
+                "background": _compact_text(dossier.get("background")),
+                "wants": dossier.get("wants") if isinstance(dossier.get("wants"), list) else [],
+                "fears": dossier.get("fears") if isinstance(dossier.get("fears"), list) else [],
+                "secrets": dossier.get("secrets") if isinstance(dossier.get("secrets"), list) else [],
+                "relationships": dossier.get("relationships") if isinstance(dossier.get("relationships"), dict) else {},
+                "recent_offscreen_activity": dossier.get("recent_offscreen_activity") if isinstance(dossier.get("recent_offscreen_activity"), list) else [],
+            } if npc else None,
+            "graph_relations": candidate_relations,
+            "graph_facts": candidate_facts,
+            "memory_logs": [
+                {
+                    "memory_id": row.memory_id,
+                    "operation": row.operation,
+                    "memory_type": row.memory_type,
+                    "reason": _compact_text(row.reason),
+                    "provenance": row.provenance_json,
+                    "evidence_status": row.evidence_status,
+                }
+                for row in logs
+            ],
+            "world_events": [
+                {
+                    "event_type": event.event_type,
+                    "summary": _compact_text(event.summary),
+                    "payload": _json_object(event.payload),
+                    "visibility": event.visibility,
+                    "created_at": event.created_at.isoformat() if event.created_at else None,
+                }
+                for event in candidate_events
+            ],
+        }
+    return bundle
+
+
 def _frozen_snapshot(campaign, session, current_user, canonical_messages, clarification):
     hot_context = build_session_hot_context(
         campaign,
@@ -82,6 +225,9 @@ def _frozen_snapshot(campaign, session, current_user, canonical_messages, clarif
         "clarification": clarification.to_dict() if clarification else None,
         "memory_revision": memory_revision or 0,
     }
+    evidence_bundle = _build_evidence_bundle(campaign, clarification, world)
+    if evidence_bundle:
+        snapshot["evidence_bundle"] = evidence_bundle
     context_hash = hashlib.sha256(
         json.dumps(snapshot, sort_keys=True, ensure_ascii=True, default=str).encode("utf-8"),
     ).hexdigest()
@@ -133,6 +279,12 @@ def _generate_reply(fork):
         messages.append({
             "role": "system",
             "content": "Clarification record:\n" + json.dumps(clarification, ensure_ascii=False),
+        })
+    evidence_bundle = snapshot.get("evidence_bundle")
+    if evidence_bundle:
+        messages.append({
+            "role": "system",
+            "content": "Frozen private clarification evidence:\n" + json.dumps(evidence_bundle, ensure_ascii=False),
         })
     for message in canonical_messages:
         role = "assistant" if message.role == "dm" else "user"
