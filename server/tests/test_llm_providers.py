@@ -456,19 +456,48 @@ class CrossProviderWorkflowParityTest(unittest.TestCase):
 
         stages = []
 
-        def fake_request_json(messages, audit_context, operation, **kwargs):
+        def _make_tool_response(tool_name, arguments_dict):
+            adapter = provider_registry.get(provider)
+            raw = {
+                'choices': [{
+                    'message': {
+                        'content': '',
+                        'tool_calls': [{
+                            'id': 'call_1',
+                            'type': 'function',
+                            'function': {
+                                'name': tool_name,
+                                'arguments': json.dumps(arguments_dict),
+                            },
+                        }],
+                    },
+                }],
+            }
+            return adapter.parse_response(raw)
+
+        def fake_chat(messages, **kwargs):
+            operation = kwargs.get('audit_context', {}).get('operation', '')
             stages.append(operation)
             if operation == 'session_memory_extract':
-                return {'running_summary': 'summary', 'candidate_facts': []}, 120
+                return _make_tool_response('submit_extraction', {
+                    'running_summary': 'summary',
+                    'fact_claims': [],
+                    'entity_claims': [],
+                    'relation_claims': [],
+                    'npc_claims': [],
+                    'event_claims': [],
+                })
             if operation == 'session_memory_update_clocks':
-                return {'create_clocks': [], 'retire_clocks': []}, 40
-            return None, 0
-
-        def fake_resolve(messages, **kwargs):
-            stages.append('resolution')
-            adapter = provider_registry.get(provider)
-            payload = json.dumps({'running_summary': 'summary', 'resolved_facts': []})
-            return adapter.parse_response({'choices': [{'message': {'content': payload}}]})
+                return _make_tool_response('submit_clock_updates', {
+                    'create_clocks': [],
+                    'retire_clocks': [],
+                })
+            if operation == 'session_memory_resolve':
+                return _make_tool_response('submit_resolved_memory', {
+                    'running_summary': 'summary',
+                    'resolved_facts': [],
+                })
+            return _make_tool_response('submit_resolved_memory', {'running_summary': 'unknown'})
 
         def fake_compile(memory_context, extracted, final_payload):
             stages.append('compilation')
@@ -476,8 +505,7 @@ class CrossProviderWorkflowParityTest(unittest.TestCase):
 
         with patch('openrouter.get_llm_provider', return_value=provider), \
                 patch('openrouter.get_llm_model', return_value='test-model'), \
-                patch('openrouter._request_session_memory_json', side_effect=fake_request_json), \
-                patch('openrouter._post_chat_normalized', side_effect=fake_resolve), \
+                patch('openrouter._post_chat_normalized', side_effect=fake_chat), \
                 patch('services.session_memory_agent.compile_staged_memory_patch', side_effect=fake_compile):
             compiled = openrouter._get_session_memory_patch_staged(
                 {'campaign_id': 1, 'session_id': 1},
@@ -489,7 +517,7 @@ class CrossProviderWorkflowParityTest(unittest.TestCase):
     def test_staged_memory_stage_order_identical_across_providers(self):
         expected = [
             'session_memory_extract',
-            'resolution',
+            'session_memory_resolve',
             'compilation',
             'session_memory_update_clocks',
         ]
