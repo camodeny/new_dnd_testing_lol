@@ -477,11 +477,18 @@ def ensure_lightweight_schema():
                 session_id INTEGER NOT NULL,
                 clarification_id VARCHAR(200),
                 anchor_message_id INTEGER,
+                base_start_message_id INTEGER,
                 created_by_user_id INTEGER NOT NULL,
                 question TEXT NOT NULL,
                 snapshot_json JSON NOT NULL,
                 resolution_json JSON,
                 status VARCHAR(30) NOT NULL DEFAULT 'active',
+                generation_error TEXT,
+                generation_attempt_count INTEGER NOT NULL DEFAULT 0,
+                memory_revision INTEGER NOT NULL DEFAULT 0,
+                context_hash VARCHAR(64),
+                compacted_summary TEXT,
+                compacted_through_message_id INTEGER,
                 created_at DATETIME NOT NULL,
                 resolved_at DATETIME,
                 archived_at DATETIME,
@@ -489,12 +496,28 @@ def ensure_lightweight_schema():
                 FOREIGN KEY(session_id) REFERENCES campaign_sessions (id),
                 FOREIGN KEY(clarification_id) REFERENCES campaign_clarifications (clarification_id),
                 FOREIGN KEY(anchor_message_id) REFERENCES session_messages (id),
+                FOREIGN KEY(base_start_message_id) REFERENCES session_messages (id),
                 FOREIGN KEY(created_by_user_id) REFERENCES users (id)
             )
         '''))
         db.session.execute(text('CREATE INDEX ix_campaign_clarification_forks_campaign_id ON campaign_clarification_forks (campaign_id)'))
         db.session.execute(text('CREATE INDEX ix_campaign_clarification_forks_session_id ON campaign_clarification_forks (session_id)'))
         db.session.execute(text('CREATE INDEX ix_campaign_clarification_forks_status ON campaign_clarification_forks (status)'))
+    else:
+        if 'base_start_message_id' not in clarification_fork_columns:
+            db.session.execute(text('ALTER TABLE campaign_clarification_forks ADD COLUMN base_start_message_id INTEGER'))
+        if 'generation_error' not in clarification_fork_columns:
+            db.session.execute(text('ALTER TABLE campaign_clarification_forks ADD COLUMN generation_error TEXT'))
+        if 'generation_attempt_count' not in clarification_fork_columns:
+            db.session.execute(text('ALTER TABLE campaign_clarification_forks ADD COLUMN generation_attempt_count INTEGER NOT NULL DEFAULT 0'))
+        if 'memory_revision' not in clarification_fork_columns:
+            db.session.execute(text('ALTER TABLE campaign_clarification_forks ADD COLUMN memory_revision INTEGER NOT NULL DEFAULT 0'))
+        if 'context_hash' not in clarification_fork_columns:
+            db.session.execute(text('ALTER TABLE campaign_clarification_forks ADD COLUMN context_hash VARCHAR(64)'))
+        if 'compacted_summary' not in clarification_fork_columns:
+            db.session.execute(text('ALTER TABLE campaign_clarification_forks ADD COLUMN compacted_summary TEXT'))
+        if 'compacted_through_message_id' not in clarification_fork_columns:
+            db.session.execute(text('ALTER TABLE campaign_clarification_forks ADD COLUMN compacted_through_message_id INTEGER'))
 
     clarification_fork_message_columns = table_columns('campaign_clarification_fork_messages')
     if not clarification_fork_message_columns:
@@ -521,5 +544,4 @@ if __name__ == '__main__':
     port = int(os.environ.get('PORT', 5889))
     debug = os.environ.get('FLASK_DEBUG', 'true').lower() == 'true'
     app.run(debug=debug, host='0.0.0.0', port=port)
-
 

@@ -2,7 +2,7 @@ from flask import Blueprint, jsonify, request
 
 from auth import token_required
 from models import db, Campaign, CampaignClarificationFork, CampaignSession
-from services.clarification_forks import add_message, archive_fork, create_fork, resolve_fork
+from services.clarification_forks import add_message, archive_fork, create_fork, resolve_fork, retry_generation
 from services.campaign_service import get_or_404
 
 
@@ -56,7 +56,7 @@ def create_clarification_fork(current_user, session_id):
         )
     except ValueError as err:
         return jsonify({"error": str(err)}), 400
-    return jsonify({"fork": fork.to_dict(include_messages=True)}), 201
+    return jsonify({"fork": fork.to_dict(include_messages=True)}), (201 if fork.status == "active" else 202)
 
 
 @clarification_forks_bp.route("/api/clarification-forks/<int:fork_id>", methods=["GET"])
@@ -66,6 +66,19 @@ def get_clarification_fork(current_user, fork_id):
     if not fork:
         return jsonify({"error": "Forbidden"}), 403
     return jsonify({"fork": fork.to_dict(include_messages=True)}), 200
+
+
+@clarification_forks_bp.route("/api/clarification-forks/<int:fork_id>/retry", methods=["POST"])
+@token_required
+def retry_clarification_fork_generation(current_user, fork_id):
+    fork = _owned_fork(current_user, fork_id)
+    if not fork:
+        return jsonify({"error": "Forbidden"}), 403
+    try:
+        fork = retry_generation(fork)
+    except ValueError as err:
+        return jsonify({"error": str(err)}), 400
+    return jsonify({"fork": fork.to_dict(include_messages=True)}), (200 if fork.status == "active" else 202)
 
 
 @clarification_forks_bp.route("/api/clarification-forks/<int:fork_id>/messages", methods=["POST"])
@@ -81,7 +94,7 @@ def send_clarification_fork_message(current_user, fork_id):
         fork = add_message(fork, content)
     except ValueError as err:
         return jsonify({"error": str(err)}), 400
-    return jsonify({"fork": fork.to_dict(include_messages=True)}), 200
+    return jsonify({"fork": fork.to_dict(include_messages=True)}), (200 if fork.status == "active" else 202)
 
 
 @clarification_forks_bp.route("/api/clarification-forks/<int:fork_id>/resolve", methods=["POST"])
