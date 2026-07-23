@@ -1296,10 +1296,12 @@ def _combat_coordinate_context(campaign, encounter_map):
     }
 
 
-def build_session_hot_context(campaign, session, current_user):
+def build_session_hot_context(campaign, session, current_user, recent_messages_override=None):
     character = _current_character(campaign, current_user)
     world, _graph, world_state, _private = _world_json(campaign)
-    recent_messages = session.messages[-8:] if session and session.messages else []
+    recent_messages = recent_messages_override if recent_messages_override is not None else (
+        session.messages[-8:] if session and session.messages else []
+    )
     active_clocks = _active_clocks(campaign)
     current_scene = world_state.get('current_scene', {}) if isinstance(world_state, dict) else {}
     members = CampaignMember.query.filter_by(campaign_id=campaign.id).order_by(CampaignMember.id.asc()).all()

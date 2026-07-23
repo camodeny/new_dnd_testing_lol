@@ -189,6 +189,7 @@ def _resolve_entity_claim(
         expected_type=entity_type,
     )
     if len(candidates) > 1:
+        entry["candidate_ids"] = sorted(candidates)
         entry["decision"] = "request_clarification"
         entry["resolution_state"] = "clarification_requested"
         entry["blocked_operations"] = ["identity_merge", "npc_update"]

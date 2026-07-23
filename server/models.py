@@ -2435,3 +2435,79 @@ class CampaignIdentityResolution(db.Model):
             "evidence_json": self.evidence_json,
             "created_at": self.created_at.isoformat() if self.created_at else None,
         }
+
+
+class CampaignClarificationFork(db.Model):
+    """An isolated, non-canonical AI clarification conversation."""
+    __tablename__ = "campaign_clarification_forks"
+
+    id = db.Column(db.Integer, primary_key=True)
+    campaign_id = db.Column(db.Integer, db.ForeignKey("campaign.id"), nullable=False, index=True)
+    session_id = db.Column(db.Integer, db.ForeignKey("campaign_sessions.id"), nullable=False, index=True)
+    clarification_id = db.Column(db.String(200), db.ForeignKey("campaign_clarifications.clarification_id"), nullable=True, index=True)
+    anchor_message_id = db.Column(db.Integer, db.ForeignKey("session_messages.id"), nullable=True, index=True)
+    base_start_message_id = db.Column(db.Integer, db.ForeignKey("session_messages.id"), nullable=True)
+    created_by_user_id = db.Column(db.Integer, db.ForeignKey("users.id"), nullable=False)
+
+    question = db.Column(db.Text, nullable=False)
+    snapshot_json = db.Column(db.JSON, nullable=False)
+    resolution_json = db.Column(db.JSON, nullable=True)
+    status = db.Column(db.String(30), nullable=False, default="active", index=True)
+    generation_error = db.Column(db.Text, nullable=True)
+    generation_attempt_count = db.Column(db.Integer, nullable=False, default=0)
+    memory_revision = db.Column(db.Integer, nullable=False, default=0)
+    context_hash = db.Column(db.String(64), nullable=True)
+    compacted_summary = db.Column(db.Text, nullable=True)
+    compacted_through_message_id = db.Column(db.Integer, nullable=True)
+    created_at = db.Column(db.DateTime, default=utcnow, nullable=False)
+    resolved_at = db.Column(db.DateTime, nullable=True)
+    archived_at = db.Column(db.DateTime, nullable=True)
+
+    campaign = db.relationship("Campaign")
+    session = db.relationship("CampaignSession")
+    clarification = db.relationship("CampaignClarification", foreign_keys=[clarification_id])
+    anchor_message = db.relationship("SessionMessage", foreign_keys=[anchor_message_id])
+    created_by = db.relationship("User", foreign_keys=[created_by_user_id])
+    messages = db.relationship("CampaignClarificationForkMessage", backref="fork", lazy=True, cascade="all, delete-orphan")
+
+    def to_dict(self, include_messages=False):
+        payload = {
+            "id": self.id,
+            "campaign_id": self.campaign_id,
+            "session_id": self.session_id,
+            "clarification_id": self.clarification_id,
+            "anchor_message_id": self.anchor_message_id,
+            "base_start_message_id": self.base_start_message_id,
+            "question": self.question,
+            "status": self.status,
+            "generation_error": self.generation_error,
+            "generation_attempt_count": self.generation_attempt_count,
+            "memory_revision": self.memory_revision,
+            "context_hash": self.context_hash,
+            "resolution": self.resolution_json,
+            "created_at": self.created_at.isoformat() if self.created_at else None,
+            "resolved_at": self.resolved_at.isoformat() if self.resolved_at else None,
+            "archived_at": self.archived_at.isoformat() if self.archived_at else None,
+        }
+        if include_messages:
+            payload["messages"] = [message.to_dict() for message in sorted(self.messages, key=lambda item: item.id)]
+        return payload
+
+
+class CampaignClarificationForkMessage(db.Model):
+    __tablename__ = "campaign_clarification_fork_messages"
+
+    id = db.Column(db.Integer, primary_key=True)
+    fork_id = db.Column(db.Integer, db.ForeignKey("campaign_clarification_forks.id"), nullable=False, index=True)
+    role = db.Column(db.String(20), nullable=False)
+    content = db.Column(db.Text, nullable=False)
+    created_at = db.Column(db.DateTime, default=utcnow, nullable=False)
+
+    def to_dict(self):
+        return {
+            "id": self.id,
+            "fork_id": self.fork_id,
+            "role": self.role,
+            "content": self.content,
+            "created_at": self.created_at.isoformat() if self.created_at else None,
+        }

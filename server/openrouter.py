@@ -699,11 +699,12 @@ def _post_chat_normalized(
     )
 
     if campaign_id:
+        audit_messages = audit_context.get('audit_messages') or messages
         log_model_request(
             campaign_id,
             operation,
             actor,
-            messages,
+            audit_messages,
             model,
             json_mode=json_mode,
             commit=True,
