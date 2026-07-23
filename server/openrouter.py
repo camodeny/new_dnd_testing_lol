@@ -5804,8 +5804,7 @@ def get_session_clock_updates(clock_context, audit_context=None):
         active_clock_ids = {
             str(clock.get('clock_id') or clock.get('id'))
             for clock in (clock_context or {}).get('active_clocks', [])
-            if isinstance(clock, dict) and str(clock.get('status') or 'active') == 'active'
-            and (clock.get('clock_id') or clock.get('id'))
+            if isinstance(clock, dict) and (clock.get('clock_id') or clock.get('id'))
         }
         covered_clock_ids = {
             str(item.get('clock_id') or item.get('id'))

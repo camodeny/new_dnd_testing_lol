@@ -769,6 +769,21 @@ class ClockAdjudicatorTest(unittest.TestCase):
             })
         self.assertIsNone(updates)
 
+    def test_clock_adjudicator_requires_coverage_for_ticking_clocks(self):
+        response = _tool_response('submit_clock_updates', {
+            'create_clocks': [],
+            'advance_clocks': [],
+            'retire_clocks': [],
+            'no_change_explanations': [],
+        })
+        with patch('openrouter.get_llm_provider', return_value='openrouter'), patch(
+            'openrouter._post_chat_normalized', return_value=response,
+        ):
+            updates = get_session_clock_updates({
+                'active_clocks': [{'clock_id': 'flood_warning', 'status': 'ticking'}],
+            })
+        self.assertIsNone(updates)
+
     def test_clock_adjudicator_rejects_missing_update_lists(self):
         response = _tool_response('submit_clock_updates', {'create_clocks': []})
         with patch('openrouter.get_llm_provider', return_value='openrouter'), patch(

@@ -6026,6 +6026,35 @@ class DmToolsTest(unittest.TestCase):
         self.assertIsInstance(turn.full_duration_ms, int)
         self.assertGreaterEqual(turn.full_duration_ms, turn.generation_duration_ms)
 
+    def test_clock_failure_does_not_rollback_persisted_memory(self):
+        token = generate_token(self.user.id)
+        client = self.app.test_client()
+
+        with patch('routes.sessions.get_session_dm_response_with_tools', return_value='The alley falls quiet.'), \
+                patch('routes.sessions.get_session_memory_patch', return_value={
+                    'source_contract': 'compiled_session_memory_v2',
+                    'running_summary': 'The alley fell quiet.',
+                    'scene_patch': {},
+                    'upsert_graph_entities': [],
+                    'upsert_graph_relations': [],
+                    'upsert_graph_facts': [],
+                    'update_npc_actors': [],
+                    'record_events': [],
+                }), \
+                patch('routes.sessions.get_session_clock_updates', return_value=None):
+            response = client.post(
+                f'/api/sessions/{self.session.id}/messages',
+                json={'content': '<ooc>What changed?</ooc>', 'role': 'player'},
+                headers={'Authorization': f'Bearer {token}'},
+            )
+
+        self.assertEqual(response.status_code, 201)
+        self.assertEqual(self.session.running_summary, 'The alley fell quiet.')
+        turn = SessionDmTurn.query.one()
+        self.assertEqual(turn.post_turn_status, 'complete')
+        self.assertEqual(turn.memory_status, 'complete')
+        self.assertEqual(turn.clock_status, 'error')
+
     def test_chat_flow_groups_visible_messages_and_nested_branches(self):
         planning_player = CharacterPlanningMessage(
             campaign_id=self.campaign.id,
