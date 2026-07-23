@@ -456,19 +456,23 @@ class CrossProviderWorkflowParityTest(unittest.TestCase):
 
         stages = []
 
-        def fake_request_json(messages, audit_context, operation, **kwargs):
+        def fake_request_tool(messages, audit_context, operation, tools, submission_tool):
             stages.append(operation)
             if operation == 'session_memory_extract':
                 return {'running_summary': 'summary', 'candidate_facts': []}, 120
-            if operation == 'session_memory_update_clocks':
-                return {'create_clocks': [], 'retire_clocks': []}, 40
             return None, 0
 
         def fake_resolve(messages, **kwargs):
             stages.append('resolution')
             adapter = provider_registry.get(provider)
-            payload = json.dumps({'running_summary': 'summary', 'resolved_facts': []})
-            return adapter.parse_response({'choices': [{'message': {'content': payload}}]})
+            return adapter.parse_response({'choices': [{'message': {'tool_calls': [{
+                'id': 'call-memory-patch',
+                'type': 'function',
+                'function': {
+                    'name': 'submit_memory_patch',
+                    'arguments': json.dumps({'running_summary': 'summary', 'resolved_facts': []}),
+                },
+            }]}}]})
 
         def fake_compile(memory_context, extracted, final_payload):
             stages.append('compilation')
@@ -476,7 +480,7 @@ class CrossProviderWorkflowParityTest(unittest.TestCase):
 
         with patch('openrouter.get_llm_provider', return_value=provider), \
                 patch('openrouter.get_llm_model', return_value='test-model'), \
-                patch('openrouter._request_session_memory_json', side_effect=fake_request_json), \
+                patch('openrouter._request_session_memory_tool', side_effect=fake_request_tool), \
                 patch('openrouter._post_chat_normalized', side_effect=fake_resolve), \
                 patch('services.session_memory_agent.compile_staged_memory_patch', side_effect=fake_compile):
             compiled = openrouter._get_session_memory_patch_staged(
@@ -491,13 +495,12 @@ class CrossProviderWorkflowParityTest(unittest.TestCase):
             'session_memory_extract',
             'resolution',
             'compilation',
-            'session_memory_update_clocks',
         ]
         baselines = {}
         for provider in ('openrouter', 'opencode_go', 'fake'):
             stages, compiled = self._run_staged_memory_with_recorder(provider)
             self.assertEqual(stages, expected)
-            self.assertEqual(compiled['create_clocks'], [])
+            self.assertEqual(compiled['running_summary'], 'summary')
             baselines[provider] = stages
         self.assertEqual(baselines['openrouter'], baselines['opencode_go'])
         self.assertEqual(baselines['openrouter'], baselines['fake'])

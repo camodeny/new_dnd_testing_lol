@@ -249,14 +249,14 @@ WORLD_GENESIS_SYSTEM_PROMPT = (
 
 SESSION_MEMORY_CLOCKS_SYSTEM_PROMPT = (
     "You manage only campaign clocks after a visible DM turn. "
-    "Return only valid JSON with keys create_clocks and retire_clocks. "
-    "Prefer empty arrays unless the exchange clearly introduced new durable pressure, a deadline, a mystery clock, or resolved an existing clock. "
+    "Think through the visible exchange, then call submit_clock_updates exactly once. "
+    "Prefer empty update arrays unless the exchange clearly introduced new durable pressure, a deadline, a mystery clock, or resolved an existing clock. "
     "Do not create clocks for ordinary scene beats or clues that do not change campaign pressure."
 )
 
 SESSION_MEMORY_EXTRACTOR_SYSTEM_PROMPT = (
     "You are the extraction stage of a D&D session memory writer. "
-    "Return only valid JSON. "
+    "Think through the visible exchange, then call submit_memory_extraction exactly once. "
     "Write a fresh running_summary that cleanly replaces the old one. "
     "Do not append fragments to the prior summary. Rewrite the current durable state after the latest visible exchange in one compact paragraph. "
     "Additionally, extract or update the structured memory_anchors representing the current session state: current_goal (string or null), current_scene (string or null), open_clues (array of strings), unresolved_questions (array of strings), npc_observations (array of strings), and recent_offers_promises (array of strings). Do not append fragments; completely rewrite or prune these anchors to reflect the current state. "
@@ -278,7 +278,7 @@ SESSION_MEMORY_RESOLVER_SYSTEM_PROMPT = (
     "Never invent ids. If you cannot resolve a reference with confidence, return it in unresolved_items instead of mutating memory. "
     "Prefer get_entity_candidates, get_scene_candidates, get_fact_candidates, and search_campaign_memory before broad raw-state tools. "
     "Use get_world_state, get_npcs, get_clocks, or transcript tools only when narrower tools are insufficient. "
-    "Final response must be exactly one JSON object with keys running_summary, memory_anchors, scene_patch, scene_reason, upsert_graph_entities, upsert_graph_relations, upsert_graph_facts, update_npc_actors, record_events, unresolved_items, evidence_basis, resolved_entity_refs, and resolved_location_refs. "
+    "After any needed read-only tools, call submit_memory_patch exactly once with running_summary, memory_anchors, scene_patch, scene_reason, upsert_graph_entities, upsert_graph_relations, upsert_graph_facts, update_npc_actors, record_events, unresolved_items, evidence_basis, resolved_entity_refs, and resolved_location_refs. "
     "Return the resolved/updated memory_anchors representing the current session state: current_goal (string or null), current_scene (string or null), open_clues (array of strings), unresolved_questions (array of strings), npc_observations (array of strings), and recent_offers_promises (array of strings). "
     "Each upsert_graph_entities item must include id (if reusing or resolving to a canonical id), name, type, summary, tags, source_surface, intended_visibility, certainty, importance, reason, expires_or_retire_condition, and memory_type. "
     "Each upsert_graph_relations item must include id (if reusing/resolving), type, source_id (resolved entity/actor id), target_id (resolved entity/actor id), summary, source_surface, intended_visibility, certainty, importance, reason, expires_or_retire_condition, and memory_type. "
@@ -5181,8 +5181,42 @@ def _memory_tool_result_message(tool_call, tool_name, result):
     }
 
 
+def _submitted_tool_arguments(message, tool_name):
+    for tool_call in message.get('tool_calls') or []:
+        function = tool_call.get('function') if isinstance(tool_call, dict) else {}
+        if not isinstance(function, dict) or function.get('name') != tool_name:
+            continue
+        arguments = _parse_tool_arguments(function.get('arguments'))
+        return arguments if isinstance(arguments, dict) else None
+    return None
+
+
+def _request_session_memory_tool(messages, audit_context, operation, tools, submission_tool):
+    normalized = _post_chat_normalized(
+        messages,
+        json_mode=False,
+        audit_context={
+            **(audit_context or {}),
+            'operation': operation,
+        },
+        tools=tools,
+        tool_choice='required',
+        parallel_tool_calls=False,
+        allow_thinking=True,
+        timeout_seconds=SESSION_MEMORY_TIMEOUT_SECONDS,
+        max_attempts=SESSION_MEMORY_MAX_ATTEMPTS,
+        max_tokens=None,
+    )
+    message = normalized.message_view()
+    submitted = _submitted_tool_arguments(message, submission_tool)
+    response_chars = len(json.dumps(submitted, ensure_ascii=False)) if submitted is not None else 0
+    return submitted, response_chars
+
+
 def _get_session_memory_patch_staged(memory_context, audit_context, telemetry):
     from services.session_memory_agent import (
+        SESSION_MEMORY_EXTRACTION_TOOL,
+        SESSION_MEMORY_FINAL_PATCH_TOOL,
         SESSION_MEMORY_TOOL_DEFINITIONS,
         MemoryPipelineError,
         compile_staged_memory_patch,
@@ -5195,12 +5229,12 @@ def _get_session_memory_patch_staged(memory_context, audit_context, telemetry):
 
     extractor_messages = build_session_memory_extractor_messages(memory_context)
     try:
-        extracted, extractor_chars = _request_session_memory_json(
+        extracted, extractor_chars = _request_session_memory_tool(
             extractor_messages,
             audit_context,
             'session_memory_extract',
-            max_tokens=SESSION_MEMORY_MAX_TOKENS,
-            timeout_seconds=SESSION_MEMORY_TIMEOUT_SECONDS,
+            [SESSION_MEMORY_EXTRACTION_TOOL],
+            'submit_memory_extraction',
         )
     except Exception as err:
         raise MemoryPipelineError(
@@ -5247,18 +5281,18 @@ def _get_session_memory_patch_staged(memory_context, audit_context, telemetry):
         recovery_messages.append({
             'role': 'user',
             'content': (
-                'Return the required final JSON object now. Do not call any more tools, do not add prose, '
-                'and use the tool results already in this conversation. If a reference remains unresolved, '
-                'put it in unresolved_items instead of omitting the final JSON object.'
+                'Call submit_memory_patch now. Do not call any read-only tools or add prose. '
+                'Use the tool results already in this conversation. If a reference remains unresolved, '
+                'put it in unresolved_items instead of omitting the submission.'
             ),
         })
         try:
-            recovered, response_chars = _request_session_memory_json(
+            recovered, response_chars = _request_session_memory_tool(
                 recovery_messages,
                 audit_context,
                 'session_memory_resolve_recovery',
-                max_tokens=SESSION_MEMORY_MAX_TOKENS,
-                timeout_seconds=SESSION_MEMORY_TIMEOUT_SECONDS,
+                [SESSION_MEMORY_FINAL_PATCH_TOOL],
+                'submit_memory_patch',
             )
         except Exception as err:
             raise MemoryPipelineError(
@@ -5327,12 +5361,13 @@ def _get_session_memory_patch_staged(memory_context, audit_context, telemetry):
                     'operation': 'session_memory_resolve',
                     'full_world_graph_included': False,
                 },
-                tools=SESSION_MEMORY_TOOL_DEFINITIONS,
+                tools=SESSION_MEMORY_TOOL_DEFINITIONS + [SESSION_MEMORY_FINAL_PATCH_TOOL],
                 tool_choice='auto',
                 parallel_tool_calls=False,
-                allow_thinking=False,
+                allow_thinking=True,
                 timeout_seconds=SESSION_MEMORY_TIMEOUT_SECONDS,
                 max_attempts=SESSION_MEMORY_MAX_ATTEMPTS,
+                max_tokens=None,
             )
         except ProviderError as err:
             if err.kind != 'malformed':
@@ -5357,6 +5392,10 @@ def _get_session_memory_patch_staged(memory_context, audit_context, telemetry):
             ) from err
         response_chain.append(normalized.raw if normalized is not None else {})
         message = normalized.message_view() if normalized is not None else {}
+        submitted = _submitted_tool_arguments(message, 'submit_memory_patch')
+        if submitted is not None:
+            final_payload = submitted
+            break
         tool_calls = message.get('tool_calls') or []
         if tool_calls:
             append_tool_results(message, tool_calls)
@@ -5368,24 +5407,7 @@ def _get_session_memory_patch_staged(memory_context, audit_context, telemetry):
             final_payload = recover_final_payload('max_tool_rounds_with_tool_calls')
             break
 
-        content = message.get('content') or ''
-        if not content.strip():
-            # Some providers occasionally return an empty terminal response
-            # after successfully completing memory lookups.  Do not discard an
-            # otherwise valid turn without giving them one contract-only retry.
-            final_payload = recover_final_payload('empty_terminal_response')
-            break
-        try:
-            final_payload = _json_object_from_text(content)
-        except Exception as err:
-            telemetry['staged_resolver_error'] = repr(err)
-            raise MemoryPipelineError(
-                stage='resolution',
-                code='malformed_output',
-                message=f'Staged memory resolver returned malformed output: {err}',
-                cause=err,
-                telemetry=telemetry,
-            ) from err
+        final_payload = recover_final_payload('missing_final_tool_call')
         break
     if final_payload is None:
         telemetry['staged_resolver_error'] = 'max_tool_rounds_exceeded'
@@ -5434,51 +5456,6 @@ def _get_session_memory_patch_staged(memory_context, audit_context, telemetry):
             commit=True,
         )
 
-    try:
-        clocks_data, clocks_chars = _request_session_memory_json(
-            build_session_memory_clocks_messages(memory_context),
-            audit_context,
-            'session_memory_update_clocks',
-            max_tokens=SESSION_MEMORY_MAX_TOKENS,
-            timeout_seconds=SESSION_MEMORY_TIMEOUT_SECONDS,
-        )
-    except Exception as err:
-        telemetry['clocks_error'] = repr(err)
-        raise MemoryPipelineError(
-            stage='clock_generation',
-            code='clock_provider_error',
-            message=f'Staged clock generation failed: {err}',
-            cause=err,
-            telemetry=telemetry,
-        ) from err
-    telemetry['clocks_response_chars'] = clocks_chars
-    if not isinstance(clocks_data, dict):
-        raise MemoryPipelineError(
-            stage='clock_generation',
-            code='malformed_output',
-            message='Staged clock generation returned invalid output.',
-            telemetry=telemetry,
-        )
-    create_clocks = clocks_data.get('create_clocks')
-    retire_clocks = clocks_data.get('retire_clocks')
-    if create_clocks is not None and not isinstance(create_clocks, list):
-        raise MemoryPipelineError(
-            stage='clock_generation',
-            code='malformed_output',
-            message='Staged clock generation returned invalid create_clocks shape.',
-            telemetry=telemetry,
-        )
-    if retire_clocks is not None and not isinstance(retire_clocks, list):
-        raise MemoryPipelineError(
-            stage='clock_generation',
-            code='malformed_output',
-            message='Staged clock generation returned invalid retire_clocks shape.',
-            telemetry=telemetry,
-        )
-    if isinstance(create_clocks, list):
-        compiled['create_clocks'] = create_clocks
-    if isinstance(retire_clocks, list):
-        compiled['retire_clocks'] = retire_clocks
     return compiled
 
 
@@ -5634,6 +5611,8 @@ def get_session_memory_patch(memory_context, audit_context=None):
 
 
 def get_session_clock_updates(clock_context, audit_context=None):
+    from services.session_memory_agent import SESSION_CLOCK_UPDATES_TOOL
+
     messages = build_session_clock_adjudication_messages(clock_context or {})
     audit_context = audit_context or {}
     provider = get_llm_provider()
@@ -5665,12 +5644,12 @@ def get_session_clock_updates(clock_context, audit_context=None):
     }
 
     try:
-        data, _response_chars = _request_session_memory_json(
+        data, _response_chars = _request_session_memory_tool(
             messages,
             request_audit,
             'session_clock_adjudication',
-            max_tokens=SESSION_MEMORY_MAX_TOKENS,
-            timeout_seconds=SESSION_MEMORY_TIMEOUT_SECONDS,
+            [SESSION_CLOCK_UPDATES_TOOL],
+            'submit_clock_updates',
         )
     except Exception as err:
         if campaign_id:
@@ -5687,7 +5666,24 @@ def get_session_clock_updates(clock_context, audit_context=None):
                 audit_role='tools',
                 commit=True,
             )
-        data = None
+        return None
+
+    if not isinstance(data, dict):
+        if campaign_id:
+            log_audit_event(
+                campaign_id,
+                'clock_adjudicator_error',
+                'Post-turn clock adjudication did not submit clock updates.',
+                {},
+                source=provider,
+                actor='session_clock_adjudicator',
+                trace_id=trace_id,
+                parent_trace_id=audit_context.get('parent_trace_id'),
+                trace_label=trace_label,
+                audit_role='tools',
+                commit=True,
+            )
+        return None
 
     result = {
         'create_clocks': data.get('create_clocks') if isinstance(data, dict) and isinstance(data.get('create_clocks'), list) else [],

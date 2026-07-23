@@ -1339,6 +1339,28 @@ class DmToolsTest(unittest.TestCase):
 
         with patch('openrouter.SESSION_MEMORY_MODE', 'staged'), \
                 patch('openrouter.get_llm_provider', return_value='openrouter'), \
+                patch('openrouter._request_session_memory_tool', side_effect=[
+                    ({'running_summary': 'Extracted summary'}, 100),
+                    ({
+                        'running_summary': 'At the Hanging Switchyard, Deputy Rona kept control of the signal token.',
+                        'scene_patch': {'location_name': 'Hanging Switchyard', 'active_npc_ids': ['deputy_rona']},
+                        'upsert_graph_facts': [{
+                            'id': 'rona_signal_token',
+                            'text': 'Deputy Rona has the signal token.',
+                            'entity_ids': ['deputy_rona'],
+                            'source_surface': 'visible_transcript',
+                            'intended_visibility': 'party_known',
+                            'certainty': 'confirmed',
+                            'importance': 3,
+                            'reason': 'The DM explicitly said Rona kept the token.',
+                            'memory_type': 'fact',
+                        }],
+                        'unresolved_items': [],
+                        'evidence_basis': [],
+                        'resolved_entity_refs': [],
+                        'resolved_location_refs': [],
+                    }, 100),
+                ]), \
                 patch('openrouter._post_chat', side_effect=[
                     json.dumps({
                         'running_summary': 'At the Hanging Switchyard, Deputy Rona kept control of the signal token.',
@@ -1458,6 +1480,27 @@ class DmToolsTest(unittest.TestCase):
 
         with patch('openrouter.SESSION_MEMORY_MODE', 'staged'), \
                 patch('openrouter.get_llm_provider', return_value='openrouter'), \
+                patch('openrouter._request_session_memory_tool', side_effect=[
+                    ({'running_summary': 'Extracted summary'}, 100),
+                    ({
+                        'running_summary': 'Someone unnamed moved the crate before dawn at the Hanging Switchyard.',
+                        'scene_patch': {'location_name': 'Hanging Switchyard'},
+                        'upsert_graph_facts': [{
+                            'text': 'The porter moved the crate before dawn.',
+                            'entity_ids': ['unknown_porter'],
+                            'source_surface': 'visible_transcript',
+                            'intended_visibility': 'party_known',
+                            'certainty': 'confirmed',
+                            'importance': 2,
+                            'reason': 'The DM stated the crate was moved.',
+                            'memory_type': 'fact',
+                        }],
+                        'unresolved_items': [{'kind': 'entity', 'label': 'porter', 'reason': 'no_canonical_match'}],
+                        'evidence_basis': [],
+                        'resolved_entity_refs': [],
+                        'resolved_location_refs': [],
+                    }, 100),
+                ]), \
                 patch('openrouter._post_chat', side_effect=[
                     json.dumps({
                         'running_summary': 'Someone unnamed moved the crate before dawn at the Hanging Switchyard.',
@@ -5946,6 +5989,35 @@ class DmToolsTest(unittest.TestCase):
         self.assertGreaterEqual(turn.generation_duration_ms, 0)
         self.assertIsInstance(turn.full_duration_ms, int)
         self.assertGreaterEqual(turn.full_duration_ms, turn.generation_duration_ms)
+
+    def test_clock_failure_does_not_rollback_persisted_memory(self):
+        token = generate_token(self.user.id)
+        client = self.app.test_client()
+
+        with patch('routes.sessions.get_session_dm_response_with_tools', return_value='The alley falls quiet.'), \
+                patch('routes.sessions.get_session_memory_patch', return_value={
+                    'source_contract': 'compiled_session_memory_v2',
+                    'running_summary': 'The alley fell quiet.',
+                    'scene_patch': {},
+                    'upsert_graph_entities': [],
+                    'upsert_graph_relations': [],
+                    'upsert_graph_facts': [],
+                    'update_npc_actors': [],
+                    'record_events': [],
+                }), \
+                patch('routes.sessions.get_session_clock_updates', return_value=None):
+            response = client.post(
+                f'/api/sessions/{self.session.id}/messages',
+                json={'content': '<ooc>What changed?</ooc>', 'role': 'player'},
+                headers={'Authorization': f'Bearer {token}'},
+            )
+
+        self.assertEqual(response.status_code, 201)
+        self.assertEqual(self.session.running_summary, 'The alley fell quiet.')
+        turn = SessionDmTurn.query.one()
+        self.assertEqual(turn.post_turn_status, 'complete')
+        self.assertEqual(turn.memory_status, 'complete')
+        self.assertEqual(turn.clock_status, 'error')
 
     def test_chat_flow_groups_visible_messages_and_nested_branches(self):
         planning_player = CharacterPlanningMessage(

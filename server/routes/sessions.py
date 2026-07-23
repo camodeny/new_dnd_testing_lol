@@ -275,16 +275,17 @@ def _run_session_memory_update(
                     'trace_label': clock_trace_label,
                 },
             )
-            if clock_updates:
-                apply_clock_adjudication(
-                    campaign,
-                    clock_updates,
-                    audit_context={
-                        'trace_id': clock_trace_id,
-                        'parent_trace_id': parent_trace_id,
-                        'trace_label': clock_trace_label,
-                    },
-                )
+            if clock_updates is None:
+                raise RuntimeError('Clock adjudication did not return a tool submission.')
+            apply_clock_adjudication(
+                campaign,
+                clock_updates,
+                audit_context={
+                    'trace_id': clock_trace_id,
+                    'parent_trace_id': parent_trace_id,
+                    'trace_label': clock_trace_label,
+                },
+            )
             clock_complete = True
             db.session.commit()
         except Exception:
