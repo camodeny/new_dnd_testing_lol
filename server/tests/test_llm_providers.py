@@ -124,6 +124,18 @@ class ProviderCapabilitiesTest(unittest.TestCase):
             capabilities = adapter.capabilities_for('deepseek-v4-flash')
         self.assertFalse(capabilities.supports_thinking)
 
+    def test_memory_request_can_force_deepseek_thinking(self):
+        adapter = OpenCodeGoAdapter()
+        request = ProviderRequest(
+            messages=[{'role': 'user', 'content': 'extract memory'}],
+            model='deepseek-v4-flash',
+            allow_thinking=True,
+            force_thinking=True,
+        )
+        with patch.dict(os.environ, {'OPENCODE_GO_THINKING': 'disabled'}):
+            payload = adapter.build_payload(request)
+        self.assertEqual(payload['thinking'], {'type': 'enabled'})
+
     def test_opencode_go_non_deepseek_has_no_thinking(self):
         adapter = OpenCodeGoAdapter()
         with patch.dict(os.environ, {'OPENCODE_GO_THINKING': 'enabled'}):
@@ -519,13 +531,12 @@ class CrossProviderWorkflowParityTest(unittest.TestCase):
             'session_memory_extract',
             'session_memory_resolve',
             'compilation',
-            'session_memory_update_clocks',
         ]
         baselines = {}
         for provider in ('openrouter', 'opencode_go', 'fake'):
             stages, compiled = self._run_staged_memory_with_recorder(provider)
             self.assertEqual(stages, expected)
-            self.assertEqual(compiled['create_clocks'], [])
+            self.assertEqual(compiled['running_summary'], 'summary')
             baselines[provider] = stages
         self.assertEqual(baselines['openrouter'], baselines['opencode_go'])
         self.assertEqual(baselines['openrouter'], baselines['fake'])

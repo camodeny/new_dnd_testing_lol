@@ -45,6 +45,22 @@ def _normalized_from_raw(raw_dict):
     return OpenRouterAdapter().parse_response(raw_dict)
 
 
+def _tool_response(name, arguments):
+    return _normalized_from_raw({
+        'choices': [{
+            'message': {
+                'content': '',
+                'tool_calls': [{
+                    'id': f'call-{name}',
+                    'type': 'function',
+                    'function': {'name': name, 'arguments': json.dumps(arguments)},
+                }],
+            },
+            'finish_reason': 'tool_calls',
+        }],
+    })
+
+
 class OpenRouterJsonRepairTest(unittest.TestCase):
     def test_json_error_excerpt_marks_the_bad_line(self):
         malformed = '{\n  "items": [\n    {"id": "one"},\n      "id": "two"\n  ]\n}'
@@ -383,7 +399,7 @@ class MemoryPipelineErrorTest(unittest.TestCase):
 
         self.assertEqual(resolver_mock.call_args_list[1].kwargs['max_attempts'], SESSION_MEMORY_MAX_ATTEMPTS)
 
-    def test_clock_generation_invalid_output_raises_error(self):
+    def test_staged_memory_does_not_generate_clocks(self):
         from openrouter import _get_session_memory_patch_staged
         fake_compiled = {
             'running_summary': 'test',
@@ -433,21 +449,15 @@ class MemoryPipelineErrorTest(unittest.TestCase):
         })
         with patch('openrouter.build_session_memory_extractor_messages', return_value=[]), \
                 patch('openrouter.build_session_memory_resolver_messages', return_value=[]), \
-                patch('openrouter.build_session_memory_clocks_messages', return_value=[]), \
                 patch('openrouter._post_chat_normalized') as mock_chat, \
                 patch('services.session_memory_agent.compile_staged_memory_patch', return_value=fake_compiled):
             mock_chat.side_effect = [
                 extractor_tool_response,
                 resolver_tool_response,
-                Exception('clock provider error'),
             ]
-            with self.assertRaises(MemoryPipelineError) as ctx:
-                _get_session_memory_patch_staged(
-                    {'campaign_id': 1, 'session_id': 1},
-                    {},
-                    {},
-                )
-            self.assertEqual(ctx.exception.stage, 'clock_generation')
+            result = _get_session_memory_patch_staged({'campaign_id': 1, 'session_id': 1}, {}, {})
+        self.assertEqual(result, fake_compiled)
+        self.assertEqual(mock_chat.call_count, 2)
 
     def test_both_providers_use_same_staged_pipeline(self):
         non_empty_patch = {
@@ -595,7 +605,7 @@ class MemoryPipelineErrorTest(unittest.TestCase):
             importlib.reload(openrouter)
         self.assertEqual(openrouter.SESSION_MEMORY_TIMEOUT_SECONDS, 180.0)
 
-    def test_staged_pipeline_uses_memory_timeout_for_all_requests(self):
+    def test_staged_pipeline_uses_tool_calls_without_token_caps(self):
         from openrouter import _get_session_memory_patch_staged
         fake_compiled = {
             'running_summary': 'test',
@@ -635,24 +645,11 @@ class MemoryPipelineErrorTest(unittest.TestCase):
                 'finish_reason': 'stop',
             }],
         })
-        clocks_tool_response = _normalized_from_raw({
-            'choices': [{
-                'message': {
-                    'content': '',
-                    'tool_calls': [{
-                        'id': 'call_clk', 'type': 'function',
-                        'function': {'name': 'submit_clock_updates', 'arguments': json.dumps({'create_clocks': [], 'retire_clocks': []})},
-                    }],
-                },
-                'finish_reason': 'stop',
-            }],
-        })
         with patch('openrouter.build_session_memory_extractor_messages', return_value=[]), \
                 patch('openrouter.build_session_memory_resolver_messages', return_value=[]), \
-                patch('openrouter.build_session_memory_clocks_messages', return_value=[]), \
                 patch('openrouter._post_chat_normalized') as mock_chat, \
                 patch('services.session_memory_agent.compile_staged_memory_patch', return_value=fake_compiled):
-            mock_chat.side_effect = [extractor_tool_response, resolver_tool_response, clocks_tool_response]
+            mock_chat.side_effect = [extractor_tool_response, resolver_tool_response]
             result = _get_session_memory_patch_staged(
                 {'campaign_id': 1, 'session_id': 1},
                 {},
@@ -660,11 +657,13 @@ class MemoryPipelineErrorTest(unittest.TestCase):
             )
 
         self.assertEqual(result['running_summary'], 'test')
-        self.assertEqual(mock_chat.call_count, 3)
+        self.assertEqual(mock_chat.call_count, 2)
         operations = [call.kwargs['audit_context']['operation'] for call in mock_chat.call_args_list]
-        self.assertEqual(operations, ['session_memory_extract', 'session_memory_resolve', 'session_memory_update_clocks'])
+        self.assertEqual(operations, ['session_memory_extract', 'session_memory_resolve'])
         for call in mock_chat.call_args_list:
-            self.assertEqual(call.kwargs['timeout_seconds'], SESSION_MEMORY_TIMEOUT_SECONDS)
+            self.assertFalse(call.kwargs['json_mode'])
+            self.assertTrue(call.kwargs['allow_thinking'])
+            self.assertIsNone(call.kwargs['max_tokens'])
 
 
 class ClockAdjudicatorTest(unittest.TestCase):
@@ -698,9 +697,7 @@ class ClockAdjudicatorTest(unittest.TestCase):
         self.assertEqual(payload['latest_player_message'], clock_context['latest_player_message'])
 
     def test_clock_adjudicator_returns_advance_clocks_payload(self):
-        with patch('openrouter.get_llm_provider', return_value='openrouter'), patch(
-            'openrouter._post_chat',
-            return_value=json.dumps({
+        response = _tool_response('submit_clock_updates', {
                 'create_clocks': [],
                 'advance_clocks': [
                     {
@@ -715,7 +712,9 @@ class ClockAdjudicatorTest(unittest.TestCase):
                 ],
                 'retire_clocks': [],
                 'no_change_explanations': [],
-            }),
+        })
+        with patch('openrouter.get_llm_provider', return_value='openrouter'), patch(
+            'openrouter._post_chat_normalized', return_value=response,
         ) as post_chat:
             updates = get_session_clock_updates({
                 'current_scene_before': {'location_id': 'docks'},
@@ -734,14 +733,11 @@ class ClockAdjudicatorTest(unittest.TestCase):
         )
 
     def test_clock_adjudicator_uses_memory_timeout(self):
+        response = _tool_response('submit_clock_updates', {
+            'create_clocks': [], 'advance_clocks': [], 'retire_clocks': [], 'no_change_explanations': [],
+        })
         with patch('openrouter.get_llm_provider', return_value='openrouter'), patch(
-            'openrouter._post_chat',
-            return_value=json.dumps({
-                'create_clocks': [],
-                'advance_clocks': [],
-                'retire_clocks': [],
-                'no_change_explanations': [],
-            }),
+            'openrouter._post_chat_normalized', return_value=response,
         ) as post_chat:
             get_session_clock_updates({
                 'current_scene_before': {'location_id': 'docks'},
@@ -755,6 +751,46 @@ class ClockAdjudicatorTest(unittest.TestCase):
             post_chat.call_args.kwargs['timeout_seconds'],
             SESSION_MEMORY_TIMEOUT_SECONDS,
         )
+        self.assertTrue(post_chat.call_args.kwargs['allow_thinking'])
+        self.assertIsNone(post_chat.call_args.kwargs['max_tokens'])
+
+    def test_clock_adjudicator_rejects_incomplete_active_clock_coverage(self):
+        response = _tool_response('submit_clock_updates', {
+            'create_clocks': [],
+            'advance_clocks': [],
+            'retire_clocks': [],
+            'no_change_explanations': [],
+        })
+        with patch('openrouter.get_llm_provider', return_value='openrouter'), patch(
+            'openrouter._post_chat_normalized', return_value=response,
+        ):
+            updates = get_session_clock_updates({
+                'active_clocks': [{'clock_id': 'race_to_crypts', 'status': 'active'}],
+            })
+        self.assertIsNone(updates)
+
+    def test_clock_adjudicator_requires_coverage_for_ticking_clocks(self):
+        response = _tool_response('submit_clock_updates', {
+            'create_clocks': [],
+            'advance_clocks': [],
+            'retire_clocks': [],
+            'no_change_explanations': [],
+        })
+        with patch('openrouter.get_llm_provider', return_value='openrouter'), patch(
+            'openrouter._post_chat_normalized', return_value=response,
+        ):
+            updates = get_session_clock_updates({
+                'active_clocks': [{'clock_id': 'flood_warning', 'status': 'ticking'}],
+            })
+        self.assertIsNone(updates)
+
+    def test_clock_adjudicator_rejects_missing_update_lists(self):
+        response = _tool_response('submit_clock_updates', {'create_clocks': []})
+        with patch('openrouter.get_llm_provider', return_value='openrouter'), patch(
+            'openrouter._post_chat_normalized', return_value=response,
+        ):
+            updates = get_session_clock_updates({'active_clocks': []})
+        self.assertIsNone(updates)
 
 
 class PlanningDmResponseTest(unittest.TestCase):

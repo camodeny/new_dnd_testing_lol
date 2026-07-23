@@ -74,6 +74,7 @@ class ProviderRequest:
     tool_choice: Optional[object] = None
     parallel_tool_calls: Optional[bool] = None
     allow_thinking: bool = True
+    force_thinking: bool = False
     timeout_seconds: float = 60
     max_attempts: Optional[int] = None
     max_tokens: Optional[int] = None
@@ -190,10 +191,15 @@ class LLMProviderAdapter:
             'Content-Type': 'application/json',
         }
 
-    def payload_options(self, model, tools, tool_choice, parallel_tool_calls, allow_thinking=True):
+    def supports_thinking_for_model(self, model):
+        return self.capabilities_for(model).supports_thinking
+
+    def payload_options(self, model, tools, tool_choice, parallel_tool_calls, allow_thinking=True, force_thinking=False):
         """Effective request options after applying capability constraints."""
         capabilities = self.capabilities_for(model)
-        thinking_enabled = bool(allow_thinking) and capabilities.supports_thinking
+        thinking_enabled = bool(allow_thinking) and (
+            capabilities.supports_thinking or (force_thinking and self.supports_thinking_for_model(model))
+        )
         options = {
             'thinking_enabled': thinking_enabled,
             'tool_choice': tool_choice,
@@ -223,6 +229,7 @@ class LLMProviderAdapter:
             request.tool_choice,
             request.parallel_tool_calls,
             allow_thinking=request.allow_thinking,
+            force_thinking=request.force_thinking,
         )
         payload = {
             'model': request.model,
@@ -363,6 +370,9 @@ class OpenCodeGoAdapter(LLMProviderAdapter):
             supports_thinking=thinking,
             reasoning_effort=effort if thinking else None,
         )
+
+    def supports_thinking_for_model(self, model):
+        return str(model or '').strip().lower().startswith('deepseek-v4-')
 
 
 class ProviderRegistry:
