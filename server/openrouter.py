@@ -571,13 +571,14 @@ def _deepseek_thinking_enabled(provider, model):
     return _adapter_for_provider(provider).capabilities_for(model).supports_thinking
 
 
-def _provider_request_payload_options(provider, model, tools, tool_choice, parallel_tool_calls, allow_thinking=True):
+def _provider_request_payload_options(provider, model, tools, tool_choice, parallel_tool_calls, allow_thinking=True, force_thinking=False):
     return _adapter_for_provider(provider).payload_options(
         model,
         tools,
         tool_choice,
         parallel_tool_calls,
         allow_thinking=allow_thinking,
+        force_thinking=force_thinking,
     )
 
 
@@ -657,6 +658,7 @@ def _post_chat_normalized(
     tool_choice=None,
     parallel_tool_calls=None,
     allow_thinking=True,
+    force_thinking=False,
     timeout_seconds=60,
     max_attempts=None,
     max_tokens=None,
@@ -696,6 +698,7 @@ def _post_chat_normalized(
         tool_choice,
         parallel_tool_calls,
         allow_thinking=allow_thinking,
+        force_thinking=force_thinking,
     )
 
     if campaign_id:
@@ -740,6 +743,7 @@ def _post_chat_normalized(
         tool_choice=tool_choice,
         parallel_tool_calls=parallel_tool_calls,
         allow_thinking=allow_thinking,
+        force_thinking=force_thinking,
         timeout_seconds=timeout_seconds,
         max_attempts=attempt_limit,
         max_tokens=max_tokens,
@@ -5239,7 +5243,7 @@ SESSION_MEMORY_CLOCKS_FINALIZER_TOOL = {
         'description': 'Submit clock updates after a visible DM turn. Call exactly once.',
         'parameters': {
             'type': 'object',
-            'required': [],
+            'required': ['create_clocks', 'advance_clocks', 'retire_clocks', 'no_change_explanations'],
             'properties': {
                 'create_clocks': {'type': 'array', 'items': {'type': 'object'}, 'description': 'Clocks to create.'},
                 'advance_clocks': {'type': 'array', 'items': {'type': 'object'}, 'description': 'Existing clocks to advance.'},
@@ -5316,6 +5320,7 @@ def _get_session_memory_patch_staged(memory_context, audit_context, telemetry):
             tools=[SESSION_MEMORY_EXTRACTOR_FINALIZER_TOOL],
             tool_choice='auto',
             allow_thinking=True,
+            force_thinking=True,
             timeout_seconds=SESSION_MEMORY_TIMEOUT_SECONDS,
             max_attempts=1,
             max_tokens=None,
@@ -5388,6 +5393,7 @@ def _get_session_memory_patch_staged(memory_context, audit_context, telemetry):
                 tool_choice='auto',
                 parallel_tool_calls=False,
                 allow_thinking=True,
+                force_thinking=True,
                 max_tokens=None,
                 timeout_seconds=SESSION_MEMORY_TIMEOUT_SECONDS,
             )
@@ -5465,6 +5471,7 @@ def _get_session_memory_patch_staged(memory_context, audit_context, telemetry):
                 tool_choice='auto',
                 parallel_tool_calls=False,
                 allow_thinking=True,
+                force_thinking=True,
                 timeout_seconds=SESSION_MEMORY_TIMEOUT_SECONDS,
                 max_attempts=SESSION_MEMORY_MAX_ATTEMPTS,
                 max_tokens=None,
@@ -5763,6 +5770,7 @@ def get_session_clock_updates(clock_context, audit_context=None):
             tool_choice='auto',
             parallel_tool_calls=False,
             allow_thinking=True,
+            force_thinking=True,
             timeout_seconds=SESSION_MEMORY_TIMEOUT_SECONDS,
             max_attempts=SESSION_MEMORY_MAX_ATTEMPTS,
             max_tokens=None,
@@ -5786,13 +5794,39 @@ def get_session_clock_updates(clock_context, audit_context=None):
             )
         return None
 
+    required_lists = ('create_clocks', 'advance_clocks', 'retire_clocks', 'no_change_explanations')
+    validation_error = None
     if not isinstance(data, dict):
+        validation_error = 'Clock adjudication did not submit clock updates.'
+    elif any(not isinstance(data.get(key), list) for key in required_lists):
+        validation_error = 'Clock adjudication submission must include all update fields as arrays.'
+    else:
+        active_clock_ids = {
+            str(clock.get('clock_id') or clock.get('id'))
+            for clock in (clock_context or {}).get('active_clocks', [])
+            if isinstance(clock, dict) and str(clock.get('status') or 'active') == 'active'
+            and (clock.get('clock_id') or clock.get('id'))
+        }
+        covered_clock_ids = {
+            str(item.get('clock_id') or item.get('id'))
+            for key in ('advance_clocks', 'retire_clocks', 'no_change_explanations')
+            for item in data[key]
+            if isinstance(item, dict) and (item.get('clock_id') or item.get('id'))
+        }
+        missing_clock_ids = active_clock_ids - covered_clock_ids
+        if missing_clock_ids:
+            validation_error = (
+                'Clock adjudication did not cover active clocks: '
+                + ', '.join(sorted(missing_clock_ids))
+            )
+
+    if validation_error:
         if campaign_id:
             log_audit_event(
                 campaign_id,
                 'clock_adjudicator_error',
-                'Post-turn clock adjudication did not submit clock updates.',
-                {},
+                validation_error,
+                {'error': validation_error},
                 source=provider,
                 actor='session_clock_adjudicator',
                 trace_id=trace_id,

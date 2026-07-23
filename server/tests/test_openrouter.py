@@ -754,6 +754,29 @@ class ClockAdjudicatorTest(unittest.TestCase):
         self.assertTrue(post_chat.call_args.kwargs['allow_thinking'])
         self.assertIsNone(post_chat.call_args.kwargs['max_tokens'])
 
+    def test_clock_adjudicator_rejects_incomplete_active_clock_coverage(self):
+        response = _tool_response('submit_clock_updates', {
+            'create_clocks': [],
+            'advance_clocks': [],
+            'retire_clocks': [],
+            'no_change_explanations': [],
+        })
+        with patch('openrouter.get_llm_provider', return_value='openrouter'), patch(
+            'openrouter._post_chat_normalized', return_value=response,
+        ):
+            updates = get_session_clock_updates({
+                'active_clocks': [{'clock_id': 'race_to_crypts', 'status': 'active'}],
+            })
+        self.assertIsNone(updates)
+
+    def test_clock_adjudicator_rejects_missing_update_lists(self):
+        response = _tool_response('submit_clock_updates', {'create_clocks': []})
+        with patch('openrouter.get_llm_provider', return_value='openrouter'), patch(
+            'openrouter._post_chat_normalized', return_value=response,
+        ):
+            updates = get_session_clock_updates({'active_clocks': []})
+        self.assertIsNone(updates)
+
 
 class PlanningDmResponseTest(unittest.TestCase):
     def test_planning_response_retries_blank_json_output(self):

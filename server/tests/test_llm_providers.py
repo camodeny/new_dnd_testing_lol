@@ -124,6 +124,18 @@ class ProviderCapabilitiesTest(unittest.TestCase):
             capabilities = adapter.capabilities_for('deepseek-v4-flash')
         self.assertFalse(capabilities.supports_thinking)
 
+    def test_memory_request_can_force_deepseek_thinking(self):
+        adapter = OpenCodeGoAdapter()
+        request = ProviderRequest(
+            messages=[{'role': 'user', 'content': 'extract memory'}],
+            model='deepseek-v4-flash',
+            allow_thinking=True,
+            force_thinking=True,
+        )
+        with patch.dict(os.environ, {'OPENCODE_GO_THINKING': 'disabled'}):
+            payload = adapter.build_payload(request)
+        self.assertEqual(payload['thinking'], {'type': 'enabled'})
+
     def test_opencode_go_non_deepseek_has_no_thinking(self):
         adapter = OpenCodeGoAdapter()
         with patch.dict(os.environ, {'OPENCODE_GO_THINKING': 'enabled'}):
