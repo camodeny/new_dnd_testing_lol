@@ -64,6 +64,7 @@ from services.dm_tools import (
     apply_memory_patch,
     build_session_hot_context,
     build_session_memory_context,
+    build_session_clock_context,
     build_session_retrieval_packet,
     context_manifest,
     execute_dm_tool,
@@ -6054,6 +6055,38 @@ class DmToolsTest(unittest.TestCase):
         self.assertEqual(turn.post_turn_status, 'complete')
         self.assertEqual(turn.memory_status, 'complete')
         self.assertEqual(turn.clock_status, 'error')
+
+    def test_clock_context_omits_completed_and_retired_clocks(self):
+        db.session.add_all([
+            CampaignClock(
+                campaign_id=self.campaign.id,
+                clock_id='completed_clock',
+                name='Completed Clock',
+                segments=4,
+                filled=4,
+                status='completed',
+            ),
+            CampaignClock(
+                campaign_id=self.campaign.id,
+                clock_id='retired_clock',
+                name='Retired Clock',
+                segments=4,
+                filled=1,
+                status='retired',
+            ),
+        ])
+        db.session.commit()
+
+        context = build_session_clock_context(
+            self.campaign,
+            self.session,
+            self.user,
+            'I wait.',
+            'Nothing changes.',
+            {},
+            {},
+        )
+        self.assertEqual(context['active_clocks'], [])
 
     def test_chat_flow_groups_visible_messages_and_nested_branches(self):
         planning_player = CharacterPlanningMessage(

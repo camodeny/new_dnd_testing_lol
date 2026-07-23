@@ -1645,7 +1645,8 @@ def build_session_clock_context(
 ):
     recent_events = WorldEvent.query.filter_by(campaign_id=campaign.id).order_by(WorldEvent.created_at.desc()).limit(6).all()
     active_clocks = []
-    for clock in _active_clocks(campaign, limit=50):
+    clocks = CampaignClock.query.filter_by(campaign_id=campaign.id).order_by(CampaignClock.id.asc()).all()
+    for clock in [clock for clock in clocks if (clock.status or 'active') in ACTIVE_CLOCK_STATUSES][:50]:
         active_clocks.append({
             'clock_id': clock.clock_id,
             'name': clock.name,
