@@ -249,14 +249,14 @@ WORLD_GENESIS_SYSTEM_PROMPT = (
 
 SESSION_MEMORY_CLOCKS_SYSTEM_PROMPT = (
     "You manage only campaign clocks after a visible DM turn. "
-    "Think through the visible exchange, then call submit_clock_updates exactly once. "
-    "Prefer empty update arrays unless the exchange clearly introduced new durable pressure, a deadline, a mystery clock, or resolved an existing clock. "
-    "Do not create clocks for ordinary scene beats or clues that do not change campaign pressure."
+    "Prefer empty arrays unless the exchange clearly introduced new durable pressure, a deadline, a mystery clock, or resolved an existing clock. "
+    "Do not create clocks for ordinary scene beats or clues that do not change campaign pressure. "
+    "Your final response must be exactly one tool call: submit_clock_updates. Do not output plain text or markdown. "
+    "The submit_clock_updates payload includes create_clocks and retire_clocks."
 )
 
 SESSION_MEMORY_EXTRACTOR_SYSTEM_PROMPT = (
     "You are the extraction stage of a D&D session memory writer. "
-    "Think through the visible exchange, then call submit_memory_extraction exactly once. "
     "Write a fresh running_summary that cleanly replaces the old one. "
     "Do not append fragments to the prior summary. Rewrite the current durable state after the latest visible exchange in one compact paragraph. "
     "Additionally, extract or update the structured memory_anchors representing the current session state: current_goal (string or null), current_scene (string or null), open_clues (array of strings), unresolved_questions (array of strings), npc_observations (array of strings), and recent_offers_promises (array of strings). Do not append fragments; completely rewrite or prune these anchors to reflect the current state. "
@@ -264,7 +264,8 @@ SESSION_MEMORY_EXTRACTOR_SYSTEM_PROMPT = (
     "Do not invent canonical ids. If a name is not already a known id in the prompt, preserve it as a raw label/ref for later resolution. "
     "Scene updates may include location_id, location_name, time_of_day, active_npc_ids, departed_npc_ids, and immediate_tension. "
     "Claims must use source_surface of visible_transcript, hidden_state, or inferred. "
-    "Return keys running_summary, memory_anchors, scene_patch, scene_reason, fact_claims, entity_claims, relation_claims, npc_claims, and event_claims. "
+    "Your final response must be exactly one tool call: submit_extraction. Do not output plain text or markdown fences. "
+    "The submit_extraction payload must include keys running_summary, memory_anchors, scene_patch, scene_reason, fact_claims, entity_claims, relation_claims, npc_claims, and event_claims. "
     "Each fact_claim must include text, entity_refs, source_surface, intended_visibility, certainty, importance, reason, expires_or_retire_condition, and memory_type. "
     "Each entity_claim must include name, type, summary, tags, source_surface, intended_visibility, certainty, importance, reason, expires_or_retire_condition, and memory_type. "
     "Each relation_claim must include type, source_ref, target_ref, summary, source_surface, intended_visibility, certainty, importance, reason, expires_or_retire_condition, and memory_type. "
@@ -278,7 +279,8 @@ SESSION_MEMORY_RESOLVER_SYSTEM_PROMPT = (
     "Never invent ids. If you cannot resolve a reference with confidence, return it in unresolved_items instead of mutating memory. "
     "Prefer get_entity_candidates, get_scene_candidates, get_fact_candidates, and search_campaign_memory before broad raw-state tools. "
     "Use get_world_state, get_npcs, get_clocks, or transcript tools only when narrower tools are insufficient. "
-    "After any needed read-only tools, call submit_memory_patch exactly once with running_summary, memory_anchors, scene_patch, scene_reason, upsert_graph_entities, upsert_graph_relations, upsert_graph_facts, update_npc_actors, record_events, unresolved_items, evidence_basis, resolved_entity_refs, and resolved_location_refs. "
+    "After using tools to resolve references, finalize by calling exactly one tool: submit_resolved_memory. Do not output plain text or markdown. "
+    "The submit_resolved_memory payload must be one JSON object with keys running_summary, memory_anchors, scene_patch, scene_reason, upsert_graph_entities, upsert_graph_relations, upsert_graph_facts, update_npc_actors, record_events, unresolved_items, evidence_basis, resolved_entity_refs, and resolved_location_refs. "
     "Return the resolved/updated memory_anchors representing the current session state: current_goal (string or null), current_scene (string or null), open_clues (array of strings), unresolved_questions (array of strings), npc_observations (array of strings), and recent_offers_promises (array of strings). "
     "Each upsert_graph_entities item must include id (if reusing or resolving to a canonical id), name, type, summary, tags, source_surface, intended_visibility, certainty, importance, reason, expires_or_retire_condition, and memory_type. "
     "Each upsert_graph_relations item must include id (if reusing/resolving), type, source_id (resolved entity/actor id), target_id (resolved entity/actor id), summary, source_surface, intended_visibility, certainty, importance, reason, expires_or_retire_condition, and memory_type. "
@@ -289,7 +291,7 @@ SESSION_MEMORY_RESOLVER_SYSTEM_PROMPT = (
 
 SESSION_CLOCK_ADJUDICATOR_SYSTEM_PROMPT = (
     "You adjudicate campaign clock progression after a visible DM turn. "
-    "Return only valid JSON with keys create_clocks, advance_clocks, retire_clocks, and no_change_explanations. "
+    "Think through the visible exchange, then call submit_clock_updates exactly once. "
     "Use only the visible player message, visible DM reply, scene transition, and existing active clocks. "
     "Do not invent offscreen developments, hidden actions, or private causes that were not visible in the exchange. "
     "For each existing active clock, either advance it or explain why it did not change. "
@@ -298,7 +300,7 @@ SESSION_CLOCK_ADJUDICATOR_SYSTEM_PROMPT = (
     "If a new pressure is already underway, prefer creating the new clock with filled set to 1 instead of 0. "
     "Do not create a new clock if an existing active clock already covers the same pressure. "
     "Each advance_clocks item must include clock_id, delta, reason, and evidence. "
-    "Each no_change_explanations item must include clock_id and reason."
+    "Each no_change_explanations item must include clock_id and reason. Do not output plain text or markdown."
 )
 
 SESSION_SPOILER_CHECK_SYSTEM_PROMPT = (
@@ -697,11 +699,12 @@ def _post_chat_normalized(
     )
 
     if campaign_id:
+        audit_messages = audit_context.get('audit_messages') or messages
         log_model_request(
             campaign_id,
             operation,
             actor,
-            messages,
+            audit_messages,
             model,
             json_mode=json_mode,
             commit=True,
@@ -3824,6 +3827,7 @@ def build_session_memory_resolver_messages(memory_context, extracted):
                     'get_scene_candidates',
                     'get_entity_candidates',
                     'get_fact_candidates',
+                    'submit_resolved_memory',
                 ],
             }, ensure_ascii=False),
         },
@@ -5172,6 +5176,111 @@ def _session_memory_compact_context(memory_context):
     }
 
 
+SESSION_MEMORY_EXTRACTOR_FINALIZER_TOOL_NAME = 'submit_extraction'
+SESSION_MEMORY_EXTRACTOR_FINALIZER_TOOL = {
+    'type': 'function',
+    'function': {
+        'name': SESSION_MEMORY_EXTRACTOR_FINALIZER_TOOL_NAME,
+        'description': 'Submit the complete extraction payload. Call exactly once with all extraction fields.',
+        'parameters': {
+            'type': 'object',
+            'required': ['running_summary'],
+            'properties': {
+                'running_summary': {'type': 'string', 'description': 'Fresh compact replacement summary for the session.'},
+                'memory_anchors': {
+                    'type': 'object',
+                    'description': 'Structured memory anchors with current_goal, current_scene, open_clues, unresolved_questions, npc_observations, recent_offers_promises.',
+                },
+                'scene_patch': {'type': 'object', 'description': 'Scene patch with location_id, location_name, time_of_day, active_npc_ids, departed_npc_ids, immediate_tension.'},
+                'scene_reason': {'type': 'string', 'description': 'Why scene state should change.'},
+                'fact_claims': {'type': 'array', 'items': {'type': 'object'}, 'description': 'Extracted fact claims.'},
+                'entity_claims': {'type': 'array', 'items': {'type': 'object'}, 'description': 'Extracted entity claims.'},
+                'relation_claims': {'type': 'array', 'items': {'type': 'object'}, 'description': 'Extracted relation claims.'},
+                'npc_claims': {'type': 'array', 'items': {'type': 'object'}, 'description': 'Extracted NPC claims.'},
+                'event_claims': {'type': 'array', 'items': {'type': 'object'}, 'description': 'Extracted event claims.'},
+            },
+        },
+    },
+}
+
+SESSION_MEMORY_RESOLVER_FINALIZER_TOOL_NAME = 'submit_resolved_memory'
+SESSION_MEMORY_RESOLVER_FINALIZER_TOOL = {
+    'type': 'function',
+    'function': {
+        'name': SESSION_MEMORY_RESOLVER_FINALIZER_TOOL_NAME,
+        'description': 'Submit the fully resolved memory patch after resolving all references through tool calls. Call exactly once when ready to finalize.',
+        'parameters': {
+            'type': 'object',
+            'required': ['running_summary'],
+            'properties': {
+                'running_summary': {'type': 'string', 'description': 'Resolved running summary.'},
+                'memory_anchors': {'type': 'object', 'description': 'Resolved memory anchors.'},
+                'scene_patch': {'type': 'object', 'description': 'Resolved scene patch.'},
+                'scene_reason': {'type': 'string'},
+                'upsert_graph_entities': {'type': 'array', 'items': {'type': 'object'}, 'description': 'Resolved entities to upsert.'},
+                'upsert_graph_relations': {'type': 'array', 'items': {'type': 'object'}, 'description': 'Resolved relations to upsert.'},
+                'upsert_graph_facts': {'type': 'array', 'items': {'type': 'object'}, 'description': 'Resolved facts to upsert.'},
+                'update_npc_actors': {'type': 'array', 'items': {'type': 'object'}, 'description': 'Resolved NPC actor updates.'},
+                'record_events': {'type': 'array', 'items': {'type': 'object'}, 'description': 'Events to record.'},
+                'unresolved_items': {'type': 'array', 'items': {'type': 'object'}, 'description': 'Items that could not be resolved.'},
+                'evidence_basis': {'type': 'array', 'items': {'type': 'object'}},
+                'resolved_entity_refs': {'type': 'array', 'items': {'type': 'object'}},
+                'resolved_location_refs': {'type': 'array', 'items': {'type': 'object'}},
+            },
+        },
+    },
+}
+
+SESSION_MEMORY_CLOCKS_FINALIZER_TOOL_NAME = 'submit_clock_updates'
+SESSION_MEMORY_CLOCKS_FINALIZER_TOOL = {
+    'type': 'function',
+    'function': {
+        'name': SESSION_MEMORY_CLOCKS_FINALIZER_TOOL_NAME,
+        'description': 'Submit clock updates after a visible DM turn. Call exactly once.',
+        'parameters': {
+            'type': 'object',
+            'required': [],
+            'properties': {
+                'create_clocks': {'type': 'array', 'items': {'type': 'object'}, 'description': 'Clocks to create.'},
+                'advance_clocks': {'type': 'array', 'items': {'type': 'object'}, 'description': 'Existing clocks to advance.'},
+                'retire_clocks': {'type': 'array', 'items': {'type': 'object'}, 'description': 'Clocks to retire.'},
+                'no_change_explanations': {'type': 'array', 'items': {'type': 'object'}, 'description': 'Reasons active clocks did not change.'},
+            },
+        },
+    },
+}
+
+
+def _parse_session_memory_extractor_tool_calls(tool_calls):
+    calls = tool_calls or []
+    if len(calls) != 1:
+        return None
+    function = calls[0].get('function') if isinstance(calls[0], dict) else {}
+    if not isinstance(function, dict) or function.get('name') != SESSION_MEMORY_EXTRACTOR_FINALIZER_TOOL_NAME:
+        return None
+    return _parse_tool_arguments(function.get('arguments'))
+
+
+def _parse_session_memory_resolver_tool_calls(tool_calls):
+    calls = tool_calls or []
+    if len(calls) != 1:
+        return None
+    function = calls[0].get('function') if isinstance(calls[0], dict) else {}
+    if not isinstance(function, dict) or function.get('name') != SESSION_MEMORY_RESOLVER_FINALIZER_TOOL_NAME:
+        return None
+    return _parse_tool_arguments(function.get('arguments'))
+
+
+def _parse_session_memory_clocks_tool_calls(tool_calls):
+    calls = tool_calls or []
+    if len(calls) != 1:
+        return None
+    function = calls[0].get('function') if isinstance(calls[0], dict) else {}
+    if not isinstance(function, dict) or function.get('name') != SESSION_MEMORY_CLOCKS_FINALIZER_TOOL_NAME:
+        return None
+    return _parse_tool_arguments(function.get('arguments'))
+
+
 def _memory_tool_result_message(tool_call, tool_name, result):
     return {
         'role': 'tool',
@@ -5181,42 +5290,8 @@ def _memory_tool_result_message(tool_call, tool_name, result):
     }
 
 
-def _submitted_tool_arguments(message, tool_name):
-    for tool_call in message.get('tool_calls') or []:
-        function = tool_call.get('function') if isinstance(tool_call, dict) else {}
-        if not isinstance(function, dict) or function.get('name') != tool_name:
-            continue
-        arguments = _parse_tool_arguments(function.get('arguments'))
-        return arguments if isinstance(arguments, dict) else None
-    return None
-
-
-def _request_session_memory_tool(messages, audit_context, operation, tools, submission_tool):
-    normalized = _post_chat_normalized(
-        messages,
-        json_mode=False,
-        audit_context={
-            **(audit_context or {}),
-            'operation': operation,
-        },
-        tools=tools,
-        tool_choice='required',
-        parallel_tool_calls=False,
-        allow_thinking=True,
-        timeout_seconds=SESSION_MEMORY_TIMEOUT_SECONDS,
-        max_attempts=SESSION_MEMORY_MAX_ATTEMPTS,
-        max_tokens=None,
-    )
-    message = normalized.message_view()
-    submitted = _submitted_tool_arguments(message, submission_tool)
-    response_chars = len(json.dumps(submitted, ensure_ascii=False)) if submitted is not None else 0
-    return submitted, response_chars
-
-
 def _get_session_memory_patch_staged(memory_context, audit_context, telemetry):
     from services.session_memory_agent import (
-        SESSION_MEMORY_EXTRACTION_TOOL,
-        SESSION_MEMORY_FINAL_PATCH_TOOL,
         SESSION_MEMORY_TOOL_DEFINITIONS,
         MemoryPipelineError,
         compile_staged_memory_patch,
@@ -5227,14 +5302,23 @@ def _get_session_memory_patch_staged(memory_context, audit_context, telemetry):
     trace_id = audit_context.get('trace_id')
     trace_label = audit_context.get('trace_label')
 
+    # --- Extractor stage (tool-call finalizer) ---
     extractor_messages = build_session_memory_extractor_messages(memory_context)
     try:
-        extracted, extractor_chars = _request_session_memory_tool(
+        extractor_normalized = _post_chat_normalized(
             extractor_messages,
-            audit_context,
-            'session_memory_extract',
-            [SESSION_MEMORY_EXTRACTION_TOOL],
-            'submit_memory_extraction',
+            json_mode=False,
+            audit_context={
+                **audit_context,
+                'operation': 'session_memory_extract',
+                'full_world_graph_included': False,
+            },
+            tools=[SESSION_MEMORY_EXTRACTOR_FINALIZER_TOOL],
+            tool_choice='auto',
+            allow_thinking=True,
+            timeout_seconds=SESSION_MEMORY_TIMEOUT_SECONDS,
+            max_attempts=1,
+            max_tokens=None,
         )
     except Exception as err:
         raise MemoryPipelineError(
@@ -5244,6 +5328,9 @@ def _get_session_memory_patch_staged(memory_context, audit_context, telemetry):
             cause=err,
             telemetry=telemetry,
         ) from err
+    extractor_message = extractor_normalized.message_view() if extractor_normalized is not None else {}
+    extracted = _parse_session_memory_extractor_tool_calls(extractor_message.get('tool_calls'))
+    extractor_chars = len(str(extractor_normalized.content or '') if extractor_normalized is not None else '')
     if not isinstance(extracted, dict) or not str(extracted.get('running_summary') or '').strip():
         telemetry['staged_extractor_error'] = 'blank_or_invalid_extractor'
         telemetry['staged_extractor_response_chars'] = extractor_chars
@@ -5269,6 +5356,8 @@ def _get_session_memory_patch_staged(memory_context, audit_context, telemetry):
             commit=True,
         )
 
+    # --- Resolver stage (read-only tools + finalizer tool call) ---
+    resolver_tools = SESSION_MEMORY_TOOL_DEFINITIONS + [SESSION_MEMORY_RESOLVER_FINALIZER_TOOL]
     messages = build_session_memory_resolver_messages(memory_context, extracted)
     tool_trace = []
     response_chain = []
@@ -5281,18 +5370,26 @@ def _get_session_memory_patch_staged(memory_context, audit_context, telemetry):
         recovery_messages.append({
             'role': 'user',
             'content': (
-                'Call submit_memory_patch now. Do not call any read-only tools or add prose. '
+                'Call submit_resolved_memory now. Do not call any retrieval tools or add prose. '
                 'Use the tool results already in this conversation. If a reference remains unresolved, '
-                'put it in unresolved_items instead of omitting the submission.'
+                'put it in unresolved_items instead of omitting the final payload.'
             ),
         })
         try:
-            recovered, response_chars = _request_session_memory_tool(
+            normalized = _post_chat_normalized(
                 recovery_messages,
-                audit_context,
-                'session_memory_resolve_recovery',
-                [SESSION_MEMORY_FINAL_PATCH_TOOL],
-                'submit_memory_patch',
+                json_mode=False,
+                audit_context={
+                    **audit_context,
+                    'operation': 'session_memory_resolve_recovery',
+                    'full_world_graph_included': False,
+                },
+                tools=[SESSION_MEMORY_RESOLVER_FINALIZER_TOOL],
+                tool_choice='auto',
+                parallel_tool_calls=False,
+                allow_thinking=True,
+                max_tokens=None,
+                timeout_seconds=SESSION_MEMORY_TIMEOUT_SECONDS,
             )
         except Exception as err:
             raise MemoryPipelineError(
@@ -5302,6 +5399,9 @@ def _get_session_memory_patch_staged(memory_context, audit_context, telemetry):
                 cause=err,
                 telemetry=telemetry,
             ) from err
+        recovery_message = normalized.message_view() if normalized is not None else {}
+        recovered = _parse_session_memory_resolver_tool_calls(recovery_message.get('tool_calls'))
+        response_chars = len(str(normalized.content or '') if normalized is not None else '')
         telemetry['staged_resolver_recovery_response_chars'] = response_chars
         if not isinstance(recovered, dict):
             raise MemoryPipelineError(
@@ -5361,7 +5461,7 @@ def _get_session_memory_patch_staged(memory_context, audit_context, telemetry):
                     'operation': 'session_memory_resolve',
                     'full_world_graph_included': False,
                 },
-                tools=SESSION_MEMORY_TOOL_DEFINITIONS + [SESSION_MEMORY_FINAL_PATCH_TOOL],
+                tools=resolver_tools,
                 tool_choice='auto',
                 parallel_tool_calls=False,
                 allow_thinking=True,
@@ -5378,9 +5478,6 @@ def _get_session_memory_patch_staged(memory_context, audit_context, telemetry):
                     cause=err,
                     telemetry=telemetry,
                 ) from err
-            # Preserve the historical handling of choice-less responses: they
-            # flow into the malformed-output path below instead of being
-            # classified as provider errors.
             normalized = None
         except Exception as err:
             raise MemoryPipelineError(
@@ -5392,11 +5489,22 @@ def _get_session_memory_patch_staged(memory_context, audit_context, telemetry):
             ) from err
         response_chain.append(normalized.raw if normalized is not None else {})
         message = normalized.message_view() if normalized is not None else {}
-        submitted = _submitted_tool_arguments(message, 'submit_memory_patch')
-        if submitted is not None:
-            final_payload = submitted
-            break
         tool_calls = message.get('tool_calls') or []
+        final_payload = _parse_session_memory_resolver_tool_calls(tool_calls)
+        if final_payload is not None:
+            break
+        if any(
+            (tool_call.get('function') if isinstance(tool_call, dict) else {}).get('name')
+            == SESSION_MEMORY_RESOLVER_FINALIZER_TOOL_NAME
+            for tool_call in tool_calls
+        ):
+            telemetry['staged_resolver_error'] = 'invalid_finalizer_usage'
+            raise MemoryPipelineError(
+                stage='resolution',
+                code='malformed_output',
+                message='Staged memory resolver must finalize with exactly one submit_resolved_memory tool call.',
+                telemetry=telemetry,
+            )
         if tool_calls:
             append_tool_results(message, tool_calls)
         if tool_calls and tool_round < max_tool_rounds:
@@ -5407,7 +5515,9 @@ def _get_session_memory_patch_staged(memory_context, audit_context, telemetry):
             final_payload = recover_final_payload('max_tool_rounds_with_tool_calls')
             break
 
-        final_payload = recover_final_payload('missing_final_tool_call')
+        content = message.get('content') or ''
+        recovery_reason = 'plain_text_terminal_response' if content.strip() else 'empty_terminal_response'
+        final_payload = recover_final_payload(recovery_reason)
         break
     if final_payload is None:
         telemetry['staged_resolver_error'] = 'max_tool_rounds_exceeded'
@@ -5611,8 +5721,6 @@ def get_session_memory_patch(memory_context, audit_context=None):
 
 
 def get_session_clock_updates(clock_context, audit_context=None):
-    from services.session_memory_agent import SESSION_CLOCK_UPDATES_TOOL
-
     messages = build_session_clock_adjudication_messages(clock_context or {})
     audit_context = audit_context or {}
     provider = get_llm_provider()
@@ -5644,13 +5752,23 @@ def get_session_clock_updates(clock_context, audit_context=None):
     }
 
     try:
-        data, _response_chars = _request_session_memory_tool(
+        normalized = _post_chat_normalized(
             messages,
-            request_audit,
-            'session_clock_adjudication',
-            [SESSION_CLOCK_UPDATES_TOOL],
-            'submit_clock_updates',
+            json_mode=False,
+            audit_context={
+                **request_audit,
+                'operation': 'session_clock_adjudication',
+            },
+            tools=[SESSION_MEMORY_CLOCKS_FINALIZER_TOOL],
+            tool_choice='auto',
+            parallel_tool_calls=False,
+            allow_thinking=True,
+            timeout_seconds=SESSION_MEMORY_TIMEOUT_SECONDS,
+            max_attempts=SESSION_MEMORY_MAX_ATTEMPTS,
+            max_tokens=None,
         )
+        message = normalized.message_view() if normalized is not None else {}
+        data = _parse_session_memory_clocks_tool_calls(message.get('tool_calls'))
     except Exception as err:
         if campaign_id:
             log_audit_event(

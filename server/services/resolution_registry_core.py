@@ -403,6 +403,7 @@ def _resolve_entity_claim(claim, known_ids, prior_resolution_map, allocated_ids,
     prior_res_list = list(prior_resolution_map.values()) if isinstance(prior_resolution_map, dict) else prior_resolution_map
     candidates = find_all_matching_candidates(name, known_ids, prior_res_list, expected_type="entity")
     if len(candidates) > 1:
+        entry["candidate_ids"] = sorted(candidates)
         entry["decision"] = "request_clarification"
         entry["resolution_state"] = "clarification_requested"
         entry["blocked_operations"] = ["identity_merge", "npc_update"]
@@ -495,6 +496,7 @@ def _resolve_npc_claim(claim, known_ids, prior_resolution_map, allocated_ids, in
     prior_res_list = list(prior_resolution_map.values()) if isinstance(prior_resolution_map, dict) else prior_resolution_map
     candidates = find_all_matching_candidates(name, known_ids, prior_res_list, expected_type="npc")
     if len(candidates) > 1:
+        entry["candidate_ids"] = sorted(candidates)
         entry["decision"] = "request_clarification"
         entry["resolution_state"] = "clarification_requested"
         entry["blocked_operations"] = ["identity_merge", "npc_update"]
@@ -627,7 +629,7 @@ def _build_clarification_record(entry, campaign, memory_context):
         "mention_entity_id": entry.get("canonical_id") or mention_ref,
         "surface_form": surface_form,
         "question": f"Is {surface_form} an existing NPC or entity?",
-        "candidate_ids": [],
+        "candidate_ids": entry.get("candidate_ids", []),
         "blocking_scope": entry.get("blocked_operations", []),
         "status": "pending",
         "source_turn_id": turn_id,
