@@ -4056,6 +4056,7 @@ def _run_session_dm_loop(
 
     tool_round = 0
     finalizer_contract_retry_count = 0
+    last_substantive_finalizer_draft = ''
     combat_batch_retry_count = 0
     combat_batch_force_tools = False
     format_retry_count = 0
@@ -4194,6 +4195,11 @@ def _run_session_dm_loop(
             if on_status_change:
                 on_status_change({"step": "guard_check"})
             raw_content = message.get('content') or ''
+            if (
+                str(raw_content).strip()
+                and not _looks_like_provider_tool_markup(raw_content)
+            ):
+                last_substantive_finalizer_draft = str(raw_content).strip()
             if finalizer_decision is not None:
                 decision = normalize_session_dm_turn_decision(finalizer_decision)
                 raw_content = json.dumps(finalizer_decision, ensure_ascii=False)
@@ -4243,10 +4249,18 @@ def _run_session_dm_loop(
                 continue
             if finalizer_contract_violation:
                 rollback_combat_if_needed('invalid_final_output', {'finalizer_contract_violation': finalizer_contract_violation})
-                return {
-                    'mode': 'silent',
-                    'reason': 'The DM response did not produce a valid finalizer tool call.',
-                }
+                if last_substantive_finalizer_draft:
+                    action_buffer['actions'].clear()
+                    decision = {
+                        'mode': 'speak',
+                        'content': last_substantive_finalizer_draft,
+                    }
+                    finalizer_contract_violation = None
+                else:
+                    return {
+                        'mode': 'silent',
+                        'reason': 'The DM response did not produce a valid finalizer tool call.',
+                    }
             combat_batch_violation = _session_dm_combat_batch_violation(decision, combat_tracker)
             if combat_batch_violation and combat_batch_retry_count < 2 and tool_round < max_tool_rounds:
                 if on_status_change:

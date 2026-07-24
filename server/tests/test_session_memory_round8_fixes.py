@@ -25,6 +25,8 @@ from services.resolution_registry import (
     find_all_matching_candidates,
 )
 from services.session_memory_agent import _known_ids, compile_staged_memory_patch
+from services.dm_tools import apply_compiled_session_memory_patch
+from services.memory_resolver_schemas import SOURCE_CONTRACT_COMPILED_V2
 
 
 class SessionMemoryRound8FixesTest(unittest.TestCase):
@@ -175,6 +177,89 @@ class SessionMemoryRound8FixesTest(unittest.TestCase):
             expected_type="npc",
         )
         self.assertEqual(candidates, {"mira": "npc"})
+
+    def test_private_plot_names_are_pruned_from_player_facing_memory_anchors(self):
+        graph = json.loads(self.world.knowledge_graph)
+        graph["entities"].extend([
+            {
+                "id": "lady_seraphine_vane",
+                "name": "Lady Seraphine Vane",
+                "type": "npc",
+                "visibility": "dm_private",
+            },
+            {
+                "id": "mirror_of_drowned_kings",
+                "name": "Mirror of Drowned Kings",
+                "type": "item",
+                "visibility": "dm_private",
+            },
+        ])
+        self.world.knowledge_graph = json.dumps(graph)
+        db.session.commit()
+
+        context = {
+            **self._context(),
+            "latest_player_message": "We inspect the canal for scrape marks.",
+            "latest_dm_message": "Fresh scrapes and an oil sheen mark the stone.",
+        }
+        compiled = compile_staged_memory_patch(
+            context,
+            {},
+            {
+                "memory_anchors": {
+                    "current_goal": "Trace the skiff through the canal.",
+                    "current_scene": "At the canal mouth.",
+                    "open_clues": ["Fresh scrape marks", "An oil sheen"],
+                    "unresolved_questions": [
+                        "What is Lady Seraphine Vane's plan involving the Mirror of Drowned Kings?"
+                    ],
+                    "npc_observations": [],
+                    "recent_offers_promises": [],
+                },
+            },
+        )
+
+        self.assertEqual(compiled["memory_anchors"]["unresolved_questions"], [])
+        self.assertEqual(
+            compiled["memory_anchors"]["open_clues"],
+            ["Fresh scrape marks", "An oil sheen"],
+        )
+
+    def test_npc_update_materializes_relation_endpoint_before_validation(self):
+        patch = {
+            "source_contract": SOURCE_CONTRACT_COMPILED_V2,
+            "base_memory_revision": self.world.memory_revision or 0,
+            "upsert_graph_entities": [],
+            "upsert_graph_relations": [{
+                "id": "rel_mira_knows_lyra",
+                "type": "knows",
+                "source_id": "mira",
+                "target_id": "lyra_sunfall",
+            }],
+            "upsert_graph_facts": [],
+            "update_npc_actors": [{
+                "id": "lyra_sunfall",
+                "name": "Lyra Sunfall",
+                "role": "Canal guide",
+                "visibility": "party_known",
+            }],
+            "record_events": [],
+        }
+        graph = json.loads(self.world.knowledge_graph)
+        graph["entities"].append({"id": "mira", "name": "Mira", "type": "npc"})
+        self.world.knowledge_graph = json.dumps(graph)
+        db.session.commit()
+
+        result = apply_compiled_session_memory_patch(
+            self.campaign,
+            self.session,
+            patch,
+        )
+        db.session.commit()
+
+        graph = json.loads(self.world.knowledge_graph)
+        self.assertIn("lyra_sunfall", {item["id"] for item in graph["entities"]})
+        self.assertEqual(result["graph_changes"][-1]["id"], "rel_mira_knows_lyra")
 
     def test_ignore_clarification_cannot_merge_patch(self):
         clarification = CampaignClarification(

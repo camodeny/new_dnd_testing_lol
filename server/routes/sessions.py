@@ -284,6 +284,8 @@ def _run_session_memory_update(
                     'trace_id': clock_trace_id,
                     'parent_trace_id': parent_trace_id,
                     'trace_label': clock_trace_label,
+                    'source_player_message_id': player_message_id,
+                    'source_dm_message_id': dm_message_id,
                 },
             )
             clock_complete = True

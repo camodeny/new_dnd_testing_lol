@@ -17,11 +17,11 @@ class RunAutomationWorkerTests(unittest.TestCase):
 
         self.assertIsNone(args.max_minutes)
 
-    def test_parse_args_defaults_dm_response_timeout_to_five_minutes(self):
+    def test_parse_args_defaults_dm_response_timeout_to_twelve_minutes(self):
         with patch.object(sys, 'argv', ['run_automation_worker.py']):
             args = worker.parse_args()
 
-        self.assertEqual(args.dm_response_timeout, 300.0)
+        self.assertEqual(args.dm_response_timeout, 720.0)
 
     def test_wait_for_dm_response_waits_for_post_turn_completion(self):
         args = SimpleNamespace(poll_interval=0.01, dm_response_timeout=5.0,
