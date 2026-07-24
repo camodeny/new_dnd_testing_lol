@@ -4,7 +4,10 @@ import hashlib
 import copy
 
 from models import Campaign, CampaignClock, CampaignSession, CampaignWorld, Character, NPCActor, SessionMessage, User, WorldEvent, db
-from services.dm_tools import _tool_search_campaign_memory
+from services.dm_tools import (
+    _contains_unrevealed_private_term,
+    _tool_search_campaign_memory,
+)
 from services.memory_resolver_schemas import (
     AUTHORITY_PRECEDENCE,
     DIAGNOSTICS_TEMPLATE,
@@ -1019,6 +1022,31 @@ def compile_staged_memory_patch(memory_context, extracted, resolved):
         "npc_observations": anchors.get("npc_observations") if isinstance(anchors.get("npc_observations"), list) else [],
         "recent_offers_promises": anchors.get("recent_offers_promises") if isinstance(anchors.get("recent_offers_promises"), list) else [],
     }
+    visible_exchange = " ".join(
+        str(value)
+        for value in (
+            memory_context.get("latest_player_message"),
+            memory_context.get("latest_dm_message"),
+        )
+        if value
+    )
+
+    def _spoiler_safe_anchor(value):
+        text = clean_text(value, 700)
+        if not text:
+            return None
+        if _contains_unrevealed_private_term(campaign, text, visible_exchange):
+            return None
+        return text
+
+    for scalar_key in ("current_goal", "current_scene"):
+        compiled_anchors[scalar_key] = _spoiler_safe_anchor(compiled_anchors.get(scalar_key))
+    for list_key in ("open_clues", "unresolved_questions", "npc_observations", "recent_offers_promises"):
+        compiled_anchors[list_key] = [
+            safe_value
+            for value in compiled_anchors[list_key]
+            if (safe_value := _spoiler_safe_anchor(value))
+        ]
 
     hot_context = memory_context.get("hot_context") if isinstance(memory_context.get("hot_context"), dict) else {}
     source_player_message_id = memory_context.get("latest_player_message_id") or memory_context.get("source_player_message_id") or hot_context.get("player_message_id") or hot_context.get("source_player_message_id")

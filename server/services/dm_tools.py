@@ -5150,6 +5150,15 @@ def apply_clock_adjudication(campaign, updates, audit_context=None):
         'errors': [],
     }
 
+    transcript_evidence_sources = [
+        make_evidence_source("transcript_message", str(message_id))
+        for message_id in (
+            audit_context.get("source_player_message_id") or audit_context.get("player_message_id"),
+            audit_context.get("source_dm_message_id") or audit_context.get("dm_message_id"),
+        )
+        if message_id is not None
+    ]
+
     def resolve_clock_reference(raw_clock_ref):
         clock_key = clean_id(raw_clock_ref, '')
         if clock_key:
@@ -5198,13 +5207,31 @@ def apply_clock_adjudication(campaign, updates, audit_context=None):
                 'reason': clean_text(item.get('reason'), 420) or 'Clock adjudicator returned no change.',
             })
             continue
+        raw_provenance = item.get('provenance') if isinstance(item.get('provenance'), dict) else {}
+        provenance = {
+            **raw_provenance,
+            'source_player_message_id': (
+                raw_provenance.get('source_player_message_id')
+                or audit_context.get('source_player_message_id')
+                or audit_context.get('player_message_id')
+            ),
+            'source_dm_message_id': (
+                raw_provenance.get('source_dm_message_id')
+                or audit_context.get('source_dm_message_id')
+                or audit_context.get('dm_message_id')
+            ),
+            'trace_id': raw_provenance.get('trace_id') or audit_context.get('trace_id'),
+        }
+        if transcript_evidence_sources:
+            provenance['evidence_sources'] = transcript_evidence_sources
+            provenance['evidence_status'] = determine_evidence_status(transcript_evidence_sources)
         change = _tool_advance_clock(campaign, None, {
             'clock_id': clock_id,
             'delta': delta,
             'reason': clean_text(item.get('reason'), 420),
             'status': clean_text(item.get('status'), 30),
             'evidence': item.get('evidence') if isinstance(item.get('evidence'), list) else [],
-            'provenance': item.get('provenance'),
+            'provenance': provenance,
         })
         if change.get('error'):
             result['errors'].append(change['error'])
@@ -6207,6 +6234,38 @@ def apply_compiled_session_memory_patch(campaign, session, patch, audit_context=
         "running_summary_updated": False,
         "memory_anchors_updated": False,
     }
+
+    graph_entity_ids = {
+        entity.get("id")
+        for entity in graph.get("entities", [])
+        if isinstance(entity, dict) and entity.get("id")
+    }
+    requested_entity_ids = {
+        clean_id(entity.get("id"), "")
+        for entity in patch.get("upsert_graph_entities", [])
+        if isinstance(entity, dict)
+    }
+    for npc_item in patch.get("update_npc_actors") if isinstance(patch.get("update_npc_actors"), list) else []:
+        if not isinstance(npc_item, dict):
+            continue
+        actor_id = clean_id(npc_item.get("id") or npc_item.get("actor_id"), "")
+        if not actor_id or actor_id in graph_entity_ids or actor_id in requested_entity_ids:
+            continue
+        patch.setdefault("upsert_graph_entities", []).append({
+            "id": actor_id,
+            "name": clean_text(npc_item.get("name"), 200) or actor_id.replace("_", " ").title(),
+            "type": "npc",
+            "summary": clean_text(npc_item.get("public_summary") or npc_item.get("role"), 500) or None,
+            "visibility": (
+                npc_item.get("visibility")
+                if npc_item.get("visibility") in VALID_VISIBILITIES
+                else "party_known"
+            ),
+            "certainty": npc_item.get("certainty") or "confirmed",
+            "reason": "Materialized NPC graph endpoint before applying its relationships.",
+            "provenance": npc_item.get("provenance"),
+        })
+        requested_entity_ids.add(actor_id)
 
     for entity in patch.get("upsert_graph_entities") if isinstance(patch.get("upsert_graph_entities"), list) else []:
         entity = entity if isinstance(entity, dict) else {}

@@ -2890,7 +2890,7 @@ class DmToolsTest(unittest.TestCase):
         self.assertEqual(post_chat.call_count, 1)
         self.assertEqual(post_chat.call_args.kwargs['tool_choice'], 'auto')
 
-    def test_plain_text_fallback_is_disabled_after_a_staged_action(self):
+    def test_plain_text_fallback_discards_staged_actions_and_preserves_visible_reply(self):
         hot_context = {
             'protected_player_characters': [],
             'private_output_terms': [],
@@ -2928,8 +2928,7 @@ class DmToolsTest(unittest.TestCase):
                 max_tool_rounds=2,
             )
 
-        self.assertEqual(result['mode'], 'silent')
-        self.assertIn('valid finalizer', result['reason'])
+        self.assertEqual(result, {'mode': 'speak', 'content': 'Last raw text.'})
 
     def test_finalizer_contract_retry_still_rewrites_ooc_label(self):
         hot_context = {
@@ -5781,7 +5780,11 @@ class DmToolsTest(unittest.TestCase):
                 'retire_clocks': [],
                 'no_change_explanations': [],
             },
-            audit_context={'trace_id': 'clock-trace'},
+            audit_context={
+                'trace_id': 'clock-trace',
+                'source_player_message_id': 101,
+                'source_dm_message_id': 102,
+            },
         )
 
         db.session.commit()
@@ -5790,6 +5793,19 @@ class DmToolsTest(unittest.TestCase):
         self.assertEqual(clock.status, 'active')
         self.assertEqual(result['errors'], [])
         self.assertEqual(result['clock_changes'][0]['action'], 'advanced')
+        event = WorldEvent.query.filter_by(
+            campaign_id=self.campaign.id,
+            event_type='clock_advanced',
+        ).one()
+        provenance = json.loads(event.payload)['provenance']
+        self.assertEqual(provenance['evidence_status'], 'supported_by_evidence')
+        self.assertEqual(
+            provenance['evidence_sources'],
+            [
+                {'source_type': 'transcript_message', 'source_id': '101'},
+                {'source_type': 'transcript_message', 'source_id': '102'},
+            ],
+        )
 
     def test_apply_clock_adjudication_accepts_database_clock_id_reference(self):
         clock = CampaignClock(
