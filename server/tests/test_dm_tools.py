@@ -5807,6 +5807,60 @@ class DmToolsTest(unittest.TestCase):
             ],
         )
 
+    def test_apply_clock_adjudication_preserves_rule_evidence_with_transcript_sources(self):
+        db.session.add(CampaignClock(
+            campaign_id=self.campaign.id,
+            clock_id='component_search',
+            name='Component Search',
+            segments=4,
+            filled=0,
+            status='active',
+        ))
+        db.session.commit()
+
+        apply_clock_adjudication(
+            self.campaign,
+            {
+                'create_clocks': [],
+                'advance_clocks': [{
+                    'clock_id': 'component_search',
+                    'delta': 1,
+                    'reason': 'The deterministic trigger matched.',
+                    'evidence': [],
+                    'provenance': {
+                        'evidence_sources': [
+                            {'source_type': 'clock_rule', 'source_id': 'component_clue_found'},
+                            {'source_type': 'transcript_message', 'source_id': '101'},
+                        ],
+                        'evidence_status': 'supported_by_rules',
+                    },
+                }],
+                'retire_clocks': [],
+                'no_change_explanations': [],
+            },
+            audit_context={
+                'trace_id': 'clock-rule-trace',
+                'source_player_message_id': 101,
+                'source_dm_message_id': 102,
+            },
+        )
+        db.session.commit()
+
+        event = WorldEvent.query.filter_by(
+            campaign_id=self.campaign.id,
+            event_type='clock_advanced',
+        ).one()
+        provenance = json.loads(event.payload)['provenance']
+        self.assertEqual(provenance['evidence_status'], 'supported_by_rules')
+        self.assertEqual(
+            provenance['evidence_sources'],
+            [
+                {'source_type': 'clock_rule', 'source_id': 'component_clue_found'},
+                {'source_type': 'transcript_message', 'source_id': '101'},
+                {'source_type': 'transcript_message', 'source_id': '102'},
+            ],
+        )
+
     def test_apply_clock_adjudication_accepts_database_clock_id_reference(self):
         clock = CampaignClock(
             campaign_id=self.campaign.id,

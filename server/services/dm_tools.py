@@ -5222,9 +5222,22 @@ def apply_clock_adjudication(campaign, updates, audit_context=None):
             ),
             'trace_id': raw_provenance.get('trace_id') or audit_context.get('trace_id'),
         }
-        if transcript_evidence_sources:
-            provenance['evidence_sources'] = transcript_evidence_sources
-            provenance['evidence_status'] = determine_evidence_status(transcript_evidence_sources)
+        combined_evidence_sources = []
+        seen_evidence_sources = set()
+        for source in [
+            *(raw_provenance.get('evidence_sources') or []),
+            *transcript_evidence_sources,
+        ]:
+            if not isinstance(source, (dict, str, int)):
+                continue
+            dedupe_key = json.dumps(source, sort_keys=True) if isinstance(source, dict) else str(source)
+            if dedupe_key in seen_evidence_sources:
+                continue
+            seen_evidence_sources.add(dedupe_key)
+            combined_evidence_sources.append(source)
+        if combined_evidence_sources:
+            provenance['evidence_sources'] = combined_evidence_sources
+            provenance['evidence_status'] = determine_evidence_status(combined_evidence_sources)
         change = _tool_advance_clock(campaign, None, {
             'clock_id': clock_id,
             'delta': delta,
