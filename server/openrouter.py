@@ -263,8 +263,8 @@ SESSION_MEMORY_EXTRACTOR_SYSTEM_PROMPT = (
     "Extract candidate scene updates, durable fact claims, entity upserts, relation upserts, NPC updates, and event records from the visible exchange. "
     "Do not invent canonical ids. If a name is not already a known id in the prompt, preserve it as a raw label/ref for later resolution. "
     "Scene updates may include location_id, location_name, time_of_day, active_npc_ids, departed_npc_ids, and immediate_tension. "
-    "When the visible transcript contains an <npc target=\"...\" info=\"...\"> annotation, treat the info attribute as authoritative context from the DM. "
-    "Do not extract claims that contradict the annotation as confirmed truth; set certainty to 'suspected' and evidence_status to 'insufficiently_supported', or skip the claim entirely. "
+    "The user payload includes a speaker_reliability field populated by the DM with hidden server-side metadata, never visible to the player. Each entry has npc_name (the public name as it appears in the visible content), reliability (reliable | unreliable_cover | unreliable_exaggeration | unreliable_omission), and an optional short in-world reason. Treat this field as authoritative context from the DM. "
+    "For any claim derived from the visible dialog of an NPC whose speaker_reliability entry is unreliable_cover, unreliable_exaggeration, or unreliable_omission, do not extract the claim as confirmed truth. Set certainty to 'suspected' and evidence_status to 'insufficiently_supported', or skip the claim entirely. Do not let an unreliable NPC's spoken dialog overwrite the NPC's canonical dossier, secrets, or background in npc_claims. "
     "Claims must use source_surface of visible_transcript, hidden_state, or inferred. "
     "Your final response must be exactly one tool call: submit_extraction. Do not output plain text or markdown fences. "
     "The submit_extraction payload must include keys running_summary, memory_anchors, scene_patch, scene_reason, fact_claims, entity_claims, relation_claims, npc_claims, and event_claims. "
@@ -281,8 +281,8 @@ SESSION_MEMORY_RESOLVER_SYSTEM_PROMPT = (
     "Never invent ids. If you cannot resolve a reference with confidence, return it in unresolved_items instead of mutating memory. "
     "Prefer get_entity_candidates, get_scene_candidates, get_fact_candidates, and search_campaign_memory before broad raw-state tools. "
     "Use get_world_state, get_npcs, get_clocks, or transcript tools only when narrower tools are insufficient. "
-    "When an <npc target=\"...\" info=\"...\"> annotation is present on a source message, treat the info attribute as authoritative context. "
-    "Do not promote claims that contradict the annotation to confirmed truth; carry certainty as 'suspected' and evidence_status as 'insufficiently_supported' through to the resolved patch, or omit the claim from upserts. "
+    "The user payload includes a speaker_reliability field populated by the DM with hidden server-side metadata, never visible to the player. Each entry has npc_name (the public name as it appears in the visible content), reliability (reliable | unreliable_cover | unreliable_exaggeration | unreliable_omission), and an optional short in-world reason. Treat this field as authoritative context from the DM. "
+    "For any claim derived from the visible dialog of an NPC whose speaker_reliability entry is unreliable_cover, unreliable_exaggeration, or unreliable_omission, carry certainty as 'suspected' and evidence_status as 'insufficiently_supported' through to the resolved patch, or omit the claim from upserts. Do not let an unreliable NPC's spoken dialog overwrite that NPC's canonical dossier, secrets, or background in update_npc_actors. "
     "After using tools to resolve references, finalize by calling exactly one tool: submit_resolved_memory. Do not output plain text or markdown. "
     "The submit_resolved_memory payload must be one JSON object with keys running_summary, memory_anchors, scene_patch, scene_reason, upsert_graph_entities, upsert_graph_relations, upsert_graph_facts, update_npc_actors, record_events, unresolved_items, evidence_basis, resolved_entity_refs, and resolved_location_refs. "
     "Return the resolved/updated memory_anchors representing the current session state: current_goal (string or null), current_scene (string or null), open_clues (array of strings), unresolved_questions (array of strings), npc_observations (array of strings), and recent_offers_promises (array of strings). "
@@ -1280,12 +1280,24 @@ SESSION_DM_FINALIZER_TOOLS = [
                     },
                     'resolver_packet': {
                         'type': 'object',
-                        'description': 'Optional. When the DM has deliberately established a hidden-canon identity, include entity_mentions with mention_ref, surface_form, identity_status, canonical_id, public_name, and visibility.',
+                        'description': 'Optional hidden server-side metadata. Never appears in visible content. Use entity_mentions to commit hidden-canon identity, and speaker_reliability to mark NPC dialog that the DM knows contradicts the NPC\'s canonical identity, dossier secrets, or dm_private motivations.',
                         'properties': {
                             'entity_mentions': {
                                 'type': 'array',
                                 'items': {'type': 'object'},
                                 'description': 'List of entity identity resolutions the DM is intentionally committing as hidden canon.',
+                            },
+                            'speaker_reliability': {
+                                'type': 'array',
+                                'description': 'List of unreliable NPC speakers in this turn. Each entry has npc_name (the public name as it appears in visible content), reliability (unreliable_cover | unreliable_exaggeration | unreliable_omission), and an optional short reason. Keep the reason a short in-world cue; do NOT restate the canonical secret, since the spoiler guard does not see this field and a leaked reason cannot be redacted.',
+                                'items': {
+                                    'type': 'object',
+                                    'properties': {
+                                        'npc_name': {'type': 'string'},
+                                        'reliability': {'type': 'string', 'enum': ['reliable', 'unreliable_cover', 'unreliable_exaggeration', 'unreliable_omission']},
+                                        'reason': {'type': 'string'},
+                                    },
+                                },
                             },
                         },
                     },
@@ -1349,8 +1361,11 @@ def _session_dm_finalizer_decision_from_tool_calls(tool_calls):
             'commit_action_ids': args.get('commit_action_ids'),
         }
         rp = args.get('resolver_packet')
-        if isinstance(rp, dict) and isinstance(rp.get('entity_mentions'), list):
-            decision['resolver_packet'] = rp
+        if isinstance(rp, dict):
+            has_entity_mentions = isinstance(rp.get('entity_mentions'), list)
+            has_speaker_reliability = isinstance(rp.get('speaker_reliability'), list)
+            if has_entity_mentions or has_speaker_reliability:
+                decision['resolver_packet'] = rp
         return decision, None
     return {
         'mode': 'silent',
@@ -3695,6 +3710,7 @@ def build_session_memory_clocks_messages(memory_context):
 
 def build_session_memory_extractor_messages(memory_context):
     compact = _session_memory_compact_context(memory_context)
+    speaker_reliability = memory_context.get('speaker_reliability') if isinstance(memory_context, dict) else None
     return [
         {'role': 'system', 'content': SESSION_MEMORY_EXTRACTOR_SYSTEM_PROMPT},
         {
@@ -3706,6 +3722,7 @@ def build_session_memory_extractor_messages(memory_context):
                 'relevant_memory': compact.get('relevant_memory'),
                 'latest_player_message': compact.get('latest_player_message'),
                 'latest_dm_message': compact.get('latest_dm_message'),
+                'speaker_reliability': speaker_reliability if isinstance(speaker_reliability, list) else [],
                 'return_shape': {
                     'running_summary': 'fresh compact replacement summary for the session after this turn',
                     'memory_anchors': {
@@ -3814,6 +3831,7 @@ def build_session_memory_extractor_messages(memory_context):
 
 def build_session_memory_resolver_messages(memory_context, extracted):
     compact = _session_memory_compact_context(memory_context)
+    speaker_reliability = memory_context.get('speaker_reliability') if isinstance(memory_context, dict) else None
     return [
         {'role': 'system', 'content': SESSION_MEMORY_RESOLVER_SYSTEM_PROMPT},
         {
@@ -3823,6 +3841,7 @@ def build_session_memory_resolver_messages(memory_context, extracted):
                 'current_scene': compact.get('current_scene'),
                 'latest_player_message': compact.get('latest_player_message'),
                 'latest_dm_message': compact.get('latest_dm_message'),
+                'speaker_reliability': speaker_reliability if isinstance(speaker_reliability, list) else [],
                 'extracted_memory_candidates': extracted,
                 'available_tools': [
                     'get_running_summary',

@@ -1092,5 +1092,214 @@ class SessionMemoryIntegrityTest(unittest.TestCase):
         self.assertEqual(res_bad_scope.status_code, 400)
 
 
+class SpeakerReliabilityTest(unittest.TestCase):
+    def test_validate_speaker_reliability_entry_accepts_well_formed(self):
+        from services.memory_resolver_schemas import validate_speaker_reliability_entry
+        ok, err = validate_speaker_reliability_entry({
+            'npc_name': 'Brother Orin',
+            'reliability': 'unreliable_cover',
+            'reason': 'covering for their actual allegiance',
+        })
+        self.assertTrue(ok, err)
+        self.assertIsNone(err)
+
+    def test_validate_speaker_reliability_entry_rejects_missing_npc_name(self):
+        from services.memory_resolver_schemas import validate_speaker_reliability_entry
+        ok, err = validate_speaker_reliability_entry({
+            'reliability': 'unreliable_cover',
+        })
+        self.assertFalse(ok)
+        self.assertIn('npc_name', err)
+
+    def test_validate_speaker_reliability_entry_rejects_invalid_reliability(self):
+        from services.memory_resolver_schemas import validate_speaker_reliability_entry
+        ok, err = validate_speaker_reliability_entry({
+            'npc_name': 'Orin',
+            'reliability': 'definitely_lying',
+        })
+        self.assertFalse(ok)
+        self.assertIn('reliability', err)
+
+    def test_validate_speaker_reliability_entry_rejects_oversized_reason(self):
+        from services.memory_resolver_schemas import validate_speaker_reliability_entry
+        ok, err = validate_speaker_reliability_entry({
+            'npc_name': 'Orin',
+            'reliability': 'unreliable_cover',
+            'reason': 'x' * 241,
+        })
+        self.assertFalse(ok)
+        self.assertIn('reason', err)
+
+    def test_validate_resolver_packet_accepts_speaker_reliability_only(self):
+        from services.memory_resolver_schemas import validate_resolver_packet
+        ok, err = validate_resolver_packet({
+            'speaker_reliability': [
+                {'npc_name': 'Brother Orin', 'reliability': 'unreliable_cover', 'reason': 'covering for true allegiance'},
+            ],
+        })
+        self.assertTrue(ok, err)
+        self.assertIsNone(err)
+
+    def test_validate_resolver_packet_accepts_both_mentions_and_speaker_reliability(self):
+        from services.memory_resolver_schemas import validate_resolver_packet
+        ok, err = validate_resolver_packet({
+            'entity_mentions': [
+                {'mention_ref': 'good_1', 'surface_form': 'the stranger', 'identity_status': 'known_hidden', 'visibility': 'dm_private'},
+            ],
+            'speaker_reliability': [
+                {'npc_name': 'Orin', 'reliability': 'unreliable_cover'},
+            ],
+        })
+        self.assertTrue(ok, err)
+
+    def test_validate_resolver_packet_rejects_bad_speaker_reliability_entry(self):
+        from services.memory_resolver_schemas import validate_resolver_packet
+        ok, err = validate_resolver_packet({
+            'speaker_reliability': [
+                {'npc_name': 'Orin', 'reliability': 'definitely_lying'},
+            ],
+        })
+        self.assertFalse(ok)
+        self.assertIn('speaker_reliability[0]', err)
+
+    def test_validate_resolver_packet_rejects_non_list_speaker_reliability(self):
+        from services.memory_resolver_schemas import validate_resolver_packet
+        ok, err = validate_resolver_packet({
+            'speaker_reliability': {'npc_name': 'Orin', 'reliability': 'unreliable_cover'},
+        })
+        self.assertFalse(ok)
+        self.assertIn('speaker_reliability', err)
+
+
+class SpeakerReliabilityNoLeakTest(unittest.TestCase):
+    """End-to-end guard: the canonical NPC secret must never enter the visible
+    message content, even when the DM marks the NPC as unreliable. The
+    speaker_reliability channel is server-side metadata; only the in-world
+    reason may be a brief cue, and the canonical truth must not appear there.
+    """
+
+    CANONICAL_SECRET = "Lady Cinder's saboteur"
+
+    def test_visible_content_does_not_carry_canonical_secret(self):
+        visible_content = (
+            '<npc target="Brother Orin">I was just a soul-lens diver. The corruption '
+            'claimed my friends, but I survived. Please, help me make it right.</npc>'
+        )
+        self.assertNotIn(self.CANONICAL_SECRET, visible_content)
+        self.assertNotIn('Cinder', visible_content)
+
+    def test_resolver_packet_speaker_reliability_can_carry_brief_inworld_cue(self):
+        from services.memory_resolver_schemas import validate_resolver_packet
+        packet = {
+            'speaker_reliability': [
+                {
+                    'npc_name': 'Brother Orin',
+                    'reliability': 'unreliable_cover',
+                    'reason': 'covering for their actual allegiance',
+                },
+            ],
+        }
+        ok, err = validate_resolver_packet(packet)
+        self.assertTrue(ok, err)
+        self.assertNotIn(self.CANONICAL_SECRET, json.dumps(packet))
+
+    def test_memory_context_speaker_reliability_reaches_extractor_messages(self):
+        from openrouter import build_session_memory_extractor_messages, build_session_memory_resolver_messages
+        memory_context = {
+            'prior_running_summary': '',
+            'prior_memory_anchors': {},
+            'hot_context': {'current_scene': {}},
+            'relevant_memory': {},
+            'latest_player_message': 'What happened to the soul-lens, Orin?',
+            'latest_dm_message': (
+                '<npc target="Brother Orin">I was just a soul-lens diver. The corruption '
+                'claimed my friends, but I survived.</npc>'
+            ),
+            'speaker_reliability': [
+                {
+                    'npc_name': 'Brother Orin',
+                    'reliability': 'unreliable_cover',
+                    'reason': 'covering for their actual allegiance',
+                },
+            ],
+        }
+
+        extractor_messages = build_session_memory_extractor_messages(memory_context)
+        extractor_user = json.loads(extractor_messages[1]['content'])
+        self.assertIn('speaker_reliability', extractor_user)
+        self.assertEqual(len(extractor_user['speaker_reliability']), 1)
+        self.assertEqual(extractor_user['speaker_reliability'][0]['npc_name'], 'Brother Orin')
+        self.assertEqual(extractor_user['speaker_reliability'][0]['reliability'], 'unreliable_cover')
+        self.assertIn('covering', extractor_user['speaker_reliability'][0]['reason'])
+
+        resolver_messages = build_session_memory_resolver_messages(memory_context, extracted={})
+        resolver_user = json.loads(resolver_messages[1]['content'])
+        self.assertIn('speaker_reliability', resolver_user)
+        self.assertEqual(len(resolver_user['speaker_reliability']), 1)
+        self.assertEqual(resolver_user['speaker_reliability'][0]['npc_name'], 'Brother Orin')
+
+    def test_extractor_prompt_instructs_downgrade_on_unreliable_speakers(self):
+        from openrouter import SESSION_MEMORY_EXTRACTOR_SYSTEM_PROMPT
+        self.assertIn('speaker_reliability', SESSION_MEMORY_EXTRACTOR_SYSTEM_PROMPT)
+        self.assertIn("'suspected'", SESSION_MEMORY_EXTRACTOR_SYSTEM_PROMPT)
+        self.assertIn("'insufficiently_supported'", SESSION_MEMORY_EXTRACTOR_SYSTEM_PROMPT)
+        self.assertIn('unreliable_cover', SESSION_MEMORY_EXTRACTOR_SYSTEM_PROMPT)
+        self.assertIn('npc_claims', SESSION_MEMORY_EXTRACTOR_SYSTEM_PROMPT)
+
+    def test_resolver_prompt_instructs_downgrade_on_unreliable_speakers(self):
+        from openrouter import SESSION_MEMORY_RESOLVER_SYSTEM_PROMPT
+        self.assertIn('speaker_reliability', SESSION_MEMORY_RESOLVER_SYSTEM_PROMPT)
+        self.assertIn("'suspected'", SESSION_MEMORY_RESOLVER_SYSTEM_PROMPT)
+        self.assertIn("'insufficiently_supported'", SESSION_MEMORY_RESOLVER_SYSTEM_PROMPT)
+        self.assertIn('unreliable_cover', SESSION_MEMORY_RESOLVER_SYSTEM_PROMPT)
+        self.assertIn('update_npc_actors', SESSION_MEMORY_RESOLVER_SYSTEM_PROMPT)
+
+    def test_dm_tool_policy_points_dm_at_hidden_field_not_visible_annotation(self):
+        from services.dm_tools import build_session_hot_context
+        from models import (
+            db,
+            User,
+            Campaign,
+            CampaignSession,
+            CampaignWorld,
+        )
+        from flask import Flask
+
+        app = Flask(__name__)
+        app.config['SQLALCHEMY_DATABASE_URI'] = 'sqlite:///:memory:'
+        app.config['SECRET_KEY'] = 'test-secret'
+        app.config['SQLALCHEMY_TRACK_MODIFICATIONS'] = False
+        db.init_app(app)
+        with app.app_context():
+            db.create_all()
+            usr = User(username='dm_user', email='dm@example.com')
+            usr.set_password('password')
+            db.session.add(usr)
+            db.session.commit()
+
+            campaign = Campaign(name='T', description='', user_id=usr.id)
+            db.session.add(campaign)
+            db.session.flush()
+            world = CampaignWorld(
+                campaign_id=campaign.id,
+                public_intro='{}',
+                knowledge_graph='{}',
+                world_state='{}',
+                dm_private='{}',
+            )
+            db.session.add(world)
+            sess = CampaignSession(campaign_id=campaign.id)
+            db.session.add(sess)
+            db.session.commit()
+
+            hot_context = build_session_hot_context(campaign, sess, usr, recent_messages_override=[])
+            tool_policy = hot_context['tool_policy']
+
+            self.assertIn('resolver_packet.speaker_reliability', tool_policy)
+            self.assertIn('unreliable_cover', tool_policy)
+            self.assertNotIn('info="cover story', tool_policy)
+            self.assertNotIn('info="cover; Orin is canonically', tool_policy)
+
+
 if __name__ == '__main__':
     unittest.main()

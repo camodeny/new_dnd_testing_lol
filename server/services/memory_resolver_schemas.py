@@ -135,19 +135,55 @@ EVIDENCE_SOURCES = {
 
 _VALID_MENTION_REF = re.compile(r"^[a-zA-Z][a-zA-Z0-9_]*$")
 
+# ── Speaker Reliability Model ──────────────────────────────────────────
+# When the DM role-plays an NPC who knowingly speaks against their canonical
+# identity, dossier secrets, or dm_private motivations, the DM can mark the
+# NPC's spoken dialog as unreliable. The marker is server-side metadata; it
+# must NEVER appear in the visible message content.
+
+SPEAKER_RELIABILITY_VALUES = {
+    "reliable",
+    "unreliable_cover",
+    "unreliable_exaggeration",
+    "unreliable_omission",
+}
+
+
+def validate_speaker_reliability_entry(entry):
+    if not isinstance(entry, dict):
+        return False, "speaker_reliability entry must be a dict"
+    npc_name = entry.get("npc_name")
+    if not isinstance(npc_name, str) or not npc_name.strip():
+        return False, "npc_name is required and must be a non-empty string"
+    reliability = entry.get("reliability")
+    if reliability not in SPEAKER_RELIABILITY_VALUES:
+        return False, f"invalid reliability: {reliability!r}"
+    reason = entry.get("reason")
+    if reason is not None and (not isinstance(reason, str) or len(reason) > 240):
+        return False, "reason must be a string of 240 chars or less, or null"
+    return True, None
+
 
 def validate_resolver_packet(packet):
     if not isinstance(packet, dict):
         return False, "resolver_packet must be a dict"
     entity_mentions = packet.get("entity_mentions")
-    if entity_mentions is None:
-        return True, None
-    if not isinstance(entity_mentions, list):
-        return False, "entity_mentions must be a list"
-    for idx, mention in enumerate(entity_mentions):
-        ok, err = validate_entity_mention(mention)
-        if not ok:
-            return False, f"entity_mentions[{idx}]: {err}"
+    if entity_mentions is not None:
+        if not isinstance(entity_mentions, list):
+            return False, "entity_mentions must be a list"
+        for idx, mention in enumerate(entity_mentions):
+            ok, err = validate_entity_mention(mention)
+            if not ok:
+                return False, f"entity_mentions[{idx}]: {err}"
+    speaker_reliability = packet.get("speaker_reliability")
+    if speaker_reliability is not None:
+        if not isinstance(speaker_reliability, list):
+            return False, "speaker_reliability must be a list"
+        for idx, entry in enumerate(speaker_reliability):
+            ok, err = validate_speaker_reliability_entry(entry)
+            if not err:
+                continue
+            return False, f"speaker_reliability[{idx}]: {err}"
     return True, None
 
 

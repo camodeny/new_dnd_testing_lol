@@ -179,6 +179,9 @@ def _run_session_memory_update(
                         telemetry={"dm_message_id": dm_message_id},
                     )
                 memory_context['resolver_packet'] = stored.packet_json
+                speaker_reliability = stored.packet_json.get('speaker_reliability')
+                if isinstance(speaker_reliability, list) and speaker_reliability:
+                    memory_context['speaker_reliability'] = speaker_reliability
 
                 # Check for transient/stored mismatch
                 if isinstance(resolver_packet, dict) and resolver_packet:
@@ -206,6 +209,9 @@ def _run_session_memory_update(
             # Fall back to transient argument only if there is definitively no committed packet
             if isinstance(resolver_packet, dict):
                 memory_context['resolver_packet'] = resolver_packet
+                speaker_reliability = resolver_packet.get('speaker_reliability')
+                if isinstance(speaker_reliability, list) and speaker_reliability:
+                    memory_context['speaker_reliability'] = speaker_reliability
 
         memory_audit_context = {
             'campaign_id': campaign.id,

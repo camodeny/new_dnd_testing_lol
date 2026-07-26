@@ -10,6 +10,7 @@ sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), '..')
 
 from openrouter import (
     _assistant_tool_message,
+    _session_dm_finalizer_decision_from_tool_calls,
     _provider_request_payload_options,
     _json_error_excerpt,
     _json_loads_with_error,
@@ -1198,6 +1199,85 @@ class CharacterSheetAgentTest(unittest.TestCase):
             'character_ids': [7],
             'missing': False,
         })
+
+
+class TalkToPlayerSpeakerReliabilityTest(unittest.TestCase):
+    def _tool_call(self, name, arguments):
+        return {
+            'id': 'call_x',
+            'function': {
+                'name': name,
+                'arguments': json.dumps(arguments),
+            },
+        }
+
+    def test_parser_captures_speaker_reliability_alone(self):
+        decision, err = _session_dm_finalizer_decision_from_tool_calls([
+            self._tool_call('talk_to_player', {
+                'content': '<npc target="Brother Orin">I was just a diver.</npc>',
+                'commit_action_ids': [],
+                'resolver_packet': {
+                    'speaker_reliability': [
+                        {'npc_name': 'Brother Orin', 'reliability': 'unreliable_cover', 'reason': 'covering for true allegiance'},
+                    ],
+                },
+            }),
+        ])
+        self.assertIsNone(err)
+        self.assertIsNotNone(decision)
+        self.assertIn('resolver_packet', decision)
+        self.assertEqual(
+            decision['resolver_packet']['speaker_reliability'][0]['npc_name'],
+            'Brother Orin',
+        )
+        self.assertEqual(
+            decision['resolver_packet']['speaker_reliability'][0]['reliability'],
+            'unreliable_cover',
+        )
+
+    def test_parser_captures_both_mentions_and_speaker_reliability(self):
+        decision, err = _session_dm_finalizer_decision_from_tool_calls([
+            self._tool_call('talk_to_player', {
+                'content': 'Visible reply.',
+                'commit_action_ids': [],
+                'resolver_packet': {
+                    'entity_mentions': [
+                        {'mention_ref': 'the_stranger', 'surface_form': 'the stranger', 'identity_status': 'known_hidden', 'visibility': 'dm_private'},
+                    ],
+                    'speaker_reliability': [
+                        {'npc_name': 'Brother Orin', 'reliability': 'unreliable_cover'},
+                    ],
+                },
+            }),
+        ])
+        self.assertIsNone(err)
+        self.assertIn('resolver_packet', decision)
+        self.assertIn('entity_mentions', decision['resolver_packet'])
+        self.assertIn('speaker_reliability', decision['resolver_packet'])
+
+    def test_parser_drops_resolver_packet_when_only_invalid_subkeys(self):
+        decision, err = _session_dm_finalizer_decision_from_tool_calls([
+            self._tool_call('talk_to_player', {
+                'content': 'Visible reply.',
+                'commit_action_ids': [],
+                'resolver_packet': {
+                    'some_future_key_we_dont_know_about': True,
+                },
+            }),
+        ])
+        self.assertIsNone(err)
+        self.assertIsNotNone(decision)
+        self.assertNotIn('resolver_packet', decision)
+
+    def test_parser_still_works_without_resolver_packet(self):
+        decision, err = _session_dm_finalizer_decision_from_tool_calls([
+            self._tool_call('talk_to_player', {
+                'content': 'Visible reply.',
+                'commit_action_ids': [],
+            }),
+        ])
+        self.assertIsNone(err)
+        self.assertNotIn('resolver_packet', decision)
 
 
 if __name__ == '__main__':
