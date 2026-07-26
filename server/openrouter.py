@@ -1373,6 +1373,117 @@ def _session_dm_finalizer_decision_from_tool_calls(tool_calls):
     }, None
 
 
+def _npc_targets_in_visible_content(content):
+    if not isinstance(content, str):
+        return []
+    import re
+    return [
+        match.group(1)
+        for match in re.finditer(r'<npc\b[^>]*\btarget=["\']([^"\']+)["\']', content, flags=re.IGNORECASE)
+    ]
+
+
+def _merge_resolver_packet_across_retry(prior_packet, new_packet, new_visible_content):
+    """Carry forward hidden metadata from a guard-rejected finalizer attempt.
+
+    The session-DM retry loop discards a candidate finalizer when a guard fires
+    (spoiler_checker, pc_control, canon_discipline, private_output, format,
+    combat_handoff/batch, finalizer_contract). The model may then produce a
+    replacement finalizer that omits optional hidden metadata like
+    resolver_packet.speaker_reliability or .entity_mentions, because nothing
+    in the retry prompt tells it to re-emit those fields.
+
+    This helper preserves that metadata across retries so that a guard
+    rejection does not silently drop the DM's epistemic annotations. Retained
+    entries are filtered to entities / NPCs still present in the accepted
+    visible reply (case-insensitive substring or <npc target=\"...\"> match),
+    so an annotation is dropped when the DM has rewritten the reply to
+    exclude the speaker.
+
+    The new packet is preferred when both sides have an entry for the same
+    identifier; the prior is only used to fill missing entries.
+    """
+    if not isinstance(prior_packet, dict) or not prior_packet:
+        if not isinstance(new_packet, dict):
+            return {}
+        return new_packet
+    if not isinstance(new_packet, dict):
+        new_packet = {}
+    content_text = new_visible_content if isinstance(new_visible_content, str) else ''
+    content_lower = content_text.lower()
+    npc_targets = [target.lower() for target in _npc_targets_in_visible_content(content_text)]
+
+    def _present(name, allow_token_match=True):
+        if not isinstance(name, str) or not name.strip():
+            return False
+        needle = name.lower()
+        if needle in content_lower:
+            return True
+        if any(needle in target for target in npc_targets):
+            return True
+        if not allow_token_match:
+            return False
+        tokens = [token for token in re.split(r'\s+', needle) if len(token) >= 4]
+        if any(token in content_lower for token in tokens):
+            return True
+        return any(
+            any(token in target for token in tokens)
+            for target in npc_targets
+        )
+
+    prior_mentions = prior_packet.get('entity_mentions')
+    if isinstance(prior_mentions, list) and prior_mentions:
+        existing = new_packet.get('entity_mentions')
+        if not isinstance(existing, list):
+            new_packet['entity_mentions'] = []
+            existing = new_packet['entity_mentions']
+        existing_refs = {
+            str(mention.get('mention_ref') or '')
+            for mention in existing
+            if isinstance(mention, dict)
+        }
+        for mention in prior_mentions:
+            if not isinstance(mention, dict):
+                continue
+            ref = str(mention.get('mention_ref') or '')
+            if ref and ref in existing_refs:
+                continue
+            surface = mention.get('surface_form')
+            if isinstance(surface, str) and surface.strip() and _present(surface, allow_token_match=False):
+                existing.append(mention)
+                if ref:
+                    existing_refs.add(ref)
+        if not existing:
+            new_packet.pop('entity_mentions', None)
+
+    prior_reliability = prior_packet.get('speaker_reliability')
+    if isinstance(prior_reliability, list) and prior_reliability:
+        existing = new_packet.get('speaker_reliability')
+        if not isinstance(existing, list):
+            new_packet['speaker_reliability'] = []
+            existing = new_packet['speaker_reliability']
+        existing_names = {
+            str(entry.get('npc_name') or '').lower()
+            for entry in existing
+            if isinstance(entry, dict)
+        }
+        for entry in prior_reliability:
+            if not isinstance(entry, dict):
+                continue
+            npc_name = str(entry.get('npc_name') or '')
+            npc_key = npc_name.lower()
+            if npc_key and npc_key in existing_names:
+                continue
+            if _present(npc_name):
+                existing.append(entry)
+                if npc_key:
+                    existing_names.add(npc_key)
+        if not existing:
+            new_packet.pop('speaker_reliability', None)
+
+    return new_packet
+
+
 def _looks_like_provider_tool_markup(raw_content):
     if not isinstance(raw_content, str):
         return False
@@ -4092,6 +4203,7 @@ def _run_session_dm_loop(
     spoiler_checker_retry_count = 0
     spoiler_checker_repair_attempted = False
     combat_handoff_retried = False
+    prior_resolver_packet = None
     guard_audits = {}
     combat_tracker = _session_dm_combat_tracker(hot_context)
     if not combat_tracker.get('campaign_id'):
@@ -4214,6 +4326,22 @@ def _run_session_dm_loop(
         finalizer_decision, finalizer_violation = _session_dm_finalizer_decision_from_tool_calls(tool_calls)
         if finalizer_violation:
             tool_calls = []
+        if isinstance(finalizer_decision, dict):
+            prior_rp = prior_resolver_packet
+            new_rp = finalizer_decision.get('resolver_packet')
+            if prior_rp is not None:
+                merged_rp = _merge_resolver_packet_across_retry(
+                    prior_rp,
+                    new_rp,
+                    finalizer_decision.get('content', ''),
+                )
+                if merged_rp:
+                    finalizer_decision['resolver_packet'] = merged_rp
+                    prior_resolver_packet = merged_rp
+                else:
+                    prior_resolver_packet = new_rp if isinstance(new_rp, dict) else None
+            else:
+                prior_resolver_packet = new_rp if isinstance(new_rp, dict) else None
         if finalizer_decision is not None or not tool_calls or tool_round >= max_tool_rounds:
             if on_status_change:
                 on_status_change({"step": "guard_check"})

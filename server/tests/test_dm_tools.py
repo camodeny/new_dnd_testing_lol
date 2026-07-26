@@ -4130,6 +4130,194 @@ class DmToolsTest(unittest.TestCase):
         )
         self.assertEqual(executed, [('search_campaign_memory', {'query': 'burned symbol infernal'})])
 
+    def test_speaker_reliability_survives_private_output_guard_retry(self):
+        hot_context = {
+            'protected_player_characters': [],
+            'private_output_terms': ['Crimson Veil'],
+            'private_spoiler_items': [],
+        }
+
+        first_response = _normalized_from_raw({
+            'choices': [{
+                'message': {
+                    'content': '',
+                    'tool_calls': [{
+                        'id': 'call_first',
+                        'function': {
+                            'name': 'talk_to_player',
+                            'arguments': json.dumps({
+                                'content': 'The Crimson Veil watches. <npc target="Brother Orin">I was just a diver.</npc>',
+                                'commit_action_ids': [],
+                                'resolver_packet': {
+                                    'speaker_reliability': [
+                                        {
+                                            'npc_name': 'Brother Orin',
+                                            'reliability': 'unreliable_cover',
+                                            'reason': 'covering for true allegiance',
+                                        },
+                                    ],
+                                },
+                            }),
+                        },
+                    }],
+                },
+            }],
+        })
+        second_response = _normalized_from_raw(dm_talk_tool_response(
+            '<npc target="Brother Orin">Trust me, I was only a diver.</npc>'
+        ))
+
+        with patch('openrouter._post_chat_normalized', side_effect=[first_response, second_response]) as post_chat:
+            result = get_session_dm_response_with_tools(
+                hot_context,
+                [],
+                [],
+                lambda *_args, **_kwargs: {},
+                max_tool_rounds=0,
+            )
+
+        self.assertEqual(result['mode'], 'speak')
+        self.assertEqual(
+            result['content'],
+            '<npc target="Brother Orin">Trust me, I was only a diver.</npc>',
+        )
+        self.assertIn('resolver_packet', result)
+        self.assertIn('speaker_reliability', result['resolver_packet'])
+        names = [entry['npc_name'] for entry in result['resolver_packet']['speaker_reliability']]
+        self.assertEqual(names, ['Brother Orin'])
+        self.assertEqual(
+            result['resolver_packet']['speaker_reliability'][0]['reliability'],
+            'unreliable_cover',
+        )
+        self.assertEqual(post_chat.call_count, 2)
+
+    def test_speaker_reliability_dropped_when_npc_no_longer_in_retry_reply(self):
+        hot_context = {
+            'protected_player_characters': [],
+            'private_output_terms': ['Crimson Veil'],
+            'private_spoiler_items': [],
+        }
+
+        first_response = _normalized_from_raw({
+            'choices': [{
+                'message': {
+                    'content': '',
+                    'tool_calls': [{
+                        'id': 'call_first',
+                        'function': {
+                            'name': 'talk_to_player',
+                            'arguments': json.dumps({
+                                'content': 'The Crimson Veil watches. <npc target="Brother Orin">I was just a diver.</npc>',
+                                'commit_action_ids': [],
+                                'resolver_packet': {
+                                    'speaker_reliability': [
+                                        {
+                                            'npc_name': 'Brother Orin',
+                                            'reliability': 'unreliable_cover',
+                                            'reason': 'covering for true allegiance',
+                                        },
+                                    ],
+                                },
+                            }),
+                        },
+                    }],
+                },
+            }],
+        })
+        second_response = _normalized_from_raw(dm_talk_tool_response(
+            'The party moves on, leaving the monk behind.'
+        ))
+
+        with patch('openrouter._post_chat_normalized', side_effect=[first_response, second_response]):
+            result = get_session_dm_response_with_tools(
+                hot_context,
+                [],
+                [],
+                lambda *_args, **_kwargs: {},
+                max_tool_rounds=0,
+            )
+
+        self.assertEqual(result['mode'], 'speak')
+        self.assertEqual(result['content'], 'The party moves on, leaving the monk behind.')
+        if 'resolver_packet' in result:
+            self.assertNotIn('speaker_reliability', result['resolver_packet'])
+
+    def test_speaker_reliability_new_entry_wins_over_carried_forward(self):
+        hot_context = {
+            'protected_player_characters': [],
+            'private_output_terms': ['Crimson Veil'],
+            'private_spoiler_items': [],
+        }
+
+        first_response = _normalized_from_raw({
+            'choices': [{
+                'message': {
+                    'content': '',
+                    'tool_calls': [{
+                        'id': 'call_first',
+                        'function': {
+                            'name': 'talk_to_player',
+                            'arguments': json.dumps({
+                                'content': 'The Crimson Veil watches. <npc target="Brother Orin">I was just a diver.</npc>',
+                                'commit_action_ids': [],
+                                'resolver_packet': {
+                                    'speaker_reliability': [
+                                        {
+                                            'npc_name': 'Brother Orin',
+                                            'reliability': 'unreliable_cover',
+                                            'reason': 'covering for true allegiance',
+                                        },
+                                    ],
+                                },
+                            }),
+                        },
+                    }],
+                },
+            }],
+        })
+        second_response = _normalized_from_raw({
+            'choices': [{
+                'message': {
+                    'content': '',
+                    'tool_calls': [{
+                        'id': 'call_second',
+                        'function': {
+                            'name': 'talk_to_player',
+                            'arguments': json.dumps({
+                                'content': '<npc target="Brother Orin">Trust me, I was only a diver.</npc>',
+                                'commit_action_ids': [],
+                                'resolver_packet': {
+                                    'speaker_reliability': [
+                                        {
+                                            'npc_name': 'Brother Orin',
+                                            'reliability': 'unreliable_exaggeration',
+                                            'reason': 'DM refined reason on retry',
+                                        },
+                                    ],
+                                },
+                            }),
+                        },
+                    }],
+                },
+            }],
+        })
+
+        with patch('openrouter._post_chat_normalized', side_effect=[first_response, second_response]):
+            result = get_session_dm_response_with_tools(
+                hot_context,
+                [],
+                [],
+                lambda *_args, **_kwargs: {},
+                max_tool_rounds=0,
+            )
+
+        self.assertEqual(result['mode'], 'speak')
+        self.assertEqual(len(result['resolver_packet']['speaker_reliability']), 1)
+        entry = result['resolver_packet']['speaker_reliability'][0]
+        self.assertEqual(entry['npc_name'], 'Brother Orin')
+        self.assertEqual(entry['reliability'], 'unreliable_exaggeration')
+        self.assertEqual(entry['reason'], 'DM refined reason on retry')
+
     def test_spoiler_checker_blocks_repeated_semantic_leak(self):
         hot_context = {
             'protected_player_characters': [],

@@ -11,6 +11,7 @@ sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), '..')
 from openrouter import (
     _assistant_tool_message,
     _session_dm_finalizer_decision_from_tool_calls,
+    _merge_resolver_packet_across_retry,
     _provider_request_payload_options,
     _json_error_excerpt,
     _json_loads_with_error,
@@ -1278,6 +1279,148 @@ class TalkToPlayerSpeakerReliabilityTest(unittest.TestCase):
         ])
         self.assertIsNone(err)
         self.assertNotIn('resolver_packet', decision)
+
+
+class ResolverPacketMergeAcrossRetryTest(unittest.TestCase):
+    """The DM retry loop discards a candidate finalizer when a guard fires
+    and reruns the model with a guard reminder. The replacement finalizer
+    may omit optional hidden metadata that the prior attempt included,
+    silently dropping the DM's epistemic annotations (e.g. speaker_reliability).
+
+    The merge helper preserves that metadata across retries and filters
+    retained entries to entities / NPCs still present in the new visible reply.
+    """
+
+    def test_carry_forward_speaker_reliability_when_new_packet_omits_it(self):
+        prior = {
+            'speaker_reliability': [
+                {'npc_name': 'Brother Orin', 'reliability': 'unreliable_cover', 'reason': 'covering'},
+            ],
+        }
+        merged = _merge_resolver_packet_across_retry(prior, None, '<npc target="Brother Orin">I was just a diver.</npc>')
+        self.assertIn('speaker_reliability', merged)
+        self.assertEqual(len(merged['speaker_reliability']), 1)
+        self.assertEqual(merged['speaker_reliability'][0]['npc_name'], 'Brother Orin')
+        self.assertEqual(merged['speaker_reliability'][0]['reliability'], 'unreliable_cover')
+
+    def test_carry_forward_entity_mentions_when_new_packet_omits_them(self):
+        prior = {
+            'entity_mentions': [
+                {'mention_ref': 'the_stranger', 'surface_form': 'the stranger', 'identity_status': 'known_hidden', 'visibility': 'dm_private'},
+            ],
+        }
+        merged = _merge_resolver_packet_across_retry(
+            prior,
+            None,
+            'You see the stranger across the room.',
+        )
+        self.assertIn('entity_mentions', merged)
+        self.assertEqual(len(merged['entity_mentions']), 1)
+        self.assertEqual(merged['entity_mentions'][0]['mention_ref'], 'the_stranger')
+
+    def test_drop_carried_forward_entry_when_npc_no_longer_in_reply(self):
+        prior = {
+            'speaker_reliability': [
+                {'npc_name': 'Brother Orin', 'reliability': 'unreliable_cover', 'reason': 'covering'},
+            ],
+        }
+        merged = _merge_resolver_packet_across_retry(prior, None, 'The party moves on without him.')
+        self.assertNotIn('speaker_reliability', merged)
+
+    def test_drop_carried_forward_mention_when_surface_form_no_longer_in_reply(self):
+        prior = {
+            'entity_mentions': [
+                {'mention_ref': 'the_stranger', 'surface_form': 'the stranger', 'identity_status': 'known_hidden', 'visibility': 'dm_private'},
+            ],
+        }
+        merged = _merge_resolver_packet_across_retry(prior, None, 'A new arrival greets the party.')
+        self.assertNotIn('entity_mentions', merged)
+
+    def test_new_packet_takes_precedence_over_prior(self):
+        prior = {
+            'speaker_reliability': [
+                {'npc_name': 'Brother Orin', 'reliability': 'unreliable_cover', 'reason': 'prior reason'},
+            ],
+        }
+        new = {
+            'speaker_reliability': [
+                {'npc_name': 'Brother Orin', 'reliability': 'unreliable_exaggeration', 'reason': 'new reason'},
+            ],
+        }
+        merged = _merge_resolver_packet_across_retry(
+            prior,
+            new,
+            '<npc target="Brother Orin">Trust me.</npc>',
+        )
+        self.assertEqual(len(merged['speaker_reliability']), 1)
+        self.assertEqual(merged['speaker_reliability'][0]['reason'], 'new reason')
+        self.assertEqual(merged['speaker_reliability'][0]['reliability'], 'unreliable_exaggeration')
+
+    def test_merge_combines_distinct_entries(self):
+        prior = {
+            'speaker_reliability': [
+                {'npc_name': 'Brother Orin', 'reliability': 'unreliable_cover', 'reason': 'covering'},
+            ],
+        }
+        new = {
+            'speaker_reliability': [
+                {'npc_name': 'Lady Vex', 'reliability': 'unreliable_omission', 'reason': 'omits key fact'},
+            ],
+        }
+        merged = _merge_resolver_packet_across_retry(
+            prior,
+            new,
+            '<npc target="Brother Orin">I was just a diver.</npc> <npc target="Lady Vex">It was a fair trade.</npc>',
+        )
+        names = {entry['npc_name'] for entry in merged['speaker_reliability']}
+        self.assertEqual(names, {'Brother Orin', 'Lady Vex'})
+
+    def test_no_prior_returns_new_packet_unchanged(self):
+        new = {'speaker_reliability': [{'npc_name': 'Orin', 'reliability': 'unreliable_cover'}]}
+        merged = _merge_resolver_packet_across_retry(None, new, 'Anything.')
+        self.assertEqual(merged, new)
+
+    def test_no_new_and_no_prior_returns_empty(self):
+        merged = _merge_resolver_packet_across_retry(None, None, 'Anything.')
+        self.assertEqual(merged, {})
+
+    def test_partial_new_packet_fills_missing_subkey(self):
+        prior = {
+            'speaker_reliability': [
+                {'npc_name': 'Brother Orin', 'reliability': 'unreliable_cover', 'reason': 'covering'},
+            ],
+            'entity_mentions': [
+                {'mention_ref': 'the_stranger', 'surface_form': 'the stranger', 'identity_status': 'known_hidden', 'visibility': 'dm_private'},
+            ],
+        }
+        new = {
+            'entity_mentions': [
+                {'mention_ref': 'other_figure', 'surface_form': 'the masked figure', 'identity_status': 'known_hidden', 'visibility': 'dm_private'},
+            ],
+        }
+        merged = _merge_resolver_packet_across_retry(
+            prior,
+            new,
+            '<npc target="Brother Orin">Trust me.</npc> The stranger and the masked figure watch from the corner.',
+        )
+        self.assertEqual(len(merged['speaker_reliability']), 1)
+        self.assertEqual(merged['speaker_reliability'][0]['npc_name'], 'Brother Orin')
+        mention_refs = {m['mention_ref'] for m in merged['entity_mentions']}
+        self.assertEqual(mention_refs, {'other_figure', 'the_stranger'})
+
+    def test_match_against_npc_tag_target(self):
+        prior = {
+            'speaker_reliability': [
+                {'npc_name': 'Brother Orin', 'reliability': 'unreliable_cover', 'reason': 'covering'},
+            ],
+        }
+        merged = _merge_resolver_packet_across_retry(
+            prior,
+            None,
+            'The mirror monk speaks: <npc target="Orin">I was just a diver.</npc>',
+        )
+        self.assertEqual(len(merged['speaker_reliability']), 1)
+        self.assertEqual(merged['speaker_reliability'][0]['npc_name'], 'Brother Orin')
 
 
 if __name__ == '__main__':
