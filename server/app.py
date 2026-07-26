@@ -407,6 +407,25 @@ def ensure_lightweight_schema():
         db.session.execute(text('CREATE INDEX ix_campaign_resolver_packets_campaign_id ON campaign_resolver_packets (campaign_id)'))
         db.session.execute(text('CREATE INDEX ix_campaign_resolver_packets_dm_message_id ON campaign_resolver_packets (dm_message_id)'))
 
+    response_parts_columns = table_columns('campaign_dm_response_parts')
+    if not response_parts_columns:
+        db.session.execute(text('''
+            CREATE TABLE campaign_dm_response_parts (
+                id INTEGER NOT NULL PRIMARY KEY AUTOINCREMENT,
+                campaign_id INTEGER NOT NULL,
+                session_id INTEGER,
+                dm_message_id INTEGER NOT NULL,
+                turn_id VARCHAR(100),
+                parts_json JSON NOT NULL,
+                accepted_at DATETIME NOT NULL,
+                FOREIGN KEY(campaign_id) REFERENCES campaign (id),
+                FOREIGN KEY(session_id) REFERENCES campaign_sessions (id),
+                FOREIGN KEY(dm_message_id) REFERENCES session_messages (id)
+            )
+        '''))
+        db.session.execute(text('CREATE INDEX ix_campaign_dm_response_parts_campaign_id ON campaign_dm_response_parts (campaign_id)'))
+        db.session.execute(text('CREATE INDEX ix_campaign_dm_response_parts_dm_message_id ON campaign_dm_response_parts (dm_message_id)'))
+
     clarification_columns = table_columns('campaign_clarifications')
     if not clarification_columns:
         db.session.execute(text('''
@@ -544,4 +563,3 @@ if __name__ == '__main__':
     port = int(os.environ.get('PORT', 5889))
     debug = os.environ.get('FLASK_DEBUG', 'true').lower() == 'true'
     app.run(debug=debug, host='0.0.0.0', port=port)
-

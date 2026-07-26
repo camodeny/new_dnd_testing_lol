@@ -11,6 +11,7 @@ from dotenv import load_dotenv
 import llm_providers
 from llm_providers import LLMProviderAdapter, ProviderError, ProviderRequest, execute_chat, provider_registry, stream_chat
 from services.audit_service import log_audit_event, log_model_error, log_model_request, log_model_response
+from services.dm_response_parts import normalize_response_parts, render_visible_response_parts
 
 load_dotenv()
 
@@ -202,11 +203,11 @@ SESSION_TOOL_PROMPT = (
     "them as objective truth. If a reply would reinterpret an established public lead, preserve uncertainty "
     "and avoid replacing prior committed facts unless the fiction clearly earns it. "
     "protected_player_characters and current_player_character; obey those boundaries exactly. "
-    "For the final turn decision, call exactly one finalization tool: use talk_to_player with visible player-facing content "
+    "For the final turn decision, call exactly one finalization tool: use talk_to_player with ordered structured response parts "
     "when the DM should send a visible reply, or call stay_silent with a short reason when the DM should not "
     "send anything. Do not mix a finalization tool call with other tools in the same assistant message. "
     "Do not send the final visible reply as plain assistant text. "
-    "When finalizing with talk_to_player, always include commit_action_ids. Select only pending action IDs whose durable mutation should commit with this exact reply, or use an empty array. "
+    "Each talk_to_player part is narration or npc_dialogue. NPC dialogue requires target and content; use optional dm_private_context only for internal memory guidance. Never put private context in visible content. Always include commit_action_ids. Select only pending action IDs whose durable mutation should commit with this exact reply, or use an empty array. "
     "Do not send handoff prompts such as 'How do you respond?' for ordinary PC-to-PC conversation."
 )
 
@@ -260,7 +261,7 @@ SESSION_MEMORY_EXTRACTOR_SYSTEM_PROMPT = (
     "Write a fresh running_summary that cleanly replaces the old one. "
     "Do not append fragments to the prior summary. Rewrite the current durable state after the latest visible exchange in one compact paragraph. "
     "Additionally, extract or update the structured memory_anchors representing the current session state: current_goal (string or null), current_scene (string or null), open_clues (array of strings), unresolved_questions (array of strings), npc_observations (array of strings), and recent_offers_promises (array of strings). Do not append fragments; completely rewrite or prune these anchors to reflect the current state. "
-    "Extract candidate scene updates, durable fact claims, entity upserts, relation upserts, NPC updates, and event records from the visible exchange. "
+    "The latest_dm_response_parts are ordered accepted segments. Each segment's dm_private_context is authoritative internal guidance for interpreting exactly that segment; it can explain a lie, cover story, omission, misconception, motive, or canonical truth. Never let a visible claim overwrite conflicting established canon when its associated private context says otherwise. Keep segment contexts independent: one speaker may be truthful in one part and deceptive in another. Extract candidate scene updates, durable fact claims, entity upserts, relation upserts, NPC updates, and event records from the exchange. "
     "Do not invent canonical ids. If a name is not already a known id in the prompt, preserve it as a raw label/ref for later resolution. "
     "Scene updates may include location_id, location_name, time_of_day, active_npc_ids, departed_npc_ids, and immediate_tension. "
     "Claims must use source_surface of visible_transcript, hidden_state, or inferred. "
@@ -275,7 +276,7 @@ SESSION_MEMORY_EXTRACTOR_SYSTEM_PROMPT = (
 
 SESSION_MEMORY_RESOLVER_SYSTEM_PROMPT = (
     "You are the resolver stage of a D&D session memory writer. "
-    "Use read-only tools to resolve scene, entity, and fact references before any durable write is compiled. "
+    "Use read-only tools to resolve scene, entity, and fact references before any durable write is compiled. Treat dm_private_context paired with a response part as authoritative interpretation for that exact visible part, especially when it conflicts with a spoken claim. "
     "Never invent ids. If you cannot resolve a reference with confidence, return it in unresolved_items instead of mutating memory. "
     "Prefer get_entity_candidates, get_scene_candidates, get_fact_candidates, and search_campaign_memory before broad raw-state tools. "
     "Use get_world_state, get_npcs, get_clocks, or transcript tools only when narrower tools are insufficient. "
@@ -1238,19 +1239,17 @@ def normalize_session_dm_turn_decision(raw_decision):
             'reason': str(data.get('reason') or 'The DM intentionally stayed silent.').strip(),
         }
 
-    content = data.get('content')
-    if content is None:
-        content = data.get('message')
-    if content is None:
-        content = data.get('visible_message')
+    parts = data.get('parts')
+    try:
+        parts = normalize_response_parts(parts)
+    except ValueError:
+        parts = []
     result = {
         'mode': 'speak',
-        'content': str(content or '').strip(),
+        'content': render_visible_response_parts(parts) if parts else '',
+        'parts': parts,
         'commit_action_ids': data.get('commit_action_ids') if isinstance(data.get('commit_action_ids'), list) else None,
     }
-    rp = data.get('resolver_packet')
-    if isinstance(rp, dict):
-        result['resolver_packet'] = rp
     return result
 
 
@@ -1260,30 +1259,30 @@ SESSION_DM_FINALIZER_TOOLS = [
         'type': 'function',
         'function': {
             'name': 'talk_to_player',
-            'description': 'Finalize the DM turn by sending one player-visible reply. Put only player-facing visible content in content and explicitly select which pending narrative actions should commit. When the DM has deliberately established hidden-canon identity for a described entity, include a resolver_packet with entity_mentions.',
+            'description': 'Finalize the DM turn with ordered response parts. The server renders player-visible content. dm_private_context is internal-only guidance for interpreting that exact part and is never sent to players.',
             'parameters': {
                 'type': 'object',
-                'required': ['content', 'commit_action_ids'],
+                'required': ['parts', 'commit_action_ids'],
                 'properties': {
-                    'content': {
-                        'type': 'string',
-                        'description': 'Visible DM reply for the player, using only valid visible-message syntax.',
+                    'parts': {
+                        'type': 'array',
+                        'minItems': 1,
+                        'description': 'Ordered visible response segments with their exact optional DM-private interpretation.',
+                        'items': {
+                            'type': 'object',
+                            'required': ['type', 'content'],
+                            'properties': {
+                                'type': {'type': 'string', 'enum': ['narration', 'npc_dialogue']},
+                                'content': {'type': 'string', 'description': 'Player-visible words for this part.'},
+                                'target': {'type': 'string', 'description': 'Required public speaker reference when type is npc_dialogue.'},
+                                'dm_private_context': {'type': 'string', 'description': 'Optional unrestricted internal guidance for memory systems. Never player-visible.'},
+                            },
+                        },
                     },
                     'commit_action_ids': {
                         'type': 'array',
                         'items': {'type': 'string'},
                         'description': 'Pending action IDs to commit with this reply. Use [] when no pending action should commit.',
-                    },
-                    'resolver_packet': {
-                        'type': 'object',
-                        'description': 'Optional. When the DM has deliberately established a hidden-canon identity, include entity_mentions with mention_ref, surface_form, identity_status, canonical_id, public_name, and visibility.',
-                        'properties': {
-                            'entity_mentions': {
-                                'type': 'array',
-                                'items': {'type': 'object'},
-                                'description': 'List of entity identity resolutions the DM is intentionally committing as hidden canon.',
-                            },
-                        },
                     },
                 },
             },
@@ -1339,14 +1338,11 @@ def _session_dm_finalizer_decision_from_tool_calls(tool_calls):
                 'kind': 'missing_commit_action_ids',
                 'detail': 'talk_to_player must include commit_action_ids, using [] when no pending action should commit.',
             }
-        decision = {
-            'mode': 'speak',
-            'content': str(args.get('content') or '').strip(),
-            'commit_action_ids': args.get('commit_action_ids'),
-        }
-        rp = args.get('resolver_packet')
-        if isinstance(rp, dict) and isinstance(rp.get('entity_mentions'), list):
-            decision['resolver_packet'] = rp
+        try:
+            parts = normalize_response_parts(args.get('parts'))
+        except ValueError as err:
+            return None, {'kind': 'invalid_response_parts', 'detail': str(err)}
+        decision = {'mode': 'speak', 'content': render_visible_response_parts(parts), 'parts': parts, 'commit_action_ids': args.get('commit_action_ids')}
         return decision, None
     return {
         'mode': 'silent',
@@ -3702,6 +3698,7 @@ def build_session_memory_extractor_messages(memory_context):
                 'relevant_memory': compact.get('relevant_memory'),
                 'latest_player_message': compact.get('latest_player_message'),
                 'latest_dm_message': compact.get('latest_dm_message'),
+                'latest_dm_response_parts': compact.get('latest_dm_response_parts'),
                 'return_shape': {
                     'running_summary': 'fresh compact replacement summary for the session after this turn',
                     'memory_anchors': {
@@ -3819,6 +3816,7 @@ def build_session_memory_resolver_messages(memory_context, extracted):
                 'current_scene': compact.get('current_scene'),
                 'latest_player_message': compact.get('latest_player_message'),
                 'latest_dm_message': compact.get('latest_dm_message'),
+                'latest_dm_response_parts': compact.get('latest_dm_response_parts'),
                 'extracted_memory_candidates': extracted,
                 'available_tools': [
                     'get_running_summary',
@@ -4056,7 +4054,6 @@ def _run_session_dm_loop(
 
     tool_round = 0
     finalizer_contract_retry_count = 0
-    last_substantive_finalizer_draft = ''
     combat_batch_retry_count = 0
     combat_batch_force_tools = False
     format_retry_count = 0
@@ -4195,11 +4192,6 @@ def _run_session_dm_loop(
             if on_status_change:
                 on_status_change({"step": "guard_check"})
             raw_content = message.get('content') or ''
-            if (
-                str(raw_content).strip()
-                and not _looks_like_provider_tool_markup(raw_content)
-            ):
-                last_substantive_finalizer_draft = str(raw_content).strip()
             if finalizer_decision is not None:
                 decision = normalize_session_dm_turn_decision(finalizer_decision)
                 raw_content = json.dumps(finalizer_decision, ensure_ascii=False)
@@ -4208,17 +4200,6 @@ def _run_session_dm_loop(
                 finalizer_contract_violation = finalizer_violation
             else:
                 finalizer_contract_violation = _session_dm_finalizer_contract_violation(raw_content)
-                if (
-                    finalizer_contract_violation
-                    and finalizer_contract_violation.get('kind') == 'missing_finalizer_tool_call'
-                    and str(raw_content or '').strip()
-                    and not action_buffer['actions']
-                ):
-                    decision = {
-                        'mode': 'speak',
-                        'content': str(raw_content or '').strip(),
-                    }
-                    finalizer_contract_violation = None
             if finalizer_contract_violation and finalizer_contract_retry_count < 2:
                 if on_status_change:
                     on_status_change({"step": "revising", "violations": {"type": "finalizer_contract", "details": finalizer_contract_violation}})
@@ -4249,18 +4230,10 @@ def _run_session_dm_loop(
                 continue
             if finalizer_contract_violation:
                 rollback_combat_if_needed('invalid_final_output', {'finalizer_contract_violation': finalizer_contract_violation})
-                if last_substantive_finalizer_draft:
-                    action_buffer['actions'].clear()
-                    decision = {
-                        'mode': 'speak',
-                        'content': last_substantive_finalizer_draft,
-                    }
-                    finalizer_contract_violation = None
-                else:
-                    return {
-                        'mode': 'silent',
-                        'reason': 'The DM response did not produce a valid finalizer tool call.',
-                    }
+                return {
+                    'mode': 'silent',
+                    'reason': 'The DM response did not produce a valid finalizer tool call.',
+                }
             combat_batch_violation = _session_dm_combat_batch_violation(decision, combat_tracker)
             if combat_batch_violation and combat_batch_retry_count < 2 and tool_round < max_tool_rounds:
                 if on_status_change:
@@ -4336,6 +4309,8 @@ def _run_session_dm_loop(
                         hot_context,
                         audit_context=loop_audit,
                     )
+                    if any(part.get('dm_private_context') for part in decision.get('parts') or []):
+                        repaired_content = ''
                     format_retry_count += 1
                     if not repaired_content:
                         break
@@ -4345,6 +4320,11 @@ def _run_session_dm_loop(
                     decision = {
                         **decision,
                         'content': repaired_content,
+                        # A repair pass only returns visible text. Rebuild a complete
+                        # safe candidate only when there was no private association to lose.
+                        'parts': [{'type': 'narration', 'content': repaired_content}]
+                        if not any(part.get('dm_private_context') for part in decision.get('parts') or [])
+                        else decision.get('parts'),
                     }
                     format_violation = _session_dm_content_format_violation(content, loop_audit)
                 mechanics_check = (
@@ -4450,12 +4430,17 @@ def _run_session_dm_loop(
                         hot_context,
                         audit_context=loop_audit,
                     )
+                    if any(part.get('dm_private_context') for part in decision.get('parts') or []):
+                        repaired_content = ''
                     if repaired_content and repaired_content != content:
                         content = repaired_content
                         raw_content = repaired_content
                         decision = {
                             **decision,
                             'content': repaired_content,
+                            'parts': [{'type': 'narration', 'content': repaired_content}]
+                            if not any(part.get('dm_private_context') for part in decision.get('parts') or [])
+                            else decision.get('parts'),
                         }
                         continue
                 if (
@@ -4493,12 +4478,17 @@ def _run_session_dm_loop(
                         hot_context,
                         audit_context=loop_audit,
                     )
+                    if any(part.get('dm_private_context') for part in decision.get('parts') or []):
+                        repaired_content = ''
                     if repaired_content and repaired_content != content:
                         content = repaired_content
                         raw_content = repaired_content
                         decision = {
                             **decision,
                             'content': repaired_content,
+                            'parts': [{'type': 'narration', 'content': repaired_content}]
+                            if not any(part.get('dm_private_context') for part in decision.get('parts') or [])
+                            else decision.get('parts'),
                         }
                         continue
                 if (
@@ -4536,12 +4526,17 @@ def _run_session_dm_loop(
                         hot_context,
                         audit_context=loop_audit,
                     )
+                    if any(part.get('dm_private_context') for part in decision.get('parts') or []):
+                        repaired_content = ''
                     if repaired_content and repaired_content != content:
                         content = repaired_content
                         raw_content = repaired_content
                         decision = {
                             **decision,
                             'content': repaired_content,
+                            'parts': [{'type': 'narration', 'content': repaired_content}]
+                            if not any(part.get('dm_private_context') for part in decision.get('parts') or [])
+                            else decision.get('parts'),
                         }
                         continue
                 break
@@ -4918,13 +4913,10 @@ def _run_session_dm_loop(
                 }
             if base_audit.get('operation') == 'session_dm_response':
                 result = {**decision, '_pending_actions': list(action_buffer['actions'])}
-                rp = decision.get('resolver_packet')
-                if rp is not None:
-                    result['resolver_packet'] = rp
                 return result
             # Preserve the direct helper's historical public return shape; production callers
             # receive the action IDs through the session-DM operation result above.
-            return {key: value for key, value in decision.items() if key != 'commit_action_ids'}
+            return {key: value for key, value in decision.items() if key not in {'commit_action_ids', 'parts'}}
 
         messages.append(_assistant_tool_message(message))
         combat_batch_force_tools = False
@@ -5190,6 +5182,7 @@ def _session_memory_compact_context(memory_context):
         'all_active_clocks_completed': bool(memory_context.get('all_active_clocks_completed')),
         'latest_player_message': memory_context.get('latest_player_message'),
         'latest_dm_message': _memory_context_lookup(memory_context, 'latest_dm_message', 'latest_dm_response'),
+        'latest_dm_response_parts': memory_context.get('latest_dm_response_parts') if isinstance(memory_context.get('latest_dm_response_parts'), list) else [],
         'relevant_memory': relevant_memory,
     }
 

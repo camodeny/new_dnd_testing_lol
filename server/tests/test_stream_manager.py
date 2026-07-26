@@ -198,6 +198,7 @@ class StreamManagerTest(unittest.TestCase):
         mock_get_dm_response.return_value = {
             "mode": "speak",
             "content": "Greetings traveller!",
+            "parts": [{"type": "narration", "content": "Greetings traveller!"}],
             "commit_action_ids": [],
             "_pending_actions": [],
         }

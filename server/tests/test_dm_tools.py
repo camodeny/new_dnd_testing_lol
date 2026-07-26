@@ -20,6 +20,7 @@ from models import (
     Campaign,
     CampaignAuditEvent,
     CampaignClock,
+    CampaignDmResponseParts,
     CampaignMemoryEmbedding,
     CampaignMember,
     CampaignMonster,
@@ -53,6 +54,7 @@ from openrouter import (
     get_session_memory_patch,
     get_session_dm_response_with_tools,
     normalize_session_dm_turn_decision,
+    _session_dm_finalizer_decision_from_tool_calls,
 )
 from routes.dev import _agent_runs_from_stream, _audit_stream_entry, _chat_flow_payload
 from routes.sessions import sessions_bp
@@ -102,7 +104,10 @@ def synthetic_grid_png(size=256, cell=32, offset=0, blank=False):
     return buffer.getvalue()
 
 
-def dm_talk_tool_response(content):
+def dm_talk_tool_response(content, private_context=None):
+    part = {'type': 'narration', 'content': content}
+    if private_context is not None:
+        part['dm_private_context'] = private_context
     return {
         'choices': [{
             'message': {
@@ -111,7 +116,7 @@ def dm_talk_tool_response(content):
                     'id': 'call_final',
                     'function': {
                         'name': 'talk_to_player',
-                        'arguments': json.dumps({'content': content, 'commit_action_ids': []}),
+                        'arguments': json.dumps({'parts': [part], 'commit_action_ids': []}),
                     },
                 }],
             },
@@ -210,6 +215,51 @@ class DmToolsTest(unittest.TestCase):
             self.assertEqual(tool['type'], 'function')
             self.assertIn('parameters', tool['function'])
             self.assertEqual(tool['function']['parameters']['type'], 'object')
+
+    def test_finalizer_renders_npc_parts_without_leaking_private_context(self):
+        tool_call = {
+            'function': {
+                'name': 'talk_to_player',
+                'arguments': json.dumps({
+                    'parts': [
+                        {'type': 'narration', 'content': 'Rain rattles the shutters.'},
+                        {
+                            'type': 'npc_dialogue',
+                            'target': 'Brother Orin',
+                            'content': '"I was only a diver."',
+                            'dm_private_context': 'Deliberate cover story; his established allegiance and background remain canon.',
+                        },
+                    ],
+                    'commit_action_ids': [],
+                }),
+            },
+        }
+        decision, violation = _session_dm_finalizer_decision_from_tool_calls([tool_call])
+        self.assertIsNone(violation)
+        self.assertEqual(
+            decision['content'],
+            'Rain rattles the shutters.\n\n<npc target="Brother Orin">"I was only a diver."</npc>',
+        )
+        self.assertNotIn('cover story', decision['content'])
+        self.assertEqual(decision['parts'][1]['dm_private_context'], 'Deliberate cover story; his established allegiance and background remain canon.')
+
+    def test_commit_stores_private_parts_separately_from_visible_message(self):
+        player_message = SessionMessage(session_id=self.session.id, user_id=self.user.id, role='player', content='Who are you?')
+        db.session.add(player_message)
+        db.session.commit()
+        parts = [{
+            'type': 'npc_dialogue',
+            'target': 'Brother Orin',
+            'content': '"Only a diver."',
+            'dm_private_context': 'This is a cover story; do not replace his canonical identity.',
+        }]
+        dm_message, _proposals, _results = commit_accepted_dm_turn(
+            self.campaign, self.session, self.user, player_message.id, 'test:parts', 'test parts',
+            '<npc target="Brother Orin">"Only a diver."</npc>', [], {'actions': []}, parts,
+        )
+        self.assertNotIn('cover story', dm_message.content)
+        stored = CampaignDmResponseParts.query.filter_by(dm_message_id=dm_message.id).one()
+        self.assertEqual(stored.parts_json, parts)
 
     def test_ai_dm_tool_places_encounter_map_actors_and_creates_monsters(self):
         npc = NPCActor(
@@ -3003,7 +3053,7 @@ class DmToolsTest(unittest.TestCase):
                         'function': {
                             'name': 'talk_to_player',
                             'arguments': json.dumps({
-                                'content': '<npc target="Brenn">"Green lights by the old willow."</npc>',
+                                'parts': [{'type': 'npc_dialogue', 'target': 'Brenn', 'content': '"Green lights by the old willow."'}],
                                 'commit_action_ids': [],
                             }),
                         },
@@ -5587,6 +5637,7 @@ class DmToolsTest(unittest.TestCase):
             'The bell answers from the north tower.',
             ['pending_action_1'],
             action_buffer,
+            [{'type': 'narration', 'content': 'The bell answers from the north tower.'}],
         )
 
         self.assertIsNotNone(dm_message.id)
@@ -5642,6 +5693,7 @@ class DmToolsTest(unittest.TestCase):
             'You find a few loose coins.',
             [],
             action_buffer,
+            [{'type': 'narration', 'content': 'You find a few loose coins.'}],
         )
 
         self.assertEqual(proposals, [])
@@ -5680,6 +5732,7 @@ class DmToolsTest(unittest.TestCase):
             'The second purse contains a few more coins.',
             ['pending_action_1'],
             selected_buffer,
+            [{'type': 'narration', 'content': 'The second purse contains a few more coins.'}],
         )
         self.assertEqual(len(selected_proposals), 1)
         self.assertEqual(selected_proposals[0].message_id, selected_message.id)
@@ -5716,6 +5769,7 @@ class DmToolsTest(unittest.TestCase):
                     'This reply must never persist.',
                     ['pending_action_1'],
                     action_buffer,
+                    [{'type': 'narration', 'content': 'This reply must never persist.'}],
                 )
 
         self.assertEqual(WorldEvent.query.filter_by(campaign_id=self.campaign.id).count(), 0)
@@ -6056,7 +6110,7 @@ class DmToolsTest(unittest.TestCase):
         token = generate_token(self.user.id)
         client = self.app.test_client()
 
-        with patch('routes.sessions.get_session_dm_response_with_tools', return_value='The alley falls quiet.'), \
+        with patch('routes.sessions.get_session_dm_response_with_tools', return_value={'mode': 'speak', 'content': 'The alley falls quiet.', 'parts': [{'type': 'narration', 'content': 'The alley falls quiet.'}], 'commit_action_ids': []}), \
                 patch('routes.sessions.get_session_memory_patch', return_value={
                     'source_contract': 'compiled_session_memory_v2',
                     'running_summary': 'The alley fell quiet.',
@@ -6101,7 +6155,7 @@ class DmToolsTest(unittest.TestCase):
         token = generate_token(self.user.id)
         client = self.app.test_client()
 
-        with patch('routes.sessions.get_session_dm_response_with_tools', return_value='The alley falls quiet.'), \
+        with patch('routes.sessions.get_session_dm_response_with_tools', return_value={'mode': 'speak', 'content': 'The alley falls quiet.', 'parts': [{'type': 'narration', 'content': 'The alley falls quiet.'}], 'commit_action_ids': []}), \
                 patch('routes.sessions.get_session_memory_patch', return_value={
                     'source_contract': 'compiled_session_memory_v2',
                     'running_summary': 'The alley fell quiet.',
