@@ -676,12 +676,12 @@ class SessionMemoryIntegrityTest(unittest.TestCase):
         idx_alias = _index_prior_resolutions(prior_alias)
         self.assertIn('the grey-cloaked figure', idx_alias)
 
-    def test_committed_packet_read_errors_fail_closed(self):
+    def test_committed_response_parts_read_errors_fail_closed(self):
         from routes.sessions import _run_session_memory_update
         from unittest.mock import patch
         from models import CampaignAuditEvent
-        with patch('models.CampaignResolverPacket') as mock_packet_class:
-            mock_packet_class.query.filter_by.side_effect = Exception("DB Connection Refused")
+        with patch('models.CampaignDmResponseParts') as mock_parts_class:
+            mock_parts_class.query.filter_by.side_effect = Exception("DB Connection Refused")
             _run_session_memory_update(
                 campaign_id=self.campaign.id,
                 session_id=self.session.id,
@@ -699,7 +699,7 @@ class SessionMemoryIntegrityTest(unittest.TestCase):
             ).all()
             self.assertEqual(len(events), 1)
             payload = json.loads(events[0].payload) if events[0].payload else {}
-            self.assertEqual(payload.get('code'), 'packet_storage_read_error')
+            self.assertEqual(payload.get('code'), 'response_parts_storage_read_error')
 
     def test_clarification_answered_and_consumed_workflow(self):
         from models import CampaignClarification

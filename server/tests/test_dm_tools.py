@@ -1205,7 +1205,12 @@ class DmToolsTest(unittest.TestCase):
                 },
                 audit_context or {},
             )
-            return {'mode': 'speak', 'content': 'A gridded map appears on the table.'}
+            return {
+                'mode': 'speak',
+                'content': 'A gridded map appears on the table.',
+                'parts': [{'type': 'narration', 'content': 'A gridded map appears on the table.'}],
+                'commit_action_ids': [],
+            }
 
         token = generate_token(self.user.id)
         with tempfile.TemporaryDirectory() as temp_dir, \
@@ -2252,6 +2257,7 @@ class DmToolsTest(unittest.TestCase):
         self.assertEqual(result, {
             'mode': 'speak',
             'content': 'The rung shudders beneath you. The landing remains within reach, but the ladder is failing fast. What do you do?',
+            'parts': [{'type': 'narration', 'content': 'The rung shudders beneath you. The landing remains within reach, but the ladder is failing fast. What do you do?'}],
             'commit_action_ids': [],
             '_pending_actions': [],
         })
@@ -2598,6 +2604,7 @@ class DmToolsTest(unittest.TestCase):
         self.assertEqual(result, {
             'mode': 'speak',
             'content': 'The constable snaps her truncheon up as you rush in. Roll initiative.',
+            'parts': [{'type': 'narration', 'content': 'The constable snaps her truncheon up as you rush in. Roll initiative.'}],
             'commit_action_ids': [],
             '_pending_actions': [],
         })
@@ -2894,8 +2901,8 @@ class DmToolsTest(unittest.TestCase):
                 max_tool_rounds=0,
             )
 
-        self.assertEqual(result, {'mode': 'speak', 'content': draft})
-        self.assertEqual(post_chat.call_count, 1)
+        self.assertEqual(result, {'mode': 'silent', 'reason': 'The DM response did not produce a valid finalizer tool call.'})
+        self.assertEqual(post_chat.call_count, 3)
 
     def test_provider_tool_markup_retry_uses_fresh_rerun_output(self):
         hot_context = {
@@ -2936,9 +2943,9 @@ class DmToolsTest(unittest.TestCase):
                 max_tool_rounds=2,
             )
 
-        self.assertEqual(result, {'mode': 'speak', 'content': 'Plain text draft only.'})
-        self.assertEqual(post_chat.call_count, 1)
-        self.assertEqual(post_chat.call_args.kwargs['tool_choice'], 'auto')
+        self.assertEqual(result, {'mode': 'silent', 'reason': 'The DM response did not produce a valid finalizer tool call.'})
+        self.assertEqual(post_chat.call_count, 3)
+        self.assertEqual(post_chat.call_args.kwargs['tool_choice'], 'required')
 
     def test_plain_text_fallback_discards_staged_actions_and_preserves_visible_reply(self):
         hot_context = {
@@ -2978,7 +2985,7 @@ class DmToolsTest(unittest.TestCase):
                 max_tool_rounds=2,
             )
 
-        self.assertEqual(result, {'mode': 'speak', 'content': 'Last raw text.'})
+        self.assertEqual(result, {'mode': 'silent', 'reason': 'The DM response did not produce a valid finalizer tool call.'})
 
     def test_finalizer_contract_retry_still_rewrites_ooc_label(self):
         hot_context = {
@@ -3000,10 +3007,7 @@ class DmToolsTest(unittest.TestCase):
         self.assertEqual(result, {'mode': 'speak', 'content': 'Make a Technology check.'})
         self.assertEqual(post_chat.call_count, 2)
         repair_messages = post_chat.call_args_list[1].args[0]
-        self.assertIn('repair malformed visible Dungeon Master replies', repair_messages[0]['content'])
-        repair_payload = json.loads(repair_messages[1]['content'])
-        self.assertEqual(repair_payload['format_violation']['errors'][0]['kind'], 'disallowed_mode_label')
-        self.assertIn('*OOC*:', repair_payload['candidate_visible_dm_reply'])
+        self.assertIn('finalize the turn by calling exactly one', repair_messages[-1]['content'])
 
     def test_finalizer_contract_retry_reprompts_provider_tool_markup_with_specific_reminder(self):
         hot_context = {
@@ -3198,6 +3202,7 @@ class DmToolsTest(unittest.TestCase):
         self.assertEqual(result, {
             'mode': 'speak',
             'content': 'Rain slicks the old stones.',
+            'parts': [{'type': 'narration', 'content': 'Rain slicks the old stones.'}],
             'commit_action_ids': [],
             '_pending_actions': [],
         })
@@ -3239,6 +3244,7 @@ class DmToolsTest(unittest.TestCase):
         self.assertEqual(result, {
             'mode': 'speak',
             'content': 'Your AC is 15.',
+            'parts': [{'type': 'narration', 'content': 'Your AC is 15.'}],
             'commit_action_ids': [],
             '_pending_actions': [],
         })
@@ -5986,7 +5992,7 @@ class DmToolsTest(unittest.TestCase):
                 'no_change_explanations': [],
             }
 
-        with patch('routes.sessions.get_session_dm_response_with_tools', return_value='You break into a run toward the crypt road.'), \
+        with patch('routes.sessions.get_session_dm_response_with_tools', return_value={'mode': 'speak', 'content': 'You break into a run toward the crypt road.', 'parts': [{'type': 'narration', 'content': 'You break into a run toward the crypt road.'}], 'commit_action_ids': []}), \
                 patch('routes.sessions.get_session_memory_patch', return_value={
                     'source_contract': 'compiled_session_memory_v2',
                     'running_summary': 'The party pursued the robbers onto the crypt road.',
@@ -6026,7 +6032,7 @@ class DmToolsTest(unittest.TestCase):
             self.assertEqual(audit_context['parent_trace_id'].split(':')[0], 'session_dm')
             return {}
 
-        with patch('routes.sessions.get_session_dm_response_with_tools', return_value='Yes, you are in a party.') as dm_response, \
+        with patch('routes.sessions.get_session_dm_response_with_tools', return_value={'mode': 'speak', 'content': 'Yes, you are in a party.', 'parts': [{'type': 'narration', 'content': 'Yes, you are in a party.'}], 'commit_action_ids': []}) as dm_response, \
                 patch('routes.sessions.get_session_memory_patch', side_effect=memory_patch_side_effect) as memory_patch:
             response = client.post(
                 f'/api/sessions/{self.session.id}/messages',
@@ -6056,7 +6062,7 @@ class DmToolsTest(unittest.TestCase):
             'GEMINI_EMBEDDINGS_ENABLED': 'true',
             'GEMINI_API_KEY': 'test-key',
         }, clear=False), patch('services.embedding_service._post_embedding', side_effect=RuntimeError('timeout')), \
-                patch('routes.sessions.get_session_dm_response_with_tools', return_value='A bell rings across the docks.'), \
+                patch('routes.sessions.get_session_dm_response_with_tools', return_value={'mode': 'speak', 'content': 'A bell rings across the docks.', 'parts': [{'type': 'narration', 'content': 'A bell rings across the docks.'}], 'commit_action_ids': []}), \
                 patch('routes.sessions.get_session_memory_patch', return_value={
                     'source_contract': 'compiled_session_memory_v2',
                     'running_summary': 'A bell rang across the docks.',
