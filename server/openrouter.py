@@ -129,10 +129,9 @@ SYSTEM_PROMPT = (
     "<ic> text as the player character's spoken words or direct in-world action, and "
     "<ooc> text as table talk, intent, questions, or instructions from the player. "
     "When in character, narrate the story, describe scenes, play NPCs, and adjudicate "
-    "player actions. When speaking as a specific NPC, wrap only that NPC's spoken line "
-    "or performance in <npc target=\"NPC name\">...</npc>; leave narration outside the "
-    "NPC tag. Every <npc> tag must include target and must close with </npc>. Do not use "
-    "<ic>, <ooc>, HTML, XML, or any other angle-bracket tags in visible DM replies. "
+    "player actions. When speaking as a specific NPC, keep the speaker and spoken words distinct from narration; "
+    "the session finalizer supplies the speaker structurally. Do not author <npc>, <ic>, <ooc>, HTML, XML, or "
+    "any other angle-bracket tags in visible DM replies. "
     "Write visible replies in English only; do not emit stray non-English glyphs or mixed-language fragments. "
     + PC_CONTROL_POLICY + " "
     "Before drafting a visible reply, identify from context which characters are protected player characters, "
@@ -142,8 +141,8 @@ SYSTEM_PROMPT = (
     "character unless the player already supplied those exact words or actions. This includes short confirmations "
     "like \"okay,\" \"right,\" \"let's go,\" nods, thanks, sighs, and similar implied participation. If a protected "
     "player character response is needed, ask the player, hand off briefly, or stay silent. "
-    "When using <npc target=\"...\">...</npc>, the target must be a concrete in-world speaker reference grounded "
-    "in the transcript or memory. Never use placeholders or meta labels such as \"the speaker,\" \"speaker,\" "
+    "NPC speakers must use a concrete in-world reference grounded in the transcript or memory. Never use placeholders "
+    "or meta labels such as \"the speaker,\" \"speaker,\" "
     "\"NPC,\" \"someone,\" \"voice,\" \"figure,\" or vague pronouns as the target. If the true name is unrevealed, "
     "use the best public-facing descriptor already supported by context. If you cannot identify a concrete speaker "
     "reference with high confidence, do not invent one and do not write quoted NPC dialogue; paraphrase the "
@@ -1740,19 +1739,17 @@ def _session_dm_guard_retry_system_prompt(guard_name, details):
         )
     if guard_name == 'missing_npc_tag':
         return (
-            'Guard reminder: if you include clearly attributed NPC speech or performed utterances, use the required '
-            '<npc> wrapper. '
-            'If you include clearly attributed current NPC spoken lines or performed utterances, wrap them in '
-            '<npc target="NPC name">...</npc>, and leave narration outside the tag. '
-            'The <npc target="..."> value must be a concrete in-world speaker reference grounded in the transcript '
+            'Guard reminder: if you include clearly attributed NPC speech or performed utterances, use an npc_dialogue '
+            'part with a target and place narration in a separate narration part. Do not author <npc> markup. '
+            'The npc_dialogue target must be a concrete in-world speaker reference grounded in the transcript '
             'or memory, not a placeholder or meta label. Never use targets like "the speaker", "speaker", "NPC", '
             '"someone", "voice", or vague pronouns. '
             'If a prior guard reminder identified an unrevealed private term, do not use that private term '
-            'anywhere, including inside <npc target="...">. Use a public descriptor such as "old dockhand", '
+            'anywhere, including inside the npc_dialogue target. Use a public descriptor such as "old dockhand", '
             '"guard captain", or "hooded figure" as the target until the name is revealed through play. '
             'If you cannot identify a concrete speaker reference with high confidence, do not invent one and do not '
             'write quoted NPC dialogue; paraphrase the utterance in narration instead. '
-            'Do not use any other angle-bracket tags. Finalize with talk_to_player or stay_silent.'
+            'Finalize with talk_to_player(parts) or stay_silent.'
             + silent_ack
         )
     if guard_name == 'mechanical_resolution':
@@ -1787,12 +1784,12 @@ def _session_dm_guard_retry_system_prompt(guard_name, details):
         return (
             'Guard reminder: do not expose DM-private information that has not become visible through '
             f'play. Do not mention these private terms in the visible reply: {terms or "(none listed)"}. '
-            'This includes narration, quoted speech, labels, and <npc target="..."> attributes. '
-            'Use public descriptors instead of unrevealed names when wrapping NPC speech. '
+            'This includes narration, quoted speech, labels, and npc_dialogue targets. '
+            'Use public descriptors instead of unrevealed names in NPC dialogue targets. '
             'Do not route around this by having another NPC reveal or label the private term. '
             'If the latest player addressed a present NPC by public description, keep that NPC as the responder '
             'using the public descriptor; do not say that NPC vanished or left unless the transcript already established it. '
-            'Finalize with talk_to_player or stay_silent using spoiler-safe visible content.'
+            'Finalize with talk_to_player(parts) or stay_silent using spoiler-safe visible content.'
             + silent_ack
         )
     if guard_name == 'spoiler_checker':
@@ -1805,7 +1802,7 @@ def _session_dm_guard_retry_system_prompt(guard_name, details):
                 'Do not imply the witness has private obligations to the faction. '
                 'Show fear using only generic visible pressure: watchers, reprisals, danger, being named, vanishing, '
                 'or keeping their head down. Keep the latest addressed witness present unless the transcript says they left. '
-                'Use a public descriptor in <npc target="...">. Finalize with talk_to_player or stay_silent.'
+                'Use a public descriptor as the npc_dialogue target. Finalize with talk_to_player(parts) or stay_silent.'
                 + silent_ack
             )
         return (
@@ -4361,51 +4358,7 @@ def _run_session_dm_loop(
                     and not mechanical_violation and not canon_violation
                     else None
                 )
-                if allow_visible_string_repairs and violation and not pc_control_repair_attempted and not pc_control_retried:
-                    if on_status_change:
-                        on_status_change({"step": "revising", "violations": {"type": "pc_control", "details": violation}})
-                    if base_audit.get('campaign_id'):
-                        audit = guard_audit('pc_control_guard')
-                        log_audit_event(
-                            base_audit.get('campaign_id'),
-                            'pc_control_guard_retry',
-                            'Session DM response controlled a protected player character; sent candidate to a repair pass and will rerun with a guard reminder if needed.',
-                            {
-                                'operation': 'pc_control_guard',
-                                'violation': violation,
-                                'draft_response': raw_content,
-                                'repair_strategy': 'repair_pass_then_rerun',
-                            },
-                            source='session_dm.guard',
-                            actor=audit.get('actor'),
-                            trace_id=audit.get('trace_id'),
-                            parent_trace_id=audit.get('parent_trace_id'),
-                            trace_label=audit.get('trace_label'),
-                            audit_role='guard',
-                            commit=True,
-                        )
-                    pc_control_repair_attempted = True
-                    repaired_content = _repair_session_dm_visible_reply(
-                        content,
-                        'pc_control',
-                        violation,
-                        hot_context,
-                        audit_context=loop_audit,
-                    )
-                    if any(part.get('dm_private_context') for part in decision.get('parts') or []):
-                        repaired_content = ''
-                    if repaired_content and repaired_content != content:
-                        content = repaired_content
-                        raw_content = repaired_content
-                        decision = {
-                            **decision,
-                            'content': repaired_content,
-                            'parts': [{'type': 'narration', 'content': repaired_content}]
-                            if not any(part.get('dm_private_context') for part in decision.get('parts') or [])
-                            else decision.get('parts'),
-                        }
-                        continue
-                if allow_visible_string_repairs and (
+                if False and (
                     canon_violation
                     and canon_checker_retry_count < 3
                     and not canon_checker_repair_attempted
@@ -4453,7 +4406,7 @@ def _run_session_dm_loop(
                             else decision.get('parts'),
                         }
                         continue
-                if allow_visible_string_repairs and (
+                if False and (
                     not spoiler_check.get('safe', True)
                     and spoiler_checker_retry_count < 3
                     and not spoiler_checker_repair_attempted

@@ -56,6 +56,8 @@ from openrouter import (
     get_session_dm_response_with_tools,
     normalize_session_dm_turn_decision,
     _session_dm_finalizer_decision_from_tool_calls,
+    build_session_memory_extractor_messages,
+    build_session_memory_resolver_messages,
 )
 from routes.dev import _agent_runs_from_stream, _audit_stream_entry, _chat_flow_payload
 from routes.sessions import sessions_bp
@@ -287,6 +289,39 @@ class DmToolsTest(unittest.TestCase):
         self.assertNotIn('cover story', dm_message.content)
         stored = CampaignDmResponseParts.query.filter_by(dm_message_id=dm_message.id).one()
         self.assertEqual(stored.parts_json, parts)
+
+    def test_memory_prompts_keep_orin_and_mixed_segment_context_paired(self):
+        parts = [
+            {'type': 'npc_dialogue', 'target': 'Brother Orin', 'content': '"I was only a diver."',
+             'dm_private_context': 'Deliberate cover story; do not overwrite Orin identity or background.'},
+            {'type': 'npc_dialogue', 'target': 'Brother Orin', 'content': '"The tide turns at dawn."',
+             'dm_private_context': 'Truthful operational detail.'},
+        ]
+        memory_context = {
+            'latest_player_message': 'Who are you?',
+            'latest_dm_message': '<npc target="Brother Orin">"I was only a diver."</npc>\n\n<npc target="Brother Orin">"The tide turns at dawn."</npc>',
+            'latest_dm_response_parts': parts,
+            'hot_context': {},
+            'prior_memory_anchors': {},
+            'relevant_memory': {},
+        }
+        extractor_payload = json.loads(build_session_memory_extractor_messages(memory_context)[1]['content'])
+        resolver_payload = json.loads(build_session_memory_resolver_messages(memory_context, {})[1]['content'])
+        self.assertEqual(extractor_payload['latest_dm_response_parts'], parts)
+        self.assertEqual(resolver_payload['latest_dm_response_parts'], parts)
+        self.assertIn('do not overwrite Orin identity', extractor_payload['latest_dm_response_parts'][0]['dm_private_context'])
+        self.assertEqual(resolver_payload['latest_dm_response_parts'][1]['dm_private_context'], 'Truthful operational detail.')
+
+    def test_commit_rejects_visible_content_that_does_not_match_parts(self):
+        player_message = SessionMessage(session_id=self.session.id, user_id=self.user.id, role='player', content='Hello')
+        db.session.add(player_message)
+        db.session.commit()
+        with self.assertRaisesRegex(ValueError, 'server-rendered response parts'):
+            commit_accepted_dm_turn(
+                self.campaign, self.session, self.user, player_message.id, 'test:mismatch', 'test mismatch',
+                'Different visible text.', [], {'actions': []},
+                [{'type': 'narration', 'content': 'Canonical visible text.'}],
+            )
 
     def test_ai_dm_tool_places_encounter_map_actors_and_creates_monsters(self):
         npc = NPCActor(
