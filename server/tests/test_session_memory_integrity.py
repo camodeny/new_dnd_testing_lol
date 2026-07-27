@@ -676,12 +676,12 @@ class SessionMemoryIntegrityTest(unittest.TestCase):
         idx_alias = _index_prior_resolutions(prior_alias)
         self.assertIn('the grey-cloaked figure', idx_alias)
 
-    def test_committed_packet_read_errors_fail_closed(self):
+    def test_committed_response_parts_read_errors_fail_closed(self):
         from routes.sessions import _run_session_memory_update
         from unittest.mock import patch
         from models import CampaignAuditEvent
-        with patch('models.CampaignResolverPacket') as mock_packet_class:
-            mock_packet_class.query.filter_by.side_effect = Exception("DB Connection Refused")
+        with patch('models.CampaignDmResponseParts') as mock_parts_class:
+            mock_parts_class.query.filter_by.side_effect = Exception("DB Connection Refused")
             _run_session_memory_update(
                 campaign_id=self.campaign.id,
                 session_id=self.session.id,
@@ -699,7 +699,125 @@ class SessionMemoryIntegrityTest(unittest.TestCase):
             ).all()
             self.assertEqual(len(events), 1)
             payload = json.loads(events[0].payload) if events[0].payload else {}
-            self.assertEqual(payload.get('code'), 'packet_storage_read_error')
+            self.assertEqual(payload.get('code'), 'response_parts_storage_read_error')
+
+    def test_committed_structured_parts_reach_both_memory_stages(self):
+        """The staged memory writer must consume the accepted stored part pairs."""
+        from llm_providers import OpenRouterAdapter
+        from routes.sessions import _run_session_memory_update
+        from services.dm_response_parts import render_visible_response_parts
+        from services.dm_turn_commit import commit_accepted_dm_turn
+
+        player_message = SessionMessage(
+            session_id=self.session.id,
+            user_id=1,
+            role='player',
+            content='Who are you, Brother Orin?',
+        )
+        db.session.add(player_message)
+        db.session.commit()
+        parts = [
+            {
+                'type': 'npc_dialogue',
+                'target': 'Brother Orin',
+                'content': '"Only a diver."',
+                'dm_private_context': (
+                    'Deliberate cover story; do not overwrite Orin identity or background.'
+                ),
+            },
+            {
+                'type': 'npc_dialogue',
+                'target': 'Brother Orin',
+                'content': '"The tide turns at dawn."',
+                'dm_private_context': 'Truthful operational detail.',
+            },
+        ]
+        visible_content = render_visible_response_parts(parts)
+        dm_message, _proposals, _results = commit_accepted_dm_turn(
+            self.campaign,
+            self.session,
+            db.session.get(User, 1),
+            player_message.id,
+            'test:structured-memory',
+            'structured memory test',
+            visible_content,
+            [],
+            {'actions': []},
+            parts,
+        )
+
+        import openrouter
+        observed = {}
+        real_extractor = openrouter.build_session_memory_extractor_messages
+        real_resolver = openrouter.build_session_memory_resolver_messages
+
+        def capture_extractor(memory_context):
+            messages = real_extractor(memory_context)
+            observed['extractor'] = json.loads(messages[1]['content'])
+            return messages
+
+        def capture_resolver(memory_context, extracted):
+            messages = real_resolver(memory_context, extracted)
+            observed['resolver'] = json.loads(messages[1]['content'])
+            return messages
+
+        adapter = OpenRouterAdapter()
+
+        def tool_response(name, arguments):
+            return adapter.parse_response({
+                'choices': [{
+                    'message': {
+                        'content': '',
+                        'tool_calls': [{
+                            'id': f'test_{name}',
+                            'type': 'function',
+                            'function': {'name': name, 'arguments': json.dumps(arguments)},
+                        }],
+                    },
+                }],
+            })
+
+        def fake_memory_provider(_messages, **kwargs):
+            operation = kwargs.get('audit_context', {}).get('operation')
+            if operation == 'session_memory_extract':
+                return tool_response('submit_extraction', {
+                    'running_summary': 'Orin offers a guarded answer.',
+                    'fact_claims': [], 'entity_claims': [], 'relation_claims': [],
+                    'npc_claims': [], 'event_claims': [],
+                })
+            self.assertEqual(operation, 'session_memory_resolve')
+            return tool_response('submit_resolved_memory', {
+                'running_summary': 'Orin offers a guarded answer.',
+                'resolved_facts': [],
+            })
+
+        with unittest.mock.patch('openrouter.build_session_memory_extractor_messages', side_effect=capture_extractor), \
+                unittest.mock.patch('openrouter.build_session_memory_resolver_messages', side_effect=capture_resolver), \
+                unittest.mock.patch('openrouter._post_chat_normalized', side_effect=fake_memory_provider), \
+                unittest.mock.patch('routes.sessions.get_session_clock_updates', return_value=[]):
+            _run_session_memory_update(
+                campaign_id=self.campaign.id,
+                session_id=self.session.id,
+                user_id=1,
+                player_message_id=player_message.id,
+                player_content=player_message.content,
+                ai_text=visible_content,
+                hot_context={},
+                parent_trace_id='test-parent-trace',
+                dm_message_id=dm_message.id,
+                response_parts=parts,
+            )
+
+        self.assertEqual(observed['extractor']['latest_dm_response_parts'], parts)
+        self.assertEqual(observed['resolver']['latest_dm_response_parts'], parts)
+        self.assertIn(
+            'do not overwrite Orin identity',
+            observed['extractor']['latest_dm_response_parts'][0]['dm_private_context'],
+        )
+        self.assertEqual(
+            observed['resolver']['latest_dm_response_parts'][1]['dm_private_context'],
+            'Truthful operational detail.',
+        )
 
     def test_clarification_answered_and_consumed_workflow(self):
         from models import CampaignClarification

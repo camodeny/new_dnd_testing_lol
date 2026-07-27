@@ -358,7 +358,7 @@ def _finalizer_speak_response(content='The DM nods.'):
                     'type': 'function',
                     'function': {
                         'name': 'talk_to_player',
-                        'arguments': json.dumps({'content': content, 'commit_action_ids': []}),
+                        'arguments': json.dumps({'parts': [{'type': 'narration', 'content': content}], 'commit_action_ids': []}),
                     },
                 }],
             },

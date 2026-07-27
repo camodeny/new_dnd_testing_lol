@@ -96,11 +96,11 @@ def _session_dm_turn_decision(raw_result):
     result = {
         'mode': 'speak',
         'content': decision.get('content') or '',
+        'parts': decision.get('parts') if isinstance(decision.get('parts'), list) else [],
         'commit_action_ids': decision.get('commit_action_ids'),
     }
-    rp = decision.get('resolver_packet')
-    if isinstance(rp, dict):
-        result['resolver_packet'] = rp
+    if isinstance(decision.get('resolver_packet'), dict):
+        result['resolver_packet'] = decision['resolver_packet']
     return result
 
 
@@ -120,6 +120,7 @@ def _run_session_memory_update(
     hot_context,
     parent_trace_id,
     dm_message_id=None,
+    response_parts=None,
     resolver_packet=None,
 ):
     from uuid import uuid4
@@ -151,59 +152,64 @@ def _run_session_memory_update(
             ai_text,
             hot_context,
         )
-        # Load committed packet from storage — this is the canonical source
-        # Load committed packet from storage — this is the canonical source
+        # Load accepted internal parts from storage; this is the canonical memory source.
         if dm_message_id:
-            from models import CampaignResolverPacket
+            from models import CampaignDmResponseParts
             try:
-                stored = CampaignResolverPacket.query.filter_by(
+                stored = CampaignDmResponseParts.query.filter_by(
                     campaign_id=campaign.id,
                     dm_message_id=dm_message_id,
-                    status='committed',
-                ).order_by(CampaignResolverPacket.id.desc()).first()
+                ).order_by(CampaignDmResponseParts.id.desc()).first()
             except Exception as e:
                 # database read failure fails the run
                 raise MemoryPipelineError(
-                    stage="ingest_resolver_packet",
-                    code="packet_storage_read_error",
-                    message=f"Failed to read committed resolver packet from database: {e}",
+                    stage="ingest_response_parts",
+                    code="response_parts_storage_read_error",
+                    message=f"Failed to read accepted response parts from database: {e}",
                     telemetry={"dm_message_id": dm_message_id, "error": str(e)},
                 )
 
             if stored:
-                if not isinstance(stored.packet_json, dict):
+                if not isinstance(stored.parts_json, list):
                     raise MemoryPipelineError(
-                        stage="ingest_resolver_packet",
-                        code="malformed_stored_packet",
-                        message="Stored resolver packet is not a valid JSON dictionary.",
+                        stage="ingest_response_parts",
+                        code="malformed_stored_response_parts",
+                        message="Stored response parts are not a valid JSON array.",
                         telemetry={"dm_message_id": dm_message_id},
                     )
-                memory_context['resolver_packet'] = stored.packet_json
+                memory_context['latest_dm_response_parts'] = stored.parts_json
+
+                from models import CampaignResolverPacket
+                stored_packet = CampaignResolverPacket.query.filter_by(
+                    campaign_id=campaign.id, dm_message_id=dm_message_id, status='committed',
+                ).order_by(CampaignResolverPacket.id.desc()).first()
+                if stored_packet:
+                    memory_context['resolver_packet'] = stored_packet.packet_json
 
                 # Check for transient/stored mismatch
-                if isinstance(resolver_packet, dict) and resolver_packet:
-                    if stored.packet_json != resolver_packet:
+                if isinstance(response_parts, list) and response_parts:
+                    if stored.parts_json != response_parts:
                         raise MemoryPipelineError(
-                            stage="ingest_resolver_packet",
-                            code="packet_mismatch",
-                            message="Transient resolver packet does not match the canonical stored packet.",
+                            stage="ingest_response_parts",
+                            code="response_parts_mismatch",
+                            message="Transient response parts do not match the accepted stored response parts.",
                             telemetry={
                                 "dm_message_id": dm_message_id,
-                                "stored": stored.packet_json,
-                                "transient": resolver_packet,
+                                "stored": stored.parts_json,
+                                "transient": response_parts,
                             },
                         )
             else:
-                # No stored packet in database. If transient packet is provided and non-empty, we have a mismatch
-                if isinstance(resolver_packet, dict) and resolver_packet:
+                if isinstance(response_parts, list) and response_parts:
                     raise MemoryPipelineError(
-                        stage="ingest_resolver_packet",
-                        code="packet_missing_in_storage",
-                        message="Resolver packet was provided transiently but is missing from storage.",
-                        telemetry={"dm_message_id": dm_message_id, "transient": resolver_packet},
+                        stage="ingest_response_parts",
+                        code="response_parts_missing_in_storage",
+                        message="Accepted response parts are missing from storage.",
+                        telemetry={"dm_message_id": dm_message_id, "transient": response_parts},
                     )
         else:
-            # Fall back to transient argument only if there is definitively no committed packet
+            if isinstance(response_parts, list):
+                memory_context['latest_dm_response_parts'] = response_parts
             if isinstance(resolver_packet, dict):
                 memory_context['resolver_packet'] = resolver_packet
 
@@ -814,6 +820,7 @@ def send_message(current_user, session_id):
         ai_text = ai_turn.get('content') or ''
 
         if ai_turn.get('mode') == 'speak' and ai_text:
+            response_parts = ai_turn.get('parts') if isinstance(ai_turn, dict) else None
             resolver_packet = ai_turn.get('resolver_packet') if isinstance(ai_turn, dict) else None
             try:
                 ai_msg, pending_proposals, _action_results = commit_accepted_dm_turn(
@@ -828,6 +835,7 @@ def send_message(current_user, session_id):
                     {'actions': ai_result.get('_pending_actions')}
                     if isinstance(ai_result, dict) and isinstance(ai_result.get('_pending_actions'), list)
                     else None,
+                    response_parts=response_parts,
                     resolver_packet=resolver_packet,
                 )
             except Exception as err:
@@ -845,6 +853,7 @@ def send_message(current_user, session_id):
                 hot_context,
                 trace_id,
                 dm_message_id=ai_msg.id,
+                response_parts=response_parts,
                 resolver_packet=resolver_packet,
             )
         elif ai_turn.get('mode') == 'silent':

@@ -1618,6 +1618,7 @@ def build_session_memory_context(campaign, session, current_user, player_message
         'prior_memory_anchors': session.to_dict().get('memory_anchors'),
         'latest_player_message': player_message,
         'latest_dm_message': dm_message,
+        'latest_dm_response_parts': [],
         'hot_context': memory_hot_context,
         'relevant_memory': _compact_memory_search_result(
             _tool_search_campaign_memory(

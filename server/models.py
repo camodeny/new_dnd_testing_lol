@@ -2325,6 +2325,19 @@ class CampaignResolverPacket(db.Model):
         }
 
 
+class CampaignDmResponseParts(db.Model):
+    """Internal structured DM output; never serialize this through player APIs."""
+    __tablename__ = "campaign_dm_response_parts"
+
+    id = db.Column(db.Integer, primary_key=True)
+    campaign_id = db.Column(db.Integer, db.ForeignKey("campaign.id"), nullable=False, index=True)
+    session_id = db.Column(db.Integer, db.ForeignKey("campaign_sessions.id"), nullable=True, index=True)
+    dm_message_id = db.Column(db.Integer, db.ForeignKey("session_messages.id"), nullable=False, index=True)
+    turn_id = db.Column(db.String(100), nullable=True, index=True)
+    parts_json = db.Column(db.JSON, nullable=False)
+    accepted_at = db.Column(db.DateTime, default=utcnow, nullable=False)
+
+
 class CampaignClarification(db.Model):
     __tablename__ = "campaign_clarifications"
 

@@ -11,6 +11,7 @@ from dotenv import load_dotenv
 import llm_providers
 from llm_providers import LLMProviderAdapter, ProviderError, ProviderRequest, execute_chat, provider_registry, stream_chat
 from services.audit_service import log_audit_event, log_model_error, log_model_request, log_model_response
+from services.dm_response_parts import normalize_response_parts, render_visible_response_parts
 
 load_dotenv()
 
@@ -128,10 +129,9 @@ SYSTEM_PROMPT = (
     "<ic> text as the player character's spoken words or direct in-world action, and "
     "<ooc> text as table talk, intent, questions, or instructions from the player. "
     "When in character, narrate the story, describe scenes, play NPCs, and adjudicate "
-    "player actions. When speaking as a specific NPC, wrap only that NPC's spoken line "
-    "or performance in <npc target=\"NPC name\">...</npc>; leave narration outside the "
-    "NPC tag. Every <npc> tag must include target and must close with </npc>. Do not use "
-    "<ic>, <ooc>, HTML, XML, or any other angle-bracket tags in visible DM replies. "
+    "player actions. When speaking as a specific NPC, keep the speaker and spoken words distinct from narration; "
+    "the session finalizer supplies the speaker structurally. Do not author <npc>, <ic>, <ooc>, HTML, XML, or "
+    "any other angle-bracket tags in visible DM replies. "
     "Write visible replies in English only; do not emit stray non-English glyphs or mixed-language fragments. "
     + PC_CONTROL_POLICY + " "
     "Before drafting a visible reply, identify from context which characters are protected player characters, "
@@ -141,8 +141,8 @@ SYSTEM_PROMPT = (
     "character unless the player already supplied those exact words or actions. This includes short confirmations "
     "like \"okay,\" \"right,\" \"let's go,\" nods, thanks, sighs, and similar implied participation. If a protected "
     "player character response is needed, ask the player, hand off briefly, or stay silent. "
-    "When using <npc target=\"...\">...</npc>, the target must be a concrete in-world speaker reference grounded "
-    "in the transcript or memory. Never use placeholders or meta labels such as \"the speaker,\" \"speaker,\" "
+    "NPC speakers must use a concrete in-world reference grounded in the transcript or memory. Never use placeholders "
+    "or meta labels such as \"the speaker,\" \"speaker,\" "
     "\"NPC,\" \"someone,\" \"voice,\" \"figure,\" or vague pronouns as the target. If the true name is unrevealed, "
     "use the best public-facing descriptor already supported by context. If you cannot identify a concrete speaker "
     "reference with high confidence, do not invent one and do not write quoted NPC dialogue; paraphrase the "
@@ -202,11 +202,11 @@ SESSION_TOOL_PROMPT = (
     "them as objective truth. If a reply would reinterpret an established public lead, preserve uncertainty "
     "and avoid replacing prior committed facts unless the fiction clearly earns it. "
     "protected_player_characters and current_player_character; obey those boundaries exactly. "
-    "For the final turn decision, call exactly one finalization tool: use talk_to_player with visible player-facing content "
+    "For the final turn decision, call exactly one finalization tool: use talk_to_player with ordered structured response parts "
     "when the DM should send a visible reply, or call stay_silent with a short reason when the DM should not "
     "send anything. Do not mix a finalization tool call with other tools in the same assistant message. "
     "Do not send the final visible reply as plain assistant text. "
-    "When finalizing with talk_to_player, always include commit_action_ids. Select only pending action IDs whose durable mutation should commit with this exact reply, or use an empty array. "
+    "Each talk_to_player part is narration or npc_dialogue. NPC dialogue requires target and content. Never place <npc> tags or any model-authored NPC markup inside a part: the server renders NPC markup. dm_private_context is optional only for ordinary truthful visible text; whenever a visible part is false, misleading, incomplete, mistaken, performative, or conflicts with established private canon, attach authoritative dm_private_context to that exact part. Never put private context in visible content. Always include commit_action_ids. Select only pending action IDs whose durable mutation should commit with this exact reply, or use an empty array. "
     "Do not send handoff prompts such as 'How do you respond?' for ordinary PC-to-PC conversation."
 )
 
@@ -260,7 +260,7 @@ SESSION_MEMORY_EXTRACTOR_SYSTEM_PROMPT = (
     "Write a fresh running_summary that cleanly replaces the old one. "
     "Do not append fragments to the prior summary. Rewrite the current durable state after the latest visible exchange in one compact paragraph. "
     "Additionally, extract or update the structured memory_anchors representing the current session state: current_goal (string or null), current_scene (string or null), open_clues (array of strings), unresolved_questions (array of strings), npc_observations (array of strings), and recent_offers_promises (array of strings). Do not append fragments; completely rewrite or prune these anchors to reflect the current state. "
-    "Extract candidate scene updates, durable fact claims, entity upserts, relation upserts, NPC updates, and event records from the visible exchange. "
+    "The latest_dm_response_parts are ordered accepted segments. Each segment's dm_private_context is authoritative internal guidance for interpreting exactly that segment; it can explain a lie, cover story, omission, misconception, motive, or canonical truth. Never let a visible claim overwrite conflicting established canon when its associated private context says otherwise. Keep segment contexts independent: one speaker may be truthful in one part and deceptive in another. Extract candidate scene updates, durable fact claims, entity upserts, relation upserts, NPC updates, and event records from the exchange. "
     "Do not invent canonical ids. If a name is not already a known id in the prompt, preserve it as a raw label/ref for later resolution. "
     "Scene updates may include location_id, location_name, time_of_day, active_npc_ids, departed_npc_ids, and immediate_tension. "
     "Claims must use source_surface of visible_transcript, hidden_state, or inferred. "
@@ -275,7 +275,7 @@ SESSION_MEMORY_EXTRACTOR_SYSTEM_PROMPT = (
 
 SESSION_MEMORY_RESOLVER_SYSTEM_PROMPT = (
     "You are the resolver stage of a D&D session memory writer. "
-    "Use read-only tools to resolve scene, entity, and fact references before any durable write is compiled. "
+    "Use read-only tools to resolve scene, entity, and fact references before any durable write is compiled. Treat dm_private_context paired with a response part as authoritative interpretation for that exact visible part, especially when it conflicts with a spoken claim. "
     "Never invent ids. If you cannot resolve a reference with confidence, return it in unresolved_items instead of mutating memory. "
     "Prefer get_entity_candidates, get_scene_candidates, get_fact_candidates, and search_campaign_memory before broad raw-state tools. "
     "Use get_world_state, get_npcs, get_clocks, or transcript tools only when narrower tools are insufficient. "
@@ -411,22 +411,6 @@ JSON_REPAIR_SYSTEM_PROMPT = (
     "You repair malformed JSON. Return only valid JSON with the same intended data and structure as "
     "the original. Make the smallest changes needed to fix syntax errors. Do not add commentary, "
     "markdown fences, or new facts."
-)
-
-SESSION_FORMAT_REPAIR_SYSTEM_PROMPT = (
-    "You repair malformed visible Dungeon Master replies. Return only the repaired visible reply text. "
-    "Preserve the same story meaning, ordering, and wording as closely as possible. Make only the smallest "
-    "changes needed to satisfy the reported formatting rules. Do not add explanations, markdown fences, new "
-    "facts, new actions, or extra dialogue. Keep narration outside NPC tags. The only allowed angle-bracket "
-    "tag is <npc target=\"NPC name\">...</npc>. Write visible replies in English only."
-)
-
-SESSION_GUARD_REPAIR_SYSTEM_PROMPT = (
-    "You repair unsafe visible Dungeon Master replies. Return only the repaired visible reply text. "
-    "Preserve the same scene facts, ordering, and story meaning as closely as possible. Make only the smallest "
-    "changes needed to satisfy the reported guard violation. Do not add explanations, markdown fences, tool-call "
-    "markup, new facts, new actions, or extra dialogue. Keep narration outside NPC tags. The only allowed "
-    "angle-bracket tag is <npc target=\"NPC name\">...</npc>. Write visible replies in English only."
 )
 
 LOOT_GENERATION_SYSTEM_PROMPT = (
@@ -952,215 +936,6 @@ def _build_json_repair_messages(candidate, error):
     ]
 
 
-def _build_session_format_repair_messages(candidate, format_violation, hot_context=None):
-    return _build_session_guard_repair_messages(
-        candidate,
-        'format',
-        format_violation,
-        hot_context=hot_context,
-    )
-
-
-def _visible_naming_target(name, hot_context):
-    normalized = str(name or '').strip().casefold()
-    constraints = (hot_context or {}).get('visible_naming_constraints') or []
-    for constraint in constraints:
-        avoid_name = str((constraint or {}).get('avoid_visible_name') or '').strip()
-        public_reference = str((constraint or {}).get('use_public_reference') or '').strip()
-        if avoid_name and public_reference and avoid_name.casefold() == normalized:
-            return public_reference
-    return str(name or '').strip()
-
-
-def _latest_player_messages_by_character(hot_context):
-    latest_player_messages = []
-    for character in (hot_context or {}).get('protected_player_characters') or []:
-        latest_player_messages.append({
-            'character_name': str(character.get('name') or '').strip(),
-            'user_id': character.get('user_id'),
-            'latest_player_message': _latest_player_message_for_character(hot_context, character),
-        })
-    return latest_player_messages
-
-
-def _leaked_private_items_for_repair(details, hot_context):
-    leaked_ids = {
-        str(item or '').strip()
-        for item in ((details or {}).get('leaked_item_ids') or [])
-        if str(item or '').strip()
-    }
-    if not leaked_ids:
-        return []
-    return [
-        {
-            'id': str(item.get('id') or '').strip(),
-            'kind': str(item.get('kind') or '').strip(),
-            'text': str(item.get('text') or '').strip(),
-        }
-        for item in ((hot_context or {}).get('private_spoiler_items') or [])
-        if isinstance(item, dict) and str(item.get('id') or '').strip() in leaked_ids
-    ]
-
-
-def _session_dm_guard_repair_payload(candidate, guard_name, details, hot_context=None):
-    payload = {
-        'candidate_visible_dm_reply': candidate,
-        'visible_naming_constraints': (hot_context or {}).get('visible_naming_constraints') or [],
-        'repair_requirements': [],
-    }
-    if guard_name == 'format':
-        payload['format_violation'] = details or {}
-        payload['repair_requirements'] = [
-            'Return only the repaired visible reply text.',
-            'Preserve the existing wording and narrative meaning unless a change is required to fix formatting.',
-            'If clearly attributed NPC speech appears, wrap only the spoken line in <npc target="NPC name">...</npc>.',
-            'Leave narration outside any <npc> tag.',
-            'If a naming constraint applies, use use_public_reference as the NPC target instead of avoid_visible_name.',
-            'Do not use any angle-bracket tag other than <npc target="NPC name">...</npc>.',
-        ]
-        return payload
-    if guard_name == 'pc_control':
-        payload['pc_control_violation'] = details or {}
-        payload['protected_player_characters'] = (hot_context or {}).get('protected_player_characters') or []
-        payload['latest_player_messages_by_character'] = _latest_player_messages_by_character(hot_context)
-        payload['repair_requirements'] = [
-            'Return only the repaired visible reply text.',
-            'Preserve the scene facts, NPC actions, and DM intent unless a change is required to stop controlling a protected player character.',
-            'Do not invent dialogue, choices, intent, interior state, or consequential actions for any protected player character.',
-            'Convert protected player character dialogue or decisions into non-controlling DM narration, a direct question, or a brief player handoff.',
-            'Keep references to protected player characters brief and non-controlling.',
-            'Do not use any angle-bracket tag other than <npc target="NPC name">...</npc>.',
-        ]
-        return payload
-    if guard_name == 'canon_discipline':
-        payload['canon_discipline_violation'] = details or {}
-        payload['latest_player_message'] = _latest_player_message(hot_context)
-        payload['established_public_facts'] = (hot_context or {}).get('established_public_facts') or []
-        payload['recent_public_world_events'] = (hot_context or {}).get('recent_public_world_events') or []
-        payload['open_public_threads'] = (hot_context or {}).get('open_public_threads') or []
-        payload['repair_requirements'] = [
-            'Return only the repaired visible reply text.',
-            'Preserve scene momentum, atmosphere, and any safe established facts unless a change is required to restore evidence discipline.',
-            'Do not turn player-supplied specifics into confirmed truth unless the confirmation is grounded in visible evidence already present in the payload.',
-            'If a player claim is not corroborated, keep it conditional, skeptical, or merely reactive from the NPC point of view.',
-            'Do not replace or sharply reframe an established public lead unless the visible evidence already supports that update.',
-            'Prefer uncertainty language over authoritative confirmation when the evidence is incomplete.',
-            'Do not use any angle-bracket tag other than <npc target="NPC name">...</npc>.',
-        ]
-        return payload
-    if guard_name == 'spoiler_checker':
-        payload['spoiler_violation'] = details or {}
-        payload['latest_player_message'] = _latest_player_message(hot_context)
-        payload['leaked_private_items'] = _leaked_private_items_for_repair(details, hot_context)
-        payload['repair_requirements'] = [
-            'Return only the repaired visible reply text.',
-            'Preserve the scene intent and any safe public facts unless a change is required to remove the spoiler leak.',
-            'Keep only what players could currently observe, hear, or reasonably infer in-world.',
-            'Replace hidden motives, hidden leverage, secret causes, private plans, and hidden-tracker language with safe surface-level clues, visible pressure, practical conditions, or evasive reluctance.',
-            'Do not reveal or strongly imply unrevealed private items, hidden countdowns, or DM-private causality.',
-            'If a witness can safely offer a clue, keep it limited, public-facing, and incomplete rather than explaining the hidden truth.',
-            'Do not use any angle-bracket tag other than <npc target="NPC name">...</npc>.',
-        ]
-        return payload
-    raise ValueError(f'Unsupported session DM guard repair type: {guard_name}')
-
-
-def _session_dm_guard_repair_system_prompt(guard_name):
-    if guard_name == 'format':
-        return SESSION_FORMAT_REPAIR_SYSTEM_PROMPT
-    return SESSION_GUARD_REPAIR_SYSTEM_PROMPT
-
-
-def _build_session_guard_repair_messages(candidate, guard_name, details, hot_context=None):
-    return [
-        {
-            'role': 'system',
-            'content': _session_dm_guard_repair_system_prompt(guard_name),
-        },
-        {
-            'role': 'user',
-            'content': json.dumps(
-                _session_dm_guard_repair_payload(candidate, guard_name, details, hot_context),
-                ensure_ascii=False,
-            ),
-        },
-    ]
-
-
-def _apply_visible_naming_constraints(text, hot_context):
-    repaired = str(text or '')
-    constraints = (hot_context or {}).get('visible_naming_constraints') or []
-    ordered_constraints = sorted(
-        [constraint for constraint in constraints if isinstance(constraint, dict)],
-        key=lambda constraint: len(str(constraint.get('avoid_visible_name') or '')),
-        reverse=True,
-    )
-    for constraint in ordered_constraints:
-        avoid_name = str(constraint.get('avoid_visible_name') or '').strip()
-        public_reference = str(constraint.get('use_public_reference') or '').strip()
-        if not avoid_name or not public_reference:
-            continue
-        repaired = re.sub(
-            rf'(?<!\w){re.escape(avoid_name)}(?!\w)',
-            public_reference,
-            repaired,
-            flags=re.IGNORECASE,
-        )
-    return repaired
-
-
-def _extract_missing_npc_tag_speaker(format_violation):
-    errors = (format_violation or {}).get('errors') or []
-    for error in errors:
-        if str((error or {}).get('kind') or '').strip().lower() != 'missing_npc_tag':
-            continue
-        detail = str((error or {}).get('detail') or '')
-        match = re.search(r'<npc\s+target="([^"]+)">', detail)
-        if match:
-            return str(match.group(1) or '').strip()
-    return ''
-
-
-def _wrap_quoted_dialogue_with_npc_tag(text, speaker):
-    target = str(speaker or '').strip()
-    if not target:
-        return str(text or '')
-
-    segments = re.split(r'(<npc\b[^>]*>.*?</npc>)', str(text or ''), flags=re.IGNORECASE | re.DOTALL)
-    quote_pattern = re.compile(r'((?:\*\*)?\s*["\u201c][^"\u201c\u201d\n]{2,400}["\u201d](?:\s*\*\*)?)')
-    rebuilt = []
-    def _wrap_match(match):
-        raw_quote = match.group(1)
-        stripped_quote = raw_quote.strip()
-        if not stripped_quote:
-            return raw_quote
-        leading_ws = raw_quote[:len(raw_quote) - len(raw_quote.lstrip())]
-        trailing_ws = raw_quote[len(raw_quote.rstrip()):]
-        return f'{leading_ws}<npc target="{target}">{stripped_quote}</npc>{trailing_ws}'
-
-    for segment in segments:
-        if not segment:
-            continue
-        if re.match(r'<npc\b[^>]*>.*?</npc>$', segment, flags=re.IGNORECASE | re.DOTALL):
-            rebuilt.append(segment)
-            continue
-        rebuilt.append(quote_pattern.sub(_wrap_match, segment))
-    return ''.join(rebuilt)
-
-
-def _local_missing_npc_tag_repair(candidate, format_violation, hot_context=None):
-    speaker = _extract_missing_npc_tag_speaker(format_violation)
-    if not speaker:
-        return ''
-
-    target = _visible_naming_target(speaker, hot_context)
-    repaired = _apply_visible_naming_constraints(candidate, hot_context)
-    wrapped = _wrap_quoted_dialogue_with_npc_tag(repaired, target)
-    if wrapped == str(candidate or ''):
-        return ''
-    return wrapped.strip()
-
-
 def _json_loads_with_repair(text, audit_context=None):
     data, error, candidate = _json_loads_with_error(text)
     if error is None or not isinstance(error, json.JSONDecodeError):
@@ -1238,19 +1013,20 @@ def normalize_session_dm_turn_decision(raw_decision):
             'reason': str(data.get('reason') or 'The DM intentionally stayed silent.').strip(),
         }
 
-    content = data.get('content')
-    if content is None:
-        content = data.get('message')
-    if content is None:
-        content = data.get('visible_message')
+    parts = data.get('parts')
+    try:
+        parts = normalize_response_parts(parts)
+    except ValueError:
+        parts = []
     result = {
         'mode': 'speak',
-        'content': str(content or '').strip(),
+        'content': render_visible_response_parts(parts) if parts else '',
+        'parts': parts,
         'commit_action_ids': data.get('commit_action_ids') if isinstance(data.get('commit_action_ids'), list) else None,
     }
-    rp = data.get('resolver_packet')
-    if isinstance(rp, dict):
-        result['resolver_packet'] = rp
+    resolver_packet = data.get('resolver_packet')
+    if isinstance(resolver_packet, dict) and isinstance(resolver_packet.get('entity_mentions'), list):
+        result['resolver_packet'] = resolver_packet
     return result
 
 
@@ -1260,14 +1036,25 @@ SESSION_DM_FINALIZER_TOOLS = [
         'type': 'function',
         'function': {
             'name': 'talk_to_player',
-            'description': 'Finalize the DM turn by sending one player-visible reply. Put only player-facing visible content in content and explicitly select which pending narrative actions should commit. When the DM has deliberately established hidden-canon identity for a described entity, include a resolver_packet with entity_mentions.',
+            'description': 'Finalize the DM turn with ordered response parts. The server renders player-visible content. dm_private_context is internal-only guidance for interpreting that exact part and is never sent to players.',
             'parameters': {
                 'type': 'object',
-                'required': ['content', 'commit_action_ids'],
+                'required': ['parts', 'commit_action_ids'],
                 'properties': {
-                    'content': {
-                        'type': 'string',
-                        'description': 'Visible DM reply for the player, using only valid visible-message syntax.',
+                    'parts': {
+                        'type': 'array',
+                        'minItems': 1,
+                        'description': 'Ordered visible response segments with their exact optional DM-private interpretation.',
+                        'items': {
+                            'type': 'object',
+                            'required': ['type', 'content'],
+                            'properties': {
+                                'type': {'type': 'string', 'enum': ['narration', 'npc_dialogue']},
+                                'content': {'type': 'string', 'description': 'Player-visible words for this part.'},
+                                'target': {'type': 'string', 'description': 'Required public speaker reference when type is npc_dialogue.'},
+                                'dm_private_context': {'type': 'string', 'description': 'Optional unrestricted internal guidance for memory systems. Never player-visible.'},
+                            },
+                        },
                     },
                     'commit_action_ids': {
                         'type': 'array',
@@ -1276,14 +1063,8 @@ SESSION_DM_FINALIZER_TOOLS = [
                     },
                     'resolver_packet': {
                         'type': 'object',
-                        'description': 'Optional. When the DM has deliberately established a hidden-canon identity, include entity_mentions with mention_ref, surface_form, identity_status, canonical_id, public_name, and visibility.',
-                        'properties': {
-                            'entity_mentions': {
-                                'type': 'array',
-                                'items': {'type': 'object'},
-                                'description': 'List of entity identity resolutions the DM is intentionally committing as hidden canon.',
-                            },
-                        },
+                        'description': 'Optional separate hidden identity commitment. Use entity_mentions for deliberate canonical identity resolution; it is not player-visible and is not part of response parts.',
+                        'properties': {'entity_mentions': {'type': 'array', 'items': {'type': 'object'}}},
                     },
                 },
             },
@@ -1339,14 +1120,14 @@ def _session_dm_finalizer_decision_from_tool_calls(tool_calls):
                 'kind': 'missing_commit_action_ids',
                 'detail': 'talk_to_player must include commit_action_ids, using [] when no pending action should commit.',
             }
-        decision = {
-            'mode': 'speak',
-            'content': str(args.get('content') or '').strip(),
-            'commit_action_ids': args.get('commit_action_ids'),
-        }
-        rp = args.get('resolver_packet')
-        if isinstance(rp, dict) and isinstance(rp.get('entity_mentions'), list):
-            decision['resolver_packet'] = rp
+        try:
+            parts = normalize_response_parts(args.get('parts'))
+        except ValueError as err:
+            return None, {'kind': 'invalid_response_parts', 'detail': str(err)}
+        decision = {'mode': 'speak', 'content': render_visible_response_parts(parts), 'parts': parts, 'commit_action_ids': args.get('commit_action_ids')}
+        resolver_packet = args.get('resolver_packet')
+        if isinstance(resolver_packet, dict) and isinstance(resolver_packet.get('entity_mentions'), list):
+            decision['resolver_packet'] = resolver_packet
         return decision, None
     return {
         'mode': 'silent',
@@ -1713,7 +1494,7 @@ def _session_dm_guard_retry_system_prompt(guard_name, details):
                 'Guard reminder: finalize the turn by calling exactly one of talk_to_player or stay_silent. '
                 'Do not output DSML, <｜｜DSML｜｜tool_calls>, invoke tags, XML, or any tool-call markup in visible content. '
                 'Do not send the final reply as plain assistant text. If you need to narrate what the player learns, '
-                'put only the player-facing visible result inside talk_to_player(content).'
+                'put the player-facing result in talk_to_player(parts); do not use <npc> markup inside a part.'
                 + silent_ack
             )
         return (
@@ -1727,27 +1508,23 @@ def _session_dm_guard_retry_system_prompt(guard_name, details):
         return (
             'Guard reminder: use valid visible-message syntax. '
             'Finalize with talk_to_player or stay_silent. '
-            'If you speak, talk_to_player content may use Markdown and '
-            'plain text. The only allowed angle-bracket tag is <npc target="NPC name">...</npc>. '
-            'Do not use <ic>, <ooc>, HTML, XML, invalid closing tags, or stray non-English glyphs. '
+            'If you speak, use talk_to_player(parts). Part content may use Markdown and plain text but may not use <npc>, <ic>, <ooc>, HTML, or XML tags; NPC dialogue must use a distinct npc_dialogue part with target. '
             'Write visible replies in English only.'
             + silent_ack
         )
     if guard_name == 'missing_npc_tag':
         return (
-            'Guard reminder: if you include clearly attributed NPC speech or performed utterances, use the required '
-            '<npc> wrapper. '
-            'If you include clearly attributed current NPC spoken lines or performed utterances, wrap them in '
-            '<npc target="NPC name">...</npc>, and leave narration outside the tag. '
-            'The <npc target="..."> value must be a concrete in-world speaker reference grounded in the transcript '
+            'Guard reminder: if you include clearly attributed NPC speech or performed utterances, use an npc_dialogue '
+            'part with a target and place narration in a separate narration part. Do not author <npc> markup. '
+            'The npc_dialogue target must be a concrete in-world speaker reference grounded in the transcript '
             'or memory, not a placeholder or meta label. Never use targets like "the speaker", "speaker", "NPC", '
             '"someone", "voice", or vague pronouns. '
             'If a prior guard reminder identified an unrevealed private term, do not use that private term '
-            'anywhere, including inside <npc target="...">. Use a public descriptor such as "old dockhand", '
+            'anywhere, including inside the npc_dialogue target. Use a public descriptor such as "old dockhand", '
             '"guard captain", or "hooded figure" as the target until the name is revealed through play. '
             'If you cannot identify a concrete speaker reference with high confidence, do not invent one and do not '
             'write quoted NPC dialogue; paraphrase the utterance in narration instead. '
-            'Do not use any other angle-bracket tags. Finalize with talk_to_player or stay_silent.'
+            'Finalize with talk_to_player(parts) or stay_silent.'
             + silent_ack
         )
     if guard_name == 'mechanical_resolution':
@@ -1782,12 +1559,12 @@ def _session_dm_guard_retry_system_prompt(guard_name, details):
         return (
             'Guard reminder: do not expose DM-private information that has not become visible through '
             f'play. Do not mention these private terms in the visible reply: {terms or "(none listed)"}. '
-            'This includes narration, quoted speech, labels, and <npc target="..."> attributes. '
-            'Use public descriptors instead of unrevealed names when wrapping NPC speech. '
+            'This includes narration, quoted speech, labels, and npc_dialogue targets. '
+            'Use public descriptors instead of unrevealed names in NPC dialogue targets. '
             'Do not route around this by having another NPC reveal or label the private term. '
             'If the latest player addressed a present NPC by public description, keep that NPC as the responder '
             'using the public descriptor; do not say that NPC vanished or left unless the transcript already established it. '
-            'Finalize with talk_to_player or stay_silent using spoiler-safe visible content.'
+            'Finalize with talk_to_player(parts) or stay_silent using spoiler-safe visible content.'
             + silent_ack
         )
     if guard_name == 'spoiler_checker':
@@ -1800,7 +1577,7 @@ def _session_dm_guard_retry_system_prompt(guard_name, details):
                 'Do not imply the witness has private obligations to the faction. '
                 'Show fear using only generic visible pressure: watchers, reprisals, danger, being named, vanishing, '
                 'or keeping their head down. Keep the latest addressed witness present unless the transcript says they left. '
-                'Use a public descriptor in <npc target="...">. Finalize with talk_to_player or stay_silent.'
+                'Use a public descriptor as the npc_dialogue target. Finalize with talk_to_player(parts) or stay_silent.'
                 + silent_ack
             )
         return (
@@ -2078,6 +1855,19 @@ def _latest_player_message_for_character(hot_context, character):
             continue
         return str(message.get('content') or '')
     return ''
+
+
+def _latest_player_messages_by_character(hot_context):
+    """Provide the PC-control checker each protected character's latest input."""
+    return [
+        {
+            'character_name': str(character.get('name') or '').strip(),
+            'user_id': character.get('user_id'),
+            'latest_player_message': _latest_player_message_for_character(hot_context, character),
+        }
+        for character in (hot_context or {}).get('protected_player_characters') or []
+        if isinstance(character, dict)
+    ]
 
 
 def _pc_control_staging_echo_exception(sentence, latest_player_message, character):
@@ -3016,69 +2806,6 @@ def _session_dm_content_format_violation(content, audit_context=None):
     return format_violation
 
 
-def _repair_session_dm_visible_reply(content, guard_name, details, hot_context, audit_context=None):
-    if not str(content or '').strip():
-        return ''
-
-    guard_operation = f'session_dm_{guard_name}_repair'
-    base_repair_audit = _child_audit_context(
-        audit_context or {},
-        guard_operation,
-        guard_operation,
-        f'{guard_operation}: visible reply repair',
-    )
-
-    estimated_tokens = max(1, _estimate_tokens(content))
-    repair_token_budgets = []
-    next_budget = max(512, estimated_tokens + 256)
-    while len(repair_token_budgets) < 3:
-        repair_token_budgets.append(next_budget)
-        if next_budget >= 16384:
-            break
-        next_budget = min(16384, max(next_budget * 2, next_budget + 1024))
-
-    for attempt_index, max_tokens in enumerate(repair_token_budgets, start=1):
-        repair_audit = base_repair_audit
-        if attempt_index > 1:
-            repair_audit = _child_audit_context(
-                base_repair_audit,
-                f'{guard_operation}_retry_{attempt_index}',
-                guard_operation,
-                f'{guard_operation}: visible reply repair retry {attempt_index}',
-            )
-        try:
-            normalized = _post_chat_normalized(
-                _build_session_guard_repair_messages(content, guard_name, details, hot_context),
-                json_mode=False,
-                audit_context=repair_audit,
-                tools=None,
-                allow_thinking=False,
-                max_tokens=max_tokens,
-            )
-        except ProviderError as err:
-            if err.kind != 'malformed':
-                raise
-            # Choice-less repair output is unusable; try the next token budget.
-            continue
-        message = normalized.message_view()
-        finish_reason = normalized.finish_reason
-        finish_reason = str(finish_reason or '').strip().lower()
-        if finish_reason == 'length':
-            continue
-        repaired_content = str(message.get('content') or '').strip()
-        if repaired_content:
-            return repaired_content
-        finalizer_decision, _violation = _session_dm_finalizer_decision_from_tool_calls(message.get('tool_calls') or [])
-        if isinstance(finalizer_decision, dict) and finalizer_decision.get('mode') == 'speak':
-            return str(finalizer_decision.get('content') or '').strip()
-
-    if guard_name == 'format':
-        local_repair = _local_missing_npc_tag_repair(content, details, hot_context)
-        if local_repair:
-            return local_repair
-    return ''
-
-
 def check_session_mechanics_with_llm(response_text, preflight_decision, hot_context, audit_context=None):
     if not (response_text or '').strip():
         return {'safe': True, 'violations': [], 'required_mechanic': '', 'reason': ''}
@@ -3702,6 +3429,7 @@ def build_session_memory_extractor_messages(memory_context):
                 'relevant_memory': compact.get('relevant_memory'),
                 'latest_player_message': compact.get('latest_player_message'),
                 'latest_dm_message': compact.get('latest_dm_message'),
+                'latest_dm_response_parts': compact.get('latest_dm_response_parts'),
                 'return_shape': {
                     'running_summary': 'fresh compact replacement summary for the session after this turn',
                     'memory_anchors': {
@@ -3819,6 +3547,7 @@ def build_session_memory_resolver_messages(memory_context, extracted):
                 'current_scene': compact.get('current_scene'),
                 'latest_player_message': compact.get('latest_player_message'),
                 'latest_dm_message': compact.get('latest_dm_message'),
+                'latest_dm_response_parts': compact.get('latest_dm_response_parts'),
                 'extracted_memory_candidates': extracted,
                 'available_tools': [
                     'get_running_summary',
@@ -4056,18 +3785,14 @@ def _run_session_dm_loop(
 
     tool_round = 0
     finalizer_contract_retry_count = 0
-    last_substantive_finalizer_draft = ''
     combat_batch_retry_count = 0
     combat_batch_force_tools = False
     format_retry_count = 0
     mechanical_retried = False
     pc_control_retried = False
-    pc_control_repair_attempted = False
     canon_checker_retry_count = 0
-    canon_checker_repair_attempted = False
     private_output_retry_count = 0
     spoiler_checker_retry_count = 0
-    spoiler_checker_repair_attempted = False
     combat_handoff_retried = False
     guard_audits = {}
     combat_tracker = _session_dm_combat_tracker(hot_context)
@@ -4195,11 +3920,6 @@ def _run_session_dm_loop(
             if on_status_change:
                 on_status_change({"step": "guard_check"})
             raw_content = message.get('content') or ''
-            if (
-                str(raw_content).strip()
-                and not _looks_like_provider_tool_markup(raw_content)
-            ):
-                last_substantive_finalizer_draft = str(raw_content).strip()
             if finalizer_decision is not None:
                 decision = normalize_session_dm_turn_decision(finalizer_decision)
                 raw_content = json.dumps(finalizer_decision, ensure_ascii=False)
@@ -4208,17 +3928,6 @@ def _run_session_dm_loop(
                 finalizer_contract_violation = finalizer_violation
             else:
                 finalizer_contract_violation = _session_dm_finalizer_contract_violation(raw_content)
-                if (
-                    finalizer_contract_violation
-                    and finalizer_contract_violation.get('kind') == 'missing_finalizer_tool_call'
-                    and str(raw_content or '').strip()
-                    and not action_buffer['actions']
-                ):
-                    decision = {
-                        'mode': 'speak',
-                        'content': str(raw_content or '').strip(),
-                    }
-                    finalizer_contract_violation = None
             if finalizer_contract_violation and finalizer_contract_retry_count < 2:
                 if on_status_change:
                     on_status_change({"step": "revising", "violations": {"type": "finalizer_contract", "details": finalizer_contract_violation}})
@@ -4249,18 +3958,10 @@ def _run_session_dm_loop(
                 continue
             if finalizer_contract_violation:
                 rollback_combat_if_needed('invalid_final_output', {'finalizer_contract_violation': finalizer_contract_violation})
-                if last_substantive_finalizer_draft:
-                    action_buffer['actions'].clear()
-                    decision = {
-                        'mode': 'speak',
-                        'content': last_substantive_finalizer_draft,
-                    }
-                    finalizer_contract_violation = None
-                else:
-                    return {
-                        'mode': 'silent',
-                        'reason': 'The DM response did not produce a valid finalizer tool call.',
-                    }
+                return {
+                    'mode': 'silent',
+                    'reason': 'The DM response did not produce a valid finalizer tool call.',
+                }
             combat_batch_violation = _session_dm_combat_batch_violation(decision, combat_tracker)
             if combat_batch_violation and combat_batch_retry_count < 2 and tool_round < max_tool_rounds:
                 if on_status_change:
@@ -4305,48 +4006,6 @@ def _run_session_dm_loop(
                     if decision.get('mode') == 'speak'
                     else None
                 )
-                repaired_from_format_guard = False
-                while format_violation and format_retry_count < 2:
-                    if on_status_change:
-                        on_status_change({"step": "revising", "violations": {"type": "format", "details": format_violation}})
-                    if base_audit.get('campaign_id'):
-                        audit = guard_audit('format_guard')
-                        log_audit_event(
-                            base_audit.get('campaign_id'),
-                            'format_guard_retry',
-                            'Session DM response used malformed visible-message syntax; sent candidate to the format repair pass.',
-                            {
-                                'operation': 'format_guard',
-                                'violation': format_violation,
-                                'draft_response': content,
-                                'repair_strategy': 'separate_repair_pass',
-                            },
-                            source='session_dm.guard',
-                            actor=audit.get('actor'),
-                            trace_id=audit.get('trace_id'),
-                            parent_trace_id=audit.get('parent_trace_id'),
-                            trace_label=audit.get('trace_label'),
-                            audit_role='guard',
-                            commit=True,
-                        )
-                    repaired_content = _repair_session_dm_visible_reply(
-                        content,
-                        'format',
-                        format_violation,
-                        hot_context,
-                        audit_context=loop_audit,
-                    )
-                    format_retry_count += 1
-                    if not repaired_content:
-                        break
-                    repaired_from_format_guard = True
-                    content = repaired_content
-                    raw_content = repaired_content
-                    decision = {
-                        **decision,
-                        'content': repaired_content,
-                    }
-                    format_violation = _session_dm_content_format_violation(content, loop_audit)
                 mechanics_check = (
                     check_session_mechanics_with_llm(content, preflight_decision, hot_context, loop_audit)
                     if decision.get('mode') == 'speak' and not format_violation
@@ -4417,133 +4076,6 @@ def _run_session_dm_loop(
                     and not mechanical_violation and not canon_violation
                     else None
                 )
-                if format_violation and repaired_from_format_guard and format_retry_count < 2:
-                    continue
-                if violation and not pc_control_repair_attempted and not pc_control_retried:
-                    if on_status_change:
-                        on_status_change({"step": "revising", "violations": {"type": "pc_control", "details": violation}})
-                    if base_audit.get('campaign_id'):
-                        audit = guard_audit('pc_control_guard')
-                        log_audit_event(
-                            base_audit.get('campaign_id'),
-                            'pc_control_guard_retry',
-                            'Session DM response controlled a protected player character; sent candidate to a repair pass and will rerun with a guard reminder if needed.',
-                            {
-                                'operation': 'pc_control_guard',
-                                'violation': violation,
-                                'draft_response': raw_content,
-                                'repair_strategy': 'repair_pass_then_rerun',
-                            },
-                            source='session_dm.guard',
-                            actor=audit.get('actor'),
-                            trace_id=audit.get('trace_id'),
-                            parent_trace_id=audit.get('parent_trace_id'),
-                            trace_label=audit.get('trace_label'),
-                            audit_role='guard',
-                            commit=True,
-                        )
-                    pc_control_repair_attempted = True
-                    repaired_content = _repair_session_dm_visible_reply(
-                        content,
-                        'pc_control',
-                        violation,
-                        hot_context,
-                        audit_context=loop_audit,
-                    )
-                    if repaired_content and repaired_content != content:
-                        content = repaired_content
-                        raw_content = repaired_content
-                        decision = {
-                            **decision,
-                            'content': repaired_content,
-                        }
-                        continue
-                if (
-                    canon_violation
-                    and canon_checker_retry_count < 3
-                    and not canon_checker_repair_attempted
-                ):
-                    if on_status_change:
-                        on_status_change({"step": "revising", "violations": {"type": "canon_discipline", "details": canon_violation}})
-                    if base_audit.get('campaign_id'):
-                        audit = guard_audit('canon_discipline_guard')
-                        log_audit_event(
-                            base_audit.get('campaign_id'),
-                            'canon_discipline_guard_retry',
-                            'Session DM response promoted unsupported claims or conflicted with established public facts; sent candidate to a repair pass and will rerun with a guard reminder if needed.',
-                            {
-                                'operation': 'canon_discipline_guard',
-                                'violation': canon_violation,
-                                'draft_response': raw_content,
-                                'repair_strategy': 'repair_pass_then_rerun',
-                            },
-                            source='session_dm.guard',
-                            actor=audit.get('actor'),
-                            trace_id=audit.get('trace_id'),
-                            parent_trace_id=audit.get('parent_trace_id'),
-                            trace_label=audit.get('trace_label'),
-                            audit_role='guard',
-                            commit=True,
-                        )
-                    canon_checker_repair_attempted = True
-                    repaired_content = _repair_session_dm_visible_reply(
-                        content,
-                        'canon_discipline',
-                        canon_violation,
-                        hot_context,
-                        audit_context=loop_audit,
-                    )
-                    if repaired_content and repaired_content != content:
-                        content = repaired_content
-                        raw_content = repaired_content
-                        decision = {
-                            **decision,
-                            'content': repaired_content,
-                        }
-                        continue
-                if (
-                    not spoiler_check.get('safe', True)
-                    and spoiler_checker_retry_count < 3
-                    and not spoiler_checker_repair_attempted
-                ):
-                    if on_status_change:
-                        on_status_change({"step": "revising", "violations": {"type": "spoiler", "details": spoiler_check}})
-                    if base_audit.get('campaign_id'):
-                        audit = guard_audit('spoiler_checker_guard')
-                        log_audit_event(
-                            base_audit.get('campaign_id'),
-                            'spoiler_checker_guard_retry',
-                            'Session spoiler checker flagged a semantic leak; sent candidate to a repair pass and will rerun with a guard reminder if needed.',
-                            {
-                                'operation': 'spoiler_checker_guard',
-                                'checker_result': spoiler_check,
-                                'draft_response': raw_content,
-                                'repair_strategy': 'repair_pass_then_rerun',
-                            },
-                            source='session_dm.guard',
-                            actor=audit.get('actor'),
-                            trace_id=audit.get('trace_id'),
-                            parent_trace_id=audit.get('parent_trace_id'),
-                            trace_label=audit.get('trace_label'),
-                            audit_role='guard',
-                            commit=True,
-                        )
-                    spoiler_checker_repair_attempted = True
-                    repaired_content = _repair_session_dm_visible_reply(
-                        content,
-                        'spoiler_checker',
-                        spoiler_check,
-                        hot_context,
-                        audit_context=loop_audit,
-                    )
-                    if repaired_content and repaired_content != content:
-                        content = repaired_content
-                        raw_content = repaired_content
-                        decision = {
-                            **decision,
-                            'content': repaired_content,
-                        }
-                        continue
                 break
             if mechanical_violation and not mechanical_retried:
                 if on_status_change:
@@ -4573,10 +4105,17 @@ def _run_session_dm_loop(
                 })
                 mechanical_retried = True
                 continue
+            if format_violation and format_retry_count < 2:
+                messages.append({
+                    'role': 'system',
+                    'content': _session_dm_guard_retry_system_prompt('format', format_violation),
+                })
+                format_retry_count += 1
+                continue
             if violation and not pc_control_retried:
-                if on_status_change and not pc_control_repair_attempted:
+                if on_status_change:
                     on_status_change({"step": "revising", "violations": {"type": "pc_control", "details": violation}})
-                if base_audit.get('campaign_id') and not pc_control_repair_attempted:
+                if base_audit.get('campaign_id'):
                     audit = guard_audit('pc_control_guard')
                     log_audit_event(
                         base_audit.get('campaign_id'),
@@ -4603,9 +4142,9 @@ def _run_session_dm_loop(
                 pc_control_retried = True
                 continue
             if canon_violation and canon_checker_retry_count < 3:
-                if on_status_change and (canon_checker_retry_count > 0 or not canon_checker_repair_attempted):
+                if on_status_change:
                     on_status_change({"step": "revising", "violations": {"type": "canon_discipline", "details": canon_violation}})
-                if base_audit.get('campaign_id') and (canon_checker_retry_count > 0 or not canon_checker_repair_attempted):
+                if base_audit.get('campaign_id'):
                     audit = guard_audit('canon_discipline_guard')
                     log_audit_event(
                         base_audit.get('campaign_id'),
@@ -4660,9 +4199,9 @@ def _run_session_dm_loop(
                 private_output_retry_count += 1
                 continue
             if not spoiler_check.get('safe', True) and spoiler_checker_retry_count < 3:
-                if on_status_change and (spoiler_checker_retry_count > 0 or not spoiler_checker_repair_attempted):
+                if on_status_change:
                     on_status_change({"step": "revising", "violations": {"type": "spoiler", "details": spoiler_check}})
-                if base_audit.get('campaign_id') and (spoiler_checker_retry_count > 0 or not spoiler_checker_repair_attempted):
+                if base_audit.get('campaign_id'):
                     audit = guard_audit('spoiler_checker_guard')
                     log_audit_event(
                         base_audit.get('campaign_id'),
@@ -4918,13 +4457,10 @@ def _run_session_dm_loop(
                 }
             if base_audit.get('operation') == 'session_dm_response':
                 result = {**decision, '_pending_actions': list(action_buffer['actions'])}
-                rp = decision.get('resolver_packet')
-                if rp is not None:
-                    result['resolver_packet'] = rp
                 return result
             # Preserve the direct helper's historical public return shape; production callers
             # receive the action IDs through the session-DM operation result above.
-            return {key: value for key, value in decision.items() if key != 'commit_action_ids'}
+            return {key: value for key, value in decision.items() if key not in {'commit_action_ids', 'parts'}}
 
         messages.append(_assistant_tool_message(message))
         combat_batch_force_tools = False
@@ -5190,6 +4726,7 @@ def _session_memory_compact_context(memory_context):
         'all_active_clocks_completed': bool(memory_context.get('all_active_clocks_completed')),
         'latest_player_message': memory_context.get('latest_player_message'),
         'latest_dm_message': _memory_context_lookup(memory_context, 'latest_dm_message', 'latest_dm_response'),
+        'latest_dm_response_parts': memory_context.get('latest_dm_response_parts') if isinstance(memory_context.get('latest_dm_response_parts'), list) else [],
         'relevant_memory': relevant_memory,
     }
 

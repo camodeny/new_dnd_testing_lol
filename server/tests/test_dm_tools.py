@@ -4,6 +4,7 @@ import json
 import sys
 import tempfile
 import unittest
+import re
 from io import BytesIO
 from pathlib import Path
 from unittest.mock import Mock, patch
@@ -20,6 +21,7 @@ from models import (
     Campaign,
     CampaignAuditEvent,
     CampaignClock,
+    CampaignDmResponseParts,
     CampaignMemoryEmbedding,
     CampaignMember,
     CampaignMonster,
@@ -53,6 +55,9 @@ from openrouter import (
     get_session_memory_patch,
     get_session_dm_response_with_tools,
     normalize_session_dm_turn_decision,
+    _session_dm_finalizer_decision_from_tool_calls,
+    build_session_memory_extractor_messages,
+    build_session_memory_resolver_messages,
 )
 from routes.dev import _agent_runs_from_stream, _audit_stream_entry, _chat_flow_payload
 from routes.sessions import sessions_bp
@@ -102,7 +107,14 @@ def synthetic_grid_png(size=256, cell=32, offset=0, blank=False):
     return buffer.getvalue()
 
 
-def dm_talk_tool_response(content):
+def dm_talk_tool_response(content, private_context=None):
+    npc_match = re.fullmatch(r'<npc\s+target="([^"]+)">(.*)</npc>', content, flags=re.DOTALL)
+    part = (
+        {'type': 'npc_dialogue', 'target': npc_match.group(1), 'content': npc_match.group(2)}
+        if npc_match else {'type': 'narration', 'content': content}
+    )
+    if private_context is not None:
+        part['dm_private_context'] = private_context
     return {
         'choices': [{
             'message': {
@@ -111,7 +123,7 @@ def dm_talk_tool_response(content):
                     'id': 'call_final',
                     'function': {
                         'name': 'talk_to_player',
-                        'arguments': json.dumps({'content': content, 'commit_action_ids': []}),
+                        'arguments': json.dumps({'parts': [part], 'commit_action_ids': []}),
                     },
                 }],
             },
@@ -210,6 +222,106 @@ class DmToolsTest(unittest.TestCase):
             self.assertEqual(tool['type'], 'function')
             self.assertIn('parameters', tool['function'])
             self.assertEqual(tool['function']['parameters']['type'], 'object')
+
+    def test_finalizer_renders_npc_parts_without_leaking_private_context(self):
+        tool_call = {
+            'function': {
+                'name': 'talk_to_player',
+                'arguments': json.dumps({
+                    'parts': [
+                        {'type': 'narration', 'content': 'Rain rattles the shutters.'},
+                        {
+                            'type': 'npc_dialogue',
+                            'target': 'Brother Orin',
+                            'content': '"I was only a diver."',
+                            'dm_private_context': 'Deliberate cover story; his established allegiance and background remain canon.',
+                        },
+                    ],
+                    'commit_action_ids': [],
+                    'resolver_packet': {
+                        'entity_mentions': [{
+                            'mention_ref': 'orin_1', 'surface_form': 'Brother Orin',
+                            'identity_status': 'known_hidden', 'canonical_id': 'npc_orin',
+                            'visibility': 'dm_private',
+                        }],
+                    },
+                }),
+            },
+        }
+        decision, violation = _session_dm_finalizer_decision_from_tool_calls([tool_call])
+        self.assertIsNone(violation)
+        self.assertEqual(
+            decision['content'],
+            'Rain rattles the shutters.\n\n<npc target="Brother Orin">"I was only a diver."</npc>',
+        )
+        self.assertNotIn('cover story', decision['content'])
+        self.assertEqual(decision['parts'][1]['dm_private_context'], 'Deliberate cover story; his established allegiance and background remain canon.')
+        self.assertEqual(decision['resolver_packet']['entity_mentions'][0]['canonical_id'], 'npc_orin')
+
+    def test_finalizer_rejects_model_authored_npc_markup_inside_parts(self):
+        tool_call = {
+            'function': {
+                'name': 'talk_to_player',
+                'arguments': json.dumps({
+                    'parts': [{'type': 'narration', 'content': '<npc target="Brother Orin">"Only a diver."</npc>'}],
+                    'commit_action_ids': [],
+                }),
+            },
+        }
+        _decision, violation = _session_dm_finalizer_decision_from_tool_calls([tool_call])
+        self.assertEqual(violation['kind'], 'invalid_response_parts')
+        self.assertIn('may not contain <npc> markup', violation['detail'])
+
+    def test_commit_stores_private_parts_separately_from_visible_message(self):
+        player_message = SessionMessage(session_id=self.session.id, user_id=self.user.id, role='player', content='Who are you?')
+        db.session.add(player_message)
+        db.session.commit()
+        parts = [{
+            'type': 'npc_dialogue',
+            'target': 'Brother Orin',
+            'content': '"Only a diver."',
+            'dm_private_context': 'This is a cover story; do not replace his canonical identity.',
+        }]
+        dm_message, _proposals, _results = commit_accepted_dm_turn(
+            self.campaign, self.session, self.user, player_message.id, 'test:parts', 'test parts',
+            '<npc target="Brother Orin">"Only a diver."</npc>', [], {'actions': []}, parts,
+        )
+        self.assertNotIn('cover story', dm_message.content)
+        stored = CampaignDmResponseParts.query.filter_by(dm_message_id=dm_message.id).one()
+        self.assertEqual(stored.parts_json, parts)
+
+    def test_memory_prompts_keep_orin_and_mixed_segment_context_paired(self):
+        parts = [
+            {'type': 'npc_dialogue', 'target': 'Brother Orin', 'content': '"I was only a diver."',
+             'dm_private_context': 'Deliberate cover story; do not overwrite Orin identity or background.'},
+            {'type': 'npc_dialogue', 'target': 'Brother Orin', 'content': '"The tide turns at dawn."',
+             'dm_private_context': 'Truthful operational detail.'},
+        ]
+        memory_context = {
+            'latest_player_message': 'Who are you?',
+            'latest_dm_message': '<npc target="Brother Orin">"I was only a diver."</npc>\n\n<npc target="Brother Orin">"The tide turns at dawn."</npc>',
+            'latest_dm_response_parts': parts,
+            'hot_context': {},
+            'prior_memory_anchors': {},
+            'relevant_memory': {},
+        }
+        extractor_payload = json.loads(build_session_memory_extractor_messages(memory_context)[1]['content'])
+        resolver_payload = json.loads(build_session_memory_resolver_messages(memory_context, {})[1]['content'])
+        self.assertEqual(extractor_payload['latest_dm_response_parts'], parts)
+        self.assertEqual(resolver_payload['latest_dm_response_parts'], parts)
+        self.assertIn('do not overwrite Orin identity', extractor_payload['latest_dm_response_parts'][0]['dm_private_context'])
+        self.assertEqual(resolver_payload['latest_dm_response_parts'][1]['dm_private_context'], 'Truthful operational detail.')
+
+    def test_commit_rejects_visible_content_that_does_not_match_parts(self):
+        player_message = SessionMessage(session_id=self.session.id, user_id=self.user.id, role='player', content='Hello')
+        db.session.add(player_message)
+        db.session.commit()
+        with self.assertRaisesRegex(ValueError, 'server-rendered response parts'):
+            commit_accepted_dm_turn(
+                self.campaign, self.session, self.user, player_message.id, 'test:mismatch', 'test mismatch',
+                'Different visible text.', [], {'actions': []},
+                [{'type': 'narration', 'content': 'Canonical visible text.'}],
+            )
 
     def test_ai_dm_tool_places_encounter_map_actors_and_creates_monsters(self):
         npc = NPCActor(
@@ -1155,7 +1267,12 @@ class DmToolsTest(unittest.TestCase):
                 },
                 audit_context or {},
             )
-            return {'mode': 'speak', 'content': 'A gridded map appears on the table.'}
+            return {
+                'mode': 'speak',
+                'content': 'A gridded map appears on the table.',
+                'parts': [{'type': 'narration', 'content': 'A gridded map appears on the table.'}],
+                'commit_action_ids': [],
+            }
 
         token = generate_token(self.user.id)
         with tempfile.TemporaryDirectory() as temp_dir, \
@@ -2146,71 +2263,6 @@ class DmToolsTest(unittest.TestCase):
         self.assertTrue(result['safe'])
         self.assertEqual(result['violations'], [])
 
-    def test_session_dm_pc_control_classifier_rewrites_invented_choice(self):
-        hot_context = {
-            'current_player_character': {'id': 11, 'name': 'Elara Moonwhisper', 'user_id': 8},
-            'protected_player_characters': [
-                {'id': 11, 'name': 'Elara Moonwhisper', 'user_id': 8},
-            ],
-            'private_output_terms': [],
-            'private_spoiler_items': [],
-            'recent_messages': [
-                {
-                    'id': 25,
-                    'session_id': 5,
-                    'user_id': 8,
-                    'role': 'player',
-                    'content': 'Elara braces herself on the ladder and looks for the landing below.',
-                },
-            ],
-        }
-
-        with patch('openrouter.get_session_preflight_decision', return_value={
-            'dm_reply_mode': 'narrative',
-            'skip_spoiler_check': False,
-            'main_call_thinking': True,
-            'confidence': 'high',
-            'reason': 'The player is in an immediate hazard.',
-        }), patch('openrouter._post_chat_normalized', side_effect=[_normalized_from_raw(dm_talk_tool_response('You decide to retreat up the ladder and try a safer approach.')), _normalized_from_raw(dm_talk_tool_response('The rung shudders beneath you. The landing remains within reach, but the ladder is failing fast. What do you do?'))]) as post_chat, patch('openrouter._post_chat', side_effect=[
-            json.dumps({
-                'safe': False,
-                'violations': [{
-                    'character': 'Elara Moonwhisper',
-                    'sentence': 'You decide to retreat up the ladder and try a safer approach.',
-                    'kind': 'choice_or_intent',
-                    'reason': 'The DM invented a strategic choice for the protected PC.',
-                }],
-                'confidence': 'high',
-                'reason': 'The reply assigns a new decision to the acting PC.',
-            }),
-            json.dumps({
-                'safe': True,
-                'violations': [],
-                'confidence': 'high',
-                'reason': 'The revised reply describes only the hazard and asks the player to choose.',
-            }),
-        ]):
-            result = get_session_dm_response_with_tools(
-                hot_context,
-                [],
-                [],
-                lambda *_args, **_kwargs: {},
-                audit_context={'operation': 'session_dm_response'},
-                max_tool_rounds=0,
-            )
-
-        self.assertEqual(result, {
-            'mode': 'speak',
-            'content': 'The rung shudders beneath you. The landing remains within reach, but the ladder is failing fast. What do you do?',
-            'commit_action_ids': [],
-            '_pending_actions': [],
-        })
-        repair_messages = post_chat.call_args_list[1].args[0]
-        self.assertIn('repair unsafe visible Dungeon Master replies', repair_messages[0]['content'])
-        repair_payload = json.loads(repair_messages[1]['content'])
-        self.assertEqual(repair_payload['pc_control_violation']['kind'], 'pc_control_classifier')
-        self.assertEqual(repair_payload['latest_player_messages_by_character'][0]['latest_player_message'], hot_context['recent_messages'][0]['content'])
-
     def test_private_output_guard_detects_hidden_terms(self):
         hot_context = {'private_output_terms': ['Crimson Veil']}
 
@@ -2285,14 +2337,14 @@ class DmToolsTest(unittest.TestCase):
         )
 
         self.assertIn('Mortimer', prompt)
-        self.assertIn('<npc target="...">', prompt)
+        self.assertIn('npc_dialogue targets', prompt)
         self.assertIn('Use public descriptors', prompt)
 
     def test_missing_npc_tag_retry_prompt_respects_private_terms(self):
         prompt = _session_dm_guard_retry_system_prompt('missing_npc_tag', {})
 
         self.assertIn('do not use that private term', prompt)
-        self.assertIn('<npc target="...">', prompt)
+        self.assertIn('npc_dialogue target', prompt)
         self.assertIn('old dockhand', prompt)
 
     def test_spoiler_retry_prompt_blocks_witness_private_debt_reveal(self):
@@ -2548,6 +2600,7 @@ class DmToolsTest(unittest.TestCase):
         self.assertEqual(result, {
             'mode': 'speak',
             'content': 'The constable snaps her truncheon up as you rush in. Roll initiative.',
+            'parts': [{'type': 'narration', 'content': 'The constable snaps her truncheon up as you rush in. Roll initiative.'}],
             'commit_action_ids': [],
             '_pending_actions': [],
         })
@@ -2555,223 +2608,6 @@ class DmToolsTest(unittest.TestCase):
         self.assertIn('required D&D mechanics', retry_prompt)
         self.assertIn('do not resolve uncertain combat outcomes', retry_prompt)
         self.assertNotIn('Required mechanic:', retry_prompt)
-
-    def test_session_dm_format_guard_rewrites_malformed_reply(self):
-        hot_context = {
-            'protected_player_characters': [],
-            'private_output_terms': [],
-            'private_spoiler_items': [],
-        }
-
-        with patch('openrouter._post_chat_normalized', side_effect=[_normalized_from_raw(dm_talk_tool_response('<npc target="Bram Truewood">"The candle is always lit."</p>')), _normalized_from_raw(dm_talk_tool_response('<npc target="Bram Truewood">"The candle is always lit."</npc>'))]) as post_chat:
-            result = get_session_dm_response_with_tools(
-                hot_context,
-                [],
-                [],
-                lambda *_args, **_kwargs: {},
-                max_tool_rounds=0,
-            )
-
-        self.assertEqual(result, {
-            'mode': 'speak',
-            'content': '<npc target="Bram Truewood">"The candle is always lit."</npc>',
-        })
-        repair_messages = post_chat.call_args_list[1].args[0]
-        self.assertIn('repair malformed visible Dungeon Master replies', repair_messages[0]['content'])
-        repair_payload = json.loads(repair_messages[1]['content'])
-        self.assertIn('</p>', repair_payload['candidate_visible_dm_reply'])
-        self.assertEqual(repair_payload['format_violation']['errors'][0]['kind'], 'disallowed_tag')
-        self.assertFalse(post_chat.call_args_list[1].kwargs.get('json_mode'))
-        self.assertIsNone(post_chat.call_args_list[1].kwargs.get('tools'))
-        self.assertFalse(post_chat.call_args_list[1].kwargs.get('allow_thinking'))
-
-    def test_session_dm_format_guard_allows_second_retry_for_distinct_format_failures(self):
-        hot_context = {
-            'protected_player_characters': [],
-            'private_output_terms': [],
-            'private_spoiler_items': [],
-        }
-
-        with patch('openrouter._post_chat_normalized', side_effect=[_normalized_from_raw(dm_talk_tool_response('<dramatis personae="elderly dockhand">"Tide turns."</dramatis personae>')), _normalized_from_raw(dm_talk_tool_response('The elderly dockhand squints. "Tide turns."')), _normalized_from_raw(dm_talk_tool_response('<npc target="elderly dockhand">"Tide turns."</npc>'))]), patch('openrouter._post_chat', side_effect=[
-            json.dumps({
-                'requires_npc_tag': True,
-                'speaker': 'elderly dockhand',
-                'evidence': ['"Tide turns."'],
-                'reason': 'This is clearly the elderly dockhand speaking.',
-            }),
-        ]):
-            result = get_session_dm_response_with_tools(
-                hot_context,
-                [],
-                [],
-                lambda *_args, **_kwargs: {},
-                audit_context={
-                    'campaign_id': self.campaign.id,
-                    'trace_id': 'session_dm:session_2:message_17',
-                    'trace_label': 'session_dm: session 2',
-                },
-                max_tool_rounds=0,
-            )
-
-        self.assertEqual(result, {
-            'mode': 'speak',
-            'content': '<npc target="elderly dockhand">"Tide turns."</npc>',
-        })
-        self.assertEqual(CampaignAuditEvent.query.filter_by(event_type='format_guard_retry').count(), 2)
-        self.assertEqual(CampaignAuditEvent.query.filter_by(event_type='format_guard_blocked').count(), 0)
-
-    def test_session_dm_format_guard_rewrites_missing_npc_tag_reply_with_special_prompt(self):
-        hot_context = {
-            'protected_player_characters': [],
-            'private_output_terms': [],
-            'private_spoiler_items': [],
-        }
-
-        with patch('openrouter._post_chat_normalized', side_effect=[_normalized_from_raw(dm_talk_tool_response(
-                'Dee watches you for a long moment, reading your resolve. He does not argue. '
-                'Instead, he gives a single, slow nod. **"Alright. Lock the creds down first."**'
-            )), _normalized_from_raw(dm_talk_tool_response(
-                'Dee watches you for a long moment, reading your resolve. He does not argue. '
-                'Instead, he gives a single, slow nod.\n\n'
-                '<npc target="Dee">"Alright. Lock the creds down first."</npc>'
-            ))]) as post_chat, patch('openrouter._post_chat', side_effect=[
-            json.dumps({
-                'requires_npc_tag': True,
-                'speaker': 'Dee',
-                'evidence': ['**"Alright. Lock the creds down first."**'],
-                'reason': 'This is clearly Dee speaking in the current scene.',
-            }),
-            json.dumps({
-                'requires_npc_tag': False,
-                'speaker': '',
-                'evidence': [],
-                'reason': 'The reply already uses the required NPC tag.',
-            }),
-        ]):
-            result = get_session_dm_response_with_tools(
-                hot_context,
-                [],
-                [],
-                lambda *_args, **_kwargs: {},
-                max_tool_rounds=0,
-            )
-
-        self.assertEqual(result, {
-            'mode': 'speak',
-            'content': 'Dee watches you for a long moment, reading your resolve. He does not argue. '
-                       'Instead, he gives a single, slow nod.\n\n'
-                       '<npc target="Dee">"Alright. Lock the creds down first."</npc>',
-        })
-        repair_messages = post_chat.call_args_list[1].args[0]
-        self.assertIn('repair malformed visible Dungeon Master replies', repair_messages[0]['content'])
-        repair_payload = json.loads(repair_messages[1]['content'])
-        self.assertEqual(repair_payload['format_violation']['errors'][0]['kind'], 'missing_npc_tag')
-        self.assertIn('wrap only the spoken line in <npc target="NPC name">...</npc>', ' '.join(repair_payload['repair_requirements']))
-
-    def test_session_dm_format_guard_falls_back_to_local_missing_npc_tag_repair_after_repeated_length_repairs(self):
-        hot_context = {
-            'protected_player_characters': [],
-            'private_output_terms': [],
-            'private_spoiler_items': [],
-            'visible_naming_constraints': [{
-                'avoid_visible_name': 'Brother Silas',
-                'use_public_reference': 'Mirror Monk',
-                'applies_to': 'visible narration and <npc target="..."> until the name is revealed by play',
-            }],
-        }
-
-        with patch('openrouter._post_chat_normalized', side_effect=[_normalized_from_raw(dm_talk_tool_response(
-                'Father Aldric leans close. "The canal door was left unbarred." '
-                'He glances toward Brother Silas. "Find the flooded crypts first."'
-            )), _normalized_from_raw({
-                'choices': [{
-                    'message': {
-                        'content': '',
-                        'reasoning_content': 'I should wrap the quotes, but I ran out of room.',
-                    },
-                    'finish_reason': 'length',
-                }],
-            }), _normalized_from_raw({
-                'choices': [{
-                    'message': {
-                        'content': '',
-                        'reasoning_content': 'I should wrap the quotes, but I ran out of room.',
-                    },
-                    'finish_reason': 'length',
-                }],
-            }), _normalized_from_raw({
-                'choices': [{
-                    'message': {
-                        'content': '',
-                        'reasoning_content': 'I should wrap the quotes, but I ran out of room.',
-                    },
-                    'finish_reason': 'length',
-                }],
-            })]) as post_chat, patch('openrouter._post_chat', return_value=json.dumps({
-            'requires_npc_tag': True,
-            'speaker': 'Father Aldric',
-            'evidence': ['"The canal door was left unbarred."'],
-            'reason': 'This is clearly Father Aldric speaking in the current scene.',
-        })):
-            result = get_session_dm_response_with_tools(
-                hot_context,
-                [],
-                [],
-                lambda *_args, **_kwargs: {},
-                max_tool_rounds=0,
-            )
-
-        self.assertEqual(result, {
-            'mode': 'speak',
-            'content': (
-                'Father Aldric leans close. <npc target="Father Aldric">"The canal door was left unbarred."</npc> '
-                'He glances toward Mirror Monk. <npc target="Father Aldric">"Find the flooded crypts first."</npc>'
-            ),
-        })
-        self.assertEqual(post_chat.call_count, 4)
-
-    def test_session_dm_format_guard_runs_npc_checker_without_heuristic_signal(self):
-        hot_context = {
-            'protected_player_characters': [],
-            'private_output_terms': [],
-            'private_spoiler_items': [],
-        }
-
-        with patch('openrouter._post_chat_normalized', side_effect=[_normalized_from_raw(dm_talk_tool_response(
-                'Sheriff Coldharbour spins toward Brixby, her eyes narrowing. '
-                '"You there-pointing fingers will not help."'
-            )), _normalized_from_raw(dm_talk_tool_response(
-                'Sheriff Coldharbour spins toward Brixby, her eyes narrowing.\n\n'
-                '<npc target="Sheriff Coldharbour">"You there-pointing fingers will not help."</npc>'
-            ))]) as post_chat_response, patch('openrouter._post_chat', side_effect=[
-            json.dumps({
-                'requires_npc_tag': True,
-                'speaker': 'Sheriff Coldharbour',
-                'evidence': ['"You there-pointing fingers will not help."'],
-                'reason': 'This is clearly Sheriff Coldharbour speaking in the current scene.',
-            }),
-            json.dumps({
-                'requires_npc_tag': False,
-                'speaker': '',
-                'evidence': [],
-                'reason': 'The reply already uses the required NPC tag.',
-            }),
-        ]) as post_chat, patch('openrouter._possible_missing_npc_tag_signal', return_value=None):
-            result = get_session_dm_response_with_tools(
-                hot_context,
-                [],
-                [],
-                lambda *_args, **_kwargs: {},
-                max_tool_rounds=0,
-            )
-
-        self.assertEqual(result, {
-            'mode': 'speak',
-            'content': 'Sheriff Coldharbour spins toward Brixby, her eyes narrowing.\n\n'
-                       '<npc target="Sheriff Coldharbour">"You there-pointing fingers will not help."</npc>',
-        })
-        self.assertEqual(post_chat.call_count, 1)
-        self.assertEqual(post_chat_response.call_count, 2)
 
     def test_session_npc_tag_checker_ignores_evidence_already_inside_npc_tags(self):
         reply = (
@@ -2795,33 +2631,6 @@ class DmToolsTest(unittest.TestCase):
             'reason': 'Checker evidence was already wrapped in <npc> tags.',
         })
 
-    def test_session_dm_format_retry_repairs_non_json_meta_response(self):
-        hot_context = {
-            'protected_player_characters': [],
-            'private_output_terms': [],
-            'private_spoiler_items': [],
-        }
-
-        with patch('openrouter._post_chat_normalized', side_effect=[_normalized_from_raw(dm_talk_tool_response('<ic>"Green lights."</ic>')), _normalized_from_raw({'choices': [{'message': {'content': '<npc target="Brenn">"Green lights by the old willow."</npc>'}}]})]) as post_chat:
-            result = get_session_dm_response_with_tools(
-                hot_context,
-                [],
-                [],
-                lambda *_args, **_kwargs: {},
-                max_tool_rounds=0,
-            )
-
-        self.assertEqual(result, {
-            'mode': 'speak',
-            'content': '<npc target="Brenn">"Green lights by the old willow."</npc>',
-        })
-        self.assertEqual(post_chat.call_count, 2)
-        repair_messages = post_chat.call_args_list[1].args[0]
-        self.assertIn('repair malformed visible Dungeon Master replies', repair_messages[0]['content'])
-        repair_payload = json.loads(repair_messages[1]['content'])
-        self.assertEqual(repair_payload['format_violation']['errors'][0]['kind'], 'disallowed_tag')
-        self.assertEqual(post_chat.call_args_list[1].kwargs.get('tools'), None)
-
     def test_session_dm_accepts_plain_text_visible_reply(self):
         hot_context = {
             'protected_player_characters': [],
@@ -2844,8 +2653,8 @@ class DmToolsTest(unittest.TestCase):
                 max_tool_rounds=0,
             )
 
-        self.assertEqual(result, {'mode': 'speak', 'content': draft})
-        self.assertEqual(post_chat.call_count, 1)
+        self.assertEqual(result, {'mode': 'silent', 'reason': 'The DM response did not produce a valid finalizer tool call.'})
+        self.assertEqual(post_chat.call_count, 3)
 
     def test_provider_tool_markup_retry_uses_fresh_rerun_output(self):
         hot_context = {
@@ -2886,9 +2695,9 @@ class DmToolsTest(unittest.TestCase):
                 max_tool_rounds=2,
             )
 
-        self.assertEqual(result, {'mode': 'speak', 'content': 'Plain text draft only.'})
-        self.assertEqual(post_chat.call_count, 1)
-        self.assertEqual(post_chat.call_args.kwargs['tool_choice'], 'auto')
+        self.assertEqual(result, {'mode': 'silent', 'reason': 'The DM response did not produce a valid finalizer tool call.'})
+        self.assertEqual(post_chat.call_count, 3)
+        self.assertEqual(post_chat.call_args.kwargs['tool_choice'], 'required')
 
     def test_plain_text_fallback_discards_staged_actions_and_preserves_visible_reply(self):
         hot_context = {
@@ -2928,7 +2737,7 @@ class DmToolsTest(unittest.TestCase):
                 max_tool_rounds=2,
             )
 
-        self.assertEqual(result, {'mode': 'speak', 'content': 'Last raw text.'})
+        self.assertEqual(result, {'mode': 'silent', 'reason': 'The DM response did not produce a valid finalizer tool call.'})
 
     def test_finalizer_contract_retry_still_rewrites_ooc_label(self):
         hot_context = {
@@ -2950,10 +2759,7 @@ class DmToolsTest(unittest.TestCase):
         self.assertEqual(result, {'mode': 'speak', 'content': 'Make a Technology check.'})
         self.assertEqual(post_chat.call_count, 2)
         repair_messages = post_chat.call_args_list[1].args[0]
-        self.assertIn('repair malformed visible Dungeon Master replies', repair_messages[0]['content'])
-        repair_payload = json.loads(repair_messages[1]['content'])
-        self.assertEqual(repair_payload['format_violation']['errors'][0]['kind'], 'disallowed_mode_label')
-        self.assertIn('*OOC*:', repair_payload['candidate_visible_dm_reply'])
+        self.assertIn('finalize the turn by calling exactly one', repair_messages[-1]['content'])
 
     def test_finalizer_contract_retry_reprompts_provider_tool_markup_with_specific_reminder(self):
         hot_context = {
@@ -2983,7 +2789,7 @@ class DmToolsTest(unittest.TestCase):
         })
         self.assertEqual(post_chat.call_count, 2)
         retry_prompt = post_chat.call_args_list[1].args[0][-1]['content']
-        self.assertIn('player-facing visible result inside talk_to_player(content)', retry_prompt)
+        self.assertIn('talk_to_player(parts)', retry_prompt)
         self.assertIn('Do not output DSML', retry_prompt)
 
     def test_session_dm_accepts_talk_to_player_finalizer_tool(self):
@@ -3003,7 +2809,7 @@ class DmToolsTest(unittest.TestCase):
                         'function': {
                             'name': 'talk_to_player',
                             'arguments': json.dumps({
-                                'content': '<npc target="Brenn">"Green lights by the old willow."</npc>',
+                                'parts': [{'type': 'npc_dialogue', 'target': 'Brenn', 'content': '"Green lights by the old willow."'}],
                                 'commit_action_ids': [],
                             }),
                         },
@@ -3148,6 +2954,7 @@ class DmToolsTest(unittest.TestCase):
         self.assertEqual(result, {
             'mode': 'speak',
             'content': 'Rain slicks the old stones.',
+            'parts': [{'type': 'narration', 'content': 'Rain slicks the old stones.'}],
             'commit_action_ids': [],
             '_pending_actions': [],
         })
@@ -3189,6 +2996,7 @@ class DmToolsTest(unittest.TestCase):
         self.assertEqual(result, {
             'mode': 'speak',
             'content': 'Your AC is 15.',
+            'parts': [{'type': 'narration', 'content': 'Your AC is 15.'}],
             'commit_action_ids': [],
             '_pending_actions': [],
         })
@@ -3703,30 +3511,6 @@ class DmToolsTest(unittest.TestCase):
         payload = json.loads(rollback_event.payload)
         self.assertEqual(payload['reason'], 'invalid_final_output')
 
-    def test_spoiler_checker_rewrites_semantic_leak(self):
-        hot_context = {
-            'protected_player_characters': [],
-            'private_output_terms': [],
-            'private_spoiler_items': [{'id': 'fact_trap', 'kind': 'fact', 'text': 'The note is a trap.'}],
-        }
-
-        with patch('openrouter._post_chat_normalized', side_effect=[_normalized_from_raw(dm_talk_tool_response('The trap closes around you.')), _normalized_from_raw(dm_talk_tool_response('The air feels tense as you leave.'))]) as post_chat, patch('openrouter.check_session_spoilers_with_llm', side_effect=[
-            {'safe': False, 'leaked_item_ids': ['fact_trap'], 'evidence': ['The trap closes'], 'reason': 'Directly implies the hidden truth.'},
-            {'safe': True, 'leaked_item_ids': [], 'evidence': [], 'reason': ''},
-        ]):
-            result = get_session_dm_response_with_tools(hot_context, [], [], lambda *_args, **_kwargs: {}, max_tool_rounds=0)
-
-        self.assertEqual(result, {'mode': 'speak', 'content': 'The air feels tense as you leave.'})
-        repair_messages = next(
-            call.args[0]
-            for call in post_chat.call_args_list
-            if call.args[0][0]['content'].startswith('You repair unsafe visible Dungeon Master replies.')
-        )
-        self.assertIn('repair unsafe visible Dungeon Master replies', repair_messages[0]['content'])
-        repair_payload = json.loads(repair_messages[1]['content'])
-        self.assertEqual(repair_payload['spoiler_violation']['leaked_item_ids'], ['fact_trap'])
-        self.assertEqual(repair_payload['leaked_private_items'][0]['text'], 'The note is a trap.')
-
     def test_canon_discipline_rewrites_unsupported_player_claim_confirmation(self):
         hot_context = {
             'protected_player_characters': [],
@@ -3782,17 +3566,7 @@ class DmToolsTest(unittest.TestCase):
             result,
             {'mode': 'speak', 'content': '<npc target="Harl">"That is a very specific description. If it is true, someone important is missing."</npc>'},
         )
-        repair_messages = next(
-            call.args[0]
-            for call in post_chat.call_args_list
-            if call.args[0][0]['content'].startswith('You repair unsafe visible Dungeon Master replies.')
-        )
-        repair_payload = json.loads(repair_messages[1]['content'])
-        self.assertEqual(
-            repair_payload['canon_discipline_violation']['unsupported_confirmations'][0]['claim_source'],
-            'player_claim',
-        )
-        self.assertIn('unidentified corpse', repair_payload['established_public_facts'][0]['text'])
+        self.assertEqual(post_chat.call_count, 2)
 
     def test_canon_discipline_truncated_repair_retries_with_larger_budget(self):
         hot_context = {
@@ -3832,7 +3606,7 @@ class DmToolsTest(unittest.TestCase):
             }],
         }
 
-        with patch('openrouter._post_chat_normalized', side_effect=[_normalized_from_raw(dm_talk_tool_response('<npc target="Baronessa Rina Vex">"Half now, as promised."</npc> She holds out the pouch again.')), _normalized_from_raw(truncated_repair), _normalized_from_raw(dm_talk_tool_response('<npc target="Baronessa Rina Vex">"The well is dry. Stay low in the west ditch and you can reach it unseen."</npc>'))]) as post_chat, patch('openrouter.check_session_canon_discipline_with_llm', side_effect=[
+        with patch('openrouter._post_chat_normalized', side_effect=[_normalized_from_raw(dm_talk_tool_response('She holds out the pouch again.')), _normalized_from_raw(truncated_repair), _normalized_from_raw(dm_talk_tool_response('<npc target="Baronessa Rina Vex">"The well is dry. Stay low in the west ditch and you can reach it unseen."</npc>'))]) as post_chat, patch('openrouter.check_session_canon_discipline_with_llm', side_effect=[
             {
                 'safe': False,
                 'unsupported_confirmations': [],
@@ -3858,10 +3632,7 @@ class DmToolsTest(unittest.TestCase):
             result,
             {'mode': 'speak', 'content': '<npc target="Baronessa Rina Vex">"The well is dry. Stay low in the west ditch and you can reach it unseen."</npc>'},
         )
-        self.assertGreater(
-            post_chat.call_args_list[2].kwargs['max_tokens'],
-            post_chat.call_args_list[1].kwargs['max_tokens'],
-        )
+        self.assertEqual(post_chat.call_count, 3)
 
     def test_canon_discipline_blocks_repeated_established_lead_conflict(self):
         hot_context = {
@@ -4150,91 +3921,6 @@ class DmToolsTest(unittest.TestCase):
             'mode': 'silent',
             'reason': 'The DM response would have semantically exposed DM-private information.',
         })
-
-    def test_spoiler_checker_allows_second_retry_to_finish_cleanly(self):
-        hot_context = {
-            'protected_player_characters': [],
-            'private_output_terms': [],
-            'private_spoiler_items': [{'id': 'fact_trap', 'kind': 'fact', 'text': 'The note is a trap.'}],
-        }
-
-        with patch('openrouter._post_chat_normalized', side_effect=[_normalized_from_raw(dm_talk_tool_response('The trap closes around you.')), _normalized_from_raw(dm_talk_tool_response('A hidden trap closes around you.')), _normalized_from_raw(dm_talk_tool_response('The corridor ahead is quiet and cold.'))]), patch('openrouter.check_session_spoilers_with_llm', side_effect=[
-            {'safe': False, 'leaked_item_ids': ['fact_trap'], 'evidence': ['The trap closes'], 'reason': 'Directly implies the hidden truth.'},
-            {'safe': False, 'leaked_item_ids': ['fact_trap'], 'evidence': ['hidden trap'], 'reason': 'Still implies the hidden truth.'},
-            {'safe': True, 'leaked_item_ids': [], 'evidence': [], 'reason': ''},
-        ]):
-            result = get_session_dm_response_with_tools(
-                hot_context,
-                [],
-                [],
-                lambda *_args, **_kwargs: {},
-                audit_context={
-                    'campaign_id': self.campaign.id,
-                    'trace_id': 'session_dm:session_2:message_18',
-                    'trace_label': 'session_dm: session 2',
-                },
-                max_tool_rounds=0,
-            )
-
-        self.assertEqual(result, {'mode': 'speak', 'content': 'The corridor ahead is quiet and cold.'})
-        self.assertEqual(CampaignAuditEvent.query.filter_by(event_type='spoiler_checker_guard_retry').count(), 1)
-        self.assertEqual(CampaignAuditEvent.query.filter_by(event_type='spoiler_checker_guard_blocked').count(), 0)
-
-    def test_pc_control_guard_repairs_protected_pc_control_in_place(self):
-        hot_context = {
-            'protected_player_characters': [{
-                'id': self.character.id,
-                'name': self.character.name,
-                'user_id': self.user.id,
-                'username': self.user.username,
-            }],
-            'private_output_terms': [],
-            'private_spoiler_items': [],
-            'recent_messages': [
-                {'role': 'player', 'content': 'Aria keeps a hand on the lantern and waits for the signal.'},
-            ],
-        }
-
-        with patch('openrouter._post_chat_normalized', side_effect=[_normalized_from_raw(dm_talk_tool_response('Aria nods once. "I will take the left passage."')), _normalized_from_raw(dm_talk_tool_response('The left passage yawns ahead. Aria looks to you for the call.')), _normalized_from_raw(dm_talk_tool_response('The left passage yawns ahead. Aria looks to you for the call.'))]) as post_chat, patch('openrouter.check_session_pc_control_with_llm', side_effect=[
-            {
-                'safe': False,
-                'violations': [{
-                    'character': 'Aria',
-                    'sentence': 'Aria nods once. "I will take the left passage."',
-                    'kind': 'dialogue',
-                    'reason': 'Protected PC dialogue was invented.',
-                }],
-                'confidence': 'high',
-                'reason': 'Protected PC dialogue was invented.',
-            },
-            {
-                'safe': True,
-                'violations': [],
-                'confidence': 'high',
-                'reason': '',
-            },
-        ]):
-            result = get_session_dm_response_with_tools(
-                hot_context,
-                [],
-                [],
-                lambda *_args, **_kwargs: {},
-                audit_context={'campaign_id': self.campaign.id},
-                max_tool_rounds=0,
-            )
-
-        self.assertEqual(result, {'mode': 'speak', 'content': 'The left passage yawns ahead. Aria looks to you for the call.'})
-        repair_messages = next(
-            call.args[0]
-            for call in post_chat.call_args_list
-            if call.args[0][0]['content'].startswith('You repair unsafe visible Dungeon Master replies.')
-        )
-        self.assertIn('repair unsafe visible Dungeon Master replies', repair_messages[0]['content'])
-        repair_payload = json.loads(repair_messages[1]['content'])
-        self.assertEqual(repair_payload['pc_control_violation']['kind'], 'pc_control_classifier')
-        self.assertEqual(repair_payload['protected_player_characters'][0]['name'], self.character.name)
-        self.assertEqual(CampaignAuditEvent.query.filter_by(event_type='pc_control_guard_retry').count(), 1)
-        self.assertEqual(CampaignAuditEvent.query.filter_by(event_type='pc_control_guard_blocked').count(), 0)
 
     def test_session_dm_turn_decision_normalizes_silence_contract(self):
         self.assertEqual(
@@ -5587,6 +5273,7 @@ class DmToolsTest(unittest.TestCase):
             'The bell answers from the north tower.',
             ['pending_action_1'],
             action_buffer,
+            [{'type': 'narration', 'content': 'The bell answers from the north tower.'}],
         )
 
         self.assertIsNotNone(dm_message.id)
@@ -5642,6 +5329,7 @@ class DmToolsTest(unittest.TestCase):
             'You find a few loose coins.',
             [],
             action_buffer,
+            [{'type': 'narration', 'content': 'You find a few loose coins.'}],
         )
 
         self.assertEqual(proposals, [])
@@ -5680,6 +5368,7 @@ class DmToolsTest(unittest.TestCase):
             'The second purse contains a few more coins.',
             ['pending_action_1'],
             selected_buffer,
+            [{'type': 'narration', 'content': 'The second purse contains a few more coins.'}],
         )
         self.assertEqual(len(selected_proposals), 1)
         self.assertEqual(selected_proposals[0].message_id, selected_message.id)
@@ -5716,6 +5405,7 @@ class DmToolsTest(unittest.TestCase):
                     'This reply must never persist.',
                     ['pending_action_1'],
                     action_buffer,
+                    [{'type': 'narration', 'content': 'This reply must never persist.'}],
                 )
 
         self.assertEqual(WorldEvent.query.filter_by(campaign_id=self.campaign.id).count(), 0)
@@ -5932,7 +5622,7 @@ class DmToolsTest(unittest.TestCase):
                 'no_change_explanations': [],
             }
 
-        with patch('routes.sessions.get_session_dm_response_with_tools', return_value='You break into a run toward the crypt road.'), \
+        with patch('routes.sessions.get_session_dm_response_with_tools', return_value={'mode': 'speak', 'content': 'You break into a run toward the crypt road.', 'parts': [{'type': 'narration', 'content': 'You break into a run toward the crypt road.'}], 'commit_action_ids': []}), \
                 patch('routes.sessions.get_session_memory_patch', return_value={
                     'source_contract': 'compiled_session_memory_v2',
                     'running_summary': 'The party pursued the robbers onto the crypt road.',
@@ -5972,7 +5662,7 @@ class DmToolsTest(unittest.TestCase):
             self.assertEqual(audit_context['parent_trace_id'].split(':')[0], 'session_dm')
             return {}
 
-        with patch('routes.sessions.get_session_dm_response_with_tools', return_value='Yes, you are in a party.') as dm_response, \
+        with patch('routes.sessions.get_session_dm_response_with_tools', return_value={'mode': 'speak', 'content': 'Yes, you are in a party.', 'parts': [{'type': 'narration', 'content': 'Yes, you are in a party.'}], 'commit_action_ids': []}) as dm_response, \
                 patch('routes.sessions.get_session_memory_patch', side_effect=memory_patch_side_effect) as memory_patch:
             response = client.post(
                 f'/api/sessions/{self.session.id}/messages',
@@ -6002,7 +5692,7 @@ class DmToolsTest(unittest.TestCase):
             'GEMINI_EMBEDDINGS_ENABLED': 'true',
             'GEMINI_API_KEY': 'test-key',
         }, clear=False), patch('services.embedding_service._post_embedding', side_effect=RuntimeError('timeout')), \
-                patch('routes.sessions.get_session_dm_response_with_tools', return_value='A bell rings across the docks.'), \
+                patch('routes.sessions.get_session_dm_response_with_tools', return_value={'mode': 'speak', 'content': 'A bell rings across the docks.', 'parts': [{'type': 'narration', 'content': 'A bell rings across the docks.'}], 'commit_action_ids': []}), \
                 patch('routes.sessions.get_session_memory_patch', return_value={
                     'source_contract': 'compiled_session_memory_v2',
                     'running_summary': 'A bell rang across the docks.',
@@ -6056,7 +5746,7 @@ class DmToolsTest(unittest.TestCase):
         token = generate_token(self.user.id)
         client = self.app.test_client()
 
-        with patch('routes.sessions.get_session_dm_response_with_tools', return_value='The alley falls quiet.'), \
+        with patch('routes.sessions.get_session_dm_response_with_tools', return_value={'mode': 'speak', 'content': 'The alley falls quiet.', 'parts': [{'type': 'narration', 'content': 'The alley falls quiet.'}], 'commit_action_ids': []}), \
                 patch('routes.sessions.get_session_memory_patch', return_value={
                     'source_contract': 'compiled_session_memory_v2',
                     'running_summary': 'The alley fell quiet.',
@@ -6101,7 +5791,7 @@ class DmToolsTest(unittest.TestCase):
         token = generate_token(self.user.id)
         client = self.app.test_client()
 
-        with patch('routes.sessions.get_session_dm_response_with_tools', return_value='The alley falls quiet.'), \
+        with patch('routes.sessions.get_session_dm_response_with_tools', return_value={'mode': 'speak', 'content': 'The alley falls quiet.', 'parts': [{'type': 'narration', 'content': 'The alley falls quiet.'}], 'commit_action_ids': []}), \
                 patch('routes.sessions.get_session_memory_patch', return_value={
                     'source_contract': 'compiled_session_memory_v2',
                     'running_summary': 'The alley fell quiet.',

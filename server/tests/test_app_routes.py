@@ -660,7 +660,7 @@ class AppRouteTest(unittest.TestCase):
 
         with patch(
             'routes.sessions.get_session_dm_response_with_tools',
-            return_value='The door groans open onto a moonlit hall.',
+            return_value={'mode': 'speak', 'content': 'The door groans open onto a moonlit hall.', 'parts': [{'type': 'narration', 'content': 'The door groans open onto a moonlit hall.'}], 'commit_action_ids': []},
         ), patch('routes.sessions.get_session_memory_patch', return_value={}):
             message_response = self.client.post(
                 f'/api/sessions/{session_id}/messages',
@@ -2496,6 +2496,8 @@ class AppRouteTest(unittest.TestCase):
             patch('routes.sessions.get_session_dm_response_with_tools', return_value={
                 'mode': 'speak',
                 'content': 'You reach the harbor by dusk.',
+                'parts': [{'type': 'narration', 'content': 'You reach the harbor by dusk.'}],
+                'commit_action_ids': [],
             }),
             patch('routes.sessions.get_session_memory_patch', return_value={
                 'source_contract': 'compiled_session_memory_v2',
