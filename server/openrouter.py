@@ -413,22 +413,6 @@ JSON_REPAIR_SYSTEM_PROMPT = (
     "markdown fences, or new facts."
 )
 
-SESSION_FORMAT_REPAIR_SYSTEM_PROMPT = (
-    "You repair malformed visible Dungeon Master replies. Return only the repaired visible reply text. "
-    "Preserve the same story meaning, ordering, and wording as closely as possible. Make only the smallest "
-    "changes needed to satisfy the reported formatting rules. Do not add explanations, markdown fences, new "
-    "facts, new actions, or extra dialogue. Keep narration outside NPC tags. The only allowed angle-bracket "
-    "tag is <npc target=\"NPC name\">...</npc>. Write visible replies in English only."
-)
-
-SESSION_GUARD_REPAIR_SYSTEM_PROMPT = (
-    "You repair unsafe visible Dungeon Master replies. Return only the repaired visible reply text. "
-    "Preserve the same scene facts, ordering, and story meaning as closely as possible. Make only the smallest "
-    "changes needed to satisfy the reported guard violation. Do not add explanations, markdown fences, tool-call "
-    "markup, new facts, new actions, or extra dialogue. Keep narration outside NPC tags. The only allowed "
-    "angle-bracket tag is <npc target=\"NPC name\">...</npc>. Write visible replies in English only."
-)
-
 LOOT_GENERATION_SYSTEM_PROMPT = (
     "You generate thematic D&D loot boxes for a party of adventurers. "
     "Each character gets their own personal pool of items tailored to their class, level, and identity. "
@@ -950,215 +934,6 @@ def _build_json_repair_messages(candidate, error):
             ),
         },
     ]
-
-
-def _build_session_format_repair_messages(candidate, format_violation, hot_context=None):
-    return _build_session_guard_repair_messages(
-        candidate,
-        'format',
-        format_violation,
-        hot_context=hot_context,
-    )
-
-
-def _visible_naming_target(name, hot_context):
-    normalized = str(name or '').strip().casefold()
-    constraints = (hot_context or {}).get('visible_naming_constraints') or []
-    for constraint in constraints:
-        avoid_name = str((constraint or {}).get('avoid_visible_name') or '').strip()
-        public_reference = str((constraint or {}).get('use_public_reference') or '').strip()
-        if avoid_name and public_reference and avoid_name.casefold() == normalized:
-            return public_reference
-    return str(name or '').strip()
-
-
-def _latest_player_messages_by_character(hot_context):
-    latest_player_messages = []
-    for character in (hot_context or {}).get('protected_player_characters') or []:
-        latest_player_messages.append({
-            'character_name': str(character.get('name') or '').strip(),
-            'user_id': character.get('user_id'),
-            'latest_player_message': _latest_player_message_for_character(hot_context, character),
-        })
-    return latest_player_messages
-
-
-def _leaked_private_items_for_repair(details, hot_context):
-    leaked_ids = {
-        str(item or '').strip()
-        for item in ((details or {}).get('leaked_item_ids') or [])
-        if str(item or '').strip()
-    }
-    if not leaked_ids:
-        return []
-    return [
-        {
-            'id': str(item.get('id') or '').strip(),
-            'kind': str(item.get('kind') or '').strip(),
-            'text': str(item.get('text') or '').strip(),
-        }
-        for item in ((hot_context or {}).get('private_spoiler_items') or [])
-        if isinstance(item, dict) and str(item.get('id') or '').strip() in leaked_ids
-    ]
-
-
-def _session_dm_guard_repair_payload(candidate, guard_name, details, hot_context=None):
-    payload = {
-        'candidate_visible_dm_reply': candidate,
-        'visible_naming_constraints': (hot_context or {}).get('visible_naming_constraints') or [],
-        'repair_requirements': [],
-    }
-    if guard_name == 'format':
-        payload['format_violation'] = details or {}
-        payload['repair_requirements'] = [
-            'Return only the repaired visible reply text.',
-            'Preserve the existing wording and narrative meaning unless a change is required to fix formatting.',
-            'If clearly attributed NPC speech appears, wrap only the spoken line in <npc target="NPC name">...</npc>.',
-            'Leave narration outside any <npc> tag.',
-            'If a naming constraint applies, use use_public_reference as the NPC target instead of avoid_visible_name.',
-            'Do not use any angle-bracket tag other than <npc target="NPC name">...</npc>.',
-        ]
-        return payload
-    if guard_name == 'pc_control':
-        payload['pc_control_violation'] = details or {}
-        payload['protected_player_characters'] = (hot_context or {}).get('protected_player_characters') or []
-        payload['latest_player_messages_by_character'] = _latest_player_messages_by_character(hot_context)
-        payload['repair_requirements'] = [
-            'Return only the repaired visible reply text.',
-            'Preserve the scene facts, NPC actions, and DM intent unless a change is required to stop controlling a protected player character.',
-            'Do not invent dialogue, choices, intent, interior state, or consequential actions for any protected player character.',
-            'Convert protected player character dialogue or decisions into non-controlling DM narration, a direct question, or a brief player handoff.',
-            'Keep references to protected player characters brief and non-controlling.',
-            'Do not use any angle-bracket tag other than <npc target="NPC name">...</npc>.',
-        ]
-        return payload
-    if guard_name == 'canon_discipline':
-        payload['canon_discipline_violation'] = details or {}
-        payload['latest_player_message'] = _latest_player_message(hot_context)
-        payload['established_public_facts'] = (hot_context or {}).get('established_public_facts') or []
-        payload['recent_public_world_events'] = (hot_context or {}).get('recent_public_world_events') or []
-        payload['open_public_threads'] = (hot_context or {}).get('open_public_threads') or []
-        payload['repair_requirements'] = [
-            'Return only the repaired visible reply text.',
-            'Preserve scene momentum, atmosphere, and any safe established facts unless a change is required to restore evidence discipline.',
-            'Do not turn player-supplied specifics into confirmed truth unless the confirmation is grounded in visible evidence already present in the payload.',
-            'If a player claim is not corroborated, keep it conditional, skeptical, or merely reactive from the NPC point of view.',
-            'Do not replace or sharply reframe an established public lead unless the visible evidence already supports that update.',
-            'Prefer uncertainty language over authoritative confirmation when the evidence is incomplete.',
-            'Do not use any angle-bracket tag other than <npc target="NPC name">...</npc>.',
-        ]
-        return payload
-    if guard_name == 'spoiler_checker':
-        payload['spoiler_violation'] = details or {}
-        payload['latest_player_message'] = _latest_player_message(hot_context)
-        payload['leaked_private_items'] = _leaked_private_items_for_repair(details, hot_context)
-        payload['repair_requirements'] = [
-            'Return only the repaired visible reply text.',
-            'Preserve the scene intent and any safe public facts unless a change is required to remove the spoiler leak.',
-            'Keep only what players could currently observe, hear, or reasonably infer in-world.',
-            'Replace hidden motives, hidden leverage, secret causes, private plans, and hidden-tracker language with safe surface-level clues, visible pressure, practical conditions, or evasive reluctance.',
-            'Do not reveal or strongly imply unrevealed private items, hidden countdowns, or DM-private causality.',
-            'If a witness can safely offer a clue, keep it limited, public-facing, and incomplete rather than explaining the hidden truth.',
-            'Do not use any angle-bracket tag other than <npc target="NPC name">...</npc>.',
-        ]
-        return payload
-    raise ValueError(f'Unsupported session DM guard repair type: {guard_name}')
-
-
-def _session_dm_guard_repair_system_prompt(guard_name):
-    if guard_name == 'format':
-        return SESSION_FORMAT_REPAIR_SYSTEM_PROMPT
-    return SESSION_GUARD_REPAIR_SYSTEM_PROMPT
-
-
-def _build_session_guard_repair_messages(candidate, guard_name, details, hot_context=None):
-    return [
-        {
-            'role': 'system',
-            'content': _session_dm_guard_repair_system_prompt(guard_name),
-        },
-        {
-            'role': 'user',
-            'content': json.dumps(
-                _session_dm_guard_repair_payload(candidate, guard_name, details, hot_context),
-                ensure_ascii=False,
-            ),
-        },
-    ]
-
-
-def _apply_visible_naming_constraints(text, hot_context):
-    repaired = str(text or '')
-    constraints = (hot_context or {}).get('visible_naming_constraints') or []
-    ordered_constraints = sorted(
-        [constraint for constraint in constraints if isinstance(constraint, dict)],
-        key=lambda constraint: len(str(constraint.get('avoid_visible_name') or '')),
-        reverse=True,
-    )
-    for constraint in ordered_constraints:
-        avoid_name = str(constraint.get('avoid_visible_name') or '').strip()
-        public_reference = str(constraint.get('use_public_reference') or '').strip()
-        if not avoid_name or not public_reference:
-            continue
-        repaired = re.sub(
-            rf'(?<!\w){re.escape(avoid_name)}(?!\w)',
-            public_reference,
-            repaired,
-            flags=re.IGNORECASE,
-        )
-    return repaired
-
-
-def _extract_missing_npc_tag_speaker(format_violation):
-    errors = (format_violation or {}).get('errors') or []
-    for error in errors:
-        if str((error or {}).get('kind') or '').strip().lower() != 'missing_npc_tag':
-            continue
-        detail = str((error or {}).get('detail') or '')
-        match = re.search(r'<npc\s+target="([^"]+)">', detail)
-        if match:
-            return str(match.group(1) or '').strip()
-    return ''
-
-
-def _wrap_quoted_dialogue_with_npc_tag(text, speaker):
-    target = str(speaker or '').strip()
-    if not target:
-        return str(text or '')
-
-    segments = re.split(r'(<npc\b[^>]*>.*?</npc>)', str(text or ''), flags=re.IGNORECASE | re.DOTALL)
-    quote_pattern = re.compile(r'((?:\*\*)?\s*["\u201c][^"\u201c\u201d\n]{2,400}["\u201d](?:\s*\*\*)?)')
-    rebuilt = []
-    def _wrap_match(match):
-        raw_quote = match.group(1)
-        stripped_quote = raw_quote.strip()
-        if not stripped_quote:
-            return raw_quote
-        leading_ws = raw_quote[:len(raw_quote) - len(raw_quote.lstrip())]
-        trailing_ws = raw_quote[len(raw_quote.rstrip()):]
-        return f'{leading_ws}<npc target="{target}">{stripped_quote}</npc>{trailing_ws}'
-
-    for segment in segments:
-        if not segment:
-            continue
-        if re.match(r'<npc\b[^>]*>.*?</npc>$', segment, flags=re.IGNORECASE | re.DOTALL):
-            rebuilt.append(segment)
-            continue
-        rebuilt.append(quote_pattern.sub(_wrap_match, segment))
-    return ''.join(rebuilt)
-
-
-def _local_missing_npc_tag_repair(candidate, format_violation, hot_context=None):
-    speaker = _extract_missing_npc_tag_speaker(format_violation)
-    if not speaker:
-        return ''
-
-    target = _visible_naming_target(speaker, hot_context)
-    repaired = _apply_visible_naming_constraints(candidate, hot_context)
-    wrapped = _wrap_quoted_dialogue_with_npc_tag(repaired, target)
-    if wrapped == str(candidate or ''):
-        return ''
-    return wrapped.strip()
 
 
 def _json_loads_with_repair(text, audit_context=None):
@@ -3018,69 +2793,6 @@ def _session_dm_content_format_violation(content, audit_context=None):
     return format_violation
 
 
-def _repair_session_dm_visible_reply(content, guard_name, details, hot_context, audit_context=None):
-    if not str(content or '').strip():
-        return ''
-
-    guard_operation = f'session_dm_{guard_name}_repair'
-    base_repair_audit = _child_audit_context(
-        audit_context or {},
-        guard_operation,
-        guard_operation,
-        f'{guard_operation}: visible reply repair',
-    )
-
-    estimated_tokens = max(1, _estimate_tokens(content))
-    repair_token_budgets = []
-    next_budget = max(512, estimated_tokens + 256)
-    while len(repair_token_budgets) < 3:
-        repair_token_budgets.append(next_budget)
-        if next_budget >= 16384:
-            break
-        next_budget = min(16384, max(next_budget * 2, next_budget + 1024))
-
-    for attempt_index, max_tokens in enumerate(repair_token_budgets, start=1):
-        repair_audit = base_repair_audit
-        if attempt_index > 1:
-            repair_audit = _child_audit_context(
-                base_repair_audit,
-                f'{guard_operation}_retry_{attempt_index}',
-                guard_operation,
-                f'{guard_operation}: visible reply repair retry {attempt_index}',
-            )
-        try:
-            normalized = _post_chat_normalized(
-                _build_session_guard_repair_messages(content, guard_name, details, hot_context),
-                json_mode=False,
-                audit_context=repair_audit,
-                tools=None,
-                allow_thinking=False,
-                max_tokens=max_tokens,
-            )
-        except ProviderError as err:
-            if err.kind != 'malformed':
-                raise
-            # Choice-less repair output is unusable; try the next token budget.
-            continue
-        message = normalized.message_view()
-        finish_reason = normalized.finish_reason
-        finish_reason = str(finish_reason or '').strip().lower()
-        if finish_reason == 'length':
-            continue
-        repaired_content = str(message.get('content') or '').strip()
-        if repaired_content:
-            return repaired_content
-        finalizer_decision, _violation = _session_dm_finalizer_decision_from_tool_calls(message.get('tool_calls') or [])
-        if isinstance(finalizer_decision, dict) and finalizer_decision.get('mode') == 'speak':
-            return str(finalizer_decision.get('content') or '').strip()
-
-    if guard_name == 'format':
-        local_repair = _local_missing_npc_tag_repair(content, details, hot_context)
-        if local_repair:
-            return local_repair
-    return ''
-
-
 def check_session_mechanics_with_llm(response_text, preflight_decision, hot_context, audit_context=None):
     if not (response_text or '').strip():
         return {'safe': True, 'violations': [], 'required_mechanic': '', 'reason': ''}
@@ -4065,12 +3777,9 @@ def _run_session_dm_loop(
     format_retry_count = 0
     mechanical_retried = False
     pc_control_retried = False
-    pc_control_repair_attempted = False
     canon_checker_retry_count = 0
-    canon_checker_repair_attempted = False
     private_output_retry_count = 0
     spoiler_checker_retry_count = 0
-    spoiler_checker_repair_attempted = False
     combat_handoff_retried = False
     guard_audits = {}
     combat_tracker = _session_dm_combat_tracker(hot_context)
@@ -4278,10 +3987,6 @@ def _run_session_dm_loop(
             private_violation = None
             spoiler_check = {'safe': True, 'leaked_item_ids': [], 'evidence': [], 'reason': ''}
             combat_handoff_violation = None
-            # Repair helpers return rendered strings, which cannot prove that part
-            # targets and private context stayed paired. Structured candidates are
-            # therefore always discarded and regenerated by the finalizer.
-            allow_visible_string_repairs = False
             while True:
                 format_violation = (
                     _session_dm_content_format_violation(content, loop_audit)
@@ -4358,102 +4063,6 @@ def _run_session_dm_loop(
                     and not mechanical_violation and not canon_violation
                     else None
                 )
-                if False and (
-                    canon_violation
-                    and canon_checker_retry_count < 3
-                    and not canon_checker_repair_attempted
-                ):
-                    if on_status_change:
-                        on_status_change({"step": "revising", "violations": {"type": "canon_discipline", "details": canon_violation}})
-                    if base_audit.get('campaign_id'):
-                        audit = guard_audit('canon_discipline_guard')
-                        log_audit_event(
-                            base_audit.get('campaign_id'),
-                            'canon_discipline_guard_retry',
-                            'Session DM response promoted unsupported claims or conflicted with established public facts; sent candidate to a repair pass and will rerun with a guard reminder if needed.',
-                            {
-                                'operation': 'canon_discipline_guard',
-                                'violation': canon_violation,
-                                'draft_response': raw_content,
-                                'repair_strategy': 'repair_pass_then_rerun',
-                            },
-                            source='session_dm.guard',
-                            actor=audit.get('actor'),
-                            trace_id=audit.get('trace_id'),
-                            parent_trace_id=audit.get('parent_trace_id'),
-                            trace_label=audit.get('trace_label'),
-                            audit_role='guard',
-                            commit=True,
-                        )
-                    canon_checker_repair_attempted = True
-                    repaired_content = _repair_session_dm_visible_reply(
-                        content,
-                        'canon_discipline',
-                        canon_violation,
-                        hot_context,
-                        audit_context=loop_audit,
-                    )
-                    if any(part.get('dm_private_context') for part in decision.get('parts') or []):
-                        repaired_content = ''
-                    if repaired_content and repaired_content != content:
-                        content = repaired_content
-                        raw_content = repaired_content
-                        decision = {
-                            **decision,
-                            'content': repaired_content,
-                            'parts': [{'type': 'narration', 'content': repaired_content}]
-                            if not any(part.get('dm_private_context') for part in decision.get('parts') or [])
-                            else decision.get('parts'),
-                        }
-                        continue
-                if False and (
-                    not spoiler_check.get('safe', True)
-                    and spoiler_checker_retry_count < 3
-                    and not spoiler_checker_repair_attempted
-                ):
-                    if on_status_change:
-                        on_status_change({"step": "revising", "violations": {"type": "spoiler", "details": spoiler_check}})
-                    if base_audit.get('campaign_id'):
-                        audit = guard_audit('spoiler_checker_guard')
-                        log_audit_event(
-                            base_audit.get('campaign_id'),
-                            'spoiler_checker_guard_retry',
-                            'Session spoiler checker flagged a semantic leak; sent candidate to a repair pass and will rerun with a guard reminder if needed.',
-                            {
-                                'operation': 'spoiler_checker_guard',
-                                'checker_result': spoiler_check,
-                                'draft_response': raw_content,
-                                'repair_strategy': 'repair_pass_then_rerun',
-                            },
-                            source='session_dm.guard',
-                            actor=audit.get('actor'),
-                            trace_id=audit.get('trace_id'),
-                            parent_trace_id=audit.get('parent_trace_id'),
-                            trace_label=audit.get('trace_label'),
-                            audit_role='guard',
-                            commit=True,
-                        )
-                    spoiler_checker_repair_attempted = True
-                    repaired_content = _repair_session_dm_visible_reply(
-                        content,
-                        'spoiler_checker',
-                        spoiler_check,
-                        hot_context,
-                        audit_context=loop_audit,
-                    )
-                    if any(part.get('dm_private_context') for part in decision.get('parts') or []):
-                        repaired_content = ''
-                    if repaired_content and repaired_content != content:
-                        content = repaired_content
-                        raw_content = repaired_content
-                        decision = {
-                            **decision,
-                            'content': repaired_content,
-                            'parts': [{'type': 'narration', 'content': repaired_content}]
-                            if not any(part.get('dm_private_context') for part in decision.get('parts') or [])
-                            else decision.get('parts'),
-                        }
-                        continue
                 break
             if mechanical_violation and not mechanical_retried:
                 if on_status_change:
@@ -4491,9 +4100,9 @@ def _run_session_dm_loop(
                 format_retry_count += 1
                 continue
             if violation and not pc_control_retried:
-                if on_status_change and not pc_control_repair_attempted:
+                if on_status_change:
                     on_status_change({"step": "revising", "violations": {"type": "pc_control", "details": violation}})
-                if base_audit.get('campaign_id') and not pc_control_repair_attempted:
+                if base_audit.get('campaign_id'):
                     audit = guard_audit('pc_control_guard')
                     log_audit_event(
                         base_audit.get('campaign_id'),
@@ -4520,9 +4129,9 @@ def _run_session_dm_loop(
                 pc_control_retried = True
                 continue
             if canon_violation and canon_checker_retry_count < 3:
-                if on_status_change and (canon_checker_retry_count > 0 or not canon_checker_repair_attempted):
+                if on_status_change:
                     on_status_change({"step": "revising", "violations": {"type": "canon_discipline", "details": canon_violation}})
-                if base_audit.get('campaign_id') and (canon_checker_retry_count > 0 or not canon_checker_repair_attempted):
+                if base_audit.get('campaign_id'):
                     audit = guard_audit('canon_discipline_guard')
                     log_audit_event(
                         base_audit.get('campaign_id'),
@@ -4577,9 +4186,9 @@ def _run_session_dm_loop(
                 private_output_retry_count += 1
                 continue
             if not spoiler_check.get('safe', True) and spoiler_checker_retry_count < 3:
-                if on_status_change and (spoiler_checker_retry_count > 0 or not spoiler_checker_repair_attempted):
+                if on_status_change:
                     on_status_change({"step": "revising", "violations": {"type": "spoiler", "details": spoiler_check}})
-                if base_audit.get('campaign_id') and (spoiler_checker_retry_count > 0 or not spoiler_checker_repair_attempted):
+                if base_audit.get('campaign_id'):
                     audit = guard_audit('spoiler_checker_guard')
                     log_audit_event(
                         base_audit.get('campaign_id'),
