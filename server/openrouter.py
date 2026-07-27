@@ -1857,6 +1857,19 @@ def _latest_player_message_for_character(hot_context, character):
     return ''
 
 
+def _latest_player_messages_by_character(hot_context):
+    """Provide the PC-control checker each protected character's latest input."""
+    return [
+        {
+            'character_name': str(character.get('name') or '').strip(),
+            'user_id': character.get('user_id'),
+            'latest_player_message': _latest_player_message_for_character(hot_context, character),
+        }
+        for character in (hot_context or {}).get('protected_player_characters') or []
+        if isinstance(character, dict)
+    ]
+
+
 def _pc_control_staging_echo_exception(sentence, latest_player_message, character):
     import re
 
