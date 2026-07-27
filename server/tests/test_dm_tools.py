@@ -2404,14 +2404,14 @@ class DmToolsTest(unittest.TestCase):
         )
 
         self.assertIn('Mortimer', prompt)
-        self.assertIn('<npc target="...">', prompt)
+        self.assertIn('npc_dialogue targets', prompt)
         self.assertIn('Use public descriptors', prompt)
 
     def test_missing_npc_tag_retry_prompt_respects_private_terms(self):
         prompt = _session_dm_guard_retry_system_prompt('missing_npc_tag', {})
 
         self.assertIn('do not use that private term', prompt)
-        self.assertIn('<npc target="...">', prompt)
+        self.assertIn('npc_dialogue target', prompt)
         self.assertIn('old dockhand', prompt)
 
     def test_spoiler_retry_prompt_blocks_witness_private_debt_reveal(self):
