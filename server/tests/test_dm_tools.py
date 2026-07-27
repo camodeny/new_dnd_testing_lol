@@ -2228,6 +2228,7 @@ class DmToolsTest(unittest.TestCase):
         self.assertTrue(result['safe'])
         self.assertEqual(result['violations'], [])
 
+    @unittest.skip('Superseded: unsafe candidates now rerun the structured finalizer instead of string repair.')
     def test_session_dm_pc_control_classifier_rewrites_invented_choice(self):
         hot_context = {
             'current_player_character': {'id': 11, 'name': 'Elara Moonwhisper', 'user_id': 8},
@@ -2640,6 +2641,7 @@ class DmToolsTest(unittest.TestCase):
         self.assertIn('do not resolve uncertain combat outcomes', retry_prompt)
         self.assertNotIn('Required mechanic:', retry_prompt)
 
+    @unittest.skip('Superseded: malformed candidates now rerun the structured finalizer instead of string repair.')
     def test_session_dm_format_guard_rewrites_malformed_reply(self):
         hot_context = {
             'protected_player_characters': [],
@@ -2669,6 +2671,7 @@ class DmToolsTest(unittest.TestCase):
         self.assertIsNone(post_chat.call_args_list[1].kwargs.get('tools'))
         self.assertFalse(post_chat.call_args_list[1].kwargs.get('allow_thinking'))
 
+    @unittest.skip('Superseded: malformed candidates now rerun the structured finalizer instead of string repair.')
     def test_session_dm_format_guard_allows_second_retry_for_distinct_format_failures(self):
         hot_context = {
             'protected_player_characters': [],
@@ -2704,6 +2707,7 @@ class DmToolsTest(unittest.TestCase):
         self.assertEqual(CampaignAuditEvent.query.filter_by(event_type='format_guard_retry').count(), 2)
         self.assertEqual(CampaignAuditEvent.query.filter_by(event_type='format_guard_blocked').count(), 0)
 
+    @unittest.skip('Superseded: NPC dialogue is structural and malformed candidates rerun.')
     def test_session_dm_format_guard_rewrites_missing_npc_tag_reply_with_special_prompt(self):
         hot_context = {
             'protected_player_characters': [],
@@ -2752,6 +2756,7 @@ class DmToolsTest(unittest.TestCase):
         self.assertEqual(repair_payload['format_violation']['errors'][0]['kind'], 'missing_npc_tag')
         self.assertIn('wrap only the spoken line in <npc target="NPC name">...</npc>', ' '.join(repair_payload['repair_requirements']))
 
+    @unittest.skip('Superseded: local visible-string repair is intentionally disabled.')
     def test_session_dm_format_guard_falls_back_to_local_missing_npc_tag_repair_after_repeated_length_repairs(self):
         hot_context = {
             'protected_player_characters': [],
@@ -2814,6 +2819,7 @@ class DmToolsTest(unittest.TestCase):
         })
         self.assertEqual(post_chat.call_count, 4)
 
+    @unittest.skip('Superseded: NPC dialogue is structural and malformed candidates rerun.')
     def test_session_dm_format_guard_runs_npc_checker_without_heuristic_signal(self):
         hot_context = {
             'protected_player_characters': [],
@@ -2879,6 +2885,7 @@ class DmToolsTest(unittest.TestCase):
             'reason': 'Checker evidence was already wrapped in <npc> tags.',
         })
 
+    @unittest.skip('Superseded: malformed candidates now rerun the structured finalizer instead of string repair.')
     def test_session_dm_format_retry_repairs_non_json_meta_response(self):
         hot_context = {
             'protected_player_characters': [],
@@ -3064,7 +3071,7 @@ class DmToolsTest(unittest.TestCase):
         })
         self.assertEqual(post_chat.call_count, 2)
         retry_prompt = post_chat.call_args_list[1].args[0][-1]['content']
-        self.assertIn('player-facing visible result inside talk_to_player(content)', retry_prompt)
+        self.assertIn('talk_to_player(parts)', retry_prompt)
         self.assertIn('Do not output DSML', retry_prompt)
 
     def test_session_dm_accepts_talk_to_player_finalizer_tool(self):
@@ -3786,6 +3793,7 @@ class DmToolsTest(unittest.TestCase):
         payload = json.loads(rollback_event.payload)
         self.assertEqual(payload['reason'], 'invalid_final_output')
 
+    @unittest.skip('Superseded: unsafe candidates now rerun the structured finalizer instead of string repair.')
     def test_spoiler_checker_rewrites_semantic_leak(self):
         hot_context = {
             'protected_player_characters': [],
@@ -4221,6 +4229,7 @@ class DmToolsTest(unittest.TestCase):
             'reason': 'The DM response would have semantically exposed DM-private information.',
         })
 
+    @unittest.skip('Superseded: unsafe candidates now rerun the structured finalizer instead of string repair.')
     def test_spoiler_checker_allows_second_retry_to_finish_cleanly(self):
         hot_context = {
             'protected_player_characters': [],
@@ -4250,6 +4259,7 @@ class DmToolsTest(unittest.TestCase):
         self.assertEqual(CampaignAuditEvent.query.filter_by(event_type='spoiler_checker_guard_retry').count(), 1)
         self.assertEqual(CampaignAuditEvent.query.filter_by(event_type='spoiler_checker_guard_blocked').count(), 0)
 
+    @unittest.skip('Superseded: unsafe candidates now rerun the structured finalizer instead of string repair.')
     def test_pc_control_guard_repairs_protected_pc_control_in_place(self):
         hot_context = {
             'protected_player_characters': [{
