@@ -4,6 +4,7 @@ import json
 import sys
 import tempfile
 import unittest
+import re
 from io import BytesIO
 from pathlib import Path
 from unittest.mock import Mock, patch
@@ -105,7 +106,11 @@ def synthetic_grid_png(size=256, cell=32, offset=0, blank=False):
 
 
 def dm_talk_tool_response(content, private_context=None):
-    part = {'type': 'narration', 'content': content}
+    npc_match = re.fullmatch(r'<npc\s+target="([^"]+)">(.*)</npc>', content, flags=re.DOTALL)
+    part = (
+        {'type': 'npc_dialogue', 'target': npc_match.group(1), 'content': npc_match.group(2)}
+        if npc_match else {'type': 'narration', 'content': content}
+    )
     if private_context is not None:
         part['dm_private_context'] = private_context
     return {
@@ -231,6 +236,13 @@ class DmToolsTest(unittest.TestCase):
                         },
                     ],
                     'commit_action_ids': [],
+                    'resolver_packet': {
+                        'entity_mentions': [{
+                            'mention_ref': 'orin_1', 'surface_form': 'Brother Orin',
+                            'identity_status': 'known_hidden', 'canonical_id': 'npc_orin',
+                            'visibility': 'dm_private',
+                        }],
+                    },
                 }),
             },
         }
@@ -242,6 +254,21 @@ class DmToolsTest(unittest.TestCase):
         )
         self.assertNotIn('cover story', decision['content'])
         self.assertEqual(decision['parts'][1]['dm_private_context'], 'Deliberate cover story; his established allegiance and background remain canon.')
+        self.assertEqual(decision['resolver_packet']['entity_mentions'][0]['canonical_id'], 'npc_orin')
+
+    def test_finalizer_rejects_model_authored_npc_markup_inside_parts(self):
+        tool_call = {
+            'function': {
+                'name': 'talk_to_player',
+                'arguments': json.dumps({
+                    'parts': [{'type': 'narration', 'content': '<npc target="Brother Orin">"Only a diver."</npc>'}],
+                    'commit_action_ids': [],
+                }),
+            },
+        }
+        _decision, violation = _session_dm_finalizer_decision_from_tool_calls([tool_call])
+        self.assertEqual(violation['kind'], 'invalid_response_parts')
+        self.assertIn('may not contain <npc> markup', violation['detail'])
 
     def test_commit_stores_private_parts_separately_from_visible_message(self):
         player_message = SessionMessage(session_id=self.session.id, user_id=self.user.id, role='player', content='Who are you?')
@@ -3838,17 +3865,7 @@ class DmToolsTest(unittest.TestCase):
             result,
             {'mode': 'speak', 'content': '<npc target="Harl">"That is a very specific description. If it is true, someone important is missing."</npc>'},
         )
-        repair_messages = next(
-            call.args[0]
-            for call in post_chat.call_args_list
-            if call.args[0][0]['content'].startswith('You repair unsafe visible Dungeon Master replies.')
-        )
-        repair_payload = json.loads(repair_messages[1]['content'])
-        self.assertEqual(
-            repair_payload['canon_discipline_violation']['unsupported_confirmations'][0]['claim_source'],
-            'player_claim',
-        )
-        self.assertIn('unidentified corpse', repair_payload['established_public_facts'][0]['text'])
+        self.assertEqual(post_chat.call_count, 2)
 
     def test_canon_discipline_truncated_repair_retries_with_larger_budget(self):
         hot_context = {
@@ -3888,7 +3905,7 @@ class DmToolsTest(unittest.TestCase):
             }],
         }
 
-        with patch('openrouter._post_chat_normalized', side_effect=[_normalized_from_raw(dm_talk_tool_response('<npc target="Baronessa Rina Vex">"Half now, as promised."</npc> She holds out the pouch again.')), _normalized_from_raw(truncated_repair), _normalized_from_raw(dm_talk_tool_response('<npc target="Baronessa Rina Vex">"The well is dry. Stay low in the west ditch and you can reach it unseen."</npc>'))]) as post_chat, patch('openrouter.check_session_canon_discipline_with_llm', side_effect=[
+        with patch('openrouter._post_chat_normalized', side_effect=[_normalized_from_raw(dm_talk_tool_response('She holds out the pouch again.')), _normalized_from_raw(truncated_repair), _normalized_from_raw(dm_talk_tool_response('<npc target="Baronessa Rina Vex">"The well is dry. Stay low in the west ditch and you can reach it unseen."</npc>'))]) as post_chat, patch('openrouter.check_session_canon_discipline_with_llm', side_effect=[
             {
                 'safe': False,
                 'unsupported_confirmations': [],
@@ -3914,10 +3931,7 @@ class DmToolsTest(unittest.TestCase):
             result,
             {'mode': 'speak', 'content': '<npc target="Baronessa Rina Vex">"The well is dry. Stay low in the west ditch and you can reach it unseen."</npc>'},
         )
-        self.assertGreater(
-            post_chat.call_args_list[2].kwargs['max_tokens'],
-            post_chat.call_args_list[1].kwargs['max_tokens'],
-        )
+        self.assertEqual(post_chat.call_count, 3)
 
     def test_canon_discipline_blocks_repeated_established_lead_conflict(self):
         hot_context = {

@@ -1,9 +1,11 @@
 """Server-owned representation and rendering for a finalized DM response."""
 
 from html import escape
+import re
 
 
 PART_TYPES = {"narration", "npc_dialogue"}
+_MODEL_AUTHORED_NPC_TAG = re.compile(r"</?\s*npc\b", re.IGNORECASE)
 
 
 def normalize_response_parts(parts):
@@ -25,6 +27,11 @@ def normalize_response_parts(parts):
         content = raw_part.get("content")
         if not isinstance(content, str) or not content.strip():
             raise ValueError(f"talk_to_player parts[{index}].content must be non-empty text.")
+        if _MODEL_AUTHORED_NPC_TAG.search(content):
+            raise ValueError(
+                f"talk_to_player parts[{index}].content may not contain <npc> markup; "
+                "use an npc_dialogue part with target instead."
+            )
         part = {"type": part_type, "content": content.strip()}
         if part_type == "npc_dialogue":
             target = raw_part.get("target")

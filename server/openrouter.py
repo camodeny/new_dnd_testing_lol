@@ -207,7 +207,7 @@ SESSION_TOOL_PROMPT = (
     "when the DM should send a visible reply, or call stay_silent with a short reason when the DM should not "
     "send anything. Do not mix a finalization tool call with other tools in the same assistant message. "
     "Do not send the final visible reply as plain assistant text. "
-    "Each talk_to_player part is narration or npc_dialogue. NPC dialogue requires target and content; use optional dm_private_context only for internal memory guidance. Never put private context in visible content. Always include commit_action_ids. Select only pending action IDs whose durable mutation should commit with this exact reply, or use an empty array. "
+    "Each talk_to_player part is narration or npc_dialogue. NPC dialogue requires target and content. Never place <npc> tags or any model-authored NPC markup inside a part: the server renders NPC markup. dm_private_context is optional only for ordinary truthful visible text; whenever a visible part is false, misleading, incomplete, mistaken, performative, or conflicts with established private canon, attach authoritative dm_private_context to that exact part. Never put private context in visible content. Always include commit_action_ids. Select only pending action IDs whose durable mutation should commit with this exact reply, or use an empty array. "
     "Do not send handoff prompts such as 'How do you respond?' for ordinary PC-to-PC conversation."
 )
 
@@ -1250,6 +1250,9 @@ def normalize_session_dm_turn_decision(raw_decision):
         'parts': parts,
         'commit_action_ids': data.get('commit_action_ids') if isinstance(data.get('commit_action_ids'), list) else None,
     }
+    resolver_packet = data.get('resolver_packet')
+    if isinstance(resolver_packet, dict) and isinstance(resolver_packet.get('entity_mentions'), list):
+        result['resolver_packet'] = resolver_packet
     return result
 
 
@@ -1283,6 +1286,11 @@ SESSION_DM_FINALIZER_TOOLS = [
                         'type': 'array',
                         'items': {'type': 'string'},
                         'description': 'Pending action IDs to commit with this reply. Use [] when no pending action should commit.',
+                    },
+                    'resolver_packet': {
+                        'type': 'object',
+                        'description': 'Optional separate hidden identity commitment. Use entity_mentions for deliberate canonical identity resolution; it is not player-visible and is not part of response parts.',
+                        'properties': {'entity_mentions': {'type': 'array', 'items': {'type': 'object'}}},
                     },
                 },
             },
@@ -1343,6 +1351,9 @@ def _session_dm_finalizer_decision_from_tool_calls(tool_calls):
         except ValueError as err:
             return None, {'kind': 'invalid_response_parts', 'detail': str(err)}
         decision = {'mode': 'speak', 'content': render_visible_response_parts(parts), 'parts': parts, 'commit_action_ids': args.get('commit_action_ids')}
+        resolver_packet = args.get('resolver_packet')
+        if isinstance(resolver_packet, dict) and isinstance(resolver_packet.get('entity_mentions'), list):
+            decision['resolver_packet'] = resolver_packet
         return decision, None
     return {
         'mode': 'silent',
@@ -1709,7 +1720,7 @@ def _session_dm_guard_retry_system_prompt(guard_name, details):
                 'Guard reminder: finalize the turn by calling exactly one of talk_to_player or stay_silent. '
                 'Do not output DSML, <｜｜DSML｜｜tool_calls>, invoke tags, XML, or any tool-call markup in visible content. '
                 'Do not send the final reply as plain assistant text. If you need to narrate what the player learns, '
-                'put only the player-facing visible result inside talk_to_player(content).'
+                'put the player-facing result in talk_to_player(parts); do not use <npc> markup inside a part.'
                 + silent_ack
             )
         return (
@@ -1723,9 +1734,7 @@ def _session_dm_guard_retry_system_prompt(guard_name, details):
         return (
             'Guard reminder: use valid visible-message syntax. '
             'Finalize with talk_to_player or stay_silent. '
-            'If you speak, talk_to_player content may use Markdown and '
-            'plain text. The only allowed angle-bracket tag is <npc target="NPC name">...</npc>. '
-            'Do not use <ic>, <ooc>, HTML, XML, invalid closing tags, or stray non-English glyphs. '
+            'If you speak, use talk_to_player(parts). Part content may use Markdown and plain text but may not use <npc>, <ic>, <ooc>, HTML, or XML tags; NPC dialogue must use a distinct npc_dialogue part with target. '
             'Write visible replies in English only.'
             + silent_ack
         )
@@ -4272,61 +4281,16 @@ def _run_session_dm_loop(
             private_violation = None
             spoiler_check = {'safe': True, 'leaked_item_ids': [], 'evidence': [], 'reason': ''}
             combat_handoff_violation = None
+            # Repair helpers return rendered strings, which cannot prove that part
+            # targets and private context stayed paired. Structured candidates are
+            # therefore always discarded and regenerated by the finalizer.
+            allow_visible_string_repairs = False
             while True:
                 format_violation = (
                     _session_dm_content_format_violation(content, loop_audit)
                     if decision.get('mode') == 'speak'
                     else None
                 )
-                repaired_from_format_guard = False
-                while format_violation and format_retry_count < 2:
-                    if on_status_change:
-                        on_status_change({"step": "revising", "violations": {"type": "format", "details": format_violation}})
-                    if base_audit.get('campaign_id'):
-                        audit = guard_audit('format_guard')
-                        log_audit_event(
-                            base_audit.get('campaign_id'),
-                            'format_guard_retry',
-                            'Session DM response used malformed visible-message syntax; sent candidate to the format repair pass.',
-                            {
-                                'operation': 'format_guard',
-                                'violation': format_violation,
-                                'draft_response': content,
-                                'repair_strategy': 'separate_repair_pass',
-                            },
-                            source='session_dm.guard',
-                            actor=audit.get('actor'),
-                            trace_id=audit.get('trace_id'),
-                            parent_trace_id=audit.get('parent_trace_id'),
-                            trace_label=audit.get('trace_label'),
-                            audit_role='guard',
-                            commit=True,
-                        )
-                    repaired_content = _repair_session_dm_visible_reply(
-                        content,
-                        'format',
-                        format_violation,
-                        hot_context,
-                        audit_context=loop_audit,
-                    )
-                    if any(part.get('dm_private_context') for part in decision.get('parts') or []):
-                        repaired_content = ''
-                    format_retry_count += 1
-                    if not repaired_content:
-                        break
-                    repaired_from_format_guard = True
-                    content = repaired_content
-                    raw_content = repaired_content
-                    decision = {
-                        **decision,
-                        'content': repaired_content,
-                        # A repair pass only returns visible text. Rebuild a complete
-                        # safe candidate only when there was no private association to lose.
-                        'parts': [{'type': 'narration', 'content': repaired_content}]
-                        if not any(part.get('dm_private_context') for part in decision.get('parts') or [])
-                        else decision.get('parts'),
-                    }
-                    format_violation = _session_dm_content_format_violation(content, loop_audit)
                 mechanics_check = (
                     check_session_mechanics_with_llm(content, preflight_decision, hot_context, loop_audit)
                     if decision.get('mode') == 'speak' and not format_violation
@@ -4397,9 +4361,7 @@ def _run_session_dm_loop(
                     and not mechanical_violation and not canon_violation
                     else None
                 )
-                if format_violation and repaired_from_format_guard and format_retry_count < 2:
-                    continue
-                if violation and not pc_control_repair_attempted and not pc_control_retried:
+                if allow_visible_string_repairs and violation and not pc_control_repair_attempted and not pc_control_retried:
                     if on_status_change:
                         on_status_change({"step": "revising", "violations": {"type": "pc_control", "details": violation}})
                     if base_audit.get('campaign_id'):
@@ -4443,7 +4405,7 @@ def _run_session_dm_loop(
                             else decision.get('parts'),
                         }
                         continue
-                if (
+                if allow_visible_string_repairs and (
                     canon_violation
                     and canon_checker_retry_count < 3
                     and not canon_checker_repair_attempted
@@ -4491,7 +4453,7 @@ def _run_session_dm_loop(
                             else decision.get('parts'),
                         }
                         continue
-                if (
+                if allow_visible_string_repairs and (
                     not spoiler_check.get('safe', True)
                     and spoiler_checker_retry_count < 3
                     and not spoiler_checker_repair_attempted
@@ -4567,6 +4529,13 @@ def _run_session_dm_loop(
                     'content': _session_dm_guard_retry_system_prompt('mechanical_resolution', mechanical_violation),
                 })
                 mechanical_retried = True
+                continue
+            if format_violation and format_retry_count < 2:
+                messages.append({
+                    'role': 'system',
+                    'content': _session_dm_guard_retry_system_prompt('format', format_violation),
+                })
+                format_retry_count += 1
                 continue
             if violation and not pc_control_retried:
                 if on_status_change and not pc_control_repair_attempted:

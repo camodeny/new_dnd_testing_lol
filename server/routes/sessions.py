@@ -99,6 +99,8 @@ def _session_dm_turn_decision(raw_result):
         'parts': decision.get('parts') if isinstance(decision.get('parts'), list) else [],
         'commit_action_ids': decision.get('commit_action_ids'),
     }
+    if isinstance(decision.get('resolver_packet'), dict):
+        result['resolver_packet'] = decision['resolver_packet']
     return result
 
 
@@ -119,6 +121,7 @@ def _run_session_memory_update(
     parent_trace_id,
     dm_message_id=None,
     response_parts=None,
+    resolver_packet=None,
 ):
     from uuid import uuid4
     memory_run_id = f"memrun_{uuid4().hex[:12]}"
@@ -176,6 +179,13 @@ def _run_session_memory_update(
                     )
                 memory_context['latest_dm_response_parts'] = stored.parts_json
 
+                from models import CampaignResolverPacket
+                stored_packet = CampaignResolverPacket.query.filter_by(
+                    campaign_id=campaign.id, dm_message_id=dm_message_id, status='committed',
+                ).order_by(CampaignResolverPacket.id.desc()).first()
+                if stored_packet:
+                    memory_context['resolver_packet'] = stored_packet.packet_json
+
                 # Check for transient/stored mismatch
                 if isinstance(response_parts, list) and response_parts:
                     if stored.parts_json != response_parts:
@@ -200,6 +210,8 @@ def _run_session_memory_update(
         else:
             if isinstance(response_parts, list):
                 memory_context['latest_dm_response_parts'] = response_parts
+            if isinstance(resolver_packet, dict):
+                memory_context['resolver_packet'] = resolver_packet
 
         memory_audit_context = {
             'campaign_id': campaign.id,
@@ -809,6 +821,7 @@ def send_message(current_user, session_id):
 
         if ai_turn.get('mode') == 'speak' and ai_text:
             response_parts = ai_turn.get('parts') if isinstance(ai_turn, dict) else None
+            resolver_packet = ai_turn.get('resolver_packet') if isinstance(ai_turn, dict) else None
             try:
                 ai_msg, pending_proposals, _action_results = commit_accepted_dm_turn(
                     campaign,
@@ -823,6 +836,7 @@ def send_message(current_user, session_id):
                     if isinstance(ai_result, dict) and isinstance(ai_result.get('_pending_actions'), list)
                     else None,
                     response_parts=response_parts,
+                    resolver_packet=resolver_packet,
                 )
             except Exception as err:
                 return jsonify({'error': repr(err), 'messages': result_messages}), 500
@@ -840,6 +854,7 @@ def send_message(current_user, session_id):
                 trace_id,
                 dm_message_id=ai_msg.id,
                 response_parts=response_parts,
+                resolver_packet=resolver_packet,
             )
         elif ai_turn.get('mode') == 'silent':
             log_audit_event(

@@ -300,6 +300,7 @@ class SessionGeneratorWorker:
 
         if ai_turn.get('mode') == 'speak' and ai_text:
             response_parts = ai_turn.get('parts') if isinstance(ai_turn, dict) else None
+            resolver_packet = ai_turn.get('resolver_packet') if isinstance(ai_turn, dict) else None
             ai_msg, pending_proposals, _action_results = commit_accepted_dm_turn(
                 campaign,
                 session,
@@ -313,6 +314,7 @@ class SessionGeneratorWorker:
                 if isinstance(ai_result, dict) and isinstance(ai_result.get('_pending_actions'), list)
                 else None,
                 response_parts=response_parts,
+                resolver_packet=resolver_packet,
             )
             result_messages.append(ai_msg.to_dict())
             sheet_proposals = [p.to_dict() for p in pending_proposals]
@@ -330,6 +332,7 @@ class SessionGeneratorWorker:
                 trace_id,
                 dm_message_id=ai_msg.id,
                 response_parts=response_parts,
+                resolver_packet=resolver_packet,
             )
             return
         elif ai_turn.get('mode') == 'silent':
@@ -403,6 +406,8 @@ def _session_dm_turn_decision(raw_result):
         'parts': decision.get('parts') if isinstance(decision.get('parts'), list) else [],
         'commit_action_ids': decision.get('commit_action_ids'),
     }
+    if isinstance(decision.get('resolver_packet'), dict):
+        result['resolver_packet'] = decision['resolver_packet']
     return result
 
 class SessionStreamManager:
