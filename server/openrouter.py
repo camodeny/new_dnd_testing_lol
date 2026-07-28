@@ -3807,6 +3807,8 @@ def _run_session_dm_loop(
 
     tool_round = 0
     finalizer_contract_retry_count = 0
+    draft_serialization_active = False
+    preserved_visible_draft = ''
     combat_batch_retry_count = 0
     combat_batch_force_tools = False
     format_retry_count = 0
@@ -3872,7 +3874,12 @@ def _run_session_dm_loop(
             spoiler_checker_retry_count > 0,
             combat_handoff_retried,
         )) and not combat_batch_force_tools
-        if retrying_visible_answer and finalizer_tools:
+        if draft_serialization_active:
+            active_tools = [
+                tool for tool in finalizer_tools
+                if str(((tool or {}).get('function') or {}).get('name') or '').strip() == 'talk_to_player'
+            ]
+        elif retrying_visible_answer and finalizer_tools:
             active_tools = finalizer_tools
         elif tool_round < max_tool_rounds and all_tools:
             active_tools = all_tools
@@ -3880,12 +3887,13 @@ def _run_session_dm_loop(
             active_tools = finalizer_tools
         else:
             active_tools = None
+        active_tool_names = {
+            str(((tool or {}).get('function') or {}).get('name') or '').strip()
+            for tool in (active_tools or [])
+        }
         finalizer_only_tools = (
-            bool(active_tools)
-            and {
-                str(((tool or {}).get('function') or {}).get('name') or '').strip()
-                for tool in (active_tools or [])
-            } == SESSION_DM_FINALIZER_TOOL_NAMES
+            bool(active_tool_names)
+            and active_tool_names.issubset(SESSION_DM_FINALIZER_TOOL_NAMES)
         )
         active_tool_choice = (
             'required'
@@ -3936,6 +3944,16 @@ def _run_session_dm_loop(
 
         tool_calls = message.get('tool_calls') or []
         finalizer_decision, finalizer_violation = _session_dm_finalizer_decision_from_tool_calls(tool_calls)
+        if (
+            draft_serialization_active
+            and finalizer_decision is not None
+            and finalizer_decision.get('mode') == 'silent'
+        ):
+            finalizer_decision = None
+            finalizer_violation = {
+                'kind': 'draft_serialization_stay_silent',
+                'detail': 'A non-empty preserved visible draft must serialize through talk_to_player.',
+            }
         if finalizer_violation:
             tool_calls = []
         if finalizer_decision is not None or not tool_calls or tool_round >= max_tool_rounds:
@@ -3953,10 +3971,19 @@ def _run_session_dm_loop(
             if finalizer_contract_violation and finalizer_contract_retry_count < 2:
                 if on_status_change:
                     on_status_change({"step": "revising", "violations": {"type": "finalizer_contract", "details": finalizer_contract_violation}})
-                serialize_existing_draft = (
+                draft_to_serialize = ''
+                if (
                     finalizer_contract_violation.get('kind') == 'missing_finalizer_tool_call'
+                    and not tool_calls
                     and bool(str(raw_content or '').strip())
-                )
+                ):
+                    draft_to_serialize = raw_content
+                elif (
+                    finalizer_contract_violation.get('kind') == 'draft_serialization_stay_silent'
+                    and preserved_visible_draft
+                ):
+                    draft_to_serialize = preserved_visible_draft
+                serialize_existing_draft = bool(draft_to_serialize)
                 if base_audit.get('campaign_id'):
                     audit = guard_audit('finalizer_contract_guard')
                     log_audit_event(
@@ -3991,8 +4018,10 @@ def _run_session_dm_loop(
                 if serialize_existing_draft:
                     # Auto-tool providers may keep regenerating prose when a reminder asks them to solve the
                     # whole turn again. Preserve the accepted draft shape and make the retry serialization-only.
+                    draft_serialization_active = True
+                    preserved_visible_draft = draft_to_serialize
                     messages.extend([
-                        {'role': 'assistant', 'content': raw_content},
+                        {'role': 'assistant', 'content': draft_to_serialize},
                         {
                             'role': 'user',
                             'content': _session_dm_draft_serialization_prompt(action_buffer),

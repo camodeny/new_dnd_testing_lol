@@ -2745,10 +2745,96 @@ class DmToolsTest(unittest.TestCase):
         self.assertIn('commit_action_ids may contain only these pending action IDs: []', repair_messages[-1]['content'])
         self.assertEqual(
             {tool['function']['name'] for tool in post_chat.call_args_list[1].kwargs['tools']},
-            {'talk_to_player', 'stay_silent'},
+            {'talk_to_player'},
         )
         self.assertEqual(post_chat.call_args_list[1].kwargs['tool_choice'], 'required')
         self.assertFalse(post_chat.call_args_list[1].kwargs['allow_thinking'])
+
+    def test_finalizer_retry_does_not_serialize_content_with_an_unexecuted_tool_call(self):
+        hot_context = {
+            'protected_player_characters': [],
+            'private_output_terms': [],
+            'private_spoiler_items': [],
+        }
+        unsafe_draft = 'The archive confirms the hidden route.'
+        unexecuted_tool_response = {
+            'choices': [{
+                'message': {
+                    'content': unsafe_draft,
+                    'tool_calls': [{
+                        'id': 'call_search',
+                        'function': {
+                            'name': 'search_campaign_memory',
+                            'arguments': '{"query":"hidden route"}',
+                        },
+                    }],
+                },
+            }],
+        }
+        execute_tool = Mock(return_value={})
+
+        with patch(
+            'openrouter._post_chat_normalized',
+            side_effect=[
+                _normalized_from_raw(unexecuted_tool_response),
+                _normalized_from_raw(dm_talk_tool_response('The archive shelves offer no immediate answer.')),
+            ],
+        ) as post_chat:
+            result = get_session_dm_response_with_tools(
+                hot_context,
+                [],
+                [{'type': 'function', 'function': {'name': 'search_campaign_memory'}}],
+                execute_tool,
+                max_tool_rounds=0,
+            )
+
+        self.assertEqual(result, {
+            'mode': 'speak',
+            'content': 'The archive shelves offer no immediate answer.',
+        })
+        execute_tool.assert_not_called()
+        repair_messages = post_chat.call_args_list[1].args[0]
+        self.assertEqual(repair_messages[-1]['role'], 'system')
+        self.assertFalse(any(
+            message.get('role') == 'assistant' and message.get('content') == unsafe_draft
+            for message in repair_messages
+        ))
+
+    def test_draft_serializer_rejects_stay_silent_and_retries_with_talk_only(self):
+        hot_context = {
+            'protected_player_characters': [],
+            'private_output_terms': [],
+            'private_spoiler_items': [],
+        }
+        draft = 'The lock shudders, and the cracked panel flashes once.'
+
+        with patch(
+            'openrouter._post_chat_normalized',
+            side_effect=[
+                _normalized_from_raw({'choices': [{'message': {'content': draft}}]}),
+                _normalized_from_raw(dm_silent_tool_response('No visible reply needed.')),
+                _normalized_from_raw(dm_talk_tool_response(draft)),
+            ],
+        ) as post_chat:
+            result = get_session_dm_response_with_tools(
+                hot_context,
+                [],
+                [],
+                lambda *_args, **_kwargs: {},
+                max_tool_rounds=0,
+            )
+
+        self.assertEqual(result, {'mode': 'speak', 'content': draft})
+        self.assertEqual(post_chat.call_count, 3)
+        for call in post_chat.call_args_list[1:]:
+            self.assertEqual(
+                {tool['function']['name'] for tool in call.kwargs['tools']},
+                {'talk_to_player'},
+            )
+            self.assertEqual(call.kwargs['tool_choice'], 'required')
+        final_retry_messages = post_chat.call_args_list[2].args[0]
+        self.assertEqual(final_retry_messages[-2], {'role': 'assistant', 'content': draft})
+        self.assertIn('do not use stay_silent', final_retry_messages[-1]['content'])
 
     def test_plain_text_reply_with_tools_does_not_force_finalizer_retry(self):
         hot_context = {
