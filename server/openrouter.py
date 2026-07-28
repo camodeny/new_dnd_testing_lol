@@ -3977,7 +3977,11 @@ def _run_session_dm_loop(
                     and not tool_calls
                     and bool(str(raw_content or '').strip())
                 ):
-                    draft_to_serialize = raw_content
+                    draft_to_serialize = (
+                        preserved_visible_draft
+                        if draft_serialization_active and preserved_visible_draft
+                        else raw_content
+                    )
                 elif (
                     finalizer_contract_violation.get('kind') == 'draft_serialization_stay_silent'
                     and preserved_visible_draft
@@ -4040,6 +4044,11 @@ def _run_session_dm_loop(
                     'mode': 'silent',
                     'reason': 'The DM response did not produce a valid finalizer tool call.',
                 }
+            # Serialization mode is only for repairing the finalizer contract. Once the
+            # preserved draft has produced a valid visible finalizer, downstream guard
+            # rewrites must regain both finalizer choices, including stay_silent.
+            draft_serialization_active = False
+            preserved_visible_draft = ''
             combat_batch_violation = _session_dm_combat_batch_violation(decision, combat_tracker)
             if combat_batch_violation and combat_batch_retry_count < 2 and tool_round < max_tool_rounds:
                 if on_status_change:
