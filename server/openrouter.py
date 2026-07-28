@@ -1614,6 +1614,28 @@ def _session_dm_guard_retry_system_prompt(guard_name, details):
     )
 
 
+def _session_dm_draft_serialization_prompt(action_buffer):
+    pending_actions = action_buffer.get('actions') if isinstance(action_buffer, dict) else []
+    allowed_action_ids = [
+        str(action.get('id')).strip()
+        for action in (pending_actions or [])
+        if isinstance(action, dict) and str(action.get('id') or '').strip()
+    ]
+    return (
+        'Finalize the turn by calling exactly one native talk_to_player function. Convert the immediately preceding '
+        'assistant draft into that tool call. '
+        'The draft is a visible DM response, so do not use stay_silent. Preserve its useful player-facing meaning '
+        'without adding new facts, changing outcomes, or repeating the draft as plain assistant text. Split narration '
+        'and attributed NPC speech into ordered response parts; use npc_dialogue with a concrete public target for '
+        'NPC speech, and remove all <npc>, <ic>, <ooc>, HTML, XML, or other angle-bracket markup from part content. '
+        'Use the full conversation context to attach authoritative dm_private_context to any part that is false, '
+        'misleading, incomplete, mistaken, performative, or in tension with established private canon. '
+        f'commit_action_ids may contain only these pending action IDs: {json.dumps(allowed_action_ids)}. '
+        'Use [] when none of those pending actions should commit with this reply. '
+        'Emit no explanation, acknowledgement, markdown fence, or text outside the native tool call.'
+    )
+
+
 SESSION_DM_GUARD_ONLY_CONTEXT_KEYS = {'private_output_terms', 'private_spoiler_items'}
 
 
@@ -3931,16 +3953,32 @@ def _run_session_dm_loop(
             if finalizer_contract_violation and finalizer_contract_retry_count < 2:
                 if on_status_change:
                     on_status_change({"step": "revising", "violations": {"type": "finalizer_contract", "details": finalizer_contract_violation}})
+                serialize_existing_draft = (
+                    finalizer_contract_violation.get('kind') == 'missing_finalizer_tool_call'
+                    and bool(str(raw_content or '').strip())
+                )
                 if base_audit.get('campaign_id'):
                     audit = guard_audit('finalizer_contract_guard')
                     log_audit_event(
                         base_audit.get('campaign_id'),
                         'finalizer_contract_guard_retry',
-                        'Session DM response did not finish with a valid finalization tool call; discarded candidate and reran with guard reminder.',
+                        (
+                            'Session DM response did not finish with a valid finalization tool call; '
+                            'preserved the visible draft and requested native tool serialization.'
+                            if serialize_existing_draft
+                            else
+                            'Session DM response did not finish with a valid finalization tool call; '
+                            'discarded candidate and reran with guard reminder.'
+                        ),
                         {
                             'operation': 'finalizer_contract_guard',
                             'violation': finalizer_contract_violation,
                             'draft_response': raw_content,
+                            'repair_strategy': (
+                                'serialize_existing_draft'
+                                if serialize_existing_draft
+                                else 'guard_reminder_rerun'
+                            ),
                         },
                         source='session_dm.guard',
                         actor=audit.get('actor'),
@@ -3950,10 +3988,21 @@ def _run_session_dm_loop(
                         audit_role='guard',
                         commit=True,
                     )
-                messages.append({
-                    'role': 'system',
-                    'content': _session_dm_guard_retry_system_prompt('finalizer_contract', finalizer_contract_violation),
-                })
+                if serialize_existing_draft:
+                    # Auto-tool providers may keep regenerating prose when a reminder asks them to solve the
+                    # whole turn again. Preserve the accepted draft shape and make the retry serialization-only.
+                    messages.extend([
+                        {'role': 'assistant', 'content': raw_content},
+                        {
+                            'role': 'user',
+                            'content': _session_dm_draft_serialization_prompt(action_buffer),
+                        },
+                    ])
+                else:
+                    messages.append({
+                        'role': 'system',
+                        'content': _session_dm_guard_retry_system_prompt('finalizer_contract', finalizer_contract_violation),
+                    })
                 finalizer_contract_retry_count += 1
                 continue
             if finalizer_contract_violation:

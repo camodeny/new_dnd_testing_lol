@@ -2677,6 +2677,79 @@ class DmToolsTest(unittest.TestCase):
         self.assertEqual(result, {'mode': 'speak', 'content': stale})
         self.assertEqual(post_chat.call_count, 2)
 
+    def test_plain_text_finalizer_retry_serializes_the_existing_draft(self):
+        hot_context = {
+            'protected_player_characters': [],
+            'private_output_terms': [],
+            'private_spoiler_items': [],
+        }
+        draft = (
+            "Mira's appeal settles the nearest dockworkers.\n\n"
+            '<npc target="Yoren">Fine. Talk fast—the gate will not hold.</npc>'
+        )
+        serialized = {
+            'choices': [{
+                'message': {
+                    'content': '',
+                    'tool_calls': [{
+                        'id': 'call_final',
+                        'function': {
+                            'name': 'talk_to_player',
+                            'arguments': json.dumps({
+                                'parts': [
+                                    {
+                                        'type': 'narration',
+                                        'content': "Mira's appeal settles the nearest dockworkers.",
+                                    },
+                                    {
+                                        'type': 'npc_dialogue',
+                                        'target': 'Yoren',
+                                        'content': 'Fine. Talk fast—the gate will not hold.',
+                                    },
+                                ],
+                                'commit_action_ids': [],
+                            }),
+                        },
+                    }],
+                },
+            }],
+        }
+
+        with patch(
+            'openrouter._post_chat_normalized',
+            side_effect=[
+                _normalized_from_raw({'choices': [{'message': {'content': draft}}]}),
+                _normalized_from_raw(serialized),
+            ],
+        ) as post_chat:
+            result = get_session_dm_response_with_tools(
+                hot_context,
+                [],
+                [],
+                lambda *_args, **_kwargs: {},
+                max_tool_rounds=0,
+            )
+
+        self.assertEqual(result, {
+            'mode': 'speak',
+            'content': (
+                "Mira's appeal settles the nearest dockworkers.\n\n"
+                '<npc target="Yoren">Fine. Talk fast—the gate will not hold.</npc>'
+            ),
+        })
+        repair_messages = post_chat.call_args_list[1].args[0]
+        self.assertEqual(repair_messages[-2], {'role': 'assistant', 'content': draft})
+        self.assertEqual(repair_messages[-1]['role'], 'user')
+        self.assertIn('immediately preceding assistant draft', repair_messages[-1]['content'])
+        self.assertIn('do not use stay_silent', repair_messages[-1]['content'])
+        self.assertIn('commit_action_ids may contain only these pending action IDs: []', repair_messages[-1]['content'])
+        self.assertEqual(
+            {tool['function']['name'] for tool in post_chat.call_args_list[1].kwargs['tools']},
+            {'talk_to_player', 'stay_silent'},
+        )
+        self.assertEqual(post_chat.call_args_list[1].kwargs['tool_choice'], 'required')
+        self.assertFalse(post_chat.call_args_list[1].kwargs['allow_thinking'])
+
     def test_plain_text_reply_with_tools_does_not_force_finalizer_retry(self):
         hot_context = {
             'protected_player_characters': [],
@@ -2759,7 +2832,8 @@ class DmToolsTest(unittest.TestCase):
         self.assertEqual(result, {'mode': 'speak', 'content': 'Make a Technology check.'})
         self.assertEqual(post_chat.call_count, 2)
         repair_messages = post_chat.call_args_list[1].args[0]
-        self.assertIn('finalize the turn by calling exactly one', repair_messages[-1]['content'])
+        self.assertEqual(repair_messages[-2], {'role': 'assistant', 'content': draft})
+        self.assertIn('Finalize the turn by calling exactly one', repair_messages[-1]['content'])
 
     def test_finalizer_contract_retry_reprompts_provider_tool_markup_with_specific_reminder(self):
         hot_context = {
