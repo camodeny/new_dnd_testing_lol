@@ -10,113 +10,80 @@ import dm_response_state
 
 
 class DmResponseStateUnitTests(unittest.TestCase):
-    def test_dm_turn_has_visible_output_speak(self):
-        self.assertTrue(dm_response_state.dm_turn_has_visible_output({'status': 'speak'}))
+    def test_visible_output_state_matrix(self):
+        cases = [
+            ({'status': 'speak'}, True),
+            ({'status': 'silent'}, True),
+            ({'status': 'empty'}, True),
+            ({'status': 'pending', 'dm_message_id': 42}, True),
+            ({'status': 'pending'}, False),
+            (None, False),
+            ([], False),
+        ]
+        for status, expected in cases:
+            with self.subTest(status=status):
+                self.assertIs(
+                    dm_response_state.dm_turn_has_visible_output(status),
+                    expected,
+                )
 
-    def test_dm_turn_has_visible_output_silent(self):
-        self.assertTrue(dm_response_state.dm_turn_has_visible_output({'status': 'silent'}))
+    def test_post_turn_resolution_state_matrix(self):
+        cases = [
+            ({'status': 'silent'}, True),
+            ({'status': 'empty'}, True),
+            ({'status': 'speak', 'post_turn_status': 'complete'}, True),
+            ({'status': 'speak', 'post_turn_status': 'error'}, True),
+            ({'status': 'speak', 'post_turn_complete': True}, True),
+            ({'status': 'speak', 'post_turn_complete': False}, False),
+            ({'status': 'speak', 'post_turn_status': 'pending'}, False),
+            ({'status': 'speak'}, True),
+            (None, False),
+        ]
+        for status, expected in cases:
+            with self.subTest(status=status):
+                self.assertIs(
+                    dm_response_state.dm_turn_post_turn_resolved(status),
+                    expected,
+                )
 
-    def test_dm_turn_has_visible_output_empty(self):
-        self.assertTrue(dm_response_state.dm_turn_has_visible_output({'status': 'empty'}))
+    def test_full_resolution_state_matrix(self):
+        cases = [
+            ({'status': 'pending'}, False),
+            ({'status': 'silent'}, True),
+            ({'status': 'empty'}, True),
+            ({'status': 'speak', 'post_turn_status': 'complete'}, True),
+            ({'status': 'speak', 'post_turn_status': 'error'}, True),
+            ({'status': 'speak', 'post_turn_status': 'pending'}, False),
+            ({'status': 'speak'}, True),
+        ]
+        for status, expected in cases:
+            with self.subTest(status=status):
+                self.assertIs(
+                    dm_response_state.dm_turn_fully_resolved(status),
+                    expected,
+                )
 
-    def test_dm_turn_has_visible_output_dm_message_id(self):
-        self.assertTrue(dm_response_state.dm_turn_has_visible_output({'status': 'pending', 'dm_message_id': 42}))
-
-    def test_dm_turn_has_visible_output_pending_no_message(self):
-        self.assertFalse(dm_response_state.dm_turn_has_visible_output({'status': 'pending'}))
-
-    def test_dm_turn_has_visible_output_none_input(self):
-        self.assertFalse(dm_response_state.dm_turn_has_visible_output(None))
-
-    def test_dm_turn_has_visible_output_non_dict(self):
-        self.assertFalse(dm_response_state.dm_turn_has_visible_output([]))
-
-    def test_dm_turn_post_turn_resolved_silent(self):
-        self.assertTrue(dm_response_state.dm_turn_post_turn_resolved({'status': 'silent'}))
-
-    def test_dm_turn_post_turn_resolved_empty(self):
-        self.assertTrue(dm_response_state.dm_turn_post_turn_resolved({'status': 'empty'}))
-
-    def test_dm_turn_post_turn_resolved_complete(self):
-        self.assertTrue(dm_response_state.dm_turn_post_turn_resolved(
-            {'status': 'speak', 'post_turn_status': 'complete'}
-        ))
-
-    def test_dm_turn_post_turn_resolved_error(self):
-        self.assertTrue(dm_response_state.dm_turn_post_turn_resolved(
-            {'status': 'speak', 'post_turn_status': 'error'}
-        ))
-
-    def test_dm_turn_post_turn_resolved_post_turn_complete_flag(self):
-        self.assertTrue(dm_response_state.dm_turn_post_turn_resolved(
-            {'status': 'speak', 'post_turn_complete': True}
-        ))
-
-    def test_dm_turn_post_turn_resolved_pending(self):
-        self.assertFalse(dm_response_state.dm_turn_post_turn_resolved(
-            {'status': 'speak', 'post_turn_status': 'pending'}
-        ))
-
-    def test_dm_turn_post_turn_resolved_no_post_turn_info(self):
-        self.assertTrue(dm_response_state.dm_turn_post_turn_resolved({'status': 'speak'}))
-
-    def test_dm_turn_post_turn_resolved_none(self):
-        self.assertFalse(dm_response_state.dm_turn_post_turn_resolved(None))
-
-    def test_dm_turn_fully_resolved_pending(self):
-        self.assertFalse(dm_response_state.dm_turn_fully_resolved({'status': 'pending'}))
-
-    def test_dm_turn_fully_resolved_silent(self):
-        self.assertTrue(dm_response_state.dm_turn_fully_resolved({'status': 'silent'}))
-
-    def test_dm_turn_fully_resolved_empty(self):
-        self.assertTrue(dm_response_state.dm_turn_fully_resolved({'status': 'empty'}))
-
-    def test_dm_turn_fully_resolved_speak_complete(self):
-        self.assertTrue(dm_response_state.dm_turn_fully_resolved(
-            {'status': 'speak', 'post_turn_status': 'complete'}
-        ))
-
-    def test_dm_turn_fully_resolved_speak_error(self):
-        self.assertTrue(dm_response_state.dm_turn_fully_resolved(
-            {'status': 'speak', 'post_turn_status': 'error'}
-        ))
-
-    def test_dm_turn_fully_resolved_speak_pending(self):
-        self.assertFalse(dm_response_state.dm_turn_fully_resolved(
-            {'status': 'speak', 'post_turn_status': 'pending'}
-        ))
-
-    def test_dm_turn_fully_resolved_backward_compat_no_post_turn(self):
-        self.assertTrue(dm_response_state.dm_turn_fully_resolved({'status': 'speak'}))
-
-    def test_classify_timeout_visible(self):
-        self.assertEqual(
-            dm_response_state.classify_timeout({'status': 'pending'}, 'visible'),
-            'dm_visible_response_timeout',
-        )
-
-    def test_classify_timeout_post_turn_pending(self):
-        self.assertEqual(
-            dm_response_state.classify_timeout(
-                {'status': 'speak', 'post_turn_status': 'pending'}, 'post_turn'
+    def test_timeout_classification_matrix(self):
+        cases = [
+            ({'status': 'pending'}, 'visible', 'dm_visible_response_timeout'),
+            (
+                {'status': 'speak', 'post_turn_status': 'pending'},
+                'post_turn',
+                'dm_post_turn_timeout',
             ),
-            'dm_post_turn_timeout',
-        )
-
-    def test_classify_timeout_post_turn_error(self):
-        self.assertEqual(
-            dm_response_state.classify_timeout(
-                {'status': 'speak', 'post_turn_status': 'error'}, 'post_turn'
+            (
+                {'status': 'speak', 'post_turn_status': 'error'},
+                'post_turn',
+                'dm_post_turn_error',
             ),
-            'dm_post_turn_error',
-        )
-
-    def test_classify_timeout_unknown_phase(self):
-        self.assertEqual(
-            dm_response_state.classify_timeout({}, 'unknown'),
-            'dm_response_timeout',
-        )
+            ({}, 'unknown', 'dm_response_timeout'),
+        ]
+        for status, phase, expected in cases:
+            with self.subTest(phase=phase, status=status):
+                self.assertEqual(
+                    dm_response_state.classify_timeout(status, phase),
+                    expected,
+                )
 
     def test_build_timeout_evidence_includes_all_fields(self):
         status = {
@@ -141,95 +108,28 @@ class DmResponseStateUnitTests(unittest.TestCase):
         self.assertEqual(evidence['visible_completed_at'], '2026-01-01T00:05:00')
         self.assertEqual(evidence['generation_duration_ms'], 300000)
 
-    def test_resolve_dm_response_timeouts_both_specified(self):
-        args = SimpleNamespace(
-            dm_visible_response_timeout=200.0,
-            dm_post_turn_timeout=100.0,
-            dm_response_timeout=300.0,
-        )
-        visible, post_turn = dm_response_state.resolve_dm_response_timeouts(args)
-        self.assertEqual(visible, 200.0)
-        self.assertEqual(post_turn, 100.0)
-
-    def test_resolve_dm_response_timeouts_only_visible(self):
-        args = SimpleNamespace(
-            dm_visible_response_timeout=200.0,
-            dm_post_turn_timeout=None,
-            dm_response_timeout=300.0,
-        )
-        visible, post_turn = dm_response_state.resolve_dm_response_timeouts(args)
-        self.assertEqual(visible, 200.0)
-        self.assertEqual(post_turn, 720.0)
-
-    def test_resolve_dm_response_timeouts_only_post_turn(self):
-        args = SimpleNamespace(
-            dm_visible_response_timeout=None,
-            dm_post_turn_timeout=100.0,
-            dm_response_timeout=300.0,
-        )
-        visible, post_turn = dm_response_state.resolve_dm_response_timeouts(args)
-        self.assertEqual(visible, 300.0)
-        self.assertEqual(post_turn, 100.0)
-
-    def test_resolve_dm_response_timeouts_legacy_fallback(self):
-        args = SimpleNamespace(
-            dm_visible_response_timeout=None,
-            dm_post_turn_timeout=None,
-            dm_response_timeout=120.0,
-        )
-        visible, post_turn = dm_response_state.resolve_dm_response_timeouts(args)
-        self.assertEqual(visible, 120.0)
-        self.assertEqual(post_turn, 720.0)
-
-    def test_resolve_dm_response_timeouts_all_none_defaults(self):
-        args = SimpleNamespace(
-            dm_visible_response_timeout=None,
-            dm_post_turn_timeout=None,
-            dm_response_timeout=None,
-        )
-        visible, post_turn = dm_response_state.resolve_dm_response_timeouts(args)
-        self.assertEqual(visible, 720.0)
-        self.assertEqual(post_turn, 720.0)
-
-    def test_resolve_dm_response_timeouts_legacy_visible_with_independent_post_turn(self):
-        args = SimpleNamespace(
-            dm_visible_response_timeout=None,
-            dm_post_turn_timeout=600.0,
-            dm_response_timeout=120.0,
-        )
-        visible, post_turn = dm_response_state.resolve_dm_response_timeouts(args)
-        self.assertEqual(visible, 120.0)
-        self.assertEqual(post_turn, 600.0)
-
-    def test_resolve_dm_response_timeouts_both_specified_via_env_overrides(self):
-        args = SimpleNamespace(
-            dm_visible_response_timeout=720.0,
-            dm_post_turn_timeout=720.0,
-            dm_response_timeout=300.0,
-        )
-        visible, post_turn = dm_response_state.resolve_dm_response_timeouts(args)
-        self.assertEqual(visible, 720.0)
-        self.assertEqual(post_turn, 720.0)
-
-    def test_resolve_dm_response_timeouts_visible_override_post_turn_defaults(self):
-        args = SimpleNamespace(
-            dm_visible_response_timeout=600.0,
-            dm_post_turn_timeout=None,
-            dm_response_timeout=None,
-        )
-        visible, post_turn = dm_response_state.resolve_dm_response_timeouts(args)
-        self.assertEqual(visible, 600.0)
-        self.assertEqual(post_turn, 720.0)
-
-    def test_resolve_dm_response_timeouts_post_turn_override_visible_defaults(self):
-        args = SimpleNamespace(
-            dm_visible_response_timeout=None,
-            dm_post_turn_timeout=600.0,
-            dm_response_timeout=None,
-        )
-        visible, post_turn = dm_response_state.resolve_dm_response_timeouts(args)
-        self.assertEqual(visible, 720.0)
-        self.assertEqual(post_turn, 600.0)
+    def test_timeout_resolution_matrix(self):
+        cases = [
+            ((200.0, 100.0, 300.0), (200.0, 100.0)),
+            ((200.0, None, 300.0), (200.0, 720.0)),
+            ((None, 100.0, 300.0), (300.0, 100.0)),
+            ((None, None, 120.0), (120.0, 720.0)),
+            ((None, None, None), (720.0, 720.0)),
+            ((None, 600.0, 120.0), (120.0, 600.0)),
+            ((600.0, None, None), (600.0, 720.0)),
+            ((None, 600.0, None), (720.0, 600.0)),
+        ]
+        for values, expected in cases:
+            with self.subTest(values=values):
+                args = SimpleNamespace(
+                    dm_visible_response_timeout=values[0],
+                    dm_post_turn_timeout=values[1],
+                    dm_response_timeout=values[2],
+                )
+                self.assertEqual(
+                    dm_response_state.resolve_dm_response_timeouts(args),
+                    expected,
+                )
 
 
 class DmResponseStatePhasedTests(unittest.TestCase):
@@ -484,17 +384,16 @@ class DmResponseStateReviewRegressionTests(unittest.TestCase):
             )
 
     def test_transient_error_is_reported_with_phase(self):
-        statuses = iter([
-            RuntimeError('temporary'),
-            {'status': 'speak', 'post_turn_status': 'complete'},
-        ])
+        attempts = 0
+        complete = {'status': 'speak', 'post_turn_status': 'complete'}
         reported = []
 
         def fetch():
-            item = next(statuses)
-            if isinstance(item, Exception):
-                raise item
-            return item
+            nonlocal attempts
+            attempts += 1
+            if attempts == 1:
+                raise RuntimeError('temporary')
+            return complete
 
         with patch.object(time, 'sleep'):
             result, timed_out, phase = dm_response_state.wait_for_dm_response(

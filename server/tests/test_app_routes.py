@@ -661,7 +661,13 @@ class AppRouteTest(unittest.TestCase):
         with patch(
             'routes.sessions.get_session_dm_response_with_tools',
             return_value={'mode': 'speak', 'content': 'The door groans open onto a moonlit hall.', 'parts': [{'type': 'narration', 'content': 'The door groans open onto a moonlit hall.'}], 'commit_action_ids': []},
-        ), patch('routes.sessions.get_session_memory_patch', return_value={}):
+        ), patch('routes.sessions.get_session_memory_patch', return_value={}), \
+                patch('routes.sessions.get_session_clock_updates', return_value={
+                    'create_clocks': [],
+                    'advance_clocks': [],
+                    'retire_clocks': [],
+                    'no_change_explanations': [],
+                }):
             message_response = self.client.post(
                 f'/api/sessions/{session_id}/messages',
                 headers={'X-API-Key': llm_api_key},
@@ -2507,6 +2513,12 @@ class AppRouteTest(unittest.TestCase):
                     'time_of_day': 'dusk',
                 },
                 'scene_reason': 'The party reached the harbor.',
+            }),
+            patch('routes.sessions.get_session_clock_updates', return_value={
+                'create_clocks': [],
+                'advance_clocks': [],
+                'retire_clocks': [],
+                'no_change_explanations': [],
             }),
             patch('routes.sessions.stream_manager.broadcast_event') as mock_broadcast,
         ):

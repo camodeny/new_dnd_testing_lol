@@ -2607,92 +2607,93 @@ class AutomationRouteTest(unittest.TestCase):
         ).get_json()
         return run_id, claim['lease_token']
 
-    def test_events_route_rejects_missing_credentials(self):
+    def test_events_route_enforces_worker_credentials(self):
         run_id, token = self._claim_for_credential_tests()
-        resp = self.client.post(
-            f'/api/automation/runs/{run_id}/events',
-            headers=self.headers,
-            json={'event_type': 'custom_event', 'payload': {}},
-        )
-        self.assertEqual(resp.status_code, 409)
+        cases = [
+            (
+                'missing credentials',
+                {'event_type': 'custom_event', 'payload': {}},
+                409,
+            ),
+            (
+                'wrong worker',
+                {
+                    'event_type': 'custom_event',
+                    'payload': {},
+                    'worker_id': 'wrong-worker',
+                    'lease_token': token,
+                },
+                409,
+            ),
+            (
+                'wrong token',
+                {
+                    'event_type': 'custom_event',
+                    'payload': {},
+                    'worker_id': 'cred-test-worker',
+                    'lease_token': 'bad-token',
+                },
+                409,
+            ),
+            (
+                'valid credentials',
+                {
+                    'event_type': 'custom_event',
+                    'payload': {},
+                    'worker_id': 'cred-test-worker',
+                    'lease_token': token,
+                },
+                201,
+            ),
+        ]
+        for label, payload, expected_status in cases:
+            with self.subTest(label=label):
+                resp = self.client.post(
+                    f'/api/automation/runs/{run_id}/events',
+                    headers=self.headers,
+                    json=payload,
+                )
+                self.assertEqual(resp.status_code, expected_status)
 
-    def test_events_route_rejects_wrong_worker_id(self):
+    def test_provider_calls_route_enforces_worker_credentials(self):
         run_id, token = self._claim_for_credential_tests()
-        resp = self.client.post(
-            f'/api/automation/runs/{run_id}/events',
-            headers=self.headers,
-            json={
-                'event_type': 'custom_event', 'payload': {},
-                'worker_id': 'wrong-worker', 'lease_token': token,
-            },
-        )
-        self.assertEqual(resp.status_code, 409)
-
-    def test_events_route_rejects_wrong_lease_token(self):
-        run_id, token = self._claim_for_credential_tests()
-        resp = self.client.post(
-            f'/api/automation/runs/{run_id}/events',
-            headers=self.headers,
-            json={
-                'event_type': 'custom_event', 'payload': {},
-                'worker_id': 'cred-test-worker', 'lease_token': 'bad-token',
-            },
-        )
-        self.assertEqual(resp.status_code, 409)
-
-    def test_events_route_accepts_valid_credentials(self):
-        run_id, token = self._claim_for_credential_tests()
-        resp = self.client.post(
-            f'/api/automation/runs/{run_id}/events',
-            headers=self.headers,
-            json={
-                'event_type': 'custom_event', 'payload': {},
+        base_payload = {
+            'phase': 'after_dm',
+            'request': {},
+            'response': {},
+            'parsed_output': {},
+        }
+        cases = [
+            ({**base_payload, 'dedupe_key': 'test-pc-cred'}, 409),
+            ({
+                **base_payload,
+                'dedupe_key': 'test-pc-cred-ok',
                 'worker_id': 'cred-test-worker', 'lease_token': token,
-            },
-        )
-        self.assertIn(resp.status_code, {200, 201})
+            }, 201),
+        ]
+        for payload, expected_status in cases:
+            with self.subTest(expected_status=expected_status):
+                resp = self.client.post(
+                    f'/api/automation/runs/{run_id}/provider-calls',
+                    headers=self.headers,
+                    json=payload,
+                )
+                self.assertEqual(resp.status_code, expected_status)
 
-    def test_provider_calls_route_rejects_missing_credentials(self):
+    def test_complete_route_enforces_worker_credentials(self):
         run_id, token = self._claim_for_credential_tests()
-        resp = self.client.post(
-            f'/api/automation/runs/{run_id}/provider-calls',
-            headers=self.headers,
-            json={'dedupe_key': 'test-pc-cred', 'phase': 'after_dm', 'request': {}, 'response': {}, 'parsed_output': {}},
-        )
-        self.assertEqual(resp.status_code, 409)
-
-    def test_provider_calls_route_accepts_valid_credentials(self):
-        run_id, token = self._claim_for_credential_tests()
-        resp = self.client.post(
-            f'/api/automation/runs/{run_id}/provider-calls',
-            headers=self.headers,
-            json={
-                'dedupe_key': 'test-pc-cred-ok', 'phase': 'after_dm',
-                'request': {}, 'response': {}, 'parsed_output': {},
-                'worker_id': 'cred-test-worker', 'lease_token': token,
-            },
-        )
-        self.assertEqual(resp.status_code, 201)
-
-    def test_complete_route_rejects_missing_credentials(self):
-        run_id, token = self._claim_for_credential_tests()
-        resp = self.client.post(
-            f'/api/automation/runs/{run_id}/complete',
-            headers=self.headers,
-            json={},
-        )
-        self.assertEqual(resp.status_code, 409)
-
-    def test_complete_route_accepts_valid_credentials(self):
-        run_id, token = self._claim_for_credential_tests()
-        resp = self.client.post(
-            f'/api/automation/runs/{run_id}/complete',
-            headers=self.headers,
-            json={
-                'worker_id': 'cred-test-worker', 'lease_token': token,
-            },
-        )
-        self.assertEqual(resp.status_code, 200)
+        cases = [
+            ({}, 409),
+            ({'worker_id': 'cred-test-worker', 'lease_token': token}, 200),
+        ]
+        for payload, expected_status in cases:
+            with self.subTest(expected_status=expected_status):
+                resp = self.client.post(
+                    f'/api/automation/runs/{run_id}/complete',
+                    headers=self.headers,
+                    json=payload,
+                )
+                self.assertEqual(resp.status_code, expected_status)
 
     def test_complete_route_rejects_stale_completion_on_terminal_run(self):
         run_id, token = self._claim_for_credential_tests()
@@ -2808,23 +2809,16 @@ class AutomationRouteTest(unittest.TestCase):
         )
         self.assertEqual(resp.status_code, 200)
 
-    def test_events_route_rejects_status_completed_bypass(self):
+    def test_events_route_rejects_status_bypasses(self):
         run_id, token = self._claim_for_credential_tests()
-        resp = self.client.post(
-            f'/api/automation/runs/{run_id}/events',
-            headers=self.headers,
-            json={'event_type': 'custom', 'status': 'completed'},
-        )
-        self.assertEqual(resp.status_code, 409)
-
-    def test_events_route_rejects_status_queued_bypass(self):
-        run_id, token = self._claim_for_credential_tests()
-        resp = self.client.post(
-            f'/api/automation/runs/{run_id}/events',
-            headers=self.headers,
-            json={'event_type': 'custom', 'status': 'queued'},
-        )
-        self.assertEqual(resp.status_code, 409)
+        for status in ('completed', 'queued'):
+            with self.subTest(status=status):
+                resp = self.client.post(
+                    f'/api/automation/runs/{run_id}/events',
+                    headers=self.headers,
+                    json={'event_type': 'custom', 'status': status},
+                )
+                self.assertEqual(resp.status_code, 409)
 
     def test_post_completion_credential_free_mutations_rejected(self):
         run_id, token = self._claim_for_credential_tests()

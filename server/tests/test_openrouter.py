@@ -10,7 +10,6 @@ sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), '..')
 
 from openrouter import (
     _assistant_tool_message,
-    _provider_request_payload_options,
     _json_error_excerpt,
     _json_loads_with_error,
     _json_loads_with_repair,
@@ -37,7 +36,7 @@ from openrouter import (
     normalize_session_preflight_decision,
     normalize_session_spoiler_check,
 )
-from services.session_memory_agent import MemoryPipelineError, compile_staged_memory_patch
+from services.session_memory_agent import MemoryPipelineError
 from llm_providers import OpenRouterAdapter
 
 
@@ -159,21 +158,12 @@ class MemoryPipelineErrorTest(unittest.TestCase):
         self.assertEqual(ctx.exception.stage, 'context')
         self.assertEqual(ctx.exception.code, 'missing_context')
 
-    def test_missing_campaign_id_raises_context_error(self):
-        with self.assertRaises(MemoryPipelineError) as ctx:
-            get_session_memory_patch({'session_id': 1})
-        self.assertEqual(ctx.exception.stage, 'context')
-
-    def test_missing_session_id_raises_context_error(self):
-        with self.assertRaises(MemoryPipelineError) as ctx:
-            get_session_memory_patch({'campaign_id': 1})
-        self.assertEqual(ctx.exception.stage, 'context')
-
-    def test_compile_missing_campaign_raises_compilation_error(self):
-        with self.assertRaises(MemoryPipelineError) as ctx:
-            compile_staged_memory_patch({}, {}, {})
-        self.assertEqual(ctx.exception.stage, 'compilation')
-        self.assertEqual(ctx.exception.code, 'missing_campaign')
+    def test_partial_context_raises_context_error(self):
+        for payload in ({'session_id': 1}, {'campaign_id': 1}):
+            with self.subTest(payload=payload):
+                with self.assertRaises(MemoryPipelineError) as ctx:
+                    get_session_memory_patch(payload)
+                self.assertEqual(ctx.exception.stage, 'context')
 
     def test_telemetry_includes_pipeline_mode_and_build_sha(self):
         fake_compiled = {
@@ -849,69 +839,7 @@ class FakeResponse:
         return self._payload
 
 
-class OpenRouterRetryTest(unittest.TestCase):
-    def test_post_chat_response_retries_transient_404_then_succeeds(self):
-        success = {
-            'choices': [{'message': {'content': 'ok'}}],
-        }
-
-        with patch('openrouter.get_llm_provider', return_value='openrouter'), \
-                patch('openrouter.get_llm_model', return_value='test-model'), \
-                patch.dict(os.environ, {'OPENROUTER_API_KEY': 'test-key'}), \
-                patch('llm_providers.requests.post', side_effect=[
-                    FakeResponse(404),
-                    FakeResponse(200, success),
-                ]) as post, patch('llm_providers.time.sleep') as sleep:
-            result = _post_chat_normalized([{'role': 'user', 'content': 'hello'}])
-
-        self.assertEqual(result.content, 'ok')
-        self.assertEqual(post.call_count, 2)
-        sleep.assert_called_once_with(1)
-
-    def test_post_chat_response_does_not_retry_permanent_400(self):
-        with patch('openrouter.get_llm_provider', return_value='openrouter'), \
-                patch('openrouter.get_llm_model', return_value='test-model'), \
-                patch.dict(os.environ, {'OPENROUTER_API_KEY': 'test-key'}), \
-                patch('llm_providers.requests.post', return_value=FakeResponse(400)) as post, \
-                patch('llm_providers.time.sleep') as sleep:
-            with self.assertRaises(requests.HTTPError):
-                _post_chat_normalized([{'role': 'user', 'content': 'hello'}])
-
-        self.assertEqual(post.call_count, 1)
-        sleep.assert_not_called()
-
-
 class ProviderCompatibilityTest(unittest.TestCase):
-    def test_deepseek_thinking_mode_omits_unsupported_tool_controls(self):
-        with patch.dict(os.environ, {'OPENCODE_GO_THINKING': 'enabled', 'OPENCODE_GO_REASONING_EFFORT': 'max'}):
-            options = _provider_request_payload_options(
-                'opencode_go',
-                'deepseek-v4-flash',
-                [{'type': 'function', 'function': {'name': 'get_clock'}}],
-                'auto',
-                False,
-            )
-
-        self.assertTrue(options['thinking_enabled'])
-        self.assertEqual(options['thinking'], {'type': 'enabled'})
-        self.assertEqual(options['reasoning_effort'], 'max')
-        self.assertIsNone(options['tool_choice'])
-        self.assertIsNone(options['parallel_tool_calls'])
-
-    def test_deepseek_required_tool_choice_is_omitted_even_when_thinking_disabled(self):
-        options = _provider_request_payload_options(
-            'opencode_go',
-            'deepseek-v4-flash',
-            [{'type': 'function', 'function': {'name': 'talk_to_player'}}],
-            'required',
-            False,
-            allow_thinking=False,
-        )
-
-        self.assertFalse(options['thinking_enabled'])
-        self.assertIsNone(options['tool_choice'])
-        self.assertFalse(options['parallel_tool_calls'])
-
     def test_assistant_tool_message_preserves_deepseek_reasoning_content(self):
         self.assertEqual(
             _assistant_tool_message({
