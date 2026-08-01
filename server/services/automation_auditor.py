@@ -935,6 +935,7 @@ def _scene_state_summary(world_payload):
 
 
 def _cycle_evidence_packet(run, cycle, args):
+    refresh_run_scorecard(run)
     campaign = _campaign_for_run(run)
     world_payload = _world_payload(campaign) if campaign else {'has_world': False}
     latest_session = latest_session_for_run(run)

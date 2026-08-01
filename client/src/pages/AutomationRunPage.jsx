@@ -315,6 +315,10 @@ export default function AutomationRunPage() {
   const messages = latestSession?.messages || []
   const incidents = data.incidents || run.scorecard_summary?.incidents || []
   const categoryBreakdown = run.scorecard_summary?.category_breakdown || {}
+  const scoreSummary = run.scorecard_summary || {}
+  const performanceScore = scoreSummary.performance_score ?? scoreSummary.weighted_score
+  const scoreSeverity = scoreSummary.severity ?? scoreSummary.overall_status ?? 'not_assessed'
+  const scoreCompleteness = scoreSummary.completeness
   const encounterMap = data.encounter_map
   const auditCycles = data.audit_cycles || []
   const auditorJobs = data.auditor_jobs || []
@@ -425,7 +429,11 @@ export default function AutomationRunPage() {
                   </div>
                   <div className="automation-meta-grid">
                     <div><strong>Status</strong><span>{run.status}</span></div>
-                    <div><strong>Weighted score</strong><span>{run.scorecard_summary?.weighted_score !== undefined && run.scorecard_summary?.weighted_score !== null ? `${run.scorecard_summary.weighted_score < 1.0 ? Math.min(99.9, run.scorecard_summary.weighted_score * 100).toFixed(1) : '100.0'}%` : 'N/A'}</span></div>
+                    <div><strong>Severity</strong><span className={`status-badge ${scoreSeverity}`}>{scoreSeverity}</span></div>
+                    <div><strong>Performance score</strong><span>{performanceScore !== undefined && performanceScore !== null ? `${performanceScore < 1.0 ? Math.min(99.9, performanceScore * 100).toFixed(1) : '100.0'}%` : 'N/A'}</span></div>
+                    <div><strong>Completeness</strong><span>{scoreCompleteness !== undefined && scoreCompleteness !== null ? `${(scoreCompleteness * 100).toFixed(1)}%` : 'N/A'}</span></div>
+                    <div><strong>Score total</strong><span>{scoreSummary.score_numerator ?? '—'} / {scoreSummary.score_denominator ?? '—'}</span></div>
+                    <div><strong>Assessments</strong><span>{scoreSummary.assessment_count ?? '—'} scored, {scoreSummary.not_assessed_count ?? '—'} missing</span></div>
                     <div><strong>Created</strong><span>{formatTime(run.created_at)}</span></div>
                     <div><strong>Started</strong><span>{formatTime(run.started_at)}</span></div>
                     <div><strong>Finished</strong><span>{formatTime(run.finished_at)}</span></div>
@@ -443,8 +451,9 @@ export default function AutomationRunPage() {
                       <h3 style={{ marginTop: 0, marginBottom: '12px', fontSize: '1.1rem', color: 'var(--text-bright, #fff)' }}>Category Breakdown</h3>
                       <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fill, minmax(220px, 1fr))', gap: '12px' }}>
                         {Object.entries(categoryBreakdown).map(([catName, data]) => {
-                          const hasScore = data.score !== null && data.score !== undefined;
-                          const formattedScore = hasScore ? `${data.score < 1.0 ? Math.min(99.9, data.score * 100).toFixed(1) : '100.0'}%` : 'N/A';
+                          const categoryScore = data.performance_score ?? data.score;
+                          const hasScore = categoryScore !== null && categoryScore !== undefined;
+                          const formattedScore = hasScore ? `${categoryScore < 1.0 ? Math.min(99.9, categoryScore * 100).toFixed(1) : '100.0'}%` : 'N/A';
                           return (
                             <div key={catName} className={`category-card status-${data.status}`} style={{ padding: '10px 12px', borderRadius: '6px', background: 'var(--card-bg, rgba(255, 255, 255, 0.05))', borderLeft: `4px solid ${data.status === 'pass' ? '#10b981' : data.status === 'warn' ? '#f59e0b' : data.status === 'fail' ? '#ef4444' : '#6b7280'}` }}>
                               <div style={{ fontSize: '0.8rem', color: 'var(--text-muted, #9ca3af)', textTransform: 'capitalize', whiteSpace: 'nowrap', overflow: 'hidden', textOverflow: 'ellipsis' }} title={catName}>

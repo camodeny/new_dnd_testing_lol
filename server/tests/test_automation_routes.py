@@ -159,6 +159,78 @@ class AutomationRouteTest(unittest.TestCase):
             db.session.remove()
         self.temp_dir.cleanup()
 
+    def _create_scorecard_run(self, criteria, *, name='Issue 76 Scorecard'):
+        scorecard_response = self.client.post(
+            '/api/automation/scorecards',
+            headers=self.headers,
+            json={'name': name, 'criteria': criteria},
+        )
+        self.assertEqual(scorecard_response.status_code, 201)
+        scorecard_id = scorecard_response.get_json()['scorecard']['id']
+        scenario_response = self.client.post(
+            '/api/automation/scenarios',
+            headers=self.headers,
+            json={
+                'source_campaign_id': self.campaign_id,
+                'scorecard_template_id': scorecard_id,
+            },
+        )
+        self.assertEqual(scenario_response.status_code, 201)
+        scenario_id = scenario_response.get_json()['scenario']['id']
+        snapshot_response = self.client.post(
+            f'/api/automation/scenarios/{scenario_id}/snapshots',
+            headers=self.headers,
+            json={},
+        )
+        self.assertEqual(snapshot_response.status_code, 201)
+        snapshot_id = snapshot_response.get_json()['snapshot']['id']
+        run_response = self.client.post(
+            f'/api/automation/scenarios/{scenario_id}/runs',
+            headers=self.headers,
+            json={'snapshot_id': snapshot_id},
+        )
+        self.assertEqual(run_response.status_code, 201)
+        return scenario_id, run_response.get_json()['run']['id']
+
+    def _seed_scored_cycles(self, run_id, cycle_criteria, *, run_status='completed'):
+        from services.automation_service import append_run_event, refresh_run_scorecard
+
+        with app.app_context():
+            run = db.session.get(AutomationRun, run_id)
+            run.status = run_status
+            for turn_number in range(1, 11):
+                append_run_event(
+                    run,
+                    'turn_result',
+                    {'action': 'speak', 'turn_number': turn_number},
+                    dedupe_key=f'issue-76-turn:{run_id}:{turn_number}',
+                    commit=False,
+                    skip_workspace=True,
+                )
+            cycles = []
+            for cycle_number, criteria in enumerate(cycle_criteria, start=1):
+                normalized = []
+                for criterion_id, status in criteria.items():
+                    applicable = status != 'not_applicable'
+                    normalized.append({
+                        'criterion_id': criterion_id,
+                        'status': status,
+                        'applicability': {'applicable': applicable},
+                    })
+                cycle = AutomationRunAuditCycle(
+                    run_id=run_id,
+                    cycle_number=cycle_number,
+                    phase='after_dm',
+                    status='audited',
+                    scorecard_json={'criteria': normalized},
+                    scorecard_summary_json={},
+                )
+                db.session.add(cycle)
+                cycles.append(cycle)
+            db.session.commit()
+            refresh_run_scorecard(run)
+            return [cycle.id for cycle in cycles]
+
     def test_create_scenario_snapshot_run_and_claim_hidden_clone(self):
         scenario_response = self.client.post(
             '/api/automation/scenarios',
@@ -547,6 +619,216 @@ class AutomationRouteTest(unittest.TestCase):
         self.assertIsNone(payload['run']['scorecard_summary']['weighted_score'])
         self.assertEqual(payload['run']['scorecard_summary']['audited_cycle_count'], 0)
         self.assertEqual(payload['run']['scorecard_summary']['completed_turns'], 0)
+
+    def test_run_37_cycle_average_preserves_worst_severity(self):
+        criteria = [
+            {'id': f'criterion_{index}', 'label': f'Criterion {index}'}
+            for index in range(1, 9)
+        ]
+        _scenario_id, run_id = self._create_scorecard_run(
+            criteria,
+            name='Run 37 Memory Audit Scorebook',
+        )
+        run_37_statuses = [
+            ['pass', 'pass', 'pass', 'pass', 'not_applicable', 'pass', 'pass', 'pass'],
+            ['pass', 'pass', 'pass', 'pass', 'not_applicable', 'pass', 'pass', 'pass'],
+            ['pass', 'pass', 'pass', 'pass', 'not_applicable', 'pass', 'pass', 'warn'],
+            ['pass', 'pass', 'pass', 'pass', 'not_applicable', 'pass', 'pass', 'pass'],
+            ['pass', 'warn', 'pass', 'pass', 'not_applicable', 'pass', 'fail', 'warn'],
+            ['pass', 'warn', 'pass', 'pass', 'pass', 'pass', 'warn', 'warn'],
+            ['pass', 'warn', 'pass', 'pass', 'not_applicable', 'pass', 'warn', 'warn'],
+            ['pass', 'warn', 'pass', 'pass', 'not_applicable', 'pass', 'warn', 'warn'],
+            ['pass', 'warn', 'pass', 'pass', 'not_applicable', 'pass', 'warn', 'fail'],
+            ['pass', 'warn', 'warn', 'fail', 'not_applicable', 'pass', 'pass', 'fail'],
+        ]
+        self._seed_scored_cycles(
+            run_id,
+            [
+                {
+                    f'criterion_{index}': statuses[index - 1]
+                    for index in range(1, 9)
+                }
+                for statuses in run_37_statuses
+            ],
+        )
+
+        response = self.client.get(
+            f'/api/automation/runs/{run_id}/scorecard',
+            headers=self.headers,
+        )
+        self.assertEqual(response.status_code, 200)
+        payload = response.get_json()
+        summary = payload['run']['scorecard_summary']
+        rows = {row['check_id']: row for row in payload['scorecard']}
+
+        self.assertEqual(summary['scoring_model'], 'cycle_assessment_v2')
+        self.assertEqual(summary['severity'], 'fail')
+        self.assertEqual(summary['overall_status'], 'fail')
+        self.assertEqual(summary['performance_score'], 0.9111)
+        self.assertEqual(summary['weighted_score'], 0.9111)
+        self.assertEqual(summary['score_numerator'], 24.6)
+        self.assertEqual(summary['score_denominator'], 27.0)
+        self.assertEqual(summary['assessment_count'], 77)
+        self.assertEqual(summary['completeness'], 1.0)
+
+        criterion_7 = rows['custom:criterion_7']
+        self.assertEqual(criterion_7['status'], 'fail')
+        self.assertEqual(criterion_7['details']['performance_score'], 0.7)
+        self.assertEqual(criterion_7['details']['assessment_count'], 10)
+        self.assertEqual(criterion_7['details']['score_numerator'], 1.4)
+        self.assertEqual(criterion_7['details']['score_denominator'], 2)
+
+    def test_missing_and_not_applicable_assessments_have_explicit_completeness(self):
+        _scenario_id, run_id = self._create_scorecard_run([
+            {
+                'id': 'weighted_memory',
+                'label': 'Weighted Memory',
+                'weight': 3,
+                'category': 'retrieval or memory use',
+            },
+            {
+                'id': 'phase_only',
+                'label': 'Phase Only',
+                'weight': 5,
+                'category': 'retrieval or memory use',
+            },
+        ])
+        cycle_ids = self._seed_scored_cycles(
+            run_id,
+            [
+                {'weighted_memory': 'pass', 'phase_only': 'not_applicable'},
+                {'phase_only': 'not_applicable'},
+            ],
+            run_status='awaiting_audit',
+        )
+        with app.app_context():
+            run = db.session.get(AutomationRun, run_id)
+            legacy_cycle = db.session.get(AutomationRunAuditCycle, cycle_ids[0])
+            legacy_scorecard = dict(legacy_cycle.scorecard_json or {})
+            legacy_criteria = [
+                dict(item)
+                for item in (legacy_scorecard.get('criteria') or [])
+            ]
+            for item in legacy_criteria:
+                if item.get('criterion_id') == 'phase_only':
+                    item['status'] = 'not_assessed'
+                    item['applicability'] = {'applicable': False}
+            legacy_cycle.scorecard_json = {
+                **legacy_scorecard,
+                'criteria': legacy_criteria,
+            }
+            run.awaiting_audit_cycle_id = cycle_ids[-1]
+            run.awaiting_audit_phase = 'after_dm'
+            db.session.commit()
+
+        run_payload = self.client.get(
+            f'/api/automation/runs/{run_id}',
+            headers=self.headers,
+        ).get_json()
+        scorecard_payload = self.client.get(
+            f'/api/automation/runs/{run_id}/scorecard',
+            headers=self.headers,
+        ).get_json()
+        bundle_payload = self.client.get(
+            f'/api/automation/runs/{run_id}/audit-bundle',
+            headers=self.headers,
+        ).get_json()
+
+        summary = scorecard_payload['run']['scorecard_summary']
+        rows = {row['check_id']: row for row in scorecard_payload['scorecard']}
+        weighted_memory = rows['custom:weighted_memory']['details']
+        phase_only = rows['custom:phase_only']['details']
+
+        self.assertEqual(weighted_memory['severity'], 'pass')
+        self.assertEqual(weighted_memory['performance_score'], 1.0)
+        self.assertEqual(weighted_memory['assessment_count'], 1)
+        self.assertEqual(weighted_memory['not_assessed_count'], 1)
+        self.assertEqual(weighted_memory['missing_assessment_count'], 1)
+        self.assertEqual(weighted_memory['completeness'], 0.5)
+        self.assertEqual(weighted_memory['score_denominator'], 3)
+        self.assertEqual(phase_only['severity'], 'not_applicable')
+        self.assertIsNone(phase_only['performance_score'])
+        self.assertIsNone(phase_only['completeness'])
+        self.assertEqual(phase_only['not_applicable_count'], 2)
+
+        self.assertLess(summary['completeness'], 1.0)
+        contract_fields = {
+            'scoring_model',
+            'severity',
+            'performance_score',
+            'score_numerator',
+            'score_denominator',
+            'assessment_count',
+            'not_assessed_count',
+            'not_applicable_count',
+            'completeness',
+        }
+        self.assertTrue(contract_fields.issubset(summary))
+        self.assertEqual(
+            run_payload['run']['scorecard_summary'],
+            summary,
+        )
+        self.assertEqual(
+            bundle_payload['run']['scorecard_summary'],
+            summary,
+        )
+
+    def test_baseline_comparison_reports_severity_and_performance_separately(self):
+        scenario_id, baseline_run_id = self._create_scorecard_run([
+            {
+                'id': 'consistency',
+                'label': 'Consistency',
+                'weight': 4,
+            },
+        ])
+        with app.app_context():
+            baseline_run = db.session.get(AutomationRun, baseline_run_id)
+            snapshot_id = baseline_run.snapshot_id
+        current_response = self.client.post(
+            f'/api/automation/scenarios/{scenario_id}/runs',
+            headers=self.headers,
+            json={'snapshot_id': snapshot_id},
+        )
+        self.assertEqual(current_response.status_code, 201)
+        current_run_id = current_response.get_json()['run']['id']
+
+        self._seed_scored_cycles(
+            baseline_run_id,
+            [
+                {'consistency': 'pass'},
+                {'consistency': 'fail'},
+            ],
+        )
+        self._seed_scored_cycles(
+            current_run_id,
+            [
+                {'consistency': 'pass'},
+                {'consistency': 'pass'},
+                {'consistency': 'fail'},
+            ],
+        )
+        with app.app_context():
+            current_run = db.session.get(AutomationRun, current_run_id)
+            current_run.scenario.baseline_run_id = baseline_run_id
+            db.session.commit()
+
+        payload = self.client.get(
+            f'/api/automation/runs/{current_run_id}/scorecard',
+            headers=self.headers,
+        ).get_json()
+        comparison = next(
+            item
+            for item in payload['baseline_comparison']['comparisons']
+            if item['check_id'] == 'custom:consistency'
+        )
+
+        self.assertEqual(comparison['baseline_severity'], 'fail')
+        self.assertEqual(comparison['current_severity'], 'fail')
+        self.assertEqual(comparison['severity_relationship'], 'unchanged')
+        self.assertEqual(comparison['baseline_performance_score'], 0.5)
+        self.assertEqual(comparison['current_performance_score'], 0.6667)
+        self.assertEqual(comparison['performance_relationship'], 'better')
+        self.assertEqual(comparison['relationship'], 'better')
 
     def test_run_scorecard_and_compare(self):
         scenario_id = self.client.post(
