@@ -5739,6 +5739,94 @@ class DmToolsTest(unittest.TestCase):
             ],
         )
 
+    def test_completion_criteria_hold_full_clock_pending_until_retirement_is_evidenced(self):
+        db.session.add(CampaignClock(
+            campaign_id=self.campaign.id,
+            clock_id='identify_saboteur',
+            name='Identify the Saboteur',
+            segments=4,
+            filled=3,
+            status='active',
+            completion_criteria=[
+                {'id': 'named_suspect', 'description': 'Visible evidence identifies a specific suspect.'},
+                {'id': 'usable_location', 'description': 'Visible evidence establishes a usable location.'},
+            ],
+        ))
+        db.session.commit()
+
+        result = apply_clock_adjudication(
+            self.campaign,
+            {
+                'create_clocks': [],
+                'advance_clocks': [{
+                    'clock_id': 'identify_saboteur',
+                    'delta': 1,
+                    'reason': 'The party found a new clue.',
+                    'evidence': [],
+                }],
+                'retire_clocks': [{
+                    'clock_id': 'identify_saboteur',
+                    'reason': 'The bar is full, so the mystery is solved.',
+                }],
+                'no_change_explanations': [],
+            },
+            audit_context={
+                'trace_id': 'completion-criteria-trace',
+                'source_player_message_id': 101,
+                'source_dm_message_id': 102,
+            },
+        )
+        db.session.commit()
+
+        clock = CampaignClock.query.filter_by(campaign_id=self.campaign.id, clock_id='identify_saboteur').one()
+        self.assertEqual(clock.filled, 4)
+        self.assertEqual(clock.status, 'completion_pending')
+        self.assertIn('cannot resolve until all completion criteria are met', result['errors'][0])
+        self.assertEqual(WorldEvent.query.filter_by(campaign_id=self.campaign.id, event_type='clock_retired').count(), 0)
+
+    def test_completion_criteria_allow_evidenced_retirement(self):
+        db.session.add(CampaignClock(
+            campaign_id=self.campaign.id,
+            clock_id='identify_saboteur',
+            name='Identify the Saboteur',
+            segments=4,
+            filled=4,
+            status='completion_pending',
+            completion_criteria=[
+                {'id': 'named_suspect', 'description': 'Visible evidence identifies a specific suspect.'},
+                {'id': 'usable_location', 'description': 'Visible evidence establishes a usable location.'},
+            ],
+        ))
+        db.session.commit()
+
+        result = apply_clock_adjudication(
+            self.campaign,
+            {
+                'create_clocks': [],
+                'advance_clocks': [],
+                'retire_clocks': [{
+                    'clock_id': 'identify_saboteur',
+                    'reason': 'The party has a named suspect and a location.',
+                    'completion_criteria_met': ['named_suspect', 'usable_location'],
+                }],
+                'no_change_explanations': [],
+            },
+            audit_context={
+                'trace_id': 'completion-criteria-success-trace',
+                'source_player_message_id': 101,
+                'source_dm_message_id': 102,
+            },
+        )
+        db.session.commit()
+
+        self.assertEqual(result['errors'], [])
+        clock = CampaignClock.query.filter_by(campaign_id=self.campaign.id, clock_id='identify_saboteur').one()
+        self.assertEqual(clock.status, 'resolved')
+        event = WorldEvent.query.filter_by(campaign_id=self.campaign.id, event_type='clock_retired').one()
+        payload = json.loads(event.payload)
+        self.assertEqual(payload['completion_criteria_met'], ['named_suspect', 'usable_location'])
+        self.assertEqual(payload['provenance']['evidence_status'], 'supported_by_evidence')
+
     def test_apply_clock_adjudication_preserves_rule_evidence_with_transcript_sources(self):
         db.session.add(CampaignClock(
             campaign_id=self.campaign.id,

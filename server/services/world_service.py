@@ -272,6 +272,7 @@ def normalize_clocks(raw_clocks):
             'summary': clean_text(clock.get('summary'), 420),
             'trigger': clean_text(clock.get('trigger'), 420),
             'on_complete': clean_text(clock.get('on_complete'), 520),
+            'completion_criteria': clock.get('completion_criteria') if isinstance(clock.get('completion_criteria'), list) else [],
             'status': clean_text(clock.get('status'), 30) or 'active',
         })
     return normalized
@@ -428,6 +429,7 @@ def persist_world_package(campaign, package):
             summary=clock.get('summary'),
             trigger=clock.get('trigger'),
             on_complete=clock.get('on_complete'),
+            completion_criteria=clock.get('completion_criteria') or [],
             status=clock.get('status') or 'active',
         ))
         upsert_memory_embedding(campaign, 'clock', clock['id'], clock)

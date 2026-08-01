@@ -300,6 +300,8 @@ SESSION_CLOCK_ADJUDICATOR_SYSTEM_PROMPT = (
     "If a new pressure is already underway, prefer creating the new clock with filled set to 1 instead of 0. "
     "Do not create a new clock if an existing active clock already covers the same pressure. "
     "Each advance_clocks item must include clock_id, delta, reason, and evidence. "
+    "A clock with completion_criteria may reach its final segment but must not be retired until every criterion is visibly supported. "
+    "For that retirement, include completion_criteria_met with every criterion id and provenance.evidence_sources that cite the visible transcript or an authorized deterministic rule. "
     "Each no_change_explanations item must include clock_id and reason. Do not output plain text or markdown."
 )
 
@@ -3244,6 +3246,7 @@ def build_world_genesis_messages(context):
                             'summary': 'what this pressure represents',
                             'trigger': 'when it advances',
                             'on_complete': 'what happens when filled',
+                            'completion_criteria': [{'id': 'criterion_id', 'description': 'what must be evidenced before this clock resolves'}],
                             'status': 'active',
                         },
                     ],
@@ -3368,6 +3371,7 @@ WORLD_GENESIS_SECTION_SPECS = (
                     'summary': 'what this pressure represents',
                     'trigger': 'when it advances',
                     'on_complete': 'what happens when filled',
+                    'completion_criteria': [{'id': 'criterion_id', 'description': 'what must be evidenced before this clock resolves'}],
                     'status': 'active',
                 },
             ],
@@ -4885,7 +4889,7 @@ SESSION_MEMORY_CLOCKS_FINALIZER_TOOL = {
             'properties': {
                 'create_clocks': {'type': 'array', 'items': {'type': 'object'}, 'description': 'Clocks to create.'},
                 'advance_clocks': {'type': 'array', 'items': {'type': 'object'}, 'description': 'Existing clocks to advance.'},
-                'retire_clocks': {'type': 'array', 'items': {'type': 'object'}, 'description': 'Clocks to retire.'},
+                'retire_clocks': {'type': 'array', 'items': {'type': 'object'}, 'description': 'Clocks to retire. For clocks with completion_criteria, include completion_criteria_met (criterion ids) and provenance.evidence_sources.'},
                 'no_change_explanations': {'type': 'array', 'items': {'type': 'object'}, 'description': 'Reasons active clocks did not change.'},
             },
         },

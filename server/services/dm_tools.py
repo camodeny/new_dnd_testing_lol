@@ -40,7 +40,7 @@ from openrouter import get_character_sheet_answer
 
 
 VALID_VISIBILITIES = {'public', 'party_known', 'dm_private'}
-ACTIVE_CLOCK_STATUSES = {'active', 'ticking', 'pending'}
+ACTIVE_CLOCK_STATUSES = {'active', 'ticking', 'pending', 'completion_pending'}
 VALID_MEMORY_CERTAINTIES = {'confirmed', 'suspected', 'inferred', 'false', 'retconned'}
 DEFERRED_NARRATIVE_TOOL_NAMES = {
     'record_world_event',
@@ -485,7 +485,29 @@ def _normalize_memory_clock_patch(item, fallback_id):
         value = _coerce_patch_text(item.get(field), limit)
         if value:
             clean_item[field] = value
+    if 'completion_criteria' in item:
+        clean_item['completion_criteria'] = _normalize_clock_completion_criteria(item.get('completion_criteria'))
     return _apply_memory_item_metadata(clean_item, item, include_memory_type=False)
+
+
+def _normalize_clock_completion_criteria(value):
+    """Return a bounded, stable list of criteria required before a full clock can resolve."""
+    if not isinstance(value, list):
+        return []
+    criteria = []
+    seen_ids = set()
+    for index, raw_item in enumerate(value[:8], start=1):
+        if isinstance(raw_item, dict):
+            criterion_id = clean_id(raw_item.get('id'), f'criterion_{index}')
+            description = _coerce_patch_text(raw_item.get('description') or raw_item.get('text'), 420)
+        else:
+            criterion_id = f'criterion_{index}'
+            description = _coerce_patch_text(raw_item, 420)
+        if not criterion_id or not description or criterion_id in seen_ids:
+            continue
+        seen_ids.add(criterion_id)
+        criteria.append({'id': criterion_id, 'description': description})
+    return criteria
 
 
 def _normalize_memory_npc_patch(item, fallback_id):
@@ -1658,6 +1680,7 @@ def build_session_clock_context(
             'summary': clock.summary,
             'trigger': clock.trigger,
             'on_complete': clock.on_complete,
+            'completion_criteria': clock.completion_criteria or [],
             'status': clock.status,
         })
     return {
@@ -2902,11 +2925,16 @@ def _tool_advance_clock(campaign, _current_user, args):
         delta = 0
     old_filled = clock.filled or 0
     clock.filled = min(max(old_filled + delta, 0), clock.segments or 4)
-    if args.get('status'):
+    completion_criteria = _normalize_clock_completion_criteria(clock.completion_criteria)
+    if clock.filled >= (clock.segments or 4) and completion_criteria:
+        # A full progress bar is not a completed investigation when its declared
+        # completion conditions still require explicit evidence.
+        clock.status = 'completion_pending'
+    elif args.get('status'):
         clock.status = clean_text(args.get('status'), 30)
     elif clock.filled >= (clock.segments or 4):
         clock.status = 'completed'
-    elif (clock.status or 'active') == 'completed' and clock.filled < (clock.segments or 4):
+    elif (clock.status or 'active') in {'completed', 'completion_pending'} and clock.filled < (clock.segments or 4):
         clock.status = 'active'
     clock.updated_at = utcnow()
     upsert_memory_embedding(campaign, 'clock', clock.clock_id, clock.to_dict(include_private=True))
@@ -5077,7 +5105,13 @@ def _create_clock_from_patch(campaign, patch):
     clock.summary = clean_text(patch.get('summary'), 420)
     clock.trigger = clean_text(patch.get('trigger'), 420)
     clock.on_complete = clean_text(patch.get('on_complete'), 520)
+    if 'completion_criteria' in patch:
+        clock.completion_criteria = _normalize_clock_completion_criteria(patch.get('completion_criteria'))
+    elif not existing:
+        clock.completion_criteria = []
     clock.status = clean_text(patch.get('status'), 30) or 'active'
+    if clock.filled >= clock.segments and clock.completion_criteria:
+        clock.status = 'completion_pending'
     clock.updated_at = utcnow()
     if not existing:
         db.session.add(clock)
@@ -5108,6 +5142,22 @@ def _retire_clock_from_patch(campaign, patch):
     clock = CampaignClock.query.filter_by(campaign_id=campaign.id, clock_id=clock_id).first()
     if not clock:
         return {'error': f'Clock not found: {clock_id}'}
+    completion_criteria = _normalize_clock_completion_criteria(clock.completion_criteria)
+    if completion_criteria and (clock.filled or 0) >= (clock.segments or 4):
+        required_ids = {criterion['id'] for criterion in completion_criteria}
+        met_ids = {
+            clean_id(item.get('id') if isinstance(item, dict) else item, '')
+            for item in (patch.get('completion_criteria_met') or [])
+        }
+        met_ids.discard('')
+        evidence_sources = (
+            (patch.get('provenance') or {}).get('evidence_sources')
+            if isinstance(patch.get('provenance'), dict) else None
+        )
+        if not required_ids.issubset(met_ids):
+            return {'error': f'Clock {clock.name} cannot resolve until all completion criteria are met.'}
+        if not isinstance(evidence_sources, list) or not evidence_sources:
+            return {'error': f'Clock {clock.name} cannot resolve without completion evidence.'}
     clock.status = clean_text(patch.get('status'), 30) or 'resolved'
     clock.updated_at = utcnow()
     upsert_memory_embedding(campaign, 'clock', clock.clock_id, clock.to_dict(include_private=True))
@@ -5120,6 +5170,7 @@ def _retire_clock_from_patch(campaign, patch):
         {
             'clock_id': clock.clock_id,
             'status': clock.status,
+            'completion_criteria_met': sorted(met_ids) if completion_criteria else [],
             'provenance': provenance,
         },
         visibility=clock.visibility or 'dm_private',
@@ -5259,7 +5310,21 @@ def apply_clock_adjudication(campaign, updates, audit_context=None):
             result['world_event_ids'].append(event_id)
 
     for item in updates.get('retire_clocks', []) if isinstance(updates.get('retire_clocks'), list) else []:
-        change = _retire_clock_from_patch(campaign, item if isinstance(item, dict) else {})
+        item = dict(item) if isinstance(item, dict) else {}
+        raw_provenance = item.get('provenance') if isinstance(item.get('provenance'), dict) else {}
+        evidence_sources = list(raw_provenance.get('evidence_sources') or [])
+        for source in transcript_evidence_sources:
+            if source not in evidence_sources:
+                evidence_sources.append(source)
+        item['provenance'] = {
+            **raw_provenance,
+            'source_player_message_id': raw_provenance.get('source_player_message_id') or audit_context.get('source_player_message_id') or audit_context.get('player_message_id'),
+            'source_dm_message_id': raw_provenance.get('source_dm_message_id') or audit_context.get('source_dm_message_id') or audit_context.get('dm_message_id'),
+            'trace_id': raw_provenance.get('trace_id') or audit_context.get('trace_id'),
+            'evidence_sources': evidence_sources,
+            'evidence_status': raw_provenance.get('evidence_status') or determine_evidence_status(evidence_sources),
+        }
+        change = _retire_clock_from_patch(campaign, item)
         result['clock_changes'].append(change)
         if change.get('event_id'):
             result['world_event_ids'].append(change['event_id'])
