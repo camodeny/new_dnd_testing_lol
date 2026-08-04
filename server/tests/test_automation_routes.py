@@ -2622,6 +2622,14 @@ class AutomationRouteTest(unittest.TestCase):
                         'applicable': 'false',
                         'reason': 'string false'
                     }
+                },
+                {
+                    'id': 'criterion_b',
+                    'status': 'not_assessed',
+                    'applicability': {
+                        'applicable': False,
+                        'reason': 'string false'
+                    }
                 }
             ]
         }
@@ -2648,6 +2656,11 @@ class AutomationRouteTest(unittest.TestCase):
                         {'kind': 'session_message'}, 
                         {'kind': 'session_message', 'id': 999, 'visibility': 'invalid_vis'}
                     ]
+                },
+                {
+                    'id': 'criterion_b',
+                    'status': 'not_assessed',
+                    'applicability': {'applicable': False}
                 }
             ]
         }
@@ -2674,10 +2687,8 @@ class AutomationRouteTest(unittest.TestCase):
             headers=self.headers,
             json={'scorecard': audit_payload_empty_criteria}
         )
-        self.assertEqual(submit_resp_4.status_code, 200)
-        with app.app_context():
-            cycle_db = db.session.get(AutomationRunAuditCycle, cycle_id)
-            self.assertEqual(cycle_db.scorecard_summary_json['overall_status'], 'fail')
+        self.assertEqual(submit_resp_4.status_code, 422)
+        self.assertEqual(submit_resp_4.get_json()['error']['code'], 'empty_criteria')
 
     def test_security_redaction_and_lease_token_safety(self):
         scorecard = self.client.post(
@@ -4958,6 +4969,7 @@ class AutomationRouteTest(unittest.TestCase):
                     'summary': 'Partial manual audit',
                     'criteria': [
                         {'id': 'narrative_done', 'status': 'pass', 'applicability': {'applicable': True}},
+                        {'id': 'narrative_pending', 'status': 'not_assessed', 'applicability': {'applicable': True}},
                     ],
                 },
             },

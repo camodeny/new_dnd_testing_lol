@@ -31,6 +31,7 @@ export default defineConfig({
     reuseExistingServer: !process.env.CI,
     stdout: 'ignore',
     stderr: 'pipe',
-    timeout: 10000,
+    // ARM self-hosted runners can need more than 10 seconds for Vite's first compile.
+    timeout: 60000,
   },
 });
