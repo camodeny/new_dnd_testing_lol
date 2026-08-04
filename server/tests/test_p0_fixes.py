@@ -1,6 +1,7 @@
 import os
 import sys
 import unittest
+import json
 from unittest.mock import Mock, patch
 from types import SimpleNamespace
 
@@ -8,7 +9,7 @@ sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), '..')
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), '../../automation')))
 
 from flask import Flask
-from models import db, Campaign, CampaignWorld,NPCActor
+from models import db, Campaign, CampaignWorld, CampaignSession, NPCActor
 from services.scene_location_resolver import resolve_scene_location_patch
 from services.session_memory_agent import compile_staged_memory_patch
 from services.dm_tools import _validate_memory_scene_patch, apply_memory_patch
@@ -96,6 +97,226 @@ class P0FixesTest(unittest.TestCase):
         compiled = compile_staged_memory_patch(memory_context, extracted, resolved)
         self.assertEqual(compiled['scene_patch']['location_id'], 'neverwinter')
         self.assertEqual(compiled['scene_patch']['location_name'], 'Neverwinter')
+
+    def test_known_location_id_canonicalizes_generated_name_without_regex_matching(self):
+        resolution = resolve_scene_location_patch(
+            {'location_id': 'waterdeep', 'location_name': 'Inside Waterdeep'},
+            self.campaign,
+            {},
+        )
+        self.assertEqual(resolution['status'], 'canonical')
+        self.assertEqual(resolution['location_id'], 'waterdeep')
+        self.assertEqual(resolution['location_name'], 'Waterdeep')
+        self.assertEqual(resolution['reason'], 'known_location_id_name_canonicalized')
+
+    def test_known_location_id_rejects_another_known_location_name(self):
+        resolution = resolve_scene_location_patch(
+            {'location_id': 'waterdeep', 'location_name': 'Neverwinter'},
+            self.campaign,
+            {},
+        )
+        self.assertEqual(resolution['status'], 'unresolved')
+        self.assertEqual(resolution['reason'], 'known_location_id_conflicts_with_another_location')
+
+    def test_resolved_location_reference_promotes_provisional_location_without_duplicate(self):
+        memory_context = {
+            'campaign_id': self.campaign.id,
+            'hot_context': {'current_scene': {'location_id': 'waterdeep', 'location_name': 'Waterdeep'}},
+        }
+        extracted = {'scene_patch': {'location_id': 'brunsworth_hall', 'location_name': 'Brunsworth Hall'}}
+        resolved = {
+            'scene_patch': {'location_id': 'brunsworth_hall', 'location_name': 'Brunsworth Hall'},
+            'resolved_location_refs': [{
+                'label': 'Brunsworth Hall',
+                'location_id': 'waterdeep',
+                'canonical_location_name': 'Brunsworth Hall',
+                'resolution': 'same',
+                'rename_existing': True,
+            }],
+        }
+        compiled = compile_staged_memory_patch(memory_context, extracted, resolved)
+        self.assertEqual(compiled['scene_patch']['location_id'], 'waterdeep')
+        self.assertEqual(compiled['scene_patch']['location_name'], 'Brunsworth Hall')
+        promoted = [entity for entity in compiled['upsert_graph_entities'] if entity['id'] == 'waterdeep']
+        self.assertEqual(len(promoted), 1)
+        self.assertEqual(promoted[0]['name'], 'Brunsworth Hall')
+        self.assertEqual(promoted[0]['aliases'], ['Waterdeep'])
+
+    def test_promotion_preserves_existing_summary_tags_and_aliases(self):
+        self.world.knowledge_graph = '{"entities":[{"id":"waterdeep","type":"location","name":"Waterdeep","aliases":["the port city","WATERDEEP"],"summary":"A bustling port city on the Sword Coast.","tags":["port","metropolis"]},{"id":"neverwinter","type":"location","name":"Neverwinter"}],"relations":[],"facts":[]}'
+        db.session.commit()
+
+        memory_context = {
+            'campaign_id': self.campaign.id,
+            'hot_context': {'current_scene': {'location_id': 'waterdeep', 'location_name': 'Waterdeep'}},
+        }
+        extracted = {'scene_patch': {'location_id': 'brunsworth_hall', 'location_name': 'Brunsworth Hall'}}
+        resolved = {
+            'scene_patch': {'location_id': 'brunsworth_hall', 'location_name': 'Brunsworth Hall'},
+            'resolved_location_refs': [{
+                'label': 'Brunsworth Hall',
+                'location_id': 'waterdeep',
+                'canonical_location_name': 'Brunsworth Hall',
+                'resolution': 'same',
+                'rename_existing': True,
+            }],
+        }
+        compiled = compile_staged_memory_patch(memory_context, extracted, resolved)
+        self.assertEqual(compiled['scene_patch']['location_id'], 'waterdeep')
+        self.assertEqual(compiled['scene_patch']['location_name'], 'Brunsworth Hall')
+        promoted = [entity for entity in compiled['upsert_graph_entities'] if entity['id'] == 'waterdeep']
+        self.assertEqual(len(promoted), 1)
+        self.assertEqual(promoted[0]['name'], 'Brunsworth Hall')
+        self.assertEqual(promoted[0]['summary'], 'A bustling port city on the Sword Coast.')
+        self.assertEqual(promoted[0]['tags'], ['port', 'metropolis'])
+        self.assertEqual(promoted[0]['aliases'], ['the port city', 'WATERDEEP'])
+
+    def test_known_location_id_with_unrelated_unknown_name_keeps_canonical_identity(self):
+        resolution = resolve_scene_location_patch(
+            {'location_id': 'waterdeep', 'location_name': 'Flaming Fist Citadel'},
+            self.campaign,
+            {},
+        )
+        self.assertEqual(resolution['status'], 'canonical')
+        self.assertEqual(resolution['location_id'], 'waterdeep')
+        self.assertEqual(resolution['location_name'], 'Waterdeep')
+        self.assertEqual(resolution['reason'], 'known_location_id_name_canonicalized')
+
+    def test_known_location_id_rejects_another_locations_alias(self):
+        self.world.knowledge_graph = '{"entities":[{"id":"waterdeep","type":"location","name":"Waterdeep","aliases":["the city of splendors"]},{"id":"neverwinter","type":"location","name":"Neverwinter"}],"relations":[],"facts":[]}'
+        db.session.commit()
+
+        resolution = resolve_scene_location_patch(
+            {'location_id': 'neverwinter', 'location_name': 'The City of Splendors'},
+            self.campaign,
+            {},
+        )
+        self.assertEqual(resolution['status'], 'unresolved')
+        self.assertEqual(resolution['reason'], 'known_location_id_conflicts_with_another_location')
+
+    def test_promoted_location_resolves_old_name_without_duplicate(self):
+        self.world.knowledge_graph = '{"entities":[{"id":"old_building","type":"location","name":"Old Building"}],"relations":[],"facts":[]}'
+        db.session.commit()
+
+        session = CampaignSession(campaign_id=self.campaign.id, running_summary='Summary')
+        db.session.add(session)
+        db.session.commit()
+
+        memory_context = {
+            'campaign_id': self.campaign.id,
+            'hot_context': {'current_scene': {'location_id': 'old_building', 'location_name': 'Old Building'}},
+        }
+        extracted = {'scene_patch': {'location_id': 'brunsworth_hall', 'location_name': 'Brunsworth Hall'}}
+        resolved = {
+            'scene_patch': {'location_id': 'brunsworth_hall', 'location_name': 'Brunsworth Hall'},
+            'resolved_location_refs': [{
+                'label': 'Brunsworth Hall',
+                'location_id': 'old_building',
+                'canonical_location_name': 'Brunsworth Hall',
+                'resolution': 'same',
+                'rename_existing': True,
+            }],
+        }
+        compiled = compile_staged_memory_patch(memory_context, extracted, resolved)
+        self.assertEqual(compiled['scene_patch']['location_id'], 'old_building')
+        self.assertEqual(compiled['scene_patch']['location_name'], 'Brunsworth Hall')
+        promoted = [entity for entity in compiled['upsert_graph_entities'] if entity['id'] == 'old_building']
+        self.assertEqual(len(promoted), 1)
+        self.assertEqual(promoted[0]['name'], 'Brunsworth Hall')
+        self.assertEqual(promoted[0]['aliases'], ['Old Building'])
+
+        apply_memory_patch(self.campaign, session, compiled)
+        db.session.refresh(self.world)
+        kg = json.loads(self.world.knowledge_graph)
+        brunsworth = [e for e in kg['entities'] if e['id'] == 'old_building']
+        self.assertEqual(len(brunsworth), 1)
+        self.assertEqual(brunsworth[0]['name'], 'Brunsworth Hall')
+        self.assertEqual(brunsworth[0].get('aliases', []), ['Old Building'])
+        self.assertEqual(len(kg['entities']), 1)
+
+        later = resolve_scene_location_patch({'location_name': 'Old Building'}, self.campaign, {})
+        self.assertEqual(later['status'], 'canonical')
+        self.assertEqual(later['location_id'], 'old_building')
+        self.assertEqual(later['location_name'], 'Brunsworth Hall')
+
+    def test_promotion_preserves_freshly_resolved_metadata(self):
+        self.world.knowledge_graph = '{"entities":[{"id":"waterdeep","type":"location","name":"Waterdeep","summary":"Stale persisted summary."}],"relations":[],"facts":[]}'
+        db.session.commit()
+
+        memory_context = {
+            'campaign_id': self.campaign.id,
+            'hot_context': {'current_scene': {'location_id': 'waterdeep', 'location_name': 'Waterdeep'}},
+        }
+        extracted = {'scene_patch': {'location_id': 'brunsworth_hall', 'location_name': 'Brunsworth Hall'}}
+        resolved = {
+            'scene_patch': {'location_id': 'brunsworth_hall', 'location_name': 'Brunsworth Hall'},
+            'resolved_location_refs': [{
+                'label': 'Brunsworth Hall',
+                'location_id': 'waterdeep',
+                'canonical_location_name': 'Brunsworth Hall',
+                'resolution': 'same',
+                'rename_existing': True,
+            }],
+            'upsert_graph_entities': [{
+                'id': 'waterdeep',
+                'name': 'Waterdeep',
+                'type': 'location',
+                'summary': 'Freshly resolved summary from the resolver.',
+            }],
+        }
+        compiled = compile_staged_memory_patch(memory_context, extracted, resolved)
+        promoted = [entity for entity in compiled['upsert_graph_entities'] if entity['id'] == 'waterdeep']
+        self.assertEqual(len(promoted), 1)
+        self.assertEqual(promoted[0]['name'], 'Brunsworth Hall')
+        self.assertEqual(promoted[0]['summary'], 'Freshly resolved summary from the resolver.')
+        self.assertEqual(promoted[0]['aliases'], ['Waterdeep'])
+
+        session = CampaignSession(campaign_id=self.campaign.id, running_summary='Summary')
+        db.session.add(session)
+        db.session.commit()
+        apply_memory_patch(self.campaign, session, compiled)
+        db.session.refresh(self.world)
+        kg = json.loads(self.world.knowledge_graph)
+        waterdeep = [e for e in kg['entities'] if e['id'] == 'waterdeep']
+        self.assertEqual(len(waterdeep), 1)
+        self.assertEqual(waterdeep[0]['name'], 'Brunsworth Hall')
+        self.assertEqual(waterdeep[0]['summary'], 'Freshly resolved summary from the resolver.')
+        self.assertEqual(waterdeep[0].get('aliases', []), ['Waterdeep'])
+
+    def test_uncertain_location_identity_does_not_create_a_duplicate_location(self):
+        memory_context = {
+            'campaign_id': self.campaign.id,
+            'hot_context': {'current_scene': {'location_id': 'waterdeep', 'location_name': 'Waterdeep'}},
+        }
+        extracted = {'scene_patch': {'location_id': 'brunsworth_hall', 'location_name': 'Brunsworth Hall'}}
+        resolved = {
+            'scene_patch': {'location_id': 'brunsworth_hall', 'location_name': 'Brunsworth Hall'},
+            'resolved_location_refs': [{
+                'label': 'Brunsworth Hall',
+                'location_id': 'waterdeep',
+                'resolution': 'uncertain',
+            }],
+        }
+        compiled = compile_staged_memory_patch(memory_context, extracted, resolved)
+        self.assertNotIn('location_id', compiled['scene_patch'])
+        self.assertFalse(any(entity['id'] == 'brunsworth_hall' for entity in compiled['upsert_graph_entities']))
+        self.assertTrue(any(
+            item['reason'] == 'uncertain_provisional_location_identity'
+            for item in compiled['unresolved_items']
+        ))
+
+    def test_new_locations_are_marked_provisional_for_later_resolution(self):
+        memory_context = {
+            'campaign_id': self.campaign.id,
+            'hot_context': {'current_scene': {'location_id': 'waterdeep', 'location_name': 'Waterdeep'}},
+        }
+        compiled = compile_staged_memory_patch(
+            memory_context,
+            {'scene_patch': {'location_id': 'old_building', 'location_name': 'Old Building'}},
+            {'scene_patch': {'location_id': 'old_building', 'location_name': 'Old Building'}},
+        )
+        created = next(entity for entity in compiled['upsert_graph_entities'] if entity['id'] == 'old_building')
+        self.assertEqual(created['identity_status'], 'provisional')
 
     # 6. apply_memory_patch never persists only one of location_id or location_name
     # 7. Direct scene update validation accepts new locations when name is supported by visible text
