@@ -1294,6 +1294,32 @@ def compile_staged_memory_patch(memory_context, extracted, resolved):
     scene_patch = resolved.get("scene_patch") if isinstance(resolved.get("scene_patch"), dict) else {}
     if not scene_patch:
         scene_patch = extracted.get("scene_patch") if isinstance(extracted.get("scene_patch"), dict) else {}
+    else:
+        scene_patch = dict(scene_patch)
+
+    # The resolver has already read the campaign state and can explicitly bind
+    # a surface form to a durable location. Consume that reference instead of
+    # resolving a generated ID/name pair a second time. This is deliberately
+    # exact matching only: it does not infer aliases from similar strings.
+    resolved_location_refs = resolved.get("resolved_location_refs") if isinstance(resolved.get("resolved_location_refs"), list) else []
+    proposed_location_id = clean_id(scene_patch.get("location_id"), "")
+    proposed_location_name = clean_text(scene_patch.get("location_name"), 160)
+    for location_ref in resolved_location_refs:
+        if not isinstance(location_ref, dict):
+            continue
+        canonical_id = clean_id(location_ref.get("canonical_location_id") or location_ref.get("location_id"), "")
+        label = clean_text(location_ref.get("label") or location_ref.get("surface_form") or location_ref.get("location_name"), 160)
+        if not canonical_id or not label:
+            continue
+        if label.lower() not in {proposed_location_id.lower(), proposed_location_name.lower()}:
+            continue
+        scene_patch["location_id"] = canonical_id
+        canonical_name = clean_text(location_ref.get("canonical_location_name"), 160)
+        if canonical_name:
+            scene_patch["location_name"] = canonical_name
+        if location_ref.get("rename_existing") is True:
+            scene_patch["rename_existing"] = True
+        break
     compiled_scene = {}
     from services.scene_location_resolver import resolve_scene_location_patch
     current_scene = hot_context.get("current_scene") if isinstance(hot_context.get("current_scene"), dict) else {}
@@ -1306,6 +1332,24 @@ def compile_staged_memory_patch(memory_context, extracted, resolved):
         compiled_scene["location_id"] = resolved_loc["location_id"]
         compiled_scene["location_name"] = resolved_loc["location_name"]
         scene_resolution_mode = "canonical" if loc_status == "canonical" else "direct"
+        if loc_status == "direct" and resolved_loc.get("previous_location_name"):
+            previous_name = resolved_loc["previous_location_name"]
+            accepted_entities.append({
+                "id": resolved_loc["location_id"],
+                "name": resolved_loc["location_name"],
+                "type": "location",
+                "aliases": [previous_name],
+                "summary": None,
+                "tags": [],
+                "visibility": "party_known",
+                "certainty": "confirmed",
+                "importance": 3,
+                "expires_or_retire_condition": None,
+                "reason": "Promoted a provisional location to its revealed canonical name.",
+                "memory_type": "location",
+                "provenance": make_provenance(scene_patch, default_tool="resolve_scene_location_patch"),
+                "resolution_mode": "promote_provisional_location",
+            })
 
     elif loc_status == "new":
         new_loc_id = resolved_loc.get("location_id") or allocate_durable_id(

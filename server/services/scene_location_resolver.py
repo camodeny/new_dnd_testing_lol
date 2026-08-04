@@ -34,6 +34,60 @@ def resolve_scene_location_patch(scene_patch, campaign, current_scene):
         if not any(loc["id"] == current_id for loc in canonical_locations):
             canonical_locations.append({"id": current_id, "name": current_name})
 
+    def unresolved(reason):
+        return {
+            "status": "unresolved",
+            "location_id": proposed_id,
+            "location_name": proposed_name,
+            "reason": reason,
+        }
+
+    def rename_requested():
+        return (
+            scene_patch.get("action") in ("rename", "rename_existing", "retcon")
+            or scene_patch.get("rename_existing") is True
+            or scene_patch.get("rename") is True
+        )
+
+    # A persisted location ID is an identity reference, not a display-name
+    # assertion. Resolve it before considering a generated name so harmless
+    # wording variants cannot create a second location.
+    known_id_location = next((loc for loc in canonical_locations if loc["id"] == proposed_id), None)
+    if known_id_location:
+        if not proposed_name or proposed_name.lower() == known_id_location["name"].lower():
+            return {
+                "status": "canonical",
+                "location_id": known_id_location["id"],
+                "location_name": known_id_location["name"],
+                "reason": "known_location_id",
+            }
+
+        conflicting_location = next(
+            (
+                loc for loc in canonical_locations
+                if loc["id"] != proposed_id and loc["name"].lower() == proposed_name.lower()
+            ),
+            None,
+        )
+        if conflicting_location:
+            return unresolved("known_location_id_conflicts_with_another_location")
+
+        if rename_requested():
+            return {
+                "status": "direct",
+                "location_id": known_id_location["id"],
+                "location_name": proposed_name,
+                "previous_location_name": known_id_location["name"],
+                "reason": "explicit_location_rename",
+            }
+
+        return {
+            "status": "canonical",
+            "location_id": known_id_location["id"],
+            "location_name": known_id_location["name"],
+            "reason": "known_location_id_name_canonicalized",
+        }
+
     resolved = None
     for loc in canonical_locations:
         loc_id = loc["id"]
@@ -60,14 +114,7 @@ def resolve_scene_location_patch(scene_patch, campaign, current_scene):
         }
 
     # Check for explicit rename/retcon action
-    allow_rename = False
-    if isinstance(scene_patch, dict):
-        if (
-            scene_patch.get("action") in ("rename", "rename_existing", "retcon")
-            or scene_patch.get("rename_existing") is True
-            or scene_patch.get("rename") is True
-        ):
-            allow_rename = True
+    allow_rename = rename_requested()
 
     if proposed_id == current_id and proposed_name and proposed_name.lower() != current_name.lower():
         # Same location ID but proposed a different name.

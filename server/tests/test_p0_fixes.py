@@ -97,6 +97,49 @@ class P0FixesTest(unittest.TestCase):
         self.assertEqual(compiled['scene_patch']['location_id'], 'neverwinter')
         self.assertEqual(compiled['scene_patch']['location_name'], 'Neverwinter')
 
+    def test_known_location_id_canonicalizes_generated_name_without_regex_matching(self):
+        resolution = resolve_scene_location_patch(
+            {'location_id': 'waterdeep', 'location_name': 'Inside Waterdeep'},
+            self.campaign,
+            {},
+        )
+        self.assertEqual(resolution['status'], 'canonical')
+        self.assertEqual(resolution['location_id'], 'waterdeep')
+        self.assertEqual(resolution['location_name'], 'Waterdeep')
+        self.assertEqual(resolution['reason'], 'known_location_id_name_canonicalized')
+
+    def test_known_location_id_rejects_another_known_location_name(self):
+        resolution = resolve_scene_location_patch(
+            {'location_id': 'waterdeep', 'location_name': 'Neverwinter'},
+            self.campaign,
+            {},
+        )
+        self.assertEqual(resolution['status'], 'unresolved')
+        self.assertEqual(resolution['reason'], 'known_location_id_conflicts_with_another_location')
+
+    def test_resolved_location_reference_promotes_provisional_location_without_duplicate(self):
+        memory_context = {
+            'campaign_id': self.campaign.id,
+            'hot_context': {'current_scene': {'location_id': 'waterdeep', 'location_name': 'Waterdeep'}},
+        }
+        extracted = {'scene_patch': {'location_id': 'brunsworth_hall', 'location_name': 'Brunsworth Hall'}}
+        resolved = {
+            'scene_patch': {'location_id': 'brunsworth_hall', 'location_name': 'Brunsworth Hall'},
+            'resolved_location_refs': [{
+                'label': 'Brunsworth Hall',
+                'location_id': 'waterdeep',
+                'canonical_location_name': 'Brunsworth Hall',
+                'rename_existing': True,
+            }],
+        }
+        compiled = compile_staged_memory_patch(memory_context, extracted, resolved)
+        self.assertEqual(compiled['scene_patch']['location_id'], 'waterdeep')
+        self.assertEqual(compiled['scene_patch']['location_name'], 'Brunsworth Hall')
+        promoted = [entity for entity in compiled['upsert_graph_entities'] if entity['id'] == 'waterdeep']
+        self.assertEqual(len(promoted), 1)
+        self.assertEqual(promoted[0]['name'], 'Brunsworth Hall')
+        self.assertEqual(promoted[0]['aliases'], ['Waterdeep'])
+
     # 6. apply_memory_patch never persists only one of location_id or location_name
     # 7. Direct scene update validation accepts new locations when name is supported by visible text
     def test_validate_memory_scene_patch_accepts_new_location_when_supported(self):

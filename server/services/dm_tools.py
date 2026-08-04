@@ -217,6 +217,8 @@ def _normalize_memory_scene_patch(scene_patch):
         clean_scene['provenance'] = scene_patch['provenance']
     if 'resolution_mode' in scene_patch:
         clean_scene['resolution_mode'] = scene_patch['resolution_mode']
+    if scene_patch.get('rename_existing') is True:
+        clean_scene['rename_existing'] = True
 
     return clean_scene
 
@@ -423,6 +425,9 @@ def _normalize_memory_entity_patch(item, fallback_id):
     tags = _coerce_patch_text_list(item.get('tags'), max_items=8, max_length=40)
     if tags:
         clean_item['tags'] = tags
+    aliases = _coerce_patch_text_list(item.get('aliases'), max_items=12, max_length=160)
+    if aliases:
+        clean_item['aliases'] = aliases
     return _apply_memory_item_metadata(clean_item, item, include_memory_type=True)
 
 
