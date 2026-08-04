@@ -641,6 +641,15 @@ class SessionMemoryIntegrityTest(unittest.TestCase):
         self.assertNotEqual(entry['canonical_id'], 'archivist')
 
     def test_current_location_id_with_different_name_rejected(self):
+        graph = json.loads(self.world.knowledge_graph)
+        graph['entities'].append({
+            'id': 'black_anchor',
+            'type': 'location',
+            'name': 'Black Anchor',
+        })
+        self.world.knowledge_graph = json.dumps(graph)
+        db.session.commit()
+
         scene_patch = {
             'location_id': 'drowned_lantern',
             'location_name': 'Black Anchor',
@@ -650,7 +659,7 @@ class SessionMemoryIntegrityTest(unittest.TestCase):
 
         scene_patch_rename = {
             'location_id': 'drowned_lantern',
-            'location_name': 'Black Anchor',
+            'location_name': 'Burning Lantern',
             'rename_existing': True,
         }
         res_rename = resolve_scene_location_patch(scene_patch_rename, self.campaign, {'location_id': 'drowned_lantern', 'location_name': 'Drowned Lantern'})
