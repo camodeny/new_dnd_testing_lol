@@ -166,37 +166,21 @@ class P2HardeningTest(unittest.TestCase):
         self.assertEqual(ctx.exception.stage, 'compilation')
         self.assertEqual(ctx.exception.code, 'missing_campaign')
 
-    def test_apply_memory_patch_raises_validation_error_on_invalid_visibility(self):
-        patch = {
-            'upsert_graph_entities': [
-                {
-                    'id': 'test_entity',
-                    'name': 'test entity',
-                    'type': 'other',
-                    'visibility': 'invalid_visibility',
+    def test_apply_memory_patch_rejects_invalid_enum_values(self):
+        for field in ('visibility', 'certainty'):
+            with self.subTest(field=field):
+                patch = {
+                    'upsert_graph_entities': [{
+                        'id': 'test_entity',
+                        'name': 'test entity',
+                        'type': 'other',
+                        field: f'invalid_{field}',
+                    }],
                 }
-            ]
-        }
-        with self.assertRaises(MemoryPipelineError) as ctx:
-            apply_memory_patch(self.campaign, self.session, patch)
-        self.assertEqual(ctx.exception.stage, 'validation')
-        self.assertEqual(ctx.exception.code, 'validation_error')
-
-    def test_apply_memory_patch_raises_validation_error_on_invalid_certainty(self):
-        patch = {
-            'upsert_graph_entities': [
-                {
-                    'id': 'test_entity',
-                    'name': 'test entity',
-                    'type': 'other',
-                    'certainty': 'invalid_certainty',
-                }
-            ]
-        }
-        with self.assertRaises(MemoryPipelineError) as ctx:
-            apply_memory_patch(self.campaign, self.session, patch)
-        self.assertEqual(ctx.exception.stage, 'validation')
-        self.assertEqual(ctx.exception.code, 'validation_error')
+                with self.assertRaises(MemoryPipelineError) as ctx:
+                    apply_memory_patch(self.campaign, self.session, patch)
+                self.assertEqual(ctx.exception.stage, 'validation')
+                self.assertEqual(ctx.exception.code, 'validation_error')
 
     def test_apply_memory_patch_raises_application_error_on_persistence_failure(self):
         from unittest.mock import patch as mock_patch

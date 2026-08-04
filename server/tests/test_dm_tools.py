@@ -2494,28 +2494,31 @@ class DmToolsTest(unittest.TestCase):
         self.assertEqual(violation['errors'][0]['kind'], 'non_english_glyph')
         self.assertIn('English', violation['errors'][0]['detail'])
 
-    def test_possible_missing_npc_tag_signal_detects_attributed_quote(self):
-        signal = _possible_missing_npc_tag_signal(
-            'Dee watches you for a long moment, reading your resolve. He does not argue. '
-            'Instead, he gives a single, slow nod. **"Alright. Lock the creds down first."**'
-        )
-        self.assertEqual(signal['speaker'], 'Dee')
-        self.assertIn('Alright.', signal['quote'])
-
-    def test_possible_missing_npc_tag_signal_detects_sentence_lead_speaker(self):
-        signal = _possible_missing_npc_tag_signal(
-            'Sheriff Coldharbour spins toward Brixby, her eyes narrowing. '
-            '"You there-pointing fingers will not help."'
-        )
-        self.assertEqual(signal['speaker'], 'Sheriff Coldharbour')
-        self.assertIn('pointing fingers', signal['quote'])
-
-    def test_possible_missing_npc_tag_signal_detects_markdown_speaker_label(self):
-        signal = _possible_missing_npc_tag_signal(
-            '**Seraphina:** "Keep your hood up and your eyes open."'
-        )
-        self.assertEqual(signal['speaker'], 'Seraphina')
-        self.assertIn('Keep your hood up', signal['quote'])
+    def test_possible_missing_npc_tag_signal_patterns(self):
+        cases = [
+            (
+                'Dee watches you for a long moment, reading your resolve. He does not argue. '
+                'Instead, he gives a single, slow nod. **"Alright. Lock the creds down first."**',
+                'Dee',
+                'Alright.',
+            ),
+            (
+                'Sheriff Coldharbour spins toward Brixby, her eyes narrowing. '
+                '"You there-pointing fingers will not help."',
+                'Sheriff Coldharbour',
+                'pointing fingers',
+            ),
+            (
+                '**Seraphina:** "Keep your hood up and your eyes open."',
+                'Seraphina',
+                'Keep your hood up',
+            ),
+        ]
+        for content, speaker, quote_excerpt in cases:
+            with self.subTest(speaker=speaker):
+                signal = _possible_missing_npc_tag_signal(content)
+                self.assertEqual(signal['speaker'], speaker)
+                self.assertIn(quote_excerpt, signal['quote'])
 
     def test_missing_npc_tag_checker_uses_llm_without_heuristic_signal(self):
         with patch('openrouter._post_chat', return_value=json.dumps({
@@ -5905,7 +5908,13 @@ class DmToolsTest(unittest.TestCase):
             return {}
 
         with patch('routes.sessions.get_session_dm_response_with_tools', return_value={'mode': 'speak', 'content': 'Yes, you are in a party.', 'parts': [{'type': 'narration', 'content': 'Yes, you are in a party.'}], 'commit_action_ids': []}) as dm_response, \
-                patch('routes.sessions.get_session_memory_patch', side_effect=memory_patch_side_effect) as memory_patch:
+                patch('routes.sessions.get_session_memory_patch', side_effect=memory_patch_side_effect) as memory_patch, \
+                patch('routes.sessions.get_session_clock_updates', return_value={
+                    'create_clocks': [],
+                    'advance_clocks': [],
+                    'retire_clocks': [],
+                    'no_change_explanations': [],
+                }):
             response = client.post(
                 f'/api/sessions/{self.session.id}/messages',
                 json={'content': '<ooc>Am I in a party?</ooc>', 'role': 'player'},
@@ -5947,6 +5956,11 @@ class DmToolsTest(unittest.TestCase):
                             'visibility': 'party_known',
                         }
                     ],
+                }), patch('routes.sessions.get_session_clock_updates', return_value={
+                    'create_clocks': [],
+                    'advance_clocks': [],
+                    'retire_clocks': [],
+                    'no_change_explanations': [],
                 }):
             response = client.post(
                 f'/api/sessions/{self.session.id}/messages',
