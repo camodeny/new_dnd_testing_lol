@@ -220,13 +220,24 @@ CANONICAL_CATEGORIES = {
     "safety_private_info": "safety/private-information handling",
     "safety": "safety/private-information handling",
 }
+CANONICAL_CATEGORY_NAMES = tuple(dict.fromkeys(CANONICAL_CATEGORIES.values()))
+UNCATEGORIZED_CATEGORY = 'uncategorized'
+SCORECARD_TEMPLATE_SCHEMA_VERSION = 2
+
+
+def normalize_criterion_category(value):
+    if value is None or not str(value).strip():
+        return None
+    return CANONICAL_CATEGORIES.get(str(value).strip().lower())
+
 
 def get_criterion_category(crit):
     cat = crit.get('category')
     if cat:
-        normalized = CANONICAL_CATEGORIES.get(str(cat).strip().lower())
+        normalized = normalize_criterion_category(cat)
         if normalized:
             return normalized
+        return UNCATEGORIZED_CATEGORY
             
     # Try by substring match on ID, metric, or label
     identifier = (str(crit.get('id') or crit.get('metric') or '') + ' ' + str(crit.get('label') or '')).lower()
@@ -241,7 +252,31 @@ def get_criterion_category(crit):
     if any(k in identifier for k in ('narrative', 'story', 'quality', 'silence', 'empty', 'dialog', 'dialogue', 'rp', 'play')):
         return "narrative quality"
         
-    return None # default fallback
+    return UNCATEGORIZED_CATEGORY
+
+
+def scorecard_configuration(template):
+    invalid = []
+    for criterion in _json_list(_json_object(template, {}).get('criteria'), []):
+        if not isinstance(criterion, dict) or not criterion.get('id'):
+            continue
+        category = criterion.get('category')
+        if category and normalize_criterion_category(category):
+            continue
+        if not category and get_criterion_category(criterion) != UNCATEGORIZED_CATEGORY:
+            continue
+        invalid.append({
+            'criterion_id': criterion.get('id'),
+            'label': criterion.get('label') or criterion.get('id'),
+            'category': category,
+            'reason': 'missing or invalid canonical category',
+        })
+    return {
+        'schema_version': SCORECARD_TEMPLATE_SCHEMA_VERSION,
+        'valid': not invalid,
+        'invalid_criteria': invalid,
+        'uncategorized_criterion_count': len(invalid),
+    }
 
 
 def _normalize_custom_scorecard_status(value, default='warn'):
@@ -389,6 +424,18 @@ def validate_scorecard_template_payload(data):
                     if str(tool).strip()
                 ],
             })
+        raw_category = (raw.get('category') or '').strip() or None
+        normalized_category = normalize_criterion_category(raw_category)
+        if raw_category and not normalized_category:
+            # Keep invalid legacy/editor values visible as configuration errors;
+            # scoring places them in the explicit uncategorized bucket.
+            normalized_category = None
+        if not raw_category:
+            inferred_category = get_criterion_category({
+                'id': criterion_id,
+                'label': raw.get('label') or criterion_id,
+            })
+            normalized_category = inferred_category
         criteria.append({
             'id': criterion_id,
             'label': (raw.get('label') or criterion_id.replace('_', ' ').title()).strip(),
@@ -396,7 +443,7 @@ def validate_scorecard_template_payload(data):
             'better_direction': (raw.get('better_direction') or 'higher').strip().lower(),
             'evidence_requirements': evidence_requirements,
             'weight': max(1, min(100, _safe_int(raw.get('weight'), 2))),
-            'category': (raw.get('category') or '').strip() or None,
+            'category': normalized_category,
         })
 
     defaults = _json_object(data.get('defaults'), {})
@@ -406,6 +453,7 @@ def validate_scorecard_template_payload(data):
         if str(item).strip().lower() in {'after_player', 'after_dm'}
     ]
     return {
+        'schema_version': SCORECARD_TEMPLATE_SCHEMA_VERSION,
         'name': name,
         'description': (data.get('description') or '').strip() or None,
         'instructions': (data.get('instructions') or '').strip() or None,
@@ -2532,11 +2580,8 @@ def refresh_run_scorecard(run):
             overall_status = 'not_applicable'
 
     CATEGORIES_TO_BREAKDOWN = [
-        "operational/runtime reliability",
-        "narrative quality",
-        "durable state correctness",
-        "retrieval or memory use",
-        "safety/private-information handling"
+        *CANONICAL_CATEGORY_NAMES,
+        UNCATEGORIZED_CATEGORY,
     ]
     category_breakdown = {}
     for cat in CATEGORIES_TO_BREAKDOWN:
@@ -2604,6 +2649,7 @@ def refresh_run_scorecard(run):
         'overall_status': overall_status,
         'incidents': calculate_run_incidents(run, event_rows, audit_rows, provider_rows),
         'custom_scorecard_name': current_scorecard_template_for_run(run).get('name'),
+        'scorecard_configuration': scorecard_configuration(current_scorecard_template_for_run(run)),
         'category_breakdown': category_breakdown,
     }
     db.session.commit()

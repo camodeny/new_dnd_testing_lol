@@ -1432,6 +1432,7 @@ class AutomationScorecardTemplate(db.Model):
     def snapshot(self):
         return {
             'template_id': self.id,
+            'schema_version': 2,
             'name': self.name,
             'description': self.description,
             'instructions': self.instructions,
@@ -1442,6 +1443,7 @@ class AutomationScorecardTemplate(db.Model):
     def to_dict(self):
         return {
             'id': self.id,
+            'schema_version': 2,
             'user_id': self.user_id,
             'name': self.name,
             'description': self.description,

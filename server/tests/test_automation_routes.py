@@ -4346,7 +4346,8 @@ class AutomationRouteTest(unittest.TestCase):
             self.assertEqual(by_id['known_errors']['status'], 'pass')
 
             # The uncategorized custom criterion stays uncategorized (no narrative fallback).
-            self.assertIsNone(by_id['custom:uncategorized_probe']['details']['category'])
+            self.assertEqual(by_id['custom:uncategorized_probe']['details']['category'], 'uncategorized')
+            self.assertFalse(run.scorecard_summary_json['scorecard_configuration']['valid'])
             self.assertEqual(by_id['custom:uncategorized_probe']['status'], 'warn')
 
             # Weighted score excludes not_assessed rows (weights 7 and 5) and counts only
@@ -4360,6 +4361,7 @@ class AutomationRouteTest(unittest.TestCase):
                 'durable state correctness',
                 'retrieval or memory use',
                 'safety/private-information handling',
+                'uncategorized',
             ]))
             # Narrative category contains only narrative_probe; if the uncategorized warn had
             # leaked in, the score would be 0.75 instead of 1.0.

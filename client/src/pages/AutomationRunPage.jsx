@@ -315,6 +315,7 @@ export default function AutomationRunPage() {
   const messages = latestSession?.messages || []
   const incidents = data.incidents || run.scorecard_summary?.incidents || []
   const categoryBreakdown = run.scorecard_summary?.category_breakdown || {}
+  const scorecardConfiguration = run.scorecard_summary?.scorecard_configuration || {}
   const encounterMap = data.encounter_map
   const auditCycles = data.audit_cycles || []
   const auditorJobs = data.auditor_jobs || []
@@ -438,6 +439,11 @@ export default function AutomationRunPage() {
 
                 <section className="automation-panel">
                   <h2>Scorecard</h2>
+                  {scorecardConfiguration.valid === false && (
+                    <div className="automation-empty" style={{ marginBottom: '16px', border: '1px solid #f59e0b', color: '#fbbf24' }}>
+                      Scorecard configuration error: {scorecardConfiguration.uncategorized_criterion_count || 0} criterion(s) are uncategorized. They remain in the overall score and are shown in the uncategorized breakdown.
+                    </div>
+                  )}
                   {categoryBreakdown && Object.keys(categoryBreakdown).length > 0 && (
                     <div className="automation-category-breakdown" style={{ marginBottom: '20px', padding: '15px', borderRadius: '8px', background: 'var(--card-bg-subtle, rgba(255, 255, 255, 0.03))', border: '1px solid var(--border-color, rgba(255, 255, 255, 0.08))' }}>
                       <h3 style={{ marginTop: 0, marginBottom: '12px', fontSize: '1.1rem', color: 'var(--text-bright, #fff)' }}>Category Breakdown</h3>
@@ -471,7 +477,7 @@ export default function AutomationRunPage() {
                         <div key={result.check_id} className={`automation-scorecard-row status-${result.status}`}>
                           <div>
                             <strong>{result.check_id}</strong>
-                            <span>{result.summary}</span>
+                            <span>{result.summary}{result.details?.category ? ` · ${result.details.category}` : ''}</span>
                           </div>
                           <span>{result.status}</span>
                         </div>
