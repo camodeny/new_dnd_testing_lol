@@ -1358,13 +1358,38 @@ def compile_staged_memory_patch(memory_context, extracted, resolved):
         scene_resolution_mode = "canonical" if loc_status == "canonical" else "direct"
         if loc_status == "direct" and resolved_loc.get("previous_location_name"):
             previous_name = resolved_loc["previous_location_name"]
+            world_payload = _world_payload(campaign)
+            graph = world_payload.get("knowledge_graph", {}) if isinstance(world_payload.get("knowledge_graph"), dict) else {}
+            existing_location = next(
+                (
+                    entity for entity in graph.get("entities", [])
+                    if isinstance(entity, dict) and entity.get("id") == resolved_loc["location_id"]
+                ),
+                {},
+            )
+            existing_aliases = [
+                clean_text(alias, 160) for alias in existing_location.get("aliases", [])
+                if clean_text(alias, 160)
+            ] if isinstance(existing_location.get("aliases", []), list) else []
+            merged_aliases = []
+            seen_aliases = set()
+            for alias in existing_aliases + [previous_name]:
+                alias_key = alias.casefold()
+                if alias_key not in seen_aliases:
+                    seen_aliases.add(alias_key)
+                    merged_aliases.append(alias)
+            existing_summary = clean_text(existing_location.get("summary"), 500) or None
+            existing_tags = [
+                clean_text(tag, 40) for tag in existing_location.get("tags", [])
+                if clean_text(tag, 40)
+            ] if isinstance(existing_location.get("tags", []), list) else []
             accepted_entities.append({
                 "id": resolved_loc["location_id"],
                 "name": resolved_loc["location_name"],
                 "type": "location",
-                "aliases": [previous_name],
-                "summary": None,
-                "tags": [],
+                "aliases": merged_aliases,
+                "summary": existing_summary,
+                "tags": existing_tags,
                 "identity_status": "canonical",
                 "visibility": "party_known",
                 "certainty": "confirmed",
