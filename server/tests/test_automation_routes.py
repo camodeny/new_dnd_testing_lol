@@ -664,10 +664,10 @@ class AutomationRouteTest(unittest.TestCase):
         self.assertEqual(summary['scoring_model'], 'cycle_assessment_v2')
         self.assertEqual(summary['severity'], 'fail')
         self.assertEqual(summary['overall_status'], 'fail')
-        self.assertEqual(summary['performance_score'], 0.9111)
-        self.assertEqual(summary['weighted_score'], 0.9111)
-        self.assertEqual(summary['score_numerator'], 24.6)
-        self.assertEqual(summary['score_denominator'], 27.0)
+        self.assertEqual(summary['performance_score'], 0.8431)
+        self.assertEqual(summary['weighted_score'], 0.8431)
+        self.assertEqual(summary['score_numerator'], 129.0)
+        self.assertEqual(summary['score_denominator'], 153.0)
         self.assertEqual(summary['assessment_count'], 77)
         self.assertEqual(summary['completeness'], 1.0)
 
@@ -675,8 +675,112 @@ class AutomationRouteTest(unittest.TestCase):
         self.assertEqual(criterion_7['status'], 'fail')
         self.assertEqual(criterion_7['details']['performance_score'], 0.7)
         self.assertEqual(criterion_7['details']['assessment_count'], 10)
-        self.assertEqual(criterion_7['details']['score_numerator'], 1.4)
-        self.assertEqual(criterion_7['details']['score_denominator'], 2)
+        self.assertEqual(criterion_7['details']['score_numerator'], 14.0)
+        self.assertEqual(criterion_7['details']['score_denominator'], 20)
+
+    def test_uneven_assessment_counts_score_per_assessment_not_per_criterion(self):
+        _scenario_id, run_id = self._create_scorecard_run([
+            {'id': 'criterion_a', 'label': 'Criterion A', 'weight': 1},
+            {'id': 'criterion_b', 'label': 'Criterion B', 'weight': 1},
+        ])
+        cycles = []
+        for cycle_number in range(1, 11):
+            cycle_criteria = {'criterion_a': 'pass'}
+            if cycle_number == 10:
+                cycle_criteria['criterion_b'] = 'fail'
+            cycles.append(cycle_criteria)
+        self._seed_scored_cycles(run_id, cycles)
+
+        payload = self.client.get(
+            f'/api/automation/runs/{run_id}/scorecard',
+            headers=self.headers,
+        ).get_json()
+        summary = payload['run']['scorecard_summary']
+        rows = {row['check_id']: row for row in payload['scorecard']}
+
+        criterion_a = rows['custom:criterion_a']['details']
+        criterion_b = rows['custom:criterion_b']['details']
+        self.assertEqual(criterion_a['assessment_count'], 10)
+        self.assertEqual(criterion_a['score_numerator'], 10.0)
+        self.assertEqual(criterion_a['score_denominator'], 10)
+        self.assertEqual(criterion_b['assessment_count'], 1)
+        self.assertEqual(criterion_b['score_numerator'], 0.0)
+        self.assertEqual(criterion_b['score_denominator'], 1)
+
+        custom_numerator = criterion_a['score_numerator'] + criterion_b['score_numerator']
+        custom_denominator = (
+            criterion_a['score_denominator'] + criterion_b['score_denominator']
+        )
+        self.assertEqual(custom_numerator / custom_denominator, 10 / 11)
+
+        default_rows = [
+            row for row in payload['scorecard']
+            if not str(row['check_id']).startswith('custom:')
+        ]
+        default_numerator = sum(row['details']['score_numerator'] for row in default_rows)
+        default_denominator = sum(row['details']['score_denominator'] for row in default_rows)
+        expected_score = (custom_numerator + default_numerator) / (
+            custom_denominator + default_denominator
+        )
+        self.assertEqual(summary['performance_score'], round(expected_score, 4))
+        self.assertEqual(summary['score_numerator'], round(custom_numerator + default_numerator, 4))
+        self.assertEqual(summary['score_denominator'], custom_denominator + default_denominator)
+        self.assertEqual(summary['assessment_count'], 11 + len(default_rows))
+        # The nine cycles that skip criterion_b are missing applicable assessments:
+        # they must lower run completeness without entering the score denominator.
+        self.assertEqual(criterion_b['not_assessed_count'], 9)
+        self.assertLess(summary['completeness'], 1.0)
+        self.assertEqual(
+            summary['completeness'],
+            round(
+                summary['assessment_count'] / summary['applicable_assessment_count'],
+                4,
+            ),
+        )
+        self.assertEqual(
+            summary['applicable_assessment_count'],
+            10 + criterion_b['applicable_assessment_count'] + len(default_rows),
+        )
+
+        self.assertEqual(rows['custom:criterion_a']['status'], 'pass')
+        self.assertEqual(rows['custom:criterion_b']['status'], 'fail')
+        self.assertEqual(summary['severity'], 'fail')
+
+    def test_uneven_assessment_counts_respect_criterion_weights(self):
+        _scenario_id, run_id = self._create_scorecard_run([
+            {'id': 'weighted_a', 'label': 'Weighted A', 'weight': 3},
+            {'id': 'weighted_b', 'label': 'Weighted B', 'weight': 1},
+        ])
+        self._seed_scored_cycles(
+            run_id,
+            [
+                {'weighted_a': 'pass', 'weighted_b': 'fail'},
+                {'weighted_a': 'pass'},
+                {'weighted_a': 'pass'},
+            ],
+        )
+        payload = self.client.get(
+            f'/api/automation/runs/{run_id}/scorecard',
+            headers=self.headers,
+        ).get_json()
+        rows = {row['check_id']: row for row in payload['scorecard']}
+        weighted_a = rows['custom:weighted_a']['details']
+        weighted_b = rows['custom:weighted_b']['details']
+
+        self.assertEqual(weighted_a['assessment_count'], 3)
+        self.assertEqual(weighted_a['score_numerator'], 9.0)
+        self.assertEqual(weighted_a['score_denominator'], 9)
+        self.assertEqual(weighted_b['assessment_count'], 1)
+        self.assertEqual(weighted_b['score_numerator'], 0.0)
+        self.assertEqual(weighted_b['score_denominator'], 1)
+
+        custom_numerator = weighted_a['score_numerator'] + weighted_b['score_numerator']
+        custom_denominator = (
+            weighted_a['score_denominator'] + weighted_b['score_denominator']
+        )
+        self.assertEqual(custom_numerator / custom_denominator, 9 / 10)
+        self.assertEqual(rows['custom:weighted_a']['status'], 'pass')
+        self.assertEqual(rows['custom:weighted_b']['status'], 'fail')
 
     def test_missing_and_not_applicable_assessments_have_explicit_completeness(self):
         _scenario_id, run_id = self._create_scorecard_run([

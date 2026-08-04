@@ -292,8 +292,8 @@ def _scoring_summary(statuses, *, weight=1):
     assessment_numerator = sum(SCORECARD_STATUS_VALUES[status] for status in assessed)
     assessment_denominator = len(assessed)
     performance_score = _score_ratio(assessment_numerator, assessment_denominator)
-    numerator = (performance_score or 0) * weight
-    denominator = weight if assessed else 0
+    numerator = assessment_numerator * weight
+    denominator = assessment_denominator * weight
     applicable_assessment_count = len(assessed) + not_assessed_count
     completeness = (
         round(len(assessed) / applicable_assessment_count, 4)
