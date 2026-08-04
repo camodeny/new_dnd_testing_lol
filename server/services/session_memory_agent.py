@@ -263,6 +263,10 @@ def _location_candidates(campaign, query_terms, limit):
             'summary': clean_text(entity.get('summary'), 220) or None,
             'visibility': clean_text(entity.get('visibility'), 40) or None,
             'identity_status': clean_text(entity.get('identity_status'), 40) or None,
+            'aliases': [
+                clean_text(alias, 160) for alias in entity.get('aliases', [])
+                if clean_text(alias, 160)
+            ] if isinstance(entity.get('aliases', []), list) else [],
         }
         score = _match_score(query_terms, candidate) if query_terms else 1
         if score:
@@ -1358,38 +1362,42 @@ def compile_staged_memory_patch(memory_context, extracted, resolved):
         scene_resolution_mode = "canonical" if loc_status == "canonical" else "direct"
         if loc_status == "direct" and resolved_loc.get("previous_location_name"):
             previous_name = resolved_loc["previous_location_name"]
+            location_id = resolved_loc["location_id"]
             world_payload = _world_payload(campaign)
             graph = world_payload.get("knowledge_graph", {}) if isinstance(world_payload.get("knowledge_graph"), dict) else {}
             existing_location = next(
                 (
                     entity for entity in graph.get("entities", [])
-                    if isinstance(entity, dict) and entity.get("id") == resolved_loc["location_id"]
+                    if isinstance(entity, dict) and entity.get("id") == location_id
                 ),
                 {},
             )
-            existing_aliases = [
+            persisted_aliases = [
                 clean_text(alias, 160) for alias in existing_location.get("aliases", [])
                 if clean_text(alias, 160)
             ] if isinstance(existing_location.get("aliases", []), list) else []
+            persisted_summary = clean_text(existing_location.get("summary"), 500) or None
+            persisted_tags = [
+                clean_text(tag, 40) for tag in existing_location.get("tags", [])
+                if clean_text(tag, 40)
+            ] if isinstance(existing_location.get("tags", []), list) else []
+            existing_accepted = next(
+                (entity for entity in accepted_entities if entity.get("id") == location_id),
+                None,
+            )
+            alias_base = existing_accepted.get("aliases", []) if isinstance(existing_accepted and existing_accepted.get("aliases"), list) else persisted_aliases
             merged_aliases = []
             seen_aliases = set()
-            for alias in existing_aliases + [previous_name]:
+            for alias in alias_base + [previous_name]:
                 alias_key = alias.casefold()
                 if alias_key not in seen_aliases:
                     seen_aliases.add(alias_key)
                     merged_aliases.append(alias)
-            existing_summary = clean_text(existing_location.get("summary"), 500) or None
-            existing_tags = [
-                clean_text(tag, 40) for tag in existing_location.get("tags", [])
-                if clean_text(tag, 40)
-            ] if isinstance(existing_location.get("tags", []), list) else []
-            accepted_entities.append({
-                "id": resolved_loc["location_id"],
+            promotion = {
+                "id": location_id,
                 "name": resolved_loc["location_name"],
                 "type": "location",
                 "aliases": merged_aliases,
-                "summary": existing_summary,
-                "tags": existing_tags,
                 "identity_status": "canonical",
                 "visibility": "party_known",
                 "certainty": "confirmed",
@@ -1399,7 +1407,20 @@ def compile_staged_memory_patch(memory_context, extracted, resolved):
                 "memory_type": "location",
                 "provenance": make_provenance(scene_patch, default_tool="resolve_scene_location_patch"),
                 "resolution_mode": "promote_provisional_location",
-            })
+            }
+            if existing_accepted is not None:
+                existing_accepted.update({
+                    key: value for key, value in promotion.items()
+                    if value not in (None, "", [])
+                })
+                if not existing_accepted.get("summary"):
+                    existing_accepted["summary"] = persisted_summary
+                if not existing_accepted.get("tags"):
+                    existing_accepted["tags"] = persisted_tags
+            else:
+                promotion["summary"] = persisted_summary
+                promotion["tags"] = persisted_tags
+                accepted_entities.append(promotion)
 
     elif loc_status == "new":
         new_loc_id = resolved_loc.get("location_id") or allocate_durable_id(

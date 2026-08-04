@@ -1,6 +1,20 @@
 from services.world_service import clean_id, clean_text, get_campaign_world, json_loads
 
 
+def _location_identity_names(location):
+    names = set()
+    name = clean_text(location.get("name"), 160)
+    if name:
+        names.add(name.lower())
+    aliases = location.get("aliases", [])
+    if isinstance(aliases, list):
+        for alias in aliases:
+            alias_text = clean_text(alias, 160)
+            if alias_text:
+                names.add(alias_text.lower())
+    return names
+
+
 def resolve_scene_location_patch(scene_patch, campaign, current_scene):
     if not isinstance(scene_patch, dict):
         return {"status": "noop"}
@@ -28,11 +42,15 @@ def resolve_scene_location_patch(scene_patch, campaign, current_scene):
                 eid = clean_id(entity.get("id"), "")
                 ename = clean_text(entity.get("name"), 160)
                 if eid and ename:
-                    canonical_locations.append({"id": eid, "name": ename})
+                    ealiases = [
+                        clean_text(alias, 160) for alias in entity.get("aliases", [])
+                        if clean_text(alias, 160)
+                    ] if isinstance(entity.get("aliases", []), list) else []
+                    canonical_locations.append({"id": eid, "name": ename, "aliases": ealiases})
 
     if current_id and current_name:
         if not any(loc["id"] == current_id for loc in canonical_locations):
-            canonical_locations.append({"id": current_id, "name": current_name})
+            canonical_locations.append({"id": current_id, "name": current_name, "aliases": []})
 
     def unresolved(reason):
         return {
@@ -54,7 +72,7 @@ def resolve_scene_location_patch(scene_patch, campaign, current_scene):
     # wording variants cannot create a second location.
     known_id_location = next((loc for loc in canonical_locations if loc["id"] == proposed_id), None)
     if known_id_location:
-        if not proposed_name or proposed_name.lower() == known_id_location["name"].lower():
+        if not proposed_name or proposed_name.lower() in _location_identity_names(known_id_location):
             return {
                 "status": "canonical",
                 "location_id": known_id_location["id"],
@@ -65,7 +83,7 @@ def resolve_scene_location_patch(scene_patch, campaign, current_scene):
         conflicting_location = next(
             (
                 loc for loc in canonical_locations
-                if loc["id"] != proposed_id and loc["name"].lower() == proposed_name.lower()
+                if loc["id"] != proposed_id and proposed_name.lower() in _location_identity_names(loc)
             ),
             None,
         )
@@ -91,10 +109,9 @@ def resolve_scene_location_patch(scene_patch, campaign, current_scene):
     resolved = None
     for loc in canonical_locations:
         loc_id = loc["id"]
-        loc_name = loc["name"]
 
         if proposed_id and proposed_name:
-            if proposed_id == loc_id and proposed_name.lower() == loc_name.lower():
+            if proposed_id == loc_id and proposed_name.lower() in _location_identity_names(loc):
                 resolved = loc
                 break
         elif proposed_id and not proposed_name:
@@ -102,7 +119,7 @@ def resolve_scene_location_patch(scene_patch, campaign, current_scene):
                 resolved = loc
                 break
         elif proposed_name and not proposed_id:
-            if proposed_name.lower() == loc_name.lower():
+            if proposed_name.lower() in _location_identity_names(loc):
                 resolved = loc
                 break
 
@@ -126,7 +143,7 @@ def resolve_scene_location_patch(scene_patch, campaign, current_scene):
             }
         # Check if the proposed name matches a DIFFERENT known location.
         for loc in canonical_locations:
-            if loc.get("name", "").lower() == proposed_name.lower() and loc["id"] != current_id:
+            if loc["id"] != current_id and proposed_name.lower() in _location_identity_names(loc):
                 return {
                     "status": "unresolved",
                     "location_id": proposed_id,
@@ -151,7 +168,7 @@ def resolve_scene_location_patch(scene_patch, campaign, current_scene):
                     }
         # Check if this name matches a different existing location
         for loc in canonical_locations:
-            if loc.get("name", "").lower() == proposed_name.lower() and loc["id"] != proposed_id:
+            if loc["id"] != proposed_id and proposed_name.lower() in _location_identity_names(loc):
                 return {
                     "status": "unresolved",
                     "location_id": proposed_id,
@@ -166,7 +183,7 @@ def resolve_scene_location_patch(scene_patch, campaign, current_scene):
     if proposed_name and not proposed_id:
         name_lower = proposed_name.lower()
         for loc in canonical_locations:
-            if loc.get("name", "").lower() == name_lower:
+            if name_lower in _location_identity_names(loc):
                 return {
                     "status": "canonical",
                     "location_id": loc["id"],
