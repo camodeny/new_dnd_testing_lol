@@ -364,6 +364,10 @@ export default function AutomationRunPage() {
             <span>Checks</span>
           </div>
           <div className="automation-stat-card">
+            <strong>{run.scorecard_summary?.audited_cycle_count || 0} / {run.scorecard_summary?.fully_scored_cycle_count || 0}</strong>
+            <span>Audited / Fully scored cycles</span>
+          </div>
+          <div className="automation-stat-card">
             <strong>{incidents.length}</strong>
             <span>Incidents</span>
           </div>
@@ -435,6 +439,8 @@ export default function AutomationRunPage() {
                     <div><strong>Completeness</strong><span>{scoreCompleteness !== undefined && scoreCompleteness !== null ? `${(scoreCompleteness * 100).toFixed(1)}%` : 'N/A'}</span></div>
                     <div><strong>Score total</strong><span>{scoreSummary.score_numerator ?? '—'} / {scoreSummary.score_denominator ?? '—'}</span></div>
                     <div><strong>Assessments</strong><span>{scoreSummary.assessment_count ?? '—'} scored, {scoreSummary.not_assessed_count ?? '—'} missing</span></div>
+                    <div><strong>Audited cycles</strong><span>{run.scorecard_summary?.audited_cycle_count || 0}</span></div>
+                    <div><strong>Fully scored cycles</strong><span>{run.scorecard_summary?.fully_scored_cycle_count || 0}</span></div>
                     <div><strong>Created</strong><span>{formatTime(run.created_at)}</span></div>
                     <div><strong>Started</strong><span>{formatTime(run.started_at)}</span></div>
                     <div><strong>Finished</strong><span>{formatTime(run.finished_at)}</span></div>
