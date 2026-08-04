@@ -7,11 +7,13 @@ from models import (
     CampaignClock,
     CampaignMember,
     CampaignMonster,
+    CampaignSession,
     Character,
     CharacterCondition,
     EncounterMap,
     EncounterMapPlacement,
     NPCActor,
+    SessionMessage,
     SheetProposal,
     WorldEvent,
 )
@@ -31,7 +33,6 @@ from services.planning_service import summary_dict_for_read
 from services.shop_generation_service import clean_shop_items, generate_scene_shops, upsert_shop
 from services.world_service import clean_id, clean_text, get_campaign_world, json_dumps, json_loads
 from services.memory_resolver_schemas import (
-    EVIDENCE_STATUSES,
     SOURCE_CONTRACT_COMPILED_V2,
     determine_evidence_status,
     make_evidence_source,
@@ -5144,39 +5145,152 @@ def _create_clock_from_patch(campaign, patch):
     }
 
 
+_CLOCK_STRONG_EVIDENCE_SOURCES = frozenset({
+    'memory_resolver_packet',
+    'prior_durable_memory',
+    'prior_memory_record',
+    'clarification_answer',
+    'existing_alias',
+    'prior_scene_cast',
+})
+_CLOCK_RULE_EVIDENCE_SOURCES = frozenset({
+    'clock_rule',
+    'deterministic_rule',
+})
+_CLOCK_TRANSCRIPT_EVIDENCE_SOURCES = frozenset({
+    'visible_transcript',
+    'transcript_message',
+})
+
+
+def _resolve_clock_transcript_message(campaign, source_id):
+    """Resolve a transcript evidence source id to a real visible session message."""
+    if source_id in (None, ''):
+        return None
+    try:
+        message_id = int(source_id)
+    except (TypeError, ValueError):
+        return None
+    message = SessionMessage.query.filter_by(id=message_id).first()
+    if not message:
+        return None
+    session = CampaignSession.query.filter_by(id=message.session_id, campaign_id=campaign.id).first()
+    if not session:
+        return None
+    return message
+
+
+def _clock_text_tokens(text):
+    tokens = re.findall(r"[a-z0-9']+", (text or '').lower())
+    return {token for token in tokens if len(token) >= 3}
+
+
+_CLOCK_EVIDENCE_STOPWORDS = frozenset({
+    'the', 'and', 'for', 'with', 'was', 'were', 'are', 'has', 'had', 'not',
+    'but', 'you', 'your', 'they', 'them', 'their', 'from', 'that', 'this',
+    'have', 'will', 'would', 'should', 'could', 'into', 'over', 'under',
+    'after', 'before', 'between', 'during', 'through', 'against', 'did', 'does',
+})
+
+
+def _clock_text_overlap(message_content, support_text):
+    """Cheap semantic check: a message supports text when it shares meaningful terms."""
+    message_tokens = _clock_text_tokens(message_content)
+    support_tokens = _clock_text_tokens(support_text)
+    if not message_tokens or not support_tokens:
+        return False
+    message_tokens -= _CLOCK_EVIDENCE_STOPWORDS
+    support_tokens -= _CLOCK_EVIDENCE_STOPWORDS
+    return bool(message_tokens & support_tokens)
+
+
+def _clock_text_contradicts(message_content, support_text):
+    """Return True when a verified message explicitly negates the proposed support."""
+    support_tokens = _clock_text_tokens(support_text) - _CLOCK_EVIDENCE_STOPWORDS
+    message_text = (message_content or '').lower()
+    for token in support_tokens:
+        for negation in (
+            f'not {token}',
+            f'never {token}',
+            f'no {token}',
+            f'denies {token}',
+            f'denied {token}',
+            f'refutes {token}',
+            f'contradicts {token}',
+            f'{token} is false',
+            f'{token} was a lie',
+            f'not actually {token}',
+        ):
+            if negation in message_text:
+                return True
+    return False
+
+
+def _verified_clock_evidence_status(campaign, evidence_sources, support_text=None):
+    """Compute evidence status at the durable boundary from verified sources only.
+
+    Evidence status is never accepted from the proposing model. Transcript sources
+    must resolve to an actual visible session message in this campaign whose content
+    supports the criterion/consequence text; a fabricated or unrelated source id is
+    dropped. Rule sources are accepted as ``supported_by_rules``, and strong durable
+    sources as ``supported_by_evidence``. A verified message that explicitly negates
+    the proposed support yields ``contradicted``.
+    """
+    if not isinstance(evidence_sources, list) or not evidence_sources:
+        return 'insufficiently_supported'
+    verified_rule = False
+    verified_strong = False
+    for source in evidence_sources:
+        if not isinstance(source, dict):
+            continue
+        source_type = source.get('source_type') or source.get('source', '')
+        if source_type in _CLOCK_TRANSCRIPT_EVIDENCE_SOURCES:
+            message = _resolve_clock_transcript_message(campaign, source.get('source_id'))
+            if message is None:
+                continue
+            if support_text and _clock_text_contradicts(message.content, support_text):
+                return 'contradicted'
+            if support_text and not _clock_text_overlap(message.content, support_text):
+                continue
+            verified_strong = True
+        elif source_type in _CLOCK_RULE_EVIDENCE_SOURCES:
+            verified_rule = True
+        elif source_type in _CLOCK_STRONG_EVIDENCE_SOURCES:
+            verified_strong = True
+    if verified_rule:
+        return 'supported_by_rules'
+    if verified_strong:
+        return 'supported_by_evidence'
+    return 'insufficiently_supported'
+
+
 def _collect_clock_criterion_met_evidence(patch, required_ids):
-    """Return (evidence, explicit_status) declared met in a retirement patch.
+    """Return {criterion_id: [evidence_sources]} declared met in a retirement patch.
 
     Completion criteria must be tied to evidence that supports each criterion, not merely
     echoed by id. Entries in ``completion_criteria_met`` may be plain criterion ids
-    (legacy) or dicts with ``criterion_id``/``id`` plus ``evidence_sources`` and an
-    optional explicit ``evidence_status``. A top-level ``completion_criteria_evidence``
-    mapping (criterion_id -> [sources]) is also merged in.
+    (legacy) or dicts with ``criterion_id``/``id`` plus ``evidence_sources``. A top-level
+    ``completion_criteria_evidence`` mapping (criterion_id -> [sources]) is also merged in.
     """
     evidence = {}
-    explicit_status = {}
     raw_met = patch.get('completion_criteria_met')
     if isinstance(raw_met, list):
         for item in raw_met:
             if isinstance(item, dict):
                 criterion_id = clean_id(item.get('criterion_id') or item.get('id'), '')
                 sources = item.get('evidence_sources') if isinstance(item.get('evidence_sources'), list) else []
-                status = item.get('evidence_status') if item.get('evidence_status') in EVIDENCE_STATUSES else None
             else:
                 criterion_id = clean_id(item, '')
                 sources = []
-                status = None
             if criterion_id:
                 evidence.setdefault(criterion_id, []).extend(sources)
-                if status:
-                    explicit_status[criterion_id] = status
     raw_map = patch.get('completion_criteria_evidence')
     if isinstance(raw_map, dict):
         for criterion_id, sources in raw_map.items():
             criterion_id = clean_id(criterion_id, '')
             if criterion_id and isinstance(sources, list):
                 evidence.setdefault(criterion_id, []).extend(sources)
-    return evidence, explicit_status
+    return evidence
 
 
 def _retire_clock_from_patch(campaign, patch):
@@ -5196,7 +5310,7 @@ def _retire_clock_from_patch(campaign, patch):
     if completion_criteria:
         if not mechanical_complete:
             return {'error': f'Clock {clock.name} cannot be retired before it is mechanically complete.'}
-        criterion_evidence, explicit_criterion_status = _collect_clock_criterion_met_evidence(patch, required_ids)
+        criterion_evidence = _collect_clock_criterion_met_evidence(patch, required_ids)
         met_ids = set(criterion_evidence.keys())
         missing_ids = required_ids - met_ids
         if missing_ids:
@@ -5212,7 +5326,11 @@ def _retire_clock_from_patch(campaign, patch):
         unsupported = []
         for criterion_id in sorted(required_ids):
             sources = criterion_evidence.get(criterion_id) or []
-            status = explicit_criterion_status.get(criterion_id) or determine_evidence_status(sources)
+            support_text = next(
+                (criterion.get('description') or criterion.get('text') for criterion in completion_criteria if criterion['id'] == criterion_id),
+                '',
+            )
+            status = _verified_clock_evidence_status(campaign, sources, support_text)
             criterion_evidence_status[criterion_id] = status
             if status not in ('supported_by_evidence', 'supported_by_rules'):
                 unsupported.append(criterion_id)
@@ -5221,10 +5339,10 @@ def _retire_clock_from_patch(campaign, patch):
                 'kind': 'completion_criterion',
                 'criterion_ids': unsupported,
                 'evidence_status': {cid: criterion_evidence_status[cid] for cid in unsupported},
-                'reason': 'Completion criteria lack supporting evidence at the durable write boundary.',
+                'reason': 'Completion criteria lack verified supporting evidence at the durable write boundary.',
             })
             return {
-                'error': f'Clock {clock.name} cannot resolve: completion criteria lack supporting evidence.',
+                'error': f'Clock {clock.name} cannot resolve: completion criteria lack verified supporting evidence.',
                 'rejected_proposals': rejected_proposals,
             }
     else:
@@ -5238,10 +5356,7 @@ def _retire_clock_from_patch(campaign, patch):
     consequence_evidence = consequence.get('evidence_sources')
     if not isinstance(consequence_evidence, list):
         consequence_evidence = None
-    consequence_status = (
-        determine_evidence_status(consequence_evidence)
-        if isinstance(consequence_evidence, list) and consequence_evidence else 'insufficiently_supported'
-    )
+    consequence_status = _verified_clock_evidence_status(campaign, consequence_evidence, consequence_text)
     applied_visibility = requested_visibility
     gate_consequence_visibility = bool(completion_criteria) or bool(consequence)
     if (
@@ -5249,16 +5364,27 @@ def _retire_clock_from_patch(campaign, patch):
         and requested_visibility in ('party_known', 'public')
         and consequence_status in ('insufficiently_supported', 'contradicted')
     ):
-        applied_visibility = 'dm_private'
-        consequence_applied = False
         rejected_proposals.append({
             'kind': 'consequence_visibility',
             'requested_visibility': requested_visibility,
-            'applied_visibility': applied_visibility,
+            'applied_visibility': 'dm_private',
             'consequence': consequence_text,
             'evidence_status': consequence_status,
-            'reason': 'Retirement consequence is not supported by evidence; retained at safe visibility.',
+            'reason': 'Retirement consequence is not supported by verified evidence; retained pending.',
         })
+        return {
+            'error': f'Clock {clock.name} cannot apply its consequence at {requested_visibility} visibility without verified evidence.',
+            'rejected_proposals': rejected_proposals,
+            'mechanical_complete': mechanical_complete,
+            'consequence_applied': False,
+            'visibility_decision': {
+                'requested': requested_visibility,
+                'applied': 'dm_private',
+                'consequence_applied': False,
+                'evidence_status': consequence_status,
+                'reason': 'consequence_pending_verified_evidence',
+            },
+        }
     visibility_decision = {
         'requested': requested_visibility,
         'applied': applied_visibility,
