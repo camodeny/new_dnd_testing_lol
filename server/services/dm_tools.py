@@ -31,6 +31,7 @@ from services.planning_service import summary_dict_for_read
 from services.shop_generation_service import clean_shop_items, generate_scene_shops, upsert_shop
 from services.world_service import clean_id, clean_text, get_campaign_world, json_dumps, json_loads
 from services.memory_resolver_schemas import (
+    EVIDENCE_STATUSES,
     SOURCE_CONTRACT_COMPILED_V2,
     determine_evidence_status,
     make_evidence_source,
@@ -487,6 +488,12 @@ def _normalize_memory_clock_patch(item, fallback_id):
             clean_item[field] = value
     if 'completion_criteria' in item:
         clean_item['completion_criteria'] = _normalize_clock_completion_criteria(item.get('completion_criteria'))
+    if 'completion_criteria_met' in item:
+        clean_item['completion_criteria_met'] = item['completion_criteria_met']
+    if 'completion_criteria_evidence' in item:
+        clean_item['completion_criteria_evidence'] = item['completion_criteria_evidence']
+    if isinstance(item.get('consequence'), dict):
+        clean_item['consequence'] = dict(item['consequence'])
     return _apply_memory_item_metadata(clean_item, item, include_memory_type=False)
 
 
@@ -5137,27 +5144,128 @@ def _create_clock_from_patch(campaign, patch):
     }
 
 
+def _collect_clock_criterion_met_evidence(patch, required_ids):
+    """Return (evidence, explicit_status) declared met in a retirement patch.
+
+    Completion criteria must be tied to evidence that supports each criterion, not merely
+    echoed by id. Entries in ``completion_criteria_met`` may be plain criterion ids
+    (legacy) or dicts with ``criterion_id``/``id`` plus ``evidence_sources`` and an
+    optional explicit ``evidence_status``. A top-level ``completion_criteria_evidence``
+    mapping (criterion_id -> [sources]) is also merged in.
+    """
+    evidence = {}
+    explicit_status = {}
+    raw_met = patch.get('completion_criteria_met')
+    if isinstance(raw_met, list):
+        for item in raw_met:
+            if isinstance(item, dict):
+                criterion_id = clean_id(item.get('criterion_id') or item.get('id'), '')
+                sources = item.get('evidence_sources') if isinstance(item.get('evidence_sources'), list) else []
+                status = item.get('evidence_status') if item.get('evidence_status') in EVIDENCE_STATUSES else None
+            else:
+                criterion_id = clean_id(item, '')
+                sources = []
+                status = None
+            if criterion_id:
+                evidence.setdefault(criterion_id, []).extend(sources)
+                if status:
+                    explicit_status[criterion_id] = status
+    raw_map = patch.get('completion_criteria_evidence')
+    if isinstance(raw_map, dict):
+        for criterion_id, sources in raw_map.items():
+            criterion_id = clean_id(criterion_id, '')
+            if criterion_id and isinstance(sources, list):
+                evidence.setdefault(criterion_id, []).extend(sources)
+    return evidence, explicit_status
+
+
 def _retire_clock_from_patch(campaign, patch):
     clock_id = clean_id(patch.get('clock_id') or patch.get('id'), '')
     clock = CampaignClock.query.filter_by(campaign_id=campaign.id, clock_id=clock_id).first()
     if not clock:
         return {'error': f'Clock not found: {clock_id}'}
     completion_criteria = _normalize_clock_completion_criteria(clock.completion_criteria)
-    if completion_criteria and (clock.filled or 0) >= (clock.segments or 4):
-        required_ids = {criterion['id'] for criterion in completion_criteria}
-        met_ids = {
-            clean_id(item.get('id') if isinstance(item, dict) else item, '')
-            for item in (patch.get('completion_criteria_met') or [])
-        }
-        met_ids.discard('')
-        evidence_sources = (
-            (patch.get('provenance') or {}).get('evidence_sources')
-            if isinstance(patch.get('provenance'), dict) else None
-        )
-        if not required_ids.issubset(met_ids):
-            return {'error': f'Clock {clock.name} cannot resolve until all completion criteria are met.'}
-        if not isinstance(evidence_sources, list) or not evidence_sources:
-            return {'error': f'Clock {clock.name} cannot resolve without completion evidence.'}
+    required_ids = {criterion['id'] for criterion in completion_criteria}
+    mechanical_complete = (clock.filled or 0) >= (clock.segments or 4)
+    met_ids = set()
+    criterion_evidence_status = {}
+    rejected_proposals = []
+    consequence_applied = True
+    visibility_decision = {}
+
+    if completion_criteria:
+        if not mechanical_complete:
+            return {'error': f'Clock {clock.name} cannot be retired before it is mechanically complete.'}
+        criterion_evidence, explicit_criterion_status = _collect_clock_criterion_met_evidence(patch, required_ids)
+        met_ids = set(criterion_evidence.keys())
+        missing_ids = required_ids - met_ids
+        if missing_ids:
+            rejected_proposals.append({
+                'kind': 'completion_criterion',
+                'criterion_ids': sorted(missing_ids),
+                'reason': 'Retirement did not declare every completion criterion as met.',
+            })
+            return {
+                'error': f'Clock {clock.name} cannot resolve until all completion criteria are met.',
+                'rejected_proposals': rejected_proposals,
+            }
+        unsupported = []
+        for criterion_id in sorted(required_ids):
+            sources = criterion_evidence.get(criterion_id) or []
+            status = explicit_criterion_status.get(criterion_id) or determine_evidence_status(sources)
+            criterion_evidence_status[criterion_id] = status
+            if status not in ('supported_by_evidence', 'supported_by_rules'):
+                unsupported.append(criterion_id)
+        if unsupported:
+            rejected_proposals.append({
+                'kind': 'completion_criterion',
+                'criterion_ids': unsupported,
+                'evidence_status': {cid: criterion_evidence_status[cid] for cid in unsupported},
+                'reason': 'Completion criteria lack supporting evidence at the durable write boundary.',
+            })
+            return {
+                'error': f'Clock {clock.name} cannot resolve: completion criteria lack supporting evidence.',
+                'rejected_proposals': rejected_proposals,
+            }
+    else:
+        criterion_evidence = {}
+
+    consequence = patch.get('consequence') if isinstance(patch.get('consequence'), dict) else {}
+    requested_visibility = consequence.get('visibility') or patch.get('visibility') or clock.visibility or 'dm_private'
+    if requested_visibility not in VALID_VISIBILITIES:
+        requested_visibility = 'dm_private'
+    consequence_text = clean_text(consequence.get('text') or consequence.get('summary') or patch.get('reason'), 520)
+    consequence_evidence = consequence.get('evidence_sources')
+    if not isinstance(consequence_evidence, list):
+        consequence_evidence = None
+    consequence_status = (
+        determine_evidence_status(consequence_evidence)
+        if isinstance(consequence_evidence, list) and consequence_evidence else 'insufficiently_supported'
+    )
+    applied_visibility = requested_visibility
+    gate_consequence_visibility = bool(completion_criteria) or bool(consequence)
+    if (
+        gate_consequence_visibility
+        and requested_visibility in ('party_known', 'public')
+        and consequence_status in ('insufficiently_supported', 'contradicted')
+    ):
+        applied_visibility = 'dm_private'
+        consequence_applied = False
+        rejected_proposals.append({
+            'kind': 'consequence_visibility',
+            'requested_visibility': requested_visibility,
+            'applied_visibility': applied_visibility,
+            'consequence': consequence_text,
+            'evidence_status': consequence_status,
+            'reason': 'Retirement consequence is not supported by evidence; retained at safe visibility.',
+        })
+    visibility_decision = {
+        'requested': requested_visibility,
+        'applied': applied_visibility,
+        'consequence_applied': consequence_applied,
+        'evidence_status': consequence_status,
+        'reason': 'applied_at_requested_visibility' if consequence_applied else 'retained_at_safe_visibility',
+    }
     clock.status = clean_text(patch.get('status'), 30) or 'resolved'
     clock.updated_at = utcnow()
     upsert_memory_embedding(campaign, 'clock', clock.clock_id, clock.to_dict(include_private=True))
@@ -5170,12 +5278,25 @@ def _retire_clock_from_patch(campaign, patch):
         {
             'clock_id': clock.clock_id,
             'status': clock.status,
+            'mechanical_complete': mechanical_complete,
             'completion_criteria_met': sorted(met_ids) if completion_criteria else [],
+            'criterion_evidence_status': criterion_evidence_status,
+            'consequence_applied': consequence_applied,
+            'visibility_decision': visibility_decision,
+            'rejected_proposals': rejected_proposals,
             'provenance': provenance,
         },
-        visibility=clock.visibility or 'dm_private',
+        visibility=applied_visibility,
     )
-    return {'clock': clock.to_dict(include_private=True), 'event_id': event.id, 'action': 'retired'}
+    return {
+        'clock': clock.to_dict(include_private=True),
+        'event_id': event.id,
+        'action': 'retired',
+        'mechanical_complete': mechanical_complete,
+        'consequence_applied': consequence_applied,
+        'visibility_decision': visibility_decision,
+        'rejected_proposals': rejected_proposals,
+    }
 
 
 def _applied_clock_provenance(raw_provenance, build_sha):

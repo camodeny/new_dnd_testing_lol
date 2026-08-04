@@ -301,7 +301,10 @@ SESSION_CLOCK_ADJUDICATOR_SYSTEM_PROMPT = (
     "Do not create a new clock if an existing active clock already covers the same pressure. "
     "Each advance_clocks item must include clock_id, delta, reason, and evidence. "
     "A clock with completion_criteria may reach its final segment but must not be retired until every criterion is visibly supported. "
-    "For that retirement, include completion_criteria_met with every criterion id and provenance.evidence_sources that cite the visible transcript or an authorized deterministic rule. "
+    "For that retirement, include completion_criteria_met where each entry includes criterion_id and the specific evidence_sources that support that criterion, "
+    "and provenance.evidence_sources that cite the visible transcript or an authorized deterministic rule. "
+    "A criterion echoed by id alone is rejected; each criterion needs its own evidence. "
+    "Retirement consequences at party_known or public visibility require supporting evidence and are retained at DM-private visibility when unsupported. "
     "Each no_change_explanations item must include clock_id and reason. Do not output plain text or markdown."
 )
 
@@ -4889,7 +4892,7 @@ SESSION_MEMORY_CLOCKS_FINALIZER_TOOL = {
             'properties': {
                 'create_clocks': {'type': 'array', 'items': {'type': 'object'}, 'description': 'Clocks to create.'},
                 'advance_clocks': {'type': 'array', 'items': {'type': 'object'}, 'description': 'Existing clocks to advance.'},
-                'retire_clocks': {'type': 'array', 'items': {'type': 'object'}, 'description': 'Clocks to retire. For clocks with completion_criteria, include completion_criteria_met (criterion ids) and provenance.evidence_sources.'},
+                'retire_clocks': {'type': 'array', 'items': {'type': 'object'}, 'description': 'Clocks to retire. For clocks with completion_criteria, include completion_criteria_met where each entry lists criterion_id and the evidence_sources supporting that criterion, and provenance.evidence_sources.'},
                 'no_change_explanations': {'type': 'array', 'items': {'type': 'object'}, 'description': 'Reasons active clocks did not change.'},
             },
         },
