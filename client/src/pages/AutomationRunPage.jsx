@@ -429,7 +429,7 @@ export default function AutomationRunPage() {
                   </div>
                   <div className="automation-meta-grid">
                     <div><strong>Status</strong><span>{run.status}</span></div>
-                    <div><strong>Severity</strong><span className={`status-badge ${scoreSeverity}`}>{scoreSeverity}</span></div>
+                    <div><strong>Severity</strong><span className={`status-${scoreSeverity}`}>{scoreSeverity}</span></div>
                     <div><strong>Performance score</strong><span>{performanceScore !== undefined && performanceScore !== null ? `${performanceScore < 1.0 ? Math.min(99.9, performanceScore * 100).toFixed(1) : '100.0'}%` : 'N/A'}</span></div>
                     <div><strong>Completeness</strong><span>{scoreCompleteness !== undefined && scoreCompleteness !== null ? `${(scoreCompleteness * 100).toFixed(1)}%` : 'N/A'}</span></div>
                     <div><strong>Score total</strong><span>{scoreSummary.score_numerator ?? '—'} / {scoreSummary.score_denominator ?? '—'}</span></div>
