@@ -428,6 +428,9 @@ def _normalize_memory_entity_patch(item, fallback_id):
     aliases = _coerce_patch_text_list(item.get('aliases'), max_items=12, max_length=160)
     if aliases:
         clean_item['aliases'] = aliases
+    identity_status = _coerce_patch_id(item.get('identity_status'), '')
+    if identity_status in {'provisional', 'canonical'}:
+        clean_item['identity_status'] = identity_status
     return _apply_memory_item_metadata(clean_item, item, include_memory_type=True)
 
 

@@ -129,6 +129,7 @@ class P0FixesTest(unittest.TestCase):
                 'label': 'Brunsworth Hall',
                 'location_id': 'waterdeep',
                 'canonical_location_name': 'Brunsworth Hall',
+                'resolution': 'same',
                 'rename_existing': True,
             }],
         }
@@ -139,6 +140,41 @@ class P0FixesTest(unittest.TestCase):
         self.assertEqual(len(promoted), 1)
         self.assertEqual(promoted[0]['name'], 'Brunsworth Hall')
         self.assertEqual(promoted[0]['aliases'], ['Waterdeep'])
+
+    def test_uncertain_location_identity_does_not_create_a_duplicate_location(self):
+        memory_context = {
+            'campaign_id': self.campaign.id,
+            'hot_context': {'current_scene': {'location_id': 'waterdeep', 'location_name': 'Waterdeep'}},
+        }
+        extracted = {'scene_patch': {'location_id': 'brunsworth_hall', 'location_name': 'Brunsworth Hall'}}
+        resolved = {
+            'scene_patch': {'location_id': 'brunsworth_hall', 'location_name': 'Brunsworth Hall'},
+            'resolved_location_refs': [{
+                'label': 'Brunsworth Hall',
+                'location_id': 'waterdeep',
+                'resolution': 'uncertain',
+            }],
+        }
+        compiled = compile_staged_memory_patch(memory_context, extracted, resolved)
+        self.assertNotIn('location_id', compiled['scene_patch'])
+        self.assertFalse(any(entity['id'] == 'brunsworth_hall' for entity in compiled['upsert_graph_entities']))
+        self.assertTrue(any(
+            item['reason'] == 'uncertain_provisional_location_identity'
+            for item in compiled['unresolved_items']
+        ))
+
+    def test_new_locations_are_marked_provisional_for_later_resolution(self):
+        memory_context = {
+            'campaign_id': self.campaign.id,
+            'hot_context': {'current_scene': {'location_id': 'waterdeep', 'location_name': 'Waterdeep'}},
+        }
+        compiled = compile_staged_memory_patch(
+            memory_context,
+            {'scene_patch': {'location_id': 'old_building', 'location_name': 'Old Building'}},
+            {'scene_patch': {'location_id': 'old_building', 'location_name': 'Old Building'}},
+        )
+        created = next(entity for entity in compiled['upsert_graph_entities'] if entity['id'] == 'old_building')
+        self.assertEqual(created['identity_status'], 'provisional')
 
     # 6. apply_memory_patch never persists only one of location_id or location_name
     # 7. Direct scene update validation accepts new locations when name is supported by visible text

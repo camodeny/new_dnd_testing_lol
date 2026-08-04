@@ -262,6 +262,7 @@ def _location_candidates(campaign, query_terms, limit):
             'location_name': clean_text(entity.get('name'), 160) or None,
             'summary': clean_text(entity.get('summary'), 220) or None,
             'visibility': clean_text(entity.get('visibility'), 40) or None,
+            'identity_status': clean_text(entity.get('identity_status'), 40) or None,
         }
         score = _match_score(query_terms, candidate) if query_terms else 1
         if score:
@@ -1304,6 +1305,7 @@ def compile_staged_memory_patch(memory_context, extracted, resolved):
     resolved_location_refs = resolved.get("resolved_location_refs") if isinstance(resolved.get("resolved_location_refs"), list) else []
     proposed_location_id = clean_id(scene_patch.get("location_id"), "")
     proposed_location_name = clean_text(scene_patch.get("location_name"), 160)
+    unresolved_location_decision = None
     for location_ref in resolved_location_refs:
         if not isinstance(location_ref, dict):
             continue
@@ -1312,6 +1314,14 @@ def compile_staged_memory_patch(memory_context, extracted, resolved):
         if not canonical_id or not label:
             continue
         if label.lower() not in {proposed_location_id.lower(), proposed_location_name.lower()}:
+            continue
+        decision = clean_text(location_ref.get("resolution"), 40).lower()
+        if decision == "uncertain":
+            unresolved_location_decision = location_ref
+            scene_patch.pop("location_id", None)
+            scene_patch.pop("location_name", None)
+            break
+        if decision != "same":
             continue
         scene_patch["location_id"] = canonical_id
         canonical_name = clean_text(location_ref.get("canonical_location_name"), 160)
@@ -1328,6 +1338,20 @@ def compile_staged_memory_patch(memory_context, extracted, resolved):
     resolved_loc = resolve_scene_location_patch(scene_patch, campaign, current_scene)
     loc_status = resolved_loc.get("status", "unresolved") if isinstance(resolved_loc, dict) else "unresolved"
 
+    if unresolved_location_decision:
+        unresolved.append({
+            "kind": "scene_location",
+            "location_id": proposed_location_id,
+            "location_name": proposed_location_name,
+            "reason": "uncertain_provisional_location_identity",
+            "candidate_location_id": clean_id(
+                unresolved_location_decision.get("canonical_location_id") or unresolved_location_decision.get("location_id"),
+                "",
+            ),
+            "provenance": make_provenance(unresolved_location_decision, default_tool="resolve_scene_location_patch"),
+            "resolution_mode": "uncertain",
+        })
+
     if loc_status == "canonical" or loc_status == "direct":
         compiled_scene["location_id"] = resolved_loc["location_id"]
         compiled_scene["location_name"] = resolved_loc["location_name"]
@@ -1341,6 +1365,7 @@ def compile_staged_memory_patch(memory_context, extracted, resolved):
                 "aliases": [previous_name],
                 "summary": None,
                 "tags": [],
+                "identity_status": "canonical",
                 "visibility": "party_known",
                 "certainty": "confirmed",
                 "importance": 3,
@@ -1377,6 +1402,7 @@ def compile_staged_memory_patch(memory_context, extracted, resolved):
             "expires_or_retire_condition": None,
             "reason": "New location created from scene patch.",
             "memory_type": "location",
+            "identity_status": "provisional",
             "provenance": make_provenance(scene_patch, default_tool="resolve_scene_location_patch"),
             "resolution_mode": "create_new",
         })
