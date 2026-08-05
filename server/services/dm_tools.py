@@ -5255,6 +5255,48 @@ def _clock_text_contradicts(message_content, support_text):
         window = message_tokens[window_start:index]
         if any(marker in window for marker in _CLOCK_NEGATION_MARKERS):
             return True
+    # Relationship opposition: departure from, mere mention of, or presence asserted
+    # at a different place than a claimed location also contradicts the claim.
+    return _clock_text_opposes_presence(message_content, support_text)
+
+
+def _clock_claim_locations(support_text):
+    """Return the location tokens a presence claim asserts (e.g. ``is at the docks``)."""
+    locations = set()
+    for match in re.finditer(r'\b(?:at|in|near)\s+(?:the\s+)?([a-z0-9\']+)', (support_text or '').lower()):
+        token = match.group(1)
+        if len(token) >= 3 and token not in _CLOCK_EVIDENCE_STOPWORDS:
+            locations.add(token)
+    return locations
+
+
+def _clock_text_opposes_presence(message_content, support_text):
+    """Return True when evidence opposes a presence-at-location claim.
+
+    Token-set coverage cannot distinguish ``Garret is at the docks`` from ``Garret
+    left the docks`` or ``Garret mentioned the docks while staying at camp``. This
+    evaluates the relationship: departing from the claimed location, only mentioning
+    it, or asserting presence at a different place all oppose the claim.
+    """
+    locations = _clock_claim_locations(support_text)
+    if not locations:
+        return False
+    message_text = (message_content or '').lower()
+    for loc in locations:
+        loc_pattern = re.escape(loc)
+        if re.search(rf'\b(?:left|departed|fled|exited|quit|abandoned)\s+(?:the\s+)?{loc_pattern}\b', message_text):
+            return True
+        if re.search(rf'\b(?:away|moved|went|walked|came|returned|traveled|travelled|rode|sailed)\s+from\s+(?:the\s+)?{loc_pattern}\b', message_text):
+            return True
+        if re.search(rf'\b(?:mentioned|talked\s+about|discussed|referenced|spoke\s+of|described|pointed\s+to)\s+(?:the\s+)?{loc_pattern}\b', message_text):
+            return True
+        # Presence asserted at a different location than the claimed one.
+        for other in re.findall(
+            r'\b(?:staying|stayed|remaining|remained|camped|camping|located|is|are|was|were)\s+(?:at|in)\s+(?:the\s+)?([a-z0-9\']+)',
+            message_text,
+        ):
+            if other != loc and len(other) >= 3 and other not in _CLOCK_EVIDENCE_STOPWORDS:
+                return True
     return False
 
 
@@ -5362,14 +5404,14 @@ def _clock_claim_tokens(text):
     return _clock_text_tokens(text) - _CLOCK_CLAIM_STOPWORDS
 
 
-def _clock_consequence_covered(campaign, evidence_sources, support_text):
-    """Return True when the union of verified evidence content covers the consequence claims.
+def _clock_claims_covered(campaign, evidence_sources, support_text):
+    """Return True when the union of verified evidence content covers the claim terms.
 
-    A single shared token is not treated as semantic support for a compound conclusion:
-    every meaningful claim term in ``support_text`` must appear in at least one resolved
-    evidence record in this campaign. Rule sources contribute their durable description
-    as the claim scope they can actually prove, so an unrelated authorized rule cannot
-    cover a consequence about a different subject.
+    A single shared token is not treated as semantic support for a compound claim:
+    every meaningful claim term in ``support_text`` must appear in at least one
+    resolved evidence record in this campaign. Rule sources contribute their durable
+    description as the claim scope they can actually prove, so an unrelated authorized
+    rule cannot cover a claim about a different subject.
     """
     support_terms = _clock_claim_tokens(support_text)
     if not support_terms:
@@ -5539,14 +5581,18 @@ def _retire_clock_from_patch(campaign, patch):
                 campaign, sources, support_text, required_visibility=requested_visibility
             )
             criterion_evidence_status[criterion_id] = status
-            if status not in ('supported_by_evidence', 'supported_by_rules'):
+            criterion_covered = _clock_claims_covered(campaign, sources, support_text)
+            if (
+                status not in ('supported_by_evidence', 'supported_by_rules')
+                or not criterion_covered
+            ):
                 unsupported.append(criterion_id)
         if unsupported:
             rejected_proposals.append({
                 'kind': 'completion_criterion',
                 'criterion_ids': unsupported,
                 'evidence_status': {cid: criterion_evidence_status[cid] for cid in unsupported},
-                'reason': 'Completion criteria lack verified supporting evidence at the durable write boundary.',
+                'reason': 'Completion criteria lack verified, fully covered supporting evidence at the durable write boundary.',
             })
             return {
                 'error': f'Clock {clock.name} cannot resolve: completion criteria lack verified supporting evidence.',
@@ -5577,7 +5623,7 @@ def _retire_clock_from_patch(campaign, patch):
                 for source in (criterion_evidence.get(criterion_id) or []):
                     if isinstance(source, dict) and source not in coverage_evidence:
                         coverage_evidence.append(source)
-    consequence_covered = _clock_consequence_covered(campaign, coverage_evidence, consequence_text)
+    consequence_covered = _clock_claims_covered(campaign, coverage_evidence, consequence_text)
     applied_visibility = requested_visibility
     gate_consequence_visibility = requested_visibility in ('party_known', 'public') and bool(consequence_text)
     if (
