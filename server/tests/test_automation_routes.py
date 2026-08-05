@@ -5273,23 +5273,57 @@ class AutomationRouteTest(unittest.TestCase):
         self.assertEqual(detach.status_code, 200)
 
     def test_legacy_scorecard_template_upgrade_assigns_canonical_categories(self):
-        # Reproduce the deployed pre-v2 Memory Audit Scorebook: generic criteria
-        # with no category or instructions. The startup repair must assign
-        # deterministic canonical categories so the template becomes activatable.
+        # Reproduce the deployed pre-v2 Memory Audit Scorebook: generic criterion
+        # ids with the real stored descriptions but no category. The startup repair
+        # must assign the explicit per-criterion categories those descriptions imply.
+        deployed_criteria = [
+            {'id': 'criterion_1', 'label': 'Criterion 1', 'weight': 2,
+             'description': 'Established facts remain stable and are recalled accurately when relevant.'},
+            {'id': 'criterion_2', 'label': 'Criterion 2', 'weight': 2,
+             'description': 'Secret or unrevealed information is not exposed to players without in-world justification.'},
+            {'id': 'criterion_3', 'label': 'Criterion 3', 'weight': 2,
+             'description': 'DM output remains consistent with the current location, participants, objectives, and immediate prior events.'},
+            {'id': 'criterion_4', 'label': 'Criterion 4', 'weight': 2,
+             'description': 'NPC and character names, roles, traits, relationships, and ownership remain consistent.'},
+            {'id': 'criterion_5', 'label': 'Criterion 5', 'weight': 2,
+             'description': 'Retrieved campaign memory is pertinent, timely, and not contradicted by stronger current evidence.'},
+            {'id': 'criterion_6', 'label': 'Criterion 6', 'weight': 2,
+             'description': 'Cycle and campaign summaries preserve material facts, decisions, unresolved threads, and consequences without invention.'},
+            {'id': 'criterion_7', 'label': 'Criterion 7', 'weight': 2,
+             'description': 'World clocks, deadlines, elapsed time, and triggered consequences align with recorded state and narration.'},
+            {'id': 'criterion_8', 'label': 'Criterion 8', 'weight': 2,
+             'description': 'Transcript, world state, characters, NPCs, clocks, and campaign memory do not materially diverge.'},
+        ]
+        expected_categories = {
+            'criterion_1': 'durable state correctness',
+            'criterion_2': 'safety/private-information handling',
+            'criterion_3': 'durable state correctness',
+            'criterion_4': 'durable state correctness',
+            'criterion_5': 'retrieval or memory use',
+            'criterion_6': 'retrieval or memory use',
+            'criterion_7': 'durable state correctness',
+            'criterion_8': 'durable state correctness',
+        }
         with app.app_context():
             from models import AutomationScorecardTemplate
-            legacy = AutomationScorecardTemplate(
+            scorebook = AutomationScorecardTemplate(
                 user_id=self.owner_id,
                 name='Memory Audit Scorebook',
-                criteria_json=[
-                    {'id': f'criterion_{index}', 'label': f'Criterion {index}', 'weight': 2}
-                    for index in range(1, 9)
-                ],
+                criteria_json=[dict(criterion) for criterion in deployed_criteria],
                 defaults_json={},
             )
-            db.session.add(legacy)
+            # An unrelated legacy template with a generic id must NOT be assigned a
+            # fabricated category; it stays invalid instead of getting a wrong one.
+            unrelated = AutomationScorecardTemplate(
+                user_id=self.owner_id,
+                name='Unrelated Legacy',
+                criteria_json=[{'id': 'generic_probe', 'label': 'Generic Probe', 'weight': 2}],
+                defaults_json={},
+            )
+            db.session.add_all([scorebook, unrelated])
             db.session.commit()
-            legacy_id = legacy.id
+            scorebook_id = scorebook.id
+            unrelated_id = unrelated.id
 
         with app.app_context():
             from models import AutomationScorecardTemplate
@@ -5303,25 +5337,22 @@ class AutomationRouteTest(unittest.TestCase):
             # Idempotent: a second pass makes no further changes.
             self.assertEqual(upgrade_legacy_scorecard_template_categories(), 0)
 
-            template = db.session.get(AutomationScorecardTemplate, legacy_id)
-            categories = [criterion['category'] for criterion in template.criteria_json]
-            self.assertEqual(categories, [
-                'durable state correctness',
-                'durable state correctness',
-                'durable state correctness',
-                'retrieval or memory use',
-                'retrieval or memory use',
-                'retrieval or memory use',
-                'safety/private-information handling',
-                'safety/private-information handling',
-            ])
-            self.assertTrue(scorecard_configuration(template.snapshot())['valid'])
-            assert_scorecard_template_activatable(template)
+            scorebook = db.session.get(AutomationScorecardTemplate, scorebook_id)
+            categories = {criterion['id']: criterion['category'] for criterion in scorebook.criteria_json}
+            self.assertEqual(categories, expected_categories)
+            # Descriptions survive the repair untouched.
+            self.assertEqual(scorebook.criteria_json[1]['description'], deployed_criteria[1]['description'])
+            self.assertTrue(scorecard_configuration(scorebook.snapshot())['valid'])
+            assert_scorecard_template_activatable(scorebook)
+
+            unrelated = db.session.get(AutomationScorecardTemplate, unrelated_id)
+            self.assertIsNone(unrelated.criteria_json[0].get('category'))
+            self.assertFalse(scorecard_configuration(unrelated.snapshot())['valid'])
 
         ok = self.client.post(
             '/api/automation/scenarios',
             headers=self.headers,
-            json={'source_campaign_id': self.campaign_id, 'scorecard_template_id': legacy_id},
+            json={'source_campaign_id': self.campaign_id, 'scorecard_template_id': scorebook_id},
         )
         self.assertEqual(ok.status_code, 201)
 

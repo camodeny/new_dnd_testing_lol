@@ -295,33 +295,37 @@ def assert_scorecard_template_activatable(template):
         )
 
 
-MEMORY_AUDIT_SCOREBOOK_CATEGORY_SEQUENCE = (
-    "durable state correctness",
-    "durable state correctness",
-    "durable state correctness",
-    "retrieval or memory use",
-    "retrieval or memory use",
-    "retrieval or memory use",
-    "safety/private-information handling",
-    "safety/private-information handling",
-)
+MEMORY_AUDIT_SCOREBOOK_NAME = 'Memory Audit Scorebook'
+
+# The deployed pre-v2 Memory Audit Scorebook stored its criteria under generic
+# ids (``criterion_1``..``criterion_8``) with real descriptions but no category.
+# Each maps to the canonical category matching its stored description semantics.
+MEMORY_AUDIT_SCOREBOOK_CATEGORY_MAP = {
+    'criterion_1': 'durable state correctness',
+    'criterion_2': 'safety/private-information handling',
+    'criterion_3': 'durable state correctness',
+    'criterion_4': 'durable state correctness',
+    'criterion_5': 'retrieval or memory use',
+    'criterion_6': 'retrieval or memory use',
+    'criterion_7': 'durable state correctness',
+    'criterion_8': 'durable state correctness',
+}
 
 
-def legacy_criterion_category(criterion, position):
-    """Deterministic canonical category for a legacy stored criterion.
+def legacy_criterion_category(criterion, template_name=None):
+    """Canonical category for a legacy stored criterion, without guessing.
 
-    Prefers semantic inference from the criterion id/label. Generic or
-    unlabeled legacy criteria (for example the pre-v2 Memory Audit Scorebook's
-    ``criterion_1``..``criterion_8``) map positionally across the memory-audit
-    categories: durable state correctness, retrieval or memory use, and
-    safety/private-information handling.
+    Semantic categories are inferred from the criterion id/label. The named
+    Memory Audit Scorebook falls back to an explicit per-criterion mapping based
+    on its real stored descriptions. Generic criteria in unrelated templates
+    are left unchanged rather than assigned a fabricated category.
     """
     inferred = get_criterion_category(criterion)
     if inferred != UNCATEGORIZED_CATEGORY:
         return inferred
-    return MEMORY_AUDIT_SCOREBOOK_CATEGORY_SEQUENCE[
-        (position - 1) % len(MEMORY_AUDIT_SCOREBOOK_CATEGORY_SEQUENCE)
-    ]
+    if template_name == MEMORY_AUDIT_SCOREBOOK_NAME:
+        return MEMORY_AUDIT_SCOREBOOK_CATEGORY_MAP.get(criterion.get('id'))
+    return None
 
 
 def upgrade_legacy_scorecard_template_categories():
@@ -329,9 +333,11 @@ def upgrade_legacy_scorecard_template_categories():
 
     Templates created before category validation existed may carry criteria
     with missing or invalid ``category`` values. This one-time repair assigns a
-    canonical category to each so active templates stay activatable under the
-    strict validator instead of being rejected or scored as ``uncategorized``.
-    Historical run snapshots are intentionally left untouched.
+    canonical category so active templates stay activatable under the strict
+    validator instead of being rejected or scored as ``uncategorized``. Only
+    semantically sound categories are assigned (inference or the explicit
+    Memory Audit Scorebook mapping); unrelated generic criteria are left
+    untouched. Historical run snapshots are intentionally left untouched.
     """
     upgraded = 0
     templates = AutomationScorecardTemplate.query.order_by(AutomationScorecardTemplate.id.asc()).all()
@@ -343,8 +349,11 @@ def upgrade_legacy_scorecard_template_categories():
                 continue
             if criterion.get('category') and normalize_criterion_category(criterion.get('category')):
                 continue
+            category = legacy_criterion_category(criterion, template_name=template.name)
+            if not category:
+                continue
             updated = dict(criterion)
-            updated['category'] = legacy_criterion_category(criterion, index + 1)
+            updated['category'] = category
             criteria[index] = updated
             changed = True
         if changed:
