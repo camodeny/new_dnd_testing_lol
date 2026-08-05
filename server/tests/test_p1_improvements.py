@@ -1323,7 +1323,7 @@ class P1ImprovementsTest(unittest.TestCase):
             for e in registry_entries
         ), 'Registry entries should preserve evidence')
 
-    def test_evidence_status_unsupported_vs_supported(self):
+    def test_compiled_fact_evidence_status_matrix(self):
         memory_context = {
             'campaign_id': self.campaign.id,
             'source_player_message_id': 1,
@@ -1332,35 +1332,60 @@ class P1ImprovementsTest(unittest.TestCase):
         db.session.add(self.world)
         db.session.commit()
 
-        resolved_unsupported = {
-            'upsert_graph_facts': [
+        cases = [
+            (
+                'An unverified claim.',
                 {
-                    'text': 'An unverified claim.',
-                    'provenance': {
                         'evidence_basis': [],
                         'evidence_status': 'insufficiently_supported',
-                    },
-                }
-            ],
-        }
-        compiled_unsupported = compile_staged_memory_patch(memory_context, {}, resolved_unsupported)
-        fact_unsupported = compiled_unsupported['upsert_graph_facts'][0]
-        self.assertEqual(fact_unsupported['provenance']['evidence_status'], 'insufficiently_supported')
-
-        resolved_supported = {
-            'upsert_graph_facts': [
+                },
+                'insufficiently_supported',
+            ),
+            (
+                'A verified claim.',
                 {
-                    'text': 'A verified claim.',
-                    'provenance': {
                         'evidence_basis': ['Transcript says verified claim.'],
                         'evidence_status': 'supported_by_evidence',
-                    },
-                }
-            ],
-        }
-        compiled_supported = compile_staged_memory_patch(memory_context, {}, resolved_supported)
-        fact_supported = compiled_supported['upsert_graph_facts'][0]
-        self.assertEqual(fact_supported['provenance']['evidence_status'], 'supported_by_evidence')
+                },
+                'supported_by_evidence',
+            ),
+            (
+                'A contradicted claim.',
+                {
+                    'evidence_status': 'contradicted',
+                    'evidence_basis': ['Earlier evidence contradicts this.'],
+                },
+                'contradicted',
+            ),
+            ('A claim with no provenance at all.', None, 'insufficiently_supported'),
+            (
+                'Rule-derived: damage reduces HP by 5.',
+                {
+                    'is_rule_derived': True,
+                    'evidence_sources': [{
+                        'source_type': 'deterministic_rule',
+                        'source_id': 'dnd_damage_rules',
+                    }],
+                },
+                'supported_by_rules',
+            ),
+        ]
+        for text, provenance, expected_status in cases:
+            with self.subTest(expected_status=expected_status):
+                fact = {'text': text}
+                if provenance is not None:
+                    fact['provenance'] = provenance
+                compiled = compile_staged_memory_patch(
+                    memory_context,
+                    {},
+                    {'upsert_graph_facts': [fact]},
+                )
+                compiled_provenance = compiled['upsert_graph_facts'][0]['provenance']
+                self.assertEqual(
+                    compiled_provenance['evidence_status'],
+                    expected_status,
+                )
+                self.assertTrue(compiled_provenance['build_sha'])
 
     def test_graph_entity_provenance_persists_in_memory_log(self):
         from models import CampaignMemoryLog
@@ -1591,68 +1616,6 @@ class P1ImprovementsTest(unittest.TestCase):
         self.assertEqual(retire_prov['evidence_status'], 'insufficiently_supported')
         self.assertTrue(retire_prov['build_sha'])
 
-    def test_contradicted_evidence_status_in_provenance(self):
-        memory_context = {
-            'campaign_id': self.campaign.id,
-            'source_player_message_id': 1,
-        }
-
-        resolved = {
-            'upsert_graph_facts': [
-                {
-                    'text': 'A contradicted claim.',
-                    'provenance': {
-                        'evidence_status': 'contradicted',
-                        'evidence_basis': ['Earlier evidence contradicts this.'],
-                    },
-                }
-            ],
-        }
-        compiled = compile_staged_memory_patch(memory_context, {}, resolved)
-        fact = compiled['upsert_graph_facts'][0]
-        self.assertEqual(fact['provenance']['evidence_status'], 'contradicted')
-
-    def test_default_evidence_is_insufficiently_supported(self):
-        memory_context = {
-            'campaign_id': self.campaign.id,
-            'source_player_message_id': 1,
-        }
-
-        resolved = {
-            'upsert_graph_facts': [
-                {
-                    'text': 'A claim with no provenance at all.',
-                }
-            ],
-        }
-        compiled = compile_staged_memory_patch(memory_context, {}, resolved)
-        fact = compiled['upsert_graph_facts'][0]
-        self.assertEqual(
-            fact['provenance']['evidence_status'],
-            'insufficiently_supported',
-        )
-
-    def test_build_sha_included_in_provenance(self):
-        memory_context = {
-            'campaign_id': self.campaign.id,
-            'source_player_message_id': 1,
-        }
-        resolved = {
-            'upsert_graph_facts': [
-                {
-                    'text': 'Test fact for build sha.',
-                    'provenance': {
-                        'evidence_basis': ['Transcript evidence'],
-                        'evidence_status': 'supported_by_evidence',
-                    },
-                }
-            ],
-        }
-        compiled = compile_staged_memory_patch(memory_context, {}, resolved)
-        fact = compiled['upsert_graph_facts'][0]
-        self.assertIn('build_sha', fact['provenance'])
-        self.assertIsNotNone(fact['provenance']['build_sha'])
-
     def test_cycle_evidence_packet_includes_memory_logs(self):
         from services.automation_auditor import _cycle_evidence_packet
         from models import AutomationRunAuditCycle
@@ -1684,28 +1647,6 @@ class P1ImprovementsTest(unittest.TestCase):
         self.assertIn('memory_log_summary', packet)
         self.assertGreater(len(packet['recent_memory_logs']), 0)
         self.assertGreater(packet['memory_log_summary']['total_returned'], 0)
-
-    def test_rule_derived_evidence_classified_as_supported_by_rules(self):
-        memory_context = {
-            'campaign_id': self.campaign.id,
-            'source_player_message_id': 1,
-        }
-        resolved = {
-            'upsert_graph_facts': [
-                {
-                    'text': 'Rule-derived: damage reduces HP by 5.',
-                    'provenance': {
-                        'is_rule_derived': True,
-                        'evidence_sources': [
-                            {'source_type': 'deterministic_rule', 'source_id': 'dnd_damage_rules'}
-                        ],
-                    },
-                }
-            ],
-        }
-        compiled = compile_staged_memory_patch(memory_context, {}, resolved)
-        fact = compiled['upsert_graph_facts'][0]
-        self.assertEqual(fact['provenance']['evidence_status'], 'supported_by_rules')
 
     def test_scene_location_change_provenance_in_memory_log(self):
         from models import CampaignMemoryLog, SessionMessage

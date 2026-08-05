@@ -129,6 +129,8 @@ DEFAULT_PROVISIONING_LEASE_SECONDS = 300
 CLAIMABLE_ACTIVE_STATUSES = {'claimed', 'running', 'stop_requested', 'reconciling'}
 AUDIT_READY_STATUSES = {'audited', 'skipped'}
 CUSTOM_SCORECARD_STATUS_ORDER = ('pass', 'warn', 'fail', 'not_assessed', 'not_applicable')
+SCORECARD_SCORING_MODEL = 'cycle_assessment_v2'
+SCORECARD_STATUS_VALUES = {'pass': 1.0, 'warn': 0.5, 'fail': 0.0}
 DEFAULT_RETENTION_POLICY = {
     'retention_days': 14,
     'keep_recent_runs': 5,
@@ -314,6 +316,88 @@ def _aggregate_custom_scorecard_statuses(statuses, default='warn'):
         return 'not_applicable'
         
     return default
+
+
+def _score_ratio(numerator, denominator):
+    if denominator <= 0:
+        return None
+    score = round(numerator / denominator, 4)
+    if numerator < denominator and score >= 1.0:
+        return 0.9999
+    return score
+
+
+def _scoring_summary(statuses, *, weight=1):
+    normalized = [
+        _normalize_custom_scorecard_status(status)
+        for status in statuses
+        if status
+    ]
+    weight = max(1, _safe_int(weight, 1))
+    assessed = [status for status in normalized if status in SCORECARD_STATUS_VALUES]
+    not_assessed_count = normalized.count('not_assessed')
+    not_applicable_count = normalized.count('not_applicable')
+    assessment_numerator = sum(SCORECARD_STATUS_VALUES[status] for status in assessed)
+    assessment_denominator = len(assessed)
+    performance_score = _score_ratio(assessment_numerator, assessment_denominator)
+    numerator = assessment_numerator * weight
+    denominator = assessment_denominator * weight
+    applicable_assessment_count = len(assessed) + not_assessed_count
+    completeness = (
+        round(len(assessed) / applicable_assessment_count, 4)
+        if applicable_assessment_count
+        else None
+    )
+    return {
+        'performance_score': performance_score,
+        'score_numerator': round(numerator, 4),
+        'score_denominator': denominator,
+        'assessment_numerator': round(assessment_numerator, 4),
+        'assessment_denominator': assessment_denominator,
+        'assessment_count': len(assessed),
+        'applicable_assessment_count': applicable_assessment_count,
+        'not_assessed_count': not_assessed_count,
+        'not_applicable_count': not_applicable_count,
+        'completeness': completeness,
+    }
+
+
+def _combine_scoring_summaries(summaries):
+    summaries = [summary for summary in summaries if isinstance(summary, dict)]
+    numerator = sum(float(summary.get('score_numerator') or 0) for summary in summaries)
+    denominator = sum(float(summary.get('score_denominator') or 0) for summary in summaries)
+    assessment_numerator = sum(
+        float(summary.get('assessment_numerator') or 0)
+        for summary in summaries
+    )
+    assessment_denominator = sum(
+        _safe_int(summary.get('assessment_denominator'))
+        for summary in summaries
+    )
+    assessment_count = sum(_safe_int(summary.get('assessment_count')) for summary in summaries)
+    applicable_assessment_count = sum(
+        _safe_int(summary.get('applicable_assessment_count'))
+        for summary in summaries
+    )
+    not_assessed_count = sum(_safe_int(summary.get('not_assessed_count')) for summary in summaries)
+    not_applicable_count = sum(_safe_int(summary.get('not_applicable_count')) for summary in summaries)
+    completeness = (
+        round(assessment_count / applicable_assessment_count, 4)
+        if applicable_assessment_count
+        else None
+    )
+    return {
+        'performance_score': _score_ratio(numerator, denominator),
+        'score_numerator': round(numerator, 4),
+        'score_denominator': round(denominator, 4),
+        'assessment_numerator': round(assessment_numerator, 4),
+        'assessment_denominator': assessment_denominator,
+        'assessment_count': assessment_count,
+        'applicable_assessment_count': applicable_assessment_count,
+        'not_assessed_count': not_assessed_count,
+        'not_applicable_count': not_applicable_count,
+        'completeness': completeness,
+    }
 
 
 def _utcnow():
@@ -2372,31 +2456,85 @@ def custom_scorecard_results(run, cycle_rows):
         return []
 
     by_criterion = {criterion['id']: [] for criterion in criteria}
-    for cycle in cycle_rows:
-        if cycle.status != 'audited':
-            continue
+    eligible_cycles = [cycle for cycle in cycle_rows if cycle.status != 'skipped']
+    for cycle in eligible_cycles:
+        cycle_results = {}
         for result in _json_list((cycle.scorecard_json or {}).get('criteria'), []):
             if not isinstance(result, dict):
                 continue
             criterion_id = _normalize_identifier(result.get('criterion_id') or result.get('id'))
             if criterion_id in by_criterion:
-                by_criterion[criterion_id].append({
+                applicability = _json_object(result.get('applicability'), {})
+                applicable = _parse_strict_bool(
+                    applicability.get('applicable'),
+                    True,
+                )
+                normalized_status = _normalize_custom_scorecard_status(result.get('status'))
+                if normalized_status == 'not_applicable' or not applicable:
+                    normalized_status = 'not_applicable'
+                    applicable = False
+                normalized_result = {
                     'cycle_number': cycle.cycle_number,
                     'phase': cycle.phase,
-                    'status': _normalize_custom_scorecard_status(result.get('status')),
+                    'cycle_status': cycle.status,
+                    'status': normalized_status,
                     'summary': result.get('summary'),
                     'evidence': result.get('evidence'),
                     'evidence_refs': _json_list(result.get('evidence_refs'), []),
-                    'applicability': _json_object(result.get('applicability'), {}),
-                })
+                    'applicability': {
+                        **applicability,
+                        'applicable': applicable,
+                    },
+                    'source': 'recorded',
+                }
+                existing = cycle_results.get(criterion_id)
+                if existing is None:
+                    cycle_results[criterion_id] = normalized_result
+                else:
+                    duplicate_statuses = [
+                        existing.get('status'),
+                        normalized_result.get('status'),
+                    ]
+                    applicable_statuses = [
+                        status
+                        for status in duplicate_statuses
+                        if status != 'not_applicable'
+                    ]
+                    if applicable_statuses:
+                        existing['status'] = _aggregate_custom_scorecard_statuses(
+                            applicable_statuses,
+                            default='not_assessed',
+                        )
+                        existing['applicability']['applicable'] = True
+                    else:
+                        existing['status'] = 'not_applicable'
+                        existing['applicability']['applicable'] = False
+                    existing['duplicate_result_count'] = (
+                        _safe_int(existing.get('duplicate_result_count')) + 1
+                    )
+        for criterion in criteria:
+            criterion_id = criterion['id']
+            assessment = cycle_results.get(criterion_id)
+            if assessment is None:
+                assessment = {
+                    'cycle_number': cycle.cycle_number,
+                    'phase': cycle.phase,
+                    'cycle_status': cycle.status,
+                    'status': 'not_assessed',
+                    'summary': 'No assessment recorded for this criterion in this cycle.',
+                    'evidence': None,
+                    'evidence_refs': [],
+                    'applicability': {'applicable': True},
+                    'source': 'missing',
+                }
+            by_criterion[criterion_id].append(assessment)
 
     rows = []
     for criterion in criteria:
         criterion_id = criterion['id']
         assessments = by_criterion.get(criterion_id) or []
         weight = max(1, _safe_int(criterion.get('weight'), 2))
-        
-        # If there are no assessments, it defaults to not_assessed
+
         if not assessments:
             status = 'not_assessed'
             summary = 'No custom audit feedback recorded for this criterion.'
@@ -2404,54 +2542,72 @@ def custom_scorecard_results(run, cycle_rows):
             exercised_count = 0
             not_assessed_applicable_count = 0
             na_count = 0
+            missing_assessment_count = 0
         else:
             applicable_assessments = [
                 item for item in assessments
                 if item.get('status') != 'not_applicable' and item.get('applicability', {}).get('applicable', True)
             ]
-            
+
             counts = Counter(item['status'] for item in assessments if item.get('status') in CUSTOM_SCORECARD_STATUS_ORDER)
             na_count = sum(
                 1 for item in assessments
                 if item.get('status') == 'not_applicable' or (item.get('status') == 'not_assessed' and not item.get('applicability', {}).get('applicable', True))
             )
             not_assessed_applicable_count = sum(1 for item in assessments if item.get('status') == 'not_assessed' and item.get('applicability', {}).get('applicable', True))
-            
+            missing_assessment_count = sum(
+                1 for item in assessments
+                if item.get('source') == 'missing'
+            )
             exercised_count = counts.get('pass', 0) + counts.get('warn', 0) + counts.get('fail', 0)
-            
-            # If there are only N/A assessments for this criterion across cycles:
-            if not applicable_assessments:
-                status = 'not_applicable'
+
+            exercised_statuses = [
+                item.get('status')
+                for item in applicable_assessments
+                if item.get('status') in SCORECARD_STATUS_VALUES
+            ]
+            if exercised_statuses:
+                status = _aggregate_custom_scorecard_statuses(exercised_statuses, default='warn')
+            elif not_assessed_applicable_count:
+                status = 'not_assessed'
             else:
-                status = _aggregate_custom_scorecard_statuses([item.get('status') for item in applicable_assessments], default='warn')
-                
+                status = 'not_applicable'
+
             summary = (
                 f'{counts.get("pass", 0)} pass, '
                 f'{counts.get("warn", 0)} warn, '
                 f'{counts.get("fail", 0)} fail, '
                 f'{not_assessed_applicable_count} not_assessed, '
-                f'{na_count} not_applicable across {len(assessments)} audited cycle(s); '
+                f'{na_count} not_applicable across {len(eligible_cycles)} audit cycle(s); '
                 f'exercised in {exercised_count} cycle(s).'
             )
-            
+
+        scoring = _scoring_summary(
+            [item.get('status') for item in assessments],
+            weight=weight,
+        )
         rows.append({
             'check_id': f'custom:{criterion_id}',
             'status': status,
             'summary': summary,
             'details': {
                 'metric': f'custom:{criterion_id}',
-                'metric_value': STATUS_RANK.get(status, 0),
+                'metric_value': scoring['performance_score'],
                 'weight': weight,
                 'thresholds': {},
                 'better_direction': criterion.get('better_direction') or 'higher',
                 'criterion': criterion,
-                'counts': counts,
+                'counts': dict(counts),
                 'aggregate_status': status,
+                'severity': status,
                 'exercised_cycle_count': exercised_count,
                 'not_assessed_cycle_count': not_assessed_applicable_count,
                 'not_applicable_cycle_count': na_count,
+                'missing_assessment_count': missing_assessment_count,
+                'eligible_cycle_count': len(eligible_cycles),
                 'assessments': assessments,
                 'template_name': template.get('name'),
+                **scoring,
             },
         })
     return rows
@@ -2477,11 +2633,23 @@ def baseline_comparison_for_run(run, results):
         current_value = (result.details_json or {}).get('metric_value')
         baseline_value = (baseline_result.details_json or {}).get('metric_value')
         direction = (result.details_json or {}).get('better_direction')
-        relationship = compare_check_values(baseline_value, current_value, direction)
+        baseline_performance = (baseline_result.details_json or {}).get('performance_score')
+        current_performance = (result.details_json or {}).get('performance_score')
+        performance_relationship = compare_check_values(
+            baseline_performance,
+            current_performance,
+            'higher',
+        )
+        severity_relationship = 'unchanged'
         if STATUS_RANK.get(result.status, 0) > STATUS_RANK.get(baseline_result.status, 0):
-            relationship = 'better'
+            severity_relationship = 'better'
         elif STATUS_RANK.get(result.status, 0) < STATUS_RANK.get(baseline_result.status, 0):
-            relationship = 'worse'
+            severity_relationship = 'worse'
+        relationship = severity_relationship
+        if relationship == 'unchanged':
+            relationship = performance_relationship
+        if relationship == 'unchanged':
+            relationship = compare_check_values(baseline_value, current_value, direction)
         if relationship == 'better':
             better += 1
         elif relationship == 'worse':
@@ -2493,6 +2661,12 @@ def baseline_comparison_for_run(run, results):
             'relationship': relationship,
             'baseline_status': baseline_result.status,
             'current_status': result.status,
+            'baseline_severity': baseline_result.status,
+            'current_severity': result.status,
+            'severity_relationship': severity_relationship,
+            'baseline_performance_score': baseline_performance,
+            'current_performance_score': current_performance,
+            'performance_relationship': performance_relationship,
             'baseline_value': baseline_value,
             'current_value': current_value,
         })
@@ -2518,6 +2692,7 @@ def refresh_run_scorecard(run):
         metric_value = metrics.get(metric_key)
         status = _evaluate_check(metric_value, check)
         weight = max(1, _safe_int(check.get('weight'), 1))
+        scoring = _scoring_summary([status], weight=weight)
         check_category = get_criterion_category(check)
         summary_template = check.get('summary_template') or '{id}: {value}'
         results_payload.append({
@@ -2538,6 +2713,8 @@ def refresh_run_scorecard(run):
                     'fail_values': check.get('fail_values'),
                 },
                 'better_direction': check.get('better_direction'),
+                'severity': status,
+                **scoring,
             },
         })
 
@@ -2553,30 +2730,17 @@ def refresh_run_scorecard(run):
     warn_count = sum(1 for check in results_payload if check['status'] == 'warn')
     pass_count = sum(1 for check in results_payload if check['status'] == 'pass')
     not_assessed_count = sum(1 for check in results_payload if check['status'] == 'not_assessed')
-    not_applicable_count = sum(1 for check in results_payload if check['status'] == 'not_applicable')
-
-    weighted_total = 0
-    weighted_pass = 0
-    for check in results_payload:
-        status = check['status']
-        weight = max(1, _safe_int(check['details'].get('weight'), 1))
-        if status == 'pass':
-            weighted_total += weight
-            weighted_pass += weight
-        elif status == 'warn':
-            weighted_total += weight
-            weighted_pass += 0.5 * weight
-        elif status == 'fail':
-            weighted_total += weight
-            weighted_pass += 0.0 * weight
 
     assessment_present = bool(metrics.get('completed_turns') or metrics.get('audited_cycle_count'))
-    if not assessment_present or weighted_total == 0:
-        weighted_score = None
-    else:
-        weighted_score = round(weighted_pass / weighted_total, 4)
-        if weighted_pass < weighted_total and weighted_score >= 1.0:
-            weighted_score = 0.9999
+    scoring = _combine_scoring_summaries(
+        [
+            check.get('details') or {}
+            for check in results_payload
+            if assessment_present or str(check.get('check_id') or '').startswith('custom:')
+        ]
+    )
+    if not assessment_present:
+        scoring['performance_score'] = None
 
     if not assessment_present:
         overall_status = 'not_assessed'
@@ -2602,37 +2766,40 @@ def refresh_run_scorecard(run):
         if not cat_checks:
             category_breakdown[cat] = {
                 'status': 'not_applicable',
-                'score': None
+                'severity': 'not_applicable',
+                'score': None,
+                **_combine_scoring_summaries([]),
             }
         else:
-            cat_statuses = [c['status'] for c in cat_checks]
-            cat_status = _aggregate_custom_scorecard_statuses(cat_statuses, default='not_assessed')
-            
-            w_total_cat = 0
-            w_pass_cat = 0
-            for c in cat_checks:
-                status = c['status']
-                weight = max(1, _safe_int(c['details'].get('weight'), 1))
-                if status == 'pass':
-                    w_total_cat += weight
-                    w_pass_cat += weight
-                elif status == 'warn':
-                    w_total_cat += weight
-                    w_pass_cat += 0.5 * weight
-                elif status == 'fail':
-                    w_total_cat += weight
-                    w_pass_cat += 0.0 * weight
-                    
-            if w_total_cat > 0:
-                cat_score = round(w_pass_cat / w_total_cat, 4)
-                if w_pass_cat < w_total_cat and cat_score >= 1.0:
-                    cat_score = 0.9999
+            category_scoring_checks = [
+                c
+                for c in cat_checks
+                if assessment_present or str(c.get('check_id') or '').startswith('custom:')
+            ]
+            scored_statuses = [
+                c['status']
+                for c in category_scoring_checks
+                if c['status'] in SCORECARD_STATUS_VALUES
+            ]
+            if scored_statuses:
+                cat_status = _aggregate_custom_scorecard_statuses(
+                    scored_statuses,
+                    default='not_assessed',
+                )
+            elif any(c['status'] == 'not_assessed' for c in category_scoring_checks):
+                cat_status = 'not_assessed'
+            elif category_scoring_checks:
+                cat_status = 'not_applicable'
             else:
-                cat_score = None
-                
+                cat_status = 'not_assessed'
+            cat_scoring = _combine_scoring_summaries(
+                [c.get('details') or {} for c in category_scoring_checks]
+            )
             category_breakdown[cat] = {
                 'status': cat_status,
-                'score': cat_score
+                'severity': cat_status,
+                'score': cat_scoring['performance_score'],
+                **cat_scoring,
             }
 
     AutomationRunAuditResult.query.filter_by(run_id=run.id).delete()
@@ -2658,8 +2825,11 @@ def refresh_run_scorecard(run):
         'completed_turns': metrics.get('completed_turns', 0),
         'error_count': metrics.get('error_count', 0),
         'audited_cycle_count': metrics.get('audited_cycle_count', 0),
-        'weighted_score': weighted_score,
+        'scoring_model': SCORECARD_SCORING_MODEL,
+        'severity': overall_status,
         'overall_status': overall_status,
+        'weighted_score': scoring['performance_score'],
+        **scoring,
         'incidents': calculate_run_incidents(run, event_rows, audit_rows, provider_rows),
         'custom_scorecard_name': current_scorecard_template_for_run(run).get('name'),
         'scorecard_configuration': scorecard_configuration(current_scorecard_template_for_run(run)),
@@ -2786,7 +2956,16 @@ def workspace_trends_for_user(user_id=None):
             for incident in ((run.scorecard_summary_json or {}).get('incidents') or [])
             if incident.get('incident_type') == 'dm_silence_loop'
         )
-        scores = [_safe_int(((run.scorecard_summary_json or {}).get('weighted_score') or 0) * 1000) for run in completed_like]
+        scores = [
+            _safe_int((
+                (run.scorecard_summary_json or {}).get(
+                    'performance_score',
+                    (run.scorecard_summary_json or {}).get('weighted_score'),
+                )
+                or 0
+            ) * 1000)
+            for run in completed_like
+        ]
         trends.append({
             'scenario_id': scenario.id,
             'scenario_name': scenario.name,

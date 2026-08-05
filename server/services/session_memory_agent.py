@@ -262,6 +262,11 @@ def _location_candidates(campaign, query_terms, limit):
             'location_name': clean_text(entity.get('name'), 160) or None,
             'summary': clean_text(entity.get('summary'), 220) or None,
             'visibility': clean_text(entity.get('visibility'), 40) or None,
+            'identity_status': clean_text(entity.get('identity_status'), 40) or None,
+            'aliases': [
+                clean_text(alias, 160) for alias in entity.get('aliases', [])
+                if clean_text(alias, 160)
+            ] if isinstance(entity.get('aliases', []), list) else [],
         }
         score = _match_score(query_terms, candidate) if query_terms else 1
         if score:
@@ -1294,6 +1299,41 @@ def compile_staged_memory_patch(memory_context, extracted, resolved):
     scene_patch = resolved.get("scene_patch") if isinstance(resolved.get("scene_patch"), dict) else {}
     if not scene_patch:
         scene_patch = extracted.get("scene_patch") if isinstance(extracted.get("scene_patch"), dict) else {}
+    else:
+        scene_patch = dict(scene_patch)
+
+    # The resolver has already read the campaign state and can explicitly bind
+    # a surface form to a durable location. Consume that reference instead of
+    # resolving a generated ID/name pair a second time. This is deliberately
+    # exact matching only: it does not infer aliases from similar strings.
+    resolved_location_refs = resolved.get("resolved_location_refs") if isinstance(resolved.get("resolved_location_refs"), list) else []
+    proposed_location_id = clean_id(scene_patch.get("location_id"), "")
+    proposed_location_name = clean_text(scene_patch.get("location_name"), 160)
+    unresolved_location_decision = None
+    for location_ref in resolved_location_refs:
+        if not isinstance(location_ref, dict):
+            continue
+        canonical_id = clean_id(location_ref.get("canonical_location_id") or location_ref.get("location_id"), "")
+        label = clean_text(location_ref.get("label") or location_ref.get("surface_form") or location_ref.get("location_name"), 160)
+        if not canonical_id or not label:
+            continue
+        if label.lower() not in {proposed_location_id.lower(), proposed_location_name.lower()}:
+            continue
+        decision = clean_text(location_ref.get("resolution"), 40).lower()
+        if decision == "uncertain":
+            unresolved_location_decision = location_ref
+            scene_patch.pop("location_id", None)
+            scene_patch.pop("location_name", None)
+            break
+        if decision != "same":
+            continue
+        scene_patch["location_id"] = canonical_id
+        canonical_name = clean_text(location_ref.get("canonical_location_name"), 160)
+        if canonical_name:
+            scene_patch["location_name"] = canonical_name
+        if location_ref.get("rename_existing") is True:
+            scene_patch["rename_existing"] = True
+        break
     compiled_scene = {}
     from services.scene_location_resolver import resolve_scene_location_patch
     current_scene = hot_context.get("current_scene") if isinstance(hot_context.get("current_scene"), dict) else {}
@@ -1302,10 +1342,85 @@ def compile_staged_memory_patch(memory_context, extracted, resolved):
     resolved_loc = resolve_scene_location_patch(scene_patch, campaign, current_scene)
     loc_status = resolved_loc.get("status", "unresolved") if isinstance(resolved_loc, dict) else "unresolved"
 
+    if unresolved_location_decision:
+        unresolved.append({
+            "kind": "scene_location",
+            "location_id": proposed_location_id,
+            "location_name": proposed_location_name,
+            "reason": "uncertain_provisional_location_identity",
+            "candidate_location_id": clean_id(
+                unresolved_location_decision.get("canonical_location_id") or unresolved_location_decision.get("location_id"),
+                "",
+            ),
+            "provenance": make_provenance(unresolved_location_decision, default_tool="resolve_scene_location_patch"),
+            "resolution_mode": "uncertain",
+        })
+
     if loc_status == "canonical" or loc_status == "direct":
         compiled_scene["location_id"] = resolved_loc["location_id"]
         compiled_scene["location_name"] = resolved_loc["location_name"]
         scene_resolution_mode = "canonical" if loc_status == "canonical" else "direct"
+        if loc_status == "direct" and resolved_loc.get("previous_location_name"):
+            previous_name = resolved_loc["previous_location_name"]
+            location_id = resolved_loc["location_id"]
+            world_payload = _world_payload(campaign)
+            graph = world_payload.get("knowledge_graph", {}) if isinstance(world_payload.get("knowledge_graph"), dict) else {}
+            existing_location = next(
+                (
+                    entity for entity in graph.get("entities", [])
+                    if isinstance(entity, dict) and entity.get("id") == location_id
+                ),
+                {},
+            )
+            persisted_aliases = [
+                clean_text(alias, 160) for alias in existing_location.get("aliases", [])
+                if clean_text(alias, 160)
+            ] if isinstance(existing_location.get("aliases", []), list) else []
+            persisted_summary = clean_text(existing_location.get("summary"), 500) or None
+            persisted_tags = [
+                clean_text(tag, 40) for tag in existing_location.get("tags", [])
+                if clean_text(tag, 40)
+            ] if isinstance(existing_location.get("tags", []), list) else []
+            existing_accepted = next(
+                (entity for entity in accepted_entities if entity.get("id") == location_id),
+                None,
+            )
+            alias_base = existing_accepted.get("aliases", []) if isinstance(existing_accepted and existing_accepted.get("aliases"), list) else persisted_aliases
+            merged_aliases = []
+            seen_aliases = set()
+            for alias in alias_base + [previous_name]:
+                alias_key = alias.casefold()
+                if alias_key not in seen_aliases:
+                    seen_aliases.add(alias_key)
+                    merged_aliases.append(alias)
+            promotion = {
+                "id": location_id,
+                "name": resolved_loc["location_name"],
+                "type": "location",
+                "aliases": merged_aliases,
+                "identity_status": "canonical",
+                "visibility": "party_known",
+                "certainty": "confirmed",
+                "importance": 3,
+                "expires_or_retire_condition": None,
+                "reason": "Promoted a provisional location to its revealed canonical name.",
+                "memory_type": "location",
+                "provenance": make_provenance(scene_patch, default_tool="resolve_scene_location_patch"),
+                "resolution_mode": "promote_provisional_location",
+            }
+            if existing_accepted is not None:
+                existing_accepted.update({
+                    key: value for key, value in promotion.items()
+                    if value not in (None, "", [])
+                })
+                if not existing_accepted.get("summary"):
+                    existing_accepted["summary"] = persisted_summary
+                if not existing_accepted.get("tags"):
+                    existing_accepted["tags"] = persisted_tags
+            else:
+                promotion["summary"] = persisted_summary
+                promotion["tags"] = persisted_tags
+                accepted_entities.append(promotion)
 
     elif loc_status == "new":
         new_loc_id = resolved_loc.get("location_id") or allocate_durable_id(
@@ -1333,6 +1448,7 @@ def compile_staged_memory_patch(memory_context, extracted, resolved):
             "expires_or_retire_condition": None,
             "reason": "New location created from scene patch.",
             "memory_type": "location",
+            "identity_status": "provisional",
             "provenance": make_provenance(scene_patch, default_tool="resolve_scene_location_patch"),
             "resolution_mode": "create_new",
         })

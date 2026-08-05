@@ -22,6 +22,8 @@ def dm_turn_post_turn_resolved(status_dict):
     post_turn = str(status_dict.get('post_turn_status') or '').strip().lower()
     if post_turn in {'complete', 'error'}:
         return True
+    if post_turn:
+        return False
 
     if 'post_turn_complete' in status_dict:
         return bool(status_dict.get('post_turn_complete'))

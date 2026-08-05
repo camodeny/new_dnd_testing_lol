@@ -192,9 +192,15 @@ class StreamManagerTest(unittest.TestCase):
         self.assertIsNotNone(latest_worker)
         self.assertEqual(latest_worker.player_message_id, 2)
 
+    @patch('routes.sessions._run_session_memory_update')
     @patch('services.stream_manager.get_session_dm_response_with_tools')
     @patch('services.stream_manager.SessionGeneratorWorker._run_dynamic_summarization')
-    def test_execute_dm_turn_success(self, mock_summarize, mock_get_dm_response):
+    def test_execute_dm_turn_success(
+        self,
+        mock_summarize,
+        mock_get_dm_response,
+        mock_memory_update,
+    ):
         mock_get_dm_response.return_value = {
             "mode": "speak",
             "content": "Greetings traveller!",
@@ -254,6 +260,7 @@ class StreamManagerTest(unittest.TestCase):
         msg = SessionMessage.query.filter_by(session_id=self.session.id, role='dm').first()
         self.assertIsNotNone(msg)
         self.assertEqual(msg.content, "Greetings traveller!")
+        mock_memory_update.assert_called_once()
 
 if __name__ == '__main__':
     unittest.main()
