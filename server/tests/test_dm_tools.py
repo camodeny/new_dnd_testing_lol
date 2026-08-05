@@ -198,8 +198,8 @@ class DmToolsTest(unittest.TestCase):
             dm_private=json.dumps({
                 'hidden_factions': ['Crimson Veil'],
                 'authorized_rules': [
-                    {'id': 'decoding_rule_v1', 'description': 'Decodes the cipher deterministically.'},
-                    {'id': 'festival_end_rule_v1', 'description': 'Ends the festival on schedule.'},
+                    {'id': 'decoding_rule_v1', 'description': 'A deterministic rule decoded the cipher.'},
+                    {'id': 'festival_end_rule_v1', 'description': 'The festival concludes with a grand parade that is safe to announce publicly.'},
                     {'id': 'pact_rule_v1', 'description': 'Seals the pact behind the scenes.'},
                     {'id': 'component_clue_found', 'description': 'The deterministic clue trigger matched.'},
                 ],
@@ -6738,6 +6738,209 @@ class DmToolsTest(unittest.TestCase):
             },
             audit_context={
                 'trace_id': 'unrelated-overlap-trace',
+                'source_player_message_id': 101,
+                'source_dm_message_id': 102,
+            },
+        )
+        db.session.commit()
+
+        self.assertNotEqual(result['errors'], [])
+        clock = CampaignClock.query.filter_by(campaign_id=self.campaign.id, clock_id='identify_saboteur').one()
+        self.assertEqual(clock.status, 'completion_pending')
+        self.assertEqual(WorldEvent.query.filter_by(campaign_id=self.campaign.id, event_type='clock_retired').count(), 0)
+
+    def test_completion_criteria_reject_mismatched_authorized_rule_for_criterion(self):
+        db.session.add(CampaignClock(
+            campaign_id=self.campaign.id,
+            clock_id='identify_saboteur',
+            name='Identify the Saboteur',
+            segments=4,
+            filled=4,
+            status='completion_pending',
+            completion_criteria=[
+                {'id': 'named_suspect', 'description': 'Visible evidence names Garret as the saboteur at the docks.'},
+            ],
+        ))
+        db.session.commit()
+
+        result = apply_clock_adjudication(
+            self.campaign,
+            {
+                'create_clocks': [],
+                'advance_clocks': [],
+                'retire_clocks': [{
+                    'clock_id': 'identify_saboteur',
+                    'reason': 'The party knows the saboteur.',
+                    'completion_criteria_met': [{
+                        'criterion_id': 'named_suspect',
+                        'evidence_sources': [
+                            {'source_type': 'deterministic_rule', 'source_id': 'festival_end_rule_v1'},
+                        ],
+                    }],
+                }],
+                'no_change_explanations': [],
+            },
+            audit_context={
+                'trace_id': 'mismatched-rule-criterion-trace',
+                'source_player_message_id': 101,
+                'source_dm_message_id': 102,
+            },
+        )
+        db.session.commit()
+
+        self.assertNotEqual(result['errors'], [])
+        clock = CampaignClock.query.filter_by(campaign_id=self.campaign.id, clock_id='identify_saboteur').one()
+        self.assertEqual(clock.status, 'completion_pending')
+        self.assertEqual(WorldEvent.query.filter_by(campaign_id=self.campaign.id, event_type='clock_retired').count(), 0)
+
+    def test_completion_criteria_reject_mismatched_authorized_rule_for_consequence(self):
+        db.session.add(CampaignClock(
+            campaign_id=self.campaign.id,
+            clock_id='identify_saboteur',
+            name='Identify the Saboteur',
+            segments=4,
+            filled=4,
+            status='completion_pending',
+            visibility='party_known',
+            completion_criteria=[
+                {'id': 'named_suspect', 'description': 'Visible evidence identifies a specific suspect.'},
+            ],
+        ))
+        db.session.commit()
+        self._add_session_message(101, 'The DM names the suspect Garret in the visible reply.')
+
+        result = apply_clock_adjudication(
+            self.campaign,
+            {
+                'create_clocks': [],
+                'advance_clocks': [],
+                'retire_clocks': [{
+                    'clock_id': 'identify_saboteur',
+                    'reason': 'The party knows the suspect.',
+                    'completion_criteria_met': [{
+                        'criterion_id': 'named_suspect',
+                        'evidence_sources': [
+                            {'source_type': 'transcript_message', 'source_id': '101', 'description': 'The DM named Garret as the suspect.'},
+                        ],
+                    }],
+                    'consequence': {
+                        'text': 'The party knows Garret is the saboteur at the docks.',
+                        'visibility': 'party_known',
+                        'evidence_sources': [
+                            {'source_type': 'deterministic_rule', 'source_id': 'festival_end_rule_v1'},
+                        ],
+                    },
+                }],
+                'no_change_explanations': [],
+            },
+            audit_context={
+                'trace_id': 'mismatched-rule-consequence-trace',
+                'source_player_message_id': 101,
+                'source_dm_message_id': 102,
+            },
+        )
+        db.session.commit()
+
+        self.assertNotEqual(result['errors'], [])
+        clock = CampaignClock.query.filter_by(campaign_id=self.campaign.id, clock_id='identify_saboteur').one()
+        self.assertEqual(clock.status, 'completion_pending')
+        self.assertEqual(WorldEvent.query.filter_by(campaign_id=self.campaign.id, event_type='clock_retired').count(), 0)
+
+    def test_completion_criteria_reject_intervening_word_negation(self):
+        db.session.add(CampaignClock(
+            campaign_id=self.campaign.id,
+            clock_id='identify_saboteur',
+            name='Identify the Saboteur',
+            segments=4,
+            filled=4,
+            status='completion_pending',
+            visibility='party_known',
+            completion_criteria=[
+                {'id': 'located_garret', 'description': 'Visible evidence establishes Garret is at the docks.'},
+            ],
+        ))
+        db.session.commit()
+        self._add_session_message(101, 'Garret is not at the docks.')
+
+        result = apply_clock_adjudication(
+            self.campaign,
+            {
+                'create_clocks': [],
+                'advance_clocks': [],
+                'retire_clocks': [{
+                    'clock_id': 'identify_saboteur',
+                    'reason': 'The party knows where Garret is.',
+                    'completion_criteria_met': [{
+                        'criterion_id': 'located_garret',
+                        'evidence_sources': [
+                            {'source_type': 'transcript_message', 'source_id': '101', 'description': 'The DM said where Garret is.'},
+                        ],
+                    }],
+                    'consequence': {
+                        'text': 'The party knows Garret is at the docks.',
+                        'visibility': 'party_known',
+                        'evidence_sources': [
+                            {'source_type': 'transcript_message', 'source_id': '101', 'description': 'The DM said where Garret is.'},
+                        ],
+                    },
+                }],
+                'no_change_explanations': [],
+            },
+            audit_context={
+                'trace_id': 'intervening-negation-trace',
+                'source_player_message_id': 101,
+                'source_dm_message_id': 102,
+            },
+        )
+        db.session.commit()
+
+        self.assertNotEqual(result['errors'], [])
+        clock = CampaignClock.query.filter_by(campaign_id=self.campaign.id, clock_id='identify_saboteur').one()
+        self.assertEqual(clock.status, 'completion_pending')
+        self.assertEqual(WorldEvent.query.filter_by(campaign_id=self.campaign.id, event_type='clock_retired').count(), 0)
+
+    def test_completion_criteria_reject_did_not_identify_negation(self):
+        db.session.add(CampaignClock(
+            campaign_id=self.campaign.id,
+            clock_id='identify_saboteur',
+            name='Identify the Saboteur',
+            segments=4,
+            filled=4,
+            status='completion_pending',
+            visibility='party_known',
+            completion_criteria=[
+                {'id': 'named_suspect', 'description': 'Visible evidence identifies Garret as the saboteur.'},
+            ],
+        ))
+        db.session.commit()
+        self._add_session_message(101, 'The party did not identify Garret in the visible reply.')
+
+        result = apply_clock_adjudication(
+            self.campaign,
+            {
+                'create_clocks': [],
+                'advance_clocks': [],
+                'retire_clocks': [{
+                    'clock_id': 'identify_saboteur',
+                    'reason': 'The party identified the saboteur.',
+                    'completion_criteria_met': [{
+                        'criterion_id': 'named_suspect',
+                        'evidence_sources': [
+                            {'source_type': 'transcript_message', 'source_id': '101', 'description': 'The DM discussed who the saboteur is.'},
+                        ],
+                    }],
+                    'consequence': {
+                        'text': 'The party identified Garret as the saboteur.',
+                        'visibility': 'party_known',
+                        'evidence_sources': [
+                            {'source_type': 'transcript_message', 'source_id': '101', 'description': 'The DM discussed who the saboteur is.'},
+                        ],
+                    },
+                }],
+                'no_change_explanations': [],
+            },
+            audit_context={
+                'trace_id': 'did-not-identify-trace',
                 'source_player_message_id': 101,
                 'source_dm_message_id': 102,
             },

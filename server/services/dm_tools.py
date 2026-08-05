@@ -5207,9 +5207,28 @@ def _clock_text_overlap(message_content, support_text):
     return bool(message_tokens & support_tokens)
 
 
+_CLOCK_NEGATION_MARKERS = frozenset({
+    'not', 'never', 'no', 'denies', 'denied', 'deny', 'refutes', 'refuted', 'refute',
+    'contradicts', 'contradicted', 'contradict', 'falsely', 'false', 'untrue',
+    'unconfirmed', 'disproves', 'disproved', 'disprove', "isn't", "wasn't", "didn't",
+    "doesn't", "hasn't", "haven't", "won't", "can't", 'cannot',
+})
+
+_CLOCK_NEGATION_WINDOW = 3
+
+
 def _clock_text_contradicts(message_content, support_text):
-    """Return True when a verified message explicitly negates the proposed support."""
+    """Return True when a verified message negates a claim in the proposed support.
+
+    In addition to direct adjacency patterns (``not docks``), this evaluates the
+    relevant phrase so intervening words do not hide a negation: ``Garret is not at
+    the docks``, ``did not identify Garret``, and ``has not revealed the location``
+    all contradict their positive counterparts even though the negation marker is not
+    immediately adjacent to the claim token.
+    """
     support_tokens = _clock_text_tokens(support_text) - _CLOCK_EVIDENCE_STOPWORDS
+    if not support_tokens:
+        return False
     message_text = (message_content or '').lower()
     for token in support_tokens:
         for negation in (
@@ -5226,29 +5245,42 @@ def _clock_text_contradicts(message_content, support_text):
         ):
             if negation in message_text:
                 return True
+    # Windowed phrase negation: a negation marker within a few tokens before a claim
+    # token negates the claim even when filler words sit between them.
+    message_tokens = re.findall(r"[a-z0-9']+", message_text)
+    for index, token in enumerate(message_tokens):
+        if token not in support_tokens:
+            continue
+        window_start = max(0, index - _CLOCK_NEGATION_WINDOW)
+        window = message_tokens[window_start:index]
+        if any(marker in window for marker in _CLOCK_NEGATION_MARKERS):
+            return True
     return False
 
 
 def _campaign_authorized_rules(campaign):
-    """Return the set of deterministic/clock rule ids authorized for this campaign.
+    """Return {rule_id: description} for deterministic/clock rules authorized in this campaign.
 
     Rules are declared in the campaign's DM-private world package under
-    ``authorized_rules`` (a list of ``{"id": ...}`` or plain id strings). A rule
-    evidence source is only trusted when its ``source_id`` is present here, so the
-    proposing model cannot invent an arbitrary rule id.
+    ``authorized_rules`` (a list of ``{"id": ..., "description": ...}`` or plain id
+    strings). The durable description is the rule's claim scope: a rule evidence source
+    may only support a criterion/consequence whose text overlaps that scope, so the
+    proposing model cannot cite an unrelated-but-valid rule to prove an arbitrary claim.
     """
     _world, _graph, _world_state, dm_private = _world_json(campaign)
     rules = dm_private.get('authorized_rules') if isinstance(dm_private, dict) else None
     if not isinstance(rules, list):
-        return set()
-    authorized = set()
+        return {}
+    authorized = {}
     for rule in rules:
         if isinstance(rule, dict):
             rule_id = clean_id(rule.get('id') or rule.get('rule_id'), '')
+            description = clean_text(rule.get('description'), 400)
         else:
             rule_id = clean_id(rule, '')
+            description = ''
         if rule_id:
-            authorized.add(rule_id)
+            authorized[rule_id] = description
     return authorized
 
 
@@ -5335,13 +5367,15 @@ def _clock_consequence_covered(campaign, evidence_sources, support_text):
 
     A single shared token is not treated as semantic support for a compound conclusion:
     every meaningful claim term in ``support_text`` must appear in at least one resolved
-    evidence record in this campaign. Rule sources are excluded here because they are
-    deterministic and are handled separately by the rule gate.
+    evidence record in this campaign. Rule sources contribute their durable description
+    as the claim scope they can actually prove, so an unrelated authorized rule cannot
+    cover a consequence about a different subject.
     """
     support_terms = _clock_claim_tokens(support_text)
     if not support_terms:
         return True
     covered = set()
+    authorized_rules = _campaign_authorized_rules(campaign)
     for source in evidence_sources or []:
         if not isinstance(source, dict):
             continue
@@ -5356,6 +5390,10 @@ def _clock_consequence_covered(campaign, evidence_sources, support_text):
             if record is None:
                 continue
             covered |= _clock_claim_tokens(_clock_memory_support_text(record))
+        elif source_type in _CLOCK_RULE_EVIDENCE_SOURCES:
+            rule_desc = authorized_rules.get(clean_id(source.get('source_id'), ''))
+            if rule_desc:
+                covered |= _clock_claim_tokens(rule_desc)
     return support_terms <= covered
 
 
@@ -5393,7 +5431,11 @@ def _verified_clock_evidence_status(campaign, evidence_sources, support_text=Non
                 continue
             verified_strong = True
         elif source_type in _CLOCK_RULE_EVIDENCE_SOURCES:
-            if clean_id(source.get('source_id'), '') in authorized_rules:
+            rule_desc = authorized_rules.get(clean_id(source.get('source_id'), ''))
+            # A rule is only usable evidence when its durable description/claim scope
+            # supports the criterion/consequence text; an authorized but unrelated rule
+            # cannot prove an arbitrary claim.
+            if rule_desc and (not support_text or _clock_text_overlap(rule_desc, support_text)):
                 verified_rule = True
         elif source_type in _CLOCK_MEMORY_EVIDENCE_SOURCES:
             record = _resolve_clock_memory_record(campaign, source.get('source_id'))
@@ -5542,7 +5584,7 @@ def _retire_clock_from_patch(campaign, patch):
         gate_consequence_visibility
         and (
             consequence_status in ('insufficiently_supported', 'contradicted')
-            or (consequence_status == 'supported_by_evidence' and not consequence_covered)
+            or (consequence_status in ('supported_by_evidence', 'supported_by_rules') and not consequence_covered)
         )
     ):
         rejected_proposals.append({
