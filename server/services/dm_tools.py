@@ -5404,39 +5404,120 @@ def _clock_claim_tokens(text):
     return _clock_text_tokens(text) - _CLOCK_CLAIM_STOPWORDS
 
 
+def _clock_claim_identity_pairs(support_text):
+    """Return (subject, role) identity assertions of the form ``X is (the|a) Y``."""
+    pairs = []
+    for match in re.finditer(r'\b([a-z0-9\']+)\s+is\s+(?:the\s+|a\s+|an\s+)?([a-z0-9\']+)', (support_text or '').lower()):
+        subject, role = match.group(1), match.group(2)
+        if len(subject) >= 3 and len(role) >= 3 and subject not in _CLOCK_EVIDENCE_STOPWORDS and role not in _CLOCK_EVIDENCE_STOPWORDS:
+            pairs.append((subject, role))
+    return pairs
+
+
+def _clock_claim_location_pairs(support_text):
+    """Return (subject, location) presence assertions (``X is at Y`` / ``X is the Z at Y``)."""
+    text = (support_text or '').lower()
+    pairs = []
+    for match in re.finditer(
+        r'\b([a-z0-9\']+)\s+(?:is|was|were|are|stands|stood|remains|remained|stays|stayed|waits|waited|appears|appeared|found|seen|located)\s+(?:at|in|near)\s+(?:the\s+)?([a-z0-9\']+)',
+        text,
+    ):
+        subject, location = match.group(1), match.group(2)
+        if len(subject) >= 3 and len(location) >= 3 and subject not in _CLOCK_EVIDENCE_STOPWORDS and location not in _CLOCK_EVIDENCE_STOPWORDS:
+            pairs.append((subject, location))
+    for match in re.finditer(
+        r'\b([a-z0-9\']+)\s+is\s+(?:the\s+|a\s+|an\s+)?[a-z0-9\']+\s+at\s+(?:the\s+)?([a-z0-9\']+)',
+        text,
+    ):
+        subject, location = match.group(1), match.group(2)
+        if len(subject) >= 3 and len(location) >= 3 and subject not in _CLOCK_EVIDENCE_STOPWORDS and location not in _CLOCK_EVIDENCE_STOPWORDS:
+            pairs.append((subject, location))
+    return pairs
+
+
+def _clock_identity_bound(content, subject, role):
+    """Return True when content asserts the subject-predicate identity binding.
+
+    ``Garret says the saboteur is Lena at the docks`` does NOT assert that Garret is
+    the saboteur even though all tokens are present; only an explicit identity or
+    appositive binding between the same subject and role is accepted.
+    """
+    text = (content or '').lower()
+    s = re.escape(subject)
+    r = re.escape(role)
+    patterns = (
+        rf'\b{s}\s+is\s+(?:the\s+|a\s+|an\s+)?{r}\b',
+        rf'\b{r}\s+is\s+(?:the\s+|a\s+|an\s+)?{s}\b',
+        rf'\b(?:the\s+|a\s+|an\s+)?{s}\s*,?\s+{r}\b',
+        rf'\b(?:the\s+|a\s+|an\s+)?{r}\s*,?\s+{s}\b',
+        rf'\bnamed\s+{s}\s+as\s+(?:the\s+|a\s+)?{r}\b',
+        rf'\bnamed\s+{r}\s+as\s+(?:the\s+|a\s+)?{s}\b',
+        rf'\bidentified\s+{s}\s+as\s+(?:the\s+|a\s+)?{r}\b',
+        rf'\bidentified\s+{r}\s+as\s+(?:the\s+|a\s+)?{s}\b',
+    )
+    return any(re.search(pattern, text) for pattern in patterns)
+
+
+def _clock_location_bound(content, subject, location):
+    """Return True when content asserts subject-presence at the claimed location.
+
+    ``Garret investigates the saboteur at the docks`` or ``spoke with Garret at the
+    docks`` contains all tokens but does not assert that Garret is located there; only
+    an explicit presence predicate binding the same subject to the location is accepted.
+    """
+    text = (content or '').lower()
+    s = re.escape(subject)
+    l = re.escape(location)
+    patterns = (
+        rf'\b{s}\s+(?:is|was|were|are|stands|stood|remains|remained|stays|stayed|waits|waited|appears|appeared|found|seen|spotted|located)\s+(?:at|in|near)\s+(?:the\s+)?{l}\b',
+        rf'\b{s}\s+is\s+located\s+(?:at|in)\s+(?:the\s+)?{l}\b',
+        rf'\b{s}\s+was\s+spotted\s+(?:at|in)\s+(?:the\s+)?{l}\b',
+    )
+    return any(re.search(pattern, text) for pattern in patterns)
+
+
 def _clock_claims_covered(campaign, evidence_sources, support_text):
-    """Return True when the union of verified evidence content covers the claim terms.
+    """Return True when the union of verified evidence content covers and binds the claim.
 
     A single shared token is not treated as semantic support for a compound claim:
     every meaningful claim term in ``support_text`` must appear in at least one
-    resolved evidence record in this campaign. Rule sources contribute their durable
-    description as the claim scope they can actually prove, so an unrelated authorized
-    rule cannot cover a claim about a different subject.
+    resolved evidence record in this campaign. Identity claims (``X is Y``) and
+    location claims (``X is at Z``) additionally require the same subject to be bound
+    to the role/location, so ``Garret says the saboteur is Lena at the docks`` cannot
+    prove ``Garret is the saboteur at the docks``. Rule sources contribute their
+    durable description as the claim scope they can actually prove.
     """
     support_terms = _clock_claim_tokens(support_text)
-    if not support_terms:
-        return True
+    contents = []
     covered = set()
     authorized_rules = _campaign_authorized_rules(campaign)
     for source in evidence_sources or []:
         if not isinstance(source, dict):
             continue
         source_type = source.get('source_type') or source.get('source', '')
+        content = None
         if source_type in _CLOCK_TRANSCRIPT_EVIDENCE_SOURCES:
             message = _resolve_clock_transcript_message(campaign, source.get('source_id'))
-            if message is None:
-                continue
-            covered |= _clock_claim_tokens(message.content)
+            if message is not None:
+                content = message.content
         elif source_type in _CLOCK_MEMORY_EVIDENCE_SOURCES:
             record = _resolve_clock_memory_record(campaign, source.get('source_id'))
-            if record is None:
-                continue
-            covered |= _clock_claim_tokens(_clock_memory_support_text(record))
+            if record is not None:
+                content = _clock_memory_support_text(record)
         elif source_type in _CLOCK_RULE_EVIDENCE_SOURCES:
-            rule_desc = authorized_rules.get(clean_id(source.get('source_id'), ''))
-            if rule_desc:
-                covered |= _clock_claim_tokens(rule_desc)
-    return support_terms <= covered
+            content = authorized_rules.get(clean_id(source.get('source_id'), ''))
+        if content:
+            contents.append(content)
+            covered |= _clock_claim_tokens(content)
+    if support_terms and not support_terms <= covered:
+        return False
+    for subject, role in _clock_claim_identity_pairs(support_text):
+        if not any(_clock_identity_bound(content, subject, role) for content in contents):
+            return False
+    for subject, location in _clock_claim_location_pairs(support_text):
+        if not any(_clock_location_bound(content, subject, location) for content in contents):
+            return False
+    return True
 
 
 def _verified_clock_evidence_status(campaign, evidence_sources, support_text=None, required_visibility=None):
