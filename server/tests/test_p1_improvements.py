@@ -1209,7 +1209,7 @@ class P1ImprovementsTest(unittest.TestCase):
             'name': 'Create Test Clock',
             'segments': 6,
             'filled': 0,
-            'visibility': 'party_known',
+            'visibility': 'dm_private',
             'provenance': {
                 'tool_name': 'test_create',
                 'evidence_status': 'supported_by_evidence',

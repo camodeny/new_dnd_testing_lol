@@ -387,6 +387,10 @@ def ensure_lightweight_schema():
             db.session.execute(text('ALTER TABLE campaign_memory_logs ADD COLUMN provenance_json JSON'))
 
     # --- campaign_clocks ---
+    campaign_clock_columns = table_columns('campaign_clocks')
+    if campaign_clock_columns:
+        if 'completion_criteria' not in campaign_clock_columns:
+            db.session.execute(text('ALTER TABLE campaign_clocks ADD COLUMN completion_criteria JSON'))
 
     # --- New tables for session memory integrity ---
     resolver_packet_columns = table_columns('campaign_resolver_packets')

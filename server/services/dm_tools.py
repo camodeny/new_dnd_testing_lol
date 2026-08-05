@@ -1703,6 +1703,7 @@ def build_session_clock_context(
         'current_scene_before': current_scene_before if isinstance(current_scene_before, dict) else {},
         'current_scene_after': current_scene_after if isinstance(current_scene_after, dict) else {},
         'active_clocks': active_clocks,
+        'authorized_rules': _campaign_authorized_rules(campaign),
         'recent_events': [event.to_dict(include_private=True) for event in reversed(recent_events)],
     }
 
@@ -5145,14 +5146,6 @@ def _create_clock_from_patch(campaign, patch):
     }
 
 
-_CLOCK_STRONG_EVIDENCE_SOURCES = frozenset({
-    'memory_resolver_packet',
-    'prior_durable_memory',
-    'prior_memory_record',
-    'clarification_answer',
-    'existing_alias',
-    'prior_scene_cast',
-})
 _CLOCK_RULE_EVIDENCE_SOURCES = frozenset({
     'clock_rule',
     'deterministic_rule',
@@ -5160,6 +5153,16 @@ _CLOCK_RULE_EVIDENCE_SOURCES = frozenset({
 _CLOCK_TRANSCRIPT_EVIDENCE_SOURCES = frozenset({
     'visible_transcript',
     'transcript_message',
+})
+_CLOCK_MEMORY_EVIDENCE_SOURCES = frozenset({
+    'prior_durable_memory',
+    'prior_memory_record',
+})
+_CLOCK_INTERNAL_EVIDENCE_SOURCES = frozenset({
+    'memory_resolver_packet',
+    'clarification_answer',
+    'existing_alias',
+    'prior_scene_cast',
 })
 
 
@@ -5226,20 +5229,156 @@ def _clock_text_contradicts(message_content, support_text):
     return False
 
 
-def _verified_clock_evidence_status(campaign, evidence_sources, support_text=None):
+def _campaign_authorized_rules(campaign):
+    """Return the set of deterministic/clock rule ids authorized for this campaign.
+
+    Rules are declared in the campaign's DM-private world package under
+    ``authorized_rules`` (a list of ``{"id": ...}`` or plain id strings). A rule
+    evidence source is only trusted when its ``source_id`` is present here, so the
+    proposing model cannot invent an arbitrary rule id.
+    """
+    _world, _graph, _world_state, dm_private = _world_json(campaign)
+    rules = dm_private.get('authorized_rules') if isinstance(dm_private, dict) else None
+    if not isinstance(rules, list):
+        return set()
+    authorized = set()
+    for rule in rules:
+        if isinstance(rule, dict):
+            rule_id = clean_id(rule.get('id') or rule.get('rule_id'), '')
+        else:
+            rule_id = clean_id(rule, '')
+        if rule_id:
+            authorized.add(rule_id)
+    return authorized
+
+
+def _resolve_clock_memory_record(campaign, source_id):
+    """Resolve a prior-memory evidence source to a real durable memory log in this campaign."""
+    if source_id in (None, ''):
+        return None
+    from models import CampaignMemoryLog
+    numeric_id = _coerce_patch_int(source_id, default=None)
+    record = None
+    if numeric_id is not None:
+        record = CampaignMemoryLog.query.filter_by(campaign_id=campaign.id, id=numeric_id).first()
+    if record is None:
+        record = CampaignMemoryLog.query.filter_by(
+            campaign_id=campaign.id, memory_id=str(source_id)
+        ).order_by(CampaignMemoryLog.id.desc()).first()
+    return record
+
+
+def _clock_memory_support_text(record):
+    """Return the supportable text of a durable memory record."""
+    parts = []
+    if isinstance(getattr(record, 'after_json', None), dict):
+        for key in ('text', 'summary', 'name', 'reason'):
+            value = record.after_json.get(key)
+            if isinstance(value, str) and value.strip():
+                parts.append(value.strip())
+    if getattr(record, 'reason', None):
+        parts.append(record.reason)
+    if getattr(record, 'memory_id', None):
+        parts.append(record.memory_id)
+    return ' '.join(parts)
+
+
+def _resolve_clock_clarification(campaign, source_id):
+    if source_id in (None, ''):
+        return None
+    from models import CampaignClarification
+    return CampaignClarification.query.filter_by(
+        campaign_id=campaign.id,
+        clarification_id=str(source_id),
+        status='answered',
+    ).first()
+
+
+def _resolve_clock_resolver_packet(campaign, source_id):
+    if source_id in (None, ''):
+        return None
+    from models import CampaignResolverPacket
+    numeric_id = _coerce_patch_int(source_id, default=None)
+    if numeric_id is None:
+        return None
+    return CampaignResolverPacket.query.filter_by(campaign_id=campaign.id, id=numeric_id).first()
+
+
+def _resolve_clock_existing_alias(campaign, source_id):
+    if source_id in (None, ''):
+        return None
+    from models import NPCActor
+    actor = NPCActor.query.filter_by(campaign_id=campaign.id, actor_id=str(source_id)).first()
+    if actor is not None:
+        return actor
+    _world, graph, _world_state, _dm_private = _world_json(campaign)
+    for entity in graph.get('entities', []) if isinstance(graph, dict) else []:
+        if entity.get('id') == source_id:
+            return entity
+    return None
+
+
+_CLOCK_CLAIM_STOPWORDS = _CLOCK_EVIDENCE_STOPWORDS | frozenset({
+    'party', 'identified', 'identifies', 'identify', 'knows', 'know', 'knew', 'known',
+    'he', 'she', 'they', 'them', 'their', 'his', 'her', 'is', 'are', 'was', 'were',
+    'at', 'in', 'on', 'of', 'to', 'the', 'and', 'that', 'this', 'these', 'those',
+})
+
+
+def _clock_claim_tokens(text):
+    """Return the meaningful claim terms in a consequence/criterion text."""
+    return _clock_text_tokens(text) - _CLOCK_CLAIM_STOPWORDS
+
+
+def _clock_consequence_covered(campaign, evidence_sources, support_text):
+    """Return True when the union of verified evidence content covers the consequence claims.
+
+    A single shared token is not treated as semantic support for a compound conclusion:
+    every meaningful claim term in ``support_text`` must appear in at least one resolved
+    evidence record in this campaign. Rule sources are excluded here because they are
+    deterministic and are handled separately by the rule gate.
+    """
+    support_terms = _clock_claim_tokens(support_text)
+    if not support_terms:
+        return True
+    covered = set()
+    for source in evidence_sources or []:
+        if not isinstance(source, dict):
+            continue
+        source_type = source.get('source_type') or source.get('source', '')
+        if source_type in _CLOCK_TRANSCRIPT_EVIDENCE_SOURCES:
+            message = _resolve_clock_transcript_message(campaign, source.get('source_id'))
+            if message is None:
+                continue
+            covered |= _clock_claim_tokens(message.content)
+        elif source_type in _CLOCK_MEMORY_EVIDENCE_SOURCES:
+            record = _resolve_clock_memory_record(campaign, source.get('source_id'))
+            if record is None:
+                continue
+            covered |= _clock_claim_tokens(_clock_memory_support_text(record))
+    return support_terms <= covered
+
+
+def _verified_clock_evidence_status(campaign, evidence_sources, support_text=None, required_visibility=None):
     """Compute evidence status at the durable boundary from verified sources only.
 
-    Evidence status is never accepted from the proposing model. Transcript sources
-    must resolve to an actual visible session message in this campaign whose content
-    supports the criterion/consequence text; a fabricated or unrelated source id is
-    dropped. Rule sources are accepted as ``supported_by_rules``, and strong durable
-    sources as ``supported_by_evidence``. A verified message that explicitly negates
-    the proposed support yields ``contradicted``.
+    Evidence status is never accepted from the proposing model. Every source must
+    resolve to a real durable record in this campaign:
+    - transcript sources must resolve to an actual visible session message whose
+      content supports the criterion/consequence text;
+    - rule sources must reference an authorized deterministic/clock rule declared in
+      the campaign's DM-private package;
+    - prior durable memory sources must resolve to a real memory log in this campaign
+      and, when ``required_visibility`` is party-known/public, must not be DM-private;
+    - clarification/packet/alias sources must resolve to the matching durable record.
+    Fabricated or unrelated source ids are dropped. A verified message that explicitly
+    negates the proposed support yields ``contradicted``.
     """
     if not isinstance(evidence_sources, list) or not evidence_sources:
         return 'insufficiently_supported'
     verified_rule = False
     verified_strong = False
+    authorized_rules = _campaign_authorized_rules(campaign)
     for source in evidence_sources:
         if not isinstance(source, dict):
             continue
@@ -5254,9 +5393,28 @@ def _verified_clock_evidence_status(campaign, evidence_sources, support_text=Non
                 continue
             verified_strong = True
         elif source_type in _CLOCK_RULE_EVIDENCE_SOURCES:
-            verified_rule = True
-        elif source_type in _CLOCK_STRONG_EVIDENCE_SOURCES:
+            if clean_id(source.get('source_id'), '') in authorized_rules:
+                verified_rule = True
+        elif source_type in _CLOCK_MEMORY_EVIDENCE_SOURCES:
+            record = _resolve_clock_memory_record(campaign, source.get('source_id'))
+            if record is None:
+                continue
+            memory_visibility = clean_text(getattr(record, 'visibility', None), 30) or 'dm_private'
+            if required_visibility in ('party_known', 'public') and memory_visibility == 'dm_private':
+                continue
+            memory_text = _clock_memory_support_text(record)
+            if support_text and not _clock_text_overlap(memory_text, support_text):
+                continue
             verified_strong = True
+        elif source_type == 'clarification_answer':
+            if _resolve_clock_clarification(campaign, source.get('source_id')) is not None:
+                verified_strong = True
+        elif source_type == 'memory_resolver_packet':
+            if _resolve_clock_resolver_packet(campaign, source.get('source_id')) is not None:
+                verified_strong = True
+        elif source_type == 'existing_alias':
+            if _resolve_clock_existing_alias(campaign, source.get('source_id')) is not None:
+                verified_strong = True
     if verified_rule:
         return 'supported_by_rules'
     if verified_strong:
@@ -5307,6 +5465,11 @@ def _retire_clock_from_patch(campaign, patch):
     consequence_applied = True
     visibility_decision = {}
 
+    consequence = patch.get('consequence') if isinstance(patch.get('consequence'), dict) else {}
+    requested_visibility = consequence.get('visibility') or patch.get('visibility') or clock.visibility or 'dm_private'
+    if requested_visibility not in VALID_VISIBILITIES:
+        requested_visibility = 'dm_private'
+
     if completion_criteria:
         if not mechanical_complete:
             return {'error': f'Clock {clock.name} cannot be retired before it is mechanically complete.'}
@@ -5330,7 +5493,9 @@ def _retire_clock_from_patch(campaign, patch):
                 (criterion.get('description') or criterion.get('text') for criterion in completion_criteria if criterion['id'] == criterion_id),
                 '',
             )
-            status = _verified_clock_evidence_status(campaign, sources, support_text)
+            status = _verified_clock_evidence_status(
+                campaign, sources, support_text, required_visibility=requested_visibility
+            )
             criterion_evidence_status[criterion_id] = status
             if status not in ('supported_by_evidence', 'supported_by_rules'):
                 unsupported.append(criterion_id)
@@ -5348,21 +5513,37 @@ def _retire_clock_from_patch(campaign, patch):
     else:
         criterion_evidence = {}
 
-    consequence = patch.get('consequence') if isinstance(patch.get('consequence'), dict) else {}
-    requested_visibility = consequence.get('visibility') or patch.get('visibility') or clock.visibility or 'dm_private'
-    if requested_visibility not in VALID_VISIBILITIES:
-        requested_visibility = 'dm_private'
     consequence_text = clean_text(consequence.get('text') or consequence.get('summary') or patch.get('reason'), 520)
     consequence_evidence = consequence.get('evidence_sources')
     if not isinstance(consequence_evidence, list):
         consequence_evidence = None
-    consequence_status = _verified_clock_evidence_status(campaign, consequence_evidence, consequence_text)
+    # The consequence's own evidence status is computed only from the structured
+    # consequence evidence_sources, never from the proposing model's declared status.
+    consequence_status = _verified_clock_evidence_status(
+        campaign,
+        consequence_evidence,
+        consequence_text,
+        required_visibility=requested_visibility,
+    )
+    # Claim coverage may be supplemented by the evidence of every individually-verified
+    # completion criterion, so a consequence derived from verified criteria is accepted
+    # instead of being approved by a single shared token.
+    coverage_evidence = list(consequence_evidence) if consequence_evidence else []
+    if completion_criteria:
+        for criterion_id in sorted(required_ids):
+            if criterion_evidence_status.get(criterion_id) in ('supported_by_evidence', 'supported_by_rules'):
+                for source in (criterion_evidence.get(criterion_id) or []):
+                    if isinstance(source, dict) and source not in coverage_evidence:
+                        coverage_evidence.append(source)
+    consequence_covered = _clock_consequence_covered(campaign, coverage_evidence, consequence_text)
     applied_visibility = requested_visibility
-    gate_consequence_visibility = bool(completion_criteria) or bool(consequence)
+    gate_consequence_visibility = requested_visibility in ('party_known', 'public') and bool(consequence_text)
     if (
         gate_consequence_visibility
-        and requested_visibility in ('party_known', 'public')
-        and consequence_status in ('insufficiently_supported', 'contradicted')
+        and (
+            consequence_status in ('insufficiently_supported', 'contradicted')
+            or (consequence_status == 'supported_by_evidence' and not consequence_covered)
+        )
     ):
         rejected_proposals.append({
             'kind': 'consequence_visibility',
@@ -5370,7 +5551,8 @@ def _retire_clock_from_patch(campaign, patch):
             'applied_visibility': 'dm_private',
             'consequence': consequence_text,
             'evidence_status': consequence_status,
-            'reason': 'Retirement consequence is not supported by verified evidence; retained pending.',
+            'consequence_covered': consequence_covered,
+            'reason': 'Retirement consequence is not covered by verified evidence; retained pending.',
         })
         return {
             'error': f'Clock {clock.name} cannot apply its consequence at {requested_visibility} visibility without verified evidence.',
@@ -5382,6 +5564,7 @@ def _retire_clock_from_patch(campaign, patch):
                 'applied': 'dm_private',
                 'consequence_applied': False,
                 'evidence_status': consequence_status,
+                'consequence_covered': consequence_covered,
                 'reason': 'consequence_pending_verified_evidence',
             },
         }

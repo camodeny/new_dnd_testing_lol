@@ -302,9 +302,9 @@ SESSION_CLOCK_ADJUDICATOR_SYSTEM_PROMPT = (
     "Each advance_clocks item must include clock_id, delta, reason, and evidence. "
     "A clock with completion_criteria may reach its final segment but must not be retired until every criterion is visibly supported. "
     "For that retirement, include completion_criteria_met where each entry includes criterion_id and the specific evidence_sources that support that criterion, "
-    "and provenance.evidence_sources that cite the visible transcript or an authorized deterministic rule. "
+    "and provenance.evidence_sources that cite the visible transcript or a deterministic rule listed in authorized_rules. "
     "A criterion echoed by id alone is rejected; each criterion needs its own evidence. "
-    "Retirement consequences at party_known or public visibility require supporting evidence and are retained at DM-private visibility when unsupported. "
+    "A retirement consequence at party_known or public visibility must be fully covered by the cited evidence; unsupported consequences are retained at DM-private visibility. "
     "Each no_change_explanations item must include clock_id and reason. Do not output plain text or markdown."
 )
 
@@ -3222,6 +3222,7 @@ def build_world_genesis_messages(context):
                         'hidden_factions': ['private faction notes'],
                         'npc_secrets': ['private NPC secrets'],
                         'opening_scene_private_notes': 'DM-only guidance for the first exchange',
+                        'authorized_rules': [{'id': 'stable_rule_id', 'description': 'deterministic rule the clock adjudicator may cite as evidence'}],
                     },
                     'npc_actors': [
                         {
@@ -3337,6 +3338,7 @@ WORLD_GENESIS_SECTION_SPECS = (
                 'hidden_factions': ['private faction notes'],
                 'npc_secrets': ['private NPC secrets'],
                 'opening_scene_private_notes': 'DM-only guidance for the first exchange',
+                'authorized_rules': [{'id': 'stable_rule_id', 'description': 'deterministic rule the clock adjudicator may cite as evidence'}],
             },
         },
     ),

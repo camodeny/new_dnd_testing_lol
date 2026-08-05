@@ -41,6 +41,18 @@ def _drop_evidence_provenance_columns():
     db.session.commit()
 
 
+def _drop_clock_completion_criteria_column():
+    db.session.execute(text('ALTER TABLE campaign_clocks DROP COLUMN completion_criteria'))
+    db.session.commit()
+
+
+def _clock_columns():
+    return {
+        row[1]
+        for row in db.session.execute(text('PRAGMA table_info(campaign_clocks)')).fetchall()
+    }
+
+
 class MemoryLogSchemaRepairTest(unittest.TestCase):
     def setUp(self):
         self.temp_dir = tempfile.TemporaryDirectory()
@@ -116,6 +128,17 @@ class MemoryLogSchemaRepairTest(unittest.TestCase):
             self.assertIn('evidence_status', columns)
             self.assertIn('provenance_json', columns)
             CampaignMemoryLog.query.limit(1).all()
+
+    def test_lightweight_schema_adds_clock_completion_criteria_column(self):
+        with self.file_app.app_context():
+            db.create_all()
+            _drop_clock_completion_criteria_column()
+            self.assertNotIn('completion_criteria', _clock_columns())
+
+            ensure_lightweight_schema()
+
+            self.assertIn('completion_criteria', _clock_columns())
+            verify_required_schema()
 
 
 class StaleAwaitingAuditReconciliationTest(unittest.TestCase):

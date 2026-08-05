@@ -280,6 +280,17 @@ def normalize_clocks(raw_clocks):
 
 def normalize_dm_private(raw_private):
     raw_private = raw_private if isinstance(raw_private, dict) else {}
+    rules = raw_private.get('authorized_rules') if isinstance(raw_private.get('authorized_rules'), list) else []
+    normalized_rules = []
+    for rule in rules[:40]:
+        if isinstance(rule, dict):
+            rule_id = clean_id(rule.get('id') or rule.get('rule_id'), '')
+            description = clean_text(rule.get('description'), 240)
+        else:
+            rule_id = clean_id(rule, '')
+            description = ''
+        if rule_id:
+            normalized_rules.append({'id': rule_id, 'description': description})
     return {
         'schema_version': '1.0',
         'true_inciting_incident': clean_text(raw_private.get('true_inciting_incident'), 900),
@@ -287,6 +298,7 @@ def normalize_dm_private(raw_private):
         'hidden_factions': raw_private.get('hidden_factions') if isinstance(raw_private.get('hidden_factions'), list) else [],
         'npc_secrets': raw_private.get('npc_secrets') if isinstance(raw_private.get('npc_secrets'), list) else [],
         'opening_scene_private_notes': clean_text(raw_private.get('opening_scene_private_notes'), 900),
+        'authorized_rules': normalized_rules,
     }
 
 
