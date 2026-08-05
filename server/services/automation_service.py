@@ -16,6 +16,7 @@ from models import (
     AutomationRunEvent,
     AutomationRunProviderCall,
     AutomationScenario,
+    AutomationScorecardTemplate,
     AutomationSnapshot,
     AutomationWorker,
     AutomationWorkspaceEvent,
@@ -292,6 +293,66 @@ def assert_scorecard_template_activatable(template):
         raise ValueError(
             f'scorecard template has invalid criteria and cannot be activated: {details}'
         )
+
+
+MEMORY_AUDIT_SCOREBOOK_CATEGORY_SEQUENCE = (
+    "durable state correctness",
+    "durable state correctness",
+    "durable state correctness",
+    "retrieval or memory use",
+    "retrieval or memory use",
+    "retrieval or memory use",
+    "safety/private-information handling",
+    "safety/private-information handling",
+)
+
+
+def legacy_criterion_category(criterion, position):
+    """Deterministic canonical category for a legacy stored criterion.
+
+    Prefers semantic inference from the criterion id/label. Generic or
+    unlabeled legacy criteria (for example the pre-v2 Memory Audit Scorebook's
+    ``criterion_1``..``criterion_8``) map positionally across the memory-audit
+    categories: durable state correctness, retrieval or memory use, and
+    safety/private-information handling.
+    """
+    inferred = get_criterion_category(criterion)
+    if inferred != UNCATEGORIZED_CATEGORY:
+        return inferred
+    return MEMORY_AUDIT_SCOREBOOK_CATEGORY_SEQUENCE[
+        (position - 1) % len(MEMORY_AUDIT_SCOREBOOK_CATEGORY_SEQUENCE)
+    ]
+
+
+def upgrade_legacy_scorecard_template_categories():
+    """Assign canonical categories to stored templates that predate validation.
+
+    Templates created before category validation existed may carry criteria
+    with missing or invalid ``category`` values. This one-time repair assigns a
+    canonical category to each so active templates stay activatable under the
+    strict validator instead of being rejected or scored as ``uncategorized``.
+    Historical run snapshots are intentionally left untouched.
+    """
+    upgraded = 0
+    templates = AutomationScorecardTemplate.query.order_by(AutomationScorecardTemplate.id.asc()).all()
+    for template in templates:
+        criteria = list(_json_list(template.criteria_json, []))
+        changed = False
+        for index, criterion in enumerate(criteria):
+            if not isinstance(criterion, dict):
+                continue
+            if criterion.get('category') and normalize_criterion_category(criterion.get('category')):
+                continue
+            updated = dict(criterion)
+            updated['category'] = legacy_criterion_category(criterion, index + 1)
+            criteria[index] = updated
+            changed = True
+        if changed:
+            template.criteria_json = criteria
+            upgraded += 1
+    if upgraded:
+        db.session.commit()
+    return upgraded
 
 
 def _normalize_custom_scorecard_status(value, default='warn'):

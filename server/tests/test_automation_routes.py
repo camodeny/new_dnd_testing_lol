@@ -5272,6 +5272,59 @@ class AutomationRouteTest(unittest.TestCase):
         )
         self.assertEqual(detach.status_code, 200)
 
+    def test_legacy_scorecard_template_upgrade_assigns_canonical_categories(self):
+        # Reproduce the deployed pre-v2 Memory Audit Scorebook: generic criteria
+        # with no category or instructions. The startup repair must assign
+        # deterministic canonical categories so the template becomes activatable.
+        with app.app_context():
+            from models import AutomationScorecardTemplate
+            legacy = AutomationScorecardTemplate(
+                user_id=self.owner_id,
+                name='Memory Audit Scorebook',
+                criteria_json=[
+                    {'id': f'criterion_{index}', 'label': f'Criterion {index}', 'weight': 2}
+                    for index in range(1, 9)
+                ],
+                defaults_json={},
+            )
+            db.session.add(legacy)
+            db.session.commit()
+            legacy_id = legacy.id
+
+        with app.app_context():
+            from models import AutomationScorecardTemplate
+            from services.automation_service import (
+                assert_scorecard_template_activatable,
+                scorecard_configuration,
+                upgrade_legacy_scorecard_template_categories,
+            )
+            upgraded = upgrade_legacy_scorecard_template_categories()
+            self.assertEqual(upgraded, 1)
+            # Idempotent: a second pass makes no further changes.
+            self.assertEqual(upgrade_legacy_scorecard_template_categories(), 0)
+
+            template = db.session.get(AutomationScorecardTemplate, legacy_id)
+            categories = [criterion['category'] for criterion in template.criteria_json]
+            self.assertEqual(categories, [
+                'durable state correctness',
+                'durable state correctness',
+                'durable state correctness',
+                'retrieval or memory use',
+                'retrieval or memory use',
+                'retrieval or memory use',
+                'safety/private-information handling',
+                'safety/private-information handling',
+            ])
+            self.assertTrue(scorecard_configuration(template.snapshot())['valid'])
+            assert_scorecard_template_activatable(template)
+
+        ok = self.client.post(
+            '/api/automation/scenarios',
+            headers=self.headers,
+            json={'source_campaign_id': self.campaign_id, 'scorecard_template_id': legacy_id},
+        )
+        self.assertEqual(ok.status_code, 201)
+
     def test_scorecard_configuration_signal_consistent_across_exports(self):
         scorecard_id = self.client.post(
             '/api/automation/scorecards',
@@ -5332,20 +5385,43 @@ class AutomationRouteTest(unittest.TestCase):
         with app.app_context():
             from services.automation_service import refresh_run_scorecard
             run = db.session.get(AutomationRun, run_id)
-            refresh_run_scorecard(run)
+            results = refresh_run_scorecard(run)
+            by_id = {row['check_id']: row for row in results}
             expected = run.scorecard_summary_json['scorecard_configuration']
+            expected_breakdown = run.scorecard_summary_json['category_breakdown']
+            expected_score = run.scorecard_summary_json['weighted_score']
+            # Scoring resolves membership via get_criterion_category(): the canonical explicit
+            # category is kept and the invalid explicit value becomes 'uncategorized'.
+            self.assertEqual(by_id['custom:memory_quality']['details']['category'], 'retrieval or memory use')
+            self.assertEqual(by_id['custom:unknown_crit']['details']['category'], 'uncategorized')
         self.assertFalse(expected['valid'])
         self.assertEqual(expected['uncategorized_criterion_count'], 1)
         self.assertEqual(expected['invalid_criteria'][0]['criterion_id'], 'unknown_crit')
 
         watch = self.client.get(f'/api/automation/runs/{run_id}', headers=self.headers).get_json()
-        self.assertEqual(watch['run']['scorecard_summary']['scorecard_configuration'], expected)
+        watch_summary = watch['run']['scorecard_summary']
+        self.assertEqual(watch_summary['scorecard_configuration'], expected)
+        self.assertEqual(watch_summary['category_breakdown'], expected_breakdown)
+        self.assertEqual(watch_summary['weighted_score'], expected_score)
 
         scorecard_endpoint = self.client.get(f'/api/automation/runs/{run_id}/scorecard', headers=self.headers).get_json()
-        self.assertEqual(scorecard_endpoint['run']['scorecard_summary']['scorecard_configuration'], expected)
+        endpoint_summary = scorecard_endpoint['run']['scorecard_summary']
+        self.assertEqual(endpoint_summary['scorecard_configuration'], expected)
+        self.assertEqual(endpoint_summary['category_breakdown'], expected_breakdown)
+        self.assertEqual(endpoint_summary['weighted_score'], expected_score)
+        endpoint_rows = {row['check_id']: row for row in scorecard_endpoint['scorecard']}
+        self.assertEqual(endpoint_rows['custom:memory_quality']['details']['category'], 'retrieval or memory use')
+        self.assertEqual(endpoint_rows['custom:unknown_crit']['details']['category'], 'uncategorized')
 
         bundle = self.client.get(f'/api/automation/runs/{run_id}/audit-bundle', headers=self.headers).get_json()
         self.assertEqual(bundle['scorecard_template']['configuration'], expected)
+        bundle_categories = {entry['id']: entry for entry in bundle['scorecard_template']['criteria']}
+        # The audit bundle exports the resolved category (same membership used by scoring)
+        # alongside the raw stored value.
+        self.assertEqual(bundle_categories['memory_quality']['category'], 'retrieval or memory use')
+        self.assertEqual(bundle_categories['memory_quality']['raw_category'], 'retrieval or memory use')
+        self.assertEqual(bundle_categories['unknown_crit']['category'], 'uncategorized')
+        self.assertEqual(bundle_categories['unknown_crit']['raw_category'], 'not-a-real-category')
 
 
 if __name__ == '__main__':

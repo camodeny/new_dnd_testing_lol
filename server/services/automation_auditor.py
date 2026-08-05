@@ -30,6 +30,7 @@ from services.automation_service import (
     continue_audit_run,
     current_scorecard_template_for_run,
     find_provider_calls_for_turn,
+    get_criterion_category,
     latest_session_for_run,
     persist_provider_call,
     refresh_run_scorecard,
@@ -2152,7 +2153,8 @@ def get_current_audit_bundle_data(run):
             'criteria': [
                 {
                     'id': c.get('id'),
-                    'category': c.get('category'),
+                    'category': get_criterion_category(c),
+                    'raw_category': c.get('category'),
                 }
                 for c in _json_list(template.get('criteria'), []) if c.get('id')
             ],
