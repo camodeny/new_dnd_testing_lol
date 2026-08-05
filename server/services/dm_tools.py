@@ -489,6 +489,8 @@ def _normalize_memory_clock_patch(item, fallback_id):
             clean_item[field] = value
     if 'completion_criteria' in item:
         clean_item['completion_criteria'] = _normalize_clock_completion_criteria(item.get('completion_criteria'))
+    if isinstance(item.get('completion_state'), dict):
+        clean_item['completion_state'] = dict(item['completion_state'])
     if 'completion_criteria_verdicts' in item:
         clean_item['completion_criteria_verdicts'] = item['completion_criteria_verdicts']
     if isinstance(item.get('consequence'), dict):
@@ -1676,8 +1678,27 @@ def build_session_clock_context(
 ):
     recent_events = WorldEvent.query.filter_by(campaign_id=campaign.id).order_by(WorldEvent.created_at.desc()).limit(6).all()
     active_clocks = []
+    pending_completion_evidence = []
+    allowed_evidence_sources = []
+    allowed_evidence_keys = set()
+
+    def allow_source(source_type, source_id):
+        if source_id in (None, ''):
+            return
+        source = {'source_type': source_type, 'source_id': str(source_id)}
+        key = _clock_evidence_key(source)
+        if key is not None and key not in allowed_evidence_keys:
+            allowed_evidence_keys.add(key)
+            allowed_evidence_sources.append(source)
+
+    allow_source('transcript_message', player_message_id)
+    allow_source('transcript_message', dm_message_id)
+    for event in recent_events:
+        allow_source('world_event', event.id)
+
     clocks = CampaignClock.query.filter_by(campaign_id=campaign.id).order_by(CampaignClock.id.asc()).all()
     for clock in [clock for clock in clocks if (clock.status or 'active') in ACTIVE_CLOCK_STATUSES][:50]:
+        completion_state = clock.completion_state if isinstance(clock.completion_state, dict) else {}
         active_clocks.append({
             'clock_id': clock.clock_id,
             'name': clock.name,
@@ -1689,8 +1710,38 @@ def build_session_clock_context(
             'trigger': clock.trigger,
             'on_complete': clock.on_complete,
             'completion_criteria': clock.completion_criteria or [],
+            'completion_state': completion_state,
             'status': clock.status,
         })
+        criteria_state = completion_state.get('criteria') if isinstance(completion_state.get('criteria'), dict) else {}
+        for criterion_id, verdict in criteria_state.items():
+            if not isinstance(verdict, dict):
+                continue
+            for source in verdict.get('evidence_sources') if isinstance(verdict.get('evidence_sources'), list) else []:
+                key = _clock_evidence_key(source)
+                if key is None:
+                    continue
+                source_type, source_id = key
+                evidence_item = {
+                    'clock_id': clock.clock_id,
+                    'criterion_id': criterion_id,
+                    'source_type': source_type,
+                    'source_id': source_id,
+                }
+                if source_type == 'transcript_message':
+                    message = _resolve_clock_transcript_message(campaign, source_id)
+                    if message is None:
+                        continue
+                    evidence_item.update({'role': message.role, 'content': message.content})
+                elif source_type == 'world_event':
+                    event = _resolve_clock_world_event(campaign, source_id)
+                    if event is None:
+                        continue
+                    evidence_item.update({'event': event.to_dict(include_private=True)})
+                else:
+                    continue
+                allow_source(source_type, source_id)
+                pending_completion_evidence.append(evidence_item)
     return {
         'campaign_id': campaign.id,
         'session_id': session.id,
@@ -1712,6 +1763,8 @@ def build_session_clock_context(
         'current_scene_after': current_scene_after if isinstance(current_scene_after, dict) else {},
         'active_clocks': active_clocks,
         'recent_events': [event.to_dict(include_private=True) for event in reversed(recent_events)],
+        'pending_completion_evidence': pending_completion_evidence,
+        'allowed_evidence_sources': allowed_evidence_sources,
     }
 
 
@@ -5123,8 +5176,10 @@ def _create_clock_from_patch(campaign, patch):
     clock.on_complete = clean_text(patch.get('on_complete'), 520)
     if 'completion_criteria' in patch:
         clock.completion_criteria = _normalize_clock_completion_criteria(patch.get('completion_criteria'))
+        clock.completion_state = {}
     elif not existing:
         clock.completion_criteria = []
+        clock.completion_state = {}
     clock.status = clean_text(patch.get('status'), 30) or 'active'
     if clock.filled >= clock.segments and clock.completion_criteria:
         clock.status = 'completion_pending'
@@ -5153,14 +5208,7 @@ def _create_clock_from_patch(campaign, patch):
     }
 
 
-_CLOCK_TRANSCRIPT_EVIDENCE_SOURCES = frozenset({
-    'visible_transcript',
-    'transcript_message',
-})
-_CLOCK_MEMORY_EVIDENCE_SOURCES = frozenset({
-    'prior_durable_memory',
-    'prior_memory_record',
-})
+_CLOCK_ALLOWED_EVIDENCE_SOURCE_TYPES = frozenset({'transcript_message', 'world_event'})
 
 
 def _resolve_clock_transcript_message(campaign, source_id):
@@ -5180,22 +5228,6 @@ def _resolve_clock_transcript_message(campaign, source_id):
     return message
 
 
-def _resolve_clock_memory_record(campaign, source_id):
-    """Resolve a prior-memory evidence source to a real durable memory log in this campaign."""
-    if source_id in (None, ''):
-        return None
-    from models import CampaignMemoryLog
-    numeric_id = _coerce_patch_int(source_id, default=None)
-    record = None
-    if numeric_id is not None:
-        record = CampaignMemoryLog.query.filter_by(campaign_id=campaign.id, id=numeric_id).first()
-    if record is None:
-        record = CampaignMemoryLog.query.filter_by(
-            campaign_id=campaign.id, memory_id=str(source_id)
-        ).order_by(CampaignMemoryLog.id.desc()).first()
-    return record
-
-
 def _resolve_clock_world_event(campaign, source_id):
     event_id = _coerce_patch_int(source_id, default=None, minimum=1)
     if event_id is None:
@@ -5213,7 +5245,22 @@ def _clock_visibility_allows(source_visibility, required_visibility):
     return True
 
 
-def _verified_clock_evidence_sources(campaign, evidence_sources, required_visibility):
+def _clock_evidence_key(source):
+    if not isinstance(source, dict):
+        return None
+    source_type = clean_text(source.get('source_type'), 50).lower()
+    source_id = source.get('source_id')
+    if source_type not in _CLOCK_ALLOWED_EVIDENCE_SOURCE_TYPES or source_id in (None, ''):
+        return None
+    return source_type, str(source_id)
+
+
+def _verified_clock_evidence_sources(
+    campaign,
+    evidence_sources,
+    required_visibility,
+    allowed_evidence_keys,
+):
     """Resolve source references without attempting to interpret their prose.
 
     Semantic support is the clock adjudicator's job. The durable boundary only checks
@@ -5226,20 +5273,22 @@ def _verified_clock_evidence_sources(campaign, evidence_sources, required_visibi
         if not isinstance(source, dict):
             rejected.append({'source': source, 'reason': 'invalid_source_shape'})
             continue
-        source_type = clean_text(source.get('source_type') or source.get('source'), 50).lower()
+        source_type = clean_text(source.get('source_type'), 50).lower()
         source_id = source.get('source_id')
+        source_key = _clock_evidence_key(source)
+        if source_type not in _CLOCK_ALLOWED_EVIDENCE_SOURCE_TYPES:
+            rejected.append({'source': source, 'reason': 'unsupported_source_type'})
+            continue
+        if source_key not in allowed_evidence_keys:
+            rejected.append({'source': source, 'reason': 'source_not_in_adjudicator_context'})
+            continue
         normalized = None
         source_visibility = 'dm_private'
-        if source_type in _CLOCK_TRANSCRIPT_EVIDENCE_SOURCES:
+        if source_type == 'transcript_message':
             message = _resolve_clock_transcript_message(campaign, source_id)
             if message is not None:
                 normalized = {'source_type': 'transcript_message', 'source_id': str(message.id)}
                 source_visibility = 'public'
-        elif source_type in _CLOCK_MEMORY_EVIDENCE_SOURCES:
-            record = _resolve_clock_memory_record(campaign, source_id)
-            if record is not None and (record.status or 'applied') == 'applied':
-                normalized = {'source_type': 'prior_memory_record', 'source_id': str(record.id)}
-                source_visibility = record.visibility or 'dm_private'
         elif source_type == 'world_event':
             event = _resolve_clock_world_event(campaign, source_id)
             if event is not None:
@@ -5292,7 +5341,31 @@ def _collect_clock_criterion_verdicts(patch):
     return verdicts, duplicates
 
 
-def _retire_clock_from_patch(campaign, patch):
+def _persist_clock_completion_verdicts(clock, applied_verdicts):
+    raw_state = clock.completion_state if isinstance(clock.completion_state, dict) else {}
+    raw_criteria = raw_state.get('criteria') if isinstance(raw_state.get('criteria'), dict) else {}
+    criteria_state = {
+        criterion_id: dict(verdict)
+        for criterion_id, verdict in raw_criteria.items()
+        if isinstance(verdict, dict)
+    }
+    for verdict in applied_verdicts:
+        if (
+            verdict.get('verdict') == 'met'
+            and verdict.get('supported_claims')
+            and verdict.get('evidence_sources')
+        ):
+            criteria_state[verdict['criterion_id']] = {
+                'verdict': 'met',
+                'supported_claims': list(verdict['supported_claims']),
+                'evidence_sources': list(verdict['evidence_sources']),
+                'reason': verdict.get('reason'),
+            }
+    clock.completion_state = {'criteria': criteria_state} if criteria_state else {}
+    clock.updated_at = utcnow()
+
+
+def _retire_clock_from_patch(campaign, patch, allowed_evidence_sources=None):
     clock_id = clean_id(patch.get('clock_id') or patch.get('id'), '')
     clock = CampaignClock.query.filter_by(campaign_id=campaign.id, clock_id=clock_id).first()
     if not clock:
@@ -5304,6 +5377,11 @@ def _retire_clock_from_patch(campaign, patch):
     criterion_evidence_status = {}
     applied_criterion_verdicts = []
     rejected_proposals = []
+    allowed_evidence_keys = {
+        key
+        for source in (allowed_evidence_sources or [])
+        if (key := _clock_evidence_key(source)) is not None
+    }
 
     consequence = patch.get('consequence') if isinstance(patch.get('consequence'), dict) else {}
     requested_visibility = consequence.get('visibility') or patch.get('visibility') or clock.visibility or 'dm_private'
@@ -5338,7 +5416,10 @@ def _retire_clock_from_patch(campaign, patch):
     for criterion_id in sorted(required_ids):
         verdict = criterion_verdicts[criterion_id]
         verified_sources, rejected_sources = _verified_clock_evidence_sources(
-            campaign, verdict['evidence_sources'], requested_visibility
+            campaign,
+            verdict['evidence_sources'],
+            requested_visibility,
+            allowed_evidence_keys,
         )
         accepted = (
             verdict['verdict'] == 'met'
@@ -5358,6 +5439,8 @@ def _retire_clock_from_patch(campaign, patch):
         met_ids.add(criterion_id)
         criterion_claims.update(verdict['supported_claims'])
 
+    _persist_clock_completion_verdicts(clock, applied_criterion_verdicts)
+
     if unsupported_ids:
         rejected_proposals.append({
             'kind': 'completion_criterion_verdicts',
@@ -5376,7 +5459,10 @@ def _retire_clock_from_patch(campaign, patch):
     consequence_claims = _normalize_clock_supported_claims(consequence.get('claims'))
     consequence_reason = clean_text(consequence.get('reason'), 520)
     verified_consequence_sources, rejected_consequence_sources = _verified_clock_evidence_sources(
-        campaign, consequence.get('evidence_sources'), requested_visibility
+        campaign,
+        consequence.get('evidence_sources'),
+        requested_visibility,
+        allowed_evidence_keys,
     )
     claims_derived_from_criteria = not completion_criteria or set(consequence_claims) <= criterion_claims
     consequence_supported = (
@@ -5419,6 +5505,7 @@ def _retire_clock_from_patch(campaign, patch):
         'reason': 'applied_at_requested_visibility',
     }
     clock.status = 'resolved'
+    clock.completion_state = {}
     clock.updated_at = utcnow()
     upsert_memory_embedding(campaign, 'clock', clock.clock_id, clock.to_dict(include_private=True))
     from openrouter import _get_cached_build_sha
@@ -5475,7 +5562,12 @@ def _applied_clock_provenance(raw_provenance, build_sha):
     return provenance
 
 
-def apply_clock_adjudication(campaign, updates, audit_context=None):
+def apply_clock_adjudication(
+    campaign,
+    updates,
+    audit_context=None,
+    allowed_evidence_sources=None,
+):
     audit_context = audit_context or {}
     updates = updates if isinstance(updates, dict) else {}
     result = {
@@ -5493,6 +5585,8 @@ def apply_clock_adjudication(campaign, updates, audit_context=None):
         )
         if message_id is not None
     ]
+    if allowed_evidence_sources is None:
+        allowed_evidence_sources = transcript_evidence_sources
 
     def resolve_clock_reference(raw_clock_ref):
         clock_key = clean_id(raw_clock_ref, '')
@@ -5607,7 +5701,11 @@ def apply_clock_adjudication(campaign, updates, audit_context=None):
             'evidence_sources': evidence_sources,
             'evidence_status': raw_provenance.get('evidence_status') or determine_evidence_status(evidence_sources),
         }
-        change = _retire_clock_from_patch(campaign, item)
+        change = _retire_clock_from_patch(
+            campaign,
+            item,
+            allowed_evidence_sources=allowed_evidence_sources,
+        )
         result['clock_changes'].append(change)
         if change.get('event_id'):
             result['world_event_ids'].append(change['event_id'])
@@ -6305,7 +6403,18 @@ def apply_memory_patch(campaign, session, patch, audit_context=None):
             existing = CampaignClock.query.filter_by(campaign_id=campaign.id, clock_id=clock_id).first() if clock_id else None
             before_val = existing.to_dict(include_private=True) if existing else None
 
-            change = _retire_clock_from_patch(campaign, item)
+            memory_allowed_evidence = audit_context.get('allowed_evidence_sources')
+            if not isinstance(memory_allowed_evidence, list):
+                memory_allowed_evidence = [
+                    {'source_type': 'transcript_message', 'source_id': str(message_id)}
+                    for message_id in (player_message_id, dm_message_id)
+                    if message_id is not None
+                ]
+            change = _retire_clock_from_patch(
+                campaign,
+                item,
+                allowed_evidence_sources=memory_allowed_evidence,
+            )
             result['clock_changes'].append(change)
             if change.get('event_id'):
                 result['world_event_ids'].append(change['event_id'])

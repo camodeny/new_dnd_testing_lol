@@ -304,7 +304,8 @@ SESSION_CLOCK_ADJUDICATOR_SYSTEM_PROMPT = (
     "Treat rumors, suspicions, hypotheticals, attributed claims, partial support, contradictions, and ambiguous subject-role-location bindings as uncertain or not_met, never as confirmed facts. "
     "A clock with completion_criteria may reach its final segment but must not be retired until every criterion is visibly supported. "
     "Every retirement must include completion_criteria_verdicts with exactly one entry per declared criterion. Each entry must contain criterion_id, verdict (met, not_met, or uncertain), atomic supported_claims, evidence_sources, and a concise reason. "
-    "Only use source IDs supplied in latest_player_message, latest_dm_message, or recent_events. Never invent a source ID. "
+    "Only use source IDs supplied in allowed_evidence_sources and whose contents appear in the current messages, recent_events, or pending_completion_evidence. Never invent a source ID. "
+    "Previously verified met criteria and their source contents may appear in active_clocks completion_state and pending_completion_evidence; preserve those met verdicts and cite those explicitly supplied sources on later turns. "
     "Every retirement must also include a consequence with verdict (supported, unsupported, or uncertain), atomic claims, visibility, evidence_sources, and reason. "
     "For criteria-backed clocks, consequence claims must be exact copies of claims from met criterion verdicts; do not add inferred connective facts or rewrite them into stronger claims. "
     "If any criterion or consequence is not fully supported, do not retire the clock; put it in no_change_explanations and leave it completion_pending. "
@@ -3613,6 +3614,8 @@ def build_session_clock_adjudication_messages(clock_context):
                 'latest_player_message': clock_context.get('latest_player_message'),
                 'latest_dm_message': clock_context.get('latest_dm_message'),
                 'recent_events': clock_context.get('recent_events') or [],
+                'pending_completion_evidence': clock_context.get('pending_completion_evidence') or [],
+                'allowed_evidence_sources': clock_context.get('allowed_evidence_sources') or [],
                 'retirement_contract': {
                     'criterion_verdicts': ['met', 'not_met', 'uncertain'],
                     'consequence_verdicts': ['supported', 'unsupported', 'uncertain'],

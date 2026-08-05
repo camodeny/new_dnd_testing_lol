@@ -295,6 +295,7 @@ def _run_session_memory_update(
                     'source_player_message_id': player_message_id,
                     'source_dm_message_id': dm_message_id,
                 },
+                allowed_evidence_sources=clock_context.get('allowed_evidence_sources') or [],
             )
             clock_complete = True
             db.session.commit()

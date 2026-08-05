@@ -387,7 +387,7 @@ def ensure_lightweight_schema():
             db.session.execute(text('ALTER TABLE campaign_memory_logs ADD COLUMN provenance_json JSON'))
 
     # --- campaign_clocks ---
-    # No runtime ALTER shim: the Alembic migration adds campaign_clocks.completion_criteria
+    # No runtime ALTER shim: the Alembic migration adds campaign clock completion fields
     # on fresh databases, and existing local data is reset rather than migrated.
 
     # --- New tables for session memory integrity ---

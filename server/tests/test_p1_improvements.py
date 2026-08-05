@@ -1246,7 +1246,9 @@ class P1ImprovementsTest(unittest.TestCase):
                 'evidence_status': 'supported_by_evidence',
                 'pipeline_stage': 'applied',
             },
-        })
+        }, allowed_evidence_sources=[
+            {'source_type': 'world_event', 'source_id': str(create_event.id)},
+        ])
         self.assertNotIn('error', retire_result)
 
         retire_event = WorldEvent.query.filter_by(
@@ -1599,7 +1601,16 @@ class P1ImprovementsTest(unittest.TestCase):
                 'provenance': {},
             }],
         }
-        apply_memory_patch(self.campaign, self.session, retire_patch)
+        apply_memory_patch(
+            self.campaign,
+            self.session,
+            retire_patch,
+            audit_context={
+                'allowed_evidence_sources': [
+                    {'source_type': 'world_event', 'source_id': str(create_event.id)},
+                ],
+            },
+        )
         retire_event = WorldEvent.query.filter_by(
             campaign_id=self.campaign.id,
             event_type='clock_retired',
