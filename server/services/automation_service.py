@@ -378,6 +378,18 @@ def _normalize_custom_scorecard_status(value, default='warn'):
     return status if status in CUSTOM_SCORECARD_STATUS_ORDER else default
 
 
+def _coerce_scorecard_text(value, criterion_id, index, field):
+    if not value:
+        return None
+    if not isinstance(value, str):
+        raise AuditScorecardValidationError(
+            f'scorecard.criteria[{index}].{field} must be a string.',
+            code='invalid_field_type',
+            details={'index': index, 'criterion_id': criterion_id, 'field': field, 'received_type': type(value).__name__},
+        )
+    return value.strip() or None
+
+
 def _aggregate_custom_scorecard_statuses(statuses, default='warn'):
     normalized = [_normalize_custom_scorecard_status(status, default='warn') for status in statuses if status]
     if not normalized:
@@ -1896,14 +1908,27 @@ def submit_audit_cycle_feedback(cycle, *, summary=None, notes=None, scorecard=No
                 details={'criterion_id': criterion_id, 'required_criterion_ids': sorted(template_criteria)},
             )
         template_row = template_criteria.get(criterion_id, {})
-        raw_status = str(raw.get('status') or 'warn').strip().lower()
+        raw_status_value = raw.get('status')
+        if raw_status_value is None:
+            raise AuditScorecardValidationError(
+                f'Criterion {criterion_id} is missing status.',
+                code='missing_status',
+                details={'criterion_id': criterion_id, 'allowed_statuses': list(CUSTOM_SCORECARD_STATUS_ORDER)},
+            )
+        if not isinstance(raw_status_value, str) or not raw_status_value.strip():
+            raise AuditScorecardValidationError(
+                f'Criterion {criterion_id} has invalid status {raw_status_value!r}.',
+                code='invalid_status',
+                details={'criterion_id': criterion_id, 'received_type': type(raw_status_value).__name__, 'allowed_statuses': list(CUSTOM_SCORECARD_STATUS_ORDER)},
+            )
+        raw_status = raw_status_value.strip().lower()
         if raw_status not in CUSTOM_SCORECARD_STATUS_ORDER:
             raise AuditScorecardValidationError(
-                f'Criterion {criterion_id} has invalid status {raw.get("status")!r}.',
+                f'Criterion {criterion_id} has invalid status {raw_status_value!r}.',
                 code='invalid_status',
                 details={'criterion_id': criterion_id, 'allowed_statuses': list(CUSTOM_SCORECARD_STATUS_ORDER)},
             )
-        status = _normalize_custom_scorecard_status(raw_status)
+        status = raw_status
         
         evidence_refs = []
         for ref in _json_list(raw.get('evidence_refs'), []):
@@ -1934,9 +1959,9 @@ def submit_audit_cycle_feedback(cycle, *, summary=None, notes=None, scorecard=No
             'criterion_id': criterion_id,
             'label': template_row.get('label') or raw.get('label') or criterion_id,
             'status': status,
-            'summary': (raw.get('summary') or '').strip() or None,
-            'primary_evidence': (raw.get('primary_evidence') or '').strip() or None,
-            'evidence': (raw.get('evidence') or '').strip() or None,
+            'summary': _coerce_scorecard_text(raw.get('summary'), criterion_id, index, 'summary'),
+            'primary_evidence': _coerce_scorecard_text(raw.get('primary_evidence'), criterion_id, index, 'primary_evidence'),
+            'evidence': _coerce_scorecard_text(raw.get('evidence'), criterion_id, index, 'evidence'),
             'evidence_refs': evidence_refs,
             'applicability': applicability,
         })
@@ -2535,8 +2560,10 @@ def _collect_run_metrics(run, event_rows=None, audit_rows=None, provider_rows=No
         }
         assessments = _json_list((cycle.scorecard_json or {}).get('criteria'), [])
         has_only_assessed_results = all(
-            _normalize_custom_scorecard_status(item.get('status')) in {'pass', 'warn', 'fail', 'not_applicable'}
-            for item in assessments if isinstance(item, dict)
+            isinstance(item, dict)
+            and isinstance(item.get('status'), str)
+            and item.get('status').strip().lower() in {'pass', 'warn', 'fail', 'not_applicable'}
+            for item in assessments
         )
         if submitted_ids >= required_criterion_ids and has_only_assessed_results:
             fully_scored_cycles.append(cycle)
