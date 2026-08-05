@@ -981,6 +981,8 @@ class CampaignClock(db.Model):
     summary = db.Column(db.Text, nullable=True)
     trigger = db.Column(db.Text, nullable=True)
     on_complete = db.Column(db.Text, nullable=True)
+    completion_criteria = db.Column(db.JSON, nullable=True)
+    completion_state = db.Column(db.JSON, nullable=True)
     status = db.Column(db.String(30), default='active')
     created_at = db.Column(db.DateTime, default=utcnow)
     updated_at = db.Column(db.DateTime, default=utcnow, onupdate=utcnow)
@@ -1004,6 +1006,8 @@ class CampaignClock(db.Model):
             'summary': self.summary,
             'trigger': self.trigger if include_private else None,
             'on_complete': self.on_complete if include_private else None,
+            'completion_criteria': self.completion_criteria if include_private else None,
+            'completion_state': self.completion_state if include_private else None,
             'status': self.status,
             'created_at': self.created_at.isoformat() if self.created_at else None,
             'updated_at': self.updated_at.isoformat() if self.updated_at else None,

@@ -301,6 +301,15 @@ SESSION_CLOCK_ADJUDICATOR_SYSTEM_PROMPT = (
     "If a new pressure is already underway, prefer creating the new clock with filled set to 1 instead of 0. "
     "Do not create a new clock if an existing active clock already covers the same pressure. "
     "Each advance_clocks item must include clock_id, delta, reason, and evidence. "
+    "You are the semantic adjudicator for clock completion; the application will validate source existence and visibility but will not reinterpret prose. "
+    "Treat rumors, suspicions, hypotheticals, attributed claims, partial support, contradictions, and ambiguous subject-role-location bindings as uncertain or not_met, never as confirmed facts. "
+    "A clock with completion_criteria may reach its final segment but must not be retired until every criterion is visibly supported. "
+    "Every retirement must include completion_criteria_verdicts with exactly one entry per declared criterion. Each entry must contain criterion_id, verdict (met, not_met, or uncertain), atomic supported_claims, evidence_sources, and a concise reason. "
+    "Only use source IDs supplied in allowed_evidence_sources and whose contents appear in the current messages, recent_events, or pending_completion_evidence. Never invent a source ID. "
+    "Previously verified met criteria and their source contents may appear in active_clocks completion_state and pending_completion_evidence; preserve those met verdicts and cite those explicitly supplied sources on later turns. "
+    "Every retirement must also include a consequence with verdict (supported, unsupported, or uncertain), atomic claims, visibility, evidence_sources, and reason. "
+    "For criteria-backed clocks, consequence claims must be exact copies of claims from met criterion verdicts; do not add inferred connective facts or rewrite them into stronger claims. "
+    "If any criterion or consequence is not fully supported, do not retire the clock; put it in no_change_explanations and leave it completion_pending. "
     "Each no_change_explanations item must include clock_id and reason. Do not output plain text or markdown."
 )
 
@@ -3218,6 +3227,7 @@ def build_world_genesis_messages(context):
                         'hidden_factions': ['private faction notes'],
                         'npc_secrets': ['private NPC secrets'],
                         'opening_scene_private_notes': 'DM-only guidance for the first exchange',
+                        'authorized_rules': [{'id': 'stable_rule_id', 'description': 'deterministic rule whose execution may emit a durable world event'}],
                     },
                     'npc_actors': [
                         {
@@ -3245,6 +3255,7 @@ def build_world_genesis_messages(context):
                             'summary': 'what this pressure represents',
                             'trigger': 'when it advances',
                             'on_complete': 'what happens when filled',
+                            'completion_criteria': [{'id': 'criterion_id', 'description': 'what must be evidenced before this clock resolves'}],
                             'status': 'active',
                         },
                     ],
@@ -3332,6 +3343,7 @@ WORLD_GENESIS_SECTION_SPECS = (
                 'hidden_factions': ['private faction notes'],
                 'npc_secrets': ['private NPC secrets'],
                 'opening_scene_private_notes': 'DM-only guidance for the first exchange',
+                'authorized_rules': [{'id': 'stable_rule_id', 'description': 'deterministic rule whose execution may emit a durable world event'}],
             },
         },
     ),
@@ -3369,6 +3381,7 @@ WORLD_GENESIS_SECTION_SPECS = (
                     'summary': 'what this pressure represents',
                     'trigger': 'when it advances',
                     'on_complete': 'what happens when filled',
+                    'completion_criteria': [{'id': 'criterion_id', 'description': 'what must be evidenced before this clock resolves'}],
                     'status': 'active',
                 },
             ],
@@ -3602,6 +3615,14 @@ def build_session_clock_adjudication_messages(clock_context):
                 'latest_player_message': clock_context.get('latest_player_message'),
                 'latest_dm_message': clock_context.get('latest_dm_message'),
                 'recent_events': clock_context.get('recent_events') or [],
+                'pending_completion_evidence': clock_context.get('pending_completion_evidence') or [],
+                'allowed_evidence_sources': clock_context.get('allowed_evidence_sources') or [],
+                'retirement_contract': {
+                    'criterion_verdicts': ['met', 'not_met', 'uncertain'],
+                    'consequence_verdicts': ['supported', 'unsupported', 'uncertain'],
+                    'evidence_source_types': ['transcript_message', 'world_event'],
+                    'fail_closed': True,
+                },
             }, ensure_ascii=False),
         },
     ]
@@ -4875,6 +4896,39 @@ SESSION_MEMORY_RESOLVER_FINALIZER_TOOL = {
 }
 
 SESSION_MEMORY_CLOCKS_FINALIZER_TOOL_NAME = 'submit_clock_updates'
+_CLOCK_EVIDENCE_SOURCE_SCHEMA = {
+    'type': 'object',
+    'required': ['source_type', 'source_id'],
+    'properties': {
+        'source_type': {'type': 'string', 'enum': ['transcript_message', 'world_event']},
+        'source_id': {'type': 'string'},
+    },
+    'additionalProperties': False,
+}
+_CLOCK_CRITERION_VERDICT_SCHEMA = {
+    'type': 'object',
+    'required': ['criterion_id', 'verdict', 'supported_claims', 'evidence_sources', 'reason'],
+    'properties': {
+        'criterion_id': {'type': 'string'},
+        'verdict': {'type': 'string', 'enum': ['met', 'not_met', 'uncertain']},
+        'supported_claims': {'type': 'array', 'items': {'type': 'string'}},
+        'evidence_sources': {'type': 'array', 'items': _CLOCK_EVIDENCE_SOURCE_SCHEMA},
+        'reason': {'type': 'string'},
+    },
+    'additionalProperties': False,
+}
+_CLOCK_CONSEQUENCE_VERDICT_SCHEMA = {
+    'type': 'object',
+    'required': ['verdict', 'claims', 'visibility', 'evidence_sources', 'reason'],
+    'properties': {
+        'verdict': {'type': 'string', 'enum': ['supported', 'unsupported', 'uncertain']},
+        'claims': {'type': 'array', 'items': {'type': 'string'}},
+        'visibility': {'type': 'string', 'enum': ['public', 'party_known', 'dm_private']},
+        'evidence_sources': {'type': 'array', 'items': _CLOCK_EVIDENCE_SOURCE_SCHEMA},
+        'reason': {'type': 'string'},
+    },
+    'additionalProperties': False,
+}
 SESSION_MEMORY_CLOCKS_FINALIZER_TOOL = {
     'type': 'function',
     'function': {
@@ -4886,7 +4940,24 @@ SESSION_MEMORY_CLOCKS_FINALIZER_TOOL = {
             'properties': {
                 'create_clocks': {'type': 'array', 'items': {'type': 'object'}, 'description': 'Clocks to create.'},
                 'advance_clocks': {'type': 'array', 'items': {'type': 'object'}, 'description': 'Existing clocks to advance.'},
-                'retire_clocks': {'type': 'array', 'items': {'type': 'object'}, 'description': 'Clocks to retire.'},
+                'retire_clocks': {
+                    'type': 'array',
+                    'items': {
+                        'type': 'object',
+                        'required': ['clock_id', 'completion_criteria_verdicts', 'consequence'],
+                        'properties': {
+                            'clock_id': {'type': 'string'},
+                            'completion_criteria_verdicts': {
+                                'type': 'array',
+                                'items': _CLOCK_CRITERION_VERDICT_SCHEMA,
+                            },
+                            'consequence': _CLOCK_CONSEQUENCE_VERDICT_SCHEMA,
+                            'provenance': {'type': 'object'},
+                        },
+                        'additionalProperties': False,
+                    },
+                    'description': 'Clocks to retire after structured semantic adjudication. Omit clocks with any uncertain or unsupported verdict.',
+                },
                 'no_change_explanations': {'type': 'array', 'items': {'type': 'object'}, 'description': 'Reasons active clocks did not change.'},
             },
         },

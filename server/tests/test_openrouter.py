@@ -685,6 +685,8 @@ class ClockAdjudicatorTest(unittest.TestCase):
         self.assertEqual(payload['current_scene_after']['location_id'], 'crypt_road')
         self.assertEqual(payload['active_clocks'][0]['clock_id'], 'race_to_crypts')
         self.assertEqual(payload['latest_player_message'], clock_context['latest_player_message'])
+        self.assertEqual(payload['retirement_contract']['criterion_verdicts'], ['met', 'not_met', 'uncertain'])
+        self.assertTrue(payload['retirement_contract']['fail_closed'])
 
     def test_clock_adjudicator_returns_advance_clocks_payload(self):
         response = _tool_response('submit_clock_updates', {
@@ -717,6 +719,16 @@ class ClockAdjudicatorTest(unittest.TestCase):
         self.assertEqual(updates['create_clocks'], [])
         self.assertEqual(updates['advance_clocks'][0]['clock_id'], 'race_to_crypts')
         self.assertEqual(updates['advance_clocks'][0]['delta'], 1)
+        retire_schema = (
+            post_chat.call_args.kwargs['tools'][0]['function']['parameters']
+            ['properties']['retire_clocks']['items']
+        )
+        self.assertEqual(
+            retire_schema['required'],
+            ['clock_id', 'completion_criteria_verdicts', 'consequence'],
+        )
+        criterion_schema = retire_schema['properties']['completion_criteria_verdicts']['items']
+        self.assertEqual(criterion_schema['properties']['verdict']['enum'], ['met', 'not_met', 'uncertain'])
         self.assertEqual(
             post_chat.call_args.kwargs['audit_context']['operation'],
             'session_clock_adjudication',

@@ -1209,7 +1209,7 @@ class P1ImprovementsTest(unittest.TestCase):
             'name': 'Create Test Clock',
             'segments': 6,
             'filled': 0,
-            'visibility': 'party_known',
+            'visibility': 'dm_private',
             'provenance': {
                 'tool_name': 'test_create',
                 'evidence_status': 'supported_by_evidence',
@@ -1231,13 +1231,24 @@ class P1ImprovementsTest(unittest.TestCase):
 
         retire_result = _retire_clock_from_patch(self.campaign, {
             'clock_id': 'clock_create_test',
-            'reason': 'Test retire',
+            'completion_criteria_verdicts': [],
+            'consequence': {
+                'verdict': 'supported',
+                'claims': ['The test clock is retired.'],
+                'visibility': 'dm_private',
+                'evidence_sources': [
+                    {'source_type': 'world_event', 'source_id': str(create_event.id)},
+                ],
+                'reason': 'Structured test adjudication.',
+            },
             'provenance': {
                 'tool_name': 'test_retire',
                 'evidence_status': 'supported_by_evidence',
                 'pipeline_stage': 'applied',
             },
-        })
+        }, allowed_evidence_sources=[
+            {'source_type': 'world_event', 'source_id': str(create_event.id)},
+        ])
         self.assertNotIn('error', retire_result)
 
         retire_event = WorldEvent.query.filter_by(
@@ -1602,10 +1613,29 @@ class P1ImprovementsTest(unittest.TestCase):
         retire_patch = {
             'retire_clocks': [{
                 'clock_id': 'clock_empty_provenance',
+                'completion_criteria_verdicts': [],
+                'consequence': {
+                    'verdict': 'supported',
+                    'claims': ['The empty-provenance test clock is retired.'],
+                    'visibility': 'dm_private',
+                    'evidence_sources': [
+                        {'source_type': 'world_event', 'source_id': str(create_event.id)},
+                    ],
+                    'reason': 'Structured test adjudication.',
+                },
                 'provenance': {},
             }],
         }
-        apply_memory_patch(self.campaign, self.session, retire_patch)
+        apply_memory_patch(
+            self.campaign,
+            self.session,
+            retire_patch,
+            audit_context={
+                'allowed_evidence_sources': [
+                    {'source_type': 'world_event', 'source_id': str(create_event.id)},
+                ],
+            },
+        )
         retire_event = WorldEvent.query.filter_by(
             campaign_id=self.campaign.id,
             event_type='clock_retired',
@@ -1613,7 +1643,7 @@ class P1ImprovementsTest(unittest.TestCase):
         retire_prov = json.loads(retire_event.payload)['provenance']
         self.assertEqual(retire_prov['pipeline_stage'], 'applied')
         self.assertEqual(retire_prov['tool_name'], 'session_memory_update_clocks')
-        self.assertEqual(retire_prov['evidence_status'], 'insufficiently_supported')
+        self.assertEqual(retire_prov['evidence_status'], 'ai_adjudicated_verified_sources')
         self.assertTrue(retire_prov['build_sha'])
 
     def test_cycle_evidence_packet_includes_memory_logs(self):

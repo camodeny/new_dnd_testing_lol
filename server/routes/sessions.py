@@ -269,6 +269,8 @@ def _run_session_memory_update(
                 ai_text,
                 current_scene_before,
                 current_scene_after_memory,
+                player_message_id=player_message_id,
+                dm_message_id=dm_message_id,
             )
             clock_updates = get_session_clock_updates(
                 clock_context,
@@ -293,6 +295,7 @@ def _run_session_memory_update(
                     'source_player_message_id': player_message_id,
                     'source_dm_message_id': dm_message_id,
                 },
+                allowed_evidence_sources=clock_context.get('allowed_evidence_sources') or [],
             )
             clock_complete = True
             db.session.commit()

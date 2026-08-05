@@ -1463,6 +1463,8 @@ def materialize_run_campaign(run):
             summary=clock.get('summary'),
             trigger=clock.get('trigger'),
             on_complete=clock.get('on_complete'),
+            completion_criteria=clock.get('completion_criteria') or [],
+            completion_state=clock.get('completion_state') or {},
             status=clock.get('status') or 'active',
         ))
 
