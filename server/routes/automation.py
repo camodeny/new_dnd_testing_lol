@@ -46,6 +46,7 @@ from services.automation_service import (
     CloneRetrievalPreflightError,
     append_run_event,
     append_workspace_event,
+    assert_scorecard_template_activatable,
     baseline_run_for_scenario,
     claim_run_for_worker,
     cleanup_hidden_clone_campaigns,
@@ -531,6 +532,10 @@ def create_automation_scenario(current_user):
         scorecard_template = get_or_404(AutomationScorecardTemplate, data.get('scorecard_template_id'))
         if scorecard_template.user_id != current_user.id:
             return jsonify({'error': 'Forbidden'}), 403
+        try:
+            assert_scorecard_template_activatable(scorecard_template)
+        except ValueError as exc:
+            return jsonify({'error': str(exc)}), 400
 
     roster_data = data.get('roster')
     if roster_data is not None:
@@ -614,6 +619,10 @@ def update_automation_scenario(current_user, scenario_id):
             scorecard_template = get_or_404(AutomationScorecardTemplate, scorecard_template_id)
             if scorecard_template.user_id != current_user.id:
                 return jsonify({'error': 'Forbidden'}), 403
+            try:
+                assert_scorecard_template_activatable(scorecard_template)
+            except ValueError as exc:
+                return jsonify({'error': str(exc)}), 400
             scenario.scorecard_template_id = scorecard_template.id
     if 'baseline_run_id' in data:
         baseline_run_id = data.get('baseline_run_id')

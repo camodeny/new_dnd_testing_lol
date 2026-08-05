@@ -109,6 +109,7 @@ def initialize_database(app):
         ensure_lightweight_schema()
         verify_required_schema()
         reconcile_stale_awaiting_audit_runs()
+        upgrade_legacy_scorecard_templates()
         bootstrap_owner_api_key()
         print("Database initialization completed.", flush=True)
 
@@ -140,6 +141,14 @@ def reconcile_stale_awaiting_audit_runs():
     reconciled = reconcile()
     if reconciled:
         print(f"Reconciled {reconciled} stale awaiting_audit run(s).", flush=True)
+
+
+def upgrade_legacy_scorecard_templates():
+    """One-time repair assigning canonical categories to stored scorecard templates."""
+    from services.automation_service import upgrade_legacy_scorecard_template_categories as upgrade
+    upgraded = upgrade()
+    if upgraded:
+        print(f"Upgraded {upgraded} legacy scorecard template(s) with canonical categories.", flush=True)
 
 
 def bootstrap_owner_api_key():

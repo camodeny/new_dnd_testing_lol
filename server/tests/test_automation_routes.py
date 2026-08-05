@@ -160,10 +160,19 @@ class AutomationRouteTest(unittest.TestCase):
         self.temp_dir.cleanup()
 
     def _create_scorecard_run(self, criteria, *, name='Issue 76 Scorecard'):
+        # Active templates require an explicit canonical category per criterion.
+        # These scoring tests focus on severity/performance/completeness, so default
+        # any category-less criterion to a canonical category.
+        normalized_criteria = []
+        for criterion in criteria:
+            item = dict(criterion)
+            if not (item.get('category') or '').strip():
+                item['category'] = 'operational/runtime reliability'
+            normalized_criteria.append(item)
         scorecard_response = self.client.post(
             '/api/automation/scorecards',
             headers=self.headers,
-            json={'name': name, 'criteria': criteria},
+            json={'name': name, 'criteria': normalized_criteria},
         )
         self.assertEqual(scorecard_response.status_code, 201)
         scorecard_id = scorecard_response.get_json()['scorecard']['id']
@@ -975,7 +984,7 @@ class AutomationRouteTest(unittest.TestCase):
             headers=self.headers,
             json={
                 'name': 'Shared Audit',
-                'criteria': [{'id': 'memory_quality', 'label': 'Memory Quality'}],
+                'criteria': [{'id': 'memory_quality', 'label': 'Memory Quality', 'category': 'retrieval or memory use'}],
             },
         ).get_json()['scorecard']['id']
         scenario_id = self.client.post(
@@ -1254,8 +1263,8 @@ class AutomationRouteTest(unittest.TestCase):
                 'name': 'DM Audit v1',
                 'instructions': 'Use runtime truth, not vibes.',
                 'criteria': [
-                    {'id': 'memory_quality', 'label': 'Memory Quality'},
-                    {'id': 'story_consistency', 'label': 'Story Consistency'},
+                    {'id': 'memory_quality', 'label': 'Memory Quality', 'category': 'retrieval or memory use'},
+                    {'id': 'story_consistency', 'label': 'Story Consistency', 'category': 'narrative quality'},
                 ],
                 'defaults': {'pause_phases': ['after_dm']},
             },
@@ -1344,8 +1353,8 @@ class AutomationRouteTest(unittest.TestCase):
             json={
                 'name': 'DM Audit v1',
                 'criteria': [
-                    {'id': 'memory_quality', 'label': 'Memory Quality'},
-                    {'id': 'story_consistency', 'label': 'Story Consistency'},
+                    {'id': 'memory_quality', 'label': 'Memory Quality', 'category': 'retrieval or memory use'},
+                    {'id': 'story_consistency', 'label': 'Story Consistency', 'category': 'narrative quality'},
                 ],
             },
         ).get_json()['scorecard']['id']
@@ -1712,6 +1721,7 @@ class AutomationRouteTest(unittest.TestCase):
                         'id': 'scene_state',
                         'label': 'Scene State',
                         'description': 'Transcript and world state stay aligned.',
+                        'category': 'durable state correctness',
                         'evidence_requirements': [
                             {
                                 'surface': 'cycle_evidence_packet.scene_state_summary',
@@ -1789,8 +1799,8 @@ class AutomationRouteTest(unittest.TestCase):
             json={
                 'name': 'Built-In Auditor Scorecard',
                 'criteria': [
-                    {'id': 'memory_quality', 'label': 'Memory Quality'},
-                    {'id': 'scene_state', 'label': 'Scene State'},
+                    {'id': 'memory_quality', 'label': 'Memory Quality', 'category': 'retrieval or memory use'},
+                    {'id': 'scene_state', 'label': 'Scene State', 'category': 'durable state correctness'},
                 ],
             },
         ).get_json()['scorecard']['id']
@@ -1899,7 +1909,7 @@ class AutomationRouteTest(unittest.TestCase):
             headers=self.headers,
             json={
                 'name': 'Cancelable Auditor Scorecard',
-                'criteria': [{'id': 'memory_quality', 'label': 'Memory Quality'}],
+                'criteria': [{'id': 'memory_quality', 'label': 'Memory Quality', 'category': 'retrieval or memory use'}],
             },
         ).get_json()['scorecard']['id']
         scenario_id = self.client.post(
@@ -1999,7 +2009,7 @@ class AutomationRouteTest(unittest.TestCase):
             headers=self.headers,
             json={
                 'name': 'Multi Auditor Scorecard',
-                'criteria': [{'id': 'memory_quality', 'label': 'Memory Quality'}],
+                'criteria': [{'id': 'memory_quality', 'label': 'Memory Quality', 'category': 'retrieval or memory use'}],
             },
         ).get_json()['scorecard']['id']
         scenario_id = self.client.post(
@@ -2077,7 +2087,7 @@ class AutomationRouteTest(unittest.TestCase):
             headers=self.headers,
             json={
                 'name': 'Scoped Audit Scorecard',
-                'criteria': [{'id': 'retrieval_relevance', 'label': 'Retrieval Relevance'}],
+                'criteria': [{'id': 'retrieval_relevance', 'label': 'Retrieval Relevance', 'category': 'retrieval or memory use'}],
             },
         ).get_json()['scorecard']['id']
         scenario_id = self.client.post(
@@ -2147,7 +2157,7 @@ class AutomationRouteTest(unittest.TestCase):
             headers=self.headers,
             json={
                 'name': 'Tool Loop Scorecard',
-                'criteria': [{'id': 'memory_quality', 'label': 'Memory Quality'}],
+                'criteria': [{'id': 'memory_quality', 'label': 'Memory Quality', 'category': 'retrieval or memory use'}],
             },
         ).get_json()['scorecard']['id']
         scenario_id = self.client.post(
@@ -2449,8 +2459,8 @@ class AutomationRouteTest(unittest.TestCase):
             json={
                 'name': 'P1 Testing Scorecard',
                 'criteria': [
-                    {'id': 'criterion_a', 'label': 'Criterion A'},
-                    {'id': 'criterion_b', 'label': 'Criterion B'}
+                    {'id': 'criterion_a', 'label': 'Criterion A', 'category': 'operational/runtime reliability'},
+                    {'id': 'criterion_b', 'label': 'Criterion B', 'category': 'narrative quality'}
                 ]
             }
         ).get_json()['scorecard']
@@ -2675,7 +2685,7 @@ class AutomationRouteTest(unittest.TestCase):
             headers=self.headers,
             json={
                 'name': 'Security Testing Scorecard',
-                'criteria': [{'id': 'criterion_sec', 'label': 'Security Criterion'}]
+                'criteria': [{'id': 'criterion_sec', 'label': 'Security Criterion', 'category': 'safety/private-information handling'}]
             }
         ).get_json()['scorecard']
         
@@ -4357,30 +4367,33 @@ class AutomationRouteTest(unittest.TestCase):
         self.assertEqual(bundle_api_data['run']['scorecard_summary']['weighted_score'], run.scorecard_summary_json['weighted_score'])
         self.assertEqual(bundle_api_data['run']['scorecard_summary']['category_breakdown'], run.scorecard_summary_json['category_breakdown'])
 
-        # 5. Verify unclassified/unknown category criterion is excluded from breakdowns but included in score
-        scorecard_id2 = self.client.post(
-            '/api/automation/scorecards',
-            headers=self.headers,
-            json={
+        # 5. Verify unclassified/unknown category criterion is excluded from breakdowns but included in score.
+        # A schema v1 legacy snapshot carries an invalid explicit category that predates strict
+        # template validation; it must remain readable via the scoring normalization path.
+        with app.app_context():
+            from models import AutomationRun
+            run = db.session.get(AutomationRun, run_id)
+            run.scorecard_template_json = {
+                'template_id': 0,
+                'schema_version': 1,
                 'name': 'Unknown category scorecard',
                 'criteria': [
                     {'id': 'unclassified_crit', 'label': 'Unclassified', 'weight': 2, 'category': 'unknown-cat-name-xyz'},
                 ],
-            },
-        ).get_json()['scorecard']['id']
-        
-        with app.app_context():
-            from models import AutomationScorecardTemplate
-            run = db.session.get(AutomationRun, run_id)
-            run.scorecard_template_json = db.session.get(AutomationScorecardTemplate, scorecard_id2).snapshot()
+                'defaults': {},
+            }
             db.session.commit()
-            
             res2 = refresh_run_scorecard(run)
             bd2 = run.scorecard_summary_json['category_breakdown']
             # "unknown-cat-name-xyz" should not be in the breakdown keys (only the 5 named categories)
             self.assertNotIn('unknown-cat-name-xyz', bd2)
             # Make sure it didn't fallback to narrative quality
             self.assertEqual(bd2['narrative quality']['status'], 'pass')
+            # The invalid explicit category is surfaced as a configuration error.
+            config = run.scorecard_summary_json['scorecard_configuration']
+            self.assertFalse(config['valid'])
+            self.assertEqual(config['uncategorized_criterion_count'], 1)
+            self.assertEqual(config['invalid_criteria'][0]['criterion_id'], 'unclassified_crit')
 
         # 6. Verify missing built-in metric (value is None) evaluates to not_assessed
         with app.app_context():
@@ -4653,7 +4666,6 @@ class AutomationRouteTest(unittest.TestCase):
                 'name': 'Mixed Missing Metric Scorecard',
                 'criteria': [
                     {'id': 'narrative_probe', 'label': 'Narrative Probe', 'weight': 2, 'category': 'narrative quality'},
-                    {'id': 'uncategorized_probe', 'label': 'Uncategorized Probe', 'weight': 2},
                 ],
             },
         ).get_json()['scorecard']['id']
@@ -4682,6 +4694,22 @@ class AutomationRouteTest(unittest.TestCase):
             headers=self.headers,
             json={'snapshot_id': snapshot_id},
         ).get_json()['run']['id']
+        with app.app_context():
+            # Simulate a historical template snapshot (schema v1) that predates strict
+            # category validation: the uncategorized criterion has no explicit category.
+            # Legacy snapshots must remain readable through the scoring normalization path.
+            run = db.session.get(AutomationRun, run_id)
+            run.scorecard_template_json = {
+                'template_id': scorecard_id,
+                'schema_version': 1,
+                'name': 'Mixed Missing Metric Scorecard',
+                'criteria': [
+                    {'id': 'narrative_probe', 'label': 'Narrative Probe', 'weight': 2, 'category': 'narrative quality'},
+                    {'id': 'uncategorized_probe', 'label': 'Uncategorized Probe', 'weight': 2},
+                ],
+                'defaults': {},
+            }
+            db.session.commit()
         claim = self.client.post(
             f'/api/automation/runs/{run_id}/claim',
             headers=self.headers,
@@ -4726,7 +4754,8 @@ class AutomationRouteTest(unittest.TestCase):
             self.assertEqual(by_id['known_errors']['status'], 'pass')
 
             # The uncategorized custom criterion stays uncategorized (no narrative fallback).
-            self.assertIsNone(by_id['custom:uncategorized_probe']['details']['category'])
+            self.assertEqual(by_id['custom:uncategorized_probe']['details']['category'], 'uncategorized')
+            self.assertFalse(run.scorecard_summary_json['scorecard_configuration']['valid'])
             self.assertEqual(by_id['custom:uncategorized_probe']['status'], 'warn')
 
             # Weighted score excludes not_assessed rows (weights 7 and 5) and counts only
@@ -4740,6 +4769,7 @@ class AutomationRouteTest(unittest.TestCase):
                 'durable state correctness',
                 'retrieval or memory use',
                 'safety/private-information handling',
+                'uncategorized',
             ]))
             # Narrative category contains only narrative_probe; if the uncategorized warn had
             # leaked in, the score would be 0.75 instead of 1.0.
@@ -4774,8 +4804,8 @@ class AutomationRouteTest(unittest.TestCase):
             json={
                 'name': 'Partial Auditor Scorecard',
                 'criteria': [
-                    {'id': 'criterion_a', 'label': 'Criterion A', 'weight': 2},
-                    {'id': 'criterion_b', 'label': 'Criterion B', 'weight': 3},
+                    {'id': 'criterion_a', 'label': 'Criterion A', 'weight': 2, 'category': 'narrative quality'},
+                    {'id': 'criterion_b', 'label': 'Criterion B', 'weight': 3, 'category': 'durable state correctness'},
                 ],
             },
         ).get_json()['scorecard']['id']
@@ -5082,6 +5112,347 @@ class AutomationRouteTest(unittest.TestCase):
         self.assertEqual(reclaim3_resp.status_code, 200)
         reclaim3_run = reclaim3_resp.get_json()['run']
         self.assertEqual(reclaim3_run['reconciliation_deadline'], deadline.isoformat())
+
+    def test_scorecard_template_creation_requires_explicit_categories(self):
+        # Missing explicit category is rejected.
+        missing = self.client.post(
+            '/api/automation/scorecards',
+            headers=self.headers,
+            json={
+                'name': 'Missing Category',
+                'criteria': [{'id': 'memory_quality', 'label': 'Memory Quality'}],
+            },
+        )
+        self.assertEqual(missing.status_code, 400)
+        self.assertIn('explicit category', missing.get_json()['error'])
+
+        # Invalid explicit category is rejected instead of being silently repaired.
+        invalid = self.client.post(
+            '/api/automation/scorecards',
+            headers=self.headers,
+            json={
+                'name': 'Invalid Category',
+                'criteria': [{'id': 'memory_quality', 'label': 'Memory Quality', 'category': 'not-a-real-category'}],
+            },
+        )
+        self.assertEqual(invalid.status_code, 400)
+        self.assertIn('invalid category', invalid.get_json()['error'])
+
+        # Alias values are accepted and normalized to the canonical name.
+        alias = self.client.post(
+            '/api/automation/scorecards',
+            headers=self.headers,
+            json={
+                'name': 'Alias Category',
+                'criteria': [{'id': 'memory_quality', 'label': 'Memory Quality', 'category': 'memory'}],
+            },
+        )
+        self.assertEqual(alias.status_code, 201)
+        self.assertEqual(alias.get_json()['scorecard']['criteria'][0]['category'], 'retrieval or memory use')
+
+        # Canonical values are accepted unchanged.
+        canonical = self.client.post(
+            '/api/automation/scorecards',
+            headers=self.headers,
+            json={
+                'name': 'Canonical Category',
+                'criteria': [{'id': 'story_consistency', 'label': 'Story Consistency', 'category': 'narrative quality'}],
+            },
+        )
+        self.assertEqual(canonical.status_code, 201)
+        self.assertEqual(canonical.get_json()['scorecard']['criteria'][0]['category'], 'narrative quality')
+
+    def test_scorecard_template_update_requires_explicit_categories(self):
+        created = self.client.post(
+            '/api/automation/scorecards',
+            headers=self.headers,
+            json={
+                'name': 'Update Target',
+                'criteria': [{'id': 'memory_quality', 'label': 'Memory Quality', 'category': 'retrieval or memory use'}],
+            },
+        ).get_json()['scorecard']
+        scorecard_id = created['id']
+
+        missing = self.client.put(
+            f'/api/automation/scorecards/{scorecard_id}',
+            headers=self.headers,
+            json={
+                'name': 'Update Target',
+                'criteria': [{'id': 'memory_quality', 'label': 'Memory Quality'}],
+            },
+        )
+        self.assertEqual(missing.status_code, 400)
+        self.assertIn('explicit category', missing.get_json()['error'])
+
+        invalid = self.client.put(
+            f'/api/automation/scorecards/{scorecard_id}',
+            headers=self.headers,
+            json={
+                'name': 'Update Target',
+                'criteria': [{'id': 'memory_quality', 'label': 'Memory Quality', 'category': 'bogus'}],
+            },
+        )
+        self.assertEqual(invalid.status_code, 400)
+        self.assertIn('invalid category', invalid.get_json()['error'])
+
+        alias = self.client.put(
+            f'/api/automation/scorecards/{scorecard_id}',
+            headers=self.headers,
+            json={
+                'name': 'Update Target',
+                'criteria': [{'id': 'story_consistency', 'label': 'Story Consistency', 'category': 'narrative'}],
+            },
+        )
+        self.assertEqual(alias.status_code, 200)
+        self.assertEqual(alias.get_json()['scorecard']['criteria'][0]['category'], 'narrative quality')
+
+        canonical = self.client.put(
+            f'/api/automation/scorecards/{scorecard_id}',
+            headers=self.headers,
+            json={
+                'name': 'Update Target',
+                'criteria': [{'id': 'scene_state', 'label': 'Scene State', 'category': 'durable state correctness'}],
+            },
+        )
+        self.assertEqual(canonical.status_code, 200)
+        self.assertEqual(canonical.get_json()['scorecard']['criteria'][0]['category'], 'durable state correctness')
+
+    def test_scorecard_template_activation_requires_valid_categories(self):
+        valid = self.client.post(
+            '/api/automation/scorecards',
+            headers=self.headers,
+            json={
+                'name': 'Activatable',
+                'criteria': [{'id': 'memory_quality', 'label': 'Memory Quality', 'category': 'retrieval or memory use'}],
+            },
+        ).get_json()['scorecard']
+        ok = self.client.post(
+            '/api/automation/scenarios',
+            headers=self.headers,
+            json={'source_campaign_id': self.campaign_id, 'scorecard_template_id': valid['id']},
+        )
+        self.assertEqual(ok.status_code, 201)
+        scenario_id = ok.get_json()['scenario']['id']
+
+        with app.app_context():
+            from models import AutomationScorecardTemplate
+            legacy = AutomationScorecardTemplate(
+                user_id=self.owner_id,
+                name='Legacy Invalid',
+                criteria_json=[
+                    {'id': 'memory_quality', 'label': 'Memory Quality', 'weight': 2},
+                    {'id': 'unknown_crit', 'label': 'Unknown', 'weight': 2, 'category': 'not-a-real-category'},
+                ],
+                defaults_json={},
+            )
+            db.session.add(legacy)
+            db.session.commit()
+            legacy_id = legacy.id
+
+        rejected = self.client.post(
+            '/api/automation/scenarios',
+            headers=self.headers,
+            json={'source_campaign_id': self.campaign_id, 'scorecard_template_id': legacy_id},
+        )
+        self.assertEqual(rejected.status_code, 400)
+        self.assertIn('cannot be activated', rejected.get_json()['error'])
+
+        update_rejected = self.client.put(
+            f'/api/automation/scenarios/{scenario_id}',
+            headers=self.headers,
+            json={'scorecard_template_id': legacy_id},
+        )
+        self.assertEqual(update_rejected.status_code, 400)
+        self.assertIn('cannot be activated', update_rejected.get_json()['error'])
+
+        detach = self.client.put(
+            f'/api/automation/scenarios/{scenario_id}',
+            headers=self.headers,
+            json={'scorecard_template_id': None},
+        )
+        self.assertEqual(detach.status_code, 200)
+
+    def test_legacy_scorecard_template_upgrade_assigns_canonical_categories(self):
+        # Reproduce the deployed pre-v2 Memory Audit Scorebook: generic criterion
+        # ids with the real stored descriptions but no category. The startup repair
+        # must assign the explicit per-criterion categories those descriptions imply.
+        deployed_criteria = [
+            {'id': 'criterion_1', 'label': 'Criterion 1', 'weight': 2,
+             'description': 'Established facts remain stable and are recalled accurately when relevant.'},
+            {'id': 'criterion_2', 'label': 'Criterion 2', 'weight': 2,
+             'description': 'Secret or unrevealed information is not exposed to players without in-world justification.'},
+            {'id': 'criterion_3', 'label': 'Criterion 3', 'weight': 2,
+             'description': 'DM output remains consistent with the current location, participants, objectives, and immediate prior events.'},
+            {'id': 'criterion_4', 'label': 'Criterion 4', 'weight': 2,
+             'description': 'NPC and character names, roles, traits, relationships, and ownership remain consistent.'},
+            {'id': 'criterion_5', 'label': 'Criterion 5', 'weight': 2,
+             'description': 'Retrieved campaign memory is pertinent, timely, and not contradicted by stronger current evidence.'},
+            {'id': 'criterion_6', 'label': 'Criterion 6', 'weight': 2,
+             'description': 'Cycle and campaign summaries preserve material facts, decisions, unresolved threads, and consequences without invention.'},
+            {'id': 'criterion_7', 'label': 'Criterion 7', 'weight': 2,
+             'description': 'World clocks, deadlines, elapsed time, and triggered consequences align with recorded state and narration.'},
+            {'id': 'criterion_8', 'label': 'Criterion 8', 'weight': 2,
+             'description': 'Transcript, world state, characters, NPCs, clocks, and campaign memory do not materially diverge.'},
+        ]
+        expected_categories = {
+            'criterion_1': 'durable state correctness',
+            'criterion_2': 'safety/private-information handling',
+            'criterion_3': 'durable state correctness',
+            'criterion_4': 'durable state correctness',
+            'criterion_5': 'retrieval or memory use',
+            'criterion_6': 'retrieval or memory use',
+            'criterion_7': 'durable state correctness',
+            'criterion_8': 'durable state correctness',
+        }
+        with app.app_context():
+            from models import AutomationScorecardTemplate
+            scorebook = AutomationScorecardTemplate(
+                user_id=self.owner_id,
+                name='Memory Audit Scorebook',
+                criteria_json=[dict(criterion) for criterion in deployed_criteria],
+                defaults_json={},
+            )
+            # An unrelated legacy template with a generic id must NOT be assigned a
+            # fabricated category; it stays invalid instead of getting a wrong one.
+            unrelated = AutomationScorecardTemplate(
+                user_id=self.owner_id,
+                name='Unrelated Legacy',
+                criteria_json=[{'id': 'generic_probe', 'label': 'Generic Probe', 'weight': 2}],
+                defaults_json={},
+            )
+            db.session.add_all([scorebook, unrelated])
+            db.session.commit()
+            scorebook_id = scorebook.id
+            unrelated_id = unrelated.id
+
+        with app.app_context():
+            from models import AutomationScorecardTemplate
+            from services.automation_service import (
+                assert_scorecard_template_activatable,
+                scorecard_configuration,
+                upgrade_legacy_scorecard_template_categories,
+            )
+            upgraded = upgrade_legacy_scorecard_template_categories()
+            self.assertEqual(upgraded, 1)
+            # Idempotent: a second pass makes no further changes.
+            self.assertEqual(upgrade_legacy_scorecard_template_categories(), 0)
+
+            scorebook = db.session.get(AutomationScorecardTemplate, scorebook_id)
+            categories = {criterion['id']: criterion['category'] for criterion in scorebook.criteria_json}
+            self.assertEqual(categories, expected_categories)
+            # Descriptions survive the repair untouched.
+            self.assertEqual(scorebook.criteria_json[1]['description'], deployed_criteria[1]['description'])
+            self.assertTrue(scorecard_configuration(scorebook.snapshot())['valid'])
+            assert_scorecard_template_activatable(scorebook)
+
+            unrelated = db.session.get(AutomationScorecardTemplate, unrelated_id)
+            self.assertIsNone(unrelated.criteria_json[0].get('category'))
+            self.assertFalse(scorecard_configuration(unrelated.snapshot())['valid'])
+
+        ok = self.client.post(
+            '/api/automation/scenarios',
+            headers=self.headers,
+            json={'source_campaign_id': self.campaign_id, 'scorecard_template_id': scorebook_id},
+        )
+        self.assertEqual(ok.status_code, 201)
+
+    def test_scorecard_configuration_signal_consistent_across_exports(self):
+        scorecard_id = self.client.post(
+            '/api/automation/scorecards',
+            headers=self.headers,
+            json={
+                'name': 'Signal Consistency',
+                'criteria': [{'id': 'memory_quality', 'label': 'Memory Quality', 'category': 'retrieval or memory use'}],
+            },
+        ).get_json()['scorecard']['id']
+        scenario_id = self.client.post(
+            '/api/automation/scenarios',
+            headers=self.headers,
+            json={'source_campaign_id': self.campaign_id, 'scorecard_template_id': scorecard_id},
+        ).get_json()['scenario']['id']
+        snapshot_id = self.client.post(
+            f'/api/automation/scenarios/{scenario_id}/snapshots',
+            headers=self.headers,
+            json={},
+        ).get_json()['snapshot']['id']
+        run_id = self.client.post(
+            f'/api/automation/scenarios/{scenario_id}/runs',
+            headers=self.headers,
+            json={'snapshot_id': snapshot_id},
+        ).get_json()['run']['id']
+        with app.app_context():
+            from models import AutomationRun
+            run = db.session.get(AutomationRun, run_id)
+            # Legacy snapshot (schema v1) carrying an invalid explicit category; must remain
+            # readable through the scoring normalization path and surface a config error.
+            run.scorecard_template_json = {
+                'template_id': scorecard_id,
+                'schema_version': 1,
+                'name': 'Signal Consistency',
+                'criteria': [
+                    {'id': 'memory_quality', 'label': 'Memory Quality', 'weight': 2, 'category': 'retrieval or memory use'},
+                    {'id': 'unknown_crit', 'label': 'Unknown', 'weight': 2, 'category': 'not-a-real-category'},
+                ],
+                'defaults': {},
+            }
+            db.session.commit()
+        claim = self.client.post(
+            f'/api/automation/runs/{run_id}/claim',
+            headers=self.headers,
+            json={'worker_id': 'worker-a'},
+        ).get_json()
+        cycle_id = self.client.post(
+            f'/api/automation/runs/{run_id}/pause',
+            headers=self.headers,
+            json={
+                'worker_id': 'worker-a',
+                'lease_token': claim['lease_token'],
+                'phase': 'after_dm',
+                'summary': 'Pause after DM turn',
+                'payload': {'turns_completed': 1},
+            },
+        ).get_json()['audit_cycle']['id']
+
+        with app.app_context():
+            from services.automation_service import refresh_run_scorecard
+            run = db.session.get(AutomationRun, run_id)
+            results = refresh_run_scorecard(run)
+            by_id = {row['check_id']: row for row in results}
+            expected = run.scorecard_summary_json['scorecard_configuration']
+            expected_breakdown = run.scorecard_summary_json['category_breakdown']
+            expected_score = run.scorecard_summary_json['weighted_score']
+            # Scoring resolves membership via get_criterion_category(): the canonical explicit
+            # category is kept and the invalid explicit value becomes 'uncategorized'.
+            self.assertEqual(by_id['custom:memory_quality']['details']['category'], 'retrieval or memory use')
+            self.assertEqual(by_id['custom:unknown_crit']['details']['category'], 'uncategorized')
+        self.assertFalse(expected['valid'])
+        self.assertEqual(expected['uncategorized_criterion_count'], 1)
+        self.assertEqual(expected['invalid_criteria'][0]['criterion_id'], 'unknown_crit')
+
+        watch = self.client.get(f'/api/automation/runs/{run_id}', headers=self.headers).get_json()
+        watch_summary = watch['run']['scorecard_summary']
+        self.assertEqual(watch_summary['scorecard_configuration'], expected)
+        self.assertEqual(watch_summary['category_breakdown'], expected_breakdown)
+        self.assertEqual(watch_summary['weighted_score'], expected_score)
+
+        scorecard_endpoint = self.client.get(f'/api/automation/runs/{run_id}/scorecard', headers=self.headers).get_json()
+        endpoint_summary = scorecard_endpoint['run']['scorecard_summary']
+        self.assertEqual(endpoint_summary['scorecard_configuration'], expected)
+        self.assertEqual(endpoint_summary['category_breakdown'], expected_breakdown)
+        self.assertEqual(endpoint_summary['weighted_score'], expected_score)
+        endpoint_rows = {row['check_id']: row for row in scorecard_endpoint['scorecard']}
+        self.assertEqual(endpoint_rows['custom:memory_quality']['details']['category'], 'retrieval or memory use')
+        self.assertEqual(endpoint_rows['custom:unknown_crit']['details']['category'], 'uncategorized')
+
+        bundle = self.client.get(f'/api/automation/runs/{run_id}/audit-bundle', headers=self.headers).get_json()
+        self.assertEqual(bundle['scorecard_template']['configuration'], expected)
+        bundle_categories = {entry['id']: entry for entry in bundle['scorecard_template']['criteria']}
+        # The audit bundle exports the resolved category (same membership used by scoring)
+        # alongside the raw stored value.
+        self.assertEqual(bundle_categories['memory_quality']['category'], 'retrieval or memory use')
+        self.assertEqual(bundle_categories['memory_quality']['raw_category'], 'retrieval or memory use')
+        self.assertEqual(bundle_categories['unknown_crit']['category'], 'uncategorized')
+        self.assertEqual(bundle_categories['unknown_crit']['raw_category'], 'not-a-real-category')
 
 
 if __name__ == '__main__':

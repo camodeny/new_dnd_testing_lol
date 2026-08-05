@@ -16,6 +16,7 @@ from models import (
     AutomationRunEvent,
     AutomationRunProviderCall,
     AutomationScenario,
+    AutomationScorecardTemplate,
     AutomationSnapshot,
     AutomationWorker,
     AutomationWorkspaceEvent,
@@ -222,13 +223,24 @@ CANONICAL_CATEGORIES = {
     "safety_private_info": "safety/private-information handling",
     "safety": "safety/private-information handling",
 }
+CANONICAL_CATEGORY_NAMES = tuple(dict.fromkeys(CANONICAL_CATEGORIES.values()))
+UNCATEGORIZED_CATEGORY = 'uncategorized'
+SCORECARD_TEMPLATE_SCHEMA_VERSION = 2
+
+
+def normalize_criterion_category(value):
+    if value is None or not str(value).strip():
+        return None
+    return CANONICAL_CATEGORIES.get(str(value).strip().lower())
+
 
 def get_criterion_category(crit):
     cat = crit.get('category')
     if cat:
-        normalized = CANONICAL_CATEGORIES.get(str(cat).strip().lower())
+        normalized = normalize_criterion_category(cat)
         if normalized:
             return normalized
+        return UNCATEGORIZED_CATEGORY
             
     # Try by substring match on ID, metric, or label
     identifier = (str(crit.get('id') or crit.get('metric') or '') + ' ' + str(crit.get('label') or '')).lower()
@@ -243,7 +255,113 @@ def get_criterion_category(crit):
     if any(k in identifier for k in ('narrative', 'story', 'quality', 'silence', 'empty', 'dialog', 'dialogue', 'rp', 'play')):
         return "narrative quality"
         
-    return None # default fallback
+    return UNCATEGORIZED_CATEGORY
+
+
+def scorecard_configuration(template):
+    invalid = []
+    for criterion in _json_list(_json_object(template, {}).get('criteria'), []):
+        if not isinstance(criterion, dict) or not criterion.get('id'):
+            continue
+        category = criterion.get('category')
+        if category and normalize_criterion_category(category):
+            continue
+        if not category and get_criterion_category(criterion) != UNCATEGORIZED_CATEGORY:
+            continue
+        invalid.append({
+            'criterion_id': criterion.get('id'),
+            'label': criterion.get('label') or criterion.get('id'),
+            'category': category,
+            'reason': 'missing or invalid canonical category',
+        })
+    return {
+        'schema_version': SCORECARD_TEMPLATE_SCHEMA_VERSION,
+        'valid': not invalid,
+        'invalid_criteria': invalid,
+        'uncategorized_criterion_count': len(invalid),
+    }
+
+
+def assert_scorecard_template_activatable(template):
+    snapshot = template.snapshot() if hasattr(template, 'snapshot') else _json_object(template, {})
+    config = scorecard_configuration(snapshot)
+    if not config['valid']:
+        details = '; '.join(
+            f"{entry['criterion_id']} ({entry['category'] or 'no category'})"
+            for entry in config['invalid_criteria']
+        )
+        raise ValueError(
+            f'scorecard template has invalid criteria and cannot be activated: {details}'
+        )
+
+
+MEMORY_AUDIT_SCOREBOOK_NAME = 'Memory Audit Scorebook'
+
+# The deployed pre-v2 Memory Audit Scorebook stored its criteria under generic
+# ids (``criterion_1``..``criterion_8``) with real descriptions but no category.
+# Each maps to the canonical category matching its stored description semantics.
+MEMORY_AUDIT_SCOREBOOK_CATEGORY_MAP = {
+    'criterion_1': 'durable state correctness',
+    'criterion_2': 'safety/private-information handling',
+    'criterion_3': 'durable state correctness',
+    'criterion_4': 'durable state correctness',
+    'criterion_5': 'retrieval or memory use',
+    'criterion_6': 'retrieval or memory use',
+    'criterion_7': 'durable state correctness',
+    'criterion_8': 'durable state correctness',
+}
+
+
+def legacy_criterion_category(criterion, template_name=None):
+    """Canonical category for a legacy stored criterion, without guessing.
+
+    Semantic categories are inferred from the criterion id/label. The named
+    Memory Audit Scorebook falls back to an explicit per-criterion mapping based
+    on its real stored descriptions. Generic criteria in unrelated templates
+    are left unchanged rather than assigned a fabricated category.
+    """
+    inferred = get_criterion_category(criterion)
+    if inferred != UNCATEGORIZED_CATEGORY:
+        return inferred
+    if template_name == MEMORY_AUDIT_SCOREBOOK_NAME:
+        return MEMORY_AUDIT_SCOREBOOK_CATEGORY_MAP.get(criterion.get('id'))
+    return None
+
+
+def upgrade_legacy_scorecard_template_categories():
+    """Assign canonical categories to stored templates that predate validation.
+
+    Templates created before category validation existed may carry criteria
+    with missing or invalid ``category`` values. This one-time repair assigns a
+    canonical category so active templates stay activatable under the strict
+    validator instead of being rejected or scored as ``uncategorized``. Only
+    semantically sound categories are assigned (inference or the explicit
+    Memory Audit Scorebook mapping); unrelated generic criteria are left
+    untouched. Historical run snapshots are intentionally left untouched.
+    """
+    upgraded = 0
+    templates = AutomationScorecardTemplate.query.order_by(AutomationScorecardTemplate.id.asc()).all()
+    for template in templates:
+        criteria = list(_json_list(template.criteria_json, []))
+        changed = False
+        for index, criterion in enumerate(criteria):
+            if not isinstance(criterion, dict):
+                continue
+            if criterion.get('category') and normalize_criterion_category(criterion.get('category')):
+                continue
+            category = legacy_criterion_category(criterion, template_name=template.name)
+            if not category:
+                continue
+            updated = dict(criterion)
+            updated['category'] = category
+            criteria[index] = updated
+            changed = True
+        if changed:
+            template.criteria_json = criteria
+            upgraded += 1
+    if upgraded:
+        db.session.commit()
+    return upgraded
 
 
 def _normalize_custom_scorecard_status(value, default='warn'):
@@ -473,6 +591,18 @@ def validate_scorecard_template_payload(data):
                     if str(tool).strip()
                 ],
             })
+        raw_category = (raw.get('category') or '').strip() or None
+        normalized_category = normalize_criterion_category(raw_category)
+        if not raw_category:
+            raise ValueError(
+                f'criteria[{index - 1}] requires an explicit category; '
+                f'expected one of {", ".join(CANONICAL_CATEGORY_NAMES)}'
+            )
+        if not normalized_category:
+            raise ValueError(
+                f'criteria[{index - 1}] has an invalid category: {raw_category!r}; '
+                f'expected one of {", ".join(CANONICAL_CATEGORY_NAMES)} or a supported alias'
+            )
         criteria.append({
             'id': criterion_id,
             'label': (raw.get('label') or criterion_id.replace('_', ' ').title()).strip(),
@@ -480,7 +610,7 @@ def validate_scorecard_template_payload(data):
             'better_direction': (raw.get('better_direction') or 'higher').strip().lower(),
             'evidence_requirements': evidence_requirements,
             'weight': max(1, min(100, _safe_int(raw.get('weight'), 2))),
-            'category': (raw.get('category') or '').strip() or None,
+            'category': normalized_category,
         })
 
     defaults = _json_object(data.get('defaults'), {})
@@ -490,6 +620,7 @@ def validate_scorecard_template_payload(data):
         if str(item).strip().lower() in {'after_player', 'after_dm'}
     ]
     return {
+        'schema_version': SCORECARD_TEMPLATE_SCHEMA_VERSION,
         'name': name,
         'description': (data.get('description') or '').strip() or None,
         'instructions': (data.get('instructions') or '').strip() or None,
@@ -2698,11 +2829,8 @@ def refresh_run_scorecard(run):
             overall_status = 'not_applicable'
 
     CATEGORIES_TO_BREAKDOWN = [
-        "operational/runtime reliability",
-        "narrative quality",
-        "durable state correctness",
-        "retrieval or memory use",
-        "safety/private-information handling"
+        *CANONICAL_CATEGORY_NAMES,
+        UNCATEGORIZED_CATEGORY,
     ]
     category_breakdown = {}
     for cat in CATEGORIES_TO_BREAKDOWN:
@@ -2776,6 +2904,7 @@ def refresh_run_scorecard(run):
         **scoring,
         'incidents': calculate_run_incidents(run, event_rows, audit_rows, provider_rows),
         'custom_scorecard_name': current_scorecard_template_for_run(run).get('name'),
+        'scorecard_configuration': scorecard_configuration(current_scorecard_template_for_run(run)),
         'category_breakdown': category_breakdown,
     }
     db.session.commit()

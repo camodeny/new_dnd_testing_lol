@@ -30,9 +30,11 @@ from services.automation_service import (
     continue_audit_run,
     current_scorecard_template_for_run,
     find_provider_calls_for_turn,
+    get_criterion_category,
     latest_session_for_run,
     persist_provider_call,
     refresh_run_scorecard,
+    scorecard_configuration,
     submit_audit_cycle_feedback,
 )
 from services.character_service import character_full_dict
@@ -2146,8 +2148,17 @@ def get_current_audit_bundle_data(run):
         },
         'scorecard_template': {
             'id': template.get('id'),
+            'schema_version': template.get('schema_version'),
             'name': template.get('name'),
-            'criteria': [c.get('id') for c in _json_list(template.get('criteria'), []) if c.get('id')]
+            'criteria': [
+                {
+                    'id': c.get('id'),
+                    'category': get_criterion_category(c),
+                    'raw_category': c.get('category'),
+                }
+                for c in _json_list(template.get('criteria'), []) if c.get('id')
+            ],
+            'configuration': scorecard_configuration(template),
         },
         'evidence_packet': evidence_packet,
         'recommended_detail_paths': recommended_detail_paths,
