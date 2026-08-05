@@ -279,6 +279,19 @@ def scorecard_configuration(template):
     }
 
 
+def assert_scorecard_template_activatable(template):
+    snapshot = template.snapshot() if hasattr(template, 'snapshot') else _json_object(template, {})
+    config = scorecard_configuration(snapshot)
+    if not config['valid']:
+        details = '; '.join(
+            f"{entry['criterion_id']} ({entry['category'] or 'no category'})"
+            for entry in config['invalid_criteria']
+        )
+        raise ValueError(
+            f'scorecard template has invalid criteria and cannot be activated: {details}'
+        )
+
+
 def _normalize_custom_scorecard_status(value, default='warn'):
     status = str(value or default).strip().lower()
     return status if status in CUSTOM_SCORECARD_STATUS_ORDER else default
@@ -426,16 +439,16 @@ def validate_scorecard_template_payload(data):
             })
         raw_category = (raw.get('category') or '').strip() or None
         normalized_category = normalize_criterion_category(raw_category)
-        if raw_category and not normalized_category:
-            # Keep invalid legacy/editor values visible as configuration errors;
-            # scoring places them in the explicit uncategorized bucket.
-            normalized_category = None
         if not raw_category:
-            inferred_category = get_criterion_category({
-                'id': criterion_id,
-                'label': raw.get('label') or criterion_id,
-            })
-            normalized_category = inferred_category
+            raise ValueError(
+                f'criteria[{index - 1}] requires an explicit category; '
+                f'expected one of {", ".join(CANONICAL_CATEGORY_NAMES)}'
+            )
+        if not normalized_category:
+            raise ValueError(
+                f'criteria[{index - 1}] has an invalid category: {raw_category!r}; '
+                f'expected one of {", ".join(CANONICAL_CATEGORY_NAMES)} or a supported alias'
+            )
         criteria.append({
             'id': criterion_id,
             'label': (raw.get('label') or criterion_id.replace('_', ' ').title()).strip(),
