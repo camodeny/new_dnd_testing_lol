@@ -6522,6 +6522,132 @@ class DmToolsTest(unittest.TestCase):
         clock = CampaignClock.query.filter_by(campaign_id=self.campaign.id, clock_id='cipher_break').one()
         self.assertEqual(clock.status, 'completion_pending')
 
+    def test_completion_criteria_reject_mixed_valid_and_invalid_sources(self):
+        db.session.add(CampaignClock(
+            campaign_id=self.campaign.id,
+            clock_id='identify_saboteur',
+            name='Identify the Saboteur',
+            segments=4,
+            filled=4,
+            status='completion_pending',
+            completion_criteria=[
+                {'id': 'named_suspect', 'description': 'Visible evidence names the suspect.'},
+            ],
+        ))
+        db.session.commit()
+        self._add_session_message(101, 'The current exchange contains a campsite description.')
+
+        result = apply_clock_adjudication(
+            self.campaign,
+            {
+                'create_clocks': [],
+                'advance_clocks': [],
+                'retire_clocks': [{
+                    'clock_id': 'identify_saboteur',
+                    'completion_criteria_verdicts': [{
+                        'criterion_id': 'named_suspect',
+                        'verdict': 'met',
+                        'supported_claims': ['Garret is the suspect.'],
+                        'evidence_sources': [
+                            {'source_type': 'transcript_message', 'source_id': '101'},
+                            {'source_type': 'transcript_message', 'source_id': '99'},
+                        ],
+                        'reason': 'The rejected source supposedly supplies the identity.',
+                    }],
+                    'consequence': {
+                        'verdict': 'supported',
+                        'claims': ['Garret is the suspect.'],
+                        'visibility': 'party_known',
+                        'evidence_sources': [
+                            {'source_type': 'transcript_message', 'source_id': '101'},
+                        ],
+                        'reason': 'The consequence repeats the criterion claim.',
+                    },
+                }],
+                'no_change_explanations': [],
+            },
+            audit_context={'trace_id': 'mixed-criterion-sources'},
+            allowed_evidence_sources=[
+                {'source_type': 'transcript_message', 'source_id': '101'},
+            ],
+        )
+        db.session.commit()
+
+        self.assertIn('source_not_in_adjudicator_context', str(result))
+        clock = CampaignClock.query.filter_by(
+            campaign_id=self.campaign.id,
+            clock_id='identify_saboteur',
+        ).one()
+        self.assertEqual(clock.status, 'completion_pending')
+        self.assertEqual(clock.completion_state, {})
+        self.assertEqual(WorldEvent.query.filter_by(
+            campaign_id=self.campaign.id,
+            event_type='clock_retired',
+        ).count(), 0)
+
+    def test_completion_criteria_reject_mixed_consequence_sources(self):
+        db.session.add(CampaignClock(
+            campaign_id=self.campaign.id,
+            clock_id='identify_saboteur',
+            name='Identify the Saboteur',
+            segments=4,
+            filled=4,
+            status='completion_pending',
+            completion_criteria=[
+                {'id': 'named_suspect', 'description': 'Visible evidence names the suspect.'},
+            ],
+        ))
+        db.session.commit()
+        self._add_session_message(101, 'The visible reply names Garret as the suspect.')
+
+        result = apply_clock_adjudication(
+            self.campaign,
+            {
+                'create_clocks': [],
+                'advance_clocks': [],
+                'retire_clocks': [{
+                    'clock_id': 'identify_saboteur',
+                    'completion_criteria_verdicts': [{
+                        'criterion_id': 'named_suspect',
+                        'verdict': 'met',
+                        'supported_claims': ['Garret is the suspect.'],
+                        'evidence_sources': [
+                            {'source_type': 'transcript_message', 'source_id': '101'},
+                        ],
+                        'reason': 'The visible reply names Garret.',
+                    }],
+                    'consequence': {
+                        'verdict': 'supported',
+                        'claims': ['Garret is the suspect.'],
+                        'visibility': 'party_known',
+                        'evidence_sources': [
+                            {'source_type': 'transcript_message', 'source_id': '101'},
+                            {'source_type': 'transcript_message', 'source_id': '99'},
+                        ],
+                        'reason': 'The rejected source is also cited for the consequence.',
+                    },
+                }],
+                'no_change_explanations': [],
+            },
+            audit_context={'trace_id': 'mixed-consequence-sources'},
+            allowed_evidence_sources=[
+                {'source_type': 'transcript_message', 'source_id': '101'},
+            ],
+        )
+        db.session.commit()
+
+        self.assertIn('source_not_in_adjudicator_context', str(result))
+        clock = CampaignClock.query.filter_by(
+            campaign_id=self.campaign.id,
+            clock_id='identify_saboteur',
+        ).one()
+        self.assertEqual(clock.status, 'completion_pending')
+        self.assertIn('named_suspect', clock.completion_state['criteria'])
+        self.assertEqual(WorldEvent.query.filter_by(
+            campaign_id=self.campaign.id,
+            event_type='clock_retired',
+        ).count(), 0)
+
     def test_completion_criteria_reject_source_outside_adjudicator_context(self):
         db.session.add(CampaignClock(
             campaign_id=self.campaign.id, clock_id='identify_saboteur', name='Identify the Saboteur',
@@ -6555,6 +6681,67 @@ class DmToolsTest(unittest.TestCase):
         self.assertIn('source_not_in_adjudicator_context', str(result))
         clock = CampaignClock.query.filter_by(campaign_id=self.campaign.id, clock_id='identify_saboteur').one()
         self.assertEqual(clock.status, 'completion_pending')
+
+    def test_completion_criteria_reject_public_consequence_backed_by_transcript(self):
+        db.session.add(CampaignClock(
+            campaign_id=self.campaign.id,
+            clock_id='public_clock',
+            name='Public Clock',
+            segments=4,
+            filled=4,
+            status='completion_pending',
+            completion_criteria=[
+                {'id': 'public_reveal', 'description': 'The festival concludes publicly.'},
+            ],
+        ))
+        db.session.commit()
+        self._add_session_message(101, 'The party sees the festival conclude.')
+
+        result = apply_clock_adjudication(
+            self.campaign,
+            {
+                'create_clocks': [],
+                'advance_clocks': [],
+                'retire_clocks': [{
+                    'clock_id': 'public_clock',
+                    'completion_criteria_verdicts': [{
+                        'criterion_id': 'public_reveal',
+                        'verdict': 'met',
+                        'supported_claims': ['The festival concludes publicly.'],
+                        'evidence_sources': [
+                            {'source_type': 'transcript_message', 'source_id': '101'},
+                        ],
+                        'reason': 'The party-visible transcript records the conclusion.',
+                    }],
+                    'consequence': {
+                        'verdict': 'supported',
+                        'claims': ['The festival concludes publicly.'],
+                        'visibility': 'public',
+                        'evidence_sources': [
+                            {'source_type': 'transcript_message', 'source_id': '101'},
+                        ],
+                        'reason': 'The proposed consequence is world-public.',
+                    },
+                }],
+                'no_change_explanations': [],
+            },
+            audit_context={'trace_id': 'transcript-public-visibility'},
+            allowed_evidence_sources=[
+                {'source_type': 'transcript_message', 'source_id': '101'},
+            ],
+        )
+        db.session.commit()
+
+        self.assertIn('source_visibility_too_private', str(result))
+        clock = CampaignClock.query.filter_by(
+            campaign_id=self.campaign.id,
+            clock_id='public_clock',
+        ).one()
+        self.assertEqual(clock.status, 'completion_pending')
+        self.assertEqual(WorldEvent.query.filter_by(
+            campaign_id=self.campaign.id,
+            event_type='clock_retired',
+        ).count(), 0)
 
     def test_completion_criteria_reject_consequence_claim_not_derived_from_criteria(self):
         db.session.add(CampaignClock(

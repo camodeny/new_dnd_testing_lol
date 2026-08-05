@@ -5288,7 +5288,7 @@ def _verified_clock_evidence_sources(
             message = _resolve_clock_transcript_message(campaign, source_id)
             if message is not None:
                 normalized = {'source_type': 'transcript_message', 'source_id': str(message.id)}
-                source_visibility = 'public'
+                source_visibility = 'party_known'
         elif source_type == 'world_event':
             event = _resolve_clock_world_event(campaign, source_id)
             if event is not None:
@@ -5354,6 +5354,7 @@ def _persist_clock_completion_verdicts(clock, applied_verdicts):
             verdict.get('verdict') == 'met'
             and verdict.get('supported_claims')
             and verdict.get('evidence_sources')
+            and not verdict.get('rejected_evidence_sources')
         ):
             criteria_state[verdict['criterion_id']] = {
                 'verdict': 'met',
@@ -5425,8 +5426,13 @@ def _retire_clock_from_patch(campaign, patch, allowed_evidence_sources=None):
             verdict['verdict'] == 'met'
             and bool(verdict['supported_claims'])
             and bool(verified_sources)
+            and not rejected_sources
         )
-        criterion_evidence_status[criterion_id] = 'verified' if verified_sources else 'missing_or_private'
+        criterion_evidence_status[criterion_id] = (
+            'verified'
+            if verified_sources and not rejected_sources
+            else 'rejected_or_missing'
+        )
         applied_verdict = {
             **verdict,
             'evidence_sources': verified_sources,
@@ -5469,6 +5475,7 @@ def _retire_clock_from_patch(campaign, patch, allowed_evidence_sources=None):
         consequence_verdict == 'supported'
         and bool(consequence_claims)
         and bool(verified_consequence_sources)
+        and not rejected_consequence_sources
         and claims_derived_from_criteria
     )
     if not consequence_supported:
