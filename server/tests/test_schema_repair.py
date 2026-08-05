@@ -41,6 +41,20 @@ def _drop_evidence_provenance_columns():
     db.session.commit()
 
 
+def _clock_columns():
+    return {
+        row[1]
+        for row in db.session.execute(text('PRAGMA table_info(campaign_clocks)')).fetchall()
+    }
+
+
+def _drop_clock_completion_columns():
+    """Simulate a database created before the clock completion criteria migration."""
+    db.session.execute(text('ALTER TABLE campaign_clocks DROP COLUMN completion_criteria'))
+    db.session.execute(text('ALTER TABLE campaign_clocks DROP COLUMN completion_state'))
+    db.session.commit()
+
+
 class MemoryLogSchemaRepairTest(unittest.TestCase):
     def setUp(self):
         self.temp_dir = tempfile.TemporaryDirectory()
@@ -116,6 +130,81 @@ class MemoryLogSchemaRepairTest(unittest.TestCase):
             self.assertIn('evidence_status', columns)
             self.assertIn('provenance_json', columns)
             CampaignMemoryLog.query.limit(1).all()
+
+
+class CampaignClockSchemaRepairTest(unittest.TestCase):
+    def setUp(self):
+        self.temp_dir = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temp_dir.cleanup)
+        db_path = os.path.join(self.temp_dir.name, 'legacy.db')
+
+        from flask import Flask
+        self.file_app = Flask(__name__)
+        self.file_app.config['SQLALCHEMY_DATABASE_URI'] = f'sqlite:///{db_path}'
+        self.file_app.config['SQLALCHEMY_TRACK_MODIFICATIONS'] = False
+        self.file_app.secret_key = 'test-key'
+        db.init_app(self.file_app)
+        self.addCleanup(self._teardown_db)
+
+    def _teardown_db(self):
+        with self.file_app.app_context():
+            db.session.remove()
+            db.engine.dispose()
+        db._app_engines.pop(self.file_app, None)
+
+    def test_fresh_database_exposes_clock_completion_columns(self):
+        with self.file_app.app_context():
+            db.create_all()
+            columns = _clock_columns()
+            self.assertIn('completion_criteria', columns)
+            self.assertIn('completion_state', columns)
+            verify_required_schema()
+
+    def test_verify_required_schema_fails_loudly_on_legacy_clock_table(self):
+        with self.file_app.app_context():
+            db.create_all()
+            _drop_clock_completion_columns()
+
+            with self.assertRaises(RuntimeError) as ctx:
+                verify_required_schema()
+
+            message = str(ctx.exception)
+            self.assertIn('campaign_clocks.completion_criteria', message)
+            self.assertIn('campaign_clocks.completion_state', message)
+
+    def test_lightweight_schema_repairs_legacy_clock_table(self):
+        with self.file_app.app_context():
+            db.create_all()
+            _drop_clock_completion_columns()
+            self.assertNotIn('completion_criteria', _clock_columns())
+            self.assertNotIn('completion_state', _clock_columns())
+
+            ensure_lightweight_schema()
+
+            columns = _clock_columns()
+            self.assertIn('completion_criteria', columns)
+            self.assertIn('completion_state', columns)
+            verify_required_schema()
+
+    def test_lightweight_schema_repair_is_idempotent(self):
+        with self.file_app.app_context():
+            db.create_all()
+            ensure_lightweight_schema()
+            ensure_lightweight_schema()
+            verify_required_schema()
+
+    def test_initialize_database_repairs_legacy_clock_table(self):
+        with self.file_app.app_context():
+            db.create_all()
+            _drop_clock_completion_columns()
+
+        initialize_database(self.file_app)
+
+        with self.file_app.app_context():
+            columns = _clock_columns()
+            self.assertIn('completion_criteria', columns)
+            self.assertIn('completion_state', columns)
+            verify_required_schema()
 
 
 class StaleAwaitingAuditReconciliationTest(unittest.TestCase):
