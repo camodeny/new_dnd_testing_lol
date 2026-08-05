@@ -1231,7 +1231,16 @@ class P1ImprovementsTest(unittest.TestCase):
 
         retire_result = _retire_clock_from_patch(self.campaign, {
             'clock_id': 'clock_create_test',
-            'reason': 'Test retire',
+            'completion_criteria_verdicts': [],
+            'consequence': {
+                'verdict': 'supported',
+                'claims': ['The test clock is retired.'],
+                'visibility': 'dm_private',
+                'evidence_sources': [
+                    {'source_type': 'world_event', 'source_id': str(create_event.id)},
+                ],
+                'reason': 'Structured test adjudication.',
+            },
             'provenance': {
                 'tool_name': 'test_retire',
                 'evidence_status': 'supported_by_evidence',
@@ -1577,6 +1586,16 @@ class P1ImprovementsTest(unittest.TestCase):
         retire_patch = {
             'retire_clocks': [{
                 'clock_id': 'clock_empty_provenance',
+                'completion_criteria_verdicts': [],
+                'consequence': {
+                    'verdict': 'supported',
+                    'claims': ['The empty-provenance test clock is retired.'],
+                    'visibility': 'dm_private',
+                    'evidence_sources': [
+                        {'source_type': 'world_event', 'source_id': str(create_event.id)},
+                    ],
+                    'reason': 'Structured test adjudication.',
+                },
                 'provenance': {},
             }],
         }
@@ -1588,7 +1607,7 @@ class P1ImprovementsTest(unittest.TestCase):
         retire_prov = json.loads(retire_event.payload)['provenance']
         self.assertEqual(retire_prov['pipeline_stage'], 'applied')
         self.assertEqual(retire_prov['tool_name'], 'session_memory_update_clocks')
-        self.assertEqual(retire_prov['evidence_status'], 'insufficiently_supported')
+        self.assertEqual(retire_prov['evidence_status'], 'ai_adjudicated_verified_sources')
         self.assertTrue(retire_prov['build_sha'])
 
     def test_contradicted_evidence_status_in_provenance(self):

@@ -489,10 +489,8 @@ def _normalize_memory_clock_patch(item, fallback_id):
             clean_item[field] = value
     if 'completion_criteria' in item:
         clean_item['completion_criteria'] = _normalize_clock_completion_criteria(item.get('completion_criteria'))
-    if 'completion_criteria_met' in item:
-        clean_item['completion_criteria_met'] = item['completion_criteria_met']
-    if 'completion_criteria_evidence' in item:
-        clean_item['completion_criteria_evidence'] = item['completion_criteria_evidence']
+    if 'completion_criteria_verdicts' in item:
+        clean_item['completion_criteria_verdicts'] = item['completion_criteria_verdicts']
     if isinstance(item.get('consequence'), dict):
         clean_item['consequence'] = dict(item['consequence'])
     return _apply_memory_item_metadata(clean_item, item, include_memory_type=False)
@@ -1673,6 +1671,8 @@ def build_session_clock_context(
     dm_message,
     current_scene_before,
     current_scene_after,
+    player_message_id=None,
+    dm_message_id=None,
 ):
     recent_events = WorldEvent.query.filter_by(campaign_id=campaign.id).order_by(WorldEvent.created_at.desc()).limit(6).all()
     active_clocks = []
@@ -1698,12 +1698,19 @@ def build_session_clock_context(
             'id': current_user.id,
             'username': current_user.username,
         },
-        'latest_player_message': player_message,
-        'latest_dm_message': dm_message,
+        'latest_player_message': {
+            'source_type': 'transcript_message',
+            'source_id': str(player_message_id) if player_message_id is not None else None,
+            'content': player_message,
+        },
+        'latest_dm_message': {
+            'source_type': 'transcript_message',
+            'source_id': str(dm_message_id) if dm_message_id is not None else None,
+            'content': dm_message,
+        },
         'current_scene_before': current_scene_before if isinstance(current_scene_before, dict) else {},
         'current_scene_after': current_scene_after if isinstance(current_scene_after, dict) else {},
         'active_clocks': active_clocks,
-        'authorized_rules': _campaign_authorized_rules(campaign),
         'recent_events': [event.to_dict(include_private=True) for event in reversed(recent_events)],
     }
 
@@ -5146,10 +5153,6 @@ def _create_clock_from_patch(campaign, patch):
     }
 
 
-_CLOCK_RULE_EVIDENCE_SOURCES = frozenset({
-    'clock_rule',
-    'deterministic_rule',
-})
 _CLOCK_TRANSCRIPT_EVIDENCE_SOURCES = frozenset({
     'visible_transcript',
     'transcript_message',
@@ -5157,12 +5160,6 @@ _CLOCK_TRANSCRIPT_EVIDENCE_SOURCES = frozenset({
 _CLOCK_MEMORY_EVIDENCE_SOURCES = frozenset({
     'prior_durable_memory',
     'prior_memory_record',
-})
-_CLOCK_INTERNAL_EVIDENCE_SOURCES = frozenset({
-    'memory_resolver_packet',
-    'clarification_answer',
-    'existing_alias',
-    'prior_scene_cast',
 })
 
 
@@ -5183,149 +5180,6 @@ def _resolve_clock_transcript_message(campaign, source_id):
     return message
 
 
-def _clock_text_tokens(text):
-    tokens = re.findall(r"[a-z0-9']+", (text or '').lower())
-    return {token for token in tokens if len(token) >= 3}
-
-
-_CLOCK_EVIDENCE_STOPWORDS = frozenset({
-    'the', 'and', 'for', 'with', 'was', 'were', 'are', 'has', 'had', 'not',
-    'but', 'you', 'your', 'they', 'them', 'their', 'from', 'that', 'this',
-    'have', 'will', 'would', 'should', 'could', 'into', 'over', 'under',
-    'after', 'before', 'between', 'during', 'through', 'against', 'did', 'does',
-})
-
-
-def _clock_text_overlap(message_content, support_text):
-    """Cheap semantic check: a message supports text when it shares meaningful terms."""
-    message_tokens = _clock_text_tokens(message_content)
-    support_tokens = _clock_text_tokens(support_text)
-    if not message_tokens or not support_tokens:
-        return False
-    message_tokens -= _CLOCK_EVIDENCE_STOPWORDS
-    support_tokens -= _CLOCK_EVIDENCE_STOPWORDS
-    return bool(message_tokens & support_tokens)
-
-
-_CLOCK_NEGATION_MARKERS = frozenset({
-    'not', 'never', 'no', 'denies', 'denied', 'deny', 'refutes', 'refuted', 'refute',
-    'contradicts', 'contradicted', 'contradict', 'falsely', 'false', 'untrue',
-    'unconfirmed', 'disproves', 'disproved', 'disprove', "isn't", "wasn't", "didn't",
-    "doesn't", "hasn't", "haven't", "won't", "can't", 'cannot',
-})
-
-_CLOCK_NEGATION_WINDOW = 3
-
-
-def _clock_text_contradicts(message_content, support_text):
-    """Return True when a verified message negates a claim in the proposed support.
-
-    In addition to direct adjacency patterns (``not docks``), this evaluates the
-    relevant phrase so intervening words do not hide a negation: ``Garret is not at
-    the docks``, ``did not identify Garret``, and ``has not revealed the location``
-    all contradict their positive counterparts even though the negation marker is not
-    immediately adjacent to the claim token.
-    """
-    support_tokens = _clock_text_tokens(support_text) - _CLOCK_EVIDENCE_STOPWORDS
-    if not support_tokens:
-        return False
-    message_text = (message_content or '').lower()
-    for token in support_tokens:
-        for negation in (
-            f'not {token}',
-            f'never {token}',
-            f'no {token}',
-            f'denies {token}',
-            f'denied {token}',
-            f'refutes {token}',
-            f'contradicts {token}',
-            f'{token} is false',
-            f'{token} was a lie',
-            f'not actually {token}',
-        ):
-            if negation in message_text:
-                return True
-    # Windowed phrase negation: a negation marker within a few tokens before a claim
-    # token negates the claim even when filler words sit between them.
-    message_tokens = re.findall(r"[a-z0-9']+", message_text)
-    for index, token in enumerate(message_tokens):
-        if token not in support_tokens:
-            continue
-        window_start = max(0, index - _CLOCK_NEGATION_WINDOW)
-        window = message_tokens[window_start:index]
-        if any(marker in window for marker in _CLOCK_NEGATION_MARKERS):
-            return True
-    # Relationship opposition: departure from, mere mention of, or presence asserted
-    # at a different place than a claimed location also contradicts the claim.
-    return _clock_text_opposes_presence(message_content, support_text)
-
-
-def _clock_claim_locations(support_text):
-    """Return the location tokens a presence claim asserts (e.g. ``is at the docks``)."""
-    locations = set()
-    for match in re.finditer(r'\b(?:at|in|near)\s+(?:the\s+)?([a-z0-9\']+)', (support_text or '').lower()):
-        token = match.group(1)
-        if len(token) >= 3 and token not in _CLOCK_EVIDENCE_STOPWORDS:
-            locations.add(token)
-    return locations
-
-
-def _clock_text_opposes_presence(message_content, support_text):
-    """Return True when evidence opposes a presence-at-location claim.
-
-    Token-set coverage cannot distinguish ``Garret is at the docks`` from ``Garret
-    left the docks`` or ``Garret mentioned the docks while staying at camp``. This
-    evaluates the relationship: departing from the claimed location, only mentioning
-    it, or asserting presence at a different place all oppose the claim.
-    """
-    locations = _clock_claim_locations(support_text)
-    if not locations:
-        return False
-    message_text = (message_content or '').lower()
-    for loc in locations:
-        loc_pattern = re.escape(loc)
-        if re.search(rf'\b(?:left|departed|fled|exited|quit|abandoned)\s+(?:the\s+)?{loc_pattern}\b', message_text):
-            return True
-        if re.search(rf'\b(?:away|moved|went|walked|came|returned|traveled|travelled|rode|sailed)\s+from\s+(?:the\s+)?{loc_pattern}\b', message_text):
-            return True
-        if re.search(rf'\b(?:mentioned|talked\s+about|discussed|referenced|spoke\s+of|described|pointed\s+to)\s+(?:the\s+)?{loc_pattern}\b', message_text):
-            return True
-        # Presence asserted at a different location than the claimed one.
-        for other in re.findall(
-            r'\b(?:staying|stayed|remaining|remained|camped|camping|located|is|are|was|were)\s+(?:at|in)\s+(?:the\s+)?([a-z0-9\']+)',
-            message_text,
-        ):
-            if other != loc and len(other) >= 3 and other not in _CLOCK_EVIDENCE_STOPWORDS:
-                return True
-    return False
-
-
-def _campaign_authorized_rules(campaign):
-    """Return {rule_id: description} for deterministic/clock rules authorized in this campaign.
-
-    Rules are declared in the campaign's DM-private world package under
-    ``authorized_rules`` (a list of ``{"id": ..., "description": ...}`` or plain id
-    strings). The durable description is the rule's claim scope: a rule evidence source
-    may only support a criterion/consequence whose text overlaps that scope, so the
-    proposing model cannot cite an unrelated-but-valid rule to prove an arbitrary claim.
-    """
-    _world, _graph, _world_state, dm_private = _world_json(campaign)
-    rules = dm_private.get('authorized_rules') if isinstance(dm_private, dict) else None
-    if not isinstance(rules, list):
-        return {}
-    authorized = {}
-    for rule in rules:
-        if isinstance(rule, dict):
-            rule_id = clean_id(rule.get('id') or rule.get('rule_id'), '')
-            description = clean_text(rule.get('description'), 400)
-        else:
-            rule_id = clean_id(rule, '')
-            description = ''
-        if rule_id:
-            authorized[rule_id] = description
-    return authorized
-
-
 def _resolve_clock_memory_record(campaign, source_id):
     """Resolve a prior-memory evidence source to a real durable memory log in this campaign."""
     if source_id in (None, ''):
@@ -5342,278 +5196,100 @@ def _resolve_clock_memory_record(campaign, source_id):
     return record
 
 
-def _clock_memory_support_text(record):
-    """Return the supportable text of a durable memory record."""
-    parts = []
-    if isinstance(getattr(record, 'after_json', None), dict):
-        for key in ('text', 'summary', 'name', 'reason'):
-            value = record.after_json.get(key)
-            if isinstance(value, str) and value.strip():
-                parts.append(value.strip())
-    if getattr(record, 'reason', None):
-        parts.append(record.reason)
-    if getattr(record, 'memory_id', None):
-        parts.append(record.memory_id)
-    return ' '.join(parts)
-
-
-def _resolve_clock_clarification(campaign, source_id):
-    if source_id in (None, ''):
+def _resolve_clock_world_event(campaign, source_id):
+    event_id = _coerce_patch_int(source_id, default=None, minimum=1)
+    if event_id is None:
         return None
-    from models import CampaignClarification
-    return CampaignClarification.query.filter_by(
-        campaign_id=campaign.id,
-        clarification_id=str(source_id),
-        status='answered',
-    ).first()
+    return WorldEvent.query.filter_by(campaign_id=campaign.id, id=event_id).first()
 
 
-def _resolve_clock_resolver_packet(campaign, source_id):
-    if source_id in (None, ''):
-        return None
-    from models import CampaignResolverPacket
-    numeric_id = _coerce_patch_int(source_id, default=None)
-    if numeric_id is None:
-        return None
-    return CampaignResolverPacket.query.filter_by(campaign_id=campaign.id, id=numeric_id).first()
-
-
-def _resolve_clock_existing_alias(campaign, source_id):
-    if source_id in (None, ''):
-        return None
-    from models import NPCActor
-    actor = NPCActor.query.filter_by(campaign_id=campaign.id, actor_id=str(source_id)).first()
-    if actor is not None:
-        return actor
-    _world, graph, _world_state, _dm_private = _world_json(campaign)
-    for entity in graph.get('entities', []) if isinstance(graph, dict) else []:
-        if entity.get('id') == source_id:
-            return entity
-    return None
-
-
-_CLOCK_CLAIM_STOPWORDS = _CLOCK_EVIDENCE_STOPWORDS | frozenset({
-    'party', 'identified', 'identifies', 'identify', 'knows', 'know', 'knew', 'known',
-    'he', 'she', 'they', 'them', 'their', 'his', 'her', 'is', 'are', 'was', 'were',
-    'at', 'in', 'on', 'of', 'to', 'the', 'and', 'that', 'this', 'these', 'those',
-})
-
-
-def _clock_claim_tokens(text):
-    """Return the meaningful claim terms in a consequence/criterion text."""
-    return _clock_text_tokens(text) - _CLOCK_CLAIM_STOPWORDS
-
-
-def _clock_claim_identity_pairs(support_text):
-    """Return (subject, role) identity assertions of the form ``X is (the|a) Y``."""
-    pairs = []
-    for match in re.finditer(r'\b([a-z0-9\']+)\s+is\s+(?:the\s+|a\s+|an\s+)?([a-z0-9\']+)', (support_text or '').lower()):
-        subject, role = match.group(1), match.group(2)
-        if len(subject) >= 3 and len(role) >= 3 and subject not in _CLOCK_EVIDENCE_STOPWORDS and role not in _CLOCK_EVIDENCE_STOPWORDS:
-            pairs.append((subject, role))
-    return pairs
-
-
-def _clock_claim_location_pairs(support_text):
-    """Return (subject, location) presence assertions (``X is at Y`` / ``X is the Z at Y``)."""
-    text = (support_text or '').lower()
-    pairs = []
-    for match in re.finditer(
-        r'\b([a-z0-9\']+)\s+(?:is|was|were|are|stands|stood|remains|remained|stays|stayed|waits|waited|appears|appeared|found|seen|located)\s+(?:at|in|near)\s+(?:the\s+)?([a-z0-9\']+)',
-        text,
-    ):
-        subject, location = match.group(1), match.group(2)
-        if len(subject) >= 3 and len(location) >= 3 and subject not in _CLOCK_EVIDENCE_STOPWORDS and location not in _CLOCK_EVIDENCE_STOPWORDS:
-            pairs.append((subject, location))
-    for match in re.finditer(
-        r'\b([a-z0-9\']+)\s+is\s+(?:the\s+|a\s+|an\s+)?[a-z0-9\']+\s+at\s+(?:the\s+)?([a-z0-9\']+)',
-        text,
-    ):
-        subject, location = match.group(1), match.group(2)
-        if len(subject) >= 3 and len(location) >= 3 and subject not in _CLOCK_EVIDENCE_STOPWORDS and location not in _CLOCK_EVIDENCE_STOPWORDS:
-            pairs.append((subject, location))
-    return pairs
-
-
-def _clock_identity_bound(content, subject, role):
-    """Return True when content asserts the subject-predicate identity binding.
-
-    ``Garret says the saboteur is Lena at the docks`` does NOT assert that Garret is
-    the saboteur even though all tokens are present; only an explicit identity or
-    appositive binding between the same subject and role is accepted.
-    """
-    text = (content or '').lower()
-    s = re.escape(subject)
-    r = re.escape(role)
-    patterns = (
-        rf'\b{s}\s+is\s+(?:the\s+|a\s+|an\s+)?{r}\b',
-        rf'\b{r}\s+is\s+(?:the\s+|a\s+|an\s+)?{s}\b',
-        rf'\b(?:the\s+|a\s+|an\s+)?{s}\s*,?\s+{r}\b',
-        rf'\b(?:the\s+|a\s+|an\s+)?{r}\s*,?\s+{s}\b',
-        rf'\bnamed\s+{s}\s+as\s+(?:the\s+|a\s+)?{r}\b',
-        rf'\bnamed\s+{r}\s+as\s+(?:the\s+|a\s+)?{s}\b',
-        rf'\bidentified\s+{s}\s+as\s+(?:the\s+|a\s+)?{r}\b',
-        rf'\bidentified\s+{r}\s+as\s+(?:the\s+|a\s+)?{s}\b',
-    )
-    return any(re.search(pattern, text) for pattern in patterns)
-
-
-def _clock_location_bound(content, subject, location):
-    """Return True when content asserts subject-presence at the claimed location.
-
-    ``Garret investigates the saboteur at the docks`` or ``spoke with Garret at the
-    docks`` contains all tokens but does not assert that Garret is located there; only
-    an explicit presence predicate binding the same subject to the location is accepted.
-    """
-    text = (content or '').lower()
-    s = re.escape(subject)
-    l = re.escape(location)
-    patterns = (
-        rf'\b{s}\s+(?:is|was|were|are|stands|stood|remains|remained|stays|stayed|waits|waited|appears|appeared|found|seen|spotted|located)\s+(?:at|in|near)\s+(?:the\s+)?{l}\b',
-        rf'\b{s}\s+is\s+located\s+(?:at|in)\s+(?:the\s+)?{l}\b',
-        rf'\b{s}\s+was\s+spotted\s+(?:at|in)\s+(?:the\s+)?{l}\b',
-    )
-    return any(re.search(pattern, text) for pattern in patterns)
-
-
-def _clock_claims_covered(campaign, evidence_sources, support_text):
-    """Return True when the union of verified evidence content covers and binds the claim.
-
-    A single shared token is not treated as semantic support for a compound claim:
-    every meaningful claim term in ``support_text`` must appear in at least one
-    resolved evidence record in this campaign. Identity claims (``X is Y``) and
-    location claims (``X is at Z``) additionally require the same subject to be bound
-    to the role/location, so ``Garret says the saboteur is Lena at the docks`` cannot
-    prove ``Garret is the saboteur at the docks``. Rule sources contribute their
-    durable description as the claim scope they can actually prove.
-    """
-    support_terms = _clock_claim_tokens(support_text)
-    contents = []
-    covered = set()
-    authorized_rules = _campaign_authorized_rules(campaign)
-    for source in evidence_sources or []:
-        if not isinstance(source, dict):
-            continue
-        source_type = source.get('source_type') or source.get('source', '')
-        content = None
-        if source_type in _CLOCK_TRANSCRIPT_EVIDENCE_SOURCES:
-            message = _resolve_clock_transcript_message(campaign, source.get('source_id'))
-            if message is not None:
-                content = message.content
-        elif source_type in _CLOCK_MEMORY_EVIDENCE_SOURCES:
-            record = _resolve_clock_memory_record(campaign, source.get('source_id'))
-            if record is not None:
-                content = _clock_memory_support_text(record)
-        elif source_type in _CLOCK_RULE_EVIDENCE_SOURCES:
-            content = authorized_rules.get(clean_id(source.get('source_id'), ''))
-        if content:
-            contents.append(content)
-            covered |= _clock_claim_tokens(content)
-    if support_terms and not support_terms <= covered:
-        return False
-    for subject, role in _clock_claim_identity_pairs(support_text):
-        if not any(_clock_identity_bound(content, subject, role) for content in contents):
-            return False
-    for subject, location in _clock_claim_location_pairs(support_text):
-        if not any(_clock_location_bound(content, subject, location) for content in contents):
-            return False
+def _clock_visibility_allows(source_visibility, required_visibility):
+    source_visibility = source_visibility if source_visibility in VALID_VISIBILITIES else 'dm_private'
+    required_visibility = required_visibility if required_visibility in VALID_VISIBILITIES else 'dm_private'
+    if required_visibility == 'public':
+        return source_visibility == 'public'
+    if required_visibility == 'party_known':
+        return source_visibility in {'party_known', 'public'}
     return True
 
 
-def _verified_clock_evidence_status(campaign, evidence_sources, support_text=None, required_visibility=None):
-    """Compute evidence status at the durable boundary from verified sources only.
+def _verified_clock_evidence_sources(campaign, evidence_sources, required_visibility):
+    """Resolve source references without attempting to interpret their prose.
 
-    Evidence status is never accepted from the proposing model. Every source must
-    resolve to a real durable record in this campaign:
-    - transcript sources must resolve to an actual visible session message whose
-      content supports the criterion/consequence text;
-    - rule sources must reference an authorized deterministic/clock rule declared in
-      the campaign's DM-private package;
-    - prior durable memory sources must resolve to a real memory log in this campaign
-      and, when ``required_visibility`` is party-known/public, must not be DM-private;
-    - clarification/packet/alias sources must resolve to the matching durable record.
-    Fabricated or unrelated source ids are dropped. A verified message that explicitly
-    negates the proposed support yields ``contradicted``.
+    Semantic support is the clock adjudicator's job. The durable boundary only checks
+    that each source exists in this campaign and is safe for the requested visibility.
     """
-    if not isinstance(evidence_sources, list) or not evidence_sources:
-        return 'insufficiently_supported'
-    verified_rule = False
-    verified_strong = False
-    authorized_rules = _campaign_authorized_rules(campaign)
-    for source in evidence_sources:
+    verified = []
+    rejected = []
+    seen = set()
+    for source in evidence_sources if isinstance(evidence_sources, list) else []:
         if not isinstance(source, dict):
+            rejected.append({'source': source, 'reason': 'invalid_source_shape'})
             continue
-        source_type = source.get('source_type') or source.get('source', '')
+        source_type = clean_text(source.get('source_type') or source.get('source'), 50).lower()
+        source_id = source.get('source_id')
+        normalized = None
+        source_visibility = 'dm_private'
         if source_type in _CLOCK_TRANSCRIPT_EVIDENCE_SOURCES:
-            message = _resolve_clock_transcript_message(campaign, source.get('source_id'))
-            if message is None:
-                continue
-            if support_text and _clock_text_contradicts(message.content, support_text):
-                return 'contradicted'
-            if support_text and not _clock_text_overlap(message.content, support_text):
-                continue
-            verified_strong = True
-        elif source_type in _CLOCK_RULE_EVIDENCE_SOURCES:
-            rule_desc = authorized_rules.get(clean_id(source.get('source_id'), ''))
-            # A rule is only usable evidence when its durable description/claim scope
-            # supports the criterion/consequence text; an authorized but unrelated rule
-            # cannot prove an arbitrary claim.
-            if rule_desc and (not support_text or _clock_text_overlap(rule_desc, support_text)):
-                verified_rule = True
+            message = _resolve_clock_transcript_message(campaign, source_id)
+            if message is not None:
+                normalized = {'source_type': 'transcript_message', 'source_id': str(message.id)}
+                source_visibility = 'public'
         elif source_type in _CLOCK_MEMORY_EVIDENCE_SOURCES:
-            record = _resolve_clock_memory_record(campaign, source.get('source_id'))
-            if record is None:
-                continue
-            memory_visibility = clean_text(getattr(record, 'visibility', None), 30) or 'dm_private'
-            if required_visibility in ('party_known', 'public') and memory_visibility == 'dm_private':
-                continue
-            memory_text = _clock_memory_support_text(record)
-            if support_text and not _clock_text_overlap(memory_text, support_text):
-                continue
-            verified_strong = True
-        elif source_type == 'clarification_answer':
-            if _resolve_clock_clarification(campaign, source.get('source_id')) is not None:
-                verified_strong = True
-        elif source_type == 'memory_resolver_packet':
-            if _resolve_clock_resolver_packet(campaign, source.get('source_id')) is not None:
-                verified_strong = True
-        elif source_type == 'existing_alias':
-            if _resolve_clock_existing_alias(campaign, source.get('source_id')) is not None:
-                verified_strong = True
-    if verified_rule:
-        return 'supported_by_rules'
-    if verified_strong:
-        return 'supported_by_evidence'
-    return 'insufficiently_supported'
+            record = _resolve_clock_memory_record(campaign, source_id)
+            if record is not None and (record.status or 'applied') == 'applied':
+                normalized = {'source_type': 'prior_memory_record', 'source_id': str(record.id)}
+                source_visibility = record.visibility or 'dm_private'
+        elif source_type == 'world_event':
+            event = _resolve_clock_world_event(campaign, source_id)
+            if event is not None:
+                normalized = {'source_type': 'world_event', 'source_id': str(event.id)}
+                source_visibility = event.visibility or 'dm_private'
+        if normalized is None:
+            rejected.append({'source': source, 'reason': 'source_not_found_or_not_durable'})
+            continue
+        if not _clock_visibility_allows(source_visibility, required_visibility):
+            rejected.append({'source': normalized, 'reason': 'source_visibility_too_private'})
+            continue
+        key = (normalized['source_type'], normalized['source_id'])
+        if key not in seen:
+            seen.add(key)
+            verified.append(normalized)
+    return verified, rejected
 
 
-def _collect_clock_criterion_met_evidence(patch, required_ids):
-    """Return {criterion_id: [evidence_sources]} declared met in a retirement patch.
+def _normalize_clock_supported_claims(value):
+    claims = []
+    seen = set()
+    for raw_claim in value[:8] if isinstance(value, list) else []:
+        claim = clean_text(raw_claim, 520)
+        if claim and claim not in seen:
+            seen.add(claim)
+            claims.append(claim)
+    return claims
 
-    Completion criteria must be tied to evidence that supports each criterion, not merely
-    echoed by id. Entries in ``completion_criteria_met`` may be plain criterion ids
-    (legacy) or dicts with ``criterion_id``/``id`` plus ``evidence_sources``. A top-level
-    ``completion_criteria_evidence`` mapping (criterion_id -> [sources]) is also merged in.
-    """
-    evidence = {}
-    raw_met = patch.get('completion_criteria_met')
-    if isinstance(raw_met, list):
-        for item in raw_met:
-            if isinstance(item, dict):
-                criterion_id = clean_id(item.get('criterion_id') or item.get('id'), '')
-                sources = item.get('evidence_sources') if isinstance(item.get('evidence_sources'), list) else []
-            else:
-                criterion_id = clean_id(item, '')
-                sources = []
-            if criterion_id:
-                evidence.setdefault(criterion_id, []).extend(sources)
-    raw_map = patch.get('completion_criteria_evidence')
-    if isinstance(raw_map, dict):
-        for criterion_id, sources in raw_map.items():
-            criterion_id = clean_id(criterion_id, '')
-            if criterion_id and isinstance(sources, list):
-                evidence.setdefault(criterion_id, []).extend(sources)
-    return evidence
+
+def _collect_clock_criterion_verdicts(patch):
+    verdicts = {}
+    duplicates = set()
+    raw_verdicts = patch.get('completion_criteria_verdicts')
+    for raw_verdict in raw_verdicts if isinstance(raw_verdicts, list) else []:
+        if not isinstance(raw_verdict, dict):
+            continue
+        criterion_id = clean_id(raw_verdict.get('criterion_id') or raw_verdict.get('id'), '')
+        if not criterion_id:
+            continue
+        if criterion_id in verdicts:
+            duplicates.add(criterion_id)
+            continue
+        verdicts[criterion_id] = {
+            'criterion_id': criterion_id,
+            'verdict': clean_text(raw_verdict.get('verdict'), 30).lower(),
+            'supported_claims': _normalize_clock_supported_claims(raw_verdict.get('supported_claims')),
+            'evidence_sources': raw_verdict.get('evidence_sources') if isinstance(raw_verdict.get('evidence_sources'), list) else [],
+            'reason': clean_text(raw_verdict.get('reason'), 520),
+        }
+    return verdicts, duplicates
 
 
 def _retire_clock_from_patch(campaign, patch):
@@ -5626,9 +5302,8 @@ def _retire_clock_from_patch(campaign, patch):
     mechanical_complete = (clock.filled or 0) >= (clock.segments or 4)
     met_ids = set()
     criterion_evidence_status = {}
+    applied_criterion_verdicts = []
     rejected_proposals = []
-    consequence_applied = True
-    visibility_decision = {}
 
     consequence = patch.get('consequence') if isinstance(patch.get('consequence'), dict) else {}
     requested_visibility = consequence.get('visibility') or patch.get('visibility') or clock.visibility or 'dm_private'
@@ -5638,93 +5313,91 @@ def _retire_clock_from_patch(campaign, patch):
     if completion_criteria:
         if not mechanical_complete:
             return {'error': f'Clock {clock.name} cannot be retired before it is mechanically complete.'}
-        criterion_evidence = _collect_clock_criterion_met_evidence(patch, required_ids)
-        met_ids = set(criterion_evidence.keys())
-        missing_ids = required_ids - met_ids
-        if missing_ids:
-            rejected_proposals.append({
-                'kind': 'completion_criterion',
-                'criterion_ids': sorted(missing_ids),
-                'reason': 'Retirement did not declare every completion criterion as met.',
-            })
-            return {
-                'error': f'Clock {clock.name} cannot resolve until all completion criteria are met.',
-                'rejected_proposals': rejected_proposals,
-            }
-        unsupported = []
-        for criterion_id in sorted(required_ids):
-            sources = criterion_evidence.get(criterion_id) or []
-            support_text = next(
-                (criterion.get('description') or criterion.get('text') for criterion in completion_criteria if criterion['id'] == criterion_id),
-                '',
-            )
-            status = _verified_clock_evidence_status(
-                campaign, sources, support_text, required_visibility=requested_visibility
-            )
-            criterion_evidence_status[criterion_id] = status
-            criterion_covered = _clock_claims_covered(campaign, sources, support_text)
-            if (
-                status not in ('supported_by_evidence', 'supported_by_rules')
-                or not criterion_covered
-            ):
-                unsupported.append(criterion_id)
-        if unsupported:
-            rejected_proposals.append({
-                'kind': 'completion_criterion',
-                'criterion_ids': unsupported,
-                'evidence_status': {cid: criterion_evidence_status[cid] for cid in unsupported},
-                'reason': 'Completion criteria lack verified, fully covered supporting evidence at the durable write boundary.',
-            })
-            return {
-                'error': f'Clock {clock.name} cannot resolve: completion criteria lack verified supporting evidence.',
-                'rejected_proposals': rejected_proposals,
-            }
-    else:
-        criterion_evidence = {}
+        clock.status = 'completion_pending'
 
-    consequence_text = clean_text(consequence.get('text') or consequence.get('summary') or patch.get('reason'), 520)
-    consequence_evidence = consequence.get('evidence_sources')
-    if not isinstance(consequence_evidence, list):
-        consequence_evidence = None
-    # The consequence's own evidence status is computed only from the structured
-    # consequence evidence_sources, never from the proposing model's declared status.
-    consequence_status = _verified_clock_evidence_status(
-        campaign,
-        consequence_evidence,
-        consequence_text,
-        required_visibility=requested_visibility,
-    )
-    # Claim coverage may be supplemented by the evidence of every individually-verified
-    # completion criterion, so a consequence derived from verified criteria is accepted
-    # instead of being approved by a single shared token.
-    coverage_evidence = list(consequence_evidence) if consequence_evidence else []
-    if completion_criteria:
-        for criterion_id in sorted(required_ids):
-            if criterion_evidence_status.get(criterion_id) in ('supported_by_evidence', 'supported_by_rules'):
-                for source in (criterion_evidence.get(criterion_id) or []):
-                    if isinstance(source, dict) and source not in coverage_evidence:
-                        coverage_evidence.append(source)
-    consequence_covered = _clock_claims_covered(campaign, coverage_evidence, consequence_text)
-    applied_visibility = requested_visibility
-    gate_consequence_visibility = requested_visibility in ('party_known', 'public') and bool(consequence_text)
-    if (
-        gate_consequence_visibility
-        and (
-            consequence_status in ('insufficiently_supported', 'contradicted')
-            or (consequence_status in ('supported_by_evidence', 'supported_by_rules') and not consequence_covered)
-        )
-    ):
+    criterion_verdicts, duplicate_ids = _collect_clock_criterion_verdicts(patch)
+    unknown_ids = set(criterion_verdicts) - required_ids
+    missing_ids = required_ids - set(criterion_verdicts)
+    if duplicate_ids or unknown_ids or missing_ids:
         rejected_proposals.append({
-            'kind': 'consequence_visibility',
-            'requested_visibility': requested_visibility,
-            'applied_visibility': 'dm_private',
-            'consequence': consequence_text,
-            'evidence_status': consequence_status,
-            'consequence_covered': consequence_covered,
-            'reason': 'Retirement consequence is not covered by verified evidence; retained pending.',
+            'kind': 'completion_criterion_verdicts',
+            'missing_ids': sorted(missing_ids),
+            'unknown_ids': sorted(unknown_ids),
+            'duplicate_ids': sorted(duplicate_ids),
+            'reason': 'Completion verdicts must map exactly once to every declared criterion.',
         })
         return {
-            'error': f'Clock {clock.name} cannot apply its consequence at {requested_visibility} visibility without verified evidence.',
+            'error': f'Clock {clock.name} cannot resolve until every completion criterion has one AI verdict.',
+            'rejected_proposals': rejected_proposals,
+            'mechanical_complete': mechanical_complete,
+            'consequence_applied': False,
+        }
+
+    criterion_claims = set()
+    unsupported_ids = []
+    for criterion_id in sorted(required_ids):
+        verdict = criterion_verdicts[criterion_id]
+        verified_sources, rejected_sources = _verified_clock_evidence_sources(
+            campaign, verdict['evidence_sources'], requested_visibility
+        )
+        accepted = (
+            verdict['verdict'] == 'met'
+            and bool(verdict['supported_claims'])
+            and bool(verified_sources)
+        )
+        criterion_evidence_status[criterion_id] = 'verified' if verified_sources else 'missing_or_private'
+        applied_verdict = {
+            **verdict,
+            'evidence_sources': verified_sources,
+            'rejected_evidence_sources': rejected_sources,
+        }
+        applied_criterion_verdicts.append(applied_verdict)
+        if not accepted:
+            unsupported_ids.append(criterion_id)
+            continue
+        met_ids.add(criterion_id)
+        criterion_claims.update(verdict['supported_claims'])
+
+    if unsupported_ids:
+        rejected_proposals.append({
+            'kind': 'completion_criterion_verdicts',
+            'criterion_ids': unsupported_ids,
+            'verdicts': applied_criterion_verdicts,
+            'reason': 'The AI adjudicator did not return met verdicts with durable, visibility-safe sources and explicit supported claims.',
+        })
+        return {
+            'error': f'Clock {clock.name} cannot resolve: one or more completion criteria remain unsupported or uncertain.',
+            'rejected_proposals': rejected_proposals,
+            'mechanical_complete': mechanical_complete,
+            'consequence_applied': False,
+        }
+
+    consequence_verdict = clean_text(consequence.get('verdict'), 30).lower()
+    consequence_claims = _normalize_clock_supported_claims(consequence.get('claims'))
+    consequence_reason = clean_text(consequence.get('reason'), 520)
+    verified_consequence_sources, rejected_consequence_sources = _verified_clock_evidence_sources(
+        campaign, consequence.get('evidence_sources'), requested_visibility
+    )
+    claims_derived_from_criteria = not completion_criteria or set(consequence_claims) <= criterion_claims
+    consequence_supported = (
+        consequence_verdict == 'supported'
+        and bool(consequence_claims)
+        and bool(verified_consequence_sources)
+        and claims_derived_from_criteria
+    )
+    if not consequence_supported:
+        rejected_proposals.append({
+            'kind': 'consequence_verdict',
+            'requested_visibility': requested_visibility,
+            'verdict': consequence_verdict or 'missing',
+            'claims': consequence_claims,
+            'evidence_sources': verified_consequence_sources,
+            'rejected_evidence_sources': rejected_consequence_sources,
+            'claims_derived_from_criteria': claims_derived_from_criteria,
+            'reason': consequence_reason or 'The consequence lacks a supported AI verdict backed by durable sources.',
+        })
+        return {
+            'error': f'Clock {clock.name} cannot apply its consequence without a supported AI verdict and verified sources.',
             'rejected_proposals': rejected_proposals,
             'mechanical_complete': mechanical_complete,
             'consequence_applied': False,
@@ -5732,34 +5405,45 @@ def _retire_clock_from_patch(campaign, patch):
                 'requested': requested_visibility,
                 'applied': 'dm_private',
                 'consequence_applied': False,
-                'evidence_status': consequence_status,
-                'consequence_covered': consequence_covered,
-                'reason': 'consequence_pending_verified_evidence',
+                'evidence_status': 'pending_ai_adjudication',
+                'reason': 'consequence_pending_ai_adjudication',
             },
         }
+
+    applied_visibility = requested_visibility
     visibility_decision = {
         'requested': requested_visibility,
         'applied': applied_visibility,
-        'consequence_applied': consequence_applied,
-        'evidence_status': consequence_status,
-        'reason': 'applied_at_requested_visibility' if consequence_applied else 'retained_at_safe_visibility',
+        'consequence_applied': True,
+        'evidence_status': 'ai_adjudicated_verified_sources',
+        'reason': 'applied_at_requested_visibility',
     }
-    clock.status = clean_text(patch.get('status'), 30) or 'resolved'
+    clock.status = 'resolved'
     clock.updated_at = utcnow()
     upsert_memory_embedding(campaign, 'clock', clock.clock_id, clock.to_dict(include_private=True))
     from openrouter import _get_cached_build_sha
     provenance = _applied_clock_provenance(patch.get('provenance'), _get_cached_build_sha())
+    provenance['evidence_sources'] = verified_consequence_sources
+    provenance['evidence_status'] = 'ai_adjudicated_verified_sources'
+    event_summary = clean_text(' '.join(consequence_claims), 1200)
     event = _record_event(
         campaign,
         'clock_retired',
-        patch.get('reason') or f'Clock {clock.name} retired as {clock.status}.',
+        event_summary,
         {
             'clock_id': clock.clock_id,
             'status': clock.status,
             'mechanical_complete': mechanical_complete,
             'completion_criteria_met': sorted(met_ids) if completion_criteria else [],
             'criterion_evidence_status': criterion_evidence_status,
-            'consequence_applied': consequence_applied,
+            'completion_criteria_verdicts': applied_criterion_verdicts,
+            'consequence_verdict': {
+                'verdict': consequence_verdict,
+                'claims': consequence_claims,
+                'evidence_sources': verified_consequence_sources,
+                'reason': consequence_reason,
+            },
+            'consequence_applied': True,
             'visibility_decision': visibility_decision,
             'rejected_proposals': rejected_proposals,
             'provenance': provenance,
@@ -5771,7 +5455,7 @@ def _retire_clock_from_patch(campaign, patch):
         'event_id': event.id,
         'action': 'retired',
         'mechanical_complete': mechanical_complete,
-        'consequence_applied': consequence_applied,
+        'consequence_applied': True,
         'visibility_decision': visibility_decision,
         'rejected_proposals': rejected_proposals,
     }
