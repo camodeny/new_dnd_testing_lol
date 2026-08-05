@@ -237,5 +237,35 @@ export const evidenceScenarios = [
     captures: [
       { name: 'page.png', locator: null, fullPage: true }
     ]
+  },
+  {
+    id: 'automation-run-scorecard',
+    description: 'Automation run page shows scorecard summary with audited and fully-scored cycle counts',
+    route: '/automation/runs/42',
+    fixture: 'automation-run',
+    verify: async ({ page }) => {
+      // Header shows the run id and status
+      await expect(page.locator('.automation-title')).toContainText('Run #42');
+      // Scorecard summary meta shows audited and fully scored cycle counts
+      await expect(page.locator('.automation-meta-grid').first()).toContainText('Audited cycles');
+      await expect(page.locator('.automation-meta-grid').first()).toContainText('Fully scored cycles');
+      await expect(page.locator('.automation-meta-grid').first()).toContainText('Severity');
+      await expect(page.locator('.automation-meta-grid').first()).toContainText('Completeness');
+      // Stat grid header shows the audited / fully scored cycle ratio
+      await expect(page.locator('.automation-stat-grid')).toContainText('Audited / Fully scored cycles');
+      await expect(page.locator('.automation-stat-grid')).toContainText('3 / 2');
+      // Category breakdown renders
+      await expect(page.locator('.automation-category-breakdown')).toBeVisible();
+      // Scorecard rows render with statuses
+      await expect(page.locator('.automation-scorecard-row')).toHaveCount(4);
+      // Live session transcript renders
+      await expect(page.locator('.automation-chat-column .chat-msg-dm').first()).toBeVisible();
+      await expect(page.locator('.automation-chat-column .chat-msg-player').first()).toBeVisible();
+    },
+    captures: [
+      { name: 'page.png', locator: null, fullPage: true },
+      { name: 'status.png', locator: '.automation-header' },
+      { name: 'scorecard.png', locator: '.automation-scorecard' }
+    ]
   }
 ];

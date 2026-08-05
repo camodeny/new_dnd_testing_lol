@@ -5,6 +5,7 @@ import { mockSessions } from './sessions.js';
 import { mockMessages } from './messages.js';
 import { mockEncounterMaps } from './encounter-maps.js';
 import { mockProposals } from './proposals.js';
+import { mockAutomationRunWatch } from './automation-run.js';
 
 export {
   mockUser,
@@ -13,7 +14,8 @@ export {
   mockSessions,
   mockMessages,
   mockEncounterMaps,
-  mockProposals
+  mockProposals,
+  mockAutomationRunWatch
 };
 
 export const fixtureProfiles = {
@@ -109,5 +111,9 @@ export const fixtureProfiles = {
     members: [
       { user_id: mockUser.id, username: mockUser.name, role: 'spectator' }
     ]
+  },
+  'automation-run': {
+    me: mockUser,
+    runWatch: mockAutomationRunWatch
   }
 };

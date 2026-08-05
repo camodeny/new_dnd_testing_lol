@@ -379,7 +379,7 @@ def _normalize_custom_scorecard_status(value, default='warn'):
 
 
 def _coerce_scorecard_text(value, criterion_id, index, field):
-    if not value:
+    if value is None:
         return None
     if not isinstance(value, str):
         raise AuditScorecardValidationError(
