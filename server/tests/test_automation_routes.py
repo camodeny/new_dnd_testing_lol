@@ -2622,6 +2622,14 @@ class AutomationRouteTest(unittest.TestCase):
                         'applicable': 'false',
                         'reason': 'string false'
                     }
+                },
+                {
+                    'id': 'criterion_b',
+                    'status': 'not_assessed',
+                    'applicability': {
+                        'applicable': False,
+                        'reason': 'string false'
+                    }
                 }
             ]
         }
@@ -2648,6 +2656,11 @@ class AutomationRouteTest(unittest.TestCase):
                         {'kind': 'session_message'}, 
                         {'kind': 'session_message', 'id': 999, 'visibility': 'invalid_vis'}
                     ]
+                },
+                {
+                    'id': 'criterion_b',
+                    'status': 'not_assessed',
+                    'applicability': {'applicable': False}
                 }
             ]
         }
@@ -2674,10 +2687,306 @@ class AutomationRouteTest(unittest.TestCase):
             headers=self.headers,
             json={'scorecard': audit_payload_empty_criteria}
         )
-        self.assertEqual(submit_resp_4.status_code, 200)
+        self.assertEqual(submit_resp_4.status_code, 422)
+        self.assertEqual(submit_resp_4.get_json()['error']['code'], 'empty_criteria')
+
+        # Test missing status is rejected instead of defaulting to warn
+        audit_payload_missing_status = {
+            'source': 'manual_auditor',
+            'criteria': [
+                {'id': 'criterion_a'},
+                {'id': 'criterion_b', 'status': 'pass'},
+            ]
+        }
+        submit_resp_5 = self.client.post(
+            f'/api/automation/runs/{run_id}/audit-cycles/{cycle_id}/audit',
+            headers=self.headers,
+            json={'scorecard': audit_payload_missing_status}
+        )
+        self.assertEqual(submit_resp_5.status_code, 422)
+        submit_5_json = submit_resp_5.get_json()
+        self.assertEqual(submit_5_json['error']['code'], 'missing_status')
+        self.assertEqual(submit_5_json['error']['details']['criterion_id'], 'criterion_a')
+
+        # Test falsey / non-string / unknown status values are rejected
+        for bad_status in (False, [], '', 0, 'bogus'):
+            audit_payload_bad_status = {
+                'source': 'manual_auditor',
+                'criteria': [
+                    {'id': 'criterion_a', 'status': bad_status},
+                    {'id': 'criterion_b', 'status': 'pass'},
+                ]
+            }
+            submit_resp_bad = self.client.post(
+                f'/api/automation/runs/{run_id}/audit-cycles/{cycle_id}/audit',
+                headers=self.headers,
+                json={'scorecard': audit_payload_bad_status}
+            )
+            self.assertEqual(
+                submit_resp_bad.status_code,
+                422,
+                f'expected 422 for status {bad_status!r}',
+            )
+            self.assertEqual(submit_resp_bad.get_json()['error']['code'], 'invalid_status')
+
+        # Test truthy and falsey non-string text fields are rejected as 422, not 500
+        for field in ('summary', 'primary_evidence', 'evidence'):
+            for bad_value in (123, 0, False, [], {}):
+                audit_payload_bad_text = {
+                    'source': 'manual_auditor',
+                    'criteria': [
+                        {'id': 'criterion_a', 'status': 'pass', field: bad_value},
+                        {'id': 'criterion_b', 'status': 'pass'},
+                    ]
+                }
+                submit_resp_text = self.client.post(
+                    f'/api/automation/runs/{run_id}/audit-cycles/{cycle_id}/audit',
+                    headers=self.headers,
+                    json={'scorecard': audit_payload_bad_text}
+                )
+                self.assertEqual(
+                    submit_resp_text.status_code,
+                    422,
+                    f'expected 422 for non-string {field}={bad_value!r}',
+                )
+                submit_text_json = submit_resp_text.get_json()
+                self.assertEqual(submit_text_json['error']['code'], 'invalid_field_type')
+                self.assertEqual(submit_text_json['error']['details']['field'], field)
+
+        # Test top-level criteria shape is rejected
+        submit_resp_toplevel = self.client.post(
+            f'/api/automation/runs/{run_id}/audit-cycles/{cycle_id}/audit',
+            headers=self.headers,
+            json={
+                'source': 'manual_auditor',
+                'criteria': [
+                    {'id': 'criterion_a', 'status': 'pass'},
+                    {'id': 'criterion_b', 'status': 'pass'},
+                ],
+            },
+        )
+        self.assertEqual(submit_resp_toplevel.status_code, 422)
+        self.assertEqual(submit_resp_toplevel.get_json()['error']['code'], 'top_level_criteria')
+
+        # Test missing scorecard is rejected for a template-backed cycle
+        submit_resp_noscorecard = self.client.post(
+            f'/api/automation/runs/{run_id}/audit-cycles/{cycle_id}/audit',
+            headers=self.headers,
+            json={'source': 'manual_auditor'},
+        )
+        self.assertEqual(submit_resp_noscorecard.status_code, 422)
+        self.assertEqual(submit_resp_noscorecard.get_json()['error']['code'], 'missing_scorecard')
+
+        # Test partial criteria coverage is rejected
+        submit_resp_partial = self.client.post(
+            f'/api/automation/runs/{run_id}/audit-cycles/{cycle_id}/audit',
+            headers=self.headers,
+            json={'scorecard': {
+                'source': 'manual_auditor',
+                'criteria': [
+                    {'id': 'criterion_a', 'status': 'pass'},
+                ],
+            }},
+        )
+        self.assertEqual(submit_resp_partial.status_code, 422)
+        partial_json = submit_resp_partial.get_json()
+        self.assertEqual(partial_json['error']['code'], 'partial_criteria')
+        self.assertEqual(partial_json['error']['details']['missing_criterion_ids'], ['criterion_b'])
+
+        # Test duplicate criterion is rejected
+        submit_resp_duplicate = self.client.post(
+            f'/api/automation/runs/{run_id}/audit-cycles/{cycle_id}/audit',
+            headers=self.headers,
+            json={'scorecard': {
+                'source': 'manual_auditor',
+                'criteria': [
+                    {'id': 'criterion_a', 'status': 'pass'},
+                    {'id': 'criterion_a', 'status': 'pass'},
+                    {'id': 'criterion_b', 'status': 'pass'},
+                ],
+            }},
+        )
+        self.assertEqual(submit_resp_duplicate.status_code, 422)
+        duplicate_json = submit_resp_duplicate.get_json()
+        self.assertEqual(duplicate_json['error']['code'], 'duplicate_criterion')
+        self.assertEqual(duplicate_json['error']['details']['criterion_id'], 'criterion_a')
+
+        # Test the retryable 422 response contract and that a fixed submission succeeds
+        for rejection in (
+            submit_resp_4,
+            submit_resp_5,
+            submit_resp_bad,
+            submit_resp_text,
+            submit_resp_toplevel,
+            submit_resp_noscorecard,
+            submit_resp_partial,
+            submit_resp_duplicate,
+        ):
+            rejection_json = rejection.get_json()
+            self.assertEqual(rejection.status_code, 422)
+            self.assertIs(rejection_json['retryable'], True)
+            self.assertIn('error', rejection_json)
+            self.assertIn('code', rejection_json['error'])
+            self.assertIn('details', rejection_json['error'])
+
+        retry_payload = {
+            'source': 'manual_auditor',
+            'criteria': [
+                {'id': 'criterion_a', 'status': 'pass'},
+                {'id': 'criterion_b', 'status': 'pass'},
+            ]
+        }
+        retry_resp = self.client.post(
+            f'/api/automation/runs/{run_id}/audit-cycles/{cycle_id}/audit',
+            headers=self.headers,
+            json={'scorecard': retry_payload}
+        )
+        self.assertEqual(retry_resp.status_code, 200)
         with app.app_context():
             cycle_db = db.session.get(AutomationRunAuditCycle, cycle_id)
-            self.assertEqual(cycle_db.scorecard_summary_json['overall_status'], 'fail')
+            self.assertEqual(cycle_db.scorecard_json['criteria'][0]['status'], 'pass')
+            self.assertEqual(cycle_db.scorecard_json['criteria'][1]['status'], 'pass')
+
+    def test_fully_scored_cycle_count_ignores_malformed_stored_statuses(self):
+        _scenario_id, run_id = self._create_scorecard_run([
+            {'id': 'criterion_a', 'label': 'Criterion A'},
+            {'id': 'criterion_b', 'label': 'Criterion B'},
+        ])
+        from services.automation_service import append_run_event, refresh_run_scorecard
+
+        with app.app_context():
+            run = db.session.get(AutomationRun, run_id)
+            run.status = 'completed'
+            for turn_number in range(1, 4):
+                append_run_event(
+                    run,
+                    'turn_result',
+                    {'action': 'speak', 'turn_number': turn_number},
+                    dedupe_key=f'issue-80-count-turn:{run_id}:{turn_number}',
+                    commit=False,
+                    skip_workspace=True,
+                )
+            full_cycle = AutomationRunAuditCycle(
+                run_id=run_id,
+                cycle_number=1,
+                phase='after_dm',
+                status='audited',
+                scorecard_json={'criteria': [
+                    {'criterion_id': 'criterion_a', 'status': 'pass', 'applicability': {'applicable': True}},
+                    {'criterion_id': 'criterion_b', 'status': 'warn', 'applicability': {'applicable': True}},
+                ]},
+                scorecard_summary_json={},
+            )
+            missing_status_cycle = AutomationRunAuditCycle(
+                run_id=run_id,
+                cycle_number=2,
+                phase='after_dm',
+                status='audited',
+                scorecard_json={'criteria': [
+                    {'criterion_id': 'criterion_a'},
+                    {'criterion_id': 'criterion_b', 'status': 'pass', 'applicability': {'applicable': True}},
+                ]},
+                scorecard_summary_json={},
+            )
+            bad_row_cycle = AutomationRunAuditCycle(
+                run_id=run_id,
+                cycle_number=3,
+                phase='after_dm',
+                status='audited',
+                scorecard_json={'criteria': [
+                    'not-a-dict',
+                    {'criterion_id': 'criterion_a', 'status': 'pass', 'applicability': {'applicable': True}},
+                    {'criterion_id': 'criterion_b', 'status': 'pass', 'applicability': {'applicable': True}},
+                ]},
+                scorecard_summary_json={},
+            )
+            invalid_status_cycle = AutomationRunAuditCycle(
+                run_id=run_id,
+                cycle_number=4,
+                phase='after_dm',
+                status='audited',
+                scorecard_json={'criteria': [
+                    {'criterion_id': 'criterion_a', 'status': 'garbage', 'applicability': {'applicable': True}},
+                    {'criterion_id': 'criterion_b', 'status': 'pass', 'applicability': {'applicable': True}},
+                ]},
+                scorecard_summary_json={},
+            )
+            db.session.add_all([full_cycle, missing_status_cycle, bad_row_cycle, invalid_status_cycle])
+            db.session.commit()
+            refresh_run_scorecard(run)
+
+        response = self.client.get(f'/api/automation/runs/{run_id}/scorecard', headers=self.headers)
+        self.assertEqual(response.status_code, 200)
+        summary = response.get_json()['run']['scorecard_summary']
+        self.assertEqual(summary['audited_cycle_count'], 4)
+        self.assertEqual(summary['fully_scored_cycle_count'], 1)
+
+    def test_replay_repairs_malformed_cycle_and_refreshes_counts(self):
+        _scenario_id, run_id = self._create_scorecard_run([
+            {'id': 'criterion_a', 'label': 'Criterion A'},
+            {'id': 'criterion_b', 'label': 'Criterion B'},
+        ])
+        from services.automation_service import append_run_event, refresh_run_scorecard
+
+        with app.app_context():
+            run = db.session.get(AutomationRun, run_id)
+            run.status = 'completed'
+            for turn_number in range(1, 4):
+                append_run_event(
+                    run,
+                    'turn_result',
+                    {'action': 'speak', 'turn_number': turn_number},
+                    dedupe_key=f'issue-80-replay-turn:{run_id}:{turn_number}',
+                    commit=False,
+                    skip_workspace=True,
+                )
+            cycle = AutomationRunAuditCycle(
+                run_id=run_id,
+                cycle_number=1,
+                phase='after_dm',
+                status='audited',
+                scorecard_json={'criteria': [
+                    {'criterion_id': 'criterion_a'},
+                    {'criterion_id': 'criterion_b', 'status': 'pass', 'applicability': {'applicable': True}},
+                ]},
+                scorecard_summary_json={},
+            )
+            db.session.add(cycle)
+            db.session.commit()
+            cycle_id = cycle.id
+            refresh_run_scorecard(run)
+
+        response = self.client.get(f'/api/automation/runs/{run_id}/scorecard', headers=self.headers)
+        summary = response.get_json()['run']['scorecard_summary']
+        self.assertEqual(summary['audited_cycle_count'], 1)
+        self.assertEqual(summary['fully_scored_cycle_count'], 0)
+
+        replay_resp = self.client.post(
+            f'/api/automation/runs/{run_id}/audit-cycles/{cycle_id}/replay',
+            headers=self.headers,
+            json={
+                'scorecard': {
+                    'source': 'repair_replay',
+                    'criteria': [
+                        {'id': 'criterion_a', 'status': 'pass', 'applicability': {'applicable': True}},
+                        {'id': 'criterion_b', 'status': 'pass', 'applicability': {'applicable': True}},
+                    ],
+                },
+            },
+        )
+        self.assertEqual(replay_resp.status_code, 200)
+        self.assertTrue(replay_resp.get_json()['replayed'])
+
+        response = self.client.get(f'/api/automation/runs/{run_id}/scorecard', headers=self.headers)
+        summary = response.get_json()['run']['scorecard_summary']
+        self.assertEqual(summary['audited_cycle_count'], 1)
+        self.assertEqual(summary['fully_scored_cycle_count'], 1)
+
+        with app.app_context():
+            cycle_db = db.session.get(AutomationRunAuditCycle, cycle_id)
+            repaired = {item['criterion_id']: item for item in cycle_db.scorecard_json['criteria']}
+            self.assertEqual(repaired['criterion_a']['status'], 'pass')
+            self.assertEqual(repaired['criterion_b']['status'], 'pass')
 
     def test_security_redaction_and_lease_token_safety(self):
         scorecard = self.client.post(
@@ -4958,6 +5267,7 @@ class AutomationRouteTest(unittest.TestCase):
                     'summary': 'Partial manual audit',
                     'criteria': [
                         {'id': 'narrative_done', 'status': 'pass', 'applicability': {'applicable': True}},
+                        {'id': 'narrative_pending', 'status': 'not_assessed', 'applicability': {'applicable': True}},
                     ],
                 },
             },

@@ -59,6 +59,15 @@ class CloneRetrievalPreflightError(ValueError):
         self.report = report or {}
 
 
+class AuditScorecardValidationError(ValueError):
+    """A scorecard cannot be accepted as an audited cycle."""
+
+    def __init__(self, message, *, code='invalid_scorecard', details=None):
+        super().__init__(message)
+        self.code = code
+        self.details = details or {}
+
+
 def _normalize_memory_anchors(value):
     anchors = value if isinstance(value, dict) else {}
     return {
@@ -367,6 +376,18 @@ def upgrade_legacy_scorecard_template_categories():
 def _normalize_custom_scorecard_status(value, default='warn'):
     status = str(value or default).strip().lower()
     return status if status in CUSTOM_SCORECARD_STATUS_ORDER else default
+
+
+def _coerce_scorecard_text(value, criterion_id, index, field):
+    if value is None:
+        return None
+    if not isinstance(value, str):
+        raise AuditScorecardValidationError(
+            f'scorecard.criteria[{index}].{field} must be a string.',
+            code='invalid_field_type',
+            details={'index': index, 'criterion_id': criterion_id, 'field': field, 'received_type': type(value).__name__},
+        )
+    return value.strip() or None
 
 
 def _aggregate_custom_scorecard_statuses(statuses, default='warn'):
@@ -1814,25 +1835,100 @@ def validate_evidence_ref(ref):
 
 
 def submit_audit_cycle_feedback(cycle, *, summary=None, notes=None, scorecard=None):
-    cycle.summary = summary if summary is not None else cycle.summary
-    cycle.notes = notes if notes is not None else cycle.notes
-
-    scorecard_payload = _json_object(scorecard, {})
+    scorecard_payload = _json_object(scorecard, None)
     criteria_results = []
     template = current_scorecard_template_for_run(cycle.run)
     template_criteria = {
-        item.get('id'): item
+        _normalize_identifier(item.get('id')): item
         for item in _json_list(template.get('criteria'), [])
         if isinstance(item, dict) and item.get('id')
     }
-    for raw in _json_list(scorecard_payload.get('criteria'), []):
+    if scorecard_payload and scorecard_payload.get('__top_level_criteria__'):
+        raise AuditScorecardValidationError(
+            'criteria must be nested under scorecard.criteria.',
+            code='top_level_criteria',
+            details={'expected_path': 'scorecard.criteria'},
+        )
+    if scorecard_payload is None:
+        if template_criteria:
+            raise AuditScorecardValidationError(
+                'scorecard.criteria is required for this template-backed audit cycle.',
+                code='missing_scorecard',
+                details={'required_criterion_ids': sorted(template_criteria)},
+            )
+        scorecard_payload = {}
+
+    raw_criteria_value = scorecard_payload.get('criteria')
+    if template_criteria and 'criteria' not in scorecard_payload:
+        raise AuditScorecardValidationError(
+            'scorecard.criteria is required for this template-backed audit cycle.',
+            code='missing_criteria',
+            details={'required_criterion_ids': sorted(template_criteria)},
+        )
+    if template_criteria and not isinstance(raw_criteria_value, list):
+        raise AuditScorecardValidationError(
+            'scorecard.criteria must be a non-empty array for this template-backed audit cycle.',
+            code='invalid_criteria',
+            details={'received_type': type(raw_criteria_value).__name__},
+        )
+    if template_criteria and not raw_criteria_value:
+        raise AuditScorecardValidationError(
+            'scorecard.criteria cannot be empty for this template-backed audit cycle.',
+            code='empty_criteria',
+            details={'required_criterion_ids': sorted(template_criteria)},
+        )
+
+    seen_ids = set()
+    raw_criteria = _json_list(raw_criteria_value, [])
+    for index, raw in enumerate(raw_criteria):
         if not isinstance(raw, dict):
-            continue
+            raise AuditScorecardValidationError(
+                f'scorecard.criteria[{index}] must be an object.',
+                code='invalid_criterion',
+                details={'index': index},
+            )
         criterion_id = _normalize_identifier(raw.get('criterion_id') or raw.get('id'))
         if not criterion_id:
-            continue
+            raise AuditScorecardValidationError(
+                f'scorecard.criteria[{index}] is missing criterion_id.',
+                code='missing_criterion_id',
+                details={'index': index},
+            )
+        if criterion_id in seen_ids:
+            raise AuditScorecardValidationError(
+                f'Duplicate scorecard criterion: {criterion_id}.',
+                code='duplicate_criterion',
+                details={'criterion_id': criterion_id},
+            )
+        seen_ids.add(criterion_id)
+        if template_criteria and criterion_id not in template_criteria:
+            raise AuditScorecardValidationError(
+                f'Criterion {criterion_id} is not part of the active scorecard template.',
+                code='unknown_criterion',
+                details={'criterion_id': criterion_id, 'required_criterion_ids': sorted(template_criteria)},
+            )
         template_row = template_criteria.get(criterion_id, {})
-        status = _normalize_custom_scorecard_status(raw.get('status'))
+        raw_status_value = raw.get('status')
+        if raw_status_value is None:
+            raise AuditScorecardValidationError(
+                f'Criterion {criterion_id} is missing status.',
+                code='missing_status',
+                details={'criterion_id': criterion_id, 'allowed_statuses': list(CUSTOM_SCORECARD_STATUS_ORDER)},
+            )
+        if not isinstance(raw_status_value, str) or not raw_status_value.strip():
+            raise AuditScorecardValidationError(
+                f'Criterion {criterion_id} has invalid status {raw_status_value!r}.',
+                code='invalid_status',
+                details={'criterion_id': criterion_id, 'received_type': type(raw_status_value).__name__, 'allowed_statuses': list(CUSTOM_SCORECARD_STATUS_ORDER)},
+            )
+        raw_status = raw_status_value.strip().lower()
+        if raw_status not in CUSTOM_SCORECARD_STATUS_ORDER:
+            raise AuditScorecardValidationError(
+                f'Criterion {criterion_id} has invalid status {raw_status_value!r}.',
+                code='invalid_status',
+                details={'criterion_id': criterion_id, 'allowed_statuses': list(CUSTOM_SCORECARD_STATUS_ORDER)},
+            )
+        status = raw_status
         
         evidence_refs = []
         for ref in _json_list(raw.get('evidence_refs'), []):
@@ -1863,12 +1959,23 @@ def submit_audit_cycle_feedback(cycle, *, summary=None, notes=None, scorecard=No
             'criterion_id': criterion_id,
             'label': template_row.get('label') or raw.get('label') or criterion_id,
             'status': status,
-            'summary': (raw.get('summary') or '').strip() or None,
-            'primary_evidence': (raw.get('primary_evidence') or '').strip() or None,
-            'evidence': (raw.get('evidence') or '').strip() or None,
+            'summary': _coerce_scorecard_text(raw.get('summary'), criterion_id, index, 'summary'),
+            'primary_evidence': _coerce_scorecard_text(raw.get('primary_evidence'), criterion_id, index, 'primary_evidence'),
+            'evidence': _coerce_scorecard_text(raw.get('evidence'), criterion_id, index, 'evidence'),
             'evidence_refs': evidence_refs,
             'applicability': applicability,
         })
+
+    missing_ids = sorted(set(template_criteria) - seen_ids)
+    if missing_ids:
+        raise AuditScorecardValidationError(
+            'The audit scorecard is missing required template criteria.',
+            code='partial_criteria',
+            details={'missing_criterion_ids': missing_ids, 'received_criterion_ids': sorted(seen_ids)},
+        )
+
+    cycle.summary = summary if summary is not None else cycle.summary
+    cycle.notes = notes if notes is not None else cycle.notes
 
     if criteria_results:
         applicable_results = [
@@ -1908,6 +2015,10 @@ def submit_audit_cycle_feedback(cycle, *, summary=None, notes=None, scorecard=No
         'criteria_not_applicable_count': criteria_not_applicable_count,
         'auditor_job_count': len(_json_list(scorecard_payload.get('auditor_jobs'), [])),
         'unresolved_evidence_gap_count': len(_json_list(scorecard_payload.get('unresolved_evidence_gaps'), [])),
+        'fully_scored': bool(
+            criteria_results
+            and all(item.get('status') in {'pass', 'warn', 'fail', 'not_applicable'} for item in criteria_results)
+        ) if template_criteria else True,
     }
     cycle.status = 'audited'
     cycle.audited_at = _utcnow()
@@ -2434,6 +2545,28 @@ def _collect_run_metrics(run, event_rows=None, audit_rows=None, provider_rows=No
     latencies = [row.latency_ms for row in provider_rows if row.latency_ms is not None]
     incidents = calculate_run_incidents(run, event_rows, audit_rows, provider_rows)
     audited_cycles = [cycle for cycle in cycle_rows if cycle.status == 'audited']
+    template = current_scorecard_template_for_run(run)
+    required_criterion_ids = {
+        _normalize_identifier(item.get('id'))
+        for item in _json_list(template.get('criteria'), [])
+        if isinstance(item, dict) and item.get('id')
+    }
+    fully_scored_cycles = []
+    for cycle in audited_cycles:
+        submitted_ids = {
+            _normalize_identifier(item.get('criterion_id') or item.get('id'))
+            for item in _json_list((cycle.scorecard_json or {}).get('criteria'), [])
+            if isinstance(item, dict)
+        }
+        assessments = _json_list((cycle.scorecard_json or {}).get('criteria'), [])
+        has_only_assessed_results = all(
+            isinstance(item, dict)
+            and isinstance(item.get('status'), str)
+            and item.get('status').strip().lower() in {'pass', 'warn', 'fail', 'not_applicable'}
+            for item in assessments
+        )
+        if submitted_ids >= required_criterion_ids and has_only_assessed_results:
+            fully_scored_cycles.append(cycle)
 
     return {
         'run_status': run.status,
@@ -2450,6 +2583,7 @@ def _collect_run_metrics(run, event_rows=None, audit_rows=None, provider_rows=No
         'warning_incident_count': sum(1 for incident in incidents if incident.get('severity') == 'warn'),
         'failing_incident_count': sum(1 for incident in incidents if incident.get('severity') == 'fail'),
         'audited_cycle_count': len(audited_cycles),
+        'fully_scored_cycle_count': len(fully_scored_cycles),
     }
 
 
@@ -2899,6 +3033,7 @@ def refresh_run_scorecard(run):
         'audited_cycle_count': metrics.get('audited_cycle_count', 0),
         'scoring_model': SCORECARD_SCORING_MODEL,
         'severity': overall_status,
+        'fully_scored_cycle_count': metrics.get('fully_scored_cycle_count', 0),
         'overall_status': overall_status,
         'weighted_score': scoring['performance_score'],
         **scoring,

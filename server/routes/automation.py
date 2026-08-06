@@ -72,6 +72,7 @@ from services.automation_service import (
     provision_automation_player,
     validate_and_normalize_roster,
     submit_audit_cycle_feedback,
+    AuditScorecardValidationError,
     validate_scorecard_template_payload,
     visible_campaigns_for_user,
     workspace_trends_for_user,
@@ -1256,12 +1257,17 @@ def audit_automation_run_cycle(current_user, run_id, cycle_id):
         "raw_payload_json": data,
     }
 
+    scorecard_payload = data.get('scorecard')
+    if scorecard_payload is None and 'criteria' in data:
+        # Do not let the legacy top-level shape become an empty scorecard.
+        scorecard_payload = {'__top_level_criteria__': True, 'criteria': data.get('criteria')}
+
     try:
         cycle = submit_audit_cycle_feedback(
             cycle,
             summary=data.get('summary'),
             notes=data.get('notes'),
-            scorecard=data.get('scorecard'),
+            scorecard=scorecard_payload,
         )
         
         # Log successful attempt
@@ -1276,6 +1282,32 @@ def audit_automation_run_cycle(current_user, run_id, cycle_id):
         )
         db.session.add(attempt)
         db.session.commit()
+    except AuditScorecardValidationError as e:
+        db.session.rollback()
+        attempt = AutomationRunAuditAttempt(
+            status="failed",
+            error_class=e.__class__.__name__,
+            error_message=str(e),
+            normalized_payload_json={
+                'validation': {
+                    'code': e.code,
+                    'message': str(e),
+                    'details': e.details,
+                },
+            },
+            **attempt_context
+        )
+        db.session.add(attempt)
+        db.session.commit()
+        return jsonify({
+            'error': {
+                'code': e.code,
+                'message': str(e),
+                'details': e.details,
+            },
+            'retryable': True,
+            'audit_cycle': cycle.to_dict(),
+        }), 422
     except Exception as e:
         db.session.rollback()
         
@@ -1308,6 +1340,63 @@ def audit_automation_run_cycle(current_user, run_id, cycle_id):
         dedupe_key=f'run_scorecard_updated:{run.id}:{run.last_event_sequence or 0}',
     )
     return jsonify({'run': run.to_dict(), 'audit_cycle': cycle.to_dict(), 'scorecard': scorecard}), 200
+
+
+@automation_bp.route('/api/automation/runs/<int:run_id>/audit-cycles/<int:cycle_id>/replay', methods=['POST'])
+@token_required
+def replay_automation_run_cycle(current_user, run_id, cycle_id):
+    """Repair/replay a previously accepted audit cycle with a corrected scorecard."""
+    run = get_or_404(AutomationRun, run_id)
+    if not _run_owned_by_user(current_user, run):
+        return jsonify({'error': 'Forbidden'}), 403
+    cycle = get_or_404(AutomationRunAuditCycle, cycle_id)
+    if cycle.run_id != run.id:
+        return jsonify({'error': 'Audit cycle does not belong to this run'}), 400
+    data = request.get_json(silent=True) or {}
+    scorecard_payload = data.get('scorecard')
+    if scorecard_payload is None and 'criteria' in data:
+        scorecard_payload = {'__top_level_criteria__': True, 'criteria': data.get('criteria')}
+    attempt_context = {
+        'run_id': run.id,
+        'cycle_id': cycle.id,
+        'cycle_number': cycle.cycle_number,
+        'phase': cycle.phase,
+        'auditor_job_id': None,
+        'auditor_slot': data.get('auditor_slot'),
+        'provider': data.get('provider'),
+        'model': data.get('model'),
+        'attempt_source': 'repair_replay',
+        'raw_payload_json': data,
+    }
+    try:
+        cycle = submit_audit_cycle_feedback(
+            cycle,
+            summary=data.get('summary'),
+            notes=data.get('notes'),
+            scorecard=scorecard_payload,
+        )
+        attempt = AutomationRunAuditAttempt(
+            status='success',
+            normalized_payload_json={'summary': cycle.summary, 'notes': cycle.notes, 'scorecard': cycle.scorecard_json},
+            **attempt_context,
+        )
+        db.session.add(attempt)
+        db.session.commit()
+    except AuditScorecardValidationError as e:
+        db.session.rollback()
+        attempt = AutomationRunAuditAttempt(
+            status='failed',
+            error_class=e.__class__.__name__,
+            error_message=str(e),
+            normalized_payload_json={'validation': {'code': e.code, 'message': str(e), 'details': e.details}},
+            **attempt_context,
+        )
+        db.session.add(attempt)
+        db.session.commit()
+        return jsonify({'error': {'code': e.code, 'message': str(e), 'details': e.details}, 'retryable': True, 'audit_cycle': cycle.to_dict()}), 422
+
+    scorecard = refresh_run_scorecard(run)
+    return jsonify({'run': run.to_dict(), 'audit_cycle': cycle.to_dict(), 'scorecard': scorecard, 'replayed': True}), 200
 
 
 @automation_bp.route('/api/automation/runs/<int:run_id>/continue', methods=['POST'])

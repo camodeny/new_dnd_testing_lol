@@ -1918,6 +1918,12 @@ class AutomationRunAuditCycle(db.Model):
     run = db.relationship('AutomationRun', foreign_keys=[run_id])
 
     def to_dict(self):
+        audit_attempts = [
+            attempt.to_dict()
+            for attempt in AutomationRunAuditAttempt.query.filter_by(cycle_id=self.id)
+            .order_by(AutomationRunAuditAttempt.created_at.asc(), AutomationRunAuditAttempt.id.asc())
+            .all()
+        ] if 'AutomationRunAuditAttempt' in globals() else []
         return {
             'id': self.id,
             'run_id': self.run_id,
@@ -1934,6 +1940,7 @@ class AutomationRunAuditCycle(db.Model):
             'audited_at': self.audited_at.isoformat() if self.audited_at else None,
             'created_at': self.created_at.isoformat() if self.created_at else None,
             'updated_at': self.updated_at.isoformat() if self.updated_at else None,
+            'audit_attempts': audit_attempts,
         }
 
 

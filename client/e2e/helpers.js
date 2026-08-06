@@ -1,7 +1,7 @@
 import { expect } from '@playwright/test';
 import fs from 'fs';
 import path from 'path';
-import { fixtureProfiles, mockCampaigns } from './fixtures/index.js';
+import { fixtureProfiles, mockCampaigns, mockAutomationRunWatch } from './fixtures/index.js';
 
 export async function setupBrowserEvidence(page, baseURL) {
   const unexpectedApiRequests = [];
@@ -134,6 +134,19 @@ export async function setupBrowserEvidence(page, baseURL) {
             ],
             scenario_trends: [],
           }),
+        });
+      } else if (/^\/api\/automation\/runs\/[^/]+\/provider-calls(\?|$)/.test(pathname)) {
+        await route.fulfill({
+          status: 200,
+          contentType: 'application/json',
+          body: JSON.stringify({ provider_calls: [] }),
+        });
+      } else if (/^\/api\/automation\/runs\/[^/]+(\?|$)/.test(pathname)) {
+        // GET /api/automation/runs/:id (run watch payload)
+        await route.fulfill({
+          status: 200,
+          contentType: 'application/json',
+          body: JSON.stringify(profile.runWatch || mockAutomationRunWatch),
         });
       } else {
         unexpectedApiRequests.push(url);
