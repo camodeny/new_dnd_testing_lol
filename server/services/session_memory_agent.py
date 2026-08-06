@@ -594,12 +594,12 @@ def _validate_final_memory_state(compiled_patch, registry_map, known, campaign):
         if isinstance(substitutions, list) and len(substitutions) > 0:
             errors.append("substitutions_not_empty")
 
-    errors.extend(_validate_resolved_entity_refs(compiled_patch))
+    errors.extend(_validate_resolved_entity_refs(compiled_patch, known))
 
     return errors
 
 
-def _validate_resolved_entity_refs(compiled_patch):
+def _validate_resolved_entity_refs(compiled_patch, known=None):
     errors = []
     raw_refs = compiled_patch.get("resolved_entity_refs")
     if not isinstance(raw_refs, list) or not raw_refs:
@@ -608,16 +608,30 @@ def _validate_resolved_entity_refs(compiled_patch):
     if not refs:
         return errors
 
-    label_to_canonical = {}
+    known = known if isinstance(known, dict) else {}
+    known_names = dict(known.get("npc_names", {}) or {})
+    known_names.update(known.get("entity_names", {}) or {})
+
+    term_to_canonical = {}
     for ref in refs:
-        label_to_canonical.setdefault(ref["label_lower"], ref["canonical_id"])
+        terms = {ref["label_lower"], ref.get("canonical_name_lower", "")}
+        known_canonical_name = known_names.get(ref["canonical_id"], "")
+        if known_canonical_name:
+            terms.add(known_canonical_name.strip().lower())
+        for term in terms:
+            if not term:
+                continue
+            term_to_canonical.setdefault(term, ref["canonical_id"])
 
     conflicts = {}
     for ref in refs:
-        conflicts.setdefault(ref["label_lower"], set()).add(ref["canonical_id"])
-    for label, ids in conflicts.items():
+        terms = {ref["label_lower"], ref.get("canonical_name_lower", "")}
+        for term in terms:
+            if term:
+                conflicts.setdefault(term, set()).add(ref["canonical_id"])
+    for term, ids in conflicts.items():
         if len(ids) > 1:
-            errors.append(f"resolved_ref_conflict: {label}")
+            errors.append(f"resolved_ref_conflict: {term}")
 
     patch_entities_by_name = {}
     for entity in compiled_patch.get("upsert_graph_entities", []):
@@ -627,8 +641,8 @@ def _validate_resolved_entity_refs(compiled_patch):
         if name:
             patch_entities_by_name.setdefault(name, []).append(entity)
 
-    for label, canonical_id in label_to_canonical.items():
-        for entity in patch_entities_by_name.get(label, []):
+    for term, canonical_id in term_to_canonical.items():
+        for entity in patch_entities_by_name.get(term, []):
             if entity["id"] != canonical_id:
                 errors.append(
                     f"resolved_ref_split_brain: {entity.get('name')} -> {entity['id']} (canonical {canonical_id})"
@@ -642,12 +656,56 @@ def _validate_resolved_entity_refs(compiled_patch):
         if not actor_id or not supplied_name:
             continue
         label = supplied_name.lower()
-        if label in label_to_canonical and actor_id != label_to_canonical[label]:
+        if label in term_to_canonical and actor_id != term_to_canonical[label]:
             errors.append(
-                f"resolved_ref_split_brain: {supplied_name} -> {actor_id} (canonical {label_to_canonical[label]})"
+                f"resolved_ref_split_brain: {supplied_name} -> {actor_id} (canonical {term_to_canonical[label]})"
             )
 
     return errors
+
+
+_EVENT_REF_KEYS = {
+    "actor_id",
+    "entity_id",
+    "npc_id",
+    "character_id",
+    "source_id",
+    "target_id",
+    "location_id",
+    "from_id",
+    "to_id",
+    "participant_id",
+    "monster_id",
+}
+_EVENT_REF_LIST_KEYS = {
+    "entity_ids",
+    "npc_ids",
+    "actor_ids",
+    "source_ids",
+    "target_ids",
+    "participant_ids",
+    "related_ids",
+    "character_ids",
+    "ids",
+}
+
+
+def _remap_event_reference_fields(value, id_remap):
+    if not id_remap:
+        return value
+    if isinstance(value, dict):
+        result = {}
+        for key, val in value.items():
+            if key in _EVENT_REF_KEYS and isinstance(val, str) and val in id_remap:
+                result[key] = id_remap[val]
+            elif key in _EVENT_REF_LIST_KEYS and isinstance(val, list):
+                result[key] = [id_remap.get(item, item) for item in val]
+            else:
+                result[key] = _remap_event_reference_fields(val, id_remap)
+        return result
+    if isinstance(value, list):
+        return [_remap_event_reference_fields(item, id_remap) for item in value]
+    return value
 
 
 def _get_memory_revision(campaign):
@@ -755,12 +813,30 @@ def _augment_registry_from_resolved(registry, resolved_entities, resolved_npcs, 
     index = len(registry)
 
     ref_by_label = {}
+    ref_by_canonical_term = {}
+    ref_by_proposed_id = {}
     for ref in entity_refs or []:
         ref_by_label[ref["label_lower"]] = ref
+        ref_by_proposed_id[ref["canonical_id"]] = ref
+        if ref.get("proposed_id"):
+            ref_by_proposed_id[ref["proposed_id"]] = ref
+        terms = {ref["canonical_name_lower"]}
+        known_canonical_name = (
+            known.get("npc_names", {}).get(ref["canonical_id"])
+            or known.get("entity_names", {}).get(ref["canonical_id"])
+        )
+        if known_canonical_name:
+            terms.add(known_canonical_name.strip().lower())
+        for term in terms:
+            ref_by_canonical_term.setdefault(term, ref)
 
-    def _ref_target(name):
+    def _ref_target(name, proposed_id=""):
         ref = ref_by_label.get(name.strip().lower())
-        if not ref:
+        if ref is None:
+            ref = ref_by_canonical_term.get(name.strip().lower())
+        if ref is None and proposed_id:
+            ref = ref_by_proposed_id.get(proposed_id)
+        if ref is None:
             return None
         ref_cid = ref["canonical_id"]
         if ref_cid not in known.get("entity_ids", set()) and ref_cid not in allocated_ids:
@@ -775,7 +851,7 @@ def _augment_registry_from_resolved(registry, resolved_entities, resolved_npcs, 
         else:
             decision = "reuse_existing"
             canonical_name = existing_name or name
-        return ref_cid, decision, canonical_name
+        return ref_cid, decision, canonical_name, ref
 
     for item in resolved_entities:
         if not isinstance(item, dict):
@@ -791,9 +867,9 @@ def _augment_registry_from_resolved(registry, resolved_entities, resolved_npcs, 
         proposed_id = clean_id(item.get("id") or item.get("entity_id"), "")
         mention_ref = f"resolved_entity_{index}"
 
-        ref_target = _ref_target(name)
+        ref_target = _ref_target(name, proposed_id)
         if ref_target is not None:
-            new_id, decision, canonical_name = ref_target
+            new_id, decision, canonical_name, matched_ref = ref_target
             allocated_ids.add(new_id)
             registry.append({
                 "mention_ref": mention_ref,
@@ -803,7 +879,7 @@ def _augment_registry_from_resolved(registry, resolved_entities, resolved_npcs, 
                 "evidence": [{
                     "source": "resolver_output",
                     "field": "upsert_graph_entities",
-                    "resolved_label": ref_by_label[name.lower()]["label"],
+                    "resolved_label": matched_ref["label"],
                 }],
                 "canonical_id": new_id,
                 "canonical_name": canonical_name,
@@ -896,9 +972,9 @@ def _augment_registry_from_resolved(registry, resolved_entities, resolved_npcs, 
         mention_ref = f"resolved_npc_{index}"
         entity_type = "npc"
 
-        ref_target = _ref_target(name)
+        ref_target = _ref_target(name, proposed_id)
         if ref_target is not None:
-            new_id, decision, canonical_name = ref_target
+            new_id, decision, canonical_name, matched_ref = ref_target
             allocated_ids.add(new_id)
             registry.append({
                 "mention_ref": mention_ref,
@@ -908,7 +984,7 @@ def _augment_registry_from_resolved(registry, resolved_entities, resolved_npcs, 
                 "evidence": [{
                     "source": "resolver_output",
                     "field": "update_npc_actors",
-                    "resolved_label": ref_by_label[name.lower()]["label"],
+                    "resolved_label": matched_ref["label"],
                 }],
                 "canonical_id": new_id,
                 "canonical_name": canonical_name,
@@ -1129,6 +1205,27 @@ def compile_staged_memory_patch(memory_context, extracted, resolved):
     # Also process resolved claims through the registry (entities and NPCs from resolver output)
     resolved_entities = resolved.get("upsert_graph_entities") if isinstance(resolved.get("upsert_graph_entities"), list) else []
     resolved_npcs = resolved.get("update_npc_actors") if isinstance(resolved.get("update_npc_actors"), list) else []
+    # Rewrite stale proposed IDs on resolver output to the canonical IDs chosen by
+    # the resolver. A ref (Old Garret -> garret) plus an item carrying the old
+    # proposed id (old_garret) must not recreate the duplicate once augmentation runs.
+    ref_id_remap = {}
+    for ref in entity_refs:
+        ref_id_remap[ref["canonical_id"]] = ref["canonical_id"]
+        if ref.get("proposed_id"):
+            ref_id_remap[ref["proposed_id"]] = ref["canonical_id"]
+        slug = clean_id(ref["label"].lower().replace(" ", "_"), "")
+        if slug:
+            ref_id_remap[slug] = ref["canonical_id"]
+        ref_id_remap[ref["label_lower"]] = ref["canonical_id"]
+    for _resolved_items in (resolved_entities, resolved_npcs):
+        for item in _resolved_items:
+            if not isinstance(item, dict):
+                continue
+            for id_field in ("id", "actor_id", "entity_id"):
+                current = item.get(id_field)
+                if current in ref_id_remap:
+                    item[id_field] = ref_id_remap[current]
+
     _augment_registry_from_resolved(
         registry,
         resolved_entities,
@@ -1835,7 +1932,10 @@ def compile_staged_memory_patch(memory_context, extracted, resolved):
         accepted_events.append({
             "event_type": clean_text(raw_event.get("event_type"), 80) or "session_memory",
             "summary": summary,
-            "payload": raw_event.get("payload") if isinstance(raw_event.get("payload"), dict) else {},
+            "payload": _remap_event_reference_fields(
+                raw_event.get("payload") if isinstance(raw_event.get("payload"), dict) else {},
+                ref_id_remap,
+            ),
             "visibility": _normalize_visibility(raw_event.get("source_surface"), raw_event.get("intended_visibility")),
             "certainty": _normalize_certainty(raw_event.get("certainty")),
             "importance": _normalize_importance(raw_event.get("importance")),

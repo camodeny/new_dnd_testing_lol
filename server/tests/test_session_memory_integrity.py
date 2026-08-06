@@ -1376,6 +1376,103 @@ class ResolvedEntityRefsTest(unittest.TestCase):
         self.assertIn('mira_wolf', entity_ids)
         self.assertNotIn('the_wolf', entity_ids)
 
+    def test_resolved_ref_catches_canonical_name_upsert(self):
+        memory_context = self._context()
+        resolved = {
+            'resolved_entity_refs': [
+                {'label': 'Old Garret', 'entity_id': 'garret'},
+            ],
+            'upsert_graph_entities': [
+                {'id': 'old_garret', 'name': 'Garret', 'type': 'npc'},
+            ],
+            'update_npc_actors': [
+                {'id': 'old_garret', 'name': 'Garret'},
+            ],
+        }
+        compiled = compile_staged_memory_patch(memory_context, {}, resolved)
+        entity_ids = [e['id'] for e in compiled['upsert_graph_entities']]
+        self.assertNotIn('old_garret', entity_ids)
+        self.assertIn('garret', entity_ids)
+        npc_ids = [n.get('id') for n in compiled['update_npc_actors']]
+        self.assertEqual(npc_ids, ['garret'])
+
+    def test_event_payload_references_use_canonical_id(self):
+        memory_context = self._context()
+        resolved = {
+            'resolved_entity_refs': [
+                {'label': 'Old Garret', 'entity_id': 'garret'},
+            ],
+            'update_npc_actors': [
+                {'id': 'old_garret', 'name': 'Old Garret'},
+            ],
+            'record_events': [
+                {
+                    'event_type': 'confrontation',
+                    'summary': 'Old Garret confronted.',
+                    'payload': {
+                        'actor_id': 'old_garret',
+                        'entity_ids': ['old_garret', 'mira'],
+                        'nested': {'target_id': 'old_garret'},
+                    },
+                },
+            ],
+        }
+        compiled = compile_staged_memory_patch(memory_context, {}, resolved)
+        events = compiled['record_events']
+        self.assertEqual(len(events), 1)
+        payload = events[0]['payload']
+        self.assertEqual(payload['actor_id'], 'garret')
+        self.assertEqual(set(payload['entity_ids']), {'garret', 'mira'})
+        self.assertEqual(payload['nested']['target_id'], 'garret')
+
+    def test_repair_preserves_overlapping_private_data(self):
+        from services.dm_tools import repair_duplicate_identity
+
+        graph = json.loads(self.world.knowledge_graph)
+        graph['entities'].append({'id': 'garret', 'name': 'Garret', 'type': 'npc'})
+        graph['entities'].append({'id': 'old_garret', 'name': 'Old Garret', 'type': 'npc'})
+        self.world.knowledge_graph = json.dumps(graph)
+        world_state = json.loads(self.world.world_state)
+        world_state['current_scene']['active_npc_ids'] = ['old_garret', 'garret']
+        self.world.world_state = json.dumps(world_state)
+        db.session.add(
+            NPCActor(
+                campaign_id=self.campaign.id,
+                actor_id='old_garret',
+                name='Old Garret',
+                dossier=json.dumps({
+                    'role': 'Old dock worker',
+                    'wants': ['retire', 'quiet pint'],
+                    'secrets': ['is the saboteur'],
+                    'relationships': {'mira': 'trusts her'},
+                }),
+            )
+        )
+        can = NPCActor.query.filter_by(campaign_id=self.campaign.id, actor_id='garret').first()
+        can.dossier = json.dumps({
+            'role': 'Foreman',
+            'wants': ['quiet pint', 'new boots'],
+            'secrets': ['owes a debt'],
+            'relationships': {'toren': 'old rival'},
+        })
+        db.session.commit()
+
+        with unittest.mock.patch('services.dm_tools.upsert_memory_embedding', return_value={'ok': True}):
+            repair_duplicate_identity(self.campaign, 'old_garret', 'garret')
+        db.session.commit()
+
+        can = NPCActor.query.filter_by(campaign_id=self.campaign.id, actor_id='garret').first()
+        self.assertEqual(can.name, 'Garret')
+        dossier = json.loads(can.dossier)
+        self.assertEqual(dossier['role'], 'Foreman')
+        self.assertEqual(set(dossier['wants']), {'retire', 'quiet pint', 'new boots'})
+        self.assertEqual(set(dossier['secrets']), {'is the saboteur', 'owes a debt'})
+        self.assertEqual(set(dossier['relationships']), {'mira', 'toren'})
+        self.assertEqual(dossier['relationships']['mira'], 'trusts her')
+
+        world_state = json.loads(self.world.world_state)
+        self.assertEqual(world_state['current_scene']['active_npc_ids'], ['garret'])
+
     def test_conflicting_refs_fail_validation(self):
         from services.session_memory_agent import _validate_resolved_entity_refs
         compiled = {

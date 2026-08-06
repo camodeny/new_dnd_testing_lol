@@ -53,14 +53,20 @@ def normalize_resolved_entity_refs(resolved_entity_refs):
         )
         if not label or not canonical_id:
             continue
+        canonical_name = clean_text(
+            ref.get("canonical_name") or ref.get("canonical_entity_name") or ref.get("canonical_name_label"),
+            200,
+        ) or label
         refs.append({
             "label": label,
             "label_lower": label.strip().lower(),
+            "canonical_name": canonical_name,
+            "canonical_name_lower": canonical_name.strip().lower(),
             "canonical_id": canonical_id,
-            "canonical_name": clean_text(
-                ref.get("canonical_name") or ref.get("canonical_entity_name") or ref.get("canonical_name_label"),
-                200,
-            ) or label,
+            "proposed_id": clean_id(
+                ref.get("proposed_id") or ref.get("mention_entity_id") or ref.get("provisional_id"),
+                "",
+            ),
             "rename_existing": ref.get("rename_existing") is True,
             "resolution": clean_text(ref.get("resolution"), 40).lower(),
         })
@@ -117,11 +123,22 @@ def reconcile_registry_with_refs(registry, refs, known_ids, allocated_ids, diagn
 
     for entry in registry:
         label_lower = str(entry.get("surface_form") or "").strip().lower()
-        if not label_lower or label_lower not in refs_by_label:
+        matched = None
+        if label_lower and label_lower in refs_by_label:
+            matched = refs_by_label[label_lower][0]
+        if matched is None:
+            for ref in refs:
+                ref_terms = {ref["canonical_name_lower"]}
+                known_canonical_name = known_names.get(ref["canonical_id"], "")
+                if known_canonical_name:
+                    ref_terms.add(known_canonical_name.strip().lower())
+                if label_lower and label_lower in ref_terms:
+                    matched = ref
+                    break
+        if matched is None:
             continue
         if entry.get("decision") in ("request_clarification", "reject"):
             continue
-        matched = refs_by_label[label_lower][0]
         ref_cid = matched["canonical_id"]
         current_cid = entry.get("canonical_id")
         if current_cid and current_cid == ref_cid:

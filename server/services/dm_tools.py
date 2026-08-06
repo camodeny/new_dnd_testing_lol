@@ -6892,6 +6892,48 @@ def _upsert_by_id_strict(items, item):
     return item, "created"
 
 
+def _dedupe_json_values(values):
+    seen = set()
+    out = []
+    for value in values:
+        key = json.dumps(value, sort_keys=True, default=str)
+        if key not in seen:
+            seen.add(key)
+            out.append(value)
+    return out
+
+
+def _merge_dossier_dicts(dup_dossier, can_dossier):
+    """Schema-aware dossier merge that never drops duplicate-only data.
+
+    Lists are unioned and de-duplicated, nested maps (relationships) are merged
+    per-key with the canonical value winning on conflicts, and scalar conflicts
+    deliberately keep the canonical value when non-empty.
+    """
+    dup_dossier = dup_dossier if isinstance(dup_dossier, dict) else {}
+    can_dossier = can_dossier if isinstance(can_dossier, dict) else {}
+    merged = {}
+    for key in set(dup_dossier) | set(can_dossier):
+        dup_val = dup_dossier.get(key)
+        can_val = can_dossier.get(key)
+        if key == "id":
+            merged[key] = can_val or dup_val
+        elif isinstance(dup_val, dict) and isinstance(can_val, dict):
+            merged_value = dict(dup_val)
+            for nested_key, nested_val in can_val.items():
+                if nested_val not in (None, "", [], {}):
+                    merged_value[nested_key] = nested_val
+            merged[key] = merged_value
+        elif isinstance(dup_val, list) and isinstance(can_val, list):
+            merged[key] = _dedupe_json_values(list(can_val) + list(dup_val))
+        else:
+            if can_val not in (None, "", []):
+                merged[key] = can_val
+            else:
+                merged[key] = dup_val
+    return merged
+
+
 def repair_duplicate_identity(campaign, duplicate_id, canonical_id):
     """Merge a duplicate identity into its canonical identity without losing data.
 
@@ -6990,10 +7032,11 @@ def repair_duplicate_identity(campaign, duplicate_id, canonical_id):
         for key in ("active_npc_ids", "departed_npc_ids"):
             ids = current_scene.get(key)
             if isinstance(ids, list):
-                current_scene[key] = [
+                rewritten = [
                     canonical_id if clean_id(item, "") == duplicate_id else item
                     for item in ids
                 ]
+                current_scene[key] = list(dict.fromkeys(rewritten))
                 changes["cast"].append(key)
 
     dup_actor = NPCActor.query.filter_by(campaign_id=campaign.id, actor_id=duplicate_id).first()
@@ -7002,12 +7045,7 @@ def repair_duplicate_identity(campaign, duplicate_id, canonical_id):
         dup_dossier = json_loads(dup_actor.dossier, {})
         if can_actor is not None:
             can_dossier = json_loads(can_actor.dossier, {})
-            merged = dict(dup_dossier)
-            for key, value in can_dossier.items():
-                if value not in (None, "", []):
-                    merged[key] = value
-            merged["id"] = canonical_id
-            can_actor.dossier = json_dumps(merged)
+            can_actor.dossier = json_dumps(_merge_dossier_dicts(dup_dossier, can_dossier))
             if not can_actor.name:
                 can_actor.name = dup_actor.name or can_actor.name
             if not can_actor.role and dup_actor.role:
