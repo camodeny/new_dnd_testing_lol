@@ -1219,5 +1219,360 @@ class SessionMemoryIntegrityTest(unittest.TestCase):
         self.assertEqual(res_bad_scope.status_code, 400)
 
 
+class ResolvedEntityRefsTest(unittest.TestCase):
+    """Issue #84: consumed resolved entity references prevent duplicate identities."""
+
+    def setUp(self):
+        self.app = Flask(__name__)
+        self.app.config['SQLALCHEMY_DATABASE_URI'] = 'sqlite:///:memory:'
+        self.app.config['SECRET_KEY'] = 'test-secret'
+        self.app.config['JWT_EXPIRATION_HOURS'] = 24
+        self.app.config['SQLALCHEMY_TRACK_MODIFICATIONS'] = False
+        db.init_app(self.app)
+        self.ctx = self.app.app_context()
+        self.ctx.push()
+        db.create_all()
+
+        usr = User(username='dm_user', email='dm@example.com')
+        usr.set_password('password')
+        db.session.add(usr)
+        db.session.commit()
+
+        self.campaign = Campaign(name='Resolved Refs Test', description='Test', user_id=usr.id)
+        db.session.add(self.campaign)
+        db.session.commit()
+
+        self.world = CampaignWorld(
+            campaign_id=self.campaign.id,
+            public_intro='{}',
+            knowledge_graph='{"entities":[{"id":"drowned_lantern","type":"location","name":"Drowned Lantern"}],"relations":[],"facts":[]}',
+            world_state='{"current_scene":{"location_id":"drowned_lantern","location_name":"Drowned Lantern"}}',
+            dm_private='{}',
+        )
+        db.session.add(self.world)
+        db.session.flush()
+
+        self.session = CampaignSession(campaign_id=self.campaign.id)
+        db.session.add(self.session)
+        db.session.flush()
+
+        mi = NPCActor(campaign_id=self.campaign.id, actor_id='mira', name='Mira', dossier='{}')
+        db.session.add(mi)
+        gar = NPCActor(campaign_id=self.campaign.id, actor_id='garret', name='Garret', dossier='{}')
+        db.session.add(gar)
+        db.session.commit()
+
+    def tearDown(self):
+        db.session.rollback()
+        db.drop_all()
+        self.ctx.pop()
+
+    def _context(self):
+        return {
+            'campaign_id': self.campaign.id,
+            'session_id': self.session.id,
+            'hot_context': {
+                'current_scene': {
+                    'location_id': 'drowned_lantern',
+                    'location_name': 'Drowned Lantern',
+                },
+            },
+        }
+
+    def test_resolved_ref_yields_one_canonical_npc(self):
+        memory_context = self._context()
+        resolved = {
+            'resolved_entity_refs': [
+                {'label': 'Old Garret', 'entity_id': 'garret'},
+            ],
+            'upsert_graph_entities': [
+                {
+                    'id': 'old_garret',
+                    'name': 'Old Garret',
+                    'type': 'npc',
+                    'source_surface': 'visible_transcript',
+                    'intended_visibility': 'party_known',
+                },
+            ],
+            'update_npc_actors': [
+                {'id': 'old_garret', 'name': 'Old Garret', 'role': 'Dock worker'},
+            ],
+            'upsert_graph_relations': [
+                {
+                    'type': 'works_at',
+                    'source_id': 'garret',
+                    'target_id': 'drowned_lantern',
+                    'summary': 'Works at the docks.',
+                },
+            ],
+            'upsert_graph_facts': [
+                {'text': 'Old Garret knows the saboteur.', 'entity_ids': ['garret']},
+            ],
+        }
+        compiled = compile_staged_memory_patch(memory_context, {}, resolved)
+        entity_ids = [e['id'] for e in compiled['upsert_graph_entities']]
+        self.assertNotIn('old_garret', entity_ids)
+        self.assertIn('garret', entity_ids)
+        npc_ids = [n.get('id') for n in compiled['update_npc_actors']]
+        self.assertEqual(npc_ids, ['garret'])
+        relations = compiled['upsert_graph_relations']
+        self.assertTrue(all(r['source_id'] == 'garret' for r in relations))
+        facts = compiled['upsert_graph_facts']
+        self.assertTrue(all('garret' in f['entity_ids'] for f in facts))
+        # Provenance for the alias is preserved in resolution records.
+        records = compiled.get('resolution_records', [])
+        matching = [r for r in records if r.get('mention_entity_id') == 'old_garret']
+        self.assertTrue(matching)
+        self.assertEqual(matching[0]['canonical_id'], 'garret')
+        self.assertEqual(matching[0]['resolution_action'], 'add_alias')
+
+    def test_registry_reconciles_provisional_to_resolver_canonical(self):
+        known = {
+            'entity_ids': {'garret'},
+            'npc_ids': {'garret'},
+            'entity_names': {},
+            'npc_names': {'garret': 'Garret'},
+            'entity_types': {'garret': 'npc'},
+        }
+        extracted = {
+            'npc_claims': [
+                {'name': 'Old Garret', 'type': 'npc', 'mention_ref': 'old_garret_claim'},
+            ],
+        }
+        registry, _, _, diagnostics = build_canonical_resolution_registry(
+            self.campaign,
+            self._context(),
+            extracted,
+            None,
+            [],
+            known,
+            resolved_entity_refs=[{'label': 'Old Garret', 'entity_id': 'garret'}],
+        )
+        entry = next(e for e in registry if e.get('mention_ref') == 'old_garret_claim')
+        self.assertEqual(entry['canonical_id'], 'garret')
+        self.assertEqual(entry['decision'], 'add_alias')
+        self.assertEqual(entry['resolution_state'], 'resolved')
+        self.assertFalse(
+            any(item.get('canonical_id') == 'old_garret' for item in diagnostics.get('created_provisional', [])),
+        )
+
+    def test_same_patch_ref_prevents_provisional_split(self):
+        memory_context = self._context()
+        extracted = {
+            'entity_claims': [
+                {'name': 'the wolf', 'type': 'beast', 'mention_ref': 'wolf_claim'},
+            ],
+        }
+        resolved = {
+            'resolved_entity_refs': [
+                {'label': 'the wolf', 'entity_id': 'mira_wolf'},
+            ],
+            'upsert_graph_entities': [
+                {'id': 'mira_wolf', 'name': 'Mira\'s Wolf', 'type': 'beast'},
+            ],
+        }
+        compiled = compile_staged_memory_patch(memory_context, extracted, resolved)
+        entity_ids = [e['id'] for e in compiled['upsert_graph_entities']]
+        self.assertIn('mira_wolf', entity_ids)
+        self.assertNotIn('the_wolf', entity_ids)
+
+    def test_resolved_ref_catches_canonical_name_upsert(self):
+        memory_context = self._context()
+        resolved = {
+            'resolved_entity_refs': [
+                {'label': 'Old Garret', 'entity_id': 'garret'},
+            ],
+            'upsert_graph_entities': [
+                {'id': 'old_garret', 'name': 'Garret', 'type': 'npc'},
+            ],
+            'update_npc_actors': [
+                {'id': 'old_garret', 'name': 'Garret'},
+            ],
+        }
+        compiled = compile_staged_memory_patch(memory_context, {}, resolved)
+        entity_ids = [e['id'] for e in compiled['upsert_graph_entities']]
+        self.assertNotIn('old_garret', entity_ids)
+        self.assertIn('garret', entity_ids)
+        npc_ids = [n.get('id') for n in compiled['update_npc_actors']]
+        self.assertEqual(npc_ids, ['garret'])
+
+    def test_event_payload_references_use_canonical_id(self):
+        memory_context = self._context()
+        resolved = {
+            'resolved_entity_refs': [
+                {'label': 'Old Garret', 'entity_id': 'garret'},
+            ],
+            'update_npc_actors': [
+                {'id': 'old_garret', 'name': 'Old Garret'},
+            ],
+            'record_events': [
+                {
+                    'event_type': 'confrontation',
+                    'summary': 'Old Garret confronted.',
+                    'payload': {
+                        'actor_id': 'old_garret',
+                        'entity_ids': ['old_garret', 'mira'],
+                        'nested': {'target_id': 'old_garret'},
+                    },
+                },
+            ],
+        }
+        compiled = compile_staged_memory_patch(memory_context, {}, resolved)
+        events = compiled['record_events']
+        self.assertEqual(len(events), 1)
+        payload = events[0]['payload']
+        self.assertEqual(payload['actor_id'], 'garret')
+        self.assertEqual(set(payload['entity_ids']), {'garret', 'mira'})
+        self.assertEqual(payload['nested']['target_id'], 'garret')
+
+    def test_repair_preserves_overlapping_private_data(self):
+        from services.dm_tools import repair_duplicate_identity
+
+        graph = json.loads(self.world.knowledge_graph)
+        graph['entities'].append({'id': 'garret', 'name': 'Garret', 'type': 'npc'})
+        graph['entities'].append({'id': 'old_garret', 'name': 'Old Garret', 'type': 'npc'})
+        self.world.knowledge_graph = json.dumps(graph)
+        world_state = json.loads(self.world.world_state)
+        world_state['current_scene']['active_npc_ids'] = ['old_garret', 'garret']
+        self.world.world_state = json.dumps(world_state)
+        db.session.add(
+            NPCActor(
+                campaign_id=self.campaign.id,
+                actor_id='old_garret',
+                name='Old Garret',
+                dossier=json.dumps({
+                    'role': 'Old dock worker',
+                    'wants': ['retire', 'quiet pint'],
+                    'secrets': ['is the saboteur'],
+                    'relationships': {'mira': 'trusts her'},
+                }),
+            )
+        )
+        can = NPCActor.query.filter_by(campaign_id=self.campaign.id, actor_id='garret').first()
+        can.dossier = json.dumps({
+            'role': 'Foreman',
+            'wants': ['quiet pint', 'new boots'],
+            'secrets': ['owes a debt'],
+            'relationships': {'toren': 'old rival'},
+        })
+        db.session.commit()
+
+        with unittest.mock.patch('services.dm_tools.upsert_memory_embedding', return_value={'ok': True}):
+            repair_duplicate_identity(self.campaign, 'old_garret', 'garret')
+        db.session.commit()
+
+        can = NPCActor.query.filter_by(campaign_id=self.campaign.id, actor_id='garret').first()
+        self.assertEqual(can.name, 'Garret')
+        dossier = json.loads(can.dossier)
+        self.assertEqual(dossier['role'], 'Foreman')
+        self.assertEqual(set(dossier['wants']), {'retire', 'quiet pint', 'new boots'})
+        self.assertEqual(set(dossier['secrets']), {'is the saboteur', 'owes a debt'})
+        self.assertEqual(set(dossier['relationships']), {'mira', 'toren'})
+        self.assertEqual(dossier['relationships']['mira'], 'trusts her')
+
+        world_state = json.loads(self.world.world_state)
+        self.assertEqual(world_state['current_scene']['active_npc_ids'], ['garret'])
+
+    def test_conflicting_refs_fail_validation(self):
+        from services.session_memory_agent import _validate_resolved_entity_refs
+        compiled = {
+            'resolved_entity_refs': [
+                {'label': 'Old Garret', 'entity_id': 'garret'},
+                {'label': 'Old Garret', 'entity_id': 'old_garret'},
+            ],
+            'upsert_graph_entities': [],
+            'update_npc_actors': [],
+        }
+        errors = _validate_resolved_entity_refs(compiled)
+        self.assertTrue(any('resolved_ref_conflict' in e for e in errors))
+
+    def test_split_brain_output_fails_validation(self):
+        from services.session_memory_agent import _validate_resolved_entity_refs
+        compiled = {
+            'resolved_entity_refs': [
+                {'label': 'Old Garret', 'entity_id': 'garret'},
+            ],
+            'upsert_graph_entities': [
+                {'id': 'garret', 'name': 'Garret', 'type': 'npc'},
+                {'id': 'old_garret', 'name': 'Old Garret', 'type': 'npc'},
+            ],
+            'update_npc_actors': [
+                {'id': 'old_garret', 'name': 'Old Garret'},
+            ],
+        }
+        errors = _validate_resolved_entity_refs(compiled)
+        self.assertTrue(any('resolved_ref_split_brain' in e for e in errors))
+
+    def test_repair_duplicate_identity_merges_safely(self):
+        from services.dm_tools import repair_duplicate_identity
+
+        graph = json.loads(self.world.knowledge_graph)
+        graph['entities'].append({'id': 'garret', 'name': 'Garret', 'type': 'npc'})
+        graph['entities'].append({'id': 'old_garret', 'name': 'Old Garret', 'type': 'npc'})
+        graph['relations'].append({
+            'id': 'rel_1',
+            'type': 'works_at',
+            'source_id': 'old_garret',
+            'target_id': 'drowned_lantern',
+        })
+        graph['facts'].append({
+            'id': 'fact_1',
+            'text': 'Old Garret knows something.',
+            'entity_ids': ['old_garret', 'mira'],
+        })
+        self.world.knowledge_graph = json.dumps(graph)
+        world_state = json.loads(self.world.world_state)
+        world_state['current_scene']['active_npc_ids'] = ['old_garret']
+        self.world.world_state = json.dumps(world_state)
+        db.session.add(
+            NPCActor(
+                campaign_id=self.campaign.id,
+                actor_id='old_garret',
+                name='Old Garret',
+                public_summary='An old hand.',
+                dossier=json.dumps({'secret': 'is the saboteur', 'role': 'Old dock worker'}),
+            )
+        )
+        can = NPCActor.query.filter_by(campaign_id=self.campaign.id, actor_id='garret').first()
+        can.dossier = json.dumps({'role': 'Foreman'})
+        can.public_summary = 'The dock foreman.'
+        db.session.commit()
+
+        with unittest.mock.patch('services.dm_tools.upsert_memory_embedding', return_value={'ok': True}):
+            result = repair_duplicate_identity(self.campaign, 'old_garret', 'garret')
+        db.session.commit()
+
+        self.assertEqual(result['duplicate_id'], 'old_garret')
+        self.assertEqual(result['canonical_id'], 'garret')
+
+        graph = json.loads(self.world.knowledge_graph)
+        entity_ids = {e['id'] for e in graph['entities']}
+        self.assertIn('garret', entity_ids)
+        self.assertNotIn('old_garret', entity_ids)
+        self.assertEqual(graph['relations'][0]['source_id'], 'garret')
+        self.assertEqual(set(graph['facts'][0]['entity_ids']), {'garret', 'mira'})
+
+        self.assertIsNone(
+            NPCActor.query.filter_by(campaign_id=self.campaign.id, actor_id='old_garret').first()
+        )
+        can = NPCActor.query.filter_by(campaign_id=self.campaign.id, actor_id='garret').first()
+        self.assertEqual(can.name, 'Garret')
+        self.assertEqual(can.public_summary, 'The dock foreman.')
+        dossier = json.loads(can.dossier)
+        self.assertEqual(dossier.get('secret'), 'is the saboteur')
+        self.assertEqual(dossier.get('role'), 'Foreman')
+
+        world_state = json.loads(self.world.world_state)
+        self.assertEqual(world_state['current_scene']['active_npc_ids'], ['garret'])
+
+        resolution = CampaignIdentityResolution.query.filter_by(
+            campaign_id=self.campaign.id,
+            mention_entity_id='old_garret',
+            canonical_id='garret',
+        ).first()
+        self.assertIsNotNone(resolution)
+        self.assertEqual(resolution.resolution_action, 'add_alias')
+
+
 if __name__ == '__main__':
     unittest.main()

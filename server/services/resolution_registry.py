@@ -362,6 +362,7 @@ def build_canonical_resolution_registry(
     resolver_packet,
     prior_resolutions,
     known_ids,
+    resolved_entity_refs=None,
 ):
     enriched_known_ids = _enrich_known_ids_with_entity_types(campaign, known_ids)
     return _core.build_canonical_resolution_registry(
@@ -371,6 +372,7 @@ def build_canonical_resolution_registry(
         resolver_packet,
         prior_resolutions,
         enriched_known_ids,
+        resolved_entity_refs=resolved_entity_refs,
     )
 
 

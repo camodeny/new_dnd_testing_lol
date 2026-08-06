@@ -6890,3 +6890,222 @@ def _upsert_by_id_strict(items, item):
             return merged, "updated"
     items.append(dict(item))
     return item, "created"
+
+
+def _dedupe_json_values(values):
+    seen = set()
+    out = []
+    for value in values:
+        key = json.dumps(value, sort_keys=True, default=str)
+        if key not in seen:
+            seen.add(key)
+            out.append(value)
+    return out
+
+
+def _merge_dossier_dicts(dup_dossier, can_dossier):
+    """Schema-aware dossier merge that never drops duplicate-only data.
+
+    Lists are unioned and de-duplicated, nested maps (relationships) are merged
+    per-key with the canonical value winning on conflicts, and scalar conflicts
+    deliberately keep the canonical value when non-empty.
+    """
+    dup_dossier = dup_dossier if isinstance(dup_dossier, dict) else {}
+    can_dossier = can_dossier if isinstance(can_dossier, dict) else {}
+    merged = {}
+    for key in set(dup_dossier) | set(can_dossier):
+        dup_val = dup_dossier.get(key)
+        can_val = can_dossier.get(key)
+        if key == "id":
+            merged[key] = can_val or dup_val
+        elif isinstance(dup_val, dict) and isinstance(can_val, dict):
+            merged_value = dict(dup_val)
+            for nested_key, nested_val in can_val.items():
+                if nested_val not in (None, "", [], {}):
+                    merged_value[nested_key] = nested_val
+            merged[key] = merged_value
+        elif isinstance(dup_val, list) and isinstance(can_val, list):
+            merged[key] = _dedupe_json_values(list(can_val) + list(dup_val))
+        else:
+            if can_val not in (None, "", []):
+                merged[key] = can_val
+            else:
+                merged[key] = dup_val
+    return merged
+
+
+def repair_duplicate_identity(campaign, duplicate_id, canonical_id):
+    """Merge a duplicate identity into its canonical identity without losing data.
+
+    Safely rewrites graph entities, relations, facts, scene cast, and NPC actor
+    rows so the campaign ends with exactly one durable identity. Used to repair
+    pre-existing split-brain states such as Run 37's provisional duplicate
+    created before resolved entity references were consumed.
+    """
+    from models import CampaignIdentityResolution, CampaignWorld, NPCActor, db
+
+    duplicate_id = clean_id(duplicate_id, "")
+    canonical_id = clean_id(canonical_id, "")
+    if not duplicate_id or not canonical_id or duplicate_id == canonical_id:
+        raise ValueError("duplicate_id and canonical_id must be distinct non-empty ids")
+
+    world = CampaignWorld.query.filter_by(campaign_id=campaign.id).first()
+    if world is None:
+        raise ValueError("campaign world not found")
+
+    graph = json_loads(world.knowledge_graph, {"entities": [], "relations": [], "facts": []})
+    if not isinstance(graph, dict):
+        graph = {}
+    world_state = json_loads(world.world_state, {})
+    if not isinstance(world_state, dict):
+        world_state = {}
+
+    entities = graph.setdefault("entities", [])
+    dup_entity = next(
+        (e for e in entities if isinstance(e, dict) and clean_id(e.get("id"), "") == duplicate_id),
+        None,
+    )
+    can_entity = next(
+        (e for e in entities if isinstance(e, dict) and clean_id(e.get("id"), "") == canonical_id),
+        None,
+    )
+
+    changes = {"graph": [], "npc": [], "cast": [], "resolutions": []}
+
+    if dup_entity is not None and isinstance(dup_entity, dict):
+        if can_entity is not None and isinstance(can_entity, dict):
+            aliases = list(can_entity.get("aliases") or []) if isinstance(can_entity.get("aliases"), list) else []
+            seen = {str(alias).strip().lower() for alias in aliases}
+            for alias in dup_entity.get("aliases") or []:
+                key = str(alias).strip().lower()
+                if key and key not in seen:
+                    seen.add(key)
+                    aliases.append(alias)
+            if str(dup_entity.get("name") or "").strip().lower() not in seen:
+                aliases.append(dup_entity.get("name"))
+            can_entity["aliases"] = aliases
+            if not can_entity.get("summary") and dup_entity.get("summary"):
+                can_entity["summary"] = dup_entity["summary"]
+            existing_tags = (
+                list(can_entity.get("tags") or [])
+                if isinstance(can_entity.get("tags"), list)
+                else []
+            )
+            for tag in dup_entity.get("tags") or []:
+                if tag not in existing_tags:
+                    existing_tags.append(tag)
+            can_entity["tags"] = existing_tags
+            if can_entity.get("identity_status") in (None, "", "provisional") and dup_entity.get("identity_status"):
+                can_entity["identity_status"] = dup_entity["identity_status"]
+            changes["graph"].append("merged_entity_into_canonical")
+        else:
+            dup_entity["id"] = canonical_id
+            changes["graph"].append("rekeyed_entity_to_canonical_id")
+
+        for rel in graph.setdefault("relations", []):
+            if not isinstance(rel, dict):
+                continue
+            if rel.get("source_id") == duplicate_id:
+                rel["source_id"] = canonical_id
+            if rel.get("target_id") == duplicate_id:
+                rel["target_id"] = canonical_id
+        for fact in graph.setdefault("facts", []):
+            if not isinstance(fact, dict) or not isinstance(fact.get("entity_ids"), list):
+                continue
+            rewritten = [canonical_id if eid == duplicate_id else eid for eid in fact["entity_ids"]]
+            deduped = []
+            seen = set()
+            for eid in rewritten:
+                if eid and eid not in seen:
+                    seen.add(eid)
+                    deduped.append(eid)
+            fact["entity_ids"] = deduped
+        graph["entities"] = [
+            e for e in graph["entities"]
+            if not (isinstance(e, dict) and clean_id(e.get("id"), "") == duplicate_id)
+        ]
+        changes["graph"].append("removed_duplicate_entity")
+        changes["graph"].append("rewrote_relations_and_facts")
+
+    current_scene = world_state.get("current_scene")
+    if isinstance(current_scene, dict):
+        for key in ("active_npc_ids", "departed_npc_ids"):
+            ids = current_scene.get(key)
+            if isinstance(ids, list):
+                rewritten = [
+                    canonical_id if clean_id(item, "") == duplicate_id else item
+                    for item in ids
+                ]
+                current_scene[key] = list(dict.fromkeys(rewritten))
+                changes["cast"].append(key)
+
+    dup_actor = NPCActor.query.filter_by(campaign_id=campaign.id, actor_id=duplicate_id).first()
+    can_actor = NPCActor.query.filter_by(campaign_id=campaign.id, actor_id=canonical_id).first()
+    if dup_actor is not None:
+        dup_dossier = json_loads(dup_actor.dossier, {})
+        if can_actor is not None:
+            can_dossier = json_loads(can_actor.dossier, {})
+            can_actor.dossier = json_dumps(_merge_dossier_dicts(dup_dossier, can_dossier))
+            if not can_actor.name:
+                can_actor.name = dup_actor.name or can_actor.name
+            if not can_actor.role and dup_actor.role:
+                can_actor.role = dup_actor.role
+            if not can_actor.public_summary and dup_actor.public_summary:
+                can_actor.public_summary = dup_actor.public_summary
+            can_actor.updated_at = utcnow()
+            db.session.delete(dup_actor)
+            changes["npc"].append("merged_npc_into_canonical")
+            actor_row = can_actor
+        else:
+            dup_actor.actor_id = canonical_id
+            dup_actor.updated_at = utcnow()
+            changes["npc"].append("renamed_npc_to_canonical_id")
+            actor_row = dup_actor
+        try:
+            upsert_memory_embedding(
+                campaign,
+                "npc_actor",
+                canonical_id,
+                actor_row.to_dict(include_private=True),
+            )
+        except Exception:
+            pass
+
+    existing_record = CampaignIdentityResolution.query.filter_by(
+        campaign_id=campaign.id,
+        mention_entity_id=duplicate_id,
+        canonical_id=canonical_id,
+    ).first()
+    if existing_record is None:
+        dup_name = (dup_entity or {}).get("name") or (dup_actor.name if dup_actor else None) or duplicate_id
+        can_name = (can_entity or {}).get("name") or (can_actor.name if can_actor else None) or canonical_id
+        import hashlib
+
+        key_raw = f"{campaign.id}:{duplicate_id}:{canonical_id}:repair"
+        db.session.add(CampaignIdentityResolution(
+            campaign_id=campaign.id,
+            resolution_id=f"ires_{hashlib.md5(key_raw.encode('utf-8')).hexdigest()[:16]}",
+            mention_entity_id=duplicate_id,
+            mention_name=clean_text(dup_name, 400),
+            resolution_action="add_alias",
+            canonical_id=canonical_id,
+            canonical_name=clean_text(can_name, 400),
+            visibility="dm_private",
+            resolved_by="identity_repair",
+            evidence_json=[{"source": "identity_repair", "field": "duplicate_merge"}],
+        ))
+        changes["resolutions"].append("added_alias_resolution_record")
+
+    world.knowledge_graph = json_dumps(graph)
+    world.world_state = json_dumps(world_state)
+    world.memory_revision = (world.memory_revision or 0) + 1
+    world.updated_at = utcnow()
+    db.session.flush()
+
+    _record_event(
+        campaign,
+        "identity_repair",
+        f"Repaired duplicate identity {duplicate_id} into canonical {canonical_id}.",
+        {"duplicate_id": duplicate_id, "canonical_id": canonical_id, "changes": changes},
+    )
+    return {"duplicate_id": duplicate_id, "canonical_id": canonical_id, "changes": changes}

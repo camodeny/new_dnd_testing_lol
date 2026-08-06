@@ -30,6 +30,168 @@ def allocate_durable_id(base_name, existing_ids, prefix="entity"):
     return f"{prefix}_{uuid.uuid4().hex[:8]}"
 
 
+def normalize_resolved_entity_refs(resolved_entity_refs):
+    """Normalize the resolver's explicit label -> canonical entity mappings.
+
+    Each ref is expected to carry a human-readable label (surface form) and a
+    durable canonical id. These are authoritative identity decisions made by the
+    resolver after reading the full campaign state; compilation must honor them.
+    """
+    refs = []
+    if not isinstance(resolved_entity_refs, list):
+        return refs
+    for ref in resolved_entity_refs:
+        if not isinstance(ref, dict):
+            continue
+        label = clean_text(
+            ref.get("label") or ref.get("surface_form") or ref.get("canonical_name"),
+            200,
+        )
+        canonical_id = clean_id(
+            ref.get("entity_id") or ref.get("canonical_entity_id") or ref.get("canonical_id"),
+            "",
+        )
+        if not label or not canonical_id:
+            continue
+        canonical_name = clean_text(
+            ref.get("canonical_name") or ref.get("canonical_entity_name") or ref.get("canonical_name_label"),
+            200,
+        ) or label
+        refs.append({
+            "label": label,
+            "label_lower": label.strip().lower(),
+            "canonical_name": canonical_name,
+            "canonical_name_lower": canonical_name.strip().lower(),
+            "canonical_id": canonical_id,
+            "proposed_id": clean_id(
+                ref.get("proposed_id") or ref.get("mention_entity_id") or ref.get("provisional_id"),
+                "",
+            ),
+            "rename_existing": ref.get("rename_existing") is True,
+            "resolution": clean_text(ref.get("resolution"), 40).lower(),
+        })
+    return refs
+
+
+def _drop_diagnostics_for_mention(diagnostics, mention_ref):
+    for key in (
+        "created_new",
+        "created_provisional",
+        "reused_existing",
+        "aliases_added",
+        "deferred_resolutions",
+        "rejected_mutations",
+        "blocked_mutations",
+    ):
+        bucket = diagnostics.get(key)
+        if isinstance(bucket, list):
+            diagnostics[key] = [
+                item for item in bucket
+                if item.get("mention_ref") != mention_ref
+            ]
+
+
+def reconcile_registry_with_refs(registry, refs, known_ids, allocated_ids, diagnostics):
+    """Reconcile registry entries against the resolver's explicit identity decisions.
+
+    When the resolver has already declared that a surface form is the same as an
+    existing canonical identity, any provisional identity allocated for that
+    surface form during registry construction must be replaced with the
+    resolver's canonical id. This prevents the compiler from creating a
+    duplicate provisional id after the resolver selected an existing entity.
+
+    Safe to run more than once: refs that target identities created later in the
+    same transaction (for example a brand-new entity the resolver also created)
+    are reconciled on the second pass once those identities exist in the registry.
+    """
+    if not refs:
+        return registry
+    refs_by_label = {}
+    for ref in refs:
+        refs_by_label.setdefault(ref["label_lower"], []).append(ref)
+
+    known_ids_map = known_ids if isinstance(known_ids, dict) else {}
+    valid_ids = (
+        set(known_ids_map.get("entity_ids", set()))
+        | set(known_ids_map.get("npc_ids", set()))
+    )
+    known_names = dict(known_ids_map.get("npc_names", {}) or {})
+    known_names.update(known_ids_map.get("entity_names", {}) or {})
+    registry_canonical_ids = {
+        entry.get("canonical_id") for entry in registry if entry.get("canonical_id")
+    }
+
+    for entry in registry:
+        label_lower = str(entry.get("surface_form") or "").strip().lower()
+        matched = None
+        if label_lower and label_lower in refs_by_label:
+            matched = refs_by_label[label_lower][0]
+        if matched is None:
+            for ref in refs:
+                ref_terms = {ref["canonical_name_lower"]}
+                known_canonical_name = known_names.get(ref["canonical_id"], "")
+                if known_canonical_name:
+                    ref_terms.add(known_canonical_name.strip().lower())
+                if label_lower and label_lower in ref_terms:
+                    matched = ref
+                    break
+        if matched is None:
+            continue
+        if entry.get("decision") in ("request_clarification", "reject"):
+            continue
+        ref_cid = matched["canonical_id"]
+        current_cid = entry.get("canonical_id")
+        if current_cid and current_cid == ref_cid:
+            continue
+        if ref_cid not in valid_ids and ref_cid not in registry_canonical_ids:
+            continue
+
+        canonical_entry_name = ""
+        for other in registry:
+            if other is entry:
+                continue
+            if other.get("canonical_id") == ref_cid:
+                canonical_entry_name = (
+                    other.get("canonical_name") or other.get("surface_form") or ""
+                )
+                break
+        existing_name = known_names.get(ref_cid, "") or canonical_entry_name
+        if matched.get("rename_existing"):
+            decision = "rename_existing"
+            canonical_name = matched["canonical_name"] or entry.get("surface_form", "")
+        elif existing_name and existing_name.strip().lower() != label_lower:
+            decision = "add_alias"
+            canonical_name = existing_name
+        else:
+            decision = "reuse_existing"
+            canonical_name = existing_name or entry.get("surface_form", "")
+
+        mention_ref = entry.get("mention_ref", "")
+        _drop_diagnostics_for_mention(diagnostics, mention_ref)
+        if current_cid and current_cid in allocated_ids:
+            allocated_ids.discard(current_cid)
+        allocated_ids.add(ref_cid)
+
+        entry["canonical_id"] = ref_cid
+        entry["canonical_name"] = canonical_name
+        entry["decision"] = decision
+        entry["resolution_state"] = "resolved"
+        entry["identity_status"] = "known_public"
+        entry["blocked_operations"] = []
+        evidence = entry.get("evidence")
+        if not isinstance(evidence, list):
+            evidence = []
+            entry["evidence"] = evidence
+        evidence.append({
+            "source": "memory_resolver_packet",
+            "field": "resolved_entity_refs",
+            "resolved_label": matched["label"],
+        })
+        _track_diagnostics(entry, diagnostics)
+
+    return registry
+
+
 def build_canonical_resolution_registry(
     campaign,
     memory_context,
@@ -37,6 +199,7 @@ def build_canonical_resolution_registry(
     resolver_packet,
     prior_resolutions,
     known_ids,
+    resolved_entity_refs=None,
 ):
     registry = []
     diagnostics = make_diagnostics()
@@ -138,6 +301,9 @@ def build_canonical_resolution_registry(
             if resolved_entry["canonical_id"]:
                 allocated_ids.add(resolved_entry["canonical_id"])
             _track_diagnostics(resolved_entry, diagnostics)
+
+    refs = normalize_resolved_entity_refs(resolved_entity_refs)
+    reconcile_registry_with_refs(registry, refs, known_ids, allocated_ids, diagnostics)
 
     registry_map = {entry["mention_ref"]: entry for entry in registry}
 
