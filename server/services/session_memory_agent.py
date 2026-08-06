@@ -27,6 +27,8 @@ from services.resolution_registry import (
     build_canonical_resolution_registry,
     fetch_prior_resolutions,
     fetch_pending_clarifications,
+    normalize_resolved_entity_refs,
+    reconcile_registry_with_refs,
     resolve_ref,
 )
 from services.world_service import clean_id, clean_text, get_campaign_world, json_loads
@@ -592,6 +594,59 @@ def _validate_final_memory_state(compiled_patch, registry_map, known, campaign):
         if isinstance(substitutions, list) and len(substitutions) > 0:
             errors.append("substitutions_not_empty")
 
+    errors.extend(_validate_resolved_entity_refs(compiled_patch))
+
+    return errors
+
+
+def _validate_resolved_entity_refs(compiled_patch):
+    errors = []
+    raw_refs = compiled_patch.get("resolved_entity_refs")
+    if not isinstance(raw_refs, list) or not raw_refs:
+        return errors
+    refs = normalize_resolved_entity_refs(raw_refs)
+    if not refs:
+        return errors
+
+    label_to_canonical = {}
+    for ref in refs:
+        label_to_canonical.setdefault(ref["label_lower"], ref["canonical_id"])
+
+    conflicts = {}
+    for ref in refs:
+        conflicts.setdefault(ref["label_lower"], set()).add(ref["canonical_id"])
+    for label, ids in conflicts.items():
+        if len(ids) > 1:
+            errors.append(f"resolved_ref_conflict: {label}")
+
+    patch_entities_by_name = {}
+    for entity in compiled_patch.get("upsert_graph_entities", []):
+        if not isinstance(entity, dict) or not entity.get("id"):
+            continue
+        name = clean_text(entity.get("name"), 200).lower()
+        if name:
+            patch_entities_by_name.setdefault(name, []).append(entity)
+
+    for label, canonical_id in label_to_canonical.items():
+        for entity in patch_entities_by_name.get(label, []):
+            if entity["id"] != canonical_id:
+                errors.append(
+                    f"resolved_ref_split_brain: {entity.get('name')} -> {entity['id']} (canonical {canonical_id})"
+                )
+
+    for npc_update in compiled_patch.get("update_npc_actors", []):
+        if not isinstance(npc_update, dict):
+            continue
+        actor_id = clean_id(npc_update.get("id") or npc_update.get("actor_id"), "")
+        supplied_name = clean_text(npc_update.get("name"), 200)
+        if not actor_id or not supplied_name:
+            continue
+        label = supplied_name.lower()
+        if label in label_to_canonical and actor_id != label_to_canonical[label]:
+            errors.append(
+                f"resolved_ref_split_brain: {supplied_name} -> {actor_id} (canonical {label_to_canonical[label]})"
+            )
+
     return errors
 
 
@@ -692,12 +747,35 @@ def _build_resolution_records(registry, compiled_patch, memory_context):
     return records
 
 
-def _augment_registry_from_resolved(registry, resolved_entities, resolved_npcs, known, prior_resolutions=None, allocated_ids=None):
+def _augment_registry_from_resolved(registry, resolved_entities, resolved_npcs, known, prior_resolutions=None, allocated_ids=None, entity_refs=None):
     if allocated_ids is None:
         allocated_ids = set()
     allocated_ids |= known.get("entity_ids", set())
     existing_forms = {entry.get("surface_form", "").strip().lower() for entry in registry}
     index = len(registry)
+
+    ref_by_label = {}
+    for ref in entity_refs or []:
+        ref_by_label[ref["label_lower"]] = ref
+
+    def _ref_target(name):
+        ref = ref_by_label.get(name.strip().lower())
+        if not ref:
+            return None
+        ref_cid = ref["canonical_id"]
+        if ref_cid not in known.get("entity_ids", set()) and ref_cid not in allocated_ids:
+            return None
+        existing_name = known.get("entity_names", {}).get(ref_cid) or known.get("npc_names", {}).get(ref_cid)
+        if ref.get("rename_existing"):
+            decision = "rename_existing"
+            canonical_name = ref["canonical_name"]
+        elif existing_name and existing_name.strip().lower() != name.strip().lower():
+            decision = "add_alias"
+            canonical_name = existing_name
+        else:
+            decision = "reuse_existing"
+            canonical_name = existing_name or name
+        return ref_cid, decision, canonical_name
 
     for item in resolved_entities:
         if not isinstance(item, dict):
@@ -712,6 +790,30 @@ def _augment_registry_from_resolved(registry, resolved_entities, resolved_npcs, 
         entity_type = clean_text(item.get("type"), 40).lower() or "other"
         proposed_id = clean_id(item.get("id") or item.get("entity_id"), "")
         mention_ref = f"resolved_entity_{index}"
+
+        ref_target = _ref_target(name)
+        if ref_target is not None:
+            new_id, decision, canonical_name = ref_target
+            allocated_ids.add(new_id)
+            registry.append({
+                "mention_ref": mention_ref,
+                "surface_form": name,
+                "identity_status": "known_public",
+                "visibility": "party_known",
+                "evidence": [{
+                    "source": "resolver_output",
+                    "field": "upsert_graph_entities",
+                    "resolved_label": ref_by_label[name.lower()]["label"],
+                }],
+                "canonical_id": new_id,
+                "canonical_name": canonical_name,
+                "decision": decision,
+                "blocked_operations": [],
+                "resolution_state": "resolved",
+                "entity_type": entity_type,
+            })
+            index += 1
+            continue
 
         skip = False
         if proposed_id and proposed_id in known.get("entity_ids", set()):
@@ -763,7 +865,7 @@ def _augment_registry_from_resolved(registry, resolved_entities, resolved_npcs, 
                     canonical_name = existing_name or name
                 identity_status = "known_public"
             else:
-                new_id = allocate_durable_id(name, allocated_ids)
+                new_id = proposed_id or allocate_durable_id(name, allocated_ids)
                 decision = "create_new"
                 canonical_name = name
                 identity_status = "provisional_new_entity"
@@ -788,77 +890,103 @@ def _augment_registry_from_resolved(registry, resolved_entities, resolved_npcs, 
             continue
         name = clean_text(item.get("name"), 200)
         proposed_id = clean_id(item.get("id") or item.get("actor_id") or item.get("actor_ref"), "")
-        if name and name.lower() not in existing_forms:
-            existing_forms.add(name.lower())
-            mention_ref = f"resolved_npc_{index}"
-            entity_type = "npc"
-            skip = False
-            if proposed_id and proposed_id in known.get("npc_ids", set()):
-                existing_name = known.get("npc_names", {}).get(proposed_id, "")
+        if not name or name.lower() in existing_forms:
+            continue
+        existing_forms.add(name.lower())
+        mention_ref = f"resolved_npc_{index}"
+        entity_type = "npc"
+
+        ref_target = _ref_target(name)
+        if ref_target is not None:
+            new_id, decision, canonical_name = ref_target
+            allocated_ids.add(new_id)
+            registry.append({
+                "mention_ref": mention_ref,
+                "surface_form": name,
+                "identity_status": "known_public",
+                "visibility": "party_known",
+                "evidence": [{
+                    "source": "resolver_output",
+                    "field": "update_npc_actors",
+                    "resolved_label": ref_by_label[name.lower()]["label"],
+                }],
+                "canonical_id": new_id,
+                "canonical_name": canonical_name,
+                "decision": decision,
+                "blocked_operations": [],
+                "resolution_state": "resolved",
+                "entity_type": entity_type,
+            })
+            index += 1
+            continue
+
+        skip = False
+        if proposed_id and proposed_id in known.get("npc_ids", set()):
+            existing_name = known.get("npc_names", {}).get(proposed_id, "")
+            if existing_name and name.lower() != existing_name.lower():
+                for other_id, other_name in known.get("npc_names", {}).items():
+                    if other_name.lower() == name.lower() and other_id != proposed_id:
+                        skip = True
+                        break
+                if skip:
+                    index += 1
+                    continue
+                # Require explicit rename/retcon action
+                item_action = item.get("action") or item.get("decision")
+                if item_action in ("rename_existing", "retcon", "rename_existing_npc"):
+                    decision = "rename_existing"
+                    canonical_name = name
+                else:
+                    decision = "add_alias"
+                    canonical_name = existing_name
+            else:
+                decision = "reuse_existing"
+                canonical_name = existing_name or name
+            registry.append({
+                "mention_ref": mention_ref,
+                "surface_form": name,
+                "identity_status": "known_public",
+                "visibility": "party_known",
+                "evidence": [{"source": "resolver_output", "field": "update_npc_actors"}],
+                "canonical_id": proposed_id,
+                "canonical_name": canonical_name,
+                "decision": decision,
+                "blocked_operations": [],
+                "resolution_state": "resolved",
+                "entity_type": entity_type,
+            })
+        else:
+            matched_id = find_matching_known_npc(name, known, prior_resolutions)
+            if matched_id:
+                new_id = matched_id
+                existing_name = known.get("npc_names", {}).get(matched_id, "")
                 if existing_name and name.lower() != existing_name.lower():
-                    for other_id, other_name in known.get("npc_names", {}).items():
-                        if other_name.lower() == name.lower() and other_id != proposed_id:
-                            skip = True
-                            break
-                    if skip:
-                        index += 1
-                        continue
-                    # Require explicit rename/retcon action
-                    item_action = item.get("action") or item.get("decision")
-                    if item_action in ("rename_existing", "retcon", "rename_existing_npc"):
-                        decision = "rename_existing"
-                        canonical_name = name
-                    else:
-                        decision = "add_alias"
-                        canonical_name = existing_name
+                    decision = "add_alias"
+                    canonical_name = existing_name
                 else:
                     decision = "reuse_existing"
                     canonical_name = existing_name or name
-                registry.append({
-                    "mention_ref": mention_ref,
-                    "surface_form": name,
-                    "identity_status": "known_public",
-                    "visibility": "party_known",
-                    "evidence": [{"source": "resolver_output", "field": "update_npc_actors"}],
-                    "canonical_id": proposed_id,
-                    "canonical_name": canonical_name,
-                    "decision": decision,
-                    "blocked_operations": [],
-                    "resolution_state": "resolved",
-                    "entity_type": entity_type,
-                })
+                identity_status = "known_public"
             else:
-                matched_id = find_matching_known_npc(name, known, prior_resolutions)
-                if matched_id:
-                    new_id = matched_id
-                    existing_name = known.get("npc_names", {}).get(matched_id, "")
-                    if existing_name and name.lower() != existing_name.lower():
-                        decision = "add_alias"
-                        canonical_name = existing_name
-                    else:
-                        decision = "reuse_existing"
-                        canonical_name = existing_name or name
-                    identity_status = "known_public"
-                else:
-                    new_id = allocate_durable_id(name, allocated_ids)
-                    decision = "create_new"
-                    canonical_name = name
-                    identity_status = "provisional_new_entity"
-                allocated_ids.add(new_id)
-                registry.append({
-                    "mention_ref": mention_ref,
-                    "surface_form": name,
-                    "identity_status": identity_status,
-                    "visibility": "party_known",
-                    "evidence": [{"source": "resolver_output", "field": "update_npc_actors"}],
-                    "canonical_id": new_id,
-                    "canonical_name": canonical_name,
-                    "decision": decision,
-                    "blocked_operations": [],
-                    "resolution_state": "resolved",
-                    "entity_type": entity_type,
-                })
-            index += 1
+                new_id = proposed_id or allocate_durable_id(name, allocated_ids)
+                decision = "create_new"
+                canonical_name = name
+                identity_status = "provisional_new_entity"
+            allocated_ids.add(new_id)
+            registry.append({
+                "mention_ref": mention_ref,
+                "surface_form": name,
+                "identity_status": identity_status,
+                "visibility": "party_known",
+                "evidence": [{"source": "resolver_output", "field": "update_npc_actors"}],
+                "canonical_id": new_id,
+                "canonical_name": canonical_name,
+                "decision": decision,
+                "blocked_operations": [],
+                "resolution_state": "resolved",
+                "entity_type": entity_type,
+            })
+        index += 1
     records = []
     for entry in registry:
         if not isinstance(entry, dict):
@@ -936,6 +1064,8 @@ def compile_staged_memory_patch(memory_context, extracted, resolved):
     known = _known_ids(campaign)
     unresolved = list(resolved.get("unresolved_items") if isinstance(resolved.get("unresolved_items"), list) else [])
 
+    entity_refs = normalize_resolved_entity_refs(resolved.get("resolved_entity_refs"))
+
     resolver_packet = memory_context.get("resolver_packet") if isinstance(memory_context, dict) else None
     if isinstance(resolver_packet, dict) and not isinstance(resolver_packet.get("entity_mentions"), list):
         resolver_packet = None
@@ -953,6 +1083,7 @@ def compile_staged_memory_patch(memory_context, extracted, resolved):
         resolver_packet,
         prior_resolutions,
         known,
+        resolved_entity_refs=entity_refs,
     )
 
     # Compile-time validation: check which answered clarifications actually resolved in the registry
@@ -1005,6 +1136,17 @@ def compile_staged_memory_patch(memory_context, extracted, resolved):
         known,
         prior_resolutions=prior_resolutions,
         allocated_ids={e.get("canonical_id") for e in registry if e.get("canonical_id")},
+        entity_refs=entity_refs,
+    )
+    # Second reconcile pass: refs that target identities created by the resolver
+    # output in this same transaction (same-patch entity creation) can only be
+    # honored once those identities exist in the registry.
+    reconcile_registry_with_refs(
+        registry,
+        entity_refs,
+        known,
+        {e.get("canonical_id") for e in registry if e.get("canonical_id")},
+        diagnostics,
     )
     registry_map = {entry["mention_ref"]: entry for entry in registry}
 
@@ -1262,13 +1404,14 @@ def compile_staged_memory_patch(memory_context, extracted, resolved):
                 entity_name_to_id[name_slug] = entity["id"]
 
     # Also map proposed IDs from resolved entities to their canonical IDs
+    entity_ref_by_label = {ref["label_lower"]: ref["canonical_id"] for ref in entity_refs}
     for item in resolved_entities:
         if not isinstance(item, dict):
             continue
         name = clean_text(item.get("name"), 200)
         proposed_id = clean_id(item.get("id") or item.get("entity_id"), "")
         if name and proposed_id:
-            canonical_id = entity_name_to_id.get(name.lower())
+            canonical_id = entity_name_to_id.get(name.lower()) or entity_ref_by_label.get(name.lower())
             if canonical_id:
                 entity_name_to_id[proposed_id] = canonical_id
                 entity_name_to_id[proposed_id.lower()] = canonical_id
@@ -1278,7 +1421,7 @@ def compile_staged_memory_patch(memory_context, extracted, resolved):
         name = clean_text(item.get("name"), 200)
         proposed_id = clean_id(item.get("id") or item.get("actor_id") or item.get("actor_ref"), "")
         if name and proposed_id:
-            canonical_id = entity_name_to_id.get(name.lower())
+            canonical_id = entity_name_to_id.get(name.lower()) or entity_ref_by_label.get(name.lower())
             if canonical_id:
                 entity_name_to_id[proposed_id] = canonical_id
                 entity_name_to_id[proposed_id.lower()] = canonical_id
