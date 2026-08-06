@@ -479,17 +479,23 @@ class RunAutomationWorkerTests(unittest.TestCase):
              patch.object(worker, 'append_event'), \
              patch.object(worker.autonomous, 'fetch_dm_turn_status', return_value=dm_status), \
              patch.object(worker, 'pause_for_audit_if_needed') as pause_mock, \
-             patch.object(worker, 'request_overseer_decision', return_value={'action': 'no_action'}), \
+             patch.object(worker, 'request_overseer_decision', return_value={'action': 'no_action'}) as overseer_mock, \
              patch.object(worker, 'heartbeat', return_value={'run': {'lease_token': 'lease-1'}}), \
              patch.object(worker, 'complete_run') as complete_mock, \
              patch.object(worker.time, 'sleep'):
             
             run_payload_stop = {'run': {'status': 'stop_requested', 'error_text': 'done'}, 'latest_session': initial_session}
-            with patch.object(worker, 'fetch_run', side_effect=[run_payload_with_silent_cycle, run_payload_stop]):
+            with patch.object(
+                worker,
+                'fetch_run',
+                side_effect=[run_payload_with_silent_cycle, run_payload_with_silent_cycle, run_payload_stop],
+            ):
                 finished = worker.execute_run(args, 2)
 
         self.assertTrue(finished)
         pause_mock.assert_not_called()
+        overseer_mock.assert_called_once()
+        self.assertEqual(overseer_mock.call_args[0][5], dm_status)
 
     def test_max_cycles_missing_after_dm_resumed(self):
         args = SimpleNamespace(

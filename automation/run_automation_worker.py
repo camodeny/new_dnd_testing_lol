@@ -897,6 +897,14 @@ def execute_run(args, run_id):
                             break
                     if not has_matching_after_dm:
                         resume_dm_wait_message_id = latest_player_message_id
+                    elif str(dm_turn_status.get('status') or '').strip().lower() in {'silent', 'empty'}:
+                        # A silent/empty DM turn is a completed state transition even
+                        # though it creates no transcript message. Restore it across the
+                        # audit lease boundary so the overseer knows the DM is finished.
+                        last_seen_fingerprint = messages_fingerprint(session_on_start)
+                        last_dm_turn = dm_turn_status
+                        force_overseer_retry = True
+                        last_change_at = time.monotonic()
             except Exception as exc:
                 append_event(
                     args.api_base,
