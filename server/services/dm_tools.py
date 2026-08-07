@@ -973,6 +973,8 @@ def _leak_guard_memory_patch(campaign, patch, visible_text):
         'npcs_demoted': 0,
         'npc_public_redacted': 0,
         'clocks_demoted': 0,
+        'summary_redacted': 0,
+        'anchor_items_redacted': 0,
         'reasons': [],
     }
 
@@ -1068,7 +1070,64 @@ def _leak_guard_memory_patch(campaign, patch, visible_text):
                 telemetry['clocks_demoted'] += 1
                 _flag('clock_private')
 
+    # ── Session-facing free text: running summary and memory anchors ───
+    # CampaignSession.to_dict() serves running_summary and normalized
+    # memory_anchors to every campaign member, so unrevealed private terms
+    # must be redacted here at the write boundary too.
+    summary, summary_changed = _redact_free_text_private_terms(
+        campaign,
+        patch.get('running_summary'),
+        visible_text,
+    )
+    if summary_changed:
+        patch['running_summary'] = summary
+        telemetry['summary_redacted'] += 1
+        _flag('running_summary_private')
+
+    anchors = patch.get('memory_anchors')
+    if isinstance(anchors, dict):
+        for key in ('current_goal', 'current_scene'):
+            value, changed = _redact_free_text_private_terms(campaign, anchors.get(key), visible_text)
+            if changed:
+                anchors[key] = value
+                telemetry['anchor_items_redacted'] += 1
+                _flag('memory_anchor_private')
+        for key in ('open_clues', 'unresolved_questions', 'npc_observations', 'recent_offers_promises'):
+            values = anchors.get(key)
+            if not isinstance(values, list):
+                continue
+            kept = []
+            for value in values:
+                if _leak_guard_has_private_content(campaign, value, visible_text):
+                    telemetry['anchor_items_redacted'] += 1
+                    _flag('memory_anchor_private')
+                    continue
+                kept.append(value)
+            anchors[key] = kept
+
     return telemetry
+
+
+def _redact_free_text_private_terms(campaign, text, visible_text):
+    """Drop sentences that carry unrevealed private terms from free text.
+
+    Used for session-facing free text (running summary, anchor scalars) where
+    a whole-record demotion is not meaningful. Returns (redacted_or_none,
+    changed) and never emits the private term itself.
+    """
+    text = clean_text(text, 4000)
+    if not text:
+        return None, False
+    if not _leak_guard_has_private_content(campaign, text, visible_text):
+        return text, False
+    sentences = re.split(r'(?<=[.!?])\s+', text)
+    kept = [
+        sentence
+        for sentence in sentences
+        if not _leak_guard_has_private_content(campaign, sentence, visible_text)
+    ]
+    cleaned = ' '.join(kept).strip()
+    return (cleaned or None), True
 
 
 def _selected_member(campaign_id, user_id):
@@ -5997,13 +6056,6 @@ def apply_memory_patch(campaign, session, patch, audit_context=None):
     patch = _normalize_memory_patch(patch)
     patch = _apply_memory_visibility_policy(campaign, patch, audit_context)
 
-    # Final output-boundary leak guard runs after the visibility policy so its
-    # redactions/demotions are authoritative: a party-visible item that still
-    # carries unrevealed private terms is demoted to dm_private or redacted.
-    leak_guard_telemetry = _leak_guard_memory_patch(campaign, patch, _visibility_policy_text(audit_context))
-    if isinstance(audit_context, dict):
-        audit_context['leak_guard_telemetry'] = leak_guard_telemetry
-
     # Initialize memory run ID and turn ID tracking
     memory_run_id = audit_context.get('memory_run_id') or f"memrun_{uuid.uuid4().hex[:12]}"
     trace_id = audit_context.get('trace_id')
@@ -6126,6 +6178,15 @@ def apply_memory_patch(campaign, session, patch, audit_context=None):
 
     try:
         from openrouter import _get_cached_build_sha
+
+        # Final output-boundary leak guard runs after the visibility policy so
+        # its redactions/demotions are authoritative: a party-visible item that
+        # still carries unrevealed private terms is demoted to dm_private or
+        # redacted. Runs inside the transaction guard so a leak-check DB failure
+        # fails closed as a persistence error instead of leaking content.
+        leak_guard_telemetry = _leak_guard_memory_patch(campaign, patch, _visibility_policy_text(audit_context))
+        if isinstance(audit_context, dict):
+            audit_context['leak_guard_telemetry'] = leak_guard_telemetry
 
         if compile_summary or unresolved_items or evidence_basis:
             log_change(

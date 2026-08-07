@@ -388,7 +388,60 @@ class Issue83VisibilityLeakPreventionTest(unittest.TestCase):
             self.assertEqual(entity['visibility'], 'dm_private')
             self.assertNotIn('Ollin', json.dumps(entity))
 
-    # ── Compiled path: private event/relation demotion + telemetry ─────
+    # ── Session-facing free text: running summary leak prevention ──────
+    def test_compiled_path_redacts_private_identity_from_running_summary(self):
+        graph = {
+            'entities': [
+                {'id': 'brother_ollin', 'type': 'npc', 'name': 'Brother Ollin', 'visibility': 'dm_private'},
+            ],
+            'relations': [],
+            'facts': [],
+        }
+        self.world.knowledge_graph = json.dumps(graph)
+        db.session.commit()
+
+        patch = {
+            'source_contract': SOURCE_CONTRACT_COMPILED_V2,
+            'base_memory_revision': self.world.memory_revision or 0,
+            'running_summary': 'The party traveled to the docks. Brother Ollin orchestrated the raid from the shadows.',
+            'memory_anchors': {
+                'current_goal': 'Find the source of the raids.',
+                'open_clues': ['A gray robe left behind.', 'Brother Ollin sent the raiders.'],
+                'unresolved_questions': [],
+                'npc_observations': [],
+                'recent_offers_promises': [],
+            },
+            'upsert_graph_entities': [],
+            'upsert_graph_relations': [],
+            'upsert_graph_facts': [],
+            'update_npc_actors': [],
+            'record_events': [],
+        }
+        audit_context = {
+            'latest_player_message': 'The party reaches the docks.',
+            'latest_dm_message': 'The harbor is quiet.',
+        }
+        apply_compiled_session_memory_patch(self.campaign, self.session, patch, audit_context=audit_context)
+        db.session.commit()
+
+        db.session.refresh(self.session)
+        self.assertNotIn('Brother Ollin', self.session.running_summary or '')
+        self.assertIn('traveled to the docks', self.session.running_summary or '')
+
+        anchors = self.session.memory_anchors if isinstance(self.session.memory_anchors, dict) else {}
+        self.assertNotIn('Brother Ollin', json.dumps(anchors))
+        self.assertIn('A gray robe left behind.', json.dumps(anchors.get('open_clues', [])))
+
+        telemetry = audit_context.get('leak_guard_telemetry') or {}
+        self.assertGreater(telemetry.get('summary_redacted', 0), 0)
+        self.assertGreaterEqual(telemetry.get('anchor_items_redacted', 0), 1)
+        self.assertNotIn('Ollin', json.dumps(telemetry))
+
+        # Party-facing session serialization must not expose the private identity.
+        serialized = json.dumps(self.session.to_dict())
+        self.assertNotIn('Brother Ollin', serialized)
+
+    # ── Compiled path: relation/event demotion + telemetry ─────────────
     def test_compiled_path_demotes_relation_and_event_with_private_terms(self):
         spymaster = NPCActor(
             campaign_id=self.campaign.id,
