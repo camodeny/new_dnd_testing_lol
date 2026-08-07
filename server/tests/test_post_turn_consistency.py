@@ -312,6 +312,70 @@ class PostTurnConsistencyTest(unittest.TestCase):
         self.assertEqual(report['clocks_superseded'], [])
         self.assertTrue(report['verified'])
 
+    def test_alive_but_drowning_is_not_resolution(self):
+        """'alive but drowning' asserts the condition is ongoing even without a
+        persistence marker, so the danger clock must remain active."""
+        graph = json.loads(self.world.knowledge_graph)
+        graph['facts'].append({
+            'id': 'fact_mira_alive_but_drowning',
+            'entity_ids': ['mira'],
+            'text': 'Mira is alive but drowning.',
+            'certainty': 'confirmed',
+            'visibility': 'party_known',
+        })
+        self.world.knowledge_graph = json.dumps(graph)
+        self.world.world_state = json.dumps({
+            'current_scene': {
+                'location_id': 'the_dock',
+                'location_name': 'The Dock',
+                'active_npc_ids': [],
+            },
+        })
+        db.session.commit()
+
+        self._clock('mira_in_peril', 'Mira in Peril', 4, 2, summary='Mira is drowning at 0 HP.')
+        db.session.commit()
+
+        report = self._run_fixture()
+        db.session.commit()
+
+        clock = CampaignClock.query.filter_by(campaign_id=self.campaign.id, clock_id='mira_in_peril').one()
+        self.assertEqual(clock.status, 'active')
+        self.assertEqual(report['clocks_superseded'], [])
+        self.assertTrue(report['verified'])
+
+    def test_conscious_but_poisoned_is_not_resolution(self):
+        """'conscious but poisoned' asserts the condition is ongoing even without
+        a persistence marker, so the danger clock must remain active."""
+        graph = json.loads(self.world.knowledge_graph)
+        graph['facts'].append({
+            'id': 'fact_mira_conscious_but_poisoned',
+            'entity_ids': ['mira'],
+            'text': 'Mira is conscious but poisoned.',
+            'certainty': 'confirmed',
+            'visibility': 'party_known',
+        })
+        self.world.knowledge_graph = json.dumps(graph)
+        self.world.world_state = json.dumps({
+            'current_scene': {
+                'location_id': 'the_dock',
+                'location_name': 'The Dock',
+                'active_npc_ids': [],
+            },
+        })
+        db.session.commit()
+
+        self._clock('mira_in_peril', 'Mira in Peril', 4, 2, summary='Mira is poisoned at 0 HP.')
+        db.session.commit()
+
+        report = self._run_fixture()
+        db.session.commit()
+
+        clock = CampaignClock.query.filter_by(campaign_id=self.campaign.id, clock_id='mira_in_peril').one()
+        self.assertEqual(clock.status, 'active')
+        self.assertEqual(report['clocks_superseded'], [])
+        self.assertTrue(report['verified'])
+
     def test_affirmative_resolution_still_supersedes_condition_clock(self):
         """Positive control: an un-negated, uncontradicted resolution fact still
         supersedes the danger clock."""

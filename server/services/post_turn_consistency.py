@@ -364,9 +364,11 @@ def _negated_before(tokens, index):
 
 def _fact_asserts_resolution(fact_text):
     """Return True only when ``fact_text`` affirmatively records that a danger
-    condition resolved: an un-negated resolution phrase AND no persistence
-    marker introducing a still-active condition word (e.g. 'alive but still
-    drowning', 'not safe', 'conscious but still poisoned' are NOT resolution)."""
+    condition resolved. Fail-closed: an affirmatively asserted condition word in
+    the same fact (e.g. 'alive but drowning', 'conscious but poisoned', 'alive
+    but still drowning') means the danger is ongoing and is NOT resolution.
+    A condition word is not a contradiction when it is negated or ceased
+    (e.g. 'no longer drowning')."""
     if not fact_text:
         return False
     tokens = _tokenize(fact_text)
@@ -380,6 +382,19 @@ def _fact_asserts_resolution(fact_text):
             continue
         following = ' '.join(tokens[index + 1:index + 4])
         if any(_contains_phrase(following, condition) for condition in CONDITION_WORDS):
+            return False
+
+    # Any condition word that is still affirmatively asserted (not negated or
+    # ceased) contradicts resolution, even without a persistence marker.
+    for condition in CONDITION_WORDS:
+        condition_tokens = _tokenize(condition)
+        if not condition_tokens:
+            continue
+        for index in range(len(tokens) - len(condition_tokens) + 1):
+            if tokens[index:index + len(condition_tokens)] != condition_tokens:
+                continue
+            if _negated_before(tokens, index):
+                continue
             return False
 
     # Any un-negated resolution phrase is affirmative evidence of resolution.
