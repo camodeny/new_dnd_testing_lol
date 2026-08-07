@@ -803,6 +803,10 @@ def _post_turn_status_for_player(campaign_id, session_id, player_message_id):
             .order_by(SessionMemoryRecoveryTask.id.desc())
             .first()
         )
+        # Player-facing shape stays minimal: the automation worker only needs the
+        # opaque task id to retry. Full recovery metadata (error_text, trace_id,
+        # dm_message_id, patch info) is exposed only through the privileged
+        # DM/owner /memory-recovery routes.
         return _with_revision({
             'post_turn_complete': True,
             'post_turn_status': 'error',
@@ -810,7 +814,7 @@ def _post_turn_status_for_player(campaign_id, session_id, player_message_id):
             'clock_status': 'skipped',
             'recoverable': True,
             'has_pending_recovery': pending_recovery is not None,
-            'recovery_task': pending_recovery.to_dict() if pending_recovery else None,
+            'recovery_task': {'id': pending_recovery.id} if pending_recovery else None,
         })
 
     memory_applied = CampaignAuditEvent.query.filter_by(

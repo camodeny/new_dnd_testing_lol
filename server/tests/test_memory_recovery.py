@@ -10,6 +10,7 @@ sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..")
 
 from models import (
     Campaign,
+    CampaignAuditEvent,
     CampaignClock,
     CampaignMember,
     CampaignSession,
@@ -1257,6 +1258,60 @@ class MemoryRecoveryRouteTest(unittest.TestCase):
         data = dm_response.get_json()
         self.assertEqual(data["count"], 1)
         self.assertEqual(data["tasks"][0]["error_code"], "missing_relation_endpoint")
+
+    def test_player_post_turn_status_does_not_leak_recovery_metadata(self):
+        # A memory failure surfaces in the ordinary player-facing dm-turn-status
+        # payload. It must stay minimal (recoverable flag + opaque task id) and
+        # must not carry DM-internal recovery fields or private entity ids.
+        player_message_id = 5
+        task = SessionMemoryRecoveryTask(
+            campaign_id=self.campaign.id,
+            session_id=self.session.id,
+            player_message_id=player_message_id,
+            dm_message_id=6,
+            trace_id="trace_secret",
+            status="pending",
+            error_code="missing_relation_endpoint",
+            error_text="Relation source 'vex_mal' not found in graph entities.",
+            last_error_text="clock_replay_failed: provider unavailable",
+            patch_json='{"upsert_graph_relations":[{"source_id":"vex_mal"}]}',
+        )
+        db.session.add(task)
+        db.session.add(CampaignAuditEvent(
+            campaign_id=self.campaign.id,
+            event_type='memory_update_error',
+            source='session_memory',
+            actor='session_memory_writer',
+            trace_id=f"session_memory_writer:session_{self.session.id}:message_{player_message_id}",
+            summary='Post-turn memory update failed.',
+            payload=json.dumps({'telemetry': {'pipeline_error_stage': 'validation'}}),
+        ))
+        db.session.add(CampaignAuditEvent(
+            campaign_id=self.campaign.id,
+            event_type='dm_output_stored',
+            source='session_messages',
+            actor='session_dm',
+            summary='DM response stored.',
+            payload=json.dumps({'player_message_id': player_message_id, 'dm_message_id': 6}),
+        ))
+        db.session.commit()
+
+        response = self.client.get(
+            f"/api/sessions/{self.session.id}/dm-turn-status",
+            headers=self.player_headers,
+            query_string={'after_message_id': player_message_id},
+        )
+        self.assertEqual(response.status_code, 200)
+        data = response.get_json()
+        self.assertTrue(data["has_pending_recovery"])
+        self.assertEqual(data["recovery_task"], {"id": task.id})
+
+        body_text = response.get_data(as_text=True)
+        self.assertNotIn("vex_mal", body_text)
+        self.assertNotIn("trace_secret", body_text)
+        self.assertNotIn("error_text", body_text)
+        self.assertNotIn("last_error_text", body_text)
+        self.assertNotIn("patch_json", body_text)
 
 
 if __name__ == "__main__":

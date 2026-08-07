@@ -1,7 +1,7 @@
 """add memory recovery task table
 
 Revision ID: e5f6a1b2c3d4
-Revises: c3d4e5f6a1b2
+Revises: e1f2a3b4c5d6
 Create Date: 2026-08-07 00:00:00.000000
 
 """
@@ -11,7 +11,7 @@ import sqlalchemy as sa
 
 # revision identifiers, used by Alembic.
 revision = 'e5f6a1b2c3d4'
-down_revision = 'c3d4e5f6a1b2'
+down_revision = 'e1f2a3b4c5d6'
 branch_labels = None
 depends_on = None
 
