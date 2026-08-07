@@ -534,7 +534,8 @@ def resolve_priority_proposal(args, manifest, claim_payload, session, turns_comp
 
     Returns a (status, detail) tuple:
       ('no_proposal', None)       - nothing eligible to resolve
-      ('no_resolver', proposal)   - proposal exists but has no roster seat
+      ('no_resolver', proposal)   - proposal exists but has no roster seat;
+                                    a blocking condition for the caller
       ('resolved', proposal)      - proposal applied or dismissed
       ('unresolvable', proposal)  - provider could not reach a valid decision
     """
@@ -1431,7 +1432,12 @@ def execute_run(args, run_id):
                     run_id,
                     lease_token,
                 )
-                if proposal_status == 'unresolvable':
+                if proposal_status in {'unresolvable', 'no_resolver'}:
+                    error_text = (
+                        'state_critical_proposal_no_resolver'
+                        if proposal_status == 'no_resolver'
+                        else 'state_critical_proposal_unresolved'
+                    )
                     complete_run(
                         args.api_base,
                         args.owner_api_key,
@@ -1439,8 +1445,8 @@ def execute_run(args, run_id):
                         args.worker_id,
                         lease_token,
                         status='failed',
-                        error_text='state_critical_proposal_unresolved',
-                        dedupe_key=f'run_completed:{run_id}:proposal-unresolved',
+                        error_text=error_text,
+                        dedupe_key=f'run_completed:{run_id}:proposal-{proposal_status}',
                     )
                     return True
                 if proposal_status == 'resolved':

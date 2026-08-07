@@ -649,8 +649,21 @@ def main():
             if fingerprint_changed or force_overseer_retry:
 
                 try:
-                    proposal_entry, priority_proposal = find_priority_proposal_llm_player(manifest, session)
-                    if proposal_entry is not None:
+                    priority_proposal = select_priority_proposal(session.get('pending_sheet_proposals') or [])
+                    if priority_proposal is not None:
+                        proposal_entry, _matched = find_priority_proposal_llm_player(manifest, session)
+                        if proposal_entry is None:
+                            print_event({
+                                'event': 'error',
+                                'timestamp': utc_now(),
+                                'campaign_id': manifest['campaign']['id'],
+                                'session_id': session['id'],
+                                'error': 'state_critical_proposal_no_resolver',
+                                'proposal_id': priority_proposal.get('id'),
+                                'character_id': priority_proposal.get('character_id'),
+                                'turns_completed': turns_completed,
+                            })
+                            return
                         proposal_result = run_orchestrator(
                             args,
                             manifest_path,
@@ -668,8 +681,8 @@ def main():
                             'timestamp': utc_now(),
                             'campaign_id': manifest['campaign']['id'],
                             'session_id': session['id'],
-                            'proposal_id': (priority_proposal or {}).get('id'),
-                            'character_id': (priority_proposal or {}).get('character_id'),
+                            'proposal_id': priority_proposal.get('id'),
+                            'character_id': priority_proposal.get('character_id'),
                             'resolver': proposal_entry['llm_player']['label'],
                             'action': proposal_action,
                             'outcome': proposal_outcome,

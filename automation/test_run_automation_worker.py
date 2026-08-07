@@ -1742,6 +1742,74 @@ class ProposalResolutionTests(unittest.TestCase):
         self.assertEqual(complete_run.call_args.kwargs['status'], 'failed')
         self.assertEqual(complete_run.call_args.kwargs['error_text'], 'state_critical_proposal_unresolved')
 
+    def test_execute_run_blocks_when_state_critical_proposal_has_no_resolver(self):
+        args = SimpleNamespace(
+            api_base='http://127.0.0.1:5889',
+            owner_api_key='owner-key',
+            worker_id='proposal-worker-test',
+            max_minutes=None,
+            idle_timeout=180.0,
+            heartbeat_interval=999.0,
+            poll_interval=0.01,
+            max_turns=50,
+            dm_response_timeout=60.0,
+            message_window=16,
+            model='test-model',
+        )
+        initial_session = {
+            'id': 4,
+            'is_active': True,
+            'started_at': '2026-07-01T15:58:50.044971',
+            'messages': [
+                {'id': 410, 'role': 'dm', 'content': 'Mira collapses at 0 HP.', 'created_at': '2026-07-01T15:59:05.608343'},
+            ],
+            'pending_sheet_proposals': [
+                {'id': 1, 'character_id': 999, 'changes': [{'field': 'current_hp', 'after': 0}], 'reason': '0 HP', 'created_at': '2026-07-01T16:00:00Z'},
+            ],
+        }
+        claim_payload = {
+            'run': {'id': 2, 'attempt_count': 1, 'runner_config': {'audit_pause_phases': []}},
+            'lease_token': 'lease-1',
+            'derived_campaign': {'id': 100003},
+            'latest_session': initial_session,
+            'gameplay_readiness': {'campaign_ready': True},
+            'roster': [
+                {
+                    'llm_player_id': 33,
+                    'user_id': 35,
+                    'label': 'Auto Player 1',
+                    'character_name': 'Mira Vell',
+                    'derived_character_id': 81,
+                },
+            ],
+        }
+        manifest = {
+            'campaign': {'id': 100003, 'name': 'Test Campaign'},
+            'llm_players': [
+                {'llm_player': {'id': 33, 'user_id': 35, 'label': 'Auto Player 1'}, 'character': {'id': 81, 'name': 'Mira Vell'}},
+            ],
+        }
+
+        with patch.object(worker, 'claim_run', return_value=claim_payload), \
+                patch.object(worker, 'heartbeat', return_value={'run': {'lease_token': 'lease-1'}}), \
+                patch.object(worker, 'build_manifest_for_run', return_value=manifest), \
+                patch.object(worker, 'append_event'), \
+                patch.object(worker, 'api_get'), \
+                patch.object(worker, 'request_player_decision'), \
+                patch.object(worker, 'submit_decision'), \
+                patch.object(worker, 'request_overseer_decision') as overseer_mock, \
+                patch.object(worker, 'fetch_run', return_value={'run': {'status': 'running'}, 'latest_session': initial_session}), \
+                patch.object(worker, 'complete_run') as complete_run, \
+                patch.object(worker.time, 'sleep'), \
+                patch.object(worker.time, 'monotonic', side_effect=iter([0.0] * 40)):
+            finished = worker.execute_run(args, 2)
+
+        self.assertTrue(finished)
+        overseer_mock.assert_not_called()
+        complete_run.assert_called_once()
+        self.assertEqual(complete_run.call_args.kwargs['status'], 'failed')
+        self.assertEqual(complete_run.call_args.kwargs['error_text'], 'state_critical_proposal_no_resolver')
+
 
 if __name__ == '__main__':
     unittest.main()
