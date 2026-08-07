@@ -664,6 +664,35 @@ def list_sessions(current_user, campaign_id):
     return jsonify({'sessions': [s.to_dict() for s in sessions]}), 200
 
 
+def _visible_pending_sheet_proposals(campaign, session, current_user):
+    """Pending proposals the requesting user is allowed to see.
+
+    Mirrors the authorization boundary of the dedicated proposals endpoint: the
+    DM sees every pending proposal, while other members only see proposals for
+    characters they own. Proposals whose source message is no longer part of the
+    session are excluded.
+    """
+    proposals = SheetProposal.query.filter_by(session_id=session.id, status='pending').all()
+    session_message_ids = {
+        message_id
+        for (message_id,) in db.session.query(SessionMessage.id)
+        .filter_by(session_id=session.id)
+        .all()
+    }
+    proposals = [
+        proposal for proposal in proposals
+        if proposal.message_id is None or proposal.message_id in session_message_ids
+    ]
+    if campaign.user_id == current_user.id:
+        return [proposal.to_dict() for proposal in proposals]
+    user_char_ids = {c.id for c in Character.query.filter_by(user_id=current_user.id).all()}
+    return [
+        proposal.to_dict()
+        for proposal in proposals
+        if proposal.character_id in user_char_ids
+    ]
+
+
 @sessions_bp.route('/api/sessions/<int:session_id>', methods=['GET'])
 @token_required
 def get_session(current_user, session_id):
@@ -678,12 +707,7 @@ def get_session(current_user, session_id):
         before_id=request.args.get('before_id'),
         limit=request.args.get('limit'),
     ))
-    data['pending_sheet_proposals'] = [
-        proposal.to_dict()
-        for proposal in SheetProposal.query.filter_by(session_id=session_id, status='pending')
-        .order_by(SheetProposal.created_at.asc(), SheetProposal.id.asc())
-        .all()
-    ]
+    data['pending_sheet_proposals'] = _visible_pending_sheet_proposals(campaign, session, current_user)
     return jsonify({'session': data}), 200
 
 
@@ -976,25 +1000,7 @@ def _get_session_proposals(current_user, session_id):
     if not ensure_member(campaign, current_user):
         return jsonify({'error': 'Forbidden'}), 403
 
-    is_dm = campaign.user_id == current_user.id
-    proposals = SheetProposal.query.filter_by(session_id=session_id, status='pending').all()
-    session_message_ids = {
-        message_id
-        for (message_id,) in db.session.query(SessionMessage.id)
-        .filter_by(session_id=session_id)
-        .all()
-    }
-    proposals = [
-        proposal for proposal in proposals
-        if proposal.message_id is None or proposal.message_id in session_message_ids
-    ]
-
-    if is_dm:
-        result = [p.to_dict() for p in proposals]
-    else:
-        user_char_ids = {c.id for c in Character.query.filter_by(user_id=current_user.id).all()}
-        result = [p.to_dict() for p in proposals if p.character_id in user_char_ids]
-
+    result = _visible_pending_sheet_proposals(campaign, session, current_user)
     return jsonify({'sheet_proposals': result}), 200
 
 

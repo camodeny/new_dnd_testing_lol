@@ -3653,6 +3653,68 @@ class AutomationRouteTest(unittest.TestCase):
         self.assertEqual(resp.status_code, 400)
         self.assertIn('not found for this actor', resp.get_json()['error'])
 
+    def test_session_get_scopes_pending_proposals_to_owner(self):
+        """A non-owner member must not see another player's pending proposal in
+        the session payload; the campaign owner (DM/automation path) still can."""
+        with app.app_context():
+            player_a = User(username='player_a', email='player_a@example.com')
+            player_a.set_password('password')
+            db.session.add(player_a)
+            db.session.flush()
+            player_b = User(username='player_b', email='player_b@example.com')
+            player_b.set_password('password')
+            db.session.add(player_b)
+            db.session.flush()
+
+            char_a = Character(
+                user_id=player_a.id, campaign_id=self.campaign_id, name='Aria Vale', race='Elf',
+            )
+            db.session.add(char_a)
+            db.session.flush()
+            char_b = Character(
+                user_id=player_b.id, campaign_id=self.campaign_id, name='Borin Stonefoot', race='Dwarf',
+            )
+            db.session.add(char_b)
+            db.session.flush()
+
+            db.session.add(CampaignMember(
+                campaign_id=self.campaign_id, user_id=player_a.id, role='player',
+                selected_character_id=char_a.id, character_ready_at=utcnow(),
+            ))
+            db.session.add(CampaignMember(
+                campaign_id=self.campaign_id, user_id=player_b.id, role='player',
+                selected_character_id=char_b.id, character_ready_at=utcnow(),
+            ))
+
+            proposal_b = SheetProposal(
+                session_id=self.session_id,
+                character_id=char_b.id,
+                reason='Borin takes a heavy blow.',
+                changes=[{'field': 'current_hp', 'after': 4}],
+                status='pending',
+            )
+            db.session.add(proposal_b)
+            db.session.commit()
+            proposal_b_id = proposal_b.id
+            token_a = generate_token(player_a.id)
+
+        headers_a = {'Authorization': f'Bearer {token_a}'}
+        resp_a = self.client.get(f'/api/sessions/{self.session_id}', headers=headers_a)
+        self.assertEqual(resp_a.status_code, 200)
+        a_proposal_ids = [
+            proposal['id']
+            for proposal in resp_a.get_json()['session']['pending_sheet_proposals']
+        ]
+        self.assertNotIn(proposal_b_id, a_proposal_ids)
+
+        resp_owner = self.client.get(f'/api/sessions/{self.session_id}', headers=self.headers)
+        self.assertEqual(resp_owner.status_code, 200)
+        owner_proposal_ids = [
+            proposal['id']
+            for proposal in resp_owner.get_json()['session']['pending_sheet_proposals']
+        ]
+        self.assertIn(proposal_b_id, owner_proposal_ids)
+
     def test_events_route_rejects_status_bypasses(self):
         run_id, token = self._claim_for_credential_tests()
         for status in ('completed', 'queued'):
