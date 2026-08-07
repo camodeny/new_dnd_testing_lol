@@ -408,6 +408,70 @@ class PostTurnConsistencyTest(unittest.TestCase):
         self.assertEqual(report['clocks_superseded'][0]['kind'], 'condition_resolved')
         self.assertTrue(report['verified'])
 
+    def test_was_unconscious_but_now_conscious_supersedes(self):
+        """An explicit historical transition ('was unconscious but is now
+        conscious') retires the danger clock."""
+        graph = json.loads(self.world.knowledge_graph)
+        graph['facts'].append({
+            'id': 'fact_mira_transition',
+            'entity_ids': ['mira'],
+            'text': 'Mira was unconscious but is now conscious.',
+            'certainty': 'confirmed',
+            'visibility': 'party_known',
+        })
+        self.world.knowledge_graph = json.dumps(graph)
+        self.world.world_state = json.dumps({
+            'current_scene': {
+                'location_id': 'the_dock',
+                'location_name': 'The Dock',
+                'active_npc_ids': [],
+            },
+        })
+        db.session.commit()
+
+        self._clock('mira_in_peril', 'Mira in Peril', 4, 2, summary='Mira is unconscious at 0 HP.')
+        db.session.commit()
+
+        report = self._run_fixture()
+        db.session.commit()
+
+        clock = CampaignClock.query.filter_by(campaign_id=self.campaign.id, clock_id='mira_in_peril').one()
+        self.assertEqual(clock.status, 'superseded')
+        self.assertEqual(report['clocks_superseded'][0]['kind'], 'condition_resolved')
+        self.assertTrue(report['verified'])
+
+    def test_was_drowning_but_has_been_rescued_supersedes(self):
+        """An explicit historical transition ('was drowning but has been
+        rescued') retires the danger clock."""
+        graph = json.loads(self.world.knowledge_graph)
+        graph['facts'].append({
+            'id': 'fact_mira_rescued',
+            'entity_ids': ['mira'],
+            'text': 'Mira was drowning but has been rescued.',
+            'certainty': 'confirmed',
+            'visibility': 'party_known',
+        })
+        self.world.knowledge_graph = json.dumps(graph)
+        self.world.world_state = json.dumps({
+            'current_scene': {
+                'location_id': 'the_dock',
+                'location_name': 'The Dock',
+                'active_npc_ids': [],
+            },
+        })
+        db.session.commit()
+
+        self._clock('mira_in_peril', 'Mira in Peril', 4, 2, summary='Mira is drowning at 0 HP.')
+        db.session.commit()
+
+        report = self._run_fixture()
+        db.session.commit()
+
+        clock = CampaignClock.query.filter_by(campaign_id=self.campaign.id, clock_id='mira_in_peril').one()
+        self.assertEqual(clock.status, 'superseded')
+        self.assertEqual(report['clocks_superseded'][0]['kind'], 'condition_resolved')
+        self.assertTrue(report['verified'])
+
     def test_generic_location_word_does_not_match_inside_larger_word(self):
         """'sea' inside 'season' / 'road' inside 'broad' must not assert a
         generic location binding and falsely supersede a clock."""

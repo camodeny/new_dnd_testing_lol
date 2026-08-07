@@ -83,7 +83,15 @@ _PERSISTENCE_MARKERS = frozenset({
     'still', 'yet', 'remains', 'remaining', 'continues', 'ongoing', 'meanwhile',
 })
 
+# Past-tense / historical markers that place a condition mention in a
+# historical clause (e.g. "was unconscious but is now conscious").
+_HISTORICAL_MARKERS = frozenset({
+    'was', 'were', 'had', 'been', 'used', 'once', 'previously', 'earlier',
+    'formerly', 'before',
+})
+
 _NEGATION_WINDOW = 3
+_HISTORICAL_WINDOW = 4
 
 SEGMENT_REF_RE = re.compile(r'(\d+)\s*/\s*(\d+)')
 _CLOCK_NEAR_WINDOW = 70
@@ -362,13 +370,32 @@ def _negated_before(tokens, index):
     return False
 
 
+def _condition_is_historical(tokens, condition_index, resolution_indices):
+    """True when a condition mention is part of an explicit historical transition
+    to resolution, e.g. 'was drowning but has been rescued': the condition sits
+    in a past-tense clause AND an un-negated resolution phrase follows it in the
+    same fact."""
+    start = max(0, condition_index - _HISTORICAL_WINDOW)
+    has_past_marker = any(
+        token in _HISTORICAL_MARKERS
+        for token in tokens[start:condition_index]
+    )
+    if not has_past_marker:
+        return False
+    return any(resolution_index > condition_index for resolution_index in resolution_indices)
+
+
 def _fact_asserts_resolution(fact_text):
     """Return True only when ``fact_text`` affirmatively records that a danger
-    condition resolved. Fail-closed: an affirmatively asserted condition word in
-    the same fact (e.g. 'alive but drowning', 'conscious but poisoned', 'alive
-    but still drowning') means the danger is ongoing and is NOT resolution.
-    A condition word is not a contradiction when it is negated or ceased
-    (e.g. 'no longer drowning')."""
+    condition resolved.
+
+    Fail-closed: a condition word that is still currently asserted (not negated
+    or ceased, and not part of an explicit historical transition to resolution)
+    means the danger is ongoing and the fact is NOT resolution. Examples that
+    are NOT resolution: 'alive but drowning', 'conscious but poisoned', 'not
+    safe', 'alive but still drowning'. Examples that ARE resolution: 'stabilized
+    and now conscious', 'was unconscious but is now conscious', 'was drowning
+    but has been rescued', 'no longer drowning'."""
     if not fact_text:
         return False
     tokens = _tokenize(fact_text)
@@ -384,20 +411,9 @@ def _fact_asserts_resolution(fact_text):
         if any(_contains_phrase(following, condition) for condition in CONDITION_WORDS):
             return False
 
-    # Any condition word that is still affirmatively asserted (not negated or
-    # ceased) contradicts resolution, even without a persistence marker.
-    for condition in CONDITION_WORDS:
-        condition_tokens = _tokenize(condition)
-        if not condition_tokens:
-            continue
-        for index in range(len(tokens) - len(condition_tokens) + 1):
-            if tokens[index:index + len(condition_tokens)] != condition_tokens:
-                continue
-            if _negated_before(tokens, index):
-                continue
-            return False
-
-    # Any un-negated resolution phrase is affirmative evidence of resolution.
+    # Locate un-negated resolution phrase starts so historical transitions can
+    # be distinguished from currently asserted conditions.
+    resolution_indices = []
     for phrase in RESOLUTION_WORDS:
         phrase_tokens = _tokenize(phrase)
         if not phrase_tokens:
@@ -407,8 +423,24 @@ def _fact_asserts_resolution(fact_text):
                 continue
             if _negated_before(tokens, index):
                 continue
-            return True
-    return False
+            resolution_indices.append(index)
+
+    # Any condition word that is still affirmatively asserted (not negated, not
+    # an explicit historical transition) contradicts resolution.
+    for condition in CONDITION_WORDS:
+        condition_tokens = _tokenize(condition)
+        if not condition_tokens:
+            continue
+        for index in range(len(tokens) - len(condition_tokens) + 1):
+            if tokens[index:index + len(condition_tokens)] != condition_tokens:
+                continue
+            if _negated_before(tokens, index):
+                continue
+            if _condition_is_historical(tokens, index, resolution_indices):
+                continue
+            return False
+
+    return bool(resolution_indices)
 
 
 def _clock_condition_resolved(campaign, graph, clock, subject_id):
