@@ -97,6 +97,29 @@ def _lower_words(text):
     return set(re.findall(r"[a-z0-9']+", str(text).lower().replace('_', ' ')))
 
 
+def _tokenize(text):
+    """Lowercase, word-boundary token list (word chars and apostrophes)."""
+    return re.findall(r"[a-z0-9']+", str(text).lower().replace('_', ' '))
+
+
+def _contains_phrase(text, phrase):
+    """True when ``phrase`` appears as a contiguous, whole-word sequence inside
+    ``text``. Substring matches inside larger words never count (e.g. 'sea' in
+    'season', 'conscious' in 'unconscious')."""
+    if not phrase:
+        return False
+    phrase_tokens = _tokenize(phrase)
+    if not phrase_tokens:
+        return False
+    tokens = _tokenize(text)
+    if len(tokens) < len(phrase_tokens):
+        return False
+    for index in range(len(tokens) - len(phrase_tokens) + 1):
+        if tokens[index:index + len(phrase_tokens)] == phrase_tokens:
+            return True
+    return False
+
+
 def _subject_index(campaign, graph):
     """Map known entity/NPC id -> display name for subjects referenced by clocks.
 
@@ -148,14 +171,14 @@ def _clock_text(clock):
 
 
 def _clock_subject_ids(clock, subject_index):
-    text = _clock_text(clock).lower()
+    text = _clock_text(clock)
     if not text:
         return []
     matched = []
     for subject_id, name in subject_index.items():
         if not name:
             continue
-        if name.lower() in text:
+        if _contains_phrase(text, name):
             matched.append(subject_id)
     return matched
 
@@ -211,12 +234,11 @@ def _subject_committed_location(campaign, graph, world_state, subject_id):
 def _clock_asserted_locations(clock, location_index):
     """Return (known_location_ids, generic_location_words) asserted by a clock."""
     text = _clock_text(clock)
-    lowered = text.lower()
     known_ids = []
     for loc_id, loc in location_index.items():
-        if loc['name'].lower() in lowered:
+        if _contains_phrase(text, loc['name']):
             known_ids.append(loc_id)
-    generic_words = sorted(word for word in LOCATION_WORDS if word in lowered)
+    generic_words = sorted(word for word in LOCATION_WORDS if _contains_phrase(text, word))
     return known_ids, generic_words
 
 
@@ -291,8 +313,8 @@ def _clock_location_conflict(campaign, graph, world_state, clock, subject_id):
 def _clock_condition_resolved(campaign, graph, clock, subject_id):
     """Return a reason string when committed facts show the subject's danger
     condition (asserted by the clock) has resolved, else None."""
-    text = _clock_text(clock).lower()
-    if not any(word in text for word in CONDITION_WORDS):
+    text = _clock_text(clock)
+    if not any(_contains_phrase(text, word) for word in CONDITION_WORDS):
         return None
     if not isinstance(graph, dict):
         return None
@@ -302,10 +324,10 @@ def _clock_condition_resolved(campaign, graph, clock, subject_id):
         entity_ids = fact.get('entity_ids', []) if isinstance(fact.get('entity_ids'), list) else []
         if subject_id not in entity_ids:
             continue
-        fact_text = clean_text(fact.get('text'), 700).lower()
+        fact_text = clean_text(fact.get('text'), 700)
         if not fact_text:
             continue
-        if any(word in fact_text for word in RESOLUTION_WORDS):
+        if any(_contains_phrase(fact_text, word) for word in RESOLUTION_WORDS):
             return (
                 f'Committed facts record that the clock subject\'s condition '
                 f'has resolved: "{clean_text(fact.get("text"), 240)}".'
@@ -321,7 +343,6 @@ def _patch_summary_clock_segments(summary, clock):
     name = clean_text(clock.name, 200)
     if not name:
         return summary, []
-    name_pattern = re.escape(name.lower())
     committed_n = min(clock.filled or 0, clock.segments or 4)
     committed_m = clock.segments or 4
 
@@ -332,7 +353,7 @@ def _patch_summary_clock_segments(summary, clock):
         window_start = max(0, match.start() - _CLOCK_NEAR_WINDOW)
         window_end = min(len(summary), match.end() + _CLOCK_NEAR_WINDOW)
         window = summary[window_start:window_end]
-        if not re.search(name_pattern, window.lower()):
+        if not _contains_phrase(window, name):
             continue
         old_n = int(match.group(1))
         old_m = int(match.group(2))

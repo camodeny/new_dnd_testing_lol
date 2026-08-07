@@ -220,6 +220,64 @@ class PostTurnConsistencyTest(unittest.TestCase):
         self.assertEqual(report['clocks_superseded'][0]['kind'], 'condition_resolved')
         self.assertTrue(report['verified'])
 
+    def test_unconscious_does_not_match_resolution_word_conscious(self):
+        """A committed fact that Mira is *unconscious* must not be treated as
+        evidence the danger condition resolved (substring 'conscious')."""
+        graph = json.loads(self.world.knowledge_graph)
+        graph['facts'].append({
+            'id': 'fact_mira_still_unconscious',
+            'entity_ids': ['mira'],
+            'text': 'Mira is still unconscious and has not regained consciousness.',
+            'certainty': 'confirmed',
+            'visibility': 'party_known',
+        })
+        self.world.knowledge_graph = json.dumps(graph)
+        db.session.commit()
+
+        self._clock('mira_in_peril', 'Mira in Peril', 4, 2, summary='Mira is unconscious and drowning at 0 HP.')
+        db.session.commit()
+
+        report = self._run_fixture()
+        db.session.commit()
+
+        clock = CampaignClock.query.filter_by(campaign_id=self.campaign.id, clock_id='mira_in_peril').one()
+        self.assertEqual(clock.status, 'active')
+        self.assertEqual(report['clocks_superseded'], [])
+        self.assertTrue(report['verified'])
+
+    def test_generic_location_word_does_not_match_inside_larger_word(self):
+        """'sea' inside 'season' / 'road' inside 'broad' must not assert a
+        generic location binding and falsely supersede a clock."""
+        self._clock('mira_in_the_season', 'Mira in the Season', 4, 2, summary='Mira drifts with the tide.')
+        db.session.commit()
+
+        report = self._run_fixture()
+        db.session.commit()
+
+        clock = CampaignClock.query.filter_by(campaign_id=self.campaign.id, clock_id='mira_in_the_season').one()
+        self.assertEqual(clock.status, 'active')
+        self.assertEqual(report['clocks_superseded'], [])
+        self.assertTrue(report['verified'])
+
+    def test_overlapping_npc_names_do_not_bind_wrong_subject(self):
+        """A clock about 'Miranda' must not bind to the NPC 'Mira' whose name is
+        a substring, so a conflicting location for Mira does not retire a clock
+        that is actually about Miranda."""
+        miram = NPCActor(campaign_id=self.campaign.id, actor_id='miranda', name='Miranda', dossier='{}')
+        db.session.add(miram)
+        db.session.commit()
+
+        self._clock('miranda_in_the_water', 'Miranda in the Water', 4, 2)
+        db.session.commit()
+
+        report = self._run_fixture()
+        db.session.commit()
+
+        clock = CampaignClock.query.filter_by(campaign_id=self.campaign.id, clock_id='miranda_in_the_water').one()
+        self.assertEqual(clock.status, 'active')
+        self.assertEqual(report['clocks_superseded'], [])
+        self.assertTrue(report['verified'])
+
     def test_memory_failure_still_reconciles_durable_state(self):
         """Even when memory fails (turn reports error), deterministic repairs
         bring clocks and summary to one coherent durable state."""
