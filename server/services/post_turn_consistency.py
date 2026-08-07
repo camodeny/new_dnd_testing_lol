@@ -511,6 +511,17 @@ def reconcile_post_turn_state(
         subject_ids = _clock_subject_ids(clock, subject_index)
         if not subject_ids:
             continue
+        if len(subject_ids) > 1:
+            # A clock that names more than one known subject has no structured
+            # identity to make one binding authoritative. Supersession is a
+            # durable destructive action, so never retire it based on an
+            # arbitrary first match: treat it as ambiguous and leave it active.
+            check('clock_subject_identity', 'ambiguous', {
+                'clock_id': clock.clock_id,
+                'subject_ids': subject_ids,
+                'reason': 'Clock references multiple subjects; refusing to supersede on an arbitrary match.',
+            })
+            continue
         subject_id = subject_ids[0]
         location_reason, location_kind = _clock_location_conflict(campaign, graph, world_state, clock, subject_id)
         condition_reason = _clock_condition_resolved(campaign, graph, clock, subject_id)

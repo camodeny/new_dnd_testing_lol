@@ -279,6 +279,36 @@ class PostTurnConsistencyTest(unittest.TestCase):
         self.assertEqual(report['clocks_superseded'], [])
         self.assertTrue(report['verified'])
 
+    def test_multiple_subjects_not_retired_on_arbitrary_first_match(self):
+        """A clock naming more than one known subject must not be superseded
+        based on an arbitrary first match. Here Mira has relocated to the dock
+        (which alone would retire the clock) but Toren is still in danger, so
+        the clock stays active."""
+        toren = NPCActor(campaign_id=self.campaign.id, actor_id='toren', name='Toren', dossier='{}')
+        db.session.add(toren)
+        db.session.commit()
+
+        self._clock(
+            'mira_and_toren_in_the_water',
+            'Mira and Toren in the Water',
+            4,
+            2,
+            summary='Both are unconscious and being hauled toward the dock.',
+        )
+        db.session.commit()
+
+        report = self._run_fixture()
+        db.session.commit()
+
+        clock = CampaignClock.query.filter_by(campaign_id=self.campaign.id, clock_id='mira_and_toren_in_the_water').one()
+        self.assertEqual(clock.status, 'active')
+        self.assertEqual(report['clocks_superseded'], [])
+        self.assertTrue(report['verified'])
+        self.assertTrue(any(
+            check['id'] == 'clock_subject_identity' and check['status'] == 'ambiguous'
+            for check in report['checks']
+        ))
+
     def test_party_known_clock_not_superseded_by_private_fact(self):
         """A party-known danger clock must not be superseded based on a
         dm_private resolution/location fact, and no party-visible surface may
