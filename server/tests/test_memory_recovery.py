@@ -11,6 +11,7 @@ sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..")
 from models import (
     Campaign,
     CampaignClock,
+    CampaignMember,
     CampaignSession,
     CampaignWorld,
     Character,
@@ -775,12 +776,82 @@ class SessionMemoryRecoveryTaskTest(unittest.TestCase):
         refreshed = db.session.get(SessionMemoryRecoveryTask, task.id)
         self.assertEqual(refreshed.status, "pending")
 
-    def test_retry_skips_reapply_when_memory_already_applied(self):
-        # Integration with #107-style failure reconciliation: a stored failed
-        # patch may carry a base_memory_revision that is now behind the durable
-        # revision (another branch advanced it during memory-failure recovery).
-        # The retry must not reject it as stale; it skips re-applying memory and
-        # completes the skipped clock replay.
+    def test_retry_skips_reapply_after_task_memory_marker_set(self):
+        # A prior attempt may have applied memory but failed the clock replay,
+        # leaving the task pending. The per-task memory_applied marker (never the
+        # world revision) records that this exact patch is durable, so the retry
+        # skips re-applying it and completes the skipped clock replay.
+        db.session.add(
+            NPCActor(
+                campaign_id=self.campaign.id,
+                actor_id="vex_mal",
+                name="Vex Mal",
+                dossier="{}",
+            )
+        )
+        db.session.add(mark_session_dm_turn_error(
+            self.campaign.id,
+            self.session.id,
+            player_message_id=7,
+            trace_id="trace_7",
+            error_text="missing_relation_endpoint",
+            memory_status="error",
+            clock_status="skipped",
+        ))
+        db.session.commit()
+
+        patch = {
+            "source_contract": SOURCE_CONTRACT_COMPILED_V2,
+            "base_memory_revision": self.world.memory_revision or 0,
+            "upsert_graph_entities": [],
+            "upsert_graph_relations": [{
+                "type": "rival_of",
+                "source_id": "vex_mal",
+                "target_id": "waterdeep",
+            }],
+        }
+        task = create_memory_recovery_task(
+            self.campaign.id,
+            self.session,
+            player_message_id=7,
+            dm_message_id=8,
+            err=MemoryPipelineError(stage="validation", code="missing_relation_endpoint", message="missing"),
+            patch=patch,
+            trace_id="trace_7",
+        )
+        # Simulate a prior partial recovery: memory already applied, clock replay
+        # failed, task left pending.
+        task.memory_applied = True
+        db.session.commit()
+
+        with mock.patch(
+            "services.dm_tools.build_session_clock_context",
+            return_value={"allowed_evidence_sources": []},
+        ), mock.patch(
+            "openrouter.get_session_clock_updates",
+            return_value={"advance_clocks": [], "retire_clocks": [], "create_clocks": []},
+        ), mock.patch(
+            "services.dm_tools.apply_compiled_session_memory_patch",
+        ) as apply_mock:
+            result = retry_memory_recovery_task(self.campaign.id, task.id)
+
+        self.assertTrue(result["ok"], result)
+        self.assertTrue(result["memory_already_applied"])
+        apply_mock.assert_not_called()
+
+        turn = SessionDmTurn.query.filter_by(
+            campaign_id=self.campaign.id,
+            player_message_id=7,
+        ).first()
+        self.assertEqual(turn.post_turn_status, "complete")
+        self.assertEqual(turn.clock_status, "complete")
+        self.assertFalse(has_pending_memory_recovery(self.campaign.id))
+
+    def test_stale_base_revision_fails_closed_not_silently_discarded(self):
+        # An unrelated later memory write advances the campaign revision while a
+        # recovery task is pending. The retry must NOT infer that the failed
+        # patch was applied; it must attempt the apply, reject the stale base,
+        # and keep the task pending so the missing memory is never silently lost.
         db.session.add(
             NPCActor(
                 campaign_id=self.campaign.id,
@@ -820,34 +891,19 @@ class SessionMemoryRecoveryTaskTest(unittest.TestCase):
             trace_id="trace_7",
         )
 
-        # Simulate a #107-style failure reconciliation that already advanced the
-        # durable world revision without this patch being applied.
+        # Unrelated write advances the revision; the failed patch is NOT applied.
         world = CampaignWorld.query.filter_by(campaign_id=self.campaign.id).first()
         world.memory_revision = (world.memory_revision or 0) + 1
         db.session.commit()
 
-        with mock.patch(
-            "services.dm_tools.build_session_clock_context",
-            return_value={"allowed_evidence_sources": []},
-        ), mock.patch(
-            "openrouter.get_session_clock_updates",
-            return_value={"advance_clocks": [], "retire_clocks": [], "create_clocks": []},
-        ), mock.patch(
-            "services.dm_tools.apply_compiled_session_memory_patch",
-        ) as apply_mock:
-            result = retry_memory_recovery_task(self.campaign.id, task.id)
+        result = retry_memory_recovery_task(self.campaign.id, task.id)
 
-        self.assertTrue(result["ok"], result)
-        self.assertTrue(result["memory_already_applied"])
-        apply_mock.assert_not_called()
-
-        turn = SessionDmTurn.query.filter_by(
-            campaign_id=self.campaign.id,
-            player_message_id=7,
-        ).first()
-        self.assertEqual(turn.post_turn_status, "complete")
-        self.assertEqual(turn.clock_status, "complete")
-        self.assertFalse(has_pending_memory_recovery(self.campaign.id))
+        self.assertFalse(result["ok"])
+        self.assertIn("stale", result["error"])
+        refreshed = db.session.get(SessionMemoryRecoveryTask, task.id)
+        self.assertEqual(refreshed.status, "pending")
+        self.assertFalse(refreshed.memory_applied)
+        self.assertTrue(has_pending_memory_recovery(self.campaign.id))
 
     def test_retry_fails_closed_for_invalid_patch(self):
         patch = {
@@ -969,11 +1025,35 @@ class MemoryRecoveryRouteTest(unittest.TestCase):
         )
         self.session = CampaignSession(campaign_id=self.campaign.id)
         db.session.add(self.session)
+
+        self.player_user = User(username="route_player", email="player@example.com")
+        self.player_user.set_password("password")
+        db.session.add(self.player_user)
+        self.dm_user = User(username="route_codm", email="codm@example.com")
+        self.dm_user.set_password("password")
+        db.session.add(self.dm_user)
+        db.session.flush()
+        db.session.add(
+            CampaignMember(
+                campaign_id=self.campaign.id,
+                user_id=self.player_user.id,
+                role="player",
+            )
+        )
+        db.session.add(
+            CampaignMember(
+                campaign_id=self.campaign.id,
+                user_id=self.dm_user.id,
+                role="dm",
+            )
+        )
         db.session.commit()
 
         self.token = generate_token(user.id)
         self.client = self.app.test_client()
         self.headers = {"Authorization": f"Bearer {self.token}"}
+        self.player_headers = {"Authorization": f"Bearer {generate_token(self.player_user.id)}"}
+        self.dm_headers = {"Authorization": f"Bearer {generate_token(self.dm_user.id)}"}
 
     def tearDown(self):
         db.session.rollback()
@@ -1095,6 +1175,88 @@ class MemoryRecoveryRouteTest(unittest.TestCase):
         refreshed = db.session.get(SessionMemoryRecoveryTask, task.id)
         self.assertEqual(refreshed.status, "pending")
         self.assertEqual(refreshed.attempts, 1)
+
+    def test_retry_route_requires_dm_or_owner(self):
+        from auth import generate_token
+
+        world = CampaignWorld.query.filter_by(campaign_id=self.campaign.id).first()
+        patch = {
+            "source_contract": SOURCE_CONTRACT_COMPILED_V2,
+            "base_memory_revision": world.memory_revision or 0,
+            "upsert_graph_entities": [],
+            "upsert_graph_relations": [{
+                "type": "rival_of",
+                "source_id": "vex_mal",
+                "target_id": "waterdeep",
+            }],
+        }
+        task = SessionMemoryRecoveryTask(
+            campaign_id=self.campaign.id,
+            player_message_id=3,
+            status="pending",
+            error_code="missing_relation_endpoint",
+            patch_json=json.dumps(patch),
+        )
+        db.session.add(task)
+        db.session.commit()
+
+        player_response = self.client.post(
+            f"/api/campaigns/{self.campaign.id}/memory-recovery/{task.id}/retry",
+            headers=self.player_headers,
+        )
+        self.assertEqual(player_response.status_code, 403)
+
+        dm_response = self.client.post(
+            f"/api/campaigns/{self.campaign.id}/memory-recovery/{task.id}/retry",
+            headers=self.dm_headers,
+        )
+        self.assertEqual(dm_response.status_code, 400)
+
+        # A non-member user is also denied.
+        stranger = User(username="stranger", email="stranger@example.com")
+        stranger.set_password("password")
+        db.session.add(stranger)
+        db.session.commit()
+        stranger_headers = {"Authorization": f"Bearer {generate_token(stranger.id)}"}
+        stranger_response = self.client.post(
+            f"/api/campaigns/{self.campaign.id}/memory-recovery/{task.id}/retry",
+            headers=stranger_headers,
+        )
+        self.assertEqual(stranger_response.status_code, 403)
+
+        # The task was not silently resolved by the denied retry; the DM retry
+        # above did legitimately attempt and fail the stale/invalid patch.
+        refreshed = db.session.get(SessionMemoryRecoveryTask, task.id)
+        self.assertEqual(refreshed.status, "pending")
+        self.assertEqual(refreshed.attempts, 1)
+
+    def test_pending_route_hides_recovery_metadata_from_players(self):
+        task = SessionMemoryRecoveryTask(
+            campaign_id=self.campaign.id,
+            player_message_id=4,
+            status="pending",
+            error_code="missing_relation_endpoint",
+            error_text="Relation source 'vex_mal' not found in graph entities.",
+            patch_json="{}",
+        )
+        db.session.add(task)
+        db.session.commit()
+
+        player_response = self.client.get(
+            f"/api/campaigns/{self.campaign.id}/memory-recovery/pending",
+            headers=self.player_headers,
+        )
+        self.assertEqual(player_response.status_code, 403)
+        self.assertNotIn("vex_mal", player_response.get_data(as_text=True))
+
+        dm_response = self.client.get(
+            f"/api/campaigns/{self.campaign.id}/memory-recovery/pending",
+            headers=self.dm_headers,
+        )
+        self.assertEqual(dm_response.status_code, 200)
+        data = dm_response.get_json()
+        self.assertEqual(data["count"], 1)
+        self.assertEqual(data["tasks"][0]["error_code"], "missing_relation_endpoint")
 
 
 if __name__ == "__main__":

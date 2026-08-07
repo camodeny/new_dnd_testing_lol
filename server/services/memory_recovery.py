@@ -185,27 +185,17 @@ def retry_memory_recovery_task(campaign_id, task_id):
     campaign = db.session.get(Campaign, campaign_id)
     session = db.session.get(CampaignSession, task.session_id) if task.session_id else None
 
-    # A failed patch may already have been partially recovered on an earlier
-    # attempt (memory durable, only clock replay pending), or another branch's
-    # failure reconciliation may have advanced the world revision. If the
-    # current revision is ahead of the patch's base, re-applying it would be a
-    # stale-base rejection; skip to clock replay instead.
-    from models import CampaignWorld
-
-    world = CampaignWorld.query.filter_by(campaign_id=campaign_id).first()
-    current_revision = world.memory_revision or 0 if world else 0
-    patch_base_revision = patch.get("base_memory_revision")
-    memory_already_applied = (
-        patch_base_revision is not None and current_revision > patch_base_revision
-    )
-
-    # 1. Re-apply the failed memory patch (unless it is already durable) and
-    # commit it as its own transaction so a later clock-replay failure cannot
+    # 1. Re-apply the failed memory patch unless this exact task already applied
+    # it on an earlier attempt (tracked explicitly by memory_applied -- never
+    # inferred from the world revision, which an unrelated write could advance).
+    # Committed as its own transaction so a later clock-replay failure cannot
     # drag partial clock mutations into the same commit.
-    memory_result = {"memory_already_applied": memory_already_applied}
-    if not memory_already_applied:
+    memory_result = {"memory_already_applied": bool(task.memory_applied)}
+    if not task.memory_applied:
         try:
             memory_result = apply_compiled_session_memory_patch(campaign, session, patch)
+            task = db.session.get(SessionMemoryRecoveryTask, task.id)
+            task.memory_applied = True
             db.session.commit()
         except Exception as err:
             db.session.rollback()
@@ -253,7 +243,7 @@ def retry_memory_recovery_task(campaign_id, task_id):
             'status': 'pending',
             'attempts': task.attempts,
             'task_id': task.id,
-            'memory_already_applied': memory_already_applied,
+            'memory_already_applied': bool(task.memory_applied),
         }
 
     # 4. Repair the durable turn and the recovery task in one transaction.
@@ -280,7 +270,7 @@ def retry_memory_recovery_task(campaign_id, task_id):
             'dm_message_id': task.dm_message_id,
             'memory_status': 'complete',
             'clock_status': 'complete',
-            'memory_already_applied': memory_already_applied,
+            'memory_already_applied': bool(task.memory_applied),
             'memory_result': memory_result,
         },
         source='session_memory',
@@ -296,6 +286,6 @@ def retry_memory_recovery_task(campaign_id, task_id):
         'attempts': task.attempts,
         'task_id': task.id,
         'clock_recovered': True,
-        'memory_already_applied': memory_already_applied,
+        'memory_already_applied': bool(task.memory_applied),
         'result': memory_result,
     }

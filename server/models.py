@@ -1444,6 +1444,7 @@ class SessionMemoryRecoveryTask(db.Model):
     error_text = db.Column(db.Text, nullable=True)
     patch_json = db.Column(db.Text, nullable=True)
     context_json = db.Column(db.Text, nullable=True)
+    memory_applied = db.Column(db.Boolean, nullable=False, default=False)
     attempts = db.Column(db.Integer, nullable=False, default=0)
     last_error_text = db.Column(db.Text, nullable=True)
 
@@ -1469,6 +1470,7 @@ class SessionMemoryRecoveryTask(db.Model):
             'error_text': self.error_text,
             'attempts': self.attempts,
             'last_error_text': self.last_error_text,
+            'memory_applied': bool(self.memory_applied),
             'has_patch': bool(self.patch_json),
             'created_at': self.created_at.isoformat() if self.created_at else None,
             'updated_at': self.updated_at.isoformat() if self.updated_at else None,

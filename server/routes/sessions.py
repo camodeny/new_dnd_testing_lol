@@ -934,11 +934,26 @@ def get_dm_turn_status(current_user, session_id):
     return jsonify(status)
 
 
+def _can_manage_memory_recovery(campaign, current_user):
+    """Recovery tasks replay DM-owned memory/clock writes.
+
+    Only the campaign owner (or a DM/co-DM campaign member) may inspect or
+    trigger them; ordinary players must not see DM-internal recovery metadata or
+    trigger DM-owned replays.
+    """
+    if campaign.user_id == current_user.id:
+        return True
+    member = _member_record(campaign.id, current_user.id)
+    if member and (member.role or '').lower() in {'dm', 'co_dm'}:
+        return True
+    return False
+
+
 @sessions_bp.route('/api/campaigns/<int:campaign_id>/memory-recovery/pending', methods=['GET'])
 @token_required
 def get_pending_memory_recovery(current_user, campaign_id):
     campaign = get_or_404(Campaign, campaign_id)
-    if not ensure_member(campaign, current_user):
+    if not _can_manage_memory_recovery(campaign, current_user):
         return jsonify({'error': 'Forbidden'}), 403
 
     from services.memory_recovery import pending_memory_recovery_tasks
@@ -955,7 +970,7 @@ def get_pending_memory_recovery(current_user, campaign_id):
 @token_required
 def retry_memory_recovery(current_user, campaign_id, task_id):
     campaign = get_or_404(Campaign, campaign_id)
-    if not ensure_member(campaign, current_user):
+    if not _can_manage_memory_recovery(campaign, current_user):
         return jsonify({'error': 'Forbidden'}), 403
 
     from services.memory_recovery import retry_memory_recovery_task
