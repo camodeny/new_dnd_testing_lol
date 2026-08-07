@@ -273,6 +273,7 @@ def _run_session_memory_update(
     clock_trace_label = f'session_clock_adjudicator: session {session_id}'
     memory_complete = False
     clock_complete = False
+    memory_patch = None
     try:
         hot_context = dict(hot_context if isinstance(hot_context, dict) else {})
         hot_context['turn_id'] = f"turn_{player_message_id}"
@@ -389,6 +390,8 @@ def _run_session_memory_update(
                     message=f"Memory patch missing required source_contract 'compiled_session_memory_v2'. Got: {source_contract!r}",
                 )
             memory_complete = True
+            from services.memory_recovery import resolve_memory_recovery_tasks
+            resolve_memory_recovery_tasks(campaign.id, player_message_id, resolved_reason='memory_applied')
 
         # Commit memory transaction independently
         try:
@@ -633,6 +636,19 @@ def _run_session_memory_update(
             audit_role='tools',
             commit=True,
         )
+        from services.memory_recovery import create_memory_recovery_task
+        try:
+            create_memory_recovery_task(
+                campaign_id,
+                session,
+                player_message_id,
+                dm_message_id,
+                err,
+                memory_patch,
+                trace_id=memory_trace_id,
+            )
+        except Exception:
+            db.session.rollback()
         # Reconcile durable surfaces even when memory failed so any pre-existing
         # drift (e.g. a stale active clock) is repaired where deterministically
         # possible. The turn still reports error for the memory failure. The
@@ -678,6 +694,19 @@ def _run_session_memory_update(
             audit_role='tools',
             commit=True,
         )
+        from services.memory_recovery import create_memory_recovery_task
+        try:
+            create_memory_recovery_task(
+                campaign_id,
+                session,
+                player_message_id,
+                dm_message_id,
+                err,
+                memory_patch,
+                trace_id=memory_trace_id,
+            )
+        except Exception:
+            db.session.rollback()
         terminal_revision, _incident_text = _repair_post_turn_clocks(
             campaign,
             session,
@@ -741,11 +770,22 @@ def _post_turn_status_for_player(campaign_id, session_id, player_message_id):
         event_type='memory_update_error',
     ).order_by(CampaignAuditEvent.id.desc()).first()
     if memory_error is not None:
+        from models import SessionMemoryRecoveryTask
+
+        pending_recovery = (
+            SessionMemoryRecoveryTask.query
+            .filter_by(campaign_id=campaign_id, player_message_id=player_message_id, status='pending')
+            .order_by(SessionMemoryRecoveryTask.id.desc())
+            .first()
+        )
         return _with_revision({
             'post_turn_complete': True,
             'post_turn_status': 'error',
             'memory_status': 'error',
             'clock_status': 'skipped',
+            'recoverable': True,
+            'has_pending_recovery': pending_recovery is not None,
+            'recovery_task': pending_recovery.to_dict() if pending_recovery else None,
         })
 
     memory_applied = CampaignAuditEvent.query.filter_by(
@@ -867,6 +907,37 @@ def get_dm_turn_status(current_user, session_id):
     after_message_id = request.args.get('after_message_id', type=int)
     status = _dm_turn_status_for_player(campaign.id, session_id, player_message_id=after_message_id)
     return jsonify(status)
+
+
+@sessions_bp.route('/api/campaigns/<int:campaign_id>/memory-recovery/pending', methods=['GET'])
+@token_required
+def get_pending_memory_recovery(current_user, campaign_id):
+    campaign = get_or_404(Campaign, campaign_id)
+    if not ensure_member(campaign, current_user):
+        return jsonify({'error': 'Forbidden'}), 403
+
+    from services.memory_recovery import pending_memory_recovery_tasks
+
+    tasks = pending_memory_recovery_tasks(campaign_id)
+    return jsonify({
+        'campaign_id': campaign_id,
+        'count': len(tasks),
+        'tasks': [task.to_dict() for task in tasks],
+    })
+
+
+@sessions_bp.route('/api/campaigns/<int:campaign_id>/memory-recovery/<int:task_id>/retry', methods=['POST'])
+@token_required
+def retry_memory_recovery(current_user, campaign_id, task_id):
+    campaign = get_or_404(Campaign, campaign_id)
+    if not ensure_member(campaign, current_user):
+        return jsonify({'error': 'Forbidden'}), 403
+
+    from services.memory_recovery import retry_memory_recovery_task
+
+    result = retry_memory_recovery_task(campaign_id, task_id)
+    status_code = 200 if result.get('ok') else 400
+    return jsonify(result), status_code
 
 
 @sessions_bp.route('/api/campaigns/<int:campaign_id>/sessions', methods=['POST'])
