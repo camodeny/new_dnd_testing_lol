@@ -32,7 +32,6 @@ from services.dm_tools import (
     SHEET_SCALAR_FIELDS,
     apply_clock_adjudication,
     apply_compiled_session_memory_patch,
-    apply_memory_patch,
     build_session_hot_context,
     build_session_clock_context,
     build_session_memory_context,

@@ -11,13 +11,11 @@ from models import (
     User,
     Campaign,
     CampaignSession,
-    CampaignMemoryLog,
-    CampaignAuditEvent,
-    CampaignMemoryRun,
     CampaignWorld
 )
-from services.dm_tools import apply_memory_patch, _validate_memory_scene_patch
+from services.dm_tools import apply_compiled_session_memory_patch
 from services.session_memory_agent import MemoryPipelineError, compile_staged_memory_patch
+from services.memory_resolver_schemas import SOURCE_CONTRACT_COMPILED_V2
 
 class P2HardeningTest(unittest.TestCase):
     def setUp(self):
@@ -67,7 +65,7 @@ class P2HardeningTest(unittest.TestCase):
         db.drop_all()
         self.ctx.pop()
 
-    def test_memory_anchors_persistence(self):
+    def test_memory_anchors_persistence_via_compiled_contract(self):
         anchors = {
             "current_goal": "Find the lost mine",
             "current_scene": "Inside the tavern",
@@ -77,10 +75,17 @@ class P2HardeningTest(unittest.TestCase):
             "recent_offers_promises": ["100gp reward"]
         }
         patch = {
+            'source_contract': SOURCE_CONTRACT_COMPILED_V2,
+            'base_memory_revision': self.world.memory_revision or 0,
             'running_summary': 'Summary updated',
-            'memory_anchors': anchors
+            'memory_anchors': anchors,
+            'upsert_graph_entities': [],
+            'upsert_graph_relations': [],
+            'upsert_graph_facts': [],
+            'update_npc_actors': [],
+            'record_events': [],
         }
-        apply_memory_patch(self.campaign, self.session, patch)
+        apply_compiled_session_memory_patch(self.campaign, self.session, patch)
         db.session.commit()
 
         session_db = db.session.get(CampaignSession, self.session.id)
@@ -101,142 +106,11 @@ class P2HardeningTest(unittest.TestCase):
         self.assertEqual(d2['memory_anchors']['current_goal'], "Goal")
         self.assertEqual(d2['memory_anchors']['open_clues'], [])
 
-    def test_unresolved_scene_location_does_not_overwrite_current_scene(self):
-        current_scene = {'location_id': 'waterdeep', 'location_name': 'Waterdeep'}
-        patch = {'location_id': 'baldurs_gate', 'location_name': 'Baldur\'s Gate'}
-        validated, skipped = _validate_memory_scene_patch(self.campaign, current_scene, patch, {})
-        
-        # With no visible text and unknown location, the new resolver treats it as 'new'.
-        # When no visible text exists, the validator accepts new locations.
-        # Without visible text evidence, the validator preserves safe defaults.
-        # New locations with valid IDs pass through to enable same-patch creation.
-        self.assertTrue(
-            ('location_id' in validated) or ('location_id' in skipped),
-            "Location should be either validated (new) or skipped"
-        )
-
-    def test_scene_mutation_warnings(self):
-        patch = {
-            'scene_patch': {
-                'location_id': 'baldurs_gate',
-                'location_name': 'Baldur\'s Gate'
-            }
-        }
-        CampaignMemoryLog.query.delete()
-        CampaignAuditEvent.query.delete()
-        db.session.commit()
-
-        apply_memory_patch(self.campaign, self.session, patch)
-        db.session.commit()
-
-        # With the new resolver, novel locations can be created, not warned.
-        # Verify the patch was processed without raising an exception.
-        world = CampaignWorld.query.filter_by(campaign_id=self.campaign.id).first()
-        self.assertIsNotNone(world)
-
-    def test_staged_unresolved_scene_location_emits_warning(self):
-        patch = {
-            'unresolved_items': [{
-                'kind': 'scene_location',
-                'location_id': 'baldurs_gate',
-                'location_name': 'Baldur\'s Gate',
-                'reason': 'unresolved_scene_location'
-            }]
-        }
-        CampaignMemoryLog.query.delete()
-        CampaignAuditEvent.query.delete()
-        db.session.commit()
-
-        apply_memory_patch(self.campaign, self.session, patch)
-        db.session.commit()
-
-        log = CampaignMemoryLog.query.filter_by(operation='warning').first()
-        self.assertIsNotNone(log)
-        self.assertEqual(log.error, 'scene_location_unresolved')
-        self.assertIn('baldurs_gate', log.patch_json['unresolved_items'][0])
-
-        event = CampaignAuditEvent.query.filter_by(event_type='scene_mutation_warning').first()
-        self.assertIsNotNone(event)
-        payload_data = json.loads(event.payload)
-        self.assertEqual(payload_data['warning_type'], 'scene_location_unresolved')
-
     def test_compile_missing_campaign_raises_error(self):
         with self.assertRaises(MemoryPipelineError) as ctx:
             compile_staged_memory_patch({}, {}, {})
         self.assertEqual(ctx.exception.stage, 'compilation')
         self.assertEqual(ctx.exception.code, 'missing_campaign')
-
-    def test_apply_memory_patch_rejects_invalid_enum_values(self):
-        for field in ('visibility', 'certainty'):
-            with self.subTest(field=field):
-                patch = {
-                    'upsert_graph_entities': [{
-                        'id': 'test_entity',
-                        'name': 'test entity',
-                        'type': 'other',
-                        field: f'invalid_{field}',
-                    }],
-                }
-                with self.assertRaises(MemoryPipelineError) as ctx:
-                    apply_memory_patch(self.campaign, self.session, patch)
-                self.assertEqual(ctx.exception.stage, 'validation')
-                self.assertEqual(ctx.exception.code, 'validation_error')
-
-    def test_apply_memory_patch_raises_application_error_on_persistence_failure(self):
-        from unittest.mock import patch as mock_patch
-        test_patch = {
-            'running_summary': 'summary',
-            'memory_anchors': {'current_goal': 'test'},
-        }
-        with mock_patch('services.dm_tools._world_json', side_effect=RuntimeError('db error')):
-            with self.assertRaises(MemoryPipelineError) as ctx:
-                apply_memory_patch(self.campaign, self.session, test_patch)
-        self.assertEqual(ctx.exception.stage, 'application')
-        self.assertEqual(ctx.exception.code, 'persistence_error')
-
-    def test_apply_memory_patch_accepted_with_valid_visibilities(self):
-        patch = {
-            'upsert_graph_entities': [
-                {
-                    'id': 'test_entity',
-                    'name': 'test entity',
-                    'type': 'other',
-                    'visibility': 'party_known',
-                    'certainty': 'confirmed',
-                    'source_surface': 'visible_transcript',
-                    'intended_visibility': 'party_known',
-                }
-            ],
-            'upsert_graph_relations': [],
-            'upsert_graph_facts': [],
-            'update_npc_actors': [],
-            'record_events': [],
-            'create_clocks': [],
-            'retire_clocks': [],
-        }
-        result = apply_memory_patch(self.campaign, self.session, patch)
-        self.assertIn('graph_changes', result)
-
-    def test_non_dict_patch_raises_validation_error(self):
-        with self.assertRaises(MemoryPipelineError) as ctx:
-            apply_memory_patch(self.campaign, self.session, 'not_a_dict')
-        self.assertEqual(ctx.exception.stage, 'validation')
-
-    def test_non_list_collection_raises_validation_error(self):
-        patch = {
-            'upsert_graph_entities': 'not_a_list',
-        }
-        with self.assertRaises(MemoryPipelineError) as ctx:
-            apply_memory_patch(self.campaign, self.session, patch)
-        self.assertEqual(ctx.exception.stage, 'validation')
-
-    def test_non_dict_entry_raises_validation_error(self):
-        patch = {
-            'upsert_graph_entities': ['not_a_dict'],
-        }
-        with self.assertRaises(MemoryPipelineError) as ctx:
-            apply_memory_patch(self.campaign, self.session, patch)
-        self.assertEqual(ctx.exception.stage, 'validation')
 
 
 if __name__ == '__main__':

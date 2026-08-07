@@ -503,12 +503,19 @@ def _known_ids(campaign):
 
 
 def _normalize_visibility(source_surface, intended_visibility):
-    source_surface = clean_text(source_surface, 40).lower()
     intended = clean_text(intended_visibility, 40).lower()
-    if source_surface == 'visible_transcript':
-        return 'public' if intended == 'public' else 'party_known'
+    source_surface = clean_text(source_surface, 40).lower()
+    # An explicit intended visibility is authoritative. A visible transcript
+    # source surface must never override a stricter (dm_private) intent; that
+    # would promote private dossier content into party-visible records.
     if intended == 'public':
         return 'public'
+    if intended == 'dm_private':
+        return 'dm_private'
+    # party_known is only reachable when the resolver asserts the content came
+    # from the visible transcript; otherwise fail closed to dm_private.
+    if source_surface == 'visible_transcript':
+        return 'party_known'
     return 'dm_private'
 
 
