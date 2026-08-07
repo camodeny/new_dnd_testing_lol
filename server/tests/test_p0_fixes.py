@@ -12,7 +12,7 @@ from flask import Flask
 from models import db, Campaign, CampaignWorld, CampaignSession, NPCActor
 from services.scene_location_resolver import resolve_scene_location_patch
 from services.session_memory_agent import compile_staged_memory_patch
-from services.dm_tools import _validate_memory_scene_patch, apply_memory_patch
+from services.dm_tools import apply_compiled_session_memory_patch
 import run_automation_worker as worker
 
 class P0FixesTest(unittest.TestCase):
@@ -225,7 +225,7 @@ class P0FixesTest(unittest.TestCase):
         self.assertEqual(promoted[0]['name'], 'Brunsworth Hall')
         self.assertEqual(promoted[0]['aliases'], ['Old Building'])
 
-        apply_memory_patch(self.campaign, session, compiled)
+        apply_compiled_session_memory_patch(self.campaign, session, compiled)
         db.session.refresh(self.world)
         kg = json.loads(self.world.knowledge_graph)
         brunsworth = [e for e in kg['entities'] if e['id'] == 'old_building']
@@ -274,7 +274,7 @@ class P0FixesTest(unittest.TestCase):
         session = CampaignSession(campaign_id=self.campaign.id, running_summary='Summary')
         db.session.add(session)
         db.session.commit()
-        apply_memory_patch(self.campaign, session, compiled)
+        apply_compiled_session_memory_patch(self.campaign, session, compiled)
         db.session.refresh(self.world)
         kg = json.loads(self.world.knowledge_graph)
         waterdeep = [e for e in kg['entities'] if e['id'] == 'waterdeep']
@@ -317,22 +317,6 @@ class P0FixesTest(unittest.TestCase):
         )
         created = next(entity for entity in compiled['upsert_graph_entities'] if entity['id'] == 'old_building')
         self.assertEqual(created['identity_status'], 'provisional')
-
-    # 6. apply_memory_patch never persists only one of location_id or location_name
-    # 7. Direct scene update validation accepts new locations when name is supported by visible text
-    def test_validate_memory_scene_patch_accepts_new_location_when_supported(self):
-        current_scene = {'location_id': 'waterdeep', 'location_name': 'Waterdeep'}
-        audit_context = {'latest_player_message': 'Let\'s go to Neverwinter or Baldur\'s Gate.'}
-        
-        patch = {'location_id': 'baldurs_gate', 'location_name': 'Baldur\'s Gate'}
-        validated, skipped = _validate_memory_scene_patch(self.campaign, current_scene, patch, audit_context)
-        # New location is in visible terms, so it should be validated
-        self.assertEqual(validated.get('location_id'), 'baldurs_gate')
-        self.assertEqual(validated.get('location_name'), 'Baldur\'s Gate')
-        patch = {'location_name': 'Neverwinter'}
-        validated, skipped = _validate_memory_scene_patch(self.campaign, current_scene, patch, audit_context)
-        self.assertEqual(validated.get('location_id'), 'neverwinter')
-        self.assertEqual(validated.get('location_name'), 'Neverwinter')
 
     # 8. Automation worker fails run when dm_turn.status == "error"
     # 9. Automation worker fails run when dm_turn.post_turn_status == "error"

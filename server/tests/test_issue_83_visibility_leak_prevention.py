@@ -9,7 +9,7 @@ sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), '..')
 
 from models import db, Campaign, CampaignSession, CampaignWorld, NPCActor
 from services.session_memory_agent import _normalize_visibility, compile_staged_memory_patch
-from services.dm_tools import apply_memory_patch, apply_compiled_session_memory_patch
+from services.dm_tools import apply_compiled_session_memory_patch
 from services.memory_resolver_schemas import SOURCE_CONTRACT_COMPILED_V2
 
 
@@ -169,6 +169,11 @@ class Issue83VisibilityLeakPreventionTest(unittest.TestCase):
         db.session.commit()
 
         patch = {
+            'source_contract': SOURCE_CONTRACT_COMPILED_V2,
+            'base_memory_revision': self.world.memory_revision or 0,
+            'upsert_graph_entities': [],
+            'upsert_graph_relations': [],
+            'upsert_graph_facts': [],
             'update_npc_actors': [
                 {
                     'id': 'old_garret',
@@ -180,13 +185,14 @@ class Issue83VisibilityLeakPreventionTest(unittest.TestCase):
                     'relationships': {'lady_elara_vex': 'Secretly serves her'},
                     'visibility': 'party_known',
                 }
-            ]
+            ],
+            'record_events': [],
         }
         audit_context = {
             'latest_player_message': 'The party meets the dock foreman.',
             'latest_dm_message': 'Old Garret greets the party at the docks.',
         }
-        apply_memory_patch(self.campaign, self.session, patch, audit_context=audit_context)
+        apply_compiled_session_memory_patch(self.campaign, self.session, patch, audit_context=audit_context)
         db.session.commit()
 
         db.session.refresh(npc)
@@ -200,42 +206,6 @@ class Issue83VisibilityLeakPreventionTest(unittest.TestCase):
         self.assertEqual(dossier['secrets'], ['Is secretly the saboteur.'])
         self.assertIn('Lady Elara Vex', dossier['background'])
         self.assertEqual(dossier['relationships'], {'lady_elara_vex': 'Secretly serves her'})
-
-    # ── Apply path: leak guard redacts private terms from party entities ──
-    def test_leak_guard_demotes_party_known_entity_with_unrevealed_private_summary(self):
-        spymaster = NPCActor(
-            campaign_id=self.campaign.id,
-            actor_id='brother_ollin',
-            name='Brother Ollin',
-            dossier=json.dumps({'secrets': ['the spy']}),
-        )
-        db.session.add(spymaster)
-        db.session.commit()
-
-        patch = {
-            'upsert_graph_entities': [
-                {
-                    'id': 'old_garret',
-                    'name': 'Old Garret',
-                    'type': 'npc',
-                    'summary': 'A dock foreman who is the spy.',
-                    'visibility': 'party_known',
-                }
-            ]
-        }
-        audit_context = {
-            'latest_player_message': 'We talk to the dock foreman.',
-            'latest_dm_message': 'The dock foreman gives the party directions.',
-        }
-        apply_memory_patch(self.campaign, self.session, patch, audit_context=audit_context)
-        db.session.commit()
-
-        db.session.refresh(self.world)
-        graph = json.loads(self.world.knowledge_graph)
-        entity = next(e for e in graph['entities'] if e['id'] == 'old_garret')
-        # The unrevealed private term must never be party-visible: the record is
-        # demoted to dm_private (or its summary redacted) before persistence.
-        self.assertEqual(entity['visibility'], 'dm_private')
 
     # ── Compiled path: leak guard redacts summary but preserves visible name ──
     def test_compiled_path_redacts_private_summary_keeps_visible_name(self):

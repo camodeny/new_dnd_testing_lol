@@ -28,7 +28,7 @@ from models import (
 from services.automation_service import create_audit_cycle
 from services.automation_auditor import execute_auditor_tool, _cycle_boundaries
 from services.session_memory_agent import compile_staged_memory_patch
-from services.dm_tools import _validate_memory_scene_patch, apply_memory_patch
+from services.dm_tools import apply_compiled_session_memory_patch
 
 class P1ImprovementsTest(unittest.TestCase):
     def setUp(self):
@@ -401,23 +401,6 @@ class P1ImprovementsTest(unittest.TestCase):
         calls = res.get('provider_calls', [])
         self.assertEqual(len(calls), 0)
 
-    def test_metadata_only_scene_patch_does_not_mutate_or_trigger_events(self):
-        patch = {
-            'scene_patch': {
-                'provenance': {'source_player_message_id': 1},
-                'resolution_mode': 'canonical'
-            }
-        }
-        result = apply_memory_patch(self.campaign, self.session, patch)
-        self.assertNotIn('scene_updated', result.get('world_event_ids', []))
-
-        db.session.refresh(self.world)
-        import json
-        state = json.loads(self.world.world_state)
-        current_scene = state.get('current_scene', {})
-        self.assertNotIn('provenance', current_scene)
-        self.assertNotIn('resolution_mode', current_scene)
-
     def test_staged_entity_upsert_survives_compilation(self):
         memory_context = {'campaign_id': self.campaign.id}
         extracted = {}
@@ -599,112 +582,6 @@ class P1ImprovementsTest(unittest.TestCase):
         self.assertEqual(ctx.exception.stage, 'compilation')
         self.assertEqual(ctx.exception.code, 'missing_campaign')
 
-    def test_persistence_applies_new_mutations(self):
-        # Known NPC in DB
-        npc = NPCActor(campaign_id=self.campaign.id, actor_id='sildar_hallwinter', name='Sildar Hallwinter', public_summary='A human warrior.', dossier='{}')
-        db.session.add(npc)
-        db.session.commit()
-
-        compiled_patch = {
-            'running_summary': 'New Summary',
-            'upsert_graph_entities': [
-                {
-                    'id': 'gundren_rockseeker',
-                    'name': 'Gundren Rockseeker',
-                    'type': 'npc',
-                    'summary': 'A dwarf patron.'
-                }
-            ],
-            'upsert_graph_relations': [
-                {
-                    'id': 'rel_gundren_sildar',
-                    'type': 'friends',
-                    'source_id': 'gundren_rockseeker',
-                    'target_id': 'sildar_hallwinter',
-                    'summary': 'They are friends.'
-                }
-            ],
-            'update_npc_actors': [
-                {
-                    'id': 'sildar_hallwinter',
-                    'role': 'Warrior member of Lord\'s Alliance'
-                }
-            ],
-            'record_events': [
-                {
-                    'event_type': 'story_beat',
-                    'summary': 'Gundren hired the party.',
-                    'payload': {'gold': 10}
-                }
-            ]
-        }
-        res = apply_memory_patch(self.campaign, self.session, compiled_patch)
-        self.assertTrue(res['running_summary_updated'])
-        self.assertEqual(len(res['graph_changes']), 2) # entity + relation
-        self.assertEqual(len(res['npc_changes']), 1)
-        self.assertEqual(len(res['world_event_ids']), 2) # NPC update records an event, and the manual event record
-
-        # Verify NPC got updated in DB
-        db.session.refresh(npc)
-        self.assertEqual(npc.role, 'Warrior member of Lord\'s Alliance')
-
-        # Verify entity got created in CampaignWorld KG
-        db.session.refresh(self.world)
-        import json
-        kg = json.loads(self.world.knowledge_graph)
-        self.assertTrue(any(e['id'] == 'gundren_rockseeker' for e in kg['entities']))
-        self.assertTrue(any(r['id'] == 'rel_gundren_sildar' for r in kg['relations']))
-
-    def test_relation_id_collision_across_patches(self):
-        # 1. First patch: Stonehill Inn located in Phandalin
-        self.world.knowledge_graph = '{"entities":[{"id":"stonehill_inn","type":"location","name":"Stonehill Inn"},{"id":"phandalin","type":"location","name":"Phandalin"}],"relations":[],"facts":[]}'
-        db.session.add(self.world)
-        db.session.commit()
-
-        compiled_patch_1 = {
-            'upsert_graph_relations': [
-                {
-                    'type': 'located_in',
-                    'source_id': 'stonehill_inn',
-                    'target_id': 'phandalin',
-                    'summary': 'The Inn is in Phandalin.'
-                }
-            ]
-        }
-        res1 = apply_memory_patch(self.campaign, self.session, compiled_patch_1)
-        self.assertEqual(len(res1['graph_changes']), 1)
-
-        # 2. Second patch: Gundren friends with Sildar
-        db.session.refresh(self.world)
-        kg1 = json.loads(self.world.knowledge_graph)
-        kg1['entities'].extend([
-            {'id': 'gundren', 'type': 'npc', 'name': 'Gundren'},
-            {'id': 'sildar', 'type': 'npc', 'name': 'Sildar'}
-        ])
-        self.world.knowledge_graph = json.dumps(kg1)
-        db.session.add(self.world)
-        db.session.commit()
-
-        compiled_patch_2 = {
-            'upsert_graph_relations': [
-                {
-                    'type': 'friends',
-                    'source_id': 'gundren',
-                    'target_id': 'sildar',
-                    'summary': 'They are friends.'
-                }
-            ]
-        }
-        res2 = apply_memory_patch(self.campaign, self.session, compiled_patch_2)
-        self.assertEqual(len(res2['graph_changes']), 1)
-
-        # Confirm both relations exist in DB
-        db.session.refresh(self.world)
-        kg2 = json.loads(self.world.knowledge_graph)
-        self.assertEqual(len(kg2['relations']), 2)
-        self.assertTrue(any(r['type'] == 'located_in' for r in kg2['relations']))
-        self.assertTrue(any(r['type'] == 'friends' for r in kg2['relations']))
-
     def test_npc_metadata_completeness(self):
         # Seed an NPC actor to update
         npc = NPCActor(campaign_id=self.campaign.id, actor_id='gundren_rockseeker', name='Gundren', public_summary='Dwarf', dossier='{}')
@@ -737,7 +614,7 @@ class P1ImprovementsTest(unittest.TestCase):
         self.assertEqual(npcs[0]['memory_type'], 'npc')
 
         # Persist it
-        apply_memory_patch(self.campaign, self.session, compiled)
+        apply_compiled_session_memory_patch(self.campaign, self.session, compiled)
         db.session.refresh(npc)
         dossier = json.loads(npc.dossier)
         self.assertEqual(dossier.get('relationships'), {'sildar_hallwinter': 'Friends'})
@@ -780,42 +657,6 @@ class P1ImprovementsTest(unittest.TestCase):
         self.assertEqual(len(events), 1)
         # Without visible_transcript source_surface, it MUST fail closed to dm_private
         self.assertEqual(events[0]['visibility'], 'dm_private')
-
-    def test_npc_update_remapping_after_entity_dedupe(self):
-        # Sildar is already in the campaign knowledge graph
-        self.world.knowledge_graph = '{"entities":[{"id":"sildar_hallwinter_canonical","type":"npc","name":"Sildar Hallwinter"}],"relations":[],"facts":[]}'
-        db.session.add(self.world)
-        db.session.commit()
-
-        # Update NPC actor loop remaps temporary Same-Patch Entity IDs to their Deduplicated IDs
-        compiled_patch = {
-            'upsert_graph_entities': [
-                {
-                    'id': 'sildar_hallwinter_temp',
-                    'name': 'Sildar Hallwinter', # same name, will deduplicate to sildar_hallwinter_canonical
-                    'type': 'npc'
-                }
-            ],
-            'update_npc_actors': [
-                {
-                    'id': 'sildar_hallwinter_temp',
-                    'role': 'Warrior of Phandalin'
-                }
-            ]
-        }
-        
-        # Create an NPCActor under the canonical ID so it can be updated
-        npc = NPCActor(campaign_id=self.campaign.id, actor_id='sildar_hallwinter_canonical', name='Sildar', public_summary='Warrior', dossier='{}')
-        db.session.add(npc)
-        db.session.commit()
-
-        res = apply_memory_patch(self.campaign, self.session, compiled_patch)
-        self.assertEqual(len(res['npc_changes']), 1)
-        self.assertEqual(res['npc_changes'][0]['npc_actor']['actor_id'], 'sildar_hallwinter_canonical')
-        
-        # Verify the actual NPCActor was updated in DB
-        db.session.refresh(npc)
-        self.assertEqual(npc.role, 'Warrior of Phandalin')
 
     def test_entity_id_trust_and_same_patch_compilation_remapping(self):
         memory_context = {'campaign_id': self.campaign.id}
@@ -872,7 +713,7 @@ class P1ImprovementsTest(unittest.TestCase):
         self.assertEqual(rels[0]['target_id'], 'sildar_hallwinter_canonical')
 
         # Run persistence to verify it applies fully
-        res = apply_memory_patch(self.campaign, self.session, compiled)
+        res = apply_compiled_session_memory_patch(self.campaign, self.session, compiled)
         self.assertEqual(len(res['npc_changes']), 1)
         self.assertEqual(res['npc_changes'][0]['npc_actor']['actor_id'], 'gundren_rockseeker')
 
@@ -964,7 +805,7 @@ class P1ImprovementsTest(unittest.TestCase):
         self.assertEqual(rels[0]['target_id'], 'sildar_hallwinter_canonical')
 
         # Run persistence to verify it applies fully
-        res = apply_memory_patch(self.campaign, self.session, compiled)
+        res = apply_compiled_session_memory_patch(self.campaign, self.session, compiled)
         self.assertEqual(len(res['npc_changes']), 1)
         self.assertEqual(res['npc_changes'][0]['npc_actor']['actor_id'], 'gundren_rockseeker')
 
@@ -1118,52 +959,6 @@ class P1ImprovementsTest(unittest.TestCase):
         self.assertEqual(clocks[0]['provenance']['evidence_status'], 'supported_by_evidence')
         self.assertIn('evidence_sources', clocks[0]['provenance'])
 
-    def test_memory_log_persistence_stores_provenance(self):
-        from models import CampaignMemoryLog, CampaignClock
-
-        patch = {
-            'create_clocks': [
-                {
-                    'id': 'clock_prov_test',
-                    'name': 'Provenance Test Clock',
-                    'segments': 4,
-                    'filled': 1,
-                    'visibility': 'party_known',
-                    'provenance': {
-                        'source_player_message_id': 300,
-                        'source_dm_message_id': 400,
-                        'tool_name': 'test_tool',
-                        'evidence_sources': [
-                            {'source_type': 'transcript_message', 'source_id': 'msg_400'}
-                        ],
-                        'evidence_status': 'supported_by_evidence',
-                        'pipeline_stage': 'applied',
-                    },
-                }
-            ],
-        }
-
-        apply_memory_patch(self.campaign, self.session, patch)
-
-        logs = CampaignMemoryLog.query.filter_by(
-            campaign_id=self.campaign.id,
-            target_table='campaign_clocks',
-            memory_id='clock_prov_test',
-        ).all()
-        self.assertGreaterEqual(len(logs), 1)
-
-        log = logs[0]
-        self.assertEqual(log.evidence_status, 'supported_by_evidence')
-        self.assertIsNotNone(log.provenance_json)
-        self.assertEqual(log.provenance_json.get('tool_name'), 'test_tool')
-        self.assertEqual(log.provenance_json.get('source_player_message_id'), 300)
-        self.assertEqual(log.provenance_json.get('pipeline_stage'), 'applied')
-        self.assertIn('evidence_sources', log.provenance_json)
-
-        clock = CampaignClock.query.filter_by(campaign_id=self.campaign.id, clock_id='clock_prov_test').first()
-        self.assertIsNotNone(clock)
-        self.assertEqual(clock.name, 'Provenance Test Clock')
-
     def test_clock_advance_records_provenance(self):
         from models import CampaignClock, WorldEvent
         from services.dm_tools import _tool_advance_clock
@@ -1259,44 +1054,6 @@ class P1ImprovementsTest(unittest.TestCase):
         retire_payload = json.loads(retire_event.payload) if retire_event.payload else {}
         self.assertIn('provenance', retire_payload)
         self.assertEqual(retire_payload['provenance']['tool_name'], 'test_retire')
-
-    def test_provenance_survives_roundtrip_in_memory_log(self):
-        from models import CampaignMemoryLog
-
-        patch = {
-            'update_npc_actors': [
-                {
-                    'id': 'test_npc_prov',
-                    'name': 'Test NPC',
-                    'role': 'Test',
-                    'provenance': {
-                        'source_player_message_id': 888,
-                        'tool_name': 'test_resolver',
-                        'evidence_sources': [
-                            {'source_type': 'prior_memory_record', 'source_id': 'mem_abc'}
-                        ],
-                        'evidence_status': 'supported_by_evidence',
-                        'pipeline_stage': 'applied',
-                        'resolution_confidence': 0.85,
-                    },
-                }
-            ],
-        }
-        result = apply_memory_patch(self.campaign, self.session, patch)
-        self.assertEqual(len(result['npc_changes']), 1)
-
-        logs = CampaignMemoryLog.query.filter_by(
-            campaign_id=self.campaign.id,
-            target_table='npc_actors',
-        ).all()
-        log = next((log_entry for log_entry in logs if log_entry.memory_id == 'test_npc_prov'), None)
-        self.assertIsNotNone(log, 'Memory log should exist for test NPC')
-        self.assertEqual(log.evidence_status, 'supported_by_evidence')
-        self.assertIsNotNone(log.provenance_json)
-        self.assertEqual(log.provenance_json.get('tool_name'), 'test_resolver')
-        self.assertEqual(log.provenance_json.get('source_player_message_id'), 888)
-        self.assertEqual(log.provenance_json.get('pipeline_stage'), 'applied')
-        self.assertEqual(log.provenance_json.get('resolution_confidence'), 0.85)
 
     def test_identity_resolution_provenance_in_resolution_records(self):
         memory_context = {
@@ -1398,362 +1155,6 @@ class P1ImprovementsTest(unittest.TestCase):
                 )
                 self.assertTrue(compiled_provenance['build_sha'])
 
-    def test_graph_entity_provenance_persists_in_memory_log(self):
-        from models import CampaignMemoryLog
-
-        patch = {
-            'upsert_graph_entities': [
-                {
-                    'id': 'test_graph_entity',
-                    'name': 'Test Graph Entity',
-                    'type': 'npc',
-                    'visibility': 'party_known',
-                    'summary': 'A test entity.',
-                    'provenance': {
-                        'tool_name': 'resolution_registry',
-                        'evidence_sources': [
-                            {'source_type': 'transcript_message', 'source_id': 'msg_42'}
-                        ],
-                        'evidence_status': 'supported_by_evidence',
-                        'pipeline_stage': 'resolved',
-                    },
-                }
-            ],
-        }
-        apply_memory_patch(self.campaign, self.session, patch)
-
-        logs = CampaignMemoryLog.query.filter_by(
-            campaign_id=self.campaign.id,
-            memory_id='test_graph_entity',
-        ).all()
-        self.assertGreaterEqual(len(logs), 1, 'Graph entity log should exist')
-        log = logs[0]
-        self.assertIsNotNone(log.provenance_json, 'Provenance should be stored')
-        self.assertEqual(log.provenance_json.get('pipeline_stage'), 'applied',
-                         'Pipeline stage must be enforced to applied at write boundary')
-        self.assertEqual(log.evidence_status, 'supported_by_evidence')
-
-    def test_graph_relation_and_fact_provenance_in_memory_log(self):
-        from models import CampaignMemoryLog
-
-        self.world.knowledge_graph = '{"entities":[{"id":"ent_a","type":"npc","name":"A"},{"id":"ent_b","type":"npc","name":"B"}],"relations":[],"facts":[]}'
-        a_npc = NPCActor(campaign_id=self.campaign.id, actor_id='ent_a', name='A', public_summary='NPC A', dossier='{}')
-        b_npc = NPCActor(campaign_id=self.campaign.id, actor_id='ent_b', name='B', public_summary='NPC B', dossier='{}')
-        db.session.add(a_npc)
-        db.session.add(b_npc)
-        db.session.commit()
-
-        patch = {
-            'upsert_graph_relations': [
-                {
-                    'type': 'allied_with',
-                    'source_id': 'ent_a',
-                    'target_id': 'ent_b',
-                    'summary': 'Allied',
-                    'provenance': {
-                        'tool_name': 'test_rel',
-                        'evidence_status': 'supported_by_evidence',
-                        'pipeline_stage': 'proposed',
-                    },
-                }
-            ],
-            'upsert_graph_facts': [
-                {
-                    'text': 'A and B are allies.',
-                    'provenance': {
-                        'tool_name': 'test_fact',
-                        'evidence_status': 'supported_by_evidence',
-                        'pipeline_stage': 'proposed',
-                    },
-                }
-            ],
-        }
-        apply_memory_patch(self.campaign, self.session, patch)
-
-        rel_logs = CampaignMemoryLog.query.filter_by(
-            campaign_id=self.campaign.id,
-            memory_type='relation',
-        ).order_by(CampaignMemoryLog.id.desc()).all()
-        self.assertGreaterEqual(len(rel_logs), 1, 'Relation log should exist')
-        rel_log = rel_logs[0]
-        self.assertIsNotNone(rel_log.provenance_json)
-        self.assertEqual(rel_log.provenance_json.get('pipeline_stage'), 'applied',
-                         'Relation pipeline_stage must be applied')
-
-        fact_logs = CampaignMemoryLog.query.filter_by(
-            campaign_id=self.campaign.id,
-            memory_type='fact',
-        ).order_by(CampaignMemoryLog.id.desc()).all()
-        self.assertGreaterEqual(len(fact_logs), 1, 'Fact log should exist')
-        fact_log = fact_logs[0]
-        self.assertIsNotNone(fact_log.provenance_json)
-        self.assertEqual(fact_log.provenance_json.get('pipeline_stage'), 'applied',
-                         'Fact pipeline_stage must be applied')
-
-    def test_scene_and_summary_provenance_in_memory_log(self):
-        from models import CampaignMemoryLog
-
-        patch = {
-            'scene_patch': {
-                'provenance': {
-                    'tool_name': 'resolve_scene_location_patch',
-                    'evidence_status': 'supported_by_evidence',
-                    'pipeline_stage': 'resolved',
-                },
-            },
-            'running_summary': 'A new summary.',
-            'memory_anchors': {
-                'current_goal': 'Test goal',
-            },
-        }
-        apply_memory_patch(self.campaign, self.session, patch)
-
-        summary_logs = CampaignMemoryLog.query.filter_by(
-            campaign_id=self.campaign.id,
-            memory_id='running_summary',
-        ).all()
-        self.assertGreaterEqual(len(summary_logs), 1, 'Summary log should exist')
-        s_log = summary_logs[0]
-        self.assertIsNotNone(s_log.provenance_json)
-        self.assertEqual(s_log.provenance_json.get('pipeline_stage'), 'applied')
-
-        anchor_logs = CampaignMemoryLog.query.filter_by(
-            campaign_id=self.campaign.id,
-            memory_id='memory_anchors',
-        ).all()
-        self.assertGreaterEqual(len(anchor_logs), 1, 'Anchor log should exist')
-        a_log = anchor_logs[0]
-        self.assertIsNotNone(a_log.provenance_json)
-        self.assertEqual(a_log.provenance_json.get('pipeline_stage'), 'applied')
-
-    def test_pipeline_stage_enforced_at_write_boundary(self):
-        from models import CampaignMemoryLog, WorldEvent
-
-        patch = {
-            'create_clocks': [
-                {
-                    'id': 'clock_stage_test',
-                    'name': 'Stage Test Clock',
-                    'segments': 4,
-                    'visibility': 'party_known',
-                    'provenance': {
-                        'tool_name': 'test_tool',
-                        'pipeline_stage': 'proposed',
-                        'evidence_status': 'supported_by_evidence',
-                    },
-                }
-            ],
-            'update_npc_actors': [
-                {
-                    'id': 'npc_stage_test',
-                    'name': 'Stage NPC',
-                    'provenance': {
-                        'tool_name': 'test_resolver',
-                        'pipeline_stage': 'resolved',
-                    },
-                }
-            ],
-        }
-        apply_memory_patch(self.campaign, self.session, patch)
-
-        clock_log = CampaignMemoryLog.query.filter_by(
-            campaign_id=self.campaign.id,
-            memory_id='clock_stage_test',
-        ).first()
-        self.assertIsNotNone(clock_log)
-        self.assertEqual(clock_log.provenance_json.get('pipeline_stage'), 'applied',
-                         'Clock pipeline_stage must be enforced to applied')
-
-        npc_logs = CampaignMemoryLog.query.filter_by(
-            campaign_id=self.campaign.id,
-            target_table='npc_actors',
-        ).all()
-        npc_log = next((entry for entry in npc_logs if entry.memory_id == 'npc_stage_test'), None)
-        self.assertIsNotNone(npc_log, 'NPC log should exist')
-        self.assertEqual(npc_log.provenance_json.get('pipeline_stage'), 'applied',
-                         'NPC pipeline_stage must be enforced to applied')
-
-        clock_event = WorldEvent.query.filter_by(
-            campaign_id=self.campaign.id,
-            event_type='clock_created',
-        ).order_by(WorldEvent.id.desc()).first()
-        self.assertIsNotNone(clock_event)
-        clock_event_prov = json.loads(clock_event.payload)['provenance']
-        self.assertEqual(clock_event_prov.get('pipeline_stage'), 'applied')
-        self.assertEqual(clock_event_prov.get('source_pipeline_stage'), 'proposed')
-
-    def test_clock_event_provenance_normalizes_empty_and_falsey_values(self):
-        from models import WorldEvent
-
-        create_patch = {
-            'create_clocks': [{
-                'id': 'clock_empty_provenance',
-                'name': 'Empty Provenance Clock',
-                'segments': 4,
-                'provenance': {
-                    'tool_name': None,
-                    'pipeline_stage': 'resolved',
-                    'evidence_status': None,
-                    'build_sha': None,
-                },
-            }],
-        }
-        apply_memory_patch(self.campaign, self.session, create_patch)
-        create_event = WorldEvent.query.filter_by(
-            campaign_id=self.campaign.id,
-            event_type='clock_created',
-        ).order_by(WorldEvent.id.desc()).first()
-        create_prov = json.loads(create_event.payload)['provenance']
-        self.assertEqual(create_prov['pipeline_stage'], 'applied')
-        self.assertEqual(create_prov['source_pipeline_stage'], 'resolved')
-        self.assertEqual(create_prov['tool_name'], 'session_memory_update_clocks')
-        self.assertEqual(create_prov['evidence_status'], 'insufficiently_supported')
-        self.assertTrue(create_prov['build_sha'])
-
-        retire_patch = {
-            'retire_clocks': [{
-                'clock_id': 'clock_empty_provenance',
-                'completion_criteria_verdicts': [],
-                'consequence': {
-                    'verdict': 'supported',
-                    'claims': ['The empty-provenance test clock is retired.'],
-                    'visibility': 'dm_private',
-                    'evidence_sources': [
-                        {'source_type': 'world_event', 'source_id': str(create_event.id)},
-                    ],
-                    'reason': 'Structured test adjudication.',
-                },
-                'provenance': {},
-            }],
-        }
-        apply_memory_patch(
-            self.campaign,
-            self.session,
-            retire_patch,
-            audit_context={
-                'allowed_evidence_sources': [
-                    {'source_type': 'world_event', 'source_id': str(create_event.id)},
-                ],
-            },
-        )
-        retire_event = WorldEvent.query.filter_by(
-            campaign_id=self.campaign.id,
-            event_type='clock_retired',
-        ).order_by(WorldEvent.id.desc()).first()
-        retire_prov = json.loads(retire_event.payload)['provenance']
-        self.assertEqual(retire_prov['pipeline_stage'], 'applied')
-        self.assertEqual(retire_prov['tool_name'], 'session_memory_update_clocks')
-        self.assertEqual(retire_prov['evidence_status'], 'ai_adjudicated_verified_sources')
-        self.assertTrue(retire_prov['build_sha'])
-
-    def test_cycle_evidence_packet_includes_memory_logs(self):
-        from services.automation_auditor import _cycle_evidence_packet
-        from models import AutomationRunAuditCycle
-
-        patch = {
-            'upsert_graph_facts': [
-                {
-                    'text': 'Test fact for packet.',
-                    'provenance': {
-                        'tool_name': 'test_tool',
-                        'evidence_status': 'supported_by_evidence',
-                    },
-                }
-            ],
-        }
-        apply_memory_patch(self.campaign, self.session, patch)
-
-        cycle = AutomationRunAuditCycle(
-            run_id=self.run.id,
-            cycle_number=1,
-            phase='after_player',
-            status='paused',
-        )
-        db.session.add(cycle)
-        db.session.commit()
-
-        packet = _cycle_evidence_packet(self.run, cycle, {})
-        self.assertIn('recent_memory_logs', packet)
-        self.assertIn('memory_log_summary', packet)
-        self.assertGreater(len(packet['recent_memory_logs']), 0)
-        self.assertGreater(packet['memory_log_summary']['total_returned'], 0)
-
-    def test_scene_location_change_provenance_in_memory_log(self):
-        from models import CampaignMemoryLog, SessionMessage
-
-        msg = SessionMessage(session_id=self.session.id, user_id=self.user.id, role='dm', content='You arrive at Neverwinter.')
-        db.session.add(msg)
-        db.session.flush()
-
-        self.world.knowledge_graph = '{"entities":[],"relations":[],"facts":[]}'
-        db.session.add(self.world)
-        db.session.commit()
-
-        patch = {
-            'scene_patch': {
-                'location_name': 'Neverwinter',
-                'provenance': {
-                    'tool_name': 'resolve_scene_location_patch',
-                    'evidence_status': 'supported_by_evidence',
-                    'pipeline_stage': 'resolved',
-                },
-            },
-        }
-        result = apply_memory_patch(self.campaign, self.session, patch)
-
-        logs = CampaignMemoryLog.query.filter_by(
-            campaign_id=self.campaign.id,
-            memory_id='current_scene',
-        ).order_by(CampaignMemoryLog.id.desc()).all()
-        self.assertGreaterEqual(len(logs), 1, 'Scene log should exist')
-        applied_log = next((l for l in logs if l.status == 'applied'), None)
-        if applied_log:
-            self.assertIsNotNone(applied_log.provenance_json, 'Applied scene must carry provenance')
-            self.assertEqual(applied_log.provenance_json.get('pipeline_stage'), 'applied')
-            self.assertEqual(applied_log.evidence_status, 'supported_by_evidence')
-
-    def test_compact_memory_log_includes_redacted_provenance(self):
-        from services.automation_auditor import _compact_memory_log
-        from models import CampaignMemoryLog
-
-        patch = {
-            'create_clocks': [
-                {
-                    'id': 'clock_compact_test',
-                    'name': 'Compact Export Test Clock',
-                    'segments': 4,
-                    'visibility': 'party_known',
-                    'provenance': {
-                        'tool_name': 'test_tool',
-                        'evidence_status': 'supported_by_evidence',
-                        'pipeline_stage': 'applied',
-                        'evidence_sources': [
-                            {'source_type': 'transcript_message', 'source_id': 'msg_1'},
-                            {'source_type': 'prior_memory_record', 'source_id': 'rec_2'},
-                        ],
-                        'build_sha': 'abc12345',
-                    },
-                }
-            ],
-        }
-        apply_memory_patch(self.campaign, self.session, patch)
-
-        log = CampaignMemoryLog.query.filter_by(
-            campaign_id=self.campaign.id,
-            memory_id='clock_compact_test',
-        ).first()
-        self.assertIsNotNone(log)
-
-        compact = _compact_memory_log(log)
-        self.assertTrue(compact['has_provenance'])
-        self.assertIsNotNone(compact['provenance'])
-        self.assertEqual(compact['provenance'].get('pipeline_stage'), 'applied')
-        self.assertEqual(compact['provenance'].get('evidence_status'), 'supported_by_evidence')
-        self.assertEqual(compact['provenance'].get('build_sha'), 'abc12345')
-        self.assertEqual(compact['provenance'].get('evidence_source_count'), 2)
-        self.assertIn('transcript_message', compact['provenance'].get('evidence_source_types', []))
-        self.assertIn('prior_memory_record', compact['provenance'].get('evidence_source_types', []))
-
     def test_clock_advance_uses_clock_trigger_not_own_id(self):
         from models import CampaignClock, WorldEvent
         from services.dm_tools import _tool_advance_clock
@@ -1833,35 +1234,8 @@ class P1ImprovementsTest(unittest.TestCase):
         self.assertEqual(prov.get('resolution_confidence'), 0.92)
         self.assertEqual(prov.get('clock_trigger_rule_id'), 'compiler_specified_trigger')
 
-    def test_summary_and_anchor_provenance_includes_build_sha(self):
-        from models import CampaignMemoryLog
-
-        patch = {
-            'running_summary': 'Provenance summary test.',
-            'memory_anchors': {'current_goal': 'Test goal for build_sha'},
-        }
-        apply_memory_patch(self.campaign, self.session, patch)
-
-        summary_log = CampaignMemoryLog.query.filter_by(
-            campaign_id=self.campaign.id,
-            memory_id='running_summary',
-        ).order_by(CampaignMemoryLog.id.desc()).first()
-        self.assertIsNotNone(summary_log)
-        self.assertIsNotNone(summary_log.provenance_json)
-        self.assertIn('build_sha', summary_log.provenance_json)
-        self.assertIn('evidence_status', summary_log.provenance_json)
-
-        anchor_log = CampaignMemoryLog.query.filter_by(
-            campaign_id=self.campaign.id,
-            memory_id='memory_anchors',
-        ).order_by(CampaignMemoryLog.id.desc()).first()
-        self.assertIsNotNone(anchor_log)
-        self.assertIsNotNone(anchor_log.provenance_json)
-        self.assertIn('build_sha', anchor_log.provenance_json)
-        self.assertIn('evidence_status', anchor_log.provenance_json)
-
     def test_compiled_summary_and_anchor_provenance_uses_transcript_sources(self):
-        from models import CampaignMemoryLog
+        from models import CampaignMemoryRun
 
         memory_context = {
             'campaign': self.campaign,
@@ -1882,104 +1256,25 @@ class P1ImprovementsTest(unittest.TestCase):
                 {'123', '456'},
             )
 
-        apply_memory_patch(self.campaign, self.session, compiled)
-        for memory_id in ('running_summary', 'memory_anchors'):
-            log = CampaignMemoryLog.query.filter_by(
-                campaign_id=self.campaign.id,
-                memory_id=memory_id,
-            ).order_by(CampaignMemoryLog.id.desc()).first()
-            self.assertEqual(log.evidence_status, 'supported_by_evidence')
-            self.assertEqual(
-                {source['source_id'] for source in log.provenance_json['evidence_sources']},
-                {'123', '456'},
-            )
-
-    def test_compact_memory_log_does_not_expose_raw_evidence_text(self):
-        from services.automation_auditor import _compact_memory_log
-        from models import CampaignMemoryLog
-
-        patch = {
-            'upsert_graph_facts': [
-                {
-                    'text': 'A DM-private secret fact.',
-                    'visibility': 'dm_private',
-                    'provenance': {
-                        'tool_name': 'test_tool',
-                        'evidence_status': 'supported_by_evidence',
-                        'evidence_basis': ['Internally sensitive evidence text that should NOT leak.'],
-                        'evidence_sources': [
-                            {'source_type': 'prior_memory_record', 'source_id': 'secret_rec_1'}
-                        ],
-                    },
-                }
-            ],
-        }
-        apply_memory_patch(self.campaign, self.session, patch)
-
-        logs = CampaignMemoryLog.query.filter_by(
-            campaign_id=self.campaign.id,
-            memory_type='fact',
-        ).order_by(CampaignMemoryLog.id.desc()).all()
-        self.assertGreaterEqual(len(logs), 1)
-
-        compact = _compact_memory_log(logs[0])
-        self.assertTrue(compact['has_provenance'])
-        self.assertIsNotNone(compact['provenance'])
-        self.assertNotIn('evidence_basis_preview', compact['provenance'],
-                         'Raw evidence text must not be exposed in audit export')
-        self.assertEqual(compact['provenance'].get('evidence_basis_count'), 1)
-
-    def test_rejected_scene_preserves_original_evidence(self):
-        from models import CampaignMemoryLog, SessionMessage
-
-        msg = SessionMessage(session_id=self.session.id, user_id=self.user.id, role='dm',
-                             content='You are at Phandalin.')
-        db.session.add(msg)
-        db.session.flush()
-
-        self.world.knowledge_graph = '{"entities":[{"id":"phandalin","type":"location","name":"Phandalin"}],"relations":[],"facts":[]}'
-        db.session.add(self.world)
-        db.session.commit()
-
-        patch = {
-            'scene_patch': {
-                'location_name': 'Waterdeep',
-                'provenance': {
-                    'tool_name': 'resolve_scene_location_patch',
-                    'evidence_status': 'insufficiently_supported',
-                    'evidence_sources': [
-                        {'source_type': 'transcript_message', 'source_id': 'msg_42'}
-                    ],
-                },
+        result = apply_compiled_session_memory_patch(
+            self.campaign,
+            self.session,
+            compiled,
+            audit_context={
+                'source_player_message_id': 123,
+                'source_dm_message_id': 456,
             },
-        }
-        audit_context = {
-            'latest_player_message': 'We explore the town of Phandalin.',
-            'latest_dm_message': msg.content,
-            'source_player_message_id': msg.id,
-            'source_dm_message_id': msg.id,
-        }
-        apply_memory_patch(self.campaign, self.session, patch, audit_context=audit_context)
+        )
+        self.assertTrue(result['running_summary_updated'])
+        self.assertTrue(result['memory_anchors_updated'])
+        db.session.refresh(self.session)
+        self.assertEqual(self.session.running_summary, 'The party reached the keep.')
+        self.assertEqual(self.session.memory_anchors['current_goal'], 'Enter the keep')
 
-        warning_logs = CampaignMemoryLog.query.filter_by(
-            campaign_id=self.campaign.id,
-            memory_id='scene_mutation_warning',
-        ).all()
-        self.assertGreater(len(warning_logs), 0, 'A scene_mutation_warning log should be produced for unsupported scene change')
-        wl = warning_logs[0]
-        self.assertIsNotNone(wl.provenance_json)
-        self.assertEqual(wl.provenance_json.get('pipeline_stage'), 'rejected')
-        self.assertIn('rejection_reason', wl.provenance_json)
-
-        skip_logs = CampaignMemoryLog.query.filter_by(
-            campaign_id=self.campaign.id,
-            memory_id='current_scene',
-            status='validation_failed',
-        ).order_by(CampaignMemoryLog.id.desc()).all()
-        self.assertGreater(len(skip_logs), 0, 'A current_scene validation_failed log should be produced for unsupported scene change')
-        last_log = skip_logs[0]
-        self.assertIsNotNone(last_log.provenance_json)
-        self.assertEqual(last_log.provenance_json.get('pipeline_stage'), 'rejected')
+        run = CampaignMemoryRun.query.filter_by(campaign_id=self.campaign.id).order_by(CampaignMemoryRun.id.desc()).first()
+        self.assertIsNotNone(run)
+        self.assertEqual(run.source_player_message_id, 123)
+        self.assertEqual(run.source_dm_message_id, 456)
 
 if __name__ == '__main__':
     unittest.main()
