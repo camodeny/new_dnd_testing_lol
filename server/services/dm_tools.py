@@ -5441,6 +5441,30 @@ def _relation_endpoint_refs(patch):
     return refs
 
 
+def _relation_endpoint_visibility(patch, endpoint_id):
+    """Derive a materialized endpoint's visibility from referencing relations.
+
+    Fails closed to ``dm_private``. A registry-backed endpoint placeholder is
+    only promoted to ``party_known`` when every relation referencing it is
+    itself party-visible (public/party_known). Any private reference, or the
+    absence of a positive visibility signal, keeps the materialized entity
+    ``dm_private`` so a resolved private NPC used only as an endpoint never
+    leaks into the party-visible graph.
+    """
+    visibilities = []
+    for rel in patch.get("upsert_graph_relations") if isinstance(patch.get("upsert_graph_relations"), list) else []:
+        if not isinstance(rel, dict):
+            continue
+        for field in ("source_id", "target_id"):
+            if clean_id(rel.get(field), "") == endpoint_id:
+                vis = clean_text(rel.get("visibility"), 30).lower()
+                if vis:
+                    visibilities.append(vis)
+    if visibilities and all(vis in {"public", "party_known"} for vis in visibilities):
+        return "party_known"
+    return "dm_private"
+
+
 def _valid_relation_endpoint_registry(campaign):
     """Build the campaign's non-graph relation endpoint registry.
 
@@ -5502,6 +5526,7 @@ def _materialize_relation_endpoints(campaign, graph, patch):
 
         entity = None
         source = None
+        endpoint_visibility = _relation_endpoint_visibility(patch, endpoint_id)
         if endpoint_id in npc_rows:
             npc = npc_rows[endpoint_id]
             source = "known_npc"
@@ -5510,7 +5535,7 @@ def _materialize_relation_endpoints(campaign, graph, patch):
                 "name": clean_text(npc.name, 200) or endpoint_id.replace("_", " ").title(),
                 "type": "npc",
                 "summary": clean_text(npc.public_summary or npc.role, 500) or None,
-                "visibility": "party_known",
+                "visibility": endpoint_visibility,
                 "certainty": "confirmed",
                 "reason": "Materialized relation endpoint from NPC actor registry before applying its relationships.",
             }
@@ -5522,7 +5547,7 @@ def _materialize_relation_endpoints(campaign, graph, patch):
                 "name": clean_text(character.name, 200) or endpoint_id.replace("_", " ").title(),
                 "type": "pc",
                 "summary": clean_text(character.background, 500) or None,
-                "visibility": "party_known",
+                "visibility": endpoint_visibility,
                 "certainty": "confirmed",
                 "reason": "Materialized relation endpoint from roster PC before applying its relationships.",
             }

@@ -254,6 +254,97 @@ class SessionMemoryRelationEndpointTest(unittest.TestCase):
         self.assertNotIn("completely_unknown_actor", self._graph_entity_ids())
         self.assertEqual(json.loads(self.world.knowledge_graph)["relations"], [])
 
+    def test_private_npc_endpoint_materializes_fail_closed_to_dm_private(self):
+        # A DM-private canonical NPC used only as a relation endpoint must never
+        # be promoted into the party-visible graph. The materialized placeholder
+        # defaults to dm_private when the referencing relation carries no
+        # party-visible evidence (and even a private relation must stay private).
+        db.session.add(
+            NPCActor(
+                campaign_id=self.campaign.id,
+                actor_id="vex_mal",
+                name="Vex Mal",
+                role="Rival",
+                public_summary="A shadowy rival.",
+                dossier="{}",
+            )
+        )
+        db.session.commit()
+
+        patch = self._base_patch()
+        patch["upsert_graph_relations"] = [{
+            "id": "rel_vex_mal_rival_waterdeep",
+            "type": "rival_of",
+            "source_id": "vex_mal",
+            "target_id": "waterdeep",
+            "visibility": "dm_private",
+        }]
+
+        result = apply_compiled_session_memory_patch(self.campaign, self.session, patch)
+        db.session.commit()
+
+        graph = json.loads(self.world.knowledge_graph)
+        vex = next(e for e in graph["entities"] if e["id"] == "vex_mal")
+        self.assertEqual(vex["visibility"], "dm_private")
+        self.assertNotIn(vex["visibility"], {"public", "party_known"})
+
+    def test_private_npc_endpoint_with_no_visibility_evidence_stays_private(self):
+        # Without any referencing-relation visibility signal, the endpoint
+        # placeholder must fail closed to dm_private rather than party_known.
+        db.session.add(
+            NPCActor(
+                campaign_id=self.campaign.id,
+                actor_id="vex_mal",
+                name="Vex Mal",
+                dossier="{}",
+            )
+        )
+        db.session.commit()
+
+        patch = self._base_patch()
+        patch["upsert_graph_relations"] = [{
+            "id": "rel_vex_mal_rival_waterdeep",
+            "type": "rival_of",
+            "source_id": "vex_mal",
+            "target_id": "waterdeep",
+        }]
+
+        apply_compiled_session_memory_patch(self.campaign, self.session, patch)
+        db.session.commit()
+
+        graph = json.loads(self.world.knowledge_graph)
+        vex = next(e for e in graph["entities"] if e["id"] == "vex_mal")
+        self.assertEqual(vex["visibility"], "dm_private")
+
+    def test_party_visible_relation_materializes_endpoint_party_known(self):
+        # Only positive party-visible evidence on every referencing relation
+        # promotes the placeholder to party_known.
+        db.session.add(
+            NPCActor(
+                campaign_id=self.campaign.id,
+                actor_id="vex_mal",
+                name="Vex Mal",
+                dossier="{}",
+            )
+        )
+        db.session.commit()
+
+        patch = self._base_patch()
+        patch["upsert_graph_relations"] = [{
+            "id": "rel_vex_mal_seen_waterdeep",
+            "type": "seen_at",
+            "source_id": "vex_mal",
+            "target_id": "waterdeep",
+            "visibility": "party_known",
+        }]
+
+        apply_compiled_session_memory_patch(self.campaign, self.session, patch)
+        db.session.commit()
+
+        graph = json.loads(self.world.knowledge_graph)
+        vex = next(e for e in graph["entities"] if e["id"] == "vex_mal")
+        self.assertEqual(vex["visibility"], "party_known")
+
     def test_compile_manifest_classifies_endpoint_kinds(self):
         db.session.add(
             NPCActor(
@@ -617,7 +708,10 @@ class SessionMemoryRecoveryTaskTest(unittest.TestCase):
         self.assertEqual(refreshed.status, "resolved")
         self.assertFalse(has_pending_memory_recovery(self.campaign.id))
 
-    def test_retry_records_clock_error_when_clock_replay_fails(self):
+    def test_clock_replay_failure_blocks_recovery(self):
+        # A failed clock replay must keep recovery blocking (fail closed) rather
+        # than returning success: the task stays pending so the worker cannot
+        # continue play on stale clocks, and the durable turn stays in error.
         db.session.add(
             NPCActor(
                 campaign_id=self.campaign.id,
@@ -663,19 +757,97 @@ class SessionMemoryRecoveryTaskTest(unittest.TestCase):
         ):
             result = retry_memory_recovery_task(self.campaign.id, task.id)
 
-        self.assertTrue(result["ok"], result)
-        self.assertFalse(result["clock_recovered"])
-        self.assertIsNotNone(result["clock_error"])
+        self.assertFalse(result["ok"])
+        self.assertEqual(result["status"], "pending")
+        self.assertIn("clock_replay_failed", result["error"])
 
-        # Memory is durable and the turn records an explicit clock error rather
-        # than leaving a permanently stale clock silently.
+        # Memory is durable but the turn is NOT reported repaired, and the task
+        # stays pending so later cycles keep blocking instead of resuming play
+        # on a stale clock.
+        graph = json.loads(self.world.knowledge_graph)
+        self.assertIn("vex_mal", {e["id"] for e in graph["entities"]})
+        turn = SessionDmTurn.query.filter_by(
+            campaign_id=self.campaign.id,
+            player_message_id=7,
+        ).first()
+        self.assertEqual(turn.post_turn_status, "error")
+        self.assertTrue(has_pending_memory_recovery(self.campaign.id))
+        refreshed = db.session.get(SessionMemoryRecoveryTask, task.id)
+        self.assertEqual(refreshed.status, "pending")
+
+    def test_retry_skips_reapply_when_memory_already_applied(self):
+        # Integration with #107-style failure reconciliation: a stored failed
+        # patch may carry a base_memory_revision that is now behind the durable
+        # revision (another branch advanced it during memory-failure recovery).
+        # The retry must not reject it as stale; it skips re-applying memory and
+        # completes the skipped clock replay.
+        db.session.add(
+            NPCActor(
+                campaign_id=self.campaign.id,
+                actor_id="vex_mal",
+                name="Vex Mal",
+                dossier="{}",
+            )
+        )
+        db.session.add(mark_session_dm_turn_error(
+            self.campaign.id,
+            self.session.id,
+            player_message_id=7,
+            trace_id="trace_7",
+            error_text="missing_relation_endpoint",
+            memory_status="error",
+            clock_status="skipped",
+        ))
+        db.session.commit()
+
+        patch = {
+            "source_contract": SOURCE_CONTRACT_COMPILED_V2,
+            "base_memory_revision": self.world.memory_revision or 0,
+            "upsert_graph_entities": [],
+            "upsert_graph_relations": [{
+                "type": "rival_of",
+                "source_id": "vex_mal",
+                "target_id": "waterdeep",
+            }],
+        }
+        task = create_memory_recovery_task(
+            self.campaign.id,
+            self.session,
+            player_message_id=7,
+            dm_message_id=8,
+            err=MemoryPipelineError(stage="validation", code="missing_relation_endpoint", message="missing"),
+            patch=patch,
+            trace_id="trace_7",
+        )
+
+        # Simulate a #107-style failure reconciliation that already advanced the
+        # durable world revision without this patch being applied.
+        world = CampaignWorld.query.filter_by(campaign_id=self.campaign.id).first()
+        world.memory_revision = (world.memory_revision or 0) + 1
+        db.session.commit()
+
+        with mock.patch(
+            "services.dm_tools.build_session_clock_context",
+            return_value={"allowed_evidence_sources": []},
+        ), mock.patch(
+            "openrouter.get_session_clock_updates",
+            return_value={"advance_clocks": [], "retire_clocks": [], "create_clocks": []},
+        ), mock.patch(
+            "services.dm_tools.apply_compiled_session_memory_patch",
+        ) as apply_mock:
+            result = retry_memory_recovery_task(self.campaign.id, task.id)
+
+        self.assertTrue(result["ok"], result)
+        self.assertTrue(result["memory_already_applied"])
+        apply_mock.assert_not_called()
+
         turn = SessionDmTurn.query.filter_by(
             campaign_id=self.campaign.id,
             player_message_id=7,
         ).first()
         self.assertEqual(turn.post_turn_status, "complete")
-        self.assertEqual(turn.memory_status, "complete")
-        self.assertEqual(turn.clock_status, "error")
+        self.assertEqual(turn.clock_status, "complete")
+        self.assertFalse(has_pending_memory_recovery(self.campaign.id))
 
     def test_retry_fails_closed_for_invalid_patch(self):
         patch = {

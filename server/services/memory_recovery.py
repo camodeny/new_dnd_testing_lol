@@ -185,29 +185,47 @@ def retry_memory_recovery_task(campaign_id, task_id):
     campaign = db.session.get(Campaign, campaign_id)
     session = db.session.get(CampaignSession, task.session_id) if task.session_id else None
 
-    # 1. Re-apply the failed memory patch.
-    try:
-        result = apply_compiled_session_memory_patch(campaign, session, patch)
-    except Exception as err:
-        db.session.rollback()
-        # The rollback above expires the task row; re-load it so the attempt
-        # counter and last error survive the failed retry.
-        task = db.session.get(SessionMemoryRecoveryTask, task.id)
-        task.attempts += 1
-        task.status = 'failed' if task.attempts >= MAX_RECOVERY_ATTEMPTS else 'pending'
-        task.last_error_text = str(err)
-        db.session.commit()
-        return {
-            'ok': False,
-            'error': str(err),
-            'status': task.status,
-            'attempts': task.attempts,
-            'task_id': task.id,
-        }
+    # A failed patch may already have been partially recovered on an earlier
+    # attempt (memory durable, only clock replay pending), or another branch's
+    # failure reconciliation may have advanced the world revision. If the
+    # current revision is ahead of the patch's base, re-applying it would be a
+    # stale-base rejection; skip to clock replay instead.
+    from models import CampaignWorld
 
-    # 2. Replay the clock adjudication the original failure skipped so time-
-    # sensitive clocks are not left stale. If it fails, the memory patch is
-    # still durable and the turn records an explicit clock error.
+    world = CampaignWorld.query.filter_by(campaign_id=campaign_id).first()
+    current_revision = world.memory_revision or 0 if world else 0
+    patch_base_revision = patch.get("base_memory_revision")
+    memory_already_applied = (
+        patch_base_revision is not None and current_revision > patch_base_revision
+    )
+
+    # 1. Re-apply the failed memory patch (unless it is already durable) and
+    # commit it as its own transaction so a later clock-replay failure cannot
+    # drag partial clock mutations into the same commit.
+    memory_result = {"memory_already_applied": memory_already_applied}
+    if not memory_already_applied:
+        try:
+            memory_result = apply_compiled_session_memory_patch(campaign, session, patch)
+            db.session.commit()
+        except Exception as err:
+            db.session.rollback()
+            # The rollback above expires the task row; re-load it so the attempt
+            # counter and last error survive the failed retry.
+            task = db.session.get(SessionMemoryRecoveryTask, task.id)
+            task.attempts += 1
+            task.status = 'failed' if task.attempts >= MAX_RECOVERY_ATTEMPTS else 'pending'
+            task.last_error_text = str(err)
+            db.session.commit()
+            return {
+                'ok': False,
+                'error': str(err),
+                'status': task.status,
+                'attempts': task.attempts,
+                'task_id': task.id,
+            }
+
+    # 2. Replay the clock adjudication the original failure skipped so
+    # time-sensitive clocks are not left stale.
     clock_recovered = False
     clock_result = None
     clock_error = None
@@ -218,27 +236,38 @@ def retry_memory_recovery_task(campaign_id, task_id):
         except Exception as err:
             clock_error = str(err)
 
-    # 3. Repair the durable turn and the recovery task in one transaction.
+    # 3. Fail closed when clock replay could not complete. Memory may already be
+    # durable, but a stale clock is exactly the silent regression this recovery
+    # exists to prevent, so the task stays pending (blocking) and the durable
+    # turn stays in its error state instead of being reported repaired.
+    if not clock_recovered:
+        db.session.rollback()
+        task = db.session.get(SessionMemoryRecoveryTask, task.id)
+        task.attempts += 1
+        task.status = 'pending'
+        task.last_error_text = f'clock_replay_failed: {clock_error}'
+        db.session.commit()
+        return {
+            'ok': False,
+            'error': f'clock_replay_failed: {clock_error}',
+            'status': 'pending',
+            'attempts': task.attempts,
+            'task_id': task.id,
+            'memory_already_applied': memory_already_applied,
+        }
+
+    # 4. Repair the durable turn and the recovery task in one transaction.
     task = db.session.get(SessionMemoryRecoveryTask, task.id)
     task.attempts += 1
     task.status = 'resolved'
     task.resolved_at = utcnow()
-    if clock_recovered:
-        task.last_error_text = None
-        repair_session_dm_turn(
-            task.player_message_id,
-            dm_message_id=task.dm_message_id,
-            memory_status='complete',
-            clock_status='complete',
-        )
-    else:
-        task.last_error_text = f'clock_replay_failed: {clock_error}'
-        repair_session_dm_turn(
-            task.player_message_id,
-            dm_message_id=task.dm_message_id,
-            memory_status='complete',
-            clock_status='error',
-        )
+    task.last_error_text = None
+    repair_session_dm_turn(
+        task.player_message_id,
+        dm_message_id=task.dm_message_id,
+        memory_status='complete',
+        clock_status='complete',
+    )
     db.session.commit()
 
     log_audit_event(
@@ -250,9 +279,9 @@ def retry_memory_recovery_task(campaign_id, task_id):
             'player_message_id': task.player_message_id,
             'dm_message_id': task.dm_message_id,
             'memory_status': 'complete',
-            'clock_status': 'complete' if clock_recovered else 'error',
-            'clock_replay_error': clock_error,
-            'memory_result': result,
+            'clock_status': 'complete',
+            'memory_already_applied': memory_already_applied,
+            'memory_result': memory_result,
         },
         source='session_memory',
         actor='session_memory_writer',
@@ -266,7 +295,7 @@ def retry_memory_recovery_task(campaign_id, task_id):
         'status': 'resolved',
         'attempts': task.attempts,
         'task_id': task.id,
-        'clock_recovered': clock_recovered,
-        'clock_error': clock_error,
-        'result': result,
+        'clock_recovered': True,
+        'memory_already_applied': memory_already_applied,
+        'result': memory_result,
     }
