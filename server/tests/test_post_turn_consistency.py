@@ -246,6 +246,104 @@ class PostTurnConsistencyTest(unittest.TestCase):
         self.assertEqual(report['clocks_superseded'], [])
         self.assertTrue(report['verified'])
 
+    def test_alive_but_still_drowning_is_not_resolution(self):
+        """'alive but still drowning' contains a resolution word and a condition
+        word, but the persistence marker makes it a contradiction, so the danger
+        clock must remain active."""
+        graph = json.loads(self.world.knowledge_graph)
+        graph['facts'].append({
+            'id': 'fact_mira_alive_still_drowning',
+            'entity_ids': ['mira'],
+            'text': 'Mira is alive but still drowning.',
+            'certainty': 'confirmed',
+            'visibility': 'party_known',
+        })
+        self.world.knowledge_graph = json.dumps(graph)
+        # Keep Mira out of the visible scene cast so only the fact binds her.
+        self.world.world_state = json.dumps({
+            'current_scene': {
+                'location_id': 'the_dock',
+                'location_name': 'The Dock',
+                'active_npc_ids': [],
+            },
+        })
+        db.session.commit()
+
+        self._clock('mira_in_peril', 'Mira in Peril', 4, 2, summary='Mira is drowning at 0 HP.')
+        db.session.commit()
+
+        report = self._run_fixture()
+        db.session.commit()
+
+        clock = CampaignClock.query.filter_by(campaign_id=self.campaign.id, clock_id='mira_in_peril').one()
+        self.assertEqual(clock.status, 'active')
+        self.assertEqual(report['clocks_superseded'], [])
+        self.assertTrue(report['verified'])
+
+    def test_not_safe_is_not_resolution(self):
+        """A negated resolution claim ('Mira is not safe') must not supersede an
+        active danger clock."""
+        graph = json.loads(self.world.knowledge_graph)
+        graph['facts'].append({
+            'id': 'fact_mira_not_safe',
+            'entity_ids': ['mira'],
+            'text': 'Mira is not safe yet.',
+            'certainty': 'confirmed',
+            'visibility': 'party_known',
+        })
+        self.world.knowledge_graph = json.dumps(graph)
+        self.world.world_state = json.dumps({
+            'current_scene': {
+                'location_id': 'the_dock',
+                'location_name': 'The Dock',
+                'active_npc_ids': [],
+            },
+        })
+        db.session.commit()
+
+        self._clock('mira_in_peril', 'Mira in Peril', 4, 2, summary='Mira is drowning at 0 HP.')
+        db.session.commit()
+
+        report = self._run_fixture()
+        db.session.commit()
+
+        clock = CampaignClock.query.filter_by(campaign_id=self.campaign.id, clock_id='mira_in_peril').one()
+        self.assertEqual(clock.status, 'active')
+        self.assertEqual(report['clocks_superseded'], [])
+        self.assertTrue(report['verified'])
+
+    def test_affirmative_resolution_still_supersedes_condition_clock(self):
+        """Positive control: an un-negated, uncontradicted resolution fact still
+        supersedes the danger clock."""
+        graph = json.loads(self.world.knowledge_graph)
+        graph['facts'].append({
+            'id': 'fact_mira_resolved',
+            'entity_ids': ['mira'],
+            'text': 'Mira was stabilized, revived, and is now conscious.',
+            'certainty': 'confirmed',
+            'visibility': 'party_known',
+        })
+        self.world.knowledge_graph = json.dumps(graph)
+        self.world.world_state = json.dumps({
+            'current_scene': {
+                'location_id': 'the_dock',
+                'location_name': 'The Dock',
+                'active_npc_ids': [],
+            },
+        })
+        db.session.commit()
+
+        self._clock('mira_in_peril', 'Mira in Peril', 4, 2, summary='Mira is drowning at 0 HP.')
+        db.session.commit()
+
+        report = self._run_fixture()
+        db.session.commit()
+
+        clock = CampaignClock.query.filter_by(campaign_id=self.campaign.id, clock_id='mira_in_peril').one()
+        self.assertEqual(clock.status, 'superseded')
+        self.assertEqual(report['clocks_superseded'][0]['kind'], 'condition_resolved')
+        self.assertTrue(report['verified'])
+
     def test_generic_location_word_does_not_match_inside_larger_word(self):
         """'sea' inside 'season' / 'road' inside 'broad' must not assert a
         generic location binding and falsely supersede a clock."""

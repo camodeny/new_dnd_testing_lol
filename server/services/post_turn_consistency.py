@@ -62,12 +62,28 @@ CONDITION_WORDS = frozenset({
 })
 
 # Committed-state words that signal a subject's danger condition has resolved.
+# Pure relocation phrases (e.g. 'on the dock', 'out of the water') are handled
+# by the location-conflict path and deliberately excluded here so a fact like
+# "Mira lies on the dock, not breathing" cannot count as resolution.
 RESOLUTION_WORDS = frozenset({
     'stabilized', 'rescued', 'saved', 'revived', 'recovered', 'awake',
     'conscious', 'safe', 'healed', 'cured', 'freed', 'escaped', 'alive',
-    'breathing', 'no longer', 'ashore', 'on shore', 'out of the water',
-    'out of water', 'pulled to safety', 'on the dock',
+    'breathing', 'no longer', 'pulled to safety',
 })
+
+# Negation markers that flip a following resolution phrase (e.g. "not safe").
+_NEGATION_MARKERS = frozenset({
+    'not', 'no', 'never', 'cannot', "can't", "isn't", "aren't", "wasn't",
+    "weren't", "don't", "doesn't", "didn't", "won't", 'without', 'nor',
+})
+
+# Persistence markers that introduce a still-active condition (e.g. "still
+# drowning", "remains poisoned"), contradicting any resolution claim.
+_PERSISTENCE_MARKERS = frozenset({
+    'still', 'yet', 'remains', 'remaining', 'continues', 'ongoing', 'meanwhile',
+})
+
+_NEGATION_WINDOW = 3
 
 SEGMENT_REF_RE = re.compile(r'(\d+)\s*/\s*(\d+)')
 _CLOCK_NEAR_WINDOW = 70
@@ -336,9 +352,55 @@ def _clock_location_conflict(campaign, graph, world_state, clock, subject_id):
     return None, None
 
 
+def _negated_before(tokens, index):
+    """True when a negation marker appears in the token window before
+    ``index``, meaning the resolution phrase at ``index`` is negated
+    (e.g. "Mira is not safe")."""
+    for token in tokens[max(0, index - _NEGATION_WINDOW):index]:
+        if token in _NEGATION_MARKERS:
+            return True
+    return False
+
+
+def _fact_asserts_resolution(fact_text):
+    """Return True only when ``fact_text`` affirmatively records that a danger
+    condition resolved: an un-negated resolution phrase AND no persistence
+    marker introducing a still-active condition word (e.g. 'alive but still
+    drowning', 'not safe', 'conscious but still poisoned' are NOT resolution)."""
+    if not fact_text:
+        return False
+    tokens = _tokenize(fact_text)
+    if not tokens:
+        return False
+
+    # A persistence marker directly introducing a condition word means the
+    # danger is ongoing, so the fact does not record resolution.
+    for index, token in enumerate(tokens):
+        if token not in _PERSISTENCE_MARKERS:
+            continue
+        following = ' '.join(tokens[index + 1:index + 4])
+        if any(_contains_phrase(following, condition) for condition in CONDITION_WORDS):
+            return False
+
+    # Any un-negated resolution phrase is affirmative evidence of resolution.
+    for phrase in RESOLUTION_WORDS:
+        phrase_tokens = _tokenize(phrase)
+        if not phrase_tokens:
+            continue
+        for index in range(len(tokens) - len(phrase_tokens) + 1):
+            if tokens[index:index + len(phrase_tokens)] != phrase_tokens:
+                continue
+            if _negated_before(tokens, index):
+                continue
+            return True
+    return False
+
+
 def _clock_condition_resolved(campaign, graph, clock, subject_id):
-    """Return a reason string when committed facts show the subject's danger
-    condition (asserted by the clock) has resolved, else None."""
+    """Return a reason string when committed facts affirmatively show the
+    subject's danger condition (asserted by the clock) has resolved, else None.
+    Only visibility-safe facts that record an un-negated, uncontradicted
+    resolution may retire the clock."""
     text = _clock_text(clock)
     if not any(_contains_phrase(text, word) for word in CONDITION_WORDS):
         return None
@@ -356,7 +418,7 @@ def _clock_condition_resolved(campaign, graph, clock, subject_id):
         fact_text = clean_text(fact.get('text'), 700)
         if not fact_text:
             continue
-        if any(_contains_phrase(fact_text, word) for word in RESOLUTION_WORDS):
+        if _fact_asserts_resolution(fact_text):
             return (
                 f'Committed facts record that the clock subject\'s condition '
                 f'has resolved: "{clean_text(fact.get("text"), 240)}".'
