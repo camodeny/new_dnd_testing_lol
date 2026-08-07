@@ -217,7 +217,7 @@ class RunAutomationWorkerTests(unittest.TestCase):
                 patch.object(worker, 'build_manifest_for_run', return_value={'campaign': {'id': 100003}}), \
                 patch.object(worker, 'append_event'), \
                 patch.object(worker, 'request_overseer_decision', return_value={'action': 'choose_player', 'llm_player_id': 33}), \
-                patch.object(worker, 'api_get', side_effect=[{'world': {}}, {'campaign': {'id': 100003}}]), \
+                patch.object(worker, 'api_get', side_effect=[{'world': {}}, {'campaign': {'id': 100003, 'name': 'Test Campaign'}}]), \
                 patch.object(worker, 'fetch_campaign_characters', return_value=[{'id': 38, 'name': 'Kaelen Shadowstep'}]), \
                 patch.object(worker, 'request_player_decision', return_value=(
                     {'action': 'speak', 'content': 'Kaelen asks about the patrols.'},
@@ -678,7 +678,7 @@ class RunAutomationWorkerTests(unittest.TestCase):
                 patch.object(worker, 'build_manifest_for_run', return_value={'campaign': {'id': 100003}}), \
                 patch.object(worker, 'append_event'), \
                 patch.object(worker, 'request_overseer_decision', return_value={'action': 'choose_player', 'llm_player_id': 33}), \
-                patch.object(worker, 'api_get', side_effect=[{'world': {}}, {'campaign': {'id': 100003}}]), \
+                patch.object(worker, 'api_get', side_effect=[{'world': {}}, {'campaign': {'id': 100003, 'name': 'Test Campaign'}}]), \
                 patch.object(worker, 'fetch_campaign_characters', return_value=[{'id': 38, 'name': 'Kaelen Shadowstep'}]), \
                 patch.object(worker, 'request_player_decision', return_value=(
                     {'action': 'speak', 'content': 'Kaelen asks about the patrols.'},
@@ -1389,6 +1389,426 @@ class DmTurnTimeoutReconciliationTest(unittest.TestCase):
         fetch.assert_not_called()
         self.assertEqual(append.call_count, 1)
         self.assertEqual(append.call_args_list[0][0][5], 'dm_turn_reconciliation_started')
+
+
+class ProposalResolutionTests(unittest.TestCase):
+    def _args(self):
+        return SimpleNamespace(
+            api_base='http://127.0.0.1:5889',
+            owner_api_key='owner-key',
+            worker_id='test-worker',
+            message_window=16,
+        )
+
+    def _manifest(self):
+        return {
+            'llm_players': [
+                {'llm_player': {'id': 33, 'user_id': 35, 'label': 'Auto Player 1'}, 'character': {'id': 81, 'name': 'Mira Vell'}},
+            ],
+        }
+
+    def _claim_payload(self):
+        return {
+            'derived_campaign': {'id': 100003},
+            'roster': [
+                {
+                    'llm_player_id': 33,
+                    'user_id': 35,
+                    'label': 'Auto Player 1',
+                    'character_name': 'Mira Vell',
+                    'derived_character_id': 81,
+                },
+            ],
+        }
+
+    def _session(self, proposals):
+        return {
+            'id': 4,
+            'messages': [{'id': 410, 'role': 'dm', 'content': 'Mira falls to 0 HP.', 'created_at': '2026-07-01T10:00:00Z'}],
+            'pending_sheet_proposals': proposals,
+        }
+
+    def test_resolve_priority_proposal_returns_no_proposal(self):
+        args = self._args()
+        session = self._session([])
+        status, detail = worker.resolve_priority_proposal(
+            args, self._manifest(), self._claim_payload(), session, 0, 7, 'lease-1',
+        )
+        self.assertEqual(status, 'no_proposal')
+        self.assertIsNone(detail)
+
+    def test_resolve_priority_proposal_skips_proposal_without_roster_seat(self):
+        args = self._args()
+        session = self._session([
+            {'id': 1, 'character_id': 999, 'changes': [{'field': 'current_hp', 'after': 0}], 'created_at': '2026-07-01T10:00:00Z'},
+        ])
+        with patch.object(worker, 'append_event') as append_event:
+            status, detail = worker.resolve_priority_proposal(
+                args, self._manifest(), self._claim_payload(), session, 0, 7, 'lease-1',
+            )
+
+        self.assertEqual(status, 'no_resolver')
+        self.assertEqual(detail['id'], 1)
+        event_types = [call.args[5] for call in append_event.call_args_list]
+        self.assertIn('proposal_skipped_no_resolver', event_types)
+
+    def test_resolve_priority_proposal_applies_hp_proposal_for_unconscious_character(self):
+        args = self._args()
+        session = self._session([
+            {'id': 1, 'character_id': 81, 'changes': [{'field': 'current_hp', 'after': 0}], 'reason': '0 HP', 'created_at': '2026-07-01T10:00:00Z'},
+        ])
+        decision = {'action': 'apply_proposal', 'proposal_id': 1}
+
+        with patch.object(worker, 'api_get', side_effect=[{'world': {}}, {'campaign': {'id': 100003, 'name': 'Test Campaign'}}]), \
+                patch.object(worker, 'fetch_campaign_characters', return_value=[{'id': 81, 'name': 'Mira Vell'}]), \
+                patch.object(worker, 'request_player_decision', return_value=(
+                    decision,
+                    '{"action":"apply_proposal","proposal_id":1}',
+                    0,
+                    'opencode_go',
+                    'deepseek-v4-flash',
+                )) as request_player_decision, \
+                patch.object(worker, 'submit_decision', return_value={'proposal': {'id': 1, 'status': 'applied'}}) as submit_decision, \
+                patch.object(worker, 'append_event') as append_event:
+            status, detail = worker.resolve_priority_proposal(
+                args, self._manifest(), self._claim_payload(), session, 0, 7, 'lease-1',
+            )
+
+        self.assertEqual(status, 'resolved')
+        self.assertEqual(detail['id'], 1)
+        submit_decision.assert_called_once()
+        self.assertEqual(submit_decision.call_args.args[4]['action'], 'apply_proposal')
+        event_types = [call.args[5] for call in append_event.call_args_list]
+        self.assertIn('proposal_discovery', event_types)
+        self.assertIn('proposal_resolution', event_types)
+        resolution_payload = next(call.args[6] for call in append_event.call_args_list if call.args[5] == 'proposal_resolution')
+        self.assertEqual(resolution_payload['outcome'], 'applied')
+        self.assertEqual(resolution_payload['turns_completed'], 0)
+
+    def test_resolve_priority_proposal_dismisses_proposal(self):
+        args = self._args()
+        session = self._session([
+            {'id': 2, 'character_id': 81, 'changes': [{'field': 'current_hp', 'after': 0}], 'created_at': '2026-07-01T10:00:00Z'},
+        ])
+        decision = {'action': 'dismiss_proposal', 'proposal_id': 2, 'reason': 'Incorrect'}
+
+        with patch.object(worker, 'api_get', side_effect=[{'world': {}}, {'campaign': {'id': 100003, 'name': 'Test Campaign'}}]), \
+                patch.object(worker, 'fetch_campaign_characters', return_value=[{'id': 81, 'name': 'Mira Vell'}]), \
+                patch.object(worker, 'request_player_decision', return_value=(decision, '{}', 0, 'opencode_go', 'model')), \
+                patch.object(worker, 'submit_decision', return_value={'proposal': {'id': 2, 'status': 'dismissed'}}) as submit_decision, \
+                patch.object(worker, 'append_event') as append_event:
+            status, detail = worker.resolve_priority_proposal(
+                args, self._manifest(), self._claim_payload(), session, 3, 7, 'lease-1',
+            )
+
+        self.assertEqual(status, 'resolved')
+        self.assertEqual(detail['id'], 2)
+        self.assertEqual(submit_decision.call_args.args[4]['action'], 'dismiss_proposal')
+        resolution_payload = next(call.args[6] for call in append_event.call_args_list if call.args[5] == 'proposal_resolution')
+        self.assertEqual(resolution_payload['outcome'], 'dismissed')
+
+    def test_resolve_priority_proposal_retries_then_applies(self):
+        args = self._args()
+        session = self._session([
+            {'id': 3, 'character_id': 81, 'changes': [{'field': 'current_hp', 'after': 0}], 'created_at': '2026-07-01T10:00:00Z'},
+        ])
+
+        with patch.object(worker, 'api_get', side_effect=[{'world': {}}, {'campaign': {'id': 100003, 'name': 'Test Campaign'}}]), \
+                patch.object(worker, 'fetch_campaign_characters', return_value=[{'id': 81, 'name': 'Mira Vell'}]), \
+                patch.object(worker, 'request_player_decision', side_effect=[
+                    ({'action': 'speak', 'content': 'Mira stirs weakly.'}, '{"action":"speak"}', 0, 'opencode_go', 'model'),
+                    ({'action': 'apply_proposal', 'proposal_id': 3}, '{"action":"apply_proposal","proposal_id":3}', 0, 'opencode_go', 'model'),
+                ]) as request_player_decision, \
+                patch.object(worker, 'submit_decision', return_value={'proposal': {'id': 3, 'status': 'applied'}}), \
+                patch.object(worker, 'append_event'):
+            status, _detail = worker.resolve_priority_proposal(
+                args, self._manifest(), self._claim_payload(), session, 0, 7, 'lease-1',
+            )
+
+        self.assertEqual(status, 'resolved')
+        self.assertEqual(request_player_decision.call_count, 2)
+        second_prompt = request_player_decision.call_args_list[1].kwargs['prompt_override']
+        self.assertIn('MUST choose one of the pending sheet proposals', second_prompt)
+
+    def test_resolve_priority_proposal_selects_most_urgent_of_multiple_proposals(self):
+        args = self._args()
+        session = self._session([
+            {'id': 60, 'character_id': 81, 'changes': [{'field': 'spell_slots_used_1', 'after': 2}], 'created_at': '2026-07-01T10:00:00Z'},
+            {'id': 61, 'character_id': 81, 'changes': [{'field': 'current_hp', 'after': 0}], 'created_at': '2026-07-01T09:00:00Z'},
+        ])
+
+        with patch.object(worker, 'api_get', side_effect=[{'world': {}}, {'campaign': {'id': 100003, 'name': 'Test Campaign'}}]), \
+                patch.object(worker, 'fetch_campaign_characters', return_value=[{'id': 81, 'name': 'Mira Vell'}]), \
+                patch.object(worker, 'request_player_decision', return_value=(
+                    {'action': 'apply_proposal', 'proposal_id': 61},
+                    '{}',
+                    0,
+                    'opencode_go',
+                    'model',
+                )) as request_player_decision, \
+                patch.object(worker, 'submit_decision', return_value={}), \
+                patch.object(worker, 'append_event'):
+            status, detail = worker.resolve_priority_proposal(
+                args, self._manifest(), self._claim_payload(), session, 0, 7, 'lease-1',
+            )
+
+        self.assertEqual(status, 'resolved')
+        self.assertEqual(detail['id'], 61)
+        passed_proposals = request_player_decision.call_args.args[7]
+        self.assertEqual([p['id'] for p in passed_proposals], [61])
+
+    def test_resolve_priority_proposal_unresolvable_after_retries(self):
+        args = self._args()
+        session = self._session([
+            {'id': 4, 'character_id': 81, 'changes': [{'field': 'current_hp', 'after': 0}], 'created_at': '2026-07-01T10:00:00Z'},
+        ])
+
+        with patch.object(worker, 'api_get', side_effect=[{'world': {}}, {'campaign': {'id': 100003, 'name': 'Test Campaign'}}]), \
+                patch.object(worker, 'fetch_campaign_characters', return_value=[{'id': 81, 'name': 'Mira Vell'}]), \
+                patch.object(worker, 'request_player_decision', return_value=(
+                    {'action': 'no_action'},
+                    '{"action":"no_action"}',
+                    0,
+                    'opencode_go',
+                    'model',
+                )) as request_player_decision, \
+                patch.object(worker, 'submit_decision') as submit_decision, \
+                patch.object(worker, 'append_event') as append_event:
+            status, detail = worker.resolve_priority_proposal(
+                args, self._manifest(), self._claim_payload(), session, 0, 7, 'lease-1',
+            )
+
+        self.assertEqual(status, 'unresolvable')
+        self.assertEqual(detail['id'], 4)
+        self.assertEqual(request_player_decision.call_count, worker.autonomous.PROPOSAL_RESOLUTION_MAX_ATTEMPTS)
+        submit_decision.assert_not_called()
+        event_types = [call.args[5] for call in append_event.call_args_list]
+        self.assertIn('proposal_resolution_failed', event_types)
+
+    def test_execute_run_resolves_proposal_before_overseer_without_incrementing_turns(self):
+        args = SimpleNamespace(
+            api_base='http://127.0.0.1:5889',
+            owner_api_key='owner-key',
+            worker_id='proposal-worker-test',
+            max_minutes=None,
+            idle_timeout=180.0,
+            heartbeat_interval=999.0,
+            poll_interval=0.01,
+            max_turns=50,
+            dm_response_timeout=60.0,
+            message_window=16,
+            model='test-model',
+        )
+        initial_session = {
+            'id': 4,
+            'is_active': True,
+            'started_at': '2026-07-01T15:58:50.044971',
+            'messages': [
+                {'id': 410, 'role': 'dm', 'content': 'Mira collapses at 0 HP.', 'created_at': '2026-07-01T15:59:05.608343'},
+            ],
+            'pending_sheet_proposals': [
+                {'id': 1, 'character_id': 81, 'changes': [{'field': 'current_hp', 'after': 0}], 'reason': '0 HP', 'created_at': '2026-07-01T16:00:00Z'},
+            ],
+        }
+        resolved_session = {
+            **initial_session,
+            'pending_sheet_proposals': [],
+        }
+        claim_payload = {
+            'run': {'id': 2, 'attempt_count': 1, 'runner_config': {'audit_pause_phases': []}},
+            'lease_token': 'lease-1',
+            'derived_campaign': {'id': 100003},
+            'latest_session': initial_session,
+            'gameplay_readiness': {'campaign_ready': True},
+            'roster': [
+                {
+                    'llm_player_id': 33,
+                    'user_id': 35,
+                    'label': 'Auto Player 1',
+                    'character_name': 'Mira Vell',
+                    'derived_character_id': 81,
+                },
+            ],
+        }
+        manifest = {
+            'campaign': {'id': 100003, 'name': 'Test Campaign'},
+            'llm_players': [
+                {'llm_player': {'id': 33, 'user_id': 35, 'label': 'Auto Player 1'}, 'character': {'id': 81, 'name': 'Mira Vell'}},
+            ],
+        }
+
+        with patch.object(worker, 'claim_run', return_value=claim_payload), \
+                patch.object(worker, 'heartbeat', return_value={'run': {'lease_token': 'lease-1'}}), \
+                patch.object(worker, 'build_manifest_for_run', return_value=manifest), \
+                patch.object(worker, 'append_event'), \
+                patch.object(worker, 'api_get', side_effect=[{'world': {}}, {'campaign': {'id': 100003, 'name': 'Test Campaign'}}]), \
+                patch.object(worker, 'fetch_campaign_characters', return_value=[{'id': 81, 'name': 'Mira Vell'}]), \
+                patch.object(worker, 'request_player_decision', return_value=(
+                    {'action': 'apply_proposal', 'proposal_id': 1},
+                    '{"action":"apply_proposal","proposal_id":1}',
+                    0,
+                    'opencode_go',
+                    'deepseek-v4-flash',
+                )) as request_player_decision, \
+                patch.object(worker, 'submit_decision', return_value={'proposal': {'id': 1, 'status': 'applied'}}) as submit_decision, \
+                patch.object(worker, 'request_overseer_decision', return_value={'action': 'no_action'}) as overseer_mock, \
+                patch.object(worker, 'fetch_run', side_effect=[
+                    {'run': {'status': 'running'}, 'latest_session': initial_session},
+                    {'run': {'status': 'running'}, 'latest_session': resolved_session},
+                    {'run': {'status': 'stop_requested', 'error_text': 'done'}, 'latest_session': resolved_session},
+                ]), \
+                patch.object(worker, 'complete_run') as complete_run, \
+                patch.object(worker.time, 'sleep'), \
+                patch.object(worker.time, 'monotonic', side_effect=iter([0.0] * 40)):
+            finished = worker.execute_run(args, 2)
+
+        self.assertTrue(finished)
+        submit_decision.assert_called_once()
+        overseer_mock.assert_called_once()
+        complete_run.assert_called_once()
+        self.assertEqual(complete_run.call_args.kwargs['status'], 'stopped')
+
+    def test_execute_run_fails_when_state_critical_proposal_unresolvable(self):
+        args = SimpleNamespace(
+            api_base='http://127.0.0.1:5889',
+            owner_api_key='owner-key',
+            worker_id='proposal-worker-test',
+            max_minutes=None,
+            idle_timeout=180.0,
+            heartbeat_interval=999.0,
+            poll_interval=0.01,
+            max_turns=50,
+            dm_response_timeout=60.0,
+            message_window=16,
+            model='test-model',
+        )
+        initial_session = {
+            'id': 4,
+            'is_active': True,
+            'started_at': '2026-07-01T15:58:50.044971',
+            'messages': [
+                {'id': 410, 'role': 'dm', 'content': 'Mira collapses at 0 HP.', 'created_at': '2026-07-01T15:59:05.608343'},
+            ],
+            'pending_sheet_proposals': [
+                {'id': 1, 'character_id': 81, 'changes': [{'field': 'current_hp', 'after': 0}], 'reason': '0 HP', 'created_at': '2026-07-01T16:00:00Z'},
+            ],
+        }
+        claim_payload = {
+            'run': {'id': 2, 'attempt_count': 1, 'runner_config': {'audit_pause_phases': []}},
+            'lease_token': 'lease-1',
+            'derived_campaign': {'id': 100003},
+            'latest_session': initial_session,
+            'gameplay_readiness': {'campaign_ready': True},
+            'roster': [
+                {
+                    'llm_player_id': 33,
+                    'user_id': 35,
+                    'label': 'Auto Player 1',
+                    'character_name': 'Mira Vell',
+                    'derived_character_id': 81,
+                },
+            ],
+        }
+        manifest = {
+            'campaign': {'id': 100003, 'name': 'Test Campaign'},
+            'llm_players': [
+                {'llm_player': {'id': 33, 'user_id': 35, 'label': 'Auto Player 1'}, 'character': {'id': 81, 'name': 'Mira Vell'}},
+            ],
+        }
+
+        with patch.object(worker, 'claim_run', return_value=claim_payload), \
+                patch.object(worker, 'heartbeat', return_value={'run': {'lease_token': 'lease-1'}}), \
+                patch.object(worker, 'build_manifest_for_run', return_value=manifest), \
+                patch.object(worker, 'append_event'), \
+                patch.object(worker, 'api_get', side_effect=[{'world': {}}, {'campaign': {'id': 100003, 'name': 'Test Campaign'}}]), \
+                patch.object(worker, 'fetch_campaign_characters', return_value=[{'id': 81, 'name': 'Mira Vell'}]), \
+                patch.object(worker, 'request_player_decision', return_value=(
+                    {'action': 'no_action'},
+                    '{"action":"no_action"}',
+                    0,
+                    'opencode_go',
+                    'deepseek-v4-flash',
+                )), \
+                patch.object(worker, 'submit_decision'), \
+                patch.object(worker, 'request_overseer_decision'), \
+                patch.object(worker, 'fetch_run', return_value={'run': {'status': 'running'}, 'latest_session': initial_session}), \
+                patch.object(worker, 'complete_run') as complete_run, \
+                patch.object(worker.time, 'sleep'), \
+                patch.object(worker.time, 'monotonic', side_effect=iter([0.0] * 40)):
+            finished = worker.execute_run(args, 2)
+
+        self.assertTrue(finished)
+        complete_run.assert_called_once()
+        self.assertEqual(complete_run.call_args.kwargs['status'], 'failed')
+        self.assertEqual(complete_run.call_args.kwargs['error_text'], 'state_critical_proposal_unresolved')
+
+    def test_execute_run_blocks_when_state_critical_proposal_has_no_resolver(self):
+        args = SimpleNamespace(
+            api_base='http://127.0.0.1:5889',
+            owner_api_key='owner-key',
+            worker_id='proposal-worker-test',
+            max_minutes=None,
+            idle_timeout=180.0,
+            heartbeat_interval=999.0,
+            poll_interval=0.01,
+            max_turns=50,
+            dm_response_timeout=60.0,
+            message_window=16,
+            model='test-model',
+        )
+        initial_session = {
+            'id': 4,
+            'is_active': True,
+            'started_at': '2026-07-01T15:58:50.044971',
+            'messages': [
+                {'id': 410, 'role': 'dm', 'content': 'Mira collapses at 0 HP.', 'created_at': '2026-07-01T15:59:05.608343'},
+            ],
+            'pending_sheet_proposals': [
+                {'id': 1, 'character_id': 999, 'changes': [{'field': 'current_hp', 'after': 0}], 'reason': '0 HP', 'created_at': '2026-07-01T16:00:00Z'},
+            ],
+        }
+        claim_payload = {
+            'run': {'id': 2, 'attempt_count': 1, 'runner_config': {'audit_pause_phases': []}},
+            'lease_token': 'lease-1',
+            'derived_campaign': {'id': 100003},
+            'latest_session': initial_session,
+            'gameplay_readiness': {'campaign_ready': True},
+            'roster': [
+                {
+                    'llm_player_id': 33,
+                    'user_id': 35,
+                    'label': 'Auto Player 1',
+                    'character_name': 'Mira Vell',
+                    'derived_character_id': 81,
+                },
+            ],
+        }
+        manifest = {
+            'campaign': {'id': 100003, 'name': 'Test Campaign'},
+            'llm_players': [
+                {'llm_player': {'id': 33, 'user_id': 35, 'label': 'Auto Player 1'}, 'character': {'id': 81, 'name': 'Mira Vell'}},
+            ],
+        }
+
+        with patch.object(worker, 'claim_run', return_value=claim_payload), \
+                patch.object(worker, 'heartbeat', return_value={'run': {'lease_token': 'lease-1'}}), \
+                patch.object(worker, 'build_manifest_for_run', return_value=manifest), \
+                patch.object(worker, 'append_event'), \
+                patch.object(worker, 'api_get'), \
+                patch.object(worker, 'request_player_decision'), \
+                patch.object(worker, 'submit_decision'), \
+                patch.object(worker, 'request_overseer_decision') as overseer_mock, \
+                patch.object(worker, 'fetch_run', return_value={'run': {'status': 'running'}, 'latest_session': initial_session}), \
+                patch.object(worker, 'complete_run') as complete_run, \
+                patch.object(worker.time, 'sleep'), \
+                patch.object(worker.time, 'monotonic', side_effect=iter([0.0] * 40)):
+            finished = worker.execute_run(args, 2)
+
+        self.assertTrue(finished)
+        overseer_mock.assert_not_called()
+        complete_run.assert_called_once()
+        self.assertEqual(complete_run.call_args.kwargs['status'], 'failed')
+        self.assertEqual(complete_run.call_args.kwargs['error_text'], 'state_critical_proposal_no_resolver')
 
 
 if __name__ == '__main__':

@@ -62,6 +62,117 @@ class RunAutonomousLlmCampaignTests(unittest.TestCase):
             self.assertEqual(lock_path.read_text(encoding='utf-8').strip(), str(autonomous.os.getpid()))
             autonomous.release_manifest_lock(acquired_lock_path)
 
+    def test_field_proposal_priority_ranks_state_critical_fields(self):
+        self.assertLess(
+            autonomous.field_proposal_priority('current_hp'),
+            autonomous.field_proposal_priority('death_save_failures'),
+        )
+        self.assertLess(
+            autonomous.field_proposal_priority('death_save_failures'),
+            autonomous.field_proposal_priority('condition:Poisoned'),
+        )
+        self.assertLess(
+            autonomous.field_proposal_priority('condition:Unconscious'),
+            autonomous.field_proposal_priority('spell_slots_used_3'),
+        )
+        self.assertLess(
+            autonomous.field_proposal_priority('spell_slots_used_1'),
+            autonomous.field_proposal_priority('equipment:Shortsword'),
+        )
+        self.assertIsNone(autonomous.field_proposal_priority('experience_points'))
+        self.assertIsNone(autonomous.field_proposal_priority('gp'))
+        self.assertIsNone(autonomous.field_proposal_priority(None))
+
+    def test_proposal_state_priority_returns_most_urgent_change(self):
+        proposal = {
+            'id': 1,
+            'changes': [
+                {'field': 'equipment:Shortsword', 'after': {'count': 0}},
+                {'field': 'current_hp', 'after': 0},
+            ],
+        }
+        self.assertEqual(
+            autonomous.proposal_state_priority(proposal),
+            autonomous.field_proposal_priority('current_hp'),
+        )
+
+    def test_proposal_state_priority_none_for_non_critical(self):
+        self.assertIsNone(autonomous.proposal_state_priority({'changes': [{'field': 'gp', 'after': 50}]}))
+        self.assertIsNone(autonomous.proposal_state_priority({'changes': []}))
+        self.assertIsNone(autonomous.proposal_state_priority({}))
+
+    def test_select_priority_proposal_prefers_hp_over_resource_depletion(self):
+        pending = [
+            {'id': 11, 'created_at': '2026-07-01T10:00:00Z', 'changes': [{'field': 'spell_slots_used_1', 'after': 2}]},
+            {'id': 10, 'created_at': '2026-07-01T10:00:00Z', 'changes': [{'field': 'current_hp', 'after': 0}]},
+        ]
+        self.assertEqual(autonomous.select_priority_proposal(pending)['id'], 10)
+
+    def test_select_priority_proposal_breaks_ties_by_created_at_and_id(self):
+        pending = [
+            {'id': 21, 'created_at': '2026-07-01T10:01:00Z', 'changes': [{'field': 'condition:Poisoned', 'after': {'count': 1}}]},
+            {'id': 20, 'created_at': '2026-07-01T10:00:00Z', 'changes': [{'field': 'condition:Poisoned', 'after': {'count': 1}}]},
+        ]
+        self.assertEqual(autonomous.select_priority_proposal(pending)['id'], 20)
+
+    def test_select_priority_proposal_skips_non_state_critical(self):
+        pending = [{'id': 30, 'changes': [{'field': 'gp', 'after': 5}]}]
+        self.assertIsNone(autonomous.select_priority_proposal(pending))
+        self.assertIsNone(autonomous.select_priority_proposal([]))
+        self.assertIsNone(autonomous.select_priority_proposal(None))
+
+    def test_find_priority_proposal_llm_player_matches_owning_character(self):
+        manifest = {
+            'llm_players': [
+                {'llm_player': {'id': 4, 'label': 'Auto Player 1'}, 'character': {'id': 40, 'name': 'Mira Vell'}},
+                {'llm_player': {'id': 5, 'label': 'Auto Player 2'}, 'character': {'id': 50, 'name': 'Toren Oakenshield'}},
+            ],
+        }
+        session = {
+            'pending_sheet_proposals': [
+                {'id': 1, 'character_id': 40, 'changes': [{'field': 'current_hp', 'after': 0}]},
+            ],
+        }
+        entry, proposal = autonomous.find_priority_proposal_llm_player(manifest, session)
+        self.assertEqual(entry['llm_player']['id'], 4)
+        self.assertEqual(proposal['id'], 1)
+
+    def test_find_priority_proposal_llm_player_returns_none_without_owner(self):
+        manifest = {
+            'llm_players': [
+                {'llm_player': {'id': 5, 'label': 'Auto Player 2'}, 'character': {'id': 50, 'name': 'Toren Oakenshield'}},
+            ],
+        }
+        session = {
+            'pending_sheet_proposals': [
+                {'id': 1, 'character_id': 40, 'changes': [{'field': 'current_hp', 'after': 0}]},
+            ],
+        }
+        entry, proposal = autonomous.find_priority_proposal_llm_player(manifest, session)
+        self.assertIsNone(entry)
+        self.assertIsNone(proposal)
+
+    def test_run_orchestrator_passes_proposal_only_flag(self):
+        args = SimpleNamespace(
+            opencode_server='http://127.0.0.1:4040',
+            model='opencode-go/deepseek-v4-flash',
+            message_window=12,
+            opencode_password=None,
+            dry_run=False,
+        )
+
+        with patch.object(autonomous.subprocess, 'run') as subprocess_run:
+            subprocess_run.return_value = SimpleNamespace(
+                returncode=0,
+                stdout=json.dumps({'decision': {'action': 'apply_proposal', 'proposal_id': 1}}),
+                stderr='',
+            )
+
+            autonomous.run_orchestrator(args, pathlib.Path('automation/state/test.json'), player_id=4, proposal_only=True)
+
+        command = subprocess_run.call_args.args[0]
+        self.assertIn('--proposal-only', command)
+
     def test_normalize_overseer_decision_accepts_valid_player_choice(self):
         manifest = {
             'llm_players': [
