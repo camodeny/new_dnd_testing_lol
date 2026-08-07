@@ -105,7 +105,7 @@ class PostTurnConsistencyTest(unittest.TestCase):
         self.ctx.pop()
         self.env_patch.stop()
 
-    def _clock(self, clock_id, name, segments, filled, status='active', summary=None, commit=True):
+    def _clock(self, clock_id, name, segments, filled, status='active', summary=None, visibility='dm_private', commit=True):
         clock = CampaignClock(
             campaign_id=self.campaign.id,
             clock_id=clock_id,
@@ -114,6 +114,7 @@ class PostTurnConsistencyTest(unittest.TestCase):
             filled=filled,
             status=status,
             summary=summary,
+            visibility=visibility,
         )
         db.session.add(clock)
         if commit:
@@ -277,6 +278,153 @@ class PostTurnConsistencyTest(unittest.TestCase):
         self.assertEqual(clock.status, 'active')
         self.assertEqual(report['clocks_superseded'], [])
         self.assertTrue(report['verified'])
+
+    def test_party_known_clock_not_superseded_by_private_fact(self):
+        """A party-known danger clock must not be superseded based on a
+        dm_private resolution/location fact, and no party-visible surface may
+        reveal the private fact."""
+        graph = json.loads(self.world.knowledge_graph)
+        graph['facts'].append({
+            'id': 'fact_mira_private_stabilization',
+            'entity_ids': ['mira'],
+            'text': 'Mira was secretly stabilized by the dockmaster\'s private ritual.',
+            'certainty': 'confirmed',
+            'visibility': 'dm_private',
+        })
+        self.world.knowledge_graph = json.dumps(graph)
+        # Mira is NOT in the visible scene cast, so the only binding for her is
+        # the private fact.
+        self.world.world_state = json.dumps({
+            'current_scene': {
+                'location_id': 'the_dock',
+                'location_name': 'The Dock',
+                'active_npc_ids': [],
+            },
+        })
+        db.session.commit()
+
+        self._clock(
+            'mira_in_the_water',
+            'Mira in the Water',
+            4,
+            2,
+            summary='Mira is drowning and unconscious at 0 HP.',
+            visibility='party_known',
+        )
+        db.session.commit()
+
+        report = self._run_fixture()
+        db.session.commit()
+
+        clock = CampaignClock.query.filter_by(campaign_id=self.campaign.id, clock_id='mira_in_the_water').one()
+        self.assertEqual(clock.status, 'active')
+        self.assertEqual(report['clocks_superseded'], [])
+        self.assertTrue(report['verified'])
+
+        from models import WorldEvent
+        supersede_events = WorldEvent.query.filter_by(
+            campaign_id=self.campaign.id,
+            event_type='clock_superseded',
+        ).all()
+        self.assertEqual(supersede_events, [])
+        for event in WorldEvent.query.filter_by(campaign_id=self.campaign.id).all():
+            summary = event.summary or ''
+            if event.visibility in {'public', 'party_known'}:
+                self.assertNotIn('private ritual', summary)
+                self.assertNotIn('secretly stabilized', summary)
+        self.assertNotIn('private ritual', clock.summary)
+        self.assertNotIn('secretly stabilized', clock.summary)
+
+    def test_party_known_clock_superseded_by_party_fact(self):
+        """Positive control: a party-visible fact about the same subject still
+        supersedes the party-known clock, showing the gate is visibility-based."""
+        graph = json.loads(self.world.knowledge_graph)
+        graph['facts'].append({
+            'id': 'fact_mira_pulled_ashore',
+            'entity_ids': ['mira'],
+            'text': 'Mira was pulled onto the dock by the crew.',
+            'certainty': 'confirmed',
+            'visibility': 'party_known',
+        })
+        self.world.knowledge_graph = json.dumps(graph)
+        self.world.world_state = json.dumps({
+            'current_scene': {
+                'location_id': 'the_dock',
+                'location_name': 'The Dock',
+                'active_npc_ids': [],
+            },
+        })
+        db.session.commit()
+
+        self._clock(
+            'mira_in_the_water',
+            'Mira in the Water',
+            4,
+            2,
+            summary='Mira is drowning and unconscious at 0 HP.',
+            visibility='party_known',
+        )
+        db.session.commit()
+
+        report = self._run_fixture()
+        db.session.commit()
+
+        clock = CampaignClock.query.filter_by(campaign_id=self.campaign.id, clock_id='mira_in_the_water').one()
+        self.assertEqual(clock.status, 'superseded')
+        self.assertEqual(report['clocks_superseded'][0]['kind'], 'subject_relocated')
+        self.assertTrue(report['verified'])
+
+    def test_memory_failure_does_not_bump_revision_for_retryable_patch(self):
+        """A memory failure must not advance world.memory_revision, so a stored
+        failed patch carrying the pre-failure base_memory_revision remains
+        retryable instead of tripping the stale check."""
+        world = db.session.get(CampaignWorld, self.world.id)
+        world.memory_revision = 3
+        db.session.commit()
+
+        from services.dm_turns import begin_session_dm_turn
+        db.session.add(begin_session_dm_turn(
+            self.campaign.id,
+            self.session.id,
+            1,
+            'session_dm:session_1:message_1',
+        ))
+        db.session.commit()
+
+        from routes.sessions import _run_session_memory_update
+        with patch('routes.sessions.get_session_memory_patch', side_effect=RuntimeError('memory failed')):
+            _run_session_memory_update(
+                campaign_id=self.campaign.id,
+                session_id=self.session.id,
+                user_id=self.user.id,
+                player_message_id=1,
+                player_content='Hello',
+                ai_text='Hi',
+                hot_context={},
+                parent_trace_id='test:trace',
+                dm_message_id=2,
+            )
+
+        world = db.session.get(CampaignWorld, self.world.id)
+        self.assertEqual(world.memory_revision, 3)
+
+        turn = SessionDmTurn.query.filter_by(player_message_id=1).first()
+        self.assertEqual(turn.post_turn_status, 'error')
+        self.assertEqual(turn.post_turn_revision, 3)
+
+        # The stored failed patch (base 3) is still applicable after recovery.
+        from services.dm_tools import apply_compiled_session_memory_patch
+        stored_patch = {
+            'source_contract': 'compiled_session_memory_v2',
+            'base_memory_revision': 3,
+            'running_summary': 'The party recovered the lead at the dock.',
+        }
+        apply_compiled_session_memory_patch(self.campaign, self.session, stored_patch)
+        db.session.commit()
+
+        world = db.session.get(CampaignWorld, self.world.id)
+        self.assertEqual(world.memory_revision, 4)
+        self.assertEqual(db.session.get(CampaignSession, self.session.id).running_summary, 'The party recovered the lead at the dock.')
 
     def test_memory_failure_still_reconciles_durable_state(self):
         """Even when memory fails (turn reports error), deterministic repairs

@@ -120,6 +120,19 @@ def _contains_phrase(text, phrase):
     return False
 
 
+def _visibility_allows(source_visibility, required_visibility):
+    """True when an evidence source at ``source_visibility`` may drive a durable
+    change surfaced at ``required_visibility``. Private evidence must never be
+    copied into party-facing clock or event text."""
+    source_visibility = source_visibility if source_visibility in {'public', 'party_known', 'dm_private'} else 'dm_private'
+    required_visibility = required_visibility if required_visibility in {'public', 'party_known', 'dm_private'} else 'dm_private'
+    if required_visibility == 'public':
+        return source_visibility == 'public'
+    if required_visibility == 'party_known':
+        return source_visibility in {'party_known', 'public'}
+    return True
+
+
 def _subject_index(campaign, graph):
     """Map known entity/NPC id -> display name for subjects referenced by clocks.
 
@@ -147,7 +160,7 @@ def _subject_index(campaign, graph):
 
 
 def _location_index(graph):
-    """Map location entity id -> (name, lower-words)."""
+    """Map location entity id -> display name."""
     index = {}
     if not isinstance(graph, dict):
         return index
@@ -159,7 +172,7 @@ def _location_index(graph):
         entity_id = clean_id(entity.get('id'), '')
         name = clean_text(entity.get('name'), 200)
         if entity_id and name:
-            index[entity_id] = {'name': name, 'words': _lower_words(name)}
+            index[entity_id] = {'name': name}
     return index
 
 
@@ -183,8 +196,12 @@ def _clock_subject_ids(clock, subject_index):
     return matched
 
 
-def _subject_committed_location(campaign, graph, world_state, subject_id):
+def _subject_committed_location(campaign, graph, world_state, subject_id, min_visibility='dm_private'):
     """Determine where committed state places a subject.
+
+    Evidence used to derive a committed location must be at least as visible as
+    ``min_visibility`` so a private fact can never be copied into a
+    party-facing clock/event surface.
 
     Returns (status, location_ref, evidence):
         status: 'at_scene' | 'departed' | 'from_facts' | 'ambiguous' | 'unknown'
@@ -211,18 +228,21 @@ def _subject_committed_location(campaign, graph, world_state, subject_id):
             entity_ids = fact.get('entity_ids', []) if isinstance(fact.get('entity_ids'), list) else []
             if subject_id not in entity_ids:
                 continue
+            fact_visibility = clean_text(fact.get('visibility'), 30) or 'dm_private'
+            if not _visibility_allows(fact_visibility, min_visibility):
+                continue
             text = clean_text(fact.get('text'), 700)
             if not text:
                 continue
-            fact_words = _lower_words(text)
             for loc_id, loc in location_index.items():
-                if loc['words'] & fact_words:
-                    committed_locations.add(loc_id)
-                    evidence.append({
-                        'fact': text[:240],
-                        'location_id': loc_id,
-                        'location_name': loc['name'],
-                    })
+                if not _contains_phrase(text, loc['name']):
+                    continue
+                committed_locations.add(loc_id)
+                evidence.append({
+                    'fact': text[:240],
+                    'location_id': loc_id,
+                    'location_name': loc['name'],
+                })
     if not committed_locations:
         return 'unknown', None, []
     if len(committed_locations) > 1:
@@ -246,7 +266,13 @@ def _clock_location_conflict(campaign, graph, world_state, clock, subject_id):
     """Return (reason, kind) when the clock's location binding contradicts the
     committed location of its subject, else (None, None). kind is
     'conflict' or 'ambiguous'."""
-    status, loc_ref, evidence = _subject_committed_location(campaign, graph, world_state, subject_id)
+    status, loc_ref, evidence = _subject_committed_location(
+        campaign,
+        graph,
+        world_state,
+        subject_id,
+        min_visibility=clock.visibility or 'dm_private',
+    )
     location_index = _location_index(graph)
     known_ids, generic_words = _clock_asserted_locations(clock, location_index)
 
@@ -323,6 +349,9 @@ def _clock_condition_resolved(campaign, graph, clock, subject_id):
             continue
         entity_ids = fact.get('entity_ids', []) if isinstance(fact.get('entity_ids'), list) else []
         if subject_id not in entity_ids:
+            continue
+        fact_visibility = clean_text(fact.get('visibility'), 30) or 'dm_private'
+        if not _visibility_allows(fact_visibility, clock.visibility or 'dm_private'):
             continue
         fact_text = clean_text(fact.get('text'), 700)
         if not fact_text:
@@ -414,6 +443,7 @@ def reconcile_post_turn_state(
     trace_label=None,
     memory_result=None,
     clock_result=None,
+    bump_revision=True,
 ):
     """Reconcile the running summary, clock descriptions, and scene state after
     memory and clock commits, then expose one correlated terminal revision.
@@ -443,10 +473,14 @@ def reconcile_post_turn_state(
 
     # One correlated terminal revision for this post-turn finalization. The
     # bump happens up front so incident reports also carry the correlated value.
+    # When ``bump_revision`` is False (memory failed this turn), the revision is
+    # left untouched so a stored failed memory patch with the pre-failure
+    # base_memory_revision remains retryable without tripping the stale check.
     from time_utils import utcnow
-    world.memory_revision = (world.memory_revision or 0) + 1
-    world.updated_at = utcnow()
-    terminal_revision = world.memory_revision
+    if bump_revision:
+        world.memory_revision = (world.memory_revision or 0) + 1
+        world.updated_at = utcnow()
+    terminal_revision = world.memory_revision or 0
 
     report = {
         'summary_patches': [],

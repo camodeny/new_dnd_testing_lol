@@ -109,7 +109,7 @@ def _member_record(campaign_id, user_id):
     return CampaignMember.query.filter_by(campaign_id=campaign_id, user_id=user_id).first()
 
 
-def _reconcile_post_turn_state(campaign, session, player_message_id, dm_message_id, parent_trace_id):
+def _reconcile_post_turn_state(campaign, session, player_message_id, dm_message_id, parent_trace_id, bump_revision=True):
     """Run deterministic post-turn reconciliation, commit its repairs, and log
     any unresolvable contradiction as an actionable incident.
 
@@ -128,6 +128,7 @@ def _reconcile_post_turn_state(campaign, session, player_message_id, dm_message_
             trace_id=parent_trace_id,
             parent_trace_id=parent_trace_id,
             trace_label=trace_label,
+            bump_revision=bump_revision,
         )
         db.session.commit()
         return report.get('terminal_revision'), None
@@ -438,13 +439,16 @@ def _run_session_memory_update(
         )
         # Reconcile durable surfaces even when memory failed so any pre-existing
         # drift (e.g. a stale active clock) is repaired where deterministically
-        # possible. The turn still reports error for the memory failure.
+        # possible. The turn still reports error for the memory failure. The
+        # revision is NOT bumped so a stored failed patch with the pre-failure
+        # base_memory_revision stays retryable.
         terminal_revision, _incident_text = _reconcile_post_turn_state(
             campaign,
             session,
             player_message_id,
             dm_message_id,
             parent_trace_id,
+            bump_revision=False,
         )
         mark_session_dm_turn_error(
             campaign_id,
@@ -484,6 +488,7 @@ def _run_session_memory_update(
             player_message_id,
             dm_message_id,
             parent_trace_id,
+            bump_revision=memory_complete,
         )
         mark_session_dm_turn_error(
             campaign_id,
