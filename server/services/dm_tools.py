@@ -898,6 +898,7 @@ def _apply_memory_visibility_policy(campaign, patch, audit_context):
         ('create_clocks', ('name', 'summary', 'trigger', 'on_complete')),
         ('retire_clocks', ('name', 'summary', 'reason')),
         ('record_events', ('event_type', 'summary')),
+        ('update_npc_actors', ('name', 'role', 'public_summary')),
     ):
         items = patch.get(key)
         if not isinstance(items, list):
@@ -930,6 +931,144 @@ def _apply_memory_visibility_policy(campaign, patch, audit_context):
             existing_ids.add(entity_id)
 
     return patch
+
+
+def _leak_guard_has_private_content(campaign, value, visible_text):
+    """True when party-visible text carries unrevealed private terms or a
+    hidden-policy signal that is not already supported by the visible exchange."""
+    if not value:
+        return False
+    text = clean_text(value, 4000)
+    if not text:
+        return False
+    if _contains_unrevealed_private_term(campaign, text, visible_text):
+        return True
+    if visible_text and _contains_hidden_policy_signal(text) and not _is_supported_by_visible_exchange(text, visible_text):
+        return True
+    return False
+
+
+def _leak_guard_memory_patch(campaign, patch, visible_text):
+    """Final write-boundary leak prevention for memory writes.
+
+    Party-visible (public/party_known) items must never carry unrevealed
+    private terms or unsupported hidden-policy signals. An identity field that
+    leaks demotes the whole item to dm_private; secondary text fields are
+    redacted in place. NPC public columns are redacted independently so a
+    visible name cannot promote a private dossier summary. Private dossier
+    fields (voice, background, wants, fears, secrets, relationships,
+    recent_offscreen_activity) always stay inside the DM-private dossier.
+
+    Returns a telemetry dict with reason codes and counts only -- never the
+    secret content itself.
+    """
+    telemetry = {
+        'entities_demoted': 0,
+        'entities_redacted': 0,
+        'relations_demoted': 0,
+        'relations_redacted': 0,
+        'facts_demoted': 0,
+        'events_demoted': 0,
+        'events_redacted': 0,
+        'npcs_demoted': 0,
+        'npc_public_redacted': 0,
+        'clocks_demoted': 0,
+        'reasons': [],
+    }
+
+    def _flag(reason):
+        telemetry['reasons'].append(reason)
+
+    for item in patch.get('upsert_graph_entities', []) if isinstance(patch.get('upsert_graph_entities'), list) else []:
+        if not isinstance(item, dict) or item.get('visibility') not in {'public', 'party_known'}:
+            continue
+        if _leak_guard_has_private_content(campaign, item.get('name'), visible_text):
+            item['visibility'] = 'dm_private'
+            telemetry['entities_demoted'] += 1
+            _flag('entity_name_private')
+            continue
+        if _leak_guard_has_private_content(
+            campaign,
+            _visibility_text_for_item(item, ('summary', 'tags')),
+            visible_text,
+        ):
+            for field in ('summary', 'tags'):
+                if field in item:
+                    item.pop(field, None)
+            telemetry['entities_redacted'] += 1
+            _flag('entity_summary_private')
+
+    for item in patch.get('upsert_graph_relations', []) if isinstance(patch.get('upsert_graph_relations'), list) else []:
+        if not isinstance(item, dict) or item.get('visibility') not in {'public', 'party_known'}:
+            continue
+        if _leak_guard_has_private_content(
+            campaign,
+            _visibility_text_for_item(item, ('summary', 'type')),
+            visible_text,
+        ):
+            item['visibility'] = 'dm_private'
+            telemetry['relations_demoted'] += 1
+            _flag('relation_private')
+
+    for item in patch.get('upsert_graph_facts', []) if isinstance(patch.get('upsert_graph_facts'), list) else []:
+        if not isinstance(item, dict) or item.get('visibility') not in {'public', 'party_known'}:
+            continue
+        if _leak_guard_has_private_content(campaign, item.get('text'), visible_text):
+            item['visibility'] = 'dm_private'
+            telemetry['facts_demoted'] += 1
+            _flag('fact_private')
+
+    for item in patch.get('update_npc_actors', []) if isinstance(patch.get('update_npc_actors'), list) else []:
+        if not isinstance(item, dict):
+            continue
+        identity_private = _leak_guard_has_private_content(campaign, item.get('name'), visible_text)
+        if identity_private:
+            item.pop('name', None)
+            telemetry['npc_public_redacted'] += 1
+            _flag('npc_name_private')
+        if _leak_guard_has_private_content(
+            campaign,
+            _visibility_text_for_item(item, ('role', 'public_summary')),
+            visible_text,
+        ):
+            for field in ('role', 'public_summary'):
+                if field in item:
+                    item.pop(field, None)
+            telemetry['npc_public_redacted'] += 1
+            _flag('npc_public_fields_private')
+        if identity_private:
+            item['visibility'] = 'dm_private'
+            telemetry['npcs_demoted'] += 1
+            _flag('npc_demoted_dm_private')
+        else:
+            item['visibility'] = _coerce_patch_visibility(item.get('visibility')) or 'dm_private'
+
+    for item in patch.get('record_events', []) if isinstance(patch.get('record_events'), list) else []:
+        if not isinstance(item, dict) or item.get('visibility') not in {'public', 'party_known'}:
+            continue
+        if _leak_guard_has_private_content(
+            campaign,
+            _visibility_text_for_item(item, ('summary', 'event_type')),
+            visible_text,
+        ):
+            item['visibility'] = 'dm_private'
+            telemetry['events_demoted'] += 1
+            _flag('event_private')
+
+    for key in ('create_clocks', 'retire_clocks'):
+        for item in patch.get(key, []) if isinstance(patch.get(key), list) else []:
+            if not isinstance(item, dict) or item.get('visibility') not in {'public', 'party_known'}:
+                continue
+            if _leak_guard_has_private_content(
+                campaign,
+                _visibility_text_for_item(item, ('name', 'summary', 'trigger', 'on_complete')),
+                visible_text,
+            ):
+                item['visibility'] = 'dm_private'
+                telemetry['clocks_demoted'] += 1
+                _flag('clock_private')
+
+    return telemetry
 
 
 def _selected_member(campaign_id, user_id):
@@ -5858,6 +5997,13 @@ def apply_memory_patch(campaign, session, patch, audit_context=None):
     patch = _normalize_memory_patch(patch)
     patch = _apply_memory_visibility_policy(campaign, patch, audit_context)
 
+    # Final output-boundary leak guard runs after the visibility policy so its
+    # redactions/demotions are authoritative: a party-visible item that still
+    # carries unrevealed private terms is demoted to dm_private or redacted.
+    leak_guard_telemetry = _leak_guard_memory_patch(campaign, patch, _visibility_policy_text(audit_context))
+    if isinstance(audit_context, dict):
+        audit_context['leak_guard_telemetry'] = leak_guard_telemetry
+
     # Initialize memory run ID and turn ID tracking
     memory_run_id = audit_context.get('memory_run_id') or f"memrun_{uuid.uuid4().hex[:12]}"
     trace_id = audit_context.get('trace_id')
@@ -6604,11 +6750,15 @@ def apply_memory_patch(campaign, session, patch, audit_context=None):
                 patch_json=None
             )
 
+        leak_telemetry = audit_context.get('leak_guard_telemetry') if isinstance(audit_context, dict) else None
+        audit_payload = {'session_id': session.id, 'patch': patch, 'result': result}
+        if isinstance(leak_telemetry, dict):
+            audit_payload['leak_guard'] = leak_telemetry
         log_audit_event(
             campaign.id,
             'memory_patch_applied',
             'Applied post-turn session memory patch.',
-            {'session_id': session.id, 'patch': patch, 'result': result},
+            audit_payload,
             source='dm_tools.memory',
             actor='session_memory_writer',
             trace_id=trace_id,
@@ -6711,6 +6861,12 @@ def apply_compiled_session_memory_patch(campaign, session, patch, audit_context=
         context_breakdown_json=telemetry if isinstance(telemetry, dict) else None,
     )
     db.session.add(run_record)
+
+    # Final output-boundary leak guard. Runs before any graph/NPC mutation so
+    # redactions and demotions are what actually persist.
+    leak_guard_telemetry = _leak_guard_memory_patch(campaign, patch, _visibility_policy_text(audit_context))
+    if isinstance(audit_context, dict):
+        audit_context['leak_guard_telemetry'] = leak_guard_telemetry
 
     world, graph, world_state, _private = _world_json(campaign)
     result = {
@@ -6861,11 +7017,15 @@ def apply_compiled_session_memory_patch(campaign, session, patch, audit_context=
     if isinstance(resolution_records, list):
         persist_identity_resolutions(resolution_records, campaign)
 
+    leak_telemetry = audit_context.get("leak_guard_telemetry") if isinstance(audit_context, dict) else None
+    audit_payload = {"session_id": session.id if session else None, "result": result}
+    if isinstance(leak_telemetry, dict):
+        audit_payload["leak_guard"] = leak_telemetry
     log_audit_event(
         campaign.id,
         "memory_patch_applied_v2",
         "Applied compiled session memory patch (v2 trusted path).",
-        {"session_id": session.id if session else None, "result": result},
+        audit_payload,
         source="dm_tools.memory_v2",
         actor="session_memory_writer",
         trace_id=trace_id,
