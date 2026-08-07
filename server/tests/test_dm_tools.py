@@ -52,6 +52,7 @@ from openrouter import (
     _session_dm_tool_result_for_prompt,
     _witness_private_leverage_spoiler_violation,
     build_session_dm_tool_messages,
+    build_session_canon_discipline_check_messages,
     get_session_memory_patch,
     get_session_dm_response_with_tools,
     normalize_session_dm_turn_decision,
@@ -2359,6 +2360,42 @@ class DmToolsTest(unittest.TestCase):
         self.assertIn('npc_dialogue targets', prompt)
         self.assertIn('Use public descriptors', prompt)
 
+    def test_canon_repair_prompt_contains_specific_sidecar_findings(self):
+        prompt = _session_dm_guard_retry_system_prompt(
+            'canon_discipline',
+            {
+                'safe': False,
+                'unsupported_confirmations': [{
+                    'sentence': 'Elbrig was taken by the saboteur.',
+                    'claim_source': 'unsupported_lore',
+                    'reason': 'The public thread establishes a missing keeper, not who took him.',
+                }],
+                'coherence_conflicts': [],
+                'confidence': 'high',
+                'reason': 'The answer disclosed details beyond the public evidence.',
+            },
+        )
+
+        self.assertIn('sidecar repair brief', prompt)
+        self.assertIn('not part of the narrative history', prompt)
+        self.assertIn('Elbrig was taken by the saboteur.', prompt)
+        self.assertIn('The public thread establishes a missing keeper, not who took him.', prompt)
+        self.assertIn('additional names, motives, causes', prompt)
+
+    def test_canon_checker_contract_treats_open_threads_as_public_evidence(self):
+        messages = build_session_canon_discipline_check_messages(
+            'The keeper vanished last night.',
+            {
+                'recent_messages': [{'role': 'player', 'content': 'Where is the missing keeper?'}],
+                'open_public_threads': ['Locate the missing keeper.'],
+            },
+        )
+
+        self.assertIn('already-established public leads', messages[0]['content'])
+        self.assertIn('refusing to infer any extra name', messages[0]['content'])
+        payload = json.loads(messages[1]['content'])
+        self.assertEqual(payload['open_public_threads'], ['Locate the missing keeper.'])
+
     def test_missing_npc_tag_retry_prompt_respects_private_terms(self):
         prompt = _session_dm_guard_retry_system_prompt('missing_npc_tag', {})
 
@@ -3831,6 +3868,85 @@ class DmToolsTest(unittest.TestCase):
             {'mode': 'speak', 'content': '<npc target="Harl">"That is a very specific description. If it is true, someone important is missing."</npc>'},
         )
         self.assertEqual(post_chat.call_count, 2)
+
+    def test_canon_repair_sidecar_discards_serialized_rejected_draft(self):
+        rejected = 'Elbrig kept the lanterns, and the saboteur took him.'
+        repaired = '<npc target="Harbormaster Thane Marrow">"A keeper is missing. I do not yet know whether it is connected."</npc>'
+        hot_context = {
+            'protected_player_characters': [],
+            'private_output_terms': [],
+            'private_spoiler_items': [],
+            'session': {'running_summary': ''},
+            'current_scene': {'location_name': 'Larkspur Landing'},
+            'recent_messages': [
+                {'role': 'player', 'content': 'Where is the missing lantern keeper?'},
+            ],
+            'established_public_facts': [],
+            'recent_public_world_events': [],
+            'open_public_threads': ['Locate the missing lantern keeper.'],
+            'visible_naming_constraints': [],
+        }
+        violation = {
+            'safe': False,
+            'unsupported_confirmations': [{
+                'sentence': 'Elbrig kept the lanterns, and the saboteur took him.',
+                'claim_source': 'unsupported_lore',
+                'reason': 'The public thread does not establish the keeper name or who took him.',
+            }],
+            'coherence_conflicts': [],
+            'confidence': 'high',
+            'reason': 'The candidate disclosed details beyond the public thread.',
+        }
+
+        raw_plain_draft = _normalized_from_raw({
+            'choices': [{'message': {'content': rejected}}],
+        })
+        with patch(
+            'openrouter._post_chat_normalized',
+            side_effect=[
+                raw_plain_draft,
+                _normalized_from_raw(dm_talk_tool_response(rejected)),
+                _normalized_from_raw(dm_talk_tool_response(repaired)),
+            ],
+        ) as post_chat, patch(
+            'openrouter.check_session_canon_discipline_with_llm',
+            side_effect=[
+                violation,
+                {
+                    'safe': True,
+                    'unsupported_confirmations': [],
+                    'coherence_conflicts': [],
+                    'confidence': 'high',
+                    'reason': '',
+                },
+            ],
+        ):
+            result = get_session_dm_response_with_tools(
+                hot_context,
+                [],
+                [],
+                lambda *_args, **_kwargs: {},
+                max_tool_rounds=0,
+            )
+
+        self.assertEqual(result, {'mode': 'speak', 'content': repaired})
+        self.assertEqual(post_chat.call_count, 3)
+        repair_messages = post_chat.call_args_list[2].args[0]
+        self.assertFalse(any(
+            message.get('role') == 'assistant' and rejected in str(message.get('content') or '')
+            for message in repair_messages
+        ))
+        self.assertFalse(any(
+            'Convert the immediately preceding assistant draft' in str(message.get('content') or '')
+            for message in repair_messages
+        ))
+        repair_prompts = [
+            str(message.get('content') or '')
+            for message in repair_messages
+            if message.get('role') == 'system' and 'sidecar repair brief' in str(message.get('content') or '')
+        ]
+        self.assertEqual(len(repair_prompts), 1)
+        self.assertIn('The public thread does not establish the keeper name or who took him.', repair_prompts[0])
 
     def test_canon_discipline_truncated_repair_retries_with_larger_budget(self):
         hot_context = {

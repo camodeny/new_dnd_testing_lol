@@ -385,6 +385,9 @@ SESSION_CANON_DISCIPLINE_CHECK_SYSTEM_PROMPT = (
     "re-offer, re-place, or reset that same object state unless the fiction visibly explains the reversal. "
     "Safe replies may react skeptically, conditionally, or provisionally to player claims, may let NPCs say "
     "that a detail sounds familiar, and may leave uncertainty in place. "
+    "The user payload's open_public_threads are already-established public leads. Treat the exact content of an "
+    "open public thread as corroborating public evidence, while refusing to infer any extra name, identity, motive, "
+    "cause, relationship, or outcome that the thread itself does not state. "
     "Be especially cautious when a candidate reply introduces a new proper noun, identity, ownership, or hidden "
     "connection that appears to come only from the player's speculative framing. "
     "If the reply can be made safe by adding uncertainty language or by keeping an NPC reaction non-authoritative, "
@@ -1554,14 +1557,23 @@ def _session_dm_guard_retry_system_prompt(guard_name, details):
             + silent_ack
         )
     if guard_name == 'canon_discipline':
+        details = details if isinstance(details, dict) else {}
+        repair_brief = {
+            'overall_reason': str(details.get('reason') or '').strip(),
+            'unsupported_confirmations': details.get('unsupported_confirmations') or [],
+            'coherence_conflicts': details.get('coherence_conflicts') or [],
+            'confidence': str(details.get('confidence') or '').strip(),
+        }
         return (
-            'Guard reminder: do not promote unsupported claims into objective truth. '
-            'Treat player-supplied details, accusations, recollections, and theories as claims unless they are '
-            'corroborated by the visible scene, a successful check, or established public facts. '
-            'NPCs may react to a claim without validating it. '
-            'Do not sharply replace or contradict an established public lead unless the visible evidence clearly earns that change. '
-            'If certainty is incomplete, speak conditionally instead of authoritatively. '
-            'Finalize with talk_to_player or stay_silent.'
+            'Canon-guard sidecar repair brief. The previous candidate was rejected and is not part of the narrative '
+            'history. Generate a fresh replacement from the clean turn context. Do not repeat any rejected sentence '
+            'or factual claim identified below. Open public threads corroborate only the exact facts they state; they '
+            'do not authorize additional names, motives, causes, relationships, or outcomes. NPCs may react to an '
+            'unverified claim without validating it, and may speak conditionally when certainty is incomplete. '
+            'Preserve established public leads unless visible evidence supports a change. If no safe visible response '
+            'is needed, use stay_silent. Otherwise finalize with talk_to_player.\n\n'
+            'Structured guard findings:\n'
+            f'{json.dumps(repair_brief, ensure_ascii=False, indent=2)}'
             + silent_ack
         )
     if guard_name == 'private_output':
@@ -3831,12 +3843,14 @@ def _run_session_dm_loop(
     finalizer_contract_retry_count = 0
     draft_serialization_active = False
     preserved_visible_draft = ''
+    draft_serialization_base_messages = None
     combat_batch_retry_count = 0
     combat_batch_force_tools = False
     format_retry_count = 0
     mechanical_retried = False
     pc_control_retried = False
     canon_checker_retry_count = 0
+    canon_repair_base_messages = None
     private_output_retry_count = 0
     spoiler_checker_retry_count = 0
     combat_handoff_retried = False
@@ -3934,6 +3948,10 @@ def _run_session_dm_loop(
             'token_estimate': base_audit.get('token_estimate'),
             'full_world_graph_included': False,
         }
+        # Capture the exact clean context that produced this candidate. Guard repairs
+        # branch from this snapshot instead of accumulating rejected drafts in the
+        # main generation conversation.
+        candidate_context_messages = list(messages)
         try:
             normalized = _post_chat_normalized(
                 messages,
@@ -4044,6 +4062,8 @@ def _run_session_dm_loop(
                 if serialize_existing_draft:
                     # Auto-tool providers may keep regenerating prose when a reminder asks them to solve the
                     # whole turn again. Preserve the accepted draft shape and make the retry serialization-only.
+                    if not draft_serialization_active:
+                        draft_serialization_base_messages = list(messages)
                     draft_serialization_active = True
                     preserved_visible_draft = draft_to_serialize
                     messages.extend([
@@ -4069,8 +4089,14 @@ def _run_session_dm_loop(
             # Serialization mode is only for repairing the finalizer contract. Once the
             # preserved draft has produced a valid visible finalizer, downstream guard
             # rewrites must regain both finalizer choices, including stay_silent.
+            guard_repair_base_messages = (
+                list(draft_serialization_base_messages)
+                if draft_serialization_active and draft_serialization_base_messages is not None
+                else list(candidate_context_messages)
+            )
             draft_serialization_active = False
             preserved_visible_draft = ''
+            draft_serialization_base_messages = None
             combat_batch_violation = _session_dm_combat_batch_violation(decision, combat_tracker)
             if combat_batch_violation and combat_batch_retry_count < 2 and tool_round < max_tool_rounds:
                 if on_status_change:
@@ -4258,12 +4284,15 @@ def _run_session_dm_loop(
                     log_audit_event(
                         base_audit.get('campaign_id'),
                         'canon_discipline_guard_retry',
-                        'Session DM response promoted unsupported claims or conflicted with established public facts; discarded candidate and reran with a guard reminder.',
+                        (
+                            'Session DM response promoted unsupported claims or conflicted with established public facts; '
+                            'discarded candidate and opened an isolated repair sidecar.'
+                        ),
                         {
                             'operation': 'canon_discipline_guard',
                             'violation': canon_violation,
                             'draft_response': raw_content,
-                            'repair_strategy': 'guard_reminder_rerun',
+                            'repair_strategy': 'isolated_guard_sidecar',
                         },
                         source='session_dm.guard',
                         actor=audit.get('actor'),
@@ -4273,6 +4302,12 @@ def _run_session_dm_loop(
                         audit_role='guard',
                         commit=True,
                     )
+                if canon_repair_base_messages is None:
+                    canon_repair_base_messages = list(guard_repair_base_messages)
+                # Rebuild the repair exchange from the clean pre-candidate context on
+                # every attempt. The rejected draft and prior repair prose remain in
+                # the audit trail, not in the next narrative-generation prompt.
+                messages = list(canon_repair_base_messages)
                 messages.append({
                     'role': 'system',
                     'content': _session_dm_guard_retry_system_prompt('canon_discipline', canon_violation),
