@@ -1443,6 +1443,7 @@ class SessionMemoryRecoveryTask(db.Model):
     error_code = db.Column(db.String(80), nullable=True)
     error_text = db.Column(db.Text, nullable=True)
     patch_json = db.Column(db.Text, nullable=True)
+    context_json = db.Column(db.Text, nullable=True)
     attempts = db.Column(db.Integer, nullable=False, default=0)
     last_error_text = db.Column(db.Text, nullable=True)
 

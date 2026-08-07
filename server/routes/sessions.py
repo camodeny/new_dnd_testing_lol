@@ -646,6 +646,10 @@ def _run_session_memory_update(
                 err,
                 memory_patch,
                 trace_id=memory_trace_id,
+                context={
+                    'current_user_id': current_user.id if current_user else None,
+                    'current_scene_before': current_scene_before,
+                },
             )
         except Exception:
             db.session.rollback()
@@ -704,6 +708,10 @@ def _run_session_memory_update(
                 err,
                 memory_patch,
                 trace_id=memory_trace_id,
+                context={
+                    'current_user_id': current_user.id if current_user else None,
+                    'current_scene_before': current_scene_before,
+                },
             )
         except Exception:
             db.session.rollback()
@@ -762,6 +770,23 @@ def _post_turn_status_for_player(campaign_id, session_id, player_message_id):
             'memory_status': 'complete',
             'clock_status': 'complete',
             'post_turn_error': 'Post-turn consistency incident: ' + (consistency_incident.summary or ''),
+        })
+
+    from models import SessionDmTurn
+
+    # The durable SessionDmTurn row is authoritative once a memory-recovery retry
+    # has repaired it. Without this, a recovered turn would still report error
+    # forever because the original memory_update_error audit event persists.
+    turn = SessionDmTurn.query.filter_by(
+        campaign_id=campaign_id,
+        player_message_id=player_message_id,
+    ).first()
+    if turn is not None and turn.post_turn_status == 'complete':
+        return _with_revision({
+            'post_turn_complete': True,
+            'post_turn_status': 'complete',
+            'memory_status': turn.memory_status or 'complete',
+            'clock_status': turn.clock_status or 'complete',
         })
 
     memory_error = CampaignAuditEvent.query.filter_by(

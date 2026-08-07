@@ -1,6 +1,6 @@
 """add memory recovery task table
 
-Revision ID: d4e5f6a1b2c3
+Revision ID: e5f6a1b2c3d4
 Revises: c3d4e5f6a1b2
 Create Date: 2026-08-07 00:00:00.000000
 
@@ -10,7 +10,7 @@ import sqlalchemy as sa
 
 
 # revision identifiers, used by Alembic.
-revision = 'd4e5f6a1b2c3'
+revision = 'e5f6a1b2c3d4'
 down_revision = 'c3d4e5f6a1b2'
 branch_labels = None
 depends_on = None
@@ -30,6 +30,7 @@ def upgrade():
         sa.Column('error_code', sa.String(length=80), nullable=True),
         sa.Column('error_text', sa.Text(), nullable=True),
         sa.Column('patch_json', sa.Text(), nullable=True),
+        sa.Column('context_json', sa.Text(), nullable=True),
         sa.Column('attempts', sa.Integer(), nullable=False, server_default='0'),
         sa.Column('last_error_text', sa.Text(), nullable=True),
         sa.Column('created_at', sa.DateTime(), nullable=True),

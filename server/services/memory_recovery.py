@@ -3,8 +3,10 @@
 When the staged memory pipeline fails validation or application, the post-turn
 clock/summary sync is skipped. Leaving that silent leaves clocks, summaries, and
 scene state stale while visible play continues. This module records an explicit
-recoverable recovery task (the failed compiled patch plus diagnostics) that must
-be resolved before the next turn, and provides a bounded retry path.
+recoverable recovery task (the failed compiled patch plus the inputs needed to
+replay the skipped clock adjudication) and provides a bounded retry path that
+repairs the whole post-turn pipeline: re-applies memory, re-runs clock
+adjudication, and flips the durable SessionDmTurn out of its error state.
 """
 import json
 
@@ -13,7 +15,20 @@ from time_utils import utcnow
 MAX_RECOVERY_ATTEMPTS = 3
 
 
-def create_memory_recovery_task(campaign_id, session, player_message_id, dm_message_id, err, patch, trace_id=None):
+def _serialize_context(context):
+    return json.dumps(context, default=str) if isinstance(context, dict) else None
+
+
+def create_memory_recovery_task(
+    campaign_id,
+    session,
+    player_message_id,
+    dm_message_id,
+    err,
+    patch,
+    trace_id=None,
+    context=None,
+):
     from models import SessionMemoryRecoveryTask, db
 
     patch_json = json.dumps(patch, default=str) if isinstance(patch, dict) else None
@@ -28,6 +43,7 @@ def create_memory_recovery_task(campaign_id, session, player_message_id, dm_mess
         error_code=getattr(err, 'code', 'unknown'),
         error_text=str(err),
         patch_json=patch_json,
+        context_json=_serialize_context(context),
         attempts=0,
     )
     db.session.add(task)
@@ -74,9 +90,75 @@ def resolve_memory_recovery_tasks(campaign_id, player_message_id, resolved_reaso
     return resolved
 
 
+def _replay_clock_adjudication(task, campaign, session):
+    """Re-run the clock adjudication that was skipped by the original failure."""
+    from models import SessionMessage, User, db
+    from openrouter import get_session_clock_updates
+    from services.dm_tools import apply_clock_adjudication, build_session_clock_context
+    from services.world_service import world_public_payload
+
+    context = {}
+    if task.context_json:
+        try:
+            context = json.loads(task.context_json)
+        except (TypeError, ValueError):
+            context = {}
+
+    player_row = db.session.get(SessionMessage, task.player_message_id) if task.player_message_id else None
+    dm_row = db.session.get(SessionMessage, task.dm_message_id) if task.dm_message_id else None
+    player_content = player_row.content if player_row else ''
+    dm_content = dm_row.content if dm_row else ''
+
+    current_user = db.session.get(User, context.get('current_user_id')) if context.get('current_user_id') else None
+    if current_user is None and campaign.user_id:
+        current_user = db.session.get(User, campaign.user_id)
+
+    current_scene_before = context.get('current_scene_before') if isinstance(context.get('current_scene_before'), dict) else {}
+    current_scene_after = (world_public_payload(campaign).get('world') or {}).get('current_scene') or {}
+
+    clock_context = build_session_clock_context(
+        campaign,
+        session,
+        current_user,
+        player_content,
+        dm_content,
+        current_scene_before,
+        current_scene_after,
+        player_message_id=task.player_message_id,
+        dm_message_id=task.dm_message_id,
+    )
+    clock_trace_id = f"session_clock_adjudicator:session_{session.id}:message_{task.player_message_id}:recovery"
+    clock_updates = get_session_clock_updates(
+        clock_context,
+        audit_context={
+            'campaign_id': campaign.id,
+            'operation': 'session_clock_adjudication_recovery',
+            'actor': 'session_clock_adjudicator',
+            'trace_id': clock_trace_id,
+            'trace_label': f'session_clock_adjudicator recovery: session {session.id}',
+            'source_player_message_id': task.player_message_id,
+            'source_dm_message_id': task.dm_message_id,
+        },
+    )
+    if clock_updates is None:
+        raise RuntimeError('Clock adjudication did not return a tool submission during recovery.')
+    return apply_clock_adjudication(
+        campaign,
+        clock_updates,
+        audit_context={
+            'trace_id': clock_trace_id,
+            'source_player_message_id': task.player_message_id,
+            'source_dm_message_id': task.dm_message_id,
+        },
+        allowed_evidence_sources=clock_context.get('allowed_evidence_sources') or [],
+    )
+
+
 def retry_memory_recovery_task(campaign_id, task_id):
     from models import Campaign, CampaignSession, SessionMemoryRecoveryTask, db
+    from services.audit_service import log_audit_event
     from services.dm_tools import apply_compiled_session_memory_patch
+    from services.dm_turns import repair_session_dm_turn
 
     task = (
         SessionMemoryRecoveryTask.query
@@ -102,6 +184,8 @@ def retry_memory_recovery_task(campaign_id, task_id):
 
     campaign = db.session.get(Campaign, campaign_id)
     session = db.session.get(CampaignSession, task.session_id) if task.session_id else None
+
+    # 1. Re-apply the failed memory patch.
     try:
         result = apply_compiled_session_memory_patch(campaign, session, patch)
     except Exception as err:
@@ -121,16 +205,68 @@ def retry_memory_recovery_task(campaign_id, task_id):
             'task_id': task.id,
         }
 
+    # 2. Replay the clock adjudication the original failure skipped so time-
+    # sensitive clocks are not left stale. If it fails, the memory patch is
+    # still durable and the turn records an explicit clock error.
+    clock_recovered = False
+    clock_result = None
+    clock_error = None
+    if session is not None:
+        try:
+            clock_result = _replay_clock_adjudication(task, campaign, session)
+            clock_recovered = True
+        except Exception as err:
+            clock_error = str(err)
+
+    # 3. Repair the durable turn and the recovery task in one transaction.
     task = db.session.get(SessionMemoryRecoveryTask, task.id)
     task.attempts += 1
     task.status = 'resolved'
     task.resolved_at = utcnow()
-    task.last_error_text = None
+    if clock_recovered:
+        task.last_error_text = None
+        repair_session_dm_turn(
+            task.player_message_id,
+            dm_message_id=task.dm_message_id,
+            memory_status='complete',
+            clock_status='complete',
+        )
+    else:
+        task.last_error_text = f'clock_replay_failed: {clock_error}'
+        repair_session_dm_turn(
+            task.player_message_id,
+            dm_message_id=task.dm_message_id,
+            memory_status='complete',
+            clock_status='error',
+        )
     db.session.commit()
+
+    log_audit_event(
+        campaign_id,
+        'memory_recovery_applied',
+        'Recovered a previously failed post-turn memory update.',
+        {
+            'recovery_task_id': task.id,
+            'player_message_id': task.player_message_id,
+            'dm_message_id': task.dm_message_id,
+            'memory_status': 'complete',
+            'clock_status': 'complete' if clock_recovered else 'error',
+            'clock_replay_error': clock_error,
+            'memory_result': result,
+        },
+        source='session_memory',
+        actor='session_memory_writer',
+        trace_id=task.trace_id,
+        audit_role='tools',
+        commit=True,
+    )
+
     return {
         'ok': True,
         'status': 'resolved',
         'attempts': task.attempts,
         'task_id': task.id,
+        'clock_recovered': clock_recovered,
+        'clock_error': clock_error,
         'result': result,
     }

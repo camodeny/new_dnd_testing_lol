@@ -2,6 +2,7 @@ import json
 import os
 import sys
 import unittest
+from unittest import mock
 
 from flask import Flask
 
@@ -9,10 +10,12 @@ sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..")
 
 from models import (
     Campaign,
+    CampaignClock,
     CampaignSession,
     CampaignWorld,
     Character,
     NPCActor,
+    SessionDmTurn,
     SessionMemoryRecoveryTask,
     User,
     db,
@@ -26,6 +29,7 @@ from services.memory_recovery import (
 )
 from services.session_memory_agent import MemoryPipelineError, compile_staged_memory_patch
 from services.dm_tools import apply_compiled_session_memory_patch
+from services.dm_turns import mark_session_dm_turn_error
 from services.memory_resolver_schemas import SOURCE_CONTRACT_COMPILED_V2
 
 
@@ -504,15 +508,174 @@ class SessionMemoryRecoveryTaskTest(unittest.TestCase):
             trace_id="trace_7",
         )
 
-        result = retry_memory_recovery_task(self.campaign.id, task.id)
+        with mock.patch(
+            "services.dm_tools.build_session_clock_context",
+            return_value={"allowed_evidence_sources": []},
+        ), mock.patch(
+            "openrouter.get_session_clock_updates",
+            return_value={"advance_clocks": [], "retire_clocks": [], "create_clocks": []},
+        ):
+            result = retry_memory_recovery_task(self.campaign.id, task.id)
         self.assertTrue(result["ok"], result)
         self.assertEqual(result["status"], "resolved")
+        self.assertTrue(result["clock_recovered"])
 
         graph = json.loads(self.world.knowledge_graph)
         entity_ids = {e["id"] for e in graph["entities"]}
         self.assertIn("vex_mal", entity_ids)
         self.assertEqual(self.session.running_summary, "Recovered summary after retry.")
         self.assertFalse(has_pending_memory_recovery(self.campaign.id))
+
+    def test_retry_replays_clock_adjudication_and_repairs_turn(self):
+        # A failed turn that should advance a clock must replay clock
+        # adjudication and flip the durable SessionDmTurn out of error state
+        # before the next visible turn can rely on it.
+        db.session.add(
+            NPCActor(
+                campaign_id=self.campaign.id,
+                actor_id="vex_mal",
+                name="Vex Mal",
+                dossier="{}",
+            )
+        )
+        db.session.add(
+            CampaignClock(
+                campaign_id=self.campaign.id,
+                clock_id="trapped_ferrymen",
+                name="Trapped Ferrymen",
+                segments=4,
+                filled=1,
+                status="active",
+            )
+        )
+        db.session.add(mark_session_dm_turn_error(
+            self.campaign.id,
+            self.session.id,
+            player_message_id=7,
+            trace_id="trace_7",
+            error_text="missing_relation_endpoint",
+            memory_status="error",
+            clock_status="skipped",
+        ))
+        db.session.commit()
+
+        patch = {
+            "source_contract": SOURCE_CONTRACT_COMPILED_V2,
+            "base_memory_revision": self.world.memory_revision or 0,
+            "upsert_graph_entities": [],
+            "upsert_graph_relations": [{
+                "type": "rival_of",
+                "source_id": "vex_mal",
+                "target_id": "waterdeep",
+            }],
+        }
+        task = create_memory_recovery_task(
+            self.campaign.id,
+            self.session,
+            player_message_id=7,
+            dm_message_id=8,
+            err=MemoryPipelineError(stage="validation", code="missing_relation_endpoint", message="missing"),
+            patch=patch,
+            trace_id="trace_7",
+            context={
+                "current_user_id": self.campaign.user_id,
+                "current_scene_before": {"location_id": "waterdeep"},
+            },
+        )
+
+        with mock.patch(
+            "services.dm_tools.build_session_clock_context",
+            return_value={"allowed_evidence_sources": []},
+        ) as clock_context_mock, mock.patch(
+            "openrouter.get_session_clock_updates",
+            return_value={"advance_clocks": [
+                {"clock_id": "trapped_ferrymen", "delta": 1, "reason": "The party freed a trapped crewman."},
+            ]},
+        ) as clock_updates_mock:
+            result = retry_memory_recovery_task(self.campaign.id, task.id)
+
+        self.assertTrue(result["ok"], result)
+        self.assertTrue(result["clock_recovered"], result.get("clock_error"))
+        self.assertIsNone(result.get("clock_error"))
+
+        clock = CampaignClock.query.filter_by(
+            campaign_id=self.campaign.id,
+            clock_id="trapped_ferrymen",
+        ).first()
+        self.assertEqual(clock.filled, 2)
+
+        turn = SessionDmTurn.query.filter_by(
+            campaign_id=self.campaign.id,
+            player_message_id=7,
+        ).first()
+        self.assertEqual(turn.post_turn_status, "complete")
+        self.assertEqual(turn.memory_status, "complete")
+        self.assertEqual(turn.clock_status, "complete")
+        self.assertIsNone(turn.error_text)
+
+        refreshed = db.session.get(SessionMemoryRecoveryTask, task.id)
+        self.assertEqual(refreshed.status, "resolved")
+        self.assertFalse(has_pending_memory_recovery(self.campaign.id))
+
+    def test_retry_records_clock_error_when_clock_replay_fails(self):
+        db.session.add(
+            NPCActor(
+                campaign_id=self.campaign.id,
+                actor_id="vex_mal",
+                name="Vex Mal",
+                dossier="{}",
+            )
+        )
+        db.session.add(mark_session_dm_turn_error(
+            self.campaign.id,
+            self.session.id,
+            player_message_id=7,
+            trace_id="trace_7",
+            error_text="missing_relation_endpoint",
+            memory_status="error",
+            clock_status="skipped",
+        ))
+        db.session.commit()
+
+        patch = {
+            "source_contract": SOURCE_CONTRACT_COMPILED_V2,
+            "base_memory_revision": self.world.memory_revision or 0,
+            "upsert_graph_entities": [],
+            "upsert_graph_relations": [{
+                "type": "rival_of",
+                "source_id": "vex_mal",
+                "target_id": "waterdeep",
+            }],
+        }
+        task = create_memory_recovery_task(
+            self.campaign.id,
+            self.session,
+            player_message_id=7,
+            dm_message_id=8,
+            err=MemoryPipelineError(stage="validation", code="missing_relation_endpoint", message="missing"),
+            patch=patch,
+            trace_id="trace_7",
+        )
+
+        with mock.patch(
+            "services.dm_tools.build_session_clock_context",
+            side_effect=RuntimeError("provider unavailable"),
+        ):
+            result = retry_memory_recovery_task(self.campaign.id, task.id)
+
+        self.assertTrue(result["ok"], result)
+        self.assertFalse(result["clock_recovered"])
+        self.assertIsNotNone(result["clock_error"])
+
+        # Memory is durable and the turn records an explicit clock error rather
+        # than leaving a permanently stale clock silently.
+        turn = SessionDmTurn.query.filter_by(
+            campaign_id=self.campaign.id,
+            player_message_id=7,
+        ).first()
+        self.assertEqual(turn.post_turn_status, "complete")
+        self.assertEqual(turn.memory_status, "complete")
+        self.assertEqual(turn.clock_status, "error")
 
     def test_retry_fails_closed_for_invalid_patch(self):
         patch = {
@@ -632,7 +795,8 @@ class MemoryRecoveryRouteTest(unittest.TestCase):
                 dm_private="{}",
             )
         )
-        db.session.add(CampaignSession(campaign_id=self.campaign.id))
+        self.session = CampaignSession(campaign_id=self.campaign.id)
+        db.session.add(self.session)
         db.session.commit()
 
         self.token = generate_token(user.id)
@@ -697,6 +861,7 @@ class MemoryRecoveryRouteTest(unittest.TestCase):
         }
         task = SessionMemoryRecoveryTask(
             campaign_id=self.campaign.id,
+            session_id=self.session.id,
             player_message_id=1,
             status="pending",
             error_code="missing_relation_endpoint",
@@ -705,14 +870,22 @@ class MemoryRecoveryRouteTest(unittest.TestCase):
         db.session.add(task)
         db.session.commit()
 
-        response = self.client.post(
-            f"/api/campaigns/{self.campaign.id}/memory-recovery/{task.id}/retry",
-            headers=self.headers,
-        )
+        with mock.patch(
+            "services.dm_tools.build_session_clock_context",
+            return_value={"allowed_evidence_sources": []},
+        ), mock.patch(
+            "openrouter.get_session_clock_updates",
+            return_value={"advance_clocks": [], "retire_clocks": [], "create_clocks": []},
+        ):
+            response = self.client.post(
+                f"/api/campaigns/{self.campaign.id}/memory-recovery/{task.id}/retry",
+                headers=self.headers,
+            )
         self.assertEqual(response.status_code, 200)
         data = response.get_json()
         self.assertTrue(data["ok"])
         self.assertEqual(data["status"], "resolved")
+        self.assertTrue(data["clock_recovered"])
 
         refreshed = db.session.get(SessionMemoryRecoveryTask, task.id)
         self.assertEqual(refreshed.status, "resolved")

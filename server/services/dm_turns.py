@@ -126,6 +126,31 @@ def mark_session_dm_turn_error(
     return turn
 
 
+def repair_session_dm_turn(player_message_id, dm_message_id=None, memory_status='complete', clock_status='complete'):
+    """Flip a failed post-turn row back into a durable completed state.
+
+    Used after a memory recovery retry has re-applied the memory patch and
+    re-run the skipped clock adjudication. Clears the error text so the durable
+    turn no longer reports error and downstream status checks see a repaired
+    turn instead of the original failure.
+    """
+    turn = _get_turn(player_message_id)
+    if turn is None:
+        return None
+    finished_at = _utcnow()
+    if dm_message_id:
+        turn.dm_message_id = dm_message_id
+    if turn.status in {'error', 'pending'}:
+        turn.status = 'speak'
+    turn.post_turn_status = 'complete'
+    turn.memory_status = memory_status
+    turn.clock_status = clock_status
+    turn.error_text = None
+    turn.finished_at = finished_at
+    turn.full_duration_ms = _duration_ms(turn.started_at, finished_at)
+    return turn
+
+
 def session_dm_turn_status_payload(player_message_id):
     turn = _get_turn(player_message_id)
     if turn is None:
