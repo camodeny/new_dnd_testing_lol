@@ -24,6 +24,100 @@ import dm_response_state
 
 ROOT = pathlib.Path(__file__).resolve().parents[1]
 
+# Deterministic priority order for state-critical character-sheet proposal
+# changes. Lower rank resolves first. Exact field names match scalar sheet
+# fields; trailing ':'/'_' prefixes match list resources such as conditions,
+# equipment, and spell-slot depletion.
+STATE_CRITICAL_PROPOSAL_PRIORITY = (
+    'current_hp',
+    'death_save_successes',
+    'death_save_failures',
+    'condition:',
+    'exhaustion_level',
+    'spell_slots_used_',
+    'equipment:',
+    'temp_hp',
+    'max_hp',
+)
+
+# Bounded provider retries before a state-critical proposal is considered
+# unresolvable and normal play is blocked.
+PROPOSAL_RESOLUTION_MAX_ATTEMPTS = 3
+
+
+def field_proposal_priority(field):
+    """Return the deterministic priority rank for a proposal change field.
+
+    Lower ranks are more urgent. Returns None when the field is not
+    state-critical (HP, death saves, conditions, resource depletion,
+    equipment loss, and similar derived sheet state).
+    """
+    text = str(field or '').strip().lower()
+    for rank, candidate in enumerate(STATE_CRITICAL_PROPOSAL_PRIORITY):
+        if text == candidate or text.startswith(candidate):
+            return rank
+    return None
+
+
+def proposal_state_priority(proposal):
+    """Return the most urgent state-critical rank among a proposal's changes.
+
+    Returns None when the proposal does not touch state-critical sheet fields.
+    """
+    changes = (proposal or {}).get('changes') or []
+    if not isinstance(changes, list) or not changes:
+        return None
+    best = None
+    for change in changes:
+        if not isinstance(change, dict):
+            continue
+        rank = field_proposal_priority(change.get('field'))
+        if rank is None:
+            continue
+        if best is None or rank < best:
+            best = rank
+    return best
+
+
+def select_priority_proposal(pending_proposals):
+    """Deterministically select the most urgent pending state-critical proposal.
+
+    Sorting is by (priority rank, created_at, id) so resolution order never
+    depends on model whim or roster ordering, and no round-robin rotation is
+    introduced.
+    """
+    eligible = []
+    for proposal in pending_proposals or []:
+        if not isinstance(proposal, dict):
+            continue
+        rank = proposal_state_priority(proposal)
+        if rank is None:
+            continue
+        eligible.append((rank, proposal.get('created_at') or '', proposal.get('id') or 0, proposal))
+    if not eligible:
+        return None
+    eligible.sort(key=lambda item: (item[0], item[1], item[2]))
+    return eligible[0][3]
+
+
+def find_priority_proposal_llm_player(manifest, session):
+    """Return (llm_player_entry, proposal) for the most urgent state-critical
+    pending proposal owned by a roster character, or (None, None).
+
+    The character whose sheet is proposed for change must be the only eligible
+    resolver; another character cannot act on it.
+    """
+    pending = session.get('pending_sheet_proposals') or []
+    proposal = select_priority_proposal(pending)
+    if proposal is None:
+        return None, None
+    character_id = proposal.get('character_id')
+    for entry in manifest.get('llm_players') or []:
+        if (entry.get('character') or {}).get('id') == character_id:
+            return entry, proposal
+    return None, None
+
+
 OVERSEER_SYSTEM_PROMPT = """You are an auto-player overseer for a live AI-run tabletop campaign.
 
 Choose exactly one LLM player to act next when the scene calls for it.
@@ -403,7 +497,7 @@ def release_manifest_lock(lock_path):
         pass
 
 
-def run_orchestrator(args, manifest_path, player_id=None):
+def run_orchestrator(args, manifest_path, player_id=None, proposal_only=False):
     command = [
         sys.executable,
         str(ROOT / 'automation' / 'run_llm_campaign_orchestrator.py'),
@@ -417,6 +511,8 @@ def run_orchestrator(args, manifest_path, player_id=None):
     ]
     if player_id is not None:
         command.extend(['--player-id', str(player_id)])
+    if proposal_only:
+        command.append('--proposal-only')
     if args.opencode_password:
         command.extend(['--opencode-password', args.opencode_password])
     if args.dry_run:
@@ -553,6 +649,39 @@ def main():
             if fingerprint_changed or force_overseer_retry:
 
                 try:
+                    proposal_entry, priority_proposal = find_priority_proposal_llm_player(manifest, session)
+                    if proposal_entry is not None:
+                        proposal_result = run_orchestrator(
+                            args,
+                            manifest_path,
+                            player_id=proposal_entry['llm_player']['id'],
+                            proposal_only=True,
+                        )
+                        proposal_action = str(((proposal_result.get('decision') or {}).get('action') or '')).strip().lower()
+                        proposal_outcome = (
+                            'applied' if proposal_action == 'apply_proposal'
+                            else 'dismissed' if proposal_action == 'dismiss_proposal'
+                            else 'unresolved'
+                        )
+                        print_event({
+                            'event': 'proposal_resolution',
+                            'timestamp': utc_now(),
+                            'campaign_id': manifest['campaign']['id'],
+                            'session_id': session['id'],
+                            'proposal_id': (priority_proposal or {}).get('id'),
+                            'character_id': (priority_proposal or {}).get('character_id'),
+                            'resolver': proposal_entry['llm_player']['label'],
+                            'action': proposal_action,
+                            'outcome': proposal_outcome,
+                            'turns_completed': turns_completed,
+                        })
+                        if proposal_action in {'apply_proposal', 'dismiss_proposal'}:
+                            force_overseer_retry = True
+                            same_fingerprint_no_action_retries = 0
+                            last_change_at = time.monotonic()
+                            time.sleep(args.poll_interval)
+                            continue
+
                     overseer = choose_player_with_overseer(args, manifest, session, last_dm_turn=last_dm_turn)
                     last_dm_turn = None
                     if overseer['action'] == 'no_action':

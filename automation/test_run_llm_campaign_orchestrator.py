@@ -158,6 +158,76 @@ class RunLlmCampaignOrchestratorTests(unittest.TestCase):
                 dry_run=False,
             )
 
+    def test_build_proposal_only_prompt_requires_proposal_action(self):
+        manifest = {
+            'llm_players': [
+                {
+                    'llm_player': {'id': 4, 'label': 'Auto Player 1'},
+                    'character': {'name': 'Mira Vell'},
+                },
+            ],
+        }
+        campaign = {'id': 6, 'name': 'Copperhollow Under Mirror'}
+        world_payload = {'world': {'world_state': {}}}
+        session = {'id': 5, 'started_at': '2026-06-19T23:00:00Z', 'messages': []}
+        chosen_player = manifest['llm_players'][0]
+        pending_proposals = [{'id': 1, 'changes': [{'field': 'current_hp', 'after': 0}]}]
+
+        prompt = orchestrator.build_proposal_only_prompt(
+            manifest,
+            campaign,
+            world_payload,
+            session,
+            chosen_player,
+            pending_proposals,
+            16,
+        )
+
+        self.assertIn('apply_proposal', prompt)
+        self.assertIn('dismiss_proposal', prompt)
+        self.assertIn('Do not speak, roll, or narrate', prompt)
+
+    def test_request_proposal_only_decision_returns_first_proposal_action(self):
+        with patch.object(orchestrator, 'request_opencode_decision', return_value=(
+            {'action': 'apply_proposal', 'proposal_id': 1},
+            '{"action":"apply_proposal","proposal_id":1}',
+            0,
+        )) as request_opencode_decision:
+            decision, response_text, json_retry_count, attempts = orchestrator.request_proposal_only_decision(
+                'http://server.test', None, 'model', 'prompt',
+            )
+
+        self.assertEqual(decision, {'action': 'apply_proposal', 'proposal_id': 1})
+        self.assertEqual(attempts, 1)
+        request_opencode_decision.assert_called_once()
+
+    def test_request_proposal_only_decision_retries_non_proposal_action(self):
+        with patch.object(orchestrator, 'request_opencode_decision', side_effect=[
+            ({'action': 'speak', 'content': 'Mira stirs.'}, '{"action":"speak"}', 0),
+            ({'action': 'dismiss_proposal', 'proposal_id': 1}, '{"action":"dismiss_proposal","proposal_id":1}', 0),
+        ]) as request_opencode_decision:
+            decision, _response, _json_retry, attempts = orchestrator.request_proposal_only_decision(
+                'http://server.test', None, 'model', 'prompt',
+            )
+
+        self.assertEqual(decision['action'], 'dismiss_proposal')
+        self.assertEqual(attempts, 2)
+        self.assertEqual(request_opencode_decision.call_count, 2)
+        second_prompt = request_opencode_decision.call_args_list[1].args[3]
+        self.assertIn('did not resolve', second_prompt)
+
+    def test_request_proposal_only_decision_raises_when_never_resolves(self):
+        with patch.object(orchestrator, 'request_opencode_decision', return_value=(
+            {'action': 'no_action'},
+            '{"action":"no_action"}',
+            0,
+        )):
+            with self.assertRaisesRegex(RuntimeError, 'failed to resolve'):
+                orchestrator.request_proposal_only_decision(
+                    'http://server.test', None, 'model', 'prompt',
+                    max_attempts=2,
+                )
+
 
 if __name__ == '__main__':
     unittest.main()

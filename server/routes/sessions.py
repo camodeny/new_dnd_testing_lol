@@ -678,6 +678,12 @@ def get_session(current_user, session_id):
         before_id=request.args.get('before_id'),
         limit=request.args.get('limit'),
     ))
+    data['pending_sheet_proposals'] = [
+        proposal.to_dict()
+        for proposal in SheetProposal.query.filter_by(session_id=session_id, status='pending')
+        .order_by(SheetProposal.created_at.asc(), SheetProposal.id.asc())
+        .all()
+    ]
     return jsonify({'session': data}), 200
 
 

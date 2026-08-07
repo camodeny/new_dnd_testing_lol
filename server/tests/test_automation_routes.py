@@ -3514,6 +3514,145 @@ class AutomationRouteTest(unittest.TestCase):
         )
         self.assertEqual(resp.status_code, 200)
 
+    def _claim_proposal_run(self, worker_id='proposal-test-worker'):
+        scenario_id = self.client.post(
+            '/api/automation/scenarios',
+            headers=self.headers,
+            json={'source_campaign_id': self.campaign_id},
+        ).get_json()['scenario']['id']
+        snapshot_id = self.client.post(
+            f'/api/automation/scenarios/{scenario_id}/snapshots',
+            headers=self.headers,
+            json={},
+        ).get_json()['snapshot']['id']
+        run_id = self.client.post(
+            f'/api/automation/scenarios/{scenario_id}/runs',
+            headers=self.headers,
+            json={'snapshot_id': snapshot_id},
+        ).get_json()['run']['id']
+        claim = self.client.post(
+            f'/api/automation/runs/{run_id}/claim',
+            headers=self.headers,
+            json={'worker_id': worker_id},
+        ).get_json()
+        return run_id, claim
+
+    def test_decisions_route_applies_proposal_for_derived_character(self):
+        run_id, claim = self._claim_proposal_run()
+        roster_entry = claim['roster'][0]
+        derived_character_id = roster_entry['derived_character_id']
+
+        with app.app_context():
+            session = CampaignSession.query.filter_by(campaign_id=claim['derived_campaign']['id'], is_active=True).first()
+            proposal = SheetProposal(
+                session_id=session.id,
+                character_id=derived_character_id,
+                reason='Reduced to 0 HP',
+                changes=[{'field': 'current_hp', 'after': 0}],
+                status='pending',
+            )
+            db.session.add(proposal)
+            db.session.commit()
+            proposal_id = proposal.id
+
+        resp = self.client.post(
+            f'/api/automation/runs/{run_id}/decisions',
+            headers=self.headers,
+            json={
+                'llm_player_id': roster_entry.get('llm_player_id') or roster_entry['user_id'],
+                'user_id': roster_entry['user_id'],
+                'decision': {'action': 'apply_proposal', 'proposal_id': proposal_id},
+                'dedupe_key': f'proposal-decision-apply-{run_id}',
+                'worker_id': 'proposal-test-worker',
+                'lease_token': claim['lease_token'],
+            },
+        )
+
+        self.assertEqual(resp.status_code, 200)
+        body = resp.get_json()
+        self.assertEqual(body['proposal']['status'], 'applied')
+        with app.app_context():
+            stored = db.session.get(SheetProposal, proposal_id)
+            self.assertEqual(stored.status, 'applied')
+            self.assertEqual(db.session.get(Character, derived_character_id).current_hp, 0)
+
+    def test_decisions_route_dismisses_proposal_for_derived_character(self):
+        run_id, claim = self._claim_proposal_run()
+        roster_entry = claim['roster'][0]
+        derived_character_id = roster_entry['derived_character_id']
+
+        with app.app_context():
+            session = CampaignSession.query.filter_by(campaign_id=claim['derived_campaign']['id'], is_active=True).first()
+            proposal = SheetProposal(
+                session_id=session.id,
+                character_id=derived_character_id,
+                reason='Reduced to 0 HP',
+                changes=[{'field': 'current_hp', 'after': 0}],
+                status='pending',
+            )
+            db.session.add(proposal)
+            db.session.commit()
+            proposal_id = proposal.id
+
+        resp = self.client.post(
+            f'/api/automation/runs/{run_id}/decisions',
+            headers=self.headers,
+            json={
+                'llm_player_id': roster_entry.get('llm_player_id') or roster_entry['user_id'],
+                'user_id': roster_entry['user_id'],
+                'decision': {'action': 'dismiss_proposal', 'proposal_id': proposal_id},
+                'dedupe_key': f'proposal-decision-dismiss-{run_id}',
+                'worker_id': 'proposal-test-worker',
+                'lease_token': claim['lease_token'],
+            },
+        )
+
+        self.assertEqual(resp.status_code, 200)
+        self.assertEqual(resp.get_json()['proposal']['status'], 'dismissed')
+        with app.app_context():
+            self.assertEqual(db.session.get(SheetProposal, proposal_id).status, 'dismissed')
+
+    def test_decisions_route_rejects_proposal_not_owned_by_acting_character(self):
+        run_id, claim = self._claim_proposal_run()
+        roster_entry = claim['roster'][0]
+
+        with app.app_context():
+            session = CampaignSession.query.filter_by(campaign_id=claim['derived_campaign']['id'], is_active=True).first()
+            other_character = Character(
+                user_id=None,
+                campaign_id=claim['derived_campaign']['id'],
+                name='NPC Warden',
+                race='Human',
+            )
+            db.session.add(other_character)
+            db.session.flush()
+            proposal = SheetProposal(
+                session_id=session.id,
+                character_id=other_character.id,
+                reason='NPC state',
+                changes=[{'field': 'current_hp', 'after': 0}],
+                status='pending',
+            )
+            db.session.add(proposal)
+            db.session.commit()
+            proposal_id = proposal.id
+
+        resp = self.client.post(
+            f'/api/automation/runs/{run_id}/decisions',
+            headers=self.headers,
+            json={
+                'llm_player_id': roster_entry.get('llm_player_id') or roster_entry['user_id'],
+                'user_id': roster_entry['user_id'],
+                'decision': {'action': 'apply_proposal', 'proposal_id': proposal_id},
+                'dedupe_key': f'proposal-decision-foreign-{run_id}',
+                'worker_id': 'proposal-test-worker',
+                'lease_token': claim['lease_token'],
+            },
+        )
+
+        self.assertEqual(resp.status_code, 400)
+        self.assertIn('not found for this actor', resp.get_json()['error'])
+
     def test_events_route_rejects_status_bypasses(self):
         run_id, token = self._claim_for_credential_tests()
         for status in ('completed', 'queued'):

@@ -214,12 +214,31 @@ def _resolve_acting_user(run, data):
     return db.session.get(User, acting_entry.get('user_id')), acting_entry
 
 
-def _pending_proposal_for_entry(session_id, acting_entry, proposal_id):
+def _derived_character_id_for_entry(run, acting_entry):
+    """Resolve the derived-campaign character id for a scenario roster entry.
+
+    Scenario rosters store the source-campaign character id, while sheet
+    proposals in the run's cloned campaign reference cloned character ids.
+    Prefer the derived member's selected character so proposal ownership checks
+    match; fall back to any supplied derived id, then the source id.
+    """
+    if run.derived_campaign_id:
+        member = CampaignMember.query.filter_by(
+            campaign_id=run.derived_campaign_id,
+            user_id=acting_entry.get('user_id'),
+        ).first()
+        if member is not None and member.selected_character_id is not None:
+            return member.selected_character_id
+    return acting_entry.get('derived_character_id') or acting_entry.get('character_id')
+
+
+def _pending_proposal_for_entry(run, session_id, acting_entry, proposal_id):
     proposals = SheetProposal.query.filter_by(session_id=session_id, status='pending').all()
+    character_id = _derived_character_id_for_entry(run, acting_entry)
     for proposal in proposals:
         if proposal.id != proposal_id:
             continue
-        if acting_entry.get('character_id') == proposal.character_id:
+        if character_id == proposal.character_id:
             return proposal
     return None
 
@@ -1920,7 +1939,7 @@ def execute_automation_run_decision(current_user, run_id):
 
     if action in {'apply_proposal', 'dismiss_proposal'}:
         proposal_id = decision.get('proposal_id')
-        proposal = _pending_proposal_for_entry(session.id, acting_entry, proposal_id)
+        proposal = _pending_proposal_for_entry(run, session.id, acting_entry, proposal_id)
         if proposal is None:
             return jsonify({'error': f'Pending proposal {proposal_id} not found for this actor'}), 400
         if action == 'apply_proposal':

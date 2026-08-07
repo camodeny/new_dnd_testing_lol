@@ -449,8 +449,8 @@ def request_overseer_decision(args, manifest, claim_payload, session, turns_comp
     raise RuntimeError('Overseer failed validation after retries')
 
 
-def request_player_decision(args, manifest, claim_payload, campaign, world_payload, session, chosen_player, pending_proposals, turns_completed, run_id, lease_token):
-    prompt = orchestrator.build_prompt(
+def request_player_decision(args, manifest, claim_payload, campaign, world_payload, session, chosen_player, pending_proposals, turns_completed, run_id, lease_token, prompt_override=None, provider_phase='player_decision', prompt_version_id='automation_player_turn_v1', dedupe_suffix=None):
+    prompt = prompt_override or orchestrator.build_prompt(
         manifest,
         campaign,
         world_payload,
@@ -460,6 +460,8 @@ def request_player_decision(args, manifest, claim_payload, campaign, world_paylo
         args.message_window,
     )
     logical_key = f'{stage_key(turns_completed, session)}:player:{chosen_player["llm_player"]["id"]}'
+    if dedupe_suffix:
+        logical_key = f'{logical_key}:{dedupe_suffix}'
     provider_dedupe_key = f'provider:player:{logical_key}'
     replay_call = maybe_replay_provider_call(args, claim_payload, provider_dedupe_key)
     if replay_call:
@@ -482,8 +484,8 @@ def request_player_decision(args, manifest, claim_payload, campaign, world_paylo
     latency_ms = int((time.monotonic() - started) * 1000)
     record_provider_call(args, run_id, lease_token, {
         'dedupe_key': provider_dedupe_key,
-        'phase': 'player_decision',
-        'prompt_version_id': 'automation_player_turn_v1',
+        'phase': provider_phase,
+        'prompt_version_id': prompt_version_id,
         'provider': result.get('provider'),
         'model': result.get('model'),
         'provider_response_id': (result.get('raw_response') or {}).get('id'),
@@ -507,6 +509,181 @@ def request_player_decision(args, manifest, claim_payload, campaign, world_paylo
         result.get('provider'),
         result.get('model'),
     )
+
+
+def proposal_corrective_hint():
+    return (
+        'Your previous decision did not resolve the pending character-sheet proposal. '
+        'For this turn you MUST choose one of the pending sheet proposals and nothing else. '
+        'Reply with strict JSON exactly like '
+        '{"action":"apply_proposal","proposal_id":123,"reason":"..."} or '
+        '{"action":"dismiss_proposal","proposal_id":123,"reason":"..."}. '
+        'Do not speak, roll, or return no_action.'
+    )
+
+
+def resolve_priority_proposal(args, manifest, claim_payload, session, turns_completed, run_id, lease_token):
+    """Resolve the most urgent pending state-critical sheet proposal for its
+    authorized AI-player seat without a visible table turn.
+
+    Runs before normal speaker selection so an incapacitated, absent, silent,
+    or otherwise non-speaking character never needs a visible turn just to fix
+    their sheet state. Applies/dismisses only through the character's own seat
+    via the existing automation decision route, records discovery/resolution
+    events, and never increments the visible turn count.
+
+    Returns a (status, detail) tuple:
+      ('no_proposal', None)       - nothing eligible to resolve
+      ('no_resolver', proposal)   - proposal exists but has no roster seat
+      ('resolved', proposal)      - proposal applied or dismissed
+      ('unresolvable', proposal)  - provider could not reach a valid decision
+    """
+    pending_proposals = session.get('pending_sheet_proposals') or []
+    proposal = autonomous.select_priority_proposal(pending_proposals)
+    if proposal is None:
+        return 'no_proposal', None
+
+    proposal_id = proposal.get('id')
+    character_id = proposal.get('character_id')
+    roster_entry = next(
+        (entry for entry in (claim_payload.get('roster') or [])
+         if entry.get('derived_character_id') == character_id),
+        None,
+    )
+    logical_key = stage_key(turns_completed, session)
+    append_event(
+        args.api_base,
+        args.owner_api_key,
+        run_id,
+        args.worker_id,
+        lease_token,
+        'proposal_discovery',
+        {
+            'proposal_id': proposal_id,
+            'character_id': character_id,
+            'priority_rank': autonomous.proposal_state_priority(proposal),
+            'changes': proposal.get('changes') or [],
+            'reason': proposal.get('reason'),
+        },
+        dedupe_key=f'proposal_discovery:{logical_key}:{proposal_id}',
+    )
+    if roster_entry is None:
+        append_event(
+            args.api_base,
+            args.owner_api_key,
+            run_id,
+            args.worker_id,
+            lease_token,
+            'proposal_skipped_no_resolver',
+            {'proposal_id': proposal_id, 'character_id': character_id},
+            dedupe_key=f'proposal_skipped_no_resolver:{logical_key}:{proposal_id}',
+        )
+        return 'no_resolver', proposal
+
+    campaign_id = claim_payload['derived_campaign']['id']
+    world_payload = api_get(args.api_base, f'/api/campaigns/{campaign_id}/world', api_key=args.owner_api_key)
+    campaign = api_get(args.api_base, f'/api/campaigns/{campaign_id}', api_key=args.owner_api_key)['campaign']
+    campaign_characters = fetch_campaign_characters(args.api_base, args.owner_api_key, campaign_id)
+    chosen_player = select_chosen_player(roster_entry, campaign_characters)
+
+    prompt = orchestrator.build_prompt(
+        manifest,
+        campaign,
+        world_payload,
+        session,
+        chosen_player,
+        [proposal],
+        args.message_window,
+    )
+    started = time.monotonic()
+    outcome = None
+    latency_ms = None
+    for attempt in range(autonomous.PROPOSAL_RESOLUTION_MAX_ATTEMPTS):
+        prompt_override = prompt if attempt == 0 else f'{prompt}\n\n{proposal_corrective_hint()}'
+        decision, _response_text, _json_retry_count, _provider, _model = request_player_decision(
+            args,
+            manifest,
+            claim_payload,
+            campaign,
+            world_payload,
+            session,
+            chosen_player,
+            [proposal],
+            turns_completed,
+            run_id,
+            lease_token,
+            prompt_override=prompt_override,
+            provider_phase='proposal_decision',
+            prompt_version_id='automation_proposal_v1',
+            dedupe_suffix=f'proposal:{proposal_id}:attempt:{attempt}',
+        )
+        action = str((decision or {}).get('action') or '').strip().lower()
+        try:
+            decision_proposal_id = orchestrator._normalize_proposal_id(decision.get('proposal_id'))
+        except RuntimeError:
+            decision_proposal_id = None
+        if action in {'apply_proposal', 'dismiss_proposal'} and decision_proposal_id == proposal_id:
+            outcome = {
+                'action': action,
+                'proposal_id': proposal_id,
+                'reason': str(decision.get('reason') or '').strip(),
+            }
+            latency_ms = int((time.monotonic() - started) * 1000)
+            submit_decision(
+                args.api_base,
+                args.owner_api_key,
+                run_id,
+                chosen_player,
+                decision,
+                dedupe_key=f'proposal_decision:{logical_key}:{proposal_id}:{attempt}',
+                worker_id=args.worker_id,
+                lease_token=lease_token,
+            )
+            break
+
+    resolver = {
+        'llm_player_id': chosen_player['llm_player']['id'],
+        'label': chosen_player['llm_player']['label'],
+        'character_name': chosen_player['character'].get('name'),
+    }
+    if outcome is None:
+        append_event(
+            args.api_base,
+            args.owner_api_key,
+            run_id,
+            args.worker_id,
+            lease_token,
+            'proposal_resolution_failed',
+            {
+                'proposal_id': proposal_id,
+                'character_id': character_id,
+                'chosen_resolver': resolver,
+                'attempts': autonomous.PROPOSAL_RESOLUTION_MAX_ATTEMPTS,
+                'latency_ms': latency_ms,
+            },
+            dedupe_key=f'proposal_resolution_failed:{logical_key}:{proposal_id}',
+        )
+        return 'unresolvable', proposal
+
+    append_event(
+        args.api_base,
+        args.owner_api_key,
+        run_id,
+        args.worker_id,
+        lease_token,
+        'proposal_resolution',
+        {
+            'proposal_id': proposal_id,
+            'character_id': character_id,
+            'chosen_resolver': resolver,
+            'decision': outcome,
+            'outcome': 'applied' if outcome['action'] == 'apply_proposal' else 'dismissed',
+            'latency_ms': latency_ms,
+            'turns_completed': turns_completed,
+        },
+        dedupe_key=f'proposal_resolution:{logical_key}:{proposal_id}:{outcome["action"]}',
+    )
+    return 'resolved', proposal
 
 
 def _reconcile_dm_turn_timeout(
@@ -1245,6 +1422,37 @@ def execute_run(args, run_id):
                     'messages': session.get('messages') or [],
                 }
                 logical_key = stage_key(turns_completed, session_for_prompt)
+                proposal_status, _proposal_detail = resolve_priority_proposal(
+                    args,
+                    manifest,
+                    claim_payload,
+                    session,
+                    turns_completed,
+                    run_id,
+                    lease_token,
+                )
+                if proposal_status == 'unresolvable':
+                    complete_run(
+                        args.api_base,
+                        args.owner_api_key,
+                        run_id,
+                        args.worker_id,
+                        lease_token,
+                        status='failed',
+                        error_text='state_critical_proposal_unresolved',
+                        dedupe_key=f'run_completed:{run_id}:proposal-unresolved',
+                    )
+                    return True
+                if proposal_status == 'resolved':
+                    # Sheet state was fixed without a visible table turn. Refresh
+                    # before the next decision so the session reflects the
+                    # applied/dismissed proposal, then keep checking remaining
+                    # state-critical proposals before any normal speaker turn.
+                    force_overseer_retry = True
+                    same_fingerprint_no_action_retries = 0
+                    last_change_at = time.monotonic()
+                    time.sleep(args.poll_interval)
+                    continue
                 overseer = request_overseer_decision(
                     args,
                     manifest,

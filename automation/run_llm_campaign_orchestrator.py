@@ -55,6 +55,7 @@ def parse_args():
     parser.add_argument('--player-id', type=int, help='Explicit LLM player id chosen by the overseer')
     parser.add_argument('--player-label', help='Explicit LLM player label chosen by the overseer')
     parser.add_argument('--message-window', type=int, default=16, help='How many recent messages to include in the player prompt')
+    parser.add_argument('--proposal-only', action='store_true', help='Resolve a pending character-sheet proposal without a visible table turn')
     parser.add_argument('--dry-run', action='store_true')
     return parser.parse_args()
 
@@ -225,6 +226,51 @@ def build_prompt(manifest, campaign, world_payload, session, chosen_player, pend
         'Current structured state:\n'
         f'{json.dumps(state, indent=2)}'
     )
+
+
+def build_proposal_only_prompt(manifest, campaign, world_payload, session, chosen_player, pending_proposals, message_window):
+    prompt = build_prompt(manifest, campaign, world_payload, session, chosen_player, pending_proposals, message_window)
+    return (
+        prompt
+        + '\n\n'
+        + 'For this turn you MUST resolve one of the pending character-sheet proposals. '
+        + 'Do not speak, roll, or narrate a table action. Reply with strict JSON exactly like '
+        + '{"action":"apply_proposal","proposal_id":123,"reason":"..."} or '
+        + '{"action":"dismiss_proposal","proposal_id":123,"reason":"..."}.'
+    )
+
+
+def build_proposal_only_retry_prompt(prompt):
+    return (
+        prompt
+        + '\n\n'
+        + 'Your previous decision did not resolve a pending character-sheet proposal. '
+        + 'You MUST apply or dismiss one of the pending proposals and nothing else. '
+        + 'Reply with strict JSON exactly like '
+        + '{"action":"apply_proposal","proposal_id":123,"reason":"..."} or '
+        + '{"action":"dismiss_proposal","proposal_id":123,"reason":"..."}.'
+    )
+
+
+def request_proposal_only_decision(opencode_server, opencode_password, model_payload, prompt, max_attempts=3):
+    """Keep asking the model for an apply/dismiss decision until it complies.
+
+    Returns (decision, response_text, json_retry_count, attempts_used). Raises
+    RuntimeError when the model never returns a proposal action.
+    """
+    decision, response_text, json_retry_count = None, '', 0
+    for attempt in range(max(1, max_attempts)):
+        decision, response_text, json_retry_count = request_opencode_decision(
+            opencode_server,
+            opencode_password,
+            model_payload,
+            prompt,
+        )
+        action = str((decision or {}).get('action') or '').strip().lower()
+        if action in {'apply_proposal', 'dismiss_proposal'}:
+            return decision, response_text, json_retry_count, attempt + 1
+        prompt = build_proposal_only_retry_prompt(prompt)
+    raise RuntimeError('Proposal-only turn failed to resolve a pending proposal')
 
 
 def request_opencode_decision(server, password, model_payload, prompt):
@@ -498,15 +544,27 @@ def main():
         chosen_player = choose_next_player(manifest, session)
     if not pending_proposals:
         pending_proposals = get_pending_sheet_proposals(api_base, session['id'], chosen_player)
-    prompt = build_prompt(manifest, campaign, world_payload, session, chosen_player, pending_proposals, args.message_window)
-    model_payload = args.model
+    if args.proposal_only:
+        if not pending_proposals:
+            raise RuntimeError('No pending sheet proposals to resolve for the chosen player')
+        model_payload = args.model
+        prompt = build_proposal_only_prompt(manifest, campaign, world_payload, session, chosen_player, pending_proposals, args.message_window)
+        decision, response_text, json_retry_count, _attempts_used = request_proposal_only_decision(
+            args.opencode_server,
+            args.opencode_password,
+            model_payload,
+            prompt,
+        )
+    else:
+        prompt = build_prompt(manifest, campaign, world_payload, session, chosen_player, pending_proposals, args.message_window)
+        model_payload = args.model
 
-    decision, response_text, json_retry_count = request_opencode_decision(
-        args.opencode_server,
-        args.opencode_password,
-        model_payload,
-        prompt,
-    )
+        decision, response_text, json_retry_count = request_opencode_decision(
+            args.opencode_server,
+            args.opencode_password,
+            model_payload,
+            prompt,
+        )
 
     run_result = {
         'timestamp': now_iso(),
