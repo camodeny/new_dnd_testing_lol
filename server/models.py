@@ -1383,6 +1383,7 @@ class SessionDmTurn(db.Model):
     post_turn_status = db.Column(db.String(20), nullable=False, default='pending')
     memory_status = db.Column(db.String(20), nullable=False, default='pending')
     clock_status = db.Column(db.String(20), nullable=False, default='pending')
+    post_turn_revision = db.Column(db.Integer, nullable=True)
     error_text = db.Column(db.Text, nullable=True)
 
     started_at = db.Column(db.DateTime, nullable=False, default=utcnow, index=True)
@@ -1407,6 +1408,7 @@ class SessionDmTurn(db.Model):
             'post_turn_status': self.post_turn_status,
             'memory_status': self.memory_status,
             'clock_status': self.clock_status,
+            'post_turn_revision': self.post_turn_revision,
             'error_text': self.error_text,
             'started_at': self.started_at.isoformat() if self.started_at else None,
             'visible_completed_at': self.visible_completed_at.isoformat() if self.visible_completed_at else None,

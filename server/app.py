@@ -387,6 +387,11 @@ def ensure_lightweight_schema():
     if 'memory_revision' not in campaign_world_columns:
         db.session.execute(text('ALTER TABLE campaign_worlds ADD COLUMN memory_revision INTEGER DEFAULT 0 NOT NULL'))
 
+    # --- session_dm_turns ---
+    session_dm_turn_columns = table_columns('session_dm_turns')
+    if session_dm_turn_columns and 'post_turn_revision' not in session_dm_turn_columns:
+        db.session.execute(text('ALTER TABLE session_dm_turns ADD COLUMN post_turn_revision INTEGER'))
+
     # --- campaign_memory_logs ---
     memory_log_columns = table_columns('campaign_memory_logs')
     if memory_log_columns:

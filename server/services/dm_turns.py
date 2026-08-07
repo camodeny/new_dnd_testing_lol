@@ -76,7 +76,7 @@ def mark_session_dm_turn_visible(
     return turn
 
 
-def mark_session_dm_turn_post_turn_complete(player_message_id, dm_message_id=None, finished_at=None, memory_status=None, clock_status=None):
+def mark_session_dm_turn_post_turn_complete(player_message_id, dm_message_id=None, finished_at=None, memory_status=None, clock_status=None, post_turn_revision=None):
     turn = _get_turn(player_message_id)
     if turn is None:
         return None
@@ -88,6 +88,8 @@ def mark_session_dm_turn_post_turn_complete(player_message_id, dm_message_id=Non
     turn.post_turn_status = 'complete'
     turn.memory_status = memory_status or 'complete'
     turn.clock_status = clock_status or 'complete'
+    if post_turn_revision is not None:
+        turn.post_turn_revision = post_turn_revision
     if turn.status == 'pending':
         turn.status = 'speak'
     return turn
@@ -103,6 +105,7 @@ def mark_session_dm_turn_error(
     dm_message_id=None,
     memory_status=None,
     clock_status=None,
+    post_turn_revision=None,
 ):
     finished_at = finished_at or _utcnow()
     turn = begin_session_dm_turn(campaign_id, session_id, player_message_id, trace_id, started_at=finished_at)
@@ -118,6 +121,8 @@ def mark_session_dm_turn_error(
     turn.post_turn_status = 'error'
     turn.memory_status = memory_status or ('complete' if turn.visible_completed_at else 'skipped')
     turn.clock_status = clock_status or 'skipped'
+    if post_turn_revision is not None:
+        turn.post_turn_revision = post_turn_revision
     return turn
 
 
@@ -130,6 +135,7 @@ def session_dm_turn_status_payload(player_message_id):
         'post_turn_status': turn.post_turn_status,
         'memory_status': turn.memory_status,
         'clock_status': turn.clock_status,
+        'post_turn_revision': turn.post_turn_revision,
         'started_at': turn.started_at.isoformat() if turn.started_at else None,
         'visible_completed_at': turn.visible_completed_at.isoformat() if turn.visible_completed_at else None,
         'finished_at': turn.finished_at.isoformat() if turn.finished_at else None,
