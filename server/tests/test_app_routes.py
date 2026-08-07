@@ -667,7 +667,8 @@ class AppRouteTest(unittest.TestCase):
                     'advance_clocks': [],
                     'retire_clocks': [],
                     'no_change_explanations': [],
-                }):
+                }), \
+                patch('routes.sessions.get_session_running_summary_finalize', return_value={'running_summary': 'The party stands in the moonlit hall.'}):
             message_response = self.client.post(
                 f'/api/sessions/{session_id}/messages',
                 headers={'X-API-Key': llm_api_key},

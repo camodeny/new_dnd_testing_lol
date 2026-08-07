@@ -2,26 +2,32 @@
 
 Authoritative ordering for a session DM turn:
 
-    1. memory compile + apply      (graph, scene, running summary, anchors)
+    1. memory compile + apply      (graph, scene, structured state)
     2. memory commit
     3. clock adjudication + apply  (clock progress, clock descriptions)
     4. clock commit
-    5. post-turn reconciliation    (summary + clock descriptions vs committed scene)
-    6. terminal revision           (one correlated revision across all surfaces)
+    5. running-summary finalization against committed post-clock state
+       (done by the summary finalizer, NOT by string-patching heuristics)
+    6. final consistency check + terminal revision
 
-The reconciliation step is deterministic. It:
+This module owns the final consistency check. It:
 
-* repairs stale clock-segment references in the running summary so a summary
-  cannot report an earlier segment after the newer segment is committed;
 * supersedes an active clock when the committed scene state places its subject
   at a different location than the clock description asserts, or when the
-  subject's danger condition has resolved according to committed facts;
+  subject's danger condition has affirmatively resolved according to committed
+  facts;
+* treats clocks that name more than one known subject as ambiguous and never
+  retires them on an arbitrary first match;
+* gates all evidence by visibility so private facts can never leak into
+  party-facing clock/event text;
 * emits one correlated terminal revision across memory, clock, summary, and
   scene-state commits.
 
-Any contradiction that cannot be deterministically repaired raises
-:class:`PostTurnConsistencyIncident`, so the turn is never declared cleanly
-``complete`` while durable surfaces disagree.
+The running summary itself is a derived narrative projection of the committed
+structured state and is authored after the clock commits, so it cannot encode a
+pre-adjudication value. Any contradiction that cannot be deterministically
+repaired raises :class:`PostTurnConsistencyIncident`, so the turn is never
+declared cleanly ``complete`` while durable surfaces disagree.
 """
 
 import re
@@ -92,10 +98,6 @@ _HISTORICAL_MARKERS = frozenset({
 
 _NEGATION_WINDOW = 3
 _HISTORICAL_WINDOW = 4
-
-SEGMENT_REF_RE = re.compile(r'(\d+)\s*/\s*(\d+)')
-_CLOCK_NEAR_WINDOW = 70
-
 
 class PostTurnConsistencyIncident(Exception):
     """Raised when durable surfaces disagree and the contradiction cannot be
@@ -473,49 +475,6 @@ def _clock_condition_resolved(campaign, graph, clock, subject_id):
     return None
 
 
-def _patch_summary_clock_segments(summary, clock):
-    """Replace a stale ``N/M`` segment reference near the clock name in the
-    running summary with the committed clock value. Returns (summary, changes)."""
-    if not summary:
-        return summary, []
-    name = clean_text(clock.name, 200)
-    if not name:
-        return summary, []
-    committed_n = min(clock.filled or 0, clock.segments or 4)
-    committed_m = clock.segments or 4
-
-    matches = list(SEGMENT_REF_RE.finditer(summary))
-    changes = []
-    replacements = []
-    for match in matches:
-        window_start = max(0, match.start() - _CLOCK_NEAR_WINDOW)
-        window_end = min(len(summary), match.end() + _CLOCK_NEAR_WINDOW)
-        window = summary[window_start:window_end]
-        if not _contains_phrase(window, name):
-            continue
-        old_n = int(match.group(1))
-        old_m = int(match.group(2))
-        if old_n == committed_n and old_m == committed_m:
-            continue
-        changes.append({
-            'clock_id': clock.clock_id,
-            'from': f'{old_n}/{old_m}',
-            'to': f'{committed_n}/{committed_m}',
-        })
-        replacements.append((match.start(), match.end(), f'{committed_n}/{committed_m}'))
-
-    if not replacements:
-        return summary, changes
-    out = []
-    cursor = 0
-    for start, end, replacement in replacements:
-        out.append(summary[cursor:start])
-        out.append(replacement)
-        cursor = end
-    out.append(summary[cursor:])
-    return ''.join(out), changes
-
-
 def _supersede_clock(campaign, clock, reason, kind, trace_id=None, parent_trace_id=None):
     """Deterministically retire an active clock whose description no longer
     matches committed scene state."""
@@ -592,14 +551,12 @@ def reconcile_post_turn_state(
     terminal_revision = world.memory_revision or 0
 
     report = {
-        'summary_patches': [],
         'clocks_superseded': [],
         'checks': [],
         'verified': True,
         'terminal_revision': terminal_revision,
     }
 
-    summary = session.running_summary if session else None
     subject_index = _subject_index(campaign, graph)
     location_index = _location_index(graph)
     clocks = CampaignClock.query.filter_by(campaign_id=campaign.id).order_by(CampaignClock.id.asc()).all()
@@ -657,18 +614,7 @@ def reconcile_post_turn_state(
             report['clocks_superseded'].append(change)
             check('clock_condition_resolution', 'reconciled', change)
 
-    # ---- Running summary clock-segment reconciliation ----
-    if summary:
-        patched_summary = summary
-        for clock in clocks:
-            patched_summary, changes = _patch_summary_clock_segments(patched_summary, clock)
-            for change in changes:
-                report['summary_patches'].append(change)
-                check('clock_segments_in_summary', 'reconciled', change)
-        if patched_summary != summary and session:
-            session.running_summary = patched_summary
-
-    if report['summary_patches'] or report['clocks_superseded']:
+    if report['clocks_superseded']:
         log_audit_event(
             campaign.id,
             'post_turn_consistency_reconciled',

@@ -1169,6 +1169,49 @@ def build_session_memory_context(campaign, session, current_user, player_message
     }
 
 
+def build_session_summary_finalize_context(
+    campaign,
+    session,
+    player_message,
+    dm_message,
+    player_message_id=None,
+    dm_message_id=None,
+):
+    """Assemble the narrow context for finalizing the running summary against
+    committed post-clock state: previous summary, current turn, committed scene,
+    committed public facts, and committed active/resolved clocks. The summary is
+    treated as a derived narrative projection of this authoritative state."""
+    world, graph, world_state, _private = _world_json(campaign)
+    current_scene = world_state.get('current_scene', {}) if isinstance(world_state, dict) else {}
+
+    active_clocks = []
+    resolved_clocks = []
+    for clock in CampaignClock.query.filter_by(campaign_id=campaign.id).order_by(CampaignClock.id.asc()).all():
+        compact = {
+            'clock_id': clock.clock_id,
+            'name': clock.name,
+            'segments': clock.segments,
+            'filled': clock.filled,
+            'status': clock.status,
+            'visibility': clock.visibility,
+            'summary': clean_text(clock.summary, 220),
+        }
+        if (clock.status or 'active') in ACTIVE_CLOCK_STATUSES:
+            active_clocks.append(compact)
+        elif (clock.status or '') in {'resolved', 'completed', 'superseded'}:
+            resolved_clocks.append(compact)
+
+    return {
+        'prior_running_summary': session.running_summary or '' if session else '',
+        'latest_player_message': player_message,
+        'latest_dm_message': dm_message,
+        'current_scene': current_scene,
+        'committed_facts': _established_public_facts(campaign, limit=6),
+        'active_clocks': active_clocks[:8],
+        'resolved_clocks': resolved_clocks[-8:],
+    }
+
+
 def build_session_clock_context(
     campaign,
     session,

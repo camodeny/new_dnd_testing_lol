@@ -132,54 +132,178 @@ class PostTurnConsistencyTest(unittest.TestCase):
             trace_label='test post-turn consistency',
         )
 
-    def test_run40_cycle4_advance_reconciles_summary_segments(self):
-        """A summary must not report an earlier clock segment after the newer
-        segment is committed (Trapped Ferrymen clock durably at 2/3, summary 1/3)."""
-        self._clock('trapped_ferrymen', 'Trapped Ferrymen', 3, 2)
-        self._clock('mira_in_the_water', 'Mira in the Water', 4, 2, summary='Mira is unconscious at 0 HP and being hauled toward the dock.')
-        self.session.running_summary = (
-            'The Trapped Ferrymen clock sits at 1/3. Mira is still in the water.'
-        )
-        db.session.commit()
-
-        report = self._run_fixture()
-        db.session.commit()
-
-        session = db.session.get(CampaignSession, self.session.id)
-        self.assertNotIn('1/3', session.running_summary)
-        self.assertIn('2/3', session.running_summary)
-        self.assertEqual(
-            [change['from'] for change in report['summary_patches']],
-            ['1/3'],
-        )
-        # The "Mira in the Water" clock is superseded because committed scene
-        # state places Mira on the dock.
-        water_clock = CampaignClock.query.filter_by(campaign_id=self.campaign.id, clock_id='mira_in_the_water').one()
-        self.assertEqual(water_clock.status, 'superseded')
-        self.assertIn('superseded', water_clock.summary.lower())
-        # One correlated terminal revision.
-        world = db.session.get(CampaignWorld, self.world.id)
-        self.assertEqual(report['terminal_revision'], world.memory_revision)
-        self.assertGreater(report['terminal_revision'], 0)
-        self.assertTrue(report['verified'])
-        # Reconciliation is audited.
-        self.assertTrue(
-            CampaignAuditEvent.query.filter_by(campaign_id=self.campaign.id, event_type='post_turn_consistency_reconciled').first()
-        )
-
-    def test_no_advance_summary_matches_clock_is_consistent(self):
+    def test_pipeline_finalizes_summary_against_committed_post_clock_state(self):
+        """The running summary is authored from committed post-clock state, not
+        from a pre-adjudication snapshot: the finalizer receives the committed
+        clock value and its output is what the session presents."""
+        from services.dm_turns import begin_session_dm_turn
+        db.session.add(begin_session_dm_turn(
+            self.campaign.id,
+            self.session.id,
+            1,
+            'session_dm:session_1:message_1',
+        ))
         self._clock('trapped_ferrymen', 'Trapped Ferrymen', 3, 1)
         self.session.running_summary = 'The Trapped Ferrymen clock sits at 1/3.'
         db.session.commit()
 
+        captured = {}
+        from routes.sessions import _run_session_memory_update
+
+        def fake_finalize(summary_context, audit_context=None):
+            captured['context'] = summary_context
+            captured['called_after_clock_commit'] = (
+                CampaignClock.query.filter_by(campaign_id=self.campaign.id, clock_id='trapped_ferrymen').one().filled == 2
+            )
+            return {'running_summary': 'The Trapped Ferrymen clock now sits at 2/3 and the party holds the gate.'}
+
+        with patch('routes.sessions.get_session_memory_patch', return_value={
+            'source_contract': 'compiled_session_memory_v2',
+            'running_summary': 'The Trapped Ferrymen clock sits at 1/3.',
+            'scene_patch': {},
+            'upsert_graph_entities': [],
+            'upsert_graph_relations': [],
+            'upsert_graph_facts': [],
+            'create_clocks': [],
+            'retire_clocks': [],
+            'update_npc_actors': [],
+            'record_events': [],
+        }), \
+                patch('routes.sessions.get_session_clock_updates', return_value={
+                    'create_clocks': [],
+                    'advance_clocks': [{
+                        'clock_id': 'trapped_ferrymen',
+                        'delta': 1,
+                        'reason': 'The visible exchange pressed the ferrymen onward.',
+                        'evidence': ['The DM confirmed the ferrymen moved.'],
+                    }],
+                    'retire_clocks': [],
+                    'no_change_explanations': [],
+                }), \
+                patch('routes.sessions.get_session_running_summary_finalize', side_effect=fake_finalize) as finalize_mock:
+            _run_session_memory_update(
+                campaign_id=self.campaign.id,
+                session_id=self.session.id,
+                user_id=self.user.id,
+                player_message_id=1,
+                player_content='We hold the gate.',
+                ai_text='The ferrymen press against the gate.',
+                hot_context={},
+                parent_trace_id='test:trace',
+                dm_message_id=2,
+            )
+
+        self.assertTrue(captured['called_after_clock_commit'])
+        self.assertEqual(captured['context']['prior_running_summary'], 'The Trapped Ferrymen clock sits at 1/3.')
+        trapped = next(
+            clock for clock in captured['context']['active_clocks']
+            if clock['clock_id'] == 'trapped_ferrymen'
+        )
+        self.assertEqual(trapped['filled'], 2)
+        self.assertEqual(trapped['segments'], 3)
+
+        turn = SessionDmTurn.query.filter_by(player_message_id=1).first()
+        self.assertEqual(turn.post_turn_status, 'complete')
+        self.assertEqual(turn.memory_status, 'complete')
+        self.assertEqual(turn.clock_status, 'complete')
+        session = db.session.get(CampaignSession, self.session.id)
+        self.assertEqual(session.running_summary, 'The Trapped Ferrymen clock now sits at 2/3 and the party holds the gate.')
+
+    def test_summary_finalize_failure_fails_closed(self):
+        """If final summary generation fails, the turn must NOT be reported
+        complete with the old summary still presented as current."""
+        from services.dm_turns import begin_session_dm_turn
+        db.session.add(begin_session_dm_turn(
+            self.campaign.id,
+            self.session.id,
+            1,
+            'session_dm:session_1:message_1',
+        ))
+        self._clock('trapped_ferrymen', 'Trapped Ferrymen', 3, 2)
+        self.session.running_summary = 'The Trapped Ferrymen clock sits at 1/3.'
+        db.session.commit()
+
+        from routes.sessions import _run_session_memory_update
+        with patch('routes.sessions.get_session_memory_patch', return_value={
+            'source_contract': 'compiled_session_memory_v2',
+            'running_summary': 'The Trapped Ferrymen clock sits at 1/3.',
+            'scene_patch': {},
+            'upsert_graph_entities': [],
+            'upsert_graph_relations': [],
+            'upsert_graph_facts': [],
+            'create_clocks': [],
+            'retire_clocks': [],
+            'update_npc_actors': [],
+            'record_events': [],
+        }), \
+                patch('routes.sessions.get_session_clock_updates', return_value={
+                    'create_clocks': [],
+                    'advance_clocks': [],
+                    'retire_clocks': [],
+                    'no_change_explanations': [],
+                }), \
+                patch('routes.sessions.get_session_running_summary_finalize', return_value=None):
+            _run_session_memory_update(
+                campaign_id=self.campaign.id,
+                session_id=self.session.id,
+                user_id=self.user.id,
+                player_message_id=1,
+                player_content='We hold the gate.',
+                ai_text='The ferrymen press against the gate.',
+                hot_context={},
+                parent_trace_id='test:trace',
+                dm_message_id=2,
+            )
+
+        turn = SessionDmTurn.query.filter_by(player_message_id=1).first()
+        self.assertEqual(turn.post_turn_status, 'error')
+        self.assertEqual(turn.memory_status, 'complete')
+        self.assertEqual(turn.clock_status, 'complete')
+        self.assertIn('summary', turn.error_text.lower())
+        # Memory and clock commits are durable; only the summary finalization
+        # is pending, so a retry can recover.
+        clock = CampaignClock.query.filter_by(campaign_id=self.campaign.id, clock_id='trapped_ferrymen').one()
+        self.assertEqual(clock.filled, 2)
+        self.assertTrue(
+            CampaignAuditEvent.query.filter_by(campaign_id=self.campaign.id, event_type='post_turn_summary_finalize_error').first()
+        )
+
+    def test_summary_finalize_context_reflects_committed_clocks(self):
+        from services.dm_tools import build_session_summary_finalize_context
+        self._clock('trapped_ferrymen', 'Trapped Ferrymen', 3, 2)
+        self._clock('mira_in_the_water', 'Mira in the Water', 4, 1, status='superseded')
+        self.session.running_summary = 'Old summary.'
+        db.session.commit()
+
+        context = build_session_summary_finalize_context(
+            self.campaign,
+            self.session,
+            'player says hi',
+            'dm replies',
+            player_message_id=1,
+            dm_message_id=2,
+        )
+
+        self.assertEqual(context['prior_running_summary'], 'Old summary.')
+        self.assertEqual(context['latest_player_message'], 'player says hi')
+        active_ids = [clock['clock_id'] for clock in context['active_clocks']]
+        self.assertIn('trapped_ferrymen', active_ids)
+        trapped = next(clock for clock in context['active_clocks'] if clock['clock_id'] == 'trapped_ferrymen')
+        self.assertEqual((trapped['filled'], trapped['segments']), (2, 3))
+        resolved_ids = [clock['clock_id'] for clock in context['resolved_clocks']]
+        self.assertIn('mira_in_the_water', resolved_ids)
+
+    def test_no_conflict_clock_stays_active_and_consistent(self):
+        self._clock('trapped_ferrymen', 'Trapped Ferrymen', 3, 1)
+        db.session.commit()
+
         report = self._run_fixture()
         db.session.commit()
 
-        self.assertEqual(report['summary_patches'], [])
         self.assertEqual(report['clocks_superseded'], [])
         self.assertTrue(report['verified'])
-        session = db.session.get(CampaignSession, self.session.id)
-        self.assertEqual(session.running_summary, 'The Trapped Ferrymen clock sits at 1/3.')
+        clock = CampaignClock.query.filter_by(campaign_id=self.campaign.id, clock_id='trapped_ferrymen').one()
+        self.assertEqual(clock.status, 'active')
 
     def test_subject_relocation_supersedes_active_clock(self):
         """A clock cannot remain actively located 'in the water' after committed
@@ -682,12 +806,109 @@ class PostTurnConsistencyTest(unittest.TestCase):
         self.assertEqual(world.memory_revision, 4)
         self.assertEqual(db.session.get(CampaignSession, self.session.id).running_summary, 'The party recovered the lead at the dock.')
 
+    def test_failure_recovery_order_apply_memory_then_clock_then_summary(self):
+        """End-to-end failure→recovery ordering (#105): recover/apply the stored
+        memory patch, replay skipped clock adjudication, then finalize the
+        summary from the resulting committed state before declaring complete."""
+        from services.dm_turns import begin_session_dm_turn
+        world = db.session.get(CampaignWorld, self.world.id)
+        world.memory_revision = 3
+        db.session.commit()
+        self._clock('trapped_ferrymen', 'Trapped Ferrymen', 3, 1)
+        db.session.add(begin_session_dm_turn(
+            self.campaign.id,
+            self.session.id,
+            1,
+            'session_dm:session_1:message_1',
+        ))
+        db.session.commit()
+
+        # 1) Simulate the memory failure that left the turn recoverable.
+        from routes.sessions import _run_session_memory_update
+        with patch('routes.sessions.get_session_memory_patch', side_effect=RuntimeError('memory failed')):
+            _run_session_memory_update(
+                campaign_id=self.campaign.id,
+                session_id=self.session.id,
+                user_id=self.user.id,
+                player_message_id=1,
+                player_content='We hold the gate.',
+                ai_text='The ferrymen press against the gate.',
+                hot_context={},
+                parent_trace_id='test:trace',
+                dm_message_id=2,
+            )
+        turn = SessionDmTurn.query.filter_by(player_message_id=1).first()
+        self.assertEqual(turn.post_turn_status, 'error')
+        self.assertEqual(db.session.get(CampaignWorld, self.world.id).memory_revision, 3)
+
+        # 2) Recover: apply the stored memory patch (base 3).
+        from services.dm_tools import apply_clock_adjudication, apply_compiled_session_memory_patch
+        stored_patch = {
+            'source_contract': 'compiled_session_memory_v2',
+            'base_memory_revision': 3,
+            'running_summary': 'The party recovered the lead at the dock.',
+            'scene_patch': {'location_id': 'the_dock', 'location_name': 'The Dock'},
+        }
+        apply_compiled_session_memory_patch(self.campaign, self.session, stored_patch)
+        db.session.commit()
+
+        # 3) Replay the skipped clock adjudication.
+        apply_clock_adjudication(self.campaign, {
+            'create_clocks': [],
+            'advance_clocks': [{
+                'clock_id': 'trapped_ferrymen',
+                'delta': 1,
+                'reason': 'The ferrymen pressed onward.',
+                'evidence': ['The DM confirmed movement.'],
+            }],
+            'retire_clocks': [],
+            'no_change_explanations': [],
+        })
+        db.session.commit()
+        clock = CampaignClock.query.filter_by(campaign_id=self.campaign.id, clock_id='trapped_ferrymen').one()
+        self.assertEqual(clock.filled, 2)
+
+        # 4) Finalize the summary from the resulting committed state.
+        from services.dm_tools import build_session_summary_finalize_context
+        context = build_session_summary_finalize_context(
+            self.campaign,
+            self.session,
+            'We hold the gate.',
+            'The ferrymen press against the gate.',
+            player_message_id=1,
+            dm_message_id=2,
+        )
+        trapped = next(c for c in context['active_clocks'] if c['clock_id'] == 'trapped_ferrymen')
+        self.assertEqual(trapped['filled'], 2)
+        self.session.running_summary = 'The ferrymen press onward; the clock now sits at 2/3.'
+        world = db.session.get(CampaignWorld, self.world.id)
+        world.memory_revision = (world.memory_revision or 0) + 1
+        db.session.commit()
+
+        # 5) Declare complete with the correlated terminal revision.
+        turn = SessionDmTurn.query.filter_by(player_message_id=1).first()
+        from services.dm_turns import mark_session_dm_turn_post_turn_complete
+        mark_session_dm_turn_post_turn_complete(
+            1,
+            dm_message_id=2,
+            memory_status='complete',
+            clock_status='complete',
+            post_turn_revision=world.memory_revision,
+        )
+        db.session.commit()
+
+        self.assertEqual(turn.post_turn_status, 'complete')
+        self.assertEqual(turn.post_turn_revision, world.memory_revision)
+        self.assertEqual(
+            db.session.get(CampaignSession, self.session.id).running_summary,
+            'The ferrymen press onward; the clock now sits at 2/3.',
+        )
+
     def test_memory_failure_still_reconciles_durable_state(self):
-        """Even when memory fails (turn reports error), deterministic repairs
-        bring clocks and summary to one coherent durable state."""
+        """Even when memory fails (turn reports error), deterministic clock
+        repairs still bring durable clock state to one coherent state."""
         self._clock('trapped_ferrymen', 'Trapped Ferrymen', 3, 2)
         self._clock('mira_in_the_water', 'Mira in the Water', 4, 2, summary='Mira is unconscious at 0 HP and being hauled toward the dock.')
-        self.session.running_summary = 'The Trapped Ferrymen clock sits at 1/3. Mira is still in the water.'
         db.session.commit()
 
         # Memory fails; clock processing is skipped. Reconciliation still runs
@@ -720,15 +941,12 @@ class PostTurnConsistencyTest(unittest.TestCase):
         self.assertEqual(turn.memory_status, 'error')
         self.assertIsNotNone(turn.post_turn_revision)
 
-        session = db.session.get(CampaignSession, self.session.id)
-        self.assertIn('2/3', session.running_summary)
         water_clock = CampaignClock.query.filter_by(campaign_id=self.campaign.id, clock_id='mira_in_the_water').one()
         self.assertEqual(water_clock.status, 'superseded')
 
     def test_late_retried_adjudication_is_idempotent(self):
         self._clock('trapped_ferrymen', 'Trapped Ferrymen', 3, 2)
         self._clock('mira_in_the_water', 'Mira in the Water', 4, 2, summary='Mira is unconscious at 0 HP and being hauled toward the dock.')
-        self.session.running_summary = 'The Trapped Ferrymen clock sits at 1/3. Mira is still in the water.'
         db.session.commit()
 
         first = self._run_fixture()
@@ -736,14 +954,12 @@ class PostTurnConsistencyTest(unittest.TestCase):
         second = self._run_fixture()
         db.session.commit()
 
-        self.assertTrue(first['summary_patches'])
-        self.assertEqual(second['summary_patches'], [])
+        self.assertTrue(first['clocks_superseded'])
         self.assertEqual(second['clocks_superseded'], [])
         # Re-running reconciliation still emits a fresh correlated revision.
         self.assertGreaterEqual(second['terminal_revision'], first['terminal_revision'])
-        session = db.session.get(CampaignSession, self.session.id)
-        self.assertIn('2/3', session.running_summary)
-        self.assertNotIn('1/3', session.running_summary)
+        water_clock = CampaignClock.query.filter_by(campaign_id=self.campaign.id, clock_id='mira_in_the_water').one()
+        self.assertEqual(water_clock.status, 'superseded')
 
     def test_ambiguous_subject_location_raises_incident(self):
         graph = json.loads(self.world.knowledge_graph)
@@ -811,7 +1027,10 @@ class PostTurnConsistencyTest(unittest.TestCase):
                     'advance_clocks': [],
                     'retire_clocks': [],
                     'no_change_explanations': [],
-                }):
+                }), \
+                patch('routes.sessions.get_session_running_summary_finalize', return_value={
+                    'running_summary': 'The Trapped Ferrymen clock sits at 2/3 and the party holds the gate.',
+                }) as finalize_mock:
             response = self.client.post(
                 f'/api/sessions/{self.session.id}/messages',
                 json={'content': 'We hold the gate.', 'role': 'player'},
@@ -819,6 +1038,7 @@ class PostTurnConsistencyTest(unittest.TestCase):
             )
 
         self.assertEqual(response.status_code, 201)
+        finalize_mock.assert_called_once()
         player_msg = SessionMessage.query.filter_by(session_id=self.session.id, role='player').first()
         turn = SessionDmTurn.query.filter_by(player_message_id=player_msg.id).first()
         self.assertEqual(turn.post_turn_status, 'complete')
@@ -826,7 +1046,7 @@ class PostTurnConsistencyTest(unittest.TestCase):
         world = db.session.get(CampaignWorld, self.world.id)
         self.assertEqual(turn.post_turn_revision, world.memory_revision)
         session = db.session.get(CampaignSession, self.session.id)
-        self.assertIn('2/3', session.running_summary)
+        self.assertEqual(session.running_summary, 'The Trapped Ferrymen clock sits at 2/3 and the party holds the gate.')
 
 
 if __name__ == '__main__':

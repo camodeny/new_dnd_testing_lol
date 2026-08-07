@@ -5609,6 +5609,126 @@ def get_session_clock_updates(clock_context, audit_context=None):
     return result
 
 
+SESSION_RUNNING_SUMMARY_FINALIZER_SYSTEM_PROMPT = (
+    "You are the final running-summary author for a D&D session. "
+    "Rewrite the running_summary into one compact paragraph that reflects the CURRENT committed state. "
+    "You are given the previous running summary, the latest visible exchange, the committed current scene, "
+    "the committed public facts, the committed active clocks (with current segment progress and status), "
+    "and any clocks that were just resolved or superseded. "
+    "The clock state you are given is authoritative and already committed: never describe a clock at a "
+    "progress value different from the one shown, and never present a clock as still active once it is "
+    "committed as resolved or superseded. "
+    "Preserve continuity: keep important prior context, leads, relationships, and unresolved questions while "
+    "cleanly folding in what just happened. Do not append fragments to the prior summary; rewrite it as one "
+    "paragraph. "
+    "Return only JSON: {\"running_summary\": \"...\"}."
+)
+
+
+def build_session_summary_finalizer_messages(summary_context):
+    return [
+        {'role': 'system', 'content': SESSION_RUNNING_SUMMARY_FINALIZER_SYSTEM_PROMPT},
+        {'role': 'user', 'content': json.dumps(
+            {key: value for key, value in (summary_context or {}).items() if value is not None},
+            ensure_ascii=False,
+        )},
+    ]
+
+
+def get_session_running_summary_finalize(summary_context, audit_context=None):
+    """Finalize the running summary against committed post-clock state.
+
+    A narrow pass: previous summary + current turn + committed scene/facts/clocks
+    in, one fresh running summary out. Returns ``{'running_summary': str}`` or
+    ``None`` on any failure so callers fail closed instead of presenting the old
+    summary as current.
+    """
+    messages = build_session_summary_finalizer_messages(summary_context or {})
+    audit_context = audit_context or {}
+    provider = get_llm_provider()
+    campaign_id = audit_context.get('campaign_id')
+    trace_id = audit_context.get('trace_id') or f"session_summary_finalizer:finalize:{uuid4().hex[:10]}"
+    trace_label = audit_context.get('trace_label') or 'session_summary_finalizer: finalize'
+
+    if campaign_id:
+        log_audit_event(
+            campaign_id,
+            'summary_finalizer_request',
+            'Requested post-clock running summary finalization.',
+            {'context': summary_context, 'messages': messages},
+            source=provider,
+            actor='session_summary_finalizer',
+            trace_id=trace_id,
+            parent_trace_id=audit_context.get('parent_trace_id'),
+            trace_label=trace_label,
+            audit_role='tools',
+            commit=True,
+        )
+
+    agent_audit = {
+        **audit_context,
+        'trace_id': trace_id,
+        'trace_label': trace_label,
+        'actor': 'session_summary_finalizer',
+        'operation': 'session_summary_finalize',
+    }
+    try:
+        data = _json_loads_with_repair(
+            _post_chat(messages, json_mode=True, audit_context=agent_audit),
+            audit_context=agent_audit,
+        )
+    except Exception as err:
+        if campaign_id:
+            log_audit_event(
+                campaign_id,
+                'summary_finalizer_error',
+                'Running summary finalization failed.',
+                {'error': repr(err)},
+                source=provider,
+                actor='session_summary_finalizer',
+                trace_id=trace_id,
+                parent_trace_id=audit_context.get('parent_trace_id'),
+                trace_label=trace_label,
+                audit_role='tools',
+                commit=True,
+            )
+        return None
+
+    summary = str(data.get('running_summary') or '').strip() if isinstance(data, dict) else ''
+    if not summary:
+        if campaign_id:
+            log_audit_event(
+                campaign_id,
+                'summary_finalizer_error',
+                'Running summary finalization returned no content.',
+                {},
+                source=provider,
+                actor='session_summary_finalizer',
+                trace_id=trace_id,
+                parent_trace_id=audit_context.get('parent_trace_id'),
+                trace_label=trace_label,
+                audit_role='tools',
+                commit=True,
+            )
+        return None
+
+    if campaign_id:
+        log_audit_event(
+            campaign_id,
+            'summary_finalizer_response',
+            'Received final running summary.',
+            {'running_summary': summary},
+            source=provider,
+            actor='session_summary_finalizer',
+            trace_id=trace_id,
+            parent_trace_id=audit_context.get('parent_trace_id'),
+            trace_label=trace_label,
+            audit_role='agent',
+            commit=True,
+        )
+    return {'running_summary': summary}
+
+
 def get_character_sheet_answer(question, scope, character_sheets, audit_context=None):
     if not character_sheets:
         return {

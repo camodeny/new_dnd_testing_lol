@@ -20,6 +20,7 @@ from openrouter import (
     get_session_clock_updates,
     get_session_dm_response_with_tools,
     get_session_memory_patch,
+    get_session_running_summary_finalize,
     normalize_session_dm_turn_decision,
 )
 from services.stream_manager import stream_manager
@@ -36,6 +37,7 @@ from services.dm_tools import (
     build_session_clock_context,
     build_session_memory_context,
     build_session_retrieval_packet,
+    build_session_summary_finalize_context,
     context_manifest,
     execute_dm_tool,
 )
@@ -370,8 +372,90 @@ def _run_session_memory_update(
             db.session.rollback()
             clock_complete = False
 
-        # Post-turn reconciliation: summary, clock descriptions, scene state,
-        # and clock progress must agree before the turn may be reported complete.
+        # Finalize the running summary against the committed post-clock state so
+        # it can never encode a pre-adjudication clock value. This is a narrow
+        # LLM pass (previous summary + current turn + committed scene/facts/
+        # clocks), not the full memory compiler. Fail closed on error: do NOT
+        # report the turn complete with the old summary still presented current.
+        summary_finalize_trace_id = f'session_summary_finalizer:session_{session_id}:message_{player_message_id}'
+        summary_finalize_label = f'session_summary_finalizer: session {session_id}'
+        summary_finalize_error = None
+        try:
+            summary_context = build_session_summary_finalize_context(
+                campaign,
+                session,
+                player_content,
+                ai_text,
+                player_message_id=player_message_id,
+                dm_message_id=dm_message_id,
+            )
+            finalized = get_session_running_summary_finalize(
+                summary_context,
+                audit_context={
+                    'campaign_id': campaign.id,
+                    'operation': 'session_summary_finalize',
+                    'actor': 'session_summary_finalizer',
+                    'trace_id': summary_finalize_trace_id,
+                    'parent_trace_id': parent_trace_id,
+                    'trace_label': summary_finalize_label,
+                },
+            )
+        except Exception as err:
+            finalized = None
+            summary_finalize_error = repr(err)
+        finalized_summary = (finalized or {}).get('running_summary') if isinstance(finalized, dict) else None
+        if not finalized_summary:
+            log_audit_event(
+                campaign_id,
+                'post_turn_summary_finalize_error',
+                'Running summary finalization failed after memory and clock commits.',
+                {
+                    'session_id': session_id,
+                    'error': summary_finalize_error or 'summary_finalizer returned no content',
+                },
+                source='session_memory',
+                actor='session_summary_finalizer',
+                trace_id=summary_finalize_trace_id,
+                parent_trace_id=parent_trace_id,
+                trace_label=summary_finalize_label,
+                audit_role='tools',
+                commit=True,
+            )
+            # Reconcile durable surfaces for the clock side, then mark the turn
+            # error/recoverable; memory and clock are already committed.
+            terminal_revision, _incident_text = _reconcile_post_turn_state(
+                campaign,
+                session,
+                player_message_id,
+                dm_message_id,
+                parent_trace_id,
+                bump_revision=True,
+            )
+            mark_session_dm_turn_error(
+                campaign_id,
+                session_id,
+                player_message_id,
+                parent_trace_id,
+                'Running summary finalization failed; the turn is recoverable but not complete.',
+                dm_message_id=dm_message_id,
+                memory_status='complete',
+                clock_status='complete',
+                post_turn_revision=terminal_revision,
+            )
+            db.session.commit()
+            world_after = world_public_payload(campaign).get('world') or {}
+            current_scene_after = world_after.get('current_scene')
+            if current_scene_after != current_scene_before:
+                stream_manager.broadcast_event(session_id, {
+                    'type': 'scene_updated',
+                    'current_scene': current_scene_after,
+                })
+            return
+        session.running_summary = finalized_summary.strip()
+        db.session.commit()
+
+        # Post-turn consistency check: clock descriptions, scene state, and clock
+        # progress must agree before the turn may be reported complete.
         terminal_revision, incident_text = _reconcile_post_turn_state(
             campaign,
             session,
