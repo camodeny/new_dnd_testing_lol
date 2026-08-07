@@ -64,6 +64,14 @@ docker exec new_dnd_testing_lol-app-1 \
 
 The container inherits provider credentials from deploy env, so the worker path only needs the generated owner automation key file plus the existing app env.
 
+The installed `/usr/local/bin/dnd-automationctl` inside the image is a symlink to `/app/automation/automationctl.sh`. The wrapper resolves the real application root rather than deriving it from the symlink destination, so the command above works from any working directory without extra environment. If the automation control env file has not been generated yet, the wrapper prints a diagnostic that names the expected path and the `dnd-ensure-host-audit-env` command to generate it.
+
+To verify the built image's installed wrapper, run the container smoke test (builds the image unless `DND_IMAGE_TAG` is set):
+
+```bash
+sh automation/container_smoke_test.sh
+```
+
 If you want shorter commands on the host, copy `automation/deployed_host/dnd-automationctl` and `automation/deployed_host/dnd-ensure-host-audit-env` into a host bin directory and run those wrappers instead of spelling out `docker exec` every time.
 If the host home filesystem is mounted `noexec`, invoke them as `sh ~/bin/dnd-automationctl ...` and `sh ~/bin/dnd-ensure-host-audit-env ...`.
 

@@ -33,6 +33,7 @@ Optional secrets:
 If `DATABASE_URL` is not set, the app uses a SQLite database stored in the remote `data/` volume.
 Local `.env` files are intentionally excluded from the deploy archive. Values that need to reach the server must be configured as GitHub secrets or variables and are written to the remote `.deploy.env` during deployment.
 For automation-audit shell work on the deployed host, the container now expects `LLM_CAMPAIGN_ENV_FILE` to point at a writable volume path, defaulting to `/app/data/automation/llm_campaign.env`.
+The in-container `/usr/local/bin/dnd-automationctl` is a symlink to `/app/automation/automationctl.sh`; the wrapper resolves the real application root (it does not depend on the symlink destination or the current working directory), and supports an explicit `AUTOMATION_ROOT` override. When the automation control env file is missing, the wrapper prints a diagnostic naming the expected path and the `dnd-ensure-host-audit-env` command to generate it.
 If the host's home directory is mounted `noexec`, host convenience wrappers copied into `~/bin` should be run through `sh` rather than executed directly.
 
 ## GitHub environment variables

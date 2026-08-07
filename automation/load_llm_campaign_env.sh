@@ -16,3 +16,8 @@ load_env_file() {
 
 load_env_file "$APP_ENV_FILE"
 load_env_file "$ENV_FILE"
+
+if [ ! -f "$ENV_FILE" ]; then
+  printf 'dnd-automationctl: automation control env file not found: %s\n' "$ENV_FILE" >&2
+  printf 'dnd-automationctl: generate it with: dnd-ensure-host-audit-env --username <owner> --env-file %s\n' "$ENV_FILE" >&2
+fi
