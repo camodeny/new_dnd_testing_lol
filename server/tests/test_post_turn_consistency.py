@@ -293,6 +293,73 @@ class PostTurnConsistencyTest(unittest.TestCase):
         resolved_ids = [clock['clock_id'] for clock in context['resolved_clocks']]
         self.assertIn('mira_in_the_water', resolved_ids)
 
+    def test_summary_finalizer_sees_repaired_clock_superseded(self):
+        """End-to-end: deterministic clock repair supersedes an active clock
+        BEFORE summary finalization, so the summary finalizer sees it already
+        superseded (in resolved_clocks), not still active."""
+        from services.dm_turns import begin_session_dm_turn
+        db.session.add(begin_session_dm_turn(
+            self.campaign.id,
+            self.session.id,
+            1,
+            'session_dm:session_1:message_1',
+        ))
+        self._clock('mira_in_the_water', 'Mira in the Water', 4, 2, summary='Mira is being hauled toward the dock.')
+        db.session.commit()
+
+        captured = {}
+        from routes.sessions import _run_session_memory_update
+
+        def fake_finalize(summary_context, audit_context=None):
+            captured['context'] = summary_context
+            return {'running_summary': 'Mira is safe on the dock.'}
+
+        with patch('routes.sessions.get_session_memory_patch', return_value={
+            'source_contract': 'compiled_session_memory_v2',
+            'running_summary': 'Mira is still in the water.',
+            'scene_patch': {},
+            'upsert_graph_entities': [],
+            'upsert_graph_relations': [],
+            'upsert_graph_facts': [],
+            'create_clocks': [],
+            'retire_clocks': [],
+            'update_npc_actors': [],
+            'record_events': [],
+        }), \
+                patch('routes.sessions.get_session_clock_updates', return_value={
+                    'create_clocks': [],
+                    'advance_clocks': [],
+                    'retire_clocks': [],
+                    'no_change_explanations': [],
+                }), \
+                patch('routes.sessions.get_session_running_summary_finalize', side_effect=fake_finalize) as finalize_mock:
+            _run_session_memory_update(
+                campaign_id=self.campaign.id,
+                session_id=self.session.id,
+                user_id=self.user.id,
+                player_message_id=1,
+                player_content='We haul Mira onto the dock.',
+                ai_text='Mira is pulled up onto the dock.',
+                hot_context={},
+                parent_trace_id='test:trace',
+                dm_message_id=2,
+            )
+
+        finalize_mock.assert_called_once()
+        active_ids = [clock['clock_id'] for clock in captured['context']['active_clocks']]
+        self.assertNotIn('mira_in_the_water', active_ids)
+        resolved_ids = [clock['clock_id'] for clock in captured['context']['resolved_clocks']]
+        self.assertIn('mira_in_the_water', resolved_ids)
+        mira = next(clock for clock in captured['context']['resolved_clocks'] if clock['clock_id'] == 'mira_in_the_water')
+        self.assertEqual(mira['status'], 'superseded')
+
+        turn = SessionDmTurn.query.filter_by(player_message_id=1).first()
+        self.assertEqual(turn.post_turn_status, 'complete')
+        self.assertEqual(
+            db.session.get(CampaignSession, self.session.id).running_summary,
+            'Mira is safe on the dock.',
+        )
+
     def test_no_conflict_clock_stays_active_and_consistent(self):
         self._clock('trapped_ferrymen', 'Trapped Ferrymen', 3, 1)
         db.session.commit()

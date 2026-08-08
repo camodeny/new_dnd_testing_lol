@@ -500,7 +500,7 @@ def _supersede_clock(campaign, clock, reason, kind, trace_id=None, parent_trace_
     return {'clock_id': clock.clock_id, 'kind': kind, 'reason': reason, 'event_id': event.id}
 
 
-def reconcile_post_turn_state(
+def repair_post_turn_clocks(
     campaign,
     session,
     *,
@@ -509,12 +509,12 @@ def reconcile_post_turn_state(
     trace_id=None,
     parent_trace_id=None,
     trace_label=None,
-    memory_result=None,
-    clock_result=None,
     bump_revision=True,
 ):
-    """Reconcile the running summary, clock descriptions, and scene state after
-    memory and clock commits, then expose one correlated terminal revision.
+    """Mutating phase of the final consistency check: supersede active clocks
+    whose committed state shows subject relocation or resolved danger, and emit
+    the correlated terminal revision. Must run BEFORE the running summary is
+    finalized so the summary is authored against repaired clock state.
 
     Returns a report dict. Raises :class:`PostTurnConsistencyIncident` when a
     contradiction cannot be deterministically repaired.
@@ -524,9 +524,8 @@ def reconcile_post_turn_state(
         world = CampaignWorld.query.filter_by(campaign_id=campaign.id).first()
     if world is None:
         # No durable world package exists, so there are no committed surfaces to
-        # contradict; reconciliation is a benign no-op rather than an incident.
+        # contradict; repair is a benign no-op rather than an incident.
         return {
-            'summary_patches': [],
             'clocks_superseded': [],
             'checks': [{'id': 'no_world_package', 'status': 'consistent'}],
             'verified': True,
@@ -570,7 +569,7 @@ def reconcile_post_turn_state(
         if status == 'inconsistent':
             report['verified'] = False
 
-    # ---- Clock subject location / condition reconciliation ----
+    # ---- Clock subject location / condition repair ----
     for clock in clocks:
         if (clock.status or 'active') not in _ACTIVE_CLOCK_STATUSES:
             continue
@@ -632,7 +631,130 @@ def reconcile_post_turn_state(
             audit_role='tools',
             commit=False,
         )
-    else:
-        check('all_surfaces', 'consistent')
 
+    return report
+
+
+def verify_post_turn_state(
+    campaign,
+    session,
+    *,
+    player_message_id=None,
+    dm_message_id=None,
+    trace_id=None,
+    parent_trace_id=None,
+    trace_label=None,
+):
+    """Read-only phase of the final consistency check, run AFTER the running
+    summary has been finalized. It never mutates durable state: it only
+    re-validates that no active clock's description contradicts committed scene
+    state. Any remaining contradiction raises :class:`PostTurnConsistencyIncident`
+    so the turn is not reported complete.
+
+    Returns a report dict with a ``verified`` flag.
+    """
+    world, graph, world_state, _private = _world_json(campaign)
+    if world is None:
+        return {
+            'checks': [{'id': 'no_world_package', 'status': 'consistent'}],
+            'verified': True,
+        }
+
+    report = {
+        'checks': [],
+        'verified': True,
+    }
+
+    def check(identity, status, detail=None):
+        report['checks'].append({
+            'id': identity,
+            'status': status,
+            'detail': detail,
+        })
+        if status == 'inconsistent':
+            report['verified'] = False
+
+    subject_index = _subject_index(campaign, graph)
+    location_index = _location_index(graph)
+    clocks = CampaignClock.query.filter_by(campaign_id=campaign.id).order_by(CampaignClock.id.asc()).all()
+
+    for clock in clocks:
+        if (clock.status or 'active') not in _ACTIVE_CLOCK_STATUSES:
+            continue
+        subject_ids = _clock_subject_ids(clock, subject_index)
+        if not subject_ids:
+            continue
+        if len(subject_ids) > 1:
+            check('clock_subject_identity', 'ambiguous', {
+                'clock_id': clock.clock_id,
+                'subject_ids': subject_ids,
+                'reason': 'Clock references multiple subjects; refusing to supersede on an arbitrary match.',
+            })
+            continue
+        subject_id = subject_ids[0]
+        location_reason, location_kind = _clock_location_conflict(campaign, graph, world_state, clock, subject_id)
+        condition_reason = _clock_condition_resolved(campaign, graph, clock, subject_id)
+        if location_kind == 'ambiguous':
+            raise PostTurnConsistencyIncident(
+                f'Clock {clock.name} subject relocation is ambiguous; refusing to verify.',
+                dict(report, checks=report['checks']),
+            )
+        if location_reason:
+            raise PostTurnConsistencyIncident(
+                f'Clock {clock.name} subject location still contradicts committed scene state.',
+                dict(report, checks=report['checks']),
+            )
+        if condition_reason:
+            raise PostTurnConsistencyIncident(
+                f'Clock {clock.name} danger condition is still resolved per committed facts.',
+                dict(report, checks=report['checks']),
+            )
+
+    check('all_surfaces', 'consistent')
+    return report
+
+
+def reconcile_post_turn_state(
+    campaign,
+    session,
+    *,
+    player_message_id=None,
+    dm_message_id=None,
+    trace_id=None,
+    parent_trace_id=None,
+    trace_label=None,
+    memory_result=None,
+    clock_result=None,
+    bump_revision=True,
+):
+    """Combined mutating repair + read-only verify, kept for callers that need a
+    single entry point (memory-failure / summary-failure error paths and tests).
+    The success path uses :func:`repair_post_turn_clocks` BEFORE summary
+    finalization and :func:`verify_post_turn_state` AFTER it."""
+    report = repair_post_turn_clocks(
+        campaign,
+        session,
+        player_message_id=player_message_id,
+        dm_message_id=dm_message_id,
+        trace_id=trace_id,
+        parent_trace_id=parent_trace_id,
+        trace_label=trace_label,
+        bump_revision=bump_revision,
+    )
+    if report.get('clocks_superseded'):
+        # Repair already reconciled every detected clock; verification is a
+        # no-op safety net for the combined path.
+        report['verified'] = True
+        return report
+    verify = verify_post_turn_state(
+        campaign,
+        session,
+        player_message_id=player_message_id,
+        dm_message_id=dm_message_id,
+        trace_id=trace_id,
+        parent_trace_id=parent_trace_id,
+        trace_label=trace_label,
+    )
+    report['verified'] = verify.get('verified', True)
+    report['checks'].extend(verify.get('checks', []))
     return report
