@@ -186,6 +186,78 @@ def fetch_run(api_base, owner_api_key, run_id):
     return api_get(api_base, f'/api/automation/runs/{run_id}', api_key=owner_api_key)
 
 
+def attempt_memory_recovery(api_base, owner_api_key, campaign_id, dm_turn):
+    """Retry a recoverable failed memory patch before a run is allowed to fail.
+
+    When the post-turn memory pipeline records an explicit recovery task
+    (has_pending_recovery + recovery_task), the failed compiled patch is
+    re-applied exactly once. A successful retry unblocks the turn so later
+    cycles are not built on permanently stale clocks/summaries. Returns
+    (recovered, detail).
+    """
+    if not dm_turn or not isinstance(dm_turn, dict):
+        return False, {'reason': 'no_turn'}
+    if not dm_turn.get('has_pending_recovery'):
+        return False, {'reason': 'no_pending_recovery'}
+    task = dm_turn.get('recovery_task') or {}
+    task_id = task.get('id')
+    if not task_id:
+        return False, {'reason': 'no_recovery_task_id'}
+    try:
+        response = api_post(
+            api_base,
+            f'/api/campaigns/{campaign_id}/memory-recovery/{task_id}/retry',
+            {},
+            api_key=owner_api_key,
+            timeout=120,
+        )
+    except Exception as err:
+        return False, {'reason': 'retry_api_error', 'error': str(err)}
+    if not isinstance(response, dict) or not response.get('ok'):
+        return False, {
+            'reason': 'retry_failed',
+            'error': (response or {}).get('error') or 'unknown',
+            'status': (response or {}).get('status'),
+        }
+    return True, {'reason': 'retry_succeeded', 'task_id': task_id}
+
+
+def drain_pending_memory_recovery(api_base, owner_api_key, campaign_id, pending_tasks):
+    """Resolve any pending recovery tasks before the next turn is allowed.
+
+    pending_tasks comes from the fetched run payload. Returns
+    (recovered_count, blocked_detail). When a pending recovery task cannot be
+    retried to success, blocked_detail is a dict describing the blocker so the
+    run fails closed instead of continuing with stale state.
+    """
+    if not pending_tasks:
+        return 0, None
+    recovered = 0
+    for task in pending_tasks:
+        task_id = task.get('id') if isinstance(task, dict) else None
+        if not task_id:
+            continue
+        try:
+            retry_response = api_post(
+                api_base,
+                f'/api/campaigns/{campaign_id}/memory-recovery/{task_id}/retry',
+                {},
+                api_key=owner_api_key,
+                timeout=120,
+            )
+        except Exception as err:
+            return recovered, {'reason': 'retry_api_error', 'error': str(err), 'task_id': task_id}
+        if not isinstance(retry_response, dict) or not retry_response.get('ok'):
+            return recovered, {
+                'reason': 'retry_failed',
+                'error': (retry_response or {}).get('error') or 'unknown',
+                'status': (retry_response or {}).get('status'),
+                'task_id': task_id,
+            }
+        recovered += 1
+    return recovered, None
+
+
 def pause_run(api_base, owner_api_key, run_id, worker_id, lease_token, phase, payload=None, summary=None, player_message_id=None, dm_message_id=None, dedupe_key=None):
     return api_post(
         api_base,
@@ -1138,6 +1210,57 @@ def execute_run(args, run_id):
             )
             return True
 
+        campaign_id = claim_payload['derived_campaign']['id']
+        recovered_count, blocked_detail = drain_pending_memory_recovery(
+            args.api_base,
+            args.owner_api_key,
+            campaign_id,
+            run_payload.get('pending_memory_recovery') or [],
+        )
+        if blocked_detail is not None:
+            append_event(
+                args.api_base,
+                args.owner_api_key,
+                run_id,
+                args.worker_id,
+                lease_token,
+                'memory_recovery_blocked',
+                {
+                    'automation_run_id': run_id,
+                    'campaign_id': campaign_id,
+                    'blocked_detail': blocked_detail,
+                },
+                dedupe_key=f'memory_recovery_blocked:{run_id}:{campaign_id}',
+            )
+            complete_run(
+                args.api_base,
+                args.owner_api_key,
+                run_id,
+                args.worker_id,
+                lease_token,
+                status='failed',
+                error_text='memory_recovery_blocked',
+                dedupe_key=f'run_completed:{run_id}:memory-recovery-blocked',
+            )
+            return True
+        if recovered_count:
+            append_event(
+                args.api_base,
+                args.owner_api_key,
+                run_id,
+                args.worker_id,
+                lease_token,
+                'memory_recovery_recovered',
+                {
+                    'automation_run_id': run_id,
+                    'campaign_id': campaign_id,
+                    'recovered_task_count': recovered_count,
+                    'outcome': 'drained_before_cycle',
+                },
+                status='running',
+                dedupe_key=f'memory_recovery_drained:{run_id}:{campaign_id}',
+            )
+
         session = active_session_from_run_payload(run_payload)
         if not session:
             complete_run(
@@ -1215,6 +1338,39 @@ def execute_run(args, run_id):
                         dedupe_key=f'run_completed:{run_id}:audit-stop',
                     )
                     return True
+
+                recovered, recovery_detail = attempt_memory_recovery(
+                    args.api_base,
+                    args.owner_api_key,
+                    claim_payload['derived_campaign']['id'],
+                    dm_turn,
+                )
+                if recovered:
+                    append_event(
+                        args.api_base,
+                        args.owner_api_key,
+                        run_id,
+                        args.worker_id,
+                        lease_token,
+                        'memory_recovery_recovered',
+                        {
+                            'automation_run_id': run_id,
+                            'player_message_id': posted_message_id,
+                            'dm_message_id': dm_turn.get('dm_message_id'),
+                            'recovery_detail': recovery_detail,
+                            'outcome': 'recovered',
+                        },
+                        status='running',
+                        dedupe_key=f'memory_recovery_recovered:{logical_key}:{posted_message_id}',
+                    )
+                    dm_turn = {
+                        'status': 'speak',
+                        'post_turn_status': 'complete',
+                        'memory_status': 'complete',
+                        'recovered_via': 'memory_recovery',
+                    }
+                    last_dm_turn = None
+                    continue
 
                 failure_payload = {
                     'player_message_id': posted_message_id,
@@ -1666,6 +1822,39 @@ def execute_run(args, run_id):
                                 dedupe_key=f'run_completed:{run_id}:audit-stop',
                             )
                             return True
+
+                        recovered, recovery_detail = attempt_memory_recovery(
+                            args.api_base,
+                            args.owner_api_key,
+                            campaign_id,
+                            dm_turn,
+                        )
+                        if recovered:
+                            append_event(
+                                args.api_base,
+                                args.owner_api_key,
+                                run_id,
+                                args.worker_id,
+                                lease_token,
+                                'memory_recovery_recovered',
+                                {
+                                    'automation_run_id': run_id,
+                                    'player_message_id': posted_message_id,
+                                    'dm_message_id': dm_turn.get('dm_message_id'),
+                                    'recovery_detail': recovery_detail,
+                                    'outcome': 'recovered',
+                                },
+                                status='running',
+                                dedupe_key=f'memory_recovery_recovered:{logical_key}:{posted_message_id}',
+                            )
+                            dm_turn = {
+                                'status': 'speak',
+                                'post_turn_status': 'complete',
+                                'memory_status': 'complete',
+                                'recovered_via': 'memory_recovery',
+                            }
+                            last_dm_turn = None
+                            continue
 
                         failure_payload = {
                             'player_message_id': posted_message_id,

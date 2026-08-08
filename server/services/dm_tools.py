@@ -5276,6 +5276,17 @@ def apply_compiled_session_memory_patch(campaign, session, patch, audit_context=
         merged, action = _upsert_by_id_strict(graph.setdefault("entities", []), entity)
         result["graph_changes"].append({"kind": "entity", "action": action, "id": entity_id})
 
+    materializations, unresolved_endpoints = _materialize_relation_endpoints(campaign, graph, patch)
+    if materializations:
+        result["relation_endpoint_materializations"] = materializations
+        for materialized in materializations:
+            result["graph_changes"].append({
+                "kind": "entity",
+                "action": "materialized_relation_endpoint",
+                "id": materialized["endpoint_id"],
+                "source": materialized["source"],
+            })
+
     for relation in patch.get("upsert_graph_relations") if isinstance(patch.get("upsert_graph_relations"), list) else []:
         relation = relation if isinstance(relation, dict) else {}
         source_id = relation.get("source_id", "")
@@ -5286,12 +5297,28 @@ def apply_compiled_session_memory_patch(campaign, session, patch, audit_context=
                 stage="validation",
                 code="missing_relation_endpoint",
                 message=f"Relation source {source_id!r} not found in graph entities.",
+                telemetry={
+                    "endpoint_id": source_id,
+                    "endpoint_role": "source",
+                    "relation_id": relation.get("id", ""),
+                    "graph_entity_count": len(all_ids),
+                    "unresolved_endpoints": unresolved_endpoints,
+                    "materialized_endpoints": materializations,
+                },
             )
         if target_id and target_id not in all_ids:
             raise MemoryPipelineError(
                 stage="validation",
                 code="missing_relation_endpoint",
                 message=f"Relation target {target_id!r} not found in graph entities.",
+                telemetry={
+                    "endpoint_id": target_id,
+                    "endpoint_role": "target",
+                    "relation_id": relation.get("id", ""),
+                    "graph_entity_count": len(all_ids),
+                    "unresolved_endpoints": unresolved_endpoints,
+                    "materialized_endpoints": materializations,
+                },
             )
 
         merged, action = _upsert_by_id_strict(graph.setdefault("relations", []), relation)
@@ -5395,6 +5422,155 @@ def _upsert_by_id_strict(items, item):
             return merged, "updated"
     items.append(dict(item))
     return item, "created"
+
+
+MAX_RELATION_ENDPOINT_MATERIALIZATIONS = 50
+
+
+def _relation_endpoint_refs(patch):
+    """Map every relation endpoint id to the relations/references that use it."""
+    refs = {}
+    for rel in patch.get("upsert_graph_relations") if isinstance(patch.get("upsert_graph_relations"), list) else []:
+        if not isinstance(rel, dict):
+            continue
+        rel_id = clean_id(rel.get("id"), "")
+        for field in ("source_id", "target_id"):
+            endpoint_id = clean_id(rel.get(field), "")
+            if endpoint_id:
+                refs.setdefault(endpoint_id, []).append((rel_id, field))
+    return refs
+
+
+def _relation_endpoint_visibility(patch, endpoint_id):
+    """Derive a materialized endpoint's visibility from referencing relations.
+
+    Fails closed to ``dm_private``. A registry-backed endpoint placeholder is
+    only promoted to ``party_known`` when every relation referencing it is
+    itself party-visible (public/party_known). Any private reference, or the
+    absence of a positive visibility signal, keeps the materialized entity
+    ``dm_private`` so a resolved private NPC used only as an endpoint never
+    leaks into the party-visible graph.
+    """
+    visibilities = []
+    for rel in patch.get("upsert_graph_relations") if isinstance(patch.get("upsert_graph_relations"), list) else []:
+        if not isinstance(rel, dict):
+            continue
+        for field in ("source_id", "target_id"):
+            if clean_id(rel.get(field), "") == endpoint_id:
+                vis = clean_text(rel.get("visibility"), 30).lower()
+                if vis:
+                    visibilities.append(vis)
+    if visibilities and all(vis in {"public", "party_known"} for vis in visibilities):
+        return "party_known"
+    return "dm_private"
+
+
+def _valid_relation_endpoint_registry(campaign):
+    """Build the campaign's non-graph relation endpoint registry.
+
+    Roster PCs and resolved NPC actors are first-class relation endpoints even
+    when they have no graph entity of their own (e.g. a private NPC referenced
+    only as a relation source). Returns (npc_rows, character_rows) keyed by id.
+    """
+    npc_rows = {
+        actor.actor_id: actor
+        for actor in NPCActor.query.filter_by(campaign_id=campaign.id).all()
+        if actor.actor_id
+    }
+    character_rows = {}
+    for character in Character.query.filter_by(campaign_id=campaign.id).all():
+        slug = clean_id(character.name, "")
+        if slug:
+            character_rows.setdefault(slug, character)
+    return npc_rows, character_rows
+
+
+def _materialize_relation_endpoints(campaign, graph, patch):
+    """Preserve valid NPC / roster-PC / known-entity relation endpoints.
+
+    A relation may reference a canonical actor that exists in the NPC actor
+    registry or the roster but has no graph entity yet. Instead of rejecting the
+    whole patch, materialize a graph entity for the endpoint (bounded) so the
+    relation can be applied and the endpoint survives into the final graph.
+    Returns (materializations, unresolved) where unresolved holds endpoints that
+    are not known to any registry and must fail closed.
+    """
+    graph_entities = graph.setdefault("entities", [])
+    graph_entity_ids = {e.get("id") for e in graph_entities if isinstance(e, dict) and e.get("id")}
+    requested_entity_ids = {
+        clean_id(entity.get("id"), "")
+        for entity in patch.get("upsert_graph_entities", [])
+        if isinstance(entity, dict)
+    }
+    endpoint_refs = _relation_endpoint_refs(patch)
+    if not endpoint_refs:
+        return [], []
+
+    npc_rows, character_rows = _valid_relation_endpoint_registry(campaign)
+
+    materializations = []
+    unresolved = []
+    materialized_ids = set()
+    for endpoint_id, refs in endpoint_refs.items():
+        if not endpoint_id:
+            continue
+        if endpoint_id in graph_entity_ids or endpoint_id in requested_entity_ids or endpoint_id in materialized_ids:
+            continue
+        if len(materializations) >= MAX_RELATION_ENDPOINT_MATERIALIZATIONS:
+            unresolved.append({
+                "endpoint_id": endpoint_id,
+                "reason": "materialization_limit_exceeded",
+                "referenced_by": refs,
+            })
+            continue
+
+        entity = None
+        source = None
+        endpoint_visibility = _relation_endpoint_visibility(patch, endpoint_id)
+        if endpoint_id in npc_rows:
+            npc = npc_rows[endpoint_id]
+            source = "known_npc"
+            entity = {
+                "id": endpoint_id,
+                "name": clean_text(npc.name, 200) or endpoint_id.replace("_", " ").title(),
+                "type": "npc",
+                "summary": clean_text(npc.public_summary or npc.role, 500) or None,
+                "visibility": endpoint_visibility,
+                "certainty": "confirmed",
+                "reason": "Materialized relation endpoint from NPC actor registry before applying its relationships.",
+            }
+        elif endpoint_id in character_rows:
+            character = character_rows[endpoint_id]
+            source = "known_roster_pc"
+            entity = {
+                "id": endpoint_id,
+                "name": clean_text(character.name, 200) or endpoint_id.replace("_", " ").title(),
+                "type": "pc",
+                "summary": clean_text(character.background, 500) or None,
+                "visibility": endpoint_visibility,
+                "certainty": "confirmed",
+                "reason": "Materialized relation endpoint from roster PC before applying its relationships.",
+            }
+
+        if entity is None:
+            unresolved.append({
+                "endpoint_id": endpoint_id,
+                "reason": "endpoint_not_in_any_registry",
+                "referenced_by": refs,
+            })
+            continue
+
+        graph_entities.append(entity)
+        graph_entity_ids.add(endpoint_id)
+        materialized_ids.add(endpoint_id)
+        materializations.append({
+            "endpoint_id": endpoint_id,
+            "source": source,
+            "materialized_type": entity["type"],
+            "referenced_by": refs,
+        })
+
+    return materializations, unresolved
 
 
 def _dedupe_json_values(values):

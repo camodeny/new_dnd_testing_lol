@@ -3092,8 +3092,21 @@ def run_watch_payload(run, current_user=None):
     ]
     current_audit_cycle = next((cycle for cycle in audit_cycles if cycle['id'] == run.awaiting_audit_cycle_id), None)
 
+    pending_memory_recovery = []
+    if run.derived_campaign_id:
+        from models import SessionMemoryRecoveryTask
+
+        pending_memory_recovery = [
+            task.to_dict()
+            for task in SessionMemoryRecoveryTask.query
+            .filter_by(campaign_id=run.derived_campaign_id, status='pending')
+            .order_by(SessionMemoryRecoveryTask.id.asc())
+            .all()
+        ]
+
     return redact_secrets({
         'run': run.to_dict(),
+        'pending_memory_recovery': pending_memory_recovery,
         'scenario': run.scenario.to_dict() if run.scenario else None,
         'snapshot': run.snapshot.to_dict() if run.snapshot else None,
         'viewer_permissions': {

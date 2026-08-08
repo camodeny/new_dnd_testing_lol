@@ -1420,6 +1420,66 @@ class SessionDmTurn(db.Model):
         }
 
 
+class SessionMemoryRecoveryTask(db.Model):
+    """Explicit recoverable partial-state record for a failed post-turn memory update.
+
+    When the memory pipeline fails validation/application, this task records the
+    failed compiled patch so it can be retried before the next turn is allowed to
+    proceed. It prevents a memory failure from silently leaving clocks, summaries,
+    and scene state permanently stale without a visible recovery path.
+    """
+
+    __tablename__ = 'session_memory_recovery_tasks'
+
+    id = db.Column(db.Integer, primary_key=True)
+    campaign_id = db.Column(db.Integer, db.ForeignKey('campaign.id'), nullable=False, index=True)
+    session_id = db.Column(db.Integer, db.ForeignKey('campaign_sessions.id'), nullable=True, index=True)
+    player_message_id = db.Column(db.Integer, db.ForeignKey('session_messages.id'), nullable=False, index=True)
+    dm_message_id = db.Column(db.Integer, db.ForeignKey('session_messages.id'), nullable=True)
+    trace_id = db.Column(db.String(160), nullable=True)
+
+    status = db.Column(db.String(20), nullable=False, default='pending', index=True)
+    error_stage = db.Column(db.String(40), nullable=True)
+    error_code = db.Column(db.String(80), nullable=True)
+    error_text = db.Column(db.Text, nullable=True)
+    patch_json = db.Column(db.Text, nullable=True)
+    context_json = db.Column(db.Text, nullable=True)
+    memory_applied = db.Column(db.Boolean, nullable=False, default=False)
+    clock_applied = db.Column(db.Boolean, nullable=False, default=False)
+    attempts = db.Column(db.Integer, nullable=False, default=0)
+    last_error_text = db.Column(db.Text, nullable=True)
+
+    created_at = db.Column(db.DateTime, default=utcnow, index=True)
+    updated_at = db.Column(db.DateTime, default=utcnow, onupdate=utcnow)
+    resolved_at = db.Column(db.DateTime, nullable=True)
+
+    __table_args__ = (
+        db.UniqueConstraint('campaign_id', 'player_message_id', name='uq_memory_recovery_campaign_player'),
+    )
+
+    def to_dict(self):
+        return {
+            'id': self.id,
+            'campaign_id': self.campaign_id,
+            'session_id': self.session_id,
+            'player_message_id': self.player_message_id,
+            'dm_message_id': self.dm_message_id,
+            'trace_id': self.trace_id,
+            'status': self.status,
+            'error_stage': self.error_stage,
+            'error_code': self.error_code,
+            'error_text': self.error_text,
+            'attempts': self.attempts,
+            'last_error_text': self.last_error_text,
+            'memory_applied': bool(self.memory_applied),
+            'clock_applied': bool(self.clock_applied),
+            'has_patch': bool(self.patch_json),
+            'created_at': self.created_at.isoformat() if self.created_at else None,
+            'updated_at': self.updated_at.isoformat() if self.updated_at else None,
+            'resolved_at': self.resolved_at.isoformat() if self.resolved_at else None,
+        }
+
+
 class AutomationScorecardTemplate(db.Model):
     __tablename__ = 'automation_scorecard_templates'
 

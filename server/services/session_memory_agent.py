@@ -471,16 +471,24 @@ def _known_ids(campaign):
         for npc in NPCActor.query.filter_by(campaign_id=campaign.id).all()
         if clean_id(npc.actor_id, '')
     }
+    character_rows = Character.query.filter_by(campaign_id=campaign.id).all()
     character_ids = {
         clean_id(character.name, '')
-        for character in Character.query.filter_by(campaign_id=campaign.id).all()
+        for character in character_rows
         if clean_id(character.name, '')
     }
     return {
         'entity_ids': entity_ids | npc_ids | character_ids,
+        'graph_entity_ids': entity_ids,
         'location_ids': location_ids,
         'npc_ids': npc_ids,
+        'character_ids': character_ids,
         'fact_ids': fact_ids,
+        'character_names': {
+            clean_id(character.name, ''): character.name
+            for character in character_rows
+            if clean_id(character.name, '') and character.name
+        },
         'location_names': {
             clean_text(entity.get('name'), 160).lower(): clean_id(entity.get('id'), '')
             for entity in graph.get('entities', [])
@@ -1841,6 +1849,40 @@ def compile_staged_memory_patch(memory_context, extracted, resolved):
             "resolution_mode": raw_rel.get("resolution_mode") or "canonical",
         })
 
+    # ── Relation Endpoint Provenance ───────────────────────────────────
+    # Structured record of where every accepted relation endpoint came from
+    # so the application boundary can preserve NPC / roster-PC / same-patch
+    # endpoints in the graph registry instead of dropping the relation when the
+    # endpoint is not yet a graph entity. This is the provenance that surfaces
+    # registry/relationship disagreements before the final application boundary.
+    relation_endpoint_manifest = []
+    graph_entity_ids = set(known.get("graph_entity_ids", set()))
+    known_npc_ids = set(known.get("npc_ids", set()))
+    known_character_ids = set(known.get("character_ids", set()))
+    for _rel in accepted_relations:
+        for _field, _value in (("source_id", _rel.get("source_id")), ("target_id", _rel.get("target_id"))):
+            if not _value:
+                continue
+            if _value in patch_created_npc_ids:
+                kind = "same_patch_npc"
+            elif _value in patch_created_entity_ids:
+                kind = "same_patch_entity"
+            elif _value in known_npc_ids:
+                kind = "known_npc"
+            elif _value in known_character_ids:
+                kind = "known_roster_pc"
+            else:
+                kind = "known_entity"
+            relation_endpoint_manifest.append({
+                "relation_id": _rel.get("id"),
+                "field": _field,
+                "endpoint_id": _value,
+                "endpoint_kind": kind,
+                "materialize_required": (
+                    _value not in graph_entity_ids and _value not in patch_created_entity_ids
+                ),
+            })
+
     # ── Compile NPC Updates via Registry ───────────────────────────────
     accepted_npc_updates = []
     raw_npc_updates = resolved.get("update_npc_actors") if isinstance(resolved.get("update_npc_actors"), list) else []
@@ -2059,6 +2101,7 @@ def compile_staged_memory_patch(memory_context, extracted, resolved):
         ) or None,
         "upsert_graph_entities": accepted_entities,
         "upsert_graph_relations": accepted_relations,
+        "relation_endpoint_manifest": relation_endpoint_manifest,
         "upsert_graph_facts": accepted_facts,
         "create_clocks": create_clocks,
         "retire_clocks": retire_clocks,

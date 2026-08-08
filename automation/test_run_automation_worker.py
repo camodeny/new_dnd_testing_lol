@@ -1233,6 +1233,92 @@ class RunAutomationWorkerTests(unittest.TestCase):
         )
 
 
+class MemoryRecoveryWorkerTest(unittest.TestCase):
+    def test_attempt_memory_recovery_skips_when_no_pending_flag(self):
+        ok, detail = worker.attempt_memory_recovery(
+            'http://127.0.0.1:5889',
+            'owner-key',
+            100,
+            {'status': 'speak', 'post_turn_status': 'error'},
+        )
+        self.assertFalse(ok)
+        self.assertEqual(detail['reason'], 'no_pending_recovery')
+
+    def test_attempt_memory_recovery_retries_pending_task(self):
+        with patch.object(worker, 'api_post', return_value={'ok': True, 'status': 'resolved'}) as post_mock:
+            ok, detail = worker.attempt_memory_recovery(
+                'http://127.0.0.1:5889',
+                'owner-key',
+                100,
+                {
+                    'has_pending_recovery': True,
+                    'recovery_task': {'id': 41},
+                },
+            )
+        self.assertTrue(ok)
+        self.assertEqual(detail['reason'], 'retry_succeeded')
+        post_mock.assert_called_once_with(
+            'http://127.0.0.1:5889',
+            '/api/campaigns/100/memory-recovery/41/retry',
+            {},
+            api_key='owner-key',
+            timeout=120,
+        )
+
+    def test_attempt_memory_recovery_reports_retry_failure(self):
+        with patch.object(worker, 'api_post', return_value={'ok': False, 'error': 'stale_base_revision'}):
+            ok, detail = worker.attempt_memory_recovery(
+                'http://127.0.0.1:5889',
+                'owner-key',
+                100,
+                {
+                    'has_pending_recovery': True,
+                    'recovery_task': {'id': 42},
+                },
+            )
+        self.assertFalse(ok)
+        self.assertEqual(detail['reason'], 'retry_failed')
+        self.assertEqual(detail['error'], 'stale_base_revision')
+
+    def test_drain_pending_memory_recovery_resolves_all(self):
+        with patch.object(worker, 'api_post', return_value={'ok': True, 'status': 'resolved'}) as post_mock:
+            recovered, blocked = worker.drain_pending_memory_recovery(
+                'http://127.0.0.1:5889',
+                'owner-key',
+                100,
+                [{'id': 1}, {'id': 2}],
+            )
+        self.assertEqual(recovered, 2)
+        self.assertIsNone(blocked)
+        self.assertEqual(post_mock.call_count, 2)
+
+    def test_drain_pending_memory_recovery_blocks_on_failure(self):
+        with patch.object(worker, 'api_post', side_effect=[
+            {'ok': True, 'status': 'resolved'},
+            {'ok': False, 'error': 'missing_relation_endpoint', 'status': 'pending'},
+        ]):
+            recovered, blocked = worker.drain_pending_memory_recovery(
+                'http://127.0.0.1:5889',
+                'owner-key',
+                100,
+                [{'id': 1}, {'id': 2}],
+            )
+        self.assertEqual(recovered, 1)
+        self.assertIsNotNone(blocked)
+        self.assertEqual(blocked['reason'], 'retry_failed')
+        self.assertEqual(blocked['task_id'], 2)
+
+    def test_drain_pending_memory_recovery_no_tasks(self):
+        recovered, blocked = worker.drain_pending_memory_recovery(
+            'http://127.0.0.1:5889',
+            'owner-key',
+            100,
+            [],
+        )
+        self.assertEqual(recovered, 0)
+        self.assertIsNone(blocked)
+
+
 class DmTurnTimeoutReconciliationTest(unittest.TestCase):
     def _args(self, reconciliation_seconds=30.0):
         return SimpleNamespace(
