@@ -40,6 +40,7 @@ from services.dm_tools import (
     build_session_summary_finalize_context,
     context_manifest,
     execute_dm_tool,
+    redact_session_summary_private_terms,
 )
 from services.dm_turn_commit import commit_accepted_dm_turn
 from services.dm_turns import (
@@ -546,6 +547,16 @@ def _run_session_memory_update(
                 })
             return
         session.running_summary = finalized_summary.strip()
+        # The finalizer writes the summary directly (bypassing the memory-patch
+        # write boundary), so re-apply the leak guard: unrevealed private terms
+        # must never reach party-facing session state.
+        redacted_summary, _redacted = redact_session_summary_private_terms(
+            campaign,
+            session.running_summary,
+            player_content,
+            ai_text,
+        )
+        session.running_summary = redacted_summary
         db.session.commit()
 
         # Read-only final consistency verification AFTER summary finalization.

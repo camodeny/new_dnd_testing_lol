@@ -143,7 +143,7 @@ class PostTurnConsistencyTest(unittest.TestCase):
             1,
             'session_dm:session_1:message_1',
         ))
-        self._clock('trapped_ferrymen', 'Trapped Ferrymen', 3, 1)
+        self._clock('trapped_ferrymen', 'Trapped Ferrymen', 3, 1, visibility='party_known')
         self.session.running_summary = 'The Trapped Ferrymen clock sits at 1/3.'
         db.session.commit()
 
@@ -219,7 +219,7 @@ class PostTurnConsistencyTest(unittest.TestCase):
             1,
             'session_dm:session_1:message_1',
         ))
-        self._clock('trapped_ferrymen', 'Trapped Ferrymen', 3, 2)
+        self._clock('trapped_ferrymen', 'Trapped Ferrymen', 3, 2, visibility='party_known')
         self.session.running_summary = 'The Trapped Ferrymen clock sits at 1/3.'
         db.session.commit()
 
@@ -270,8 +270,8 @@ class PostTurnConsistencyTest(unittest.TestCase):
 
     def test_summary_finalize_context_reflects_committed_clocks(self):
         from services.dm_tools import build_session_summary_finalize_context
-        self._clock('trapped_ferrymen', 'Trapped Ferrymen', 3, 2)
-        self._clock('mira_in_the_water', 'Mira in the Water', 4, 1, status='superseded')
+        self._clock('trapped_ferrymen', 'Trapped Ferrymen', 3, 2, visibility='party_known')
+        self._clock('mira_in_the_water', 'Mira in the Water', 4, 1, status='superseded', visibility='party_known')
         self.session.running_summary = 'Old summary.'
         db.session.commit()
 
@@ -304,7 +304,7 @@ class PostTurnConsistencyTest(unittest.TestCase):
             1,
             'session_dm:session_1:message_1',
         ))
-        self._clock('mira_in_the_water', 'Mira in the Water', 4, 2, summary='Mira is being hauled toward the dock.')
+        self._clock('mira_in_the_water', 'Mira in the Water', 4, 2, summary='Mira is being hauled toward the dock.', visibility='party_known')
         db.session.commit()
 
         captured = {}
@@ -359,6 +359,68 @@ class PostTurnConsistencyTest(unittest.TestCase):
             db.session.get(CampaignSession, self.session.id).running_summary,
             'Mira is safe on the dock.',
         )
+
+    def test_finalized_summary_is_leak_guarded(self):
+        """The finalizer writes session.running_summary directly, so the leak
+        guard must still redact unrevealed private terms from its output."""
+        graph = json.loads(self.world.knowledge_graph)
+        graph['entities'].append({
+            'id': 'orin_vane',
+            'type': 'npc',
+            'name': 'Orin Vane',
+            'visibility': 'dm_private',
+        })
+        self.world.knowledge_graph = json.dumps(graph)
+        db.session.commit()
+
+        from services.dm_turns import begin_session_dm_turn
+        db.session.add(begin_session_dm_turn(
+            self.campaign.id,
+            self.session.id,
+            1,
+            'session_dm:session_1:message_1',
+        ))
+        db.session.commit()
+
+        from routes.sessions import _run_session_memory_update
+        with patch('routes.sessions.get_session_memory_patch', return_value={
+            'source_contract': 'compiled_session_memory_v2',
+            'running_summary': 'Mira is being hauled toward the dock.',
+            'scene_patch': {},
+            'upsert_graph_entities': [],
+            'upsert_graph_relations': [],
+            'upsert_graph_facts': [],
+            'create_clocks': [],
+            'retire_clocks': [],
+            'update_npc_actors': [],
+            'record_events': [],
+        }), \
+                patch('routes.sessions.get_session_clock_updates', return_value={
+                    'create_clocks': [],
+                    'advance_clocks': [],
+                    'retire_clocks': [],
+                    'no_change_explanations': [],
+                }), \
+                patch('routes.sessions.get_session_running_summary_finalize', return_value={
+                    'running_summary': 'Mira learned that Orin Vane commands the fleet.',
+                }):
+            _run_session_memory_update(
+                campaign_id=self.campaign.id,
+                session_id=self.session.id,
+                user_id=self.user.id,
+                player_message_id=1,
+                player_content='We haul Mira onto the dock.',
+                ai_text='Mira is pulled up onto the dock.',
+                hot_context={},
+                parent_trace_id='test:trace',
+                dm_message_id=2,
+            )
+
+        summary = db.session.get(CampaignSession, self.session.id).running_summary
+        self.assertNotIn('Orin Vane', summary or '')
+        self.assertNotIn('orin vane', (summary or '').lower())
+        turn = SessionDmTurn.query.filter_by(player_message_id=1).first()
+        self.assertEqual(turn.post_turn_status, 'complete')
 
     def test_no_conflict_clock_stays_active_and_consistent(self):
         self._clock('trapped_ferrymen', 'Trapped Ferrymen', 3, 1)
@@ -881,7 +943,7 @@ class PostTurnConsistencyTest(unittest.TestCase):
         world = db.session.get(CampaignWorld, self.world.id)
         world.memory_revision = 3
         db.session.commit()
-        self._clock('trapped_ferrymen', 'Trapped Ferrymen', 3, 1)
+        self._clock('trapped_ferrymen', 'Trapped Ferrymen', 3, 1, visibility='party_known')
         db.session.add(begin_session_dm_turn(
             self.campaign.id,
             self.session.id,
@@ -1067,7 +1129,7 @@ class PostTurnConsistencyTest(unittest.TestCase):
 
     def test_route_sets_correlated_revision_on_complete_turn(self):
         token = generate_token(self.user.id)
-        self._clock('trapped_ferrymen', 'Trapped Ferrymen', 3, 2)
+        self._clock('trapped_ferrymen', 'Trapped Ferrymen', 3, 2, visibility='party_known')
         self.session.running_summary = 'The Trapped Ferrymen clock sits at 1/3.'
         db.session.commit()
 

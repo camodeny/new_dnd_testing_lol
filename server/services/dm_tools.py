@@ -428,6 +428,18 @@ def _redact_free_text_private_terms(campaign, text, visible_text):
     return (cleaned or None), True
 
 
+def redact_session_summary_private_terms(campaign, summary, player_message, dm_message):
+    """Apply the leak guard to a running summary produced by the post-clock
+    summary finalizer, which writes session.running_summary directly (bypassing
+    the memory patch write boundary). Returns (redacted_or_none, changed)."""
+    visible_text = ' '.join(
+        clean_text(value, 2400)
+        for value in (player_message, dm_message)
+        if value
+    ).strip()
+    return _redact_free_text_private_terms(campaign, summary, visible_text)
+
+
 def _selected_member(campaign_id, user_id):
     return CampaignMember.query.filter_by(campaign_id=campaign_id, user_id=user_id).first()
 
@@ -1187,13 +1199,18 @@ def build_session_summary_finalize_context(
     active_clocks = []
     resolved_clocks = []
     for clock in CampaignClock.query.filter_by(campaign_id=campaign.id).order_by(CampaignClock.id.asc()).all():
+        visibility = clock.visibility or 'dm_private'
+        if visibility not in {'public', 'party_known'}:
+            # The running summary is party-facing; unrevealed dm_private clocks
+            # must never be named in it.
+            continue
         compact = {
             'clock_id': clock.clock_id,
             'name': clock.name,
             'segments': clock.segments,
             'filled': clock.filled,
             'status': clock.status,
-            'visibility': clock.visibility,
+            'visibility': visibility,
             'summary': clean_text(clock.summary, 220),
         }
         if (clock.status or 'active') in ACTIVE_CLOCK_STATUSES:
