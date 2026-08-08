@@ -404,6 +404,12 @@ def ensure_lightweight_schema():
     if 'completion_state' not in campaign_clock_columns:
         db.session.execute(text('ALTER TABLE campaign_clocks ADD COLUMN completion_state JSON'))
 
+    # --- session_dm_turns ---
+    # Deployments currently use this additive repair path rather than Alembic.
+    session_dm_turn_columns = table_columns('session_dm_turns')
+    if 'post_turn_revision' not in session_dm_turn_columns:
+        db.session.execute(text('ALTER TABLE session_dm_turns ADD COLUMN post_turn_revision INTEGER'))
+
     # --- New tables for session memory integrity ---
     resolver_packet_columns = table_columns('campaign_resolver_packets')
     if not resolver_packet_columns:

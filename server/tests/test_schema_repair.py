@@ -55,6 +55,19 @@ def _drop_clock_completion_columns():
     db.session.commit()
 
 
+def _session_dm_turn_columns():
+    return {
+        row[1]
+        for row in db.session.execute(text('PRAGMA table_info(session_dm_turns)')).fetchall()
+    }
+
+
+def _drop_post_turn_revision_column():
+    """Simulate a database created before the post-turn revision migration."""
+    db.session.execute(text('ALTER TABLE session_dm_turns DROP COLUMN post_turn_revision'))
+    db.session.commit()
+
+
 class MemoryLogSchemaRepairTest(unittest.TestCase):
     def setUp(self):
         self.temp_dir = tempfile.TemporaryDirectory()
@@ -204,6 +217,60 @@ class CampaignClockSchemaRepairTest(unittest.TestCase):
             columns = _clock_columns()
             self.assertIn('completion_criteria', columns)
             self.assertIn('completion_state', columns)
+            verify_required_schema()
+
+
+class SessionDmTurnSchemaRepairTest(unittest.TestCase):
+    def setUp(self):
+        self.temp_dir = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temp_dir.cleanup)
+        db_path = os.path.join(self.temp_dir.name, 'legacy.db')
+
+        from flask import Flask
+        self.file_app = Flask(__name__)
+        self.file_app.config['SQLALCHEMY_DATABASE_URI'] = f'sqlite:///{db_path}'
+        self.file_app.config['SQLALCHEMY_TRACK_MODIFICATIONS'] = False
+        self.file_app.secret_key = 'test-key'
+        db.init_app(self.file_app)
+        self.addCleanup(self._teardown_db)
+
+    def _teardown_db(self):
+        with self.file_app.app_context():
+            db.session.remove()
+            db.engine.dispose()
+        db._app_engines.pop(self.file_app, None)
+
+    def test_lightweight_schema_repairs_legacy_session_dm_turn_table(self):
+        with self.file_app.app_context():
+            db.create_all()
+            _drop_post_turn_revision_column()
+            self.assertNotIn('post_turn_revision', _session_dm_turn_columns())
+
+            ensure_lightweight_schema()
+
+            self.assertIn('post_turn_revision', _session_dm_turn_columns())
+            verify_required_schema()
+
+    def test_session_dm_turn_repair_is_idempotent(self):
+        with self.file_app.app_context():
+            db.create_all()
+            _drop_post_turn_revision_column()
+
+            ensure_lightweight_schema()
+            ensure_lightweight_schema()
+
+            self.assertIn('post_turn_revision', _session_dm_turn_columns())
+            verify_required_schema()
+
+    def test_initialize_database_repairs_legacy_session_dm_turn_table(self):
+        with self.file_app.app_context():
+            db.create_all()
+            _drop_post_turn_revision_column()
+
+        initialize_database(self.file_app)
+
+        with self.file_app.app_context():
+            self.assertIn('post_turn_revision', _session_dm_turn_columns())
             verify_required_schema()
 
 
