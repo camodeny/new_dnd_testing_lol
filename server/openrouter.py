@@ -5609,6 +5609,244 @@ def get_session_clock_updates(clock_context, audit_context=None):
     return result
 
 
+SESSION_RUNNING_SUMMARY_FINALIZER_SYSTEM_PROMPT = (
+    "You are the final running-summary author for a D&D session. "
+    "Rewrite the running_summary into one compact paragraph that reflects the CURRENT committed state. "
+    "You are given the previous running summary, the latest visible exchange, the committed current scene, "
+    "the committed public facts, the committed active clocks (with current segment progress and status), "
+    "and any clocks that were just resolved or superseded. "
+    "The clock state you are given is authoritative and already committed: never describe a clock at a "
+    "progress value different from the one shown, and never present a clock as still active once it is "
+    "committed as resolved or superseded. "
+    "Preserve continuity: keep important prior context, leads, relationships, and unresolved questions while "
+    "cleanly folding in what just happened. Do not append fragments to the prior summary; rewrite it as one "
+    "paragraph. "
+    "Return only JSON: {\"running_summary\": \"...\"}."
+)
+
+
+def build_session_summary_finalizer_messages(summary_context):
+    return [
+        {'role': 'system', 'content': SESSION_RUNNING_SUMMARY_FINALIZER_SYSTEM_PROMPT},
+        {'role': 'user', 'content': json.dumps(
+            {key: value for key, value in (summary_context or {}).items() if value is not None},
+            ensure_ascii=False,
+        )},
+    ]
+
+
+def get_session_running_summary_finalize(summary_context, audit_context=None):
+    """Finalize the running summary against committed post-clock state.
+
+    A narrow pass: previous summary + current turn + committed scene/facts/clocks
+    in, one fresh running summary out. Returns ``{'running_summary': str}`` or
+    ``None`` on any failure so callers fail closed instead of presenting the old
+    summary as current.
+    """
+    messages = build_session_summary_finalizer_messages(summary_context or {})
+    audit_context = audit_context or {}
+    provider = get_llm_provider()
+    campaign_id = audit_context.get('campaign_id')
+    trace_id = audit_context.get('trace_id') or f"session_summary_finalizer:finalize:{uuid4().hex[:10]}"
+    trace_label = audit_context.get('trace_label') or 'session_summary_finalizer: finalize'
+
+    if campaign_id:
+        log_audit_event(
+            campaign_id,
+            'summary_finalizer_request',
+            'Requested post-clock running summary finalization.',
+            {'context': summary_context, 'messages': messages},
+            source=provider,
+            actor='session_summary_finalizer',
+            trace_id=trace_id,
+            parent_trace_id=audit_context.get('parent_trace_id'),
+            trace_label=trace_label,
+            audit_role='tools',
+            commit=True,
+        )
+
+    agent_audit = {
+        **audit_context,
+        'trace_id': trace_id,
+        'trace_label': trace_label,
+        'actor': 'session_summary_finalizer',
+        'operation': 'session_summary_finalize',
+    }
+    try:
+        data = _json_loads_with_repair(
+            _post_chat(messages, json_mode=True, audit_context=agent_audit),
+            audit_context=agent_audit,
+        )
+    except Exception as err:
+        if campaign_id:
+            log_audit_event(
+                campaign_id,
+                'summary_finalizer_error',
+                'Running summary finalization failed.',
+                {'error': repr(err)},
+                source=provider,
+                actor='session_summary_finalizer',
+                trace_id=trace_id,
+                parent_trace_id=audit_context.get('parent_trace_id'),
+                trace_label=trace_label,
+                audit_role='tools',
+                commit=True,
+            )
+        return None
+
+    summary = str(data.get('running_summary') or '').strip() if isinstance(data, dict) else ''
+    if not summary:
+        if campaign_id:
+            log_audit_event(
+                campaign_id,
+                'summary_finalizer_error',
+                'Running summary finalization returned no content.',
+                {},
+                source=provider,
+                actor='session_summary_finalizer',
+                trace_id=trace_id,
+                parent_trace_id=audit_context.get('parent_trace_id'),
+                trace_label=trace_label,
+                audit_role='tools',
+                commit=True,
+            )
+        return None
+
+    if campaign_id:
+        log_audit_event(
+            campaign_id,
+            'summary_finalizer_response',
+            'Received final running summary.',
+            {'running_summary': summary},
+            source=provider,
+            actor='session_summary_finalizer',
+            trace_id=trace_id,
+            parent_trace_id=audit_context.get('parent_trace_id'),
+            trace_label=trace_label,
+            audit_role='agent',
+            commit=True,
+        )
+    return {'running_summary': summary}
+
+
+SESSION_SUMMARY_CONSISTENCY_CHECK_SYSTEM_PROMPT = (
+    "You are a read-only consistency checker for a D&D session running summary. "
+    "You are given the finalized running_summary and the authoritative committed state: the current scene, "
+    "committed public facts, committed active clocks (with current segment progress and status), and "
+    "resolved/superseded clocks. The committed state is ground truth. "
+    "Return JSON: {\"consistent\": true, \"contradictions\": [\"...\"]}. "
+    "Mark consistent=false ONLY when the summary states something that directly contradicts the committed state, "
+    "for example: reporting a clock at a progress value different from the committed value, presenting a "
+    "resolved/superseded clock as still active, or stating a scene/fact that contradicts committed state. "
+    "Do not flag omissions, stylistic differences, or prose that simply does not mention a clock. "
+    "Return only JSON."
+)
+
+
+def build_session_summary_consistency_check_messages(summary_text, summary_context):
+    # Only authoritative committed state may be ground truth for the verifier.
+    # prior_running_summary and the latest exchange are allowed to be stale (the
+    # prior summary is exactly what this finalization replaces), so they must
+    # never appear under committed_state.
+    authoritative_keys = ('current_scene', 'committed_facts', 'active_clocks', 'resolved_clocks')
+    committed_state = {
+        key: summary_context.get(key)
+        for key in authoritative_keys
+        if summary_context.get(key) is not None
+    }
+    return [
+        {'role': 'system', 'content': SESSION_SUMMARY_CONSISTENCY_CHECK_SYSTEM_PROMPT},
+        {'role': 'user', 'content': json.dumps({
+            'running_summary': summary_text,
+            'committed_state': committed_state,
+        }, ensure_ascii=False)},
+    ]
+
+
+def get_session_summary_consistency_check(summary_text, summary_context, audit_context=None):
+    """Narrow read-only semantic check that the finalized running summary does
+    not contradict the authoritative committed clock/scene/fact state. Returns
+    ``{'consistent': bool, 'contradictions': [...]}`` or ``None`` on failure so
+    callers fail closed rather than marking a turn complete unverified."""
+    if not summary_text:
+        return None
+    messages = build_session_summary_consistency_check_messages(summary_text, summary_context or {})
+    audit_context = audit_context or {}
+    provider = get_llm_provider()
+    campaign_id = audit_context.get('campaign_id')
+    trace_id = audit_context.get('trace_id') or f"session_summary_verifier:verify:{uuid4().hex[:10]}"
+    trace_label = audit_context.get('trace_label') or 'session_summary_verifier: verify'
+
+    agent_audit = {
+        **audit_context,
+        'trace_id': trace_id,
+        'trace_label': trace_label,
+        'actor': 'session_summary_verifier',
+        'operation': 'session_summary_consistency_check',
+    }
+    try:
+        data = _json_loads_with_repair(
+            _post_chat(messages, json_mode=True, audit_context=agent_audit),
+            audit_context=agent_audit,
+        )
+    except Exception as err:
+        if campaign_id:
+            log_audit_event(
+                campaign_id,
+                'summary_verifier_error',
+                'Running summary consistency verification failed.',
+                {'error': repr(err)},
+                source=provider,
+                actor='session_summary_verifier',
+                trace_id=trace_id,
+                parent_trace_id=audit_context.get('parent_trace_id'),
+                trace_label=trace_label,
+                audit_role='tools',
+                commit=True,
+            )
+        return None
+
+    if not isinstance(data, dict) or not isinstance(data.get('consistent'), bool):
+        if campaign_id:
+            log_audit_event(
+                campaign_id,
+                'summary_verifier_error',
+                'Running summary consistency verification returned an invalid verdict.',
+                {'verdict': data},
+                source=provider,
+                actor='session_summary_verifier',
+                trace_id=trace_id,
+                parent_trace_id=audit_context.get('parent_trace_id'),
+                trace_label=trace_label,
+                audit_role='tools',
+                commit=True,
+            )
+        return None
+
+    result = {
+        'consistent': data.get('consistent', True),
+        'contradictions': [
+            str(item) for item in (data.get('contradictions') or [])
+            if isinstance(item, str) and item.strip()
+        ][:5],
+    }
+    if campaign_id:
+        log_audit_event(
+            campaign_id,
+            'summary_verifier_response',
+            'Received running summary consistency verdict.',
+            result,
+            source=provider,
+            actor='session_summary_verifier',
+            trace_id=trace_id,
+            parent_trace_id=audit_context.get('parent_trace_id'),
+            trace_label=trace_label,
+            audit_role='agent',
+            commit=True,
+        )
+    return result
+
+
 def get_character_sheet_answer(question, scope, character_sheets, audit_context=None):
     if not character_sheets:
         return {

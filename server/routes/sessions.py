@@ -20,6 +20,7 @@ from openrouter import (
     get_session_clock_updates,
     get_session_dm_response_with_tools,
     get_session_memory_patch,
+    get_session_running_summary_finalize,
     normalize_session_dm_turn_decision,
 )
 from services.stream_manager import stream_manager
@@ -36,8 +37,10 @@ from services.dm_tools import (
     build_session_clock_context,
     build_session_memory_context,
     build_session_retrieval_packet,
+    build_session_summary_finalize_context,
     context_manifest,
     execute_dm_tool,
+    redact_session_summary_private_terms,
 )
 from services.dm_turn_commit import commit_accepted_dm_turn
 from services.dm_turns import (
@@ -107,6 +110,146 @@ def _member_record(campaign_id, user_id):
     from models import CampaignMember
 
     return CampaignMember.query.filter_by(campaign_id=campaign_id, user_id=user_id).first()
+
+
+def _repair_post_turn_clocks(campaign, session, player_message_id, dm_message_id, parent_trace_id, bump_revision=True):
+    """Mutating post-turn clock repair (supersede stale clocks, emit the
+    correlated terminal revision). Must run BEFORE the running summary is
+    finalized. Commits its repairs and logs any unresolvable contradiction as an
+    actionable incident.
+
+    Returns (terminal_revision, incident_text_or_None).
+    """
+    from services.post_turn_consistency import PostTurnConsistencyIncident, repair_post_turn_clocks
+    from services.audit_service import log_audit_event as _log_reconcile_audit
+
+    trace_label = f'post_turn_consistency: session {session.id if session else None}'
+    try:
+        report = repair_post_turn_clocks(
+            campaign,
+            session,
+            player_message_id=player_message_id,
+            dm_message_id=dm_message_id,
+            trace_id=parent_trace_id,
+            parent_trace_id=parent_trace_id,
+            trace_label=trace_label,
+            bump_revision=bump_revision,
+        )
+        db.session.commit()
+        return report.get('terminal_revision'), None
+    except PostTurnConsistencyIncident as incident:
+        # Deterministic repairs made before the incident were intentional and safe;
+        # commit them so the durable state is still as coherent as possible.
+        db.session.commit()
+        _log_reconcile_audit(
+            campaign.id,
+            'post_turn_consistency_incident',
+            incident.summary,
+            {
+                'player_message_id': player_message_id,
+                'dm_message_id': dm_message_id,
+                'report': incident.report,
+            },
+            source='post_turn_consistency',
+            actor='session_memory_writer',
+            trace_id=parent_trace_id,
+            parent_trace_id=parent_trace_id,
+            trace_label=trace_label,
+            audit_role='tools',
+            commit=True,
+        )
+        return incident.terminal_revision, incident.summary
+    except Exception as err:
+        db.session.rollback()
+        incident_summary = repr(err)
+        _log_reconcile_audit(
+            campaign.id,
+            'post_turn_consistency_incident',
+            'Post-turn consistency reconciliation failed.',
+            {
+                'player_message_id': player_message_id,
+                'dm_message_id': dm_message_id,
+                'error': incident_summary,
+            },
+            source='post_turn_consistency',
+            actor='session_memory_writer',
+            trace_id=parent_trace_id,
+            parent_trace_id=parent_trace_id,
+            trace_label=trace_label,
+            audit_role='tools',
+            commit=True,
+        )
+        return None, incident_summary
+
+
+def _verify_post_turn_state(campaign, session, player_message_id, dm_message_id, parent_trace_id, summary_text=None, summary_context=None):
+    """Read-only post-turn consistency verification, run AFTER the running
+    summary has been finalized. Semantically verifies the finalized summary
+    against committed clock/scene/fact state and re-checks active clocks. Never
+    mutates durable state. Logs and returns an incident text when a
+    contradiction remains so the turn is not reported complete.
+
+    Returns (verified, incident_text_or_None).
+    """
+    from services.post_turn_consistency import PostTurnConsistencyIncident, verify_post_turn_state
+    from services.audit_service import log_audit_event as _log_reconcile_audit
+
+    trace_label = f'post_turn_consistency: session {session.id if session else None}'
+    try:
+        report = verify_post_turn_state(
+            campaign,
+            session,
+            player_message_id=player_message_id,
+            dm_message_id=dm_message_id,
+            trace_id=parent_trace_id,
+            parent_trace_id=parent_trace_id,
+            trace_label=trace_label,
+            summary_text=summary_text,
+            summary_context=summary_context,
+        )
+        db.session.commit()
+        return report.get('verified', True), None
+    except PostTurnConsistencyIncident as incident:
+        db.session.commit()
+        _log_reconcile_audit(
+            campaign.id,
+            'post_turn_consistency_incident',
+            incident.summary,
+            {
+                'player_message_id': player_message_id,
+                'dm_message_id': dm_message_id,
+                'report': incident.report,
+            },
+            source='post_turn_consistency',
+            actor='session_memory_writer',
+            trace_id=parent_trace_id,
+            parent_trace_id=parent_trace_id,
+            trace_label=trace_label,
+            audit_role='tools',
+            commit=True,
+        )
+        return False, incident.summary
+    except Exception as err:
+        db.session.rollback()
+        incident_summary = repr(err)
+        _log_reconcile_audit(
+            campaign.id,
+            'post_turn_consistency_incident',
+            'Post-turn consistency verification failed.',
+            {
+                'player_message_id': player_message_id,
+                'dm_message_id': dm_message_id,
+                'error': incident_summary,
+            },
+            source='post_turn_consistency',
+            actor='session_memory_writer',
+            trace_id=parent_trace_id,
+            parent_trace_id=parent_trace_id,
+            trace_label=trace_label,
+            audit_role='tools',
+            commit=True,
+        )
+        return False, incident_summary
 
 
 def _run_session_memory_update(
@@ -302,13 +445,158 @@ def _run_session_memory_update(
             db.session.rollback()
             clock_complete = False
 
-        mark_session_dm_turn_post_turn_complete(
+        # Deterministic clock repair BEFORE summary finalization so the running
+        # summary is authored against repaired (not merely adjudicated) clock
+        # state: supersede stale clocks and emit the correlated terminal revision.
+        terminal_revision, repair_incident = _repair_post_turn_clocks(
+            campaign,
+            session,
             player_message_id,
-            dm_message_id=dm_message_id,
-            memory_status='complete' if memory_complete else 'skipped',
-            clock_status='complete' if clock_complete else 'error',
+            dm_message_id,
+            parent_trace_id,
+            bump_revision=True,
         )
+        if repair_incident:
+            mark_session_dm_turn_error(
+                campaign.id,
+                session_id,
+                player_message_id,
+                parent_trace_id,
+                repair_incident,
+                dm_message_id=dm_message_id,
+                memory_status='complete' if memory_complete else 'skipped',
+                clock_status='complete' if clock_complete else 'error',
+                post_turn_revision=terminal_revision,
+            )
+            db.session.commit()
+            world_after = world_public_payload(campaign).get('world') or {}
+            current_scene_after = world_after.get('current_scene')
+            if current_scene_after != current_scene_before:
+                stream_manager.broadcast_event(session_id, {
+                    'type': 'scene_updated',
+                    'current_scene': current_scene_after,
+                })
+            return
+
+        # Finalize the running summary against the committed, repaired post-clock
+        # state so it can never encode a pre-adjudication clock value. This is a
+        # narrow LLM pass (previous summary + current turn + committed scene/
+        # facts/clocks), not the full memory compiler. Fail closed on error: do
+        # NOT report the turn complete with the old summary still presented current.
+        summary_finalize_trace_id = f'session_summary_finalizer:session_{session_id}:message_{player_message_id}'
+        summary_finalize_label = f'session_summary_finalizer: session {session_id}'
+        summary_finalize_error = None
+        try:
+            summary_context = build_session_summary_finalize_context(
+                campaign,
+                session,
+                player_content,
+                ai_text,
+                player_message_id=player_message_id,
+                dm_message_id=dm_message_id,
+            )
+            finalized = get_session_running_summary_finalize(
+                summary_context,
+                audit_context={
+                    'campaign_id': campaign.id,
+                    'operation': 'session_summary_finalize',
+                    'actor': 'session_summary_finalizer',
+                    'trace_id': summary_finalize_trace_id,
+                    'parent_trace_id': parent_trace_id,
+                    'trace_label': summary_finalize_label,
+                },
+            )
+        except Exception as err:
+            finalized = None
+            summary_finalize_error = repr(err)
+        finalized_summary = (finalized or {}).get('running_summary') if isinstance(finalized, dict) else None
+        if not finalized_summary:
+            log_audit_event(
+                campaign_id,
+                'post_turn_summary_finalize_error',
+                'Running summary finalization failed after memory and clock commits.',
+                {
+                    'session_id': session_id,
+                    'error': summary_finalize_error or 'summary_finalizer returned no content',
+                },
+                source='session_memory',
+                actor='session_summary_finalizer',
+                trace_id=summary_finalize_trace_id,
+                parent_trace_id=parent_trace_id,
+                trace_label=summary_finalize_label,
+                audit_role='tools',
+                commit=True,
+            )
+            # Memory and clock are already committed; only the summary pass is
+            # pending, so the turn is error/recoverable rather than complete.
+            mark_session_dm_turn_error(
+                campaign_id,
+                session_id,
+                player_message_id,
+                parent_trace_id,
+                'Running summary finalization failed; the turn is recoverable but not complete.',
+                dm_message_id=dm_message_id,
+                memory_status='complete',
+                clock_status='complete',
+                post_turn_revision=terminal_revision,
+            )
+            db.session.commit()
+            world_after = world_public_payload(campaign).get('world') or {}
+            current_scene_after = world_after.get('current_scene')
+            if current_scene_after != current_scene_before:
+                stream_manager.broadcast_event(session_id, {
+                    'type': 'scene_updated',
+                    'current_scene': current_scene_after,
+                })
+            return
+        session.running_summary = finalized_summary.strip()
+        # The finalizer writes the summary directly (bypassing the memory-patch
+        # write boundary), so re-apply the leak guard: unrevealed private terms
+        # must never reach party-facing session state.
+        redacted_summary, _redacted = redact_session_summary_private_terms(
+            campaign,
+            session.running_summary,
+            player_content,
+            ai_text,
+        )
+        session.running_summary = redacted_summary
         db.session.commit()
+
+        # Read-only final consistency verification AFTER summary finalization.
+        # It never mutates state; the finalized summary is semantically checked
+        # against committed clock/scene state and any remaining contradiction
+        # prevents complete.
+        _verified, verify_incident = _verify_post_turn_state(
+            campaign,
+            session,
+            player_message_id,
+            dm_message_id,
+            parent_trace_id,
+            summary_text=session.running_summary,
+            summary_context=summary_context,
+        )
+        if verify_incident:
+            mark_session_dm_turn_error(
+                campaign.id,
+                session_id,
+                player_message_id,
+                parent_trace_id,
+                verify_incident,
+                dm_message_id=dm_message_id,
+                memory_status='complete' if memory_complete else 'skipped',
+                clock_status='complete' if clock_complete else 'error',
+                post_turn_revision=terminal_revision,
+            )
+            db.session.commit()
+        else:
+            mark_session_dm_turn_post_turn_complete(
+                player_message_id,
+                dm_message_id=dm_message_id,
+                memory_status='complete' if memory_complete else 'skipped',
+                clock_status='complete' if clock_complete else 'error',
+                post_turn_revision=terminal_revision,
+            )
+            db.session.commit()
 
         world_after = world_public_payload(campaign).get('world') or {}
         current_scene_after = world_after.get('current_scene')
@@ -345,6 +633,19 @@ def _run_session_memory_update(
             audit_role='tools',
             commit=True,
         )
+        # Reconcile durable surfaces even when memory failed so any pre-existing
+        # drift (e.g. a stale active clock) is repaired where deterministically
+        # possible. The turn still reports error for the memory failure. The
+        # revision is NOT bumped so a stored failed patch with the pre-failure
+        # base_memory_revision stays retryable.
+        terminal_revision, _incident_text = _repair_post_turn_clocks(
+            campaign,
+            session,
+            player_message_id,
+            dm_message_id,
+            parent_trace_id,
+            bump_revision=False,
+        )
         mark_session_dm_turn_error(
             campaign_id,
             session_id,
@@ -354,6 +655,7 @@ def _run_session_memory_update(
             dm_message_id=dm_message_id,
             memory_status='error',
             clock_status='skipped',
+            post_turn_revision=terminal_revision,
         )
         db.session.commit()
     except Exception as err:
@@ -376,6 +678,14 @@ def _run_session_memory_update(
             audit_role='tools',
             commit=True,
         )
+        terminal_revision, _incident_text = _repair_post_turn_clocks(
+            campaign,
+            session,
+            player_message_id,
+            dm_message_id,
+            parent_trace_id,
+            bump_revision=memory_complete,
+        )
         mark_session_dm_turn_error(
             campaign_id,
             session_id,
@@ -385,6 +695,7 @@ def _run_session_memory_update(
             dm_message_id=dm_message_id,
             memory_status='complete' if memory_complete else 'error',
             clock_status='error' if memory_complete and not clock_complete else 'skipped',
+            post_turn_revision=terminal_revision,
         )
         db.session.commit()
 
@@ -393,18 +704,49 @@ def _post_turn_status_for_player(campaign_id, session_id, player_message_id):
     memory_trace_id = f'session_memory_writer:session_{session_id}:message_{player_message_id}'
     clock_trace_id = f'session_clock_adjudicator:session_{session_id}:message_{player_message_id}'
 
+    def _with_revision(status):
+        from services.dm_turns import session_dm_turn_status_payload
+        revision = session_dm_turn_status_payload(player_message_id).get('post_turn_revision')
+        if revision is not None:
+            status['post_turn_revision'] = revision
+        return status
+
+    consistency_incident = None
+    for row in (
+        CampaignAuditEvent.query
+        .filter_by(campaign_id=campaign_id, event_type='post_turn_consistency_incident')
+        .order_by(CampaignAuditEvent.id.desc())
+        .limit(32)
+        .all()
+    ):
+        try:
+            payload = json.loads(row.payload) if row.payload else {}
+        except (TypeError, ValueError):
+            payload = {}
+        if payload.get('player_message_id') == player_message_id:
+            consistency_incident = row
+            break
+    if consistency_incident is not None:
+        return _with_revision({
+            'post_turn_complete': True,
+            'post_turn_status': 'error',
+            'memory_status': 'complete',
+            'clock_status': 'complete',
+            'post_turn_error': 'Post-turn consistency incident: ' + (consistency_incident.summary or ''),
+        })
+
     memory_error = CampaignAuditEvent.query.filter_by(
         campaign_id=campaign_id,
         trace_id=memory_trace_id,
         event_type='memory_update_error',
     ).order_by(CampaignAuditEvent.id.desc()).first()
     if memory_error is not None:
-        return {
+        return _with_revision({
             'post_turn_complete': True,
             'post_turn_status': 'error',
             'memory_status': 'error',
             'clock_status': 'skipped',
-        }
+        })
 
     memory_applied = CampaignAuditEvent.query.filter_by(
         campaign_id=campaign_id,
@@ -412,12 +754,12 @@ def _post_turn_status_for_player(campaign_id, session_id, player_message_id):
         event_type='memory_patch_applied',
     ).order_by(CampaignAuditEvent.id.desc()).first()
     if memory_applied is None:
-        return {
+        return _with_revision({
             'post_turn_complete': False,
             'post_turn_status': 'pending',
             'memory_status': 'pending',
             'clock_status': 'pending',
-        }
+        })
 
     clock_applied = CampaignAuditEvent.query.filter_by(
         campaign_id=campaign_id,
@@ -425,19 +767,19 @@ def _post_turn_status_for_player(campaign_id, session_id, player_message_id):
         event_type='clock_adjudication_applied',
     ).order_by(CampaignAuditEvent.id.desc()).first()
     if clock_applied is None:
-        return {
+        return _with_revision({
             'post_turn_complete': False,
             'post_turn_status': 'pending',
             'memory_status': 'complete',
             'clock_status': 'pending',
-        }
+        })
 
-    return {
+    return _with_revision({
         'post_turn_complete': True,
         'post_turn_status': 'complete',
         'memory_status': 'complete',
         'clock_status': 'complete',
-    }
+    })
 
 
 def _dm_turn_status_for_player(campaign_id, session_id, player_message_id=None):

@@ -428,6 +428,18 @@ def _redact_free_text_private_terms(campaign, text, visible_text):
     return (cleaned or None), True
 
 
+def redact_session_summary_private_terms(campaign, summary, player_message, dm_message):
+    """Apply the leak guard to a running summary produced by the post-clock
+    summary finalizer, which writes session.running_summary directly (bypassing
+    the memory patch write boundary). Returns (redacted_or_none, changed)."""
+    visible_text = ' '.join(
+        clean_text(value, 2400)
+        for value in (player_message, dm_message)
+        if value
+    ).strip()
+    return _redact_free_text_private_terms(campaign, summary, visible_text)
+
+
 def _selected_member(campaign_id, user_id):
     return CampaignMember.query.filter_by(campaign_id=campaign_id, user_id=user_id).first()
 
@@ -1166,6 +1178,54 @@ def build_session_memory_context(campaign, session, current_user, player_message
             (clock.status or 'active') not in ACTIVE_CLOCK_STATUSES or (clock.filled or 0) >= (clock.segments or 4)
             for clock in CampaignClock.query.filter_by(campaign_id=campaign.id).all()
         ),
+    }
+
+
+def build_session_summary_finalize_context(
+    campaign,
+    session,
+    player_message,
+    dm_message,
+    player_message_id=None,
+    dm_message_id=None,
+):
+    """Assemble the narrow context for finalizing the running summary against
+    committed post-clock state: previous summary, current turn, committed scene,
+    committed public facts, and committed active/resolved clocks. The summary is
+    treated as a derived narrative projection of this authoritative state."""
+    world, graph, world_state, _private = _world_json(campaign)
+    current_scene = world_state.get('current_scene', {}) if isinstance(world_state, dict) else {}
+
+    active_clocks = []
+    resolved_clocks = []
+    for clock in CampaignClock.query.filter_by(campaign_id=campaign.id).order_by(CampaignClock.id.asc()).all():
+        visibility = clock.visibility or 'dm_private'
+        if visibility not in {'public', 'party_known'}:
+            # The running summary is party-facing; unrevealed dm_private clocks
+            # must never be named in it.
+            continue
+        compact = {
+            'clock_id': clock.clock_id,
+            'name': clock.name,
+            'segments': clock.segments,
+            'filled': clock.filled,
+            'status': clock.status,
+            'visibility': visibility,
+            'summary': clean_text(clock.summary, 220),
+        }
+        if (clock.status or 'active') in ACTIVE_CLOCK_STATUSES:
+            active_clocks.append(compact)
+        elif (clock.status or '') in {'resolved', 'completed', 'superseded'}:
+            resolved_clocks.append(compact)
+
+    return {
+        'prior_running_summary': session.running_summary or '' if session else '',
+        'latest_player_message': player_message,
+        'latest_dm_message': dm_message,
+        'current_scene': current_scene,
+        'committed_facts': _established_public_facts(campaign, limit=6),
+        'active_clocks': active_clocks[:8],
+        'resolved_clocks': resolved_clocks[-8:],
     }
 
 
