@@ -32,6 +32,7 @@ def upgrade():
         sa.Column('patch_json', sa.Text(), nullable=True),
         sa.Column('context_json', sa.Text(), nullable=True),
         sa.Column('memory_applied', sa.Boolean(), nullable=False, server_default=sa.false()),
+        sa.Column('clock_applied', sa.Boolean(), nullable=False, server_default=sa.false()),
         sa.Column('attempts', sa.Integer(), nullable=False, server_default='0'),
         sa.Column('last_error_text', sa.Text(), nullable=True),
         sa.Column('created_at', sa.DateTime(), nullable=True),

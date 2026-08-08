@@ -887,6 +887,12 @@ class SessionMemoryRecoveryTaskTest(unittest.TestCase):
         self.assertIn("summary_finalize_failed", result["error"])
         self.assertEqual(result["status"], "pending")
 
+        # Memory and clock replay are durable even though finalization failed,
+        # so the next retry must not replay the non-idempotent clock advance.
+        refreshed = db.session.get(SessionMemoryRecoveryTask, task.id)
+        self.assertTrue(refreshed.memory_applied)
+        self.assertTrue(refreshed.clock_applied)
+
         turn = SessionDmTurn.query.filter_by(
             campaign_id=self.campaign.id,
             player_message_id=7,
@@ -961,12 +967,133 @@ class SessionMemoryRecoveryTaskTest(unittest.TestCase):
         self.assertIn("verify_incident", result["error"])
         self.assertEqual(result["status"], "pending")
 
+        # Clock replay is durable even though verification failed.
+        refreshed = db.session.get(SessionMemoryRecoveryTask, task.id)
+        self.assertTrue(refreshed.memory_applied)
+        self.assertTrue(refreshed.clock_applied)
+
         turn = SessionDmTurn.query.filter_by(
             campaign_id=self.campaign.id,
             player_message_id=7,
         ).first()
         self.assertEqual(turn.post_turn_status, "error")
         self.assertTrue(has_pending_memory_recovery(self.campaign.id))
+
+    def test_retry_does_not_replay_clock_after_finalization_failure(self):
+        # Clock starts 1/4. First retry replays adjudication (1/4 -> 2/4) then
+        # summary finalization fails. The clock_applied marker must be durable so
+        # the second retry skips the non-idempotent clock replay, resumes at the
+        # finalization tail, and the final clock is still 2/4 (not 3/4).
+        db.session.add(
+            NPCActor(
+                campaign_id=self.campaign.id,
+                actor_id="vex_mal",
+                name="Vex Mal",
+                dossier="{}",
+            )
+        )
+        db.session.add(
+            CampaignClock(
+                campaign_id=self.campaign.id,
+                clock_id="trapped_ferrymen",
+                name="Trapped Ferrymen",
+                segments=4,
+                filled=1,
+                status="active",
+                visibility="party_known",
+            )
+        )
+        db.session.add(mark_session_dm_turn_error(
+            self.campaign.id,
+            self.session.id,
+            player_message_id=7,
+            trace_id="trace_7",
+            error_text="missing_relation_endpoint",
+            memory_status="error",
+            clock_status="skipped",
+        ))
+        db.session.commit()
+
+        patch = {
+            "source_contract": SOURCE_CONTRACT_COMPILED_V2,
+            "base_memory_revision": self.world.memory_revision or 0,
+            "upsert_graph_entities": [],
+            "upsert_graph_relations": [{
+                "type": "rival_of",
+                "source_id": "vex_mal",
+                "target_id": "waterdeep",
+            }],
+        }
+        task = create_memory_recovery_task(
+            self.campaign.id,
+            self.session,
+            player_message_id=7,
+            dm_message_id=8,
+            err=MemoryPipelineError(stage="validation", code="missing_relation_endpoint", message="missing"),
+            patch=patch,
+            trace_id="trace_7",
+        )
+
+        finalize_calls = {"count": 0}
+
+        def _fake_finalize(summary_context, audit_context=None):
+            finalize_calls["count"] += 1
+            if finalize_calls["count"] == 1:
+                return {"running_summary": None}
+            clock = CampaignClock.query.filter_by(
+                campaign_id=self.campaign.id,
+                clock_id="trapped_ferrymen",
+            ).first()
+            return {"running_summary": f"Trapped Ferrymen at {clock.filled}/4."}
+
+        with mock.patch(
+            "services.dm_tools.build_session_clock_context",
+            return_value={"allowed_evidence_sources": []},
+        ), mock.patch(
+            "openrouter.get_session_clock_updates",
+            return_value={"advance_clocks": [
+                {"clock_id": "trapped_ferrymen", "delta": 1, "reason": "The party freed a trapped crewman."},
+            ]},
+        ), mock.patch(
+            "routes.sessions._repair_post_turn_clocks",
+            return_value=(7, None),
+        ), mock.patch(
+            "services.dm_tools.build_session_summary_finalize_context",
+            return_value={"summary_context": True},
+        ), mock.patch(
+            "openrouter.get_session_running_summary_finalize",
+            side_effect=_fake_finalize,
+        ), mock.patch(
+            "routes.sessions._verify_post_turn_state",
+            return_value=(True, None),
+        ):
+            first = retry_memory_recovery_task(self.campaign.id, task.id)
+            self.assertFalse(first["ok"])
+            self.assertIn("summary_finalize_failed", first["error"])
+
+            clock_after_first = CampaignClock.query.filter_by(
+                campaign_id=self.campaign.id,
+                clock_id="trapped_ferrymen",
+            ).first()
+            self.assertEqual(clock_after_first.filled, 2)
+
+            second = retry_memory_recovery_task(self.campaign.id, task.id)
+            self.assertTrue(second["ok"], second)
+
+        clock_final = CampaignClock.query.filter_by(
+            campaign_id=self.campaign.id,
+            clock_id="trapped_ferrymen",
+        ).first()
+        # The second retry must NOT re-apply the same adjudication; 2/4 is the
+        # durable recovered state, not 3/4.
+        self.assertEqual(clock_final.filled, 2)
+        self.assertEqual(second["clock_recovered"], True)
+        turn = SessionDmTurn.query.filter_by(
+            campaign_id=self.campaign.id,
+            player_message_id=7,
+        ).first()
+        self.assertEqual(turn.post_turn_status, "complete")
+        self.assertFalse(has_pending_memory_recovery(self.campaign.id))
 
     def test_retry_skips_reapply_after_task_memory_marker_set(self):
         # A prior attempt may have applied memory but failed the clock replay,

@@ -313,13 +313,22 @@ def retry_memory_recovery_task(campaign_id, task_id):
             }
 
     # 2. Replay the clock adjudication the original failure skipped so
-    # time-sensitive clocks are not left stale.
-    clock_recovered = False
+    # time-sensitive clocks are not left stale. The result is committed
+    # atomically with the durable clock_applied marker so a later failure in the
+    # summary/finalization tail cannot cause the SAME non-idempotent
+    # adjudication to be replayed on the next retry (clock advances are
+    # additive: replaying 1/4 -> 2/4 twice would produce 3/4).
+    clock_recovered = bool(task.clock_applied)
     clock_result = None
     clock_error = None
-    if session is not None:
+    if clock_recovered:
+        clock_result = {'clock_already_applied': True}
+    elif session is not None:
         try:
             clock_result = _replay_clock_adjudication(task, campaign, session)
+            task = db.session.get(SessionMemoryRecoveryTask, task.id)
+            task.clock_applied = True
+            db.session.commit()
             clock_recovered = True
         except Exception as err:
             clock_error = str(err)
