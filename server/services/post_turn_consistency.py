@@ -644,12 +644,15 @@ def verify_post_turn_state(
     trace_id=None,
     parent_trace_id=None,
     trace_label=None,
+    summary_text=None,
+    summary_context=None,
 ):
     """Read-only phase of the final consistency check, run AFTER the running
-    summary has been finalized. It never mutates durable state: it only
-    re-validates that no active clock's description contradicts committed scene
-    state. Any remaining contradiction raises :class:`PostTurnConsistencyIncident`
-    so the turn is not reported complete.
+    summary has been finalized. It never mutates durable state. It semantically
+    verifies the finalized summary against the authoritative committed
+    clock/scene/fact state, and re-validates that no active clock's description
+    contradicts committed scene state. Any remaining contradiction raises
+    :class:`PostTurnConsistencyIncident` so the turn is not reported complete.
 
     Returns a report dict with a ``verified`` flag.
     """
@@ -673,6 +676,33 @@ def verify_post_turn_state(
         })
         if status == 'inconsistent':
             report['verified'] = False
+
+    # The finalized running summary must not contradict the authoritative
+    # committed clock/scene/fact state. Fail closed if it cannot be verified.
+    if summary_text:
+        from openrouter import get_session_summary_consistency_check
+        verdict = get_session_summary_consistency_check(
+            summary_text,
+            summary_context or {},
+            audit_context={
+                'campaign_id': campaign.id,
+                'trace_id': trace_id,
+                'parent_trace_id': parent_trace_id,
+                'trace_label': trace_label or 'post_turn_consistency: summary verification',
+            },
+        )
+        if verdict is None:
+            raise PostTurnConsistencyIncident(
+                'Running summary consistency verification failed; refusing to mark the turn complete.',
+                dict(report, checks=report['checks']),
+            )
+        if not verdict.get('consistent', True):
+            contradictions = verdict.get('contradictions') or ['running summary contradicts committed state']
+            raise PostTurnConsistencyIncident(
+                'Running summary contradicts committed state: ' + '; '.join(contradictions[:3]),
+                dict(report, checks=report['checks'], contradictions=contradictions),
+            )
+        check('summary_consistency', 'consistent')
 
     subject_index = _subject_index(campaign, graph)
     location_index = _location_index(graph)

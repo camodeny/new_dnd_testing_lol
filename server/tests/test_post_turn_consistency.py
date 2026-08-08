@@ -180,7 +180,8 @@ class PostTurnConsistencyTest(unittest.TestCase):
                     'retire_clocks': [],
                     'no_change_explanations': [],
                 }), \
-                patch('routes.sessions.get_session_running_summary_finalize', side_effect=fake_finalize) as finalize_mock:
+                patch('routes.sessions.get_session_running_summary_finalize', side_effect=fake_finalize) as finalize_mock, \
+                patch('openrouter.get_session_summary_consistency_check', return_value={'consistent': True, 'contradictions': []}):
             _run_session_memory_update(
                 campaign_id=self.campaign.id,
                 session_id=self.session.id,
@@ -332,7 +333,8 @@ class PostTurnConsistencyTest(unittest.TestCase):
                     'retire_clocks': [],
                     'no_change_explanations': [],
                 }), \
-                patch('routes.sessions.get_session_running_summary_finalize', side_effect=fake_finalize) as finalize_mock:
+                patch('routes.sessions.get_session_running_summary_finalize', side_effect=fake_finalize) as finalize_mock, \
+                patch('openrouter.get_session_summary_consistency_check', return_value={'consistent': True, 'contradictions': []}):
             _run_session_memory_update(
                 campaign_id=self.campaign.id,
                 session_id=self.session.id,
@@ -421,6 +423,70 @@ class PostTurnConsistencyTest(unittest.TestCase):
         self.assertNotIn('orin vane', (summary or '').lower())
         turn = SessionDmTurn.query.filter_by(player_message_id=1).first()
         self.assertEqual(turn.post_turn_status, 'complete')
+
+    def test_stale_summary_fails_closed(self):
+        """If the finalized summary still reports an earlier clock segment than
+        the committed value (e.g. 1/3 vs committed 2/3), the read-only verifier
+        must reject it and the turn must end error, not complete."""
+        from services.dm_turns import begin_session_dm_turn
+        db.session.add(begin_session_dm_turn(
+            self.campaign.id,
+            self.session.id,
+            1,
+            'session_dm:session_1:message_1',
+        ))
+        self._clock('trapped_ferrymen', 'Trapped Ferrymen', 3, 2, visibility='party_known')
+        db.session.commit()
+
+        from routes.sessions import _run_session_memory_update
+        with patch('routes.sessions.get_session_memory_patch', return_value={
+            'source_contract': 'compiled_session_memory_v2',
+            'running_summary': 'The Trapped Ferrymen clock sits at 1/3.',
+            'scene_patch': {},
+            'upsert_graph_entities': [],
+            'upsert_graph_relations': [],
+            'upsert_graph_facts': [],
+            'create_clocks': [],
+            'retire_clocks': [],
+            'update_npc_actors': [],
+            'record_events': [],
+        }), \
+                patch('routes.sessions.get_session_clock_updates', return_value={
+                    'create_clocks': [],
+                    'advance_clocks': [],
+                    'retire_clocks': [],
+                    'no_change_explanations': [],
+                }), \
+                patch('routes.sessions.get_session_running_summary_finalize', return_value={
+                    'running_summary': 'The Trapped Ferrymen remain at 1/3.',
+                }) as finalize_mock, \
+                patch('openrouter.get_session_summary_consistency_check', return_value={
+                    'consistent': False,
+                    'contradictions': ['Trapped Ferrymen reported at 1/3 but committed at 2/3.'],
+                }) as verify_mock:
+            _run_session_memory_update(
+                campaign_id=self.campaign.id,
+                session_id=self.session.id,
+                user_id=self.user.id,
+                player_message_id=1,
+                player_content='We hold the gate.',
+                ai_text='The ferrymen press against the gate.',
+                hot_context={},
+                parent_trace_id='test:trace',
+                dm_message_id=2,
+            )
+
+        finalize_mock.assert_called_once()
+        verify_mock.assert_called_once()
+        turn = SessionDmTurn.query.filter_by(player_message_id=1).first()
+        self.assertEqual(turn.post_turn_status, 'error')
+        self.assertEqual(turn.memory_status, 'complete')
+        self.assertEqual(turn.clock_status, 'complete')
+        self.assertIn('contradicts', turn.error_text.lower())
+        # The stale summary is never presented as current for a completed turn.
+        self.assertTrue(
+            CampaignAuditEvent.query.filter_by(campaign_id=self.campaign.id, event_type='post_turn_consistency_incident').first()
+        )
 
     def test_no_conflict_clock_stays_active_and_consistent(self):
         self._clock('trapped_ferrymen', 'Trapped Ferrymen', 3, 1)
@@ -1159,7 +1225,8 @@ class PostTurnConsistencyTest(unittest.TestCase):
                 }), \
                 patch('routes.sessions.get_session_running_summary_finalize', return_value={
                     'running_summary': 'The Trapped Ferrymen clock sits at 2/3 and the party holds the gate.',
-                }) as finalize_mock:
+                }) as finalize_mock, \
+                patch('openrouter.get_session_summary_consistency_check', return_value={'consistent': True, 'contradictions': []}):
             response = self.client.post(
                 f'/api/sessions/{self.session.id}/messages',
                 json={'content': 'We hold the gate.', 'role': 'player'},

@@ -5729,6 +5729,117 @@ def get_session_running_summary_finalize(summary_context, audit_context=None):
     return {'running_summary': summary}
 
 
+SESSION_SUMMARY_CONSISTENCY_CHECK_SYSTEM_PROMPT = (
+    "You are a read-only consistency checker for a D&D session running summary. "
+    "You are given the finalized running_summary and the authoritative committed state: the current scene, "
+    "committed public facts, committed active clocks (with current segment progress and status), and "
+    "resolved/superseded clocks. The committed state is ground truth. "
+    "Return JSON: {\"consistent\": true, \"contradictions\": [\"...\"]}. "
+    "Mark consistent=false ONLY when the summary states something that directly contradicts the committed state, "
+    "for example: reporting a clock at a progress value different from the committed value, presenting a "
+    "resolved/superseded clock as still active, or stating a scene/fact that contradicts committed state. "
+    "Do not flag omissions, stylistic differences, or prose that simply does not mention a clock. "
+    "Return only JSON."
+)
+
+
+def build_session_summary_consistency_check_messages(summary_text, summary_context):
+    return [
+        {'role': 'system', 'content': SESSION_SUMMARY_CONSISTENCY_CHECK_SYSTEM_PROMPT},
+        {'role': 'user', 'content': json.dumps({
+            'running_summary': summary_text,
+            'committed_state': {
+                key: value for key, value in (summary_context or {}).items()
+                if value is not None
+            },
+        }, ensure_ascii=False)},
+    ]
+
+
+def get_session_summary_consistency_check(summary_text, summary_context, audit_context=None):
+    """Narrow read-only semantic check that the finalized running summary does
+    not contradict the authoritative committed clock/scene/fact state. Returns
+    ``{'consistent': bool, 'contradictions': [...]}`` or ``None`` on failure so
+    callers fail closed rather than marking a turn complete unverified."""
+    if not summary_text:
+        return None
+    messages = build_session_summary_consistency_check_messages(summary_text, summary_context or {})
+    audit_context = audit_context or {}
+    provider = get_llm_provider()
+    campaign_id = audit_context.get('campaign_id')
+    trace_id = audit_context.get('trace_id') or f"session_summary_verifier:verify:{uuid4().hex[:10]}"
+    trace_label = audit_context.get('trace_label') or 'session_summary_verifier: verify'
+
+    agent_audit = {
+        **audit_context,
+        'trace_id': trace_id,
+        'trace_label': trace_label,
+        'actor': 'session_summary_verifier',
+        'operation': 'session_summary_consistency_check',
+    }
+    try:
+        data = _json_loads_with_repair(
+            _post_chat(messages, json_mode=True, audit_context=agent_audit),
+            audit_context=agent_audit,
+        )
+    except Exception as err:
+        if campaign_id:
+            log_audit_event(
+                campaign_id,
+                'summary_verifier_error',
+                'Running summary consistency verification failed.',
+                {'error': repr(err)},
+                source=provider,
+                actor='session_summary_verifier',
+                trace_id=trace_id,
+                parent_trace_id=audit_context.get('parent_trace_id'),
+                trace_label=trace_label,
+                audit_role='tools',
+                commit=True,
+            )
+        return None
+
+    if not isinstance(data, dict) or not isinstance(data.get('consistent'), bool):
+        if campaign_id:
+            log_audit_event(
+                campaign_id,
+                'summary_verifier_error',
+                'Running summary consistency verification returned an invalid verdict.',
+                {'verdict': data},
+                source=provider,
+                actor='session_summary_verifier',
+                trace_id=trace_id,
+                parent_trace_id=audit_context.get('parent_trace_id'),
+                trace_label=trace_label,
+                audit_role='tools',
+                commit=True,
+            )
+        return None
+
+    result = {
+        'consistent': data.get('consistent', True),
+        'contradictions': [
+            str(item) for item in (data.get('contradictions') or [])
+            if isinstance(item, str) and item.strip()
+        ][:5],
+    }
+    if campaign_id:
+        log_audit_event(
+            campaign_id,
+            'summary_verifier_response',
+            'Received running summary consistency verdict.',
+            result,
+            source=provider,
+            actor='session_summary_verifier',
+            trace_id=trace_id,
+            parent_trace_id=audit_context.get('parent_trace_id'),
+            trace_label=trace_label,
+            audit_role='agent',
+            commit=True,
+        )
+    return result
+
+
 def get_character_sheet_answer(question, scope, character_sheets, audit_context=None):
     if not character_sheets:
         return {

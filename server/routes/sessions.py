@@ -182,11 +182,12 @@ def _repair_post_turn_clocks(campaign, session, player_message_id, dm_message_id
         return None, incident_summary
 
 
-def _verify_post_turn_state(campaign, session, player_message_id, dm_message_id, parent_trace_id):
+def _verify_post_turn_state(campaign, session, player_message_id, dm_message_id, parent_trace_id, summary_text=None, summary_context=None):
     """Read-only post-turn consistency verification, run AFTER the running
-    summary has been finalized. Never mutates durable state. Logs and returns an
-    incident text when a contradiction remains so the turn is not reported
-    complete.
+    summary has been finalized. Semantically verifies the finalized summary
+    against committed clock/scene/fact state and re-checks active clocks. Never
+    mutates durable state. Logs and returns an incident text when a
+    contradiction remains so the turn is not reported complete.
 
     Returns (verified, incident_text_or_None).
     """
@@ -203,6 +204,8 @@ def _verify_post_turn_state(campaign, session, player_message_id, dm_message_id,
             trace_id=parent_trace_id,
             parent_trace_id=parent_trace_id,
             trace_label=trace_label,
+            summary_text=summary_text,
+            summary_context=summary_context,
         )
         db.session.commit()
         return report.get('verified', True), None
@@ -560,13 +563,17 @@ def _run_session_memory_update(
         db.session.commit()
 
         # Read-only final consistency verification AFTER summary finalization.
-        # It never mutates state; any remaining contradiction prevents complete.
+        # It never mutates state; the finalized summary is semantically checked
+        # against committed clock/scene state and any remaining contradiction
+        # prevents complete.
         _verified, verify_incident = _verify_post_turn_state(
             campaign,
             session,
             player_message_id,
             dm_message_id,
             parent_trace_id,
+            summary_text=session.running_summary,
+            summary_context=summary_context,
         )
         if verify_incident:
             mark_session_dm_turn_error(

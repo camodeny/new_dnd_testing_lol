@@ -6376,7 +6376,8 @@ class DmToolsTest(unittest.TestCase):
                     'retire_clocks': [],
                     'no_change_explanations': [],
                 }), \
-                patch('routes.sessions.get_session_running_summary_finalize', return_value={'running_summary': 'The alley fell quiet.'}):
+                patch('routes.sessions.get_session_running_summary_finalize', return_value={'running_summary': 'The alley fell quiet.'}), \
+                patch('openrouter.get_session_summary_consistency_check', return_value={'consistent': True, 'contradictions': []}):
             response = client.post(
                 f'/api/sessions/{self.session.id}/messages',
                 json={'content': '<ooc>What changed?</ooc>', 'role': 'player'},
@@ -6415,7 +6416,8 @@ class DmToolsTest(unittest.TestCase):
                     'record_events': [],
                 }), \
                 patch('routes.sessions.get_session_clock_updates', return_value=None), \
-                patch('routes.sessions.get_session_running_summary_finalize', return_value={'running_summary': 'The alley fell quiet.'}):
+                patch('routes.sessions.get_session_running_summary_finalize', return_value={'running_summary': 'The alley fell quiet.'}), \
+                patch('openrouter.get_session_summary_consistency_check', return_value={'consistent': True, 'contradictions': []}):
             response = client.post(
                 f'/api/sessions/{self.session.id}/messages',
                 json={'content': '<ooc>What changed?</ooc>', 'role': 'player'},
