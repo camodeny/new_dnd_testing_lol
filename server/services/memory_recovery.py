@@ -154,6 +154,104 @@ def _replay_clock_adjudication(task, campaign, session):
     )
 
 
+def _recovery_transcript_content(task):
+    from models import SessionMessage, db
+
+    player_row = db.session.get(SessionMessage, task.player_message_id) if task.player_message_id else None
+    dm_row = db.session.get(SessionMessage, task.dm_message_id) if task.dm_message_id else None
+    return (
+        player_row.content if player_row else '',
+        dm_row.content if dm_row else '',
+    )
+
+
+def _run_recovery_finalization(campaign, session, task, player_content, dm_content):
+    """Complete the #107 post-clock finalization pipeline for a recovered turn.
+
+    Mirrors the normal turn's terminal ordering: deterministic clock repair ->
+    running-summary finalization against repaired committed state -> leak-guard
+    redaction -> read-only semantic verification. Returns
+    (terminal_revision, final_summary_or_None, error_or_None). Any failure leaves
+    the caller to keep recovery pending (fail closed) rather than marking the
+    turn complete with stale or unchecked state.
+    """
+    from openrouter import get_session_running_summary_finalize
+    from routes.sessions import _repair_post_turn_clocks, _verify_post_turn_state
+    from services.dm_tools import (
+        build_session_summary_finalize_context,
+        redact_session_summary_private_terms,
+    )
+    from models import db
+
+    # 3. Deterministic clock repair BEFORE summary finalization so the running
+    # summary is authored against repaired (not merely adjudicated) clock state.
+    terminal_revision, repair_incident = _repair_post_turn_clocks(
+        campaign,
+        session,
+        task.player_message_id,
+        task.dm_message_id,
+        task.trace_id,
+        bump_revision=True,
+    )
+    if repair_incident:
+        return terminal_revision, None, f'post_clock_repair_incident: {repair_incident}'
+
+    # 4. Finalize the running summary from the repaired committed state.
+    summary_context = None
+    finalized_summary = None
+    summary_error = None
+    summary_trace_id = f"session_summary_finalizer:session_{session.id}:message_{task.player_message_id}:recovery"
+    try:
+        summary_context = build_session_summary_finalize_context(
+            campaign,
+            session,
+            player_content,
+            dm_content,
+            player_message_id=task.player_message_id,
+            dm_message_id=task.dm_message_id,
+        )
+        finalized = get_session_running_summary_finalize(
+            summary_context,
+            audit_context={
+                'campaign_id': campaign.id,
+                'operation': 'session_summary_finalize_recovery',
+                'actor': 'session_summary_finalizer',
+                'trace_id': summary_trace_id,
+                'trace_label': f'session_summary_finalizer recovery: session {session.id}',
+            },
+        )
+        finalized_summary = (finalized or {}).get('running_summary') if isinstance(finalized, dict) else None
+    except Exception as err:
+        summary_error = repr(err)
+    if not finalized_summary:
+        return terminal_revision, None, f'summary_finalize_failed: {summary_error or "no content"}'
+
+    session.running_summary = finalized_summary.strip()
+    redacted, _redacted = redact_session_summary_private_terms(
+        campaign,
+        session.running_summary,
+        player_content,
+        dm_content,
+    )
+    session.running_summary = redacted
+    db.session.commit()
+
+    # 5. Read-only semantic/state verification AFTER summary finalization.
+    _verified, verify_incident = _verify_post_turn_state(
+        campaign,
+        session,
+        task.player_message_id,
+        task.dm_message_id,
+        task.trace_id,
+        summary_text=session.running_summary,
+        summary_context=summary_context,
+    )
+    if verify_incident:
+        return terminal_revision, None, f'verify_incident: {verify_incident}'
+
+    return terminal_revision, session.running_summary, None
+
+
 def retry_memory_recovery_task(campaign_id, task_id):
     from models import Campaign, CampaignSession, SessionMemoryRecoveryTask, db
     from services.audit_service import log_audit_event
@@ -246,7 +344,36 @@ def retry_memory_recovery_task(campaign_id, task_id):
             'memory_already_applied': bool(task.memory_applied),
         }
 
-    # 4. Repair the durable turn and the recovery task in one transaction.
+    # 4. Complete the #107 post-clock finalization pipeline: deterministic clock
+    # repair, running-summary finalization against repaired committed state,
+    # leak-guard redaction, then read-only semantic verification. Only a clean
+    # finalization may resolve the task and mark the turn complete.
+    player_content, dm_content = _recovery_transcript_content(task)
+    terminal_revision, final_summary, finalize_error = _run_recovery_finalization(
+        campaign,
+        session,
+        task,
+        player_content,
+        dm_content,
+    )
+    if finalize_error:
+        db.session.rollback()
+        task = db.session.get(SessionMemoryRecoveryTask, task.id)
+        task.attempts += 1
+        task.status = 'pending'
+        task.last_error_text = finalize_error
+        db.session.commit()
+        return {
+            'ok': False,
+            'error': finalize_error,
+            'status': 'pending',
+            'attempts': task.attempts,
+            'task_id': task.id,
+            'memory_already_applied': bool(task.memory_applied),
+        }
+
+    # 5. Resolve the recovery task and repair the durable turn, recording the
+    # correlated terminal revision produced by the finalization pipeline.
     task = db.session.get(SessionMemoryRecoveryTask, task.id)
     task.attempts += 1
     task.status = 'resolved'
@@ -257,6 +384,7 @@ def retry_memory_recovery_task(campaign_id, task_id):
         dm_message_id=task.dm_message_id,
         memory_status='complete',
         clock_status='complete',
+        post_turn_revision=terminal_revision,
     )
     db.session.commit()
 
@@ -271,6 +399,7 @@ def retry_memory_recovery_task(campaign_id, task_id):
             'memory_status': 'complete',
             'clock_status': 'complete',
             'memory_already_applied': bool(task.memory_applied),
+            'post_turn_revision': terminal_revision,
             'memory_result': memory_result,
         },
         source='session_memory',
@@ -286,6 +415,7 @@ def retry_memory_recovery_task(campaign_id, task_id):
         'attempts': task.attempts,
         'task_id': task.id,
         'clock_recovered': True,
+        'post_turn_revision': terminal_revision,
         'memory_already_applied': bool(task.memory_applied),
         'result': memory_result,
     }

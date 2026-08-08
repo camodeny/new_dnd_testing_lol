@@ -529,6 +529,17 @@ class SessionMemoryRecoveryTaskTest(unittest.TestCase):
         db.drop_all()
         self.ctx.pop()
 
+    def _summary_with_clock_state(self):
+        """A mock summary-finalizer payload that reflects the committed clock
+        state at finalization time, proving the summary sees recovered clocks."""
+        clock = CampaignClock.query.filter_by(
+            campaign_id=self.campaign.id,
+            clock_id="trapped_ferrymen",
+        ).first()
+        if clock is None:
+            return "No clock state."
+        return f"Trapped Ferrymen now at {clock.filled}/{clock.segments}."
+
     def test_create_task_records_recoverable_partial_state(self):
         db.session.add(
             NPCActor(
@@ -607,11 +618,24 @@ class SessionMemoryRecoveryTaskTest(unittest.TestCase):
         ), mock.patch(
             "openrouter.get_session_clock_updates",
             return_value={"advance_clocks": [], "retire_clocks": [], "create_clocks": []},
+        ), mock.patch(
+            "routes.sessions._repair_post_turn_clocks",
+            return_value=(7, None),
+        ), mock.patch(
+            "services.dm_tools.build_session_summary_finalize_context",
+            return_value={"summary_context": True},
+        ), mock.patch(
+            "openrouter.get_session_running_summary_finalize",
+            return_value={"running_summary": "Recovered summary after retry."},
+        ), mock.patch(
+            "routes.sessions._verify_post_turn_state",
+            return_value=(True, None),
         ):
             result = retry_memory_recovery_task(self.campaign.id, task.id)
         self.assertTrue(result["ok"], result)
         self.assertEqual(result["status"], "resolved")
         self.assertTrue(result["clock_recovered"])
+        self.assertEqual(result["post_turn_revision"], 7)
 
         graph = json.loads(self.world.knowledge_graph)
         entity_ids = {e["id"] for e in graph["entities"]}
@@ -639,6 +663,7 @@ class SessionMemoryRecoveryTaskTest(unittest.TestCase):
                 segments=4,
                 filled=1,
                 status="active",
+                visibility="party_known",
             )
         )
         db.session.add(mark_session_dm_turn_error(
@@ -684,18 +709,36 @@ class SessionMemoryRecoveryTaskTest(unittest.TestCase):
             return_value={"advance_clocks": [
                 {"clock_id": "trapped_ferrymen", "delta": 1, "reason": "The party freed a trapped crewman."},
             ]},
-        ) as clock_updates_mock:
+        ) as clock_updates_mock, mock.patch(
+            "routes.sessions._repair_post_turn_clocks",
+            return_value=(7, None),
+        ), mock.patch(
+            "services.dm_tools.build_session_summary_finalize_context",
+            return_value={"summary_context": True},
+        ), mock.patch(
+            "openrouter.get_session_running_summary_finalize",
+            side_effect=lambda summary_context, audit_context=None: {"running_summary": self._summary_with_clock_state()},
+        ), mock.patch(
+            "routes.sessions._verify_post_turn_state",
+            return_value=(True, None),
+        ):
             result = retry_memory_recovery_task(self.campaign.id, task.id)
 
         self.assertTrue(result["ok"], result)
         self.assertTrue(result["clock_recovered"], result.get("clock_error"))
         self.assertIsNone(result.get("clock_error"))
+        self.assertEqual(result["post_turn_revision"], 7)
 
         clock = CampaignClock.query.filter_by(
             campaign_id=self.campaign.id,
             clock_id="trapped_ferrymen",
         ).first()
         self.assertEqual(clock.filled, 2)
+
+        # The finalized summary is authored after clock replay, so it must see
+        # the recovered clock state (2/4), not the pre-recovery 1/4.
+        self.assertIn("2/4", self.session.running_summary)
+        self.assertNotIn("1/4", self.session.running_summary)
 
         turn = SessionDmTurn.query.filter_by(
             campaign_id=self.campaign.id,
@@ -704,6 +747,7 @@ class SessionMemoryRecoveryTaskTest(unittest.TestCase):
         self.assertEqual(turn.post_turn_status, "complete")
         self.assertEqual(turn.memory_status, "complete")
         self.assertEqual(turn.clock_status, "complete")
+        self.assertEqual(turn.post_turn_revision, 7)
         self.assertIsNone(turn.error_text)
 
         refreshed = db.session.get(SessionMemoryRecoveryTask, task.id)
@@ -777,6 +821,153 @@ class SessionMemoryRecoveryTaskTest(unittest.TestCase):
         refreshed = db.session.get(SessionMemoryRecoveryTask, task.id)
         self.assertEqual(refreshed.status, "pending")
 
+    def test_summary_finalize_failure_keeps_recovery_pending(self):
+        # The finalized summary must come from the repaired committed state. A
+        # finalization that returns no summary keeps the task pending (fail
+        # closed) and the turn in error instead of marking it complete with the
+        # stale pre-recovery summary.
+        db.session.add(
+            NPCActor(
+                campaign_id=self.campaign.id,
+                actor_id="vex_mal",
+                name="Vex Mal",
+                dossier="{}",
+            )
+        )
+        db.session.add(mark_session_dm_turn_error(
+            self.campaign.id,
+            self.session.id,
+            player_message_id=7,
+            trace_id="trace_7",
+            error_text="missing_relation_endpoint",
+            memory_status="error",
+            clock_status="skipped",
+        ))
+        db.session.commit()
+
+        patch = {
+            "source_contract": SOURCE_CONTRACT_COMPILED_V2,
+            "base_memory_revision": self.world.memory_revision or 0,
+            "upsert_graph_entities": [],
+            "upsert_graph_relations": [{
+                "type": "rival_of",
+                "source_id": "vex_mal",
+                "target_id": "waterdeep",
+            }],
+        }
+        task = create_memory_recovery_task(
+            self.campaign.id,
+            self.session,
+            player_message_id=7,
+            dm_message_id=8,
+            err=MemoryPipelineError(stage="validation", code="missing_relation_endpoint", message="missing"),
+            patch=patch,
+            trace_id="trace_7",
+        )
+
+        with mock.patch(
+            "services.dm_tools.build_session_clock_context",
+            return_value={"allowed_evidence_sources": []},
+        ), mock.patch(
+            "openrouter.get_session_clock_updates",
+            return_value={"advance_clocks": [], "retire_clocks": [], "create_clocks": []},
+        ), mock.patch(
+            "routes.sessions._repair_post_turn_clocks",
+            return_value=(7, None),
+        ), mock.patch(
+            "services.dm_tools.build_session_summary_finalize_context",
+            return_value={"summary_context": True},
+        ), mock.patch(
+            "openrouter.get_session_running_summary_finalize",
+            return_value={"running_summary": None},
+        ):
+            result = retry_memory_recovery_task(self.campaign.id, task.id)
+
+        self.assertFalse(result["ok"])
+        self.assertIn("summary_finalize_failed", result["error"])
+        self.assertEqual(result["status"], "pending")
+
+        turn = SessionDmTurn.query.filter_by(
+            campaign_id=self.campaign.id,
+            player_message_id=7,
+        ).first()
+        self.assertEqual(turn.post_turn_status, "error")
+        self.assertTrue(has_pending_memory_recovery(self.campaign.id))
+
+    def test_verify_incident_keeps_recovery_pending(self):
+        # A read-only verification contradiction must not be resolved: the task
+        # stays pending and the turn stays in error.
+        db.session.add(
+            NPCActor(
+                campaign_id=self.campaign.id,
+                actor_id="vex_mal",
+                name="Vex Mal",
+                dossier="{}",
+            )
+        )
+        db.session.add(mark_session_dm_turn_error(
+            self.campaign.id,
+            self.session.id,
+            player_message_id=7,
+            trace_id="trace_7",
+            error_text="missing_relation_endpoint",
+            memory_status="error",
+            clock_status="skipped",
+        ))
+        db.session.commit()
+
+        patch = {
+            "source_contract": SOURCE_CONTRACT_COMPILED_V2,
+            "base_memory_revision": self.world.memory_revision or 0,
+            "upsert_graph_entities": [],
+            "upsert_graph_relations": [{
+                "type": "rival_of",
+                "source_id": "vex_mal",
+                "target_id": "waterdeep",
+            }],
+        }
+        task = create_memory_recovery_task(
+            self.campaign.id,
+            self.session,
+            player_message_id=7,
+            dm_message_id=8,
+            err=MemoryPipelineError(stage="validation", code="missing_relation_endpoint", message="missing"),
+            patch=patch,
+            trace_id="trace_7",
+        )
+
+        with mock.patch(
+            "services.dm_tools.build_session_clock_context",
+            return_value={"allowed_evidence_sources": []},
+        ), mock.patch(
+            "openrouter.get_session_clock_updates",
+            return_value={"advance_clocks": [], "retire_clocks": [], "create_clocks": []},
+        ), mock.patch(
+            "routes.sessions._repair_post_turn_clocks",
+            return_value=(7, None),
+        ), mock.patch(
+            "services.dm_tools.build_session_summary_finalize_context",
+            return_value={"summary_context": True},
+        ), mock.patch(
+            "openrouter.get_session_running_summary_finalize",
+            return_value={"running_summary": "Recovered summary."},
+        ), mock.patch(
+            "routes.sessions._verify_post_turn_state",
+            return_value=(False, "summary contradicts committed clock state"),
+        ):
+            result = retry_memory_recovery_task(self.campaign.id, task.id)
+
+        self.assertFalse(result["ok"])
+        self.assertIn("verify_incident", result["error"])
+        self.assertEqual(result["status"], "pending")
+
+        turn = SessionDmTurn.query.filter_by(
+            campaign_id=self.campaign.id,
+            player_message_id=7,
+        ).first()
+        self.assertEqual(turn.post_turn_status, "error")
+        self.assertTrue(has_pending_memory_recovery(self.campaign.id))
+
     def test_retry_skips_reapply_after_task_memory_marker_set(self):
         # A prior attempt may have applied memory but failed the clock replay,
         # leaving the task pending. The per-task memory_applied marker (never the
@@ -833,7 +1024,19 @@ class SessionMemoryRecoveryTaskTest(unittest.TestCase):
             return_value={"advance_clocks": [], "retire_clocks": [], "create_clocks": []},
         ), mock.patch(
             "services.dm_tools.apply_compiled_session_memory_patch",
-        ) as apply_mock:
+        ) as apply_mock, mock.patch(
+            "routes.sessions._repair_post_turn_clocks",
+            return_value=(7, None),
+        ), mock.patch(
+            "services.dm_tools.build_session_summary_finalize_context",
+            return_value={"summary_context": True},
+        ), mock.patch(
+            "openrouter.get_session_running_summary_finalize",
+            return_value={"running_summary": "Recovered summary."},
+        ), mock.patch(
+            "routes.sessions._verify_post_turn_state",
+            return_value=(True, None),
+        ):
             result = retry_memory_recovery_task(self.campaign.id, task.id)
 
         self.assertTrue(result["ok"], result)
@@ -1129,6 +1332,18 @@ class MemoryRecoveryRouteTest(unittest.TestCase):
         ), mock.patch(
             "openrouter.get_session_clock_updates",
             return_value={"advance_clocks": [], "retire_clocks": [], "create_clocks": []},
+        ), mock.patch(
+            "routes.sessions._repair_post_turn_clocks",
+            return_value=(7, None),
+        ), mock.patch(
+            "services.dm_tools.build_session_summary_finalize_context",
+            return_value={"summary_context": True},
+        ), mock.patch(
+            "openrouter.get_session_running_summary_finalize",
+            return_value={"running_summary": "Recovered summary."},
+        ), mock.patch(
+            "routes.sessions._verify_post_turn_state",
+            return_value=(True, None),
         ):
             response = self.client.post(
                 f"/api/campaigns/{self.campaign.id}/memory-recovery/{task.id}/retry",

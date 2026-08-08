@@ -126,13 +126,15 @@ def mark_session_dm_turn_error(
     return turn
 
 
-def repair_session_dm_turn(player_message_id, dm_message_id=None, memory_status='complete', clock_status='complete'):
+def repair_session_dm_turn(player_message_id, dm_message_id=None, memory_status='complete', clock_status='complete', post_turn_revision=None):
     """Flip a failed post-turn row back into a durable completed state.
 
-    Used after a memory recovery retry has re-applied the memory patch and
-    re-run the skipped clock adjudication. Clears the error text so the durable
-    turn no longer reports error and downstream status checks see a repaired
-    turn instead of the original failure.
+    Used after a memory recovery retry has re-applied the memory patch, re-run
+    the skipped clock adjudication, and completed the #107 post-clock
+    finalization pipeline (clock repair -> summary finalize -> verification).
+    Clears the error text and records the correlated terminal revision so the
+    durable turn no longer reports error and downstream status checks see a
+    repaired turn instead of the original failure.
     """
     turn = _get_turn(player_message_id)
     if turn is None:
@@ -146,6 +148,8 @@ def repair_session_dm_turn(player_message_id, dm_message_id=None, memory_status=
     turn.memory_status = memory_status
     turn.clock_status = clock_status
     turn.error_text = None
+    if post_turn_revision is not None:
+        turn.post_turn_revision = post_turn_revision
     turn.finished_at = finished_at
     turn.full_duration_ms = _duration_ms(turn.started_at, finished_at)
     return turn
