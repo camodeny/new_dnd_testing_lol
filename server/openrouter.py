@@ -5744,14 +5744,21 @@ SESSION_SUMMARY_CONSISTENCY_CHECK_SYSTEM_PROMPT = (
 
 
 def build_session_summary_consistency_check_messages(summary_text, summary_context):
+    # Only authoritative committed state may be ground truth for the verifier.
+    # prior_running_summary and the latest exchange are allowed to be stale (the
+    # prior summary is exactly what this finalization replaces), so they must
+    # never appear under committed_state.
+    authoritative_keys = ('current_scene', 'committed_facts', 'active_clocks', 'resolved_clocks')
+    committed_state = {
+        key: summary_context.get(key)
+        for key in authoritative_keys
+        if summary_context.get(key) is not None
+    }
     return [
         {'role': 'system', 'content': SESSION_SUMMARY_CONSISTENCY_CHECK_SYSTEM_PROMPT},
         {'role': 'user', 'content': json.dumps({
             'running_summary': summary_text,
-            'committed_state': {
-                key: value for key, value in (summary_context or {}).items()
-                if value is not None
-            },
+            'committed_state': committed_state,
         }, ensure_ascii=False)},
     ]
 

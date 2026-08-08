@@ -424,6 +424,38 @@ class PostTurnConsistencyTest(unittest.TestCase):
         turn = SessionDmTurn.query.filter_by(player_message_id=1).first()
         self.assertEqual(turn.post_turn_status, 'complete')
 
+    def test_summary_verifier_payload_excludes_stale_prior_summary(self):
+        """The consistency verifier must compare the finalized summary only
+        against authoritative committed state. The stale prior running summary
+        and the current exchange are allowed to be out of date and must not
+        appear under committed_state, or a healthy turn could fail closed."""
+        from openrouter import build_session_summary_consistency_check_messages
+        import json as _json
+
+        context = {
+            'prior_running_summary': 'The Trapped Ferrymen clock sits at 1/3.',
+            'latest_player_message': 'We hold the gate.',
+            'latest_dm_message': 'The ferrymen press against the gate.',
+            'current_scene': {'location_id': 'the_dock', 'location_name': 'The Dock'},
+            'committed_facts': [{'text': 'The ferrymen press against the gate.'}],
+            'active_clocks': [{'clock_id': 'trapped_ferrymen', 'filled': 2, 'segments': 3}],
+            'resolved_clocks': [],
+        }
+        messages = build_session_summary_consistency_check_messages(
+            'The Trapped Ferrymen clock sits at 2/3.',
+            context,
+        )
+        payload = _json.loads(messages[1]['content'])
+        committed_state = payload['committed_state']
+
+        self.assertEqual(set(committed_state.keys()), {'current_scene', 'committed_facts', 'active_clocks', 'resolved_clocks'})
+        self.assertNotIn('prior_running_summary', committed_state)
+        self.assertNotIn('latest_player_message', committed_state)
+        self.assertNotIn('latest_dm_message', committed_state)
+        self.assertNotIn('1/3', _json.dumps(committed_state))
+        self.assertEqual(committed_state['active_clocks'][0]['filled'], 2)
+        self.assertEqual(committed_state['active_clocks'][0]['segments'], 3)
+
     def test_stale_summary_fails_closed(self):
         """If the finalized summary still reports an earlier clock segment than
         the committed value (e.g. 1/3 vs committed 2/3), the read-only verifier
