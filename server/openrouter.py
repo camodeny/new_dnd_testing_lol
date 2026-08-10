@@ -1659,14 +1659,73 @@ def _session_dm_draft_serialization_prompt(action_buffer):
 
 
 SESSION_DM_GUARD_ONLY_CONTEXT_KEYS = {'private_output_terms', 'private_spoiler_items'}
+SESSION_DM_INTERNAL_ONLY_CONTEXT_KEYS = SESSION_DM_GUARD_ONLY_CONTEXT_KEYS | {'recent_messages'}
 
 
 def _session_dm_prompt_context(hot_context):
     return {
         key: value
         for key, value in (hot_context or {}).items()
-        if key not in SESSION_DM_GUARD_ONLY_CONTEXT_KEYS
+        if key not in SESSION_DM_INTERNAL_ONLY_CONTEXT_KEYS
     }
+
+
+def _session_message_value(message, key, default=None):
+    if isinstance(message, dict):
+        return message.get(key, default)
+    return getattr(message, key, default)
+
+
+def _session_message_source_id(message):
+    message_id = _session_message_value(message, 'id')
+    if message_id is None:
+        return None
+    return f'session_message:{message_id}'
+
+
+def _session_message_source_refs(messages):
+    refs = []
+    for message in messages or []:
+        source_id = _session_message_source_id(message)
+        if source_id is None:
+            continue
+        refs.append({
+            'source_id': source_id,
+            'message_id': _session_message_value(message, 'id'),
+            'session_id': _session_message_value(message, 'session_id'),
+            'role': _session_message_value(message, 'role'),
+        })
+    return refs
+
+
+def _validate_session_dm_request_sources(prompt_context, recent_messages):
+    system_source_ids = [
+        source_id
+        for source_id in (
+            _session_message_source_id(message)
+            for message in (prompt_context or {}).get('recent_messages', [])
+        )
+        if source_id is not None
+    ]
+    canonical_source_ids = [
+        source_id
+        for source_id in (_session_message_source_id(message) for message in recent_messages or [])
+        if source_id is not None
+    ]
+    duplicate_source_ids = sorted(
+        set(system_source_ids).intersection(canonical_source_ids)
+        | {
+            source_id
+            for source_id in canonical_source_ids
+            if canonical_source_ids.count(source_id) > 1
+        }
+    )
+    if duplicate_source_ids:
+        raise ValueError(
+            'Duplicate raw transcript sources in primary AI-DM request: '
+            + ', '.join(duplicate_source_ids)
+        )
+    return _session_message_source_refs(recent_messages)
 
 
 def build_session_dm_tool_messages(hot_context):
@@ -1700,6 +1759,25 @@ def build_session_dm_tool_messages(hot_context):
                 'unless the latest player message already used that name. Use the listed public reference instead:\n'
                 + json.dumps(naming_constraints, ensure_ascii=False)
             ),
+        })
+    return messages
+
+
+def build_session_dm_request_messages(hot_context, recent_messages):
+    prompt_context = _session_dm_prompt_context(hot_context)
+    _validate_session_dm_request_sources(prompt_context, recent_messages)
+    messages = build_session_dm_tool_messages(hot_context)
+    for message in recent_messages or []:
+        source_role = _session_message_value(message, 'role', 'user')
+        if source_role == 'dm':
+            role = 'assistant'
+        elif source_role == 'player':
+            role = 'user'
+        else:
+            role = source_role
+        messages.append({
+            'role': role,
+            'content': _session_message_value(message, 'content', ''),
         })
     return messages
 
@@ -3826,15 +3904,14 @@ def _run_session_dm_loop(
                     commit=True,
                 )
 
-    messages = build_session_dm_tool_messages(hot_context)
-    for msg in recent_messages:
-        if msg.role == 'dm':
-            role = 'assistant'
-        elif msg.role == 'player':
-            role = 'user'
-        else:
-            role = msg.role
-        messages.append({'role': role, 'content': msg.content})
+    messages = build_session_dm_request_messages(hot_context, recent_messages)
+    transcript_source_refs = _session_message_source_refs(recent_messages)
+    request_context_manifest = {
+        **(base_audit.get('context_manifest') or {}),
+        'primary_request_transcript_source_refs': transcript_source_refs,
+        'duplicate_raw_transcript_source_count': 0,
+        'transcript_source_validation': 'passed',
+    }
 
     if on_status_change:
         on_status_change({"step": "preflight"})
@@ -3944,8 +4021,16 @@ def _run_session_dm_loop(
             'trace_id': trace_id,
             'trace_label': trace_label,
             'operation': base_audit.get('operation') or 'session_dm_response',
-            'context_manifest': base_audit.get('context_manifest'),
-            'token_estimate': base_audit.get('token_estimate'),
+            'context_manifest': request_context_manifest,
+            'token_estimate': {
+                **(base_audit.get('token_estimate') or {}),
+                'estimated_message_tokens': _estimate_tokens(messages),
+                'estimated_tool_schema_tokens': _estimate_tokens(active_tools or []),
+                'estimated_duplicate_transcript_tokens_removed': _estimate_tokens(
+                    (hot_context or {}).get('recent_messages') or []
+                ),
+                'duplicate_raw_transcript_source_count': 0,
+            },
             'full_world_graph_included': False,
         }
         # Capture the exact clean context that produced this candidate. Guard repairs

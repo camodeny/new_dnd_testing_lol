@@ -50,7 +50,9 @@ from openrouter import (
     _session_dm_format_violation,
     _session_dm_guard_retry_system_prompt,
     _session_dm_tool_result_for_prompt,
+    _validate_session_dm_request_sources,
     _witness_private_leverage_spoiler_violation,
+    build_session_dm_request_messages,
     build_session_dm_tool_messages,
     build_session_canon_discipline_check_messages,
     get_session_memory_patch,
@@ -780,13 +782,90 @@ class DmToolsTest(unittest.TestCase):
         self.assertEqual(sheets[0]['character']['general']['passive_perception'], 13)
 
     def test_context_manifest_reports_compact_strategy(self):
-        hot_context = build_session_hot_context(self.campaign, self.session, self.user)
+        opening = SessionMessage(
+            session_id=self.session.id,
+            role='dm',
+            content="Harlen stands and announces, 'That's four this week.'",
+        )
+        db.session.add(opening)
+        db.session.commit()
+        hot_context = build_session_hot_context(
+            self.campaign,
+            self.session,
+            self.user,
+            recent_messages_override=[opening],
+        )
         manifest = context_manifest(hot_context, DM_TOOL_DEFINITIONS)
         self.assertEqual(manifest['strategy'], 'compact_hot_context_with_dm_tools')
         self.assertFalse(manifest['full_world_graph_included'])
         self.assertIn('ask_character_sheet', manifest['available_tools'])
         self.assertIn('create_encounter_map', manifest['available_tools'])
         self.assertIn('recent_messages', manifest['estimated_tokens_by_section'])
+        self.assertNotIn('recent_messages', manifest['fed_sections'])
+        self.assertIn('recent_messages', manifest['internal_only_sections'])
+        self.assertEqual(manifest['recent_message_source_ids'], [opening.id])
+        self.assertEqual(
+            manifest['recent_message_source_refs'][0]['source_id'],
+            f'session_message:{opening.id}',
+        )
+        self.assertGreater(manifest['estimated_duplicate_transcript_tokens_removed'], 0)
+        self.assertLess(
+            manifest['estimated_primary_prompt_context_tokens'],
+            manifest['estimated_total_tokens'],
+        )
+
+    def test_run_41_transcript_is_canonical_once_while_audience_state_stays_authoritative(self):
+        opening_text = "Harlen stands and announces to the Lake Nobility, 'That's four this week.'"
+        recent_messages = [
+            {
+                'id': 4101,
+                'session_id': self.session.id,
+                'role': 'dm',
+                'content': opening_text,
+            },
+            {
+                'id': 4102,
+                'session_id': self.session.id,
+                'role': 'player',
+                'content': 'I watch the room for reactions.',
+            },
+        ]
+        hot_context = {
+            'campaign': {'id': self.campaign.id, 'name': self.campaign.name},
+            'audience_knowledge': [{
+                'claim': 'Four incidents happened this week.',
+                'heard_by': ['Lake Nobility'],
+                'source_message_id': 4101,
+            }],
+            'recent_messages': recent_messages,
+            'private_output_terms': [],
+            'private_spoiler_items': [],
+        }
+
+        messages = build_session_dm_request_messages(hot_context, recent_messages)
+
+        serialized_request = '\n'.join(message['content'] for message in messages)
+        self.assertEqual(serialized_request.count(opening_text), 1)
+        self.assertNotIn('"recent_messages"', messages[1]['content'])
+        self.assertIn('"audience_knowledge"', messages[1]['content'])
+        self.assertEqual(messages[-2:], [
+            {'role': 'assistant', 'content': opening_text},
+            {'role': 'user', 'content': 'I watch the room for reactions.'},
+        ])
+
+    def test_source_identity_validation_rejects_system_and_conversation_duplication(self):
+        duplicated = {
+            'id': 117,
+            'session_id': self.session.id,
+            'role': 'player',
+            'content': 'This text is intentionally irrelevant to identity validation.',
+        }
+
+        with self.assertRaisesRegex(ValueError, 'session_message:117'):
+            _validate_session_dm_request_sources(
+                {'recent_messages': [{**duplicated, 'content': 'A transformed copy.'}]},
+                [duplicated],
+            )
 
     def test_hot_context_includes_visible_naming_constraints_for_private_npc_names(self):
         world = CampaignWorld.query.filter_by(campaign_id=self.campaign.id).one()
@@ -3205,6 +3284,57 @@ class DmToolsTest(unittest.TestCase):
             'content': '',
             'reason': 'PC-to-PC exchange.',
         })
+
+    def test_session_dm_request_audit_reports_transcript_sources_and_removed_tokens(self):
+        recent_messages = [{
+            'id': 117,
+            'session_id': self.session.id,
+            'role': 'player',
+            'content': 'I wait for the others to finish speaking.',
+        }]
+        hot_context = {
+            'protected_player_characters': [],
+            'private_output_terms': [],
+            'private_spoiler_items': [],
+            'recent_messages': recent_messages,
+        }
+
+        with patch('openrouter._post_chat_normalized', return_value=_normalized_from_raw({
+            'choices': [{
+                'message': {
+                    'content': '',
+                    'tool_calls': [{
+                        'id': 'call_silent',
+                        'function': {
+                            'name': 'stay_silent',
+                            'arguments': json.dumps({'reason': 'PC-to-PC exchange.'}),
+                        },
+                    }],
+                },
+            }],
+        })) as post_chat:
+            get_session_dm_response_with_tools(
+                hot_context,
+                recent_messages,
+                [],
+                lambda *_args, **_kwargs: {},
+                max_tool_rounds=1,
+            )
+
+        request_audit = post_chat.call_args.kwargs['audit_context']
+        self.assertEqual(
+            request_audit['context_manifest']['primary_request_transcript_source_refs'][0]['source_id'],
+            'session_message:117',
+        )
+        self.assertEqual(
+            request_audit['context_manifest']['duplicate_raw_transcript_source_count'],
+            0,
+        )
+        self.assertEqual(request_audit['context_manifest']['transcript_source_validation'], 'passed')
+        self.assertGreater(
+            request_audit['token_estimate']['estimated_duplicate_transcript_tokens_removed'],
+            0,
+        )
 
     def test_spoiler_checker_allows_safe_reply(self):
         hot_context = {
