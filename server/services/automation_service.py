@@ -88,6 +88,21 @@ class AuditScorecardValidationError(ValueError):
         self.details = details or {}
 
 
+class InfrastructureFailureThresholdError(ValueError):
+    """A reclaim was refused because consecutive identical infrastructure
+    failures already reached the configured threshold (issue #131)."""
+
+    def __init__(self, run):
+        super().__init__(
+            f'Run {run.id} has reached the infrastructure-failure reclaim threshold '
+            f'({run.reclaim_failure_count} consecutive '
+            f'"{run.reclaim_failure_fingerprint}") and will not be reclaimed'
+        )
+        self.run_id = run.id
+        self.fingerprint = run.reclaim_failure_fingerprint
+        self.count = run.reclaim_failure_count
+
+
 def _normalize_memory_anchors(value):
     anchors = value if isinstance(value, dict) else {}
     return {
@@ -156,6 +171,7 @@ def _vector_digest(vector):
 
 DEFAULT_LEASE_SECONDS = 45
 DEFAULT_PROVISIONING_LEASE_SECONDS = 300
+DEFAULT_MAX_RECLAIM_FAILURES = 5
 CLAIMABLE_ACTIVE_STATUSES = {'claimed', 'running', 'stop_requested', 'reconciling'}
 AUDIT_READY_STATUSES = {'audited', 'skipped'}
 CUSTOM_SCORECARD_STATUS_ORDER = ('pass', 'warn', 'fail', 'not_assessed', 'not_applicable')
@@ -2054,6 +2070,16 @@ def provisioning_lease_seconds_for_run(run):
     return max(60, configured)
 
 
+def max_reclaim_failures_for_run(run):
+    """Consecutive identical infrastructure-failure reclaims allowed before the
+    run is terminalized instead of being reclaimed again (issue #131)."""
+    configured = _safe_int(
+        (run.runner_config_json or {}).get('max_reclaim_failures'),
+        DEFAULT_MAX_RECLAIM_FAILURES,
+    )
+    return max(1, configured)
+
+
 from sqlalchemy import update as sa_update
 
 
@@ -2096,6 +2122,19 @@ def reserve_run_lease(run_id, worker_id, now, provisioning=False):
     if result.rowcount == 1:
         db.session.commit()
         return run, new_lease_token, False
+
+    # Belt-and-suspenders for issue #131: never reclaim a run whose
+    # consecutive identical infrastructure failures already hit the threshold.
+    # The worker's /worker-error report normally terminalizes first; this guard
+    # catches the case where the run became reclaimable again (e.g. the
+    # terminalizing report raced with lease expiry).
+    run = db.session.get(AutomationRun, run_id)
+    if (
+        run
+        and run.reclaim_failure_fingerprint
+        and run.reclaim_failure_count >= max_reclaim_failures_for_run(run)
+    ):
+        raise InfrastructureFailureThresholdError(run)
 
     # Try reclaim (active status but expired lease)
     reclaim_stmt = (
@@ -2167,6 +2206,109 @@ def release_run_for_audit(run_id, lease_token):
     result = db.session.execute(stmt)
     db.session.commit()
     return result.rowcount > 0
+
+
+def record_worker_infrastructure_failure(
+    run_id,
+    worker_id,
+    lease_token,
+    *,
+    stage,
+    fingerprint,
+    error,
+    attempt_number=None,
+):
+    """Persist a stable control-plane failure fingerprint on a run and either
+    release the lease for bounded retry or terminalize the run once the
+    consecutive-failure threshold is reached (issue #131).
+
+    A worker that aborts outside gameplay reports the failure with its current
+    worker_id/lease_token. The server:
+      - validates the reporter still owns the run lease (or matches worker_id
+        when no token is available, e.g. a claim-stage failure),
+      - rolls the failure into a stable fingerprint + consecutive count,
+      - records one durable event per attempt (dedupe key carries the attempt
+        number so every identical failure is observable),
+      - releases the lease back to queued while the count is below the
+        threshold so transient failures retry with bounded backoff,
+      - transitions the run to a terminal `failed` state once the threshold is
+        hit, ending the reclaim crash loop with a diagnosable error.
+
+    Returns a dict with `action` in {'released', 'terminalized', 'already_terminal'}.
+    """
+    run = db.session.get(AutomationRun, run_id)
+    if run is None:
+        raise ValueError('Run not found')
+
+    if run.status in {'completed', 'failed', 'stopped'}:
+        return {'action': 'already_terminal', 'status': run.status}
+
+    if run.worker_id and worker_id and run.worker_id != worker_id:
+        raise ValueError('Run is leased by another worker')
+    if lease_token and run.lease_token and run.lease_token != lease_token:
+        raise ValueError('Run lease token is no longer valid')
+
+    now = _utcnow()
+    threshold = max_reclaim_failures_for_run(run)
+    if run.reclaim_failure_fingerprint == fingerprint:
+        run.reclaim_failure_count = (run.reclaim_failure_count or 0) + 1
+    else:
+        run.reclaim_failure_fingerprint = fingerprint
+        run.reclaim_failure_count = 1
+    run.reclaim_failure_attempt = attempt_number if attempt_number is not None else run.attempt_count
+    run.reclaim_failure_stage = stage
+    run.reclaim_failure_error = error
+    run.reclaim_failure_at = now
+
+    append_run_event(
+        run,
+        'worker_infrastructure_failure',
+        {
+            'stage': stage,
+            'fingerprint': fingerprint,
+            'attempt_number': run.reclaim_failure_attempt,
+            'count': run.reclaim_failure_count,
+            'threshold': threshold,
+            'error': error,
+            'semantic_key': f'infra:{stage}:{fingerprint}',
+            'reporter_worker_id': worker_id,
+            'reported_with_lease_token': bool(lease_token),
+        },
+        dedupe_key=f'worker_infrastructure_failure:{run.id}:{fingerprint}:attempt:{run.reclaim_failure_attempt}',
+    )
+
+    if run.reclaim_failure_count >= threshold:
+        run.status = 'failed'
+        run.error_text = (
+            f'infrastructure_failure_reclaim_loop:'
+            f'stage:{stage}:fingerprint:{fingerprint}:'
+            f'count:{run.reclaim_failure_count}:attempt:{run.reclaim_failure_attempt}'
+        )
+        run.finished_at = now
+        run.lease_expires_at = now
+        run.lease_token = None
+        run.worker_id = None
+        run.heartbeat_at = now
+        db.session.commit()
+        return {
+            'action': 'terminalized',
+            'status': 'failed',
+            'count': run.reclaim_failure_count,
+            'threshold': threshold,
+        }
+
+    run.status = 'queued'
+    run.worker_id = None
+    run.lease_token = None
+    run.heartbeat_at = None
+    run.lease_expires_at = None
+    db.session.commit()
+    return {
+        'action': 'released',
+        'status': 'queued',
+        'count': run.reclaim_failure_count,
+        'threshold': threshold,
+    }
 
 
 def lease_is_expired(run, at=None):
@@ -3852,6 +3994,24 @@ def run_debug_summary(run_id):
         
     if run.claim_failure_reason:
         stuck_reasons.append('worker_claim_failure')
+
+    reclaim_failure = None
+    if run.reclaim_failure_fingerprint:
+        reclaim_threshold = max_reclaim_failures_for_run(run)
+        reclaim_failure = {
+            'fingerprint': run.reclaim_failure_fingerprint,
+            'count': run.reclaim_failure_count,
+            'threshold': reclaim_threshold,
+            'last_attempt': run.reclaim_failure_attempt,
+            'stage': run.reclaim_failure_stage,
+            'error': run.reclaim_failure_error,
+            'last_at': run.reclaim_failure_at.isoformat() if run.reclaim_failure_at else None,
+            'terminal': run.reclaim_failure_count >= reclaim_threshold,
+        }
+        if run.reclaim_failure_count >= reclaim_threshold:
+            stuck_reasons.append('reclaim_failure_threshold_reached')
+        else:
+            stuck_reasons.append('worker_infrastructure_failure')
         
     if run.status == 'claimed' and run.lease_expires_at and now >= run.lease_expires_at:
         stuck_reasons.append('claimed_lease_expired')
@@ -3906,6 +4066,7 @@ def run_debug_summary(run_id):
         'status': run.status,
         'last_event': last_event,
         'lease': lease_summary,
+        'reclaim_failure': reclaim_failure,
         'worker': {
             'id': worker.worker_id if worker else None,
             'last_heartbeat_at': worker.last_heartbeat_at.isoformat() if worker and worker.last_heartbeat_at else None,

@@ -29,9 +29,12 @@ from models import (
 from services.automation_service import (
     AUTOMATION_SNAPSHOT_SCHEMA_VERSION,
     CloneRetrievalPreflightError,
+    InfrastructureFailureThresholdError,
     claim_run_for_worker,
     create_snapshot_for_scenario,
     ensure_worker_lease,
+    max_reclaim_failures_for_run,
+    record_worker_infrastructure_failure,
     reserve_run_lease,
     release_run_lease,
 )
@@ -39,7 +42,7 @@ from services.automation_service import lease_is_expired
 from services.character_service import update_character_relations
 
 
-class AutomationConcurrencyTest(unittest.TestCase):
+class _AutomationConcurrencyBase(unittest.TestCase):
     def setUp(self):
         self.temp_dir = tempfile.TemporaryDirectory()
         self.old_root_path = app.root_path
@@ -140,6 +143,9 @@ class AutomationConcurrencyTest(unittest.TestCase):
             run_id = run.id
             db.session.commit()
             return run_id
+
+
+class AutomationConcurrencyTest(_AutomationConcurrencyBase):
 
     # ── Atomic-claim behaviour tests ──────────────────────────────
 
@@ -665,6 +671,188 @@ class AutomationConcurrentClaimTest(unittest.TestCase):
         with test_app.app_context():
             run = db.session.get(AutomationRun, run_id)
             self.assertEqual(run.status, 'completed')
+
+
+# ── Bounded infrastructure-failure reclaim tests (issue #131) ───────────────
+
+class InfrastructureFailureReclaimTest(_AutomationConcurrencyBase):
+    """Repeated identical control-plane failures must terminalize the run at a
+    configured threshold instead of allowing unbounded claim/restart reclaims."""
+
+    def test_transient_infrastructure_failure_releases_lease_for_bounded_retry(self):
+        run_id = self._create_scenario_and_run()
+        fingerprint = 'fetch_run:/api/automation/runs/1:http:500'
+        with app.app_context():
+            run = db.session.get(AutomationRun, run_id)
+            claim_run_for_worker(run, 'worker-a')
+            run = db.session.get(AutomationRun, run_id)
+            result = record_worker_infrastructure_failure(
+                run_id, 'worker-a', run.lease_token,
+                stage='fetch_run', fingerprint=fingerprint,
+                error='HTTP 500: internal failure', attempt_number=1,
+            )
+            self.assertEqual(result['action'], 'released')
+            self.assertEqual(result['count'], 1)
+
+            run = db.session.get(AutomationRun, run_id)
+            self.assertEqual(run.status, 'queued')
+            self.assertIsNone(run.worker_id)
+            self.assertIsNone(run.lease_token)
+            self.assertEqual(run.reclaim_failure_count, 1)
+            self.assertEqual(run.reclaim_failure_fingerprint, fingerprint)
+            self.assertEqual(run.reclaim_failure_attempt, 1)
+            self.assertEqual(run.reclaim_failure_stage, 'fetch_run')
+
+    def test_repeated_identical_failures_terminalize_at_threshold(self):
+        run_id = self._create_scenario_and_run()
+        fingerprint = 'fetch_run:/api/automation/runs/1:http:500'
+        with app.app_context():
+            threshold = max_reclaim_failures_for_run(db.session.get(AutomationRun, run_id))
+            self.assertEqual(threshold, 5)
+
+        for attempt in range(1, 6):
+            with app.app_context():
+                run = db.session.get(AutomationRun, run_id)
+                claim_run_for_worker(run, f'worker-{attempt}')
+                run = db.session.get(AutomationRun, run_id)
+                result = record_worker_infrastructure_failure(
+                    run_id, f'worker-{attempt}', run.lease_token,
+                    stage='fetch_run', fingerprint=fingerprint,
+                    error='HTTP 500: internal failure', attempt_number=attempt,
+                )
+                if attempt < 5:
+                    self.assertEqual(result['action'], 'released')
+                else:
+                    self.assertEqual(result['action'], 'terminalized')
+
+        with app.app_context():
+            run = db.session.get(AutomationRun, run_id)
+            self.assertEqual(run.status, 'failed')
+            self.assertEqual(run.reclaim_failure_count, 5)
+            self.assertEqual(run.reclaim_failure_attempt, 5)
+            self.assertIn('infrastructure_failure_reclaim_loop', run.error_text or '')
+            self.assertIn(fingerprint, run.error_text or '')
+            self.assertIsNone(run.lease_token)
+            self.assertIsNone(run.worker_id)
+            self.assertTrue(run.finished_at is not None)
+
+    def test_different_fingerprint_resets_consecutive_count(self):
+        run_id = self._create_scenario_and_run()
+        with app.app_context():
+            run = db.session.get(AutomationRun, run_id)
+            claim_run_for_worker(run, 'worker-a')
+            run = db.session.get(AutomationRun, run_id)
+            record_worker_infrastructure_failure(
+                run_id, 'worker-a', run.lease_token, stage='fetch_run',
+                fingerprint='fetch_run:/api/automation/runs/1:http:500',
+                error='HTTP 500', attempt_number=1,
+            )
+            run = db.session.get(AutomationRun, run_id)
+            claim_run_for_worker(run, 'worker-b')
+            run = db.session.get(AutomationRun, run_id)
+            record_worker_infrastructure_failure(
+                run_id, 'worker-b', run.lease_token, stage='heartbeat',
+                fingerprint='heartbeat:/api/automation/runs/1:http:503',
+                error='HTTP 503', attempt_number=2,
+            )
+            run = db.session.get(AutomationRun, run_id)
+            self.assertEqual(run.reclaim_failure_count, 1)
+            self.assertEqual(run.reclaim_failure_fingerprint, 'heartbeat:/api/automation/runs/1:http:503')
+
+    def test_reserve_run_lease_refuses_reclaim_after_threshold(self):
+        run_id = self._create_scenario_and_run()
+        with app.app_context():
+            run = db.session.get(AutomationRun, run_id)
+            run.status = 'running'
+            run.lease_expires_at = utcnow() - timedelta(seconds=5)
+            run.reclaim_failure_fingerprint = 'fetch_run:/api/automation/runs/1:http:500'
+            run.reclaim_failure_count = 5
+            db.session.commit()
+
+            with self.assertRaises(InfrastructureFailureThresholdError):
+                reserve_run_lease(run_id, 'worker-b', utcnow())
+
+    def test_each_failed_attempt_is_durably_observable(self):
+        run_id = self._create_scenario_and_run()
+        fingerprint = 'fetch_run:/api/automation/runs/1:http:500'
+        with app.app_context():
+            for attempt in range(1, 4):
+                run = db.session.get(AutomationRun, run_id)
+                claim_run_for_worker(run, f'worker-{attempt}')
+                run = db.session.get(AutomationRun, run_id)
+                record_worker_infrastructure_failure(
+                    run_id, f'worker-{attempt}', run.lease_token,
+                    stage='fetch_run', fingerprint=fingerprint,
+                    error='HTTP 500', attempt_number=attempt,
+                )
+            events = (
+                AutomationRunEvent.query
+                .filter_by(run_id=run_id, event_type='worker_infrastructure_failure')
+                .order_by(AutomationRunEvent.sequence_number.asc())
+                .all()
+            )
+            self.assertEqual(len(events), 3)
+            self.assertEqual([e.attempt_number for e in events], [1, 2, 3])
+            self.assertEqual([e.payload_json.get('count') for e in events], [1, 2, 3])
+            self.assertEqual([e.payload_json.get('fingerprint') for e in events], [fingerprint] * 3)
+            self.assertEqual(len({e.dedupe_key for e in events}), 3)
+
+    def test_worker_error_route_releases_lease(self):
+        run_id = self._create_scenario_and_run()
+        with app.app_context():
+            run = db.session.get(AutomationRun, run_id)
+            claim_run_for_worker(run, 'worker-a')
+            run = db.session.get(AutomationRun, run_id)
+            lease_token = run.lease_token
+
+        resp = self.client.post(
+            f'/api/automation/runs/{run_id}/worker-error',
+            headers=self.headers,
+            json={
+                'worker_id': 'worker-a',
+                'lease_token': lease_token,
+                'stage': 'fetch_run',
+                'fingerprint': 'fetch_run:/api/automation/runs/1:http:500',
+                'error': 'HTTP 500',
+                'attempt_number': 1,
+            },
+        )
+        self.assertEqual(resp.status_code, 200)
+        self.assertEqual(resp.get_json()['result']['action'], 'released')
+        with app.app_context():
+            run = db.session.get(AutomationRun, run_id)
+            self.assertEqual(run.status, 'queued')
+            self.assertEqual(run.reclaim_failure_count, 1)
+
+    def test_worker_error_route_rejects_stale_lease_token(self):
+        run_id = self._create_scenario_and_run()
+        with app.app_context():
+            run = db.session.get(AutomationRun, run_id)
+            claim_run_for_worker(run, 'worker-a')
+            run = db.session.get(AutomationRun, run_id)
+            token_a = run.lease_token
+            run.lease_expires_at = utcnow() - timedelta(seconds=5)
+            db.session.commit()
+            run = db.session.get(AutomationRun, run_id)
+            claim_run_for_worker(run, 'worker-b')
+
+        resp = self.client.post(
+            f'/api/automation/runs/{run_id}/worker-error',
+            headers=self.headers,
+            json={
+                'worker_id': 'worker-a',
+                'lease_token': token_a,
+                'stage': 'fetch_run',
+                'fingerprint': 'x:http:500',
+                'error': 'HTTP 500',
+                'attempt_number': 1,
+            },
+        )
+        self.assertEqual(resp.status_code, 409)
+        with app.app_context():
+            run = db.session.get(AutomationRun, run_id)
+            self.assertEqual(run.worker_id, 'worker-b')
+            self.assertIsNone(run.reclaim_failure_fingerprint)
 
 
 if __name__ == '__main__':

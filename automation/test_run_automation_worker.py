@@ -2048,5 +2048,171 @@ class ProposalResolutionTests(unittest.TestCase):
         self.assertEqual(complete_run.call_args.kwargs['error_text'], 'state_critical_proposal_no_resolver')
 
 
+class InfrastructureFailureBoundedReclaimTest(unittest.TestCase):
+    """Issue #131: repeated identical control-plane failures must not cause
+    unbounded run reclaims. A worker that aborts outside gameplay reports a
+    stable failure fingerprint; the server releases for bounded retry or
+    terminalizes at the threshold."""
+
+    def _args(self, **overrides):
+        defaults = dict(
+            api_base='http://127.0.0.1:5889',
+            owner_api_key='owner-key',
+            worker_id='test-worker',
+            max_minutes=None,
+            idle_timeout=180.0,
+            heartbeat_interval=999.0,
+            poll_interval=0.01,
+            max_turns=50,
+            dm_response_timeout=60.0,
+            message_window=16,
+            model='test-model',
+            init_lease_seconds=900,
+            session_start_timeout=900,
+        )
+        defaults.update(overrides)
+        return SimpleNamespace(**defaults)
+
+    def _claim_payload(self, attempt_count=33):
+        return {
+            'run': {'id': 2, 'attempt_count': attempt_count, 'runner_config': {}},
+            'lease_token': 'lease-1',
+            'derived_campaign': {'id': 100003},
+            'latest_session': {
+                'id': 4,
+                'is_active': True,
+                'messages': [{'id': 410, 'role': 'dm', 'content': 'Opening scene.'}],
+            },
+            'gameplay_readiness': {'campaign_ready': True},
+            'roster': [],
+        }
+
+    def test_control_plane_fingerprint_groups_identical_http_500(self):
+        exc = worker.ApiError('GET http://127.0.0.1:5889/api/automation/runs/2 -> HTTP 500: Internal Server Error')
+        fingerprint = worker.control_plane_fingerprint('execute_run', exc)
+        self.assertEqual(fingerprint, 'execute_run:/api/automation/runs/2:http:500')
+        same_body_differs = worker.ApiError('GET http://127.0.0.1:5889/api/automation/runs/2 -> HTTP 500: another body')
+        self.assertEqual(
+            fingerprint,
+            worker.control_plane_fingerprint('execute_run', same_body_differs),
+        )
+
+    def test_control_plane_fingerprint_falls_back_to_exception_type(self):
+        exc = RuntimeError('boom')
+        self.assertEqual(
+            worker.control_plane_fingerprint('fetch_run', exc),
+            'fetch_run:unknown:RuntimeError',
+        )
+
+    def test_report_infrastructure_failure_posts_with_fingerprint_and_attempt(self):
+        args = self._args()
+        exc = worker.ApiError('GET http://127.0.0.1:5889/api/automation/runs/2 -> HTTP 500: boom')
+        with patch.object(worker, 'api_post', return_value={'result': {'action': 'released'}}) as post:
+            worker.report_infrastructure_failure(args, 2, 'lease-1', 'execute_run', exc, 33)
+
+        post.assert_called_once()
+        call = post.call_args
+        self.assertEqual(call.args[1], '/api/automation/runs/2/worker-error')
+        body = call.args[2]
+        self.assertEqual(body['worker_id'], 'test-worker')
+        self.assertEqual(body['lease_token'], 'lease-1')
+        self.assertEqual(body['stage'], 'execute_run')
+        self.assertEqual(body['attempt_number'], 33)
+        self.assertEqual(body['fingerprint'], 'execute_run:/api/automation/runs/2:http:500')
+        self.assertEqual(body['error'], str(exc))
+
+    def test_report_infrastructure_failure_tolerates_unreachable_control_plane(self):
+        args = self._args()
+        exc = worker.ApiError('GET http://127.0.0.1:5889/api/automation/runs/2 -> HTTP 500: boom')
+        with patch.object(worker, 'api_post', side_effect=worker.ApiError('POST http://127.0.0.1:5889/api/automation/runs/2/worker-error -> HTTP 500: down')):
+            result = worker.report_infrastructure_failure(args, 2, 'lease-1', 'execute_run', exc, 33)
+        self.assertIsNone(result)
+
+    def test_execute_run_reports_control_plane_fetch_failure_instead_of_dying(self):
+        """Reproduce Run 42's claim/start/HTTP 500 loop at the top-of-loop
+        fetch_run: the worker must report the infrastructure failure and return
+        cleanly instead of letting ApiError escape and kill the process."""
+        args = self._args()
+        claim_payload = self._claim_payload(attempt_count=33)
+        initial_session = claim_payload['latest_session']
+        api_error = worker.ApiError('GET http://127.0.0.1:5889/api/automation/runs/2 -> HTTP 500: internal failure')
+
+        with patch.object(worker, 'claim_run', return_value=claim_payload), \
+                patch.object(worker, 'heartbeat', return_value={'run': {'lease_token': 'lease-1'}}), \
+                patch.object(worker, 'ensure_campaign_initialized', return_value=(initial_session, {'world': {'world_state': {}}})), \
+                patch.object(worker, 'build_manifest_for_run', return_value={'session': {'id': 4}}), \
+                patch.object(worker, 'append_event'), \
+                patch.object(worker, 'fetch_run', side_effect=api_error), \
+                patch.object(worker, 'report_infrastructure_failure') as report, \
+                patch.object(worker.time, 'sleep'):
+            finished = worker.execute_run(args, 2)
+
+        self.assertTrue(finished)
+        report.assert_called_once()
+        self.assertEqual(report.call_args.args[1], 2)
+        self.assertEqual(report.call_args.args[2], 'lease-1')
+        self.assertEqual(report.call_args.args[3], 'execute_run')
+        self.assertEqual(report.call_args.args[4], api_error)
+        self.assertEqual(report.call_args.args[5], 33)
+
+    def test_main_survives_control_plane_error_and_reports_claim_stage(self):
+        args = self._args(run_id=None, once=True)
+        api_error = worker.ApiError('GET http://127.0.0.1:5889/api/automation/runs/5 -> HTTP 500: boom')
+        with patch.object(worker, 'parse_args', return_value=args), \
+                patch.object(worker, 'list_candidate_run_ids', return_value=[5]), \
+                patch.object(worker, 'execute_run', side_effect=api_error), \
+                patch.object(worker, 'report_infrastructure_failure') as report:
+            worker.main()
+
+        report.assert_called_once()
+        self.assertEqual(report.call_args.args[1], 5)
+        self.assertIsNone(report.call_args.args[2])
+        self.assertEqual(report.call_args.args[3], 'claim')
+
+    def test_after_dm_resume_probe_error_includes_attempt_in_dedupe_key(self):
+        """Every failed after_dm resume probe must be durably observable even
+        when every attempt shares the same semantic fingerprint."""
+        args = self._args()
+        initial_session = {
+            'id': 4,
+            'is_active': True,
+            'messages': [
+                {'id': 410, 'role': 'player', 'content': 'We continue.'},
+                {'id': 411, 'role': 'dm', 'content': 'A door creaks open.'},
+            ],
+        }
+        claim_payload = {
+            'run': {'id': 2, 'attempt_count': 3, 'runner_config': {'audit_pause_phases': []}},
+            'lease_token': 'lease-1',
+            'derived_campaign': {'id': 100003},
+            'latest_session': initial_session,
+            'gameplay_readiness': {'campaign_ready': True},
+            'roster': [],
+        }
+        stop_payload = {'run': {'status': 'stop_requested', 'error_text': 'done'}, 'latest_session': initial_session}
+
+        with patch.object(worker, 'claim_run', return_value=claim_payload), \
+                patch.object(worker, 'heartbeat', return_value={'run': {'lease_token': 'lease-1'}}), \
+                patch.object(worker, 'ensure_campaign_initialized', return_value=(initial_session, {'world': {'world_state': {}}})), \
+                patch.object(worker, 'build_manifest_for_run', return_value={'session': {'id': 4}}), \
+                patch.object(worker, 'append_event') as append_event, \
+                patch.object(worker.autonomous, 'find_latest_player_message_id', return_value=410), \
+                patch.object(worker.autonomous, 'fetch_dm_turn_status', side_effect=RuntimeError('boom')), \
+                patch.object(worker, 'fetch_run', return_value=stop_payload), \
+                patch.object(worker, 'complete_run') as complete_run, \
+                patch.object(worker.time, 'sleep'):
+            finished = worker.execute_run(args, 2)
+
+        self.assertTrue(finished)
+        probe = [call for call in append_event.call_args_list if call.args[5] == 'after_dm_resume_probe_error']
+        self.assertEqual(len(probe), 1)
+        self.assertEqual(probe[0].kwargs['dedupe_key'], 'after_dm_resume_probe_error:2:410:attempt:3')
+        self.assertEqual(probe[0].args[6]['attempt_number'], 3)
+        self.assertEqual(
+            probe[0].args[6]['semantic_key'],
+            'after_dm_resume_probe:2:410',
+        )
+
+
 if __name__ == '__main__':
     unittest.main()
