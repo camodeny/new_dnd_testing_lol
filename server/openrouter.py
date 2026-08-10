@@ -4174,9 +4174,27 @@ def _run_session_dm_loop(
                 'kind': 'draft_serialization_stay_silent',
                 'detail': 'A non-empty preserved visible draft must serialize through talk_to_player.',
             }
-        if resolver_repair_candidate is not None and finalizer_decision is not None:
-            repaired_packet = finalizer_decision.get('resolver_packet')
-            if finalizer_decision.get('mode') != 'speak':
+        if resolver_repair_candidate is not None:
+            repaired_packet = (
+                finalizer_decision.get('resolver_packet')
+                if isinstance(finalizer_decision, dict)
+                else None
+            )
+            if finalizer_decision is None:
+                outer_violation = finalizer_violation or _session_dm_finalizer_contract_violation(
+                    message.get('content') or ''
+                )
+                finalizer_violation = {
+                    'kind': 'invalid_resolver_packet',
+                    'detail': (
+                        'resolver-contract repair did not return a valid talk_to_player call: '
+                        f'{outer_violation.get("detail")}'
+                    ),
+                    'outer_finalizer_violation': outer_violation,
+                    'identity_commitment_required': resolver_repair_required,
+                    'fallback_decision': resolver_repair_candidate,
+                }
+            elif finalizer_decision.get('mode') != 'speak':
                 finalizer_decision = None
                 finalizer_violation = {
                     'kind': 'invalid_resolver_packet',

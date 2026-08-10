@@ -158,6 +158,23 @@ def dm_silent_tool_response(reason):
     }
 
 
+def dm_tool_response(name, arguments, call_id='call_tool'):
+    return {
+        'choices': [{
+            'message': {
+                'content': '',
+                'tool_calls': [{
+                    'id': call_id,
+                    'function': {
+                        'name': name,
+                        'arguments': json.dumps(arguments),
+                    },
+                }],
+            },
+        }],
+    }
+
+
 class DmToolsTest(unittest.TestCase):
     def setUp(self):
         self.env_patch = patch.dict(os.environ, {'GEMINI_EMBEDDINGS_ENABLED': 'false'}, clear=False)
@@ -531,6 +548,119 @@ class DmToolsTest(unittest.TestCase):
         self.assertEqual(result['commit_action_ids'], ['pending_action_1'])
         self.assertEqual(result['_pending_actions'], [staged_action])
         self.assertNotIn('resolver_packet', result)
+
+    def test_optional_resolver_repair_owns_invalid_outer_finalizers(self):
+        malformed = {
+            'entity_mentions': [{'entity': 'harlen_moss', 'mention': 'Harlen Moss'}],
+        }
+        staged_action = {
+            'id': 'pending_action_1',
+            'name': 'update_current_scene',
+            'args': {'scene_patch': {'location_name': "Widow's Lamp"}},
+            'preview': {'pending': True},
+        }
+        executed = []
+
+        def execute_tool(name, _args, audit):
+            executed.append(name)
+            audit['pending_action_buffer']['actions'].append(staged_action)
+            return {'pending_action_id': 'pending_action_1'}
+
+        initial_finalizer = dm_talk_tool_response(
+            "You reach the Widow's Lamp as its sign creaks overhead.",
+            resolver_packet=malformed,
+            commit_action_ids=['pending_action_1'],
+        )
+        with patch(
+            'openrouter._post_chat_normalized',
+            side_effect=[
+                _normalized_from_raw(dm_tool_response(
+                    'update_current_scene',
+                    {'scene_patch': {'location_name': "Widow's Lamp"}},
+                    'call_scene',
+                )),
+                _normalized_from_raw(initial_finalizer),
+                _normalized_from_raw({'choices': [{'message': {'content': 'Plain-text repair failure.'}}]}),
+                _normalized_from_raw(dm_tool_response(
+                    'search_campaign_memory',
+                    {'query': 'Harlen Moss'},
+                    'call_wrong_repair_tool',
+                )),
+            ],
+        ) as post_chat, patch(
+            'openrouter.get_session_preflight_decision',
+            return_value={
+                'dm_reply_mode': 'unknown',
+                'skip_spoiler_check': True,
+                'main_call_thinking': False,
+                'confidence': 'high',
+                'reason': 'Test preflight.',
+            },
+        ):
+            result = get_session_dm_response_with_tools(
+                {'protected_player_characters': [], 'private_output_terms': [], 'private_spoiler_items': []},
+                [],
+                [{'type': 'function', 'function': {'name': 'update_current_scene'}}],
+                execute_tool,
+                audit_context={'operation': 'session_dm_response'},
+                max_tool_rounds=1,
+            )
+
+        self.assertEqual(post_chat.call_count, 4)
+        self.assertEqual(executed, ['update_current_scene'])
+        self.assertEqual(result['content'], "You reach the Widow's Lamp as its sign creaks overhead.")
+        self.assertEqual(result['commit_action_ids'], ['pending_action_1'])
+        self.assertEqual(result['_pending_actions'], [staged_action])
+        self.assertNotIn('resolver_packet', result)
+
+    def test_required_resolver_repair_owns_invalid_outer_finalizers_and_fails_closed(self):
+        malformed_required = {
+            'entity_mentions': [{
+                'mention_ref': 'harlen_1',
+                'surface_form': 'Harlen Moss',
+                'identity_status': 'known_hidden',
+                'canonical_id': 'harlen_moss',
+            }],
+        }
+        with patch(
+            'openrouter._post_chat_normalized',
+            side_effect=[
+                _normalized_from_raw(dm_talk_tool_response(
+                    'Harlen lowers the lamp.',
+                    resolver_packet=malformed_required,
+                )),
+                _normalized_from_raw({'choices': [{'message': {'content': 'Plain-text repair failure.'}}]}),
+                _normalized_from_raw(dm_silent_tool_response('Incorrect repair silence.')),
+            ],
+        ) as post_chat:
+            result = get_session_dm_response_with_tools(
+                {'protected_player_characters': [], 'private_output_terms': [], 'private_spoiler_items': []},
+                [],
+                [],
+                lambda *_args, **_kwargs: {},
+                audit_context={
+                    'campaign_id': self.campaign.id,
+                    'operation': 'resolver_contract_required_test',
+                    'trace_id': 'session_dm:test:required-resolver-contract',
+                },
+                max_tool_rounds=0,
+            )
+
+        self.assertEqual(post_chat.call_count, 3)
+        self.assertEqual(result['mode'], 'silent')
+        self.assertIn('canonical identity metadata', result['reason'])
+        self.assertEqual(
+            CampaignAuditEvent.query.filter_by(event_type='resolver_contract_repair_requested').count(),
+            2,
+        )
+        self.assertEqual(
+            CampaignAuditEvent.query.filter_by(event_type='resolver_contract_repair_blocked').count(),
+            1,
+        )
+        self.assertEqual(
+            CampaignAuditEvent.query.filter_by(event_type='finalizer_contract_guard_retry').count(),
+            0,
+        )
 
     def test_malformed_required_resolver_packet_fails_closed_after_repair(self):
         malformed = {
