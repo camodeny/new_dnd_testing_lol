@@ -3,6 +3,18 @@
 import time
 
 
+TERMINAL_POST_TURN_STATUSES = {
+    'complete', 'reconciled', 'partial', 'failed', 'timed_out', 'error',
+}
+FAILED_POST_TURN_STATUSES = {'partial', 'failed', 'timed_out', 'error'}
+
+
+def dm_turn_post_turn_failed(status_dict):
+    if not isinstance(status_dict, dict):
+        return False
+    return str(status_dict.get('post_turn_status') or '').strip().lower() in FAILED_POST_TURN_STATUSES
+
+
 def dm_turn_has_visible_output(status_dict):
     if not isinstance(status_dict, dict):
         return False
@@ -20,7 +32,7 @@ def dm_turn_post_turn_resolved(status_dict):
         return True
 
     post_turn = str(status_dict.get('post_turn_status') or '').strip().lower()
-    if post_turn in {'complete', 'error'}:
+    if post_turn in TERMINAL_POST_TURN_STATUSES:
         return True
     if post_turn:
         return False

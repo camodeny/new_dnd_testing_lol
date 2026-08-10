@@ -181,6 +181,7 @@ def _run_recovery_finalization(campaign, session, task, player_content, dm_conte
         build_session_summary_finalize_context,
         redact_session_summary_private_terms,
     )
+    from services.audit_service import log_audit_event
     from models import db
 
     # 3. Deterministic clock repair BEFORE summary finalization so the running
@@ -217,6 +218,7 @@ def _run_recovery_finalization(campaign, session, task, player_content, dm_conte
                 'operation': 'session_summary_finalize_recovery',
                 'actor': 'session_summary_finalizer',
                 'trace_id': summary_trace_id,
+                'parent_trace_id': task.trace_id,
                 'trace_label': f'session_summary_finalizer recovery: session {session.id}',
             },
         )
@@ -235,6 +237,24 @@ def _run_recovery_finalization(campaign, session, task, player_content, dm_conte
     )
     session.running_summary = redacted
     db.session.commit()
+    log_audit_event(
+        campaign.id,
+        'summary_finalizer_applied',
+        'Committed the recovered post-turn running summary.',
+        {
+            'session_id': session.id,
+            'player_message_id': task.player_message_id,
+            'dm_message_id': task.dm_message_id,
+            'recovery_task_id': task.id,
+        },
+        source='memory_recovery',
+        actor='session_summary_finalizer',
+        trace_id=summary_trace_id,
+        parent_trace_id=task.trace_id,
+        trace_label=f'session_summary_finalizer recovery: session {session.id}',
+        audit_role='tools',
+        commit=True,
+    )
 
     # 5. Read-only semantic/state verification AFTER summary finalization.
     _verified, verify_incident = _verify_post_turn_state(

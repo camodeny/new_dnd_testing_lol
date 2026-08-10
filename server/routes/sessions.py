@@ -564,6 +564,23 @@ def _run_session_memory_update(
         )
         session.running_summary = redacted_summary
         db.session.commit()
+        log_audit_event(
+            campaign_id,
+            'summary_finalizer_applied',
+            'Committed the finalized post-turn running summary.',
+            {
+                'session_id': session_id,
+                'player_message_id': player_message_id,
+                'dm_message_id': dm_message_id,
+            },
+            source='session_memory',
+            actor='session_summary_finalizer',
+            trace_id=summary_finalize_trace_id,
+            parent_trace_id=parent_trace_id,
+            trace_label=summary_finalize_label,
+            audit_role='tools',
+            commit=True,
+        )
 
         # Read-only final consistency verification AFTER summary finalization.
         # It never mutates state; the finalized summary is semantically checked
@@ -748,46 +765,30 @@ def _post_turn_status_for_player(campaign_id, session_id, player_message_id):
             status['post_turn_revision'] = revision
         return status
 
-    consistency_incident = None
-    for row in (
-        CampaignAuditEvent.query
-        .filter_by(campaign_id=campaign_id, event_type='post_turn_consistency_incident')
-        .order_by(CampaignAuditEvent.id.desc())
-        .limit(32)
-        .all()
-    ):
-        try:
-            payload = json.loads(row.payload) if row.payload else {}
-        except (TypeError, ValueError):
-            payload = {}
-        if payload.get('player_message_id') == player_message_id:
-            consistency_incident = row
-            break
-    if consistency_incident is not None:
-        return _with_revision({
-            'post_turn_complete': True,
-            'post_turn_status': 'error',
-            'memory_status': 'complete',
-            'clock_status': 'complete',
-            'post_turn_error': 'Post-turn consistency incident: ' + (consistency_incident.summary or ''),
-        })
-
     from models import SessionDmTurn
 
-    # The durable SessionDmTurn row is authoritative once a memory-recovery retry
-    # has repaired it. Without this, a recovered turn would still report error
-    # forever because the original memory_update_error audit event persists.
+    # The durable row is the state machine. Audit events only supply committed
+    # write evidence to its canonical projection.
     turn = SessionDmTurn.query.filter_by(
         campaign_id=campaign_id,
         player_message_id=player_message_id,
     ).first()
-    if turn is not None and turn.post_turn_status == 'complete':
-        return _with_revision({
-            'post_turn_complete': True,
-            'post_turn_status': 'complete',
-            'memory_status': turn.memory_status or 'complete',
-            'clock_status': turn.clock_status or 'complete',
-        })
+    if turn is not None:
+        status = session_dm_turn_status_payload(player_message_id)
+        if status.get('post_turn_status') in {'partial', 'failed', 'timed_out'}:
+            from models import SessionMemoryRecoveryTask
+            pending_recovery = (
+                SessionMemoryRecoveryTask.query
+                .filter_by(campaign_id=campaign_id, player_message_id=player_message_id, status='pending')
+                .order_by(SessionMemoryRecoveryTask.id.desc())
+                .first()
+            )
+            status.update({
+                'recoverable': pending_recovery is not None,
+                'has_pending_recovery': pending_recovery is not None,
+                'recovery_task': {'id': pending_recovery.id} if pending_recovery else None,
+            })
+        return status
 
     memory_error = CampaignAuditEvent.query.filter_by(
         campaign_id=campaign_id,
@@ -817,10 +818,10 @@ def _post_turn_status_for_player(campaign_id, session_id, player_message_id):
             'recovery_task': {'id': pending_recovery.id} if pending_recovery else None,
         })
 
-    memory_applied = CampaignAuditEvent.query.filter_by(
-        campaign_id=campaign_id,
-        trace_id=memory_trace_id,
-        event_type='memory_patch_applied',
+    memory_applied = CampaignAuditEvent.query.filter(
+        CampaignAuditEvent.campaign_id == campaign_id,
+        CampaignAuditEvent.trace_id == memory_trace_id,
+        CampaignAuditEvent.event_type.in_(['memory_patch_applied', 'memory_patch_applied_v2']),
     ).order_by(CampaignAuditEvent.id.desc()).first()
     if memory_applied is None:
         return _with_revision({

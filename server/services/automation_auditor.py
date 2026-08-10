@@ -38,6 +38,7 @@ from services.automation_service import (
     submit_audit_cycle_feedback,
 )
 from services.character_service import character_full_dict
+from services.post_turn_state import state_for_turn
 
 
 AUDITOR_PROMPT_VERSION = 'automation_auditor_tool_loop_v4'
@@ -980,6 +981,9 @@ def _cycle_evidence_packet(run, cycle, args):
             )
         memory_log_rows = log_query.order_by(CampaignMemoryLog.id.desc()).limit(memory_log_limit).all()
 
+    turn = SessionDmTurn.query.filter_by(dm_message_id=cycle.dm_message_id).first() if cycle.dm_message_id else None
+    post_turn_state = state_for_turn(turn) if turn else None
+
     return {
         'run': {
             'id': run.id,
@@ -999,6 +1003,7 @@ def _cycle_evidence_packet(run, cycle, args):
             'dm_message_id': cycle.dm_message_id,
             'payload': cycle.payload_json or {},
         },
+        'post_turn_state': post_turn_state,
         'transcript_window': _transcript_focus_window(run, cycle, transcript_limit, max_message_id=boundaries.get("message_id")),
         'scene_state_summary': _scene_state_summary(world_payload),
         'running_summary': latest_session.running_summary if latest_session else None,
@@ -2060,6 +2065,7 @@ def get_evidence_gaps(run, cycle):
         
     turn = SessionDmTurn.query.filter_by(dm_message_id=cycle.dm_message_id).first()
     trace_id = turn.trace_id if turn else None
+    post_turn_state = state_for_turn(turn) if turn else None
     pcs = find_provider_calls_for_turn(run.id, trace_id)
     if not pcs:
         gaps.append({
@@ -2068,12 +2074,12 @@ def get_evidence_gaps(run, cycle):
             'severity': 'warn'
         })
         
-    has_memory_event = False
-    if trace_id:
+    has_memory_event = bool(post_turn_state and post_turn_state.get('durable_memory_write'))
+    if trace_id and not has_memory_event:
         has_memory_event = CampaignAuditEvent.query.filter_by(
             campaign_id=run.derived_campaign_id,
             trace_id=trace_id,
-            event_type='memory_patch'
+            event_type='memory_patch_applied_v2'
         ).first() is not None
         if not has_memory_event:
             has_memory_event = CampaignAuditEvent.query.filter(
@@ -2090,8 +2096,8 @@ def get_evidence_gaps(run, cycle):
             'severity': 'not_applicable_for_phase'
         })
         
-    has_clock_event = False
-    if trace_id:
+    has_clock_event = bool(post_turn_state and post_turn_state.get('durable_clock_write'))
+    if trace_id and not has_clock_event:
         has_clock_event = CampaignAuditEvent.query.filter(
             CampaignAuditEvent.campaign_id == run.derived_campaign_id,
             CampaignAuditEvent.trace_id == trace_id,
