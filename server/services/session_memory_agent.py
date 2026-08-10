@@ -21,6 +21,7 @@ from services.memory_resolver_schemas import (
     normalize_evidence_status,
     validate_diagnostics,
     validate_resolved_entity_refs_contract,
+    validate_resolver_packet,
 )
 from services.resolution_registry import (
     allocate_durable_id,
@@ -1193,7 +1194,7 @@ def compile_staged_memory_patch(memory_context, extracted, resolved):
         )
 
     resolver_packet = memory_context.get("resolver_packet") if isinstance(memory_context, dict) else None
-    if isinstance(resolver_packet, dict) and not isinstance(resolver_packet.get("entity_mentions"), list):
+    if resolver_packet is not None and not validate_resolver_packet(resolver_packet)[0]:
         resolver_packet = None
 
     prior_resolutions = fetch_prior_resolutions(campaign)

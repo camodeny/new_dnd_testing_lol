@@ -42,6 +42,10 @@ def commit_accepted_dm_turn(
     revalidated or persisted. Callers must not send the visible reply until this returns.
     """
     try:
+        if resolver_packet is not None:
+            ok, err = validate_resolver_packet(resolver_packet)
+            if not ok:
+                raise ValueError(f"Invalid resolver_packet in accepted DM turn: {err}")
         response_parts = normalize_response_parts(response_parts)
         rendered_content = render_visible_response_parts(response_parts)
         if content != rendered_content:
@@ -74,10 +78,7 @@ def commit_accepted_dm_turn(
                 parts_json=response_parts,
             )
         )
-        if isinstance(resolver_packet, dict):
-            ok, err = validate_resolver_packet(resolver_packet)
-            if not ok:
-                raise ValueError(f"Invalid resolver_packet in accepted DM turn: {err}")
+        if resolver_packet is not None:
             db.session.add(CampaignResolverPacket(
                 campaign_id=campaign.id,
                 session_id=session.id,

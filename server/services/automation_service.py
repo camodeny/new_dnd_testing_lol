@@ -64,6 +64,7 @@ CLONE_RETRIEVAL_PREFLIGHT_VERSION = 1
 MODEL_RETRY_TAXONOMY = {
     'provider_retry': 'Transient provider/transport retry recorded as model_retry.',
     'parse_repair': 'Structured-output parse repair recorded on a provider call.',
+    'resolver_contract_repair': 'Resolver-packet-only contract repair that preserves an accepted visible turn.',
     'contract_guard_retry': 'Finalizer contract retry that re-invokes the model.',
     'tool_repair': 'Tool-call or tool-output repair that re-invokes the model.',
     'guard_retry': 'Non-contract response guard retry that re-invokes the model.',
@@ -2508,6 +2509,8 @@ def collect_model_retry_metrics(audit_rows, provider_rows, *, run_status=None):
         kind = None
         if event_type == 'model_retry':
             kind = 'provider_retry'
+        elif event_type == 'resolver_contract_repair_requested':
+            kind = 'resolver_contract_repair'
         elif event_type == 'finalizer_contract_guard_retry':
             kind = 'contract_guard_retry'
         elif event_type.endswith('_guard_retry') and 'tool' in event_type:
