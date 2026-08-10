@@ -1292,20 +1292,38 @@ def build_session_clock_context(
     pending_completion_evidence = []
     allowed_evidence_sources = []
     allowed_evidence_keys = set()
+    current_player_row = _resolve_clock_transcript_message(campaign, player_message_id)
+    turn_started_at = current_player_row.created_at if current_player_row is not None else None
 
-    def allow_source(source_type, source_id):
+    def allow_source(source_type, source_id, chronology='historical_or_restated', occurred_at=None):
         if source_id in (None, ''):
             return
-        source = {'source_type': source_type, 'source_id': str(source_id)}
+        source = {
+            'source_type': source_type,
+            'source_id': str(source_id),
+            'chronology': chronology,
+        }
+        if occurred_at is not None:
+            source['occurred_at'] = occurred_at.isoformat()
         key = _clock_evidence_key(source)
         if key is not None and key not in allowed_evidence_keys:
             allowed_evidence_keys.add(key)
             allowed_evidence_sources.append(source)
 
-    allow_source('transcript_message', player_message_id)
-    allow_source('transcript_message', dm_message_id)
+    allow_source('transcript_message', player_message_id, 'current_turn')
+    allow_source('transcript_message', dm_message_id, 'current_turn')
     for event in recent_events:
-        allow_source('world_event', event.id)
+        event_is_current = bool(
+            turn_started_at is not None
+            and event.created_at is not None
+            and event.created_at >= turn_started_at
+        )
+        allow_source(
+            'world_event',
+            event.id,
+            'current_turn' if event_is_current else 'historical_or_restated',
+            event.created_at,
+        )
 
     clocks = CampaignClock.query.filter_by(campaign_id=campaign.id).order_by(CampaignClock.id.asc()).all()
     for clock in [clock for clock in clocks if (clock.status or 'active') in ACTIVE_CLOCK_STATUSES][:50]:
@@ -1319,6 +1337,7 @@ def build_session_clock_context(
             'visibility': clock.visibility,
             'summary': clock.summary,
             'trigger': clock.trigger,
+            'trigger_clauses': _clock_trigger_clauses(clock),
             'on_complete': clock.on_complete,
             'completion_criteria': clock.completion_criteria or [],
             'completion_state': completion_state,
@@ -2643,6 +2662,9 @@ def _tool_advance_clock(campaign, _current_user, args):
     }
     if upstream.get('clock_trigger_rule_id'):
         provenance['clock_trigger_rule_id'] = upstream['clock_trigger_rule_id']
+    for field in ('trigger_clause_id', 'chronology_verdict', 'new_evidence_ids', 'trigger_verdict'):
+        if upstream.get(field) is not None:
+            provenance[field] = upstream[field]
     event = _record_event(
         campaign,
         'clock_advanced',
@@ -4659,6 +4681,35 @@ def _clock_evidence_key(source):
     return source_type, str(source_id)
 
 
+def _clock_trigger_clauses(clock):
+    """Expose stable clause IDs without trying to parse narrative trigger prose."""
+    trigger = clean_text(clock.trigger, 420)
+    clauses = [{
+        'clause_id': 'declared_trigger' if trigger else 'visible_narrative_progress',
+        'description': trigger or 'Visible new progress or escalation matching this clock pressure.',
+        'allowed_deltas': [1, 2],
+    }]
+    clauses.append({
+        'clause_id': 'visible_prevention_or_relief',
+        'description': 'Visible new prevention, relief, or setback that reverses this clock pressure.',
+        'allowed_deltas': [-1, -2],
+    })
+    return clauses
+
+
+def _normalize_clock_trigger_verdict(value):
+    if not isinstance(value, dict):
+        return None
+    return {
+        'clause_id': clean_id(value.get('clause_id'), ''),
+        'verdict': clean_text(value.get('verdict'), 30).lower(),
+        'supported_claims': _normalize_clock_supported_claims(value.get('supported_claims')),
+        'evidence_sources': value.get('evidence_sources') if isinstance(value.get('evidence_sources'), list) else [],
+        'chronology_verdict': clean_text(value.get('chronology_verdict'), 40).lower(),
+        'reason': clean_text(value.get('reason'), 520),
+    }
+
+
 def _verified_clock_evidence_sources(
     campaign,
     evidence_sources,
@@ -4985,6 +5036,7 @@ def apply_clock_adjudication(
         'clock_changes': [],
         'world_event_ids': [],
         'no_change_explanations': [],
+        'rejected_advances': [],
         'errors': [],
     }
 
@@ -4998,6 +5050,32 @@ def apply_clock_adjudication(
     ]
     if allowed_evidence_sources is None:
         allowed_evidence_sources = transcript_evidence_sources
+
+    allowed_evidence_keys = {
+        key
+        for source in allowed_evidence_sources
+        if (key := _clock_evidence_key(source)) is not None
+    }
+    # Recompute chronology from durable turn IDs and timestamps. The
+    # adjudicator-facing chronology label is context, not authority.
+    current_turn_evidence_keys = set()
+    for source in transcript_evidence_sources:
+        key = _clock_evidence_key(source)
+        if key is not None:
+            current_turn_evidence_keys.add(key)
+
+    player_boundary = _resolve_clock_transcript_message(
+        campaign,
+        audit_context.get('source_player_message_id') or audit_context.get('player_message_id'),
+    )
+    if player_boundary is not None and player_boundary.created_at is not None:
+        for source in allowed_evidence_sources:
+            key = _clock_evidence_key(source)
+            if key is None or key[0] != 'world_event':
+                continue
+            event = _resolve_clock_world_event(campaign, key[1])
+            if event is not None and event.created_at is not None and event.created_at >= player_boundary.created_at:
+                current_turn_evidence_keys.add(key)
 
     def resolve_clock_reference(raw_clock_ref):
         clock_key = clean_id(raw_clock_ref, '')
@@ -5047,6 +5125,59 @@ def apply_clock_adjudication(
                 'reason': clean_text(item.get('reason'), 420) or 'Clock adjudicator returned no change.',
             })
             continue
+        trigger_verdict = _normalize_clock_trigger_verdict(item.get('trigger_verdict'))
+        trigger_clauses = {
+            clause['clause_id']: clause
+            for clause in _clock_trigger_clauses(clock)
+        }
+        evidence_gaps = []
+        verified_trigger_sources = []
+        rejected_trigger_sources = []
+        if trigger_verdict is None:
+            evidence_gaps.append('missing_structured_trigger_verdict')
+        else:
+            clause = trigger_clauses.get(trigger_verdict['clause_id'])
+            if clause is None:
+                evidence_gaps.append('unknown_trigger_clause')
+            elif delta not in clause['allowed_deltas']:
+                evidence_gaps.append('delta_does_not_match_trigger_clause')
+            if trigger_verdict['verdict'] != 'satisfied':
+                evidence_gaps.append('trigger_not_satisfied')
+            if trigger_verdict['chronology_verdict'] != 'new_current_turn':
+                evidence_gaps.append('evidence_not_new_current_turn')
+            if not trigger_verdict['supported_claims']:
+                evidence_gaps.append('missing_supported_claims')
+            if not trigger_verdict['evidence_sources']:
+                evidence_gaps.append('missing_evidence_sources')
+            else:
+                verified_trigger_sources, rejected_trigger_sources = _verified_clock_evidence_sources(
+                    campaign,
+                    trigger_verdict['evidence_sources'],
+                    clock.visibility or 'dm_private',
+                    allowed_evidence_keys,
+                )
+                if rejected_trigger_sources:
+                    evidence_gaps.append('unverified_evidence_sources')
+                verified_keys = {
+                    key for source in verified_trigger_sources
+                    if (key := _clock_evidence_key(source)) is not None
+                }
+                if verified_keys and not verified_keys.issubset(current_turn_evidence_keys):
+                    evidence_gaps.append('historical_or_restated_evidence')
+                if not verified_keys:
+                    evidence_gaps.append('no_verified_new_evidence')
+
+        if evidence_gaps:
+            diagnostic = {
+                'clock_id': clock_id,
+                'reason': 'Clock advance rejected: ' + ', '.join(dict.fromkeys(evidence_gaps)) + '.',
+                'evidence_gaps': list(dict.fromkeys(evidence_gaps)),
+                'trigger_verdict': trigger_verdict,
+                'rejected_evidence_sources': rejected_trigger_sources,
+            }
+            result['rejected_advances'].append(diagnostic)
+            result['no_change_explanations'].append(diagnostic)
+            continue
         raw_provenance = item.get('provenance') if isinstance(item.get('provenance'), dict) else {}
         provenance = {
             **raw_provenance,
@@ -5061,23 +5192,16 @@ def apply_clock_adjudication(
                 or audit_context.get('dm_message_id')
             ),
             'trace_id': raw_provenance.get('trace_id') or audit_context.get('trace_id'),
+            'trigger_clause_id': trigger_verdict['clause_id'],
+            'chronology_verdict': trigger_verdict['chronology_verdict'],
+            'new_evidence_ids': [source['source_id'] for source in verified_trigger_sources],
+            'trigger_verdict': {
+                **trigger_verdict,
+                'evidence_sources': verified_trigger_sources,
+            },
         }
-        combined_evidence_sources = []
-        seen_evidence_sources = set()
-        for source in [
-            *(raw_provenance.get('evidence_sources') or []),
-            *transcript_evidence_sources,
-        ]:
-            if not isinstance(source, (dict, str, int)):
-                continue
-            dedupe_key = json.dumps(source, sort_keys=True) if isinstance(source, dict) else str(source)
-            if dedupe_key in seen_evidence_sources:
-                continue
-            seen_evidence_sources.add(dedupe_key)
-            combined_evidence_sources.append(source)
-        if combined_evidence_sources:
-            provenance['evidence_sources'] = combined_evidence_sources
-            provenance['evidence_status'] = determine_evidence_status(combined_evidence_sources)
+        provenance['evidence_sources'] = verified_trigger_sources
+        provenance['evidence_status'] = determine_evidence_status(verified_trigger_sources)
         change = _tool_advance_clock(campaign, None, {
             'clock_id': clock_id,
             'delta': delta,

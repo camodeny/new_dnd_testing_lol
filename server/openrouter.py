@@ -300,7 +300,10 @@ SESSION_CLOCK_ADJUDICATOR_SYSTEM_PROMPT = (
     "Do not emit delta 0. Do not advance unrelated clocks. "
     "If a new pressure is already underway, prefer creating the new clock with filled set to 1 instead of 0. "
     "Do not create a new clock if an existing active clock already covers the same pressure. "
-    "Each advance_clocks item must include clock_id, delta, reason, and evidence. "
+    "Each advance_clocks item must include clock_id, delta, reason, evidence, and one structured trigger_verdict. "
+    "The trigger_verdict must name exactly one supplied trigger clause, use verdict satisfied, and include atomic supported_claims, explicit evidence_sources, chronology_verdict new_current_turn, and a concise reason. "
+    "Only newly occurring current-turn evidence can satisfy a trigger. Historical facts, background state, prior failures, restatements, and disclosures about existing severity have chronology_verdict historical_or_restated and cannot advance a clock. A disclosure can advance only when the declared trigger clause explicitly permits disclosure. "
+    "Use chronology_verdict ambiguous when the timing or whether an event is new cannot be established; ambiguous proposals must be no-change explanations, not advances. Cite every source needed by a multi-source trigger. Visible prevention or relief may use its supplied prevention clause with a negative delta. "
     "You are the semantic adjudicator for clock completion; the application will validate source existence and visibility but will not reinterpret prose. "
     "Treat rumors, suspicions, hypotheticals, attributed claims, partial support, contradictions, and ambiguous subject-role-location bindings as uncertain or not_met, never as confirmed facts. "
     "A clock with completion_criteria may reach its final segment but must not be retired until every criterion is visibly supported. "
@@ -3713,6 +3716,12 @@ def build_session_clock_adjudication_messages(clock_context):
                     'evidence_source_types': ['transcript_message', 'world_event'],
                     'fail_closed': True,
                 },
+                'advance_contract': {
+                    'trigger_verdicts': ['satisfied', 'not_satisfied', 'uncertain'],
+                    'chronology_verdicts': ['new_current_turn', 'historical_or_restated', 'ambiguous'],
+                    'require_new_evidence': True,
+                    'fail_closed': True,
+                },
             }, ensure_ascii=False),
         },
     ]
@@ -5095,6 +5104,25 @@ _CLOCK_CONSEQUENCE_VERDICT_SCHEMA = {
     },
     'additionalProperties': False,
 }
+_CLOCK_TRIGGER_VERDICT_SCHEMA = {
+    'type': 'object',
+    'required': [
+        'clause_id', 'verdict', 'supported_claims', 'evidence_sources',
+        'chronology_verdict', 'reason',
+    ],
+    'properties': {
+        'clause_id': {'type': 'string'},
+        'verdict': {'type': 'string', 'enum': ['satisfied', 'not_satisfied', 'uncertain']},
+        'supported_claims': {'type': 'array', 'minItems': 1, 'items': {'type': 'string'}},
+        'evidence_sources': {'type': 'array', 'minItems': 1, 'items': _CLOCK_EVIDENCE_SOURCE_SCHEMA},
+        'chronology_verdict': {
+            'type': 'string',
+            'enum': ['new_current_turn', 'historical_or_restated', 'ambiguous'],
+        },
+        'reason': {'type': 'string'},
+    },
+    'additionalProperties': False,
+}
 SESSION_MEMORY_CLOCKS_FINALIZER_TOOL = {
     'type': 'function',
     'function': {
@@ -5105,7 +5133,24 @@ SESSION_MEMORY_CLOCKS_FINALIZER_TOOL = {
             'required': ['create_clocks', 'advance_clocks', 'retire_clocks', 'no_change_explanations'],
             'properties': {
                 'create_clocks': {'type': 'array', 'items': {'type': 'object'}, 'description': 'Clocks to create.'},
-                'advance_clocks': {'type': 'array', 'items': {'type': 'object'}, 'description': 'Existing clocks to advance.'},
+                'advance_clocks': {
+                    'type': 'array',
+                    'items': {
+                        'type': 'object',
+                        'required': ['clock_id', 'delta', 'reason', 'evidence', 'trigger_verdict'],
+                        'properties': {
+                            'clock_id': {'type': 'string'},
+                            'delta': {'type': 'integer', 'enum': [-2, -1, 1, 2]},
+                            'reason': {'type': 'string'},
+                            'evidence': {'type': 'array', 'items': {'type': 'string'}},
+                            'trigger_verdict': _CLOCK_TRIGGER_VERDICT_SCHEMA,
+                            'status': {'type': 'string'},
+                            'provenance': {'type': 'object'},
+                        },
+                        'additionalProperties': False,
+                    },
+                    'description': 'Existing clocks to advance only after a declared trigger is satisfied by new current-turn evidence.',
+                },
                 'retire_clocks': {
                     'type': 'array',
                     'items': {
@@ -5694,6 +5739,18 @@ def get_session_clock_updates(clock_context, audit_context=None):
                 'Clock adjudication did not cover active clocks: '
                 + ', '.join(sorted(missing_clock_ids))
             )
+        for item in data['advance_clocks'] if validation_error is None else []:
+            trigger_verdict = item.get('trigger_verdict') if isinstance(item, dict) else None
+            if not isinstance(trigger_verdict, dict):
+                validation_error = 'Every clock advance requires a structured trigger verdict.'
+                break
+            required_trigger_fields = {
+                'clause_id', 'verdict', 'supported_claims', 'evidence_sources',
+                'chronology_verdict', 'reason',
+            }
+            if not required_trigger_fields.issubset(trigger_verdict):
+                validation_error = 'Clock advance trigger verdict is missing required fields.'
+                break
 
     if validation_error:
         if campaign_id:

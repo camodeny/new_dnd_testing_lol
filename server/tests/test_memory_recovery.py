@@ -17,6 +17,7 @@ from models import (
     CampaignWorld,
     Character,
     NPCActor,
+    SessionMessage,
     SessionDmTurn,
     SessionMemoryRecoveryTask,
     User,
@@ -33,6 +34,20 @@ from services.session_memory_agent import MemoryPipelineError, compile_staged_me
 from services.dm_tools import apply_compiled_session_memory_patch
 from services.dm_turns import mark_session_dm_turn_error
 from services.memory_resolver_schemas import SOURCE_CONTRACT_COMPILED_V2
+
+
+def _trigger_verdict(*source_ids):
+    return {
+        "clause_id": "visible_narrative_progress",
+        "verdict": "satisfied",
+        "supported_claims": ["The party visibly changed the clock pressure this turn."],
+        "evidence_sources": [
+            {"source_type": "transcript_message", "source_id": str(source_id)}
+            for source_id in source_ids
+        ],
+        "chronology_verdict": "new_current_turn",
+        "reason": "The current exchange visibly changes the pressure.",
+    }
 
 
 class SessionMemoryRelationEndpointTest(unittest.TestCase):
@@ -522,6 +537,9 @@ class SessionMemoryRecoveryTaskTest(unittest.TestCase):
 
         self.session = CampaignSession(campaign_id=self.campaign.id)
         db.session.add(self.session)
+        db.session.flush()
+        db.session.add(SessionMessage(id=7, session_id=self.session.id, role="user", content="We free the trapped crewman."))
+        db.session.add(SessionMessage(id=8, session_id=self.session.id, role="assistant", content="The crewman reaches safety."))
         db.session.commit()
 
     def tearDown(self):
@@ -614,7 +632,10 @@ class SessionMemoryRecoveryTaskTest(unittest.TestCase):
 
         with mock.patch(
             "services.dm_tools.build_session_clock_context",
-            return_value={"allowed_evidence_sources": []},
+            return_value={"allowed_evidence_sources": [
+                {"source_type": "transcript_message", "source_id": "7", "chronology": "current_turn"},
+                {"source_type": "transcript_message", "source_id": "8", "chronology": "current_turn"},
+            ]},
         ), mock.patch(
             "openrouter.get_session_clock_updates",
             return_value={"advance_clocks": [], "retire_clocks": [], "create_clocks": []},
@@ -703,11 +724,20 @@ class SessionMemoryRecoveryTaskTest(unittest.TestCase):
 
         with mock.patch(
             "services.dm_tools.build_session_clock_context",
-            return_value={"allowed_evidence_sources": []},
+            return_value={"allowed_evidence_sources": [
+                {"source_type": "transcript_message", "source_id": "7", "chronology": "current_turn"},
+                {"source_type": "transcript_message", "source_id": "8", "chronology": "current_turn"},
+            ]},
         ) as clock_context_mock, mock.patch(
             "openrouter.get_session_clock_updates",
             return_value={"advance_clocks": [
-                {"clock_id": "trapped_ferrymen", "delta": 1, "reason": "The party freed a trapped crewman."},
+                {
+                    "clock_id": "trapped_ferrymen",
+                    "delta": 1,
+                    "reason": "The party freed a trapped crewman.",
+                    "evidence": ["The crewman reached safety."],
+                    "trigger_verdict": _trigger_verdict(7, 8),
+                },
             ]},
         ) as clock_updates_mock, mock.patch(
             "routes.sessions._repair_post_turn_clocks",
@@ -1048,11 +1078,20 @@ class SessionMemoryRecoveryTaskTest(unittest.TestCase):
 
         with mock.patch(
             "services.dm_tools.build_session_clock_context",
-            return_value={"allowed_evidence_sources": []},
+            return_value={"allowed_evidence_sources": [
+                {"source_type": "transcript_message", "source_id": "7", "chronology": "current_turn"},
+                {"source_type": "transcript_message", "source_id": "8", "chronology": "current_turn"},
+            ]},
         ), mock.patch(
             "openrouter.get_session_clock_updates",
             return_value={"advance_clocks": [
-                {"clock_id": "trapped_ferrymen", "delta": 1, "reason": "The party freed a trapped crewman."},
+                {
+                    "clock_id": "trapped_ferrymen",
+                    "delta": 1,
+                    "reason": "The party freed a trapped crewman.",
+                    "evidence": ["The crewman reached safety."],
+                    "trigger_verdict": _trigger_verdict(7, 8),
+                },
             ]},
         ), mock.patch(
             "routes.sessions._repair_post_turn_clocks",

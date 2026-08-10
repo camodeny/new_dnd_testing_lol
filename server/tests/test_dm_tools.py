@@ -226,6 +226,19 @@ class DmToolsTest(unittest.TestCase):
         db.session.commit()
         return message_id
 
+    def _trigger_verdict(self, *source_ids, clause_id='visible_narrative_progress'):
+        return {
+            'clause_id': clause_id,
+            'verdict': 'satisfied',
+            'supported_claims': ['The clock pressure changed visibly during this turn.'],
+            'evidence_sources': [
+                {'source_type': 'transcript_message', 'source_id': str(source_id)}
+                for source_id in source_ids
+            ],
+            'chronology_verdict': 'new_current_turn',
+            'reason': 'The cited current-turn exchange satisfies the clause.',
+        }
+
     def test_tool_definitions_are_function_schemas(self):
         names = {tool['function']['name'] for tool in DM_TOOL_DEFINITIONS}
         self.assertIn('ask_character_sheet', names)
@@ -4839,6 +4852,8 @@ class DmToolsTest(unittest.TestCase):
         self.assertEqual(clock.status, 'active')
 
     def test_apply_clock_adjudication_advances_existing_clock(self):
+        self._add_session_message(101, 'We chase them toward the crypt road.', role='player')
+        self._add_session_message(102, 'The chase reaches the crypt road.')
         db.session.add(CampaignClock(
             campaign_id=self.campaign.id,
             clock_id='race_to_crypts',
@@ -4859,6 +4874,7 @@ class DmToolsTest(unittest.TestCase):
                         'delta': 1,
                         'reason': 'The pursuit visibly moved toward the crypt road.',
                         'evidence': ['The chase left the market and hit the crypt road.'],
+                        'trigger_verdict': self._trigger_verdict(101, 102),
                     }
                 ],
                 'retire_clocks': [],
@@ -4890,8 +4906,13 @@ class DmToolsTest(unittest.TestCase):
                 {'source_type': 'transcript_message', 'source_id': '102'},
             ],
         )
+        self.assertEqual(provenance['trigger_clause_id'], 'visible_narrative_progress')
+        self.assertEqual(provenance['chronology_verdict'], 'new_current_turn')
+        self.assertEqual(provenance['new_evidence_ids'], ['101', '102'])
 
     def test_completion_criteria_hold_full_clock_pending_until_retirement_is_evidenced(self):
+        self._add_session_message(101, 'We investigate the new clue.', role='player')
+        self._add_session_message(102, 'You uncover a new clue.')
         db.session.add(CampaignClock(
             campaign_id=self.campaign.id,
             clock_id='identify_saboteur',
@@ -4915,6 +4936,7 @@ class DmToolsTest(unittest.TestCase):
                     'delta': 1,
                     'reason': 'The party found a new clue.',
                     'evidence': [],
+                    'trigger_verdict': self._trigger_verdict(101, 102),
                 }],
                 'retire_clocks': [{
                     'clock_id': 'identify_saboteur',
@@ -4935,6 +4957,192 @@ class DmToolsTest(unittest.TestCase):
         self.assertEqual(clock.status, 'completion_pending')
         self.assertIn('every completion criterion has one AI verdict', result['errors'][0])
         self.assertEqual(WorldEvent.query.filter_by(campaign_id=self.campaign.id, event_type='clock_retired').count(), 0)
+
+    def test_run_41_historical_lantern_failure_cannot_advance_clock(self):
+        self._add_session_message(101, 'How many lanterns are actually still burning?', role='player')
+        self._add_session_message(
+            102,
+            'Harlen distinguishes the official count from the real count and says the Widow\'s Lamp went dark two nights ago.',
+        )
+        db.session.add(CampaignClock(
+            campaign_id=self.campaign.id,
+            clock_id='lantern_failure_clock',
+            name='Lantern Failures',
+            segments=4,
+            filled=0,
+            status='active',
+            trigger='Each dusk, one additional lantern goes dark unless the party prevents it.',
+        ))
+        db.session.commit()
+
+        verdict = self._trigger_verdict(102, clause_id='declared_trigger')
+        verdict.update({
+            'supported_claims': ['The Widow\'s Lamp went dark two nights ago.'],
+            'chronology_verdict': 'historical_or_restated',
+            'reason': 'The exchange only restates an older failure; no dusk or new failure occurred.',
+        })
+        result = apply_clock_adjudication(
+            self.campaign,
+            {
+                'create_clocks': [],
+                'advance_clocks': [{
+                    'clock_id': 'lantern_failure_clock',
+                    'delta': 1,
+                    'reason': 'The disclosed count sounds worse.',
+                    'evidence': ['The Widow\'s Lamp failed two nights ago.'],
+                    'trigger_verdict': verdict,
+                }],
+                'retire_clocks': [],
+                'no_change_explanations': [],
+            },
+            audit_context={
+                'trace_id': 'run-41-cycle-2',
+                'source_player_message_id': 101,
+                'source_dm_message_id': 102,
+            },
+        )
+        db.session.commit()
+
+        clock = CampaignClock.query.filter_by(
+            campaign_id=self.campaign.id,
+            clock_id='lantern_failure_clock',
+        ).one()
+        self.assertEqual(clock.filled, 0)
+        self.assertEqual(WorldEvent.query.filter_by(
+            campaign_id=self.campaign.id,
+            event_type='clock_advanced',
+        ).count(), 0)
+        self.assertEqual(result['rejected_advances'][0]['clock_id'], 'lantern_failure_clock')
+        self.assertIn('evidence_not_new_current_turn', result['rejected_advances'][0]['evidence_gaps'])
+
+    def test_clock_advance_rejects_historical_source_even_when_verdict_claims_new(self):
+        self._add_session_message(99, 'Yesterday, the east lantern went dark.')
+        self._add_session_message(101, 'What happens now?', role='player')
+        self._add_session_message(102, 'No additional lantern fails.')
+        db.session.add(CampaignClock(
+            campaign_id=self.campaign.id,
+            clock_id='lantern_failure_clock',
+            name='Lantern Failures',
+            segments=4,
+            filled=0,
+            status='active',
+            trigger='Each dusk, one additional lantern goes dark unless the party prevents it.',
+        ))
+        db.session.commit()
+
+        result = apply_clock_adjudication(
+            self.campaign,
+            {
+                'create_clocks': [],
+                'advance_clocks': [{
+                    'clock_id': 'lantern_failure_clock',
+                    'delta': 1,
+                    'reason': 'A lantern failure was cited.',
+                    'evidence': [],
+                    'trigger_verdict': self._trigger_verdict(99, clause_id='declared_trigger'),
+                }],
+                'retire_clocks': [],
+                'no_change_explanations': [],
+            },
+            audit_context={
+                'source_player_message_id': 101,
+                'source_dm_message_id': 102,
+            },
+            allowed_evidence_sources=[
+                {'source_type': 'transcript_message', 'source_id': '99', 'chronology': 'historical_or_restated'},
+                {'source_type': 'transcript_message', 'source_id': '101', 'chronology': 'current_turn'},
+                {'source_type': 'transcript_message', 'source_id': '102', 'chronology': 'current_turn'},
+            ],
+        )
+
+        clock = CampaignClock.query.filter_by(
+            campaign_id=self.campaign.id,
+            clock_id='lantern_failure_clock',
+        ).one()
+        self.assertEqual(clock.filled, 0)
+        self.assertIn('historical_or_restated_evidence', result['rejected_advances'][0]['evidence_gaps'])
+
+    def test_new_dusk_and_new_failure_satisfy_declared_multi_source_trigger(self):
+        self._add_session_message(101, 'We wait and watch the lantern line through dusk.', role='player')
+        self._add_session_message(102, 'Dusk falls, and the east lantern newly gutters out.')
+        db.session.add(CampaignClock(
+            campaign_id=self.campaign.id,
+            clock_id='lantern_failure_clock',
+            name='Lantern Failures',
+            segments=4,
+            filled=0,
+            status='active',
+            trigger='Each dusk, one additional lantern goes dark unless the party prevents it.',
+        ))
+        db.session.commit()
+        verdict = self._trigger_verdict(101, 102, clause_id='declared_trigger')
+        verdict['supported_claims'] = ['Dusk newly fell.', 'The east lantern newly went dark.']
+
+        result = apply_clock_adjudication(
+            self.campaign,
+            {
+                'create_clocks': [],
+                'advance_clocks': [{
+                    'clock_id': 'lantern_failure_clock',
+                    'delta': 1,
+                    'reason': 'A new dusk and lantern failure occurred visibly.',
+                    'evidence': ['Dusk fell.', 'The east lantern went dark.'],
+                    'trigger_verdict': verdict,
+                }],
+                'retire_clocks': [],
+                'no_change_explanations': [],
+            },
+            audit_context={'source_player_message_id': 101, 'source_dm_message_id': 102},
+        )
+
+        clock = CampaignClock.query.filter_by(
+            campaign_id=self.campaign.id,
+            clock_id='lantern_failure_clock',
+        ).one()
+        self.assertEqual(clock.filled, 1)
+        self.assertEqual(result['errors'], [])
+        event = WorldEvent.query.filter_by(campaign_id=self.campaign.id, event_type='clock_advanced').one()
+        verdict_payload = json.loads(event.payload)['provenance']['trigger_verdict']
+        self.assertEqual(verdict_payload['supported_claims'], ['Dusk newly fell.', 'The east lantern newly went dark.'])
+
+    def test_visible_player_prevention_can_reduce_clock(self):
+        self._add_session_message(101, 'I shield the lantern and replace its failing wick.', role='player')
+        self._add_session_message(102, 'Your repair catches; the lantern burns steadily again.')
+        db.session.add(CampaignClock(
+            campaign_id=self.campaign.id,
+            clock_id='lantern_failure_clock',
+            name='Lantern Failures',
+            segments=4,
+            filled=2,
+            status='active',
+            trigger='Each dusk, one additional lantern goes dark unless the party prevents it.',
+        ))
+        db.session.commit()
+        verdict = self._trigger_verdict(101, 102, clause_id='visible_prevention_or_relief')
+        verdict['supported_claims'] = ['The party newly prevented a lantern failure.']
+
+        apply_clock_adjudication(
+            self.campaign,
+            {
+                'create_clocks': [],
+                'advance_clocks': [{
+                    'clock_id': 'lantern_failure_clock',
+                    'delta': -1,
+                    'reason': 'The party visibly prevented the failure.',
+                    'evidence': ['The repaired lantern burns steadily.'],
+                    'trigger_verdict': verdict,
+                }],
+                'retire_clocks': [],
+                'no_change_explanations': [],
+            },
+            audit_context={'source_player_message_id': 101, 'source_dm_message_id': 102},
+        )
+
+        clock = CampaignClock.query.filter_by(
+            campaign_id=self.campaign.id,
+            clock_id='lantern_failure_clock',
+        ).one()
+        self.assertEqual(clock.filled, 1)
 
     def test_completion_criteria_allow_evidenced_retirement(self):
         self._add_session_message(101, 'The DM names the suspect and establishes the location.')
@@ -5535,10 +5743,11 @@ class DmToolsTest(unittest.TestCase):
             player_message_id=201,
             dm_message_id=202,
         )
-        self.assertIn(
-            {'source_type': 'transcript_message', 'source_id': '101'},
-            later_context['allowed_evidence_sources'],
+        prior_source = next(
+            source for source in later_context['allowed_evidence_sources']
+            if source['source_type'] == 'transcript_message' and source['source_id'] == '101'
         )
+        self.assertEqual(prior_source['chronology'], 'historical_or_restated')
         self.assertTrue(any(
             item['source_id'] == '101'
             and item['criterion_id'] == 'named_suspect'
@@ -6227,7 +6436,9 @@ class DmToolsTest(unittest.TestCase):
         ).one()
         self.assertEqual(event.visibility, 'party_known')
 
-    def test_apply_clock_adjudication_preserves_rule_evidence_with_transcript_sources(self):
+    def test_apply_clock_adjudication_uses_verified_trigger_evidence_sources(self):
+        self._add_session_message(101, 'We search for the component.', role='player')
+        self._add_session_message(102, 'You find a new component clue.')
         db.session.add(CampaignClock(
             campaign_id=self.campaign.id,
             clock_id='component_search',
@@ -6247,6 +6458,7 @@ class DmToolsTest(unittest.TestCase):
                     'delta': 1,
                     'reason': 'The deterministic trigger matched.',
                     'evidence': [],
+                    'trigger_verdict': self._trigger_verdict(101, 102),
                     'provenance': {
                         'evidence_sources': [
                             {'source_type': 'clock_rule', 'source_id': 'component_clue_found'},
@@ -6271,17 +6483,17 @@ class DmToolsTest(unittest.TestCase):
             event_type='clock_advanced',
         ).one()
         provenance = json.loads(event.payload)['provenance']
-        self.assertEqual(provenance['evidence_status'], 'supported_by_rules')
+        self.assertEqual(provenance['evidence_status'], 'supported_by_evidence')
         self.assertEqual(
             provenance['evidence_sources'],
             [
-                {'source_type': 'clock_rule', 'source_id': 'component_clue_found'},
                 {'source_type': 'transcript_message', 'source_id': '101'},
                 {'source_type': 'transcript_message', 'source_id': '102'},
             ],
         )
 
     def test_apply_clock_adjudication_accepts_database_clock_id_reference(self):
+        self._add_session_message(101, 'We chase them toward the crypt road.', role='player')
         clock = CampaignClock(
             campaign_id=self.campaign.id,
             clock_id='race_to_crypts',
@@ -6303,6 +6515,7 @@ class DmToolsTest(unittest.TestCase):
                         'delta': 1,
                         'reason': 'The pursuit visibly moved toward the crypt road.',
                         'evidence': ['The chase left the market and hit the crypt road.'],
+                        'trigger_verdict': self._trigger_verdict(101),
                     }
                 ],
                 'retire_clocks': [],
@@ -6313,7 +6526,7 @@ class DmToolsTest(unittest.TestCase):
                     }
                 ],
             },
-            audit_context={'trace_id': 'clock-trace-db-id'},
+            audit_context={'trace_id': 'clock-trace-db-id', 'source_player_message_id': 101},
         )
 
         db.session.commit()
@@ -6338,6 +6551,8 @@ class DmToolsTest(unittest.TestCase):
         def clock_updates_side_effect(clock_context, audit_context=None):
             self.assertEqual(clock_context['current_scene_after']['location_id'], 'crypt_road')
             self.assertEqual(clock_context['current_scene_before']['location_name'], 'Dock Ward')
+            player_source_id = clock_context['latest_player_message']['source_id']
+            dm_source_id = clock_context['latest_dm_message']['source_id']
             return {
                 'create_clocks': [],
                 'advance_clocks': [
@@ -6346,6 +6561,7 @@ class DmToolsTest(unittest.TestCase):
                         'delta': 1,
                         'reason': 'The visible chase moved onto the crypt road.',
                         'evidence': ['The DM confirmed the chase left Dock Ward.'],
+                        'trigger_verdict': self._trigger_verdict(player_source_id, dm_source_id),
                     }
                 ],
                 'retire_clocks': [],
