@@ -430,7 +430,9 @@ def _cycle_boundaries(cycle):
 
     def get_boundary(key):
         if key not in payload:
-            return None
+            # Audit cycles are created with explicit snapshot boundaries. Fail
+            # closed if malformed current-state data omits one.
+            return 0
         val = payload[key]
         if val is None:
             return 0

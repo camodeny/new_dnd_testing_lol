@@ -205,30 +205,6 @@ class P1ImprovementsTest(unittest.TestCase):
         paused_event = db.session.get(AutomationRunEvent, boundaries["run_event_id"])
         self.assertEqual(paused_event.event_type, 'audit_cycle_paused')
 
-    # 7. test_old_unbounded_cycle_preserves_backward_compatibility
-    def test_old_unbounded_cycle_preserves_backward_compatibility(self):
-        # Create cycle without boundary markers in payload
-        cycle = AutomationRunAuditCycle(
-            run_id=self.run.id,
-            cycle_number=99,
-            phase='after_player',
-            status='pending',
-            payload_json={}
-        )
-        db.session.add(cycle)
-        db.session.flush()
-        self.run.awaiting_audit_cycle_id = cycle.id
-        db.session.commit()
-
-        # Add provider call
-        pc1 = AutomationRunProviderCall(run_id=self.run.id, dedupe_key="pc1", phase="after_player", request_json={})
-        db.session.add(pc1)
-        db.session.commit()
-
-        # Should fetch without boundaries blocking it
-        res = execute_auditor_tool(self.run, 'get_provider_calls')
-        self.assertEqual(len(res.get('provider_calls', [])), 1)
-
     # 8. test_failed_attempt_survives_after_submit_validation_exception
     def test_failed_attempt_survives_after_submit_validation_exception(self):
         cycle = create_audit_cycle(self.run, 'after_player')
