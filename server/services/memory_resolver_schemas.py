@@ -247,35 +247,6 @@ def validate_diagnostics(diagnostics):
     return True, None
 
 
-# ── Identity-Worthy Check ─────────────────────────────────────────────
-# Heuristic to determine if a noun phrase is identity-worthy (should get
-# a provisional entity) vs a generic descriptor that can be ignored.
-
-
-_IDENTITY_WORTHY_PATTERNS = [
-    r"\bthe\s+[\w'-]+(?:\s+[\w'-]+){0,3}\b",  # "the grey-cloaked figure", "the innkeeper", "the hooded figure"
-    r"\ba\s+(?:tall|short|hooded|masked|robed|armored|cloaked|mysterious)\s+[\w'-]+\b",
-    r"\b[A-Z][a-z']+(?:\s+[A-Z][a-z']+)+\b",  # Proper names like "Kaelen Morwen"
-    r"\bthe\s+[\w'-]+\b",                        # "the guard", "the innkeeper"
-]
-
-
-def is_identity_worthy(phrase):
-    if not isinstance(phrase, str) or len(phrase.strip()) < 4:
-        return False
-    phrase_lower = phrase.strip().lower()
-    generic_terms = {"someone", "something", "a person", "people", "them", "everyone", "nobody", "it", "that"}
-    if phrase_lower in generic_terms:
-        return False
-    for pattern in _IDENTITY_WORTHY_PATTERNS:
-        if re.search(pattern, phrase):
-            return True
-    proper_name = re.match(r"^[A-Z][a-z']+(\s+[A-Z][a-z']+)*$", phrase.strip())
-    if proper_name:
-        return True
-    return False
-
-
 # ── Evidence-Aware Identity Matching ──────────────────────────────────
 
 def identity_in_evidence(registry_entry, evidence_dict):

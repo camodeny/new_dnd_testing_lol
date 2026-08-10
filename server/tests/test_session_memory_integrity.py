@@ -34,11 +34,7 @@ from services.resolution_registry import (
     allocate_durable_id,
     resolve_ref,
 )
-from services.memory_resolver_schemas import (
-    is_identity_worthy,
-    validate_diagnostics,
-    DIAGNOSTICS_TEMPLATE,
-)
+from services.memory_resolver_schemas import validate_diagnostics, DIAGNOSTICS_TEMPLATE
 
 
 class SessionMemoryIntegrityTest(unittest.TestCase):
@@ -399,12 +395,39 @@ class SessionMemoryIntegrityTest(unittest.TestCase):
         with self.assertRaises(MemoryPipelineError):
             compile_staged_memory_patch(memory_context, extracted, resolved)
 
-    def test_identity_worthy_heuristic(self):
-        self.assertTrue(is_identity_worthy('the grey-cloaked figure'))
-        self.assertTrue(is_identity_worthy('Kaelen Morwen'))
-        self.assertTrue(is_identity_worthy('the innkeeper'))
-        self.assertFalse(is_identity_worthy('someone'))
-        self.assertFalse(is_identity_worthy('them'))
+    def test_structured_claims_bypass_surface_form_heuristics(self):
+        extracted = {
+            'entity_claims': [
+                {'name': 'Ael', 'type': 'person', 'mention_ref': 'one_word_name'},
+                {'name': '7th-Sigil', 'type': 'artifact', 'mention_ref': 'fantasy_name'},
+            ],
+            'npc_claims': [
+                {
+                    'name': 'obsidian-veiled witness',
+                    'mention_ref': 'unusual_descriptor',
+                },
+            ],
+        }
+
+        registry, _, _, _ = build_canonical_resolution_registry(
+            self.campaign,
+            self._base_context(),
+            extracted,
+            None,
+            [],
+            {},
+        )
+
+        entries = {entry['mention_ref']: entry for entry in registry}
+        self.assertEqual(set(entries), {
+            'one_word_name',
+            'fantasy_name',
+            'unusual_descriptor',
+        })
+        for entry in entries.values():
+            self.assertEqual(entry['decision'], 'create_provisional')
+            self.assertEqual(entry['resolution_state'], 'provisional')
+            self.assertIsNotNone(entry['canonical_id'])
 
     def test_diagnostics_validation_rejects_nonempty_substitutions(self):
         bad_diag = dict(DIAGNOSTICS_TEMPLATE)
