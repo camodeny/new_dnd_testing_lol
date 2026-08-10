@@ -868,7 +868,7 @@ class AutomationRouteTest(unittest.TestCase):
         self.assertEqual(payload['run']['scorecard_summary']['audited_cycle_count'], 0)
         self.assertEqual(payload['run']['scorecard_summary']['completed_turns'], 0)
 
-    def test_run_37_cycle_average_preserves_worst_severity(self):
+    def test_cycle_average_preserves_worst_severity(self):
         criteria = [
             {'id': f'criterion_{index}', 'label': f'Criterion {index}'}
             for index in range(1, 9)
@@ -6133,7 +6133,7 @@ class AutomationRouteTest(unittest.TestCase):
         self.assertEqual(bundle_categories['unknown_crit']['category'], 'uncategorized')
         self.assertEqual(bundle_categories['unknown_crit']['raw_category'], 'not-a-real-category')
 
-    def test_run_37_retry_taxonomy_is_complete_deduplicated_and_cross_surface_consistent(self):
+    def test_retry_taxonomy_is_complete_deduplicated_and_cross_surface_consistent(self):
         scenario_id = self.client.post(
             '/api/automation/scenarios',
             headers=self.headers,

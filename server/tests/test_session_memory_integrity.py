@@ -1415,7 +1415,7 @@ class ResolvedEntityRefsTest(unittest.TestCase):
         self.assertIn('mira_wolf', entity_ids)
         self.assertNotIn('the_wolf', entity_ids)
 
-    def test_run_41_corrected_label_refs_reconcile_factions(self):
+    def test_corrected_label_refs_reconcile_canonical_factions(self):
         graph = json.loads(self.world.knowledge_graph)
         graph['entities'].extend([
             {'id': 'ferry_guild', 'name': 'Ferry Guild', 'type': 'faction'},
@@ -1459,7 +1459,7 @@ class ResolvedEntityRefsTest(unittest.TestCase):
                 )
             self.assertEqual(raised.exception.code, 'invalid_resolved_entity_refs')
 
-    def test_exact_run_41_surface_payload_is_rejected_with_contract_error(self):
+    def test_surface_only_resolved_refs_are_rejected_with_contract_error(self):
         with self.assertRaises(MemoryPipelineError) as raised:
             compile_staged_memory_patch(self._context(), {}, {
                 'resolved_entity_refs': [
@@ -1687,7 +1687,7 @@ class ResolvedEntityRefsTest(unittest.TestCase):
         self.assertIsNotNone(resolution)
         self.assertEqual(resolution.resolution_action, 'add_alias')
 
-    def test_run_41_faction_repair_preserves_visibility_and_provenance(self):
+    def test_faction_repair_preserves_visibility_and_provenance(self):
         from services.dm_tools import repair_duplicate_identity
 
         graph = json.loads(self.world.knowledge_graph)

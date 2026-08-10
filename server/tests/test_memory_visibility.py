@@ -13,7 +13,7 @@ from services.dm_tools import apply_compiled_session_memory_patch
 from services.memory_resolver_schemas import SOURCE_CONTRACT_COMPILED_V2
 
 
-class Issue83VisibilityLeakPreventionTest(unittest.TestCase):
+class MemoryVisibilityInvariantTest(unittest.TestCase):
     """Safety regression coverage for issue #83.
 
     Prevents mixed-visibility NPC updates and party-visible graph items from

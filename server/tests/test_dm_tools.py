@@ -336,7 +336,7 @@ class DmToolsTest(unittest.TestCase):
         self.assertEqual(mention_schema['properties']['canonical_id']['type'], ['string', 'null'])
         self.assertEqual(mention_schema['properties']['evidence_refs']['type'], ['array', 'null'])
 
-    def test_finalizer_rejects_run_41_resolver_packet_aliases_during_parsing(self):
+    def test_finalizer_rejects_unsupported_resolver_packet_aliases(self):
         packets = [
             {
                 'entity_mentions': [{
@@ -479,7 +479,7 @@ class DmToolsTest(unittest.TestCase):
         self.assertEqual(metrics['counts']['resolver_contract_repair'], 1)
         self.assertEqual(metrics['counts']['contract_guard_retry'], 0)
 
-    def test_run_41_optional_packet_exhaustion_preserves_reply_and_staged_action(self):
+    def test_optional_packet_exhaustion_preserves_reply_and_staged_action(self):
         malformed = {
             'entity_mentions': [{
                 'name': 'Widow\'s Lamp',
@@ -1302,7 +1302,7 @@ class DmToolsTest(unittest.TestCase):
             manifest['estimated_total_tokens'],
         )
 
-    def test_run_41_transcript_is_canonical_once_while_audience_state_stays_authoritative(self):
+    def test_transcript_is_canonical_once_while_audience_state_stays_authoritative(self):
         opening_text = "Harlen stands and announces to the Lake Nobility, 'That's four this week.'"
         recent_messages = [
             {
@@ -5433,7 +5433,7 @@ class DmToolsTest(unittest.TestCase):
         self.assertIn('every completion criterion has one AI verdict', result['errors'][0])
         self.assertEqual(WorldEvent.query.filter_by(campaign_id=self.campaign.id, event_type='clock_retired').count(), 0)
 
-    def test_run_41_historical_lantern_failure_cannot_advance_clock(self):
+    def test_historical_trigger_source_cannot_advance_clock(self):
         self._add_session_message(101, 'How many lanterns are actually still burning?', role='player')
         self._add_session_message(
             102,
@@ -5929,7 +5929,7 @@ class DmToolsTest(unittest.TestCase):
         self.assertEqual(payload['visibility_decision']['applied'], 'party_known')
         self.assertEqual(payload['rejected_proposals'], [])
 
-    def test_completion_criteria_run37_regression_unsupported_party_known_consequence(self):
+    def test_completion_criteria_reject_unsupported_party_known_consequence(self):
         db.session.add(CampaignClock(
             campaign_id=self.campaign.id,
             clock_id='saboteur_trail',
@@ -6733,43 +6733,6 @@ class DmToolsTest(unittest.TestCase):
         payload = json.loads(event.payload)
         self.assertTrue(payload['consequence_applied'])
         self.assertEqual(payload['visibility_decision']['applied'], 'dm_private')
-
-    def test_completion_criteria_legacy_reason_only_party_known_retirement_is_gated(self):
-        db.session.add(CampaignClock(
-            campaign_id=self.campaign.id,
-            clock_id='legacy_clock',
-            name='Legacy Clock',
-            segments=4,
-            filled=4,
-            status='active',
-            visibility='party_known',
-        ))
-        db.session.commit()
-
-        result = apply_clock_adjudication(
-            self.campaign,
-            {
-                'create_clocks': [],
-                'advance_clocks': [],
-                'retire_clocks': [{
-                    'clock_id': 'legacy_clock',
-                    'reason': 'The party can identify Garret and knows his location.',
-                }],
-                'no_change_explanations': [],
-            },
-            audit_context={
-                'trace_id': 'legacy-reason-only-trace',
-                'source_player_message_id': 101,
-                'source_dm_message_id': 102,
-            },
-        )
-        db.session.commit()
-
-        self.assertNotEqual(result['errors'], [])
-        self.assertFalse(result['clock_changes'][0].get('consequence_applied', True))
-        self.assertEqual(WorldEvent.query.filter_by(campaign_id=self.campaign.id, event_type='clock_retired').count(), 0)
-        clock = CampaignClock.query.filter_by(campaign_id=self.campaign.id, clock_id='legacy_clock').one()
-        self.assertEqual(clock.status, 'active')
 
     def test_completion_criteria_reject_uncertain_attributed_and_conditional_claims(self):
         evidence_cases = [

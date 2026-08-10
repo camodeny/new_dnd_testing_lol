@@ -19,7 +19,7 @@ class _Event:
         self.payload = json.dumps(payload or {})
 
 
-class CanonicalPostTurnStateTest(unittest.TestCase):
+class PostTurnStateInvariantTest(unittest.TestCase):
     def state(self, post='pending', memory='pending', clock='pending', **kwargs):
         return derive_post_turn_state(
             post,
