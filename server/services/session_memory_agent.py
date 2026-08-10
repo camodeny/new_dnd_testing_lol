@@ -3,7 +3,7 @@ import re
 import hashlib
 import copy
 
-from models import Campaign, CampaignClock, CampaignSession, CampaignWorld, Character, NPCActor, SessionMessage, User, WorldEvent, db
+from models import Campaign, CampaignClock, CampaignSession, CampaignWorld, CampaignWorldIdentity, Character, NPCActor, SessionMessage, User, WorldEvent, db
 from services.dm_tools import (
     _contains_unrevealed_private_term,
     _tool_search_campaign_memory,
@@ -447,6 +447,52 @@ def execute_memory_tool(memory_context, tool_name, args=None):
     return {'error': f'Unknown memory tool: {tool_name}'}
 
 
+def _world_identity_maps(campaign):
+    """Authoritative graph entity id <-> npc_actors actor id mapping.
+
+    World generation materializes one fictional identity as both a
+    knowledge-graph NPC entity and an npc_actors row with distinct ID
+    namespaces (e.g. `the_candlewright` vs `npc_the_candlewright`). Newer
+    campaigns persist the pairing in campaign_world_identities; legacy
+    campaigns fall back to deriving it from the persisted world data using
+    the same exact-name rule world generation used, so already-generated
+    worlds (such as Run 42's) can be validated without a backfill.
+    """
+    entity_to_actor = {}
+    actor_to_entity = {}
+    if campaign is None:
+        return entity_to_actor, actor_to_entity
+    rows = CampaignWorldIdentity.query.filter_by(campaign_id=campaign.id).all()
+    for row in rows:
+        entity_to_actor[row.graph_entity_id] = row.actor_id
+        actor_to_entity[row.actor_id] = row.graph_entity_id
+    if entity_to_actor:
+        return entity_to_actor, actor_to_entity
+    world = get_campaign_world(campaign.id)
+    if not world:
+        return entity_to_actor, actor_to_entity
+    graph = json_loads(world.knowledge_graph, {'entities': [], 'relations': [], 'facts': []})
+    entities = graph.get('entities') if isinstance(graph.get('entities'), list) else []
+    npc_entities_by_name = {}
+    for entity in entities:
+        if not isinstance(entity, dict):
+            continue
+        if clean_text(entity.get('type'), 40).lower() != 'npc':
+            continue
+        name = clean_text(entity.get('name'), 160).lower()
+        if name:
+            npc_entities_by_name.setdefault(name, []).append(entity)
+    for npc in NPCActor.query.filter_by(campaign_id=campaign.id).all():
+        name = clean_text(npc.name, 160).lower()
+        candidates = npc_entities_by_name.get(name, []) if name else []
+        if len(candidates) == 1:
+            entity_id = clean_id(candidates[0].get('id'), '')
+            if entity_id:
+                entity_to_actor.setdefault(entity_id, npc.actor_id)
+                actor_to_entity.setdefault(npc.actor_id, entity_id)
+    return entity_to_actor, actor_to_entity
+
+
 def _known_ids(campaign):
     world_payload = _world_payload(campaign)
     graph = world_payload.get('knowledge_graph') if isinstance(world_payload.get('knowledge_graph'), dict) else {}
@@ -478,6 +524,7 @@ def _known_ids(campaign):
         for character in character_rows
         if clean_id(character.name, '')
     }
+    entity_to_actor, actor_to_entity = _world_identity_maps(campaign)
     return {
         'entity_ids': entity_ids | npc_ids | character_ids,
         'graph_entity_ids': entity_ids,
@@ -508,6 +555,8 @@ def _known_ids(campaign):
             for entity in graph.get('entities', [])
             if isinstance(entity, dict) and clean_id(entity.get('id'), '') and clean_text(entity.get('name'), 160)
         },
+        'entity_to_actor': entity_to_actor,
+        'actor_to_entity': actor_to_entity,
     }
 
 
@@ -668,6 +717,16 @@ def _validate_resolved_entity_refs(compiled_patch, known=None):
         if len(ids) > 1:
             errors.append(f"resolved_ref_conflict: {term}")
 
+    # Namespace-aware actor lookup. npc_actors rows and graph entities use
+    # distinct canonical ID namespaces, so actor names map to actor IDs only.
+    known_npc_names = dict(known.get("npc_names", {}) or {})
+    actor_name_to_id = {}
+    for _actor_id, _actor_name in known_npc_names.items():
+        _name = clean_text(_actor_name, 200).lower()
+        if _name:
+            actor_name_to_id.setdefault(_name, _actor_id)
+    entity_to_actor = dict(known.get("entity_to_actor", {}) or {})
+
     patch_entities_by_name = {}
     for entity in compiled_patch.get("upsert_graph_entities", []):
         if not isinstance(entity, dict) or not entity.get("id"):
@@ -691,10 +750,33 @@ def _validate_resolved_entity_refs(compiled_patch, known=None):
         if not actor_id or not supplied_name:
             continue
         label = supplied_name.lower()
-        if label in term_to_canonical and actor_id != term_to_canonical[label]:
-            errors.append(
-                f"resolved_ref_split_brain: {supplied_name} -> {actor_id} (canonical {term_to_canonical[label]})"
-            )
+
+        # Same-layer only: an existing npc_actors row already owns this name.
+        # An update targeting a different actor is a genuine duplicate UNLESS
+        # that actor is the canonical the resolver picked for the identity or
+        # its authoritative mapped actor (stale pre-merge rows may still own
+        # the name while the patch updates the canonical actor).
+        known_actor = actor_name_to_id.get(label)
+        if known_actor and known_actor != actor_id:
+            graph_canonical = term_to_canonical.get(label)
+            authoritative = entity_to_actor.get(graph_canonical) if graph_canonical else None
+            if actor_id != graph_canonical and actor_id != authoritative:
+                errors.append(
+                    f"npc_actor_split_brain: {supplied_name} -> {actor_id} (canonical actor {known_actor})"
+                )
+                continue
+
+        # Cross-layer: name equality alone is never proof that storage IDs
+        # must match. Only the authoritative graph<->actor mapping may bind a
+        # graph identity to an actor row; an update to a different actor is
+        # rejected, while a matching (or unmapped) actor is allowed.
+        graph_canonical = term_to_canonical.get(label)
+        if graph_canonical:
+            authoritative_actor = entity_to_actor.get(graph_canonical)
+            if authoritative_actor and authoritative_actor != actor_id:
+                errors.append(
+                    f"resolved_ref_split_brain: {supplied_name} -> {actor_id} (identity {graph_canonical} maps to actor {authoritative_actor})"
+                )
 
     return errors
 

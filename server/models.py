@@ -967,6 +967,40 @@ class NPCActor(db.Model):
         return data
 
 
+class CampaignWorldIdentity(db.Model):
+    """Authoritative graph NPC entity <-> npc_actors row pairing.
+
+    World generation materializes one fictional identity as both a
+    knowledge-graph entity (type 'npc') and an npc_actors row. The two
+    records use distinct ID namespaces (e.g. `the_candlewright` graph entity
+    vs `npc_the_candlewright` actor row), so this table records which graph
+    entity maps to which actor row for each campaign. Validation and identity
+    resolution consult this mapping instead of assuming the storage IDs must
+    be equal.
+    """
+
+    __tablename__ = 'campaign_world_identities'
+
+    id = db.Column(db.Integer, primary_key=True)
+    campaign_id = db.Column(db.Integer, db.ForeignKey('campaign.id'), nullable=False)
+    graph_entity_id = db.Column(db.String(100), nullable=False)
+    actor_id = db.Column(db.String(100), nullable=False)
+    created_at = db.Column(db.DateTime, default=utcnow)
+
+    __table_args__ = (
+        db.UniqueConstraint('campaign_id', 'graph_entity_id', name='uq_world_identity_campaign_entity'),
+        db.UniqueConstraint('campaign_id', 'actor_id', name='uq_world_identity_campaign_actor'),
+    )
+
+    def to_dict(self):
+        return {
+            'campaign_id': self.campaign_id,
+            'graph_entity_id': self.graph_entity_id,
+            'actor_id': self.actor_id,
+            'created_at': self.created_at.isoformat() if self.created_at else None,
+        }
+
+
 class CampaignClock(db.Model):
     __tablename__ = 'campaign_clocks'
 

@@ -26,6 +26,7 @@ from services.session_memory_agent import (
     compile_staged_memory_patch,
     MemoryPipelineError,
     _validate_final_memory_state,
+    _validate_resolved_entity_refs,
     _known_ids,
     _build_resolution_records,
 )
@@ -1405,6 +1406,239 @@ class ResolvedEntityRefsTest(unittest.TestCase):
         self.assertIsNotNone(resolution)
         self.assertEqual(resolution.resolution_action, 'add_alias')
 
+
+class WorldIdentityNamespaceTest(unittest.TestCase):
+    """Issue #130: graph NPC entities and npc_actors rows use distinct IDs.
+
+    World generation materializes one fictional identity as both a graph
+    entity (e.g. `the_candlewright`) and an npc_actors row
+    (e.g. `npc_the_candlewright`). Final-state validation must check graph
+    upserts against graph canonical IDs and NPC updates against actor IDs,
+    using an authoritative graph<->actor mapping instead of treating
+    cross-layer name equality as proof that storage IDs must be equal.
+    """
+
+    def setUp(self):
+        self.app = Flask(__name__)
+        self.app.config['SQLALCHEMY_DATABASE_URI'] = 'sqlite:///:memory:'
+        self.app.config['SECRET_KEY'] = 'test-secret'
+        self.app.config['JWT_EXPIRATION_HOURS'] = 24
+        self.app.config['SQLALCHEMY_TRACK_MODIFICATIONS'] = False
+        db.init_app(self.app)
+        self.ctx = self.app.app_context()
+        self.ctx.push()
+        db.create_all()
+
+        usr = User(username='dm_user', email='dm@example.com')
+        usr.set_password('password')
+        db.session.add(usr)
+        db.session.commit()
+
+        self.campaign = Campaign(name='World Identity Test', description='Test', user_id=usr.id)
+        db.session.add(self.campaign)
+        db.session.commit()
+
+        self.world = CampaignWorld(
+            campaign_id=self.campaign.id,
+            public_intro='{}',
+            knowledge_graph=json.dumps({
+                'entities': [
+                    {'id': 'drowned_lantern', 'type': 'location', 'name': 'Drowned Lantern'},
+                    {'id': 'the_candlewright', 'type': 'npc', 'name': 'The Candlewright'},
+                    {'id': 'lake_tender', 'type': 'npc', 'name': 'Lake Tender'},
+                ],
+                'relations': [],
+                'facts': [],
+            }),
+            world_state='{"current_scene":{"location_id":"drowned_lantern","location_name":"Drowned Lantern"}}',
+            dm_private='{}',
+        )
+        db.session.add(self.world)
+        db.session.flush()
+
+        self.session = CampaignSession(campaign_id=self.campaign.id)
+        db.session.add(self.session)
+        db.session.flush()
+
+        db.session.add(NPCActor(
+            campaign_id=self.campaign.id,
+            actor_id='npc_the_candlewright',
+            name='The Candlewright',
+            dossier='{}',
+        ))
+        db.session.add(NPCActor(
+            campaign_id=self.campaign.id,
+            actor_id='npc_lake_tender',
+            name='Lake Tender',
+            dossier='{}',
+        ))
+        db.session.commit()
+
+    def tearDown(self):
+        db.session.rollback()
+        db.drop_all()
+        self.ctx.pop()
+
+    def _context(self):
+        return {
+            'campaign_id': self.campaign.id,
+            'session_id': self.session.id,
+            'hot_context': {
+                'current_scene': {
+                    'location_id': 'drowned_lantern',
+                    'location_name': 'Drowned Lantern',
+                },
+            },
+        }
+
+    def test_known_ids_expose_authoritative_mapping(self):
+        known = _known_ids(self.campaign)
+        self.assertEqual(known['entity_to_actor']['the_candlewright'], 'npc_the_candlewright')
+        self.assertEqual(known['entity_to_actor']['lake_tender'], 'npc_lake_tender')
+        self.assertEqual(known['actor_to_entity']['npc_the_candlewright'], 'the_candlewright')
+
+    def test_persisted_mapping_wins_over_derived(self):
+        from services.world_service import persist_world_identity_pairs
+        persist_world_identity_pairs(self.campaign, [
+            {'graph_entity_id': 'the_candlewright', 'actor_id': 'npc_the_candlewright'},
+        ])
+        known = _known_ids(self.campaign)
+        self.assertEqual(known['entity_to_actor'], {
+            'the_candlewright': 'npc_the_candlewright',
+        })
+
+    def test_world_identity_pairs_derived_from_package(self):
+        from services.world_service import build_world_identity_pairs
+        package = {
+            'knowledge_graph': {
+                'entities': [
+                    {'id': 'drowned_lantern', 'type': 'location', 'name': 'Drowned Lantern'},
+                    {'id': 'the_candlewright', 'type': 'npc', 'name': 'The Candlewright'},
+                    {'id': 'lake_tender', 'type': 'npc', 'name': 'Lake Tender'},
+                ],
+            },
+            'npc_actors': [
+                {'id': 'npc_the_candlewright', 'name': 'The Candlewright'},
+                {'id': 'npc_lake_tender', 'name': 'Lake Tender'},
+            ],
+        }
+        pairs = build_world_identity_pairs(package)
+        self.assertEqual(
+            {(p['graph_entity_id'], p['actor_id']) for p in pairs},
+            {('the_candlewright', 'npc_the_candlewright'), ('lake_tender', 'npc_lake_tender')},
+        )
+
+    def test_production_shape_actor_update_not_a_split_brain(self):
+        # Regression for Run 42: updating the npc_actors row for an identity
+        # the resolver mapped to a graph entity must not fail validation just
+        # because the actor id differs from the graph entity id.
+        memory_context = self._context()
+        resolved = {
+            'resolved_entity_refs': [
+                {
+                    'label': 'Candlewright',
+                    'entity_id': 'the_candlewright',
+                    'resolution': 'same',
+                    'canonical_name': 'The Candlewright',
+                },
+                {
+                    'label': 'the grey-hooded stranger',
+                    'entity_id': 'the_candlewright',
+                    'resolution': 'same',
+                    'canonical_name': 'The Candlewright',
+                },
+            ],
+            'update_npc_actors': [
+                {
+                    'id': 'npc_the_candlewright',
+                    'name': 'The Candlewright',
+                    'role': 'Candle maker',
+                    'wants': ['keep the shop lit'],
+                    'secrets': ['hides a wax hoard'],
+                },
+            ],
+        }
+        compiled = compile_staged_memory_patch(memory_context, {}, resolved)
+        npcs = compiled.get('update_npc_actors', [])
+        self.assertEqual(len(npcs), 1)
+        self.assertEqual(npcs[0]['id'], 'npc_the_candlewright')
+        self.assertEqual(npcs[0]['role'], 'Candle maker')
+
+    def test_lake_tender_update_not_a_split_brain(self):
+        memory_context = self._context()
+        resolved = {
+            'resolved_entity_refs': [
+                {
+                    'label': 'the lake tender',
+                    'entity_id': 'lake_tender',
+                    'resolution': 'same',
+                    'canonical_name': 'Lake Tender',
+                },
+            ],
+            'update_npc_actors': [
+                {'id': 'npc_lake_tender', 'name': 'Lake Tender', 'role': 'Dockside guide'},
+            ],
+        }
+        compiled = compile_staged_memory_patch(memory_context, {}, resolved)
+        npcs = compiled.get('update_npc_actors', [])
+        self.assertEqual(len(npcs), 1)
+        self.assertEqual(npcs[0]['id'], 'npc_lake_tender')
+        self.assertEqual(npcs[0]['role'], 'Dockside guide')
+
+    def test_actor_update_to_unmapped_actor_rejected(self):
+        # A patch that writes "The Candlewright" onto a different actor row is
+        # a genuine duplicate in the actor layer, not the paired identity.
+        compiled = {
+            'resolved_entity_refs': [
+                {'label': 'The Candlewright', 'entity_id': 'the_candlewright', 'resolution': 'same'},
+            ],
+            'upsert_graph_entities': [],
+            'update_npc_actors': [
+                {'id': 'npc_other_candlewright', 'name': 'The Candlewright'},
+            ],
+        }
+        known = {
+            'npc_names': {'npc_the_candlewright': 'The Candlewright'},
+            'entity_names': {'the_candlewright': 'The Candlewright'},
+            'entity_to_actor': {'the_candlewright': 'npc_the_candlewright'},
+        }
+        errors = _validate_resolved_entity_refs(compiled, known)
+        self.assertTrue(any('npc_actor_split_brain' in e for e in errors))
+
+    def test_duplicate_graph_identity_still_rejected(self):
+        # A genuinely new graph identity that duplicates a resolved canonical
+        # is still rejected within the graph layer.
+        compiled = {
+            'resolved_entity_refs': [
+                {'label': 'The Candlewright', 'entity_id': 'the_candlewright', 'resolution': 'same'},
+            ],
+            'upsert_graph_entities': [
+                {'id': 'the_candlewright_2', 'name': 'The Candlewright', 'type': 'npc'},
+            ],
+            'update_npc_actors': [],
+        }
+        errors = _validate_resolved_entity_refs(compiled, {})
+        self.assertTrue(any('resolved_ref_split_brain' in e for e in errors))
+
+    def test_cross_layer_name_equality_alone_not_split_brain(self):
+        # Cross-layer name equality with NO authoritative mapping is not
+        # proof that storage IDs must be equal.
+        compiled = {
+            'resolved_entity_refs': [
+                {'label': 'The Candlewright', 'entity_id': 'the_candlewright', 'resolution': 'same'},
+            ],
+            'upsert_graph_entities': [],
+            'update_npc_actors': [
+                {'id': 'npc_the_candlewright', 'name': 'The Candlewright'},
+            ],
+        }
+        known = {
+            'npc_names': {'npc_the_candlewright': 'The Candlewright'},
+            'entity_names': {'the_candlewright': 'The Candlewright'},
+            'entity_to_actor': {},
+        }
+        errors = _validate_resolved_entity_refs(compiled, known)
+        self.assertEqual(errors, [])
 
 
 if __name__ == '__main__':
