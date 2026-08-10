@@ -6316,6 +6316,13 @@ class DmToolsTest(unittest.TestCase):
                     'advance_clocks': [],
                     'retire_clocks': [],
                     'no_change_explanations': [],
+                }), \
+                patch('routes.sessions.get_session_running_summary_finalize', return_value={
+                    'running_summary': 'A bell rang across the docks.',
+                }), \
+                patch('openrouter.get_session_summary_consistency_check', return_value={
+                    'consistent': True,
+                    'contradictions': [],
                 }):
             response = client.post(
                 f'/api/sessions/{self.session.id}/messages',
