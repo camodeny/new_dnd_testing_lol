@@ -28,6 +28,7 @@ from openrouter import _post_chat_normalized, get_llm_model, get_llm_provider
 from services.automation_service import (
     append_run_event,
     continue_audit_run,
+    collect_model_retry_metrics,
     current_scorecard_template_for_run,
     find_provider_calls_for_turn,
     get_criterion_category,
@@ -965,6 +966,17 @@ def _cycle_evidence_packet(run, cycle, args):
         run_event_query = run_event_query.filter(AutomationRunEvent.id <= boundaries["run_event_id"])
     run_event_rows = run_event_query.order_by(AutomationRunEvent.id.desc()).limit(run_event_limit).all()
 
+    all_audit_rows = (
+        CampaignAuditEvent.query.filter_by(campaign_id=campaign.id)
+        .order_by(CampaignAuditEvent.id.asc()).all()
+        if campaign else []
+    )
+    all_provider_rows = (
+        AutomationRunProviderCall.query.filter_by(run_id=run.id)
+        .order_by(AutomationRunProviderCall.id.asc()).all()
+    )
+    retry_metrics = collect_model_retry_metrics(all_audit_rows, all_provider_rows, run_status=run.status)
+
     clock_rows = CampaignClock.query.filter_by(campaign_id=campaign.id).order_by(CampaignClock.id.asc()).all() if campaign else []
     npc_rows = NPCActor.query.filter_by(campaign_id=campaign.id).order_by(NPCActor.id.asc()).all() if campaign else []
 
@@ -1016,6 +1028,7 @@ def _cycle_evidence_packet(run, cycle, args):
         'recent_audit_events': [_compact_audit_event(row, include_payload=False) for row in reversed(audit_rows)],
         'recent_provider_calls': [_compact_provider_call(row, include_artifacts=False) for row in reversed(provider_rows)],
         'recent_run_events': [_compact_run_event(row, include_payload=False) for row in reversed(run_event_rows)],
+        'retry_metrics': retry_metrics,
         'follow_up_tools': [
             'get_audit_event_detail',
             'get_provider_call_detail',
@@ -2161,6 +2174,7 @@ def get_current_audit_bundle_data(run):
             'configuration': scorecard_configuration(template),
         },
         'evidence_packet': evidence_packet,
+        'retry_metrics': evidence_packet.get('retry_metrics') or {},
         'recommended_detail_paths': recommended_detail_paths,
         'evidence_gaps': gaps,
         'memory_retrieval_summary': retrievals,

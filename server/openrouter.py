@@ -4128,6 +4128,9 @@ def _run_session_dm_loop(
                         ),
                         {
                             'operation': 'finalizer_contract_guard',
+                            'attempt': finalizer_contract_retry_count + 1,
+                            'player_message_id': base_audit.get('player_message_id'),
+                            'provider_call_id': base_audit.get('provider_call_id'),
                             'violation': finalizer_contract_violation,
                             'draft_response': raw_content,
                             'repair_strategy': (
@@ -4166,6 +4169,28 @@ def _run_session_dm_loop(
                 finalizer_contract_retry_count += 1
                 continue
             if finalizer_contract_violation:
+                if base_audit.get('campaign_id'):
+                    audit = guard_audit('finalizer_contract_guard')
+                    log_audit_event(
+                        base_audit.get('campaign_id'),
+                        'finalizer_contract_guard_blocked',
+                        'Session DM response still did not finish with a valid finalization tool call after retry.',
+                        {
+                            'operation': 'finalizer_contract_guard',
+                            'attempt': finalizer_contract_retry_count + 1,
+                            'player_message_id': base_audit.get('player_message_id'),
+                            'provider_call_id': base_audit.get('provider_call_id'),
+                            'outcome': 'exhausted',
+                            'violation': finalizer_contract_violation,
+                        },
+                        source='session_dm.guard',
+                        actor=audit.get('actor'),
+                        trace_id=audit.get('trace_id'),
+                        parent_trace_id=audit.get('parent_trace_id'),
+                        trace_label=audit.get('trace_label'),
+                        audit_role='guard',
+                        commit=True,
+                    )
                 rollback_combat_if_needed('invalid_final_output', {'finalizer_contract_violation': finalizer_contract_violation})
                 return {
                     'mode': 'silent',
@@ -4326,6 +4351,27 @@ def _run_session_dm_loop(
                 mechanical_retried = True
                 continue
             if format_violation and format_retry_count < 2:
+                if base_audit.get('campaign_id'):
+                    audit = guard_audit('format_guard')
+                    log_audit_event(
+                        base_audit.get('campaign_id'),
+                        'format_guard_retry',
+                        'Session DM response used malformed visible-message syntax; discarded candidate and reran with a format reminder.',
+                        {
+                            'operation': 'format_guard',
+                            'attempt': format_retry_count + 1,
+                            'player_message_id': base_audit.get('player_message_id'),
+                            'provider_call_id': base_audit.get('provider_call_id'),
+                            'violation': format_violation,
+                        },
+                        source='session_dm.guard',
+                        actor=audit.get('actor'),
+                        trace_id=audit.get('trace_id'),
+                        parent_trace_id=audit.get('parent_trace_id'),
+                        trace_label=audit.get('trace_label'),
+                        audit_role='guard',
+                        commit=True,
+                    )
                 messages.append({
                     'role': 'system',
                     'content': _session_dm_guard_retry_system_prompt('format', format_violation),
