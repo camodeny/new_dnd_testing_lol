@@ -2130,6 +2130,9 @@ def get_current_audit_bundle_data(run):
     cycle = db.session.get(AutomationRunAuditCycle, run.awaiting_audit_cycle_id) if run.awaiting_audit_cycle_id else None
     if cycle is None:
         return {'error': 'Run is not currently paused at an audit cycle.'}
+    # Keep the exported evidence bundle on the same canonical error snapshot as
+    # the API, scorecard, incidents, UI, and run-comparison surfaces.
+    refresh_run_scorecard(run)
         
     evidence_packet = _cycle_evidence_packet(run, cycle, {})
     template = current_scorecard_template_for_run(run)

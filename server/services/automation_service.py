@@ -46,6 +46,12 @@ from models import (
 )
 from werkzeug.security import generate_password_hash
 from services.character_service import build_character_from_data, character_full_dict, update_character_relations
+from services.post_turn_state import (
+    FAILED_STAGE_STATUSES,
+    SUCCESS_POST_TURN_STATUSES,
+    derive_post_turn_state,
+    state_for_turn,
+)
 
 
 AUTOMATION_ACTIVE_STATUSES = {'queued', 'claimed', 'running', 'stop_requested', 'awaiting_audit', 'reconciling'}
@@ -2564,12 +2570,235 @@ def collect_model_retry_metrics(audit_rows, provider_rows, *, run_status=None):
     }
 
 
+POST_TURN_AUDIT_ERROR_KINDS = {
+    'memory_update_error': 'memory',
+    'clock_adjudicator_error': 'clock',
+    'post_turn_summary_finalize_error': 'summary',
+    'summary_finalizer_error': 'finalizer',
+    'summary_verifier_error': 'durable_application',
+    'post_turn_consistency_incident': 'durable_application',
+    'post_turn_state_invariant_incident': 'durable_application',
+    'embedding_fallback': 'embedding',
+}
+
+
+def _post_turn_correlation(*, payload=None, trace_id=None, parent_trace_id=None, fallback=None):
+    payload = payload if isinstance(payload, dict) else {}
+    player_message_id = payload.get('player_message_id') or payload.get('source_player_message_id')
+    if player_message_id is None:
+        for value in (trace_id, parent_trace_id):
+            match = re.search(r'(?:message_|message:)(\d+)', str(value or ''))
+            if match:
+                player_message_id = int(match.group(1))
+                break
+    if player_message_id is not None:
+        return f'player_message:{player_message_id}', player_message_id
+    trace = parent_trace_id or trace_id
+    if trace:
+        return f'trace:{trace}', None
+    return fallback, None
+
+
+def collect_automation_errors(run, event_rows=None, audit_rows=None):
+    """Collect correlated failures using canonical durable post-turn state."""
+    if event_rows is None or audit_rows is None:
+        event_rows, audit_rows, _, _ = _run_context(run)
+
+    turns = (
+        SessionDmTurn.query.filter_by(campaign_id=run.derived_campaign_id)
+        .order_by(SessionDmTurn.id.asc()).all()
+        if run.derived_campaign_id else []
+    )
+    turn_states = {turn.player_message_id: state_for_turn(turn) for turn in turns}
+    groups = {}
+
+    def add(kind, correlation, *, player_message_id=None, summary=None, evidence=None, transient=False):
+        correlation = correlation or f'uncorrelated:{kind}:{len(groups)}'
+        group = groups.setdefault(correlation, {
+            'player_message_id': player_message_id,
+            'candidates': [],
+        })
+        if group.get('player_message_id') is None and player_message_id is not None:
+            group['player_message_id'] = player_message_id
+        group['candidates'].append({
+            'kind': kind,
+            'summary': summary,
+            'evidence': evidence,
+            'transient': transient,
+        })
+
+    for turn in turns:
+        correlation = f'player_message:{turn.player_message_id}'
+        evidence = {
+            'kind': 'session_message',
+            'id': turn.player_message_id,
+            'path': 'session_dm_turn',
+            'summary': f'Durable DM turn {turn.id}',
+            'visibility': 'dm_private',
+        }
+        state = turn_states[turn.player_message_id]
+        stage_kinds = [
+            kind
+            for kind in ('memory', 'clock')
+            if state['post_turn_stages'].get(kind) in FAILED_STAGE_STATUSES
+        ]
+        if state['post_turn_stages'].get('finalizer') in FAILED_STAGE_STATUSES:
+            stage_kinds.append('finalizer')
+        if not state.get('post_turn_complete') and state.get('post_turn_resolved') and not stage_kinds:
+            stage_kinds.append('post_turn')
+        if turn.status == 'error' and not stage_kinds:
+            stage_kinds.append('finalizer')
+        for kind in stage_kinds:
+            add(
+                kind,
+                correlation,
+                player_message_id=turn.player_message_id,
+                summary=turn.error_text or f'Durable DM turn reports {kind} failure.',
+                evidence=evidence,
+            )
+
+    for row in audit_rows:
+        kind = POST_TURN_AUDIT_ERROR_KINDS.get(row.event_type)
+        if kind is None:
+            continue
+        payload = _audit_payload(row)
+        correlation, player_message_id = _post_turn_correlation(
+            payload=payload,
+            trace_id=row.trace_id,
+            parent_trace_id=row.parent_trace_id,
+            fallback=f'audit_event:{row.id}',
+        )
+        add(
+            kind,
+            correlation,
+            player_message_id=player_message_id,
+            summary=row.summary,
+            transient=row.event_type == 'embedding_fallback',
+            evidence={
+                'kind': 'audit_event',
+                'id': row.id,
+                'path': 'payload',
+                'summary': row.summary,
+                'visibility': 'dm_private',
+            },
+        )
+
+    for row in event_rows:
+        payload = row.payload_json or {}
+        if row.event_type not in {'error', 'dm_turn_status'}:
+            continue
+        correlation, player_message_id = _post_turn_correlation(
+            payload=payload,
+            trace_id=payload.get('trace_id'),
+            parent_trace_id=payload.get('parent_trace_id'),
+            fallback=f'run_event:{row.id}',
+        )
+        state = derive_post_turn_state(
+            payload.get('post_turn_status'),
+            payload.get('memory_status'),
+            payload.get('clock_status'),
+            correlation_id=correlation,
+            error_text=payload.get('post_turn_error') or payload.get('turn_error'),
+        )
+        failed_kinds = [
+            kind
+            for kind in ('memory', 'clock')
+            if state.get(f'{kind}_status') in FAILED_STAGE_STATUSES
+        ]
+        if not state.get('post_turn_complete') and state.get('post_turn_resolved') and not failed_kinds:
+            failed_kinds.append('post_turn')
+        if row.event_type == 'error' and not failed_kinds:
+            failed_kinds.append('automation')
+        for kind in failed_kinds:
+            add(
+                kind,
+                correlation,
+                player_message_id=player_message_id,
+                summary=payload.get('post_turn_error') or payload.get('turn_error') or payload.get('error') or 'Automation run error.',
+                evidence={
+                    'kind': 'run_event',
+                    'id': row.id,
+                    'path': 'payload',
+                    'summary': f'{row.event_type} run event',
+                    'visibility': 'dm_private',
+                },
+            )
+
+    recovered_correlations = set()
+    for row in audit_rows:
+        if row.event_type not in {'memory_recovery_applied', 'post_turn_consistency_reconciled'}:
+            continue
+        correlation, _ = _post_turn_correlation(
+            payload=_audit_payload(row), trace_id=row.trace_id, parent_trace_id=row.parent_trace_id,
+        )
+        if correlation:
+            recovered_correlations.add(correlation)
+
+    errors = []
+    for correlation, group in groups.items():
+        candidates = group['candidates']
+        specific_kinds = {item['kind'] for item in candidates if item['kind'] not in {'automation', 'post_turn'}}
+        kinds = specific_kinds or {item['kind'] for item in candidates}
+        player_message_id = group.get('player_message_id')
+        turn_state = turn_states.get(player_message_id)
+        durable_recovered = bool(
+            turn_state
+            and turn_state.get('post_turn_status') in SUCCESS_POST_TURN_STATUSES
+            and turn_state.get('post_turn_complete')
+        )
+        for kind in sorted(kinds):
+            matching = [item for item in candidates if item['kind'] == kind] or candidates
+            evidence_refs = []
+            seen_refs = set()
+            for item in matching:
+                ref = item.get('evidence')
+                if not ref:
+                    continue
+                ref_key = (ref.get('kind'), ref.get('id'), ref.get('path'))
+                if ref_key not in seen_refs:
+                    evidence_refs.append(ref)
+                    seen_refs.add(ref_key)
+            recovered = durable_recovered or correlation in recovered_correlations or all(item.get('transient') for item in matching)
+            errors.append({
+                'error_id': f'{correlation}:{kind}',
+                'kind': kind,
+                'recovery_status': 'recovered' if recovered else 'unrecovered',
+                'summary': next((item.get('summary') for item in matching if item.get('summary')), f'{kind} automation failure'),
+                'correlation_key': correlation,
+                'player_message_id': player_message_id,
+                'evidence_refs': evidence_refs,
+            })
+
+    errors.sort(key=lambda item: (item['correlation_key'], item['kind']))
+    kind_counts = Counter(item['kind'] for item in errors)
+    return {
+        'error_count': len(errors),
+        'error_counts_by_kind': dict(sorted(kind_counts.items())),
+        'recovered_error_count': sum(1 for item in errors if item['recovery_status'] == 'recovered'),
+        'unrecovered_error_count': sum(1 for item in errors if item['recovery_status'] == 'unrecovered'),
+        'errors': errors,
+    }
+
+
 def calculate_run_incidents(run, event_rows=None, audit_rows=None, provider_rows=None):
     if event_rows is None or audit_rows is None or provider_rows is None:
         event_rows, audit_rows, provider_rows, _ = _run_context(run)
 
     audit_counts = Counter(audit.event_type for audit in audit_rows)
     incidents = []
+    automation_errors = collect_automation_errors(run, event_rows, audit_rows)
+    for error in automation_errors['errors']:
+        recovered = error['recovery_status'] == 'recovered'
+        incidents.append({
+            'incident_type': f"post_turn_{error['kind']}_failure",
+            'severity': 'warn' if recovered else 'fail',
+            'summary': error['summary'],
+            'count': 1,
+            'error_kind': error['kind'],
+            'recovery_status': error['recovery_status'],
+            'evidence_refs': error['evidence_refs'],
+            'error_id': error['error_id'],
+        })
     dm_silence_count = audit_counts.get('dm_silence_chosen', 0)
     if dm_silence_count >= 2:
         incidents.append({
@@ -2638,7 +2867,7 @@ def _collect_run_metrics(run, event_rows=None, audit_rows=None, provider_rows=No
         event_rows, audit_rows, provider_rows, cycle_rows = _run_context(run)
 
     audit_counts = Counter(audit.event_type for audit in audit_rows)
-    errors = [event for event in event_rows if event.event_type == 'error']
+    automation_errors = collect_automation_errors(run, event_rows, audit_rows)
     turn_results = [event for event in event_rows if event.event_type == 'turn_result']
     completed_turns = [event for event in turn_results if (event.payload_json or {}).get('action') != 'no_action']
     if not completed_turns:
@@ -2676,7 +2905,11 @@ def _collect_run_metrics(run, event_rows=None, audit_rows=None, provider_rows=No
 
     return {
         'run_status': run.status,
-        'error_count': len(errors),
+        'error_count': automation_errors['error_count'],
+        'error_counts_by_kind': automation_errors['error_counts_by_kind'],
+        'recovered_error_count': automation_errors['recovered_error_count'],
+        'unrecovered_error_count': automation_errors['unrecovered_error_count'],
+        'automation_errors': automation_errors['errors'],
         'turn_count': len(completed_turns),
         'completed_turns': len(completed_turns),
         'dm_silence_count': audit_counts.get('dm_silence_chosen', 0),
@@ -3007,6 +3240,14 @@ def refresh_run_scorecard(run):
     for check in checks:
         metric_key = check.get('metric')
         metric_value = metrics.get(metric_key)
+        metric_context = {}
+        if metric_key == 'error_count':
+            metric_context = {
+                'error_counts_by_kind': metrics.get('error_counts_by_kind', {}),
+                'recovered_error_count': metrics.get('recovered_error_count', 0),
+                'unrecovered_error_count': metrics.get('unrecovered_error_count', 0),
+                'automation_errors': metrics.get('automation_errors', []),
+            }
         status = _evaluate_check(metric_value, check)
         weight = max(1, _safe_int(check.get('weight'), 1))
         scoring = _scoring_summary([status], weight=weight)
@@ -3032,6 +3273,7 @@ def refresh_run_scorecard(run):
                 'better_direction': check.get('better_direction'),
                 'severity': status,
                 **({'retry_metrics': metrics.get('model_retry_metrics')} if metric_key == 'model_retry_count' else {}),
+                **metric_context,
                 **scoring,
             },
         })
@@ -3142,6 +3384,10 @@ def refresh_run_scorecard(run):
         'warning_checks': warn_count,
         'completed_turns': metrics.get('completed_turns', 0),
         'error_count': metrics.get('error_count', 0),
+        'error_counts_by_kind': metrics.get('error_counts_by_kind', {}),
+        'recovered_error_count': metrics.get('recovered_error_count', 0),
+        'unrecovered_error_count': metrics.get('unrecovered_error_count', 0),
+        'automation_errors': metrics.get('automation_errors', []),
         'retry_metrics': metrics.get('model_retry_metrics'),
         'audited_cycle_count': metrics.get('audited_cycle_count', 0),
         'scoring_model': SCORECARD_SCORING_MODEL,

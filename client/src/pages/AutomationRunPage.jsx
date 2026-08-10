@@ -359,7 +359,13 @@ export default function AutomationRunPage() {
           </div>
           <div className="automation-stat-card">
             <strong>{run.scorecard_summary?.error_count || 0}</strong>
-            <span>Errors</span>
+            <span>
+              Errors · {run.scorecard_summary?.unrecovered_error_count || 0} unrecovered
+              {run.scorecard_summary?.recovered_error_count ? ` · ${run.scorecard_summary.recovered_error_count} recovered` : ''}
+              {Object.keys(run.scorecard_summary?.error_counts_by_kind || {}).length
+                ? ` · ${Object.entries(run.scorecard_summary.error_counts_by_kind).map(([kind, count]) => `${kind} ${count}`).join(', ')}`
+                : ''}
+            </span>
           </div>
           <div className="automation-stat-card">
             <strong>{retryMetrics.total || 0}</strong>
@@ -684,6 +690,14 @@ export default function AutomationRunPage() {
                           <div>
                             <strong>{incident.incident_type}</strong>
                             <span>{incident.summary}</span>
+                            {incident.error_kind && (
+                              <span>
+                                {incident.error_kind} · {incident.recovery_status}
+                                {incident.evidence_refs?.length
+                                  ? ` · evidence ${incident.evidence_refs.map((ref) => `${ref.kind}:${ref.id}`).join(', ')}`
+                                  : ''}
+                              </span>
+                            )}
                           </div>
                           <span>{incident.severity}</span>
                         </div>
