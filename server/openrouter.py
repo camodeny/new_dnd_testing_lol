@@ -14,7 +14,10 @@ from services.audit_service import log_audit_event, log_model_error, log_model_r
 from services.dm_response_parts import normalize_response_parts, render_visible_response_parts
 from services.memory_resolver_schemas import (
     RESOLVED_ENTITY_REF_SCHEMA,
+    RESOLVER_PACKET_SCHEMA,
+    resolver_packet_requires_identity_commitment,
     validate_resolved_entity_refs_contract,
+    validate_resolver_packet,
 )
 
 load_dotenv()
@@ -1083,9 +1086,8 @@ SESSION_DM_FINALIZER_TOOLS = [
                         'description': 'Pending action IDs to commit with this reply. Use [] when no pending action should commit.',
                     },
                     'resolver_packet': {
-                        'type': 'object',
-                        'description': 'Optional separate hidden identity commitment. Use entity_mentions for deliberate canonical identity resolution; it is not player-visible and is not part of response parts.',
-                        'properties': {'entity_mentions': {'type': 'array', 'items': {'type': 'object'}}},
+                        **RESOLVER_PACKET_SCHEMA,
+                        'description': 'Optional separate hidden identity commitment. Use only the declared canonical entity_mentions fields. It is not player-visible and is not part of response parts. Omit the packet when no identity commitment is needed.',
                     },
                 },
             },
@@ -1146,8 +1148,22 @@ def _session_dm_finalizer_decision_from_tool_calls(tool_calls):
         except ValueError as err:
             return None, {'kind': 'invalid_response_parts', 'detail': str(err)}
         decision = {'mode': 'speak', 'content': render_visible_response_parts(parts), 'parts': parts, 'commit_action_ids': args.get('commit_action_ids')}
-        resolver_packet = args.get('resolver_packet')
-        if isinstance(resolver_packet, dict) and isinstance(resolver_packet.get('entity_mentions'), list):
+        if 'resolver_packet' in args:
+            resolver_packet = args.get('resolver_packet')
+            packet_ok, packet_error = validate_resolver_packet(resolver_packet)
+            if not packet_ok:
+                required = resolver_packet_requires_identity_commitment(resolver_packet)
+                return None, {
+                    'kind': 'invalid_resolver_packet',
+                    'detail': f'resolver_packet failed the canonical contract: {packet_error}',
+                    'repair': {
+                        'action': 'repair_resolver_packet' if required else 'repair_or_omit_resolver_packet',
+                        'preserve_fields': ['parts', 'commit_action_ids'],
+                        'required_entity_mention_fields': list(RESOLVER_PACKET_SCHEMA['properties']['entity_mentions']['items']['required']),
+                    },
+                    'identity_commitment_required': required,
+                    'fallback_decision': decision,
+                }
             decision['resolver_packet'] = resolver_packet
         return decision, None
     return {
@@ -1663,6 +1679,31 @@ def _session_dm_draft_serialization_prompt(action_buffer):
         f'commit_action_ids may contain only these pending action IDs: {json.dumps(allowed_action_ids)}. '
         'Use [] when none of those pending actions should commit with this reply. '
         'Emit no explanation, acknowledgement, markdown fence, or text outside the native tool call.'
+    )
+
+
+def _session_dm_resolver_packet_repair_prompt(decision, violation, *, required, attempt):
+    preserved = {
+        'parts': decision.get('parts') if isinstance(decision, dict) else [],
+        'commit_action_ids': decision.get('commit_action_ids') if isinstance(decision, dict) else [],
+    }
+    packet_instruction = (
+        'A canonical_id was attempted, so resolver_packet is required. Repair it; do not omit it. '
+        'Every canonical_id requires at least one evidence_refs entry.'
+        if required else
+        'If no deliberate canonical identity commitment is needed, omit resolver_packet entirely. '
+        'Otherwise repair it to the canonical schema.'
+    )
+    return (
+        f'Resolver-contract repair {attempt}/2. The previous talk_to_player call had valid visible parts and '
+        f'commit_action_ids, but invalid optional identity metadata: {violation.get("detail")}. '
+        'Call talk_to_player again. Copy the following parts and commit_action_ids exactly; do not add, remove, '
+        'reword, or reorder visible content or staged actions: '
+        f'{json.dumps(preserved, ensure_ascii=False)}. '
+        f'{packet_instruction} '
+        'Each entity mention must use mention_ref, surface_form, and identity_status; supported optional fields are '
+        'visibility, canonical_id, public_name, and evidence_refs. Do not use aliases such as entity, mention, name, '
+        'role, or campaign_entity. Emit no text outside the native tool call.'
     )
 
 
@@ -3932,6 +3973,11 @@ def _run_session_dm_loop(
 
     tool_round = 0
     finalizer_contract_retry_count = 0
+    resolver_contract_retry_count = 0
+    resolver_repair_candidate = None
+    resolver_repair_required = False
+    resolver_repair_base_messages = None
+    resolver_contract_audit = None
     draft_serialization_active = False
     preserved_visible_draft = ''
     draft_serialization_base_messages = None
@@ -3960,6 +4006,40 @@ def _run_session_dm_loop(
                 f'session_dm_guard: {guard_name}',
             )
         return guard_audits[guard_name]
+
+    def resolver_audit():
+        nonlocal resolver_contract_audit
+        if resolver_contract_audit is None:
+            resolver_contract_audit = _child_audit_context(
+                base_audit,
+                'resolver_contract_repair',
+                'session_dm_resolver_contract',
+                'session_dm: resolver contract repair',
+            )
+        return resolver_contract_audit
+
+    def log_resolver_contract_event(event_type, summary, payload):
+        if not base_audit.get('campaign_id'):
+            return
+        audit = resolver_audit()
+        log_audit_event(
+            base_audit.get('campaign_id'),
+            event_type,
+            summary,
+            {
+                'operation': 'resolver_contract_repair',
+                'player_message_id': base_audit.get('player_message_id'),
+                'provider_call_id': base_audit.get('provider_call_id'),
+                **payload,
+            },
+            source='session_dm.resolver_contract',
+            actor=audit.get('actor'),
+            trace_id=audit.get('trace_id'),
+            parent_trace_id=audit.get('parent_trace_id'),
+            trace_label=audit.get('trace_label'),
+            audit_role='guard',
+            commit=True,
+        )
 
     def rollback_combat_if_needed(reason, details=None):
         if not combat_tracker.get('mutated') or not combat_tracker.get('snapshot'):
@@ -3993,6 +4073,7 @@ def _run_session_dm_loop(
 
         retrying_visible_answer = any((
             finalizer_contract_retry_count > 0,
+            resolver_contract_retry_count > 0,
             format_retry_count > 0,
             mechanical_retried,
             pc_control_retried,
@@ -4093,6 +4174,137 @@ def _run_session_dm_loop(
                 'kind': 'draft_serialization_stay_silent',
                 'detail': 'A non-empty preserved visible draft must serialize through talk_to_player.',
             }
+        if resolver_repair_candidate is not None:
+            repaired_packet = (
+                finalizer_decision.get('resolver_packet')
+                if isinstance(finalizer_decision, dict)
+                else None
+            )
+            if finalizer_decision is None:
+                outer_violation = finalizer_violation or _session_dm_finalizer_contract_violation(
+                    message.get('content') or ''
+                )
+                finalizer_violation = {
+                    'kind': 'invalid_resolver_packet',
+                    'detail': (
+                        'resolver-contract repair did not return a valid talk_to_player call: '
+                        f'{outer_violation.get("detail")}'
+                    ),
+                    'outer_finalizer_violation': outer_violation,
+                    'identity_commitment_required': resolver_repair_required,
+                    'fallback_decision': resolver_repair_candidate,
+                }
+            elif finalizer_decision.get('mode') != 'speak':
+                finalizer_decision = None
+                finalizer_violation = {
+                    'kind': 'invalid_resolver_packet',
+                    'detail': 'resolver-contract repair must use talk_to_player and preserve the accepted visible reply',
+                    'identity_commitment_required': resolver_repair_required,
+                    'fallback_decision': resolver_repair_candidate,
+                }
+            elif resolver_repair_required and repaired_packet is None:
+                finalizer_decision = None
+                finalizer_violation = {
+                    'kind': 'invalid_resolver_packet',
+                    'detail': 'resolver-contract repair omitted a required canonical identity commitment',
+                    'identity_commitment_required': True,
+                    'fallback_decision': resolver_repair_candidate,
+                }
+            else:
+                original_candidate = resolver_repair_candidate
+                finalizer_decision = dict(original_candidate)
+                if repaired_packet is not None:
+                    finalizer_decision['resolver_packet'] = repaired_packet
+                log_resolver_contract_event(
+                    'resolver_contract_repair_completed',
+                    'Accepted repaired resolver metadata while preserving the original visible DM turn.',
+                    {
+                        'attempt': resolver_contract_retry_count,
+                        'outcome': 'repaired' if repaired_packet is not None else 'omitted_by_model',
+                        'identity_commitment_required': resolver_repair_required,
+                    },
+                )
+                resolver_repair_candidate = None
+                resolver_repair_required = False
+                resolver_repair_base_messages = None
+                resolver_contract_retry_count = 0
+        if finalizer_violation and finalizer_violation.get('kind') == 'invalid_resolver_packet':
+            if resolver_repair_candidate is None:
+                resolver_repair_candidate = finalizer_violation.get('fallback_decision')
+                resolver_repair_required = finalizer_violation.get('identity_commitment_required') is True
+                resolver_repair_base_messages = list(candidate_context_messages)
+            if resolver_contract_retry_count < 2:
+                resolver_contract_retry_count += 1
+                log_resolver_contract_event(
+                    'resolver_contract_repair_requested',
+                    'Requested a resolver-packet-only repair while preserving the valid visible DM turn.',
+                    {
+                        'attempt': resolver_contract_retry_count,
+                        'outcome': 'pending',
+                        'violation': {
+                            key: value for key, value in finalizer_violation.items()
+                            if key != 'fallback_decision'
+                        },
+                        'identity_commitment_required': resolver_repair_required,
+                    },
+                )
+                if on_status_change:
+                    on_status_change({
+                        'step': 'revising',
+                        'violations': {
+                            'type': 'resolver_contract',
+                            'details': {
+                                key: value for key, value in finalizer_violation.items()
+                                if key != 'fallback_decision'
+                            },
+                        },
+                    })
+                messages = list(resolver_repair_base_messages or messages)
+                messages.append({
+                    'role': 'system',
+                    'content': _session_dm_resolver_packet_repair_prompt(
+                        resolver_repair_candidate,
+                        finalizer_violation,
+                        required=resolver_repair_required,
+                        attempt=resolver_contract_retry_count,
+                    ),
+                })
+                continue
+            if resolver_repair_required:
+                log_resolver_contract_event(
+                    'resolver_contract_repair_blocked',
+                    'Blocked a DM turn whose required canonical identity commitment remained malformed.',
+                    {
+                        'attempt': resolver_contract_retry_count,
+                        'outcome': 'exhausted',
+                        'violation': {
+                            key: value for key, value in finalizer_violation.items()
+                            if key != 'fallback_decision'
+                        },
+                        'identity_commitment_required': True,
+                    },
+                )
+                rollback_combat_if_needed('invalid_required_resolver_packet', {
+                    key: value for key, value in finalizer_violation.items()
+                    if key != 'fallback_decision'
+                })
+                return {
+                    'mode': 'silent',
+                    'reason': 'The DM response required canonical identity metadata that could not be validated.',
+                }
+            finalizer_decision = dict(resolver_repair_candidate)
+            finalizer_violation = None
+            log_resolver_contract_event(
+                'resolver_contract_packet_omitted',
+                'Omitted malformed optional resolver metadata and preserved the valid visible DM turn.',
+                {
+                    'attempt': resolver_contract_retry_count,
+                    'outcome': 'omitted_after_repair',
+                    'identity_commitment_required': False,
+                },
+            )
+            resolver_repair_candidate = None
+            resolver_repair_base_messages = None
         if finalizer_violation:
             tool_calls = []
         if finalizer_decision is not None or not tool_calls or tool_round >= max_tool_rounds:

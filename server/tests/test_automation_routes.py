@@ -6314,6 +6314,7 @@ class AutomationRouteTest(unittest.TestCase):
             expected_counts = {
                 'provider_retry': 1,
                 'parse_repair': 3,
+                'resolver_contract_repair': 0,
                 'contract_guard_retry': 10,
                 'tool_repair': 1,
                 'guard_retry': 2,

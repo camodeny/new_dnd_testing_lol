@@ -234,6 +234,7 @@ class SessionMemoryIntegrityTest(unittest.TestCase):
                 'canonical_id': 'aldric',
                 'public_name': 'the grey-cloaked figure',
                 'visibility': 'dm_private',
+                'evidence_refs': ['campaign_entity:aldric'],
             }],
         }
         extracted = {}
@@ -282,6 +283,7 @@ class SessionMemoryIntegrityTest(unittest.TestCase):
                 'surface_form': 'Kaelen Morwen',
                 'identity_status': 'known_hidden',
                 'canonical_id': 'aldric',
+                'evidence_refs': ['campaign_entity:aldric'],
             }],
         }
         extracted = {}
@@ -463,6 +465,7 @@ class SessionMemoryIntegrityTest(unittest.TestCase):
                 'canonical_id': 'toren',
                 'public_name': 'the familiar figure',
                 'visibility': 'dm_private',
+                'evidence_refs': ['campaign_entity:toren'],
             }],
         }
         extracted = {
@@ -531,6 +534,7 @@ class SessionMemoryIntegrityTest(unittest.TestCase):
                 'canonical_id': 'aldric',
                 'public_name': 'Kaelen Morwen',
                 'visibility': 'dm_private',
+                'evidence_refs': ['campaign_entity:aldric'],
             }],
         }
         extracted = {}
@@ -573,6 +577,7 @@ class SessionMemoryIntegrityTest(unittest.TestCase):
                 'canonical_id': 'aldric',
                 'public_name': 'the grey-cloaked figure',
                 'visibility': 'dm_private',
+                'evidence_refs': ['campaign_entity:aldric'],
             }],
         }
         extracted = {}
@@ -605,6 +610,7 @@ class SessionMemoryIntegrityTest(unittest.TestCase):
                 'canonical_id': 'toren',
                 'public_name': 'the hooded stranger',
                 'visibility': 'dm_private',
+                'evidence_refs': ['campaign_entity:toren'],
             }],
         }
         extracted = {}
@@ -623,6 +629,16 @@ class SessionMemoryIntegrityTest(unittest.TestCase):
 
         ok, err = validate_resolver_packet({'entity_mentions': [{'mention_ref': 'good_1', 'surface_form': 'the stranger', 'identity_status': 'known_hidden', 'visibility': 'dm_private'}]})
         self.assertTrue(ok)
+
+        ok, err = validate_resolver_packet({'entity_mentions': [{
+            'mention_ref': 'unknown_1',
+            'surface_form': 'the stranger',
+            'identity_status': 'intentionally_undetermined',
+            'canonical_id': None,
+            'public_name': None,
+            'evidence_refs': None,
+        }]})
+        self.assertTrue(ok, err)
 
     def test_alias_does_not_rename_canonical_data(self):
         memory_context = self._base_context()

@@ -21,6 +21,12 @@ IDENTITY_STATUSES = {
     "candidate_existing_entity",
 }
 
+IDENTITY_VISIBILITIES = {
+    "public",
+    "party_known",
+    "dm_private",
+}
+
 # ── Resolution Decisions ──────────────────────────────────────────────
 RESOLUTION_DECISIONS = {
     "reuse_existing",
@@ -197,13 +203,93 @@ EVIDENCE_SOURCES = {
 
 _VALID_MENTION_REF = re.compile(r"^[a-zA-Z][a-zA-Z0-9_]*$")
 
+ENTITY_MENTION_SCHEMA = {
+    "type": "object",
+    "additionalProperties": False,
+    "required": ["mention_ref", "surface_form", "identity_status"],
+    "properties": {
+        "mention_ref": {
+            "type": "string",
+            "pattern": _VALID_MENTION_REF.pattern,
+            "description": "Stable turn-local reference beginning with a letter and containing only letters, digits, and underscores.",
+        },
+        "surface_form": {
+            "type": "string",
+            "minLength": 1,
+            "description": "Exact non-empty name or descriptor used for the entity in this turn.",
+        },
+        "identity_status": {
+            "type": "string",
+            "enum": sorted(IDENTITY_STATUSES),
+        },
+        "visibility": {
+            "type": "string",
+            "enum": sorted(IDENTITY_VISIBILITIES),
+            "description": "Defaults to dm_private when omitted.",
+        },
+        "canonical_id": {
+            "type": ["string", "null"],
+            "minLength": 1,
+            "description": "Existing or deliberately allocated canonical entity ID, or null when no canonical commitment is made.",
+        },
+        "public_name": {
+            "type": ["string", "null"],
+            "minLength": 1,
+            "description": "Optional player-safe name or descriptor for the entity.",
+        },
+        "evidence_refs": {
+            "type": ["array", "null"],
+            "items": {},
+            "description": "Source references supporting canonical_id, or null when no canonical commitment is made.",
+        },
+    },
+    "allOf": [{
+        "if": {
+            "required": ["canonical_id"],
+            "properties": {"canonical_id": {"type": "string"}},
+        },
+        "then": {
+            "required": ["evidence_refs"],
+            "properties": {"evidence_refs": {"type": "array", "minItems": 1}},
+        },
+    }],
+}
+
+RESOLVER_PACKET_SCHEMA = {
+    "type": "object",
+    "additionalProperties": False,
+    "required": ["entity_mentions"],
+    "properties": {
+        "entity_mentions": {
+            "type": "array",
+            "items": ENTITY_MENTION_SCHEMA,
+        },
+    },
+}
+
+
+def resolver_packet_requires_identity_commitment(packet):
+    """Return whether dropping this packet could discard a canonical identity mutation."""
+    mentions = packet.get("entity_mentions") if isinstance(packet, dict) else None
+    if not isinstance(mentions, list):
+        return False
+    return any(
+        isinstance(mention, dict)
+        and isinstance(mention.get("canonical_id"), str)
+        and bool(mention["canonical_id"].strip())
+        for mention in mentions
+    )
+
 
 def validate_resolver_packet(packet):
     if not isinstance(packet, dict):
         return False, "resolver_packet must be a dict"
+    unknown_fields = sorted(set(packet) - set(RESOLVER_PACKET_SCHEMA["properties"]))
+    if unknown_fields:
+        return False, f"unknown fields: {unknown_fields}"
+    if "entity_mentions" not in packet:
+        return False, "missing required field: entity_mentions"
     entity_mentions = packet.get("entity_mentions")
-    if entity_mentions is None:
-        return True, None
     if not isinstance(entity_mentions, list):
         return False, "entity_mentions must be a list"
     for idx, mention in enumerate(entity_mentions):
@@ -216,6 +302,12 @@ def validate_resolver_packet(packet):
 def validate_entity_mention(mention):
     if not isinstance(mention, dict):
         return False, "must be a dict"
+    unknown_fields = sorted(set(mention) - set(ENTITY_MENTION_SCHEMA["properties"]))
+    if unknown_fields:
+        return False, f"unknown fields: {unknown_fields}"
+    for field in ENTITY_MENTION_SCHEMA["required"]:
+        if field not in mention:
+            return False, f"missing required field: {field}"
     mention_ref = mention.get("mention_ref", "")
     if not _VALID_MENTION_REF.match(str(mention_ref)):
         return False, f"invalid mention_ref: {mention_ref!r}"
@@ -226,14 +318,21 @@ def validate_entity_mention(mention):
     if not isinstance(surface_form, str) or not surface_form.strip():
         return False, "surface_form is required and must be non-empty"
     visibility = mention.get("visibility", "dm_private")
-    if visibility not in ("public", "party_known", "dm_private"):
+    if visibility not in IDENTITY_VISIBILITIES:
         return False, f"invalid visibility: {visibility!r}"
     canonical_id = mention.get("canonical_id")
     if canonical_id is not None and not isinstance(canonical_id, str):
         return False, "canonical_id must be a string or null"
+    if isinstance(canonical_id, str) and not canonical_id.strip():
+        return False, "canonical_id must be non-empty or null"
+    public_name = mention.get("public_name")
+    if public_name is not None and (not isinstance(public_name, str) or not public_name.strip()):
+        return False, "public_name must be a non-empty string or null"
     evidence_refs = mention.get("evidence_refs")
     if evidence_refs is not None and not isinstance(evidence_refs, list):
         return False, "evidence_refs must be a list or null"
+    if canonical_id is not None and not evidence_refs:
+        return False, "evidence_refs must contain at least one source when canonical_id is set"
     return True, None
 
 
