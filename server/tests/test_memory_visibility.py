@@ -13,10 +13,8 @@ from services.dm_tools import apply_compiled_session_memory_patch
 from services.memory_resolver_schemas import SOURCE_CONTRACT_COMPILED_V2
 
 
-class Issue83VisibilityLeakPreventionTest(unittest.TestCase):
-    """Safety regression coverage for issue #83.
-
-    Prevents mixed-visibility NPC updates and party-visible graph items from
+class MemoryVisibilityInvariantTest(unittest.TestCase):
+    """Prevent mixed-visibility NPC updates and party-visible graph items from
     leaking DM-private fields (identity, role in a plot, relationships, secrets)
     at the durable write boundary.
     """
@@ -31,7 +29,7 @@ class Issue83VisibilityLeakPreventionTest(unittest.TestCase):
         self.ctx.push()
         db.create_all()
 
-        self.campaign = Campaign(name='Issue 83 Test', description='Test campaign', user_id=1)
+        self.campaign = Campaign(name='Visibility Test', description='Test campaign', user_id=1)
         db.session.add(self.campaign)
         db.session.flush()
 
@@ -55,21 +53,20 @@ class Issue83VisibilityLeakPreventionTest(unittest.TestCase):
         self.ctx.pop()
 
     # ── _normalize_visibility ──────────────────────────────────────────
-    def test_normalize_visibility_never_promotes_dm_private_intent(self):
-        self.assertEqual(_normalize_visibility('visible_transcript', 'dm_private'), 'dm_private')
-
-    def test_normalize_visibility_party_known_requires_visible_transcript(self):
-        self.assertEqual(_normalize_visibility('visible_transcript', 'party_known'), 'party_known')
-        self.assertEqual(_normalize_visibility(None, 'party_known'), 'dm_private')
-        self.assertEqual(_normalize_visibility('dm_private', None), 'dm_private')
-
-    def test_normalize_visibility_public_intent_stays_public(self):
-        self.assertEqual(_normalize_visibility(None, 'public'), 'public')
-        self.assertEqual(_normalize_visibility('visible_transcript', 'public'), 'public')
-
-    def test_normalize_visibility_visible_transcript_defaults_party_known(self):
-        self.assertEqual(_normalize_visibility('visible_transcript', None), 'party_known')
-        self.assertEqual(_normalize_visibility('visible_transcript', 'unknown_value'), 'party_known')
+    def test_visibility_normalization_matrix(self):
+        cases = [
+            ('visible_transcript', 'dm_private', 'dm_private'),
+            ('visible_transcript', 'party_known', 'party_known'),
+            (None, 'party_known', 'dm_private'),
+            ('dm_private', None, 'dm_private'),
+            (None, 'public', 'public'),
+            ('visible_transcript', 'public', 'public'),
+            ('visible_transcript', None, 'party_known'),
+            ('visible_transcript', 'unknown_value', 'party_known'),
+        ]
+        for source_surface, intended_visibility, expected in cases:
+            with self.subTest(source_surface=source_surface, intended_visibility=intended_visibility):
+                self.assertEqual(_normalize_visibility(source_surface, intended_visibility), expected)
 
     # ── Compile path: dm_private intent survives visible source surface ──
     def _compile(self, resolved):

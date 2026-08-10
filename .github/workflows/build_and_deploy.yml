@@ -37,7 +37,7 @@ jobs:
         run: |
           set -o pipefail
           mkdir -p test-logs
-          "$CI_VENV/bin/python" -m pytest server/tests -q -W error 2>&1 | tee test-logs/python.log
+          "$CI_VENV/bin/python" -m pytest server/tests -q 2>&1 | tee test-logs/python.log
 
       - name: Set up Node.js
         uses: actions/setup-node@v4

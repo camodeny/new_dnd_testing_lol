@@ -41,26 +41,17 @@ class FakeResponse:
 
 
 class ProviderRegistryTest(unittest.TestCase):
-    def test_builtin_providers_registered(self):
+    def test_registry_resolution_contract(self):
         self.assertEqual(provider_registry.names(), {'openrouter', 'opencode_go'})
         self.assertIsInstance(provider_registry.get('openrouter'), OpenRouterAdapter)
         self.assertIsInstance(provider_registry.get('opencode_go'), OpenCodeGoAdapter)
-
-    def test_get_normalizes_provider_names(self):
         self.assertIs(provider_registry.get('opencode-go'), provider_registry.get('opencode_go'))
         self.assertIs(provider_registry.get(' OpenRouter '), provider_registry.get('openrouter'))
-
-    def test_unknown_provider_raises(self):
         with self.assertRaises(RuntimeError):
             provider_registry.get('not_a_provider')
-
-    def test_current_reads_llm_provider_env(self):
-        with patch.dict(os.environ, {'LLM_PROVIDER': 'opencode_go'}):
-            self.assertEqual(provider_registry.current().name, 'opencode_go')
-        with patch.dict(os.environ, {'LLM_PROVIDER': 'openrouter'}):
-            self.assertEqual(provider_registry.current().name, 'openrouter')
-
-    def test_current_rejects_unknown_provider(self):
+        for configured, expected in [('opencode_go', 'opencode_go'), ('openrouter', 'openrouter')]:
+            with self.subTest(configured=configured), patch.dict(os.environ, {'LLM_PROVIDER': configured}):
+                self.assertEqual(provider_registry.current().name, expected)
         with patch.dict(os.environ, {'LLM_PROVIDER': 'bogus'}):
             with self.assertRaises(RuntimeError):
                 provider_registry.current()
@@ -102,14 +93,13 @@ class ProviderRegistryTest(unittest.TestCase):
 
 
 class ProviderCapabilitiesTest(unittest.TestCase):
-    def test_openrouter_supports_tool_controls(self):
+    def test_provider_capability_contract(self):
         adapter = OpenRouterAdapter()
         capabilities = adapter.capabilities_for('any-model')
         self.assertTrue(capabilities.supports_tool_choice_required)
         self.assertTrue(capabilities.supports_parallel_tool_calls)
         self.assertFalse(capabilities.supports_thinking)
 
-    def test_opencode_go_deepseek_thinking_capability(self):
         adapter = OpenCodeGoAdapter()
         with patch.dict(os.environ, {'OPENCODE_GO_THINKING': 'enabled', 'OPENCODE_GO_REASONING_EFFORT': 'max'}):
             capabilities = adapter.capabilities_for('deepseek-v4-flash')
@@ -117,15 +107,11 @@ class ProviderCapabilitiesTest(unittest.TestCase):
         self.assertEqual(capabilities.reasoning_effort, 'max')
         self.assertFalse(capabilities.supports_tool_choice_required)
 
-    def test_opencode_go_thinking_disabled_by_default(self):
-        adapter = OpenCodeGoAdapter()
         with patch.dict(os.environ, {}, clear=False):
             os.environ.pop('OPENCODE_GO_THINKING', None)
             capabilities = adapter.capabilities_for('deepseek-v4-flash')
         self.assertFalse(capabilities.supports_thinking)
 
-    def test_memory_request_can_force_deepseek_thinking(self):
-        adapter = OpenCodeGoAdapter()
         request = ProviderRequest(
             messages=[{'role': 'user', 'content': 'extract memory'}],
             model='deepseek-v4-flash',
@@ -136,8 +122,6 @@ class ProviderCapabilitiesTest(unittest.TestCase):
             payload = adapter.build_payload(request)
         self.assertEqual(payload['thinking'], {'type': 'enabled'})
 
-    def test_opencode_go_non_deepseek_has_no_thinking(self):
-        adapter = OpenCodeGoAdapter()
         with patch.dict(os.environ, {'OPENCODE_GO_THINKING': 'enabled'}):
             capabilities = adapter.capabilities_for('some-other-model')
         self.assertFalse(capabilities.supports_thinking)
@@ -231,16 +215,12 @@ class ResponseNormalizationTest(unittest.TestCase):
         self.assertEqual(normalized.tool_calls[0].name, 'get_clock')
         self.assertEqual(normalized.tool_calls[0].arguments, '{"a": 1}')
         self.assertIs(normalized.raw, data)
+        list_content = {'choices': [{'message': {'content': [{'text': 'foo'}, {'text': 'bar'}]}}]}
+        self.assertEqual(adapter.parse_response(list_content).content, 'foobar')
 
-    def test_parse_response_joins_list_content(self):
-        adapter = OpenRouterAdapter()
-        data = {'choices': [{'message': {'content': [{'text': 'foo'}, {'text': 'bar'}]}}]}
-        self.assertEqual(adapter.parse_response(data).content, 'foobar')
-
-    def test_malformed_response_raises_provider_error(self):
-        adapter = OpenCodeGoAdapter()
+        malformed_adapter = OpenCodeGoAdapter()
         with self.assertRaises(ProviderError) as ctx:
-            adapter.parse_response({'unexpected': True})
+            malformed_adapter.parse_response({'unexpected': True})
         self.assertEqual(ctx.exception.kind, 'malformed')
         self.assertFalse(ctx.exception.retryable)
 

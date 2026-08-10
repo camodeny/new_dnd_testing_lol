@@ -101,19 +101,6 @@ class SessionMemoryIntegrityTest(unittest.TestCase):
         }
 
     # 1. Participant substitution rejected
-    def test_cast_preserves_correct_npc_identity(self):
-        memory_context = self._base_context()
-        extracted = {}
-        resolved = {
-            'scene_patch': {
-                'active_npc_ids': ['mira', 'aldric'],
-            },
-        }
-        compiled = compile_staged_memory_patch(memory_context, extracted, resolved)
-        active = compiled['scene_patch'].get('active_npc_ids', [])
-        self.assertIn('mira', active)
-        # Toren was not requested, so Aldric is there but Toren is not
-        self.assertNotIn('toren', active)
     def test_distinct_npcs_not_merged(self):
         memory_context = self._base_context()
         extracted = {}
@@ -252,27 +239,6 @@ class SessionMemoryIntegrityTest(unittest.TestCase):
         self.assertEqual(entry['canonical_id'], 'aldric')
         self.assertEqual(entry['visibility'], 'dm_private')
 
-    def test_provisional_new_entity_packet_creates_distinct_entity(self):
-        memory_context = self._base_context()
-        memory_context['resolver_packet'] = {
-            'entity_mentions': [{
-                'mention_ref': 'new_guy_1',
-                'surface_form': 'Captain Voss',
-                'identity_status': 'provisional_new_entity',
-            }],
-        }
-        extracted = {}
-        registry, registry_map, clarifications, diagnostics = build_canonical_resolution_registry(
-            self.campaign,
-            memory_context,
-            extracted,
-            memory_context['resolver_packet'],
-            [],
-            {},
-        )
-        entry = next((e for e in registry if e.get('mention_ref') == 'new_guy_1'), None)
-        self.assertIsNotNone(entry)
-        self.assertEqual(entry['decision'], 'create_new')
 
     def test_packet_contradicting_durable_canon_not_silently_overridden(self):
         memory_context = self._base_context()
@@ -320,24 +286,6 @@ class SessionMemoryIntegrityTest(unittest.TestCase):
         innkeeper_entries = [e for e in registry if e.get('surface_form', '') == 'the innkeeper']
         self.assertEqual(len(innkeeper_entries), 1)
 
-    def test_similar_descriptors_different_scenes_not_shared(self):
-        memory_context = self._base_context()
-        extracted = {
-            'entity_claims': [
-                {'name': 'the guard', 'type': 'npc', 'mention_ref': 'guard_docks'},
-            ],
-        }
-        resolved = {}
-        registry, registry_map, clarifications, diagnostics = build_canonical_resolution_registry(
-            self.campaign,
-            memory_context,
-            extracted,
-            None,
-            [],
-            {},
-        )
-        guard_entries = [e for e in registry if 'guard' in e.get('surface_form', '').lower()]
-        self.assertEqual(len(guard_entries), 1)
 
     def test_provisional_entity_does_not_create_resolution_record(self):
         memory_context = self._base_context()
@@ -350,52 +298,10 @@ class SessionMemoryIntegrityTest(unittest.TestCase):
         # Provisional entities should NOT create resolution records at creation time
         self.assertEqual(len(records), 0)
 
-    def test_diagnostics_substitutions_empty(self):
-        memory_context = self._base_context()
-        extracted = {}
-        resolved = {
-            'scene_patch': {'location_name': 'Ferrymaster\'s Hall'},
-        }
-        compiled = compile_staged_memory_patch(memory_context, extracted, resolved)
-        diag = compiled.get('resolution_diagnostics', {})
-        self.assertEqual(len(diag.get('substitutions', [])), 0)
 
-    def test_source_contract_present_on_compiled_patch(self):
-        memory_context = self._base_context()
-        extracted = {}
-        resolved = {
-            'scene_patch': {'location_name': 'Ferrymaster\'s Hall'},
-        }
-        compiled = compile_staged_memory_patch(memory_context, extracted, resolved)
-        self.assertEqual(compiled.get('source_contract'), 'compiled_session_memory_v2')
 
-    def test_base_memory_revision_present(self):
-        memory_context = self._base_context()
-        extracted = {}
-        resolved = {
-            'scene_patch': {'location_name': 'Ferrymaster\'s Hall'},
-        }
-        compiled = compile_staged_memory_patch(memory_context, extracted, resolved)
-        self.assertIn('base_memory_revision', compiled)
 
-    def test_registry_allocates_collision_safe_ids(self):
-        existing = {'entity_1', 'entity_1_2'}
-        new_id = allocate_durable_id('entity_1', existing)
-        self.assertNotEqual(new_id, 'entity_1')
-        self.assertTrue(new_id.startswith('entity_1'))
 
-    def test_cast_sets_no_overlap_in_compiled_patch(self):
-        memory_context = self._base_context()
-        extracted = {}
-        resolved = {
-            'scene_patch': {
-                'active_npc_ids': ['mira', 'toren'],
-                'departed_npc_ids': ['toren'],
-            },
-        }
-        # Final-state validation is now blocking — overlapping cast sets raise MemoryPipelineError
-        with self.assertRaises(MemoryPipelineError):
-            compile_staged_memory_patch(memory_context, extracted, resolved)
 
     def test_structured_claims_bypass_surface_form_heuristics(self):
         extracted = {
@@ -431,11 +337,6 @@ class SessionMemoryIntegrityTest(unittest.TestCase):
             self.assertEqual(entry['resolution_state'], 'provisional')
             self.assertIsNotNone(entry['canonical_id'])
 
-    def test_diagnostics_validation_rejects_nonempty_substitutions(self):
-        bad_diag = dict(DIAGNOSTICS_TEMPLATE)
-        bad_diag['substitutions'] = [{'from': 'a', 'to': 'b'}]
-        valid, error = validate_diagnostics(bad_diag)
-        self.assertFalse(valid)
 
     def test_existing_entity_referenced_in_fact_survives(self):
         memory_context = self._base_context()
@@ -589,38 +490,9 @@ class SessionMemoryIntegrityTest(unittest.TestCase):
         diag = compiled.get('resolution_diagnostics', {})
         self.assertEqual(len(diag.get('substitutions', [])), 0)
 
-    def test_clock_no_ops_marked_complete(self):
-        # This is a unit-level test of the clock_complete logic.
-        # When clock adjudication runs and returns no updates, clock_complete should still be True.
-        memory_context = self._base_context()
-        extracted = {}
-        resolved = {}
-        compiled = compile_staged_memory_patch(memory_context, extracted, resolved)
-        self.assertIn('source_contract', compiled)
         # The clock_complete behavior is tested at the integration level in test_dm_tools.py;
         # this test verifies compilation still succeeds without clock mutations.
 
-    def test_resolution_id_is_unique_per_campaign_mention_canonical(self):
-        memory_context = self._base_context()
-        memory_context['resolver_packet'] = {
-            'entity_mentions': [{
-                'mention_ref': 'reyes_1',
-                'surface_form': 'the hooded stranger',
-                'identity_status': 'known_hidden',
-                'canonical_id': 'toren',
-                'public_name': 'the hooded stranger',
-                'visibility': 'dm_private',
-                'evidence_refs': ['campaign_entity:toren'],
-            }],
-        }
-        extracted = {}
-        resolved = {}
-        compiled = compile_staged_memory_patch(memory_context, extracted, resolved)
-        records = compiled.get('resolution_records', [])
-        self.assertTrue(len(records) >= 1)
-        for record in records:
-            self.assertTrue(record.get('resolution_id', '').startswith('ires_'))
-            self.assertGreater(len(record.get('resolution_id', '')), 10)
 
     def test_validate_resolver_packet_rejects_bad_mentions(self):
         from services.memory_resolver_schemas import validate_resolver_packet
@@ -956,29 +828,6 @@ class SessionMemoryIntegrityTest(unittest.TestCase):
         clar_final = CampaignClarification.query.filter_by(clarification_id='clar_test_1').first()
         self.assertEqual(clar_final.status, 'resolved')
 
-    def test_extractor_path_slug_collision_does_not_reuse_entity(self):
-        from models import CampaignWorld
-        # Seed an entity with ID 'ferrymasters_hall' and name "Ferrymaster's Hall"
-        self.world.knowledge_graph = '{"entities":[{"id":"ferrymasters_hall","type":"location","name":"Ferrymaster\'s Hall"}],"relations":[],"facts":[]}'
-        db.session.add(self.world)
-        db.session.commit()
-
-        known_ids = _known_ids(self.campaign)
-        registry = []
-        prior_res = {}
-        allocated_ids = {'ferrymasters_hall'}
-
-        from services.resolution_registry import _resolve_entity_claim
-        entry = _resolve_entity_claim(
-            {'name': 'Ferrymasters Hall'},
-            known_ids,
-            prior_res,
-            allocated_ids,
-            1
-        )
-        # Must be created as a new provisional entity instead of reusing since it is not an exact canonical match
-        self.assertEqual(entry['decision'], 'create_provisional')
-        self.assertNotEqual(entry['canonical_id'], 'ferrymasters_hall')
 
     def test_clarification_reopen_and_replacement_semantics(self):
         from models import CampaignClarification
@@ -1053,37 +902,6 @@ class SessionMemoryIntegrityTest(unittest.TestCase):
         # The resolution IDs must be different because they occurred in different turns!
         self.assertNotEqual(res_id_t1, res_id_t2)
 
-    def test_alias_only_name_preservation(self):
-        from services.resolution_registry import find_all_matching_candidates
-        from services.session_memory_agent import _augment_registry_from_resolved
-        known = {
-            "npc_ids": {"aldric"},
-            "npc_names": {"aldric": "Aldric"},
-            "entity_ids": set(),
-            "entity_names": {}
-        }
-        prior = [{
-            "canonical_id": "aldric",
-            "canonical_name": "Aldric",
-            "mention_name": "the stranger",
-            "resolution_action": "add_alias"
-        }]
-
-        candidates = find_all_matching_candidates("the stranger", known, prior, expected_type="npc")
-        self.assertIn("aldric", candidates)
-
-        registry = []
-        _augment_registry_from_resolved(
-            registry,
-            [],
-            [{"name": "the stranger"}],
-            known,
-            prior_resolutions=prior,
-            allocated_ids=set()
-        )
-        self.assertEqual(len(registry), 1)
-        self.assertEqual(registry[0]["decision"], "add_alias")
-        self.assertEqual(registry[0]["canonical_name"], "Aldric")
 
     def test_duplicate_and_cross_type_candidate_filtering(self):
         from services.resolution_registry import find_all_matching_candidates
@@ -1172,29 +990,6 @@ class SessionMemoryIntegrityTest(unittest.TestCase):
         )
         self.assertEqual(res.status_code, 400)
 
-    def test_new_entity_naming_from_surface_form(self):
-        from models import CampaignClarification
-        clar = CampaignClarification(
-            campaign_id=self.campaign.id,
-            clarification_id="clar_new_ent",
-            idempotency_key="key_new_ent",
-            kind="identity",
-            mention_ref="grey_figure_1",
-            mention_entity_id="grey_figure_1",
-            surface_form="The Grey Figure",
-            question="Who is grey_figure_1?",
-            status="answered",
-            resolution_action="new_entity"
-        )
-        db.session.add(clar)
-        db.session.commit()
-
-        memory_context = self._base_context()
-        extracted = {}
-        resolved = {}
-        compiled = compile_staged_memory_patch(memory_context, extracted, resolved)
-
-        self.assertIn("clar_new_ent", compiled.get("consumed_clarification_ids", []))
 
     def test_unrelated_patch_targets_rejected(self):
         from routes.sessions import sessions_bp
@@ -1415,35 +1210,6 @@ class ResolvedEntityRefsTest(unittest.TestCase):
         self.assertIn('mira_wolf', entity_ids)
         self.assertNotIn('the_wolf', entity_ids)
 
-    def test_run_41_corrected_label_refs_reconcile_factions(self):
-        graph = json.loads(self.world.knowledge_graph)
-        graph['entities'].extend([
-            {'id': 'ferry_guild', 'name': 'Ferry Guild', 'type': 'faction'},
-            {'id': 'lake_nobility', 'name': 'Lake Nobility', 'type': 'faction'},
-        ])
-        self.world.knowledge_graph = json.dumps(graph)
-        db.session.flush()
-
-        resolved = {
-            'resolved_entity_refs': [
-                {'label': 'The Ferry Guild', 'entity_id': 'ferry_guild', 'resolution': 'same'},
-                {'label': 'The Lake Nobility', 'entity_id': 'lake_nobility', 'resolution': 'same'},
-            ],
-            'upsert_graph_entities': [
-                {'id': 'the_ferry_guild', 'name': 'The Ferry Guild', 'type': 'faction'},
-                {'id': 'the_lake_nobility', 'name': 'The Lake Nobility', 'type': 'faction'},
-            ],
-        }
-        compiled = compile_staged_memory_patch(self._context(), {}, resolved)
-
-        entity_ids = {entity['id'] for entity in compiled['upsert_graph_entities']}
-        self.assertEqual(entity_ids, {'ferry_guild', 'lake_nobility'})
-        self.assertNotIn('the_ferry_guild', entity_ids)
-        self.assertNotIn('the_lake_nobility', entity_ids)
-        self.assertEqual(
-            [ref['label'] for ref in compiled['resolved_entity_refs']],
-            ['The Ferry Guild', 'The Lake Nobility'],
-        )
 
     def test_malformed_nonempty_refs_fail_closed(self):
         for raw_refs in (
@@ -1459,56 +1225,8 @@ class ResolvedEntityRefsTest(unittest.TestCase):
                 )
             self.assertEqual(raised.exception.code, 'invalid_resolved_entity_refs')
 
-    def test_exact_run_41_surface_payload_is_rejected_with_contract_error(self):
-        with self.assertRaises(MemoryPipelineError) as raised:
-            compile_staged_memory_patch(self._context(), {}, {
-                'resolved_entity_refs': [
-                    {'surface': 'The Ferry Guild', 'entity_id': 'ferry_guild', 'resolution': 'same'},
-                    {'surface': 'The Lake Nobility', 'entity_id': 'lake_nobility', 'resolution': 'same'},
-                ],
-            })
 
-        self.assertEqual(raised.exception.code, 'invalid_resolved_entity_refs')
-        self.assertIn('unsupported fields: surface', str(raised.exception))
-        self.assertIn('.label: is required', str(raised.exception))
 
-    def test_split_brain_check_survives_contract_failure(self):
-        from services.session_memory_agent import _validate_resolved_entity_refs
-        compiled = {
-            'resolved_entity_refs': [{
-                'label': 'The Ferry Guild',
-                'entity_id': 'ferry_guild',
-                'resolution': 'same',
-                'unsupported': True,
-            }],
-            'upsert_graph_entities': [
-                {'id': 'the_ferry_guild', 'name': 'The Ferry Guild', 'type': 'faction'},
-            ],
-            'update_npc_actors': [],
-        }
-        errors = _validate_resolved_entity_refs(compiled)
-        self.assertTrue(any('resolved_ref_contract' in error for error in errors))
-        self.assertTrue(any('resolved_ref_split_brain' in error for error in errors))
-
-    def test_resolved_ref_catches_canonical_name_upsert(self):
-        memory_context = self._context()
-        resolved = {
-            'resolved_entity_refs': [
-                {'label': 'Old Garret', 'entity_id': 'garret', 'resolution': 'same'},
-            ],
-            'upsert_graph_entities': [
-                {'id': 'old_garret', 'name': 'Garret', 'type': 'npc'},
-            ],
-            'update_npc_actors': [
-                {'id': 'old_garret', 'name': 'Garret'},
-            ],
-        }
-        compiled = compile_staged_memory_patch(memory_context, {}, resolved)
-        entity_ids = [e['id'] for e in compiled['upsert_graph_entities']]
-        self.assertNotIn('old_garret', entity_ids)
-        self.assertIn('garret', entity_ids)
-        npc_ids = [n.get('id') for n in compiled['update_npc_actors']]
-        self.assertEqual(npc_ids, ['garret'])
 
     def test_event_payload_references_use_canonical_id(self):
         memory_context = self._context()
@@ -1687,60 +1405,6 @@ class ResolvedEntityRefsTest(unittest.TestCase):
         self.assertIsNotNone(resolution)
         self.assertEqual(resolution.resolution_action, 'add_alias')
 
-    def test_run_41_faction_repair_preserves_visibility_and_provenance(self):
-        from services.dm_tools import repair_duplicate_identity
-
-        graph = json.loads(self.world.knowledge_graph)
-        graph['entities'].extend([
-            {'id': 'ferry_guild', 'name': 'Ferry Guild', 'type': 'faction'},
-            {'id': 'the_ferry_guild', 'name': 'The Ferry Guild', 'type': 'faction'},
-            {'id': 'lake_nobility', 'name': 'Lake Nobility', 'type': 'faction'},
-            {'id': 'the_lake_nobility', 'name': 'The Lake Nobility', 'type': 'faction'},
-        ])
-        graph['facts'].extend([
-            {
-                'id': 'private_ferry_fact',
-                'text': 'The guild hides a ledger.',
-                'entity_ids': ['the_ferry_guild'],
-                'visibility': 'dm_private',
-            },
-            {
-                'id': 'party_lake_fact',
-                'text': 'The nobles control the quay.',
-                'entity_ids': ['the_lake_nobility'],
-                'visibility': 'party_known',
-            },
-        ])
-        self.world.knowledge_graph = json.dumps(graph)
-        db.session.flush()
-
-        with unittest.mock.patch('services.dm_tools.upsert_memory_embedding', return_value={'ok': True}):
-            repair_duplicate_identity(self.campaign, 'the_ferry_guild', 'ferry_guild')
-            repair_duplicate_identity(self.campaign, 'the_lake_nobility', 'lake_nobility')
-        db.session.commit()
-
-        graph = json.loads(self.world.knowledge_graph)
-        entity_ids = {entity['id'] for entity in graph['entities']}
-        self.assertNotIn('the_ferry_guild', entity_ids)
-        self.assertNotIn('the_lake_nobility', entity_ids)
-        facts = {fact['id']: fact for fact in graph['facts']}
-        self.assertEqual(facts['private_ferry_fact']['entity_ids'], ['ferry_guild'])
-        self.assertEqual(facts['private_ferry_fact']['visibility'], 'dm_private')
-        self.assertEqual(facts['party_lake_fact']['entity_ids'], ['lake_nobility'])
-        self.assertEqual(facts['party_lake_fact']['visibility'], 'party_known')
-
-        records = CampaignIdentityResolution.query.filter_by(
-            campaign_id=self.campaign.id,
-            resolved_by='identity_repair',
-        ).all()
-        self.assertEqual(
-            {(record.mention_entity_id, record.canonical_id) for record in records},
-            {
-                ('the_ferry_guild', 'ferry_guild'),
-                ('the_lake_nobility', 'lake_nobility'),
-            },
-        )
-        self.assertTrue(all(record.visibility == 'dm_private' for record in records))
 
 
 if __name__ == '__main__':

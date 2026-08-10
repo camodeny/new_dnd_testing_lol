@@ -19,7 +19,7 @@ class _Event:
         self.payload = json.dumps(payload or {})
 
 
-class CanonicalPostTurnStateTest(unittest.TestCase):
+class PostTurnStateInvariantTest(unittest.TestCase):
     def state(self, post='pending', memory='pending', clock='pending', **kwargs):
         return derive_post_turn_state(
             post,
@@ -29,45 +29,27 @@ class CanonicalPostTurnStateTest(unittest.TestCase):
             **kwargs,
         )
 
-    def test_full_success_has_one_consistent_completion_representation(self):
-        state = self.state('complete', 'complete', 'complete', durable_memory_write=True)
-        self.assertTrue(state['post_turn_complete'])
-        self.assertTrue(state['post_turn_resolved'])
-        self.assertEqual(state['post_turn_status'], 'complete')
-        self.assertTrue(state['durable_write_present'])
-        self.assertEqual(state['post_turn_invariant_violations'], [])
+    def test_post_turn_status_matrix(self):
+        cases = [
+            ('complete', 'complete', 'complete', 'complete', True, True),
+            ('error', 'error', 'skipped', 'partial', False, True),
+            ('error', 'complete', 'error', 'partial', False, True),
+            ('complete', 'complete', 'pending', 'partial', False, True),
+            ('timed_out', 'complete', 'pending', 'timed_out', False, True),
+            ('reconciled', 'complete', 'complete', 'reconciled', True, True),
+        ]
+        for post, memory, clock, expected_status, complete, resolved in cases:
+            with self.subTest(post=post, memory=memory, clock=clock):
+                state = self.state(post, memory, clock, durable_memory_write=complete)
+                self.assertEqual(state['post_turn_status'], expected_status)
+                self.assertEqual(state['post_turn_complete'], complete)
+                self.assertEqual(state['post_turn_resolved'], resolved)
+                self.assertEqual(state['durable_write_present'], complete)
 
-    def test_memory_and_clock_failures_are_unambiguous(self):
-        memory_failure = self.state('error', 'error', 'skipped')
-        clock_failure = self.state('error', 'complete', 'error')
-        self.assertEqual(memory_failure['post_turn_status'], 'partial')
-        self.assertFalse(memory_failure['post_turn_complete'])
-        self.assertEqual(clock_failure['post_turn_status'], 'partial')
-        self.assertFalse(clock_failure['post_turn_complete'])
-
-    def test_partial_success_and_timeout_are_terminal_but_not_complete(self):
-        partial = self.state('complete', 'complete', 'pending')
-        timed_out = self.state('timed_out', 'complete', 'pending')
-        self.assertEqual(partial['post_turn_status'], 'partial')
-        self.assertTrue(partial['post_turn_resolved'])
-        self.assertEqual(timed_out['post_turn_status'], 'timed_out')
-        self.assertTrue(timed_out['post_turn_resolved'])
-        self.assertFalse(timed_out['post_turn_complete'])
-
-    def test_reconciled_retry_is_a_success_terminal_state(self):
-        state = self.state('reconciled', 'complete', 'complete')
-        self.assertEqual(state['post_turn_status'], 'reconciled')
-        self.assertTrue(state['post_turn_complete'])
-
-    def test_committed_memory_patch_v2_counts_as_durable_write(self):
-        state = self.state('complete', 'complete', 'complete', durable_memory_write=True)
-        self.assertTrue(state['durable_memory_write'])
-        self.assertTrue(state['durable_write_present'])
-
-    def test_duplicate_or_late_stage_evidence_cannot_change_terminal_state(self):
-        first = self.state('complete', 'complete', 'complete', durable_memory_write=True)
-        duplicate = self.state('complete', 'complete', 'complete', durable_memory_write=True)
-        self.assertEqual(first, duplicate)
+        success = self.state('complete', 'complete', 'complete', durable_memory_write=True)
+        self.assertTrue(success['durable_memory_write'])
+        self.assertEqual(success['post_turn_invariant_violations'], [])
+        self.assertEqual(success, self.state('complete', 'complete', 'complete', durable_memory_write=True))
 
     def test_late_error_and_duplicate_visible_event_cannot_regress_success(self):
         turn = SimpleNamespace(

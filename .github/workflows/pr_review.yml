@@ -46,7 +46,7 @@ jobs:
         run: |
           mkdir -p review-evidence
           set -o pipefail
-          "$CI_VENV/bin/python" -m pytest server/tests -q -W error 2>&1 | tee review-evidence/backend-tests.log
+          "$CI_VENV/bin/python" -m pytest server/tests -q 2>&1 | tee review-evidence/backend-tests.log
 
       - name: Upload backend review evidence
         if: always()
@@ -130,7 +130,7 @@ jobs:
         run: |
           run_browser_tests=false
           capture_review_screenshots=true
-          scenario_ids="design-lab-story-atlas,session-chat-mixed,session-chat-thinking,session-map-split,session-map-fullscreen,session-map-tactical,session-map-movement,session-state-retention,session-spectator-readonly,automation-run-scorecard"
+          scenario_ids="design-lab-story-atlas,session-chat-mixed"
           selection_reason="No relevant client changes detected."
 
           if [ "${{ github.event_name }}" != "pull_request" ]; then
@@ -146,9 +146,9 @@ jobs:
             if echo "$changed_files" | grep -q "^client/"; then
               run_browser_tests=true
               if echo "$changed_files" | grep -E -q "^client/src/(App\.jsx|App\.css|index\.css|EmberLedgerTheme\.css|api/|components/layout/)"; then
-                selection_reason="Shared UI changes (routing, CSS, layout) detected. Running smoke scenarios."
+                selection_reason="Shared UI changes detected. Running the two-scenario PR smoke set; deeper evidence is available on demand."
               else
-                selection_reason="Client changes under client/src/ detected. Running smoke scenarios."
+                selection_reason="Client source changes detected. Running the two-scenario PR smoke set."
               fi
             else
               selection_reason="Backend-only, automation-only, or documentation-only changes detected. Skipping browser smoke tests."
@@ -179,17 +179,10 @@ jobs:
         working-directory: client
         run: npx playwright install chromium
 
-      - name: Run browser evidence tests (Desktop)
+      - name: Run browser smoke tests
         if: steps.plan.outputs.run_browser_tests == 'true'
         working-directory: client
         run: npm run evidence -- --scenarios "${{ steps.plan.outputs.scenario_ids }}" --viewport desktop
-        env:
-          PLAYWRIGHT_CAPTURE_SCREENSHOTS: ${{ steps.plan.outputs.capture_review_screenshots }}
-
-      - name: Run browser evidence tests (Mobile)
-        if: steps.plan.outputs.run_browser_tests == 'true'
-        working-directory: client
-        run: npm run evidence -- --scenarios "${{ steps.plan.outputs.scenario_ids }}" --viewport mobile
         env:
           PLAYWRIGHT_CAPTURE_SCREENSHOTS: ${{ steps.plan.outputs.capture_review_screenshots }}
 

@@ -446,8 +446,7 @@ class AutomationCloneRetrievalTest(unittest.TestCase):
         self.assertEqual(res_data['retrieval_preflight']['status'], 'pass')
         self.assertEqual(res_data['retrieval_preflight']['source_embedding_count'], 0)
 
-    def test_claim_rejects_legacy_snapshot_without_retrieval_contract(self):
-        """Test 11: legacy snapshot is rejected with instructions"""
+    def test_claim_rejects_snapshot_without_retrieval_contract(self):
         snapshot = db.session.get(AutomationSnapshot, self.snapshot.id)
         corrupted_payload = json.loads(json.dumps(snapshot.snapshot_json))
         corrupted_payload.pop('snapshot_schema_version', None)
@@ -465,7 +464,6 @@ class AutomationCloneRetrievalTest(unittest.TestCase):
         self.assertIn('predates the retrieval-equivalent clone contract', res_data['error'])
 
     def test_reclaim_does_not_compare_mutated_clone_to_original_snapshot(self):
-        """Test 12: reclaim does not rerun initial equivalence check and successfully claims"""
         headers = {'Authorization': f'Bearer {self.token}'}
         response = self.client.post(
             f'/api/automation/runs/{self.run.id}/claim',
