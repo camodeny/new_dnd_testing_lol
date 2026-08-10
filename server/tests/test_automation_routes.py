@@ -29,6 +29,7 @@ from models import (
     Character,
     SheetProposal,
     SessionMessage,
+    SessionDmTurn,
     User,
     db,
 )
@@ -239,6 +240,244 @@ class AutomationRouteTest(unittest.TestCase):
             db.session.commit()
             refresh_run_scorecard(run)
             return [cycle.id for cycle in cycles]
+
+    def test_post_turn_failures_are_correlated_once_across_metrics_and_incidents(self):
+        _scenario_id, run_id = self._create_scorecard_run([{'id': 'runtime_truth', 'label': 'Runtime truth'}])
+        from services.automation_service import append_run_event, refresh_run_scorecard
+
+        with app.app_context():
+            run = db.session.get(AutomationRun, run_id)
+            run.status = 'completed'
+            run.derived_campaign_id = self.campaign_id
+            session = CampaignSession.query.filter_by(campaign_id=run.derived_campaign_id).first()
+            if session is None:
+                session = CampaignSession(campaign_id=run.derived_campaign_id, is_active=True)
+                db.session.add(session)
+                db.session.flush()
+
+            for index in range(3):
+                player_message = SessionMessage(
+                    session_id=session.id,
+                    user_id=run.user_id,
+                    role='player',
+                    content=f'Post-turn failure {index}',
+                )
+                db.session.add(player_message)
+                db.session.flush()
+                trace_id = f'session_dm:session_{session.id}:message_{player_message.id}'
+                db.session.add(SessionDmTurn(
+                    campaign_id=run.derived_campaign_id,
+                    session_id=session.id,
+                    player_message_id=player_message.id,
+                    trace_id=trace_id,
+                    status='speak',
+                    post_turn_status='error',
+                    memory_status='error',
+                    clock_status='skipped',
+                    error_text='Missing relation endpoint.',
+                ))
+                db.session.add(CampaignAuditEvent(
+                    campaign_id=run.derived_campaign_id,
+                    event_type='memory_update_error',
+                    summary='Post-turn memory update failed.',
+                    payload=json.dumps({'player_message_id': player_message.id}),
+                    trace_id=f'session_memory_writer:session_{session.id}:message_{player_message.id}',
+                    parent_trace_id=trace_id,
+                ))
+                append_run_event(
+                    run,
+                    'dm_turn_status',
+                    {
+                        'player_message_id': player_message.id,
+                        'status': 'speak',
+                        'post_turn_status': 'error',
+                        'memory_status': 'error',
+                        'clock_status': 'skipped',
+                        'post_turn_error': 'Missing relation endpoint.',
+                    },
+                    dedupe_key=f'issue-99-dm-status:{player_message.id}',
+                    commit=False,
+                    skip_workspace=True,
+                )
+                append_run_event(
+                    run,
+                    'turn_result',
+                    {'action': 'speak', 'player_message_id': player_message.id},
+                    dedupe_key=f'issue-99-turn:{player_message.id}',
+                    commit=False,
+                    skip_workspace=True,
+                )
+            db.session.commit()
+            results = refresh_run_scorecard(run)
+            summary = run.scorecard_summary_json
+
+            self.assertEqual(summary['error_count'], 3)
+            self.assertEqual(summary['error_counts_by_kind'], {'memory': 3})
+            self.assertEqual(summary['unrecovered_error_count'], 3)
+            self.assertEqual(summary['recovered_error_count'], 0)
+            self.assertEqual(len(summary['automation_errors']), 3)
+            self.assertEqual(len(summary['incidents']), 3)
+            self.assertTrue(all(item['evidence_refs'] for item in summary['automation_errors']))
+            error_check = next(item for item in results if item['check_id'] == 'error_count')
+            self.assertEqual(error_check['status'], 'fail')
+            self.assertEqual(error_check['details']['metric_value'], 3)
+
+        response = self.client.get(f'/api/automation/runs/{run_id}/scorecard', headers=self.headers)
+        self.assertEqual(response.status_code, 200)
+        api_summary = response.get_json()['run']['scorecard_summary']
+        self.assertEqual(api_summary['error_count'], 3)
+        self.assertEqual(api_summary['error_counts_by_kind'], {'memory': 3})
+        self.assertEqual(len(api_summary['incidents']), 3)
+
+    def test_post_turn_error_kinds_and_recovery_classification(self):
+        _scenario_id, run_id = self._create_scorecard_run([{'id': 'runtime_truth', 'label': 'Runtime truth'}])
+        from services.automation_service import append_run_event, refresh_run_scorecard
+
+        with app.app_context():
+            run = db.session.get(AutomationRun, run_id)
+            run.status = 'completed'
+            run.derived_campaign_id = self.campaign_id
+            session = CampaignSession.query.filter_by(campaign_id=run.derived_campaign_id).first()
+            if session is None:
+                session = CampaignSession(campaign_id=run.derived_campaign_id, is_active=True)
+                db.session.add(session)
+                db.session.flush()
+
+            def add_message(label):
+                message = SessionMessage(session_id=session.id, user_id=run.user_id, role='player', content=label)
+                db.session.add(message)
+                db.session.flush()
+                return message
+
+            recovered_message = add_message('Recovered retry')
+            recovered_trace = f'session_dm:session_{session.id}:message_{recovered_message.id}'
+            db.session.add(SessionDmTurn(
+                campaign_id=run.derived_campaign_id,
+                session_id=session.id,
+                player_message_id=recovered_message.id,
+                trace_id=recovered_trace,
+                status='speak',
+                post_turn_status='reconciled',
+                memory_status='complete',
+                clock_status='complete',
+            ))
+            db.session.add(CampaignAuditEvent(
+                campaign_id=run.derived_campaign_id,
+                event_type='memory_update_error',
+                summary='Memory failed before retry.',
+                payload=json.dumps({'player_message_id': recovered_message.id}),
+                trace_id=f'session_memory_writer:session_{session.id}:message_{recovered_message.id}',
+                parent_trace_id=recovered_trace,
+            ))
+
+            clock_message = add_message('Clock partial success')
+            db.session.add(SessionDmTurn(
+                campaign_id=run.derived_campaign_id,
+                session_id=session.id,
+                player_message_id=clock_message.id,
+                trace_id=f'session_dm:session_{session.id}:message_{clock_message.id}',
+                status='speak',
+                post_turn_status='partial',
+                memory_status='complete',
+                clock_status='failed',
+                error_text='Clock adjudication failed.',
+            ))
+
+            for status in ('failed', 'timed_out'):
+                message = add_message(f'Canonical {status} post-turn')
+                db.session.add(SessionDmTurn(
+                    campaign_id=run.derived_campaign_id,
+                    session_id=session.id,
+                    player_message_id=message.id,
+                    trace_id=f'session_dm:session_{session.id}:message_{message.id}',
+                    status='speak',
+                    post_turn_status=status,
+                    memory_status='skipped' if status == 'failed' else 'pending',
+                    clock_status='skipped' if status == 'failed' else 'pending',
+                    error_text=f'Post-turn {status}.',
+                ))
+
+            audit_kinds = [
+                ('post_turn_summary_finalize_error', 'Summary finalization failed.'),
+                ('summary_finalizer_error', 'Finalizer failed.'),
+                ('post_turn_consistency_incident', 'Durable state verification failed.'),
+                ('embedding_fallback', 'Embedding failed open.'),
+            ]
+            for event_type, text in audit_kinds:
+                message = add_message(text)
+                db.session.add(CampaignAuditEvent(
+                    campaign_id=run.derived_campaign_id,
+                    event_type=event_type,
+                    summary=text,
+                    payload=json.dumps({'player_message_id': message.id}),
+                    trace_id=f'post_turn:message_{message.id}',
+                ))
+
+            append_run_event(
+                run,
+                'turn_result',
+                {'action': 'speak'},
+                dedupe_key=f'issue-99-classification-turn:{run.id}',
+                commit=False,
+                skip_workspace=True,
+            )
+            db.session.commit()
+            refresh_run_scorecard(run)
+            summary = run.scorecard_summary_json
+
+            self.assertEqual(summary['error_count'], 8)
+            self.assertEqual(summary['error_counts_by_kind'], {
+                'clock': 1,
+                'durable_application': 1,
+                'embedding': 1,
+                'finalizer': 1,
+                'memory': 1,
+                'post_turn': 2,
+                'summary': 1,
+            })
+            self.assertEqual(summary['recovered_error_count'], 2)
+            self.assertEqual(summary['unrecovered_error_count'], 6)
+            by_kind = {item['kind']: item for item in summary['automation_errors']}
+            self.assertEqual(by_kind['memory']['recovery_status'], 'recovered')
+            self.assertEqual(by_kind['embedding']['recovery_status'], 'recovered')
+            self.assertEqual(by_kind['clock']['recovery_status'], 'unrecovered')
+
+    def test_clean_completed_post_turn_has_no_automation_errors(self):
+        _scenario_id, run_id = self._create_scorecard_run([{'id': 'runtime_truth', 'label': 'Runtime truth'}])
+        from services.automation_service import append_run_event, refresh_run_scorecard
+
+        with app.app_context():
+            run = db.session.get(AutomationRun, run_id)
+            run.status = 'completed'
+            run.derived_campaign_id = self.campaign_id
+            player_message = SessionMessage.query.filter_by(session_id=self.session_id, role='player').first()
+            db.session.add(SessionDmTurn(
+                campaign_id=self.campaign_id,
+                session_id=self.session_id,
+                player_message_id=player_message.id,
+                trace_id=f'session_dm:session_{self.session_id}:message_{player_message.id}',
+                status='speak',
+                post_turn_status='complete',
+                memory_status='complete',
+                clock_status='complete',
+            ))
+            append_run_event(
+                run,
+                'turn_result',
+                {'action': 'speak', 'player_message_id': player_message.id},
+                dedupe_key=f'issue-99-clean-turn:{run.id}',
+                commit=False,
+                skip_workspace=True,
+            )
+            db.session.commit()
+            results = refresh_run_scorecard(run)
+
+            self.assertEqual(run.scorecard_summary_json['error_count'], 0)
+            self.assertEqual(run.scorecard_summary_json['error_counts_by_kind'], {})
+            self.assertEqual(run.scorecard_summary_json['automation_errors'], [])
+            self.assertEqual(run.scorecard_summary_json['incidents'], [])
+            error_check = next(item for item in results if item['check_id'] == 'error_count')
+            self.assertEqual(error_check['status'], 'pass')
 
     def test_create_scenario_snapshot_run_and_claim_hidden_clone(self):
         scenario_response = self.client.post(
