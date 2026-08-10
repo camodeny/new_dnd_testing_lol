@@ -700,6 +700,16 @@ class ClockAdjudicatorTest(unittest.TestCase):
                             'The player pursued the robbers toward the crypts.',
                             'The DM confirmed the chase left the market for the crypt road.',
                         ],
+                        'trigger_verdict': {
+                            'clause_id': 'visible_narrative_progress',
+                            'verdict': 'satisfied',
+                            'supported_claims': ['The chase newly reached the crypt road.'],
+                            'evidence_sources': [
+                                {'source_type': 'transcript_message', 'source_id': '101'},
+                            ],
+                            'chronology_verdict': 'new_current_turn',
+                            'reason': 'The visible exchange contains new progress.',
+                        },
                     }
                 ],
                 'retire_clocks': [],
@@ -719,6 +729,15 @@ class ClockAdjudicatorTest(unittest.TestCase):
         self.assertEqual(updates['create_clocks'], [])
         self.assertEqual(updates['advance_clocks'][0]['clock_id'], 'race_to_crypts')
         self.assertEqual(updates['advance_clocks'][0]['delta'], 1)
+        advance_schema = (
+            post_chat.call_args.kwargs['tools'][0]['function']['parameters']
+            ['properties']['advance_clocks']['items']
+        )
+        self.assertIn('trigger_verdict', advance_schema['required'])
+        self.assertEqual(
+            advance_schema['properties']['trigger_verdict']['properties']['chronology_verdict']['enum'],
+            ['new_current_turn', 'historical_or_restated', 'ambiguous'],
+        )
         retire_schema = (
             post_chat.call_args.kwargs['tools'][0]['function']['parameters']
             ['properties']['retire_clocks']['items']

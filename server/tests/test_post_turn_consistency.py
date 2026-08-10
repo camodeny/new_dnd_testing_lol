@@ -53,6 +53,20 @@ def _world_state(location_id='the_dock', active_ids=('mira',)):
     }
 
 
+def _trigger_verdict(*source_ids):
+    return {
+        'clause_id': 'visible_narrative_progress',
+        'verdict': 'satisfied',
+        'supported_claims': ['The ferrymen pressure visibly changed this turn.'],
+        'evidence_sources': [
+            {'source_type': 'transcript_message', 'source_id': str(source_id)}
+            for source_id in source_ids
+        ],
+        'chronology_verdict': 'new_current_turn',
+        'reason': 'The current exchange visibly changes the clock pressure.',
+    }
+
+
 class PostTurnConsistencyTest(unittest.TestCase):
     def setUp(self):
         self.env_patch = patch.dict(os.environ, {'GEMINI_EMBEDDINGS_ENABLED': 'false'}, clear=False)
@@ -145,6 +159,8 @@ class PostTurnConsistencyTest(unittest.TestCase):
         ))
         self._clock('trapped_ferrymen', 'Trapped Ferrymen', 3, 1, visibility='party_known')
         self.session.running_summary = 'The Trapped Ferrymen clock sits at 1/3.'
+        db.session.add(SessionMessage(id=1, session_id=self.session.id, role='user', content='We hold the gate.'))
+        db.session.add(SessionMessage(id=2, session_id=self.session.id, role='assistant', content='The ferrymen press against the gate.'))
         db.session.commit()
 
         captured = {}
@@ -176,6 +192,7 @@ class PostTurnConsistencyTest(unittest.TestCase):
                         'delta': 1,
                         'reason': 'The visible exchange pressed the ferrymen onward.',
                         'evidence': ['The DM confirmed the ferrymen moved.'],
+                        'trigger_verdict': _trigger_verdict(1, 2),
                     }],
                     'retire_clocks': [],
                     'no_change_explanations': [],
@@ -1042,6 +1059,8 @@ class PostTurnConsistencyTest(unittest.TestCase):
         world.memory_revision = 3
         db.session.commit()
         self._clock('trapped_ferrymen', 'Trapped Ferrymen', 3, 1, visibility='party_known')
+        db.session.add(SessionMessage(id=1, session_id=self.session.id, role='user', content='We hold the gate.'))
+        db.session.add(SessionMessage(id=2, session_id=self.session.id, role='assistant', content='The ferrymen press against the gate.'))
         db.session.add(begin_session_dm_turn(
             self.campaign.id,
             self.session.id,
@@ -1087,10 +1106,11 @@ class PostTurnConsistencyTest(unittest.TestCase):
                 'delta': 1,
                 'reason': 'The ferrymen pressed onward.',
                 'evidence': ['The DM confirmed movement.'],
+                'trigger_verdict': _trigger_verdict(1, 2),
             }],
             'retire_clocks': [],
             'no_change_explanations': [],
-        })
+        }, audit_context={'source_player_message_id': 1, 'source_dm_message_id': 2})
         db.session.commit()
         clock = CampaignClock.query.filter_by(campaign_id=self.campaign.id, clock_id='trapped_ferrymen').one()
         self.assertEqual(clock.filled, 2)
