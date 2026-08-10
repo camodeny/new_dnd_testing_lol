@@ -941,6 +941,35 @@ def build_session_hot_context(campaign, session, current_user, recent_messages_o
     return context
 
 
+SESSION_DM_PRIMARY_PROMPT_EXCLUDED_CONTEXT_KEYS = {
+    'private_output_terms',
+    'private_spoiler_items',
+    'recent_messages',
+}
+
+
+def _transcript_source_refs(messages):
+    refs = []
+    for message in messages or []:
+        if isinstance(message, dict):
+            message_id = message.get('id')
+            session_id = message.get('session_id')
+            role = message.get('role')
+        else:
+            message_id = getattr(message, 'id', None)
+            session_id = getattr(message, 'session_id', None)
+            role = getattr(message, 'role', None)
+        if message_id is None:
+            continue
+        refs.append({
+            'source_id': f'session_message:{message_id}',
+            'message_id': message_id,
+            'session_id': session_id,
+            'role': role,
+        })
+    return refs
+
+
 def context_manifest(context, tools):
     section_tokens = {
         key: estimate_tokens(value)
@@ -948,13 +977,31 @@ def context_manifest(context, tools):
         if key not in {'recent_messages'}
     }
     section_tokens['recent_messages'] = estimate_tokens(context.get('recent_messages', []))
+    primary_prompt_section_tokens = {
+        key: token_count
+        for key, token_count in section_tokens.items()
+        if key not in SESSION_DM_PRIMARY_PROMPT_EXCLUDED_CONTEXT_KEYS
+    }
+    transcript_source_refs = _transcript_source_refs(context.get('recent_messages', []))
     return {
         'strategy': context.get('strategy'),
         'full_world_graph_included': False,
-        'fed_sections': list(context.keys()),
+        'fed_sections': [
+            key for key in context.keys()
+            if key not in SESSION_DM_PRIMARY_PROMPT_EXCLUDED_CONTEXT_KEYS
+        ],
+        'internal_only_sections': [
+            key for key in context.keys()
+            if key in SESSION_DM_PRIMARY_PROMPT_EXCLUDED_CONTEXT_KEYS
+        ],
         'available_tools': [tool['function']['name'] for tool in tools],
         'estimated_tokens_by_section': section_tokens,
         'estimated_total_tokens': sum(section_tokens.values()),
+        'estimated_primary_prompt_tokens_by_section': primary_prompt_section_tokens,
+        'estimated_primary_prompt_context_tokens': sum(primary_prompt_section_tokens.values()),
+        'estimated_duplicate_transcript_tokens_removed': section_tokens['recent_messages'],
+        'recent_message_source_ids': [ref['message_id'] for ref in transcript_source_refs],
+        'recent_message_source_refs': transcript_source_refs,
     }
 
 
