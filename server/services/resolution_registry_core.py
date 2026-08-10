@@ -42,7 +42,7 @@ def normalize_resolved_entity_refs(resolved_entity_refs):
     if not valid:
         return refs
     for ref in resolved_entity_refs:
-        label = clean_text(ref.get("label") or ref.get("surface"), 200)
+        label = clean_text(ref.get("label"), 200)
         canonical_id = clean_id(ref.get("entity_id"), "")
         if not label or not canonical_id:
             continue

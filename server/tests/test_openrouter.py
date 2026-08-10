@@ -109,21 +109,18 @@ class OpenRouterJsonRepairTest(unittest.TestCase):
             SESSION_MEMORY_RESOLVER_FINALIZER_TOOL['function']['parameters']
             ['properties']['resolved_entity_refs']['items']
         )
-        self.assertEqual(item_schema['required'], ['entity_id', 'resolution'])
+        self.assertEqual(item_schema['required'], ['label', 'entity_id', 'resolution'])
         self.assertFalse(item_schema['additionalProperties'])
-        self.assertEqual(item_schema['oneOf'], [
-            {'required': ['label']},
-            {'required': ['surface']},
-        ])
+        self.assertNotIn('surface', item_schema['properties'])
 
-    def test_resolver_parser_normalizes_surface_alias(self):
+    def test_resolver_parser_accepts_canonical_label_contract(self):
         parsed = _parse_session_memory_resolver_tool_calls([{
             'function': {
                 'name': 'submit_resolved_memory',
                 'arguments': json.dumps({
                     'running_summary': 'Run 41',
                     'resolved_entity_refs': [{
-                        'surface': 'The Ferry Guild',
+                        'label': 'The Ferry Guild',
                         'entity_id': 'ferry_guild',
                         'resolution': 'same',
                     }],
@@ -140,6 +137,7 @@ class OpenRouterJsonRepairTest(unittest.TestCase):
         for ref in (
             {'label': 'The Ferry Guild', 'resolution': 'same'},
             {'label': 'The Ferry Guild', 'entity_id': 'ferry_guild'},
+            {'surface': 'The Ferry Guild', 'entity_id': 'ferry_guild', 'resolution': 'same'},
             {
                 'label': 'The Ferry Guild',
                 'entity_id': 'ferry_guild',

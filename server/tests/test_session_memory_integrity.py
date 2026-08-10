@@ -1399,7 +1399,7 @@ class ResolvedEntityRefsTest(unittest.TestCase):
         self.assertIn('mira_wolf', entity_ids)
         self.assertNotIn('the_wolf', entity_ids)
 
-    def test_run_41_surface_refs_reconcile_factions(self):
+    def test_run_41_corrected_label_refs_reconcile_factions(self):
         graph = json.loads(self.world.knowledge_graph)
         graph['entities'].extend([
             {'id': 'ferry_guild', 'name': 'Ferry Guild', 'type': 'faction'},
@@ -1410,8 +1410,8 @@ class ResolvedEntityRefsTest(unittest.TestCase):
 
         resolved = {
             'resolved_entity_refs': [
-                {'surface': 'The Ferry Guild', 'entity_id': 'ferry_guild', 'resolution': 'same'},
-                {'surface': 'The Lake Nobility', 'entity_id': 'lake_nobility', 'resolution': 'same'},
+                {'label': 'The Ferry Guild', 'entity_id': 'ferry_guild', 'resolution': 'same'},
+                {'label': 'The Lake Nobility', 'entity_id': 'lake_nobility', 'resolution': 'same'},
             ],
             'upsert_graph_entities': [
                 {'id': 'the_ferry_guild', 'name': 'The Ferry Guild', 'type': 'faction'},
@@ -1443,11 +1443,24 @@ class ResolvedEntityRefsTest(unittest.TestCase):
                 )
             self.assertEqual(raised.exception.code, 'invalid_resolved_entity_refs')
 
+    def test_exact_run_41_surface_payload_is_rejected_with_contract_error(self):
+        with self.assertRaises(MemoryPipelineError) as raised:
+            compile_staged_memory_patch(self._context(), {}, {
+                'resolved_entity_refs': [
+                    {'surface': 'The Ferry Guild', 'entity_id': 'ferry_guild', 'resolution': 'same'},
+                    {'surface': 'The Lake Nobility', 'entity_id': 'lake_nobility', 'resolution': 'same'},
+                ],
+            })
+
+        self.assertEqual(raised.exception.code, 'invalid_resolved_entity_refs')
+        self.assertIn('unsupported fields: surface', str(raised.exception))
+        self.assertIn('.label: is required', str(raised.exception))
+
     def test_split_brain_check_survives_contract_failure(self):
         from services.session_memory_agent import _validate_resolved_entity_refs
         compiled = {
             'resolved_entity_refs': [{
-                'surface': 'The Ferry Guild',
+                'label': 'The Ferry Guild',
                 'entity_id': 'ferry_guild',
                 'resolution': 'same',
                 'unsupported': True,

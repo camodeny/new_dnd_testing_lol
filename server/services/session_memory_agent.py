@@ -633,7 +633,7 @@ def _validate_resolved_entity_refs(compiled_patch, known=None):
     for raw_ref in raw_refs:
         if not isinstance(raw_ref, dict):
             continue
-        label = clean_text(raw_ref.get("label") or raw_ref.get("surface"), 200)
+        label = clean_text(raw_ref.get("label"), 200)
         canonical_id = clean_id(raw_ref.get("entity_id"), "")
         if label and canonical_id:
             evidence_refs.append({

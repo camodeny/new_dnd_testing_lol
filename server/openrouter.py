@@ -285,7 +285,7 @@ SESSION_MEMORY_RESOLVER_SYSTEM_PROMPT = (
     "Use get_world_state, get_npcs, get_clocks, or transcript tools only when narrower tools are insufficient. "
     "After using tools to resolve references, finalize by calling exactly one tool: submit_resolved_memory. Do not output plain text or markdown. "
     "The submit_resolved_memory payload must be one JSON object with keys running_summary, memory_anchors, scene_patch, scene_reason, upsert_graph_entities, upsert_graph_relations, upsert_graph_facts, update_npc_actors, record_events, unresolved_items, evidence_basis, resolved_entity_refs, and resolved_location_refs. "
-    "Each resolved_entity_refs item must include label (the observed surface name), entity_id (the selected durable canonical id), and resolution set to same. The legacy surface field is accepted only as an alias for label. Do not include both label and surface. Put different or uncertain identity decisions in unresolved_items instead of resolved_entity_refs. "
+    "Each resolved_entity_refs item must include label (the observed surface name), entity_id (the selected durable canonical id), and resolution set to same. Label is the only accepted surface-name field. Put different or uncertain identity decisions in unresolved_items instead of resolved_entity_refs. "
     "Return the resolved/updated memory_anchors representing the current session state: current_goal (string or null), current_scene (string or null), open_clues (array of strings), unresolved_questions (array of strings), npc_observations (array of strings), and recent_offers_promises (array of strings). "
     "Each upsert_graph_entities item must include id (if reusing or resolving to a canonical id), name, type, summary, tags, source_surface, intended_visibility, certainty, importance, reason, expires_or_retire_condition, and memory_type. "
     "When a newly named location might identify a provisional location, call get_scene_candidates and place an explicit resolution of same, different, or uncertain in resolved_location_refs. Only same may reuse the prior durable ID; uncertain must go in unresolved_items and must not create or promote a location. When same gives a provisional location its proper name, put its existing durable ID in resolved_location_refs and set rename_existing true there; do not create a second location ID. "
@@ -5072,8 +5072,7 @@ SESSION_MEMORY_RESOLVER_FINALIZER_TOOL = {
                     'type': 'array',
                     'items': RESOLVED_ENTITY_REF_SCHEMA,
                     'description': (
-                        'Structured identity decisions. Use label (canonical) or surface '
-                        '(compatibility alias), plus entity_id and resolution.'
+                        'Structured identity decisions using label, entity_id, and resolution.'
                     ),
                 },
                 'resolved_location_refs': {'type': 'array', 'items': {'type': 'object'}},
@@ -5212,14 +5211,6 @@ def _parse_session_memory_resolver_tool_calls(tool_calls):
     valid, _errors = validate_resolved_entity_refs_contract(raw_refs)
     if not valid:
         return None
-    payload['resolved_entity_refs'] = [
-        {**ref, 'label': ref.get('label') or ref.get('surface')}
-        if 'surface' in ref
-        else dict(ref)
-        for ref in raw_refs
-    ]
-    for ref in payload['resolved_entity_refs']:
-        ref.pop('surface', None)
     return payload
 
 
