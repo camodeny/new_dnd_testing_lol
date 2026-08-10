@@ -317,6 +317,8 @@ export default function AutomationRunPage() {
   const categoryBreakdown = run.scorecard_summary?.category_breakdown || {}
   const scorecardConfiguration = run.scorecard_summary?.scorecard_configuration || {}
   const scoreSummary = run.scorecard_summary || {}
+  const retryMetrics = data.retry_metrics || scoreSummary.retry_metrics || {}
+  const retryCounts = retryMetrics.counts || {}
   const performanceScore = scoreSummary.performance_score ?? scoreSummary.weighted_score
   const scoreSeverity = scoreSummary.severity ?? scoreSummary.overall_status ?? 'not_assessed'
   const scoreCompleteness = scoreSummary.completeness
@@ -358,6 +360,10 @@ export default function AutomationRunPage() {
           <div className="automation-stat-card">
             <strong>{run.scorecard_summary?.error_count || 0}</strong>
             <span>Errors</span>
+          </div>
+          <div className="automation-stat-card">
+            <strong>{retryMetrics.total || 0}</strong>
+            <span>Model retries & repairs</span>
           </div>
           <div className="automation-stat-card">
             <strong>{scorecard.length}</strong>
@@ -439,6 +445,7 @@ export default function AutomationRunPage() {
                     <div><strong>Completeness</strong><span>{scoreCompleteness !== undefined && scoreCompleteness !== null ? `${(scoreCompleteness * 100).toFixed(1)}%` : 'N/A'}</span></div>
                     <div><strong>Score total</strong><span>{scoreSummary.score_numerator ?? '—'} / {scoreSummary.score_denominator ?? '—'}</span></div>
                     <div><strong>Assessments</strong><span>{scoreSummary.assessment_count ?? '—'} scored, {scoreSummary.not_assessed_count ?? '—'} missing</span></div>
+                    <div><strong>Model retries & repairs</strong><span>{retryMetrics.total || 0}</span></div>
                     <div><strong>Audited cycles</strong><span>{run.scorecard_summary?.audited_cycle_count || 0}</span></div>
                     <div><strong>Fully scored cycles</strong><span>{run.scorecard_summary?.fully_scored_cycle_count || 0}</span></div>
                     <div><strong>Created</strong><span>{formatTime(run.created_at)}</span></div>
@@ -448,6 +455,16 @@ export default function AutomationRunPage() {
                     <div><strong>Snapshot</strong><span>{data.snapshot?.label || run.snapshot_id}</span></div>
                     <div><strong>Encounter map</strong><span>{encounterMap?.title || 'None'}</span></div>
                   </div>
+                  {Object.values(retryCounts).some((count) => count > 0) && (
+                    <div className="automation-scorecard" style={{ marginTop: '16px' }}>
+                      {Object.entries(retryCounts).map(([kind, count]) => (
+                        <div key={kind} className="automation-scorecard-row">
+                          <div><strong>{kind.replaceAll('_', ' ')}</strong></div>
+                          <span>{count}</span>
+                        </div>
+                      ))}
+                    </div>
+                  )}
                   {run.error_text && <ErrorMessage message={run.error_text} />}
                 </section>
 

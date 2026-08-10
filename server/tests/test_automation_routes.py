@@ -5965,6 +5965,175 @@ class AutomationRouteTest(unittest.TestCase):
         self.assertEqual(bundle_categories['unknown_crit']['category'], 'uncategorized')
         self.assertEqual(bundle_categories['unknown_crit']['raw_category'], 'not-a-real-category')
 
+    def test_run_37_retry_taxonomy_is_complete_deduplicated_and_cross_surface_consistent(self):
+        scenario_id = self.client.post(
+            '/api/automation/scenarios',
+            headers=self.headers,
+            json={'source_campaign_id': self.campaign_id},
+        ).get_json()['scenario']['id']
+        snapshot_id = self.client.post(
+            f'/api/automation/scenarios/{scenario_id}/snapshots',
+            headers=self.headers,
+            json={},
+        ).get_json()['snapshot']['id']
+        run_id = self.client.post(
+            f'/api/automation/scenarios/{scenario_id}/runs',
+            headers=self.headers,
+            json={'snapshot_id': snapshot_id},
+        ).get_json()['run']['id']
+        self.client.post(
+            f'/api/automation/runs/{run_id}/claim',
+            headers=self.headers,
+            json={'worker_id': 'run-37-worker'},
+        )
+
+        with app.app_context():
+            from services.automation_service import refresh_run_scorecard
+
+            run = db.session.get(AutomationRun, run_id)
+            run.status = 'completed'
+            db.session.add(AutomationRunEvent(
+                run_id=run.id,
+                event_type='turn_result',
+                sequence_number=(run.last_event_sequence or 0) + 1,
+                attempt_number=1,
+                dedupe_key='run-37:turn-result',
+                payload_json={'action': 'speak', 'turn_number': 1},
+            ))
+            cycle = AutomationRunAuditCycle(
+                run_id=run.id,
+                cycle_number=1,
+                phase='after_dm',
+                status='audited',
+                payload_json={},
+                scorecard_json={},
+            )
+            db.session.add(cycle)
+            db.session.flush()
+            run.awaiting_audit_cycle_id = cycle.id
+            run.awaiting_audit_phase = 'after_dm'
+
+            # Run 37 fixture: one finalizer contract guard retry on each of ten turns.
+            for turn in range(1, 11):
+                db.session.add(CampaignAuditEvent(
+                    campaign_id=run.derived_campaign_id,
+                    event_type='finalizer_contract_guard_retry',
+                    source='session_dm.guard',
+                    actor='session_dm_guard',
+                    trace_id=f'run-37:turn:{turn}:finalizer_contract_guard',
+                    parent_trace_id=f'run-37:turn:{turn}',
+                    summary='Finalizer contract repair.',
+                    payload=json.dumps({'turn_number': turn, 'attempt': 1, 'provider_call_id': 1000 + turn}),
+                ))
+            # The tenth repair was exhausted; the shared trace correlates its outcome.
+            db.session.add(CampaignAuditEvent(
+                campaign_id=run.derived_campaign_id,
+                event_type='finalizer_contract_guard_blocked',
+                source='session_dm.guard',
+                actor='session_dm_guard',
+                trace_id='run-37:turn:10:finalizer_contract_guard',
+                parent_trace_id='run-37:turn:10',
+                summary='Finalizer contract repair exhausted.',
+                payload='{"turn_number":10,"outcome":"exhausted"}',
+            ))
+            mixed_events = [
+                ('model_retry', 'provider:1', {'turn_number': 2, 'attempt': 1, 'next_attempt': 2}),
+                ('private_output_guard_retry', 'guard:success', {'turn_number': 3, 'attempt': 1}),
+                ('private_output_guard_retry', 'guard:exhausted', {'turn_number': 3, 'attempt': 2}),
+                ('private_output_guard_blocked', 'guard:exhausted', {'turn_number': 3, 'outcome': 'exhausted'}),
+                ('tool_call_repair', 'tool:1', {'turn_number': 4, 'attempt': 1, 'outcome': 'repaired'}),
+                ('model_request', 'other:1', {'turn_number': 5, 'operation': 'planning_dm_response_blank_retry'}),
+            ]
+            for event_type, trace_id, payload in mixed_events:
+                db.session.add(CampaignAuditEvent(
+                    campaign_id=run.derived_campaign_id,
+                    event_type=event_type,
+                    source='test',
+                    actor='session_dm',
+                    trace_id=trace_id,
+                    parent_trace_id=f'{trace_id}:parent',
+                    summary=event_type,
+                    payload=json.dumps(payload),
+                ))
+            db.session.add(AutomationRunProviderCall(
+                run_id=run.id,
+                dedupe_key='run-37:parse-repairs',
+                phase='session_dm',
+                provider='test',
+                model='test-model',
+                parse_repair_attempts=3,
+                request_json={'turn_number': 6, 'trace_id': 'parse:1'},
+                response_json={},
+                parsed_output_json={},
+            ))
+            db.session.commit()
+
+            first = refresh_run_scorecard(run)
+            second = refresh_run_scorecard(run)
+            first_retry = next(row for row in first if row['check_id'] == 'model_retry_count')
+            second_retry = next(row for row in second if row['check_id'] == 'model_retry_count')
+            expected_counts = {
+                'provider_retry': 1,
+                'parse_repair': 3,
+                'contract_guard_retry': 10,
+                'tool_repair': 1,
+                'guard_retry': 2,
+                'other_model_reinvocation': 1,
+            }
+            self.assertEqual(first_retry['details']['metric_value'], 18)
+            self.assertEqual(second_retry['details']['metric_value'], 18)
+            self.assertEqual(first_retry['details']['retry_metrics']['counts'], expected_counts)
+            self.assertEqual(sum(expected_counts.values()), first_retry['details']['retry_metrics']['total'])
+            self.assertEqual(first_retry['status'], 'fail')
+            self.assertIn('18 model retries or repair re-invocations', first_retry['summary'])
+            correlations = first_retry['details']['retry_metrics']['correlations']
+            self.assertEqual(len({item['source_key'] for item in correlations}), 18)
+            self.assertTrue(any(item['outcome'] == 'repaired' for item in correlations))
+            self.assertTrue(any(item['outcome'] == 'exhausted' for item in correlations))
+            self.assertTrue(all('turn' in item and 'provider_call_id' in item and 'attempt' in item for item in correlations))
+
+        baseline_run_id = self.client.post(
+            f'/api/automation/scenarios/{scenario_id}/runs',
+            headers=self.headers,
+            json={'snapshot_id': snapshot_id},
+        ).get_json()['run']['id']
+        with app.app_context():
+            from services.automation_service import refresh_run_scorecard
+
+            run = db.session.get(AutomationRun, run_id)
+            baseline_run = db.session.get(AutomationRun, baseline_run_id)
+            baseline_run.status = 'completed'
+            db.session.add(AutomationRunEvent(
+                run_id=baseline_run.id,
+                event_type='turn_result',
+                sequence_number=(baseline_run.last_event_sequence or 0) + 1,
+                attempt_number=1,
+                dedupe_key='run-37:baseline-turn-result',
+                payload_json={'action': 'speak', 'turn_number': 1},
+            ))
+            run.scenario.baseline_run_id = baseline_run.id
+            db.session.commit()
+            refresh_run_scorecard(run)
+
+        watch = self.client.get(f'/api/automation/runs/{run_id}', headers=self.headers).get_json()
+        scorecard = self.client.get(f'/api/automation/runs/{run_id}/scorecard', headers=self.headers).get_json()
+        bundle = self.client.get(f'/api/automation/runs/{run_id}/audit-bundle', headers=self.headers).get_json()
+        self.assertEqual(watch['retry_metrics']['counts'], expected_counts)
+        self.assertEqual(watch['run']['scorecard_summary']['retry_metrics']['total'], 18)
+        scorecard_retry = next(row for row in scorecard['scorecard'] if row['check_id'] == 'model_retry_count')
+        self.assertEqual(scorecard_retry['details']['retry_metrics']['counts'], expected_counts)
+        self.assertEqual(bundle['retry_metrics']['counts'], expected_counts)
+        self.assertEqual(bundle['evidence_packet']['retry_metrics']['total'], 18)
+        baseline_retry = next(
+            row for row in watch['baseline_comparison']['comparisons']
+            if row['check_id'] == 'model_retry_count'
+        )
+        self.assertEqual(baseline_retry['baseline_retry_metrics']['total'], 0)
+        self.assertEqual(baseline_retry['current_retry_metrics']['counts'], expected_counts)
+        retry_incident = next(item for item in watch['incidents'] if item['incident_type'] == 'retry_storm')
+        self.assertEqual(retry_incident['count'], 18)
+        self.assertEqual(retry_incident['retry_counts'], expected_counts)
+
 
 if __name__ == '__main__':
     unittest.main()

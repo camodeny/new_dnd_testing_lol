@@ -52,6 +52,18 @@ AUTOMATION_ACTIVE_STATUSES = {'queued', 'claimed', 'running', 'stop_requested', 
 AUTOMATION_SNAPSHOT_SCHEMA_VERSION = 2
 CLONE_RETRIEVAL_PREFLIGHT_VERSION = 1
 
+# Canonical, non-overlapping model retry taxonomy. Classification is ordered:
+# one persisted audit event or provider-call repair attempt contributes to one
+# kind only, and ``total`` is always the sum of these keys.
+MODEL_RETRY_TAXONOMY = {
+    'provider_retry': 'Transient provider/transport retry recorded as model_retry.',
+    'parse_repair': 'Structured-output parse repair recorded on a provider call.',
+    'contract_guard_retry': 'Finalizer contract retry that re-invokes the model.',
+    'tool_repair': 'Tool-call or tool-output repair that re-invokes the model.',
+    'guard_retry': 'Non-contract response guard retry that re-invokes the model.',
+    'other_model_reinvocation': 'Other explicitly retry-labelled model re-invocation.',
+}
+
 
 class CloneRetrievalPreflightError(ValueError):
     def __init__(self, message, report=None):
@@ -207,7 +219,7 @@ DEFAULT_AUDIT_CONFIG = {
             'fail_if': {'gt': 4},
             'weight': 1,
             'better_direction': 'lower',
-            'summary_template': '{value} model retries or parse repairs.',
+            'summary_template': '{value} model retries or repair re-invocations.',
         },
     ],
 }
@@ -2461,6 +2473,97 @@ def _run_context(run):
     return event_rows, audit_rows, provider_rows, cycle_rows
 
 
+def _audit_payload(row):
+    try:
+        value = json.loads(row.payload) if row.payload else {}
+    except (TypeError, ValueError):
+        value = {}
+    return value if isinstance(value, dict) else {}
+
+
+def collect_model_retry_metrics(audit_rows, provider_rows, *, run_status=None):
+    """Return the canonical retry total, per-kind counts, and correlations.
+
+    Audit row ids and provider-call ids form stable source keys, preventing a
+    retry from being counted twice when scorecards and exports are refreshed.
+    Parse repair attempts are expanded into stable per-attempt source keys.
+    """
+    counts = {kind: 0 for kind in MODEL_RETRY_TAXONOMY}
+    correlations = []
+    blocked_traces = {
+        (row.trace_id, row.event_type.removesuffix('_blocked'))
+        for row in audit_rows
+        if row.trace_id and row.event_type.endswith('_guard_blocked')
+    }
+
+    for row in audit_rows:
+        event_type = row.event_type or ''
+        payload = _audit_payload(row)
+        kind = None
+        if event_type == 'model_retry':
+            kind = 'provider_retry'
+        elif event_type == 'finalizer_contract_guard_retry':
+            kind = 'contract_guard_retry'
+        elif event_type.endswith('_guard_retry') and 'tool' in event_type:
+            kind = 'tool_repair'
+        elif event_type.endswith('_guard_retry'):
+            kind = 'guard_retry'
+        elif event_type in {'tool_repair', 'tool_call_repair', 'tool_output_repair'}:
+            kind = 'tool_repair'
+        elif event_type == 'model_request':
+            operation = str(payload.get('operation') or '')
+            if operation.endswith('_retry') or '_repair_retry' in operation:
+                kind = 'other_model_reinvocation'
+        if kind is None:
+            continue
+
+        guard_base = event_type.removesuffix('_retry')
+        if event_type.endswith('_guard_retry'):
+            outcome = 'exhausted' if (row.trace_id, guard_base) in blocked_traces else (
+                'pending' if run_status in AUTOMATION_ACTIVE_STATUSES else 'repaired'
+            )
+        else:
+            outcome = payload.get('outcome') or 'retried'
+        counts[kind] += 1
+        correlations.append({
+            'source_key': f'audit_event:{row.id}',
+            'kind': kind,
+            'event_type': event_type,
+            'turn': payload.get('turn_number') or payload.get('turn') or payload.get('player_message_id'),
+            'provider_call_id': payload.get('provider_call_id'),
+            'attempt': payload.get('next_attempt') or payload.get('attempt'),
+            'outcome': outcome,
+            'trace_id': row.trace_id,
+            'parent_trace_id': row.parent_trace_id,
+        })
+
+    for row in provider_rows:
+        attempts = max(0, row.parse_repair_attempts or 0)
+        for attempt in range(1, attempts + 1):
+            counts['parse_repair'] += 1
+            correlations.append({
+                'source_key': f'provider_call:{row.id}:parse_repair:{attempt}',
+                'kind': 'parse_repair',
+                'event_type': 'provider_parse_repair',
+                'turn': (row.request_json or {}).get('turn_number'),
+                'provider_call_id': row.id,
+                'attempt': attempt,
+                'outcome': 'exhausted' if row.failure_class else 'repaired',
+                'trace_id': (row.request_json or {}).get('trace_id'),
+                'parent_trace_id': (row.request_json or {}).get('parent_trace_id'),
+            })
+
+    total = sum(counts.values())
+    return {
+        'taxonomy_version': 1,
+        'label': 'All model retries and repair re-invocations',
+        'definitions': dict(MODEL_RETRY_TAXONOMY),
+        'counts': counts,
+        'total': total,
+        'correlations': correlations,
+    }
+
+
 def calculate_run_incidents(run, event_rows=None, audit_rows=None, provider_rows=None):
     if event_rows is None or audit_rows is None or provider_rows is None:
         event_rows, audit_rows, provider_rows, _ = _run_context(run)
@@ -2485,13 +2588,15 @@ def calculate_run_incidents(run, event_rows=None, audit_rows=None, provider_rows
             'count': dm_empty_count,
         })
 
-    retry_count = audit_counts.get('model_retry', 0) + sum((row.parse_repair_attempts or 0) for row in provider_rows)
+    retry_metrics = collect_model_retry_metrics(audit_rows, provider_rows, run_status=run.status)
+    retry_count = retry_metrics['total']
     if retry_count >= 3:
         incidents.append({
             'incident_type': 'retry_storm',
             'severity': 'warn' if retry_count < 6 else 'fail',
-            'summary': f'Recorded {retry_count} provider retries or parse repairs.',
+            'summary': f'Recorded {retry_count} model retries or repair re-invocations.',
             'count': retry_count,
+            'retry_counts': retry_metrics['counts'],
         })
 
     failure_count = sum(1 for row in provider_rows if row.failure_class)
@@ -2543,6 +2648,7 @@ def _collect_run_metrics(run, event_rows=None, audit_rows=None, provider_rows=No
             if (event.payload_json or {}).get('decision', {}).get('action') != 'no_action'
         ]
     latencies = [row.latency_ms for row in provider_rows if row.latency_ms is not None]
+    retry_metrics = collect_model_retry_metrics(audit_rows, provider_rows, run_status=run.status)
     incidents = calculate_run_incidents(run, event_rows, audit_rows, provider_rows)
     audited_cycles = [cycle for cycle in cycle_rows if cycle.status == 'audited']
     template = current_scorecard_template_for_run(run)
@@ -2575,7 +2681,8 @@ def _collect_run_metrics(run, event_rows=None, audit_rows=None, provider_rows=No
         'completed_turns': len(completed_turns),
         'dm_silence_count': audit_counts.get('dm_silence_chosen', 0),
         'dm_empty_count': audit_counts.get('dm_output_empty', 0),
-        'model_retry_count': audit_counts.get('model_retry', 0) + sum((row.parse_repair_attempts or 0) for row in provider_rows),
+        'model_retry_count': retry_metrics['total'],
+        'model_retry_metrics': retry_metrics,
         'provider_failure_count': sum(1 for row in provider_rows if row.failure_class),
         'provider_call_count': len(provider_rows),
         'median_provider_latency_ms': median(latencies) if latencies else None,
@@ -2875,6 +2982,10 @@ def baseline_comparison_for_run(run, results):
             'performance_relationship': performance_relationship,
             'baseline_value': baseline_value,
             'current_value': current_value,
+            **({
+                'baseline_retry_metrics': (baseline_result.details_json or {}).get('retry_metrics'),
+                'current_retry_metrics': (result.details_json or {}).get('retry_metrics'),
+            } if result.check_id == 'model_retry_count' else {}),
         })
     return {
         'baseline_run_id': baseline_run.id,
@@ -2920,6 +3031,7 @@ def refresh_run_scorecard(run):
                 },
                 'better_direction': check.get('better_direction'),
                 'severity': status,
+                **({'retry_metrics': metrics.get('model_retry_metrics')} if metric_key == 'model_retry_count' else {}),
                 **scoring,
             },
         })
@@ -3030,6 +3142,7 @@ def refresh_run_scorecard(run):
         'warning_checks': warn_count,
         'completed_turns': metrics.get('completed_turns', 0),
         'error_count': metrics.get('error_count', 0),
+        'retry_metrics': metrics.get('model_retry_metrics'),
         'audited_cycle_count': metrics.get('audited_cycle_count', 0),
         'scoring_model': SCORECARD_SCORING_MODEL,
         'severity': overall_status,
@@ -3138,6 +3251,7 @@ def run_watch_payload(run, current_user=None):
             .all()
         ],
         'incidents': run.scorecard_summary_json.get('incidents') or [],
+        'retry_metrics': run.scorecard_summary_json.get('retry_metrics') or {},
         'provider_calls': provider_calls,
         'baseline_comparison': run.baseline_comparison_json or {},
     })
