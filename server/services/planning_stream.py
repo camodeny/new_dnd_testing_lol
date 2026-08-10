@@ -129,6 +129,8 @@ class PlanningGeneratorWorker:
         self.is_done = False
         self.finished_at = None
         self.error = None
+        self.result_active_page = None
+        self.result_form_patch = {}
 
     def add_listener(self):
         q = queue.Queue()
@@ -155,10 +157,12 @@ class PlanningGeneratorWorker:
     def finish_success(self, result):
         self.is_done = True
         self.finished_at = time.monotonic()
+        self.result_active_page = result.get('active_page')
+        self.result_form_patch = result.get('form_patch') or {}
         self.broadcast({
             'type': 'done',
-            'active_page': result.get('active_page'),
-            'form_patch': result.get('form_patch') or {},
+            'active_page': self.result_active_page,
+            'form_patch': self.result_form_patch,
         })
 
     def finish_error(self, error_msg):
@@ -355,6 +359,18 @@ class PlanningStreamManager:
             if key not in self.listeners:
                 self.listeners[key] = []
             self.listeners[key].append(q)
+            # Replay the terminal state so a client that (re)connects after the
+            # worker finished still receives done/error instead of waiting forever.
+            worker = self.workers.get(key)
+            if worker and worker.is_done:
+                if worker.error:
+                    q.put({'type': 'error', 'error': worker.error})
+                else:
+                    q.put({
+                        'type': 'done',
+                        'active_page': worker.result_active_page,
+                        'form_patch': worker.result_form_patch or {},
+                    })
         return q
 
     def remove_listener(self, campaign_id, user_id, q):

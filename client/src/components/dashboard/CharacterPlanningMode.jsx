@@ -267,6 +267,7 @@ export default function CharacterPlanningMode({
   const isAutoScrollEnabledRef = useRef(true)
   const lastAppliedDraftPatchEventIdRef = useRef(null)
   const pendingMessageIdsRef = useRef(new Set())
+  const pendingGenerationRef = useRef(false)
 
   const handleScroll = useCallback(() => {
     const container = chatMessagesRef.current
@@ -287,12 +288,23 @@ export default function CharacterPlanningMode({
     })
   }, [baselineCharacter])
 
+  const finalizeSending = useCallback(() => {
+    pendingGenerationRef.current = false
+    setStreamingContent('')
+    changeSending(false)
+    // Clear any optimistic temp messages still in the feed
+    setPlanning((prev) => {
+      if (!prev) return prev
+      const filtered = (prev.messages || []).filter((msg) => !pendingMessageIdsRef.current.has(msg.id))
+      pendingMessageIdsRef.current.clear()
+      return { ...prev, messages: filtered }
+    })
+  }, [changeSending])
+
   const loadPlanning = useCallback(async ({ quiet = false, onComplete } = {}) => {
-    if (quiet && sendingRef.current && !onComplete) return
     if (!quiet) setLoading(true)
     try {
       const data = await getCampaignPlanning(campaign.id)
-      if (quiet && sendingRef.current && !onComplete) return
       setPlanning(data.planning)
       const draftPatchEventId = data.planning?.draft_patch_event_id
       if (draftPatchEventId && lastAppliedDraftPatchEventIdRef.current !== draftPatchEventId) {
@@ -300,13 +312,27 @@ export default function CharacterPlanningMode({
         applyFormPatch(data.planning?.draft_patch)
       }
       setError('')
-      if (onComplete) onComplete()
+      if (onComplete) {
+        onComplete()
+      } else if (quiet && pendingGenerationRef.current) {
+        // Recovery path: if the SSE "done" event was missed (reconnect gap,
+        // dropped connection, etc.), detect completion via polling instead of
+        // leaving the UI stuck on "Thinking..." indefinitely.
+        const messages = data.planning?.messages || []
+        const lastMessage = messages[messages.length - 1]
+        if (lastMessage?.role === 'dm') {
+          finalizeSending()
+        }
+      }
     } catch (err) {
       setError(err.message)
+      // Always finalize a pending send even if the refresh fetch failed, so the
+      // chat never deadlocks on a stuck "Thinking..." indicator.
+      if (onComplete) onComplete()
     } finally {
       if (!quiet) setLoading(false)
     }
-  }, [campaign.id, applyFormPatch, sendingRef])
+  }, [campaign.id, applyFormPatch, finalizeSending, sendingRef])
 
   useEffect(() => {
     Promise.resolve().then(() => loadPlanning())
@@ -331,6 +357,7 @@ export default function CharacterPlanningMode({
           const payload = JSON.parse(event.data)
           if (payload.type === 'token') {
             changeSending(true)
+            pendingGenerationRef.current = true
             setStreamingContent((prev) => prev + payload.token)
             const container = chatMessagesRef.current
             if (container && isAutoScrollEnabledRef.current) {
@@ -343,23 +370,10 @@ export default function CharacterPlanningMode({
             applyFormPatch(payload.form_patch)
             loadPlanning({
               quiet: true,
-              onComplete: () => {
-                setStreamingContent('')
-                changeSending(false)
-
-                // Clear the optimistic temp message
-                setPlanning((prev) => {
-                  if (!prev) return prev
-                  const filtered = (prev.messages || []).filter((msg) => !pendingMessageIdsRef.current.has(msg.id))
-                  pendingMessageIdsRef.current.clear()
-                  return {
-                    ...prev,
-                    messages: filtered
-                  }
-                })
-              },
+              onComplete: finalizeSending,
             })
           } else if (payload.type === 'error') {
+            pendingGenerationRef.current = false
             setError(payload.error)
             setStreamingContent('')
             changeSending(false)
@@ -375,6 +389,7 @@ export default function CharacterPlanningMode({
 
       eventSource.onerror = () => {
         // If we were actively receiving content, clean up
+        pendingGenerationRef.current = false
         changeSending(false)
         setStreamingContent('')
         loadPlanning({ quiet: true })
@@ -389,7 +404,7 @@ export default function CharacterPlanningMode({
         eventSource.close()
       }
     }
-  }, [campaign.id, loadPlanning, applyFormPatch, changeSending, onComplete])
+  }, [campaign.id, loadPlanning, applyFormPatch, changeSending, finalizeSending, onComplete])
 
   useEffect(() => {
     saveStoredDraft(campaign.id, currentUser?.id, draftCharacter)
@@ -570,8 +585,11 @@ export default function CharacterPlanningMode({
         return
       }
 
-      // Production: wait for updates to stream into the persistent SSE listener!
+      // Production: the server kicked off a streaming generation; the persistent
+      // SSE listener will deliver tokens and the final "done" event.
+      pendingGenerationRef.current = true
     } catch (err) {
+      pendingGenerationRef.current = false
       pendingAutoScrollRef.current = false
       setStreamingContent('')
       setError(err.message)
