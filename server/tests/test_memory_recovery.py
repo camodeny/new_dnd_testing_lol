@@ -51,7 +51,7 @@ def _trigger_verdict(*source_ids):
 
 
 class SessionMemoryRelationEndpointTest(unittest.TestCase):
-    """Regression coverage for issue #100.
+    """Invariant coverage for relation endpoint materialization.
 
     Resolved NPC actors and roster PCs referenced as relation endpoints must
     survive resolution, compilation, validation, and application even when they
