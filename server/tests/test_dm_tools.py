@@ -1653,7 +1653,7 @@ class DmToolsTest(unittest.TestCase):
                                             ],
                                             'unresolved_items': [],
                                             'evidence_basis': [{'surface': 'latest_dm_message', 'summary': 'Rona kept the token.'}],
-                                            'resolved_entity_refs': [{'label': 'Deputy Rona', 'entity_id': 'deputy_rona'}],
+                                            'resolved_entity_refs': [{'label': 'Deputy Rona', 'entity_id': 'deputy_rona', 'resolution': 'same'}],
                                             'resolved_location_refs': [{'label': 'Hanging Switchyard', 'location_id': 'hanging_switchyard'}],
                                         }),
                                     },

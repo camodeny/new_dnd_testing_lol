@@ -14,6 +14,7 @@ from services.memory_resolver_schemas import (
     can_reuse_existing,
     validate_registry_entry,
     validate_clarification_request,
+    validate_resolved_entity_refs_contract,
 )
 from services.world_service import clean_id, clean_text, get_campaign_world, json_loads
 
@@ -37,23 +38,16 @@ def normalize_resolved_entity_refs(resolved_entity_refs):
     resolver after reading the full campaign state; compilation must honor them.
     """
     refs = []
-    if not isinstance(resolved_entity_refs, list):
+    valid, _errors = validate_resolved_entity_refs_contract(resolved_entity_refs)
+    if not valid:
         return refs
     for ref in resolved_entity_refs:
-        if not isinstance(ref, dict):
-            continue
-        label = clean_text(
-            ref.get("label") or ref.get("surface_form") or ref.get("canonical_name"),
-            200,
-        )
-        canonical_id = clean_id(
-            ref.get("entity_id") or ref.get("canonical_entity_id") or ref.get("canonical_id"),
-            "",
-        )
+        label = clean_text(ref.get("label"), 200)
+        canonical_id = clean_id(ref.get("entity_id"), "")
         if not label or not canonical_id:
             continue
         canonical_name = clean_text(
-            ref.get("canonical_name") or ref.get("canonical_entity_name") or ref.get("canonical_name_label"),
+            ref.get("canonical_name"),
             200,
         ) or label
         refs.append({
@@ -63,7 +57,7 @@ def normalize_resolved_entity_refs(resolved_entity_refs):
             "canonical_name_lower": canonical_name.strip().lower(),
             "canonical_id": canonical_id,
             "proposed_id": clean_id(
-                ref.get("proposed_id") or ref.get("mention_entity_id") or ref.get("provisional_id"),
+                ref.get("proposed_id"),
                 "",
             ),
             "rename_existing": ref.get("rename_existing") is True,

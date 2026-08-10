@@ -5791,8 +5791,8 @@ def repair_duplicate_identity(campaign, duplicate_id, canonical_id):
 
     Safely rewrites graph entities, relations, facts, scene cast, and NPC actor
     rows so the campaign ends with exactly one durable identity. Used to repair
-    pre-existing split-brain states such as Run 37's provisional duplicate
-    created before resolved entity references were consumed.
+    pre-existing split-brain states such as the Run 37 and Run 41 provisional
+    duplicates created before resolved entity references were consumed.
     """
     from models import CampaignIdentityResolution, CampaignWorld, NPCActor, db
 

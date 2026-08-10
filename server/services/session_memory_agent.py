@@ -20,6 +20,7 @@ from services.memory_resolver_schemas import (
     make_provenance_record,
     normalize_evidence_status,
     validate_diagnostics,
+    validate_resolved_entity_refs_contract,
 )
 from services.resolution_registry import (
     allocate_durable_id,
@@ -616,18 +617,37 @@ def _validate_final_memory_state(compiled_patch, registry_map, known, campaign):
 def _validate_resolved_entity_refs(compiled_patch, known=None):
     errors = []
     raw_refs = compiled_patch.get("resolved_entity_refs")
+    if raw_refs is None:
+        return errors
+    _valid_contract, contract_errors = validate_resolved_entity_refs_contract(raw_refs)
+    errors.extend(f"resolved_ref_contract: {error}" for error in contract_errors)
     if not isinstance(raw_refs, list) or not raw_refs:
         return errors
     refs = normalize_resolved_entity_refs(raw_refs)
     if not refs:
-        return errors
+        errors.append("resolved_ref_contract: nonempty refs normalized to zero valid entries")
+
+    # Build the final split-brain evidence directly from the structured raw
+    # fields. This deliberately does not depend on normalization succeeding.
+    evidence_refs = []
+    for raw_ref in raw_refs:
+        if not isinstance(raw_ref, dict):
+            continue
+        label = clean_text(raw_ref.get("label"), 200)
+        canonical_id = clean_id(raw_ref.get("entity_id"), "")
+        if label and canonical_id:
+            evidence_refs.append({
+                "label_lower": label.lower(),
+                "canonical_name_lower": clean_text(raw_ref.get("canonical_name"), 200).lower(),
+                "canonical_id": canonical_id,
+            })
 
     known = known if isinstance(known, dict) else {}
     known_names = dict(known.get("npc_names", {}) or {})
     known_names.update(known.get("entity_names", {}) or {})
 
     term_to_canonical = {}
-    for ref in refs:
+    for ref in evidence_refs:
         terms = {ref["label_lower"], ref.get("canonical_name_lower", "")}
         known_canonical_name = known_names.get(ref["canonical_id"], "")
         if known_canonical_name:
@@ -638,7 +658,7 @@ def _validate_resolved_entity_refs(compiled_patch, known=None):
             term_to_canonical.setdefault(term, ref["canonical_id"])
 
     conflicts = {}
-    for ref in refs:
+    for ref in evidence_refs:
         terms = {ref["label_lower"], ref.get("canonical_name_lower", "")}
         for term in terms:
             if term:
@@ -1154,7 +1174,23 @@ def compile_staged_memory_patch(memory_context, extracted, resolved):
     known = _known_ids(campaign)
     unresolved = list(resolved.get("unresolved_items") if isinstance(resolved.get("unresolved_items"), list) else [])
 
-    entity_refs = normalize_resolved_entity_refs(resolved.get("resolved_entity_refs"))
+    raw_entity_refs = resolved.get("resolved_entity_refs", [])
+    refs_valid, refs_errors = validate_resolved_entity_refs_contract(raw_entity_refs)
+    if not refs_valid:
+        raise MemoryPipelineError(
+            stage="compilation",
+            code="invalid_resolved_entity_refs",
+            message=f"Invalid resolved_entity_refs contract: {'; '.join(refs_errors[:5])}",
+            telemetry={"validation_errors": refs_errors},
+        )
+    entity_refs = normalize_resolved_entity_refs(raw_entity_refs)
+    if raw_entity_refs and not entity_refs:
+        raise MemoryPipelineError(
+            stage="compilation",
+            code="invalid_resolved_entity_refs",
+            message="Invalid resolved_entity_refs contract: nonempty refs normalized to zero valid entries",
+            telemetry={"validation_errors": ["nonempty refs normalized to zero valid entries"]},
+        )
 
     resolver_packet = memory_context.get("resolver_packet") if isinstance(memory_context, dict) else None
     if isinstance(resolver_packet, dict) and not isinstance(resolver_packet.get("entity_mentions"), list):
@@ -1173,7 +1209,7 @@ def compile_staged_memory_patch(memory_context, extracted, resolved):
         resolver_packet,
         prior_resolutions,
         known,
-        resolved_entity_refs=entity_refs,
+        resolved_entity_refs=raw_entity_refs,
     )
 
     # Compile-time validation: check which answered clarifications actually resolved in the registry
@@ -2123,7 +2159,17 @@ def compile_staged_memory_patch(memory_context, extracted, resolved):
         "source_contract": SOURCE_CONTRACT_COMPILED_V2,
         "base_memory_revision": _get_memory_revision(campaign),
         "evidence_basis": resolved.get("evidence_basis") if isinstance(resolved.get("evidence_basis"), list) else [],
-        "resolved_entity_refs": resolved.get("resolved_entity_refs") if isinstance(resolved.get("resolved_entity_refs"), list) else [],
+        "resolved_entity_refs": [
+            {
+                "label": ref["label"],
+                "entity_id": ref["canonical_id"],
+                "resolution": ref["resolution"],
+                **({"canonical_name": ref["canonical_name"]} if ref.get("canonical_name") else {}),
+                **({"proposed_id": ref["proposed_id"]} if ref.get("proposed_id") else {}),
+                **({"rename_existing": True} if ref.get("rename_existing") else {}),
+            }
+            for ref in entity_refs
+        ],
         "resolved_location_refs": resolved.get("resolved_location_refs") if isinstance(resolved.get("resolved_location_refs"), list) else [],
         "consumed_clarification_ids": consumed_clarification_ids,
     }
