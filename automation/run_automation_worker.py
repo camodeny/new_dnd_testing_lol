@@ -871,7 +871,7 @@ def _reconcile_dm_turn_timeout(
             if dm_response_state.dm_turn_fully_resolved(last_status):
                 turn_status = str(last_status.get('status') or '').strip().lower()
                 post_turn_status = str(last_status.get('post_turn_status') or '').strip().lower()
-                if turn_status == 'error' or post_turn_status == 'error':
+                if turn_status == 'error' or dm_response_state.dm_turn_post_turn_failed(last_status):
                     _exhausted_event('dm_turn_error', last_status)
                     terminal_error = (
                         last_status.get('turn_error')
@@ -1307,7 +1307,7 @@ def execute_run(args, run_id):
                 dm_turn,
                 dedupe_key=f'dm_turn_status:{logical_key}:{posted_message_id}',
             )
-            if dm_turn.get('status') == 'error' or dm_turn.get('post_turn_status') == 'error':
+            if dm_turn.get('status') == 'error' or dm_response_state.dm_turn_post_turn_failed(dm_turn):
                 should_stop, lease_token = pause_for_audit_if_needed(
                     args,
                     claim_payload,
@@ -1399,7 +1399,7 @@ def execute_run(args, run_id):
                 )
                 error_classification = (
                     'dm_post_turn_error'
-                    if str(dm_turn.get('post_turn_status') or '').strip().lower() == 'error'
+                    if dm_response_state.dm_turn_post_turn_failed(dm_turn)
                     else (dm_turn.get('turn_error') or dm_turn.get('error_text') or 'dm_turn_failed')
                 )
                 complete_run(
@@ -1791,7 +1791,7 @@ def execute_run(args, run_id):
                         dm_turn,
                         dedupe_key=f'dm_turn_status:{logical_key}:{posted_message_id}',
                     )
-                    if dm_turn.get('status') == 'error' or dm_turn.get('post_turn_status') == 'error':
+                    if dm_turn.get('status') == 'error' or dm_response_state.dm_turn_post_turn_failed(dm_turn):
                         should_stop, lease_token = pause_for_audit_if_needed(
                             args,
                             claim_payload,
@@ -1883,7 +1883,7 @@ def execute_run(args, run_id):
                         )
                         error_classification = (
                             'dm_post_turn_error'
-                            if str(dm_turn.get('post_turn_status') or '').strip().lower() == 'error'
+                            if dm_response_state.dm_turn_post_turn_failed(dm_turn)
                             else (dm_turn.get('turn_error') or dm_turn.get('error_text') or 'dm_turn_failed')
                         )
                         complete_run(

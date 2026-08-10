@@ -1,5 +1,10 @@
 from models import SessionDmTurn
 from time_utils import utcnow
+from services.post_turn_state import (
+    SUCCESS_POST_TURN_STATUSES,
+    TERMINAL_POST_TURN_STATUSES,
+    state_for_turn,
+)
 
 
 def session_dm_trace_id(session_id, player_message_id):
@@ -22,6 +27,42 @@ def _get_turn(player_message_id):
     if not player_message_id:
         return None
     return SessionDmTurn.query.filter_by(player_message_id=player_message_id).first()
+
+
+def _record_invariant_incident(turn):
+    """Persist a diagnostic instead of silently publishing contradictions."""
+    state = state_for_turn(turn)
+    violations = state.get('post_turn_invariant_violations') or []
+    if not violations:
+        return
+    from models import CampaignAuditEvent
+    from services.audit_service import log_audit_event
+
+    existing = CampaignAuditEvent.query.filter_by(
+        campaign_id=turn.campaign_id,
+        event_type='post_turn_state_invariant_incident',
+        trace_id=turn.trace_id,
+    ).first()
+    if existing is not None:
+        return
+    log_audit_event(
+        turn.campaign_id,
+        'post_turn_state_invariant_incident',
+        'Canonical post-turn state rejected contradictory telemetry.',
+        {
+            'player_message_id': turn.player_message_id,
+            'dm_message_id': turn.dm_message_id,
+            'violations': violations,
+            'canonical_state': state,
+        },
+        source='post_turn_state',
+        actor='session_dm',
+        trace_id=turn.trace_id,
+        parent_trace_id=turn.trace_id,
+        trace_label='post-turn state invariant',
+        audit_role='tools',
+        commit=False,
+    )
 
 
 def begin_session_dm_turn(campaign_id, session_id, player_message_id, trace_id, started_at=None):
@@ -58,6 +99,9 @@ def mark_session_dm_turn_visible(
 ):
     completed_at = completed_at or _utcnow()
     turn = begin_session_dm_turn(campaign_id, session_id, player_message_id, trace_id)
+    if turn.post_turn_status in TERMINAL_POST_TURN_STATUSES:
+        turn.dm_message_id = turn.dm_message_id or dm_message_id
+        return turn
     turn.dm_message_id = dm_message_id or turn.dm_message_id
     turn.trace_id = trace_id or turn.trace_id
     turn.status = status
@@ -88,10 +132,12 @@ def mark_session_dm_turn_post_turn_complete(player_message_id, dm_message_id=Non
     turn.post_turn_status = 'complete'
     turn.memory_status = memory_status or 'complete'
     turn.clock_status = clock_status or 'complete'
+    turn.error_text = None
     if post_turn_revision is not None:
         turn.post_turn_revision = post_turn_revision
     if turn.status == 'pending':
         turn.status = 'speak'
+    _record_invariant_incident(turn)
     return turn
 
 
@@ -109,6 +155,9 @@ def mark_session_dm_turn_error(
 ):
     finished_at = finished_at or _utcnow()
     turn = begin_session_dm_turn(campaign_id, session_id, player_message_id, trace_id, started_at=finished_at)
+    # A stale retry/duplicate must not regress a successfully committed turn.
+    if turn.post_turn_status in SUCCESS_POST_TURN_STATUSES:
+        return turn
     if dm_message_id:
         turn.dm_message_id = dm_message_id
     if turn.status not in {'speak', 'silent', 'empty'}:
@@ -123,6 +172,7 @@ def mark_session_dm_turn_error(
     turn.clock_status = clock_status or 'skipped'
     if post_turn_revision is not None:
         turn.post_turn_revision = post_turn_revision
+    _record_invariant_incident(turn)
     return turn
 
 
@@ -159,11 +209,10 @@ def session_dm_turn_status_payload(player_message_id):
     turn = _get_turn(player_message_id)
     if turn is None:
         return {}
+    state = state_for_turn(turn)
     return {
         'status': turn.status,
-        'post_turn_status': turn.post_turn_status,
-        'memory_status': turn.memory_status,
-        'clock_status': turn.clock_status,
+        **state,
         'post_turn_revision': turn.post_turn_revision,
         'started_at': turn.started_at.isoformat() if turn.started_at else None,
         'visible_completed_at': turn.visible_completed_at.isoformat() if turn.visible_completed_at else None,
