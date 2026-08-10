@@ -1306,7 +1306,7 @@ class ResolvedEntityRefsTest(unittest.TestCase):
         memory_context = self._context()
         resolved = {
             'resolved_entity_refs': [
-                {'label': 'Old Garret', 'entity_id': 'garret'},
+                {'label': 'Old Garret', 'entity_id': 'garret', 'resolution': 'same'},
             ],
             'upsert_graph_entities': [
                 {
@@ -1369,7 +1369,7 @@ class ResolvedEntityRefsTest(unittest.TestCase):
             None,
             [],
             known,
-            resolved_entity_refs=[{'label': 'Old Garret', 'entity_id': 'garret'}],
+            resolved_entity_refs=[{'label': 'Old Garret', 'entity_id': 'garret', 'resolution': 'same'}],
         )
         entry = next(e for e in registry if e.get('mention_ref') == 'old_garret_claim')
         self.assertEqual(entry['canonical_id'], 'garret')
@@ -1388,7 +1388,7 @@ class ResolvedEntityRefsTest(unittest.TestCase):
         }
         resolved = {
             'resolved_entity_refs': [
-                {'label': 'the wolf', 'entity_id': 'mira_wolf'},
+                {'label': 'the wolf', 'entity_id': 'mira_wolf', 'resolution': 'same'},
             ],
             'upsert_graph_entities': [
                 {'id': 'mira_wolf', 'name': 'Mira\'s Wolf', 'type': 'beast'},
@@ -1399,11 +1399,73 @@ class ResolvedEntityRefsTest(unittest.TestCase):
         self.assertIn('mira_wolf', entity_ids)
         self.assertNotIn('the_wolf', entity_ids)
 
+    def test_run_41_surface_refs_reconcile_factions(self):
+        graph = json.loads(self.world.knowledge_graph)
+        graph['entities'].extend([
+            {'id': 'ferry_guild', 'name': 'Ferry Guild', 'type': 'faction'},
+            {'id': 'lake_nobility', 'name': 'Lake Nobility', 'type': 'faction'},
+        ])
+        self.world.knowledge_graph = json.dumps(graph)
+        db.session.flush()
+
+        resolved = {
+            'resolved_entity_refs': [
+                {'surface': 'The Ferry Guild', 'entity_id': 'ferry_guild', 'resolution': 'same'},
+                {'surface': 'The Lake Nobility', 'entity_id': 'lake_nobility', 'resolution': 'same'},
+            ],
+            'upsert_graph_entities': [
+                {'id': 'the_ferry_guild', 'name': 'The Ferry Guild', 'type': 'faction'},
+                {'id': 'the_lake_nobility', 'name': 'The Lake Nobility', 'type': 'faction'},
+            ],
+        }
+        compiled = compile_staged_memory_patch(self._context(), {}, resolved)
+
+        entity_ids = {entity['id'] for entity in compiled['upsert_graph_entities']}
+        self.assertEqual(entity_ids, {'ferry_guild', 'lake_nobility'})
+        self.assertNotIn('the_ferry_guild', entity_ids)
+        self.assertNotIn('the_lake_nobility', entity_ids)
+        self.assertEqual(
+            [ref['label'] for ref in compiled['resolved_entity_refs']],
+            ['The Ferry Guild', 'The Lake Nobility'],
+        )
+
+    def test_malformed_nonempty_refs_fail_closed(self):
+        for raw_refs in (
+            [{}],
+            ['The Ferry Guild'],
+            [{'surface_form': 'The Ferry Guild', 'canonical_id': 'ferry_guild'}],
+        ):
+            with self.assertRaises(MemoryPipelineError) as raised:
+                compile_staged_memory_patch(
+                    self._context(),
+                    {},
+                    {'resolved_entity_refs': raw_refs},
+                )
+            self.assertEqual(raised.exception.code, 'invalid_resolved_entity_refs')
+
+    def test_split_brain_check_survives_contract_failure(self):
+        from services.session_memory_agent import _validate_resolved_entity_refs
+        compiled = {
+            'resolved_entity_refs': [{
+                'surface': 'The Ferry Guild',
+                'entity_id': 'ferry_guild',
+                'resolution': 'same',
+                'unsupported': True,
+            }],
+            'upsert_graph_entities': [
+                {'id': 'the_ferry_guild', 'name': 'The Ferry Guild', 'type': 'faction'},
+            ],
+            'update_npc_actors': [],
+        }
+        errors = _validate_resolved_entity_refs(compiled)
+        self.assertTrue(any('resolved_ref_contract' in error for error in errors))
+        self.assertTrue(any('resolved_ref_split_brain' in error for error in errors))
+
     def test_resolved_ref_catches_canonical_name_upsert(self):
         memory_context = self._context()
         resolved = {
             'resolved_entity_refs': [
-                {'label': 'Old Garret', 'entity_id': 'garret'},
+                {'label': 'Old Garret', 'entity_id': 'garret', 'resolution': 'same'},
             ],
             'upsert_graph_entities': [
                 {'id': 'old_garret', 'name': 'Garret', 'type': 'npc'},
@@ -1423,7 +1485,7 @@ class ResolvedEntityRefsTest(unittest.TestCase):
         memory_context = self._context()
         resolved = {
             'resolved_entity_refs': [
-                {'label': 'Old Garret', 'entity_id': 'garret'},
+                {'label': 'Old Garret', 'entity_id': 'garret', 'resolution': 'same'},
             ],
             'update_npc_actors': [
                 {'id': 'old_garret', 'name': 'Old Garret'},
@@ -1500,8 +1562,8 @@ class ResolvedEntityRefsTest(unittest.TestCase):
         from services.session_memory_agent import _validate_resolved_entity_refs
         compiled = {
             'resolved_entity_refs': [
-                {'label': 'Old Garret', 'entity_id': 'garret'},
-                {'label': 'Old Garret', 'entity_id': 'old_garret'},
+                {'label': 'Old Garret', 'entity_id': 'garret', 'resolution': 'same'},
+                {'label': 'Old Garret', 'entity_id': 'old_garret', 'resolution': 'same'},
             ],
             'upsert_graph_entities': [],
             'update_npc_actors': [],
@@ -1513,7 +1575,7 @@ class ResolvedEntityRefsTest(unittest.TestCase):
         from services.session_memory_agent import _validate_resolved_entity_refs
         compiled = {
             'resolved_entity_refs': [
-                {'label': 'Old Garret', 'entity_id': 'garret'},
+                {'label': 'Old Garret', 'entity_id': 'garret', 'resolution': 'same'},
             ],
             'upsert_graph_entities': [
                 {'id': 'garret', 'name': 'Garret', 'type': 'npc'},
@@ -1595,6 +1657,61 @@ class ResolvedEntityRefsTest(unittest.TestCase):
         ).first()
         self.assertIsNotNone(resolution)
         self.assertEqual(resolution.resolution_action, 'add_alias')
+
+    def test_run_41_faction_repair_preserves_visibility_and_provenance(self):
+        from services.dm_tools import repair_duplicate_identity
+
+        graph = json.loads(self.world.knowledge_graph)
+        graph['entities'].extend([
+            {'id': 'ferry_guild', 'name': 'Ferry Guild', 'type': 'faction'},
+            {'id': 'the_ferry_guild', 'name': 'The Ferry Guild', 'type': 'faction'},
+            {'id': 'lake_nobility', 'name': 'Lake Nobility', 'type': 'faction'},
+            {'id': 'the_lake_nobility', 'name': 'The Lake Nobility', 'type': 'faction'},
+        ])
+        graph['facts'].extend([
+            {
+                'id': 'private_ferry_fact',
+                'text': 'The guild hides a ledger.',
+                'entity_ids': ['the_ferry_guild'],
+                'visibility': 'dm_private',
+            },
+            {
+                'id': 'party_lake_fact',
+                'text': 'The nobles control the quay.',
+                'entity_ids': ['the_lake_nobility'],
+                'visibility': 'party_known',
+            },
+        ])
+        self.world.knowledge_graph = json.dumps(graph)
+        db.session.flush()
+
+        with unittest.mock.patch('services.dm_tools.upsert_memory_embedding', return_value={'ok': True}):
+            repair_duplicate_identity(self.campaign, 'the_ferry_guild', 'ferry_guild')
+            repair_duplicate_identity(self.campaign, 'the_lake_nobility', 'lake_nobility')
+        db.session.commit()
+
+        graph = json.loads(self.world.knowledge_graph)
+        entity_ids = {entity['id'] for entity in graph['entities']}
+        self.assertNotIn('the_ferry_guild', entity_ids)
+        self.assertNotIn('the_lake_nobility', entity_ids)
+        facts = {fact['id']: fact for fact in graph['facts']}
+        self.assertEqual(facts['private_ferry_fact']['entity_ids'], ['ferry_guild'])
+        self.assertEqual(facts['private_ferry_fact']['visibility'], 'dm_private')
+        self.assertEqual(facts['party_lake_fact']['entity_ids'], ['lake_nobility'])
+        self.assertEqual(facts['party_lake_fact']['visibility'], 'party_known')
+
+        records = CampaignIdentityResolution.query.filter_by(
+            campaign_id=self.campaign.id,
+            resolved_by='identity_repair',
+        ).all()
+        self.assertEqual(
+            {(record.mention_entity_id, record.canonical_id) for record in records},
+            {
+                ('the_ferry_guild', 'ferry_guild'),
+                ('the_lake_nobility', 'lake_nobility'),
+            },
+        )
+        self.assertTrue(all(record.visibility == 'dm_private' for record in records))
 
 
 if __name__ == '__main__':

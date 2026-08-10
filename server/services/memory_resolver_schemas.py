@@ -68,6 +68,77 @@ MEMORY_RUN_STATUSES = {
     "failed",
 }
 
+# ── Resolved Entity Reference Contract ───────────────────────────────
+# ``label`` is the canonical surface-name field. ``surface`` is retained as
+# one explicit compatibility alias for resolver packets emitted before this
+# contract was tightened. Exactly one must be present.
+RESOLVED_ENTITY_REF_RESOLUTIONS = {"same"}
+RESOLVED_ENTITY_REF_ALLOWED_FIELDS = {
+    "label",
+    "surface",
+    "entity_id",
+    "resolution",
+    "canonical_name",
+    "proposed_id",
+    "rename_existing",
+}
+RESOLVED_ENTITY_REF_SCHEMA = {
+    "type": "object",
+    "required": ["entity_id", "resolution"],
+    "properties": {
+        "label": {"type": "string", "minLength": 1},
+        "surface": {"type": "string", "minLength": 1},
+        "entity_id": {"type": "string", "minLength": 1},
+        "resolution": {
+            "type": "string",
+            "enum": sorted(RESOLVED_ENTITY_REF_RESOLUTIONS),
+        },
+        "canonical_name": {"type": "string", "minLength": 1},
+        "proposed_id": {"type": "string", "minLength": 1},
+        "rename_existing": {"type": "boolean"},
+    },
+    "oneOf": [
+        {"required": ["label"]},
+        {"required": ["surface"]},
+    ],
+    "additionalProperties": False,
+}
+
+
+def validate_resolved_entity_refs_contract(resolved_entity_refs):
+    """Validate the shared finalizer/compiler identity-reference contract."""
+    if not isinstance(resolved_entity_refs, list):
+        return False, ["resolved_entity_refs must be a list"]
+
+    errors = []
+    for index, ref in enumerate(resolved_entity_refs):
+        prefix = f"resolved_entity_refs[{index}]"
+        if not isinstance(ref, dict):
+            errors.append(f"{prefix}: must be an object")
+            continue
+        unsupported = sorted(set(ref) - RESOLVED_ENTITY_REF_ALLOWED_FIELDS)
+        if unsupported:
+            errors.append(f"{prefix}: unsupported fields: {', '.join(unsupported)}")
+        surface_fields = [field for field in ("label", "surface") if field in ref]
+        if len(surface_fields) != 1:
+            errors.append(f"{prefix}: exactly one of label or surface is required")
+        elif not isinstance(ref.get(surface_fields[0]), str) or not ref[surface_fields[0]].strip():
+            errors.append(f"{prefix}.{surface_fields[0]}: must be a non-empty string")
+        entity_id = ref.get("entity_id")
+        if not isinstance(entity_id, str) or not entity_id.strip():
+            errors.append(f"{prefix}.entity_id: is required and must be a non-empty string")
+        resolution = ref.get("resolution")
+        if resolution not in RESOLVED_ENTITY_REF_RESOLUTIONS:
+            errors.append(
+                f"{prefix}.resolution: must be one of {', '.join(sorted(RESOLVED_ENTITY_REF_RESOLUTIONS))}"
+            )
+        for field in ("canonical_name", "proposed_id"):
+            if field in ref and (not isinstance(ref[field], str) or not ref[field].strip()):
+                errors.append(f"{prefix}.{field}: must be a non-empty string")
+        if "rename_existing" in ref and not isinstance(ref["rename_existing"], bool):
+            errors.append(f"{prefix}.rename_existing: must be a boolean")
+    return not errors, errors
+
 # ── Source Contract Markers ───────────────────────────────────────────
 SOURCE_CONTRACT_COMPILED_V2 = "compiled_session_memory_v2"
 

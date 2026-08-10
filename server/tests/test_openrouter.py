@@ -35,6 +35,8 @@ from openrouter import (
     get_world_genesis_package,
     normalize_session_preflight_decision,
     normalize_session_spoiler_check,
+    _parse_session_memory_resolver_tool_calls,
+    SESSION_MEMORY_RESOLVER_FINALIZER_TOOL,
 )
 from services.session_memory_agent import MemoryPipelineError
 from llm_providers import OpenRouterAdapter
@@ -101,6 +103,57 @@ class OpenRouterJsonRepairTest(unittest.TestCase):
             post_chat.call_args.kwargs['audit_context']['operation'],
             'world_genesis_json_repair',
         )
+
+    def test_resolved_entity_ref_schema_is_strict_and_shared(self):
+        item_schema = (
+            SESSION_MEMORY_RESOLVER_FINALIZER_TOOL['function']['parameters']
+            ['properties']['resolved_entity_refs']['items']
+        )
+        self.assertEqual(item_schema['required'], ['entity_id', 'resolution'])
+        self.assertFalse(item_schema['additionalProperties'])
+        self.assertEqual(item_schema['oneOf'], [
+            {'required': ['label']},
+            {'required': ['surface']},
+        ])
+
+    def test_resolver_parser_normalizes_surface_alias(self):
+        parsed = _parse_session_memory_resolver_tool_calls([{
+            'function': {
+                'name': 'submit_resolved_memory',
+                'arguments': json.dumps({
+                    'running_summary': 'Run 41',
+                    'resolved_entity_refs': [{
+                        'surface': 'The Ferry Guild',
+                        'entity_id': 'ferry_guild',
+                        'resolution': 'same',
+                    }],
+                }),
+            },
+        }])
+        self.assertEqual(parsed['resolved_entity_refs'], [{
+            'label': 'The Ferry Guild',
+            'entity_id': 'ferry_guild',
+            'resolution': 'same',
+        }])
+
+    def test_resolver_parser_rejects_incomplete_or_unsupported_refs(self):
+        for ref in (
+            {'label': 'The Ferry Guild', 'resolution': 'same'},
+            {'label': 'The Ferry Guild', 'entity_id': 'ferry_guild'},
+            {
+                'label': 'The Ferry Guild',
+                'entity_id': 'ferry_guild',
+                'resolution': 'same',
+                'unsupported': True,
+            },
+        ):
+            parsed = _parse_session_memory_resolver_tool_calls([{
+                'function': {
+                    'name': 'submit_resolved_memory',
+                    'arguments': json.dumps({'running_summary': 'test', 'resolved_entity_refs': [ref]}),
+                },
+            }])
+            self.assertIsNone(parsed)
 
     def test_world_genesis_builds_sections_with_retained_history_and_repair(self):
         malformed_intro = '{"public_intro": {"title": "Test"}'
