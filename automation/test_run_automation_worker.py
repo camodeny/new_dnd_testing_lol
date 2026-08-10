@@ -371,6 +371,157 @@ class RunAutomationWorkerTests(unittest.TestCase):
         complete_mock.assert_called_once()
         self.assertEqual(complete_mock.call_args.kwargs['status'], 'completed')
 
+    def test_resume_after_errored_dm_turn_fails_instead_of_idle_timeout(self):
+        """Reproduce Run 41 cycle 4: a durably errored DM turn with a matching
+        after_dm audit cycle must route to DM recovery and fail with a specific
+        unrecovered-DM-turn error instead of deadlocking into the idle timeout.
+        Normal player selection (overseer) must not run while the DM still owes
+        a response."""
+        args = SimpleNamespace(
+            api_base='http://127.0.0.1:5889',
+            owner_api_key='owner-key',
+            worker_id='test-worker',
+            max_minutes=None,
+            idle_timeout=180.0,
+            heartbeat_interval=999.0,
+            poll_interval=0.01,
+            max_turns=50,
+            dm_response_timeout=60.0,
+            message_window=16,
+            model='test-model',
+        )
+        initial_session = {
+            'id': 4,
+            'is_active': True,
+            'messages': [
+                {'id': 564, 'role': 'player', 'content': 'We agree to travel.'},
+            ],
+        }
+        claim_payload = {
+            'run': {'id': 2, 'attempt_count': 2, 'runner_config': {'audit_pause_phases': ['after_dm']}},
+            'lease_token': 'lease-1',
+            'derived_campaign': {'id': 100003},
+            'latest_session': initial_session,
+            'gameplay_readiness': {'campaign_ready': True},
+            'roster': [],
+        }
+        run_payload_with_error_cycle = {
+            'run': {'status': 'running', 'completed_turns': 4},
+            'latest_session': initial_session,
+            'audit_cycles': [
+                {'phase': 'after_dm', 'player_message_id': 564, 'dm_message_id': 565}
+            ]
+        }
+        dm_status = {
+            'status': 'error',
+            'player_message_id': 564,
+            'dm_message_id': 565,
+            'post_turn_status': 'error',
+            'turn_error': 'provider unavailable',
+        }
+
+        with patch.object(worker, 'claim_run', return_value=claim_payload), \
+             patch.object(worker, 'build_manifest_for_run', return_value={}), \
+             patch.object(worker, 'append_event') as append_mock, \
+             patch.object(worker, 'fetch_run', return_value=run_payload_with_error_cycle), \
+             patch.object(worker.autonomous, 'fetch_dm_turn_status', return_value=dm_status), \
+             patch.object(worker, 'wait_for_dm_response', return_value=(dm_status, False, None)), \
+             patch.object(worker, 'heartbeat', return_value={'run': {'lease_token': 'lease-1'}}), \
+             patch.object(worker, 'pause_for_audit_if_needed', return_value=(False, 'lease-1')), \
+             patch.object(worker, 'attempt_memory_recovery', return_value=(False, {'reason': 'no_pending_recovery'})), \
+             patch.object(worker, 'request_overseer_decision') as overseer_mock, \
+             patch.object(worker, 'complete_run') as complete_mock, \
+             patch.object(worker.time, 'sleep'):
+            finished = worker.execute_run(args, 2)
+
+        self.assertTrue(finished)
+        overseer_mock.assert_not_called()
+        complete_mock.assert_called_once()
+        self.assertEqual(complete_mock.call_args.kwargs['status'], 'failed')
+        self.assertEqual(complete_mock.call_args.kwargs['error_text'], 'unrecovered_dm_turn:dm_post_turn_error')
+
+        failed_events = [
+            call for call in append_mock.call_args_list
+            if len(call[0]) > 6 and call[0][5] == 'dm_turn_failed'
+        ]
+        self.assertEqual(len(failed_events), 1)
+        payload = failed_events[0][0][6]
+        self.assertEqual(payload['player_message_id'], 564)
+        self.assertEqual(payload['dm_message_id'], 565)
+        self.assertEqual(payload['error_class'], 'dm_post_turn_error')
+        self.assertEqual(payload['recovery_attempts'], 2)
+
+    def test_resume_after_errored_dm_turn_recovers_same_player_message(self):
+        """A recoverable errored DM turn (memory recovery) retries the same
+        player message without duplicating visible messages and then advances
+        to the overseer instead of idling."""
+        args = SimpleNamespace(
+            api_base='http://127.0.0.1:5889',
+            owner_api_key='owner-key',
+            worker_id='test-worker',
+            max_minutes=None,
+            idle_timeout=180.0,
+            heartbeat_interval=999.0,
+            poll_interval=0.01,
+            max_turns=50,
+            dm_response_timeout=60.0,
+            message_window=16,
+            model='test-model',
+        )
+        initial_session = {
+            'id': 4,
+            'is_active': True,
+            'messages': [
+                {'id': 564, 'role': 'player', 'content': 'We agree to travel.'},
+            ],
+        }
+        claim_payload = {
+            'run': {'id': 2, 'attempt_count': 1, 'runner_config': {'audit_pause_phases': ['after_dm']}},
+            'lease_token': 'lease-1',
+            'derived_campaign': {'id': 100003},
+            'latest_session': initial_session,
+            'gameplay_readiness': {'campaign_ready': True},
+            'roster': [],
+        }
+        run_payload_with_error_cycle = {
+            'run': {'status': 'running', 'completed_turns': 4},
+            'latest_session': initial_session,
+            'audit_cycles': [
+                {'phase': 'after_dm', 'player_message_id': 564, 'dm_message_id': 565}
+            ]
+        }
+        dm_status = {
+            'status': 'error',
+            'player_message_id': 564,
+            'dm_message_id': 565,
+            'post_turn_status': 'error',
+            'has_pending_recovery': True,
+            'recovery_task': {'id': 77},
+            'turn_error': 'memory write failed',
+        }
+        run_payload_stop = {
+            'run': {'status': 'stop_requested', 'error_text': 'done'},
+            'latest_session': initial_session,
+        }
+
+        with patch.object(worker, 'claim_run', return_value=claim_payload), \
+             patch.object(worker, 'build_manifest_for_run', return_value={}), \
+             patch.object(worker, 'append_event'), \
+             patch.object(worker, 'fetch_run', side_effect=[run_payload_with_error_cycle, run_payload_with_error_cycle, run_payload_stop]), \
+             patch.object(worker.autonomous, 'fetch_dm_turn_status', return_value=dm_status), \
+             patch.object(worker, 'wait_for_dm_response', return_value=(dm_status, False, None)), \
+             patch.object(worker, 'heartbeat', return_value={'run': {'lease_token': 'lease-1'}}), \
+             patch.object(worker, 'pause_for_audit_if_needed', return_value=(False, 'lease-1')), \
+             patch.object(worker, 'attempt_memory_recovery', return_value=(True, {'reason': 'retry_succeeded', 'task_id': 77})), \
+             patch.object(worker, 'request_overseer_decision', return_value={'action': 'no_action'}) as overseer_mock, \
+             patch.object(worker, 'complete_run') as complete_mock, \
+             patch.object(worker.time, 'sleep'):
+            finished = worker.execute_run(args, 2)
+
+        self.assertTrue(finished)
+        overseer_mock.assert_called_once()
+        self.assertNotEqual(complete_mock.call_args.kwargs.get('error_text'), 'idle_timeout')
+
     def test_max_cycles_missing_after_dm(self):
         args = SimpleNamespace(
             api_base='http://127.0.0.1:5889',
