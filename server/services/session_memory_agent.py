@@ -16,7 +16,6 @@ from services.memory_resolver_schemas import (
     MEMORY_RUN_STATUSES,
     SOURCE_CONTRACT_COMPILED_V2,
     determine_evidence_status,
-    is_identity_worthy,
     make_evidence_source,
     make_provenance_record,
     normalize_evidence_status,

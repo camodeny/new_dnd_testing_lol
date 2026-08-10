@@ -216,17 +216,13 @@ def _resolve_entity_claim(
         )
         return entry
 
-    if is_identity_worthy(name):
-        entry["canonical_id"] = allocate_durable_id(name, allocated_ids)
-        entry["canonical_name"] = name
-        entry["decision"] = "create_provisional"
-        entry["resolution_state"] = "provisional"
-        entry["evidence"].append(
-            {"source": "visible_transcript", "field": "surface_form_claim"}
-        )
-    else:
-        entry["decision"] = "reject"
-        entry["resolution_state"] = "rejected"
+    entry["canonical_id"] = allocate_durable_id(name, allocated_ids)
+    entry["canonical_name"] = name
+    entry["decision"] = "create_provisional"
+    entry["resolution_state"] = "provisional"
+    entry["evidence"].append(
+        {"source": "visible_transcript", "field": "surface_form_claim"}
+    )
     return entry
 
 

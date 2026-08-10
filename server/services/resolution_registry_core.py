@@ -11,7 +11,6 @@ from services.memory_resolver_schemas import (
     BLOCKING_SCOPES,
     DIAGNOSTICS_TEMPLATE,
     make_diagnostics,
-    is_identity_worthy,
     can_reuse_existing,
     validate_registry_entry,
     validate_clarification_request,
@@ -250,9 +249,6 @@ def build_canonical_resolution_registry(
             continue
         if _registry_has_surface_form(registry, name):
             continue
-        if not is_identity_worthy(name):
-            continue
-
         entry = _resolve_entity_claim(
             claim, known_ids, prior_resolution_map, allocated_ids, mention_index
         )
@@ -275,9 +271,6 @@ def build_canonical_resolution_registry(
             continue
         if _registry_has_surface_form(registry, name):
             continue
-        if not is_identity_worthy(name):
-            continue
-
         entry = _resolve_npc_claim(
             claim, known_ids, prior_resolution_map, allocated_ids, mention_index
         )
@@ -589,17 +582,12 @@ def _resolve_entity_claim(claim, known_ids, prior_resolution_map, allocated_ids,
         entry["evidence"].append({"source": "prior_durable_memory", "field": "entity_name_match"})
         return entry
     else:
-        if is_identity_worthy(name):
-            new_id = allocate_durable_id(name, allocated_ids)
-            entry["canonical_id"] = new_id
-            entry["canonical_name"] = name
-            entry["decision"] = "create_provisional"
-            entry["resolution_state"] = "provisional"
-            entry["evidence"].append({"source": "visible_transcript", "field": "surface_form_claim"})
-        else:
-            entry["decision"] = "reject"
-            entry["resolution_state"] = "rejected"
-
+        new_id = allocate_durable_id(name, allocated_ids)
+        entry["canonical_id"] = new_id
+        entry["canonical_name"] = name
+        entry["decision"] = "create_provisional"
+        entry["resolution_state"] = "provisional"
+        entry["evidence"].append({"source": "visible_transcript", "field": "surface_form_claim"})
         return entry
 
 
@@ -682,17 +670,12 @@ def _resolve_npc_claim(claim, known_ids, prior_resolution_map, allocated_ids, in
         entry["evidence"].append({"source": "prior_durable_memory", "field": "npc_name_match"})
         return entry
     else:
-        if is_identity_worthy(name):
-            new_id = allocate_durable_id(name, allocated_ids)
-            entry["canonical_id"] = new_id
-            entry["canonical_name"] = name
-            entry["decision"] = "create_provisional"
-            entry["resolution_state"] = "provisional"
-            entry["evidence"].append({"source": "visible_transcript", "field": "surface_form_claim"})
-        else:
-            entry["decision"] = "reject"
-            entry["resolution_state"] = "rejected"
-
+        new_id = allocate_durable_id(name, allocated_ids)
+        entry["canonical_id"] = new_id
+        entry["canonical_name"] = name
+        entry["decision"] = "create_provisional"
+        entry["resolution_state"] = "provisional"
+        entry["evidence"].append({"source": "visible_transcript", "field": "surface_form_claim"})
         return entry
 
 
