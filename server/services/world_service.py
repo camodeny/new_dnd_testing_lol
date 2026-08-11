@@ -318,20 +318,34 @@ def normalize_world_state(raw_state, public_intro):
     }
 
 
-def normalize_npc_actors(raw_actors):
+def normalize_npc_actors(raw_actors, selected_characters=None):
     actors = raw_actors if isinstance(raw_actors, list) else []
+    character_specs = selected_characters if isinstance(selected_characters, list) else []
+    character_ids = {
+        clean_id(spec.get('id'), '')
+        for spec in character_specs
+        if isinstance(spec, dict) and clean_id(spec.get('id'), '')
+    }
+    character_names = {
+        clean_text(spec.get('name'), 160).casefold()
+        for spec in character_specs
+        if isinstance(spec, dict) and clean_text(spec.get('name'), 160)
+    }
     normalized = []
     seen = set()
     for index, actor in enumerate(actors):
         if not isinstance(actor, dict):
             continue
         actor_id = clean_id(actor.get('id'), f'npc_{index + 1}')
+        actor_name = clean_text(actor.get('name'), 160)
+        if actor_id in character_ids or (actor_name and actor_name.casefold() in character_names):
+            continue
         if actor_id in seen:
             continue
         seen.add(actor_id)
         normalized.append({
             'id': actor_id,
-            'name': clean_text(actor.get('name'), 160) or actor_id.replace('_', ' ').title(),
+            'name': actor_name or actor_id.replace('_', ' ').title(),
             'role': clean_text(actor.get('role'), 180),
             'public_summary': clean_text(actor.get('public_summary'), 420),
             'voice': clean_text(actor.get('voice'), 240),
@@ -486,15 +500,16 @@ def normalize_dm_private(raw_private):
 def normalize_world_package(raw_package, campaign):
     raw_package = raw_package if isinstance(raw_package, dict) else {}
     public_intro = sanitize_public_intro(raw_package.get('public_intro'), campaign)
+    selected_characters = _selected_character_entities(campaign)
     return {
         'public_intro': public_intro,
         'knowledge_graph': normalize_knowledge_graph(
             raw_package.get('knowledge_graph'),
-            _selected_character_entities(campaign),
+            selected_characters,
         ),
         'world_state': normalize_world_state(raw_package.get('world_state'), public_intro),
         'dm_private': normalize_dm_private(raw_package.get('dm_private')),
-        'npc_actors': normalize_npc_actors(raw_package.get('npc_actors')),
+        'npc_actors': normalize_npc_actors(raw_package.get('npc_actors'), selected_characters),
         'clocks': normalize_clocks(raw_package.get('clocks')),
     }
 

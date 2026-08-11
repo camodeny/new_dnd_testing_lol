@@ -2,15 +2,16 @@ import json
 import os
 import sys
 import unittest
+from unittest import mock
 
 from flask import Flask
 
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), '..')))
 
-from models import Campaign, CampaignMember, Character, CharacterClass, User, db
+from models import Campaign, CampaignMember, Character, CharacterClass, NPCActor, User, db
 from openrouter import WORLD_GENESIS_SECTION_SPECS, build_world_genesis_messages
 from services.entity_types import WORLD_ENTITY_TYPE_HINT, normalize_world_entity_type
-from services.world_service import build_world_identity_pairs, normalize_entities, normalize_world_package
+from services.world_service import normalize_entities, normalize_world_package, persist_world_package
 
 
 class WorldEntityTypeTest(unittest.TestCase):
@@ -127,12 +128,26 @@ class WorldEntityTypeTest(unittest.TestCase):
         self.assertEqual(relation['target_id'], 'the_moth')
         self.assertEqual(graph['facts'][0]['entity_ids'], ['roronoa_zoro', 'the_moth'])
 
-    def test_roster_characters_are_not_paired_with_npc_actor_rows(self):
-        package = normalize_world_package(self._raw_package(), self.campaign)
-        package['npc_actors'] = [
+    def test_selected_roster_character_is_not_persisted_as_npc_actor(self):
+        raw_package = self._raw_package()
+        raw_package['npc_actors'] = [
             {'id': 'npc_zoro', 'name': 'Roronoa Zoro'},
+            {'id': 'npc_harbormaster', 'name': 'Harbormaster Venn'},
         ]
-        self.assertEqual(build_world_identity_pairs(package), [])
+        package = normalize_world_package(raw_package, self.campaign)
+
+        self.assertEqual(
+            [actor['id'] for actor in package['npc_actors']],
+            ['npc_harbormaster'],
+        )
+        with mock.patch('services.world_service.upsert_memory_embedding', return_value={'ok': False}):
+            persist_world_package(self.campaign, package)
+            db.session.commit()
+
+        actors = NPCActor.query.filter_by(campaign_id=self.campaign.id).all()
+        self.assertEqual([(actor.actor_id, actor.name) for actor in actors], [
+            ('npc_harbormaster', 'Harbormaster Venn'),
+        ])
 
     def test_entity_type_aliases_collapse_to_canonical_vocabulary(self):
         entities = normalize_entities([
