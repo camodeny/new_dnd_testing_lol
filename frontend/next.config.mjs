@@ -1,6 +1,6 @@
 /** @type {import('next').NextConfig} */
 const nextConfig = {
-  output: "standalone",
+  output: process.env.VERCEL ? undefined : "standalone",
   async rewrites() {
     // When running locally, proxy /api/* to the FastAPI backend.
     // On Vercel this is unset and vercel.json's service rewrite handles routing.
