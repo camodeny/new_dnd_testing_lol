@@ -1,7 +1,7 @@
-/instance
-/server/instance
-/data
-/venv
+/legacy_system/instance
+/legacy_system/server/instance
+/legacy_system/data
+/legacy_system/venv
 *.pyc
 __pycache__/
 .DS_Store
@@ -11,10 +11,9 @@ __pycache__/
 *.env
 
 # Local automation state and run artifacts
-/automation/state/
-/automation/llm-campaign-*.json
-/automation/llm-campaign-*.runs.jsonl
+/legacy_system/automation/state/
+/legacy_system/automation/llm-campaign-*.json
+/legacy_system/automation/llm-campaign-*.runs.jsonl
 
 # Review evidence
-/review-evidence/
-
+/legacy_system/review-evidence/

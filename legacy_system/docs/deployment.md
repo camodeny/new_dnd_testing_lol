@@ -2,7 +2,7 @@
 
 This app deploys through GitHub Actions using the same general flow as Cognito:
 
-1. run backend tests and build the Vite client;
+1. build the Vite client;
 2. join the tailnet with Tailscale OAuth credentials;
 3. ship the repository archive to the server over SSH;
 4. build the Docker image on the server;
@@ -157,6 +157,6 @@ The workspace endpoint (`/api/automation`) surfaces:
 
 ## Trigger
 
-- Pushes to `main` deploy with `docker-compose.yml`.
+- Pushes to `main` that change `legacy_system/**` deploy with `docker-compose.yml`.
 - Manual workflow runs deploy only when the selected ref is `main`.
-- Pushes to non-`main` branches run tests and build only.
+- Pull requests targeting `main` that change `legacy_system/**` run the legacy client build checks.
