@@ -12,6 +12,53 @@ import run_llm_campaign_orchestrator as orchestrator
 
 
 class RunLlmCampaignOrchestratorTests(unittest.TestCase):
+    def test_format_player_message_for_dm_matches_frontend_quote_contract(self):
+        self.assertEqual(
+            orchestrator.format_player_message_for_dm('I check the hinges. "The door is trapped."'),
+            '<ooc>I check the hinges.</ooc><ic>The door is trapped.</ic>',
+        )
+        self.assertEqual(
+            orchestrator.format_player_message_for_dm('\u201cI open the door.\u201d'),
+            '<ic>I open the door.</ic>',
+        )
+
+    def test_execute_speak_decision_posts_frontend_formatted_content(self):
+        chosen_player = {
+            'llm_player': {'id': 5, 'user_id': 7, 'label': 'Auto Player 2'},
+            'character': {'name': 'Seraphina Duskweaver'},
+            'api_key': 'key-2',
+        }
+        decision = {'action': 'speak', 'content': 'I check the hinges. "The door is trapped."'}
+
+        with patch.object(orchestrator, 'api_post', return_value={'messages': []}) as api_post:
+            orchestrator.execute_player_decision(
+                'http://example.test', 6, 5, chosen_player, decision, [], dry_run=False,
+            )
+
+        self.assertEqual(
+            api_post.call_args.args[2]['content'],
+            '<ooc>I check the hinges.</ooc><ic>The door is trapped.</ic>',
+        )
+
+    def test_execute_roll_decision_posts_roll_as_ooc(self):
+        chosen_player = {
+            'llm_player': {'id': 5, 'user_id': 7, 'label': 'Auto Player 2'},
+            'character': {'name': 'Seraphina Duskweaver'},
+            'api_key': 'key-2',
+        }
+        decision = {'action': 'roll', 'label': 'Arcana check', 'expression': '1d20+5'}
+
+        with patch.object(orchestrator.random, 'randint', return_value=12), \
+                patch.object(orchestrator, 'api_post', return_value={'messages': []}) as api_post:
+            orchestrator.execute_player_decision(
+                'http://example.test', 6, 5, chosen_player, decision, [], dry_run=False,
+            )
+
+        self.assertEqual(
+            api_post.call_args.args[2]['content'],
+            '<ooc>[Roll: Arcana check] total: 17 | rolls: 12 | mod: 5 | sides: 20</ooc>',
+        )
+
     def test_execute_player_roll_formats_advantage_roll(self):
         with patch.object(orchestrator.random, 'randint', side_effect=[4, 17]):
             roll = orchestrator.execute_player_roll(
