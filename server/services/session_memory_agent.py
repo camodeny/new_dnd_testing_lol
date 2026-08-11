@@ -8,6 +8,7 @@ from services.dm_tools import (
     _contains_unrevealed_private_term,
     _tool_search_campaign_memory,
 )
+from services.entity_types import normalize_world_entity_type
 from services.memory_resolver_schemas import (
     AUTHORITY_PRECEDENCE,
     DIAGNOSTICS_TEMPLATE,
@@ -1549,8 +1550,8 @@ def compile_staged_memory_patch(memory_context, extracted, resolved):
         if entity_id in seen_entity_ids:
             continue
 
-        entity_type = entry.get("entity_type", "other")
-        if entity_type in ("npc", "person"):
+        entity_type = normalize_world_entity_type(entry.get("entity_type"))
+        if entity_type == "npc":
             patch_created_npc_ids.add(entity_id)
         patch_created_entity_ids.add(entity_id)
         seen_entity_ids.add(entity_id)

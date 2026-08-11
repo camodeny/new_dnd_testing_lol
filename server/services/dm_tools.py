@@ -28,6 +28,7 @@ from services.embedding_service import (
 )
 from services.encounter_movement import reachable_cells
 from services.encounter_map_service import create_encounter_map as do_create_encounter_map, latest_encounter_map
+from services.entity_types import normalize_world_entity_type
 from services.lootbox_service import generate_loot_box as do_generate_loot_box
 from services.planning_service import summary_dict_for_read
 from services.shop_generation_service import clean_shop_items, generate_scene_shops, upsert_shop
@@ -4571,7 +4572,8 @@ def execute_dm_tool(campaign, session, current_user, name, args, audit_context=N
 def _entity_type_key(item):
     if not isinstance(item, dict):
         return ''
-    return clean_id(item.get('type'), '')
+    raw_type = clean_text(item.get('type'), 40)
+    return normalize_world_entity_type(raw_type) if raw_type else ''
 
 
 def _entity_types_compatible(left, right):
@@ -5431,13 +5433,16 @@ def apply_compiled_session_memory_patch(campaign, session, patch, audit_context=
         if not entity_id:
             continue
 
+        if entity.get("type"):
+            entity["type"] = normalize_world_entity_type(entity.get("type"))
+
         existing_ids = {e.get("id") for e in graph.get("entities", []) if isinstance(e, dict) and e.get("id")}
         if entity_id in existing_ids:
             collisions = [e for e in graph.get("entities", []) if isinstance(e, dict) and e.get("id") == entity_id]
             for collision in collisions:
-                existing_type = clean_text(collision.get("type"), 40).lower()
-                new_type = clean_text(entity.get("type"), 40).lower()
-                if existing_type and new_type and existing_type != new_type and existing_type != "other" and new_type != "other":
+                existing_type = _entity_type_key(collision)
+                new_type = _entity_type_key(entity)
+                if not _entity_types_compatible(collision, entity):
                     raise MemoryPipelineError(
                         stage="validation",
                         code="exact_id_collision",
@@ -5716,7 +5721,7 @@ def _materialize_relation_endpoints(campaign, graph, patch):
             entity = {
                 "id": endpoint_id,
                 "name": clean_text(character.name, 200) or endpoint_id.replace("_", " ").title(),
-                "type": "pc",
+                "type": "character",
                 "summary": clean_text(character.background, 500) or None,
                 "visibility": endpoint_visibility,
                 "certainty": "confirmed",

@@ -19,6 +19,7 @@ from services.memory_resolver_schemas import (
     validate_resolved_entity_refs_contract,
     validate_resolver_packet,
 )
+from services.entity_types import WORLD_ENTITY_TYPE_HINT
 
 load_dotenv()
 
@@ -251,7 +252,10 @@ WORLD_GENESIS_SYSTEM_PROMPT = (
     "pressure mechanics in dm_private, knowledge_graph, npc_actors, clocks, or world_state with "
     "visibility set to dm_private where appropriate. Build around the party's confirmed characters, "
     "accepted hooks, planning summary, campaign seed, description, and tone. Create a playable opening "
-    "situation with active pressures, not a complete railroad."
+    "situation with active pressures, not a complete railroad. "
+    "In knowledge_graph entities, use type character only for selected player characters, npc for "
+    "AI-controlled individuals or companions, vehicle for ships and other conveyances, group for "
+    "non-faction collectives, and other only when no more specific canonical type fits."
 )
 
 SESSION_MEMORY_CLOCKS_SYSTEM_PROMPT = (
@@ -3340,7 +3344,7 @@ def build_world_genesis_messages(context):
                         'entities': [
                             {
                                 'id': 'stable_snake_case_id',
-                                'type': 'npc | location | faction | item | event | threat | concept',
+                                'type': WORLD_ENTITY_TYPE_HINT,
                                 'name': 'display name',
                                 'summary': 'durable fact summary',
                                 'visibility': 'public | party_known | dm_private',
@@ -3446,7 +3450,7 @@ WORLD_GENESIS_SECTION_SPECS = (
                 'entities': [
                     {
                         'id': 'stable_snake_case_id',
-                        'type': 'npc | location | faction | item | event | threat | concept',
+                        'type': WORLD_ENTITY_TYPE_HINT,
                         'name': 'display name',
                         'summary': 'durable fact summary',
                         'visibility': 'public | party_known | dm_private',
