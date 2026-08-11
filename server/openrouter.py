@@ -399,6 +399,9 @@ SESSION_CANON_DISCIPLINE_CHECK_SYSTEM_PROMPT = (
     "The user payload's open_public_threads are already-established public leads. Treat the exact content of an "
     "open public thread as corroborating public evidence, while refusing to infer any extra name, identity, motive, "
     "cause, relationship, or outcome that the thread itself does not state. "
+    "The user payload's visible_active_clocks are also authoritative public or party-known evidence. Treat their "
+    "names, summaries, current progress, triggers, and status as corroborated facts, but do not infer hidden outcomes "
+    "or causes beyond those supplied fields. "
     "Be especially cautious when a candidate reply introduces a new proper noun, identity, ownership, or hidden "
     "connection that appears to come only from the player's speculative framing. "
     "If the reply can be made safe by adding uncertainty language or by keeping an NPC reaction non-authoritative, "
@@ -2856,6 +2859,20 @@ def build_session_canon_discipline_check_messages(response_text, hot_context):
     established_public_facts = (hot_context or {}).get('established_public_facts') or []
     recent_public_world_events = (hot_context or {}).get('recent_public_world_events') or []
     open_public_threads = (hot_context or {}).get('open_public_threads') or []
+    visible_active_clocks = []
+    for clock in (hot_context or {}).get('active_clocks') or []:
+        if not isinstance(clock, dict) or clock.get('visibility') not in {'public', 'party_known'}:
+            continue
+        visible_active_clocks.append({
+            'clock_id': clock.get('clock_id') or clock.get('id'),
+            'name': clock.get('name'),
+            'summary': clock.get('summary'),
+            'filled': clock.get('filled'),
+            'segments': clock.get('segments'),
+            'trigger': clock.get('trigger'),
+            'status': clock.get('status'),
+            'visibility': clock.get('visibility'),
+        })
     session_meta = (hot_context or {}).get('session') or {}
 
     return [
@@ -2871,6 +2888,7 @@ def build_session_canon_discipline_check_messages(response_text, hot_context):
                 'established_public_facts': established_public_facts[:8],
                 'recent_public_world_events': recent_public_world_events[:6],
                 'open_public_threads': open_public_threads[:6],
+                'visible_active_clocks': visible_active_clocks[:8],
                 'return_shape': {
                     'safe': 'boolean',
                     'unsupported_confirmations': [{
@@ -2926,6 +2944,10 @@ def _canon_discipline_check_needed(response_text, hot_context):
         (hot_context or {}).get('established_public_facts')
         or (hot_context or {}).get('recent_public_world_events')
         or (hot_context or {}).get('open_public_threads')
+        or any(
+            isinstance(clock, dict) and clock.get('visibility') in {'public', 'party_known'}
+            for clock in ((hot_context or {}).get('active_clocks') or [])
+        )
     )
 
 

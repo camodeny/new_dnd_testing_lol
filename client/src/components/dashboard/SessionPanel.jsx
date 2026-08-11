@@ -142,7 +142,7 @@ function formatRollSummary(roll) {
 }
 
 function getMessageSenderLabel(msg, currentUser) {
-  if (msg.role === 'dm') return 'DM'
+  if (msg.role === 'dm') return 'AI Dungeon Master'
   if (msg.role === 'system') return 'System'
   if (msg.user_id && currentUser?.id && msg.user_id === currentUser.id) return 'You'
   return msg.username || 'Player'
