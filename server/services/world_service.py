@@ -416,16 +416,30 @@ def world_generation_is_stale(world):
     return utcnow() - updated_at > WORLD_GENERATION_STALE_AFTER
 
 
+def clear_world_generation_claim(campaign_id):
+    """Remove a placeholder left behind by an interrupted generation attempt."""
+    placeholder = get_campaign_world(campaign_id)
+    if not world_generation_in_progress(placeholder):
+        return False
+    db.session.delete(placeholder)
+    db.session.commit()
+    return True
+
+
 def world_public_payload(campaign, clean_ready_states=True):
     world = get_campaign_world(campaign.id)
     if world_generation_in_progress(world):
-        return {
-            'world': None,
-            'is_ready': False,
-            'can_generate': False,
-            'generation_in_progress': True,
-            'planning': None,
-        }
+        if world_generation_is_stale(world):
+            clear_world_generation_claim(campaign.id)
+            world = None
+        else:
+            return {
+                'world': None,
+                'is_ready': False,
+                'can_generate': False,
+                'generation_in_progress': True,
+                'planning': None,
+            }
 
     if not world:
         ready, details = can_start_session(campaign, clean_ready_states=clean_ready_states)
@@ -622,55 +636,58 @@ def ensure_world_generated(campaign, current_user):
     if claimed_world or claim_error:
         return claimed_world, claim_error
 
-    campaign = db.session.get(type(campaign), campaign.id)
-    existing = get_campaign_world(campaign.id)
-    if existing and not world_generation_in_progress(existing):
-        return existing, None
+    campaign_id = campaign.id
+    try:
+        campaign = db.session.get(type(campaign), campaign_id)
+        existing = get_campaign_world(campaign_id)
+        if existing and not world_generation_in_progress(existing):
+            return existing, None
 
-    ready, details = can_start_session(campaign)
-    if not ready:
-        placeholder = get_campaign_world(campaign.id)
-        if world_generation_in_progress(placeholder):
-            db.session.delete(placeholder)
-            db.session.commit()
-        return None, {
-            'error': 'Every party member must select and ready a character before building the world',
-            'planning': details,
-            'status': 400,
-        }
+        ready, details = can_start_session(campaign)
+        if not ready:
+            clear_world_generation_claim(campaign_id)
+            return None, {
+                'error': 'Every party member must select and ready a character before building the world',
+                'planning': details,
+                'status': 400,
+            }
 
-    context = planning_context(campaign, current_user)
-    log_audit_event(
-        campaign.id,
-        'planning_context_read',
-        'Read planning context for world generation.',
-        {'context': context},
-        source='planning_context',
-        actor='server',
-        commit=True,
-    )
-    raw_package = get_world_genesis_package(
-        context,
-        audit_context={
-            'campaign_id': campaign.id,
-            'operation': 'world_genesis',
-            'actor': 'world_architect',
-        },
-    )
-    if not raw_package:
-        placeholder = get_campaign_world(campaign.id)
-        if world_generation_in_progress(placeholder):
-            db.session.delete(placeholder)
-            db.session.commit()
-        return None, {
-            'error': 'The DM could not build the world package',
-            'status': 500,
-        }
+        context = planning_context(campaign, current_user)
+        log_audit_event(
+            campaign_id,
+            'planning_context_read',
+            'Read planning context for world generation.',
+            {'context': context},
+            source='planning_context',
+            actor='server',
+            commit=True,
+        )
+        raw_package = get_world_genesis_package(
+            context,
+            audit_context={
+                'campaign_id': campaign_id,
+                'operation': 'world_genesis',
+                'actor': 'world_architect',
+            },
+        )
+        if not raw_package:
+            clear_world_generation_claim(campaign_id)
+            return None, {
+                'error': 'The DM could not build the world package',
+                'status': 500,
+            }
 
-    package = normalize_world_package(raw_package, campaign)
-    world = persist_world_package(campaign, package)
-    db.session.commit()
-    return world, None
+        package = normalize_world_package(raw_package, campaign)
+        world = persist_world_package(campaign, package)
+        db.session.commit()
+        return world, None
+    except Exception:
+        db.session.rollback()
+        try:
+            clear_world_generation_claim(campaign_id)
+        except Exception:
+            db.session.rollback()
+        raise
 
 
 def approve_world(world):

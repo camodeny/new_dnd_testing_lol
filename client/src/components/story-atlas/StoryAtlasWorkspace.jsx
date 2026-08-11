@@ -46,7 +46,7 @@ export default function StoryAtlasWorkspace({
   }
 
   return (
-    <div className={`story-atlas-workspace-container mobile-tab-${mobileTab} ${isMapModeActive ? 'is-map-active' : ''}`}>
+    <div className={`story-atlas-workspace-container mobile-tab-${mobileTab} ${isMapModeActive ? 'is-map-active' : ''}`} data-view={isMapModeActive ? 'atlas' : 'story'}>
       {/* Immersive Map view (AtlasWorkspace Mode) */}
       <div className="map-view-wrapper">
         <StoryAtlasMapMode

@@ -10,6 +10,9 @@ const BUILD_STEPS = [
   { icon: 'bi-stars', label: 'Writing the opening scene' },
 ]
 
+const WORLD_BUILD_POLL_INTERVAL_MS = 3000
+const WORLD_BUILD_TIMEOUT_MS = 6 * 60 * 1000
+
 function getToneList(intro) {
   return Array.isArray(intro?.campaign_tone) ? intro.campaign_tone.filter(Boolean) : []
 }
@@ -31,11 +34,18 @@ export default function WorldBuildingMode({ campaign, onBegin, onBack }) {
     let cancelled = false
 
     async function waitForGeneratedWorld() {
+      const deadline = Date.now() + WORLD_BUILD_TIMEOUT_MS
       while (!cancelled) {
         const latest = await getCampaignWorld(campaign.id)
         if (cancelled) return null
         if (latest.world?.public_intro) return latest.world
-        await wait(3000)
+        if (!latest.generation_in_progress) {
+          throw new Error('World building stopped before the campaign intro was ready. Please retry.')
+        }
+        if (Date.now() >= deadline) {
+          throw new Error('World building is taking longer than expected. Please retry.')
+        }
+        await wait(WORLD_BUILD_POLL_INTERVAL_MS)
       }
       return null
     }
@@ -121,9 +131,16 @@ export default function WorldBuildingMode({ campaign, onBegin, onBack }) {
     } catch (err) {
       if (err.status === 409 || err.data?.generation_in_progress) {
         try {
+          const deadline = Date.now() + WORLD_BUILD_TIMEOUT_MS
           let latest = await getCampaignWorld(campaign.id)
           while (!latest.world?.public_intro) {
-            await wait(3000)
+            if (!latest.generation_in_progress) {
+              throw new Error('World building stopped before the campaign intro was ready. Please retry.', { cause: err })
+            }
+            if (Date.now() >= deadline) {
+              throw new Error('World building is taking longer than expected. Please retry.', { cause: err })
+            }
+            await wait(WORLD_BUILD_POLL_INTERVAL_MS)
             latest = await getCampaignWorld(campaign.id)
           }
           setWorld(latest.world)
@@ -150,7 +167,7 @@ export default function WorldBuildingMode({ campaign, onBegin, onBack }) {
   }
 
   return (
-    <div className="world-build-page">
+    <div className={`world-build-page is-${status}`}>
       <header className="world-build-header">
         <button className="dashboard-back" onClick={onBack} title="Back to campaigns">
           <i className="bi bi-arrow-left"></i>
@@ -175,7 +192,7 @@ export default function WorldBuildingMode({ campaign, onBegin, onBack }) {
             ))}
           </div>
 
-          <div className="world-build-copy">
+          <div className="world-build-copy" aria-live="polite">
             {status === 'ready' ? (
               <>
                 <span className="world-build-kicker">Campaign pitch</span>
@@ -239,7 +256,7 @@ export default function WorldBuildingMode({ campaign, onBegin, onBack }) {
               </div>
 
               {status === 'error' && (
-                <button className="btn btn-secondary world-build-retry" onClick={handleRetry}>
+                <button type="button" className="btn btn-secondary world-build-retry" onClick={handleRetry}>
                   <i className="bi bi-arrow-clockwise"></i>
                   Retry
                 </button>

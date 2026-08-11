@@ -21,13 +21,15 @@ export default function StoryAtlasHeader({
 
   return (
     <header className="sampler-topbar">
-      <div>
+      <div className="story-atlas-session-context">
         <span className={isSessionLive ? 'is-live' : ''}>
           <i />
           {statusLabel}
         </span>
-        <strong>{scene.location_name || campaign.settings?.current_location || 'World Map'}</strong>
-        <small>{isEncounterActive ? 'Combat' : 'Exploration'}</small>
+        <div className="story-atlas-scene-title">
+          <strong>{scene.location_name || campaign.settings?.current_location || 'World Map'}</strong>
+          <small>{isEncounterActive ? 'Combat encounter' : 'Exploration'}</small>
+        </div>
       </div>
 
       <nav role="tablist" className="atlas-hybrid-tabs">
@@ -52,7 +54,7 @@ export default function StoryAtlasHeader({
       </nav>
 
       <button className="sampler-end" onClick={handleSessionAction}>
-        {isSessionLive ? 'End Session' : 'Start Session'}
+        {isSessionLive ? 'End session' : 'Start session'}
       </button>
     </header>
   )

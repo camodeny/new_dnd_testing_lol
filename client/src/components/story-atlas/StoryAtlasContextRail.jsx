@@ -80,11 +80,11 @@ export default function StoryAtlasContextRail({
         <header>
           <small>RECENT ACTIVITY</small>
         </header>
-        <div style={{ display: 'grid', gap: '8px', marginTop: '8px' }}>
+        <div className="story-atlas-activity-list">
           {activity.length > 0 ? (
             activity.map((act) => (
-              <div key={act.id} style={{ display: 'flex', gap: '8px', fontSize: '10px' }}>
-                <span style={{ flexShrink: 0 }}>{act.avatar || '🎲'}</span>
+              <div className="story-atlas-activity" key={act.id}>
+                <span>{act.avatar || '🎲'}</span>
                 <div>
                   <strong>{act.user}</strong> {act.text}
                 </div>
