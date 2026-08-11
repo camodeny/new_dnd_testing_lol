@@ -17,3 +17,15 @@ __pycache__/
 
 # Review evidence
 /legacy_system/review-evidence/
+
+# Next.js frontend
+/frontend/node_modules
+/frontend/.next
+/frontend/out
+/frontend/*.tsbuildinfo
+/frontend/next-env.d.ts
+
+# Python backend
+/backend/__pycache__
+/backend/.venv
+/backend/venv
