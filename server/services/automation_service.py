@@ -1,5 +1,6 @@
 import hashlib
 import json
+import re
 import secrets
 from collections import Counter
 from datetime import datetime, timedelta
@@ -1784,7 +1785,31 @@ def validate_evidence_ref(ref):
     return True
 
 
+def _validate_audit_text_field(name, value):
+    if value is None:
+        return value
+    if not isinstance(value, str):
+        raise AuditScorecardValidationError(
+            f'audit {name} must be a string.',
+            code=f'invalid_{name}',
+            details={'received_type': type(value).__name__},
+        )
+    return value
+
+
 def submit_audit_cycle_feedback(cycle, *, summary=None, notes=None, scorecard=None):
+    # Validate the complete submission schema before any ORM mutation so
+    # dictionary/list values cannot reach TEXT columns and surface as opaque
+    # database binder failures. This keeps validation errors structured and
+    # retryable instead of a generic 500.
+    summary = _validate_audit_text_field('summary', summary)
+    notes = _validate_audit_text_field('notes', notes)
+    if scorecard is not None and not isinstance(scorecard, dict):
+        raise AuditScorecardValidationError(
+            'audit scorecard must be an object.',
+            code='invalid_scorecard_shape',
+            details={'received_type': type(scorecard).__name__},
+        )
     scorecard_payload = _json_object(scorecard, None)
     criteria_results = []
     template = current_scorecard_template_for_run(cycle.run)
@@ -3163,7 +3188,13 @@ def baseline_comparison_for_run(run, results):
     }
 
 
-def refresh_run_scorecard(run):
+def refresh_run_scorecard(run, *, commit=True):
+    """Recompute and persist scorecard aggregates from authoritative source rows.
+
+    ``commit=False`` flushes without committing so the recomputation can
+    participate in a caller-owned transaction (e.g. audit acceptance). Callers
+    that pass ``commit=False`` own the eventual commit/rollback.
+    """
     event_rows, audit_rows, provider_rows, cycle_rows = _run_context(run)
     metrics = _collect_run_metrics(run, event_rows, audit_rows, provider_rows, cycle_rows)
     config = dict(DEFAULT_AUDIT_CONFIG)
@@ -3335,8 +3366,96 @@ def refresh_run_scorecard(run):
         'scorecard_configuration': scorecard_configuration(current_scorecard_template_for_run(run)),
         'category_breakdown': category_breakdown,
     }
-    db.session.commit()
+    if commit:
+        db.session.commit()
+    else:
+        db.session.flush()
     return results_payload
+
+
+def _record_scorecard_refresh_failure(run, exc, *, correlation_id=None):
+    """Durably record a structured, diagnosable scorecard refresh failure.
+
+    The failure is recorded on the run (``scorecard_summary_json``) so
+    control-plane reads can surface structured diagnostics without re-running
+    the failing recomputation. The pre-existing (possibly stale) aggregate rows
+    are preserved so an active run stays observable while refresh is unhealthy.
+    """
+    correlation_id = correlation_id or f'scorecard_refresh_{run.id}_{utcnow().isoformat()}'
+    summary = dict(run.scorecard_summary_json or {})
+    summary['scorecard_refresh'] = {
+        'status': 'failed',
+        'error_class': type(exc).__name__,
+        'message': str(exc),
+        'correlation_id': correlation_id,
+        'recorded_at': utcnow().isoformat(),
+    }
+    run.scorecard_summary_json = summary
+    try:
+        db.session.commit()
+    except Exception:
+        db.session.rollback()
+    try:
+        append_run_event(
+            run,
+            'run_scorecard_refresh_failed',
+            {
+                'error_class': type(exc).__name__,
+                'message': str(exc),
+                'correlation_id': correlation_id,
+                'stale_scorecard_preserved': True,
+            },
+            dedupe_key=f'run_scorecard_refresh_failed:{run.id}:{correlation_id}',
+            skip_workspace=True,
+        )
+    except Exception:
+        # The run-level diagnostic above is the durable source of truth; a
+        # control-plane event append must never mask the underlying failure.
+        pass
+    return correlation_id
+
+
+def scorecard_refresh_diagnostic(run):
+    """Return the stored scorecard refresh diagnostic, if any."""
+    return (run.scorecard_summary_json or {}).get('scorecard_refresh')
+
+
+def try_refresh_run_scorecard(run, *, commit=True):
+    """Best-effort scorecard refresh for control-plane and evidence paths.
+
+    A downstream scorecard defect must not make an active run unobservable or
+    unresumable, and must not make evidence endpoints wholly unavailable. On
+    failure the exception is recorded as a structured diagnostic, the stored
+    (stale) aggregates are preserved, and ``(False, None, diagnostic)`` is
+    returned. Returns ``(True, results_payload, None)`` on success.
+    """
+    try:
+        results = refresh_run_scorecard(run, commit=commit)
+    except Exception as exc:
+        try:
+            db.session.rollback()
+        except Exception:
+            pass
+        diagnostic = {
+            'status': 'failed',
+            'error_class': type(exc).__name__,
+            'message': str(exc),
+            'correlation_id': _record_scorecard_refresh_failure(run, exc),
+        }
+        return False, None, diagnostic
+    return True, results, None
+
+
+def repair_run_scorecard(run, *, commit=True):
+    """Rebuild stale aggregate scorecard state from authoritative audited cycles.
+
+    This is the repair/retry path for runs whose aggregates drifted because a
+    downstream scorecard refresh previously failed (Run 42-style). It recomputes
+    from the durable source rows and returns the same contract as
+    :func:`try_refresh_run_scorecard`, so a repeated failure is diagnosed
+    structurally instead of surfacing as a generic 500.
+    """
+    return try_refresh_run_scorecard(run, commit=commit)
 
 
 def latest_session_for_run(run):
@@ -3364,7 +3483,6 @@ def run_watch_payload(run, current_user=None):
     if run.derived_campaign_id:
         encounter_map = EncounterMap.query.filter_by(campaign_id=run.derived_campaign_id, is_archived=False).order_by(EncounterMap.created_at.desc(), EncounterMap.id.desc()).first()
 
-    refresh_run_scorecard(run)
     provider_calls = [
         row.to_dict()
         for row in AutomationRunProviderCall.query.filter_by(run_id=run.id)
@@ -3432,6 +3550,7 @@ def run_watch_payload(run, current_user=None):
         ],
         'incidents': run.scorecard_summary_json.get('incidents') or [],
         'retry_metrics': run.scorecard_summary_json.get('retry_metrics') or {},
+        'scorecard_refresh': scorecard_refresh_diagnostic(run),
         'provider_calls': provider_calls,
         'baseline_comparison': run.baseline_comparison_json or {},
     })

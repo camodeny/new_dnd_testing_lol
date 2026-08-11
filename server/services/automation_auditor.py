@@ -34,9 +34,9 @@ from services.automation_service import (
     get_criterion_category,
     latest_session_for_run,
     persist_provider_call,
-    refresh_run_scorecard,
     scorecard_configuration,
     submit_audit_cycle_feedback,
+    try_refresh_run_scorecard,
 )
 from services.character_service import character_full_dict
 from services.post_turn_state import state_for_turn
@@ -941,7 +941,9 @@ def _scene_state_summary(world_payload):
 
 
 def _cycle_evidence_packet(run, cycle, args):
-    refresh_run_scorecard(run)
+    # Derived scorecard refresh is decoupled from evidence availability: a
+    # scorecard defect must not make the evidence packet wholly unavailable.
+    refresh_ok, _, refresh_diagnostic = try_refresh_run_scorecard(run)
     campaign = _campaign_for_run(run)
     world_payload = _world_payload(campaign) if campaign else {'has_world': False}
     latest_session = latest_session_for_run(run)
@@ -1036,6 +1038,10 @@ def _cycle_evidence_packet(run, cycle, args):
         'recent_provider_calls': [_compact_provider_call(row, include_artifacts=False) for row in reversed(provider_rows)],
         'recent_run_events': [_compact_run_event(row, include_payload=False) for row in reversed(run_event_rows)],
         'retry_metrics': retry_metrics,
+        'scorecard_refresh': {
+            'status': 'ok' if refresh_ok else 'failed',
+            'diagnostic': refresh_diagnostic,
+        },
         'follow_up_tools': [
             'get_audit_event_detail',
             'get_provider_call_detail',
@@ -1741,17 +1747,30 @@ def run_builtin_auditors_for_current_cycle(run_id, *, rerun_failed=False):
         {'audit_cycle': cycle.to_dict(), 'auditor_jobs': [job.to_dict() for job in jobs]},
         dedupe_key=f'audit_cycle_audited:built_in:{cycle.id}:{completed_count}',
     )
-    scorecard = refresh_run_scorecard(run)
-    append_run_event(
-        run,
-        'run_scorecard_updated',
-        {
-            'scorecard': scorecard,
-            'scorecard_summary': run.scorecard_summary_json or {},
-            'baseline_comparison': run.baseline_comparison_json or {},
-        },
-        dedupe_key=f'run_scorecard_updated:{run.id}:{run.last_event_sequence or 0}:auditor:{cycle.id}',
-    )
+    refresh_ok, scorecard, refresh_diagnostic = try_refresh_run_scorecard(run)
+    if refresh_ok:
+        append_run_event(
+            run,
+            'run_scorecard_updated',
+            {
+                'scorecard': scorecard,
+                'scorecard_summary': run.scorecard_summary_json or {},
+                'baseline_comparison': run.baseline_comparison_json or {},
+            },
+            dedupe_key=f'run_scorecard_updated:{run.id}:{run.last_event_sequence or 0}:auditor:{cycle.id}',
+        )
+    else:
+        append_run_event(
+            run,
+            'run_scorecard_refresh_failed',
+            {
+                **refresh_diagnostic,
+                'audit_accepted': True,
+                'built_in_auditor': True,
+            },
+            dedupe_key=f'run_scorecard_refresh_failed:{run.id}:{refresh_diagnostic.get("correlation_id") or ""}',
+            skip_workspace=True,
+        )
     should_continue = bool(config.get('auto_continue'))
     if should_continue and config.get('target_cycles') is not None:
         should_continue = _audited_cycle_count(run) < config.get('target_cycles')
@@ -2132,10 +2151,10 @@ def get_current_audit_bundle_data(run):
     cycle = db.session.get(AutomationRunAuditCycle, run.awaiting_audit_cycle_id) if run.awaiting_audit_cycle_id else None
     if cycle is None:
         return {'error': 'Run is not currently paused at an audit cycle.'}
-    # Keep the exported evidence bundle on the same canonical error snapshot as
-    # the API, scorecard, incidents, UI, and run-comparison surfaces.
-    refresh_run_scorecard(run)
-        
+    # The exported evidence bundle must stay available even when derived
+    # scorecard refresh is unhealthy; the refresh outcome is surfaced as
+    # structured diagnostics instead of making the bundle a hard dependency.
+    refresh_ok, _, refresh_diagnostic = try_refresh_run_scorecard(run)
     evidence_packet = _cycle_evidence_packet(run, cycle, {})
     template = current_scorecard_template_for_run(run)
     
@@ -2186,6 +2205,10 @@ def get_current_audit_bundle_data(run):
         },
         'evidence_packet': evidence_packet,
         'retry_metrics': evidence_packet.get('retry_metrics') or {},
+        'scorecard_refresh': {
+            'status': 'ok' if refresh_ok else 'failed',
+            'diagnostic': refresh_diagnostic,
+        },
         'recommended_detail_paths': recommended_detail_paths,
         'evidence_gaps': gaps,
         'memory_retrieval_summary': retrievals,
