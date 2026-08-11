@@ -668,7 +668,6 @@ class CampaignSession(db.Model):
             'started_at': self.started_at.isoformat() if self.started_at else None,
             'ended_at': self.ended_at.isoformat() if self.ended_at else None,
             'recap': self.recap,
-            'running_summary': self.running_summary,
             'is_active': self.is_active,
             'memory_anchors': normalized_anchors,
         }

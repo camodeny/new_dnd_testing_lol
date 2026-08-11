@@ -370,9 +370,12 @@ def _leak_guard_memory_patch(campaign, patch, visible_text):
                 _flag('clock_private')
 
     # ── Session-facing free text: running summary and memory anchors ───
-    # CampaignSession.to_dict() serves running_summary and normalized
-    # memory_anchors to every campaign member, so unrevealed private terms
-    # must be redacted here at the write boundary too.
+    # The running summary is DM/AI-internal session memory (it feeds the DM hot
+    # context and prior-summary passes), not a party-facing surface. It is
+    # redacted here anyway so unrevealed private terms never enter the AI's own
+    # working memory and get echoed into visible narration. memory_anchors are
+    # served to every campaign member via CampaignSession.to_dict(), so they are
+    # redacted at the write boundary too.
     summary, summary_changed = _redact_free_text_private_terms(
         campaign,
         patch.get('running_summary'),
