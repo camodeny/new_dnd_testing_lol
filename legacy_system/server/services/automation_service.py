@@ -888,6 +888,7 @@ def serialize_campaign_snapshot(campaign, source_session_id=None):
     for session in sessions:
         serialized_sessions.append({
             **session.to_dict(),
+            'running_summary': session.running_summary,
             'messages': _session_messages(session.id),
             'sheet_proposals': _session_proposals(session.id),
         })
@@ -3695,6 +3696,7 @@ def run_watch_payload(run, current_user=None):
         'auditor_jobs': auditor_jobs,
         'latest_session': {
             **latest_session.to_dict(),
+            'running_summary': latest_session.running_summary,
             'messages': messages,
             'pending_sheet_proposals': pending_sheet_proposals,
         } if latest_session else None,
