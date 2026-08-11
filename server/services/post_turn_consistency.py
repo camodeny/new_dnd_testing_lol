@@ -292,6 +292,16 @@ def _clock_location_conflict(campaign, graph, world_state, clock, subject_id):
     """Return (reason, kind) when the clock's location binding contradicts the
     committed location of its subject, else (None, None). kind is
     'conflict' or 'ambiguous'."""
+    location_index = _location_index(graph)
+    known_ids, generic_words = _clock_asserted_locations(clock, location_index)
+
+    # A clock with no location claim cannot contradict a subject's location.
+    # This matters for subjects that legitimately span multiple places, such
+    # as an infrastructure network: facts may mention both the district it
+    # serves and one of its component sites without relocating the network.
+    if not known_ids and not generic_words:
+        return None, None
+
     status, loc_ref, evidence = _subject_committed_location(
         campaign,
         graph,
@@ -299,8 +309,6 @@ def _clock_location_conflict(campaign, graph, world_state, clock, subject_id):
         subject_id,
         min_visibility=clock.visibility or 'dm_private',
     )
-    location_index = _location_index(graph)
-    known_ids, generic_words = _clock_asserted_locations(clock, location_index)
 
     if status == 'departed':
         if known_ids or generic_words:

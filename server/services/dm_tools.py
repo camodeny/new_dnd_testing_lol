@@ -214,11 +214,29 @@ def _contains_unrevealed_private_term(campaign, item_text, visible_text):
     lowered_visible = clean_text(visible_text, 4000).lower()
     if not lowered_item:
         return False
+    item_words = _visibility_words(item_text)
+    visibly_supported = None
     for term in _private_output_terms(campaign):
         lowered_term = clean_text(term, 240).lower()
         if len(lowered_term) < 4:
             continue
         if lowered_term in lowered_item and lowered_term not in lowered_visible:
+            return True
+        # Finalizers frequently paraphrase private facts or reorder private
+        # clock names instead of copying them verbatim. Catch strong lexical
+        # overlap as well as exact substrings, while preserving information
+        # already supported by the visible player/DM exchange.
+        term_words = _visibility_words(term)
+        if len(term_words) < 3:
+            continue
+        overlap = item_words & term_words
+        minimum_overlap = 3 if len(term_words) <= 6 else 4
+        shorter_size = min(len(item_words), len(term_words))
+        if len(overlap) < minimum_overlap or len(overlap) / max(shorter_size, 1) < 0.6:
+            continue
+        if visibly_supported is None:
+            visibly_supported = _is_supported_by_visible_exchange(item_text, visible_text)
+        if not visibly_supported:
             return True
     return False
 
@@ -416,14 +434,16 @@ def _redact_free_text_private_terms(campaign, text, visible_text):
     text = clean_text(text, 4000)
     if not text:
         return None, False
-    if not _leak_guard_has_private_content(campaign, text, visible_text):
-        return text, False
     sentences = re.split(r'(?<=[.!?])\s+', text)
-    kept = [
-        sentence
-        for sentence in sentences
-        if not _leak_guard_has_private_content(campaign, sentence, visible_text)
-    ]
+    kept = []
+    changed = False
+    for sentence in sentences:
+        if _leak_guard_has_private_content(campaign, sentence, visible_text):
+            changed = True
+            continue
+        kept.append(sentence)
+    if not changed:
+        return text, False
     cleaned = ' '.join(kept).strip()
     return (cleaned or None), True
 
@@ -1242,6 +1262,12 @@ def build_session_summary_finalize_context(
     treated as a derived narrative projection of this authoritative state."""
     world, graph, world_state, _private = _world_json(campaign)
     current_scene = world_state.get('current_scene', {}) if isinstance(world_state, dict) else {}
+    prior_running_summary, _prior_summary_redacted = redact_session_summary_private_terms(
+        campaign,
+        session.running_summary if session else '',
+        player_message,
+        dm_message,
+    )
 
     active_clocks = []
     resolved_clocks = []
@@ -1266,7 +1292,7 @@ def build_session_summary_finalize_context(
             resolved_clocks.append(compact)
 
     return {
-        'prior_running_summary': session.running_summary or '' if session else '',
+        'prior_running_summary': prior_running_summary or '',
         'latest_player_message': player_message,
         'latest_dm_message': dm_message,
         'current_scene': current_scene,
