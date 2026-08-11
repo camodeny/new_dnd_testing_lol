@@ -172,6 +172,11 @@ def _vector_digest(vector):
 DEFAULT_LEASE_SECONDS = 45
 DEFAULT_PROVISIONING_LEASE_SECONDS = 300
 DEFAULT_MAX_RECLAIM_FAILURES = 5
+# A reclaim-failure fingerprint/count records *consecutive* identical control-plane
+# failures. Appending any of these gameplay milestones proves the run recovered
+# and must reset the counter so a handful of transient failures spread across an
+# otherwise healthy long-running run never terminalizes it as a reclaim loop.
+RECLAIM_RECOVERY_EVENT_TYPES = {'player_decision', 'turn_result', 'dm_turn_status'}
 CLAIMABLE_ACTIVE_STATUSES = {'claimed', 'running', 'stop_requested', 'reconciling'}
 AUDIT_READY_STATUSES = {'audited', 'skipped'}
 CUSTOM_SCORECARD_STATUS_ORDER = ('pass', 'warn', 'fail', 'not_assessed', 'not_applicable')
@@ -2208,6 +2213,20 @@ def release_run_for_audit(run_id, lease_token):
     return result.rowcount > 0
 
 
+def clear_reclaim_failure(run):
+    """Reset the consecutive infrastructure-failure tracking after the run has
+    demonstrably recovered (a gameplay milestone was reached), so the counter
+    reflects only back-to-back failures with no intervening recovery."""
+    if not run.reclaim_failure_fingerprint:
+        return
+    run.reclaim_failure_fingerprint = None
+    run.reclaim_failure_count = 0
+    run.reclaim_failure_attempt = None
+    run.reclaim_failure_stage = None
+    run.reclaim_failure_error = None
+    run.reclaim_failure_at = None
+
+
 def record_worker_infrastructure_failure(
     run_id,
     worker_id,
@@ -2363,6 +2382,8 @@ def append_run_event(run, event_type, payload=None, *, dedupe_key=None, worker_i
     )
     db.session.add(row)
     db.session.flush()
+    if event_type in RECLAIM_RECOVERY_EVENT_TYPES:
+        clear_reclaim_failure(run)
     run.last_event_id = row.id
     run.last_event_sequence = row.sequence_number
     run.updated_at = _utcnow()

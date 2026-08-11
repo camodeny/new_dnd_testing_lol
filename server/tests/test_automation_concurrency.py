@@ -30,6 +30,7 @@ from services.automation_service import (
     AUTOMATION_SNAPSHOT_SCHEMA_VERSION,
     CloneRetrievalPreflightError,
     InfrastructureFailureThresholdError,
+    append_run_event,
     claim_run_for_worker,
     create_snapshot_for_scenario,
     ensure_worker_lease,
@@ -735,6 +736,45 @@ class InfrastructureFailureReclaimTest(_AutomationConcurrencyBase):
             self.assertIsNone(run.lease_token)
             self.assertIsNone(run.worker_id)
             self.assertTrue(run.finished_at is not None)
+
+    def test_successful_recovery_resets_consecutive_failure_count(self):
+        """Regression: failure A -> successful retry/progress -> failure A again
+        must count as 1 (not 2), so a handful of transient 500s spread across an
+        otherwise healthy long-running run never terminalize it as a reclaim loop."""
+        run_id = self._create_scenario_and_run()
+        fingerprint = 'fetch_run:/api/automation/runs/1:http:500'
+        with app.app_context():
+            run = db.session.get(AutomationRun, run_id)
+            claim_run_for_worker(run, 'worker-a')
+            run = db.session.get(AutomationRun, run_id)
+            record_worker_infrastructure_failure(
+                run_id, 'worker-a', run.lease_token, stage='fetch_run',
+                fingerprint=fingerprint, error='HTTP 500', attempt_number=1,
+            )
+            run = db.session.get(AutomationRun, run_id)
+            self.assertEqual(run.reclaim_failure_count, 1)
+
+            # The run is reclaimed and demonstrably recovers: a gameplay
+            # milestone (completed turn) is reached before the next failure.
+            run = db.session.get(AutomationRun, run_id)
+            claim_run_for_worker(run, 'worker-b')
+            run = db.session.get(AutomationRun, run_id)
+            append_run_event(run, 'turn_result', {'action': 'speak'}, dedupe_key=f'recovery_turn:{run.id}')
+
+            run = db.session.get(AutomationRun, run_id)
+            self.assertEqual(run.reclaim_failure_count, 0)
+            self.assertIsNone(run.reclaim_failure_fingerprint)
+
+            # The same failure shape recurs under the same worker: count is 1,
+            # not 2, because the intervening recovery reset the counter.
+            run = db.session.get(AutomationRun, run_id)
+            record_worker_infrastructure_failure(
+                run_id, 'worker-b', run.lease_token, stage='fetch_run',
+                fingerprint=fingerprint, error='HTTP 500', attempt_number=2,
+            )
+            run = db.session.get(AutomationRun, run_id)
+            self.assertEqual(run.reclaim_failure_count, 1)
+            self.assertEqual(run.reclaim_failure_fingerprint, fingerprint)
 
     def test_different_fingerprint_resets_consecutive_count(self):
         run_id = self._create_scenario_and_run()

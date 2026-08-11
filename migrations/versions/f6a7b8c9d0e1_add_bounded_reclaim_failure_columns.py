@@ -1,7 +1,7 @@
 """add bounded reclaim failure columns
 
 Revision ID: f6a7b8c9d0e1
-Revises: e5f6a1b2c3d4
+Revises: d6e7f8a9b0c1
 Create Date: 2026-08-10 12:00:00.000000
 
 """
@@ -11,7 +11,7 @@ import sqlalchemy as sa
 
 # revision identifiers, used by Alembic.
 revision = 'f6a7b8c9d0e1'
-down_revision = 'e5f6a1b2c3d4'
+down_revision = 'd6e7f8a9b0c1'
 branch_labels = None
 depends_on = None
 
