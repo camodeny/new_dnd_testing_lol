@@ -250,15 +250,16 @@ def build_world_identity_pairs(package):
     identity: a knowledge-graph entity (type 'npc') and an npc_actors row,
     using distinct ID namespaces (e.g. `the_candlewright` vs
     `npc_the_candlewright`). The pairing is derived here from the
-    authoritative generated package by exact, case-insensitive name match
-    against the graph NPC entity. A pair is only recorded when exactly one
-    graph NPC entity matches an actor name, so ambiguous names are left
-    unpaired rather than guessed.
+    authoritative generated package by exact, case-insensitive name match.
+    A pair is only recorded when the normalized name is unique on BOTH the
+    graph-NPC side and the actor side, so a genuinely one-to-one mapping is
+    persisted; ambiguous names are left unpaired rather than guessed.
     """
     graph = package.get('knowledge_graph') if isinstance(package.get('knowledge_graph'), dict) else {}
     entities = graph.get('entities') if isinstance(graph.get('entities'), list) else []
     actors = package.get('npc_actors') if isinstance(package.get('npc_actors'), list) else []
-    npc_entities_by_name = {}
+    npc_name_counts = {}
+    npc_by_name = {}
     for entity in entities:
         if not isinstance(entity, dict):
             continue
@@ -267,7 +268,16 @@ def build_world_identity_pairs(package):
         name = clean_text(entity.get('name'), 160).lower()
         if not name:
             continue
-        npc_entities_by_name.setdefault(name, []).append(entity)
+        npc_name_counts[name] = npc_name_counts.get(name, 0) + 1
+        npc_by_name.setdefault(name, entity)
+    actor_name_counts = {}
+    for actor in actors:
+        if not isinstance(actor, dict):
+            continue
+        name = clean_text(actor.get('name'), 160).lower()
+        if not name:
+            continue
+        actor_name_counts[name] = actor_name_counts.get(name, 0) + 1
     pairs = []
     seen_actors = set()
     for actor in actors:
@@ -277,10 +287,14 @@ def build_world_identity_pairs(package):
         actor_name = clean_text(actor.get('name'), 160).lower()
         if not actor_id or not actor_name or actor_id in seen_actors:
             continue
-        candidates = npc_entities_by_name.get(actor_name, [])
-        if len(candidates) == 1 and clean_id(candidates[0].get('id'), ''):
+        if actor_name_counts.get(actor_name, 0) != 1:
+            continue
+        if npc_name_counts.get(actor_name, 0) != 1:
+            continue
+        entity = npc_by_name.get(actor_name)
+        if entity is not None and clean_id(entity.get('id'), ''):
             pairs.append({
-                'graph_entity_id': candidates[0]['id'],
+                'graph_entity_id': entity['id'],
                 'actor_id': actor_id,
             })
             seen_actors.add(actor_id)

@@ -1473,6 +1473,12 @@ class WorldIdentityNamespaceTest(unittest.TestCase):
             dossier='{}',
         ))
         db.session.commit()
+        from services.world_service import persist_world_identity_pairs
+        persist_world_identity_pairs(self.campaign, [
+            {'graph_entity_id': 'the_candlewright', 'actor_id': 'npc_the_candlewright'},
+            {'graph_entity_id': 'lake_tender', 'actor_id': 'npc_lake_tender'},
+        ])
+        db.session.commit()
 
     def tearDown(self):
         db.session.rollback()
@@ -1497,15 +1503,15 @@ class WorldIdentityNamespaceTest(unittest.TestCase):
         self.assertEqual(known['entity_to_actor']['lake_tender'], 'npc_lake_tender')
         self.assertEqual(known['actor_to_entity']['npc_the_candlewright'], 'the_candlewright')
 
-    def test_persisted_mapping_wins_over_derived(self):
-        from services.world_service import persist_world_identity_pairs
-        persist_world_identity_pairs(self.campaign, [
-            {'graph_entity_id': 'the_candlewright', 'actor_id': 'npc_the_candlewright'},
-        ])
+    def test_mapping_is_authoritative_without_derivation_fallback(self):
+        # _known_ids must only read the persisted campaign_world_identities
+        # rows, never derive a cross-layer identity from name equality.
+        from models import CampaignWorldIdentity
+        CampaignWorldIdentity.query.filter_by(campaign_id=self.campaign.id).delete()
+        db.session.commit()
         known = _known_ids(self.campaign)
-        self.assertEqual(known['entity_to_actor'], {
-            'the_candlewright': 'npc_the_candlewright',
-        })
+        self.assertEqual(known['entity_to_actor'], {})
+        self.assertEqual(known['actor_to_entity'], {})
 
     def test_world_identity_pairs_derived_from_package(self):
         from services.world_service import build_world_identity_pairs
@@ -1527,6 +1533,69 @@ class WorldIdentityNamespaceTest(unittest.TestCase):
             {(p['graph_entity_id'], p['actor_id']) for p in pairs},
             {('the_candlewright', 'npc_the_candlewright'), ('lake_tender', 'npc_lake_tender')},
         )
+
+    def test_duplicate_actor_names_not_paired(self):
+        # normalize_npc_actors permits two actor rows to share a name. A
+        # one-to-one mapping must not be produced for a name that is not
+        # unique on the actor side, or the unique (campaign_id,
+        # graph_entity_id) constraint would be violated at persistence.
+        from services.world_service import build_world_identity_pairs
+        package = {
+            'knowledge_graph': {
+                'entities': [
+                    {'id': 'bob', 'type': 'npc', 'name': 'Bob'},
+                ],
+            },
+            'npc_actors': [
+                {'id': 'npc_bob_1', 'name': 'Bob'},
+                {'id': 'npc_bob_2', 'name': 'Bob'},
+            ],
+        }
+        self.assertEqual(build_world_identity_pairs(package), [])
+
+    def test_duplicate_graph_entity_names_not_paired(self):
+        from services.world_service import build_world_identity_pairs
+        package = {
+            'knowledge_graph': {
+                'entities': [
+                    {'id': 'bob', 'type': 'npc', 'name': 'Bob'},
+                    {'id': 'bob_2', 'type': 'npc', 'name': 'Bob'},
+                ],
+            },
+            'npc_actors': [
+                {'id': 'npc_bob', 'name': 'Bob'},
+            ],
+        }
+        self.assertEqual(build_world_identity_pairs(package), [])
+
+    def test_duplicate_actor_names_persist_without_constraint_violation(self):
+        # Pairing is genuinely one-to-one, so a package with duplicate actor
+        # names must persist the mapping without tripping the unique
+        # (campaign_id, graph_entity_id) constraint at flush/commit.
+        from services.world_service import build_world_identity_pairs, persist_world_identity_pairs
+        from models import CampaignWorldIdentity
+        package = {
+            'knowledge_graph': {
+                'entities': [
+                    {'id': 'bob', 'type': 'npc', 'name': 'Bob'},
+                    {'id': 'lake_tender', 'type': 'npc', 'name': 'Lake Tender'},
+                ],
+            },
+            'npc_actors': [
+                {'id': 'npc_bob_1', 'name': 'Bob'},
+                {'id': 'npc_bob_2', 'name': 'Bob'},
+                {'id': 'npc_lake_tender', 'name': 'Lake Tender'},
+            ],
+        }
+        pairs = build_world_identity_pairs(package)
+        self.assertEqual(pairs, [{'graph_entity_id': 'lake_tender', 'actor_id': 'npc_lake_tender'}])
+        persist_world_identity_pairs(self.campaign, pairs)
+        db.session.commit()
+        rows = {
+            row.graph_entity_id
+            for row in CampaignWorldIdentity.query.filter_by(campaign_id=self.campaign.id).all()
+        }
+        self.assertEqual(rows, {'lake_tender'})
 
     def test_production_shape_actor_update_not_a_split_brain(self):
         # Regression for Run 42: updating the npc_actors row for an identity

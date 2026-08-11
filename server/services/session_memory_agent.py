@@ -452,11 +452,10 @@ def _world_identity_maps(campaign):
 
     World generation materializes one fictional identity as both a
     knowledge-graph NPC entity and an npc_actors row with distinct ID
-    namespaces (e.g. `the_candlewright` vs `npc_the_candlewright`). Newer
-    campaigns persist the pairing in campaign_world_identities; legacy
-    campaigns fall back to deriving it from the persisted world data using
-    the same exact-name rule world generation used, so already-generated
-    worlds (such as Run 42's) can be validated without a backfill.
+    namespaces (e.g. `the_candlewright` vs `npc_the_candlewright`). The
+    pairing is persisted at world-gen in campaign_world_identities and is the
+    single authoritative source here; validation never derives identity from
+    name equality across layers.
     """
     entity_to_actor = {}
     actor_to_entity = {}
@@ -466,30 +465,6 @@ def _world_identity_maps(campaign):
     for row in rows:
         entity_to_actor[row.graph_entity_id] = row.actor_id
         actor_to_entity[row.actor_id] = row.graph_entity_id
-    if entity_to_actor:
-        return entity_to_actor, actor_to_entity
-    world = get_campaign_world(campaign.id)
-    if not world:
-        return entity_to_actor, actor_to_entity
-    graph = json_loads(world.knowledge_graph, {'entities': [], 'relations': [], 'facts': []})
-    entities = graph.get('entities') if isinstance(graph.get('entities'), list) else []
-    npc_entities_by_name = {}
-    for entity in entities:
-        if not isinstance(entity, dict):
-            continue
-        if clean_text(entity.get('type'), 40).lower() != 'npc':
-            continue
-        name = clean_text(entity.get('name'), 160).lower()
-        if name:
-            npc_entities_by_name.setdefault(name, []).append(entity)
-    for npc in NPCActor.query.filter_by(campaign_id=campaign.id).all():
-        name = clean_text(npc.name, 160).lower()
-        candidates = npc_entities_by_name.get(name, []) if name else []
-        if len(candidates) == 1:
-            entity_id = clean_id(candidates[0].get('id'), '')
-            if entity_id:
-                entity_to_actor.setdefault(entity_id, npc.actor_id)
-                actor_to_entity.setdefault(npc.actor_id, entity_id)
     return entity_to_actor, actor_to_entity
 
 
