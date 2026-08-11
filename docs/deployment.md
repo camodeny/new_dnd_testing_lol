@@ -140,6 +140,7 @@ Each replica:
 | Heartbeat | Workers heartbeat via `/api/automation/runs/{id}/heartbeat`, extending the runtime lease. |
 | Expiry | Expired leases can be claimed by any worker. |
 | Token safety | Every lease operation (heartbeat, event, completion) is gated by both `worker_id` and `lease_token` to prevent cross-worker interference. |
+| Bounded reclaim | When a worker aborts a run outside gameplay due to a control-plane failure, it reports a stable failure fingerprint via `/api/automation/runs/{id}/worker-error`. Identical failures increment a consecutive count; the run is released back to `queued` for retry below `runner_config.max_reclaim_failures` (default 5), and terminalized as `failed` with a diagnosable `infrastructure_failure_reclaim_loop` error once the threshold is reached. |
 
 ### Operational inspection
 

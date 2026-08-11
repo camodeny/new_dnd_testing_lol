@@ -60,6 +60,7 @@ from services.automation_service import (
     merged_runner_config_for_scenario,
     persist_provider_call,
     record_worker_activity,
+    record_worker_infrastructure_failure,
     release_run_for_audit,
     provider_call_for_replay,
     run_debug_summary,
@@ -1951,6 +1952,40 @@ def complete_automation_run(current_user, run_id):
             **({'error': refresh_error} if refresh_error else {}),
         },
     }), 200
+
+
+@automation_bp.route('/api/automation/runs/<int:run_id>/worker-error', methods=['POST'])
+@token_required
+def report_worker_infrastructure_failure(current_user, run_id):
+    """Record a worker control-plane/infrastructure failure for bounded reclaim.
+
+    The worker calls this when it aborts a run outside gameplay due to a
+    required control-plane fetch failure. The server persists a stable failure
+    fingerprint with a consecutive occurrence count and either releases the
+    lease for bounded retry or terminalizes the run once the threshold is hit
+    (issue #131).
+    """
+    run = get_or_404(AutomationRun, run_id)
+    if not _run_owned_by_user(current_user, run):
+        return jsonify({'error': 'Forbidden'}), 403
+
+    data = request.get_json(silent=True) or {}
+    try:
+        result = record_worker_infrastructure_failure(
+            run.id,
+            data.get('worker_id'),
+            data.get('lease_token'),
+            stage=data.get('stage') or 'unknown',
+            fingerprint=data.get('fingerprint') or 'unknown',
+            error=data.get('error'),
+            attempt_number=data.get('attempt_number'),
+        )
+    except ValueError as exc:
+        db.session.rollback()
+        return jsonify({'error': str(exc)}), 409
+
+    run = db.session.get(AutomationRun, run.id)
+    return jsonify({'result': result, 'run': run.to_dict()}), 200
 
 
 @automation_bp.route('/api/automation/runs/<int:run_id>/scorecard', methods=['GET'])

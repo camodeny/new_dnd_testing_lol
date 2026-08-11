@@ -1708,6 +1708,14 @@ class AutomationRun(db.Model):
     reconciliation_started_at = db.Column(db.DateTime, nullable=True)
     reconciliation_deadline = db.Column(db.DateTime, nullable=True)
 
+    # Added columns for bounded infrastructure-failure reclaim (issue #131)
+    reclaim_failure_fingerprint = db.Column(db.String(160), nullable=True)
+    reclaim_failure_count = db.Column(db.Integer, nullable=False, default=0)
+    reclaim_failure_attempt = db.Column(db.Integer, nullable=True)
+    reclaim_failure_stage = db.Column(db.String(120), nullable=True)
+    reclaim_failure_error = db.Column(db.Text, nullable=True)
+    reclaim_failure_at = db.Column(db.DateTime, nullable=True)
+
     scenario = db.relationship('AutomationScenario', foreign_keys=[scenario_id])
     snapshot = db.relationship('AutomationSnapshot', foreign_keys=[snapshot_id])
     owner = db.relationship('User')
@@ -1950,6 +1958,14 @@ class AutomationRun(db.Model):
             'completed_turns': completed_turns_count,
             'turn_count': completed_turns_count,
             'audit_pause_summary': self.get_audit_pause_summary(),
+            'reclaim_failure': {
+                'fingerprint': self.reclaim_failure_fingerprint,
+                'count': self.reclaim_failure_count,
+                'last_attempt': self.reclaim_failure_attempt,
+                'stage': self.reclaim_failure_stage,
+                'error': self.reclaim_failure_error,
+                'last_at': self.reclaim_failure_at.isoformat() if self.reclaim_failure_at else None,
+            } if self.reclaim_failure_fingerprint else None,
         }
         if include_secrets:
             result['lease_token'] = self.lease_token
