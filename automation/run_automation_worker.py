@@ -2,6 +2,7 @@
 import argparse
 from datetime import datetime, timedelta
 import os
+import re
 import socket
 import sys
 import threading
@@ -912,6 +913,119 @@ def _reconcile_dm_turn_timeout(
         time.sleep(min(args.poll_interval, max(0.05, remaining)))
 
 
+def _recover_or_fail_dm_turn(
+    args,
+    claim_payload,
+    run_id,
+    lease_token,
+    campaign_id,
+    posted_message_id,
+    dm_turn,
+    logical_key,
+    turns_completed,
+    maybe_heartbeat,
+    recovery_attempts,
+):
+    """Reconcile a durably errored DM turn or finalize the run as failed.
+
+    Runs the after_dm audit checkpoint (idempotent on the server), attempts
+    memory recovery for the same player message, and either reports the
+    reconciled turn or fails the run with a specific unrecovered-DM-turn
+    classification instead of leaving the table blocked until the idle timeout.
+
+    Returns (outcome, lease_token) where outcome is one of:
+    - 'recovered': the caller should continue the normal cycle with a completed
+      DM turn (the visible turn was already committed; nothing was duplicated).
+    - 'stopped': the run was stopped externally or for audit; the caller should
+      finalize as stopped (respecting a released lease).
+    - 'failed': the run was finalized as failed; the caller should return.
+    """
+    should_stop, lease_token = pause_for_audit_if_needed(
+        args,
+        claim_payload,
+        run_id,
+        lease_token,
+        'after_dm',
+        maybe_heartbeat,
+        payload={
+            'dm_turn': dm_turn,
+            'posted_message_id': posted_message_id,
+            'turns_completed': turns_completed,
+        },
+        summary='Paused after resolved DM error.',
+        player_message_id=posted_message_id,
+        dm_message_id=dm_turn.get('dm_message_id'),
+        dedupe_key=f'audit_pause:after_dm:{logical_key}:{posted_message_id}',
+    )
+    if should_stop:
+        return 'stopped', lease_token
+
+    recovered, recovery_detail = attempt_memory_recovery(
+        args.api_base,
+        args.owner_api_key,
+        campaign_id,
+        dm_turn,
+    )
+    if recovered:
+        append_event(
+            args.api_base,
+            args.owner_api_key,
+            run_id,
+            args.worker_id,
+            lease_token,
+            'memory_recovery_recovered',
+            {
+                'automation_run_id': run_id,
+                'player_message_id': posted_message_id,
+                'dm_message_id': dm_turn.get('dm_message_id'),
+                'recovery_detail': recovery_detail,
+                'outcome': 'recovered',
+            },
+            status='running',
+            dedupe_key=f'memory_recovery_recovered:{logical_key}:{posted_message_id}',
+        )
+        return 'recovered', lease_token
+
+    error_class = dm_response_state.dm_turn_error_class(dm_turn)
+    failure_payload = {
+        'player_message_id': posted_message_id,
+        'dm_message_id': dm_turn.get('dm_message_id'),
+        'status': dm_turn.get('status'),
+        'post_turn_status': dm_turn.get('post_turn_status'),
+        'memory_status': dm_turn.get('memory_status', 'skipped'),
+        'clock_status': dm_turn.get('clock_status', 'skipped'),
+        'turn_error': dm_turn.get('turn_error') or dm_turn.get('error_text') or dm_turn.get('post_turn_error'),
+        'error_class': error_class,
+        'phase': 'after_dm',
+        'recovery_attempts': recovery_attempts,
+        'skipped_downstream_expectations': [
+            'memory_validation',
+            'clock_validation',
+        ],
+    }
+    append_event(
+        args.api_base,
+        args.owner_api_key,
+        run_id,
+        args.worker_id,
+        lease_token,
+        'dm_turn_failed',
+        failure_payload,
+        dedupe_key=f'dm_turn_failed:{logical_key}:{posted_message_id}',
+    )
+    complete_run(
+        args.api_base,
+        args.owner_api_key,
+        run_id,
+        args.worker_id,
+        lease_token,
+        status='failed',
+        error_text=f'unrecovered_dm_turn:{error_class}',
+        dedupe_key=f'run_completed:{run_id}:unrecovered-dm-turn:{posted_message_id}',
+    )
+    return 'failed', lease_token
+
+
 def wait_for_dm_response(args, manifest, player_message_id, maybe_heartbeat_fn):
     visible_timeout, post_turn_timeout = dm_response_state.resolve_dm_response_timeouts(args)
 
@@ -1010,6 +1124,66 @@ def parse_utc_iso(iso_str):
         return datetime.fromisoformat(iso_str)
     except ValueError:
         return None
+
+
+_HTTP_STATUS_RE = re.compile(r'HTTP\s+(\d{3})')
+_API_PATH_RE = re.compile(r'\b(?:GET|POST|PUT|PATCH|DELETE)\s+https?://[^/\s]*([^\s?]*)')
+
+
+def control_plane_fingerprint(stage, exc):
+    """Return a stable fingerprint for a control-plane/infrastructure failure.
+
+    Groups identical failures semantically for rollups (stage + endpoint + HTTP
+    status, or stage + endpoint + exception type) while the per-event evidence
+    keeps the full error text and attempt number.
+    """
+    message = str(exc)
+    endpoint = 'unknown'
+    path_match = _API_PATH_RE.search(message)
+    if path_match:
+        endpoint = path_match.group(1) or '/'
+    match = _HTTP_STATUS_RE.search(message)
+    if match:
+        return f'{stage}:{endpoint}:http:{match.group(1)}'
+    return f'{stage}:{endpoint}:{type(exc).__name__}'
+
+
+def report_infrastructure_failure(args, run_id, lease_token, stage, exc, attempt_number=None):
+    """Durably report a worker control-plane failure that aborted a run.
+
+    The server persists a stable fingerprint with a consecutive occurrence
+    count and either releases the lease back to the queue (bounded retry) or
+    terminalizes the run once the reclaim threshold is reached. Best-effort:
+    if the report itself cannot reach the control plane the worker keeps going.
+    """
+    fingerprint = control_plane_fingerprint(stage, exc)
+    body = {
+        'worker_id': args.worker_id,
+        'lease_token': lease_token,
+        'stage': stage,
+        'fingerprint': fingerprint,
+        'error': str(exc),
+        'attempt_number': attempt_number,
+    }
+    print(
+        f'error: run {run_id} infrastructure failure at {stage}: {exc} '
+        f'(fingerprint={fingerprint}, attempt={attempt_number})',
+        file=sys.stderr,
+    )
+    try:
+        response = api_post(
+            args.api_base,
+            f'/api/automation/runs/{run_id}/worker-error',
+            body,
+            api_key=args.owner_api_key,
+        )
+    except Exception as report_exc:
+        print(
+            f'error: failed to report infrastructure failure for run {run_id}: {report_exc}',
+            file=sys.stderr,
+        )
+        return None
+    return response
 
 
 def execute_run(args, run_id):
@@ -1131,6 +1305,13 @@ def execute_run(args, run_id):
                 dm_turn_status = autonomous.fetch_dm_turn_status(manifest, latest_player_message_id)
                 if not autonomous.dm_turn_status_resolved(dm_turn_status):
                     resume_dm_wait_message_id = latest_player_message_id
+                elif dm_response_state.dm_turn_is_error(dm_turn_status):
+                    # A durably errored DM turn is an outstanding DM obligation.
+                    # Route it through the DM-wait reconciliation path so the
+                    # worker retries/reconciles the same player message or fails
+                    # the run with an unrecovered-DM-turn error instead of
+                    # deadlocking into the idle timeout (Run 41 cycle 4).
+                    resume_dm_wait_message_id = latest_player_message_id
                 elif 'after_dm' in pause_phases(claim_payload):
                     initial_run_payload = fetch_run(args.api_base, args.owner_api_key, run_id)
                     audit_cycles = initial_run_payload.get('audit_cycles') or []
@@ -1156,6 +1337,7 @@ def execute_run(args, run_id):
                         force_overseer_retry = True
                         last_change_at = time.monotonic()
             except Exception as exc:
+                attempt_number = (claim_payload.get('run') or {}).get('attempt_count') or 1
                 append_event(
                     args.api_base,
                     args.owner_api_key,
@@ -1166,8 +1348,10 @@ def execute_run(args, run_id):
                     {
                         "latest_player_message_id": latest_player_message_id,
                         "error": str(exc),
+                        "attempt_number": attempt_number,
+                        "semantic_key": f"after_dm_resume_probe:{run_id}:{latest_player_message_id}",
                     },
-                    dedupe_key=f"after_dm_resume_probe_error:{run_id}:{latest_player_message_id}",
+                    dedupe_key=f"after_dm_resume_probe_error:{run_id}:{latest_player_message_id}:attempt:{attempt_number}",
                 )
                 if "after_dm" in pause_phases(claim_payload):
                     resume_dm_wait_message_id = latest_player_message_id
@@ -1181,133 +1365,244 @@ def execute_run(args, run_id):
         last_heartbeat_at = time.monotonic()
 
     while True:
-        maybe_heartbeat()
-        if deadline is not None and time.monotonic() >= deadline:
-            complete_run(
-                args.api_base,
-                args.owner_api_key,
-                run_id,
-                args.worker_id,
-                lease_token,
-                status='stopped',
-                error_text='max_minutes',
-                dedupe_key=f'run_completed:{run_id}:max_minutes',
-            )
-            return True
+        try:
+            maybe_heartbeat()
+            if deadline is not None and time.monotonic() >= deadline:
+                complete_run(
+                    args.api_base,
+                    args.owner_api_key,
+                    run_id,
+                    args.worker_id,
+                    lease_token,
+                    status='stopped',
+                    error_text='max_minutes',
+                    dedupe_key=f'run_completed:{run_id}:max_minutes',
+                )
+                return True
 
-        run_payload = fetch_run(args.api_base, args.owner_api_key, run_id)
-        run_state = run_payload.get('run') or {}
-        if run_state.get('status') in {'stop_requested', 'stopped', 'failed'}:
-            complete_run(
-                args.api_base,
-                args.owner_api_key,
-                run_id,
-                args.worker_id,
-                lease_token,
-                status='stopped',
-                error_text=run_state.get('error_text'),
-                dedupe_key=f'run_completed:{run_id}:external-stop',
-            )
-            return True
+            run_payload = fetch_run(args.api_base, args.owner_api_key, run_id)
+            run_state = run_payload.get('run') or {}
+            if run_state.get('status') in {'stop_requested', 'stopped', 'failed'}:
+                complete_run(
+                    args.api_base,
+                    args.owner_api_key,
+                    run_id,
+                    args.worker_id,
+                    lease_token,
+                    status='stopped',
+                    error_text=run_state.get('error_text'),
+                    dedupe_key=f'run_completed:{run_id}:external-stop',
+                )
+                return True
 
-        campaign_id = claim_payload['derived_campaign']['id']
-        recovered_count, blocked_detail = drain_pending_memory_recovery(
-            args.api_base,
-            args.owner_api_key,
-            campaign_id,
-            run_payload.get('pending_memory_recovery') or [],
-        )
-        if blocked_detail is not None:
-            append_event(
+            campaign_id = claim_payload['derived_campaign']['id']
+            recovered_count, blocked_detail = drain_pending_memory_recovery(
                 args.api_base,
                 args.owner_api_key,
-                run_id,
-                args.worker_id,
-                lease_token,
-                'memory_recovery_blocked',
-                {
-                    'automation_run_id': run_id,
-                    'campaign_id': campaign_id,
-                    'blocked_detail': blocked_detail,
-                },
-                dedupe_key=f'memory_recovery_blocked:{run_id}:{campaign_id}',
+                campaign_id,
+                run_payload.get('pending_memory_recovery') or [],
             )
-            complete_run(
-                args.api_base,
-                args.owner_api_key,
-                run_id,
-                args.worker_id,
-                lease_token,
-                status='failed',
-                error_text='memory_recovery_blocked',
-                dedupe_key=f'run_completed:{run_id}:memory-recovery-blocked',
-            )
-            return True
-        if recovered_count:
-            append_event(
-                args.api_base,
-                args.owner_api_key,
-                run_id,
-                args.worker_id,
-                lease_token,
-                'memory_recovery_recovered',
-                {
-                    'automation_run_id': run_id,
-                    'campaign_id': campaign_id,
-                    'recovered_task_count': recovered_count,
-                    'outcome': 'drained_before_cycle',
-                },
-                status='running',
-                dedupe_key=f'memory_recovery_drained:{run_id}:{campaign_id}',
-            )
+            if blocked_detail is not None:
+                append_event(
+                    args.api_base,
+                    args.owner_api_key,
+                    run_id,
+                    args.worker_id,
+                    lease_token,
+                    'memory_recovery_blocked',
+                    {
+                        'automation_run_id': run_id,
+                        'campaign_id': campaign_id,
+                        'blocked_detail': blocked_detail,
+                    },
+                    dedupe_key=f'memory_recovery_blocked:{run_id}:{campaign_id}',
+                )
+                complete_run(
+                    args.api_base,
+                    args.owner_api_key,
+                    run_id,
+                    args.worker_id,
+                    lease_token,
+                    status='failed',
+                    error_text='memory_recovery_blocked',
+                    dedupe_key=f'run_completed:{run_id}:memory-recovery-blocked',
+                )
+                return True
+            if recovered_count:
+                append_event(
+                    args.api_base,
+                    args.owner_api_key,
+                    run_id,
+                    args.worker_id,
+                    lease_token,
+                    'memory_recovery_recovered',
+                    {
+                        'automation_run_id': run_id,
+                        'campaign_id': campaign_id,
+                        'recovered_task_count': recovered_count,
+                        'outcome': 'drained_before_cycle',
+                    },
+                    status='running',
+                    dedupe_key=f'memory_recovery_drained:{run_id}:{campaign_id}',
+                )
 
-        session = active_session_from_run_payload(run_payload)
-        if not session:
-            complete_run(
-                args.api_base,
-                args.owner_api_key,
-                run_id,
-                args.worker_id,
-                lease_token,
-                status='failed',
-                error_text='Run has no session',
-                dedupe_key=f'run_completed:{run_id}:no-session',
-            )
-            return True
+            session = active_session_from_run_payload(run_payload)
+            if not session:
+                complete_run(
+                    args.api_base,
+                    args.owner_api_key,
+                    run_id,
+                    args.worker_id,
+                    lease_token,
+                    status='failed',
+                    error_text='Run has no session',
+                    dedupe_key=f'run_completed:{run_id}:no-session',
+                )
+                return True
 
-        if resume_dm_wait_message_id is not None:
-            posted_message_id = resume_dm_wait_message_id
-            resume_dm_wait_message_id = None
-            last_seen_fingerprint = messages_fingerprint(session)
-            session_for_prompt = {
-                'id': session.get('id'),
-                'started_at': session.get('started_at'),
-                'is_active': session.get('is_active', True),
-                'messages': session.get('messages') or [],
-            }
-            logical_key = stage_key(turns_completed, session_for_prompt)
-            last_change_at = time.monotonic()
-            if resume_reconciliation_active:
-                resume_reconciliation_active = False
-                dm_timed_out = True
-                timeout_phase = run.get('reconciliation_timeout_phase') or 'post_turn'
-                dm_turn = {
-                    'status': 'speak',
-                    'post_turn_status': 'pending',
+            if resume_dm_wait_message_id is not None:
+                posted_message_id = resume_dm_wait_message_id
+                resume_dm_wait_message_id = None
+                last_seen_fingerprint = messages_fingerprint(session)
+                session_for_prompt = {
+                    'id': session.get('id'),
+                    'started_at': session.get('started_at'),
+                    'is_active': session.get('is_active', True),
+                    'messages': session.get('messages') or [],
                 }
-            else:
-                dm_turn, dm_timed_out, timeout_phase = wait_for_dm_response(args, manifest, posted_message_id, maybe_heartbeat)
-            append_event(
-                args.api_base,
-                args.owner_api_key,
-                run_id,
-                args.worker_id,
-                lease_token,
-                'dm_turn_status',
-                dm_turn,
-                dedupe_key=f'dm_turn_status:{logical_key}:{posted_message_id}',
-            )
-            if dm_turn.get('status') == 'error' or dm_response_state.dm_turn_post_turn_failed(dm_turn):
+                logical_key = stage_key(turns_completed, session_for_prompt)
+                last_change_at = time.monotonic()
+                if resume_reconciliation_active:
+                    resume_reconciliation_active = False
+                    dm_timed_out = True
+                    timeout_phase = run.get('reconciliation_timeout_phase') or 'post_turn'
+                    dm_turn = {
+                        'status': 'speak',
+                        'post_turn_status': 'pending',
+                    }
+                else:
+                    dm_turn, dm_timed_out, timeout_phase = wait_for_dm_response(args, manifest, posted_message_id, maybe_heartbeat)
+                append_event(
+                    args.api_base,
+                    args.owner_api_key,
+                    run_id,
+                    args.worker_id,
+                    lease_token,
+                    'dm_turn_status',
+                    dm_turn,
+                    dedupe_key=f'dm_turn_status:{logical_key}:{posted_message_id}',
+                )
+                if dm_response_state.dm_turn_is_error(dm_turn):
+                    recovery_outcome, lease_token = _recover_or_fail_dm_turn(
+                        args,
+                        claim_payload,
+                        run_id,
+                        lease_token,
+                        claim_payload['derived_campaign']['id'],
+                        posted_message_id,
+                        dm_turn,
+                        logical_key,
+                        turns_completed,
+                        maybe_heartbeat,
+                        recovery_attempts=(claim_payload.get('run') or {}).get('attempt_count') or 1,
+                    )
+                    if recovery_outcome == 'recovered':
+                        dm_turn = {
+                            'status': 'speak',
+                            'post_turn_status': 'complete',
+                            'memory_status': 'complete',
+                            'recovered_via': 'memory_recovery',
+                        }
+                        last_dm_turn = None
+                        # The DM obligation is now fulfilled; advance to the next
+                        # overseer decision even though the transcript fingerprint is
+                        # unchanged (the repaired turn produced no new visible message).
+                        force_overseer_retry = True
+                        continue
+                    if recovery_outcome == 'stopped':
+                        if lease_token is None:
+                            return False
+                        complete_run(
+                            args.api_base,
+                            args.owner_api_key,
+                            run_id,
+                            args.worker_id,
+                            lease_token,
+                            status='stopped',
+                            dedupe_key=f'run_completed:{run_id}:audit-stop',
+                        )
+                        return True
+                    return True
+                if dm_timed_out:
+                    timeout_error = dm_response_state.classify_timeout(dm_turn, timeout_phase)
+                    timeout_evidence = dm_response_state.build_timeout_evidence(dm_turn, timeout_phase)
+                    timeout_evidence['timeout_phase'] = timeout_phase
+                    visible_timeout, post_turn_timeout = dm_response_state.resolve_dm_response_timeouts(args)
+                    timeout_evidence['configured_timeouts'] = {
+                        'visible_seconds': visible_timeout,
+                        'post_turn_seconds': post_turn_timeout,
+                    }
+                    append_event(
+                        args.api_base,
+                        args.owner_api_key,
+                        run_id,
+                        args.worker_id,
+                        lease_token,
+                        'dm_turn_timeout',
+                        timeout_evidence,
+                        dedupe_key=f'dm_turn_timeout:{logical_key}:{posted_message_id}:{timeout_phase}',
+                    )
+                    is_resuming = (reconciliation_deadline_utc is not None)
+                    recovered_turn, stop_state, terminal_error = _reconcile_dm_turn_timeout(
+                        args,
+                        manifest,
+                        claim_payload,
+                        run_id,
+                        lease_token,
+                        posted_message_id,
+                        logical_key,
+                        timeout_phase,
+                        timeout_error,
+                        timeout_evidence,
+                        maybe_heartbeat,
+                        resumed_deadline_utc=reconciliation_deadline_utc if is_resuming else None,
+                        resumed_started_at_utc=reconciliation_started_at_utc if is_resuming else None,
+                    )
+                    reconciliation_deadline_utc = None
+                    reconciliation_started_at_utc = None
+
+                    if stop_state is not None:
+                        if stop_state.get('status') == 'stop_requested':
+                            complete_run(
+                                args.api_base,
+                                args.owner_api_key,
+                                run_id,
+                                args.worker_id,
+                                lease_token,
+                                status='stopped',
+                                error_text=stop_state.get('error_text'),
+                                dedupe_key=f'run_completed:{run_id}:external-stop',
+                            )
+                            return True
+                        else:
+                            return True
+                    if recovered_turn is None:
+                        complete_run(
+                            args.api_base,
+                            args.owner_api_key,
+                            run_id,
+                            args.worker_id,
+                            lease_token,
+                            status='failed',
+                            error_text=terminal_error,
+                            dedupe_key=f'run_completed:{run_id}:dm-timeout:{timeout_phase}',
+                        )
+                        return True
+                    dm_turn = recovered_turn
+                last_dm_turn = dm_turn if dm_turn.get('status') in {'silent', 'empty'} else None
+                force_overseer_retry = True
+                same_fingerprint_no_action_retries = 0
+                last_change_at = time.monotonic()
                 should_stop, lease_token = pause_for_audit_if_needed(
                     args,
                     claim_payload,
@@ -1320,7 +1615,7 @@ def execute_run(args, run_id):
                         'posted_message_id': posted_message_id,
                         'turns_completed': turns_completed,
                     },
-                    summary='Paused after resolved DM error.',
+                    summary='Paused after DM response.',
                     player_message_id=posted_message_id,
                     dm_message_id=dm_turn.get('dm_message_id'),
                     dedupe_key=f'audit_pause:after_dm:{logical_key}:{posted_message_id}',
@@ -1338,182 +1633,20 @@ def execute_run(args, run_id):
                         dedupe_key=f'run_completed:{run_id}:audit-stop',
                     )
                     return True
+                last_change_at = time.monotonic()
 
-                recovered, recovery_detail = attempt_memory_recovery(
-                    args.api_base,
-                    args.owner_api_key,
-                    claim_payload['derived_campaign']['id'],
-                    dm_turn,
-                )
-                if recovered:
-                    append_event(
-                        args.api_base,
-                        args.owner_api_key,
-                        run_id,
-                        args.worker_id,
-                        lease_token,
-                        'memory_recovery_recovered',
-                        {
-                            'automation_run_id': run_id,
-                            'player_message_id': posted_message_id,
-                            'dm_message_id': dm_turn.get('dm_message_id'),
-                            'recovery_detail': recovery_detail,
-                            'outcome': 'recovered',
-                        },
-                        status='running',
-                        dedupe_key=f'memory_recovery_recovered:{logical_key}:{posted_message_id}',
-                    )
-                    dm_turn = {
-                        'status': 'speak',
-                        'post_turn_status': 'complete',
-                        'memory_status': 'complete',
-                        'recovered_via': 'memory_recovery',
-                    }
-                    last_dm_turn = None
-                    continue
-
-                failure_payload = {
-                    'player_message_id': posted_message_id,
-                    'dm_message_id': dm_turn.get('dm_message_id'),
-                    'status': dm_turn.get('status'),
-                    'post_turn_status': dm_turn.get('post_turn_status'),
-                    'memory_status': dm_turn.get('memory_status', 'skipped'),
-                    'clock_status': dm_turn.get('clock_status', 'skipped'),
-                    'turn_error': dm_turn.get('turn_error') or dm_turn.get('error_text') or dm_turn.get('post_turn_error'),
-                    'phase': 'after_dm',
-                    'retry_count': 0,
-                    'skipped_downstream_expectations': [
-                        'memory_validation',
-                        'clock_validation',
-                    ],
-                }
-                append_event(
-                    args.api_base,
-                    args.owner_api_key,
-                    run_id,
-                    args.worker_id,
-                    lease_token,
-                    'dm_turn_failed',
-                    failure_payload,
-                    dedupe_key=f'dm_turn_failed:{logical_key}:{posted_message_id}',
-                )
-                error_classification = (
-                    'dm_post_turn_error'
-                    if dm_response_state.dm_turn_post_turn_failed(dm_turn)
-                    else (dm_turn.get('turn_error') or dm_turn.get('error_text') or 'dm_turn_failed')
-                )
-                complete_run(
-                    args.api_base,
-                    args.owner_api_key,
-                    run_id,
-                    args.worker_id,
-                    lease_token,
-                    status='failed',
-                    error_text=error_classification,
-                    dedupe_key=f'run_completed:{run_id}:dm-failure:{posted_message_id}',
-                )
-                return True
-            if dm_timed_out:
-                timeout_error = dm_response_state.classify_timeout(dm_turn, timeout_phase)
-                timeout_evidence = dm_response_state.build_timeout_evidence(dm_turn, timeout_phase)
-                timeout_evidence['timeout_phase'] = timeout_phase
-                visible_timeout, post_turn_timeout = dm_response_state.resolve_dm_response_timeouts(args)
-                timeout_evidence['configured_timeouts'] = {
-                    'visible_seconds': visible_timeout,
-                    'post_turn_seconds': post_turn_timeout,
-                }
-                append_event(
-                    args.api_base,
-                    args.owner_api_key,
-                    run_id,
-                    args.worker_id,
-                    lease_token,
-                    'dm_turn_timeout',
-                    timeout_evidence,
-                    dedupe_key=f'dm_turn_timeout:{logical_key}:{posted_message_id}:{timeout_phase}',
-                )
-                is_resuming = (reconciliation_deadline_utc is not None)
-                recovered_turn, stop_state, terminal_error = _reconcile_dm_turn_timeout(
-                    args,
-                    manifest,
-                    claim_payload,
-                    run_id,
-                    lease_token,
-                    posted_message_id,
-                    logical_key,
-                    timeout_phase,
-                    timeout_error,
-                    timeout_evidence,
-                    maybe_heartbeat,
-                    resumed_deadline_utc=reconciliation_deadline_utc if is_resuming else None,
-                    resumed_started_at_utc=reconciliation_started_at_utc if is_resuming else None,
-                )
-                reconciliation_deadline_utc = None
-                reconciliation_started_at_utc = None
-
-                if stop_state is not None:
-                    if stop_state.get('status') == 'stop_requested':
-                        complete_run(
-                            args.api_base,
-                            args.owner_api_key,
-                            run_id,
-                            args.worker_id,
-                            lease_token,
-                            status='stopped',
-                            error_text=stop_state.get('error_text'),
-                            dedupe_key=f'run_completed:{run_id}:external-stop',
-                        )
-                        return True
-                    else:
-                        return True
-                if recovered_turn is None:
+                if turns_completed >= max_turns:
                     complete_run(
                         args.api_base,
                         args.owner_api_key,
                         run_id,
                         args.worker_id,
                         lease_token,
-                        status='failed',
-                        error_text=terminal_error,
-                        dedupe_key=f'run_completed:{run_id}:dm-timeout:{timeout_phase}',
+                        status='completed',
+                        dedupe_key=f'run_completed:{run_id}:max-turns',
                     )
                     return True
-                dm_turn = recovered_turn
-            last_dm_turn = dm_turn if dm_turn.get('status') in {'silent', 'empty'} else None
-            force_overseer_retry = True
-            same_fingerprint_no_action_retries = 0
-            last_change_at = time.monotonic()
-            should_stop, lease_token = pause_for_audit_if_needed(
-                args,
-                claim_payload,
-                run_id,
-                lease_token,
-                'after_dm',
-                maybe_heartbeat,
-                payload={
-                    'dm_turn': dm_turn,
-                    'posted_message_id': posted_message_id,
-                    'turns_completed': turns_completed,
-                },
-                summary='Paused after DM response.',
-                player_message_id=posted_message_id,
-                dm_message_id=dm_turn.get('dm_message_id'),
-                dedupe_key=f'audit_pause:after_dm:{logical_key}:{posted_message_id}',
-            )
-            if should_stop:
-                if lease_token is None:
-                    return False
-                complete_run(
-                    args.api_base,
-                    args.owner_api_key,
-                    run_id,
-                    args.worker_id,
-                    lease_token,
-                    status='stopped',
-                    dedupe_key=f'run_completed:{run_id}:audit-stop',
-                )
-                return True
-            last_change_at = time.monotonic()
+                continue
 
             if turns_completed >= max_turns:
                 complete_run(
@@ -1526,119 +1659,194 @@ def execute_run(args, run_id):
                     dedupe_key=f'run_completed:{run_id}:max-turns',
                 )
                 return True
-            continue
 
-        if turns_completed >= max_turns:
-            complete_run(
-                args.api_base,
-                args.owner_api_key,
-                run_id,
-                args.worker_id,
-                lease_token,
-                status='completed',
-                dedupe_key=f'run_completed:{run_id}:max-turns',
-            )
-            return True
+            current_fingerprint = messages_fingerprint(session)
+            fingerprint_changed = current_fingerprint != last_seen_fingerprint
+            if fingerprint_changed:
+                last_seen_fingerprint = current_fingerprint
+                last_change_at = time.monotonic()
+                same_fingerprint_no_action_retries = 0
+                force_overseer_retry = False
+                last_dm_turn = None
 
-        current_fingerprint = messages_fingerprint(session)
-        fingerprint_changed = current_fingerprint != last_seen_fingerprint
-        if fingerprint_changed:
-            last_seen_fingerprint = current_fingerprint
-            last_change_at = time.monotonic()
-            same_fingerprint_no_action_retries = 0
-            force_overseer_retry = False
-            last_dm_turn = None
-
-        if fingerprint_changed or force_overseer_retry:
-            if 'after_dm' in pause_phases(claim_payload) and resume_dm_wait_message_id is None:
-                audit_cycles_raw = run_payload.get('audit_cycles') or []
-                if audit_cycles_raw:
-                    last_cycle = audit_cycles_raw[-1] if isinstance(audit_cycles_raw[-1], dict) else {}
-                    if last_cycle.get('phase') == 'after_player':
-                        last_player_msg_id = last_cycle.get('player_message_id')
-                        if last_player_msg_id is not None:
-                            has_after_dm = any(
-                                c.get('phase') == 'after_dm'
-                                and (
-                                    c.get('player_message_id') == last_player_msg_id
-                                    or (
-                                        last_cycle.get('dm_message_id') is not None
-                                        and c.get('dm_message_id') == last_cycle.get('dm_message_id')
+            if fingerprint_changed or force_overseer_retry:
+                if 'after_dm' in pause_phases(claim_payload) and resume_dm_wait_message_id is None:
+                    audit_cycles_raw = run_payload.get('audit_cycles') or []
+                    if audit_cycles_raw:
+                        last_cycle = audit_cycles_raw[-1] if isinstance(audit_cycles_raw[-1], dict) else {}
+                        if last_cycle.get('phase') == 'after_player':
+                            last_player_msg_id = last_cycle.get('player_message_id')
+                            if last_player_msg_id is not None:
+                                has_after_dm = any(
+                                    c.get('phase') == 'after_dm'
+                                    and (
+                                        c.get('player_message_id') == last_player_msg_id
+                                        or (
+                                            last_cycle.get('dm_message_id') is not None
+                                            and c.get('dm_message_id') == last_cycle.get('dm_message_id')
+                                        )
                                     )
+                                    for c in audit_cycles_raw
                                 )
-                                for c in audit_cycles_raw
-                            )
-                            if not has_after_dm:
-                                resume_dm_wait_message_id = last_player_msg_id
-                                continue
-            try:
-                session_for_prompt = {
-                    'id': session.get('id'),
-                    'started_at': session.get('started_at'),
-                    'is_active': session.get('is_active', True),
-                    'messages': session.get('messages') or [],
-                }
-                logical_key = stage_key(turns_completed, session_for_prompt)
-                proposal_status, _proposal_detail = resolve_priority_proposal(
-                    args,
-                    manifest,
-                    claim_payload,
-                    session,
-                    turns_completed,
-                    run_id,
-                    lease_token,
-                )
-                if proposal_status in {'unresolvable', 'no_resolver'}:
-                    error_text = (
-                        'state_critical_proposal_no_resolver'
-                        if proposal_status == 'no_resolver'
-                        else 'state_critical_proposal_unresolved'
+                                if not has_after_dm:
+                                    resume_dm_wait_message_id = last_player_msg_id
+                                    continue
+                try:
+                    session_for_prompt = {
+                        'id': session.get('id'),
+                        'started_at': session.get('started_at'),
+                        'is_active': session.get('is_active', True),
+                        'messages': session.get('messages') or [],
+                    }
+                    logical_key = stage_key(turns_completed, session_for_prompt)
+                    proposal_status, _proposal_detail = resolve_priority_proposal(
+                        args,
+                        manifest,
+                        claim_payload,
+                        session,
+                        turns_completed,
+                        run_id,
+                        lease_token,
                     )
-                    complete_run(
+                    if proposal_status in {'unresolvable', 'no_resolver'}:
+                        error_text = (
+                            'state_critical_proposal_no_resolver'
+                            if proposal_status == 'no_resolver'
+                            else 'state_critical_proposal_unresolved'
+                        )
+                        complete_run(
+                            args.api_base,
+                            args.owner_api_key,
+                            run_id,
+                            args.worker_id,
+                            lease_token,
+                            status='failed',
+                            error_text=error_text,
+                            dedupe_key=f'run_completed:{run_id}:proposal-{proposal_status}',
+                        )
+                        return True
+                    if proposal_status == 'resolved':
+                        # Sheet state was fixed without a visible table turn. Refresh
+                        # before the next decision so the session reflects the
+                        # applied/dismissed proposal, then keep checking remaining
+                        # state-critical proposals before any normal speaker turn.
+                        force_overseer_retry = True
+                        same_fingerprint_no_action_retries = 0
+                        last_change_at = time.monotonic()
+                        time.sleep(args.poll_interval)
+                        continue
+                    overseer = request_overseer_decision(
+                        args,
+                        manifest,
+                        claim_payload,
+                        session_for_prompt,
+                        turns_completed,
+                        last_dm_turn,
+                        run_id,
+                        lease_token,
+                    )
+                    last_dm_turn = None
+                    append_event(
                         args.api_base,
                         args.owner_api_key,
                         run_id,
                         args.worker_id,
                         lease_token,
-                        status='failed',
-                        error_text=error_text,
-                        dedupe_key=f'run_completed:{run_id}:proposal-{proposal_status}',
+                        'overseer_decision',
+                        {'overseer': overseer},
+                        dedupe_key=f'overseer_decision:{logical_key}',
                     )
-                    return True
-                if proposal_status == 'resolved':
-                    # Sheet state was fixed without a visible table turn. Refresh
-                    # before the next decision so the session reflects the
-                    # applied/dismissed proposal, then keep checking remaining
-                    # state-critical proposals before any normal speaker turn.
-                    force_overseer_retry = True
-                    same_fingerprint_no_action_retries = 0
-                    last_change_at = time.monotonic()
-                    time.sleep(args.poll_interval)
-                    continue
-                overseer = request_overseer_decision(
-                    args,
-                    manifest,
-                    claim_payload,
-                    session_for_prompt,
-                    turns_completed,
-                    last_dm_turn,
-                    run_id,
-                    lease_token,
-                )
-                last_dm_turn = None
-                append_event(
-                    args.api_base,
-                    args.owner_api_key,
-                    run_id,
-                    args.worker_id,
-                    lease_token,
-                    'overseer_decision',
-                    {'overseer': overseer},
-                    dedupe_key=f'overseer_decision:{logical_key}',
-                )
-                if overseer['action'] == 'no_action':
-                    force_overseer_retry = False
-                    same_fingerprint_no_action_retries += 1
+                    if overseer['action'] == 'no_action':
+                        force_overseer_retry = False
+                        same_fingerprint_no_action_retries += 1
+                        append_event(
+                            args.api_base,
+                            args.owner_api_key,
+                            run_id,
+                            args.worker_id,
+                            lease_token,
+                            'turn_result',
+                            {
+                                'action': 'no_action',
+                                'overseer': overseer,
+                                'turns_completed': turns_completed,
+                            },
+                            dedupe_key=f'turn_result:no_action:{logical_key}',
+                        )
+                        time.sleep(args.poll_interval)
+                        continue
+
+                    roster_entry = next(
+                        (entry for entry in (claim_payload.get('roster') or []) if (entry.get('llm_player_id') or entry.get('user_id')) == overseer['llm_player_id']),
+                        None,
+                    )
+                    if roster_entry is None:
+                        raise RuntimeError(f'No roster entry for llm_player_id {overseer["llm_player_id"]}')
+
+                    campaign_id = claim_payload['derived_campaign']['id']
+                    world_payload = api_get(args.api_base, f'/api/campaigns/{campaign_id}/world', api_key=args.owner_api_key)
+                    campaign = api_get(args.api_base, f'/api/campaigns/{campaign_id}', api_key=args.owner_api_key)['campaign']
+                    campaign_characters = fetch_campaign_characters(args.api_base, args.owner_api_key, campaign_id)
+                    chosen_player = select_chosen_player(roster_entry, campaign_characters)
+                    pending_proposals = [
+                        proposal for proposal in (session.get('pending_sheet_proposals') or [])
+                        if proposal.get('character_id') == chosen_player['character'].get('id')
+                    ]
+                    decision, response_text, json_retry_count, provider_name, provider_model = request_player_decision(
+                        args,
+                        manifest,
+                        claim_payload,
+                        campaign,
+                        world_payload,
+                        session_for_prompt,
+                        chosen_player,
+                        pending_proposals,
+                        turns_completed,
+                        run_id,
+                        lease_token,
+                    )
+                    if (decision.get('action') or '').strip().lower() == 'roll':
+                        roll_summary = orchestrator.execute_player_roll(decision.get('label'), decision.get('expression'))
+                        decision['content'] = orchestrator.build_player_roll_message(decision.get('content'), roll_summary)
+                    if (decision.get('action') or '').strip().lower() in {'speak', 'roll'}:
+                        decision['content'] = orchestrator.format_player_message_for_dm(decision.get('content'))
+                    result = submit_decision(
+                        args.api_base,
+                        args.owner_api_key,
+                        run_id,
+                        chosen_player,
+                        decision,
+                        dedupe_key=f'player_message:{logical_key}:{chosen_player["llm_player"]["id"]}',
+                        worker_id=args.worker_id,
+                        lease_token=lease_token,
+                    )
+                    posted_message_id = (result.get('message') or {}).get('id')
+                    append_event(
+                        args.api_base,
+                        args.owner_api_key,
+                        run_id,
+                        args.worker_id,
+                        lease_token,
+                        'player_decision',
+                        {
+                            'speaker': {
+                                'llm_player_id': chosen_player['llm_player']['id'],
+                                'label': chosen_player['llm_player']['label'],
+                                'character_name': chosen_player['character'].get('name'),
+                            },
+                            'decision': decision,
+                            'raw_response_text': response_text,
+                            'json_retry_count': json_retry_count,
+                            'provider': provider_name,
+                            'model': provider_model,
+                            'posted_message_id': posted_message_id,
+                        },
+                        dedupe_key=f'player_decision:{logical_key}:{chosen_player["llm_player"]["id"]}',
+                    )
+                    if (decision.get('action') or '').strip().lower() != 'no_action':
+                        turns_completed += 1
+
+                    # Log turn result event here BEFORE any pause!
                     append_event(
                         args.api_base,
                         args.owner_api_key,
@@ -1647,151 +1855,171 @@ def execute_run(args, run_id):
                         lease_token,
                         'turn_result',
                         {
-                            'action': 'no_action',
-                            'overseer': overseer,
+                            'campaign_id': campaign_id,
+                            'session_id': session_for_prompt['id'],
+                            'speaker': {
+                                'llm_player_id': chosen_player['llm_player']['id'],
+                                'label': chosen_player['llm_player']['label'],
+                                'character_name': chosen_player['character'].get('name'),
+                            } if chosen_player else None,
+                            'action': (decision.get('action') or '').strip().lower(),
                             'turns_completed': turns_completed,
+                            'json_retry_count': json_retry_count,
                         },
-                        dedupe_key=f'turn_result:no_action:{logical_key}',
+                        dedupe_key=f'turn_result:{logical_key}',
                     )
-                    time.sleep(args.poll_interval)
-                    continue
 
-                roster_entry = next(
-                    (entry for entry in (claim_payload.get('roster') or []) if (entry.get('llm_player_id') or entry.get('user_id')) == overseer['llm_player_id']),
-                    None,
-                )
-                if roster_entry is None:
-                    raise RuntimeError(f'No roster entry for llm_player_id {overseer["llm_player_id"]}')
-
-                campaign_id = claim_payload['derived_campaign']['id']
-                world_payload = api_get(args.api_base, f'/api/campaigns/{campaign_id}/world', api_key=args.owner_api_key)
-                campaign = api_get(args.api_base, f'/api/campaigns/{campaign_id}', api_key=args.owner_api_key)['campaign']
-                campaign_characters = fetch_campaign_characters(args.api_base, args.owner_api_key, campaign_id)
-                chosen_player = select_chosen_player(roster_entry, campaign_characters)
-                pending_proposals = [
-                    proposal for proposal in (session.get('pending_sheet_proposals') or [])
-                    if proposal.get('character_id') == chosen_player['character'].get('id')
-                ]
-                decision, response_text, json_retry_count, provider_name, provider_model = request_player_decision(
-                    args,
-                    manifest,
-                    claim_payload,
-                    campaign,
-                    world_payload,
-                    session_for_prompt,
-                    chosen_player,
-                    pending_proposals,
-                    turns_completed,
-                    run_id,
-                    lease_token,
-                )
-                if (decision.get('action') or '').strip().lower() == 'roll':
-                    roll_summary = orchestrator.execute_player_roll(decision.get('label'), decision.get('expression'))
-                    decision['content'] = orchestrator.build_player_roll_message(decision.get('content'), roll_summary)
-                result = submit_decision(
-                    args.api_base,
-                    args.owner_api_key,
-                    run_id,
-                    chosen_player,
-                    decision,
-                    dedupe_key=f'player_message:{logical_key}:{chosen_player["llm_player"]["id"]}',
-                    worker_id=args.worker_id,
-                    lease_token=lease_token,
-                )
-                posted_message_id = (result.get('message') or {}).get('id')
-                append_event(
-                    args.api_base,
-                    args.owner_api_key,
-                    run_id,
-                    args.worker_id,
-                    lease_token,
-                    'player_decision',
-                    {
-                        'speaker': {
-                            'llm_player_id': chosen_player['llm_player']['id'],
-                            'label': chosen_player['llm_player']['label'],
-                            'character_name': chosen_player['character'].get('name'),
-                        },
-                        'decision': decision,
-                        'raw_response_text': response_text,
-                        'json_retry_count': json_retry_count,
-                        'provider': provider_name,
-                        'model': provider_model,
-                        'posted_message_id': posted_message_id,
-                    },
-                    dedupe_key=f'player_decision:{logical_key}:{chosen_player["llm_player"]["id"]}',
-                )
-                if (decision.get('action') or '').strip().lower() != 'no_action':
-                    turns_completed += 1
-
-                # Log turn result event here BEFORE any pause!
-                append_event(
-                    args.api_base,
-                    args.owner_api_key,
-                    run_id,
-                    args.worker_id,
-                    lease_token,
-                    'turn_result',
-                    {
-                        'campaign_id': campaign_id,
-                        'session_id': session_for_prompt['id'],
-                        'speaker': {
-                            'llm_player_id': chosen_player['llm_player']['id'],
-                            'label': chosen_player['llm_player']['label'],
-                            'character_name': chosen_player['character'].get('name'),
-                        } if chosen_player else None,
-                        'action': (decision.get('action') or '').strip().lower(),
-                        'turns_completed': turns_completed,
-                        'json_retry_count': json_retry_count,
-                    },
-                    dedupe_key=f'turn_result:{logical_key}',
-                )
-
-                if posted_message_id is not None:
-                    should_stop, lease_token = pause_for_audit_if_needed(
-                        args,
-                        claim_payload,
-                        run_id,
-                        lease_token,
-                        'after_player',
-                        maybe_heartbeat,
-                        payload={
-                            'speaker': chosen_player['llm_player'],
-                            'character': chosen_player['character'],
-                            'decision': decision,
-                            'posted_message_id': posted_message_id,
-                            'turns_completed': turns_completed,
-                        },
-                        summary=f'Paused after player action from {chosen_player["character"].get("name") or chosen_player["llm_player"]["label"]}.',
-                        player_message_id=posted_message_id,
-                        dedupe_key=f'audit_pause:after_player:{logical_key}:{posted_message_id}',
-                    )
-                    if should_stop:
-                        if lease_token is None:
-                            return False
-                        complete_run(
+                    if posted_message_id is not None:
+                        should_stop, lease_token = pause_for_audit_if_needed(
+                            args,
+                            claim_payload,
+                            run_id,
+                            lease_token,
+                            'after_player',
+                            maybe_heartbeat,
+                            payload={
+                                'speaker': chosen_player['llm_player'],
+                                'character': chosen_player['character'],
+                                'decision': decision,
+                                'posted_message_id': posted_message_id,
+                                'turns_completed': turns_completed,
+                            },
+                            summary=f'Paused after player action from {chosen_player["character"].get("name") or chosen_player["llm_player"]["label"]}.',
+                            player_message_id=posted_message_id,
+                            dedupe_key=f'audit_pause:after_player:{logical_key}:{posted_message_id}',
+                        )
+                        if should_stop:
+                            if lease_token is None:
+                                return False
+                            complete_run(
+                                args.api_base,
+                                args.owner_api_key,
+                                run_id,
+                                args.worker_id,
+                                lease_token,
+                                status='stopped',
+                                dedupe_key=f'run_completed:{run_id}:audit-stop',
+                            )
+                            return True
+                        last_change_at = time.monotonic()
+                        dm_turn, dm_timed_out, timeout_phase = wait_for_dm_response(args, manifest, posted_message_id, maybe_heartbeat)
+                        append_event(
                             args.api_base,
                             args.owner_api_key,
                             run_id,
                             args.worker_id,
                             lease_token,
-                            status='stopped',
-                            dedupe_key=f'run_completed:{run_id}:audit-stop',
+                            'dm_turn_status',
+                            dm_turn,
+                            dedupe_key=f'dm_turn_status:{logical_key}:{posted_message_id}',
                         )
-                        return True
-                    last_change_at = time.monotonic()
-                    dm_turn, dm_timed_out, timeout_phase = wait_for_dm_response(args, manifest, posted_message_id, maybe_heartbeat)
-                    append_event(
-                        args.api_base,
-                        args.owner_api_key,
-                        run_id,
-                        args.worker_id,
-                        lease_token,
-                        'dm_turn_status',
-                        dm_turn,
-                        dedupe_key=f'dm_turn_status:{logical_key}:{posted_message_id}',
-                    )
-                    if dm_turn.get('status') == 'error' or dm_response_state.dm_turn_post_turn_failed(dm_turn):
+                        if dm_response_state.dm_turn_is_error(dm_turn):
+                            recovery_outcome, lease_token = _recover_or_fail_dm_turn(
+                                args,
+                                claim_payload,
+                                run_id,
+                                lease_token,
+                                campaign_id,
+                                posted_message_id,
+                                dm_turn,
+                                logical_key,
+                                turns_completed,
+                                maybe_heartbeat,
+                                recovery_attempts=(claim_payload.get('run') or {}).get('attempt_count') or 1,
+                            )
+                            if recovery_outcome == 'recovered':
+                                dm_turn = {
+                                    'status': 'speak',
+                                    'post_turn_status': 'complete',
+                                    'memory_status': 'complete',
+                                    'recovered_via': 'memory_recovery',
+                                }
+                                last_dm_turn = None
+                                continue
+                            if recovery_outcome == 'stopped':
+                                if lease_token is None:
+                                    return False
+                                complete_run(
+                                    args.api_base,
+                                    args.owner_api_key,
+                                    run_id,
+                                    args.worker_id,
+                                    lease_token,
+                                    status='stopped',
+                                    dedupe_key=f'run_completed:{run_id}:audit-stop',
+                                )
+                                return True
+                            return True
+                        if dm_timed_out:
+                            timeout_error = dm_response_state.classify_timeout(dm_turn, timeout_phase)
+                            timeout_evidence = dm_response_state.build_timeout_evidence(dm_turn, timeout_phase)
+                            timeout_evidence['timeout_phase'] = timeout_phase
+                            visible_timeout, post_turn_timeout = dm_response_state.resolve_dm_response_timeouts(args)
+                            timeout_evidence['configured_timeouts'] = {
+                                'visible_seconds': visible_timeout,
+                                'post_turn_seconds': post_turn_timeout,
+                            }
+                            append_event(
+                                args.api_base,
+                                args.owner_api_key,
+                                run_id,
+                                args.worker_id,
+                                lease_token,
+                                'dm_turn_timeout',
+                                timeout_evidence,
+                                dedupe_key=f'dm_turn_timeout:{logical_key}:{posted_message_id}:{timeout_phase}',
+                            )
+                            is_resuming = (reconciliation_deadline_utc is not None)
+                            recovered_turn, stop_state, terminal_error = _reconcile_dm_turn_timeout(
+                                args,
+                                manifest,
+                                claim_payload,
+                                run_id,
+                                lease_token,
+                                posted_message_id,
+                                logical_key,
+                                timeout_phase,
+                                timeout_error,
+                                timeout_evidence,
+                                maybe_heartbeat,
+                                resumed_deadline_utc=reconciliation_deadline_utc if is_resuming else None,
+                                resumed_started_at_utc=reconciliation_started_at_utc if is_resuming else None,
+                            )
+                            reconciliation_deadline_utc = None
+                            reconciliation_started_at_utc = None
+
+                            if stop_state is not None:
+                                if stop_state.get('status') == 'stop_requested':
+                                    complete_run(
+                                        args.api_base,
+                                        args.owner_api_key,
+                                        run_id,
+                                        args.worker_id,
+                                        lease_token,
+                                        status='stopped',
+                                        error_text=stop_state.get('error_text'),
+                                        dedupe_key=f'run_completed:{run_id}:external-stop',
+                                    )
+                                    return True
+                                else:
+                                    return True
+                            if recovered_turn is None:
+                                complete_run(
+                                    args.api_base,
+                                    args.owner_api_key,
+                                    run_id,
+                                    args.worker_id,
+                                    lease_token,
+                                    status='failed',
+                                    error_text=terminal_error,
+                                    dedupe_key=f'run_completed:{run_id}:dm-timeout:{timeout_phase}',
+                                )
+                                return True
+                            dm_turn = recovered_turn
+                        last_dm_turn = dm_turn if dm_turn.get('status') in {'silent', 'empty'} else None
+                        force_overseer_retry = True
+                        same_fingerprint_no_action_retries = 0
+                        last_change_at = time.monotonic()
                         should_stop, lease_token = pause_for_audit_if_needed(
                             args,
                             claim_payload,
@@ -1804,7 +2032,7 @@ def execute_run(args, run_id):
                                 'posted_message_id': posted_message_id,
                                 'turns_completed': turns_completed,
                             },
-                            summary='Paused after resolved DM error.',
+                            summary='Paused after DM response.',
                             player_message_id=posted_message_id,
                             dm_message_id=dm_turn.get('dm_message_id'),
                             dedupe_key=f'audit_pause:after_dm:{logical_key}:{posted_message_id}',
@@ -1822,244 +2050,75 @@ def execute_run(args, run_id):
                                 dedupe_key=f'run_completed:{run_id}:audit-stop',
                             )
                             return True
+                        last_change_at = time.monotonic()
+                    else:
+                        force_overseer_retry, same_fingerprint_no_action_retries = autonomous.update_same_fingerprint_retry_state(
+                            (decision.get('action') or '').strip().lower(),
+                            same_fingerprint_no_action_retries,
+                            len(manifest.get('llm_players') or []),
+                        )
 
-                        recovered, recovery_detail = attempt_memory_recovery(
-                            args.api_base,
-                            args.owner_api_key,
-                            campaign_id,
-                            dm_turn,
-                        )
-                        if recovered:
-                            append_event(
-                                args.api_base,
-                                args.owner_api_key,
-                                run_id,
-                                args.worker_id,
-                                lease_token,
-                                'memory_recovery_recovered',
-                                {
-                                    'automation_run_id': run_id,
-                                    'player_message_id': posted_message_id,
-                                    'dm_message_id': dm_turn.get('dm_message_id'),
-                                    'recovery_detail': recovery_detail,
-                                    'outcome': 'recovered',
-                                },
-                                status='running',
-                                dedupe_key=f'memory_recovery_recovered:{logical_key}:{posted_message_id}',
-                            )
-                            dm_turn = {
-                                'status': 'speak',
-                                'post_turn_status': 'complete',
-                                'memory_status': 'complete',
-                                'recovered_via': 'memory_recovery',
-                            }
-                            last_dm_turn = None
-                            continue
 
-                        failure_payload = {
-                            'player_message_id': posted_message_id,
-                            'dm_message_id': dm_turn.get('dm_message_id'),
-                            'status': dm_turn.get('status'),
-                            'post_turn_status': dm_turn.get('post_turn_status'),
-                            'memory_status': dm_turn.get('memory_status', 'skipped'),
-                            'clock_status': dm_turn.get('clock_status', 'skipped'),
-                            'turn_error': dm_turn.get('turn_error') or dm_turn.get('error_text') or dm_turn.get('post_turn_error'),
-                            'phase': 'after_dm',
-                            'retry_count': 0,
-                            'skipped_downstream_expectations': [
-                                'memory_validation',
-                                'clock_validation',
-                            ],
-                        }
-                        append_event(
-                            args.api_base,
-                            args.owner_api_key,
-                            run_id,
-                            args.worker_id,
-                            lease_token,
-                            'dm_turn_failed',
-                            failure_payload,
-                            dedupe_key=f'dm_turn_failed:{logical_key}:{posted_message_id}',
-                        )
-                        error_classification = (
-                            'dm_post_turn_error'
-                            if dm_response_state.dm_turn_post_turn_failed(dm_turn)
-                            else (dm_turn.get('turn_error') or dm_turn.get('error_text') or 'dm_turn_failed')
-                        )
+
+                    if turns_completed >= max_turns:
                         complete_run(
                             args.api_base,
                             args.owner_api_key,
                             run_id,
                             args.worker_id,
                             lease_token,
-                            status='failed',
-                            error_text=error_classification,
-                            dedupe_key=f'run_completed:{run_id}:dm-failure:{posted_message_id}',
+                            status='completed',
+                            dedupe_key=f'run_completed:{run_id}:max-turns',
                         )
                         return True
-                    if dm_timed_out:
-                        timeout_error = dm_response_state.classify_timeout(dm_turn, timeout_phase)
-                        timeout_evidence = dm_response_state.build_timeout_evidence(dm_turn, timeout_phase)
-                        timeout_evidence['timeout_phase'] = timeout_phase
-                        visible_timeout, post_turn_timeout = dm_response_state.resolve_dm_response_timeouts(args)
-                        timeout_evidence['configured_timeouts'] = {
-                            'visible_seconds': visible_timeout,
-                            'post_turn_seconds': post_turn_timeout,
-                        }
-                        append_event(
-                            args.api_base,
-                            args.owner_api_key,
-                            run_id,
-                            args.worker_id,
-                            lease_token,
-                            'dm_turn_timeout',
-                            timeout_evidence,
-                            dedupe_key=f'dm_turn_timeout:{logical_key}:{posted_message_id}:{timeout_phase}',
-                        )
-                        is_resuming = (reconciliation_deadline_utc is not None)
-                        recovered_turn, stop_state, terminal_error = _reconcile_dm_turn_timeout(
-                            args,
-                            manifest,
-                            claim_payload,
-                            run_id,
-                            lease_token,
-                            posted_message_id,
-                            logical_key,
-                            timeout_phase,
-                            timeout_error,
-                            timeout_evidence,
-                            maybe_heartbeat,
-                            resumed_deadline_utc=reconciliation_deadline_utc if is_resuming else None,
-                            resumed_started_at_utc=reconciliation_started_at_utc if is_resuming else None,
-                        )
-                        reconciliation_deadline_utc = None
-                        reconciliation_started_at_utc = None
-
-                        if stop_state is not None:
-                            if stop_state.get('status') == 'stop_requested':
-                                complete_run(
-                                    args.api_base,
-                                    args.owner_api_key,
-                                    run_id,
-                                    args.worker_id,
-                                    lease_token,
-                                    status='stopped',
-                                    error_text=stop_state.get('error_text'),
-                                    dedupe_key=f'run_completed:{run_id}:external-stop',
-                                )
-                                return True
-                            else:
-                                return True
-                        if recovered_turn is None:
-                            complete_run(
-                                args.api_base,
-                                args.owner_api_key,
-                                run_id,
-                                args.worker_id,
-                                lease_token,
-                                status='failed',
-                                error_text=terminal_error,
-                                dedupe_key=f'run_completed:{run_id}:dm-timeout:{timeout_phase}',
-                            )
-                            return True
-                        dm_turn = recovered_turn
-                    last_dm_turn = dm_turn if dm_turn.get('status') in {'silent', 'empty'} else None
-                    force_overseer_retry = True
-                    same_fingerprint_no_action_retries = 0
-                    last_change_at = time.monotonic()
-                    should_stop, lease_token = pause_for_audit_if_needed(
-                        args,
-                        claim_payload,
+                except Exception as exc:
+                    append_event(
+                        args.api_base,
+                        args.owner_api_key,
                         run_id,
+                        args.worker_id,
                         lease_token,
-                        'after_dm',
-                        maybe_heartbeat,
-                        payload={
-                            'dm_turn': dm_turn,
-                            'posted_message_id': posted_message_id,
+                        'error',
+                        {
+                            'error': str(exc),
                             'turns_completed': turns_completed,
                         },
-                        summary='Paused after DM response.',
-                        player_message_id=posted_message_id,
-                        dm_message_id=dm_turn.get('dm_message_id'),
-                        dedupe_key=f'audit_pause:after_dm:{logical_key}:{posted_message_id}',
+                        status='running',
+                        error_text=str(exc),
+                        dedupe_key=f'error:{run_id}:{turns_completed}:{type(exc).__name__}',
                     )
-                    if should_stop:
-                        if lease_token is None:
-                            return False
-                        complete_run(
-                            args.api_base,
-                            args.owner_api_key,
-                            run_id,
-                            args.worker_id,
-                            lease_token,
-                            status='stopped',
-                            dedupe_key=f'run_completed:{run_id}:audit-stop',
-                        )
-                        return True
-                    last_change_at = time.monotonic()
-                else:
-                    force_overseer_retry, same_fingerprint_no_action_retries = autonomous.update_same_fingerprint_retry_state(
-                        (decision.get('action') or '').strip().lower(),
-                        same_fingerprint_no_action_retries,
-                        len(manifest.get('llm_players') or []),
-                    )
-
-
-
-                if turns_completed >= max_turns:
                     complete_run(
                         args.api_base,
                         args.owner_api_key,
                         run_id,
                         args.worker_id,
                         lease_token,
-                        status='completed',
-                        dedupe_key=f'run_completed:{run_id}:max-turns',
+                        status='failed',
+                        error_text=str(exc),
+                        dedupe_key=f'run_completed:{run_id}:error:{type(exc).__name__}',
                     )
                     return True
-            except Exception as exc:
-                append_event(
-                    args.api_base,
-                    args.owner_api_key,
-                    run_id,
-                    args.worker_id,
-                    lease_token,
-                    'error',
-                    {
-                        'error': str(exc),
-                        'turns_completed': turns_completed,
-                    },
-                    status='running',
-                    error_text=str(exc),
-                    dedupe_key=f'error:{run_id}:{turns_completed}:{type(exc).__name__}',
-                )
+
+            if time.monotonic() - last_change_at >= args.idle_timeout:
                 complete_run(
                     args.api_base,
                     args.owner_api_key,
                     run_id,
                     args.worker_id,
                     lease_token,
-                    status='failed',
-                    error_text=str(exc),
-                    dedupe_key=f'run_completed:{run_id}:error:{type(exc).__name__}',
+                    status='stopped',
+                    error_text='idle_timeout',
+                    dedupe_key=f'run_completed:{run_id}:idle-timeout',
                 )
                 return True
 
-        if time.monotonic() - last_change_at >= args.idle_timeout:
-            complete_run(
-                args.api_base,
-                args.owner_api_key,
-                run_id,
-                args.worker_id,
-                lease_token,
-                status='stopped',
-                error_text='idle_timeout',
-                dedupe_key=f'run_completed:{run_id}:idle-timeout',
-            )
-            return True
+            time.sleep(args.poll_interval)
 
-        time.sleep(args.poll_interval)
+
+        except ApiError as exc:
+            attempt_number = (claim_payload.get('run') or {}).get('attempt_count') or 1
+            report_infrastructure_failure(args, run_id, lease_token, 'execute_run', exc, attempt_number)
+            return True
 
 
 def main():
@@ -2086,7 +2145,13 @@ def main():
             except ApiError as exc:
                 if 'HTTP 409' in str(exc) and not args.run_id:
                     continue
-                raise
+                # A control-plane failure escaped execute_run (e.g. claim-stage
+                # or a failure before a lease token was tracked). Report it so
+                # repeated identical failures terminalize the run instead of
+                # cycling through unbounded reclaims, then keep the worker alive.
+                report_infrastructure_failure(args, run_id, None, 'claim', exc, None)
+                if args.run_id or args.once:
+                    return
 
         if args.run_id or args.once:
             return

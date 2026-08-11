@@ -967,6 +967,40 @@ class NPCActor(db.Model):
         return data
 
 
+class CampaignWorldIdentity(db.Model):
+    """Authoritative graph NPC entity <-> npc_actors row pairing.
+
+    World generation materializes one fictional identity as both a
+    knowledge-graph entity (type 'npc') and an npc_actors row. The two
+    records use distinct ID namespaces (e.g. `the_candlewright` graph entity
+    vs `npc_the_candlewright` actor row), so this table records which graph
+    entity maps to which actor row for each campaign. Validation and identity
+    resolution consult this mapping instead of assuming the storage IDs must
+    be equal.
+    """
+
+    __tablename__ = 'campaign_world_identities'
+
+    id = db.Column(db.Integer, primary_key=True)
+    campaign_id = db.Column(db.Integer, db.ForeignKey('campaign.id'), nullable=False)
+    graph_entity_id = db.Column(db.String(100), nullable=False)
+    actor_id = db.Column(db.String(100), nullable=False)
+    created_at = db.Column(db.DateTime, default=utcnow)
+
+    __table_args__ = (
+        db.UniqueConstraint('campaign_id', 'graph_entity_id', name='uq_world_identity_campaign_entity'),
+        db.UniqueConstraint('campaign_id', 'actor_id', name='uq_world_identity_campaign_actor'),
+    )
+
+    def to_dict(self):
+        return {
+            'campaign_id': self.campaign_id,
+            'graph_entity_id': self.graph_entity_id,
+            'actor_id': self.actor_id,
+            'created_at': self.created_at.isoformat() if self.created_at else None,
+        }
+
+
 class CampaignClock(db.Model):
     __tablename__ = 'campaign_clocks'
 
@@ -1674,6 +1708,14 @@ class AutomationRun(db.Model):
     reconciliation_started_at = db.Column(db.DateTime, nullable=True)
     reconciliation_deadline = db.Column(db.DateTime, nullable=True)
 
+    # Added columns for bounded infrastructure-failure reclaim (issue #131)
+    reclaim_failure_fingerprint = db.Column(db.String(160), nullable=True)
+    reclaim_failure_count = db.Column(db.Integer, nullable=False, default=0)
+    reclaim_failure_attempt = db.Column(db.Integer, nullable=True)
+    reclaim_failure_stage = db.Column(db.String(120), nullable=True)
+    reclaim_failure_error = db.Column(db.Text, nullable=True)
+    reclaim_failure_at = db.Column(db.DateTime, nullable=True)
+
     scenario = db.relationship('AutomationScenario', foreign_keys=[scenario_id])
     snapshot = db.relationship('AutomationSnapshot', foreign_keys=[snapshot_id])
     owner = db.relationship('User')
@@ -1916,6 +1958,14 @@ class AutomationRun(db.Model):
             'completed_turns': completed_turns_count,
             'turn_count': completed_turns_count,
             'audit_pause_summary': self.get_audit_pause_summary(),
+            'reclaim_failure': {
+                'fingerprint': self.reclaim_failure_fingerprint,
+                'count': self.reclaim_failure_count,
+                'last_attempt': self.reclaim_failure_attempt,
+                'stage': self.reclaim_failure_stage,
+                'error': self.reclaim_failure_error,
+                'last_at': self.reclaim_failure_at.isoformat() if self.reclaim_failure_at else None,
+            } if self.reclaim_failure_fingerprint else None,
         }
         if include_secrets:
             result['lease_token'] = self.lease_token

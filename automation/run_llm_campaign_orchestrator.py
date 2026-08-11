@@ -25,6 +25,8 @@ Rules:
 - Act only as the assigned player character.
 - Do not narrate for the DM or for other player characters.
 - Prefer one concrete in-character action or short spoken line.
+- Write visible message content exactly as a player would type it in the table composer: put in-character speech or direct in-world action inside double quotation marks, and leave out-of-character table talk unquoted. The automation will convert those portions to the table's IC/OOC tags before posting.
+- Do not write <ic>, <ooc>, or other message-formatting tags yourself.
 - If pending character-sheet proposals are present for your character, you may choose to apply or dismiss one instead of posting a table message.
 - If the DM explicitly asks you for a check, save, attack roll, damage roll, initiative, or another clear player-side roll, use the roll action instead of inventing a result.
 - For rolls, return strict JSON like {"action":"roll","label":"Arcana check","expression":"1d20+5"}.
@@ -402,6 +404,54 @@ def build_player_roll_message(content, roll_summary):
     return f'{prefix}\n{roll_summary["message"]}'
 
 
+def format_player_message_for_dm(content):
+    """Serialize composer-style player text using the front end's IC/OOC rules."""
+    value = str(content or '')
+    segments = []
+    ooc_buffer = ''
+    ic_buffer = ''
+    opener = None
+
+    def push_segment(segment_type, text):
+        if not text:
+            return
+        if segments and segments[-1][0] == segment_type:
+            segments[-1] = (segment_type, segments[-1][1] + text)
+        else:
+            segments.append((segment_type, text))
+
+    for char in value:
+        if opener is None and char in {'"', '\u201c', '\u201d'}:
+            push_segment('ooc', ooc_buffer)
+            ooc_buffer = ''
+            opener = char
+            ic_buffer = ''
+            continue
+
+        closes_quote = opener == '"' and char == '"'
+        closes_curly_quote = opener in {'\u201c', '\u201d'} and char == '\u201d'
+        if opener is not None and (closes_quote or closes_curly_quote):
+            push_segment('ic', ic_buffer)
+            ic_buffer = ''
+            opener = None
+            continue
+
+        if opener is not None:
+            ic_buffer += char
+        else:
+            ooc_buffer += char
+
+    if opener is not None:
+        ooc_buffer += ic_buffer
+
+    push_segment('ooc', ooc_buffer)
+    return ''.join(
+        f'<{segment_type}>{text.strip()}</{segment_type}>'
+        for segment_type, text in segments
+        if text.strip()
+    )
+
+
 def maybe_submit_initiative_roll(api_base, campaign_id, chosen_player, roll_summary):
     if 'initiative' not in roll_summary['label'].casefold():
         return None
@@ -458,6 +508,8 @@ def execute_player_decision(api_base, campaign_id, session_id, chosen_player, de
         content = str(decision.get('content') or '').strip()
         if not content:
             raise RuntimeError('OpenCode returned action=speak without content')
+        content = format_player_message_for_dm(content)
+        decision['content'] = content
         if not dry_run:
             posted = api_post(
                 api_base,
@@ -474,6 +526,7 @@ def execute_player_decision(api_base, campaign_id, session_id, chosen_player, de
             decision.get('expression'),
         )
         content = build_player_roll_message(decision.get('content'), roll_summary)
+        content = format_player_message_for_dm(content)
         run_result['roll'] = roll_summary
         decision['content'] = content
         if not dry_run:

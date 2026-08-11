@@ -2,7 +2,6 @@ import threading
 from datetime import datetime
 
 from flask import Blueprint, current_app, jsonify, request, stream_with_context
-from sqlalchemy.exc import SQLAlchemyError
 
 from auth import authenticate_request, token_required
 from time_utils import utcnow
@@ -61,9 +60,9 @@ from services.automation_service import (
     merged_runner_config_for_scenario,
     persist_provider_call,
     record_worker_activity,
+    record_worker_infrastructure_failure,
     release_run_for_audit,
     provider_call_for_replay,
-    refresh_run_scorecard,
     run_debug_summary,
     run_watch_payload,
     runner_config_from_request,
@@ -72,6 +71,8 @@ from services.automation_service import (
     provision_automation_player,
     validate_and_normalize_roster,
     submit_audit_cycle_feedback,
+    try_refresh_run_scorecard,
+    repair_run_scorecard,
     AuditScorecardValidationError,
     validate_scorecard_template_payload,
     visible_campaigns_for_user,
@@ -1253,6 +1254,28 @@ def audit_automation_run_cycle(current_user, run_id, cycle_id):
     if cycle.run_id != run.id:
         return jsonify({'error': 'Audit cycle does not belong to this run'}), 400
 
+    # Idempotent retry protection: if the audit already committed durably but
+    # the client never observed the response (e.g. a downstream scorecard
+    # refresh failure after acceptance), a retry must not duplicate attempts or
+    # events or overwrite the accepted feedback. Return the committed state.
+    if cycle.status == 'audited':
+        prior = AutomationRunAuditAttempt.query.filter_by(
+            cycle_id=cycle.id,
+            status='success',
+        ).order_by(AutomationRunAuditAttempt.id.desc()).first()
+        if prior is not None:
+            refresh_ok, scorecard, refresh_error = try_refresh_run_scorecard(run)
+            return jsonify({
+                'run': run.to_dict(),
+                'audit_cycle': cycle.to_dict(),
+                'scorecard': scorecard or [],
+                'idempotent_retry': True,
+                'scorecard_refresh': {
+                    'status': 'ok' if refresh_ok else 'failed',
+                    **({'error': refresh_error} if refresh_error else {}),
+                },
+            }), 200
+
     data = request.get_json(silent=True) or {}
 
     # Sanitize auditor_job_id to ensure it exists for this run
@@ -1347,18 +1370,44 @@ def audit_automation_run_cycle(current_user, run_id, cycle_id):
         {'audit_cycle': cycle.to_dict()},
         dedupe_key=data.get('dedupe_key') or f'audit_cycle_audited:{cycle.id}:{cycle.updated_at.isoformat() if cycle.updated_at else cycle.id}',
     )
-    scorecard = refresh_run_scorecard(run)
-    append_run_event(
-        run,
-        'run_scorecard_updated',
-        {
-            'scorecard': scorecard,
-            'scorecard_summary': run.scorecard_summary_json or {},
-            'baseline_comparison': run.baseline_comparison_json or {},
+
+    # Audit acceptance is durable at this point. Scorecard recomputation is
+    # decoupled: a downstream scorecard defect must not turn a committed audit
+    # into an ambiguous generic 500. The response always reports acceptance and
+    # the scorecard refresh outcome (ok/pending/failed) as structured data, with
+    # the repair endpoint able to reconcile stale aggregates later.
+    refresh_ok, scorecard, refresh_error = try_refresh_run_scorecard(run)
+    if refresh_ok:
+        append_run_event(
+            run,
+            'run_scorecard_updated',
+            {
+                'scorecard': scorecard,
+                'scorecard_summary': run.scorecard_summary_json or {},
+                'baseline_comparison': run.baseline_comparison_json or {},
+            },
+            dedupe_key=f'run_scorecard_updated:{run.id}:{run.last_event_sequence or 0}',
+        )
+    else:
+        append_run_event(
+            run,
+            'run_scorecard_refresh_failed',
+            {
+                **refresh_error,
+                'audit_accepted': True,
+            },
+            dedupe_key=f'run_scorecard_refresh_failed:{run.id}:{refresh_error.get("correlation_id") or ""}',
+            skip_workspace=True,
+        )
+    return jsonify({
+        'run': run.to_dict(),
+        'audit_cycle': cycle.to_dict(),
+        'scorecard': scorecard or [],
+        'scorecard_refresh': {
+            'status': 'ok' if refresh_ok else 'failed',
+            **({'error': refresh_error} if refresh_error else {}),
         },
-        dedupe_key=f'run_scorecard_updated:{run.id}:{run.last_event_sequence or 0}',
-    )
-    return jsonify({'run': run.to_dict(), 'audit_cycle': cycle.to_dict(), 'scorecard': scorecard}), 200
+    }), 200
 
 
 @automation_bp.route('/api/automation/runs/<int:run_id>/audit-cycles/<int:cycle_id>/replay', methods=['POST'])
@@ -1414,8 +1463,17 @@ def replay_automation_run_cycle(current_user, run_id, cycle_id):
         db.session.commit()
         return jsonify({'error': {'code': e.code, 'message': str(e), 'details': e.details}, 'retryable': True, 'audit_cycle': cycle.to_dict()}), 422
 
-    scorecard = refresh_run_scorecard(run)
-    return jsonify({'run': run.to_dict(), 'audit_cycle': cycle.to_dict(), 'scorecard': scorecard, 'replayed': True}), 200
+    refresh_ok, scorecard, refresh_error = try_refresh_run_scorecard(run)
+    return jsonify({
+        'run': run.to_dict(),
+        'audit_cycle': cycle.to_dict(),
+        'scorecard': scorecard or [],
+        'replayed': True,
+        'scorecard_refresh': {
+            'status': 'ok' if refresh_ok else 'failed',
+            **({'error': refresh_error} if refresh_error else {}),
+        },
+    }), 200
 
 
 @automation_bp.route('/api/automation/runs/<int:run_id>/continue', methods=['POST'])
@@ -1523,11 +1581,13 @@ def execute_automation_auditor_tool(current_user, run_id, tool_name):
     args = data.get('args') if isinstance(data.get('args'), dict) else {}
     try:
         result = execute_auditor_tool(run, tool_name, args)
-    except SQLAlchemyError as exc:
+    except Exception as exc:
         db.session.rollback()
         return jsonify({
-            'error': f'Database error while executing auditor tool: {tool_name}',
+            'error': f'Unexpected error while executing auditor tool: {tool_name}',
             'error_class': type(exc).__name__,
+            'error_message': str(exc),
+            'correlation_id': f'auditor_tool:{run.id}:{tool_name}:{utcnow().isoformat()}',
         }), 500
     return jsonify({'run_id': run.id, 'tool_name': tool_name, 'result': result}), 200
 
@@ -1861,18 +1921,71 @@ def complete_automation_run(current_user, run_id):
         worker_id=data.get('worker_id'),
         lease_token=data.get('lease_token'),
     )
-    checks = refresh_run_scorecard(run)
-    append_run_event(
-        run,
-        'run_scorecard_updated',
-        {
-            'scorecard': checks,
-            'scorecard_summary': run.scorecard_summary_json or {},
-            'baseline_comparison': run.baseline_comparison_json or {},
+    refresh_ok, checks, refresh_error = try_refresh_run_scorecard(run)
+    if refresh_ok:
+        append_run_event(
+            run,
+            'run_scorecard_updated',
+            {
+                'scorecard': checks,
+                'scorecard_summary': run.scorecard_summary_json or {},
+                'baseline_comparison': run.baseline_comparison_json or {},
+            },
+            dedupe_key=f'run_scorecard_updated:{run.id}:{run.last_event_sequence or 0}',
+        )
+    else:
+        append_run_event(
+            run,
+            'run_scorecard_refresh_failed',
+            {
+                **refresh_error,
+                'terminal_status': run.status,
+            },
+            dedupe_key=f'run_scorecard_refresh_failed:{run.id}:{refresh_error.get("correlation_id") or ""}',
+            skip_workspace=True,
+        )
+    return jsonify({
+        'run': run.to_dict(),
+        'scorecard': checks or [],
+        'scorecard_refresh': {
+            'status': 'ok' if refresh_ok else 'failed',
+            **({'error': refresh_error} if refresh_error else {}),
         },
-        dedupe_key=f'run_scorecard_updated:{run.id}:{run.last_event_sequence or 0}',
-    )
-    return jsonify({'run': run.to_dict(), 'scorecard': checks}), 200
+    }), 200
+
+
+@automation_bp.route('/api/automation/runs/<int:run_id>/worker-error', methods=['POST'])
+@token_required
+def report_worker_infrastructure_failure(current_user, run_id):
+    """Record a worker control-plane/infrastructure failure for bounded reclaim.
+
+    The worker calls this when it aborts a run outside gameplay due to a
+    required control-plane fetch failure. The server persists a stable failure
+    fingerprint with a consecutive occurrence count and either releases the
+    lease for bounded retry or terminalizes the run once the threshold is hit
+    (issue #131).
+    """
+    run = get_or_404(AutomationRun, run_id)
+    if not _run_owned_by_user(current_user, run):
+        return jsonify({'error': 'Forbidden'}), 403
+
+    data = request.get_json(silent=True) or {}
+    try:
+        result = record_worker_infrastructure_failure(
+            run.id,
+            data.get('worker_id'),
+            data.get('lease_token'),
+            stage=data.get('stage') or 'unknown',
+            fingerprint=data.get('fingerprint') or 'unknown',
+            error=data.get('error'),
+            attempt_number=data.get('attempt_number'),
+        )
+    except ValueError as exc:
+        db.session.rollback()
+        return jsonify({'error': str(exc)}), 409
+
+    run = db.session.get(AutomationRun, run.id)
+    return jsonify({'result': result, 'run': run.to_dict()}), 200
 
 
 @automation_bp.route('/api/automation/runs/<int:run_id>/scorecard', methods=['GET'])
@@ -1881,9 +1994,48 @@ def get_automation_run_scorecard(current_user, run_id):
     run = get_or_404(AutomationRun, run_id)
     if not _run_visible_to_user(current_user, run):
         return jsonify({'error': 'Forbidden'}), 403
-    refresh_run_scorecard(run)
+    refresh_ok, _, refresh_error = try_refresh_run_scorecard(run)
     results = AutomationRunAuditResult.query.filter_by(run_id=run.id).order_by(AutomationRunAuditResult.check_id.asc()).all()
-    return jsonify({'run': run.to_dict(), 'scorecard': [result.to_dict() for result in results], 'baseline_comparison': run.baseline_comparison_json or {}}), 200
+    return jsonify({
+        'run': run.to_dict(),
+        'scorecard': [result.to_dict() for result in results],
+        'baseline_comparison': run.baseline_comparison_json or {},
+        'scorecard_refresh': {
+            'status': 'ok' if refresh_ok else 'failed',
+            **({'error': refresh_error} if refresh_error else {}),
+        },
+    }), 200
+
+
+@automation_bp.route('/api/automation/runs/<int:run_id>/scorecard/repair', methods=['POST'])
+@token_required
+def repair_automation_run_scorecard(current_user, run_id):
+    """Rebuild stale aggregate scorecard state from authoritative audited cycles."""
+    run = get_or_404(AutomationRun, run_id)
+    if not _run_owned_by_user(current_user, run):
+        return jsonify({'error': 'Forbidden'}), 403
+    ok, checks, refresh_error = repair_run_scorecard(run)
+    results = AutomationRunAuditResult.query.filter_by(run_id=run.id).order_by(AutomationRunAuditResult.check_id.asc()).all()
+    if ok:
+        append_run_event(
+            run,
+            'run_scorecard_updated',
+            {
+                'scorecard': checks,
+                'scorecard_summary': run.scorecard_summary_json or {},
+                'baseline_comparison': run.baseline_comparison_json or {},
+                'repair': True,
+            },
+            dedupe_key=f'run_scorecard_updated:{run.id}:{run.last_event_sequence or 0}',
+        )
+    return jsonify({
+        'run': run.to_dict(),
+        'scorecard': [result.to_dict() for result in results],
+        'scorecard_refresh': {
+            'status': 'ok' if ok else 'failed',
+            **({'error': refresh_error} if refresh_error else {}),
+        },
+    }), (200 if ok else 502)
 
 
 @automation_bp.route('/api/automation/compare', methods=['POST'])
@@ -1995,11 +2147,13 @@ def get_automation_run_audit_bundle(current_user, run_id):
         return jsonify({'error': 'Forbidden'}), 403
     try:
         bundle = get_current_audit_bundle_data(run)
-    except SQLAlchemyError as exc:
+    except Exception as exc:
         db.session.rollback()
         return jsonify({
-            'error': 'Database error while building the audit bundle.',
+            'error': 'Unexpected error while building the audit bundle.',
             'error_class': type(exc).__name__,
+            'error_message': str(exc),
+            'correlation_id': f'audit_bundle:{run.id}:{utcnow().isoformat()}',
         }), 500
     return jsonify(bundle), 200
 

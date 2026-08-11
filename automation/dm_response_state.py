@@ -24,6 +24,30 @@ def dm_turn_has_visible_output(status_dict):
     return status_dict.get('dm_message_id') is not None
 
 
+def dm_turn_is_error(status_dict):
+    """True when a DM turn durably failed (visible error or failed post-turn)."""
+    if not isinstance(status_dict, dict):
+        return False
+    return str(status_dict.get('status') or '').strip().lower() == 'error' or dm_turn_post_turn_failed(status_dict)
+
+
+def dm_turn_error_class(status_dict):
+    """Return a stable, bounded classification for a failed DM turn."""
+    if not isinstance(status_dict, dict):
+        return 'dm_turn_failed'
+    status = str(status_dict.get('status') or '').strip().lower()
+    post_turn = str(status_dict.get('post_turn_status') or '').strip().lower()
+    if post_turn == 'error':
+        return 'dm_post_turn_error'
+    if post_turn == 'timed_out':
+        return 'dm_post_turn_timeout'
+    if post_turn in {'partial', 'failed'}:
+        return 'dm_post_turn_failed'
+    if status == 'error':
+        return 'dm_turn_error'
+    return 'dm_turn_failed'
+
+
 def dm_turn_post_turn_resolved(status_dict):
     if not isinstance(status_dict, dict):
         return False

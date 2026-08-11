@@ -1,5 +1,6 @@
 import hashlib
 import json
+import re
 import secrets
 from collections import Counter
 from datetime import datetime, timedelta
@@ -87,6 +88,21 @@ class AuditScorecardValidationError(ValueError):
         self.details = details or {}
 
 
+class InfrastructureFailureThresholdError(ValueError):
+    """A reclaim was refused because consecutive identical infrastructure
+    failures already reached the configured threshold (issue #131)."""
+
+    def __init__(self, run):
+        super().__init__(
+            f'Run {run.id} has reached the infrastructure-failure reclaim threshold '
+            f'({run.reclaim_failure_count} consecutive '
+            f'"{run.reclaim_failure_fingerprint}") and will not be reclaimed'
+        )
+        self.run_id = run.id
+        self.fingerprint = run.reclaim_failure_fingerprint
+        self.count = run.reclaim_failure_count
+
+
 def _normalize_memory_anchors(value):
     anchors = value if isinstance(value, dict) else {}
     return {
@@ -155,6 +171,12 @@ def _vector_digest(vector):
 
 DEFAULT_LEASE_SECONDS = 45
 DEFAULT_PROVISIONING_LEASE_SECONDS = 300
+DEFAULT_MAX_RECLAIM_FAILURES = 5
+# A reclaim-failure fingerprint/count records *consecutive* identical control-plane
+# failures. Appending any of these gameplay milestones proves the run recovered
+# and must reset the counter so a handful of transient failures spread across an
+# otherwise healthy long-running run never terminalizes it as a reclaim loop.
+RECLAIM_RECOVERY_EVENT_TYPES = {'player_decision', 'turn_result', 'dm_turn_status'}
 CLAIMABLE_ACTIVE_STATUSES = {'claimed', 'running', 'stop_requested', 'reconciling'}
 AUDIT_READY_STATUSES = {'audited', 'skipped'}
 CUSTOM_SCORECARD_STATUS_ORDER = ('pass', 'warn', 'fail', 'not_assessed', 'not_applicable')
@@ -1784,7 +1806,31 @@ def validate_evidence_ref(ref):
     return True
 
 
+def _validate_audit_text_field(name, value):
+    if value is None:
+        return value
+    if not isinstance(value, str):
+        raise AuditScorecardValidationError(
+            f'audit {name} must be a string.',
+            code=f'invalid_{name}',
+            details={'received_type': type(value).__name__},
+        )
+    return value
+
+
 def submit_audit_cycle_feedback(cycle, *, summary=None, notes=None, scorecard=None):
+    # Validate the complete submission schema before any ORM mutation so
+    # dictionary/list values cannot reach TEXT columns and surface as opaque
+    # database binder failures. This keeps validation errors structured and
+    # retryable instead of a generic 500.
+    summary = _validate_audit_text_field('summary', summary)
+    notes = _validate_audit_text_field('notes', notes)
+    if scorecard is not None and not isinstance(scorecard, dict):
+        raise AuditScorecardValidationError(
+            'audit scorecard must be an object.',
+            code='invalid_scorecard_shape',
+            details={'received_type': type(scorecard).__name__},
+        )
     scorecard_payload = _json_object(scorecard, None)
     criteria_results = []
     template = current_scorecard_template_for_run(cycle.run)
@@ -2029,6 +2075,16 @@ def provisioning_lease_seconds_for_run(run):
     return max(60, configured)
 
 
+def max_reclaim_failures_for_run(run):
+    """Consecutive identical infrastructure-failure reclaims allowed before the
+    run is terminalized instead of being reclaimed again (issue #131)."""
+    configured = _safe_int(
+        (run.runner_config_json or {}).get('max_reclaim_failures'),
+        DEFAULT_MAX_RECLAIM_FAILURES,
+    )
+    return max(1, configured)
+
+
 from sqlalchemy import update as sa_update
 
 
@@ -2071,6 +2127,19 @@ def reserve_run_lease(run_id, worker_id, now, provisioning=False):
     if result.rowcount == 1:
         db.session.commit()
         return run, new_lease_token, False
+
+    # Belt-and-suspenders for issue #131: never reclaim a run whose
+    # consecutive identical infrastructure failures already hit the threshold.
+    # The worker's /worker-error report normally terminalizes first; this guard
+    # catches the case where the run became reclaimable again (e.g. the
+    # terminalizing report raced with lease expiry).
+    run = db.session.get(AutomationRun, run_id)
+    if (
+        run
+        and run.reclaim_failure_fingerprint
+        and run.reclaim_failure_count >= max_reclaim_failures_for_run(run)
+    ):
+        raise InfrastructureFailureThresholdError(run)
 
     # Try reclaim (active status but expired lease)
     reclaim_stmt = (
@@ -2144,6 +2213,123 @@ def release_run_for_audit(run_id, lease_token):
     return result.rowcount > 0
 
 
+def clear_reclaim_failure(run):
+    """Reset the consecutive infrastructure-failure tracking after the run has
+    demonstrably recovered (a gameplay milestone was reached), so the counter
+    reflects only back-to-back failures with no intervening recovery."""
+    if not run.reclaim_failure_fingerprint:
+        return
+    run.reclaim_failure_fingerprint = None
+    run.reclaim_failure_count = 0
+    run.reclaim_failure_attempt = None
+    run.reclaim_failure_stage = None
+    run.reclaim_failure_error = None
+    run.reclaim_failure_at = None
+
+
+def record_worker_infrastructure_failure(
+    run_id,
+    worker_id,
+    lease_token,
+    *,
+    stage,
+    fingerprint,
+    error,
+    attempt_number=None,
+):
+    """Persist a stable control-plane failure fingerprint on a run and either
+    release the lease for bounded retry or terminalize the run once the
+    consecutive-failure threshold is reached (issue #131).
+
+    A worker that aborts outside gameplay reports the failure with its current
+    worker_id/lease_token. The server:
+      - validates the reporter still owns the run lease (or matches worker_id
+        when no token is available, e.g. a claim-stage failure),
+      - rolls the failure into a stable fingerprint + consecutive count,
+      - records one durable event per attempt (dedupe key carries the attempt
+        number so every identical failure is observable),
+      - releases the lease back to queued while the count is below the
+        threshold so transient failures retry with bounded backoff,
+      - transitions the run to a terminal `failed` state once the threshold is
+        hit, ending the reclaim crash loop with a diagnosable error.
+
+    Returns a dict with `action` in {'released', 'terminalized', 'already_terminal'}.
+    """
+    run = db.session.get(AutomationRun, run_id)
+    if run is None:
+        raise ValueError('Run not found')
+
+    if run.status in {'completed', 'failed', 'stopped'}:
+        return {'action': 'already_terminal', 'status': run.status}
+
+    if run.worker_id and worker_id and run.worker_id != worker_id:
+        raise ValueError('Run is leased by another worker')
+    if lease_token and run.lease_token and run.lease_token != lease_token:
+        raise ValueError('Run lease token is no longer valid')
+
+    now = _utcnow()
+    threshold = max_reclaim_failures_for_run(run)
+    if run.reclaim_failure_fingerprint == fingerprint:
+        run.reclaim_failure_count = (run.reclaim_failure_count or 0) + 1
+    else:
+        run.reclaim_failure_fingerprint = fingerprint
+        run.reclaim_failure_count = 1
+    run.reclaim_failure_attempt = attempt_number if attempt_number is not None else run.attempt_count
+    run.reclaim_failure_stage = stage
+    run.reclaim_failure_error = error
+    run.reclaim_failure_at = now
+
+    append_run_event(
+        run,
+        'worker_infrastructure_failure',
+        {
+            'stage': stage,
+            'fingerprint': fingerprint,
+            'attempt_number': run.reclaim_failure_attempt,
+            'count': run.reclaim_failure_count,
+            'threshold': threshold,
+            'error': error,
+            'semantic_key': f'infra:{stage}:{fingerprint}',
+            'reporter_worker_id': worker_id,
+            'reported_with_lease_token': bool(lease_token),
+        },
+        dedupe_key=f'worker_infrastructure_failure:{run.id}:{fingerprint}:attempt:{run.reclaim_failure_attempt}',
+    )
+
+    if run.reclaim_failure_count >= threshold:
+        run.status = 'failed'
+        run.error_text = (
+            f'infrastructure_failure_reclaim_loop:'
+            f'stage:{stage}:fingerprint:{fingerprint}:'
+            f'count:{run.reclaim_failure_count}:attempt:{run.reclaim_failure_attempt}'
+        )
+        run.finished_at = now
+        run.lease_expires_at = now
+        run.lease_token = None
+        run.worker_id = None
+        run.heartbeat_at = now
+        db.session.commit()
+        return {
+            'action': 'terminalized',
+            'status': 'failed',
+            'count': run.reclaim_failure_count,
+            'threshold': threshold,
+        }
+
+    run.status = 'queued'
+    run.worker_id = None
+    run.lease_token = None
+    run.heartbeat_at = None
+    run.lease_expires_at = None
+    db.session.commit()
+    return {
+        'action': 'released',
+        'status': 'queued',
+        'count': run.reclaim_failure_count,
+        'threshold': threshold,
+    }
+
+
 def lease_is_expired(run, at=None):
     if run.status == 'queued':
         return False
@@ -2196,6 +2382,8 @@ def append_run_event(run, event_type, payload=None, *, dedupe_key=None, worker_i
     )
     db.session.add(row)
     db.session.flush()
+    if event_type in RECLAIM_RECOVERY_EVENT_TYPES:
+        clear_reclaim_failure(run)
     run.last_event_id = row.id
     run.last_event_sequence = row.sequence_number
     run.updated_at = _utcnow()
@@ -3163,7 +3351,13 @@ def baseline_comparison_for_run(run, results):
     }
 
 
-def refresh_run_scorecard(run):
+def refresh_run_scorecard(run, *, commit=True):
+    """Recompute and persist scorecard aggregates from authoritative source rows.
+
+    ``commit=False`` flushes without committing so the recomputation can
+    participate in a caller-owned transaction (e.g. audit acceptance). Callers
+    that pass ``commit=False`` own the eventual commit/rollback.
+    """
     event_rows, audit_rows, provider_rows, cycle_rows = _run_context(run)
     metrics = _collect_run_metrics(run, event_rows, audit_rows, provider_rows, cycle_rows)
     config = dict(DEFAULT_AUDIT_CONFIG)
@@ -3335,8 +3529,96 @@ def refresh_run_scorecard(run):
         'scorecard_configuration': scorecard_configuration(current_scorecard_template_for_run(run)),
         'category_breakdown': category_breakdown,
     }
-    db.session.commit()
+    if commit:
+        db.session.commit()
+    else:
+        db.session.flush()
     return results_payload
+
+
+def _record_scorecard_refresh_failure(run, exc, *, correlation_id=None):
+    """Durably record a structured, diagnosable scorecard refresh failure.
+
+    The failure is recorded on the run (``scorecard_summary_json``) so
+    control-plane reads can surface structured diagnostics without re-running
+    the failing recomputation. The pre-existing (possibly stale) aggregate rows
+    are preserved so an active run stays observable while refresh is unhealthy.
+    """
+    correlation_id = correlation_id or f'scorecard_refresh_{run.id}_{utcnow().isoformat()}'
+    summary = dict(run.scorecard_summary_json or {})
+    summary['scorecard_refresh'] = {
+        'status': 'failed',
+        'error_class': type(exc).__name__,
+        'message': str(exc),
+        'correlation_id': correlation_id,
+        'recorded_at': utcnow().isoformat(),
+    }
+    run.scorecard_summary_json = summary
+    try:
+        db.session.commit()
+    except Exception:
+        db.session.rollback()
+    try:
+        append_run_event(
+            run,
+            'run_scorecard_refresh_failed',
+            {
+                'error_class': type(exc).__name__,
+                'message': str(exc),
+                'correlation_id': correlation_id,
+                'stale_scorecard_preserved': True,
+            },
+            dedupe_key=f'run_scorecard_refresh_failed:{run.id}:{correlation_id}',
+            skip_workspace=True,
+        )
+    except Exception:
+        # The run-level diagnostic above is the durable source of truth; a
+        # control-plane event append must never mask the underlying failure.
+        pass
+    return correlation_id
+
+
+def scorecard_refresh_diagnostic(run):
+    """Return the stored scorecard refresh diagnostic, if any."""
+    return (run.scorecard_summary_json or {}).get('scorecard_refresh')
+
+
+def try_refresh_run_scorecard(run, *, commit=True):
+    """Best-effort scorecard refresh for control-plane and evidence paths.
+
+    A downstream scorecard defect must not make an active run unobservable or
+    unresumable, and must not make evidence endpoints wholly unavailable. On
+    failure the exception is recorded as a structured diagnostic, the stored
+    (stale) aggregates are preserved, and ``(False, None, diagnostic)`` is
+    returned. Returns ``(True, results_payload, None)`` on success.
+    """
+    try:
+        results = refresh_run_scorecard(run, commit=commit)
+    except Exception as exc:
+        try:
+            db.session.rollback()
+        except Exception:
+            pass
+        diagnostic = {
+            'status': 'failed',
+            'error_class': type(exc).__name__,
+            'message': str(exc),
+            'correlation_id': _record_scorecard_refresh_failure(run, exc),
+        }
+        return False, None, diagnostic
+    return True, results, None
+
+
+def repair_run_scorecard(run, *, commit=True):
+    """Rebuild stale aggregate scorecard state from authoritative audited cycles.
+
+    This is the repair/retry path for runs whose aggregates drifted because a
+    downstream scorecard refresh previously failed (Run 42-style). It recomputes
+    from the durable source rows and returns the same contract as
+    :func:`try_refresh_run_scorecard`, so a repeated failure is diagnosed
+    structurally instead of surfacing as a generic 500.
+    """
+    return try_refresh_run_scorecard(run, commit=commit)
 
 
 def latest_session_for_run(run):
@@ -3364,7 +3646,6 @@ def run_watch_payload(run, current_user=None):
     if run.derived_campaign_id:
         encounter_map = EncounterMap.query.filter_by(campaign_id=run.derived_campaign_id, is_archived=False).order_by(EncounterMap.created_at.desc(), EncounterMap.id.desc()).first()
 
-    refresh_run_scorecard(run)
     provider_calls = [
         row.to_dict()
         for row in AutomationRunProviderCall.query.filter_by(run_id=run.id)
@@ -3432,6 +3713,7 @@ def run_watch_payload(run, current_user=None):
         ],
         'incidents': run.scorecard_summary_json.get('incidents') or [],
         'retry_metrics': run.scorecard_summary_json.get('retry_metrics') or {},
+        'scorecard_refresh': scorecard_refresh_diagnostic(run),
         'provider_calls': provider_calls,
         'baseline_comparison': run.baseline_comparison_json or {},
     })
@@ -3733,6 +4015,24 @@ def run_debug_summary(run_id):
         
     if run.claim_failure_reason:
         stuck_reasons.append('worker_claim_failure')
+
+    reclaim_failure = None
+    if run.reclaim_failure_fingerprint:
+        reclaim_threshold = max_reclaim_failures_for_run(run)
+        reclaim_failure = {
+            'fingerprint': run.reclaim_failure_fingerprint,
+            'count': run.reclaim_failure_count,
+            'threshold': reclaim_threshold,
+            'last_attempt': run.reclaim_failure_attempt,
+            'stage': run.reclaim_failure_stage,
+            'error': run.reclaim_failure_error,
+            'last_at': run.reclaim_failure_at.isoformat() if run.reclaim_failure_at else None,
+            'terminal': run.reclaim_failure_count >= reclaim_threshold,
+        }
+        if run.reclaim_failure_count >= reclaim_threshold:
+            stuck_reasons.append('reclaim_failure_threshold_reached')
+        else:
+            stuck_reasons.append('worker_infrastructure_failure')
         
     if run.status == 'claimed' and run.lease_expires_at and now >= run.lease_expires_at:
         stuck_reasons.append('claimed_lease_expired')
@@ -3787,6 +4087,7 @@ def run_debug_summary(run_id):
         'status': run.status,
         'last_event': last_event,
         'lease': lease_summary,
+        'reclaim_failure': reclaim_failure,
         'worker': {
             'id': worker.worker_id if worker else None,
             'last_heartbeat_at': worker.last_heartbeat_at.isoformat() if worker and worker.last_heartbeat_at else None,

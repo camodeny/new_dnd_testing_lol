@@ -331,6 +331,44 @@ class AutomationRouteTest(unittest.TestCase):
 
 
 
+    def test_trace_only_memory_update_error_is_correlated_without_raising(self):
+        _scenario_id, run_id = self._create_scorecard_run([{'id': 'runtime_truth', 'label': 'Runtime truth'}])
+        from services.automation_service import refresh_run_scorecard
+
+        with app.app_context():
+            run = db.session.get(AutomationRun, run_id)
+            run.status = 'completed'
+            run.derived_campaign_id = self.campaign_id
+            # Regression for Run 42: a trace-only post-turn error event whose
+            # payload omits player_message_id must correlate via the trace id
+            # without raising (the missing `re` import surfaced here).
+            db.session.add(CampaignAuditEvent(
+                campaign_id=run.derived_campaign_id,
+                event_type='memory_update_error',
+                summary='Post-turn memory update failed.',
+                payload=json.dumps({'kind': 'trace_only'}),
+                trace_id='session_memory_writer:session_1:message_4242',
+                parent_trace_id='session_dm:session_1:message_4242',
+            ))
+            db.session.commit()
+            results = refresh_run_scorecard(run)
+            summary = run.scorecard_summary_json
+
+            self.assertEqual(summary['error_counts_by_kind'], {'memory': 1})
+            self.assertEqual(summary['unrecovered_error_count'], 1)
+            correlated = summary['automation_errors'][0]['correlation_key']
+            self.assertTrue(correlated.startswith('player_message:'))
+            self.assertEqual(summary['automation_errors'][0]['player_message_id'], 4242)
+            error_check = next(item for item in results if item['check_id'] == 'error_count')
+            self.assertEqual(error_check['status'], 'fail')
+
+        response = self.client.get(f'/api/automation/runs/{run_id}/scorecard', headers=self.headers)
+        self.assertEqual(response.status_code, 200)
+        api_summary = response.get_json()['run']['scorecard_summary']
+        self.assertEqual(api_summary['error_counts_by_kind'], {'memory': 1})
+        self.assertEqual(api_summary['automation_errors'][0]['player_message_id'], 4242)
+
+
     def test_create_scenario_snapshot_run_and_claim_hidden_clone(self):
         scenario_response = self.client.post(
             '/api/automation/scenarios',
@@ -623,12 +661,15 @@ class AutomationRouteTest(unittest.TestCase):
             run.awaiting_audit_phase = 'after_dm'
             db.session.commit()
 
-        run_payload = self.client.get(
-            f'/api/automation/runs/{run_id}',
-            headers=self.headers,
-        ).get_json()
+        # Derived recomputation happens on the scorecard/evidence endpoints;
+        # control-plane reads serve the last committed aggregate state. Recompute
+        # first so all surfaces observe the same canonical snapshot.
         scorecard_payload = self.client.get(
             f'/api/automation/runs/{run_id}/scorecard',
+            headers=self.headers,
+        ).get_json()
+        run_payload = self.client.get(
+            f'/api/automation/runs/{run_id}',
             headers=self.headers,
         ).get_json()
         bundle_payload = self.client.get(

@@ -1477,6 +1477,49 @@ class DmToolsTest(unittest.TestCase):
         payload = json.loads(messages[1]['content'])
         self.assertEqual(payload['open_public_threads'], ['Locate the missing keeper.'])
 
+    def test_canon_checker_contract_includes_only_visible_clock_evidence(self):
+        messages = build_session_canon_discipline_check_messages(
+            'The festival is four days out.',
+            {
+                'recent_messages': [{'role': 'player', 'content': '<ooc>How is it going?</ooc>'}],
+                'active_clocks': [
+                    {
+                        'clock_id': 'clock_harvest_festival',
+                        'name': 'Harvest Festival Countdown',
+                        'summary': 'The festival will begin in four days.',
+                        'filled': 0,
+                        'segments': 4,
+                        'trigger': 'Each daybreak advances this clock.',
+                        'status': 'active',
+                        'visibility': 'public',
+                        'on_complete': 'A hidden specter manifests.',
+                    },
+                    {
+                        'clock_id': 'clock_hidden_ritual',
+                        'name': 'Hidden Ritual',
+                        'summary': 'The cult completes its ritual.',
+                        'filled': 1,
+                        'segments': 4,
+                        'status': 'active',
+                        'visibility': 'dm_private',
+                    },
+                ],
+            },
+        )
+
+        self.assertIn('visible_active_clocks', messages[0]['content'])
+        payload = json.loads(messages[1]['content'])
+        self.assertEqual(payload['visible_active_clocks'], [{
+            'clock_id': 'clock_harvest_festival',
+            'name': 'Harvest Festival Countdown',
+            'summary': 'The festival will begin in four days.',
+            'filled': 0,
+            'segments': 4,
+            'trigger': 'Each daybreak advances this clock.',
+            'status': 'active',
+            'visibility': 'public',
+        }])
+
 
 
 

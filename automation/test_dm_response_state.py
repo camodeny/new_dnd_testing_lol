@@ -63,6 +63,46 @@ class DmResponseStateUnitTests(unittest.TestCase):
                     expected,
                 )
 
+    def test_dm_turn_is_error_matrix(self):
+        cases = [
+            ({'status': 'error'}, True),
+            ({'status': 'speak', 'post_turn_status': 'error'}, True),
+            ({'status': 'speak', 'post_turn_status': 'failed'}, True),
+            ({'status': 'speak', 'post_turn_status': 'partial'}, True),
+            ({'status': 'speak', 'post_turn_status': 'timed_out'}, True),
+            ({'status': 'speak', 'post_turn_status': 'complete'}, False),
+            ({'status': 'silent'}, False),
+            ({'status': 'empty'}, False),
+            ({'status': 'pending'}, False),
+            ({}, False),
+            (None, False),
+        ]
+        for status, expected in cases:
+            with self.subTest(status=status):
+                self.assertIs(
+                    dm_response_state.dm_turn_is_error(status),
+                    expected,
+                )
+
+    def test_dm_turn_error_class_matrix(self):
+        cases = [
+            ({'status': 'error'}, 'dm_turn_error'),
+            ({'status': 'speak', 'post_turn_status': 'error'}, 'dm_post_turn_error'),
+            ({'status': 'speak', 'post_turn_status': 'timed_out'}, 'dm_post_turn_timeout'),
+            ({'status': 'speak', 'post_turn_status': 'partial'}, 'dm_post_turn_failed'),
+            ({'status': 'speak', 'post_turn_status': 'failed'}, 'dm_post_turn_failed'),
+            ({'status': 'speak', 'post_turn_status': 'complete'}, 'dm_turn_failed'),
+            ({'status': 'silent'}, 'dm_turn_failed'),
+            ({}, 'dm_turn_failed'),
+            (None, 'dm_turn_failed'),
+        ]
+        for status, expected in cases:
+            with self.subTest(status=status):
+                self.assertEqual(
+                    dm_response_state.dm_turn_error_class(status),
+                    expected,
+                )
+
     def test_timeout_classification_matrix(self):
         cases = [
             ({'status': 'pending'}, 'visible', 'dm_visible_response_timeout'),

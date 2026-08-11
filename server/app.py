@@ -105,6 +105,8 @@ def create_app():
 def initialize_database(app):
     with app.app_context():
         db.create_all()
+        from schema_reconciliation import reconcile_schema
+        reconcile_schema(app)
         reconcile_stale_awaiting_audit_runs()
         bootstrap_owner_api_key()
         print("Database initialization completed.", flush=True)
