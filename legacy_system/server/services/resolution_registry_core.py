@@ -66,6 +66,15 @@ def normalize_resolved_entity_refs(resolved_entity_refs):
     return refs
 
 
+def _canonical_entity_type(known_ids, canonical_id):
+    """Return the durable type of a known entity id, falling back to npc/other."""
+    if not isinstance(known_ids, dict):
+        return "other"
+    if canonical_id in known_ids.get("npc_ids", set()):
+        return "npc"
+    return known_ids.get("entity_types", {}).get(canonical_id, "other") or "other"
+
+
 def _drop_diagnostics_for_mention(diagnostics, mention_ref):
     for key in (
         "created_new",
@@ -171,6 +180,8 @@ def reconcile_registry_with_refs(registry, refs, known_ids, allocated_ids, diagn
         entry["resolution_state"] = "resolved"
         entry["identity_status"] = "known_public"
         entry["blocked_operations"] = []
+        if ref_cid in valid_ids:
+            entry["entity_type"] = _canonical_entity_type(known_ids_map, ref_cid)
         evidence = entry.get("evidence")
         if not isinstance(evidence, list):
             evidence = []
@@ -453,6 +464,7 @@ def _resolve_packet_mention(mention, known_ids, prior_resolution_map, allocated_
             entry["canonical_name"] = existing_name or public_name
             entry["decision"] = "reuse_existing"
             entry["resolution_state"] = "resolved"
+            entry["entity_type"] = _canonical_entity_type(known_ids, canonical_id_from_packet)
         else:
             entry["decision"] = "request_clarification"
             entry["resolution_state"] = "clarification_requested"
@@ -481,6 +493,7 @@ def _resolve_packet_mention(mention, known_ids, prior_resolution_map, allocated_
             entry["decision"] = "reuse_existing"
             entry["resolution_state"] = "resolved"
             entry["visibility"] = "public"
+            entry["entity_type"] = _canonical_entity_type(known_ids, canonical_id_from_packet)
         else:
             entry["canonical_id"] = canonical_id_from_packet or allocate_durable_id(
                 public_name, allocated_ids
@@ -550,6 +563,7 @@ def _resolve_entity_claim(claim, known_ids, prior_resolution_map, allocated_ids,
             entry["decision"] = "reuse_existing"
             entry["resolution_state"] = "resolved"
             entry["identity_status"] = prior.get("visibility", "") == "dm_private" and "known_hidden" or "known_public"
+            entry["entity_type"] = _canonical_entity_type(known_ids, canonical_id)
             entry["evidence"].append({"source": "prior_durable_memory", "field": "identity_resolution_record"})
             return entry
 
@@ -573,6 +587,7 @@ def _resolve_entity_claim(claim, known_ids, prior_resolution_map, allocated_ids,
             entry["canonical_name"] = existing_name or name
         entry["resolution_state"] = "resolved"
         entry["identity_status"] = "known_public"
+        entry["entity_type"] = _canonical_entity_type(known_ids, can_id)
         entry["evidence"].append({"source": "prior_durable_memory", "field": "entity_name_match"})
         return entry
     else:
@@ -706,6 +721,7 @@ def _apply_clarification_answer(pending_clarification, known_ids, allocated_ids)
             "decision": "reuse_existing",
             "blocked_operations": [],
             "resolution_state": "resolved",
+            "entity_type": _canonical_entity_type(known_ids, resolved_canonical_id),
         }
 
     if resolution_action == "new_entity":

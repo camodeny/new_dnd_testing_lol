@@ -531,6 +531,11 @@ def _known_ids(campaign):
             for entity in graph.get('entities', [])
             if isinstance(entity, dict) and clean_id(entity.get('id'), '') and clean_text(entity.get('name'), 160)
         },
+        'entity_types': {
+            clean_id(entity.get('id'), ''): normalize_world_entity_type(entity.get('type')) or 'other'
+            for entity in graph.get('entities', [])
+            if isinstance(entity, dict) and clean_id(entity.get('id'), '')
+        },
         'entity_to_actor': entity_to_actor,
         'actor_to_entity': actor_to_entity,
     }
@@ -923,6 +928,16 @@ def _augment_registry_from_resolved(registry, resolved_entities, resolved_npcs, 
         for term in terms:
             ref_by_canonical_term.setdefault(term, ref)
 
+    def _canonical_type_for(entity_id):
+        if entity_id in known.get("npc_ids", set()):
+            return "npc"
+        return known.get("entity_types", {}).get(entity_id, "other") or "other"
+
+    def _entity_type_for(entity_id, claimed_type):
+        if entity_id in known.get("entity_ids", set()) or entity_id in known.get("npc_ids", set()):
+            return _canonical_type_for(entity_id)
+        return claimed_type
+
     def _ref_target(name, proposed_id=""):
         ref = ref_by_label.get(name.strip().lower())
         if ref is None:
@@ -979,7 +994,7 @@ def _augment_registry_from_resolved(registry, resolved_entities, resolved_npcs, 
                 "decision": decision,
                 "blocked_operations": [],
                 "resolution_state": "resolved",
-                "entity_type": entity_type,
+                "entity_type": _entity_type_for(new_id, entity_type),
             })
             index += 1
             continue
@@ -1018,7 +1033,7 @@ def _augment_registry_from_resolved(registry, resolved_entities, resolved_npcs, 
                 "decision": decision,
                 "blocked_operations": [],
                 "resolution_state": "resolved",
-                "entity_type": entity_type,
+                "entity_type": _entity_type_for(proposed_id, entity_type),
             })
         else:
             # Look up matching known entity by canonical name or alias (not slug)
@@ -1050,7 +1065,7 @@ def _augment_registry_from_resolved(registry, resolved_entities, resolved_npcs, 
                 "decision": decision,
                 "blocked_operations": [],
                 "resolution_state": "resolved",
-                "entity_type": entity_type,
+                "entity_type": _entity_type_for(new_id, entity_type),
             })
         index += 1
 
