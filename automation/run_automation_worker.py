@@ -1808,6 +1808,8 @@ def execute_run(args, run_id):
                     if (decision.get('action') or '').strip().lower() == 'roll':
                         roll_summary = orchestrator.execute_player_roll(decision.get('label'), decision.get('expression'))
                         decision['content'] = orchestrator.build_player_roll_message(decision.get('content'), roll_summary)
+                    if (decision.get('action') or '').strip().lower() in {'speak', 'roll'}:
+                        decision['content'] = orchestrator.format_player_message_for_dm(decision.get('content'))
                     result = submit_decision(
                         args.api_base,
                         args.owner_api_key,
