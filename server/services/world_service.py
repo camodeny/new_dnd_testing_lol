@@ -6,15 +6,18 @@ from sqlalchemy.exc import IntegrityError
 from time_utils import utcnow
 from models import (
     db,
+    CampaignMember,
     CampaignClock,
     CampaignWorld,
     CampaignWorldIdentity,
+    Character,
     NPCActor,
     WorldEvent,
 )
 from openrouter import get_world_genesis_package
 from services.audit_service import log_audit_event
 from services.embedding_service import upsert_memory_embedding
+from services.entity_types import normalize_world_entity_type
 from services.planning_service import can_start_session, planning_context
 
 
@@ -118,39 +121,134 @@ def sanitize_public_intro(raw_intro, campaign):
     return intro
 
 
-def normalize_entities(raw_entities):
+def _selected_character_entities(campaign):
+    if campaign is None or campaign.id is None:
+        return []
+    members = (
+        CampaignMember.query
+        .filter_by(campaign_id=campaign.id)
+        .filter(CampaignMember.selected_character_id.isnot(None))
+        .order_by(CampaignMember.id.asc())
+        .all()
+    )
+    selected_ids = []
+    for member in members:
+        if (member.role or 'player') == 'spectator':
+            continue
+        if member.selected_character_id not in selected_ids:
+            selected_ids.append(member.selected_character_id)
+    if not selected_ids:
+        return []
+
+    characters = {
+        character.id: character
+        for character in Character.query.filter(Character.id.in_(selected_ids)).all()
+        if character.campaign_id == campaign.id
+    }
+    result = []
+    for character_id in selected_ids:
+        character = characters.get(character_id)
+        if character is None or not clean_text(character.name, 160):
+            continue
+        class_names = [
+            clean_text(character_class.class_name, 40)
+            for character_class in character.classes
+            if clean_text(character_class.class_name, 40)
+        ]
+        description = ' '.join(
+            part for part in (
+                clean_text(character.subrace or character.race, 80),
+                '/'.join(class_names[:3]),
+                'adventurer',
+            )
+            if part
+        )
+        result.append({
+            'id': clean_id(character.name, f'character_{character.id}'),
+            'name': clean_text(character.name, 160),
+            'summary': description or 'A player character in the campaign.',
+            'visibility': 'public',
+            'tags': ['player_character'] + [clean_id(name, '') for name in class_names[:3] if clean_id(name, '')],
+        })
+    return result
+
+
+def _normalize_entities_with_reference_map(raw_entities, selected_characters=None):
     entities = raw_entities if isinstance(raw_entities, list) else []
     normalized = []
     seen = set()
+    reference_map = {}
+    character_specs = selected_characters if isinstance(selected_characters, list) else []
+    characters_by_id = {spec['id']: spec for spec in character_specs if spec.get('id')}
+    characters_by_name = {
+        clean_text(spec.get('name'), 160).casefold(): spec
+        for spec in character_specs
+        if clean_text(spec.get('name'), 160)
+    }
     for index, entity in enumerate(entities):
         if not isinstance(entity, dict):
             continue
-        entity_id = clean_id(entity.get('id'), f'entity_{index + 1}')
+        raw_entity_id = clean_id(entity.get('id'), f'entity_{index + 1}')
+        entity_name = clean_text(entity.get('name'), 160)
+        character_spec = characters_by_id.get(raw_entity_id)
+        if character_spec is None and entity_name:
+            character_spec = characters_by_name.get(entity_name.casefold())
+        entity_id = character_spec['id'] if character_spec else raw_entity_id
+        reference_map[raw_entity_id] = entity_id
         if entity_id in seen:
             continue
         seen.add(entity_id)
+        tags = [clean_text(tag, 40) for tag in entity.get('tags', [])[:8] if clean_text(tag, 40)] \
+            if isinstance(entity.get('tags'), list) else []
+        if character_spec and 'player_character' not in tags:
+            tags.insert(0, 'player_character')
         normalized.append({
             'id': entity_id,
-            'type': clean_text(entity.get('type'), 40) or 'other',
-            'name': clean_text(entity.get('name'), 160) or entity_id.replace('_', ' ').title(),
-            'summary': clean_text(entity.get('summary'), 500),
-            'visibility': clean_text(entity.get('visibility'), 30) or 'dm_private',
-            'tags': [clean_text(tag, 40) for tag in entity.get('tags', [])[:8] if clean_text(tag, 40)]
-            if isinstance(entity.get('tags'), list) else [],
+            'type': 'character' if character_spec else normalize_world_entity_type(entity.get('type')),
+            'name': character_spec['name'] if character_spec else (entity_name or entity_id.replace('_', ' ').title()),
+            'summary': clean_text(entity.get('summary'), 500) or (character_spec or {}).get('summary', ''),
+            'visibility': 'public' if character_spec else (clean_text(entity.get('visibility'), 30) or 'dm_private'),
+            'tags': tags,
         })
+    for character_spec in character_specs:
+        entity_id = character_spec.get('id')
+        if not entity_id or entity_id in seen:
+            continue
+        seen.add(entity_id)
+        reference_map[entity_id] = entity_id
+        normalized.append({
+            'id': entity_id,
+            'type': 'character',
+            'name': character_spec['name'],
+            'summary': character_spec.get('summary', ''),
+            'visibility': 'public',
+            'tags': list(character_spec.get('tags') or ['player_character']),
+        })
+    return normalized, reference_map
+
+
+def normalize_entities(raw_entities, selected_characters=None):
+    normalized, _reference_map = _normalize_entities_with_reference_map(raw_entities, selected_characters)
     return normalized
 
 
-def normalize_relations(raw_relations):
+def normalize_relations(raw_relations, reference_map=None):
     relations = raw_relations if isinstance(raw_relations, list) else []
+    reference_map = reference_map if isinstance(reference_map, dict) else {}
     normalized = []
     for index, relation in enumerate(relations):
         if not isinstance(relation, dict):
             continue
         normalized.append({
             'id': clean_id(relation.get('id'), f'relation_{index + 1}'),
-            'source_id': clean_id(relation.get('source_id'), 'unknown_source'),
-            'target_id': clean_id(relation.get('target_id'), 'unknown_target'),
+            'source_id': reference_map.get(
+                clean_id(relation.get('source_id'), 'unknown_source'),
+                clean_id(relation.get('source_id'), 'unknown_source'),
+            ),
+            'target_id': reference_map.get(
+                clean_id(relation.get('target_id'), 'unknown_target'),
+                clean_id(relation.get('target_id'), 'unknown_target'),
+            ),
             'type': clean_text(relation.get('type'), 80) or 'related_to',
             'summary': clean_text(relation.get('summary'), 500),
             'visibility': clean_text(relation.get('visibility'), 30) or 'dm_private',
@@ -158,8 +256,9 @@ def normalize_relations(raw_relations):
     return normalized
 
 
-def normalize_facts(raw_facts):
+def normalize_facts(raw_facts, reference_map=None):
     facts = raw_facts if isinstance(raw_facts, list) else []
+    reference_map = reference_map if isinstance(reference_map, dict) else {}
     normalized = []
     for index, fact in enumerate(facts):
         if not isinstance(fact, dict):
@@ -169,7 +268,10 @@ def normalize_facts(raw_facts):
             entity_ids = [entity_ids]
         normalized.append({
             'id': clean_id(fact.get('id'), f'fact_{index + 1}'),
-            'entity_ids': [clean_id(entity_id, 'unknown_entity') for entity_id in entity_ids[:8]],
+            'entity_ids': [
+                reference_map.get(clean_id(entity_id, 'unknown_entity'), clean_id(entity_id, 'unknown_entity'))
+                for entity_id in entity_ids[:8]
+            ],
             'text': clean_text(fact.get('text'), 700),
             'certainty': clean_text(fact.get('certainty'), 40) or 'confirmed',
             'visibility': clean_text(fact.get('visibility'), 30) or 'dm_private',
@@ -177,13 +279,17 @@ def normalize_facts(raw_facts):
     return [fact for fact in normalized if fact['text']]
 
 
-def normalize_knowledge_graph(raw_graph):
+def normalize_knowledge_graph(raw_graph, selected_characters=None):
     raw_graph = raw_graph if isinstance(raw_graph, dict) else {}
+    entities, reference_map = _normalize_entities_with_reference_map(
+        raw_graph.get('entities', []),
+        selected_characters,
+    )
     return {
         'schema_version': '1.0',
-        'entities': normalize_entities(raw_graph.get('entities', [])),
-        'relations': normalize_relations(raw_graph.get('relations', [])),
-        'facts': normalize_facts(raw_graph.get('facts', [])),
+        'entities': entities,
+        'relations': normalize_relations(raw_graph.get('relations', []), reference_map),
+        'facts': normalize_facts(raw_graph.get('facts', []), reference_map),
     }
 
 
@@ -212,20 +318,34 @@ def normalize_world_state(raw_state, public_intro):
     }
 
 
-def normalize_npc_actors(raw_actors):
+def normalize_npc_actors(raw_actors, selected_characters=None):
     actors = raw_actors if isinstance(raw_actors, list) else []
+    character_specs = selected_characters if isinstance(selected_characters, list) else []
+    character_ids = {
+        clean_id(spec.get('id'), '')
+        for spec in character_specs
+        if isinstance(spec, dict) and clean_id(spec.get('id'), '')
+    }
+    character_names = {
+        clean_text(spec.get('name'), 160).casefold()
+        for spec in character_specs
+        if isinstance(spec, dict) and clean_text(spec.get('name'), 160)
+    }
     normalized = []
     seen = set()
     for index, actor in enumerate(actors):
         if not isinstance(actor, dict):
             continue
         actor_id = clean_id(actor.get('id'), f'npc_{index + 1}')
+        actor_name = clean_text(actor.get('name'), 160)
+        if actor_id in character_ids or (actor_name and actor_name.casefold() in character_names):
+            continue
         if actor_id in seen:
             continue
         seen.add(actor_id)
         normalized.append({
             'id': actor_id,
-            'name': clean_text(actor.get('name'), 160) or actor_id.replace('_', ' ').title(),
+            'name': actor_name or actor_id.replace('_', ' ').title(),
             'role': clean_text(actor.get('role'), 180),
             'public_summary': clean_text(actor.get('public_summary'), 420),
             'voice': clean_text(actor.get('voice'), 240),
@@ -380,12 +500,16 @@ def normalize_dm_private(raw_private):
 def normalize_world_package(raw_package, campaign):
     raw_package = raw_package if isinstance(raw_package, dict) else {}
     public_intro = sanitize_public_intro(raw_package.get('public_intro'), campaign)
+    selected_characters = _selected_character_entities(campaign)
     return {
         'public_intro': public_intro,
-        'knowledge_graph': normalize_knowledge_graph(raw_package.get('knowledge_graph')),
+        'knowledge_graph': normalize_knowledge_graph(
+            raw_package.get('knowledge_graph'),
+            selected_characters,
+        ),
         'world_state': normalize_world_state(raw_package.get('world_state'), public_intro),
         'dm_private': normalize_dm_private(raw_package.get('dm_private')),
-        'npc_actors': normalize_npc_actors(raw_package.get('npc_actors')),
+        'npc_actors': normalize_npc_actors(raw_package.get('npc_actors'), selected_characters),
         'clocks': normalize_clocks(raw_package.get('clocks')),
     }
 

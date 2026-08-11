@@ -192,12 +192,37 @@ class SessionMemoryRelationEndpointTest(unittest.TestCase):
         materializations = result.get("relation_endpoint_materializations", [])
         self.assertEqual(materializations[0]["endpoint_id"], "toren_reed")
         self.assertEqual(materializations[0]["source"], "known_roster_pc")
-        self.assertEqual(materializations[0]["materialized_type"], "pc")
+        self.assertEqual(materializations[0]["materialized_type"], "character")
 
         graph = json.loads(self.world.knowledge_graph)
         toren = next(e for e in graph["entities"] if e["id"] == "toren_reed")
         self.assertEqual(toren["name"], "Toren Reed")
-        self.assertEqual(toren["type"], "pc")
+        self.assertEqual(toren["type"], "character")
+
+    def test_entity_type_alias_merges_under_canonical_type(self):
+        graph = json.loads(self.world.knowledge_graph)
+        graph["entities"].append({
+            "id": "the_moth",
+            "name": "The Moth",
+            "type": "vehicle",
+        })
+        self.world.knowledge_graph = json.dumps(graph)
+        db.session.commit()
+
+        patch = self._base_patch()
+        patch["upsert_graph_entities"] = [{
+            "id": "the_moth",
+            "name": "The Moth",
+            "type": "ship",
+            "summary": "A lantern-lit river vessel.",
+        }]
+
+        apply_compiled_session_memory_patch(self.campaign, self.session, patch)
+        db.session.commit()
+
+        graph = json.loads(self.world.knowledge_graph)
+        the_moth = next(e for e in graph["entities"] if e["id"] == "the_moth")
+        self.assertEqual(the_moth["type"], "vehicle")
 
     def test_relation_endpoint_resolves_by_character_name_slug(self):
         # A roster character named "Toren Reed" maps to slug toren_reed; a
