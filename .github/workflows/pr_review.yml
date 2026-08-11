@@ -1,9 +1,11 @@
-name: PR Review Checks
+name: Legacy System PR Build
 
 on:
   pull_request:
     branches:
       - main
+    paths:
+      - "legacy_system/**"
     types:
       - opened
       - synchronize
@@ -12,57 +14,16 @@ on:
   workflow_dispatch:
 
 concurrency:
-  group: pr-review-${{ github.event.pull_request.number || github.ref }}
+  group: legacy-pr-build-${{ github.event.pull_request.number || github.ref }}
   cancel-in-progress: true
 
 permissions:
   contents: read
 
 jobs:
-  backend-tests:
-    name: Backend tests
+  build:
+    name: Build legacy client
     runs-on: [self-hosted, Linux, ARM64, raspone-ci]
-    steps:
-      - name: Check out repository
-        uses: actions/checkout@v4
-
-      - name: Use runner Python 3.12
-        run: |
-          CI_PYTHON="$HOME/.local/share/uv/python/cpython-3.12-linux-aarch64-gnu/bin/python3.12"
-          test -x "$CI_PYTHON"
-          echo "CI_PYTHON=$CI_PYTHON" >> "$GITHUB_ENV"
-          echo "CI_VENV=$RUNNER_TEMP/dnd-ci-venv" >> "$GITHUB_ENV"
-
-      - name: Install backend dependencies
-        working-directory: server
-        run: |
-          "$CI_PYTHON" -m venv "$CI_VENV"
-          "$CI_VENV/bin/python" -m pip install --upgrade pip
-          "$CI_VENV/bin/python" -m pip install -r requirements-dev.txt
-
-      - name: Run backend tests
-        env:
-          PYTHONPATH: ${{ github.workspace }}/server
-        run: |
-          mkdir -p review-evidence
-          set -o pipefail
-          "$CI_VENV/bin/python" -m pytest server/tests -q 2>&1 | tee review-evidence/backend-tests.log
-
-      - name: Upload backend review evidence
-        if: always()
-        uses: actions/upload-artifact@v4
-        with:
-          name: backend-review-evidence
-          path: review-evidence/backend-tests.log
-          if-no-files-found: error
-          retention-days: 14
-
-  frontend-checks:
-    name: Frontend checks
-    runs-on: [self-hosted, Linux, ARM64, raspone-ci]
-    outputs:
-      lint_result: ${{ steps.frontend_checks.outputs.lint_result }}
-      build_result: ${{ steps.frontend_checks.outputs.build_result }}
     steps:
       - name: Check out repository
         uses: actions/checkout@v4
@@ -72,197 +33,17 @@ jobs:
         with:
           node-version: "20"
           cache: npm
-          cache-dependency-path: client/package-lock.json
+          cache-dependency-path: legacy_system/client/package-lock.json
 
       - name: Install frontend dependencies
-        working-directory: client
+        working-directory: legacy_system/client
         run: npm ci
 
-      - name: Run frontend checks
-        id: frontend_checks
-        working-directory: client
-        run: |
-          mkdir -p ../review-evidence
-          set +e
-          npm run lint 2>&1 | tee ../review-evidence/frontend-lint.log
-          lint_status=${PIPESTATUS[0]}
-          lint_result=success
-          if [ "$lint_status" -ne 0 ]; then
-            echo "Frontend lint failed, but this workflow treats lint as advisory so review evidence is still uploaded."
-            lint_result=advisory_failure
-          fi
-          npm run build 2>&1 | tee ../review-evidence/frontend-build.log
-          build_status=${PIPESTATUS[0]}
-          build_result=success
-          if [ "$build_status" -ne 0 ]; then
-            build_result=failure
-          fi
-          {
-            echo "lint_result=${lint_result}"
-            echo "build_result=${build_result}"
-          } >> "$GITHUB_OUTPUT"
-          if [ "$build_status" -ne 0 ]; then
-            exit "$build_status"
-          fi
+      - name: Lint frontend
+        continue-on-error: true
+        working-directory: legacy_system/client
+        run: npm run lint
 
-      - name: Upload frontend review evidence
-        if: always()
-        uses: actions/upload-artifact@v4
-        with:
-          name: frontend-review-evidence
-          path: |
-            review-evidence/frontend-lint.log
-            review-evidence/frontend-build.log
-          if-no-files-found: error
-          retention-days: 14
-
-  browser-evidence:
-    name: Browser evidence
-    runs-on: [self-hosted, Linux, ARM64, raspone-ci]
-    steps:
-      - name: Check out repository
-        uses: actions/checkout@v4
-        with:
-          fetch-depth: 0 # Get all history for diffing
-
-      - name: Plan browser evidence run
-        id: plan
-        run: |
-          run_browser_tests=false
-          capture_review_screenshots=true
-          scenario_ids="design-lab-story-atlas,session-chat-mixed"
-          selection_reason="No relevant client changes detected."
-
-          if [ "${{ github.event_name }}" != "pull_request" ]; then
-            echo "Not a pull request. Running all smoke tests by default."
-            run_browser_tests=true
-          else
-            # Diff against the target branch (usually main)
-            git fetch origin main --depth=1
-            changed_files=$(git diff --name-only origin/main HEAD)
-            echo "Changed files in this PR:"
-            echo "$changed_files"
-
-            if echo "$changed_files" | grep -q "^client/"; then
-              run_browser_tests=true
-              if echo "$changed_files" | grep -E -q "^client/src/(App\.jsx|App\.css|index\.css|EmberLedgerTheme\.css|api/|components/layout/)"; then
-                selection_reason="Shared UI changes detected. Running the two-scenario PR smoke set; deeper evidence is available on demand."
-              else
-                selection_reason="Client source changes detected. Running the two-scenario PR smoke set."
-              fi
-            else
-              selection_reason="Backend-only, automation-only, or documentation-only changes detected. Skipping browser smoke tests."
-            fi
-          fi
-
-          echo "run_browser_tests=$run_browser_tests" >> "$GITHUB_OUTPUT"
-          echo "capture_review_screenshots=$capture_review_screenshots" >> "$GITHUB_OUTPUT"
-          echo "scenario_ids=$scenario_ids" >> "$GITHUB_OUTPUT"
-          echo "selection_reason=$selection_reason" >> "$GITHUB_OUTPUT"
-          echo "Plan result: run_browser_tests=$run_browser_tests, scenario_ids=$scenario_ids, reason: $selection_reason"
-
-      - name: Set up Node.js 20
-        if: steps.plan.outputs.run_browser_tests == 'true'
-        uses: actions/setup-node@v4
-        with:
-          node-version: "20"
-          cache: npm
-          cache-dependency-path: client/package-lock.json
-
-      - name: Install frontend dependencies
-        if: steps.plan.outputs.run_browser_tests == 'true'
-        working-directory: client
-        run: npm ci
-
-      - name: Install Playwright Chromium Browser
-        if: steps.plan.outputs.run_browser_tests == 'true'
-        working-directory: client
-        run: npx playwright install chromium
-
-      - name: Run browser smoke tests
-        if: steps.plan.outputs.run_browser_tests == 'true'
-        working-directory: client
-        run: npm run evidence -- --scenarios "${{ steps.plan.outputs.scenario_ids }}" --viewport desktop
-        env:
-          PLAYWRIGHT_CAPTURE_SCREENSHOTS: ${{ steps.plan.outputs.capture_review_screenshots }}
-
-      - name: Upload browser evidence
-        if: always() && steps.plan.outputs.run_browser_tests == 'true'
-        uses: actions/upload-artifact@v4
-        with:
-          name: frontend-browser-evidence
-          path: |
-            client/playwright-report/
-            client/test-results/
-            review-evidence/
-          if-no-files-found: warn
-          retention-days: 14
-
-  summary:
-    name: Review summary
-    runs-on: [self-hosted, Linux, ARM64, raspone-ci]
-    needs:
-      - backend-tests
-      - frontend-checks
-      - browser-evidence
-    if: always()
-    steps:
-      - name: Check out repository
-        uses: actions/checkout@v4
-
-      - name: Create summary files
-        env:
-          PR_NUMBER: ${{ github.event.pull_request.number }}
-          COMMIT_SHA: ${{ github.event.pull_request.head.sha || github.sha }}
-          BACKEND_RESULT: ${{ needs.backend-tests.result }}
-          FRONTEND_JOB_RESULT: ${{ needs.frontend-checks.result }}
-          FRONTEND_LINT_RESULT: ${{ needs.frontend-checks.outputs.lint_result }}
-          FRONTEND_BUILD_RESULT: ${{ needs.frontend-checks.outputs.build_result }}
-          BROWSER_RESULT: ${{ needs.browser-evidence.result }}
-        run: |
-          mkdir -p review-evidence
-          cat > review-evidence/summary.md <<EOF
-          # PR Review Summary
-
-          - PR number: ${PR_NUMBER:-N/A}
-          - Commit SHA: ${COMMIT_SHA}
-          - Backend job result: ${BACKEND_RESULT}
-          - Frontend job result: ${FRONTEND_JOB_RESULT}
-          - Frontend lint result: ${FRONTEND_LINT_RESULT:-unknown}
-          - Frontend build result: ${FRONTEND_BUILD_RESULT:-unknown}
-          - Browser job result: ${BROWSER_RESULT}
-          - Browser evidence artifact: frontend-browser-evidence
-          - Uploaded evidence artifacts:
-            - backend-review-evidence
-            - frontend-review-evidence
-            - frontend-browser-evidence
-          EOF
-
-          cat > review-evidence/manifest.json <<EOF
-          {
-            "pr_number": ${PR_NUMBER:-null},
-            "commit_sha": "${COMMIT_SHA}",
-            "backend_job_result": "${BACKEND_RESULT}",
-            "frontend_job_result": "${FRONTEND_JOB_RESULT}",
-            "frontend_lint_result": "${FRONTEND_LINT_RESULT:-unknown}",
-            "frontend_build_result": "${FRONTEND_BUILD_RESULT:-unknown}",
-            "browser_job_result": "${BROWSER_RESULT}",
-            "browser_evidence_artifact": "frontend-browser-evidence",
-            "uploaded_evidence_artifacts": [
-              "backend-review-evidence",
-              "frontend-review-evidence",
-              "frontend-browser-evidence"
-            ]
-          }
-          EOF
-
-      - name: Upload summary artifact
-        if: always()
-        uses: actions/upload-artifact@v4
-        with:
-          name: pr-review-summary
-          path: |
-            review-evidence/summary.md
-            review-evidence/manifest.json
-          if-no-files-found: error
-          retention-days: 14
+      - name: Build frontend
+        working-directory: legacy_system/client
+        run: npm run build

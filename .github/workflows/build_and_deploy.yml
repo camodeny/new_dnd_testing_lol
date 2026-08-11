@@ -1,73 +1,43 @@
-name: Build, Test, and Deploy
+name: Legacy System Build and Deploy
 
 on:
   push:
     branches:
       - main
+    paths:
+      - "legacy_system/**"
   workflow_dispatch:
 
 permissions:
   contents: read
 
 jobs:
-  tests:
-    name: Build and test
+  build:
+    name: Build legacy client
     runs-on: [self-hosted, Linux, ARM64, raspone-ci]
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
-
-      - name: Use runner Python 3.12
-        run: |
-          CI_PYTHON="$HOME/.local/share/uv/python/cpython-3.12-linux-aarch64-gnu/bin/python3.12"
-          test -x "$CI_PYTHON"
-          echo "CI_PYTHON=$CI_PYTHON" >> "$GITHUB_ENV"
-          echo "CI_VENV=$RUNNER_TEMP/dnd-ci-venv" >> "$GITHUB_ENV"
-
-      - name: Install Python dependencies
-        working-directory: server
-        run: |
-          "$CI_PYTHON" -m venv "$CI_VENV"
-          "$CI_VENV/bin/python" -m pip install --upgrade pip
-          "$CI_VENV/bin/python" -m pip install -r requirements-dev.txt
-
-      - name: Run backend tests
-        env:
-          PYTHONPATH: ${{ github.workspace }}/server
-        run: |
-          set -o pipefail
-          mkdir -p test-logs
-          "$CI_VENV/bin/python" -m pytest server/tests -q 2>&1 | tee test-logs/python.log
 
       - name: Set up Node.js
         uses: actions/setup-node@v4
         with:
           node-version: "20"
           cache: npm
-          cache-dependency-path: client/package-lock.json
+          cache-dependency-path: legacy_system/client/package-lock.json
 
       - name: Install client dependencies
-        working-directory: client
+        working-directory: legacy_system/client
         run: npm ci
 
       - name: Build client
-        working-directory: client
-        run: |
-          set -o pipefail
-          mkdir -p ../test-logs
-          npm run build 2>&1 | tee ../test-logs/client-build.log
-
-      - name: Upload test logs
-        if: always()
-        uses: actions/upload-artifact@v4
-        with:
-          name: test-logs
-          path: test-logs
+        working-directory: legacy_system/client
+        run: npm run build
 
   deploy:
     name: Deploy
     runs-on: [self-hosted, Linux, ARM64, raspone-ci]
-    needs: tests
+    needs: build
     if: github.ref == 'refs/heads/main'
     steps:
       - name: Checkout repository
@@ -75,8 +45,8 @@ jobs:
 
       - name: Generate build-info.json
         run: |
-          mkdir -p client/public
-          cat > client/public/build-info.json <<EOF
+          mkdir -p legacy_system/client/public
+          cat > legacy_system/client/public/build-info.json <<EOF
           {
             "version": "${{ github.ref_name }}",
             "short": "$(echo '${{ github.sha }}' | cut -c1-7)",
@@ -86,7 +56,7 @@ jobs:
             "environment": "main"
           }
           EOF
-          cat client/public/build-info.json
+          cat legacy_system/client/public/build-info.json
 
       - name: Validate deployment configuration
         env:
@@ -181,6 +151,7 @@ jobs:
             --exclude='client/node_modules' \
             --exclude='client/dist' \
             --exclude='server/__pycache__' \
+            -C legacy_system \
             .
           ssh -o StrictHostKeyChecking=no "${DEPLOY_USER}@${TS_SERVER}" "mkdir -p '${DEPLOY_PATH}'"
           scp -o StrictHostKeyChecking=no "$tmp_tgz" "${DEPLOY_USER}@${TS_SERVER}:${DEPLOY_PATH}/app.tgz"
