@@ -214,29 +214,11 @@ def _contains_unrevealed_private_term(campaign, item_text, visible_text):
     lowered_visible = clean_text(visible_text, 4000).lower()
     if not lowered_item:
         return False
-    item_words = _visibility_words(item_text)
-    visibly_supported = None
     for term in _private_output_terms(campaign):
         lowered_term = clean_text(term, 240).lower()
         if len(lowered_term) < 4:
             continue
         if lowered_term in lowered_item and lowered_term not in lowered_visible:
-            return True
-        # Finalizers frequently paraphrase private facts or reorder private
-        # clock names instead of copying them verbatim. Catch strong lexical
-        # overlap as well as exact substrings, while preserving information
-        # already supported by the visible player/DM exchange.
-        term_words = _visibility_words(term)
-        if len(term_words) < 3:
-            continue
-        overlap = item_words & term_words
-        minimum_overlap = 3 if len(term_words) <= 6 else 4
-        shorter_size = min(len(item_words), len(term_words))
-        if len(overlap) < minimum_overlap or len(overlap) / max(shorter_size, 1) < 0.6:
-            continue
-        if visibly_supported is None:
-            visibly_supported = _is_supported_by_visible_exchange(item_text, visible_text)
-        if not visibly_supported:
             return True
     return False
 
