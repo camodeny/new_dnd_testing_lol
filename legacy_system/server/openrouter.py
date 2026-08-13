@@ -2520,34 +2520,53 @@ def _approved_disclosure_texts(approved_facet_ids, hot_context):
     ]
 
 
-def _approved_disclosure_spoiler_item_ids(approved_facet_ids, hot_context):
-    """Spoiler-item ids covered by approved disclosure facets (facet-precise exemption)."""
-    disclosure_facets = {
+IDENTIFIER_FACET_KINDS = {'identity', 'entity_name', 'clock_name'}
+
+
+def _semantic_spoiler_items(hot_context, exempt_facet_ids=None):
+    """Facet-sized spoiler inputs for the semantic checker, minus approved disclosures.
+
+    Entities, NPCs, relations, facts, clocks, and dm_private prose are enumerated at
+    disclosure-facet granularity so approving one facet (for example a name) never suppresses
+    semantic checking of still-hidden facets of the same record (for example that entity's
+    summary). An approved identifier facet also exempts its linked identifier representation
+    (npc identity <-> entity name), but never the same record's non-identifier facets.
+    DM-private world events are appended as discrete items (they are not modeled as disclosure
+    facets). Only currently-hidden facets are included.
+    """
+    exempt_ids = set(exempt_facet_ids or [])
+    facets_by_id = {
         facet.get('id'): facet
         for facet in (hot_context.get('disclosure_facets') or [])
         if isinstance(facet, dict) and facet.get('id')
     }
-    return {
-        str(disclosure_facets[item_id].get('spoiler_item_id') or '').strip()
-        for item_id in approved_facet_ids or []
-        if item_id in disclosure_facets
-        and str(disclosure_facets[item_id].get('spoiler_item_id') or '').strip()
+    exempt_identifier_spoiler_ids = {
+        str(facets_by_id[facet_id].get('spoiler_item_id') or '').strip()
+        for facet_id in exempt_ids
+        if facet_id in facets_by_id
+        and facets_by_id[facet_id].get('kind') in IDENTIFIER_FACET_KINDS
+        and facets_by_id[facet_id].get('spoiler_item_id')
     }
-
-
-def _spoiler_items_without_disclosed(hot_context, approved_facet_ids):
-    """Private spoiler items minus those covered by an approved disclosure this turn."""
-    items = hot_context.get('private_spoiler_items') or []
-    if not approved_facet_ids:
-        return items
-    exempt_ids = _approved_disclosure_spoiler_item_ids(approved_facet_ids, hot_context)
-    if not exempt_ids:
-        return items
-    return [
-        item
-        for item in items
-        if not (isinstance(item, dict) and str(item.get('id') or '').strip() in exempt_ids)
-    ]
+    items = []
+    for facet in hot_context.get('disclosure_facets') or []:
+        if not isinstance(facet, dict) or not facet.get('id'):
+            continue
+        if facet.get('visibility') != 'dm_private':
+            continue
+        if facet['id'] in exempt_ids:
+            continue
+        if (
+            facet.get('kind') in IDENTIFIER_FACET_KINDS
+            and str(facet.get('spoiler_item_id') or '').strip() in exempt_identifier_spoiler_ids
+        ):
+            continue
+        text = str(facet.get('canonical_text') or '').strip()
+        if text:
+            items.append({'id': facet['id'], 'kind': facet.get('kind'), 'text': text})
+    for item in hot_context.get('private_spoiler_items') or []:
+        if isinstance(item, dict) and str(item.get('id') or '').startswith('world_event'):
+            items.append(item)
+    return items
 
 
 def _spoiler_check_allows_earned_clue(response_text, hot_context, spoiler_check):
@@ -2577,7 +2596,13 @@ def _spoiler_check_allows_earned_clue(response_text, hot_context, spoiler_check)
         return False
     if not re.search(r'\b(?:saw|seen|heard|witness|know|noticed|dropped|figure|shape|clue)\b', response_text or '', flags=re.IGNORECASE):
         return False
-    if not any(('witness' in leaked_id or 'npc_secret' in leaked_id or 'clue' in leaked_id) for leaked_id in leaked_ids):
+
+    def _is_earned_clue_leak(leaked_id):
+        if any(marker in leaked_id for marker in ('witness', 'npc_secret', 'clue')):
+            return True
+        return leaked_id.startswith('npc:') and ':secret:' in leaked_id
+
+    if not any(_is_earned_clue_leak(leaked_id) for leaked_id in leaked_ids):
         return False
     return True
 
@@ -4786,7 +4811,7 @@ def _run_session_dm_loop(
                     deterministic_spoiler_violation
                     or check_session_spoilers_with_llm(
                         content,
-                        {**hot_context, 'private_spoiler_items': _spoiler_items_without_disclosed(hot_context, approved_disclosures)},
+                        {**hot_context, 'private_spoiler_items': _semantic_spoiler_items(hot_context, approved_disclosures)},
                         loop_audit,
                         skip_spoiler_check=preflight_decision.get('skip_spoiler_check') is True,
                     )
