@@ -2,7 +2,7 @@
 
 from models import db, SessionMessage, CampaignDmResponseParts, CampaignResolverPacket
 from services.audit_service import log_audit_event
-from services.dm_tools import apply_deferred_narrative_action
+from services.dm_tools import apply_deferred_narrative_action, mark_facet_disclosures
 from services.dm_turns import mark_session_dm_turn_error, mark_session_dm_turn_visible
 from services.memory_resolver_schemas import validate_resolver_packet
 from services.dm_response_parts import normalize_response_parts, render_visible_response_parts
@@ -35,11 +35,13 @@ def commit_accepted_dm_turn(
     action_buffer,
     response_parts,
     resolver_packet=None,
+    disclose_item_ids=None,
 ):
     """Commit selected staged actions and the visible message as one transaction.
 
     This intentionally raises after recording the turn error if any selected action cannot be
     revalidated or persisted. Callers must not send the visible reply until this returns.
+    Approved ``disclose_item_ids`` are committed atomically with the visible turn.
     """
     try:
         if resolver_packet is not None:
@@ -54,7 +56,13 @@ def commit_accepted_dm_turn(
         created_proposals = []
         action_results = []
         for action in selected_actions:
-            result, proposal = apply_deferred_narrative_action(campaign, session, current_user, action)
+            result, proposal = apply_deferred_narrative_action(
+                campaign,
+                session,
+                current_user,
+                action,
+                source_message_id=player_message_id,
+            )
             if isinstance(result, dict) and result.get('error'):
                 raise ValueError(result['error'])
             action_results.append({'pending_action_id': action['id'], 'tool_name': action['name'], 'result': result})
@@ -101,6 +109,33 @@ def commit_accepted_dm_turn(
                 audit_role='tools',
                 commit=False,
             )
+        if disclose_item_ids:
+            approved = [item for item in disclose_item_ids if item]
+            if approved:
+                created = mark_facet_disclosures(
+                    campaign,
+                    approved,
+                    source='talk_to_player',
+                    source_message_id=ai_msg.id,
+                )
+                log_audit_event(
+                    campaign.id,
+                    'dm_disclosure_committed',
+                    'Committed approved private-item disclosures with the visible DM turn.',
+                    {
+                        'session_id': session.id,
+                        'player_message_id': player_message_id,
+                        'dm_message_id': ai_msg.id,
+                        'disclosed_item_ids': approved,
+                        'rows_created': created,
+                    },
+                    source='session_messages',
+                    actor='session_dm',
+                    trace_id=trace_id,
+                    trace_label=trace_label,
+                    audit_role='guard',
+                    commit=False,
+                )
         log_audit_event(
             campaign.id,
             'dm_output_stored',
