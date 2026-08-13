@@ -364,6 +364,8 @@ def _leak_guard_memory_patch(campaign, patch, visible_text):
     def _evidence_source_ids(item):
         provenance = item.get('provenance') if isinstance(item.get('provenance'), dict) else {}
         sources = provenance.get('evidence_sources')
+        if not isinstance(sources, list):
+            return []
         return [
             str(source.get('source_id'))
             for source in sources
