@@ -1,12 +1,11 @@
 """Recoverable partial-state tracking for failed post-turn memory updates.
 
-When the staged memory pipeline fails validation or application, the post-turn
+When the staged memory pipeline fails, the post-turn
 clock/summary sync is skipped. Leaving that silent leaves clocks, summaries, and
 scene state stale while visible play continues. This module records an explicit
-recoverable recovery task (the failed compiled patch plus the inputs needed to
-replay the skipped clock adjudication) and provides a bounded retry path that
-repairs the whole post-turn pipeline: re-applies memory, re-runs clock
-adjudication, and flips the durable SessionDmTurn out of its error state.
+recoverable recovery task containing a compiled patch when one exists. For
+extraction or compilation failures it retains the durable turn references and
+rebuilds the patch before replaying skipped clock adjudication.
 """
 import json
 
@@ -165,6 +164,66 @@ def _recovery_transcript_content(task):
     )
 
 
+def _rebuild_missing_memory_patch(task, campaign, session):
+    """Re-run extraction/compilation from durable turn inputs.
+
+    A patchless task is expected when the original failure happened before the
+    compiler returned a patch. The player message, accepted DM response parts,
+    resolver packet, and current durable session context are enough to safely
+    reconstruct it; never misclassify this case as task_missing_patch.
+    """
+    from models import CampaignDmResponseParts, CampaignResolverPacket, User, db
+    from openrouter import get_session_memory_patch
+    from services.dm_tools import build_session_hot_context, build_session_memory_context
+
+    context = {}
+    if task.context_json:
+        try:
+            context = json.loads(task.context_json)
+        except (TypeError, ValueError):
+            context = {}
+    current_user = db.session.get(User, context.get('current_user_id')) if context.get('current_user_id') else None
+    if current_user is None and campaign.user_id:
+        current_user = db.session.get(User, campaign.user_id)
+    if current_user is None:
+        raise RuntimeError('recovery_missing_current_user')
+
+    player_content, dm_content = _recovery_transcript_content(task)
+    if not player_content or not dm_content:
+        raise RuntimeError('recovery_missing_turn_transcript')
+    hot_context = build_session_hot_context(campaign, session, current_user)
+    hot_context['turn_id'] = f'turn_{task.player_message_id}'
+    memory_context = build_session_memory_context(
+        campaign, session, current_user, player_content, dm_content, hot_context,
+    )
+    stored_parts = CampaignDmResponseParts.query.filter_by(
+        campaign_id=campaign.id, dm_message_id=task.dm_message_id,
+    ).order_by(CampaignDmResponseParts.id.desc()).first()
+    if stored_parts is None or not isinstance(stored_parts.parts_json, list):
+        raise RuntimeError('recovery_missing_response_parts')
+    memory_context['latest_dm_response_parts'] = stored_parts.parts_json
+    packet = CampaignResolverPacket.query.filter_by(
+        campaign_id=campaign.id, dm_message_id=task.dm_message_id, status='committed',
+    ).order_by(CampaignResolverPacket.id.desc()).first()
+    if packet is not None:
+        memory_context['resolver_packet'] = packet.packet_json
+
+    patch = get_session_memory_patch(memory_context, audit_context={
+        'campaign_id': campaign.id,
+        'operation': 'session_memory_recovery_rebuild',
+        'actor': 'session_memory_writer',
+        'trace_id': f'{task.trace_id}:rebuild' if task.trace_id else None,
+        'parent_trace_id': task.trace_id,
+        'source_player_message_id': task.player_message_id,
+        'source_dm_message_id': task.dm_message_id,
+        'latest_player_message': player_content,
+        'latest_dm_message': dm_content,
+    })
+    if not isinstance(patch, dict):
+        raise RuntimeError('recovery_rebuild_returned_no_patch')
+    return patch
+
+
 def _run_recovery_finalization(campaign, session, task, player_content, dm_content):
     """Complete the #107 post-clock finalization pipeline for a recovered turn.
 
@@ -287,21 +346,38 @@ def retry_memory_recovery_task(campaign_id, task_id):
         return {'ok': False, 'error': 'task_not_found', 'status': None}
     if task.status != 'pending':
         return {'ok': False, 'error': f'task_status_{task.status}', 'status': task.status}
-    if not task.patch_json:
-        task.status = 'failed'
-        task.last_error_text = 'task_missing_patch'
-        db.session.commit()
-        return {'ok': False, 'error': 'task_missing_patch', 'status': 'failed'}
-    try:
-        patch = json.loads(task.patch_json)
-    except Exception as err:
-        task.status = 'failed'
-        task.last_error_text = f'invalid_stored_patch: {err}'
-        db.session.commit()
-        return {'ok': False, 'error': 'invalid_stored_patch', 'status': 'failed'}
-
     campaign = db.session.get(Campaign, campaign_id)
     session = db.session.get(CampaignSession, task.session_id) if task.session_id else None
+    if campaign is None or session is None:
+        return {'ok': False, 'error': 'recovery_campaign_or_session_missing', 'status': 'pending'}
+    if not task.patch_json:
+        try:
+            patch = _rebuild_missing_memory_patch(task, campaign, session)
+            task.patch_json = json.dumps(patch, default=str)
+            task.last_error_text = 'patch_rebuilt_from_durable_turn_inputs'
+            db.session.commit()
+        except Exception as err:
+            db.session.rollback()
+            task = db.session.get(SessionMemoryRecoveryTask, task.id)
+            task.attempts += 1
+            task.status = 'failed' if task.attempts >= MAX_RECOVERY_ATTEMPTS else 'pending'
+            task.last_error_text = f'patch_rebuild_failed: {err}'
+            db.session.commit()
+            return {
+                'ok': False,
+                'error': f'patch_rebuild_failed: {err}',
+                'status': task.status,
+                'attempts': task.attempts,
+                'task_id': task.id,
+            }
+    else:
+        try:
+            patch = json.loads(task.patch_json)
+        except Exception as err:
+            task.status = 'failed'
+            task.last_error_text = f'invalid_stored_patch: {err}'
+            db.session.commit()
+            return {'ok': False, 'error': 'invalid_stored_patch', 'status': 'failed'}
 
     # 1. Re-apply the failed memory patch unless this exact task already applied
     # it on an earlier attempt (tracked explicitly by memory_applied -- never
