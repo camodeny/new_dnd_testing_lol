@@ -364,11 +364,15 @@ def _index_pending_clarifications(pending_clarifications):
 
 
 def _registry_has_surface_form(registry, surface_form):
-    form_lower = surface_form.strip().lower()
+    form_lower = clean_text(surface_form, 200).lower()
+    if not form_lower:
+        return False
     for entry in registry:
-        if entry.get("surface_form", "").strip().lower() == form_lower:
+        if clean_text(entry.get("surface_form"), 200).lower() == form_lower:
             return True
-        if entry.get("canonical_name", "").strip().lower() == form_lower:
+        # Candidate identities intentionally have no canonical name until they
+        # are resolved. Treat that as an absent comparison value, not an error.
+        if clean_text(entry.get("canonical_name"), 200).lower() == form_lower:
             return True
     return False
 

@@ -346,19 +346,10 @@ def _clock_location_conflict(campaign, graph, world_state, clock, subject_id):
                 'conflict',
             )
 
-        # A generic location word asserted by the clock that does not describe
-        # the committed location is a contradiction.
-        conflicting_generic = [
-            word for word in generic_words
-            if word not in committed_words
-        ]
-        if conflicting_generic:
-            return (
-                f'Clock description asserts the subject is {", ".join(conflicting_generic)} '
-                f'but committed scene state places the subject at '
-                f'{committed_name or committed_loc_id}.',
-                'conflict',
-            )
+        # Generic words such as "lake" describe a clock's pressure or an
+        # infrastructure system's domain; they do not establish that the clock
+        # subject itself moved. Only a mismatch against a canonical location is
+        # safe enough to supersede a durable clock automatically.
         return None, None
 
     if status == 'ambiguous':
