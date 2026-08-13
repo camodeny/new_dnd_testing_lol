@@ -1000,6 +1000,44 @@ class CampaignWorldIdentity(db.Model):
         }
 
 
+class CampaignDisclosure(db.Model):
+    """Durable disclosure registry: which private knowledge facets the party has learned.
+
+    ``item_id`` is a stable disclosure-sized facet id (for example ``npc:npc_rook:name``
+    or ``fact:glass_council_allegiance:text``). Rows are written only by intentional
+    reveal paths (e.g. ``reveal_fact`` and, later, structured finalizer disclosure),
+    never inferred from player transcript mentions. Absence of a row means the facet
+    stays hidden unless canonical game state (world-graph / clock visibility) makes it
+    party-known.
+    """
+
+    __tablename__ = 'campaign_disclosures'
+
+    id = db.Column(db.Integer, primary_key=True)
+    campaign_id = db.Column(db.Integer, db.ForeignKey('campaign.id'), nullable=False)
+    item_id = db.Column(db.String(255), nullable=False)
+    state = db.Column(db.String(20), default='revealed')
+    source = db.Column(db.String(80), nullable=True)
+    source_message_id = db.Column(db.Integer, nullable=True)
+    created_at = db.Column(db.DateTime, default=utcnow)
+    updated_at = db.Column(db.DateTime, default=utcnow, onupdate=utcnow)
+
+    __table_args__ = (
+        db.UniqueConstraint('campaign_id', 'item_id', name='uq_campaign_disclosure_item'),
+    )
+
+    def to_dict(self):
+        return {
+            'campaign_id': self.campaign_id,
+            'item_id': self.item_id,
+            'state': self.state,
+            'source': self.source,
+            'source_message_id': self.source_message_id,
+            'created_at': self.created_at.isoformat() if self.created_at else None,
+            'updated_at': self.updated_at.isoformat() if self.updated_at else None,
+        }
+
+
 class CampaignClock(db.Model):
     __tablename__ = 'campaign_clocks'
 

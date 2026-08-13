@@ -1055,6 +1055,10 @@ def normalize_session_dm_turn_decision(raw_decision):
         'parts': parts,
         'commit_action_ids': data.get('commit_action_ids') if isinstance(data.get('commit_action_ids'), list) else None,
     }
+    if isinstance(data.get('disclose_item_ids'), list):
+        result['disclose_item_ids'] = [
+            str(item).strip() for item in data['disclose_item_ids'] if str(item).strip()
+        ]
     resolver_packet = data.get('resolver_packet')
     if isinstance(resolver_packet, dict) and isinstance(resolver_packet.get('entity_mentions'), list):
         result['resolver_packet'] = resolver_packet
@@ -1091,6 +1095,11 @@ SESSION_DM_FINALIZER_TOOLS = [
                         'type': 'array',
                         'items': {'type': 'string'},
                         'description': 'Pending action IDs to commit with this reply. Use [] when no pending action should commit.',
+                    },
+                    'disclose_item_ids': {
+                        'type': 'array',
+                        'items': {'type': 'string'},
+                        'description': 'Optional stable private-item facet IDs this reply intentionally reveals to the party (for example "npc:npc_rook:name"). Disclosure is intent, not authority: the server only commits a disclosure when the visible reply actually states that facet and it is not yet public. Omit or use [] when nothing is intentionally revealed.',
                     },
                     'resolver_packet': {
                         **RESOLVER_PACKET_SCHEMA,
@@ -1155,6 +1164,12 @@ def _session_dm_finalizer_decision_from_tool_calls(tool_calls):
         except ValueError as err:
             return None, {'kind': 'invalid_response_parts', 'detail': str(err)}
         decision = {'mode': 'speak', 'content': render_visible_response_parts(parts), 'parts': parts, 'commit_action_ids': args.get('commit_action_ids')}
+        if 'disclose_item_ids' in args:
+            disclose_item_ids = args.get('disclose_item_ids')
+            if isinstance(disclose_item_ids, list):
+                decision['disclose_item_ids'] = [
+                    str(item).strip() for item in disclose_item_ids if str(item).strip()
+                ]
         if 'resolver_packet' in args:
             resolver_packet = args.get('resolver_packet')
             packet_ok, packet_error = validate_resolver_packet(resolver_packet)
@@ -1612,12 +1627,27 @@ def _session_dm_guard_retry_system_prompt(guard_name, details):
         return (
             'Guard reminder: do not expose DM-private information that has not become visible through '
             f'play. Do not mention these private terms in the visible reply: {terms or "(none listed)"}. '
-            'This includes narration, quoted speech, labels, and npc_dialogue targets. '
+            'This includes narration, quoted speech labels, and npc_dialogue targets. '
             'Use public descriptors instead of unrevealed names in NPC dialogue targets. '
             'Do not route around this by having another NPC reveal or label the private term. '
             'If the latest player addressed a present NPC by public description, keep that NPC as the responder '
             'using the public descriptor; do not say that NPC vanished or left unless the transcript already established it. '
             'Finalize with talk_to_player(parts) or stay_silent using spoiler-safe visible content.'
+            + silent_ack
+        )
+    if guard_name == 'disclosure':
+        rejected = details.get('rejected') if isinstance(details, dict) else []
+        lines = '; '.join(
+            f'{item.get("item_id")} ({item.get("reason")})'
+            for item in rejected
+        ) if isinstance(rejected, list) and rejected else 'none'
+        return (
+            'Guard reminder: disclose_item_ids is intent, not authority. The server only commits a disclosure '
+            'when the visible reply actually states that private facet and it is not yet public. '
+            f'The following requested disclosures were rejected: {lines}. '
+            'Either (a) make the visible reply actually reveal the rejected facet\'s exact text (so the server can '
+            'approve it), or (b) remove that item_id from disclose_item_ids. Do not reveal a private term without '
+            'a matching approved disclosure. Finalize with talk_to_player(parts) or stay_silent.'
             + silent_ack
         )
     if guard_name == 'spoiler_checker':
@@ -1664,6 +1694,21 @@ def _session_dm_guard_retry_system_prompt(guard_name, details):
         'Guard reminder: return exactly one valid JSON object '
         'matching the final contract.'
         + silent_ack
+    )
+
+
+def _session_dm_privacy_salvage_prompt(private_violation):
+    terms = ', '.join(private_violation.get('matched_terms') or []) if isinstance(private_violation, dict) else ''
+    return (
+        'Privacy-safety salvage attempt. The previous visible reply was rejected because it contained '
+        f'unrevealed private terms: {terms or "(none listed)"}. DM-private context has been stripped from this '
+        'attempt. The player still has an unresolved action that needs a visible resolution. '
+        'Produce a minimal, concrete player-visible reply that resolves the player\'s immediate action using only '
+        'public and party-known information, consistent with the fiction and any mechanical result already '
+        'established. Do not mention the private terms above or imply them through close paraphrases. '
+        'If a safe resolution genuinely cannot be described, ask the player exactly what they do next or restate '
+        'the immediate choice, instead of staying silent. '
+        'Finalize with talk_to_player(parts).'
     )
 
 
@@ -1714,7 +1759,7 @@ def _session_dm_resolver_packet_repair_prompt(decision, violation, *, required, 
     )
 
 
-SESSION_DM_GUARD_ONLY_CONTEXT_KEYS = {'private_output_terms', 'private_spoiler_items'}
+SESSION_DM_GUARD_ONLY_CONTEXT_KEYS = {'protected_identifier_terms', 'private_spoiler_items', 'disclosure_state', 'disclosure_facets'}
 SESSION_DM_INTERNAL_ONLY_CONTEXT_KEYS = SESSION_DM_GUARD_ONLY_CONTEXT_KEYS | {'recent_messages'}
 
 
@@ -1811,8 +1856,9 @@ def build_session_dm_tool_messages(hot_context):
             'role': 'system',
             'content': (
                 'Visible naming constraints: obey these before drafting any visible reply. '
-                'Do not use any avoid_visible_name in narration, quoted speech labels, or <npc target="..."> '
-                'unless the latest player message already used that name. Use the listed public reference instead:\n'
+                'Do not use any avoid_visible_name in narration, quoted speech labels, or <npc target="...">. '
+                'A player merely mentioning or guessing a private name does not make it public; keep using the '
+                'listed public reference until the name is revealed through play:\n'
                 + json.dumps(naming_constraints, ensure_ascii=False)
             ),
         })
@@ -2312,7 +2358,54 @@ def _pc_control_violation(response_text, hot_context):
     return None
 
 
-def _private_output_violation(response_text, hot_context):
+def _private_literal_identifier_tokens(text):
+    """Split text into lowercase alphanumeric tokens for literal-identifier matching."""
+    return re.findall(r'[a-z0-9]+', str(text or '').lower())
+
+
+def _tokens_contain_sequence(container, sub):
+    """True when ``sub`` (a list of tokens) appears contiguously inside ``container``."""
+    if not sub:
+        return False
+    if len(sub) > len(container):
+        return False
+    first = sub[0]
+    start = 0
+    while True:
+        try:
+            index = container.index(first, start)
+        except ValueError:
+            return False
+        if container[index:index + len(sub)] == sub:
+            return True
+        start = index + 1
+
+
+def _private_text_contains_token_sequence(text, term):
+    """True when the private term appears as a contiguous token sequence inside text."""
+    return _tokens_contain_sequence(
+        _private_literal_identifier_tokens(text),
+        _private_literal_identifier_tokens(term),
+    )
+
+
+def _disclosure_allows_term(candidate, allowed_terms):
+    """True when printing ``candidate`` reveals no more than an approved disclosure.
+
+    A private term is allowed only when its token sequence is contained within one of the
+    approved disclosure canonical texts (so revealing the name also permits the name inside
+    an approved fact, but revealing the name does not permit the whole fact verbatim).
+    """
+    candidate_tokens = _private_literal_identifier_tokens(candidate)
+    if not candidate_tokens:
+        return False
+    for allowed in allowed_terms or []:
+        if _tokens_contain_sequence(_private_literal_identifier_tokens(allowed), candidate_tokens):
+            return True
+    return False
+
+
+def _private_output_violation(response_text, hot_context, allowed_terms=None):
     import re
 
     visible = re.sub(r'</?npc\b[^>]*>', '', response_text or '', flags=re.IGNORECASE)
@@ -2321,19 +2414,140 @@ def _private_output_violation(response_text, hot_context):
         for match in re.finditer(r'<npc\b[^>]*\btarget=["\']([^"\']+)["\']', response_text or '', flags=re.IGNORECASE)
     )
     visible_for_private_terms = f'{visible}\n{npc_targets}'
-    latest_player_message = _latest_player_message(hot_context)
     matched_terms = []
-    for term in hot_context.get('private_output_terms') or []:
+    for term in hot_context.get('protected_identifier_terms') or []:
         candidate = str(term or '').strip()
         if len(candidate) < 4:
             continue
-        if latest_player_message and re.search(re.escape(candidate), latest_player_message, flags=re.IGNORECASE):
+        if not _private_text_contains_token_sequence(visible_for_private_terms, candidate):
             continue
-        if re.search(re.escape(candidate), visible_for_private_terms, flags=re.IGNORECASE):
-            matched_terms.append(candidate)
+        if _disclosure_allows_term(candidate, allowed_terms):
+            continue
+        matched_terms.append(candidate)
     if matched_terms:
         return {'matched_terms': matched_terms}
     return None
+
+
+def _privacy_salvage_context(hot_context):
+    """Return a copy of hot_context with DM-private details stripped so a blocked reply can be re-drafted.
+
+    Keeps guard-only keys (protected_identifier_terms, private_spoiler_items, recent_messages) intact so the
+    deterministic literal-identifier backstop and semantic spoiler checker still run on the salvage candidate.
+    """
+    hot_context = dict(hot_context or {})
+    active_clocks = hot_context.get('active_clocks')
+    if isinstance(active_clocks, list):
+        hot_context['active_clocks'] = [
+            clock for clock in active_clocks
+            if not (isinstance(clock, dict) and clock.get('visibility') == 'dm_private')
+        ]
+    retrieval_packet = hot_context.get('retrieval_packet')
+    if isinstance(retrieval_packet, dict):
+        lanes = retrieval_packet.get('lanes')
+        if isinstance(lanes, list):
+            scrubbed_lanes = []
+            for lane in lanes:
+                if not isinstance(lane, dict):
+                    scrubbed_lanes.append(lane)
+                    continue
+                matches = lane.get('matches')
+                if isinstance(matches, list):
+                    lane = {
+                        **lane,
+                        'matches': [
+                            match for match in matches
+                            if not (isinstance(match, dict) and match.get('internal_only'))
+                        ],
+                    }
+                scrubbed_lanes.append(lane)
+            hot_context['retrieval_packet'] = {**retrieval_packet, 'lanes': scrubbed_lanes}
+    return hot_context
+
+
+def _session_dm_disclosure_validation(decision, hot_context):
+    """Validate proposed ``disclose_item_ids`` against the candidate reply and current disclosure state.
+
+    Returns ``(approved_ids, violations)``. A proposed facet is approved only when it is a known
+    private item, is not yet public, and the candidate visible reply literally states its canonical
+    text (token-sequence match). Disclosure is intent, not authority: the reply must actually reveal it.
+    """
+    proposed = []
+    if isinstance(decision, dict):
+        proposed = decision.get('disclose_item_ids') or []
+        proposed = [str(item or '').strip() for item in proposed if str(item or '').strip()]
+    if not proposed:
+        return [], []
+
+    disclosure_state = hot_context.get('disclosure_state') or {}
+    disclosure_facets = {
+        facet.get('id'): facet
+        for facet in (hot_context.get('disclosure_facets') or [])
+        if isinstance(facet, dict) and facet.get('id')
+    }
+    content = str((decision.get('content') or '') if isinstance(decision, dict) else '')
+
+    approved = []
+    violations = []
+    for item_id in proposed:
+        facet = disclosure_facets.get(item_id)
+        if facet is None:
+            violations.append({'item_id': item_id, 'reason': 'unknown_private_item'})
+            continue
+        if disclosure_state.get(item_id) == 'revealed':
+            approved.append(item_id)
+            continue
+        canonical = facet.get('canonical_text') or ''
+        if not canonical or not _private_text_contains_token_sequence(content, canonical):
+            violations.append({'item_id': item_id, 'reason': 'not_supported_by_visible_reply'})
+            continue
+        approved.append(item_id)
+    return approved, violations
+
+
+def _approved_disclosure_texts(approved_facet_ids, hot_context):
+    """Canonical texts for approved disclosure facets, used to relax the literal guard."""
+    disclosure_facets = {
+        facet.get('id'): facet
+        for facet in (hot_context.get('disclosure_facets') or [])
+        if isinstance(facet, dict) and facet.get('id')
+    }
+    return [
+        str(disclosure_facets[item_id].get('canonical_text') or '').strip()
+        for item_id in approved_facet_ids or []
+        if item_id in disclosure_facets
+        and str(disclosure_facets[item_id].get('canonical_text') or '').strip()
+    ]
+
+
+def _approved_disclosure_spoiler_item_ids(approved_facet_ids, hot_context):
+    """Spoiler-item ids covered by approved disclosure facets (facet-precise exemption)."""
+    disclosure_facets = {
+        facet.get('id'): facet
+        for facet in (hot_context.get('disclosure_facets') or [])
+        if isinstance(facet, dict) and facet.get('id')
+    }
+    return {
+        str(disclosure_facets[item_id].get('spoiler_item_id') or '').strip()
+        for item_id in approved_facet_ids or []
+        if item_id in disclosure_facets
+        and str(disclosure_facets[item_id].get('spoiler_item_id') or '').strip()
+    }
+
+
+def _spoiler_items_without_disclosed(hot_context, approved_facet_ids):
+    """Private spoiler items minus those covered by an approved disclosure this turn."""
+    items = hot_context.get('private_spoiler_items') or []
+    if not approved_facet_ids:
+        return items
+    exempt_ids = _approved_disclosure_spoiler_item_ids(approved_facet_ids, hot_context)
+    if not exempt_ids:
+        return items
+    return [
+        item
+        for item in items
+        if not (isinstance(item, dict) and str(item.get('id') or '').strip() in exempt_ids)
+    ]
 
 
 def _spoiler_check_allows_earned_clue(response_text, hot_context, spoiler_check):
@@ -4015,6 +4229,8 @@ def _run_session_dm_loop(
     canon_checker_retry_count = 0
     canon_repair_base_messages = None
     private_output_retry_count = 0
+    disclosure_retry_count = 0
+    privacy_salvage_attempted = False
     spoiler_checker_retry_count = 0
     combat_handoff_retried = False
     guard_audits = {}
@@ -4105,6 +4321,7 @@ def _run_session_dm_loop(
             pc_control_retried,
             canon_checker_retry_count > 0,
             private_output_retry_count > 0,
+            disclosure_retry_count > 0,
             spoiler_checker_retry_count > 0,
             combat_handoff_retried,
         )) and not combat_batch_force_tools
@@ -4495,9 +4712,18 @@ def _run_session_dm_loop(
             violation = None
             canon_violation = None
             private_violation = None
+            disclosure_violation = None
+            approved_disclosures = []
             spoiler_check = {'safe': True, 'leaked_item_ids': [], 'evidence': [], 'reason': ''}
             combat_handoff_violation = None
             while True:
+                approved_disclosures, disclosure_violations = _session_dm_disclosure_validation(decision, hot_context)
+                approved_disclosure_texts = _approved_disclosure_texts(approved_disclosures, hot_context)
+                disclosure_violation = (
+                    {'kind': 'disclosure', 'rejected': disclosure_violations}
+                    if decision.get('mode') == 'speak' and disclosure_violations
+                    else None
+                )
                 format_violation = (
                     _session_dm_content_format_violation(content, loop_audit)
                     if decision.get('mode') == 'speak'
@@ -4545,35 +4771,37 @@ def _run_session_dm_loop(
                     } if not canon_check.get('safe', True) else None
                 )
                 private_violation = (
-                    _private_output_violation(content, hot_context)
+                    _private_output_violation(content, hot_context, allowed_terms=approved_disclosure_texts)
                     if decision.get('mode') == 'speak' and not format_violation and not canon_violation
+                    and not disclosure_violation
                     else None
                 )
                 deterministic_spoiler_violation = (
                     _witness_private_leverage_spoiler_violation(content, hot_context)
                     if decision.get('mode') == 'speak' and not format_violation and not private_violation
-                    and not mechanical_violation and not canon_violation
+                    and not mechanical_violation and not canon_violation and not disclosure_violation
                     else None
                 )
                 spoiler_check = (
                     deterministic_spoiler_violation
                     or check_session_spoilers_with_llm(
                         content,
-                        hot_context,
+                        {**hot_context, 'private_spoiler_items': _spoiler_items_without_disclosed(hot_context, approved_disclosures)},
                         loop_audit,
                         skip_spoiler_check=preflight_decision.get('skip_spoiler_check') is True,
                     )
                     if decision.get('mode') == 'speak' and not format_violation and not private_violation
-                    and not mechanical_violation and not canon_violation
+                    and not mechanical_violation and not canon_violation and not disclosure_violation
                     else {'safe': True, 'leaked_item_ids': [], 'evidence': [], 'reason': ''}
                 )
                 combat_handoff_violation = (
                     _session_dm_combat_handoff_violation(content, combat_tracker)
                     if decision.get('mode') == 'speak' and not format_violation and not private_violation
-                    and not mechanical_violation and not canon_violation
+                    and not mechanical_violation and not canon_violation and not disclosure_violation
                     else None
                 )
                 break
+            decision['disclose_item_ids'] = approved_disclosures
             if mechanical_violation and not mechanical_retried:
                 if on_status_change:
                     on_status_change({"step": "revising", "violations": {"type": "mechanical_resolution", "details": mechanical_violation}})
@@ -4696,6 +4924,34 @@ def _run_session_dm_loop(
                     'content': _session_dm_guard_retry_system_prompt('canon_discipline', canon_violation),
                 })
                 canon_checker_retry_count += 1
+                continue
+            if disclosure_violation and disclosure_retry_count < 2:
+                if on_status_change:
+                    on_status_change({"step": "revising", "violations": {"type": "disclosure", "details": disclosure_violation}})
+                if base_audit.get('campaign_id'):
+                    audit = guard_audit('disclosure_guard')
+                    log_audit_event(
+                        base_audit.get('campaign_id'),
+                        'disclosure_guard_retry',
+                        'Session DM proposed disclosures that the visible reply does not support; discarded candidate and reran with guard reminder.',
+                        {
+                            'operation': 'disclosure_guard',
+                            'violation': disclosure_violation,
+                            'draft_response': raw_content,
+                        },
+                        source='session_dm.guard',
+                        actor=audit.get('actor'),
+                        trace_id=audit.get('trace_id'),
+                        parent_trace_id=audit.get('parent_trace_id'),
+                        trace_label=audit.get('trace_label'),
+                        audit_role='guard',
+                        commit=True,
+                    )
+                messages.append({
+                    'role': 'system',
+                    'content': _session_dm_guard_retry_system_prompt('disclosure', disclosure_violation),
+                })
+                disclosure_retry_count += 1
                 continue
             if private_violation and private_output_retry_count < 2:
                 if on_status_change:
@@ -4882,6 +5138,31 @@ def _run_session_dm_loop(
                     'mode': 'silent',
                     'reason': 'The DM response would have resolved combat without required D&D mechanics.',
                 }
+            if disclosure_violation:
+                if base_audit.get('campaign_id'):
+                    audit = guard_audit('disclosure_guard')
+                    log_audit_event(
+                        base_audit.get('campaign_id'),
+                        'disclosure_guard_blocked',
+                        'Session DM still proposed disclosures unsupported by the visible reply after retry.',
+                        {
+                            'operation': 'disclosure_guard',
+                            'violation': disclosure_violation,
+                            'draft_response': raw_content,
+                        },
+                        source='session_dm.guard',
+                        actor=audit.get('actor'),
+                        trace_id=audit.get('trace_id'),
+                        parent_trace_id=audit.get('parent_trace_id'),
+                        trace_label=audit.get('trace_label'),
+                        audit_role='guard',
+                        commit=True,
+                    )
+                rollback_combat_if_needed('disclosure_violation', disclosure_violation)
+                return {
+                    'mode': 'silent',
+                    'reason': 'The DM response proposed disclosures that the visible reply did not support.',
+                }
             if private_violation:
                 if base_audit.get('campaign_id'):
                     audit = guard_audit('private_output_guard')
@@ -4903,9 +5184,44 @@ def _run_session_dm_loop(
                         commit=True,
                     )
                 rollback_combat_if_needed('private_output_violation', private_violation)
+                if not privacy_salvage_attempted:
+                    privacy_salvage_attempted = True
+                    salvage_hot_context = _privacy_salvage_context(hot_context)
+                    messages = build_session_dm_request_messages(salvage_hot_context, recent_messages)
+                    messages.append({
+                        'role': 'system',
+                        'content': _session_dm_privacy_salvage_prompt(private_violation),
+                    })
+                    action_buffer['actions'] = []
+                    private_output_retry_count = 0
+                    if on_status_change:
+                        on_status_change({
+                            "step": "revising",
+                            "violations": {"type": "private_output_salvage", "details": private_violation},
+                        })
+                    if base_audit.get('campaign_id'):
+                        log_audit_event(
+                            base_audit.get('campaign_id'),
+                            'private_output_salvage_attempt',
+                            'Privacy retry budget exhausted; re-drafting with DM-private context stripped to resolve the pending player action.',
+                            {
+                                'operation': 'private_output_guard',
+                                'violation': private_violation,
+                                'draft_response': raw_content,
+                                'repair_strategy': 'privacy_safe_salvage_rerun',
+                            },
+                            source='session_dm.guard',
+                            actor=audit.get('actor'),
+                            trace_id=audit.get('trace_id'),
+                            parent_trace_id=audit.get('parent_trace_id'),
+                            trace_label=audit.get('trace_label'),
+                            audit_role='guard',
+                            commit=True,
+                        )
+                    continue
                 return {
                     'mode': 'silent',
-                    'reason': 'The DM response would have exposed DM-private information.',
+                    'reason': 'The DM response would have exposed DM-private information even after a privacy-safe salvage attempt.',
                 }
             if format_violation:
                 if base_audit.get('campaign_id'):

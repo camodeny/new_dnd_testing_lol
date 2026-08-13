@@ -101,6 +101,8 @@ def _session_dm_turn_decision(raw_result):
         'parts': decision.get('parts') if isinstance(decision.get('parts'), list) else [],
         'commit_action_ids': decision.get('commit_action_ids'),
     }
+    if isinstance(decision.get('disclose_item_ids'), list):
+        result['disclose_item_ids'] = decision['disclose_item_ids']
     if isinstance(decision.get('resolver_packet'), dict):
         result['resolver_packet'] = decision['resolver_packet']
     return result
@@ -1327,6 +1329,7 @@ def send_message(current_user, session_id):
                     else None,
                     response_parts=response_parts,
                     resolver_packet=resolver_packet,
+                    disclose_item_ids=ai_turn.get('disclose_item_ids') if isinstance(ai_turn, dict) else None,
                 )
             except Exception as err:
                 return jsonify({'error': repr(err), 'messages': result_messages}), 500

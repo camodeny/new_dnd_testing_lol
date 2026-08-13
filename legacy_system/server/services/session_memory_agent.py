@@ -5,7 +5,8 @@ import copy
 
 from models import Campaign, CampaignClock, CampaignSession, CampaignWorld, CampaignWorldIdentity, Character, NPCActor, SessionMessage, User, WorldEvent, db
 from services.dm_tools import (
-    _contains_unrevealed_private_term,
+    _memory_text_has_hidden_identifier,
+    _protected_identifier_terms,
     _tool_search_campaign_memory,
 )
 from services.entity_types import normalize_world_entity_type
@@ -1403,9 +1404,11 @@ def compile_staged_memory_patch(memory_context, extracted, resolved):
         text = clean_text(value, 700)
         if not text:
             return None
-        if _contains_unrevealed_private_term(campaign, text, visible_exchange):
+        if _memory_text_has_hidden_identifier(campaign, text, visible_exchange, terms=identifier_terms):
             return None
         return text
+
+    identifier_terms = _protected_identifier_terms(campaign)
 
     for scalar_key in ("current_goal", "current_scene"):
         compiled_anchors[scalar_key] = _spoiler_safe_anchor(compiled_anchors.get(scalar_key))

@@ -5,9 +5,12 @@ from time_utils import utcnow
 from models import (
     db,
     CampaignClock,
+    CampaignDisclosure,
     CampaignMember,
     CampaignMonster,
     CampaignSession,
+    CampaignWorldIdentity,
+    CampaignMemoryLog,
     Character,
     CharacterCondition,
     EncounterMap,
@@ -208,20 +211,87 @@ def _contains_hidden_policy_signal(item_text):
     return bool(item_words & PRIVATE_VISIBILITY_TERMS)
 
 
-def _contains_unrevealed_private_term(campaign, item_text, visible_text):
+def _text_contains_token_sequence(text, term):
+    """True when ``term`` appears as a contiguous lowercase token sequence inside ``text``."""
+    term_tokens = re.findall(r'[a-z0-9]+', clean_text(term, 240).lower())
+    if not term_tokens:
+        return False
+    text_tokens = re.findall(r'[a-z0-9]+', clean_text(text, 8000).lower())
+    if len(term_tokens) > len(text_tokens):
+        return False
+    first = term_tokens[0]
+    start = 0
+    while True:
+        try:
+            index = text_tokens.index(first, start)
+        except ValueError:
+            return False
+        if text_tokens[index:index + len(term_tokens)] == term_tokens:
+            return True
+        start = index + 1
+
+
+def _memory_text_has_hidden_identifier(campaign, text, visible_text, terms=None):
+    """True when text carries a hidden protected identifier not present in the visible exchange.
+
+    Uses token-sequence matching against the narrow protected-identifier backstop (entity and
+    clock names only), so ordinary words such as 'crooked' never false-positive on a hidden name
+    like 'Rook'. Facts, relation summaries, and secret prose are not guarded lexically here; they
+    are governed by evidence/provenance validation at the memory write boundary.
+    """
     if not campaign:
         return False
-    lowered_item = clean_text(item_text, 4000).lower()
-    lowered_visible = clean_text(visible_text, 4000).lower()
-    if not lowered_item:
-        return False
-    for term in _private_output_terms(campaign):
+    if terms is None:
+        terms = _protected_identifier_terms(campaign)
+    for term in terms:
         lowered_term = clean_text(term, 240).lower()
         if len(lowered_term) < 4:
             continue
-        if lowered_term in lowered_item and lowered_term not in lowered_visible:
+        if _text_contains_token_sequence(visible_text, lowered_term):
+            continue
+        if _text_contains_token_sequence(text, lowered_term):
             return True
     return False
+
+
+def _evidence_source_is_party_visible(campaign, source):
+    """True when an evidence source supports committing a party-visible memory record.
+
+    Transcript/visible sources are party-visible by definition. Referenced world events and prior
+    memory records are party-visible only when their stored visibility is public or party_known.
+    Unknown or model-authored sources default permissive so legitimate resolved memory is not
+    over-demoted; explicit ``internal_only`` / ``dm_private`` markers always demote.
+    """
+    if not isinstance(source, dict):
+        return True
+    if source.get('internal_only') is True or source.get('visibility') == 'dm_private':
+        return False
+    source_type = str(source.get('source_type') or source.get('source') or '').strip()
+    source_id = source.get('source_id')
+    if source_type in (
+        'transcript_message',
+        'visible_transcript',
+        'clarification_answer',
+        'existing_alias',
+        'prior_scene_cast',
+        'clock_rule',
+        'deterministic_rule',
+        'memory_resolver_packet',
+    ):
+        return True
+    if source_type == 'world_event':
+        event = WorldEvent.query.filter_by(id=source_id).first() if source_id is not None else None
+        return bool(event) and (event.visibility or 'dm_private') in ('public', 'party_known')
+    if source_type in ('prior_memory_record', 'prior_durable_memory'):
+        record = (
+            CampaignMemoryLog.query.filter(
+                db.or_(CampaignMemoryLog.id == source_id, CampaignMemoryLog.memory_id == source_id)
+            ).first()
+            if source_id is not None
+            else None
+        )
+        return bool(record) and (record.visibility or 'dm_private') in ('public', 'party_known')
+    return True
 
 
 def _visibility_policy_text(audit_context):
@@ -232,15 +302,23 @@ def _visibility_policy_text(audit_context):
     )
 
 
-def _leak_guard_has_private_content(campaign, value, visible_text):
-    """True when party-visible text carries unrevealed private terms or a
-    hidden-policy signal that is not already supported by the visible exchange."""
-    if not value:
-        return False
+def _leak_guard_has_private_content(campaign, value, visible_text, item=None, terms=None):
+    """True when a party-visible memory value is unsafe to commit as party-visible.
+
+    Provenance-first: when the owning item carries evidence sources, any non-party-visible source
+    makes the value unsafe (no lexical matching required). Otherwise it falls back to the narrow
+    token-based protected-identifier backstop plus the hidden-policy signal, so clean prose
+    (e.g. 'crooked') is never dropped for lexically resembling a private name.
+    """
+    if item is not None:
+        provenance = item.get('provenance') if isinstance(item.get('provenance'), dict) else {}
+        evidence_sources = provenance.get('evidence_sources')
+        if isinstance(evidence_sources, list) and evidence_sources:
+            return any(not _evidence_source_is_party_visible(campaign, source) for source in evidence_sources)
     text = clean_text(value, 4000)
     if not text:
         return False
-    if _contains_unrevealed_private_term(campaign, text, visible_text):
+    if _memory_text_has_hidden_identifier(campaign, text, visible_text, terms=terms):
         return True
     if visible_text and _contains_hidden_policy_signal(text) and not _is_supported_by_visible_exchange(text, visible_text):
         return True
@@ -275,16 +353,36 @@ def _leak_guard_memory_patch(campaign, patch, visible_text):
         'summary_redacted': 0,
         'anchor_items_redacted': 0,
         'reasons': [],
+        'demotions': [],
     }
 
     def _flag(reason):
         telemetry['reasons'].append(reason)
 
+    identifier_terms = _protected_identifier_terms(campaign)
+
+    def _evidence_source_ids(item):
+        provenance = item.get('provenance') if isinstance(item.get('provenance'), dict) else {}
+        sources = provenance.get('evidence_sources')
+        return [
+            str(source.get('source_id'))
+            for source in sources
+            if isinstance(source, dict) and source.get('source_id') is not None
+        ]
+
+    def _demote(item, reason):
+        item['visibility'] = 'dm_private'
+        telemetry['demotions'].append({
+            'item_id': str(item.get('id') or item.get('actor_id') or ''),
+            'reason': reason,
+            'evidence_source_ids': _evidence_source_ids(item),
+        })
+
     for item in patch.get('upsert_graph_entities', []) if isinstance(patch.get('upsert_graph_entities'), list) else []:
         if not isinstance(item, dict) or item.get('visibility') not in {'public', 'party_known'}:
             continue
-        if _leak_guard_has_private_content(campaign, item.get('name'), visible_text):
-            item['visibility'] = 'dm_private'
+        if _leak_guard_has_private_content(campaign, item.get('name'), visible_text, item=item, terms=identifier_terms):
+            _demote(item, 'entity_name_private_evidence')
             telemetry['entities_demoted'] += 1
             _flag('entity_name_private')
             continue
@@ -292,6 +390,8 @@ def _leak_guard_memory_patch(campaign, patch, visible_text):
             campaign,
             _visibility_text_for_item(item, ('summary', 'tags')),
             visible_text,
+            item=item,
+            terms=identifier_terms,
         ):
             for field in ('summary', 'tags'):
                 if field in item:
@@ -306,23 +406,25 @@ def _leak_guard_memory_patch(campaign, patch, visible_text):
             campaign,
             _visibility_text_for_item(item, ('summary', 'type')),
             visible_text,
+            item=item,
+            terms=identifier_terms,
         ):
-            item['visibility'] = 'dm_private'
+            _demote(item, 'relation_private_evidence')
             telemetry['relations_demoted'] += 1
             _flag('relation_private')
 
     for item in patch.get('upsert_graph_facts', []) if isinstance(patch.get('upsert_graph_facts'), list) else []:
         if not isinstance(item, dict) or item.get('visibility') not in {'public', 'party_known'}:
             continue
-        if _leak_guard_has_private_content(campaign, item.get('text'), visible_text):
-            item['visibility'] = 'dm_private'
+        if _leak_guard_has_private_content(campaign, item.get('text'), visible_text, item=item, terms=identifier_terms):
+            _demote(item, 'fact_private_evidence')
             telemetry['facts_demoted'] += 1
             _flag('fact_private')
 
     for item in patch.get('update_npc_actors', []) if isinstance(patch.get('update_npc_actors'), list) else []:
         if not isinstance(item, dict):
             continue
-        identity_private = _leak_guard_has_private_content(campaign, item.get('name'), visible_text)
+        identity_private = _leak_guard_has_private_content(campaign, item.get('name'), visible_text, item=item, terms=identifier_terms)
         if identity_private:
             item.pop('name', None)
             telemetry['npc_public_redacted'] += 1
@@ -331,6 +433,8 @@ def _leak_guard_memory_patch(campaign, patch, visible_text):
             campaign,
             _visibility_text_for_item(item, ('role', 'public_summary')),
             visible_text,
+            item=item,
+            terms=identifier_terms,
         ):
             for field in ('role', 'public_summary'):
                 if field in item:
@@ -338,7 +442,7 @@ def _leak_guard_memory_patch(campaign, patch, visible_text):
             telemetry['npc_public_redacted'] += 1
             _flag('npc_public_fields_private')
         if identity_private:
-            item['visibility'] = 'dm_private'
+            _demote(item, 'npc_private_evidence')
             telemetry['npcs_demoted'] += 1
             _flag('npc_demoted_dm_private')
         else:
@@ -351,8 +455,10 @@ def _leak_guard_memory_patch(campaign, patch, visible_text):
             campaign,
             _visibility_text_for_item(item, ('summary', 'event_type')),
             visible_text,
+            item=item,
+            terms=identifier_terms,
         ):
-            item['visibility'] = 'dm_private'
+            _demote(item, 'event_private_evidence')
             telemetry['events_demoted'] += 1
             _flag('event_private')
 
@@ -364,22 +470,27 @@ def _leak_guard_memory_patch(campaign, patch, visible_text):
                 campaign,
                 _visibility_text_for_item(item, ('name', 'summary', 'trigger', 'on_complete')),
                 visible_text,
+                item=item,
+                terms=identifier_terms,
             ):
-                item['visibility'] = 'dm_private'
+                _demote(item, 'clock_private_evidence')
                 telemetry['clocks_demoted'] += 1
                 _flag('clock_private')
 
     # ── Session-facing free text: running summary and memory anchors ───
     # The running summary is DM/AI-internal session memory (it feeds the DM hot
     # context and prior-summary passes), not a party-facing surface. It is
-    # redacted here anyway so unrevealed private terms never enter the AI's own
-    # working memory and get echoed into visible narration. memory_anchors are
-    # served to every campaign member via CampaignSession.to_dict(), so they are
-    # redacted at the write boundary too.
+    # checked here with the narrow identifier backstop so hidden names never
+    # enter the AI's own working memory and get echoed into visible narration.
+    # memory_anchors are served to every campaign member via
+    # CampaignSession.to_dict(), so they are guarded at the write boundary too.
+    # Sentences are only dropped when they carry a hidden protected identifier;
+    # clean prose that merely lexically resembles a name is preserved.
     summary, summary_changed = _redact_free_text_private_terms(
         campaign,
         patch.get('running_summary'),
         visible_text,
+        terms=identifier_terms,
     )
     if summary_changed:
         patch['running_summary'] = summary
@@ -389,7 +500,7 @@ def _leak_guard_memory_patch(campaign, patch, visible_text):
     anchors = patch.get('memory_anchors')
     if isinstance(anchors, dict):
         for key in ('current_goal', 'current_scene'):
-            value, changed = _redact_free_text_private_terms(campaign, anchors.get(key), visible_text)
+            value, changed = _redact_free_text_private_terms(campaign, anchors.get(key), visible_text, terms=identifier_terms)
             if changed:
                 anchors[key] = value
                 telemetry['anchor_items_redacted'] += 1
@@ -400,7 +511,7 @@ def _leak_guard_memory_patch(campaign, patch, visible_text):
                 continue
             kept = []
             for value in values:
-                if _leak_guard_has_private_content(campaign, value, visible_text):
+                if _leak_guard_has_private_content(campaign, value, visible_text, terms=identifier_terms):
                     telemetry['anchor_items_redacted'] += 1
                     _flag('memory_anchor_private')
                     continue
@@ -410,21 +521,24 @@ def _leak_guard_memory_patch(campaign, patch, visible_text):
     return telemetry
 
 
-def _redact_free_text_private_terms(campaign, text, visible_text):
-    """Drop sentences that carry unrevealed private terms from free text.
+def _redact_free_text_private_terms(campaign, text, visible_text, terms=None):
+    """Drop sentences that carry a hidden protected identifier from free text.
 
-    Used for session-facing free text (running summary, anchor scalars) where
-    a whole-record demotion is not meaningful. Returns (redacted_or_none,
-    changed) and never emits the private term itself.
+    Uses the narrow token-based identifier backstop (entity/clock names only), so clean prose
+    such as a sentence containing 'crooked' is preserved even when a hidden name like 'Rook'
+    lexically overlaps it. Facts and secret prose are not sentence-redacted here. Returns
+    (redacted_or_none, changed) and never emits the identifier itself.
     """
     text = clean_text(text, 4000)
     if not text:
         return None, False
+    if terms is None:
+        terms = _protected_identifier_terms(campaign)
     sentences = re.split(r'(?<=[.!?])\s+', text)
     kept = []
     changed = False
     for sentence in sentences:
-        if _leak_guard_has_private_content(campaign, sentence, visible_text):
+        if _leak_guard_has_private_content(campaign, sentence, visible_text, terms=terms):
             changed = True
             continue
         kept.append(sentence)
@@ -571,51 +685,268 @@ def _open_public_threads(campaign, limit=6):
     ]
 
 
-def _private_output_terms(campaign):
-    _world, graph, _world_state, dm_private = _world_json(campaign)
-    terms = set()
+DISCLOSURE_REVEALED_STATE = 'revealed'
+DISCLOSURE_HIDDEN_STATE = 'hidden'
 
-    def add(value):
-        text = clean_text(value, 240)
-        if len(text) >= 4:
-            terms.add(text)
+
+def _explicit_revealed_facet_ids(campaign):
+    """Facet ids with an explicit durable disclosure row recording that the party learned them."""
+    rows = CampaignDisclosure.query.filter_by(campaign_id=campaign.id, state=DISCLOSURE_REVEALED_STATE).all()
+    return {row.item_id for row in rows}
+
+
+def _derived_revealed_facet_ids(campaign, graph):
+    """Facet ids revealed by canonical game state (world-graph / clock visibility), not transcript inference."""
+    revealed = set()
+    for entity in graph.get('entities', []) if isinstance(graph, dict) else []:
+        if entity.get('visibility') in ('public', 'party_known'):
+            entity_id = clean_id(entity.get('id'), '')
+            if entity_id:
+                revealed.add(f'entity:{entity_id}:name')
+                revealed.add(f'entity:{entity_id}:summary')
+    for relation in graph.get('relations', []) if isinstance(graph, dict) else []:
+        if relation.get('visibility') in ('public', 'party_known'):
+            relation_id = clean_id(relation.get('id'), '')
+            if relation_id:
+                revealed.add(f'relation:{relation_id}:summary')
+    for fact in graph.get('facts', []) if isinstance(graph, dict) else []:
+        if fact.get('visibility') in ('public', 'party_known'):
+            fact_id = clean_id(fact.get('id'), '')
+            if fact_id:
+                revealed.add(f'fact:{fact_id}:text')
+    for clock in CampaignClock.query.filter_by(campaign_id=campaign.id).all():
+        if (clock.visibility or 'dm_private') in ('public', 'party_known'):
+            clock_id = clean_id(clock.clock_id, '')
+            if clock_id:
+                revealed.add(f'clock:{clock_id}:name')
+                revealed.add(f'clock:{clock_id}:summary')
+                revealed.add(f'clock:{clock_id}:trigger')
+                revealed.add(f'clock:{clock_id}:on_complete')
+    actor_by_entity = {}
+    for row in CampaignWorldIdentity.query.filter_by(campaign_id=campaign.id).all():
+        actor_by_entity[row.graph_entity_id] = row.actor_id
+    for entity in graph.get('entities', []) if isinstance(graph, dict) else []:
+        if entity.get('visibility') in ('public', 'party_known'):
+            actor_id = actor_by_entity.get(entity.get('id'))
+            if actor_id:
+                revealed.add(f'npc:{clean_id(actor_id, "")}:name')
+    return revealed
+
+
+def _disclosure_item_facets(campaign):
+    """Stable disclosure-sized facets for a campaign's private knowledge.
+
+    Each facet is a discrete piece of knowledge the party can learn independently
+    (an NPC name vs. that NPC's secrets, a clock name vs. its trigger, and so on).
+    ``visibility`` reflects the current disclosure state: ``dm_private`` while hidden
+    and ``party_known`` once revealed through an explicit disclosure or canonical
+    world-graph/clock state.
+    """
+    world, graph, _world_state, dm_private = _world_json(campaign)
+    if not world:
+        return []
+    revealed = _explicit_revealed_facet_ids(campaign) | _derived_revealed_facet_ids(campaign, graph)
+    facets = []
+    seen = set()
+
+    def add_facet(facet_id, kind, text, subject_id, source, spoiler_item_id=None):
+        clean = clean_text(text, 700)
+        if not clean or facet_id in seen:
+            return
+        seen.add(facet_id)
+        facets.append({
+            'id': facet_id,
+            'kind': kind,
+            'canonical_text': clean,
+            'subject_id': subject_id,
+            'source': source,
+            'spoiler_item_id': spoiler_item_id or subject_id,
+            'visibility': 'party_known' if facet_id in revealed else 'dm_private',
+        })
 
     for entity in graph.get('entities', []) if isinstance(graph, dict) else []:
-        if entity.get('visibility') == 'dm_private':
-            add(entity.get('name'))
+        if entity.get('visibility') != 'dm_private':
+            continue
+        entity_id = clean_id(entity.get('id'), '')
+        if not entity_id:
+            continue
+        add_facet(f'entity:{entity_id}:name', 'entity_name', entity.get('name'), entity_id, 'graph_entity')
+        add_facet(f'entity:{entity_id}:summary', 'entity_summary', entity.get('summary'), entity_id, 'graph_entity')
     for relation in graph.get('relations', []) if isinstance(graph, dict) else []:
-        if relation.get('visibility') == 'dm_private':
-            add(relation.get('summary'))
+        if relation.get('visibility') != 'dm_private':
+            continue
+        relation_id = clean_id(relation.get('id'), '')
+        if relation_id:
+            add_facet(f'relation:{relation_id}:summary', 'relation_summary', relation.get('summary'), relation_id, 'graph_relation')
     for fact in graph.get('facts', []) if isinstance(graph, dict) else []:
-        if fact.get('visibility') == 'dm_private':
-            add(fact.get('text'))
+        if fact.get('visibility') != 'dm_private':
+            continue
+        fact_id = clean_id(fact.get('id'), '')
+        if fact_id:
+            add_facet(f'fact:{fact_id}:text', 'fact_text', fact.get('text'), fact_id, 'graph_fact')
 
     for clock in CampaignClock.query.filter_by(campaign_id=campaign.id).all():
-        if (clock.visibility or 'dm_private') == 'dm_private':
-            add(clock.name)
+        if (clock.visibility or 'dm_private') != 'dm_private':
+            continue
+        clock_id = clean_id(clock.clock_id, '')
+        if not clock_id:
+            continue
+        spoiler_item_id = f'clock_{clock_id}'
+        add_facet(f'clock:{clock_id}:name', 'clock_name', clock.name, clock_id, 'campaign_clock', spoiler_item_id)
+        add_facet(f'clock:{clock_id}:summary', 'clock_summary', clock.summary, clock_id, 'campaign_clock', spoiler_item_id)
+        add_facet(f'clock:{clock_id}:trigger', 'clock_trigger', clock.trigger, clock_id, 'campaign_clock', spoiler_item_id)
+        add_facet(f'clock:{clock_id}:on_complete', 'clock_on_complete', clock.on_complete, clock_id, 'campaign_clock', spoiler_item_id)
 
+    entity_by_actor = {}
+    for identity in CampaignWorldIdentity.query.filter_by(campaign_id=campaign.id).all():
+        entity_by_actor[clean_id(identity.actor_id, '')] = identity.graph_entity_id
     for npc in NPCActor.query.filter_by(campaign_id=campaign.id).all():
+        actor_id = clean_id(npc.actor_id, '')
+        if not actor_id:
+            continue
+        add_facet(
+            f'npc:{actor_id}:name',
+            'identity',
+            npc.name,
+            actor_id,
+            'npc_actor',
+            spoiler_item_id=clean_id(entity_by_actor.get(actor_id), '') or None,
+        )
         dossier = json_loads(npc.dossier, {})
-        for secret in dossier.get('secrets', []) if isinstance(dossier, dict) else []:
-            add(secret)
+        for index, secret in enumerate(dossier.get('secrets', []) if isinstance(dossier, dict) else []):
+            add_facet(
+                f'npc:{actor_id}:secret:{index + 1}',
+                'npc_secret',
+                secret,
+                actor_id,
+                'npc_actor',
+                spoiler_item_id=f'npc_secret_{actor_id}_{index + 1}',
+            )
 
     if isinstance(dm_private, dict):
         for key in ('true_inciting_incident', 'villain_plan'):
-            add(dm_private.get(key))
-        for value in dm_private.get('hidden_factions', []) if isinstance(dm_private.get('hidden_factions'), list) else []:
-            add(value)
-        for value in dm_private.get('npc_secrets', []) if isinstance(dm_private.get('npc_secrets'), list) else []:
-            add(value)
+            add_facet(f'dm_private:{key}', key, dm_private.get(key), 'dm_private', 'dm_private', f'dm_private_{key}')
+        for index, value in enumerate(dm_private.get('hidden_factions', []) if isinstance(dm_private.get('hidden_factions'), list) else []):
+            add_facet(f'dm_private:hidden_faction:{index + 1}', 'hidden_faction', value, 'dm_private', 'dm_private', f'dm_private_hidden_faction_{index + 1}')
+        for index, value in enumerate(dm_private.get('npc_secrets', []) if isinstance(dm_private.get('npc_secrets'), list) else []):
+            add_facet(f'dm_private:npc_secret:{index + 1}', 'npc_secret', value, 'dm_private', 'dm_private', f'dm_private_npc_secret_{index + 1}')
 
+    return facets
+
+
+def _disclosure_state(campaign):
+    """Map of facet id -> 'revealed' | 'hidden' for the campaign's disclosure registry."""
+    _world, graph, _world_state, _dm_private = _world_json(campaign)
+    revealed = _explicit_revealed_facet_ids(campaign) | _derived_revealed_facet_ids(campaign, graph)
+    state = {}
+    for facet in _disclosure_item_facets(campaign):
+        state[facet['id']] = DISCLOSURE_REVEALED_STATE if facet['id'] in revealed else DISCLOSURE_HIDDEN_STATE
+    for facet_id in revealed:
+        state[facet_id] = DISCLOSURE_REVEALED_STATE
+    return state
+
+
+def mark_facet_disclosures(campaign, facet_ids, source, source_message_id=None):
+    """Record durable disclosures for the given facet ids (upsert). Returns the number of rows created.
+
+    Linked representations of the same identifier (``npc:<actor_id>:name`` and the mapped
+    ``entity:<entity_id>:name``) are disclosed together so the registry stays consistent.
+    """
+    facet_ids = sorted({
+        str(facet_id or '').strip()
+        for facet_id in facet_ids
+        if facet_id and str(facet_id or '').strip()
+    })
+    if not facet_ids:
+        return 0
+    facet_ids = sorted(_linked_disclosure_facet_ids(campaign, facet_ids))
+    existing = {
+        row.item_id: row
+        for row in CampaignDisclosure.query.filter_by(campaign_id=campaign.id).filter(
+            CampaignDisclosure.item_id.in_(facet_ids)
+        ).all()
+    }
+    created = 0
+    for facet_id in facet_ids:
+        row = existing.get(facet_id)
+        if row is None:
+            db.session.add(CampaignDisclosure(
+                campaign_id=campaign.id,
+                item_id=facet_id,
+                state=DISCLOSURE_REVEALED_STATE,
+                source=source,
+                source_message_id=source_message_id,
+            ))
+            created += 1
+        elif row.state != DISCLOSURE_REVEALED_STATE or row.source != source or row.source_message_id != source_message_id:
+            row.state = DISCLOSURE_REVEALED_STATE
+            row.source = source
+            row.source_message_id = source_message_id
+    return created
+
+
+def _linked_disclosure_facet_ids(campaign, facet_ids):
+    """Expand disclosure facet ids across linked representations of the same identifier.
+
+    NPC identity facets (``npc:<actor_id>:name``) and the mapped graph entity name facets
+    (``entity:<entity_id>:name``) refer to the same literal identifier; revealing either one
+    must reveal both so the literal-identifier backstop stays consistent with disclosure state.
+    """
+    expanded = set(facet_ids)
+    entity_by_actor = {}
+    actor_by_entity = {}
+    for row in CampaignWorldIdentity.query.filter_by(campaign_id=campaign.id).all():
+        actor_id = clean_id(row.actor_id, '')
+        entity_id = clean_id(row.graph_entity_id, '')
+        if actor_id:
+            entity_by_actor[actor_id] = entity_id
+        if entity_id:
+            actor_by_entity[entity_id] = actor_id
+    for facet_id in list(expanded):
+        parts = facet_id.split(':')
+        if len(parts) == 3 and parts[2] == 'name':
+            if parts[0] == 'npc' and parts[1] in entity_by_actor:
+                expanded.add(f'entity:{entity_by_actor[parts[1]]}:name')
+            elif parts[0] == 'entity' and parts[1] in actor_by_entity:
+                expanded.add(f'npc:{actor_by_entity[parts[1]]}:name')
+    return expanded
+
+
+def _protected_identifier_terms(campaign):
+    """Narrow deterministic literal-identifier backstop: hidden entity and clock names only.
+
+    Relation summaries, fact texts, dossier secrets, and other prose are deliberately excluded;
+    those are governed by the semantic spoiler checker and provenance-based memory validation.
+    An identifier is guarded only while its disclosure facet is hidden.
+    """
+    world, graph, _world_state, _dm_private = _world_json(campaign)
+    if not world:
+        return []
+    disclosure_state = _disclosure_state(campaign)
+    terms = set()
+    for entity in graph.get('entities', []) if isinstance(graph, dict) else []:
+        if entity.get('visibility') != 'dm_private':
+            continue
+        entity_id = clean_id(entity.get('id'), '')
+        if not entity_id:
+            continue
+        if disclosure_state.get(f'entity:{entity_id}:name') == DISCLOSURE_REVEALED_STATE:
+            continue
+        name = clean_text(entity.get('name'), 240)
+        if len(name) >= 4:
+            terms.add(name)
+    for clock in CampaignClock.query.filter_by(campaign_id=campaign.id).all():
+        if (clock.visibility or 'dm_private') != 'dm_private':
+            continue
+        clock_id = clean_id(clock.clock_id, '')
+        if not clock_id:
+            continue
+        if disclosure_state.get(f'clock:{clock_id}:name') == DISCLOSURE_REVEALED_STATE:
+            continue
+        name = clean_text(clock.name, 240)
+        if len(name) >= 4:
+            terms.add(name)
     return sorted(terms, key=lambda value: value.lower())
-
-
-def _latest_player_content_from_messages(messages):
-    for message in reversed(messages or []):
-        role = getattr(message, 'role', None)
-        if role == 'player':
-            return getattr(message, 'content', '') or ''
-    return ''
 
 
 def _public_npc_reference(npc):
@@ -636,19 +967,21 @@ def _public_npc_reference(npc):
     return 'unrevealed NPC'
 
 
-def _visible_naming_constraints(campaign, recent_messages):
-    private_terms = {term.lower() for term in _private_output_terms(campaign)}
-    latest_player_content = _latest_player_content_from_messages(recent_messages)
+def _visible_naming_constraints(campaign):
+    protected_identifiers = {term.lower() for term in _protected_identifier_terms(campaign)}
+    disclosure_state = _disclosure_state(campaign)
     constraints = []
     for npc in NPCActor.query.filter_by(campaign_id=campaign.id).order_by(NPCActor.id.asc()).all():
         name = clean_text(npc.name, 120)
-        if not name or name.lower() not in private_terms:
+        if not name or name.lower() not in protected_identifiers:
             continue
-        if re.search(re.escape(name), latest_player_content, flags=re.IGNORECASE):
+        name_facet = f'npc:{clean_id(npc.actor_id, "")}:name'
+        if disclosure_state.get(name_facet) == DISCLOSURE_REVEALED_STATE:
             continue
         constraints.append({
             'avoid_visible_name': name,
             'use_public_reference': _public_npc_reference(npc),
+            'item_id': name_facet,
             'applies_to': 'visible narration and <npc target="..."> until the name is revealed by play',
         })
     return constraints
@@ -908,9 +1241,11 @@ def build_session_hot_context(campaign, session, current_user, recent_messages_o
         'established_public_facts': _established_public_facts(campaign),
         'recent_public_world_events': _recent_public_world_events(campaign),
         'open_public_threads': _open_public_threads(campaign),
-        'visible_naming_constraints': _visible_naming_constraints(campaign, recent_messages),
-        'private_output_terms': _private_output_terms(campaign),
+        'visible_naming_constraints': _visible_naming_constraints(campaign),
+        'protected_identifier_terms': _protected_identifier_terms(campaign),
         'private_spoiler_items': _private_spoiler_items(campaign),
+        'disclosure_state': _disclosure_state(campaign),
+        'disclosure_facets': _disclosure_item_facets(campaign),
         'recent_messages': [message.to_dict() for message in recent_messages],
         'tool_policy': (
             'Treat hot-context memory as authoritative state for lore, continuity, NPC motivations, active pressure, '
@@ -918,8 +1253,9 @@ def build_session_hot_context(campaign, session, current_user, recent_messages_o
             'scene state, and durable state writes instead of guessing. If a question or action touches remembered '
             'facts, unresolved clocks, recent world events, or stored NPC agendas, inspect and follow that state '
             'before improvising. Do not claim to update world state unless a write tool succeeds. Never reveal '
-            'DM-private tool results unless they have become visible through play. private_output_terms are '
-            'reasoning-only strings that must not appear in visible narration unless they are first revealed through play. '
+            'DM-private tool results unless they have become visible through play. Protected identifiers are '
+            'hidden names that must not appear in visible narration unless a matching disclosure has been committed '
+            'through play; disclose a private item intentionally with talk_to_player disclose_item_ids. '
             'Treat specific player-supplied recollections, accusations, guesses, bluff details, and theories as claims, '
             'not confirmed truth, unless they are corroborated by the visible scene, established public facts, a '
             'successful check, or another grounded source. NPCs may react to a claim without validating it. '
@@ -948,8 +1284,10 @@ def build_session_hot_context(campaign, session, current_user, recent_messages_o
 
 
 SESSION_DM_PRIMARY_PROMPT_EXCLUDED_CONTEXT_KEYS = {
-    'private_output_terms',
+    'protected_identifier_terms',
     'private_spoiler_items',
+    'disclosure_state',
+    'disclosure_facets',
     'recent_messages',
 }
 
@@ -2711,7 +3049,17 @@ def _tool_advance_clock(campaign, _current_user, args):
     return {'clock': clock.to_dict(include_private=True), 'affected_ids': {'clock_ids': [clock.id], 'world_event_ids': [event.id]}}
 
 
-def _tool_reveal_fact(campaign, _current_user, args):
+def _reveal_fact_facet_ids(item_type, item_id):
+    if item_type == 'entity':
+        return [f'entity:{item_id}:name', f'entity:{item_id}:summary']
+    if item_type == 'relation':
+        return [f'relation:{item_id}:summary']
+    if item_type == 'fact':
+        return [f'fact:{item_id}:text']
+    return []
+
+
+def _tool_reveal_fact(campaign, _current_user, args, source_message_id=None):
     world, graph, _world_state, _private = _world_json(campaign)
     if not world:
         return {'error': 'No world package exists.'}
@@ -2740,6 +3088,13 @@ def _tool_reveal_fact(campaign, _current_user, args):
         {'item_type': item_type, 'item_id': item_id, 'from': old_visibility, 'to': visibility},
         visibility=visibility,
     )
+    if visibility in ('public', 'party_known'):
+        mark_facet_disclosures(
+            campaign,
+            _reveal_fact_facet_ids(item_type, item_id),
+            source='reveal_fact',
+            source_message_id=source_message_id,
+        )
     return {'item': target, 'affected_ids': {'world_id': world.id, 'world_event_ids': [event.id]}}
 
 
@@ -2811,7 +3166,7 @@ def _stage_deferred_narrative_action(campaign, session, current_user, name, args
     return {**preview, 'pending_action_id': action_id}
 
 
-def apply_deferred_narrative_action(campaign, session, current_user, action):
+def apply_deferred_narrative_action(campaign, session, current_user, action, source_message_id=None):
     """Apply a previously staged action inside the accepted-turn transaction."""
     name = action.get('name')
     args = action.get('args') if isinstance(action.get('args'), dict) else {}
@@ -2820,7 +3175,7 @@ def apply_deferred_narrative_action(campaign, session, current_user, action):
     if name == 'update_current_scene':
         return _tool_update_current_scene(campaign, current_user, args), None
     if name == 'reveal_fact':
-        return _tool_reveal_fact(campaign, current_user, args), None
+        return _tool_reveal_fact(campaign, current_user, args, source_message_id=source_message_id), None
     if name == 'propose_sheet_update':
         prepared = _prepare_sheet_proposal(campaign, current_user, args, session)
         if prepared.get('error'):
