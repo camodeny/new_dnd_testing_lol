@@ -2475,8 +2475,12 @@ def _session_dm_disclosure_validation(decision, hot_context):
     """Validate proposed ``disclose_item_ids`` against the candidate reply and current disclosure state.
 
     Returns ``(approved_ids, violations)``. A proposed facet is approved only when it is a known
-    private item, is not yet public, and the candidate visible reply literally states its canonical
-    text (token-sequence match). Disclosure is intent, not authority: the reply must actually reveal it.
+    private item, is not yet public, and the DM produced a visible reply. The ID is the structured
+    authorization and audit record for a player-earned reveal; the narration may express that
+    reveal naturally rather than repeating private canonical storage text verbatim.
+
+    Other hidden facets remain in the spoiler-check input, so declaring one disclosure never
+    authorizes adjacent secrets from the same private record.
     """
     proposed = []
     if isinstance(decision, dict):
@@ -2503,9 +2507,8 @@ def _session_dm_disclosure_validation(decision, hot_context):
         if disclosure_state.get(item_id) == 'revealed':
             approved.append(item_id)
             continue
-        canonical = facet.get('canonical_text') or ''
-        if not canonical or not _private_text_contains_token_sequence(content, canonical):
-            violations.append({'item_id': item_id, 'reason': 'not_supported_by_visible_reply'})
+        if not content.strip():
+            violations.append({'item_id': item_id, 'reason': 'missing_visible_reply'})
             continue
         approved.append(item_id)
     return approved, violations
