@@ -216,6 +216,12 @@ SESSION_TOOL_PROMPT = (
     "Do not send the final visible reply as plain assistant text. "
     "Each talk_to_player part is narration or npc_dialogue. NPC dialogue requires target and content. Never place <npc> tags or any model-authored NPC markup inside a part: the server renders NPC markup. dm_private_context is optional only for ordinary truthful visible text; whenever a visible part is false, misleading, incomplete, mistaken, performative, or conflicts with established private canon, attach authoritative dm_private_context to that exact part. Never put private context in visible content. Always include commit_action_ids. Select only pending action IDs whose durable mutation should commit with this exact reply, or use an empty array. "
     "Do not send handoff prompts such as 'How do you respond?' for ordinary PC-to-PC conversation."
+    " The hot context may include canonical_private_facts. Those are the same DM's authoritative private canon, "
+    "not absent knowledge: use them to choose NPC intent, resistance, pacing, and consequences. A canonical "
+    "private fact is unrevealed unless its disclosure_state says otherwise. Do not quote it, name it, or offer "
+    "it as a possible explanation in visible narration. For an unrevealed fact, visible content may use only "
+    "grounded public observations, public facts, and explicit disclosures committed through play. A question, "
+    "hypothesis, contrast, or metaphor that supplies a private answer is still a disclosure."
 )
 
 PLANNING_SYSTEM_PROMPT = (

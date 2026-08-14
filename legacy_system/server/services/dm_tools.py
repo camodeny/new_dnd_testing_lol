@@ -625,14 +625,48 @@ def _active_clocks(campaign, limit=8):
     return (active or clocks)[:limit]
 
 
+PUBLIC_VISIBILITIES = {'public', 'party_known'}
+
+
+def _revealed_entity_ids(campaign, graph):
+    """Return graph entity ids whose identity is safe in party-facing projections."""
+    disclosed = _explicit_revealed_facet_ids(campaign)
+    return {
+        clean_id(entity.get('id'), '')
+        for entity in (graph.get('entities', []) if isinstance(graph, dict) else [])
+        if isinstance(entity, dict)
+        and clean_id(entity.get('id'), '')
+        and (
+            entity.get('visibility') in PUBLIC_VISIBILITIES
+            or f"entity:{clean_id(entity.get('id'), '')}:name" in disclosed
+        )
+    }
+
+
+def _fact_has_public_provenance(fact, revealed_entity_ids):
+    """Whether a public fact references only already-revealed canonical entities.
+
+    Facts are authored by multiple model stages. Their `visibility` label alone is
+    not evidence that a summary did not copy a hidden entity or clue. Until
+    source-facet provenance is available for every fact, entity references are
+    the conservative structural backstop: a fact that names a hidden entity is
+    not eligible for the main prompt's public projection.
+    """
+    entity_ids = _coerce_patch_id_list(fact.get('entity_ids'), max_items=24)
+    return all(entity_id in revealed_entity_ids for entity_id in entity_ids)
+
+
 def _established_public_facts(campaign, limit=8):
     _world, graph, _world_state, _dm_private = _world_json(campaign)
+    revealed_entity_ids = _revealed_entity_ids(campaign, graph)
     facts = []
     for fact in graph.get('facts', []) if isinstance(graph, dict) else []:
         if not isinstance(fact, dict):
             continue
         visibility = clean_text(fact.get('visibility'), 30) or 'dm_private'
-        if visibility not in {'public', 'party_known'}:
+        if visibility not in PUBLIC_VISIBILITIES:
+            continue
+        if not _fact_has_public_provenance(fact, revealed_entity_ids):
             continue
         text = clean_text(fact.get('text'), 220)
         if not text:
@@ -659,7 +693,13 @@ def _recent_public_world_events(campaign, limit=6):
     public_events = []
     for event in events:
         visibility = clean_text(event.visibility, 30) or 'dm_private'
-        if visibility not in {'public', 'party_known'}:
+        if visibility not in PUBLIC_VISIBILITIES:
+            continue
+        payload = json_loads(event.payload, {})
+        source_facet_ids = payload.get('source_facet_ids') if isinstance(payload, dict) else None
+        # Event summaries have no inherent graph reference. Require explicit
+        # provenance rather than trusting a visibility label on generated prose.
+        if not isinstance(source_facet_ids, list):
             continue
         summary = clean_text(event.summary, 220)
         if not summary:
@@ -680,10 +720,52 @@ def _open_public_threads(campaign, limit=6):
     open_threads = world_state.get('open_threads', []) if isinstance(world_state, dict) else []
     if not isinstance(open_threads, list):
         open_threads = [open_threads]
+    # Threads used to be arbitrary strings, allowing private explanations to
+    # be appended to party-facing thread text. Only typed, provenance-bearing
+    # thread projections may reach the primary DM prompt.
+    threads = []
+    for thread in open_threads:
+        if not isinstance(thread, dict):
+            continue
+        if clean_text(thread.get('visibility'), 30) not in PUBLIC_VISIBILITIES:
+            continue
+        source_facet_ids = thread.get('source_facet_ids')
+        text = clean_text(thread.get('text'), 180)
+        if not text or not isinstance(source_facet_ids, list):
+            continue
+        threads.append({
+            'id': clean_id(thread.get('id'), f'public_thread_{len(threads) + 1}'),
+            'text': text,
+            'source_facet_ids': [str(item).strip() for item in source_facet_ids if str(item).strip()],
+        })
+        if len(threads) >= limit:
+            break
+    return threads
+
+
+def _public_scene_projection(current_scene):
+    """Return observable scene fields, excluding free-form private interpretation."""
+    current_scene = current_scene if isinstance(current_scene, dict) else {}
+    return {
+        key: current_scene.get(key)
+        for key in ('location_id', 'location_name', 'time_of_day', 'active_npc_ids')
+        if current_scene.get(key) is not None
+    }
+
+
+def _canonical_private_facts(campaign):
+    """One structured private-canon lane for the DM, never a public projection."""
     return [
-        clean_text(thread, 180)
-        for thread in open_threads[:limit]
-        if clean_text(thread, 180)
+        {
+            'id': facet['id'],
+            'kind': facet['kind'],
+            'truth': facet['canonical_text'],
+            'subject_id': facet['subject_id'],
+            'disclosure_state': DISCLOSURE_HIDDEN_STATE,
+            'visible_use': 'Use for NPC intent, pacing, and consequences; do not state or speculate about this truth until its disclosure is committed through play.',
+        }
+        for facet in _disclosure_item_facets(campaign)
+        if facet.get('visibility') == 'dm_private'
     ]
 
 
@@ -1236,13 +1318,20 @@ def build_session_hot_context(campaign, session, current_user, recent_messages_o
             }
             for member in members
         ],
-        'current_scene': current_scene,
+        # The primary prompt receives observable scene coordinates only. Free-form
+        # `immediate_tension` belongs to the canonical/private lane because it is
+        # often authored from hidden NPC motives.
+        'current_scene': _public_scene_projection(current_scene),
         'current_encounter_map': _compact_encounter_map(encounter_map),
         'combat_coordinates': _combat_coordinate_context(campaign, encounter_map),
-        'active_clocks': [clock.to_dict(include_private=True) for clock in active_clocks],
+        'active_clocks': [clock.to_dict(include_private=False) for clock in active_clocks],
         'established_public_facts': _established_public_facts(campaign),
         'recent_public_world_events': _recent_public_world_events(campaign),
         'open_public_threads': _open_public_threads(campaign),
+        # This is intentionally the DM's single private-canon lane. It replaces
+        # repeated private prose in scene summaries, public facts, events, and
+        # threads while preserving the DM's ability to reason from the truth.
+        'canonical_private_facts': _canonical_private_facts(campaign),
         'visible_naming_constraints': _visible_naming_constraints(campaign),
         'protected_identifier_terms': _protected_identifier_terms(campaign),
         'private_spoiler_items': _private_spoiler_items(campaign),
@@ -1972,7 +2061,10 @@ DM_TOOL_DEFINITIONS = [
                 'properties': {
                     'event_type': {'type': 'string'},
                     'summary': {'type': 'string'},
-                    'payload': {'type': 'object'},
+                    'payload': {
+                        'type': 'object',
+                        'description': 'For public or party_known events, include source_facet_ids: the revealed canonical facets supporting the summary.',
+                    },
                     'visibility': {'type': 'string', 'enum': ['public', 'party_known', 'dm_private'], 'default': 'dm_private'},
                 },
             },
@@ -2910,12 +3002,19 @@ def build_session_retrieval_packet(campaign, current_user, hot_context, prefligh
 
 
 def _record_event(campaign, event_type, summary, payload=None, visibility='dm_private'):
+    payload = payload if isinstance(payload, dict) else {}
+    requested_visibility = visibility if visibility in VALID_VISIBILITIES else 'dm_private'
+    # A generated summary is not public merely because its caller labels it so.
+    # Public event prose must carry references to already-revealed canonical
+    # facets; otherwise retain it as private operational memory.
+    if requested_visibility in PUBLIC_VISIBILITIES and not isinstance(payload.get('source_facet_ids'), list):
+        requested_visibility = 'dm_private'
     event = WorldEvent(
         campaign_id=campaign.id,
         event_type=clean_id(event_type, 'world_event')[:80],
         summary=clean_text(summary, 1200) or 'World event recorded.',
-        payload=json_dumps(payload or {}),
-        visibility=visibility if visibility in VALID_VISIBILITIES else 'dm_private',
+        payload=json_dumps(payload),
+        visibility=requested_visibility,
     )
     db.session.add(event)
     db.session.flush()
