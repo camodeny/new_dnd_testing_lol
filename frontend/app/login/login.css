@@ -1,0 +1,320 @@
+.login-container {
+  display: grid;
+  min-height: 100svh;
+  grid-template-columns: minmax(0, 1.35fr) minmax(430px, 0.65fr);
+  overflow: hidden;
+  background: var(--surface-paper);
+}
+
+.login-illustration {
+  position: relative;
+  display: flex;
+  min-height: 100svh;
+  overflow: hidden;
+  flex-direction: column;
+  justify-content: space-between;
+  padding: clamp(30px, 4vw, 64px);
+  isolation: isolate;
+  color: var(--ink-strong);
+  background:
+    linear-gradient(90deg, rgba(255, 248, 232, 0.94) 0%, rgba(255, 248, 232, 0.74) 42%, rgba(255, 248, 232, 0.12) 72%, transparent 100%),
+    url('/images/fireside-hero.jpg') 63% center / cover no-repeat;
+}
+
+.login-illustration::after {
+  position: absolute;
+  z-index: -1;
+  inset: 0;
+  content: '';
+  opacity: 0.2;
+  pointer-events: none;
+  background-image: url("data:image/svg+xml,%3Csvg viewBox='0 0 180 180' xmlns='http://www.w3.org/2000/svg'%3E%3Cfilter id='n'%3E%3CfeTurbulence type='fractalNoise' baseFrequency='.9' numOctaves='2' stitchTiles='stitch'/%3E%3C/filter%3E%3Crect width='100%25' height='100%25' filter='url(%23n)' opacity='.18'/%3E%3C/svg%3E");
+  mix-blend-mode: soft-light;
+}
+
+.login-visual-brand,
+.login-brand {
+  display: inline-flex;
+  align-items: center;
+  gap: 10px;
+  font-family: var(--heading);
+  font-size: 1.25rem;
+  font-weight: 600;
+  letter-spacing: -0.03em;
+}
+
+.login-visual-brand span,
+.login-brand span {
+  color: var(--ember);
+  font-family: var(--sans);
+  font-size: 0.9rem;
+}
+
+.login-visual-copy {
+  max-width: 650px;
+  margin: auto 0;
+  padding: 9vh 0;
+}
+
+.login-visual-kicker,
+.login-kicker {
+  display: block;
+  margin-bottom: 18px;
+  color: var(--ember-hover);
+  font: 700 0.68rem/1 var(--mono);
+  letter-spacing: 0.18em;
+}
+
+.login-visual-copy h2 {
+  max-width: 580px;
+  margin: 0 0 24px;
+  color: var(--ink-strong);
+  font-size: clamp(3.2rem, 5.2vw, 6rem);
+  line-height: 0.91;
+  letter-spacing: -0.05em;
+}
+
+.login-visual-copy p {
+  max-width: 470px;
+  margin: 0;
+  color: rgba(43, 42, 38, 0.76);
+  font-size: clamp(1rem, 1.4vw, 1.18rem);
+  line-height: 1.65;
+}
+
+.login-visual-note {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  color: rgba(43, 42, 38, 0.66);
+  font-size: 0.75rem;
+  letter-spacing: 0.04em;
+}
+
+.login-panel {
+  position: relative;
+  display: flex;
+  min-height: 100svh;
+  align-items: center;
+  justify-content: center;
+  padding: clamp(34px, 5vw, 84px);
+  background:
+    radial-gradient(circle at 100% 0%, rgba(200, 95, 61, 0.08), transparent 23rem),
+    var(--surface-paper);
+}
+
+.login-card {
+  width: min(100%, 410px);
+  animation: login-enter 520ms cubic-bezier(0.2, 0.8, 0.2, 1) both;
+}
+
+.login-brand {
+  display: none;
+  margin-bottom: 56px;
+  color: var(--ink-strong);
+}
+
+.login-kicker {
+  margin-bottom: 14px;
+}
+
+.login-card h1 {
+  margin: 0 0 12px;
+  color: var(--ink-strong);
+  font-size: clamp(2.6rem, 4.5vw, 3.8rem);
+  line-height: 0.96;
+}
+
+.login-subtitle {
+  margin: 0 0 34px;
+  color: var(--ink-muted);
+  font-size: 0.95rem;
+}
+
+.login-card .form-group {
+  margin-bottom: 19px;
+}
+
+.login-card .form-group label {
+  display: block;
+  margin-bottom: 8px;
+  color: var(--ink);
+  font-size: 0.72rem;
+  font-weight: 700;
+  letter-spacing: 0.09em;
+  text-transform: uppercase;
+}
+
+.login-card .form-group input {
+  width: 100%;
+  min-height: 50px;
+  padding: 12px 14px;
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  background: var(--surface-raised);
+  color: var(--ink-strong);
+  font-size: 0.95rem;
+  transition: border-color var(--transition-smooth), box-shadow var(--transition-smooth),
+    background var(--transition-smooth);
+}
+
+.login-card .form-group input:hover { border-color: var(--line-strong); }
+
+.login-card .form-group input:focus {
+  border-color: var(--ember);
+  background: #fff;
+  box-shadow: 0 0 0 3px rgba(200, 95, 61, 0.12);
+  outline: none;
+}
+
+.login-card .form-group input::placeholder { color: #aaa79f; }
+
+.login-button {
+  display: flex;
+  width: 100%;
+  min-height: 50px;
+  align-items: center;
+  justify-content: center;
+  gap: 12px;
+  margin-top: 8px;
+  padding: 12px 18px;
+  border: 1px solid var(--surface-ink);
+  border-radius: 8px;
+  cursor: pointer;
+  background: var(--surface-ink);
+  color: #fff9ee;
+  font-size: 0.9rem;
+  font-weight: 700;
+  transition: transform var(--transition-smooth), background var(--transition-smooth),
+    border-color var(--transition-smooth), box-shadow var(--transition-smooth);
+}
+
+.login-button:hover:not(:disabled) {
+  border-color: #282f30;
+  background: #282f30;
+  box-shadow: 0 8px 24px rgba(20, 24, 24, 0.14);
+  transform: translateY(-1px);
+}
+
+.login-button:active:not(:disabled) { transform: translateY(0); }
+.login-button:disabled { cursor: not-allowed; opacity: 0.5; }
+
+.sso-button {
+  justify-content: space-between;
+  margin: 0 0 24px;
+  border-color: var(--ember);
+  background: var(--ember);
+}
+
+.sso-button:hover:not(:disabled) {
+  border-color: var(--ember-hover);
+  background: var(--ember-hover);
+  box-shadow: 0 8px 24px rgba(169, 71, 44, 0.2);
+}
+
+.login-divider {
+  display: flex;
+  align-items: center;
+  gap: 14px;
+  margin: 0 0 22px;
+  color: var(--ink-faint);
+  font-size: 0.65rem;
+  font-weight: 700;
+  letter-spacing: 0.13em;
+  text-transform: uppercase;
+}
+
+.login-divider::before,
+.login-divider::after {
+  height: 1px;
+  flex: 1;
+  content: '';
+  background: var(--line);
+}
+
+.login-card .error-message {
+  margin-bottom: 20px;
+  padding: 12px 14px;
+  border: 1px solid rgba(169, 73, 62, 0.3);
+  border-radius: 8px;
+  background: var(--danger-soft);
+  color: #7f322a;
+  font-size: 0.84rem;
+}
+
+.toggle-text {
+  margin: 24px 0 0;
+  color: var(--ink-muted);
+  font-size: 0.84rem;
+  text-align: center;
+}
+
+.toggle-button {
+  padding: 0;
+  border: 0;
+  cursor: pointer;
+  background: none;
+  color: var(--ember-hover);
+  font-weight: 700;
+}
+
+.toggle-button:hover {
+  color: var(--ember);
+  text-decoration: underline;
+  text-underline-offset: 3px;
+}
+
+.login-footer {
+  position: absolute;
+  right: clamp(34px, 5vw, 84px);
+  bottom: 24px;
+  margin: 0;
+  color: var(--ink-faint);
+  font-size: 0.67rem;
+  letter-spacing: 0.05em;
+}
+
+@keyframes login-enter {
+  from { opacity: 0; transform: translateY(16px); }
+  to { opacity: 1; transform: translateY(0); }
+}
+
+@media (max-width: 980px) {
+  .login-container {
+    grid-template-columns: minmax(0, 0.8fr) minmax(400px, 1fr);
+  }
+}
+
+@media (max-width: 760px) {
+  .login-container {
+    display: block;
+    min-height: 100svh;
+    background: var(--surface-paper);
+  }
+
+  .login-illustration {
+    min-height: 290px;
+    padding: 24px;
+    background:
+      linear-gradient(90deg, rgba(255, 248, 232, 0.82), rgba(255, 248, 232, 0.08)),
+      url('/images/fireside-hero.jpg') 72% 45% / cover no-repeat;
+  }
+
+  .login-visual-copy,
+  .login-visual-note { display: none; }
+
+  .login-panel {
+    min-height: calc(100svh - 290px);
+    align-items: flex-start;
+    padding: 52px 24px 64px;
+  }
+
+  .login-card { width: 100%; max-width: 480px; }
+  .login-footer { display: none; }
+}
+
+@media (max-width: 430px) {
+  .login-illustration { min-height: 260px; }
+  .login-panel { min-height: calc(100svh - 260px); padding-top: 48px; }
+  .login-card h1 { font-size: 2.65rem; }
+}
