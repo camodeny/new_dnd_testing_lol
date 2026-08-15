@@ -5049,6 +5049,74 @@ def _entity_types_compatible(left, right):
     return not left_type or not right_type or left_type == 'other' or right_type == 'other' or left_type == right_type
 
 
+def _normalize_clock_entity_ids(patch, campaign):
+    """Resolve a clock patch's structured subject binding to known entity ids.
+
+    Accepts ``entity_ids`` (or ``subject_ids``) from the authoring patch. Only
+    ids that resolve to an existing graph entity or NPC actor are kept; unknown
+    or absent bindings produce ``None`` so the clock is treated as "no
+    assertion" by reconciliation rather than guessed from prose.
+    """
+    raw_ids = patch.get('entity_ids') if isinstance(patch.get('entity_ids'), list) else patch.get('subject_ids')
+    if not isinstance(raw_ids, list):
+        return None
+    known_ids = set()
+    world = get_campaign_world(campaign.id)
+    if world is not None:
+        graph = json_loads(world.knowledge_graph, {'entities': [], 'relations': [], 'facts': []})
+        for entity in graph.get('entities', []) if isinstance(graph, dict) else []:
+            if isinstance(entity, dict):
+                entity_id = clean_id(entity.get('id'), '')
+                if entity_id:
+                    known_ids.add(entity_id)
+    for npc in NPCActor.query.filter_by(campaign_id=campaign.id).all():
+        actor_id = clean_id(npc.actor_id, '')
+        if actor_id:
+            known_ids.add(actor_id)
+    resolved = []
+    seen = set()
+    for raw in raw_ids:
+        entity_id = clean_id(raw, '')
+        if not entity_id or entity_id in seen or entity_id not in known_ids:
+            continue
+        seen.add(entity_id)
+        resolved.append(entity_id)
+    return resolved or None
+
+
+def _normalize_clock_location_ids(patch, campaign):
+    """Resolve a clock patch's structured location binding to known location ids.
+
+    ``location_ids`` must resolve to entities of type ``location``. Unknown
+    bindings produce ``None`` so the clock is treated as "no assertion" by
+    reconciliation rather than guessed from prose.
+    """
+    raw_ids = patch.get('location_ids') if isinstance(patch.get('location_ids'), list) else None
+    if not isinstance(raw_ids, list):
+        return None
+    location_ids = set()
+    world = get_campaign_world(campaign.id)
+    if world is not None:
+        graph = json_loads(world.knowledge_graph, {'entities': [], 'relations': [], 'facts': []})
+        for entity in graph.get('entities', []) if isinstance(graph, dict) else []:
+            if not isinstance(entity, dict):
+                continue
+            if clean_text(entity.get('type'), 30) != 'location':
+                continue
+            entity_id = clean_id(entity.get('id'), '')
+            if entity_id:
+                location_ids.add(entity_id)
+    resolved = []
+    seen = set()
+    for raw in raw_ids:
+        entity_id = clean_id(raw, '')
+        if not entity_id or entity_id in seen or entity_id not in location_ids:
+            continue
+        seen.add(entity_id)
+        resolved.append(entity_id)
+    return resolved or None
+
+
 def _create_clock_from_patch(campaign, patch):
     clock_id = clean_id(patch.get('id') or patch.get('clock_id'), f'clock_{utcnow().strftime("%Y%m%d%H%M%S")}')
     existing = CampaignClock.query.filter_by(campaign_id=campaign.id, clock_id=clock_id).first()
@@ -5062,6 +5130,8 @@ def _create_clock_from_patch(campaign, patch):
         filled = 0
     clock = existing or CampaignClock(campaign_id=campaign.id, clock_id=clock_id)
     clock.name = clean_text(patch.get('name'), 200) or clock_id.replace('_', ' ').title()
+    clock.entity_ids = _normalize_clock_entity_ids(patch, campaign)
+    clock.location_ids = _normalize_clock_location_ids(patch, campaign)
     clock.segments = segments
     clock.filled = filled
     clock.pressure_type = clean_text(patch.get('pressure_type'), 80) or 'story'

@@ -649,6 +649,8 @@ def persist_world_package(campaign, package):
             campaign_id=campaign.id,
             clock_id=clock['id'],
             name=clock['name'],
+            entity_ids=clock.get('entity_ids'),
+            location_ids=clock.get('location_ids'),
             segments=clock['segments'],
             filled=clock['filled'],
             pressure_type=clock.get('pressure_type'),

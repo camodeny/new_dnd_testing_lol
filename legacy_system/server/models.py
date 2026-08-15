@@ -1045,6 +1045,8 @@ class CampaignClock(db.Model):
     campaign_id = db.Column(db.Integer, db.ForeignKey('campaign.id'), nullable=False)
     clock_id = db.Column(db.String(100), nullable=False)
     name = db.Column(db.String(200), nullable=False)
+    entity_ids = db.Column(db.JSON, nullable=True)
+    location_ids = db.Column(db.JSON, nullable=True)
     segments = db.Column(db.Integer, default=4)
     filled = db.Column(db.Integer, default=0)
     pressure_type = db.Column(db.String(80), nullable=True)
@@ -1070,6 +1072,8 @@ class CampaignClock(db.Model):
             'campaign_id': self.campaign_id,
             'clock_id': self.clock_id,
             'name': self.name,
+            'entity_ids': self.entity_ids,
+            'location_ids': self.location_ids,
             'segments': self.segments,
             'filled': self.filled,
             'pressure_type': self.pressure_type,
