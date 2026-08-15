@@ -14,6 +14,34 @@ from time_utils import utcnow
 MAX_RECOVERY_ATTEMPTS = 3
 
 
+def _dm_repair_memory(task, campaign, session, err):
+    """Consult the AI DM to arbitrate a repair for a failed memory patch.
+
+    Returns ``(outcome, patch)`` where outcome is one of:
+
+    - ``('repaired', repaired_patch)`` -- the patch was DM-repaired and may be
+      re-applied.
+    - ``('skip', None)`` -- the DM chose to drop the durable memory write for
+      this turn (clocks and running summary still complete).
+    - ``('unrepairable', None)`` -- not a repair-eligible conflict or the DM
+      could not produce a usable decision.
+    """
+    from services.dm_memory_repair import attempt_dm_repair
+
+    repair = attempt_dm_repair(campaign, session, err, audit_context={
+        'campaign_id': campaign.id if campaign else None,
+        'source_player_message_id': task.player_message_id if task else None,
+        'source_dm_message_id': task.dm_message_id if task else None,
+        'parent_trace_id': task.trace_id if task else None,
+        'trace_id': f'{task.trace_id}:repair' if task is not None and task.trace_id else None,
+    })
+    if repair is None:
+        return 'unrepairable', None
+    if repair.get('patch') is None:
+        return 'skip', None
+    return 'repaired', repair['patch']
+
+
 def _serialize_context(context):
     return json.dumps(context, default=str) if isinstance(context, dict) else None
 
@@ -336,6 +364,7 @@ def retry_memory_recovery_task(campaign_id, task_id):
     from services.audit_service import log_audit_event
     from services.dm_tools import apply_compiled_session_memory_patch
     from services.dm_turns import repair_session_dm_turn
+    from services.session_memory_agent import MemoryPipelineError
 
     task = (
         SessionMemoryRecoveryTask.query
@@ -356,6 +385,36 @@ def retry_memory_recovery_task(campaign_id, task_id):
             task.patch_json = json.dumps(patch, default=str)
             task.last_error_text = 'patch_rebuilt_from_durable_turn_inputs'
             db.session.commit()
+        except MemoryPipelineError as memory_err:
+            db.session.rollback()
+            # The rebuild re-ran the compiler and hit the same deterministic
+            # identity conflict (split brain). Consult the AI DM to arbitrate a
+            # repair instead of failing the task with patch_rebuild_failed.
+            outcome, repaired = _dm_repair_memory(task, campaign, session, memory_err)
+            task = db.session.get(SessionMemoryRecoveryTask, task.id)
+            if outcome == 'repaired':
+                task.patch_json = json.dumps(repaired, default=str)
+                task.last_error_text = 'patch_rebuilt_via_dm_repair'
+                patch = repaired
+                db.session.commit()
+            elif outcome == 'skip':
+                task.memory_applied = True
+                task.patch_json = None
+                task.last_error_text = 'dm_arbitrated_skip_memory_write'
+                patch = None
+                db.session.commit()
+            else:
+                task.attempts += 1
+                task.status = 'failed' if task.attempts >= MAX_RECOVERY_ATTEMPTS else 'pending'
+                task.last_error_text = f'patch_rebuild_failed: {memory_err}'
+                db.session.commit()
+                return {
+                    'ok': False,
+                    'error': f'patch_rebuild_failed: {memory_err}',
+                    'status': task.status,
+                    'attempts': task.attempts,
+                    'task_id': task.id,
+                }
         except Exception as err:
             db.session.rollback()
             task = db.session.get(SessionMemoryRecoveryTask, task.id)
@@ -393,20 +452,54 @@ def retry_memory_recovery_task(campaign_id, task_id):
             db.session.commit()
         except Exception as err:
             db.session.rollback()
-            # The rollback above expires the task row; re-load it so the attempt
-            # counter and last error survive the failed retry.
-            task = db.session.get(SessionMemoryRecoveryTask, task.id)
-            task.attempts += 1
-            task.status = 'failed' if task.attempts >= MAX_RECOVERY_ATTEMPTS else 'pending'
-            task.last_error_text = str(err)
-            db.session.commit()
-            return {
-                'ok': False,
-                'error': str(err),
-                'status': task.status,
-                'attempts': task.attempts,
-                'task_id': task.id,
-            }
+            # Deterministic identity conflicts (duplicate-entity split brains)
+            # can never be fixed by re-applying the identical stored patch.
+            # Consult the AI DM to arbitrate a repair before failing the retry.
+            outcome, repaired_patch = _dm_repair_memory(task, campaign, session, err)
+            if outcome == 'repaired':
+                try:
+                    apply_compiled_session_memory_patch(campaign, session, repaired_patch)
+                    task = db.session.get(SessionMemoryRecoveryTask, task.id)
+                    task.memory_applied = True
+                    task.patch_json = json.dumps(repaired_patch, default=str)
+                    task.last_error_text = 'dm_arbitrated_repair_applied'
+                    db.session.commit()
+                except Exception as repair_err:
+                    db.session.rollback()
+                    task = db.session.get(SessionMemoryRecoveryTask, task.id)
+                    task.attempts += 1
+                    task.status = 'failed' if task.attempts >= MAX_RECOVERY_ATTEMPTS else 'pending'
+                    task.last_error_text = f'repair_reapply_failed: {repair_err}'
+                    db.session.commit()
+                    return {
+                        'ok': False,
+                        'error': f'repair_reapply_failed: {repair_err}',
+                        'status': task.status,
+                        'attempts': task.attempts,
+                        'task_id': task.id,
+                    }
+            elif outcome == 'skip':
+                # DM chose to skip the durable memory write for this turn. The
+                # visible turn already happened; proceed to clock replay and the
+                # summary finalization tail so the turn can still complete.
+                task = db.session.get(SessionMemoryRecoveryTask, task.id)
+                task.memory_applied = True
+                task.patch_json = None
+                task.last_error_text = 'dm_arbitrated_skip_memory_write'
+                db.session.commit()
+            else:
+                task = db.session.get(SessionMemoryRecoveryTask, task.id)
+                task.attempts += 1
+                task.status = 'failed' if task.attempts >= MAX_RECOVERY_ATTEMPTS else 'pending'
+                task.last_error_text = str(err)
+                db.session.commit()
+                return {
+                    'ok': False,
+                    'error': str(err),
+                    'status': task.status,
+                    'attempts': task.attempts,
+                    'task_id': task.id,
+                }
 
     # 2. Replay the clock adjudication the original failure skipped so
     # time-sensitive clocks are not left stale. The result is committed
