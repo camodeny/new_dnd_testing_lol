@@ -372,10 +372,33 @@ def _run_session_memory_update(
             'latest_dm_message': ai_text,
         }
 
-        memory_patch = get_session_memory_patch(
-            memory_context,
-            audit_context=memory_audit_context,
-        )
+        try:
+            memory_patch = get_session_memory_patch(
+                memory_context,
+                audit_context=memory_audit_context,
+            )
+        except MemoryPipelineError as memory_err:
+            # A deterministic identity conflict (duplicate-entity split brain)
+            # can never be fixed by re-running the identical patch. Ask the AI
+            # DM to arbitrate a repair: merge, keep distinct, or skip the memory
+            # write for this turn. A repaired patch continues the normal
+            # pipeline; skip_memory_write drops the memory patch but still runs
+            # clocks and the running-summary tail.
+            from services.dm_memory_repair import attempt_dm_repair
+            memory_repair = attempt_dm_repair(
+                campaign,
+                session,
+                memory_err,
+                audit_context=memory_audit_context,
+            )
+            if memory_repair is None:
+                raise
+            memory_patch = memory_repair.get('patch')
+            if memory_patch is None:
+                memory_complete = False
+                # Skip the memory write but continue with clock adjudication and
+                # the running-summary finalizer below.
+                memory_patch = None
         if memory_patch:
             source_contract = memory_patch.get('source_contract', '') if isinstance(memory_patch, dict) else ''
             if source_contract == 'compiled_session_memory_v2':

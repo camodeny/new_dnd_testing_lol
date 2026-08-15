@@ -24,6 +24,7 @@ __pycache__/
 /frontend/out
 /frontend/*.tsbuildinfo
 /frontend/next-env.d.ts
+/frontend/.env.local
 
 # Python backend
 /backend/__pycache__

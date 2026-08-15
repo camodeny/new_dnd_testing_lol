@@ -2258,7 +2258,13 @@ def compile_staged_memory_patch(memory_context, extracted, resolved):
             stage="compilation",
             code="final_state_validation_failed",
             message=f"Final-state validation failed: {'; '.join(validation_errors[:5])}",
-            telemetry={"validation_errors": validation_errors},
+            telemetry={
+                "validation_errors": validation_errors,
+                # The failed compiled patch is attached so a DM-arbitrated
+                # repair chain can rewrite it (resolve split-brain identity
+                # conflicts) instead of blind-retrying the identical patch.
+                "compiled_patch": compiled_patch,
+            },
         )
 
     # ── Validate diagnostics ───────────────────────────────────────────
