@@ -6078,11 +6078,17 @@ def apply_compiled_session_memory_patch(campaign, session, patch, audit_context=
         response_chars=telemetry.get("response_chars") if isinstance(telemetry, dict) else None,
         context_breakdown_json=telemetry if isinstance(telemetry, dict) else None,
     )
-    db.session.add(run_record)
 
     # Final output-boundary leak guard. Runs before any graph/NPC mutation so
-    # redactions and demotions are what actually persist.
+    # redactions and demotions are what actually persist. The leak guard itself
+    # performs DB reads (_protected_identifier_terms, _recent_session_transcript)
+    # and may block on a slow model adjudicator call (up to 2 × 120s with retry),
+    # so the run_record insert is registered only AFTER the leak guard: adding it
+    # first would let SQLAlchemy autoflush open a SQLite write transaction before
+    # that blocking call, holding the writer lock and recreating the
+    # lock-contention failures we've seen around concurrent workers/heartbeats.
     leak_guard_telemetry = _leak_guard_memory_patch(campaign, patch, _visibility_policy_text(audit_context))
+    db.session.add(run_record)
     if isinstance(audit_context, dict):
         audit_context['leak_guard_telemetry'] = leak_guard_telemetry
 
