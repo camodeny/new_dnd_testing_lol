@@ -359,7 +359,11 @@ def upsert_memory_embedding(campaign, item_type, item_id, value, audit_context=N
     if not embedding['ok']:
         return embedding
 
-    visibility = clean_text(value.get('visibility') if isinstance(value, dict) else '', 40) or 'dm_private'
+    if item_type == 'npc_actor':
+        from services.npc_visibility import identity_visibility
+        visibility = identity_visibility(value)
+    else:
+        visibility = clean_text(value.get('visibility') if isinstance(value, dict) else '', 40) or 'dm_private'
     row = CampaignMemoryEmbedding.query.filter_by(
         campaign_id=campaign.id,
         item_type=item_type,
