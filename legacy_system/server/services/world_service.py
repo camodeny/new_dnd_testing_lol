@@ -293,7 +293,56 @@ def normalize_knowledge_graph(raw_graph, selected_characters=None):
     }
 
 
-def normalize_world_state(raw_state, public_intro):
+def _normalize_subject_locations(raw, known_subject_ids=None, known_location_ids=None):
+    """Normalize the structured subject -> location map in world state.
+
+    Keys are subject entity ids and values are location entity ids. Missing or
+    malformed maps produce ``None`` (no assertion); entries are kept only when
+    both ids are non-empty and, when known-id sets are supplied, both resolve.
+    """
+    if not isinstance(raw, dict):
+        return None
+    normalized = {}
+    for subject_id, location_id in raw.items():
+        subject_id = clean_id(subject_id, '')
+        location_id = clean_id(location_id, '')
+        if not subject_id or not location_id:
+            continue
+        if known_subject_ids is not None and subject_id not in known_subject_ids:
+            continue
+        if known_location_ids is not None and location_id not in known_location_ids:
+            continue
+        normalized[subject_id] = location_id
+    return normalized or None
+
+
+def _normalize_condition_state(raw, known_subject_ids=None):
+    """Normalize the structured per-subject condition map in world state.
+
+    Each entry maps a subject id to ``{"status": "active"|"resolved", "kind":
+    <condition kind>}``. Malformed entries are dropped. Missing maps produce
+    ``None`` (no assertion).
+    """
+    if not isinstance(raw, dict):
+        return None
+    normalized = {}
+    for subject_id, state in raw.items():
+        subject_id = clean_id(subject_id, '')
+        if not subject_id or not isinstance(state, dict):
+            continue
+        if known_subject_ids is not None and subject_id not in known_subject_ids:
+            continue
+        status = clean_text(state.get('status'), 30) or 'active'
+        if status not in {'active', 'resolved'}:
+            status = 'active'
+        kind = clean_text(state.get('kind'), 80)
+        if not kind:
+            continue
+        normalized[subject_id] = {'status': status, 'kind': kind}
+    return normalized or None
+
+
+def normalize_world_state(raw_state, public_intro, known_subject_ids=None, known_location_ids=None):
     raw_state = raw_state if isinstance(raw_state, dict) else {}
     current_scene = raw_state.get('current_scene') if isinstance(raw_state.get('current_scene'), dict) else {}
     party = raw_state.get('party') if isinstance(raw_state.get('party'), dict) else {}
@@ -315,6 +364,15 @@ def normalize_world_state(raw_state, public_intro):
             'public_reputation': clean_text(party.get('public_reputation'), 180) or 'new arrivals',
         },
         'open_threads': [clean_text(thread, 240) for thread in open_threads[:8] if clean_text(thread, 240)],
+        'subject_locations': _normalize_subject_locations(
+            raw_state.get('subject_locations'),
+            known_subject_ids=known_subject_ids,
+            known_location_ids=known_location_ids,
+        ),
+        'condition_state': _normalize_condition_state(
+            raw_state.get('condition_state'),
+            known_subject_ids=known_subject_ids,
+        ),
     }
 
 
@@ -436,8 +494,32 @@ def persist_world_identity_pairs(campaign, pairs):
         ))
 
 
-def normalize_clocks(raw_clocks):
+def _normalize_clock_binding_ids(raw_ids, known_ids):
+    """Canonicalize a clock binding list to known graph entity ids.
+
+    Returns ``None`` when the binding is absent or nothing resolves, so the
+    clock is treated as "no assertion" by reconciliation rather than guessed
+    from prose.
+    """
+    if not isinstance(raw_ids, list):
+        return None
+    resolved = []
+    seen = set()
+    for raw in raw_ids:
+        binding_id = clean_id(raw, '')
+        if not binding_id or binding_id in seen:
+            continue
+        if known_ids is not None and binding_id not in known_ids:
+            continue
+        seen.add(binding_id)
+        resolved.append(binding_id)
+    return resolved or None
+
+
+def normalize_clocks(raw_clocks, known_entity_ids=None, known_location_ids=None):
     clocks = raw_clocks if isinstance(raw_clocks, list) else []
+    known_entity_ids = known_entity_ids if isinstance(known_entity_ids, set) else None
+    known_location_ids = known_location_ids if isinstance(known_location_ids, set) else None
     normalized = []
     seen = set()
     for index, clock in enumerate(clocks):
@@ -459,6 +541,9 @@ def normalize_clocks(raw_clocks):
         normalized.append({
             'id': clock_id,
             'name': clean_text(clock.get('name'), 180) or clock_id.replace('_', ' ').title(),
+            'entity_ids': _normalize_clock_binding_ids(clock.get('entity_ids'), known_entity_ids),
+            'location_ids': _normalize_clock_binding_ids(clock.get('location_ids'), known_location_ids),
+            'condition': clean_text(clock.get('condition') or clock.get('condition_kind'), 80) or None,
             'segments': segments,
             'filled': min(max(filled, 0), segments),
             'pressure_type': clean_text(clock.get('pressure_type'), 80) or 'story',
@@ -501,16 +586,37 @@ def normalize_world_package(raw_package, campaign):
     raw_package = raw_package if isinstance(raw_package, dict) else {}
     public_intro = sanitize_public_intro(raw_package.get('public_intro'), campaign)
     selected_characters = _selected_character_entities(campaign)
+    knowledge_graph = normalize_knowledge_graph(
+        raw_package.get('knowledge_graph'),
+        selected_characters,
+    )
+    known_entity_ids = {
+        clean_id(entity.get('id'), '')
+        for entity in knowledge_graph.get('entities', []) if isinstance(entity, dict)
+    }
+    known_entity_ids.discard('')
+    known_location_ids = {
+        clean_id(entity.get('id'), '')
+        for entity in knowledge_graph.get('entities', [])
+        if isinstance(entity, dict) and clean_id(entity.get('type'), '') == 'location'
+    }
+    known_location_ids.discard('')
     return {
         'public_intro': public_intro,
-        'knowledge_graph': normalize_knowledge_graph(
-            raw_package.get('knowledge_graph'),
-            selected_characters,
+        'knowledge_graph': knowledge_graph,
+        'world_state': normalize_world_state(
+            raw_package.get('world_state'),
+            public_intro,
+            known_subject_ids=known_entity_ids,
+            known_location_ids=known_location_ids,
         ),
-        'world_state': normalize_world_state(raw_package.get('world_state'), public_intro),
         'dm_private': normalize_dm_private(raw_package.get('dm_private')),
         'npc_actors': normalize_npc_actors(raw_package.get('npc_actors'), selected_characters),
-        'clocks': normalize_clocks(raw_package.get('clocks')),
+        'clocks': normalize_clocks(
+            raw_package.get('clocks'),
+            known_entity_ids=known_entity_ids,
+            known_location_ids=known_location_ids,
+        ),
     }
 
 
@@ -651,6 +757,7 @@ def persist_world_package(campaign, package):
             name=clock['name'],
             entity_ids=clock.get('entity_ids'),
             location_ids=clock.get('location_ids'),
+            condition=clock.get('condition'),
             segments=clock['segments'],
             filled=clock['filled'],
             pressure_type=clock.get('pressure_type'),

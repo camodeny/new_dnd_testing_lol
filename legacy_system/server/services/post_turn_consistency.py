@@ -185,20 +185,28 @@ def _clock_location_conflict(campaign, world_state, clock, subject_id):
 
 def _clock_condition_resolved(campaign, world_state, clock, subject_id):
     """Return a reason string when committed structured state affirmatively
-    shows the subject's danger condition has resolved, else None.
+    shows the clock subject's *scoped* danger condition has resolved, else None.
 
-    Condition status is a structured field authored by the resolver. Absent
-    structured status is "no assertion": the danger is never declared resolved
-    from prose alone.
+    Condition status is a structured field authored by the resolver, and the
+    clock carries its own structured ``condition`` kind. Resolution only counts
+    when the resolved condition kind matches the clock's condition, so one
+    subject with several pressure clocks (e.g. poisoned and drowning) only has
+    the clock whose condition actually resolved superseded.
+
+    Absent structured status or a clock condition binding is "no assertion":
+    the danger is never declared resolved from prose alone.
     """
+    clock_condition = clean_text(getattr(clock, 'condition', None), 80)
+    if not clock_condition:
+        return None
     condition_state = world_state.get('condition_state') if isinstance(world_state, dict) else None
     if not isinstance(condition_state, dict):
         return None
     subject_state = condition_state.get(subject_id)
     if not isinstance(subject_state, dict):
         return None
-    if subject_state.get('status') == 'resolved':
-        kind = clean_text(subject_state.get('kind'), 60) or 'condition'
+    if subject_state.get('status') == 'resolved' and clean_text(subject_state.get('kind'), 80) == clock_condition:
+        kind = clean_text(subject_state.get('kind'), 60) or clock_condition
         return (
             f'Committed structured state records that the clock subject\'s '
             f'{kind} has resolved.'

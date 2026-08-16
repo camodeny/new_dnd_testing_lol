@@ -3052,6 +3052,10 @@ def _tool_update_current_scene(campaign, _current_user, args):
     current_scene.update(clean_scene_patch)
     world_state['current_scene'] = current_scene
     _sync_party_known_location(world_state, current_scene)
+    if 'subject_locations' in scene_patch:
+        world_state['subject_locations'] = scene_patch.get('subject_locations')
+    if 'condition_state' in scene_patch:
+        world_state['condition_state'] = scene_patch.get('condition_state')
     world.world_state = json_dumps(world_state)
     world.updated_at = utcnow()
     upsert_memory_embedding(campaign, 'world_state', 'current', world_state)
@@ -5132,6 +5136,7 @@ def _create_clock_from_patch(campaign, patch):
     clock.name = clean_text(patch.get('name'), 200) or clock_id.replace('_', ' ').title()
     clock.entity_ids = _normalize_clock_entity_ids(patch, campaign)
     clock.location_ids = _normalize_clock_location_ids(patch, campaign)
+    clock.condition = clean_text(patch.get('condition') or patch.get('condition_kind'), 80) or None
     clock.segments = segments
     clock.filled = filled
     clock.pressure_type = clean_text(patch.get('pressure_type'), 80) or 'story'
@@ -6051,6 +6056,12 @@ def apply_compiled_session_memory_patch(campaign, session, patch, audit_context=
         current_scene.update(clean_scene_state)
         world_state["current_scene"] = current_scene
         _sync_party_known_location(world_state, current_scene)
+
+    if isinstance(world_state, dict):
+        if "subject_locations" in scene_patch:
+            world_state["subject_locations"] = scene_patch.get("subject_locations")
+        if "condition_state" in scene_patch:
+            world_state["condition_state"] = scene_patch.get("condition_state")
 
     world.knowledge_graph = json_dumps(graph)
     world.world_state = json_dumps(world_state)

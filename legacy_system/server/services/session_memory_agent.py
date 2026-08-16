@@ -1893,6 +1893,59 @@ def compile_staged_memory_patch(memory_context, extracted, resolved):
     if departed_npc_ids:
         compiled_scene["departed_npc_ids"] = departed_npc_ids
 
+    # ── Compile Structured Subject Locations via Registry ─────────────
+    # ``subject_locations`` maps a subject id -> location id in world state so
+    # post-turn reconciliation never has to read prose for off-scene relocation.
+    subject_locations = {}
+    raw_subject_locations = scene_patch.get("subject_locations")
+    if isinstance(raw_subject_locations, dict):
+        for raw_subject, raw_location in raw_subject_locations.items():
+            subject_id = resolve_ref_with_names(clean_id(raw_subject, ""))
+            location_id = resolve_ref_with_names(clean_id(raw_location, ""))
+            if not subject_id or not location_id:
+                unresolved.append({
+                    "kind": "subject_location",
+                    "subject_id": clean_id(raw_subject, ""),
+                    "location_id": clean_id(raw_location, ""),
+                    "reason": "subject_location_id_unresolved",
+                    "provenance": make_provenance(scene_patch),
+                    "resolution_mode": "unresolved",
+                })
+                continue
+            if subject_id not in known["npc_ids"] and subject_id not in patch_created_npc_ids and subject_id not in patch_created_entity_ids:
+                unresolved.append({
+                    "kind": "subject_location",
+                    "subject_id": subject_id,
+                    "location_id": location_id,
+                    "reason": "subject_location_subject_unknown",
+                    "provenance": make_provenance(scene_patch),
+                    "resolution_mode": "unresolved",
+                })
+                continue
+            subject_locations[subject_id] = location_id
+    if subject_locations:
+        compiled_scene["subject_locations"] = subject_locations
+
+    # ── Compile Structured Condition State via Registry ───────────────
+    # ``condition_state`` maps a subject id -> {status, kind} so post-turn
+    # reconciliation can scope condition resolution to the clock's own kind.
+    condition_state = {}
+    raw_condition_state = scene_patch.get("condition_state")
+    if isinstance(raw_condition_state, dict):
+        for raw_subject, raw_state in raw_condition_state.items():
+            subject_id = resolve_ref_with_names(clean_id(raw_subject, ""))
+            if not subject_id or not isinstance(raw_state, dict):
+                continue
+            status = clean_text(raw_state.get("status"), 30) or "active"
+            if status not in {"active", "resolved"}:
+                status = "active"
+            kind = clean_text(raw_state.get("kind"), 80)
+            if not kind:
+                continue
+            condition_state[subject_id] = {"status": status, "kind": kind}
+    if condition_state:
+        compiled_scene["condition_state"] = condition_state
+
     # ── Compile Relations via Registry ─────────────────────────────────
     accepted_relations = []
     raw_relations = resolved.get("upsert_graph_relations") if isinstance(resolved.get("upsert_graph_relations"), list) else []

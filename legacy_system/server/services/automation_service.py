@@ -1583,6 +1583,7 @@ def materialize_run_campaign(run):
             name=clock.get('name') or 'Clock',
             entity_ids=clock.get('entity_ids'),
             location_ids=clock.get('location_ids'),
+            condition=clock.get('condition'),
             segments=clock.get('segments') or 4,
             filled=clock.get('filled') or 0,
             pressure_type=clock.get('pressure_type'),
