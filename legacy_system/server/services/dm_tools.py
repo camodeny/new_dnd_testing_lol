@@ -184,6 +184,24 @@ def _visibility_text_for_item(item, fields):
     return ' '.join(values)
 
 
+def _drop_npc_field_visibility(item, field):
+    """Remove one aspect from an NPC item's field_visibility (fail to private)."""
+    field_vis = item.get('field_visibility')
+    if isinstance(field_vis, dict):
+        field_vis.pop(field, None)
+
+
+def _npc_party_visible_aspect_fields(item):
+    """Non-column dossier fields an NPC item marks party-visible."""
+    field_vis = item.get('field_visibility')
+    if not isinstance(field_vis, dict):
+        return []
+    return [
+        field for field, vis in field_vis.items()
+        if field not in ('name', 'role', 'public_summary') and vis in ('public', 'party_known')
+    ]
+
+
 def _visibility_words(text):
     return {
         word
@@ -514,6 +532,7 @@ def _leak_guard_memory_patch(campaign, patch, visible_text):
         'events_redacted': 0,
         'npcs_demoted': 0,
         'npc_public_redacted': 0,
+        'npc_aspects_demoted': 0,
         'clocks_demoted': 0,
         'summary_redacted': 0,
         'anchor_items_redacted': 0,
@@ -607,6 +626,7 @@ def _leak_guard_memory_patch(campaign, patch, visible_text):
         identity_private = _leak_guard_has_private_content(campaign, item.get('name'), visible_text, item=item, terms=identifier_terms)
         if identity_private:
             item.pop('name', None)
+            _drop_npc_field_visibility(item, 'name')
             telemetry['npc_public_redacted'] += 1
             _flag('npc_name_private')
         if _leak_guard_has_private_content(
@@ -619,12 +639,26 @@ def _leak_guard_memory_patch(campaign, patch, visible_text):
             for field in ('role', 'public_summary'):
                 if field in item:
                     item.pop(field, None)
+                    _drop_npc_field_visibility(item, field)
             telemetry['npc_public_redacted'] += 1
             _flag('npc_public_fields_private')
         if identity_private:
             _handle_demote_flag(item, 'npc', 'npc_private_evidence', 'npc_demoted_dm_private', 'npcs_demoted')
         else:
             item['visibility'] = _coerce_patch_visibility(item.get('visibility')) or 'dm_private'
+        # Per-field aspect guard: aspects the resolver marked party-visible must
+        # not carry private content. Downgrade the aspect, not the whole NPC.
+        for field in _npc_party_visible_aspect_fields(item):
+            text = item.get(field)
+            if text is None:
+                continue
+            check = _visibility_text_for_item(item, (field,))
+            if not check:
+                continue
+            if _leak_guard_has_private_content(campaign, check, visible_text, item=item, terms=identifier_terms):
+                _drop_npc_field_visibility(item, field)
+                telemetry['npc_aspects_demoted'] += 1
+                _flag(f'npc_aspect_demoted:{field}')
 
     for item in patch.get('record_events', []) if isinstance(patch.get('record_events'), list) else []:
         if not isinstance(item, dict) or item.get('visibility') not in {'public', 'party_known'}:
@@ -1731,19 +1765,22 @@ def _compact_memory_search_value(kind, value):
             'visibility': value.get('visibility'),
         }
     if kind == 'npc_actor' and isinstance(value, dict):
-        return {
+        from services.npc_visibility import content_includable
+        dossier = value.get('dossier') if isinstance(value.get('dossier'), dict) else value
+        compact = {
             'name': value.get('name'),
             'role': value.get('role'),
             'public_summary': _memory_text(value.get('public_summary'), 220),
-            'wants': [
-                _memory_text(item, 100)
-                for item in (value.get('wants') or [])[:3]
-            ],
-            'fears': [
-                _memory_text(item, 100)
-                for item in (value.get('fears') or [])[:3]
-            ],
         }
+        for field in ('wants', 'fears'):
+            if content_includable(value, field):
+                items = dossier.get(field)
+                if isinstance(items, list):
+                    compact[field] = [
+                        _memory_text(item, 100)
+                        for item in items[:3]
+                    ]
+        return compact
     if isinstance(value, dict):
         compact = {}
         for key in (

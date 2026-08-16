@@ -2080,6 +2080,11 @@ def compile_staged_memory_patch(memory_context, extracted, resolved):
         if isinstance(roa, list):
             npc_data["recent_offscreen_activity"] = [clean_text(v, 300) for v in roa if clean_text(v, 300)]
 
+        from services.npc_visibility import normalize_field_visibility
+        npc_field_visibility = normalize_field_visibility(raw_npc.get("field_visibility"))
+        if npc_field_visibility:
+            npc_data["field_visibility"] = npc_field_visibility
+
         npc_data = {k: v for k, v in npc_data.items() if v is not None}
         accepted_npc_updates.append(npc_data)
 

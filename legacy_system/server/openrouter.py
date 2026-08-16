@@ -305,7 +305,9 @@ SESSION_MEMORY_RESOLVER_SYSTEM_PROMPT = (
     "Each upsert_graph_relations item must include id (if reusing/resolving), type, source_id (resolved entity/actor id), target_id (resolved entity/actor id), summary, source_surface, intended_visibility, certainty, importance, reason, expires_or_retire_condition, and memory_type. "
     "Each upsert_graph_facts item must include text, entity_ids (resolved entity/actor ids), id if reusing an existing fact, source_surface, intended_visibility, certainty, importance, reason, expires_or_retire_condition, and memory_type. "
     "Each update_npc_actors item must include id/actor_id (resolved NPC actor id), name, role, public_summary, voice, background, wants, fears, secrets, relationships, recent_offscreen_activity, source_surface, intended_visibility, certainty, importance, reason, expires_or_retire_condition, and memory_type. "
-    "Each record_events item must include event_type, summary, payload, source_surface, intended_visibility, certainty, importance, reason, and expires_or_retire_condition."
+    "Each update_npc_actors item may also include field_visibility: a map of dossier field to public|party_known|dm_private expressing which aspects the party actually knows. Mark only seen/heard/inferred aspects party_known (e.g. observed wants, fears, or behavior); keep secrets, background, and recent_offscreen_activity dm_private. Fields omitted default to dm_private; name/role/public_summary default to the identity visibility. "
+    "Each record_events item must include event_type, summary, payload, source_surface, intended_visibility, certainty, importance, reason, and expires_or_retire_condition. "
+    "When a concrete source is available, also attach optional per-item evidence to each upsert_graph_entities/upsert_graph_relations/upsert_graph_facts/update_npc_actors/record_events item: evidence is an array of {\"source_type\": \"transcript_message|prior_memory_record|world_event|clock_rule|clarification_answer|deterministic_rule|resolver_output\", \"source_id\": \"...\"}. Use transcript_message with the actual message id for content the party saw or heard, and cite the prior record/world_event/clock id when the item is backed by durable memory you resolved from a tool result. Omit evidence when no specific source applies; never invent a source id."
 )
 
 SESSION_CLOCK_ADJUDICATOR_SYSTEM_PROMPT = (
@@ -5636,6 +5638,54 @@ SESSION_MEMORY_EXTRACTOR_FINALIZER_TOOL = {
 }
 
 SESSION_MEMORY_RESOLVER_FINALIZER_TOOL_NAME = 'submit_resolved_memory'
+_MEMORY_ITEM_EVIDENCE_SCHEMA = {
+    'type': 'array',
+    'description': (
+        'Optional per-item evidence sources the item is actually based on. '
+        'Populate only when you have a concrete source from the visible transcript '
+        'or a tool result (e.g. transcript_message with the source message id, or a '
+        'prior_memory_record/world_event/clock_rule id). Omit or leave empty when no '
+        'specific source applies. Each entry: {"source_type": "transcript_message|'
+        'prior_memory_record|world_event|clock_rule|clarification_answer|'
+        'deterministic_rule|resolver_output", "source_id": "..."}.'
+    ),
+    'items': {
+        'type': 'object',
+        'properties': {
+            'source_type': {'type': 'string'},
+            'source_id': {'type': 'string'},
+        },
+        'required': ['source_type', 'source_id'],
+    },
+}
+_MEMORY_ITEM_WITH_EVIDENCE = {
+    'type': 'object',
+    'properties': {
+        'evidence': _MEMORY_ITEM_EVIDENCE_SCHEMA,
+    },
+}
+_MEMORY_NPC_ITEM_SCHEMA = {
+    'type': 'object',
+    'properties': {
+        'evidence': _MEMORY_ITEM_EVIDENCE_SCHEMA,
+        'field_visibility': {
+            'type': 'object',
+            'description': (
+                'Optional per-aspect content visibility for this NPC dossier: '
+                'map dossier fields to public | party_known | dm_private. '
+                'Public columns (name, role, public_summary) are party_visible by '
+                'default. Mark only the aspects the party has actually seen, heard, '
+                'or inferred as party_known (e.g. observed wants/fears/behavior). '
+                'secrets, background, and recent_offscreen_activity are dm_private. '
+                'Fields omitted from this map default to dm_private.'
+            ),
+            'additionalProperties': {
+                'type': 'string',
+                'enum': ['public', 'party_known', 'dm_private'],
+            },
+        },
+    },
+}
 SESSION_MEMORY_RESOLVER_FINALIZER_TOOL = {
     'type': 'function',
     'function': {
@@ -5649,11 +5699,11 @@ SESSION_MEMORY_RESOLVER_FINALIZER_TOOL = {
                 'memory_anchors': {'type': 'object', 'description': 'Resolved memory anchors.'},
                 'scene_patch': {'type': 'object', 'description': 'Resolved scene patch.'},
                 'scene_reason': {'type': 'string'},
-                'upsert_graph_entities': {'type': 'array', 'items': {'type': 'object'}, 'description': 'Resolved entities to upsert.'},
-                'upsert_graph_relations': {'type': 'array', 'items': {'type': 'object'}, 'description': 'Resolved relations to upsert.'},
-                'upsert_graph_facts': {'type': 'array', 'items': {'type': 'object'}, 'description': 'Resolved facts to upsert.'},
-                'update_npc_actors': {'type': 'array', 'items': {'type': 'object'}, 'description': 'Resolved NPC actor updates.'},
-                'record_events': {'type': 'array', 'items': {'type': 'object'}, 'description': 'Events to record.'},
+                'upsert_graph_entities': {'type': 'array', 'items': _MEMORY_ITEM_WITH_EVIDENCE, 'description': 'Resolved entities to upsert. Each item may include optional evidence sources.'},
+                'upsert_graph_relations': {'type': 'array', 'items': _MEMORY_ITEM_WITH_EVIDENCE, 'description': 'Resolved relations to upsert. Each item may include optional evidence sources.'},
+                'upsert_graph_facts': {'type': 'array', 'items': _MEMORY_ITEM_WITH_EVIDENCE, 'description': 'Resolved facts to upsert. Each item may include optional evidence sources.'},
+                'update_npc_actors': {'type': 'array', 'items': _MEMORY_NPC_ITEM_SCHEMA, 'description': 'Resolved NPC actor updates. Each item may include optional evidence sources and per-field field_visibility.'},
+                'record_events': {'type': 'array', 'items': _MEMORY_ITEM_WITH_EVIDENCE, 'description': 'Events to record. Each item may include optional evidence sources.'},
                 'unresolved_items': {'type': 'array', 'items': {'type': 'object'}, 'description': 'Items that could not be resolved.'},
                 'evidence_basis': {'type': 'array', 'items': {'type': 'object'}},
                 'resolved_entity_refs': {

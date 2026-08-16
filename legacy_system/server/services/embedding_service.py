@@ -101,17 +101,22 @@ def canonical_text_for_item(item_type, value):
             f"Visibility: {clean_text(value.get('visibility'), 40)}",
         ]
     elif item_type == 'npc_actor':
+        from services.npc_visibility import content_includable
         dossier = value.get('dossier') if isinstance(value.get('dossier'), dict) else value
         parts = [
             f"NPC: {clean_text(value.get('name') or dossier.get('name'), 200)}",
             f"ID: {clean_text(value.get('actor_id') or dossier.get('id'), 160)}",
             f"Role: {clean_text(value.get('role') or dossier.get('role'), 200)}",
             f"Public summary: {clean_text(value.get('public_summary') or dossier.get('public_summary'), 1000)}",
-            f"Wants: {_list_text(dossier.get('wants'))}",
-            f"Fears: {_list_text(dossier.get('fears'))}",
-            f"Secrets: {_list_text(dossier.get('secrets'))}",
-            f"Recent offscreen activity: {_list_text(dossier.get('recent_offscreen_activity'))}",
         ]
+        for field, label in (
+            ('wants', 'Wants'),
+            ('fears', 'Fears'),
+            ('secrets', 'Secrets'),
+            ('recent_offscreen_activity', 'Recent offscreen activity'),
+        ):
+            if content_includable(value, field):
+                parts.append(f"{label}: {_list_text(dossier.get(field))}")
     elif item_type == 'clock':
         parts = [
             f"Clock: {clean_text(value.get('name'), 200)}",

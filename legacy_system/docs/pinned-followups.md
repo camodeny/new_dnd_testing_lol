@@ -3,7 +3,7 @@
 Work queue of items intentionally deferred for a future session. When an item is
 done, remove it from this file.
 
-## 1. NPC dossier public/private content-visibility split (PINNED 2026-08-15)
+## 1. NPC dossier per-field visibility (IMPLEMENTED 2026-08-16)
 
 **Context:** Run 56 (Memory Audit Scorebook) flagged Criterion 8 as `warn` in
 both audited cycles: "Mixed-visibility party_known NPC dossiers contain private
@@ -12,31 +12,37 @@ material." Party-known NPC dossiers (e.g. `selka_moss`, `brother_cyrus`,
 DM-private `background`, `secrets`, `recent_offscreen_activity`, `wants`,
 `fears` (audit events 23548 / 23636, derived campaign 59).
 
-**The problem:** `visibility` on an NPC dossier is overloaded. It means *identity*
-visibility (does the party know this NPC exists?) but is consumed in places as if
-it were *content* visibility:
+**Implemented:** per-field (aspect) visibility for NPC dossiers. The dossier's
+`visibility` remains *identity* visibility; a new optional `field_visibility`
+map on the dossier expresses *content* visibility per aspect
+(`{field: public|party_known|dm_private}`). Defaults preserve old safe behavior:
+`name`/`role`/`public_summary` inherit the identity visibility; all other fields
+default to `dm_private`. An explicit entry always wins.
 
-- The DM prompt says "Treat public and party_known items as grounded context"
-  (`openrouter.py` build_session_dm_tool_messages), and `internal_only` is
-  computed as `visibility == 'dm_private'` (`dm_tools.py` build_session_retrieval_packet).
-- The leak guard's NPC branch (`dm_tools.py` `_leak_guard_memory_patch`) only
-  inspects `name`, `role`, `public_summary` — it structurally cannot catch
-  private fields riding inside a party_known dossier.
-- Embeddings (`embedding_service.py` `canonical_text_for_item` for `npc_actor`)
-  embed `Secrets` + `Recent offscreen activity` regardless of visibility. They
-  only stayed `dm_private` in run 56 by luck: `upsert_memory_embedding` reads
-  top-level `visibility`, which `NPCActor.to_dict()` does not expose.
+Consumers now respect the split (`services/npc_visibility.py`):
+- The resolver finalizer schema + prompt emit `field_visibility` (verified: run
+  emits e.g. `{"role": party_known, "public_summary": party_known,
+  "voice": party_known}`, leaving secrets/background/offscreen unlisted →
+  dm_private).
+- Embeddings (`canonical_text_for_item` for `npc_actor`) embed only party-visible
+  aspects — except a fully DM-private NPC, whose full content stays embedded for
+  DM retrieval (never reaches party surfaces).
+- DM retrieval-packet compaction reads `wants`/`fears` from the dossier (fixing
+  the old nesting bug) and only when party-visible or the NPC is DM-private.
+- The leak guard enforces aspects: a party-visible aspect carrying private
+  content is downgraded to `dm_private` in `field_visibility` (new
+  `npc_aspects_demoted` telemetry) instead of demoting the whole NPC, and
+  redactions keep `field_visibility` consistent.
 
-**No current direct party leak** (party-facing surfaces use
-`world.to_public_dict()` / `NPCActor.to_dict(include_private=False)`), and the
-DM retrieval packet compacts NPCs to name/role/public_summary + wants/fears
-(currently empty due to a nesting bug). But the labeling is fragile and the
-embedding path is a latent leak if visibility is ever used as a content gate.
+**Synergy with item 2:** once per-item `evidence` is populated (transcript
+sources), Path 1's provenance check short-circuits the brittle lexical
+heuristics for well-provenanced items — the run-56 false-positive demotions are
+bypassed entirely (verified: party facts with transcript evidence are not
+flagged at all). This makes the model adjudicator a second line of defense
+rather than the only one.
 
-**Proposed fix direction:** separate identity visibility from content
-visibility for NPC dossiers — e.g. an explicit `public` slice vs `private`
-slice inside the dossier, or a distinct content tier; then teach the leak guard,
-embedding compaction, and `internal_only` labeling to use it.
+**No direct party leak before or after** (party-facing surfaces use
+`world.to_public_dict()` / `NPCActor.to_dict(include_private=False)`).
 
 ## 2. Leak-guard demotion heuristics are brittle; rework toward provenance-first (PINNED 2026-08-15)
 
@@ -64,20 +70,37 @@ private interpretation lives in a parallel dm_private record and must not gate
 the public record's visibility. The guard's real job is preventing the reverse —
 laundering private canon into a party_known item with no party-visible backing.
 
-**TODO (investigate): why is `provenance.evidence_sources` always None?**
-`_resolve_evidence_sources` (session_memory_agent.py:1427) reads, in order:
-item `evidence` -> item `provenance.evidence_sources` -> item `evidence_basis`.
-In run 56 all three were absent on the compiled facts, so the provenance-first
-path never ran. The resolver's `submit_resolved_memory` DOES emit a top-level
-`evidence_basis` (transcript_message_673, world_state_dm_private,
-npc_dossier_selka_moss, get_scene_candidates, ...), but that global basis is
-never propagated to per-item provenance, and the extraction/resolver prompts
-(openrouter.py:283-308) list `evidence` fields but the model doesn't populate
-them per item. Question to answer: should the resolver schema require per-item
-`evidence`/`source_surface` provenance, or should compile attach the relevant
-subset of the top-level `evidence_basis` to each item so Path 1 can actually
-decide? Also note the risk if fixed naively: wiring the global basis (which
-contains dm_private sources) into per-item sources would demote everything.
+**ROOT CAUSE CONFIRMED 2026-08-16 — why `evidence_sources` is always None:**
+The consumer plumbing is ready, but nothing upstream produces per-item evidence.
+`_resolve_evidence_sources` (session_memory_agent.py:1427) handles all three
+shapes — `item.evidence`, `item.provenance.evidence_sources`,
+`item.evidence_basis` — yet all three are absent on every item:
+
+- Neither finalizer schema defines an `evidence` field on per-item arrays.
+  `SESSION_MEMORY_EXTRACTOR_FINALIZER_TOOL` and
+  `SESSION_MEMORY_RESOLVER_FINALIZER_TOOL` (openrouter.py:5612/5639) type the
+  claim/upsert arrays as free-form `{'type': 'object'}`, and the prompt text
+  (openrouter.py:283-308) lists per-item `source_surface`/`intended_visibility`/
+  `certainty`/etc. but never `evidence`. The model is never asked to emit it.
+  Verified against run 56: resolver `upsert_graph_facts[0]` keys are
+  `certainty, entity_ids, expires_or_retire_condition, id, importance,
+  intended_visibility, memory_type, reason, source_surface, text` — no
+  `evidence`, no `provenance`, no `evidence_basis`; extraction `fact_claim[0]`
+  likewise.
+- `evidence_basis` exists only at the resolver's top level; compile copies it to
+  the patch top level (session_memory_agent.py:2238) but never distributes it to
+  items. `_resolve_evidence_sources` therefore returns `[]` and
+  `make_provenance` records `evidence_sources: None` (plus
+  `evidence_status: insufficiently_supported`, since the per-item status fallback
+  at 1481 also reads empty item provenance).
+- **Fix is NOT to naively wire the global top-level `evidence_basis` into every
+  item** — it contains `world_state_dm_private` / `npc_dossier_selka_moss`, which
+  would make Path 1's `any(private source) -> demote` fire on everything. Correct
+  fix: extend the resolver finalizer schema + prompt to require per-item
+  `evidence` (array of `{source_type, source_id}`), so party facts cite
+  `transcript_message` sources and private canon cites its dm_private sources.
+  Then Path 1 can decide per item and the model adjudicator becomes a second line
+  of defense instead of the only one.
 
 **Path 2 — hidden identifier backstop** (`_protected_identifier_terms` +
 `_memory_text_has_hidden_identifier`): the most dangerous; caused run 56's
