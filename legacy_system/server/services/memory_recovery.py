@@ -266,7 +266,6 @@ def _run_recovery_finalization(campaign, session, task, player_content, dm_conte
     from routes.sessions import _repair_post_turn_clocks, _verify_post_turn_state
     from services.dm_tools import (
         build_session_summary_finalize_context,
-        redact_session_summary_private_terms,
     )
     from services.audit_service import log_audit_event
     from models import db
@@ -316,13 +315,6 @@ def _run_recovery_finalization(campaign, session, task, player_content, dm_conte
         return terminal_revision, None, f'summary_finalize_failed: {summary_error or "no content"}'
 
     session.running_summary = finalized_summary.strip()
-    redacted, _redacted = redact_session_summary_private_terms(
-        campaign,
-        session.running_summary,
-        player_content,
-        dm_content,
-    )
-    session.running_summary = redacted
     db.session.commit()
     log_audit_event(
         campaign.id,
