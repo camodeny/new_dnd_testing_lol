@@ -1,4 +1,5 @@
 import json
+import os
 import random
 import re
 from time_utils import utcnow
@@ -325,6 +326,165 @@ def _leak_guard_has_private_content(campaign, value, visible_text, item=None, te
     return False
 
 
+def _recent_session_transcript(campaign, limit=14):
+    """Compact recent visible transcript for the campaign's latest session."""
+    session = (
+        CampaignSession.query
+        .filter_by(campaign_id=campaign.id)
+        .order_by(CampaignSession.id.desc())
+        .first()
+    )
+    if not session:
+        return []
+    messages = (
+        SessionMessage.query
+        .filter_by(session_id=session.id)
+        .order_by(SessionMessage.id.desc())
+        .limit(limit)
+        .all()
+    )
+    lines = []
+    for message in reversed(messages):
+        content = clean_text(message.content, 700)
+        if content:
+            lines.append(f"{message.role}: {content}")
+    return lines
+
+
+def _adjudicator_item_content(entry):
+    item = entry.get('item') if isinstance(entry.get('item'), dict) else {}
+    kind = entry.get('kind')
+    if kind == 'fact':
+        return clean_text(item.get('text'), 700)
+    if kind == 'entity':
+        return clean_text(
+            ' '.join(str(item.get(k, '')) for k in ('name', 'summary', 'tags') if item.get(k)),
+            700,
+        )
+    if kind == 'relation':
+        return clean_text(
+            ' '.join(str(item.get(k, '')) for k in ('summary', 'type') if item.get(k)),
+            500,
+        )
+    if kind == 'npc':
+        return clean_text(
+            ' '.join(str(item.get(k, '')) for k in ('name', 'role', 'public_summary') if item.get(k)),
+            700,
+        )
+    if kind == 'event':
+        return clean_text(
+            ' '.join(str(item.get(k, '')) for k in ('summary', 'event_type') if item.get(k)),
+            500,
+        )
+    if kind == 'clock':
+        return clean_text(
+            ' '.join(str(item.get(k, '')) for k in ('name', 'summary', 'trigger', 'on_complete') if item.get(k)),
+            700,
+        )
+    return clean_text(str(item)[:700], 700)
+
+
+def _adjudicate_leak_guard_flags(campaign, flagged, visible_text):
+    """Adjudicate deterministic leak-guard flags with a real model call.
+
+    Returns a dict {flag_ref: 'keep'|'demote'}. Any flag the model does not
+    answer is treated as 'demote' by the caller (fail closed).
+    """
+    items_payload = [
+        {
+            'item_ref': entry['ref'],
+            'kind': entry['kind'],
+            'filter_reason': entry['reason'],
+            'content': _adjudicator_item_content(entry),
+        }
+        for entry in flagged
+    ]
+    transcript = _recent_session_transcript(campaign)
+    system_prompt = (
+        "You are the adjudicator for a D&D AI-DM campaign memory system. A "
+        "deterministic safety filter flagged some memory items as possibly leaking "
+        "secret information and would normally demote them from party-visible to "
+        "dm_private (DM-only). Demotion is only correct when an item's CONTENT would "
+        "reveal information the party has NOT seen, heard, or reasonably inferred "
+        "through play. It is a FALSE POSITIVE when the party legitimately knows the "
+        "content, even if the DM holds private knowledge behind it. The filter's "
+        "heuristics are frequently wrong: it treats any dm_private entity or clock "
+        "name as a hidden identifier, so an openly-discussed location or NPC can be "
+        "flagged even though the party is actively investigating it.\n"
+        "For each flagged item decide:\n"
+        "- keep: the content is party-visible; the party saw, heard, or inferred it, "
+        "even if private canon backs it.\n"
+        "- demote: the content would leak secret or unrevealed canon the party has "
+        "not earned through play.\n"
+        "Base your judgment on the recent transcript and the current visible "
+        "exchange. Keep the reason to a very short phrase (max 8 words). Respond "
+        "with ONLY valid JSON, no prose and no markdown fences: "
+        '{"decisions":[{"item_ref":"...","decision":"keep"|"demote","reason":"short phrase"}]}'
+    )
+    user_payload = {
+        'flagged_items': items_payload,
+        'current_exchange': clean_text(visible_text, 4000),
+        'recent_transcript': transcript,
+    }
+    try:
+        from llm_providers import ProviderRequest, execute_chat, provider_registry
+        provider_name, model = provider_registry.resolve_provider_and_model(
+            os.environ.get('DND_LEAK_GUARD_ADJUDICATOR_MODEL')
+        )
+        adapter = provider_registry.get(provider_name)
+    except Exception:
+        return {}
+    content = ''
+    for _attempt in range(2):
+        try:
+            response = execute_chat(adapter, ProviderRequest(
+                messages=[
+                    {'role': 'system', 'content': system_prompt},
+                    {'role': 'user', 'content': json.dumps(user_payload, ensure_ascii=False)},
+                ],
+                model=model,
+                json_mode=True,
+                max_tokens=3000,
+                timeout_seconds=120,
+            ))
+            content = (response.content or '').strip()
+        except Exception:
+            content = ''
+        decisions = _parse_adjudicator_decisions(content)
+        if decisions:
+            return decisions
+    return {}
+
+
+def _parse_adjudicator_decisions(content):
+    """Robustly parse the adjudicator's JSON response into {item_ref: decision}."""
+    if not content:
+        return {}
+    candidates = [content]
+    stripped = content.strip()
+    if stripped.startswith('```'):
+        stripped = re.sub(r'^```[a-zA-Z]*\s*|\s*```$', '', stripped).strip()
+        candidates.insert(0, stripped)
+    start = stripped.find('{')
+    end = stripped.rfind('}')
+    if start != -1 and end > start:
+        candidates.insert(0, stripped[start:end + 1])
+    for candidate in candidates:
+        try:
+            data = json.loads(candidate)
+        except (TypeError, ValueError):
+            continue
+        decisions = {}
+        for entry in (data.get('decisions') or []):
+            if isinstance(entry, dict) and entry.get('item_ref'):
+                decision = str(entry.get('decision') or '').strip().lower()
+                if decision in {'keep', 'demote'}:
+                    decisions[str(entry['item_ref'])] = decision
+        if decisions:
+            return decisions
+    return {}
+
+
 def _leak_guard_memory_patch(campaign, patch, visible_text):
     """Final write-boundary leak prevention for memory writes.
 
@@ -335,6 +495,11 @@ def _leak_guard_memory_patch(campaign, patch, visible_text):
     visible name cannot promote a private dossier summary. Private dossier
     fields (voice, background, wants, fears, secrets, relationships,
     recent_offscreen_activity) always stay inside the DM-private dossier.
+
+    The deterministic demotion heuristics flag candidate leaks, but every
+    flagged item is reviewed by a model adjudicator against the live transcript
+    before any demotion is committed; items the party legitimately knows are
+    kept party-visible, and unresolved flags fail closed to demote.
 
     Returns a telemetry dict with reason codes and counts only -- never the
     secret content itself.
@@ -352,6 +517,7 @@ def _leak_guard_memory_patch(campaign, patch, visible_text):
         'clocks_demoted': 0,
         'summary_redacted': 0,
         'anchor_items_redacted': 0,
+        'adjudicator_kept': 0,
         'reasons': [],
         'demotions': [],
     }
@@ -360,6 +526,7 @@ def _leak_guard_memory_patch(campaign, patch, visible_text):
         telemetry['reasons'].append(reason)
 
     identifier_terms = _protected_identifier_terms(campaign)
+    flagged = []
 
     def _evidence_source_ids(item):
         provenance = item.get('provenance') if isinstance(item.get('provenance'), dict) else {}
@@ -380,13 +547,28 @@ def _leak_guard_memory_patch(campaign, patch, visible_text):
             'evidence_source_ids': _evidence_source_ids(item),
         })
 
+    def _handle_demote_flag(item, kind, reason, flag_reason, counter_key):
+        """Defer a potential demotion to the model adjudicator.
+
+        The deterministic heuristics produce false positives (e.g. an openly
+        discussed location or NPC whose graph identity is dm_private), so every
+        flagged item is reviewed by a real model against the transcript before
+        any demotion is committed.
+        """
+        flagged.append({
+            'ref': f'{kind}#{len(flagged)}',
+            'item': item,
+            'kind': kind,
+            'reason': reason,
+            'flag_reason': flag_reason,
+            'counter_key': counter_key,
+        })
+
     for item in patch.get('upsert_graph_entities', []) if isinstance(patch.get('upsert_graph_entities'), list) else []:
         if not isinstance(item, dict) or item.get('visibility') not in {'public', 'party_known'}:
             continue
         if _leak_guard_has_private_content(campaign, item.get('name'), visible_text, item=item, terms=identifier_terms):
-            _demote(item, 'entity_name_private_evidence')
-            telemetry['entities_demoted'] += 1
-            _flag('entity_name_private')
+            _handle_demote_flag(item, 'entity', 'entity_name_private_evidence', 'entity_name_private', 'entities_demoted')
             continue
         if _leak_guard_has_private_content(
             campaign,
@@ -411,17 +593,13 @@ def _leak_guard_memory_patch(campaign, patch, visible_text):
             item=item,
             terms=identifier_terms,
         ):
-            _demote(item, 'relation_private_evidence')
-            telemetry['relations_demoted'] += 1
-            _flag('relation_private')
+            _handle_demote_flag(item, 'relation', 'relation_private_evidence', 'relation_private', 'relations_demoted')
 
     for item in patch.get('upsert_graph_facts', []) if isinstance(patch.get('upsert_graph_facts'), list) else []:
         if not isinstance(item, dict) or item.get('visibility') not in {'public', 'party_known'}:
             continue
         if _leak_guard_has_private_content(campaign, item.get('text'), visible_text, item=item, terms=identifier_terms):
-            _demote(item, 'fact_private_evidence')
-            telemetry['facts_demoted'] += 1
-            _flag('fact_private')
+            _handle_demote_flag(item, 'fact', 'fact_private_evidence', 'fact_private', 'facts_demoted')
 
     for item in patch.get('update_npc_actors', []) if isinstance(patch.get('update_npc_actors'), list) else []:
         if not isinstance(item, dict):
@@ -444,9 +622,7 @@ def _leak_guard_memory_patch(campaign, patch, visible_text):
             telemetry['npc_public_redacted'] += 1
             _flag('npc_public_fields_private')
         if identity_private:
-            _demote(item, 'npc_private_evidence')
-            telemetry['npcs_demoted'] += 1
-            _flag('npc_demoted_dm_private')
+            _handle_demote_flag(item, 'npc', 'npc_private_evidence', 'npc_demoted_dm_private', 'npcs_demoted')
         else:
             item['visibility'] = _coerce_patch_visibility(item.get('visibility')) or 'dm_private'
 
@@ -460,9 +636,7 @@ def _leak_guard_memory_patch(campaign, patch, visible_text):
             item=item,
             terms=identifier_terms,
         ):
-            _demote(item, 'event_private_evidence')
-            telemetry['events_demoted'] += 1
-            _flag('event_private')
+            _handle_demote_flag(item, 'event', 'event_private_evidence', 'event_private', 'events_demoted')
 
     for key in ('create_clocks', 'retire_clocks'):
         for item in patch.get(key, []) if isinstance(patch.get(key), list) else []:
@@ -475,30 +649,31 @@ def _leak_guard_memory_patch(campaign, patch, visible_text):
                 item=item,
                 terms=identifier_terms,
             ):
-                _demote(item, 'clock_private_evidence')
-                telemetry['clocks_demoted'] += 1
-                _flag('clock_private')
+                _handle_demote_flag(item, 'clock', 'clock_private_evidence', 'clock_private', 'clocks_demoted')
 
-    # ── Session-facing free text: running summary and memory anchors ───
-    # The running summary is DM/AI-internal session memory (it feeds the DM hot
-    # context and prior-summary passes), not a party-facing surface. It is
-    # checked here with the narrow identifier backstop so hidden names never
-    # enter the AI's own working memory and get echoed into visible narration.
+    # ── Adjudicate deferred flags ─────────────────────────────────────────
+    # The deterministic heuristics produce false positives (e.g. an openly
+    # discussed location or NPC whose graph identity is dm_private), so a real
+    # model reviews the flagged items against the transcript and keeps the ones
+    # the party legitimately knows. Unanswered flags fail closed to demote.
+    if flagged:
+        decisions = _adjudicate_leak_guard_flags(campaign, flagged, visible_text)
+        for entry in flagged:
+            if decisions.get(entry['ref'], 'demote') == 'keep':
+                telemetry['adjudicator_kept'] += 1
+                telemetry['reasons'].append('adjudicator_kept:' + entry['flag_reason'])
+            else:
+                _demote(entry['item'], entry['reason'])
+                telemetry[entry['counter_key']] += 1
+                _flag(entry['flag_reason'])
+
+    # ── Session-facing free text: memory anchors ─────────────────────────
     # memory_anchors are served to every campaign member via
-    # CampaignSession.to_dict(), so they are guarded at the write boundary too.
-    # Sentences are only dropped when they carry a hidden protected identifier;
-    # clean prose that merely lexically resembles a name is preserved.
-    summary, summary_changed = _redact_free_text_private_terms(
-        campaign,
-        patch.get('running_summary'),
-        visible_text,
-        terms=identifier_terms,
-    )
-    if summary_changed:
-        patch['running_summary'] = summary
-        telemetry['summary_redacted'] += 1
-        _flag('running_summary_private')
-
+    # CampaignSession.to_dict(), so they are guarded at the write boundary.
+    # The running summary is deliberately NOT redacted here: it is the DM's
+    # own working memory and the DM is expected to know private context.
+    # Output-side defenses (canon discipline check, private output guard,
+    # spoiler checker) handle leak prevention at the visible-reply boundary.
     anchors = patch.get('memory_anchors')
     if isinstance(anchors, dict):
         for key in ('current_goal', 'current_scene'):
@@ -548,18 +723,6 @@ def _redact_free_text_private_terms(campaign, text, visible_text, terms=None):
         return text, False
     cleaned = ' '.join(kept).strip()
     return (cleaned or None), True
-
-
-def redact_session_summary_private_terms(campaign, summary, player_message, dm_message):
-    """Apply the leak guard to a running summary produced by the post-clock
-    summary finalizer, which writes session.running_summary directly (bypassing
-    the memory patch write boundary). Returns (redacted_or_none, changed)."""
-    visible_text = ' '.join(
-        clean_text(value, 2400)
-        for value in (player_message, dm_message)
-        if value
-    ).strip()
-    return _redact_free_text_private_terms(campaign, summary, visible_text)
 
 
 def _selected_member(campaign_id, user_id):
@@ -1677,12 +1840,7 @@ def build_session_summary_finalize_context(
     treated as a derived narrative projection of this authoritative state."""
     world, graph, world_state, _private = _world_json(campaign)
     current_scene = world_state.get('current_scene', {}) if isinstance(world_state, dict) else {}
-    prior_running_summary, _prior_summary_redacted = redact_session_summary_private_terms(
-        campaign,
-        session.running_summary if session else '',
-        player_message,
-        dm_message,
-    )
+    prior_running_summary = (session.running_summary if session else '') or ''
 
     active_clocks = []
     resolved_clocks = []
