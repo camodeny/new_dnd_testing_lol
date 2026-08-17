@@ -1,20 +1,18 @@
 /** @type {import('next').NextConfig} */
 const nextConfig = {
-  output: process.env.VERCEL ? undefined : "standalone",
   async rewrites() {
-    // When running locally, proxy /api/* to the FastAPI backend.
-    // On Vercel this is unset and vercel.json's service rewrite handles routing.
-    const backendUrl = process.env.BACKEND_URL;
-    if (!backendUrl) {
-      return [];
-    }
+    const backendUrl = process.env.BACKEND_URL || 'http://localhost:5889'
     return [
       {
-        source: "/api/:path*",
+        source: '/api/:path*',
         destination: `${backendUrl}/api/:path*`,
       },
-    ];
+      {
+        source: '/assets/:path*',
+        destination: `${backendUrl}/assets/:path*`,
+      },
+    ]
   },
-};
+}
 
-export default nextConfig;
+export default nextConfig
