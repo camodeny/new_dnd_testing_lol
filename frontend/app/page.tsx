@@ -151,10 +151,6 @@ export default function HomePage() {
           </div>
           <div className="campaign-hero-art" aria-hidden="true">
             <span className="campaign-hero-grain" />
-            <div className="campaign-hero-caption">
-              <span className="campaign-hero-caption-mark">✦</span>
-              <span>Gather here. Go anywhere.</span>
-            </div>
           </div>
         </section>
         {modals}

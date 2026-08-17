@@ -795,22 +795,6 @@ select.input:focus,
   margin-top: 30px;
 }
 
-.campaign-hero-caption {
-  position: absolute;
-  right: clamp(22px, 3vw, 46px);
-  bottom: 24px;
-  display: flex;
-  align-items: center;
-  gap: 8px;
-  color: rgba(43, 42, 38, 0.64);
-  font-size: 0.65rem;
-  font-weight: 600;
-  letter-spacing: 0.08em;
-  text-transform: uppercase;
-}
-
-.campaign-hero-caption-mark { color: var(--ember-hover); }
-
 .campaigns-header,
 .character-library-header {
   display: flex;
