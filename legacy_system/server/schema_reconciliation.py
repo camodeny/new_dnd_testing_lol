@@ -34,6 +34,10 @@ ADDED_COLUMNS = [
     ('automation_runs', 'reclaim_failure_stage', 'VARCHAR(120)'),
     ('automation_runs', 'reclaim_failure_error', 'TEXT'),
     ('automation_runs', 'reclaim_failure_at', 'DATETIME'),
+    # structured clock subject/location bindings for structured-only reconciliation
+    ('campaign_clocks', 'entity_ids', 'JSON'),
+    ('campaign_clocks', 'location_ids', 'JSON'),
+    ('campaign_clocks', 'condition', 'VARCHAR(80)'),
 ]
 
 
