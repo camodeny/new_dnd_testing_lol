@@ -98,8 +98,7 @@ Use OpenCode Go with a thinking-mode model (DeepSeek V4 Flash, Mimo 2.5):
 ```bash
 LLM_PROVIDER=opencode_go
 OPENCODE_GO_API_KEY=...
-OPENCODE_GO_MODEL=deepseek-v4-flash
-OPENCODE_GO_MODEL=mimo-2.5
+OPENCODE_GO_MODEL=mimo-v2.5
 OPENCODE_GO_THINKING=enabled
 OPENCODE_GO_REASONING_EFFORT=high
 ```
