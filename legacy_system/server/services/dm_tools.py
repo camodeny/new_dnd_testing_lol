@@ -184,11 +184,20 @@ def _visibility_text_for_item(item, fields):
     return ' '.join(values)
 
 
-def _drop_npc_field_visibility(item, field):
-    """Remove one aspect from an NPC item's field_visibility (fail to private)."""
+def _demote_npc_field_visibility(item, field):
+    """Mark one dossier aspect dm_private in an NPC item's field_visibility.
+
+    Writes an explicit ``dm_private`` entry rather than removing it. Removing the
+    entry would let a public column (``name``/``role``/``public_summary``) resolve
+    back to the NPC's identity visibility (e.g. ``party_known``) via the
+    inheritance default when the old stored value survives a redaction, which
+    silently re-publicizes private content.
+    """
     field_vis = item.get('field_visibility')
-    if isinstance(field_vis, dict):
-        field_vis.pop(field, None)
+    if not isinstance(field_vis, dict):
+        field_vis = {}
+        item['field_visibility'] = field_vis
+    field_vis[field] = 'dm_private'
 
 
 def _npc_party_visible_aspect_fields(item):
@@ -273,23 +282,39 @@ def _memory_text_has_hidden_identifier(campaign, text, visible_text, terms=None)
     return False
 
 
+def _transcript_source_is_party_visible(campaign, source_id):
+    """True when ``source_id`` is a real transcript message from this campaign.
+
+    A model-supplied transcript id must be validated against the persisted
+    transcript before it can certify party visibility; invented ids fail closed
+    and push the item to the adjudicator.
+    """
+    return _resolve_clock_transcript_message(campaign, source_id) is not None
+
+
 def _evidence_source_is_party_visible(campaign, source):
     """True when an evidence source supports committing a party-visible memory record.
 
-    Transcript/visible sources are party-visible by definition. Referenced world events and prior
-    memory records are party-visible only when their stored visibility is public or party_known.
-    Unknown or model-authored sources default permissive so legitimate resolved memory is not
-    over-demoted; explicit ``internal_only`` / ``dm_private`` markers always demote.
+    Provenance-first and fail-closed: only *validated concrete* sources certify
+    party visibility and short-circuit the lexical backstop.
+    - Transcript sources are party-visible only when the message id actually
+      resolves to a message in this campaign's sessions.
+    - World events and prior memory records are party-visible only when they exist
+      and their stored visibility is public or party_known.
+    - Model-authored ``resolver_output`` (and any unvalidatable/unknown source)
+      does NOT certify party visibility, so items whose only backing is
+      model-authored output are reviewed by the adjudicator instead of silently
+      short-circuiting.
     """
     if not isinstance(source, dict):
-        return True
+        return False
     if source.get('internal_only') is True or source.get('visibility') == 'dm_private':
         return False
     source_type = str(source.get('source_type') or source.get('source') or '').strip()
     source_id = source.get('source_id')
+    if source_type in ('transcript_message', 'visible_transcript'):
+        return _transcript_source_is_party_visible(campaign, source_id)
     if source_type in (
-        'transcript_message',
-        'visible_transcript',
         'clarification_answer',
         'existing_alias',
         'prior_scene_cast',
@@ -310,7 +335,7 @@ def _evidence_source_is_party_visible(campaign, source):
             else None
         )
         return bool(record) and (record.visibility or 'dm_private') in ('public', 'party_known')
-    return True
+    return False
 
 
 def _visibility_policy_text(audit_context):
@@ -626,7 +651,7 @@ def _leak_guard_memory_patch(campaign, patch, visible_text):
         identity_private = _leak_guard_has_private_content(campaign, item.get('name'), visible_text, item=item, terms=identifier_terms)
         if identity_private:
             item.pop('name', None)
-            _drop_npc_field_visibility(item, 'name')
+            _demote_npc_field_visibility(item, 'name')
             telemetry['npc_public_redacted'] += 1
             _flag('npc_name_private')
         if _leak_guard_has_private_content(
@@ -639,7 +664,7 @@ def _leak_guard_memory_patch(campaign, patch, visible_text):
             for field in ('role', 'public_summary'):
                 if field in item:
                     item.pop(field, None)
-                    _drop_npc_field_visibility(item, field)
+                    _demote_npc_field_visibility(item, field)
             telemetry['npc_public_redacted'] += 1
             _flag('npc_public_fields_private')
         if identity_private:
@@ -656,7 +681,7 @@ def _leak_guard_memory_patch(campaign, patch, visible_text):
             if not check:
                 continue
             if _leak_guard_has_private_content(campaign, check, visible_text, item=item, terms=identifier_terms):
-                _drop_npc_field_visibility(item, field)
+                _demote_npc_field_visibility(item, field)
                 telemetry['npc_aspects_demoted'] += 1
                 _flag(f'npc_aspect_demoted:{field}')
 
@@ -3247,6 +3272,10 @@ def _tool_update_current_scene(campaign, _current_user, args):
     current_scene.update(clean_scene_patch)
     world_state['current_scene'] = current_scene
     _sync_party_known_location(world_state, current_scene)
+    if 'subject_locations' in scene_patch:
+        world_state['subject_locations'] = scene_patch.get('subject_locations')
+    if 'condition_state' in scene_patch:
+        world_state['condition_state'] = scene_patch.get('condition_state')
     world.world_state = json_dumps(world_state)
     world.updated_at = utcnow()
     upsert_memory_embedding(campaign, 'world_state', 'current', world_state)
@@ -5244,6 +5273,74 @@ def _entity_types_compatible(left, right):
     return not left_type or not right_type or left_type == 'other' or right_type == 'other' or left_type == right_type
 
 
+def _normalize_clock_entity_ids(patch, campaign):
+    """Resolve a clock patch's structured subject binding to known entity ids.
+
+    Accepts ``entity_ids`` (or ``subject_ids``) from the authoring patch. Only
+    ids that resolve to an existing graph entity or NPC actor are kept; unknown
+    or absent bindings produce ``None`` so the clock is treated as "no
+    assertion" by reconciliation rather than guessed from prose.
+    """
+    raw_ids = patch.get('entity_ids') if isinstance(patch.get('entity_ids'), list) else patch.get('subject_ids')
+    if not isinstance(raw_ids, list):
+        return None
+    known_ids = set()
+    world = get_campaign_world(campaign.id)
+    if world is not None:
+        graph = json_loads(world.knowledge_graph, {'entities': [], 'relations': [], 'facts': []})
+        for entity in graph.get('entities', []) if isinstance(graph, dict) else []:
+            if isinstance(entity, dict):
+                entity_id = clean_id(entity.get('id'), '')
+                if entity_id:
+                    known_ids.add(entity_id)
+    for npc in NPCActor.query.filter_by(campaign_id=campaign.id).all():
+        actor_id = clean_id(npc.actor_id, '')
+        if actor_id:
+            known_ids.add(actor_id)
+    resolved = []
+    seen = set()
+    for raw in raw_ids:
+        entity_id = clean_id(raw, '')
+        if not entity_id or entity_id in seen or entity_id not in known_ids:
+            continue
+        seen.add(entity_id)
+        resolved.append(entity_id)
+    return resolved or None
+
+
+def _normalize_clock_location_ids(patch, campaign):
+    """Resolve a clock patch's structured location binding to known location ids.
+
+    ``location_ids`` must resolve to entities of type ``location``. Unknown
+    bindings produce ``None`` so the clock is treated as "no assertion" by
+    reconciliation rather than guessed from prose.
+    """
+    raw_ids = patch.get('location_ids') if isinstance(patch.get('location_ids'), list) else None
+    if not isinstance(raw_ids, list):
+        return None
+    location_ids = set()
+    world = get_campaign_world(campaign.id)
+    if world is not None:
+        graph = json_loads(world.knowledge_graph, {'entities': [], 'relations': [], 'facts': []})
+        for entity in graph.get('entities', []) if isinstance(graph, dict) else []:
+            if not isinstance(entity, dict):
+                continue
+            if clean_text(entity.get('type'), 30) != 'location':
+                continue
+            entity_id = clean_id(entity.get('id'), '')
+            if entity_id:
+                location_ids.add(entity_id)
+    resolved = []
+    seen = set()
+    for raw in raw_ids:
+        entity_id = clean_id(raw, '')
+        if not entity_id or entity_id in seen or entity_id not in location_ids:
+            continue
+        seen.add(entity_id)
+        resolved.append(entity_id)
+    return resolved or None
+
+
 def _create_clock_from_patch(campaign, patch):
     clock_id = clean_id(patch.get('id') or patch.get('clock_id'), f'clock_{utcnow().strftime("%Y%m%d%H%M%S")}')
     existing = CampaignClock.query.filter_by(campaign_id=campaign.id, clock_id=clock_id).first()
@@ -5257,6 +5354,9 @@ def _create_clock_from_patch(campaign, patch):
         filled = 0
     clock = existing or CampaignClock(campaign_id=campaign.id, clock_id=clock_id)
     clock.name = clean_text(patch.get('name'), 200) or clock_id.replace('_', ' ').title()
+    clock.entity_ids = _normalize_clock_entity_ids(patch, campaign)
+    clock.location_ids = _normalize_clock_location_ids(patch, campaign)
+    clock.condition = clean_text(patch.get('condition') or patch.get('condition_kind'), 80) or None
     clock.segments = segments
     clock.filled = filled
     clock.pressure_type = clean_text(patch.get('pressure_type'), 80) or 'story'
@@ -5952,7 +6052,21 @@ def _update_npc_actor(campaign, patch):
         actor = NPCActor(campaign_id=campaign.id, actor_id=actor_id, name=actor_id.replace('_', ' ').title(), dossier='{}')
         db.session.add(actor)
     dossier = json_loads(actor.dossier, {})
-    dossier.update({key: value for key, value in patch.items() if value not in (None, '', [])})
+    # Merge the resolver's field_visibility into the persisted map instead of
+    # replacing it wholesale: updates are partial, so a fresh map must not wipe
+    # previously-demoted aspect entries (which would re-publicize public columns).
+    patch_field_vis = patch.get('field_visibility')
+    if isinstance(patch_field_vis, dict):
+        stored_field_vis = dossier.get('field_visibility')
+        if not isinstance(stored_field_vis, dict):
+            stored_field_vis = {}
+            dossier['field_visibility'] = stored_field_vis
+        stored_field_vis.update(patch_field_vis)
+    dossier.update({
+        key: value
+        for key, value in patch.items()
+        if value not in (None, '', []) and key != 'field_visibility'
+    })
     dossier['id'] = actor_id
     actor.name = clean_text(patch.get('name'), 200) or actor.name
     actor.role = clean_text(patch.get('role'), 200) or actor.role
@@ -6040,11 +6154,17 @@ def apply_compiled_session_memory_patch(campaign, session, patch, audit_context=
         response_chars=telemetry.get("response_chars") if isinstance(telemetry, dict) else None,
         context_breakdown_json=telemetry if isinstance(telemetry, dict) else None,
     )
-    db.session.add(run_record)
 
     # Final output-boundary leak guard. Runs before any graph/NPC mutation so
-    # redactions and demotions are what actually persist.
+    # redactions and demotions are what actually persist. The leak guard itself
+    # performs DB reads (_protected_identifier_terms, _recent_session_transcript)
+    # and may block on a slow model adjudicator call (up to 2 × 120s with retry),
+    # so the run_record insert is registered only AFTER the leak guard: adding it
+    # first would let SQLAlchemy autoflush open a SQLite write transaction before
+    # that blocking call, holding the writer lock and recreating the
+    # lock-contention failures we've seen around concurrent workers/heartbeats.
     leak_guard_telemetry = _leak_guard_memory_patch(campaign, patch, _visibility_policy_text(audit_context))
+    db.session.add(run_record)
     if isinstance(audit_context, dict):
         audit_context['leak_guard_telemetry'] = leak_guard_telemetry
 
@@ -6176,6 +6296,12 @@ def apply_compiled_session_memory_patch(campaign, session, patch, audit_context=
         current_scene.update(clean_scene_state)
         world_state["current_scene"] = current_scene
         _sync_party_known_location(world_state, current_scene)
+
+    if isinstance(world_state, dict):
+        if "subject_locations" in scene_patch:
+            world_state["subject_locations"] = scene_patch.get("subject_locations")
+        if "condition_state" in scene_patch:
+            world_state["condition_state"] = scene_patch.get("condition_state")
 
     world.knowledge_graph = json_dumps(graph)
     world.world_state = json_dumps(world_state)

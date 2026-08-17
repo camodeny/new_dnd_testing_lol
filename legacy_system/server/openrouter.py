@@ -280,6 +280,8 @@ SESSION_MEMORY_EXTRACTOR_SYSTEM_PROMPT = (
     "The latest_dm_response_parts are ordered accepted segments. Each segment's dm_private_context is authoritative internal guidance for interpreting exactly that segment; it can explain a lie, cover story, omission, misconception, motive, or canonical truth. Never let a visible claim overwrite conflicting established canon when its associated private context says otherwise. Keep segment contexts independent: one speaker may be truthful in one part and deceptive in another. Extract candidate scene updates, durable fact claims, entity upserts, relation upserts, NPC updates, and event records from the exchange. "
     "Do not invent canonical ids. If a name is not already a known id in the prompt, preserve it as a raw label/ref for later resolution. "
     "Scene updates may include location_id, location_name, time_of_day, active_npc_ids, departed_npc_ids, and immediate_tension. "
+    "When an off-stage subject moves to a known location, also set scene_patch.subject_locations as a map from subject entity id to location entity id (canonical ids only). "
+    "When a subject's danger condition changes, set scene_patch.condition_state as a map from subject entity id to {status: 'active' or 'resolved', kind: <condition kind>} using canonical ids only; do not infer condition status from narration alone unless it is affirmatively shown resolved. "
     "Claims must use source_surface of visible_transcript, hidden_state, or inferred. "
     "Your final response must be exactly one tool call: submit_extraction. Do not output plain text or markdown fences. "
     "The submit_extraction payload must include keys running_summary, memory_anchors, scene_patch, scene_reason, fact_claims, entity_claims, relation_claims, npc_claims, and event_claims. "
@@ -307,7 +309,7 @@ SESSION_MEMORY_RESOLVER_SYSTEM_PROMPT = (
     "Each update_npc_actors item must include id/actor_id (resolved NPC actor id), name, role, public_summary, voice, background, wants, fears, secrets, relationships, recent_offscreen_activity, source_surface, intended_visibility, certainty, importance, reason, expires_or_retire_condition, and memory_type. "
     "Each update_npc_actors item may also include field_visibility: a map of dossier field to public|party_known|dm_private expressing which aspects the party actually knows. Mark only seen/heard/inferred aspects party_known (e.g. observed wants, fears, or behavior); keep secrets, background, and recent_offscreen_activity dm_private. Fields omitted default to dm_private; name/role/public_summary default to the identity visibility. "
     "Each record_events item must include event_type, summary, payload, source_surface, intended_visibility, certainty, importance, reason, and expires_or_retire_condition. "
-    "When a concrete source is available, also attach optional per-item evidence to each upsert_graph_entities/upsert_graph_relations/upsert_graph_facts/update_npc_actors/record_events item: evidence is an array of {\"source_type\": \"transcript_message|prior_memory_record|world_event|clock_rule|clarification_answer|deterministic_rule|resolver_output\", \"source_id\": \"...\"}. Use transcript_message with the actual message id for content the party saw or heard, and cite the prior record/world_event/clock id when the item is backed by durable memory you resolved from a tool result. Omit evidence when no specific source applies; never invent a source id."
+    "When a concrete source is available, also attach optional per-item evidence to each upsert_graph_entities/upsert_graph_relations/upsert_graph_facts/update_npc_actors/record_events item: evidence is an array of {\"source_type\": \"transcript_message|prior_memory_record|world_event|clock_rule|clarification_answer|deterministic_rule|resolver_output\", \"source_id\": \"...\"}. Use transcript_message with the actual message id for content the party saw or heard, and cite the prior record/world_event/clock id when the item is backed by durable memory you resolved from a tool result. resolver_output is audit provenance only and never certifies party visibility, so prefer a concrete transcript/record/event id for party-visible items. Omit evidence when no specific source applies; never invent a source id."
 )
 
 SESSION_CLOCK_ADJUDICATOR_SYSTEM_PROMPT = (
@@ -320,6 +322,7 @@ SESSION_CLOCK_ADJUDICATOR_SYSTEM_PROMPT = (
     "Do not emit delta 0. Do not advance unrelated clocks. "
     "If a new pressure is already underway, prefer creating the new clock with filled set to 1 instead of 0. "
     "Do not create a new clock if an existing active clock already covers the same pressure. "
+    "When creating a clock, bind it to the entities it is about via create_clocks entity_ids (canonical entity ids), bind its asserted location via location_ids (canonical location entity ids), and if it tracks a specific danger condition set condition to that kind (e.g. drowning, trapped, poisoned). Only use ids already present in the prompt context; never invent ids. "
     "Each advance_clocks item must include clock_id, delta, reason, evidence, and one structured trigger_verdict. "
     "The trigger_verdict must name exactly one supplied trigger clause, use verdict satisfied, and include atomic supported_claims, explicit evidence_sources, chronology_verdict new_current_turn, and a concise reason. "
     "Only newly occurring current-turn evidence can satisfy a trigger. Historical facts, background state, prior failures, restatements, and disclosures about existing severity have chronology_verdict historical_or_restated and cannot advance a clock. A disclosure can advance only when the declared trigger clause explicitly permits disclosure. "
@@ -5625,7 +5628,7 @@ SESSION_MEMORY_EXTRACTOR_FINALIZER_TOOL = {
                     'type': 'object',
                     'description': 'Structured memory anchors with current_goal, current_scene, open_clues, unresolved_questions, npc_observations, recent_offers_promises.',
                 },
-                'scene_patch': {'type': 'object', 'description': 'Scene patch with location_id, location_name, time_of_day, active_npc_ids, departed_npc_ids, immediate_tension.'},
+                'scene_patch': {'type': 'object', 'description': 'Scene patch with location_id, location_name, time_of_day, active_npc_ids, departed_npc_ids, immediate_tension, plus optional subject_locations (map of subject entity id to location entity id) and condition_state (map of subject entity id to {status: active|resolved, kind}).'},
                 'scene_reason': {'type': 'string', 'description': 'Why scene state should change.'},
                 'fact_claims': {'type': 'array', 'items': {'type': 'object'}, 'description': 'Extracted fact claims.'},
                 'entity_claims': {'type': 'array', 'items': {'type': 'object'}, 'description': 'Extracted entity claims.'},
@@ -5697,7 +5700,7 @@ SESSION_MEMORY_RESOLVER_FINALIZER_TOOL = {
             'properties': {
                 'running_summary': {'type': 'string', 'description': 'Resolved running summary.'},
                 'memory_anchors': {'type': 'object', 'description': 'Resolved memory anchors.'},
-                'scene_patch': {'type': 'object', 'description': 'Resolved scene patch.'},
+                'scene_patch': {'type': 'object', 'description': 'Resolved scene patch with location_id, location_name, time_of_day, active_npc_ids, departed_npc_ids, immediate_tension, plus optional subject_locations (map of subject entity id to location entity id) and condition_state (map of subject entity id to {status: active|resolved, kind}).'},
                 'scene_reason': {'type': 'string'},
                 'upsert_graph_entities': {'type': 'array', 'items': _MEMORY_ITEM_WITH_EVIDENCE, 'description': 'Resolved entities to upsert. Each item may include optional evidence sources.'},
                 'upsert_graph_relations': {'type': 'array', 'items': _MEMORY_ITEM_WITH_EVIDENCE, 'description': 'Resolved relations to upsert. Each item may include optional evidence sources.'},
@@ -5781,7 +5784,7 @@ SESSION_MEMORY_CLOCKS_FINALIZER_TOOL = {
             'type': 'object',
             'required': ['create_clocks', 'advance_clocks', 'retire_clocks', 'no_change_explanations'],
             'properties': {
-                'create_clocks': {'type': 'array', 'items': {'type': 'object'}, 'description': 'Clocks to create.'},
+                'create_clocks': {'type': 'array', 'items': {'type': 'object'}, 'description': 'Clocks to create. Each may include id, name, segments, filled, pressure_type, visibility, summary, trigger, on_complete, condition (danger-condition kind this clock tracks, e.g. "drowning"), entity_ids (canonical entity ids this clock is about), and location_ids (canonical location entity ids the clock asserts for its subject).'},
                 'advance_clocks': {
                     'type': 'array',
                     'items': {

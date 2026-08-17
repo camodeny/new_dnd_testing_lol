@@ -12,6 +12,21 @@ material." Party-known NPC dossiers (e.g. `selka_moss`, `brother_cyrus`,
 DM-private `background`, `secrets`, `recent_offscreen_activity`, `wants`,
 `fears` (audit events 23548 / 23636, derived campaign 59).
 
+**The problem:** `visibility` on an NPC dossier is overloaded. It means *identity*
+visibility (does the party know this NPC exists?) but is consumed in places as if
+it were *content* visibility:
+
+- The DM prompt says "Treat public and party_known items as grounded context"
+  (`openrouter.py` build_session_dm_tool_messages), and `internal_only` is
+  computed as `visibility == 'dm_private'` (`dm_tools.py` build_session_retrieval_packet).
+- The leak guard's NPC branch (`dm_tools.py` `_leak_guard_memory_patch`) only
+  inspects `name`, `role`, `public_summary` — it structurally cannot catch
+  private fields riding inside a party_known dossier.
+- Embeddings (`embedding_service.py` `canonical_text_for_item` for `npc_actor`)
+  embed `Secrets` + `Recent offscreen activity` regardless of visibility. They
+  only stayed `dm_private` in run 56 by luck: `upsert_memory_embedding` reads
+  top-level `visibility`, which `NPCActor.to_dict()` does not expose.
+
 **Implemented:** per-field (aspect) visibility for NPC dossiers. The dossier's
 `visibility` remains *identity* visibility; a new optional `field_visibility`
 map on the dossier expresses *content* visibility per aspect
@@ -167,6 +182,27 @@ lie; DM holds the truth) should be adjudicated differently (e.g. always keep the
 surface claim + ensure the companion private record exists); consider gating the
 adjudicator batch to one call per turn (already the shape); and validate on more
 failure points than this one before enabling by default.
+
+**REVIEW FIX 2026-08-16 (PR 159 blockers) — fail-closed provenance:**
+
+- `_evidence_source_is_party_visible` is now fail-closed. Only *validated
+  concrete* sources certify party visibility: transcript ids must resolve to a
+  real `session_messages` row in this campaign
+  (`_transcript_source_is_party_visible` → `_resolve_clock_transcript_message`),
+  and `world_event` / `prior_memory_record` sources still require a matching row
+  with public/party_known visibility. Model-authored `resolver_output` (and any
+  unknown/unvalidatable source, including bare non-dict evidence) no longer
+  short-circuits the guard — such items are routed to the model adjudicator
+  instead of silently bypassing the lexical backstop. The resolver prompt now
+  tells the model `resolver_output` is audit provenance only and never certifies
+  party visibility.
+- NPC aspect demotion writes an explicit `field_visibility[field] = "dm_private"`
+  (`_demote_npc_field_visibility`) instead of removing the entry, so a demoted
+  public column (`name`/`role`/`public_summary`) cannot resolve back to the
+  NPC's identity visibility (e.g. `party_known`) via the inheritance default when
+  the old stored value survives a redaction. `_update_npc_actor` also merges the
+  patch's `field_visibility` into the persisted map instead of replacing it
+  wholesale, so partial resolver updates can't wipe previously-demoted aspects.
 
 ## 3. Running-summary redaction removed (DONE 2026-08-15)
 
