@@ -355,24 +355,26 @@ class OpenCodeGoAdapter(LLMProviderAdapter):
     env_prefix = 'OPENCODE_GO'
     default_base_url = 'https://opencode.ai/zen/go/v1/chat/completions'
 
+    _THINKING_MODEL_FAMILIES = ('deepseek-v4-', 'mimo-')
+
     def configured_reasoning_effort(self):
         return os.environ.get('OPENCODE_GO_REASONING_EFFORT', 'high')
 
     def capabilities_for(self, model):
-        is_deepseek_v4 = str(model or '').strip().lower().startswith('deepseek-v4-')
-        thinking = is_deepseek_v4 and _enabled(os.environ.get('OPENCODE_GO_THINKING', 'disabled'))
+        is_thinking_family = str(model or '').strip().lower().startswith(self._THINKING_MODEL_FAMILIES)
+        thinking = is_thinking_family and _enabled(os.environ.get('OPENCODE_GO_THINKING', 'disabled'))
         effort = (os.environ.get('OPENCODE_GO_REASONING_EFFORT', 'high') or 'high').strip().lower()
         if effort not in {'high', 'max'}:
             effort = 'high'
         return ProviderCapabilities(
-            supports_tool_choice_required=not is_deepseek_v4,
+            supports_tool_choice_required=not is_thinking_family,
             supports_parallel_tool_calls=True,
             supports_thinking=thinking,
             reasoning_effort=effort if thinking else None,
         )
 
     def supports_thinking_for_model(self, model):
-        return str(model or '').strip().lower().startswith('deepseek-v4-')
+        return str(model or '').strip().lower().startswith(self._THINKING_MODEL_FAMILIES)
 
 
 class ProviderRegistry:

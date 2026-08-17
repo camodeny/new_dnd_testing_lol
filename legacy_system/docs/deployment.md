@@ -93,15 +93,18 @@ OPENROUTER_API_KEY=...
 OPENROUTER_MODEL=deepseek/deepseek-v4-flash
 ```
 
-Use OpenCode Go with DeepSeek V4 Flash thinking mode:
+Use OpenCode Go with a thinking-mode model (DeepSeek V4 Flash, Mimo 2.5):
 
 ```bash
 LLM_PROVIDER=opencode_go
 OPENCODE_GO_API_KEY=...
 OPENCODE_GO_MODEL=deepseek-v4-flash
+OPENCODE_GO_MODEL=mimo-2.5
 OPENCODE_GO_THINKING=enabled
 OPENCODE_GO_REASONING_EFFORT=high
 ```
+
+`OPENCODE_GO_THINKING` applies to thinking-capable model families (`deepseek-v4-*` and `mimo-*`); these families also get `tool_choice: required` disabled automatically.
 
 Enable hosted Pendergrass SSO for the current deployment:
 
