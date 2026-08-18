@@ -597,7 +597,16 @@ def _deepseek_thinking_enabled(provider, model):
     return _adapter_for_provider(provider).capabilities_for(model).supports_thinking
 
 
-def _provider_request_payload_options(provider, model, tools, tool_choice, parallel_tool_calls, allow_thinking=True, force_thinking=False):
+def _provider_request_payload_options(
+    provider,
+    model,
+    tools,
+    tool_choice,
+    parallel_tool_calls,
+    allow_thinking=True,
+    force_thinking=False,
+    force_tool_choice=False,
+):
     return _adapter_for_provider(provider).payload_options(
         model,
         tools,
@@ -605,6 +614,7 @@ def _provider_request_payload_options(provider, model, tools, tool_choice, paral
         parallel_tool_calls,
         allow_thinking=allow_thinking,
         force_thinking=force_thinking,
+        force_tool_choice=force_tool_choice,
     )
 
 
@@ -685,6 +695,7 @@ def _post_chat_normalized(
     parallel_tool_calls=None,
     allow_thinking=True,
     force_thinking=False,
+    force_tool_choice=False,
     timeout_seconds=60,
     max_attempts=None,
     max_tokens=None,
@@ -725,6 +736,7 @@ def _post_chat_normalized(
         parallel_tool_calls,
         allow_thinking=allow_thinking,
         force_thinking=force_thinking,
+        force_tool_choice=force_tool_choice,
     )
 
     if campaign_id:
@@ -770,6 +782,7 @@ def _post_chat_normalized(
         parallel_tool_calls=parallel_tool_calls,
         allow_thinking=allow_thinking,
         force_thinking=force_thinking,
+        force_tool_choice=force_tool_choice,
         timeout_seconds=timeout_seconds,
         max_attempts=attempt_limit,
         max_tokens=max_tokens,
@@ -4392,6 +4405,7 @@ def _run_session_dm_loop(
             if active_tools
             else None
         )
+        force_finalizer_tool_choice = finalizer_only_tools
 
         loop_audit = {
             **base_audit,
@@ -4426,9 +4440,10 @@ def _run_session_dm_loop(
                 parallel_tool_calls=False if active_tools else None,
                 allow_thinking=(
                     False
-                    if retrying_visible_answer
+                    if retrying_visible_answer or finalizer_only_tools
                     else preflight_decision.get('main_call_thinking') is not False or tool_round > 0
                 ),
+                force_tool_choice=force_finalizer_tool_choice,
             )
         except ProviderError as err:
             if err.kind != 'malformed':
