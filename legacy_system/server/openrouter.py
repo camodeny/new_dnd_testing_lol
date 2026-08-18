@@ -210,10 +210,9 @@ SESSION_TOOL_PROMPT = (
     "them as objective truth. If a reply would reinterpret an established public lead, preserve uncertainty "
     "and avoid replacing prior committed facts unless the fiction clearly earns it. "
     "protected_player_characters and current_player_character; obey those boundaries exactly. "
-    "For the final turn decision, call exactly one finalization tool: use talk_to_player with ordered structured response parts "
-    "when the DM should send a visible reply, or call stay_silent with a short reason when the DM should not "
-    "send anything. Do not mix a finalization tool call with other tools in the same assistant message. "
-    "Do not send the final visible reply as plain assistant text. "
+    "For a final turn that commits pending actions or needs hidden resolver metadata, call talk_to_player with "
+    "ordered structured response parts. Otherwise, you may send a plain player-facing reply directly. Do not mix "
+    "a finalization tool call with other tools in the same assistant message. "
     "Each talk_to_player part is narration or npc_dialogue. NPC dialogue requires target and content. Never place <npc> tags or any model-authored NPC markup inside a part: the server renders NPC markup. dm_private_context is optional only for ordinary truthful visible text; whenever a visible part is false, misleading, incomplete, mistaken, performative, or conflicts with established private canon, attach authoritative dm_private_context to that exact part. Never put private context in visible content. Always include commit_action_ids. Select only pending action IDs whose durable mutation should commit with this exact reply, or use an empty array. "
     "Do not send handoff prompts such as 'How do you respond?' for ordinary PC-to-PC conversation."
     " The hot context may include canonical_private_facts. Those are the same DM's authoritative private canon, "
@@ -411,6 +410,10 @@ SESSION_CANON_DISCIPLINE_CHECK_SYSTEM_PROMPT = (
     "re-offer, re-place, or reset that same object state unless the fiction visibly explains the reversal. "
     "Safe replies may react skeptically, conditionally, or provisionally to player claims, may let NPCs say "
     "that a detail sounds familiar, and may leave uncertainty in place. "
+    "Clearly attributed NPC dialogue is unverified in-world testimony, not objective confirmation. Do not flag "
+    "a new clue merely because it is new when the reply attributes it to that NPC and does not state or imply "
+    "that the clue is objectively confirmed. Still flag contradictions and narration that upgrades testimony "
+    "into objective truth. "
     "The user payload's open_public_threads are already-established public leads. Treat the exact content of an "
     "open public thread as corroborating public evidence, while refusing to infer any extra name, identity, motive, "
     "cause, relationship, or outcome that the thread itself does not state. "
@@ -4461,6 +4464,22 @@ def _run_session_dm_loop(
 
         tool_calls = message.get('tool_calls') or []
         finalizer_decision, finalizer_violation = _session_dm_finalizer_decision_from_tool_calls(tool_calls)
+        # A normal visible reply does not need a redundant finalizer tool call.
+        # Native finalizers remain the path for action commits and resolver metadata.
+        # Every direct reply still passes through the downstream format, agency,
+        # canon, spoiler, and privacy guards.
+        if (
+            finalizer_decision is None
+            and not tool_calls
+            and str(message.get('content') or '').strip()
+            and not _looks_like_provider_tool_markup(message.get('content') or '')
+        ):
+            finalizer_decision = {
+                'mode': 'speak',
+                'parts': [{'type': 'narration', 'content': str(message.get('content') or '').strip()}],
+                'commit_action_ids': [],
+            }
+            finalizer_violation = None
         if (
             draft_serialization_active
             and finalizer_decision is not None
