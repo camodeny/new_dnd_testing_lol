@@ -75,6 +75,7 @@ class ProviderRequest:
     parallel_tool_calls: Optional[bool] = None
     allow_thinking: bool = True
     force_thinking: bool = False
+    force_tool_choice: bool = False
     timeout_seconds: float = 60
     max_attempts: Optional[int] = None
     max_tokens: Optional[int] = None
@@ -194,7 +195,16 @@ class LLMProviderAdapter:
     def supports_thinking_for_model(self, model):
         return self.capabilities_for(model).supports_thinking
 
-    def payload_options(self, model, tools, tool_choice, parallel_tool_calls, allow_thinking=True, force_thinking=False):
+    def payload_options(
+        self,
+        model,
+        tools,
+        tool_choice,
+        parallel_tool_calls,
+        allow_thinking=True,
+        force_thinking=False,
+        force_tool_choice=False,
+    ):
         """Effective request options after applying capability constraints."""
         capabilities = self.capabilities_for(model)
         thinking_enabled = bool(allow_thinking) and (
@@ -212,7 +222,12 @@ class LLMProviderAdapter:
                 # Thinking mode rejects tool_choice and does not document parallel_tool_calls.
                 options['tool_choice'] = None
                 options['parallel_tool_calls'] = None
-        elif tools and tool_choice == 'required' and not capabilities.supports_tool_choice_required:
+        elif (
+            tools
+            and tool_choice == 'required'
+            and not capabilities.supports_tool_choice_required
+            and not force_tool_choice
+        ):
             options['tool_choice'] = None
         return options
 
@@ -230,6 +245,7 @@ class LLMProviderAdapter:
             request.parallel_tool_calls,
             allow_thinking=request.allow_thinking,
             force_thinking=request.force_thinking,
+            force_tool_choice=request.force_tool_choice,
         )
         payload = {
             'model': request.model,
