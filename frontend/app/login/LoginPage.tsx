@@ -1,7 +1,7 @@
 'use client'
 
 import { useState, useEffect } from 'react'
-import { auth } from '@/lib/api'
+import { supabase, isSupabaseConfigured } from '@/lib/supabase'
 import type { User } from '@/types'
 import './login.css'
 
@@ -38,14 +38,55 @@ export default function LoginPage({ onLogin }: LoginPageProps) {
     setLoading(true)
 
     try {
-      const data = isRegistering
-        ? await auth.register(username, password)
-        : await auth.login(username, password)
-
-      if (data.token) {
-        localStorage.setItem('token', data.token)
+      if (isSupabaseConfigured()) {
+        // Supabase Auth path — email is required for Supabase; username is stored in user_metadata
+        const emailVal = email.trim() || (username.includes('@') ? username.trim() : '')
+        if (!emailVal) {
+          throw new Error('Email is required for Supabase auth.')
+        }
+        if (isRegistering) {
+          const { data, error } = await supabase.auth.signUp({
+            email: emailVal,
+            password,
+            options: { data: { username: username.trim() || emailVal.split('@')[0] } },
+          })
+          if (error) throw error
+          // If email confirmation is on, user may need to confirm — surface that
+          if (data.user && !data.session) {
+            setError('Check your email to confirm your account, then sign in.')
+            return
+          }
+          if (data.session?.access_token) {
+            localStorage.setItem('token', data.session.access_token)
+          }
+          const supaUser = data.user
+          const u = supaUser
+            ? { id: supaUser.id as unknown as number, username: username.trim() || supaUser.email?.split('@')[0] || 'adventurer', email: supaUser.email ?? emailVal }
+            : { id: 0 as unknown as number, username: username.trim(), email: emailVal }
+          onLogin(u as unknown as User)
+        } else {
+          const emailLogin = username.includes('@') ? username.trim() : email.trim() || username.trim()
+          // Try email login; Supabase requires email
+          const { data, error } = await supabase.auth.signInWithPassword({
+            email: emailLogin.includes('@') ? emailLogin : emailVal,
+            password,
+          })
+          if (error) throw error
+          if (data.session?.access_token) {
+            localStorage.setItem('token', data.session.access_token)
+          }
+          const u = data.user!
+          onLogin({ id: u.id as unknown as number, username: (u.user_metadata?.username as string) ?? u.email?.split('@')[0] ?? username, email: u.email ?? undefined } as unknown as User)
+        }
+      } else {
+        // Fallback: backend custom auth (if SUPABASE not configured yet)
+        const { auth } = await import('@/lib/api')
+        const data = isRegistering
+          ? await auth.register(username, password)
+          : await auth.login(username, password)
+        if (data.token) localStorage.setItem('token', data.token)
+        onLogin(data.user)
       }
-      onLogin(data.user)
     } catch (err) {
       setError((err as Error).message)
     } finally {
