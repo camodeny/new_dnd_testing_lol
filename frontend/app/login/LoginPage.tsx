@@ -15,6 +15,7 @@ export default function LoginPage({ onLogin }: LoginPageProps) {
   const [email, setEmail] = useState('')
   const [password, setPassword] = useState('')
   const [error, setError] = useState('')
+  const [success, setSuccess] = useState('')
   const [loading, setLoading] = useState(false)
   useEffect(() => {
     let ignore = false
@@ -35,6 +36,7 @@ export default function LoginPage({ onLogin }: LoginPageProps) {
   const handleSubmit = async (e: React.FormEvent) => {
     e.preventDefault()
     setError('')
+    setSuccess('')
     setLoading(true)
 
     try {
@@ -51,9 +53,9 @@ export default function LoginPage({ onLogin }: LoginPageProps) {
             options: { data: { username: username.trim() || emailVal.split('@')[0] } },
           })
           if (error) throw error
-          // If email confirmation is on, user may need to confirm — surface that
+          // If email confirmation is on, user needs to confirm before signing in
           if (data.user && !data.session) {
-            setError('Check your email to confirm your account, then sign in.')
+            setSuccess(emailVal)
             return
           }
           if (data.session?.access_token) {
@@ -120,15 +122,39 @@ export default function LoginPage({ onLogin }: LoginPageProps) {
             <span aria-hidden="true">✦</span> Fireside
           </div>
           <span className="login-kicker">YOUR CAMPAIGN WORKSPACE</span>
-          <h1>{isRegistering ? 'Begin a story' : 'Welcome back'}</h1>
+          <h1>{success ? 'Check your email' : isRegistering ? 'Begin a story' : 'Welcome back'}</h1>
           <p className="login-subtitle">
-            {isRegistering
-              ? 'Create an account and take your seat.'
-              : 'Sign in to return to your campaigns.'}
+            {success
+              ? 'Your adventure is almost ready.'
+              : isRegistering
+                ? 'Create an account and take your seat.'
+                : 'Sign in to return to your campaigns.'}
           </p>
 
-          <form onSubmit={handleSubmit}>
-            {error && <div className="error-message">{error}</div>}
+          {success ? (
+            <div className="success-message" role="status" aria-live="polite">
+              <div className="success-message-icon" aria-hidden="true">✉︎</div>
+              <div className="success-message-body">
+                <strong>Confirmation email sent</strong>
+                <p>
+                  We&apos;ve sent a confirmation link to <strong>{success}</strong>. Open your inbox and click the link to confirm your account, then return here to sign in.
+                </p>
+              </div>
+              <button
+                type="button"
+                className="login-button"
+                onClick={() => {
+                  setSuccess('')
+                  setIsRegistering(false)
+                  setError('')
+                }}
+              >
+                Back to sign in
+              </button>
+            </div>
+          ) : (
+            <form onSubmit={handleSubmit}>
+              {error && <div className="error-message" role="alert">{error}</div>}
 
             <div className="form-group">
               <label htmlFor="username">Username</label>
@@ -170,24 +196,28 @@ export default function LoginPage({ onLogin }: LoginPageProps) {
               />
             </div>
 
-            <button type="submit" className="login-button" disabled={loading}>
-              {loading ? 'Loading…' : isRegistering ? 'Create Account' : 'Sign In'}
-            </button>
-          </form>
+              <button type="submit" className="login-button" disabled={loading}>
+                {loading ? 'Loading…' : isRegistering ? 'Create Account' : 'Sign In'}
+              </button>
+            </form>
+          )}
 
-          <p className="toggle-text">
-            {isRegistering ? 'Already have an account?' : "Don't have an account?"}{' '}
-            <button
-              type="button"
-              className="toggle-button"
-              onClick={() => {
-                setIsRegistering((r) => !r)
-                setError('')
-              }}
-            >
-              {isRegistering ? 'Sign In' : 'Create Account'}
-            </button>
-          </p>
+          {!success && (
+            <p className="toggle-text">
+              {isRegistering ? 'Already have an account?' : "Don't have an account?"}{' '}
+              <button
+                type="button"
+                className="toggle-button"
+                onClick={() => {
+                  setIsRegistering((r) => !r)
+                  setError('')
+                  setSuccess('')
+                }}
+              >
+                {isRegistering ? 'Sign In' : 'Create Account'}
+              </button>
+            </p>
+          )}
         </div>
       </main>
     </div>
