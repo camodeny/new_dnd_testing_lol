@@ -2,12 +2,24 @@
 
 import { useState, useEffect, useCallback } from 'react'
 import { auth } from '@/lib/api'
+import { supabase } from '@/lib/supabase'
 import type { User } from '@/types'
 
 const MOCK_USER: User | null =
   process.env.NEXT_PUBLIC_MOCK_USER === 'true'
     ? { id: 1, username: 'dev', email: 'dev@fireside.local' }
     : null
+
+function supabaseUserToAppUser(su: { id: string; email?: string | null; user_metadata?: Record<string, unknown> }): User {
+  const email = (su.email ?? null) as string | null
+  const meta = su.user_metadata ?? {}
+  const username =
+    (meta.username as string | undefined) ??
+    (meta.full_name as string | undefined) ??
+    (meta.name as string | undefined) ??
+    (email ? email.split('@')[0] : su.id.slice(0, 8))
+  return { id: su.id as unknown as number, username, email: email ?? undefined } as unknown as User
+}
 
 export function useAuth() {
   const [user, setUser] = useState<User | null>(MOCK_USER)
@@ -16,28 +28,69 @@ export function useAuth() {
   useEffect(() => {
     if (MOCK_USER) return
 
-    const controller = new AbortController()
-    const timer = setTimeout(() => controller.abort(), 5000)
+    let cancelled = false
 
-    auth
-      .me(controller.signal)
-      .then((data) => setUser(data.user))
-      .catch(() => {
+    // 1. Check Supabase session first; sync token to localStorage for apiFetch (backend JWT)
+    supabase.auth.getSession().then(async ({ data }) => {
+      const session = data.session
+      if (session?.access_token) {
+        localStorage.setItem('token', session.access_token)
+        if (!cancelled) {
+          // Prefer backend /api/me (verifies JWT + upserts profiles) but fallback to Supabase user
+          try {
+            const controller = new AbortController()
+            const timer = setTimeout(() => controller.abort(), 5000)
+            const backendUser = await auth.me(controller.signal)
+            clearTimeout(timer)
+            if (!cancelled) setUser(backendUser.user)
+          } catch {
+            const su = session.user
+            if (su && !cancelled) setUser(supabaseUserToAppUser(su as never))
+          } finally {
+            if (!cancelled) setLoading(false)
+          }
+          return
+        }
+      }
+      // No supabase session — try legacy token flow (back-compat) then mark unauthenticated
+      try {
+        const controller = new AbortController()
+        const timer = setTimeout(() => controller.abort(), 5000)
+        const data = await auth.me(controller.signal)
+        clearTimeout(timer)
+        if (!cancelled) setUser(data.user)
+      } catch {
+        localStorage.removeItem('token')
+        if (!cancelled) setUser(null)
+      } finally {
+        if (!cancelled) setLoading(false)
+      }
+    })
+
+    // 2. Keep token in sync on refresh / sign-out
+    const {
+      data: { subscription },
+    } = supabase.auth.onAuthStateChange((_event, session) => {
+      if (session?.access_token) {
+        localStorage.setItem('token', session.access_token)
+      } else {
         localStorage.removeItem('token')
         setUser(null)
-      })
-      .finally(() => {
-        clearTimeout(timer)
-        setLoading(false)
-      })
+      }
+    })
 
     return () => {
-      clearTimeout(timer)
-      controller.abort()
+      cancelled = true
+      subscription.unsubscribe()
     }
   }, [])
 
   const logout = useCallback(async () => {
+    try {
+      await supabase.auth.signOut()
+    } catch {
+      // fall through
+    }
     try {
       await auth.logout()
     } catch {
