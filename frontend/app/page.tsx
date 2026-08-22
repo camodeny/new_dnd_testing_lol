@@ -4,6 +4,7 @@ import { useState, useEffect } from 'react'
 import { useRouter } from 'next/navigation'
 import { useAuthContext } from '@/contexts/AuthContext'
 import { campaigns as campaignsApi, campaignMembers } from '@/lib/api'
+import LandingPage from '@/components/landing/LandingPage'
 import CampaignCard from '@/components/campaign/CampaignCard'
 import CampaignForm from '@/components/campaign/CampaignForm'
 import Modal from '@/components/common/Modal'
@@ -40,12 +41,16 @@ export default function HomePage() {
   const [deleteError, setDeleteError] = useState('')
 
   useEffect(() => {
+    if (!user) {
+      setLoadingList(false)
+      return
+    }
     campaignsApi
       .list()
       .then((data) => setCampaignList(data.campaigns ?? []))
       .catch(() => { /* show empty state when backend is unavailable */ })
       .finally(() => setLoadingList(false))
-  }, [])
+  }, [user])
 
   const handleCampaignCreated = (campaign: Campaign) => {
     setCampaignList((prev) => [campaign, ...prev])
@@ -88,6 +93,10 @@ export default function HomePage() {
     } finally {
       setJoinLoading(false)
     }
+  }
+
+  if (!user) {
+    return <LandingPage />
   }
 
   if (loadingList) return <Loading />
