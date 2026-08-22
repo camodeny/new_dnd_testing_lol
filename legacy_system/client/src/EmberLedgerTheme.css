@@ -548,6 +548,13 @@ select.input:focus,
   mix-blend-mode: soft-light;
 }
 
+.character-library-hero .campaign-hero-art {
+  background:
+    linear-gradient(90deg, rgba(255, 248, 232, 0.96) 0%, rgba(255, 248, 232, 0.8) 35%, rgba(255, 248, 232, 0.18) 62%, transparent 100%),
+    linear-gradient(0deg, rgba(255, 248, 232, 0.12), transparent 42%),
+    url('/assets/character-creator-hero.png') 62% center / cover no-repeat;
+}
+
 .campaign-hero-copy {
   z-index: 2;
   width: min(720px, 62%);
