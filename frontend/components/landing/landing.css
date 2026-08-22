@@ -364,9 +364,7 @@
 .v4-breakout {
   width: 100vw;
   margin: 52px calc(50% - 50vw) 0;
-  background: linear-gradient(180deg, #f8f5ee 0%, #efece5 100%);
-  border-top: 1px solid var(--line, #d5d0c5);
-  border-bottom: 1px solid var(--line, #d5d0c5);
+  background: var(--surface-canvas, #efece5);
 }
 
 .v4-breakout-grid {
@@ -662,8 +660,7 @@
   gap: 12px;
   max-width: 1160px;
   margin: 0 auto;
-  padding: 18px clamp(20px, 3.2vw, 24px) 32px;
-  border-top: 1px solid var(--line, #d5d0c5);
+  padding: 60px;
   color: var(--ink-faint, #686a64);
   font-size: 0.72rem;
   font-weight: 600;
