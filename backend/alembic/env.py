@@ -42,7 +42,7 @@ def _get_database_url() -> str | None:
 
 _db_url = _get_database_url()
 if _db_url:
-    config.set_main_option("sqlalchemy.url", _db_url)
+    config.set_main_option("sqlalchemy.url", _db_url.replace("%", "%%"))
 
 # other values from the config, defined by the needs of env.py,
 # can be acquired:

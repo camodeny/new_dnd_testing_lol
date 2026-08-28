@@ -32,6 +32,8 @@ interface CharacterFormPageProps {
   initial?: Partial<Character>
   onSaved: (character: Character) => void
   onCancel: () => void
+  onToggleAI?: () => void
+  aiCollapsed?: boolean
 }
 
 const ITEM_CONFIG_BY_KEY = Object.fromEntries(
@@ -84,7 +86,7 @@ function GeneralSection({
   )
 }
 
-export default function CharacterFormPage({ initial, onSaved, onCancel }: CharacterFormPageProps) {
+export default function CharacterFormPage({ initial, onSaved, onCancel, onToggleAI, aiCollapsed }: CharacterFormPageProps) {
   const [draft, setDraft] = useState<CharacterDraft>(() => mergeCharacterDraft(initial))
   const [activePageIndex, setActivePageIndex] = useState(0)
   const [error, setError] = useState('')
@@ -265,6 +267,11 @@ export default function CharacterFormPage({ initial, onSaved, onCancel }: Charac
       <div className="character-form-wizard__actions">
         <div className="character-form-wizard__actions-start">
           <Button type="button" variant="secondary" onClick={onCancel} disabled={saving}>Cancel</Button>
+          {onToggleAI && (
+            <Button type="button" variant={aiCollapsed ? 'primary' : 'secondary'} onClick={onToggleAI} disabled={saving}>
+              <i className="bi bi-stars" aria-hidden="true" /> {aiCollapsed ? 'AI Help' : 'Hide AI'}
+            </Button>
+          )}
         </div>
         <div className="character-form-wizard__actions-end">
           <Button

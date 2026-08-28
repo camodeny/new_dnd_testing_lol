@@ -35,7 +35,7 @@ def _run_migrations():
             return
 
         cfg = Config(alembic_ini)
-        cfg.set_main_option("sqlalchemy.url", db_url)
+        cfg.set_main_option("sqlalchemy.url", db_url.replace("%", "%%"))
         # Ensure backend/ is on path for env.py imports when running from Vercel's wd
         cfg.set_main_option("script_location", os.path.join(os.path.dirname(__file__), "alembic"))
         command.upgrade(cfg, "head")
