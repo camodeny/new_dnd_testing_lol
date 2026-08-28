@@ -113,15 +113,33 @@ export default function CharacterFormPage({ initial, aiPatch, onAiPatchApplied, 
 
   useEffect(() => {
     if (!aiPatch) return
-    // merge AI patch into current draft (preserves manual edits for fields AI didn't touch)
     aiPatchRef.current += 1
-    const patchId = aiPatchRef.current
     setDraft((prev) => {
-      // deep merge: only overwrite fields that AI actually provided
-      const merged = mergeCharacterDraft({ ...prev, ...aiPatch })
-      // for nested groups, prefer AI values where defined
-      // mergeCharacterDraft already handles nested groups correctly
-      return merged
+      // Deep-merge nested groups against prev so partial patches don't reset untouched fields.
+      // Lists (classes, skills, etc.) replace wholesale; nested objects merge.
+      const mergedBase: Record<string, unknown> = { ...prev }
+      for (const [key, value] of Object.entries(aiPatch)) {
+        const prevVal = (prev as unknown as Record<string, unknown>)[key]
+        const isPlainObject = (v: unknown) => v !== null && typeof v === 'object' && !Array.isArray(v)
+        if (isPlainObject(value) && isPlainObject(prevVal)) {
+          if (key === 'spellcasting') {
+            const prevSpell = prevVal as Record<string, unknown>
+            const patchSpell = value as Record<string, unknown>
+            const prevSlots = prevSpell.spell_slots as Record<string, unknown> | undefined
+            const patchSlots = patchSpell.spell_slots as Record<string, unknown> | undefined
+            if (isPlainObject(prevSlots) && isPlainObject(patchSlots)) {
+              mergedBase[key] = { ...prevVal, ...value, spell_slots: { ...prevSlots, ...patchSlots } } as unknown
+            } else {
+              mergedBase[key] = { ...prevVal, ...value } as unknown
+            }
+          } else {
+            mergedBase[key] = { ...prevVal, ...value } as unknown
+          }
+        } else {
+          ;(mergedBase as Record<string, unknown>)[key] = value as unknown
+        }
+      }
+      return mergeCharacterDraft(mergedBase)
     })
     onAiPatchApplied?.()
   }, [aiPatch, onAiPatchApplied])

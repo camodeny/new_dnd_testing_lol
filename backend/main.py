@@ -166,35 +166,58 @@ def _get_or_create_mock_profile(db: Session) -> Profile:
     return profile
 
 
-def _resolve_profile(request: Request, db: Session) -> Profile:
-    """Try real auth, fallback to mock for local dev (NEXT_PUBLIC_MOCK_USER)."""
-    auth = request.headers.get("authorization") or request.headers.get("Authorization")
-    if auth and auth.lower().startswith("bearer "):
-        token = auth[7:].strip()
-        if token:
-            try:
-                from auth import verify_supabase_jwt
+def _is_mock_auth_allowed() -> bool:
+    # Explicit local-dev gate; invalid credentials never fall through to mock.
+    # Set ALLOW_MOCK_AUTH=true in backend/.env for local dev (never in production).
+    if os.getenv("ALLOW_MOCK_AUTH", "").strip().lower() in ("1", "true", "yes", "on"):
+        return True
+    # Legacy dev flag used by frontend; also allow when explicitly set
+    if os.getenv("NEXT_PUBLIC_MOCK_USER", "").strip().lower() in ("1", "true"):
+        return True
+    # Vercel production should not allow mock
+    if os.getenv("VERCEL_ENV") == "production":
+        return False
+    # Default: allow mock only when no prod env is set (local dev)
+    return os.getenv("VERCEL_ENV") is None and os.getenv("NODE_ENV") != "production"
 
-                payload = verify_supabase_jwt(token)
-                sub = payload.get("sub")
-                if sub:
-                    uid = uuid_lib.UUID(str(sub))
-                    prof = db.get(Profile, uid)
-                    if prof:
-                        return prof
-                    # create if verified but not in profiles
-                    email = payload.get("email")
-                    md = payload.get("user_metadata") or {}
-                    username = md.get("username") or md.get("full_name") or md.get("name")
-                    prof = Profile(id=uid, email=email, username=username)
-                    db.add(prof)
-                    db.commit()
-                    db.refresh(prof)
-                    return prof
-            except Exception:
-                pass
-    # fallback to mock in dev
-    return _get_or_create_mock_profile(db)
+
+def _resolve_profile(request: Request, db: Session) -> Profile:
+    """Resolve profile via verified JWT; mock only when no credentials and mock is explicitly allowed."""
+    auth = request.headers.get("authorization") or request.headers.get("Authorization")
+    has_credentials = bool(auth and auth.strip())
+    if has_credentials:
+        if not auth.lower().startswith("bearer "):
+            raise HTTPException(status_code=401, detail="Invalid Authorization header")
+        token = auth[7:].strip()
+        if not token:
+            raise HTTPException(status_code=401, detail="Missing token")
+        # Any supplied credentials must verify; never fall through to mock.
+        from auth import verify_supabase_jwt
+
+        payload = verify_supabase_jwt(token)  # raises 401 on failure
+        sub = payload.get("sub")
+        if not sub:
+            raise HTTPException(status_code=401, detail="Token missing sub")
+        try:
+            uid = uuid_lib.UUID(str(sub))
+        except ValueError:
+            raise HTTPException(status_code=401, detail="Invalid sub format")
+        prof = db.get(Profile, uid)
+        if prof:
+            return prof
+        email = payload.get("email")
+        md = payload.get("user_metadata") or {}
+        username = md.get("username") or md.get("full_name") or md.get("name")
+        prof = Profile(id=uid, email=email, username=username)
+        db.add(prof)
+        db.commit()
+        db.refresh(prof)
+        return prof
+
+    # No credentials supplied — allow mock only behind explicit flag
+    if _is_mock_auth_allowed():
+        return _get_or_create_mock_profile(db)
+    raise HTTPException(status_code=401, detail="Missing Authorization header")
 
 
 def _character_with_sheet(db: Session, char: Character):
@@ -450,14 +473,23 @@ def _character_chat_sync_generator(req: CharacterChatRequest):
 
 
 @app.post("/api/characters/{character_id}/chat")
-async def character_chat(character_id: str, req: CharacterChatRequest, request: Request):
+async def character_chat(character_id: str, req: CharacterChatRequest, request: Request, db: Session = Depends(get_db)):
     """
-    SSE chat for character creator.
+    SSE chat for character creator. Requires verified profile.
 
-    - character_id: "new" for unsaved draft, or existing character UUID
+    - character_id: "new" for unsaved draft, or existing character UUID (ownership validated)
     - streams tokens via text/event-stream: {type:"token", text} + {type:"patch", patch} + {type:"done"}
-    Frontend should POST with {content, history, draft_character, active_page}.
     """
+    profile = _resolve_profile(request, db)
+    if character_id != "new":
+        try:
+            cid = uuid_lib.UUID(character_id)
+        except ValueError:
+            raise HTTPException(status_code=404, detail="Invalid character id")
+        char = db.get(Character, cid)
+        if not char or char.owner_id != profile.id:
+            raise HTTPException(status_code=404, detail="Character not found")
+
     return StreamingResponse(
         _character_chat_sync_generator(req),
         media_type="text/event-stream",
