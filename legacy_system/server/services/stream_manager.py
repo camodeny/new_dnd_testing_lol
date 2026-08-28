@@ -5,16 +5,14 @@ import threading
 import time
 from uuid import uuid4
 from flask import current_app
-from models import db, Campaign, CampaignSession, SessionMessage, SheetProposal, User
+from models import db, Campaign, CampaignSession, SessionMessage, User
 from openrouter import (
-    get_session_dm_response_with_tools,
     normalize_session_dm_turn_decision,
     get_llm_provider,
     _post_chat,
 )
 from services.dm_tools import (
     build_session_hot_context,
-    build_session_retrieval_packet,
     get_dm_tool_definitions,
     context_manifest,
     execute_dm_tool,
@@ -51,6 +49,8 @@ class SessionGeneratorWorker:
         self.sheet_proposals_result = []
         self.dynamic_summary_lock = threading.Lock()
         self.last_dynamic_summary_at = 0.0
+        self.dm_stream_id = None
+        self.dm_stream_text = ''
 
     def add_listener(self):
         q = queue.Queue()
@@ -58,6 +58,12 @@ class SessionGeneratorWorker:
             self.listeners.append(q)
             # Catch up new listener with current status
             q.put({"type": "status", "status": self.status})
+            if self.dm_stream_id and self.dm_stream_text and not self.is_done:
+                q.put({
+                    "type": "dm_stream_snapshot",
+                    "stream_id": self.dm_stream_id,
+                    "content": self.dm_stream_text,
+                })
             if self.is_done:
                 if self.error:
                     q.put({"type": "error", "error": self.error})
@@ -116,6 +122,10 @@ class SessionGeneratorWorker:
                 args = raw_status_or_data.get("arguments") or {}
                 action_desc = f"Executing D&D campaign tool: {tool_name} with parameters: {json.dumps(args)}"
                 self.status = f"Using tool ({tool_name})..."
+            elif step == "data_gather":
+                prelude = str(raw_status_or_data.get("prelude") or "").strip()
+                action_desc = prelude or "Gathering the evidence needed to resolve the turn."
+                self.status = prelude or "Checking the campaign record..."
             elif step == "guard_check":
                 action_desc = "Verifying the candidate response against D&D player control limits, rules formatting, and spoiler protection guidelines."
                 self.status = "Reviewing rules..."
@@ -263,33 +273,14 @@ class SessionGeneratorWorker:
             SessionMessage.created_at.asc(),
         ).all()[-8:]
 
-        # Execute DM turn with our status update callback
-        ai_result = get_session_dm_response_with_tools(
-            hot_context,
+        ai_result = self._try_data_first_turn(
+            campaign,
+            session,
+            current_user,
             recent_messages,
-            dm_tools_filtered,
-            lambda name, args, tool_audit: execute_dm_tool(campaign, session, current_user, name, args, tool_audit),
-            audit_context={
-                'campaign_id': campaign.id,
-                'operation': 'session_dm_response',
-                'actor': 'session_dm',
-                'trace_id': trace_id,
-                'trace_label': trace_label,
-                'context_manifest': manifest,
-                'full_world_graph_included': False,
-            },
-            on_status_change=self.update_status,
-            build_retrieval_packet=lambda preflight: build_session_retrieval_packet(
-                campaign,
-                current_user,
-                hot_context,
-                preflight,
-                audit_context={
-                    'trace_id': trace_id,
-                    'trace_label': trace_label,
-                    'campaign_id': campaign.id,
-                },
-            ),
+            hot_context,
+            trace_id,
+            trace_label,
         )
 
         ai_turn = _session_dm_turn_decision(ai_result)
@@ -298,7 +289,7 @@ class SessionGeneratorWorker:
         sheet_proposals = []
         result_messages = [player_msg.to_dict()] if player_msg else []
 
-        if ai_turn.get('mode') == 'speak' and ai_text:
+        if ai_turn.get('mode') in {'speak', 'table_chat'} and ai_text:
             response_parts = ai_turn.get('parts') if isinstance(ai_turn, dict) else None
             resolver_packet = ai_turn.get('resolver_packet') if isinstance(ai_turn, dict) else None
             ai_msg, pending_proposals, _action_results = commit_accepted_dm_turn(
@@ -316,11 +307,22 @@ class SessionGeneratorWorker:
                 response_parts=response_parts,
                 resolver_packet=resolver_packet,
                 disclose_item_ids=ai_turn.get('disclose_item_ids') if isinstance(ai_turn, dict) else None,
+                roll_request=ai_turn.get('roll_request') if isinstance(ai_turn, dict) else None,
+                visible_status=ai_turn.get('mode'),
             )
             result_messages.append(ai_msg.to_dict())
             sheet_proposals = [p.to_dict() for p in pending_proposals]
 
+            if ai_turn.get('roll_request'):
+                from services.session_rolls import pending_roll_requests
+                self.broadcast({
+                    'type': 'roll_request_state',
+                    'pending_roll_requests': pending_roll_requests(session.id),
+                })
+
             self.finish_success(result_messages, sheet_proposals)
+            if ai_turn.get('mode') == 'table_chat':
+                return
             from routes.sessions import _run_session_memory_update
             _run_session_memory_update(
                 campaign.id,
@@ -392,6 +394,348 @@ class SessionGeneratorWorker:
 
         self.finish_success(result_messages, sheet_proposals)
 
+    def _try_data_first_turn(self, campaign, session, current_user, recent_messages, hot_context, trace_id, trace_label):
+        """Return a data-first decision or raise; legacy turn generation is not a fallback."""
+        from services.data_first_turn import (
+            DataFirstTurnError,
+            authorized_player_fact_texts,
+            canonicalize_turn_character_refs,
+            data_first_enabled,
+            expansion_basis_text,
+            generate_turn_attempt,
+            guard_turn_actions,
+            memory_private_context,
+            public_expansion_packet,
+            resolve_and_retry_turn_attempt,
+            stage_turn_actions,
+            stream_turn_expansion,
+            validate_expansion_text,
+            validate_turn_claim_provenance,
+            validate_turn_entity_refs,
+        )
+
+        from openrouter import (
+            _approved_disclosure_texts,
+            _pc_control_violation,
+            _private_output_violation,
+            _private_text_contains_token_sequence,
+            _session_dm_disclosure_validation,
+            _session_dm_format_violation,
+        )
+
+        started_at = time.monotonic()
+        stream_started = False
+        audit_base = {
+            'campaign_id': campaign.id,
+            'trace_id': trace_id,
+            'parent_trace_id': trace_id,
+            'trace_label': trace_label,
+            'full_world_graph_included': False,
+        }
+        try:
+            if not data_first_enabled():
+                raise DataFirstTurnError(
+                    'data_first_disabled',
+                    'Data-first DM generation is disabled and legacy fallback has been removed.',
+                )
+            combat = hot_context.get('combat_coordinates') if isinstance(hot_context, dict) else None
+            if isinstance(combat, dict) and combat.get('active'):
+                raise DataFirstTurnError(
+                    'unsupported_combat',
+                    'Combat turns are not supported by the data-first DM path.',
+                )
+
+            self.update_status({'step': 'thinking', 'reasoning': 'Building a structured turn attempt'})
+            attempt = generate_turn_attempt(hot_context, recent_messages, audit_context=audit_base)
+            plan_ms = round((time.monotonic() - started_at) * 1000)
+            log_audit_event(
+                campaign.id,
+                'data_first_turn_attempt_generated',
+                'Generated an MVP structured turn attempt.',
+                {'attempt': attempt, 'plan_ms': plan_ms},
+                source='session_dm.data_first',
+                actor='session_dm_turn_planner',
+                trace_id=trace_id,
+                trace_label=trace_label,
+                audit_role='agent',
+                commit=True,
+            )
+            resolution_ms = 0
+            replan_ms = 0
+            initial_attempt = attempt
+            evidence_bundle = None
+            if attempt['mode'] == 'resolve':
+                safe_prelude = attempt.get('safe_prelude') or 'Checking the campaign record...'
+                prelude_private_violation = _private_output_violation(safe_prelude, hot_context)
+                if prelude_private_violation:
+                    raise DataFirstTurnError(
+                        'unsafe_resolver_prelude',
+                        'The resolver prelude failed deterministic privacy validation.',
+                        details={'private': prelude_private_violation},
+                    )
+                self.update_status({'step': 'data_gather', 'prelude': safe_prelude})
+                resolution_started = time.monotonic()
+
+                def on_evidence_request(request, arguments):
+                    self.update_status({
+                        'step': 'tool_call',
+                        'tool_name': request.get('tool'),
+                        'arguments': arguments,
+                    })
+
+                def execute_evidence_tool(name, args, tool_audit):
+                    result = execute_dm_tool(campaign, session, current_user, name, args, tool_audit)
+                    return result
+
+                evidence_ready_at = [None]
+
+                def on_evidence_ready(_bundle):
+                    evidence_ready_at[0] = time.monotonic()
+
+                attempt, evidence_bundle = resolve_and_retry_turn_attempt(
+                    hot_context,
+                    recent_messages,
+                    attempt,
+                    execute_evidence_tool,
+                    audit_context=audit_base,
+                    on_request=on_evidence_request,
+                    on_evidence_ready=on_evidence_ready,
+                )
+                resolved_at = time.monotonic()
+                evidence_finished_at = evidence_ready_at[0] or resolved_at
+                resolution_ms = round((evidence_finished_at - resolution_started) * 1000)
+                replan_ms = round((resolved_at - evidence_finished_at) * 1000)
+                plan_ms = round((time.monotonic() - started_at) * 1000)
+                log_audit_event(
+                    campaign.id,
+                    'data_first_turn_resolved',
+                    'Gathered read-only evidence and generated a bounded retry attempt.',
+                    {
+                        'initial_attempt': initial_attempt,
+                        'evidence_bundle': evidence_bundle,
+                        'attempt': attempt,
+                        'resolution_ms': resolution_ms,
+                        'replan_ms': replan_ms,
+                        'total_plan_ms': plan_ms,
+                    },
+                    source='session_dm.data_first',
+                    actor='session_dm_evidence_resolver',
+                    trace_id=trace_id,
+                    trace_label=trace_label,
+                    audit_role='tools',
+                    commit=True,
+                )
+            if attempt['mode'] == 'fallback':
+                raise DataFirstTurnError(
+                    'unsupported_turn',
+                    'The structured planner could not handle this turn.',
+                    details={
+                        'reason': attempt.get('reason'),
+                        'plan_ms': plan_ms,
+                        'resolved_once': evidence_bundle is not None,
+                    },
+                )
+            if attempt['mode'] == 'silent':
+                return {'mode': 'silent', 'reason': attempt.get('reason') or 'The DM intentionally stayed silent.'}
+
+            attempt = canonicalize_turn_character_refs(attempt, hot_context)
+            attempt = validate_turn_entity_refs(attempt, hot_context)
+            attempt = validate_turn_claim_provenance(
+                attempt,
+                hot_context,
+                recent_messages,
+                evidence_bundle=evidence_bundle,
+            )
+
+            authorized_player_facts = authorized_player_fact_texts(
+                attempt,
+                hot_context,
+                recent_messages,
+                _pc_control_violation,
+            )
+
+            attempt, action_guard_notes = guard_turn_actions(attempt, hot_context)
+            if action_guard_notes:
+                log_audit_event(
+                    campaign.id,
+                    'data_first_action_guard_applied',
+                    'Normalized redundant or epistemically unsupported staged actions.',
+                    {'notes': action_guard_notes, 'guarded_actions': attempt.get('actions') or []},
+                    source='session_dm.data_first',
+                    actor='session_dm_action_guard',
+                    trace_id=trace_id,
+                    trace_label=trace_label,
+                    audit_role='guardrail',
+                    commit=True,
+                )
+
+            action_buffer, commit_action_ids = stage_turn_actions(
+                attempt,
+                lambda name, args, tool_audit: execute_dm_tool(
+                    campaign, session, current_user, name, args, tool_audit,
+                ),
+                audit_context=audit_base,
+            )
+
+            packet = public_expansion_packet(
+                attempt,
+                authorized_player_facts=authorized_player_facts,
+                action_buffer=action_buffer,
+            )
+            basis = expansion_basis_text(packet)
+            from services.dm_tools import _reveal_fact_facet_ids
+            proposed_disclosures = []
+            for action in attempt.get('actions') or []:
+                args = action.get('arguments') or {}
+                if action.get('tool') == 'reveal_fact' and args.get('visibility') in {'public', 'party_known'}:
+                    proposed_disclosures.extend(_reveal_fact_facet_ids(args.get('item_type'), args.get('item_id')))
+            approved_disclosures, disclosure_violations = _session_dm_disclosure_validation(
+                {'content': basis, 'disclose_item_ids': proposed_disclosures},
+                hot_context,
+            )
+            if disclosure_violations:
+                raise DataFirstTurnError(
+                    'invalid_structured_disclosure',
+                    'A structured reveal action did not map to a known disclosure facet.',
+                    details={'violations': disclosure_violations},
+                )
+            allowed_disclosure_terms = _approved_disclosure_texts(approved_disclosures, hot_context)
+            visible_transcript = "\n".join(
+                str(item.get('content') or '')
+                for item in (hot_context.get('recent_messages') or [])
+                if isinstance(item, dict)
+            )
+            previously_visible_terms = [
+                str(term).strip()
+                for term in (hot_context.get('protected_identifier_terms') or [])
+                if str(term or '').strip()
+                and _private_text_contains_token_sequence(visible_transcript, str(term))
+            ]
+            allowed_disclosure_terms = list(dict.fromkeys(
+                [*allowed_disclosure_terms, *previously_visible_terms]
+            ))
+            private_violation = _private_output_violation(
+                basis, hot_context, allowed_terms=allowed_disclosure_terms,
+            )
+            agency_violation = _pc_control_violation(
+                basis, hot_context, allowed_player_facts=authorized_player_facts,
+            )
+            if private_violation or agency_violation:
+                raise DataFirstTurnError(
+                    'public_packet_rejected',
+                    'The public expansion packet failed deterministic safety validation.',
+                    details={
+                        'private': private_violation,
+                        'agency': agency_violation,
+                    },
+                )
+
+            self.dm_stream_id = f'dm-stream-{self.player_message_id or uuid4().hex[:10]}'
+            self.dm_stream_text = ''
+            self.broadcast({'type': 'dm_stream_start', 'stream_id': self.dm_stream_id})
+            stream_started = True
+            expansion_started_at = time.monotonic()
+            first_token_ms = None
+
+            def on_token(delta):
+                nonlocal first_token_ms
+                if not delta:
+                    return
+                if first_token_ms is None:
+                    first_token_ms = round((time.monotonic() - started_at) * 1000)
+                self.dm_stream_text += delta
+                self.broadcast({
+                    'type': 'dm_stream_token',
+                    'stream_id': self.dm_stream_id,
+                    'token': delta,
+                })
+
+            expanded = stream_turn_expansion(packet, audit_context=audit_base, on_token=on_token)
+            expanded = validate_expansion_text(expanded, packet)
+            final_private_violation = _private_output_violation(
+                expanded, hot_context, allowed_terms=allowed_disclosure_terms,
+            )
+            final_agency_violation = _pc_control_violation(
+                expanded, hot_context, allowed_player_facts=authorized_player_facts,
+            )
+            format_violation = _session_dm_format_violation(expanded)
+            if final_private_violation or final_agency_violation or format_violation:
+                raise DataFirstTurnError(
+                    'streamed_expansion_rejected',
+                    'The streamed expansion failed deterministic surface validation.',
+                    details={
+                        'private': final_private_violation,
+                        'agency': final_agency_violation,
+                        'format': format_violation,
+                    },
+                )
+
+            expansion_ms = round((time.monotonic() - expansion_started_at) * 1000)
+            total_ms = round((time.monotonic() - started_at) * 1000)
+            log_audit_event(
+                campaign.id,
+                'data_first_expansion_completed',
+                'Streamed prose from an approved public turn packet.',
+                {
+                    'attempt': attempt,
+                    'public_packet': packet,
+                    'expansion': expanded,
+                    'plan_ms': plan_ms,
+                    'resolution_ms': resolution_ms,
+                    'replan_ms': replan_ms,
+                    'first_token_ms': first_token_ms,
+                    'expansion_ms': expansion_ms,
+                    'total_ms': total_ms,
+                },
+                source='session_dm.data_first',
+                actor='session_dm_prose_expander',
+                trace_id=trace_id,
+                trace_label=trace_label,
+                audit_role='agent',
+                commit=True,
+            )
+            response_part = {'type': 'narration', 'content': expanded}
+            private_context = memory_private_context(attempt)
+            if private_context:
+                response_part['dm_private_context'] = private_context
+            return {
+                'mode': attempt['mode'],
+                'content': expanded,
+                'parts': [response_part],
+                'commit_action_ids': commit_action_ids,
+                'disclose_item_ids': approved_disclosures,
+                '_pending_actions': action_buffer['actions'],
+                '_data_first_turn_attempt': attempt,
+                **({'roll_request': attempt['roll_request']} if attempt.get('roll_request') else {}),
+            }
+        except Exception as err:
+            if stream_started:
+                self.broadcast({
+                    'type': 'dm_stream_reset',
+                    'stream_id': self.dm_stream_id,
+                    'reason': 'The streamed draft failed validation and was discarded.',
+                })
+                self.dm_stream_id = None
+                self.dm_stream_text = ''
+            log_audit_event(
+                campaign.id,
+                'data_first_turn_failed',
+                'Data-first DM generation failed closed; no legacy generation was attempted.',
+                {
+                    'error': repr(err),
+                    'code': getattr(err, 'code', None),
+                    'details': getattr(err, 'details', None),
+                    'elapsed_ms': round((time.monotonic() - started_at) * 1000),
+                },
+                source='session_dm.data_first',
+                actor='session_dm_turn_planner',
+                trace_id=trace_id,
+                trace_label=trace_label,
+                audit_role='agent',
+                commit=True,
+            )
+            raise
+
 def _session_dm_turn_decision(raw_result):
     normalize = normalize_session_dm_turn_decision
     decision = normalize(raw_result)
@@ -402,7 +746,7 @@ def _session_dm_turn_decision(raw_result):
             'reason': decision.get('reason') or 'The DM intentionally stayed silent.',
         }
     result = {
-        'mode': 'speak',
+        'mode': 'table_chat' if decision.get('mode') == 'table_chat' else 'speak',
         'content': decision.get('content') or '',
         'parts': decision.get('parts') if isinstance(decision.get('parts'), list) else [],
         'commit_action_ids': decision.get('commit_action_ids'),
@@ -411,6 +755,8 @@ def _session_dm_turn_decision(raw_result):
         result['disclose_item_ids'] = decision['disclose_item_ids']
     if isinstance(decision.get('resolver_packet'), dict):
         result['resolver_packet'] = decision['resolver_packet']
+    if isinstance(decision.get('roll_request'), dict):
+        result['roll_request'] = decision['roll_request']
     return result
 
 class SessionStreamManager:

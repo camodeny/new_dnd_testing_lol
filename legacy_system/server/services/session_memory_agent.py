@@ -568,6 +568,19 @@ def _normalize_importance(value):
     return _safe_int(value, 3, minimum=1, maximum=5)
 
 
+def _allocate_new_fact_id(known_fact_ids, allocated_fact_ids=None):
+    """Allocate a fact_N id without reusing an id from an earlier memory turn."""
+    occupied = {
+        clean_id(value, "")
+        for value in [*(known_fact_ids or set()), *(allocated_fact_ids or set())]
+        if clean_id(value, "")
+    }
+    suffix = 1
+    while f"fact_{suffix}" in occupied:
+        suffix += 1
+    return f"fact_{suffix}"
+
+
 def _validate_final_memory_state(compiled_patch, registry_map, known, campaign):
     errors = []
     all_entity_ids = set(known.get("entity_ids", set()))
@@ -2168,6 +2181,7 @@ def compile_staged_memory_patch(memory_context, extracted, resolved):
     # ── Compile Facts via Registry ─────────────────────────────────────
     accepted_facts = []
     skipped_facts = []
+    allocated_fact_ids = set()
     raw_facts = resolved.get("upsert_graph_facts") if isinstance(resolved.get("upsert_graph_facts"), list) else []
     for index, raw_fact in enumerate(raw_facts):
         if not isinstance(raw_fact, dict):
@@ -2222,8 +2236,11 @@ def compile_staged_memory_patch(memory_context, extracted, resolved):
         fact_id = clean_id(raw_fact.get("id"), "")
         if fact_id and fact_id not in known["fact_ids"]:
             fact_id = ""
+        if not fact_id:
+            fact_id = _allocate_new_fact_id(known["fact_ids"], allocated_fact_ids)
+        allocated_fact_ids.add(fact_id)
         accepted_facts.append({
-            "id": fact_id or f"fact_{index + 1}",
+            "id": fact_id,
             "entity_ids": entity_ids,
             "text": text,
             "visibility": _normalize_visibility(raw_fact.get("source_surface"), raw_fact.get("intended_visibility")),

@@ -1030,7 +1030,7 @@ export default function SessionPanel({
                   characters={characters}
                 />
               ))}
-              {aiThinking && (
+              {aiThinking && !messages.some((message) => message.is_streaming_dm) && (
                 <div className="session-msg session-msg-dm">
                   <div className="session-msg-header">
                     <span className="session-msg-role"><i className="bi bi-mic-fill"></i> DM</span>

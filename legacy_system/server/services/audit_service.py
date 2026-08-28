@@ -227,6 +227,12 @@ def log_model_error(
     trace_label=None,
     provider='openrouter',
 ):
+    response = getattr(error, 'response', None)
+    original = getattr(error, 'original', None)
+    if response is None and original is not None:
+        response = getattr(original, 'response', None)
+    status_code = getattr(error, 'status_code', None) or getattr(response, 'status_code', None)
+    response_body = str(getattr(response, 'text', '') or '').strip()[:4000]
     return log_audit_event(
         campaign_id,
         'model_error',
@@ -235,6 +241,9 @@ def log_model_error(
             'operation': operation,
             'provider': provider,
             'error': repr(error),
+            'error_kind': getattr(error, 'kind', None),
+            'status_code': status_code,
+            'response_body': response_body or None,
         },
         source=provider,
         actor=actor,

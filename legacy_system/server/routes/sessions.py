@@ -18,12 +18,11 @@ from time_utils import utcnow
 from openrouter import (
     get_opening_scene_response,
     get_session_clock_updates,
-    get_session_dm_response_with_tools,
     get_session_memory_patch,
     get_session_running_summary_finalize,
     normalize_session_dm_turn_decision,
 )
-from services.stream_manager import stream_manager
+from services.stream_manager import SessionGeneratorWorker, stream_manager
 from services.planning_stream import planning_stream_manager
 from services.audit_service import log_audit_event
 from services.campaign_service import ensure_member, get_or_404
@@ -104,6 +103,8 @@ def _session_dm_turn_decision(raw_result):
         result['disclose_item_ids'] = decision['disclose_item_ids']
     if isinstance(decision.get('resolver_packet'), dict):
         result['resolver_packet'] = decision['resolver_packet']
+    if isinstance(decision.get('roll_request'), dict):
+        result['roll_request'] = decision['roll_request']
     return result
 
 
@@ -1179,6 +1180,12 @@ def get_session(current_user, session_id):
         limit=request.args.get('limit'),
     ))
     data['pending_sheet_proposals'] = _visible_pending_sheet_proposals(campaign, session, current_user)
+    from services.session_rolls import pending_roll_requests, pending_roll_requests_for_player
+    data['pending_roll_requests'] = (
+        pending_roll_requests(session.id)
+        if campaign.user_id == current_user.id and request.args.get('include_all_roll_requests') == '1'
+        else pending_roll_requests_for_player(session.id, current_user.id)
+    )
     return jsonify({'session': data}), 200
 
 
@@ -1240,7 +1247,44 @@ def send_message(current_user, session_id):
         content=content,
     )
     db.session.add(msg)
+    db.session.flush()
+    from services.session_rolls import fulfill_matching_roll_request, fulfill_roll_request
+    try:
+        fulfilled_roll_request = (
+            fulfill_roll_request(
+                session_id,
+                current_user.id,
+                msg,
+                data.get('roll_request_id'),
+                data.get('roll_result'),
+            )
+            if data.get('roll_request_id') and data.get('roll_result') is not None
+            else fulfill_matching_roll_request(session_id, current_user.id, msg)
+        )
+    except ValueError as error:
+        db.session.rollback()
+        return jsonify({'error': str(error)}), 400
+    if fulfilled_roll_request:
+        log_audit_event(
+            campaign.id,
+            'player_roll_request_fulfilled',
+            'Correlated a player roll with a typed AI DM request.',
+            {
+                'session_id': session_id,
+                'player_message_id': msg.id,
+                'roll_request': fulfilled_roll_request.to_dict(include_private=True),
+            },
+            source='session_rolls',
+            actor=current_user.username,
+            commit=False,
+        )
     db.session.commit()
+    if fulfilled_roll_request:
+        from services.session_rolls import pending_roll_requests
+        stream_manager.broadcast_event(session_id, {
+            'type': 'roll_request_state',
+            'pending_roll_requests': pending_roll_requests(session_id),
+        })
     stream_manager.broadcast_event(session_id, {"type": "message", "message": msg.to_dict()})
     result_messages = [msg.to_dict()]
     log_audit_event(
@@ -1283,31 +1327,21 @@ def send_message(current_user, session_id):
         )
 
         try:
-            ai_result = get_session_dm_response_with_tools(
-                hot_context,
+            synchronous_worker = SessionGeneratorWorker(
+                campaign.id,
+                session_id,
+                current_user.id,
+                content,
+                player_message_id=msg.id,
+            )
+            ai_result = synchronous_worker._try_data_first_turn(
+                campaign,
+                session,
+                current_user,
                 recent_messages,
-                dm_tools_filtered,
-                lambda name, args, tool_audit: execute_dm_tool(campaign, session, current_user, name, args, tool_audit),
-                audit_context={
-                    'campaign_id': campaign.id,
-                    'operation': 'session_dm_response',
-                    'actor': 'session_dm',
-                    'trace_id': trace_id,
-                    'trace_label': trace_label,
-                    'context_manifest': manifest,
-                    'full_world_graph_included': False,
-                },
-                build_retrieval_packet=lambda preflight: build_session_retrieval_packet(
-                    campaign,
-                    current_user,
-                    hot_context,
-                    preflight,
-                    audit_context={
-                        'trace_id': trace_id,
-                        'trace_label': trace_label,
-                        'campaign_id': campaign.id,
-                    },
-                ),
+                hot_context,
+                trace_id,
+                trace_label,
             )
         except Exception as err:
             db.session.add(mark_session_dm_turn_error(
@@ -1342,6 +1376,7 @@ def send_message(current_user, session_id):
                     response_parts=response_parts,
                     resolver_packet=resolver_packet,
                     disclose_item_ids=ai_turn.get('disclose_item_ids') if isinstance(ai_turn, dict) else None,
+                    roll_request=ai_turn.get('roll_request') if isinstance(ai_turn, dict) else None,
                 )
             except Exception as err:
                 return jsonify({'error': repr(err), 'messages': result_messages}), 500

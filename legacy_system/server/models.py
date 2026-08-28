@@ -697,6 +697,61 @@ class SessionMessage(db.Model):
         }
 
 
+class SessionRollRequest(db.Model):
+    """Durable, typed player-roll request issued by the AI DM."""
+
+    __tablename__ = 'session_roll_requests'
+
+    id = db.Column(db.Integer, primary_key=True)
+    request_id = db.Column(db.String(160), nullable=False, unique=True, index=True)
+    campaign_id = db.Column(db.Integer, db.ForeignKey('campaign.id'), nullable=False, index=True)
+    session_id = db.Column(db.Integer, db.ForeignKey('campaign_sessions.id'), nullable=False, index=True)
+    source_player_message_id = db.Column(db.Integer, db.ForeignKey('session_messages.id'), nullable=False, index=True)
+    requesting_dm_message_id = db.Column(db.Integer, db.ForeignKey('session_messages.id'), nullable=False, index=True)
+    requested_user_id = db.Column(db.Integer, db.ForeignKey('users.id'), nullable=True, index=True)
+    character_id = db.Column(db.Integer, db.ForeignKey('characters.id'), nullable=True, index=True)
+
+    roll_kind = db.Column(db.String(40), nullable=False, default='check')
+    ability_or_skill = db.Column(db.String(120), nullable=False)
+    label = db.Column(db.String(160), nullable=False)
+    advantage_state = db.Column(db.String(20), nullable=False, default='normal')
+    reason_public = db.Column(db.Text, nullable=False)
+    dc_private = db.Column(db.Integer, nullable=True)
+
+    status = db.Column(db.String(20), nullable=False, default='pending', index=True)
+    result_message_id = db.Column(db.Integer, db.ForeignKey('session_messages.id'), nullable=True, index=True)
+    result_json = db.Column(db.JSON, nullable=True)
+    created_at = db.Column(db.DateTime, default=utcnow, nullable=False, index=True)
+    fulfilled_at = db.Column(db.DateTime, nullable=True)
+    cancelled_at = db.Column(db.DateTime, nullable=True)
+
+    def to_dict(self, include_private=False):
+        data = {
+            'id': self.id,
+            'request_id': self.request_id,
+            'campaign_id': self.campaign_id,
+            'session_id': self.session_id,
+            'source_player_message_id': self.source_player_message_id,
+            'requesting_dm_message_id': self.requesting_dm_message_id,
+            'requested_user_id': self.requested_user_id,
+            'character_id': self.character_id,
+            'roll_kind': self.roll_kind,
+            'ability_or_skill': self.ability_or_skill,
+            'label': self.label,
+            'advantage_state': self.advantage_state,
+            'reason_public': self.reason_public,
+            'status': self.status,
+            'result_message_id': self.result_message_id,
+            'result': self.result_json if self.status == 'fulfilled' else None,
+            'created_at': self.created_at.isoformat() if self.created_at else None,
+            'fulfilled_at': self.fulfilled_at.isoformat() if self.fulfilled_at else None,
+        }
+        if include_private:
+            data['dc_private'] = self.dc_private
+            data['cancelled_at'] = self.cancelled_at.isoformat() if self.cancelled_at else None
+        return data
+
+
 class CampaignMember(db.Model):
     __tablename__ = 'campaign_members'
 

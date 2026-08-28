@@ -70,6 +70,9 @@ class ProviderRequest:
     messages: list
     model: str
     json_mode: bool = False
+    json_schema: Optional[dict] = None
+    json_schema_name: Optional[str] = None
+    reasoning_effort: Optional[str] = None
     tools: Optional[list] = None
     tool_choice: Optional[object] = None
     parallel_tool_calls: Optional[bool] = None
@@ -262,7 +265,16 @@ class LLMProviderAdapter:
         if options.get('thinking_enabled'):
             payload['thinking'] = options['thinking']
             payload['reasoning_effort'] = options['reasoning_effort']
-        if request.json_mode:
+        if request.json_schema:
+            payload['response_format'] = {
+                'type': 'json_schema',
+                'json_schema': {
+                    'name': request.json_schema_name or 'structured_response',
+                    'strict': True,
+                    'schema': request.json_schema,
+                },
+            }
+        elif request.json_mode:
             payload['response_format'] = {'type': 'json_object'}
         if request.stream:
             payload['stream'] = True
@@ -373,7 +385,7 @@ class OpenCodeGoAdapter(LLMProviderAdapter):
     responses_base_url = 'https://opencode.ai/zen/go/v1/responses'
 
     _THINKING_MODEL_FAMILIES = ('deepseek-v4-', 'mimo-', 'muse-spark-1.2')
-    _RESPONSES_MODEL_FAMILIES = ('muse-spark-1.2',)
+    _RESPONSES_MODEL_FAMILIES = ('muse-spark-1.2', 'gpt-5.6-luna')
 
     @staticmethod
     def _model_name(model):
@@ -492,9 +504,30 @@ class OpenCodeGoAdapter(LLMProviderAdapter):
             payload['tool_choice'] = options['tool_choice']
         if options.get('parallel_tool_calls') is not None and capabilities.supports_parallel_tool_calls:
             payload['parallel_tool_calls'] = options['parallel_tool_calls']
-        if options.get('thinking_enabled'):
+        if request.reasoning_effort:
+            effort = str(request.reasoning_effort).strip().lower()
+            allowed_efforts = {'minimal', 'low', 'medium', 'high', 'xhigh'}
+            if self._model_name(request.model).startswith('gpt-5.6-luna'):
+                allowed_efforts.add('none')
+            if effort not in allowed_efforts:
+                raise ProviderError(
+                    f'Unsupported Responses reasoning effort: {request.reasoning_effort!r}',
+                    provider=self.name,
+                    kind='unsupported_feature',
+                )
+            payload['reasoning'] = {'effort': effort}
+        elif options.get('thinking_enabled'):
             payload['reasoning'] = {'effort': options['reasoning_effort']}
-        if request.json_mode:
+        if request.json_schema:
+            payload['text'] = {
+                'format': {
+                    'type': 'json_schema',
+                    'name': request.json_schema_name or 'structured_response',
+                    'strict': True,
+                    'schema': request.json_schema,
+                },
+            }
+        elif request.json_mode:
             payload['text'] = {'format': {'type': 'json_object'}}
         if request.stream:
             payload['stream'] = True
@@ -677,6 +710,7 @@ def stream_chat(adapter, request, *, hooks=None):
                 stream=True,
             )
             response.raise_for_status()
+            response.encoding = 'utf-8'
         except Exception as error:
             classified = adapter.classify_error(error)
             if attempt < attempt_limit and classified.retryable:

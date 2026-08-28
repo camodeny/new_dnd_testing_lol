@@ -143,7 +143,7 @@ async function fetchCampaignPageData(id) {
     return {
       campaign,
       characters: charData.characters || [],
-      activeSession,
+      activeSession: { ...activeSession, ...(data.session || {}) },
       currentScene,
       worldTitle,
       messages,
@@ -494,8 +494,56 @@ export default function CampaignViewPage({ user }) {
             }
           } else if (payload.type === 'error') {
             setError(payload.error)
+            setMessages((prev) => prev.filter((message) => !message.is_streaming_dm))
             setAiThinking(false)
             setAiThinkingStatus('')
+          } else if (payload.type === 'dm_stream_start') {
+            const streamId = payload.stream_id
+            if (streamId) {
+              setMessages((prev) => {
+                const withoutOldDraft = prev.filter((message) => !message.is_streaming_dm || message.id === streamId)
+                if (withoutOldDraft.some((message) => message.id === streamId)) return withoutOldDraft
+                return [...withoutOldDraft, {
+                  id: streamId,
+                  session_id: session.id,
+                  role: 'dm',
+                  content: '',
+                  is_streaming_dm: true,
+                  created_at: new Date().toISOString(),
+                }]
+              })
+            }
+          } else if (payload.type === 'dm_stream_snapshot') {
+            const streamId = payload.stream_id
+            if (streamId) {
+              setMessages((prev) => {
+                const draft = {
+                  id: streamId,
+                  session_id: session.id,
+                  role: 'dm',
+                  content: payload.content || '',
+                  is_streaming_dm: true,
+                  created_at: new Date().toISOString(),
+                }
+                const index = prev.findIndex((message) => message.id === streamId)
+                if (index < 0) return [...prev.filter((message) => !message.is_streaming_dm), draft]
+                return prev.map((message) => message.id === streamId ? { ...message, ...draft } : message)
+              })
+            }
+          } else if (payload.type === 'dm_stream_token') {
+            const streamId = payload.stream_id
+            const token = payload.token || ''
+            if (streamId && token) {
+              setMessages((prev) => prev.map((message) => (
+                message.id === streamId
+                  ? { ...message, content: `${message.content || ''}${token}` }
+                  : message
+              )))
+            }
+          } else if (payload.type === 'dm_stream_reset') {
+            setMessages((prev) => prev.filter((message) => message.id !== payload.stream_id))
+            setAiThinking(true)
+            setAiThinkingStatus(payload.reason || 'Regenerating response...')
           } else if (payload.type === 'message') {
             if (payload.message) {
               setMessages((prev) => mergeUniqueMessages(prev, [payload.message]))
@@ -525,20 +573,27 @@ export default function CampaignViewPage({ user }) {
             )
           } else if (payload.type === 'scene_updated') {
             setCurrentScene(payload.current_scene || null)
+          } else if (payload.type === 'roll_request_state') {
+            const pending = (payload.pending_roll_requests || []).filter((rollRequest) => (
+              rollRequest.requested_user_id == null || rollRequest.requested_user_id === user?.id
+            ))
+            setSession((prev) => prev ? { ...prev, pending_roll_requests: pending } : prev)
           } else if (payload.type === 'refresh') {
             loadData()
           } else if (payload.type === 'done') {
             const serverMessages = payload.messages || []
-            if (serverMessages.length) {
-              setMessages((prev) => {
-                let next = prev
+            setMessages((prev) => {
+              const withoutStreamingDrafts = prev.filter((message) => !message.is_streaming_dm)
+              if (serverMessages.length) {
+                let next = withoutStreamingDrafts
                 for (const pendingId of pendingMessageIdsRef.current) {
                   next = reconcilePendingMessage(next, pendingId, serverMessages)
                 }
                 pendingMessageIdsRef.current.clear()
                 return mergeUniqueMessages(next, serverMessages)
-              })
-            }
+              }
+              return withoutStreamingDrafts
+            })
             if (payload.sheet_proposals?.length) {
               setSheetProposals((prev) => {
                 const existing = new Set(prev.map((p) => p.id))
@@ -584,7 +639,7 @@ export default function CampaignViewPage({ user }) {
         eventSource.close()
       }
     }
-  }, [loadData, session?.id])
+  }, [loadData, session?.id, user?.id])
 
   const handleEndSession = async () => {
     if (!session) return
@@ -599,7 +654,7 @@ export default function CampaignViewPage({ user }) {
     }
   }
 
-  const handleSendMessage = async (content) => {
+  const handleSendMessage = async (content, metadata = {}) => {
     if (!session) return
     const pendingMessage = optimisticPlayerMessage(session.id, content, user)
     setMessages((prev) => [...prev, pendingMessage])
@@ -608,7 +663,7 @@ export default function CampaignViewPage({ user }) {
     setAiThinkingStatus("Checking safety...")
 
     try {
-      const data = await sendMessage(session.id, content)
+      const data = await sendMessage(session.id, content, 'player', metadata)
       setMessages((prev) => {
         const next = reconcilePendingMessage(prev, pendingMessage.id, data.messages || [])
         pendingMessageIdsRef.current.delete(pendingMessage.id)

@@ -578,6 +578,27 @@ def ensure_manifest_session_started(args, manifest_path, manifest):
     return manifest
 
 
+def wait_for_opening_dm(args, manifest):
+    """Do not start the overseer until the opening foreground turn is visible."""
+    deadline = time.monotonic() + max(float(args.session_start_timeout), 1.0)
+    while True:
+        session = fetch_session(manifest, args.message_window)
+        if any(
+            str(message.get('role') or '').lower() == 'dm'
+            and str(message.get('content') or '').strip()
+            for message in session.get('messages') or []
+            if isinstance(message, dict)
+        ):
+            return session
+        if not session.get('is_active', True):
+            raise RuntimeError('Session became inactive before its opening DM message was visible')
+        if time.monotonic() >= deadline:
+            raise RuntimeError(
+                f"Opening DM message was not visible within {args.session_start_timeout} seconds"
+            )
+        time.sleep(min(max(float(args.poll_interval), 0.1), 2.0))
+
+
 def main():
     args = parse_args()
     manifest_path = resolve_manifest(args)
@@ -585,6 +606,7 @@ def main():
     try:
         manifest = load_manifest(manifest_path)
         manifest = ensure_manifest_session_started(args, manifest_path, manifest)
+        opening_session = wait_for_opening_dm(args, manifest)
         start_time = time.monotonic()
         deadline = (
             start_time + (args.max_minutes * 60.0)
@@ -611,6 +633,11 @@ def main():
             'api_base': manifest['api_base'],
             'dm_visible_response_timeout': visible_timeout,
             'dm_post_turn_timeout': post_turn_timeout,
+            'opening_dm_message_id': next((
+                message.get('id')
+                for message in reversed(opening_session.get('messages') or [])
+                if isinstance(message, dict) and str(message.get('role') or '').lower() == 'dm'
+            ), None),
         })
 
         while True:
@@ -735,6 +762,7 @@ def main():
                     turns_completed += 1
 
                 posted_player_message_id = find_latest_player_message_id(result.get('posted_messages') or [])
+                dm_turn = None
                 if posted_player_message_id is not None:
                     dm_turn, dm_timed_out, timeout_phase = wait_for_dm_response(args, manifest, posted_player_message_id)
                     if dm_timed_out:
@@ -750,6 +778,23 @@ def main():
                             'errors': error_count,
                         })
                         return
+
+                    if dm_response_state.dm_turn_is_error(dm_turn):
+                        error_count += 1
+                        error_class = dm_response_state.dm_turn_error_class(dm_turn)
+                        print_event({
+                            'event': 'dm_turn_error',
+                            'timestamp': utc_now(),
+                            'reason': error_class,
+                            'player_message_id': posted_player_message_id,
+                            'dm_turn': dm_turn,
+                            'turns_completed': turns_completed,
+                            'errors': error_count,
+                        })
+                        if args.stop_on_error:
+                            raise RuntimeError(
+                                f'{error_class} after player message {posted_player_message_id}'
+                            )
 
                     last_dm_turn = dm_turn if dm_turn.get('status') in ('silent', 'empty') else None
                     session = fetch_session(manifest, args.message_window)
@@ -774,6 +819,7 @@ def main():
                     'dry_run': bool(result.get('dry_run')),
                     'turns_completed': turns_completed,
                     'json_retry_count': result.get('json_retry_count'),
+                    'dm_turn': dm_turn,
                 })
 
                 if turns_completed >= args.max_turns:

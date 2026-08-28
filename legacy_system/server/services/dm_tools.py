@@ -54,6 +54,7 @@ DEFERRED_NARRATIVE_TOOL_NAMES = {
     'update_current_scene',
     'reveal_fact',
     'propose_sheet_update',
+    'register_npc_actor',
 }
 RETRIEVAL_LANE_ORDER = ('entities', 'scene_events', 'clocks_promises', 'prior_facts')
 PRIVATE_VISIBILITY_TERMS = {
@@ -1488,8 +1489,10 @@ def _combat_coordinate_context(campaign, encounter_map):
 
 
 def build_session_hot_context(campaign, session, current_user, recent_messages_override=None):
+    from services.session_rolls import roll_context_for_session
+
     character = _current_character(campaign, current_user)
-    world, _graph, world_state, _private = _world_json(campaign)
+    world, graph, world_state, _private = _world_json(campaign)
     recent_messages = recent_messages_override if recent_messages_override is not None else (
         session.messages[-8:] if session and session.messages else []
     )
@@ -1499,6 +1502,31 @@ def build_session_hot_context(campaign, session, current_user, recent_messages_o
     protected_player_characters = _protected_player_characters(members)
     loot_mode = _campaign_loot_mode(campaign)
     encounter_map = latest_encounter_map(campaign.id)
+    known_npc_actors = [
+        {
+            'id': npc.actor_id,
+            'type': 'npc',
+            # Do not turn the actor table into a second name-disclosure path.
+            # This helper substitutes a safe descriptor for unrevealed names.
+            'name': _public_npc_reference(npc),
+            'role': None,
+            'public_summary': _public_npc_reference(npc),
+        }
+        for npc in NPCActor.query.filter_by(campaign_id=campaign.id).order_by(NPCActor.id.asc()).limit(40).all()
+    ]
+    protected_by_name = {
+        clean_text(item.get('name'), 200).casefold(): item
+        for item in protected_player_characters
+        if isinstance(item, dict) and clean_text(item.get('name'), 200)
+    }
+    character_ref_aliases = {}
+    for entity in graph.get('entities', []) if isinstance(graph, dict) else []:
+        if not isinstance(entity, dict) or clean_text(entity.get('type'), 40).lower() != 'character':
+            continue
+        protected_character = protected_by_name.get(clean_text(entity.get('name'), 200).casefold())
+        entity_id = clean_id(entity.get('id'), '')
+        if protected_character and entity_id and protected_character.get('id') is not None:
+            character_ref_aliases[entity_id] = protected_character['id']
 
     context = {
         'strategy': 'compact_hot_context_with_dm_tools',
@@ -1527,6 +1555,10 @@ def build_session_hot_context(campaign, session, current_user, recent_messages_o
             if character else None
         ),
         'protected_player_characters': protected_player_characters,
+        # Graph IDs are useful world references but cannot authorize PC control.
+        # The planner receives this explicit map and the turn boundary canonicalizes
+        # it to the character table's literal primary key before ownership checks.
+        'character_ref_aliases': character_ref_aliases,
         'party': [
             {
                 'user_id': member.user_id,
@@ -1544,6 +1576,9 @@ def build_session_hot_context(campaign, session, current_user, recent_messages_o
         # `immediate_tension` belongs to the canonical/private lane because it is
         # often authored from hidden NPC motives.
         'current_scene': _public_scene_projection(current_scene),
+        # This is the authoritative literal-ID catalog for NPCs introduced in
+        # play as well as those created by world generation.
+        'known_npc_actors': known_npc_actors,
         'current_encounter_map': _compact_encounter_map(encounter_map),
         'combat_coordinates': _combat_coordinate_context(campaign, encounter_map),
         'active_clocks': [clock.to_dict(include_private=False) for clock in active_clocks],
@@ -1560,6 +1595,7 @@ def build_session_hot_context(campaign, session, current_user, recent_messages_o
         'disclosure_state': _disclosure_state(campaign),
         'disclosure_facets': _disclosure_item_facets(campaign),
         'recent_messages': [message.to_dict() for message in recent_messages],
+        'recent_roll_requests': roll_context_for_session(session.id) if session else [],
         'tool_policy': (
             'Treat hot-context memory as authoritative state for lore, continuity, NPC motivations, active pressure, '
             'and world consequences. Use tools for character-sheet answers, campaign memory, NPC dossiers, clocks, '
@@ -3221,14 +3257,20 @@ def build_session_retrieval_packet(campaign, current_user, hot_context, prefligh
     return packet
 
 
-def _record_event(campaign, event_type, summary, payload=None, visibility='dm_private'):
+def _effective_world_event_visibility(payload, visibility):
     payload = payload if isinstance(payload, dict) else {}
     requested_visibility = visibility if visibility in VALID_VISIBILITIES else 'dm_private'
+    if requested_visibility in PUBLIC_VISIBILITIES and not isinstance(payload.get('source_facet_ids'), list):
+        return 'dm_private'
+    return requested_visibility
+
+
+def _record_event(campaign, event_type, summary, payload=None, visibility='dm_private'):
+    payload = payload if isinstance(payload, dict) else {}
+    requested_visibility = _effective_world_event_visibility(payload, visibility)
     # A generated summary is not public merely because its caller labels it so.
     # Public event prose must carry references to already-revealed canonical
     # facets; otherwise retain it as private operational memory.
-    if requested_visibility in PUBLIC_VISIBILITIES and not isinstance(payload.get('source_facet_ids'), list):
-        requested_visibility = 'dm_private'
     event = WorldEvent(
         campaign_id=campaign.id,
         event_type=clean_id(event_type, 'world_event')[:80],
@@ -3428,16 +3470,48 @@ def _stage_deferred_narrative_action(campaign, session, current_user, name, args
     args = args if isinstance(args, dict) else {}
     action_id = f'pending_action_{len(action_buffer["actions"]) + 1}'
     preview = None
-    if name == 'record_world_event':
+    if name == 'register_npc_actor':
+        local_id = clean_id(args.get('local_id'), '')
+        name_text = clean_text(args.get('name'), 200)
+        if not local_id or not name_text:
+            return {'error': 'New NPC registration requires a local id and public name.'}
+        duplicate = NPCActor.query.filter(
+            NPCActor.campaign_id == campaign.id,
+            db.func.lower(NPCActor.name) == name_text.lower(),
+        ).first()
+        if duplicate:
+            return {'error': f'An NPC named {name_text} already exists in this campaign.'}
+        # The server, not the planner, chooses the durable namespace. The numeric
+        # suffix eliminates collisions without making packet-local ids persistent.
+        stem = clean_id(name_text, 'npc')[:72]
+        actor_id = f'npc_{stem}'
+        suffix = 2
+        while NPCActor.query.filter_by(campaign_id=campaign.id, actor_id=actor_id).first():
+            actor_id = f'npc_{stem}_{suffix}'
+            suffix += 1
+        preview = {
+            'npc_actor': {
+                'local_id': local_id,
+                'actor_id': actor_id,
+                'name': name_text,
+                'role': clean_text(args.get('role'), 200) or None,
+                'public_summary': clean_text(args.get('public_summary'), 420) or None,
+                'location_id': clean_id(args.get('location_id'), '') or None,
+                'pending': True,
+            },
+        }
+        args = {**args, 'local_id': local_id, 'actor_id': actor_id, 'name': name_text}
+    elif name == 'record_world_event':
         summary = clean_text(args.get('summary'), 1200)
         if not summary:
             return {'error': 'A world-event summary is required.'}
+        payload = args.get('payload') if isinstance(args.get('payload'), dict) else {}
         preview = {
             'event': {
                 'id': action_id,
                 'event_type': clean_id(args.get('event_type'), 'world_event')[:80],
                 'summary': summary,
-                'visibility': args.get('visibility') if args.get('visibility') in VALID_VISIBILITIES else 'dm_private',
+                'visibility': _effective_world_event_visibility(payload, args.get('visibility')),
                 'pending': True,
             },
         }
@@ -3495,6 +3569,44 @@ def apply_deferred_narrative_action(campaign, session, current_user, action, sou
     """Apply a previously staged action inside the accepted-turn transaction."""
     name = action.get('name')
     args = action.get('args') if isinstance(action.get('args'), dict) else {}
+    if name == 'register_npc_actor':
+        actor_id = clean_id(args.get('actor_id'), '')
+        name_text = clean_text(args.get('name'), 200)
+        if not actor_id or not name_text:
+            return {'error': 'New NPC registration is missing its durable id or name.'}, None
+        if NPCActor.query.filter_by(campaign_id=campaign.id, actor_id=actor_id).first():
+            return {'error': f'NPC actor id already exists: {actor_id}'}, None
+        actor = NPCActor(
+            campaign_id=campaign.id,
+            actor_id=actor_id,
+            name=name_text,
+            role=clean_text(args.get('role'), 200) or None,
+            public_summary=clean_text(args.get('public_summary'), 420) or None,
+            dossier=json_dumps({
+                'id': actor_id,
+                'name': name_text,
+                'role': clean_text(args.get('role'), 200) or None,
+                'public_summary': clean_text(args.get('public_summary'), 420) or None,
+                'field_visibility': {'name': 'party_known', 'role': 'party_known', 'public_summary': 'party_known'},
+                'introduced_by': 'data_first_turn',
+                'source_player_message_id': source_message_id,
+            }),
+        )
+        db.session.add(actor)
+        db.session.flush()
+        upsert_memory_embedding(campaign, 'npc_actor', actor.actor_id, actor.to_dict(include_private=True))
+        event = _record_event(
+            campaign,
+            'npc_actor_introduced',
+            f'NPC actor {actor.name} was introduced in play.',
+            {'npc_actor': actor.to_dict(include_private=False), 'location_id': clean_id(args.get('location_id'), '') or None},
+            visibility='party_known',
+        )
+        return {
+            'npc_actor': actor.to_dict(include_private=False),
+            'local_id': clean_id(args.get('local_id'), ''),
+            'affected_ids': {'npc_actor_ids': [actor.actor_id], 'world_event_ids': [event.id]},
+        }, None
     if name == 'record_world_event':
         return _tool_record_world_event(campaign, current_user, args), None
     if name == 'update_current_scene':
@@ -3514,8 +3626,9 @@ def apply_deferred_narrative_action(campaign, session, current_user, action, sou
             status='pending',
         )
         db.session.add(proposal)
+        db.session.flush()
         return {
-            'proposal_id': None,
+            'proposal_id': proposal.id,
             'character_id': proposal.character_id,
             'reason': proposal.reason,
             'changes': proposal.changes,
