@@ -105,18 +105,18 @@ export const campaigns = {
 
 export const characters = {
   list: () => apiFetch<{ characters: import('@/types').Character[] }>('/characters'),
-  get: (id: number) => apiFetch<{ character: import('@/types').Character }>(`/characters/${id}`),
+  get: (id: number | string) => apiFetch<{ character: import('@/types').Character }>(`/characters/${id}`),
   create: (payload: Record<string, unknown>) =>
     apiFetch<{ character: import('@/types').Character }>('/characters', {
       method: 'POST',
       body: JSON.stringify(payload),
     }),
-  update: (id: number, payload: Record<string, unknown>) =>
+  update: (id: number | string, payload: Record<string, unknown>) =>
     apiFetch<{ character: import('@/types').Character }>(`/characters/${id}`, {
       method: 'PUT',
       body: JSON.stringify(payload),
     }),
-  delete: (id: number) => apiFetch(`/characters/${id}`, { method: 'DELETE' }),
+  delete: (id: number | string) => apiFetch(`/characters/${id}`, { method: 'DELETE' }),
 }
 
 // ── Campaign characters & members ─────────────────────────────────────────

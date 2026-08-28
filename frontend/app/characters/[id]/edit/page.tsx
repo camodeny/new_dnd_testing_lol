@@ -17,8 +17,9 @@ export default function CharacterEditPage() {
   const [error, setError] = useState('')
 
   useEffect(() => {
+    if (!id) return
     charactersApi
-      .get(Number(id))
+      .get(id)
       .then((data) => setCharacter(data.character))
       .catch((err: Error) => setError(err.message))
       .finally(() => setLoading(false))

@@ -11,8 +11,8 @@ If you prefer to use `auth.users` directly without a mirror, point FKs there —
 import uuid
 from datetime import datetime
 
-from sqlalchemy import DateTime, String, func
-from sqlalchemy.dialects.postgresql import UUID
+from sqlalchemy import Boolean, DateTime, ForeignKey, Integer, String, Text, func
+from sqlalchemy.dialects.postgresql import JSONB, UUID
 from sqlalchemy.orm import Mapped, mapped_column
 
 from database import Base
@@ -43,3 +43,281 @@ class Profile(Base):
             "username": self.username or (self.email.split("@")[0] if self.email else "adventurer"),
             "email": self.email,
         }
+
+
+class Character(Base):
+    """Generic character identity. FK target for all system-specific sheets.
+
+    Lets the app refer to a 'character' without caring about ruleset.
+    System-specific data lives in 1:1 tables like dnd5e_character_sheets.
+    """
+
+    __tablename__ = "characters"
+
+    id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    owner_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("profiles.id", ondelete="CASCADE"), nullable=False, index=True
+    )
+    system: Mapped[str] = mapped_column(String(32), nullable=False, default="dnd5e")  # dnd5e | pf2e | etc.
+    name: Mapped[str] = mapped_column(String(128), nullable=False)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now(), nullable=False
+    )
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now(), onupdate=func.now(), nullable=False
+    )
+
+    def to_dict(self):
+        return {
+            "id": str(self.id),
+            "owner_id": str(self.owner_id),
+            "system": self.system,
+            "name": self.name,
+        }
+
+
+class Dnd5eCharacterSheet(Base):
+    """Full D&D 5e character sheet. Named explicitly for 5e to allow future systems.
+
+    Canonical DTO matches frontend CharacterDraft shape where possible:
+    - frontend sends `name`, `total_level`, `max_hp`/`current_hp`/`temp_hp`, `skills[]`,
+      `saving_throws[]`, `weapons[]`, `resources[]`, `companions[]`, `conditions[]`,
+      spell slots as `{max, used}`.
+    - DB keeps `character_name`/`level`/`hit_points_*` etc. as storage columns;
+      to_dict() emits both legacy and frontend aliases plus JSONB lists.
+    - Derived values (level, proficiency_bonus, passive_perception, spell DC/attack)
+      are stored as overrides; canonical values are computed from classes/abilities
+      when not overridden.
+
+    Covers the official 5e sheet sections:
+    - Identity (name, race, class/level, background, alignment, XP)
+    - Ability scores + modifiers (stored as base scores, mods computed)
+    - Inspiration / proficiency bonus (override)
+    - Saving throws & skills (both per-flag booleans and list JSONB)
+    - Combat (AC, initiative, speed, HP, hit dice, death saves, exhaustion)
+    - Attacks/weapons, equipment, currency
+    - Spellcasting, features & traits, proficiencies/languages, resources, companions, conditions
+    - Flavor (personality, ideals, bonds, flaws, appearance, backstory)
+    - Extras JSONB for homebrew / future fields
+    """
+
+    __tablename__ = "dnd5e_character_sheets"
+
+    id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    # Generic character FK for future system support; nullable for back-compat. New rows should set character_id.
+    character_id: Mapped[uuid.UUID | None] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("characters.id", ondelete="CASCADE"), nullable=True, index=True
+    )
+    owner_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("profiles.id", ondelete="CASCADE"), nullable=False, index=True
+    )
+
+    # ── Identity ───────────────────────────────────────────────────────
+    character_name: Mapped[str] = mapped_column(String(128), nullable=False)
+    player_name: Mapped[str | None] = mapped_column(String(128), nullable=True)
+    race: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    subrace: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    background: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    alignment: Mapped[str | None] = mapped_column(String(32), nullable=True)
+    # Multiclass support via JSONB + denormalized display fields
+    char_class: Mapped[str | None] = mapped_column(String(64), nullable=True)  # e.g. "Fighter 3 / Wizard 2"
+    classes: Mapped[list | None] = mapped_column(JSONB, nullable=True)  # [{"class_name": "Fighter", "level": 3, "subclass": "Champion"}]
+    level: Mapped[int] = mapped_column(Integer, nullable=False, default=1)
+    experience_points: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+
+    # Flavor / descriptive
+    age: Mapped[str | None] = mapped_column(String(32), nullable=True)
+    height: Mapped[str | None] = mapped_column(String(32), nullable=True)
+    weight: Mapped[str | None] = mapped_column(String(32), nullable=True)
+    eyes: Mapped[str | None] = mapped_column(String(32), nullable=True)
+    skin: Mapped[str | None] = mapped_column(String(32), nullable=True)
+    hair: Mapped[str | None] = mapped_column(String(32), nullable=True)
+    appearance: Mapped[str | None] = mapped_column(Text, nullable=True)
+    backstory: Mapped[str | None] = mapped_column(Text, nullable=True)
+    allies_and_organizations: Mapped[str | None] = mapped_column(Text, nullable=True)
+    personality_traits: Mapped[str | None] = mapped_column(Text, nullable=True)
+    ideals: Mapped[str | None] = mapped_column(Text, nullable=True)
+    bonds: Mapped[str | None] = mapped_column(Text, nullable=True)
+    flaws: Mapped[str | None] = mapped_column(Text, nullable=True)
+
+    # ── Ability Scores (3-30) ──────────────────────────────────────────
+    strength: Mapped[int] = mapped_column(Integer, nullable=False, default=10)
+    dexterity: Mapped[int] = mapped_column(Integer, nullable=False, default=10)
+    constitution: Mapped[int] = mapped_column(Integer, nullable=False, default=10)
+    intelligence: Mapped[int] = mapped_column(Integer, nullable=False, default=10)
+    wisdom: Mapped[int] = mapped_column(Integer, nullable=False, default=10)
+    charisma: Mapped[int] = mapped_column(Integer, nullable=False, default=10)
+
+    # ── Inspiration & Proficiency ──────────────────────────────────────
+    inspiration: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
+    proficiency_bonus: Mapped[int] = mapped_column(Integer, nullable=False, default=2)
+
+    # Saving throw proficiencies
+    str_save_prof: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
+    dex_save_prof: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
+    con_save_prof: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
+    int_save_prof: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
+    wis_save_prof: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
+    cha_save_prof: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
+
+    # Skill proficiencies (18) + expertise flags stored in JSONB for flexibility
+    acrobatics_prof: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
+    animal_handling_prof: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
+    arcana_prof: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
+    athletics_prof: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
+    deception_prof: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
+    history_prof: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
+    insight_prof: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
+    intimidation_prof: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
+    investigation_prof: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
+    medicine_prof: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
+    nature_prof: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
+    perception_prof: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
+    performance_prof: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
+    persuasion_prof: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
+    religion_prof: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
+    sleight_of_hand_prof: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
+    stealth_prof: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
+    survival_prof: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
+    # expertise / custom skill mods
+    skill_expertise: Mapped[dict | None] = mapped_column(JSONB, nullable=True)  # e.g. {"stealth": true, "perception": true}
+
+    # Frontend-aligned lists (canonical for draft round-trip; booleans above are denormalized overrides)
+    skills: Mapped[list | None] = mapped_column(JSONB, nullable=True)  # [{"skill_name":"Stealth","is_proficient":true,"is_expertise":false}]
+    saving_throws: Mapped[list | None] = mapped_column(JSONB, nullable=True)  # [{"ability":"dexterity","is_proficient":true}]
+
+    passive_perception: Mapped[int | None] = mapped_column(Integer, nullable=True)  # override, else 10+WIS+prof
+
+    # ── Combat ─────────────────────────────────────────────────────────
+    armor_class: Mapped[int] = mapped_column(Integer, nullable=False, default=10)
+    initiative_bonus: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    speed: Mapped[int] = mapped_column(Integer, nullable=False, default=30)  # feet per round
+    speed_details: Mapped[str | None] = mapped_column(String(128), nullable=True)  # e.g. "fly 30, swim 20"
+
+    hit_points_max: Mapped[int] = mapped_column(Integer, nullable=False, default=10)
+    hit_points_current: Mapped[int] = mapped_column(Integer, nullable=False, default=10)
+    hit_points_temp: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    hit_dice: Mapped[str | None] = mapped_column(String(32), nullable=True)  # e.g. "1d8"
+    hit_dice_total: Mapped[str | None] = mapped_column(String(32), nullable=True)  # e.g. "3d8"
+    hit_dice_remaining: Mapped[str | None] = mapped_column(String(32), nullable=True)
+    death_save_successes: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    death_save_failures: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    exhaustion_level: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    encumbrance_status: Mapped[str | None] = mapped_column(String(32), nullable=True)  # frontend alias for encumbrance
+
+    # ── Attacks & Spellcasting ─────────────────────────────────────────
+    attacks: Mapped[list | None] = mapped_column(JSONB, nullable=True)  # [{"name":"Longsword","bonus":5,"damage":"1d8+3","type":"slashing"}]
+    weapons: Mapped[list | None] = mapped_column(JSONB, nullable=True)  # frontend alias: same shape as attacks, kept separate for round-trip
+    spellcasting_ability: Mapped[str | None] = mapped_column(String(16), nullable=True)  # int/wis/cha
+    spell_save_dc: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    spell_attack_bonus: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    spell_slots: Mapped[dict | None] = mapped_column(JSONB, nullable=True)  # {"1": {"max":4,"used":1}, ...} canonical frontend shape
+    spells: Mapped[list | None] = mapped_column(JSONB, nullable=True)  # [{"name":"Fireball","level":3,"prepared":true}]
+    cantrips: Mapped[list | None] = mapped_column(JSONB, nullable=True)
+
+    # ── Equipment / Treasure ───────────────────────────────────────────
+    equipment: Mapped[list | None] = mapped_column(JSONB, nullable=True)  # [{"name":"Rope","qty":1,"weight":5}]
+    equipment_text: Mapped[str | None] = mapped_column(Text, nullable=True)
+    treasure: Mapped[str | None] = mapped_column(Text, nullable=True)
+    cp: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    sp: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    ep: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    gp: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    pp: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    encumbrance: Mapped[str | None] = mapped_column(String(32), nullable=True)
+    # legacy alias kept; new code uses encumbrance_status
+
+    # ── Features, Traits, Proficiencies ────────────────────────────────
+    features_and_traits: Mapped[str | None] = mapped_column(Text, nullable=True)  # class/racial features
+    features: Mapped[list | None] = mapped_column(JSONB, nullable=True)  # frontend structured features[]
+    proficiencies: Mapped[list | None] = mapped_column(JSONB, nullable=True)  # frontend proficiencies[]
+    other_proficiencies_languages: Mapped[str | None] = mapped_column(Text, nullable=True)
+    proficiencies_languages_json: Mapped[list | None] = mapped_column(JSONB, nullable=True)
+    resources: Mapped[list | None] = mapped_column(JSONB, nullable=True)
+    companions: Mapped[list | None] = mapped_column(JSONB, nullable=True)
+    conditions: Mapped[list | None] = mapped_column(JSONB, nullable=True)
+
+    # ── Extras ─────────────────────────────────────────────────────────
+    extras: Mapped[dict | None] = mapped_column(JSONB, nullable=True)  # homebrew / future game fields
+    portrait_url: Mapped[str | None] = mapped_column(String(512), nullable=True)
+    notes: Mapped[str | None] = mapped_column(Text, nullable=True)
+
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now(), nullable=False
+    )
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now(), onupdate=func.now(), nullable=False
+    )
+
+    def to_dict(self):
+        base = {c.name: getattr(self, c.name) for c in self.__table__.columns}
+        # id as string for frontend UUID handling
+        base["id"] = str(base["id"]) if base.get("id") else None
+        base["character_id"] = str(base["character_id"]) if base.get("character_id") else None
+        base["owner_id"] = str(base["owner_id"]) if base.get("owner_id") else None
+        # frontend aliases for round-trip
+        base["name"] = base.get("character_name")
+        base["total_level"] = base.get("level")
+        base["max_hp"] = base.get("hit_points_max")
+        base["current_hp"] = base.get("hit_points_current")
+        base["temp_hp"] = base.get("hit_points_temp")
+        # encumbrance alias
+        base["encumbrance_status"] = base.get("encumbrance_status") or base.get("encumbrance")
+        # weapons alias
+        if base.get("weapons") is None and base.get("attacks") is not None:
+            base["weapons"] = base["attacks"]
+        # keep skill_expertise as is; frontend can read either
+        return base
+
+    @classmethod
+    def from_frontend(cls, data: dict, owner_id: uuid.UUID):
+        """Create instance from frontend CharacterDraft shape."""
+        # map frontend names to storage columns
+        mapped = {}
+        if "name" in data:
+            mapped["character_name"] = data["name"]
+        elif "character_name" in data:
+            mapped["character_name"] = data["character_name"]
+        else:
+            mapped["character_name"] = "Unnamed Hero"
+        for k in ("player_name", "race", "subrace", "background", "alignment", "experience_points"):
+            if k in data:
+                mapped[k] = data[k]
+        if "total_level" in data:
+            mapped["level"] = data["total_level"]
+        elif "level" in data:
+            mapped["level"] = data["level"]
+        # combat
+        if "max_hp" in data:
+            mapped["hit_points_max"] = data["max_hp"]
+        if "current_hp" in data:
+            mapped["hit_points_current"] = data["current_hp"]
+        if "temp_hp" in data:
+            mapped["hit_points_temp"] = data["temp_hp"]
+        for k in ("armor_class", "initiative_bonus", "speed", "death_save_successes", "death_save_failures", "exhaustion_level"):
+            if k in data:
+                mapped[k] = data[k]
+        # compat: frontend sends combat.abilities etc flattened already via toCharacterPayload
+        for k in ("strength", "dexterity", "constitution", "intelligence", "wisdom", "charisma",
+                  "inspiration", "proficiency_bonus", "passive_perception",
+                  "armor_class", "initiative_bonus", "speed"):
+            if k in data:
+                mapped[k] = data[k]
+        # lists
+        for k in ("classes", "skills", "saving_throws", "proficiencies", "features", "weapons", "equipment", "spells", "resources", "companions", "conditions"):
+            if k in data:
+                mapped[k] = data[k]
+        # attacks alias
+        if "attacks" in data and "weapons" not in mapped:
+            mapped["weapons"] = data["attacks"]
+        # spellcasting
+        for k in ("spellcasting_ability", "spell_save_dc", "spell_attack_bonus", "spell_slots", "cantrips"):
+            if k in data:
+                mapped[k] = data[k]
+        if "encumbrance_status" in data:
+            mapped["encumbrance_status"] = data["encumbrance_status"]
+            mapped["encumbrance"] = data["encumbrance_status"]
+        mapped["owner_id"] = owner_id
+        # per-skill booleans from skills[] if provided
+        # (kept for queryability; not required for round-trip)
+        return cls(**{k: v for k, v in mapped.items() if k in cls.__table__.columns})

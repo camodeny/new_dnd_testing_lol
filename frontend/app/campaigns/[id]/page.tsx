@@ -168,7 +168,7 @@ export default function CampaignViewPage() {
   if (!campaign) return <ErrorMessage message="Campaign not found." />
 
   const isOwner = campaign.user_id === user?.id
-  const currentCharacter = characters.find((c) => c.id === (user as { character_id?: number } | null)?.character_id) ?? characters[0] ?? null
+  const currentCharacter = characters.find((c) => String(c.id) === String((user as { character_id?: number | string } | null)?.character_id)) ?? characters[0] ?? null
 
   if (mode === 'lobby') {
     return (
