@@ -277,6 +277,7 @@ SESSION_MEMORY_EXTRACTOR_SYSTEM_PROMPT = (
     "Do not append fragments to the prior summary. Rewrite the current durable state after the latest visible exchange in one compact paragraph. "
     "Additionally, extract or update the structured memory_anchors representing the current session state: current_goal (string or null), current_scene (string or null), open_clues (array of strings), unresolved_questions (array of strings), npc_observations (array of strings), and recent_offers_promises (array of strings). Do not append fragments; completely rewrite or prune these anchors to reflect the current state. "
     "The latest_dm_response_parts are ordered accepted segments. Each segment's dm_private_context is authoritative internal guidance for interpreting exactly that segment; it can explain a lie, cover story, omission, misconception, motive, or canonical truth. Never let a visible claim overwrite conflicting established canon when its associated private context says otherwise. Keep segment contexts independent: one speaker may be truthful in one part and deceptive in another. Extract candidate scene updates, durable fact claims, entity upserts, relation upserts, NPC updates, and event records from the exchange. "
+    "A player statement remains a player claim unless the accepted DM response independently adjudicates it as true from established canon, resolver evidence, or a successful check. Third-person attribution such as 'Mara says/states/claims that X' is not confirmation of X. Preserve it as an attributed uncertain claim; never rewrite says, states, suspects, interprets, or claims into proves, confirms, establishes, discovers, or demonstrates. A failed or inconclusive check cannot support the asserted conclusion. "
     "Do not invent canonical ids. If a name is not already a known id in the prompt, preserve it as a raw label/ref for later resolution. "
     "Scene updates may include location_id, location_name, time_of_day, active_npc_ids, departed_npc_ids, and immediate_tension. "
     "When an off-stage subject moves to a known location, also set scene_patch.subject_locations as a map from subject entity id to location entity id (canonical ids only). "
@@ -294,6 +295,7 @@ SESSION_MEMORY_EXTRACTOR_SYSTEM_PROMPT = (
 SESSION_MEMORY_RESOLVER_SYSTEM_PROMPT = (
     "You are the resolver stage of a D&D session memory writer. "
     "Use read-only tools to resolve scene, entity, and fact references before any durable write is compiled. Treat dm_private_context paired with a response part as authoritative interpretation for that exact visible part, especially when it conflicts with a spoken claim. "
+    "Do not promote a player-authored theory through resolution. An attributed statement remains uncertain unless a concrete supplied source independently confirms it; an inconclusive or failed roll is evidence against treating the conclusion as confirmed. Keep such material in unresolved_items or record it explicitly as an attributed player_claim, never as canonical fact. "
     "Never invent ids. If you cannot resolve a reference with confidence, return it in unresolved_items instead of mutating memory. "
     "Prefer get_entity_candidates, get_scene_candidates, get_fact_candidates, and search_campaign_memory before broad raw-state tools. "
     "Use get_world_state, get_npcs, get_clocks, or transcript tools only when narrower tools are insufficient. "
@@ -704,6 +706,9 @@ def _post_chat_normalized(
     max_tokens=None,
     provider=None,
     model=None,
+    json_schema=None,
+    json_schema_name=None,
+    reasoning_effort=None,
 ):
     audit_context = audit_context or {}
     campaign_id = audit_context.get('campaign_id')
@@ -765,9 +770,11 @@ def _post_chat_normalized(
                 'estimated_tool_schema_tokens': _estimate_tokens(tools or []),
                 'full_world_graph_included': audit_context.get('full_world_graph_included', None),
             },
-            reasoning_requested_by_app=provider_options.get('thinking_enabled', False),
+            reasoning_requested_by_app=bool(reasoning_effort) or provider_options.get('thinking_enabled', False),
             reasoning_note=(
-                'DeepSeek V4 thinking mode is enabled by app configuration.'
+                f'Responses reasoning effort explicitly set to {reasoning_effort}.'
+                if reasoning_effort
+                else 'DeepSeek V4 thinking mode is enabled by app configuration.'
                 if provider_options.get('thinking_enabled')
                 else None
             ),
@@ -780,6 +787,9 @@ def _post_chat_normalized(
         messages=messages,
         model=model,
         json_mode=json_mode,
+        json_schema=json_schema,
+        json_schema_name=json_schema_name,
+        reasoning_effort=reasoning_effort,
         tools=tools,
         tool_choice=tool_choice,
         parallel_tool_calls=parallel_tool_calls,
@@ -826,10 +836,16 @@ def _post_chat(
     timeout_seconds=60,
     max_attempts=None,
     max_tokens=None,
+    json_schema=None,
+    json_schema_name=None,
+    reasoning_effort=None,
 ):
     return _post_chat_normalized(
         messages,
         json_mode=json_mode,
+        json_schema=json_schema,
+        json_schema_name=json_schema_name,
+        reasoning_effort=reasoning_effort,
         audit_context=audit_context,
         allow_thinking=allow_thinking,
         timeout_seconds=timeout_seconds,
@@ -844,7 +860,12 @@ def _post_chat_stream(
     audit_context=None,
     allow_thinking=False,
     timeout_seconds=90,
+    max_attempts=None,
+    max_tokens=None,
     on_token=None,
+    provider=None,
+    model=None,
+    reasoning_effort=None,
 ):
     """Stream an LLM chat completion, calling on_token(delta_text) for each content chunk.
 
@@ -858,7 +879,7 @@ def _post_chat_stream(
     parent_trace_id = audit_context.get('parent_trace_id')
     trace_label = audit_context.get('trace_label') or f'{actor}: {operation}'
 
-    provider, model = _resolve_transport_provider_model(None, None)
+    provider, model = _resolve_transport_provider_model(provider, model)
     adapter = _adapter_for_provider(provider)
     _require_llm_config(provider, model)
 
@@ -868,14 +889,22 @@ def _post_chat_stream(
             json_mode=json_mode, commit=True,
             trace_id=trace_id, parent_trace_id=parent_trace_id,
             trace_label=trace_label, provider=provider,
+            reasoning_requested_by_app=bool(reasoning_effort),
+            reasoning_note=(
+                f'Responses reasoning effort explicitly set to {reasoning_effort}.'
+                if reasoning_effort else None
+            ),
         )
 
     request = ProviderRequest(
         messages=messages,
         model=model,
         json_mode=json_mode,
+        reasoning_effort=reasoning_effort,
         allow_thinking=allow_thinking,
         timeout_seconds=timeout_seconds,
+        max_attempts=max_attempts,
+        max_tokens=max_tokens,
         stream=True,
     )
     hooks = _make_audit_hooks(campaign_id, operation, actor, provider, trace_id, parent_trace_id, trace_label, audit_context)
@@ -1070,6 +1099,18 @@ def normalize_session_dm_turn_decision(raw_decision):
             'content': '',
             'reason': str(data.get('reason') or 'The DM intentionally stayed silent.').strip(),
         }
+    if mode == 'table_chat':
+        parts = data.get('parts')
+        try:
+            parts = normalize_response_parts(parts)
+        except ValueError:
+            parts = []
+        return {
+            'mode': 'table_chat',
+            'content': render_visible_response_parts(parts) if parts else str(data.get('content') or '').strip(),
+            'parts': parts,
+            'commit_action_ids': [],
+        }
 
     parts = data.get('parts')
     try:
@@ -1089,6 +1130,8 @@ def normalize_session_dm_turn_decision(raw_decision):
     resolver_packet = data.get('resolver_packet')
     if isinstance(resolver_packet, dict) and isinstance(resolver_packet.get('entity_mentions'), list):
         result['resolver_packet'] = resolver_packet
+    if isinstance(data.get('roll_request'), dict):
+        result['roll_request'] = data['roll_request']
     return result
 
 
@@ -2318,7 +2361,50 @@ def _pc_control_filter_allowed_violations(result, hot_context):
     }
 
 
-def _pc_control_violation(response_text, hot_context):
+def _pc_control_allowed_fact_match(sentence, character, allowed_player_facts):
+    """Allow a surface PC reference only when it restates an approved player fact."""
+    if not allowed_player_facts:
+        return False
+    name = str((character or {}).get('name') or '').strip()
+    excluded = {
+        'about', 'after', 'again', 'against', 'along', 'before', 'being', 'beside',
+        'could', 'does', 'from', 'have', 'into', 'itself', 'more', 'only', 'other',
+        'over', 'said', 'says', 'speaks', 'their', 'there', 'these', 'they', 'this',
+        'through', 'toward', 'towards', 'under', 'what', 'when', 'where', 'which',
+        'while', 'with', 'would', 'your',
+    }
+    excluded.update(re.findall(r'[a-z0-9]+', name.lower()))
+
+    def tokens(value):
+        result = set()
+        for token in re.findall(r'[a-z0-9]+', str(value or '').lower()):
+            if len(token) < 4 or token in excluded:
+                continue
+            for suffix in ('ing', 'ied', 'ed', 'es', 's'):
+                if token.endswith(suffix) and len(token) - len(suffix) >= 4:
+                    token = token[:-len(suffix)]
+                    break
+            result.add(token)
+        return result
+
+    sentence_tokens = tokens(sentence)
+    if not sentence_tokens:
+        return False
+    name_pattern = None
+    if name:
+        name_pattern = rf'\b(?:{re.escape(name)}|{re.escape(name.split()[0])})\b'
+    for fact in allowed_player_facts:
+        if name_pattern and not re.search(name_pattern, str(fact or ''), flags=re.IGNORECASE):
+            continue
+        fact_tokens = tokens(fact)
+        overlap = sentence_tokens & fact_tokens
+        required = 1 if min(len(sentence_tokens), len(fact_tokens)) <= 3 else 2
+        if len(overlap) >= required:
+            return True
+    return False
+
+
+def _pc_control_violation(response_text, hot_context, allowed_player_facts=None):
     import re
 
     visible = _strip_npc_blocks(response_text)
@@ -2350,16 +2436,21 @@ def _pc_control_violation(response_text, hot_context):
             continue
         escaped = re.escape(name)
         first = re.escape(name.split()[0])
-        name_pattern = f'(?:{escaped}|{first})'
+        remaining_name = ' '.join(name.split()[1:])
+        first_alias = (
+            rf'{first}(?!\s+{re.escape(remaining_name)}\b)'
+            if remaining_name else first
+        )
+        name_pattern = f'(?:{escaped}|{first_alias})'
         handoff_pattern = rf'\b{name_pattern}\s*,\s+how do you respond\?'
         visible_for_character = re.sub(handoff_pattern, '', visible, flags=re.IGNORECASE)
         latest_player_message = _latest_player_message_for_character(hot_context, character)
         checks = [
             (rf'\*\*{name_pattern}\b[^*]*:\*\*', speech_reason),
             (rf'<npc\s+target=["\']{escaped}["\']', speech_reason),
-            (rf'\b{name_pattern}\b[^.!?\n]{{0,80}}\b(?:{"|".join(speech_verbs)})\b', speech_reason),
+            (rf'\b{name_pattern}\b(?![’\']s\b)[^.!?\n]{{0,80}}\b(?:{"|".join(speech_verbs)})\b', speech_reason),
             (rf'\b{name_pattern}(?:[’\']s)?\b[^.!?\n]{{0,80}}\b(?:{"|".join(consequential_action_verbs)})\b', action_reason),
-            (rf'\b{name_pattern}\b[^.!?\n]{{0,80}}\b(?:{"|".join(choice_verbs)})\b', choice_reason),
+            (rf'\b{name_pattern}\b(?![’\']s\b)[^.!?\n]{{0,80}}\b(?:{"|".join(choice_verbs)})\b', choice_reason),
             (rf'\b{name_pattern}[’\']s\s+(?:eyes|expression|face|voice|smirk|smile|shoulders|hands)\b', interior_reason),
         ]
         for pattern, reason in checks:
@@ -2374,6 +2465,8 @@ def _pc_control_violation(response_text, hot_context):
                 if reason == interior_reason and _pc_control_minor_affect_exception(sentence, character):
                     continue
                 if reason == interior_reason and _pc_control_minor_flair_exception(sentence):
+                    continue
+                if _pc_control_allowed_fact_match(sentence, character, allowed_player_facts):
                     continue
                 return {
                     'character': character,

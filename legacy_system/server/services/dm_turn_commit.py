@@ -36,6 +36,8 @@ def commit_accepted_dm_turn(
     response_parts,
     resolver_packet=None,
     disclose_item_ids=None,
+    roll_request=None,
+    visible_status='speak',
 ):
     """Commit selected staged actions and the visible message as one transaction.
 
@@ -72,6 +74,16 @@ def commit_accepted_dm_turn(
         ai_msg = SessionMessage(session_id=session.id, role='dm', content=rendered_content)
         db.session.add(ai_msg)
         db.session.flush()
+        created_roll_request = None
+        if roll_request is not None:
+            from services.session_rolls import create_roll_request
+            created_roll_request = create_roll_request(
+                campaign,
+                session,
+                player_message_id,
+                ai_msg.id,
+                roll_request,
+            )
         for proposal in created_proposals:
             proposal.message_id = ai_msg.id
 
@@ -107,6 +119,24 @@ def commit_accepted_dm_turn(
                 trace_id=trace_id,
                 trace_label=trace_label,
                 audit_role='tools',
+                commit=False,
+            )
+        if created_roll_request is not None:
+            log_audit_event(
+                campaign.id,
+                'dm_roll_requested',
+                'Stored a typed player-roll request with the accepted DM turn.',
+                {
+                    'session_id': session.id,
+                    'player_message_id': player_message_id,
+                    'dm_message_id': ai_msg.id,
+                    'roll_request': created_roll_request.to_dict(include_private=True),
+                },
+                source='session_rolls',
+                actor='session_dm',
+                trace_id=trace_id,
+                trace_label=trace_label,
+                audit_role='agent',
                 commit=False,
             )
         if disclose_item_ids:
@@ -146,6 +176,7 @@ def commit_accepted_dm_turn(
                 'dm_message_id': ai_msg.id,
                 'message': {'role': 'dm', 'content': rendered_content},
                 'committed_action_ids': list(commit_action_ids),
+                'roll_request_id': created_roll_request.request_id if created_roll_request else None,
             },
             source='session_messages',
             actor='session_dm',
@@ -158,7 +189,7 @@ def commit_accepted_dm_turn(
             session.id,
             player_message_id,
             trace_id,
-            status='speak',
+            status=visible_status,
             dm_message_id=ai_msg.id,
         ))
         db.session.commit()

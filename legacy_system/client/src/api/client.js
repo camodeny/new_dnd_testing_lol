@@ -311,8 +311,8 @@ export function getMessages(sessionId, options = {}) {
   })}`)
 }
 
-export function sendMessage(sessionId, content, role = 'player') {
-  return apiFetch(`/sessions/${sessionId}/messages`, { method: 'POST', body: JSON.stringify({ content, role }) })
+export function sendMessage(sessionId, content, role = 'player', metadata = {}) {
+  return apiFetch(`/sessions/${sessionId}/messages`, { method: 'POST', body: JSON.stringify({ content, role, ...metadata }) })
 }
 
 export function getSessionStreamUrl(sessionId) {

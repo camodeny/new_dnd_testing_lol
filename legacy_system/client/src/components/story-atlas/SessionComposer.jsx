@@ -195,7 +195,16 @@ export default function SessionComposer({
     const modifierVal = parseInt(physicalModifier, 10) || 0
     const msg = `[Roll: ${physicalLabel || 'Physical Roll'}] total: ${totalVal} | rolls: ${rolls.join(',')} | mod: ${modifierVal} | sides: ${sidesVal}`
 
-    onSendMessage(formatMessageForDm(msg))
+    onSendMessage(formatMessageForDm(msg), pendingRollRequest ? {
+      roll_request_id: pendingRollRequest.request_id,
+      roll_result: {
+        label: physicalLabel || pendingRollRequest.label || 'Physical Roll',
+        total: totalVal,
+        rolls,
+        modifier: modifierVal,
+        sides: sidesVal,
+      },
+    } : {})
     cancelSlashCommand()
   }
 
@@ -322,7 +331,17 @@ export default function SessionComposer({
     const msg = rollQueue.map((roll) => {
       return `[Roll: ${roll.label}] total: ${roll.total} | rolls: ${roll.rolls.join(',')} | mod: ${roll.modifier} | sides: ${roll.sides}`
     }).join('\n')
-    onSendMessage(formatMessageForDm(msg))
+    const requestedRoll = rollQueue.length === 1 && pendingRollRequest ? rollQueue[0] : null
+    onSendMessage(formatMessageForDm(msg), requestedRoll ? {
+      roll_request_id: pendingRollRequest.request_id,
+      roll_result: {
+        label: requestedRoll.label,
+        total: requestedRoll.total,
+        rolls: requestedRoll.rolls,
+        modifier: requestedRoll.modifier,
+        sides: requestedRoll.sides,
+      },
+    } : {})
     setRollQueue([])
   }
 
@@ -434,9 +453,32 @@ export default function SessionComposer({
 
   const showCommandsHelp = cleanedInput.startsWith('/') && !activeSlashCommand && !showDice && filteredSuggestions.length > 0
   const canSubmitPhysicalRoll = activeSlashCommand !== 'roll' || physicalRolls.trim().length > 0
+  const pendingRollRequest = session?.pending_roll_requests?.[0] || null
+
+  const openRequestedRoll = () => {
+    if (!pendingRollRequest) return
+    setCustomLabel(pendingRollRequest.label || pendingRollRequest.ability_or_skill || 'Requested roll')
+    setRollMode(pendingRollRequest.advantage_state || 'normal')
+    setActiveTab('custom')
+    setShowDice(true)
+  }
 
   return (
     <div style={{ position: 'relative', width: '100%' }}>
+      {pendingRollRequest && (
+        <div className="story-atlas-roll-request" role="status" style={{
+          display: 'flex', alignItems: 'center', justifyContent: 'space-between', gap: '12px',
+          padding: '10px 14px', borderTop: '1px solid var(--border-color)', background: 'rgba(205, 160, 78, 0.08)'
+        }}>
+          <div>
+            <strong style={{ color: 'var(--text-gold)' }}>{pendingRollRequest.label}</strong>
+            <div style={{ color: 'var(--text-dim)', fontSize: '0.8rem' }}>{pendingRollRequest.reason_public}</div>
+          </div>
+          <button type="button" className="btn btn-primary small" onClick={openRequestedRoll}>
+            <i className="bi bi-dice-5-fill" /> Roll
+          </button>
+        </div>
+      )}
       {showDice && active && (
         <div className="session-roll-bar" style={{ display: 'block' }}>
           <>

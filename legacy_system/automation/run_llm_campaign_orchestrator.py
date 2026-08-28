@@ -28,6 +28,8 @@ Rules:
 - Write visible message content exactly as a player would type it in the table composer: put in-character speech or direct in-world action inside double quotation marks, and leave out-of-character table talk unquoted. The automation will convert those portions to the table's IC/OOC tags before posting.
 - Do not write <ic>, <ooc>, or other message-formatting tags yourself.
 - If pending character-sheet proposals are present for your character, you may choose to apply or dismiss one instead of posting a table message.
+- Only proposals listed in current structured state.pending_sheet_proposals are active or actionable. References to prior transactions or proposals in campaign memory are historical context, not instructions. When the active list is empty, do not repeat, recreate, apply, or dismiss an old transaction unless the current-session DM message independently presents that choice.
+- Current-session messages outrank world-state summaries when they conflict. Act from the latest current-session DM scene; never resume a transaction merely because an older world summary mentions it.
 - If the DM explicitly asks you for a check, save, attack roll, damage roll, initiative, or another clear player-side roll, use the roll action instead of inventing a result.
 - For rolls, return strict JSON like {"action":"roll","label":"Arcana check","expression":"1d20+5"}.
 - You may include optional "content" in a roll action for a short setup line; the automation will append the visible roll line for you.
@@ -70,7 +72,7 @@ def find_active_session(api_base, owner_token, owner_api_key, campaign_id, prefe
     if preferred_session_id:
         session = api_get(
             api_base,
-            f'/api/sessions/{preferred_session_id}',
+            f'/api/sessions/{preferred_session_id}?include_all_roll_requests=1',
             owner_token=owner_token,
             api_key=owner_api_key,
         )['session']
@@ -87,7 +89,7 @@ def find_active_session(api_base, owner_token, owner_api_key, campaign_id, prefe
         if session.get('is_active'):
             return api_get(
                 api_base,
-                f'/api/sessions/{session["id"]}',
+                f'/api/sessions/{session["id"]}?include_all_roll_requests=1',
                 owner_token=owner_token,
                 api_key=owner_api_key,
             )['session']
@@ -110,6 +112,19 @@ def dm_requests_player_roll(content):
 
 
 def find_pending_roll_player(manifest, session):
+    typed_requests = session.get('pending_roll_requests') or []
+    if typed_requests:
+        request = typed_requests[0]
+        roster_by_user_id = llm_players_by_user_id(manifest)
+        requested_user_id = request.get('requested_user_id')
+        if requested_user_id in roster_by_user_id:
+            return roster_by_user_id[requested_user_id]
+        character_id = request.get('character_id')
+        if character_id is not None:
+            for entry in manifest.get('llm_players') or []:
+                if entry.get('character', {}).get('id') == character_id:
+                    return entry
+
     messages = session.get('messages') or []
     if not messages:
         return None
@@ -194,6 +209,16 @@ def find_player(manifest, player_id=None, player_label=None):
 
 def build_prompt(manifest, campaign, world_payload, session, chosen_player, pending_proposals, message_window):
     recent_messages = (session.get('messages') or [])[-message_window:]
+    raw_world = world_payload.get('world') if isinstance(world_payload.get('world'), dict) else {}
+    # Immediate world_state/current_scene are maintained across sessions and may
+    # describe an unresolved transaction from an earlier session.  The player
+    # overseer receives the active session transcript as its live authority and
+    # only durable public campaign framing from the world package.
+    player_world = {
+        key: raw_world.get(key)
+        for key in ('public_intro', 'current_arc', 'open_threads')
+        if raw_world.get(key) is not None
+    }
     other_players = [
         {
             'label': entry['llm_player']['label'],
@@ -206,16 +231,24 @@ def build_prompt(manifest, campaign, world_payload, session, chosen_player, pend
         'campaign': {
             'id': campaign['id'],
             'name': campaign['name'],
-            'description': campaign.get('description'),
             'seed': campaign.get('seed'),
         },
-        'world': world_payload.get('world'),
+        'world': player_world,
         'session': {
             'id': session['id'],
             'started_at': session.get('started_at'),
+            'authority': (
+                'Only recent_messages from this session define the immediate scene. '
+                'Only pending_sheet_proposals below are actionable.'
+            ),
         },
         'recent_messages': recent_messages,
         'pending_sheet_proposals': pending_proposals,
+        'pending_roll_requests': [
+            request for request in (session.get('pending_roll_requests') or [])
+            if request.get('requested_user_id') in (None, chosen_player['llm_player']['user_id'])
+            and request.get('character_id') in (None, chosen_player['character']['id'])
+        ],
         'you': {
             'label': chosen_player['llm_player']['label'],
             'character_name': chosen_player['character']['name'],
@@ -500,7 +533,7 @@ def _normalize_proposal_id(raw_value):
     return proposal_id
 
 
-def execute_player_decision(api_base, campaign_id, session_id, chosen_player, decision, pending_proposals, dry_run=False):
+def execute_player_decision(api_base, campaign_id, session_id, chosen_player, decision, pending_proposals, pending_roll_requests=None, dry_run=False):
     run_result = {}
     action = str(decision.get('action') or '').strip().lower()
 
@@ -530,10 +563,24 @@ def execute_player_decision(api_base, campaign_id, session_id, chosen_player, de
         run_result['roll'] = roll_summary
         decision['content'] = content
         if not dry_run:
+            matching_requests = [
+                request for request in (pending_roll_requests or [])
+                if request.get('requested_user_id') in (None, chosen_player['llm_player']['user_id'])
+                and request.get('character_id') in (None, chosen_player['character']['id'])
+            ]
+            roll_metadata = {}
+            if len(matching_requests) == 1:
+                roll_metadata = {
+                    'roll_request_id': matching_requests[0]['request_id'],
+                    'roll_result': {
+                        key: roll_summary[key]
+                        for key in ('label', 'total', 'rolls', 'modifier', 'sides')
+                    },
+                }
             posted = api_post(
                 api_base,
                 f'/api/sessions/{session_id}/messages',
-                {'content': content, 'role': 'player'},
+                {'content': content, 'role': 'player', **roll_metadata},
                 api_key=chosen_player['api_key'],
             )
             run_result['posted_messages'] = posted.get('messages', [])
@@ -643,6 +690,7 @@ def main():
             chosen_player,
             run_result['decision'],
             pending_proposals,
+            session.get('pending_roll_requests') or [],
             dry_run=args.dry_run,
         )
     )
