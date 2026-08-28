@@ -87,12 +87,6 @@ export default function CharactersListPage() {
         </Link>
       </header>
 
-      <div className="character-roster-labels" aria-hidden="true">
-        <span>Character</span>
-        <span>Class</span>
-        <span>Abilities</span>
-        <span />
-      </div>
       <div className="character-roster" role="list" aria-label="Characters">
         {characterList.map((c) => (
           <article

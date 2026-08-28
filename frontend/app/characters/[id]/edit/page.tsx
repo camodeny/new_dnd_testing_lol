@@ -2,9 +2,8 @@
 
 import { useEffect, useState } from 'react'
 import { useParams, useRouter } from 'next/navigation'
-import Link from 'next/link'
 import { characters as charactersApi } from '@/lib/api'
-import CharacterFormPage from '@/components/character/CharacterFormPage'
+import CharacterFormLayout from '@/components/character/CharacterFormLayout'
 import Loading from '@/components/common/Loading'
 import ErrorMessage from '@/components/common/ErrorMessage'
 import type { Character } from '@/types'
@@ -30,21 +29,11 @@ export default function CharacterEditPage() {
   if (!character) return <ErrorMessage message="Character not found." />
 
   return (
-    <div className="page character-edit-page">
-      <div className="character-form-header">
-        <div>
-          <span className="character-form-wizard__eyebrow">EDITING</span>
-          <h1>{character.name}</h1>
-        </div>
-        <Link href={`/characters/${id}`} className="character-back-btn">
-          <i className="bi bi-arrow-left" aria-hidden="true" /> View character
-        </Link>
-      </div>
-      <CharacterFormPage
-        initial={character}
-        onSaved={() => router.push(`/characters/${id}`)}
-        onCancel={() => router.push(`/characters/${id}`)}
-      />
-    </div>
+    <CharacterFormLayout
+      characterId={String(id)}
+      initial={character}
+      onSaved={() => router.push(`/characters/${id}`)}
+      onCancel={() => router.push(`/characters/${id}`)}
+    />
   )
 }

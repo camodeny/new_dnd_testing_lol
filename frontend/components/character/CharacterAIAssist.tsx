@@ -6,6 +6,9 @@ import type { CharacterDraft } from './characterFormConfig'
 
 interface Props {
   onGenerated: (draft: Partial<CharacterDraft>) => void
+  characterId?: string
+  draftCharacter?: Record<string, unknown> | CharacterDraft | null
+  activePage?: string | null
 }
 
 const EXAMPLES = [
@@ -94,7 +97,7 @@ function mockGenerate(prompt: string): Partial<CharacterDraft> {
 
 type ChatMsg = { role: 'ai' | 'user'; content: string }
 
-export default function CharacterAIAssist({ onGenerated }: Props) {
+export default function CharacterAIAssist({ onGenerated, characterId = 'new', draftCharacter, activePage }: Props) {
   const [messages, setMessages] = useState<ChatMsg[]>([
     { role: 'ai', content: "Hey! I can help you build your D&D 5e sheet — just describe who you imagine (e.g. 'grumpy dwarf cleric who loves ale' or 'shy half-elf druid, level 2'). I'll draft the stats and you can tweak everything before saving." },
   ])
@@ -105,15 +108,132 @@ export default function CharacterAIAssist({ onGenerated }: Props) {
     const text = input.trim()
     if (!text || loading) return
     setInput('')
+    const history = [...messages]
     setMessages((m) => [...m, { role: 'user', content: text }])
     setLoading(true)
-    await new Promise((r) => setTimeout(r, 800))
+
+    // ai will be appended on first token; no empty placeholder to avoid duplicate bubbles
+    const aiIndex = history.length + 1
+
+    const token = typeof window !== 'undefined' ? localStorage.getItem('token') : null
+    // bypass Next rewrites for SSE to avoid buffering; hit backend directly when local
+    const backendBase =
+      (typeof process !== 'undefined' && (process.env.NEXT_PUBLIC_BACKEND_URL as string | undefined)) ||
+      (typeof window !== 'undefined' && window.location.hostname === 'localhost' ? 'http://localhost:8000' : '')
+    const chatUrl = backendBase
+      ? `${backendBase.replace(/\/$/, '')}/api/characters/${encodeURIComponent(characterId)}/chat`
+      : `/api/characters/${encodeURIComponent(characterId)}/chat`
+
     try {
-      const draft = mockGenerate(text)
-      onGenerated(draft)
-      setMessages((m) => [...m, { role: 'ai', content: "Draft applied to the form → review the 5 steps on the right and hit Create when you're happy. Want to adjust anything? Just tell me." }])
+      const res = await fetch(chatUrl, {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          ...(token ? { Authorization: `Bearer ${token}` } : {}),
+        },
+        body: JSON.stringify({
+          content: text,
+          history: history.map((m) => ({ role: m.role === 'ai' ? 'assistant' : m.role, content: m.content })),
+          draft_character: draftCharacter ?? null,
+          active_page: activePage ?? null,
+        }),
+      })
+
+      if (!res.ok || !res.body) throw new Error(`HTTP ${res.status}`)
+
+      const reader = res.body.getReader()
+      const decoder = new TextDecoder()
+      let buffer = ''
+      let fullText = ''
+      let gotPatch = false
+
+      while (true) {
+        const { done, value } = await reader.read()
+        if (done) break
+        buffer += decoder.decode(value, { stream: true })
+        const lines = buffer.split('\n')
+        buffer = lines.pop() ?? ''
+        for (const line of lines) {
+          const trimmed = line.trim()
+          if (!trimmed || !trimmed.startsWith('data:')) continue
+          const dataStr = trimmed.slice(5).trim()
+          if (!dataStr) continue
+          try {
+            const data = JSON.parse(dataStr)
+            if (data.type === 'token' && typeof data.text === 'string') {
+              fullText += data.text
+              setMessages((m) => {
+                const copy = [...m]
+                if (copy[aiIndex] && copy[aiIndex].role === 'ai') {
+                  copy[aiIndex] = { ...copy[aiIndex], content: fullText }
+                } else if (copy.length === aiIndex) {
+                  copy.push({ role: 'ai', content: fullText })
+                } else {
+                  // fallback: ensure ai message exists
+                  copy[aiIndex] = { role: 'ai', content: fullText }
+                }
+                return copy
+              })
+            } else if (data.type === 'patch' && data.patch) {
+              gotPatch = true
+              onGenerated(data.patch as Partial<CharacterDraft>)
+              if (!fullText) {
+                setMessages((m) => {
+                  const copy = [...m]
+                  if (copy[aiIndex] && copy[aiIndex].role === 'ai') {
+                    copy[aiIndex] = { ...copy[aiIndex], content: 'Draft applied to the form → review the steps and hit Create when ready.' }
+                  } else if (copy.length === aiIndex) {
+                    copy.push({ role: 'ai', content: 'Draft applied to the form → review the steps and hit Create when ready.' })
+                  }
+                  return copy
+                })
+              }
+            } else if (data.type === 'done') {
+              // no-op
+            } else if (data.error) {
+              throw new Error(data.error)
+            }
+          } catch {
+            // ignore parse errors for partial json
+          }
+        }
+      }
+
+      if (!fullText) {
+        setMessages((m) => {
+          const copy = [...m]
+          if (copy[aiIndex] && copy[aiIndex].role === 'ai') {
+            copy[aiIndex] = { ...copy[aiIndex], content: "Hmm, I didn't get a response — try again?" }
+          } else if (copy.length === aiIndex) {
+            copy.push({ role: 'ai', content: "Hmm, I didn't get a response — try again?" })
+          }
+          return copy
+        })
+      } else if (!gotPatch) {
+        // still show completion; patch will be empty but message is there
+      }
     } catch {
-      setMessages((m) => [...m, { role: 'ai', content: "Hmm, I had trouble with that — try rephrasing your idea." }])
+      try {
+        const draft = mockGenerate(text)
+        onGenerated(draft)
+        setMessages((m) => {
+          const copy = [...m]
+          const msg = "Draft applied to the form → review the 5 steps on the right and hit Create when you're happy. Want to adjust anything? Just tell me. (offline mock)"
+          if (copy[aiIndex] && copy[aiIndex].role === 'ai') copy[aiIndex] = { ...copy[aiIndex], content: msg }
+          else if (copy.length === aiIndex) copy.push({ role: 'ai', content: msg })
+          else copy[aiIndex] = { role: 'ai', content: msg }
+          return copy
+        })
+      } catch {
+        setMessages((m) => {
+          const copy = [...m]
+          const msg = "Hmm, I had trouble with that — try rephrasing your idea."
+          if (copy[aiIndex] && copy[aiIndex].role === 'ai') copy[aiIndex] = { ...copy[aiIndex], content: msg }
+          else if (copy.length === aiIndex) copy.push({ role: 'ai', content: msg })
+          else copy[aiIndex] = { role: 'ai', content: msg }
+          return copy
+        })
+      }
     } finally {
       setLoading(false)
     }
@@ -128,7 +248,7 @@ export default function CharacterAIAssist({ onGenerated }: Props) {
             <p>{msg.content}</p>
           </div>
         ))}
-        {loading && <div className="character-ai-chat__bubble is-ai is-typing"><span>AI</span><p>Drafting…</p></div>}
+        {loading && messages[messages.length - 1]?.role !== 'ai' && <div className="character-ai-chat__bubble is-ai is-typing"><span>AI</span><p>Drafting…</p></div>}
       </div>
 
       <div className="character-ai-chat__composer">

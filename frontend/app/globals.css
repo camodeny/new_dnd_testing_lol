@@ -615,6 +615,12 @@ select.input:focus,
   transform: translateY(-1px);
 }
 
+.character-sheet-view.card:hover {
+  border-color: var(--line);
+  box-shadow: none;
+  transform: none;
+}
+
 .loading {
   display: grid;
   min-height: 260px;
@@ -1242,6 +1248,10 @@ select.input:focus,
 }
 
 .character-back-btn:hover { border-color: var(--line-strong); color: var(--ink-strong); }
+
+.character-view-page .character-back-btn {
+  margin-bottom: 16px;
+}
 
 .character-form-wizard { container-type: inline-size; }
 

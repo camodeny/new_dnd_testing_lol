@@ -22,7 +22,7 @@ export default function PersonalitySection({ data, onChange }: Props) {
           <FormGroup key={key} label={label} htmlFor={`per-${key}`}>
             <TextArea
               id={`per-${key}`}
-              value={data[key]}
+              value={data[key] ?? ''}
               onChange={(event) => onChange({ ...data, [key]: event.target.value })}
             />
           </FormGroup>

@@ -36,6 +36,8 @@ interface CharacterFormPageProps {
   onCancel: () => void
   onToggleAI?: () => void
   aiCollapsed?: boolean
+  onDraftChange?: (draft: CharacterDraft) => void
+  onActivePageChange?: (page: string) => void
 }
 
 const ITEM_CONFIG_BY_KEY = Object.fromEntries(
@@ -88,21 +90,60 @@ function GeneralSection({
   )
 }
 
-export default function CharacterFormPage({ initial, aiPatch, onAiPatchApplied, onSaved, onCancel, onToggleAI, aiCollapsed }: CharacterFormPageProps) {
+export default function CharacterFormPage({ initial, aiPatch, onAiPatchApplied, onSaved, onCancel, onToggleAI, aiCollapsed, onDraftChange, onActivePageChange }: CharacterFormPageProps) {
   const [draft, setDraft] = useState<CharacterDraft>(() => mergeCharacterDraft(initial))
   const aiPatchRef = useRef(0)
+  const prevInitialRef = useRef<string | undefined>(undefined)
+
+  useEffect(() => {
+    onDraftChange?.(draft)
+  }, [draft, onDraftChange])
+
+  useEffect(() => {
+    // when editing, initial loads async — sync draft to loaded character
+    const key = initial?.id ? String(initial.id) : undefined
+    if (key && key !== prevInitialRef.current) {
+      prevInitialRef.current = key
+      setDraft(mergeCharacterDraft(initial))
+    } else if (!initial?.id && prevInitialRef.current) {
+      // cleared initial (should not happen in normal flow)
+      prevInitialRef.current = undefined
+    }
+  }, [initial])
 
   useEffect(() => {
     if (!aiPatch) return
-    // merge AI patch into current draft (preserves manual edits for fields AI didn't touch)
     aiPatchRef.current += 1
-    const patchId = aiPatchRef.current
     setDraft((prev) => {
-      // deep merge: only overwrite fields that AI actually provided
-      const merged = mergeCharacterDraft({ ...prev, ...aiPatch })
-      // for nested groups, prefer AI values where defined
-      // mergeCharacterDraft already handles nested groups correctly
-      return merged
+      // Deep-merge nested groups against prev so partial patches don't reset untouched fields.
+      // Lists (classes, skills, etc.) replace wholesale; nested objects merge.
+      const mergedBase: Record<string, unknown> = { ...prev }
+      for (const [key, value] of Object.entries(aiPatch)) {
+        const prevVal = (prev as unknown as Record<string, unknown>)[key]
+        const isPlainObject = (v: unknown) => v !== null && typeof v === 'object' && !Array.isArray(v)
+        if (isPlainObject(value) && isPlainObject(prevVal)) {
+          if (key === 'spellcasting') {
+            const prevSpell = prevVal as Record<string, unknown>
+            const patchSpell = value as Record<string, unknown>
+            const prevSlots = prevSpell.spell_slots as Record<string, unknown> | undefined
+            const patchSlots = patchSpell.spell_slots as Record<string, unknown> | undefined
+            if (isPlainObject(prevSlots) && isPlainObject(patchSlots)) {
+              mergedBase[key] = {
+                ...(prevVal as Record<string, unknown>),
+                ...(value as Record<string, unknown>),
+                spell_slots: { ...(prevSlots as Record<string, unknown>), ...(patchSlots as Record<string, unknown>) },
+              } as unknown
+            } else {
+              mergedBase[key] = { ...(prevVal as Record<string, unknown>), ...(value as Record<string, unknown>) } as unknown
+            }
+          } else {
+            mergedBase[key] = { ...(prevVal as Record<string, unknown>), ...(value as Record<string, unknown>) } as unknown
+          }
+        } else {
+          ;(mergedBase as Record<string, unknown>)[key] = value as unknown
+        }
+      }
+      return mergeCharacterDraft(mergedBase)
     })
     onAiPatchApplied?.()
   }, [aiPatch, onAiPatchApplied])
@@ -112,6 +153,10 @@ export default function CharacterFormPage({ initial, aiPatch, onAiPatchApplied, 
   const formRef = useRef<HTMLFormElement>(null)
   const isEdit = Boolean(initial?.id)
   const activePage = CHARACTER_FORM_PAGES[activePageIndex]
+
+  useEffect(() => {
+    onActivePageChange?.(activePage.key)
+  }, [activePage.key, onActivePageChange])
   const isFirstPage = activePageIndex === 0
   const isLastPage = activePageIndex === CHARACTER_FORM_PAGES.length - 1
 

@@ -17,14 +17,14 @@ export default function AppearanceSection({ data, onChange }: Props) {
       <div className="form-grid three-col">
         {FIELDS.map((field) => (
           <FormGroup key={field} label={`${field[0].toUpperCase()}${field.slice(1)}`} htmlFor={`app-${field}`}>
-            <Input id={`app-${field}`} value={data[field]} onChange={(event) => set(field, event.target.value)} />
+            <Input id={`app-${field}`} value={data[field] ?? ''} onChange={(event) => set(field, event.target.value)} />
           </FormGroup>
         ))}
       </div>
       <FormGroup label="Character Appearance Description" htmlFor="app-description">
         <TextArea
           id="app-description"
-          value={data.character_appearance}
+          value={data.character_appearance ?? ''}
           onChange={(event) => set('character_appearance', event.target.value)}
           rows={4}
         />
