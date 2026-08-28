@@ -36,6 +36,8 @@ interface CharacterFormPageProps {
   onCancel: () => void
   onToggleAI?: () => void
   aiCollapsed?: boolean
+  onDraftChange?: (draft: CharacterDraft) => void
+  onActivePageChange?: (page: string) => void
 }
 
 const ITEM_CONFIG_BY_KEY = Object.fromEntries(
@@ -88,9 +90,26 @@ function GeneralSection({
   )
 }
 
-export default function CharacterFormPage({ initial, aiPatch, onAiPatchApplied, onSaved, onCancel, onToggleAI, aiCollapsed }: CharacterFormPageProps) {
+export default function CharacterFormPage({ initial, aiPatch, onAiPatchApplied, onSaved, onCancel, onToggleAI, aiCollapsed, onDraftChange, onActivePageChange }: CharacterFormPageProps) {
   const [draft, setDraft] = useState<CharacterDraft>(() => mergeCharacterDraft(initial))
   const aiPatchRef = useRef(0)
+  const prevInitialRef = useRef<string | undefined>(undefined)
+
+  useEffect(() => {
+    onDraftChange?.(draft)
+  }, [draft, onDraftChange])
+
+  useEffect(() => {
+    // when editing, initial loads async — sync draft to loaded character
+    const key = initial?.id ? String(initial.id) : undefined
+    if (key && key !== prevInitialRef.current) {
+      prevInitialRef.current = key
+      setDraft(mergeCharacterDraft(initial))
+    } else if (!initial?.id && prevInitialRef.current) {
+      // cleared initial (should not happen in normal flow)
+      prevInitialRef.current = undefined
+    }
+  }, [initial])
 
   useEffect(() => {
     if (!aiPatch) return
@@ -112,6 +131,10 @@ export default function CharacterFormPage({ initial, aiPatch, onAiPatchApplied, 
   const formRef = useRef<HTMLFormElement>(null)
   const isEdit = Boolean(initial?.id)
   const activePage = CHARACTER_FORM_PAGES[activePageIndex]
+
+  useEffect(() => {
+    onActivePageChange?.(activePage.key)
+  }, [activePage.key, onActivePageChange])
   const isFirstPage = activePageIndex === 0
   const isLastPage = activePageIndex === CHARACTER_FORM_PAGES.length - 1
 

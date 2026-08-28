@@ -12,6 +12,10 @@ We keep pool small; Supavisor handles multiplexing.
 import os
 from typing import Generator
 
+from dotenv import load_dotenv
+
+load_dotenv()
+
 from sqlalchemy import create_engine, text
 from sqlalchemy.orm import DeclarativeBase, sessionmaker, Session
 

@@ -29,7 +29,7 @@ export default function SpellcastingSection({ data, onChange }: Props) {
         <FormGroup label="Spellcasting Ability" htmlFor="spc-ability">
           <Input
             id="spc-ability"
-            value={data.spellcasting_ability}
+            value={(data.spellcasting_ability as string) ?? ''}
             onChange={(event) => set('spellcasting_ability', event.target.value)}
             placeholder="INT, WIS, CHA"
           />

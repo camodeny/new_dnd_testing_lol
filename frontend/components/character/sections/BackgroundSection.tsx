@@ -21,7 +21,7 @@ export default function BackgroundSection({ data, onChange }: Props) {
         <FormGroup key={key} label={label} htmlFor={`bg-${key}`}>
           <TextArea
             id={`bg-${key}`}
-            value={data[key]}
+            value={data[key] ?? ''}
             onChange={(event) => onChange({ ...data, [key]: event.target.value })}
             rows={rows}
           />

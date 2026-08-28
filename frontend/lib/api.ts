@@ -117,6 +117,17 @@ export const characters = {
       body: JSON.stringify(payload),
     }),
   delete: (id: number | string) => apiFetch(`/characters/${id}`, { method: 'DELETE' }),
+  chatStream: (id: string | number, payload: Record<string, unknown>) =>
+    fetch(`/api/characters/${encodeURIComponent(String(id))}/chat`, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        ...(typeof window !== 'undefined' && localStorage.getItem('token')
+          ? { Authorization: `Bearer ${localStorage.getItem('token')}` }
+          : {}),
+      },
+      body: JSON.stringify(payload),
+    }),
 }
 
 // ── Campaign characters & members ─────────────────────────────────────────
