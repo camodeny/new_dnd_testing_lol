@@ -128,12 +128,16 @@ export default function CharacterFormPage({ initial, aiPatch, onAiPatchApplied, 
             const prevSlots = prevSpell.spell_slots as Record<string, unknown> | undefined
             const patchSlots = patchSpell.spell_slots as Record<string, unknown> | undefined
             if (isPlainObject(prevSlots) && isPlainObject(patchSlots)) {
-              mergedBase[key] = { ...prevVal, ...value, spell_slots: { ...prevSlots, ...patchSlots } } as unknown
+              mergedBase[key] = {
+                ...(prevVal as Record<string, unknown>),
+                ...(value as Record<string, unknown>),
+                spell_slots: { ...(prevSlots as Record<string, unknown>), ...(patchSlots as Record<string, unknown>) },
+              } as unknown
             } else {
-              mergedBase[key] = { ...prevVal, ...value } as unknown
+              mergedBase[key] = { ...(prevVal as Record<string, unknown>), ...(value as Record<string, unknown>) } as unknown
             }
           } else {
-            mergedBase[key] = { ...prevVal, ...value } as unknown
+            mergedBase[key] = { ...(prevVal as Record<string, unknown>), ...(value as Record<string, unknown>) } as unknown
           }
         } else {
           ;(mergedBase as Record<string, unknown>)[key] = value as unknown
