@@ -9,7 +9,7 @@ import type { CharacterDraft } from '@/components/character/characterFormConfig'
 
 export default function CharacterCreatePage() {
   const router = useRouter()
-  const [aiDraft, setAiDraft] = useState<Partial<CharacterDraft> | undefined>(undefined)
+  const [aiPatch, setAiPatch] = useState<Partial<CharacterDraft> | null>(null)
   const [aiCollapsed, setAiCollapsed] = useState(false)
 
   return (
@@ -24,11 +24,11 @@ export default function CharacterCreatePage() {
               </button>
             </div>
             <div className="character-ai-sidebar__content">
-              <CharacterAIAssist onGenerated={(draft) => setAiDraft(draft)} />
-              {aiDraft && (
+              <CharacterAIAssist onGenerated={(draft) => setAiPatch({ ...draft } as Partial<CharacterDraft>)} />
+              {aiPatch && (
                 <div className="character-ai-banner">
                   <i className="bi bi-check-circle-fill" aria-hidden="true" /> Draft applied
-                  <button type="button" className="link-button" onClick={() => setAiDraft(undefined)}>Clear</button>
+                  <button type="button" className="link-button" onClick={() => setAiPatch(null)}>Clear</button>
                 </div>
               )}
             </div>
@@ -37,8 +37,7 @@ export default function CharacterCreatePage() {
 
         <div className="character-create-main">
           <CharacterFormPage
-            key={aiDraft ? JSON.stringify(aiDraft) : 'empty'}
-            initial={aiDraft as unknown as Partial<import('@/types').Character>}
+            aiPatch={aiPatch}
             onSaved={(character) => router.push(`/characters/${character.id}`)}
             onCancel={() => router.push('/characters')}
             onToggleAI={() => setAiCollapsed((v) => !v)}

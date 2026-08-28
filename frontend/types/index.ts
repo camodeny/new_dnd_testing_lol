@@ -18,7 +18,7 @@ export interface Campaign {
 }
 
 export interface Character {
-  id: number
+  id: number | string
   name: string
   race?: string
   background?: string
@@ -65,7 +65,7 @@ export interface CampaignMember {
   user_id: number
   username: string
   role: 'owner' | 'player'
-  character_id?: number
+  character_id?: number | string
   character_name?: string
   is_ready?: boolean
 }
@@ -110,7 +110,7 @@ export interface InitiativeEntry {
 export interface SheetProposal {
   id: number
   session_id: number
-  character_id: number
+  character_id: number | string
   changes: Record<string, unknown>
   reason?: string
   status: 'pending' | 'applied' | 'dismissed'
@@ -121,7 +121,7 @@ export interface LlmPlayer {
   campaign_id: number
   name: string
   persona?: string
-  character_id?: number
+  character_id?: number | string
   character_name?: string
 }
 

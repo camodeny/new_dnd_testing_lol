@@ -1,6 +1,6 @@
 'use client'
 
-import { useRef, useState, type FormEvent } from 'react'
+import { useEffect, useRef, useState, type FormEvent } from 'react'
 import { characters as charactersApi } from '@/lib/api'
 import type { Character } from '@/types'
 import Button from '@/components/common/Button'
@@ -30,6 +30,8 @@ import {
 
 interface CharacterFormPageProps {
   initial?: Partial<Character>
+  aiPatch?: Partial<CharacterDraft> | null
+  onAiPatchApplied?: () => void
   onSaved: (character: Character) => void
   onCancel: () => void
   onToggleAI?: () => void
@@ -86,8 +88,24 @@ function GeneralSection({
   )
 }
 
-export default function CharacterFormPage({ initial, onSaved, onCancel, onToggleAI, aiCollapsed }: CharacterFormPageProps) {
+export default function CharacterFormPage({ initial, aiPatch, onAiPatchApplied, onSaved, onCancel, onToggleAI, aiCollapsed }: CharacterFormPageProps) {
   const [draft, setDraft] = useState<CharacterDraft>(() => mergeCharacterDraft(initial))
+  const aiPatchRef = useRef(0)
+
+  useEffect(() => {
+    if (!aiPatch) return
+    // merge AI patch into current draft (preserves manual edits for fields AI didn't touch)
+    aiPatchRef.current += 1
+    const patchId = aiPatchRef.current
+    setDraft((prev) => {
+      // deep merge: only overwrite fields that AI actually provided
+      const merged = mergeCharacterDraft({ ...prev, ...aiPatch })
+      // for nested groups, prefer AI values where defined
+      // mergeCharacterDraft already handles nested groups correctly
+      return merged
+    })
+    onAiPatchApplied?.()
+  }, [aiPatch, onAiPatchApplied])
   const [activePageIndex, setActivePageIndex] = useState(0)
   const [error, setError] = useState('')
   const [saving, setSaving] = useState(false)

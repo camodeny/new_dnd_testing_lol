@@ -41,13 +41,18 @@ function mockGenerate(prompt: string): Partial<CharacterDraft> {
     fighter: 'Fighter', barbarian: 'Barbarian', bard: 'Bard', druid: 'Druid',
     paladin: 'Paladin', monk: 'Monk', sorcerer: 'Sorcerer', warlock: 'Warlock',
   }
+  const hitDiceByClass: Record<string, string> = {
+    Barbarian: 'd12',
+    Fighter: 'd10', Paladin: 'd10', Ranger: 'd10',
+    Bard: 'd8', Cleric: 'd8', Druid: 'd8', Monk: 'd8', Rogue: 'd8', Warlock: 'd8',
+    Sorcerer: 'd6', Wizard: 'd6',
+  }
   const foundClasses: { class_name: string; level: number; subclass: string; hit_die_type: string }[] = []
   for (const [kw, name] of Object.entries(classMap)) {
     if (lower.includes(kw)) {
-      // try to find level like "3rd" or "level 3"
       const m = lower.match(new RegExp(`${kw}[^\\d]{0,10}(\\d+)`))
       const lvl = m ? Math.min(20, Math.max(1, parseInt(m[1], 10))) : 1
-      foundClasses.push({ class_name: name, level: lvl, subclass: '', hit_die_type: 'd8' })
+      foundClasses.push({ class_name: name, level: lvl, subclass: '', hit_die_type: hitDiceByClass[name] ?? 'd8' })
     }
   }
   if (foundClasses.length) (draft as unknown as Record<string, unknown>).classes = foundClasses
