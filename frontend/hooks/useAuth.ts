@@ -7,7 +7,7 @@ import type { User } from '@/types'
 
 const MOCK_USER: User | null =
   process.env.NEXT_PUBLIC_MOCK_USER === 'true'
-    ? { id: 1, username: 'dev', email: 'dev@fireside.local' }
+    ? { id: '23f3b2d1-efb6-4785-9a67-fa7ca57d72a3', username: 'dev', email: 'dev@fireside.local' }
     : null
 
 function supabaseUserToAppUser(su: { id: string; email?: string | null; user_metadata?: Record<string, unknown> }): User {
@@ -18,7 +18,7 @@ function supabaseUserToAppUser(su: { id: string; email?: string | null; user_met
     (meta.full_name as string | undefined) ??
     (meta.name as string | undefined) ??
     (email ? email.split('@')[0] : su.id.slice(0, 8))
-  return { id: su.id as unknown as number, username, email: email ?? undefined } as unknown as User
+  return { id: su.id, username, email: email ?? undefined }
 }
 
 export function useAuth() {

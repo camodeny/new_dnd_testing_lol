@@ -1,18 +1,21 @@
 export interface User {
-  id: number
+  id: string
   username: string
   email?: string
 }
 
 export interface Campaign {
-  id: number
+  id: string
   name: string
   description?: string
   random_seed?: string
   loot_drop_rate?: string
+  loot_mode?: string
+  required_players?: number
   created_at: string
   updated_at?: string
-  owner_id: number
+  owner_id: string
+  user_id?: string
   session_count?: number
   member_count?: number
 }
@@ -62,7 +65,7 @@ export interface Message {
 }
 
 export interface CampaignMember {
-  user_id: number
+  user_id: string
   username: string
   role: 'owner' | 'player'
   character_id?: number | string

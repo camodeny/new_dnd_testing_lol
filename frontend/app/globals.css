@@ -1605,8 +1605,10 @@ a.automation-list-item:focus-visible {
 /* ── Campaign lobby ──────────────────────────────────────────────────── */
 
 .lobby-page {
+  display: grid;
+  place-items: center;
   min-height: 100svh;
-  padding: clamp(24px, 4vw, 54px);
+  padding: clamp(16px, 2vw, 24px);
   background:
     radial-gradient(circle at 100% 0%, rgba(200, 95, 61, 0.08), transparent 32rem),
     var(--surface-canvas);
@@ -1615,6 +1617,7 @@ a.automation-list-item:focus-visible {
 
 .lobby-container {
   position: relative;
+  width: 100%;
   max-width: 1120px;
   margin: 0 auto;
   animation: page-enter 360ms ease-out both;
@@ -1624,7 +1627,7 @@ a.automation-list-item:focus-visible {
   display: grid;
   overflow: hidden;
   grid-template-columns: minmax(330px, 0.8fr) minmax(0, 1.2fr);
-  padding: 38px;
+  padding: 24px;
   border: 1px solid var(--line);
   border-radius: 14px;
   background: var(--surface-raised);
@@ -1634,7 +1637,7 @@ a.automation-list-item:focus-visible {
 .lobby-hero {
   position: relative;
   display: flex;
-  min-height: 660px;
+  min-height: clamp(320px, 42svh, 480px);
   grid-row: 1 / span 4;
   flex-direction: column;
   align-items: flex-start;
@@ -1664,7 +1667,7 @@ a.automation-list-item:focus-visible {
 .lobby-footer,
 .lobby-card > .llm-manager-card { grid-column: 2; }
 
-.lobby-party-section { margin: 0; padding: 42px 42px 30px; }
+.lobby-party-section { margin: 0; padding: 28px 28px 20px; }
 
 .lobby-section-header {
   display: flex;
@@ -1719,7 +1722,7 @@ a.automation-list-item:focus-visible {
 .lobby-slot-empty { border-style: dashed; background: transparent; opacity: 0.72; }
 .lobby-slot-circle-empty { border: 1px dashed var(--line-strong); background: transparent !important; color: var(--ink-faint); }
 
-.lobby-invite-section { margin: 0; padding: 30px 42px; border-top: 1px solid var(--line); }
+.lobby-invite-section { margin: 0; padding: 20px 28px; border-top: 1px solid var(--line); }
 
 .lobby-invite-card {
   margin-top: 15px;
@@ -1760,7 +1763,7 @@ a.automation-list-item:focus-visible {
 .lobby-copy-btn:hover, .lobby-generate-btn:hover { border-color: var(--line-strong); color: var(--ink-strong); }
 .lobby-copy-btn.copied { border-color: var(--moss); background: var(--moss); color: #fff; }
 
-.lobby-footer { display: flex; justify-content: flex-start; padding: 28px 42px 40px; border-top: 1px solid var(--line); }
+.lobby-footer { display: flex; justify-content: flex-start; padding: 20px 28px 24px; border-top: 1px solid var(--line); }
 
 .lobby-begin-btn {
   display: inline-flex;
@@ -1978,7 +1981,9 @@ a.automation-list-item:focus-visible {
     backdrop-filter: blur(18px) !important;
   }
 
-  .lobby-card { grid-template-columns: 1fr; padding: 24px; }
+  .lobby-page { display: block; min-height: auto; max-height: none; height: auto; overflow: visible; place-items: initial; padding: clamp(16px, 3vw, 24px); }
+  .lobby-container { max-height: none; overflow: visible; }
+  .lobby-card { grid-template-columns: 1fr; padding: 24px; max-height: none; overflow: visible; }
   .lobby-hero { min-height: 410px; grid-row: auto; }
   .lobby-party-section,
   .lobby-invite-section,

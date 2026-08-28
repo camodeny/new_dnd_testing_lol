@@ -6,7 +6,7 @@ import MarkdownContent from '@/components/common/MarkdownContent'
 import type { Campaign, Character, Session, Message, EncounterMap, User } from '@/types'
 
 interface StoryAtlasProps {
-  campaign: Campaign & { user_id?: number }
+  campaign: Campaign & { user_id?: string }
   characters: Character[]
   session: Session | null
   messages: Message[]

@@ -78,16 +78,16 @@ export const auth = {
 
 export const campaigns = {
   list: () => apiFetch<{ campaigns: import('@/types').Campaign[] }>('/campaigns'),
-  get: (id: number) => apiFetch<{ campaign: import('@/types').Campaign }>(`/campaigns/${id}`),
+  get: (id: string | number) => apiFetch<{ campaign: import('@/types').Campaign }>(`/campaigns/${id}`),
   create: (payload: Record<string, unknown>) =>
     apiFetch<{ campaign: import('@/types').Campaign }>('/campaigns', {
       method: 'POST',
       body: JSON.stringify(payload),
     }),
-  update: (id: number, payload: Record<string, unknown>) =>
+  update: (id: string | number, payload: Record<string, unknown>) =>
     apiFetch(`/campaigns/${id}`, { method: 'PUT', body: JSON.stringify(payload) }),
-  delete: (id: number) => apiFetch(`/campaigns/${id}`, { method: 'DELETE' }),
-  export: (id: number) => apiBlob(`/campaigns/${id}/export`),
+  delete: (id: string | number) => apiFetch(`/campaigns/${id}`, { method: 'DELETE' }),
+  export: (id: string | number) => apiBlob(`/campaigns/${id}/export`),
   randomBrief: (payload: Record<string, unknown> = {}) =>
     apiFetch<{ name?: string; description?: string; random_seed?: string }>(
       '/campaigns/random-brief',
@@ -98,7 +98,7 @@ export const campaigns = {
       method: 'POST',
       body: JSON.stringify(payload),
     }),
-  devAudit: (id: number) => apiFetch(`/campaigns/${id}/dev`),
+  devAudit: (id: string | number) => apiFetch(`/campaigns/${id}/dev`),
 }
 
 // ── Characters ────────────────────────────────────────────────────────────
@@ -133,24 +133,24 @@ export const characters = {
 // ── Campaign characters & members ─────────────────────────────────────────
 
 export const campaignMembers = {
-  listCharacters: (campaignId: number) =>
+  listCharacters: (campaignId: string | number) =>
     apiFetch<{ characters: import('@/types').Character[] }>(`/campaigns/${campaignId}/characters`),
-  addCharacter: (campaignId: number, characterId: number) =>
+  addCharacter: (campaignId: string | number, characterId: number) =>
     apiFetch(`/campaigns/${campaignId}/characters`, {
       method: 'POST',
       body: JSON.stringify({ character_id: characterId }),
     }),
-  listMembers: (campaignId: number) =>
+  listMembers: (campaignId: string | number) =>
     apiFetch<{ members: import('@/types').CampaignMember[] }>(`/campaigns/${campaignId}/members`),
-  removeMember: (campaignId: number, userId: number) =>
+  removeMember: (campaignId: string | number, userId: string | number) =>
     apiFetch(`/campaigns/${campaignId}/members/${userId}`, { method: 'DELETE' }),
-  createInvite: (campaignId: number) =>
+  createInvite: (campaignId: string | number) =>
     apiFetch<{ code: string }>(`/campaigns/${campaignId}/invites`, { method: 'POST' }),
-  getInvite: (campaignId: number) =>
+  getInvite: (campaignId: string | number) =>
     apiFetch<{ code?: string }>(`/campaigns/${campaignId}/invites`),
   lookupInvite: (code: string) =>
-    apiFetch<{ campaign: import('@/types').Campaign }>(`/invites/lookup?code=${encodeURIComponent(code)}`),
-  joinCampaign: (campaignId: number, code: string) =>
+    apiFetch<{ campaign: import('@/types').Campaign; campaign_id?: string }>(`/invites/lookup?code=${encodeURIComponent(code)}`),
+  joinCampaign: (campaignId: string | number, code: string) =>
     apiFetch(`/campaigns/${campaignId}/join`, {
       method: 'POST',
       body: JSON.stringify({ code }),
@@ -160,7 +160,7 @@ export const campaignMembers = {
 // ── Sessions ──────────────────────────────────────────────────────────────
 
 export const sessions = {
-  start: (campaignId: number) =>
+  start: (campaignId: string | number) =>
     apiFetch<{ session: import('@/types').Session }>(`/campaigns/${campaignId}/sessions`, {
       method: 'POST',
     }),
@@ -195,16 +195,16 @@ export const sessions = {
 // ── World & planning ──────────────────────────────────────────────────────
 
 export const world = {
-  get: (campaignId: number) =>
+  get: (campaignId: string | number) =>
     apiFetch<{ world: import('@/types').CampaignWorld }>(`/campaigns/${campaignId}/world`),
-  generate: (campaignId: number) =>
+  generate: (campaignId: string | number) =>
     apiFetch(`/campaigns/${campaignId}/world`, { method: 'POST' }),
 }
 
 export const planning = {
-  get: (campaignId: number) => apiFetch(`/campaigns/${campaignId}/planning`),
+  get: (campaignId: string | number) => apiFetch(`/campaigns/${campaignId}/planning`),
   sendMessage: (
-    campaignId: number,
+    campaignId: string | number,
     content: string,
     opts: { draftCharacter?: unknown; activePage?: string } = {},
   ) =>
@@ -216,18 +216,18 @@ export const planning = {
         active_page: opts.activePage,
       }),
     }),
-  streamUrl: (campaignId: number) => getStreamUrl(`/campaigns/${campaignId}/planning/stream`),
-  selectCharacter: (campaignId: number, characterId: number) =>
+  streamUrl: (campaignId: string | number) => getStreamUrl(`/campaigns/${campaignId}/planning/stream`),
+  selectCharacter: (campaignId: string | number, characterId: number) =>
     apiFetch(`/campaigns/${campaignId}/planning/character`, {
       method: 'PUT',
       body: JSON.stringify({ character_id: characterId }),
     }),
-  setReady: (campaignId: number, ready: boolean) =>
+  setReady: (campaignId: string | number, ready: boolean) =>
     apiFetch(`/campaigns/${campaignId}/planning/ready`, {
       method: 'PUT',
       body: JSON.stringify({ ready }),
     }),
-  updateBond: (campaignId: number, bondId: number, payload: Record<string, unknown>) =>
+  updateBond: (campaignId: string | number, bondId: number, payload: Record<string, unknown>) =>
     apiFetch(`/campaigns/${campaignId}/planning/bonds/${bondId}`, {
       method: 'PUT',
       body: JSON.stringify(payload),
@@ -237,7 +237,7 @@ export const planning = {
 // ── Encounter maps ────────────────────────────────────────────────────────
 
 export const encounterMaps = {
-  getCurrent: (campaignId: number) =>
+  getCurrent: (campaignId: string | number) =>
     apiFetch<{ map: import('@/types').EncounterMap }>(`/campaigns/${campaignId}/encounter-maps/current`),
   image: (encounterMapId: number) => apiBlob(`/encounter-maps/${encounterMapId}/image`),
   labeledImage: (encounterMapId: number) => apiBlob(`/encounter-maps/${encounterMapId}/labeled-image`),
@@ -274,21 +274,21 @@ export const proposals = {
 // ── LLM players ───────────────────────────────────────────────────────────
 
 export const llmPlayers = {
-  list: (campaignId: number) =>
+  list: (campaignId: string | number) =>
     apiFetch<{ llm_players: import('@/types').LlmPlayer[] }>(`/campaigns/${campaignId}/llm-players`),
-  create: (campaignId: number, payload: Record<string, unknown>) =>
+  create: (campaignId: string | number, payload: Record<string, unknown>) =>
     apiFetch(`/campaigns/${campaignId}/llm-players`, {
       method: 'POST',
       body: JSON.stringify(payload),
     }),
-  assign: (campaignId: number, llmPlayerId: number) =>
+  assign: (campaignId: string | number, llmPlayerId: number) =>
     apiFetch(`/campaigns/${campaignId}/llm-players/assign`, {
       method: 'POST',
       body: JSON.stringify({ llm_player_id: llmPlayerId }),
     }),
-  rotateKey: (campaignId: number, llmPlayerId: number) =>
+  rotateKey: (campaignId: string | number, llmPlayerId: number) =>
     apiFetch(`/campaigns/${campaignId}/llm-players/${llmPlayerId}/rotate-key`, { method: 'POST' }),
-  delete: (campaignId: number, llmPlayerId: number) =>
+  delete: (campaignId: string | number, llmPlayerId: number) =>
     apiFetch(`/campaigns/${campaignId}/llm-players/${llmPlayerId}`, { method: 'DELETE' }),
 }
 
@@ -351,14 +351,14 @@ export const automation = {
 // ── Loot & shops ──────────────────────────────────────────────────────────
 
 export const loot = {
-  list: (campaignId: number) =>
+  list: (campaignId: string | number) =>
     apiFetch<{ loot_boxes: import('@/types').LootBox[] }>(`/campaigns/${campaignId}/lootboxes`),
   open: (lootBoxId: number) =>
     apiFetch(`/lootboxes/${lootBoxId}/open`, { method: 'POST' }),
 }
 
 export const shops = {
-  list: (campaignId: number) =>
+  list: (campaignId: string | number) =>
     apiFetch<{ shops: import('@/types').Shop[] }>(`/campaigns/${campaignId}/shops`),
   buy: (shopId: number, characterId: number, itemName: string) =>
     apiFetch(`/shops/${shopId}/buy`, {
