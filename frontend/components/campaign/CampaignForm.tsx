@@ -63,6 +63,9 @@ export default function CampaignForm({ onCreated, onCancel }: CampaignFormProps)
 
   const handleSubmit = async (e: React.FormEvent) => {
     e.preventDefault()
+    const trimmed = name.trim()
+    if (!trimmed) { setError('Campaign name is required'); return }
+    if (trimmed.length > 128) { setError('Campaign name must be 128 characters or fewer'); return }
     setError('')
     setLoading(true)
     try {
@@ -131,6 +134,7 @@ export default function CampaignForm({ onCreated, onCancel }: CampaignFormProps)
           value={name}
           onChange={(e) => setName(e.target.value)}
           required
+          maxLength={128}
           placeholder="The Lost Mines…"
           autoFocus
           disabled={busy}
@@ -190,6 +194,7 @@ export default function CampaignForm({ onCreated, onCancel }: CampaignFormProps)
           placeholder="e.g. fantasy, sci-fi, nautical horror…"
           value={seed}
           onChange={(e) => setSeed(e.target.value)}
+          maxLength={128}
           disabled={busy}
         />
         <p style={{ margin: '5px 0 0', fontSize: '0.78rem', color: 'var(--ink-muted)' }}>

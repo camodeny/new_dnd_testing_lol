@@ -404,11 +404,15 @@ def create_campaign(payload: dict, request: Request, db: Session = Depends(get_d
     name = (payload.get("name") or "").strip()
     if not name:
         raise HTTPException(status_code=400, detail="Campaign name is required")
+    if len(name) > 128:
+        raise HTTPException(status_code=400, detail="Campaign name must be 128 characters or fewer")
     description = payload.get("description")
     random_seed = payload.get("random_seed") or payload.get("seed")
-    # seed may be genre/theme text — store as-is (truncated)
     if random_seed is not None:
-        random_seed = str(random_seed).strip()[:128] or None
+        random_seed = str(random_seed).strip()
+        if random_seed and len(random_seed) > 128:
+            raise HTTPException(status_code=400, detail="Seed must be 128 characters or fewer")
+        random_seed = random_seed or None
     try:
         required_players = int(payload.get("required_players") or payload.get("requiredPlayers") or 1)
     except Exception:
@@ -506,12 +510,20 @@ def update_campaign(campaign_id: str, payload: dict, request: Request, db: Sessi
         raise HTTPException(status_code=404, detail="Campaign not found")
     if camp.owner_id != profile.id:
         raise HTTPException(status_code=403, detail="Only owner can update")
-    if "name" in payload and payload["name"]:
-        camp.name = str(payload["name"]).strip()[:128]
+    if "name" in payload and payload["name"] is not None:
+        new_name = str(payload["name"]).strip()
+        if not new_name:
+            raise HTTPException(status_code=400, detail="Campaign name is required")
+        if len(new_name) > 128:
+            raise HTTPException(status_code=400, detail="Campaign name must be 128 characters or fewer")
+        camp.name = new_name
     if "description" in payload:
         camp.description = payload["description"]
     if "random_seed" in payload or "seed" in payload:
-        camp.random_seed = str(payload.get("random_seed") or payload.get("seed") or "").strip()[:128] or None
+        raw_seed = str(payload.get("random_seed") or payload.get("seed") or "").strip()
+        if raw_seed and len(raw_seed) > 128:
+            raise HTTPException(status_code=400, detail="Seed must be 128 characters or fewer")
+        camp.random_seed = raw_seed or None
     db.commit()
     db.refresh(camp)
     return {"campaign": camp.to_dict()}
