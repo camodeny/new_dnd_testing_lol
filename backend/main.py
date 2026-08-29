@@ -783,8 +783,10 @@ def _character_chat_sync_generator(
 
     full_text = ""
     has_patch = False
+    pending_patch: dict | None = None
+    pending_active: str | None = None
     try:
-        from llm_providers import ProviderRequest as PR, execute_chat
+        from llm_providers import ProviderRequest as PR, stream_chat
 
         pr = PR(
             messages=messages,
@@ -793,15 +795,18 @@ def _character_chat_sync_generator(
             tool_choice="auto",
             allow_thinking=False,
             timeout_seconds=60,
+            stream=True,
         )
-        resp = execute_chat(adapter, pr)
-        full_text = resp.content or ""
-        if full_text:
-            for i in range(0, len(full_text), 24):
-                chunk = full_text[i : i + 24]
-                if chunk:
-                    yield f"data: {json.dumps({'type': 'token', 'text': chunk})}\n\n"
-        for tc in resp.tool_calls or []:
+        pending_tool_calls: list = []
+        for ev in stream_chat(adapter, pr):
+            if ev.kind == "token" and ev.text:
+                full_text += ev.text
+                yield f"data: {json.dumps({'type': 'token', 'text': ev.text})}\n\n"
+            elif ev.kind == "tool_call" and ev.tool_call:
+                pending_tool_calls.append(ev.tool_call)
+            elif ev.kind == "done":
+                break
+        for tc in pending_tool_calls:
             try:
                 args_raw = tc.arguments
                 if isinstance(args_raw, str):
@@ -819,12 +824,18 @@ def _character_chat_sync_generator(
                 active_page = ap if ap in ("identity", "scores", "combat", "magic_gear", "story") else None
                 if patch:
                     has_patch = True
+                    pending_patch = patch
+                    pending_active = active_page
                     yield f"data: {json.dumps({'type': 'patch', 'patch': patch, 'active_page': active_page})}\n\n"
                     break
             except Exception as e:
                 logger.warning("patch tool parse failed: %s", e)
+        if has_patch and not full_text:
+            canonical = "Draft applied to the form \u2192 review the steps and hit Create when ready."
+            full_text = canonical
+            yield f"data: {json.dumps({'type': 'token', 'text': canonical})}\n\n"
         if not full_text and not has_patch:
-            fallback = "I had trouble reaching the AI, but I can still help — tell me more about your character idea."
+            fallback = "I had trouble reaching the AI, but I can still help \u2014 tell me more about your character idea."
             full_text = fallback
             yield f"data: {json.dumps({'type': 'token', 'text': fallback})}\n\n"
     except Exception as e:
