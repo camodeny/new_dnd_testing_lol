@@ -36,7 +36,6 @@ export default function CampaignViewPage() {
   const router = useRouter()
 
   const [campaign, setCampaign] = useState<(Campaign & { active_session?: Session | null; world?: unknown; user_id?: string }) | null>(null)
-  const [members, setMembers] = useState<import('@/types').CampaignMember[]>([])
   const [characters, setCharacters] = useState<Character[]>([])
   const [session, setSession] = useState<Session | null>(null)
   const [messages, setMessages] = useState<Message[]>([])
@@ -52,16 +51,14 @@ export default function CampaignViewPage() {
   const loadData = useCallback(async () => {
     if (!id) return
     try {
-      const [campData, charData, memberData] = await Promise.all([
+      const [campData, charData] = await Promise.all([
         campaignsApi.get(String(id)) as Promise<{ campaign: Campaign & { active_session?: Session | null; user_id?: string } }>,
         campaignMembers.listCharacters(String(id)),
-        campaignMembers.listMembers(String(id)).catch(() => ({ members: [] as import('@/types').CampaignMember[] })),
       ])
 
       const camp = campData.campaign
       setCampaign(camp)
       setCharacters(charData.characters ?? [])
-      setMembers((memberData as { members?: import('@/types').CampaignMember[] }).members ?? [])
 
       const activeSession = camp.active_session ?? null
 
@@ -132,20 +129,6 @@ export default function CampaignViewPage() {
       setMessages([])
       setMode('session')
     } catch (err) {
-      // Backend stub is 501 — fall through to local stub so Begin adventure still navigates
-      const apiErr = err as { status?: number; message?: string }
-      if (apiErr?.status === 501 || /not yet implemented/i.test(apiErr?.message ?? '')) {
-        const stub: Session = {
-          id: Date.now(),
-          campaign_id: Number(String(id).slice(0, 8).replace(/[^0-9]/g, '').slice(0, 8) || 1),
-          status: 'active',
-          created_at: new Date().toISOString(),
-        }
-        setSession(stub)
-        setMessages([])
-        setMode('session')
-        return
-      }
       setError((err as Error).message)
     }
   }, [id])
@@ -180,9 +163,9 @@ export default function CampaignViewPage() {
     }
   }, [session?.id, hasOlderMessages, messages])
 
-  // Solo lobbies skip the holding page — go straight to world-building
+  // Genuine solo campaigns (required_players <= 1) skip the multiplayer holding page
   // Must be before any early returns to preserve hook order
-  const isSolo = !loading && campaign ? (members.length > 0 ? members.length <= 1 : (campaign.required_players ?? 1) <= 1) : false
+  const isSolo = !loading && campaign ? (campaign.required_players ?? 1) <= 1 : false
 
   useEffect(() => {
     if (mode === 'planning' && isSolo && !session) {
