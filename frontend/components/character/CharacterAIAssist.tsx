@@ -241,7 +241,7 @@ export default function CharacterAIAssist({ onGenerated, characterId = 'new', dr
         }
       }
 
-      if (!fullText) {
+      if (!fullText && !gotPatch) {
         setMessages((m) => {
           const copy = [...m]
           if (copy[aiIndex] && copy[aiIndex].role === 'ai') {

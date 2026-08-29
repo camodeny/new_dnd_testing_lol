@@ -262,6 +262,18 @@ def create_character(request: Request, payload: dict, db: Session = Depends(get_
         db.add(sheet)
         db.commit()
         db.refresh(char)
+        # transfer draft chat (NULL namespace) to new character so history follows the created character and next /new is clean
+        try:
+            from sqlalchemy import update as sa_update
+
+            db.execute(
+                sa_update(DbChatMessage)
+                .where(DbChatMessage.owner_id == profile.id, DbChatMessage.character_id.is_(None))
+                .values(character_id=char.id)
+            )
+            db.commit()
+        except Exception as e:
+            logger.warning("failed to transfer draft chat: %s", e)
         # refresh sheet
         sheet = db.execute(select(Dnd5eCharacterSheet).where(Dnd5eCharacterSheet.character_id == char.id)).scalars().first()
     except Exception as e:
@@ -770,6 +782,7 @@ def _character_chat_sync_generator(
         return
 
     full_text = ""
+    has_patch = False
     try:
         from llm_providers import ProviderRequest as PR, execute_chat
 
@@ -805,11 +818,12 @@ def _character_chat_sync_generator(
                 ap = args.get("active_page")
                 active_page = ap if ap in ("identity", "scores", "combat", "magic_gear", "story") else None
                 if patch:
+                    has_patch = True
                     yield f"data: {json.dumps({'type': 'patch', 'patch': patch, 'active_page': active_page})}\n\n"
                     break
             except Exception as e:
                 logger.warning("patch tool parse failed: %s", e)
-        if not full_text:
+        if not full_text and not has_patch:
             fallback = "I had trouble reaching the AI, but I can still help — tell me more about your character idea."
             full_text = fallback
             yield f"data: {json.dumps({'type': 'token', 'text': fallback})}\n\n"
