@@ -45,8 +45,6 @@ export default function CampaignLobby({ campaign, currentUser, isOwner, onBegin 
     setTimeout(() => setCopied(false), 2000)
   }, [invite?.code])
 
-  const initials = campaign.name.split(' ').map((w) => w[0]).join('').slice(0, 2).toUpperCase()
-
   const filledSlots = members.length
   const totalSlots = (campaign as { required_players?: number }).required_players ?? members.length
   const canBegin = isOwner
@@ -57,7 +55,6 @@ export default function CampaignLobby({ campaign, currentUser, isOwner, onBegin 
         <div className="lobby-card">
           {/* Left: hero panel */}
           <div className="lobby-hero">
-            <div className="lobby-hero-avatar" aria-hidden="true">{initials}</div>
             <h1 className="lobby-title">{campaign.name}</h1>
             {campaign.description && (
               <p className="lobby-desc">{campaign.description}</p>
