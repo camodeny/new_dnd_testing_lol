@@ -36,6 +36,7 @@ export default function CampaignViewPage() {
   const router = useRouter()
 
   const [campaign, setCampaign] = useState<(Campaign & { active_session?: Session | null; world?: unknown; user_id?: string }) | null>(null)
+  const [members, setMembers] = useState<import('@/types').CampaignMember[]>([])
   const [characters, setCharacters] = useState<Character[]>([])
   const [session, setSession] = useState<Session | null>(null)
   const [messages, setMessages] = useState<Message[]>([])
@@ -51,14 +52,16 @@ export default function CampaignViewPage() {
   const loadData = useCallback(async () => {
     if (!id) return
     try {
-      const [campData, charData] = await Promise.all([
+      const [campData, charData, memberData] = await Promise.all([
         campaignsApi.get(String(id)) as Promise<{ campaign: Campaign & { active_session?: Session | null; user_id?: string } }>,
         campaignMembers.listCharacters(String(id)),
+        campaignMembers.listMembers(String(id)).catch(() => ({ members: [] as import('@/types').CampaignMember[] })),
       ])
 
       const camp = campData.campaign
       setCampaign(camp)
       setCharacters(charData.characters ?? [])
+      setMembers((memberData as { members?: import('@/types').CampaignMember[] }).members ?? [])
 
       const activeSession = camp.active_session ?? null
 
@@ -129,6 +132,20 @@ export default function CampaignViewPage() {
       setMessages([])
       setMode('session')
     } catch (err) {
+      // Backend stub is 501 — fall through to local stub so Begin adventure still navigates
+      const apiErr = err as { status?: number; message?: string }
+      if (apiErr?.status === 501 || /not yet implemented/i.test(apiErr?.message ?? '')) {
+        const stub: Session = {
+          id: Date.now(),
+          campaign_id: Number(String(id).slice(0, 8).replace(/[^0-9]/g, '').slice(0, 8) || 1),
+          status: 'active',
+          created_at: new Date().toISOString(),
+        }
+        setSession(stub)
+        setMessages([])
+        setMode('session')
+        return
+      }
       setError((err as Error).message)
     }
   }, [id])
@@ -163,6 +180,16 @@ export default function CampaignViewPage() {
     }
   }, [session?.id, hasOlderMessages, messages])
 
+  // Solo lobbies skip the holding page — go straight to world-building
+  // Must be before any early returns to preserve hook order
+  const isSolo = !loading && campaign ? (members.length > 0 ? members.length <= 1 : (campaign.required_players ?? 1) <= 1) : false
+
+  useEffect(() => {
+    if (mode === 'planning' && isSolo && !session) {
+      setMode('world-building')
+    }
+  }, [mode, isSolo, session])
+
   if (loading) return <Loading message="Loading campaign…" />
   if (error && !campaign) return <ErrorMessage message={error} />
   if (!campaign) return <ErrorMessage message="Campaign not found." />
@@ -178,7 +205,7 @@ export default function CampaignViewPage() {
           campaign={campaign}
           currentUser={user}
           isOwner={isOwner}
-          onBegin={() => setMode('planning')}
+          onBegin={() => setMode(isSolo ? 'world-building' : 'planning')}
         />
       </>
     )
@@ -186,31 +213,21 @@ export default function CampaignViewPage() {
 
   if (mode === 'planning' && !session) {
     return (
-      <div className="planning-page">
-        <header className="planning-header">
-          <button
-            type="button"
-            className="dashboard-back"
-            onClick={() => setMode('lobby')}
-            aria-label="Back to lobby"
-          >
-            <i className="bi bi-arrow-left" aria-hidden="true" />
-          </button>
-          <div>
-            <h1>{campaign.name}</h1>
-            <p>PLANNING PHASE</p>
-          </div>
-          <button
-            type="button"
-            className="btn btn-primary"
-            onClick={() => setMode('world-building')}
-            style={{ marginLeft: 'auto' }}
-          >
-            Continue <i className="bi bi-chevron-right" aria-hidden="true" />
-          </button>
-        </header>
-        <div style={{ flex: 1, display: 'grid', placeItems: 'center', padding: 'clamp(24px, 4vw, 48px)' }}>
+      <div className="planning-page" style={{ justifyContent: 'center', position: 'relative' }}>
+        <button
+          type="button"
+          className="dashboard-back"
+          onClick={() => setMode('lobby')}
+          aria-label="Back to lobby"
+          style={{ position: 'absolute', top: 16, left: 16, zIndex: 2 }}
+        >
+          <i className="bi bi-arrow-left" aria-hidden="true" />
+        </button>
+        <div style={{ display: 'grid', placeItems: 'center', padding: 'clamp(24px, 4vw, 48px)', width: '100%' }}>
           <div style={{ textAlign: 'center', maxWidth: 480 }}>
+            <p style={{ margin: '0 0 8px', color: 'var(--ember-hover)', font: '700 0.62rem/1 var(--mono)', letterSpacing: '0.12em', textTransform: 'uppercase' }}>
+              {campaign.name} — Planning
+            </p>
             <div className="planning-wait-icon" style={{ margin: '0 auto 24px', width: 54, height: 54, display: 'grid', placeItems: 'center', borderRadius: '50%', background: 'var(--ember-soft)', color: 'var(--ember-hover)', fontSize: '1.15rem' }}>
               <i className="bi bi-people" aria-hidden="true" />
             </div>
@@ -225,7 +242,7 @@ export default function CampaignViewPage() {
               className="btn btn-primary"
               onClick={() => setMode('world-building')}
             >
-              <i className="bi bi-arrow-right" aria-hidden="true" /> Enter the world
+              Continue <i className="bi bi-chevron-right" aria-hidden="true" />
             </button>
           </div>
         </div>
@@ -234,24 +251,35 @@ export default function CampaignViewPage() {
   }
 
   if (mode === 'world-building' && !session) {
+    const canGoBack = !isSolo
     return (
-      <div className="planning-page">
-        <header className="planning-header">
+      <div className="planning-page" style={{ justifyContent: 'center', position: 'relative' }}>
+        {canGoBack ? (
           <button
             type="button"
             className="dashboard-back"
             onClick={() => setMode('planning')}
             aria-label="Back to planning"
+            style={{ position: 'absolute', top: 16, left: 16, zIndex: 2 }}
           >
             <i className="bi bi-arrow-left" aria-hidden="true" />
           </button>
-          <div>
-            <h1>{campaign.name}</h1>
-            <p>WORLD BUILDING</p>
-          </div>
-        </header>
-        <div style={{ flex: 1, display: 'grid', placeItems: 'center', padding: 'clamp(24px, 4vw, 48px)' }}>
+        ) : (
+          <button
+            type="button"
+            className="dashboard-back"
+            onClick={() => setMode('lobby')}
+            aria-label="Back to lobby"
+            style={{ position: 'absolute', top: 16, left: 16, zIndex: 2 }}
+          >
+            <i className="bi bi-arrow-left" aria-hidden="true" />
+          </button>
+        )}
+        <div style={{ display: 'grid', placeItems: 'center', padding: 'clamp(24px, 4vw, 48px)', width: '100%' }}>
           <div style={{ textAlign: 'center', maxWidth: 480 }}>
+            <p style={{ margin: '0 0 8px', color: 'var(--ember-hover)', font: '700 0.62rem/1 var(--mono)', letterSpacing: '0.12em', textTransform: 'uppercase' }}>
+              {campaign.name} — World building
+            </p>
             <div className="planning-wait-icon" style={{ margin: '0 auto 24px', width: 54, height: 54, display: 'grid', placeItems: 'center', borderRadius: '50%', background: 'var(--ember-soft)', color: 'var(--ember-hover)', fontSize: '1.15rem' }}>
               <i className="bi bi-globe2" aria-hidden="true" />
             </div>
