@@ -14,7 +14,7 @@ from sqlalchemy import text
 
 from auth import get_current_profile
 from database import Base, db_healthcheck, engine, get_database_url, get_db
-from models import Character, Dnd5eCharacterSheet, Profile
+from models import Campaign, CampaignInvite, CampaignMember, Character, Dnd5eCharacterSheet, Profile
 
 load_dotenv()
 
@@ -339,6 +339,314 @@ def delete_character(character_id: str, request: Request, db: Session = Depends(
     db.delete(char)
     db.commit()
     return {"ok": True}
+
+
+# ── Campaigns ─────────────────────────────────────────────────────────────
+
+import random
+import secrets
+import string as _string
+
+
+def _generate_invite_code(length: int = 8) -> str:
+    alphabet = _string.ascii_uppercase + _string.digits
+    # avoid ambiguous 0/O 1/I
+    alphabet = alphabet.replace("0", "").replace("O", "").replace("1", "").replace("I", "")
+    return "".join(secrets.choice(alphabet) for _ in range(length))
+
+
+def _is_campaign_member(db: Session, campaign_id: uuid_lib.UUID, user_id: uuid_lib.UUID) -> bool:
+    return db.get(CampaignMember, {"campaign_id": campaign_id, "user_id": user_id}) is not None
+
+
+def _parse_campaign_id(campaign_id: str) -> uuid_lib.UUID:
+    try:
+        return uuid_lib.UUID(str(campaign_id))
+    except ValueError:
+        raise HTTPException(status_code=404, detail="Invalid campaign id")
+
+
+RANDOM_CAMPAIGN_NAMES = [
+    "The Whispering Hollow", "Embers of the Forgotten Keep", "Tides of Shadowfen",
+    "The Clockwork Sanctum", "Wolves of Winter's Edge", "The Sunken Archive",
+    "Ashen Crown", "The Starless Citadel", "Echoes of the Barrowlands",
+]
+RANDOM_CAMPAIGN_DESCS = [
+    "Ancient ruins stir as a forgotten power awakens beneath the earth.",
+    "A coastal town hires brave souls to investigate lights beyond the fog.",
+    "Rival factions race to claim a relic that could reshape the realm.",
+    "Whispers from another plane bleed into the forests—something is watching.",
+]
+
+
+def _random_brief(seed: str | None = None) -> dict:
+    return {
+        "name": random.choice(RANDOM_CAMPAIGN_NAMES),
+        "description": random.choice(RANDOM_CAMPAIGN_DESCS),
+        "random_seed": seed or _generate_invite_code(6),
+    }
+
+
+@app.get("/api/campaigns")
+def list_campaigns(request: Request, db: Session = Depends(get_db)):
+    profile = _resolve_profile(request, db)
+    # campaigns where user is owner or member
+    member_rows = db.execute(select(CampaignMember.campaign_id).where(CampaignMember.user_id == profile.id)).scalars().all()
+    member_ids = set(member_rows)
+    rows = db.execute(select(Campaign).order_by(Campaign.updated_at.desc())).scalars().all()
+    visible = [c for c in rows if c.owner_id == profile.id or c.id in member_ids]
+    return {"campaigns": [c.to_dict() for c in visible]}
+
+
+@app.post("/api/campaigns")
+def create_campaign(payload: dict, request: Request, db: Session = Depends(get_db)):
+    profile = _resolve_profile(request, db)
+    name = (payload.get("name") or "").strip()
+    if not name:
+        raise HTTPException(status_code=400, detail="Campaign name is required")
+    if len(name) > 128:
+        raise HTTPException(status_code=400, detail="Campaign name must be 128 characters or fewer")
+    description = payload.get("description")
+    random_seed = payload.get("random_seed") or payload.get("seed")
+    if random_seed is not None:
+        random_seed = str(random_seed).strip()
+        if random_seed and len(random_seed) > 128:
+            raise HTTPException(status_code=400, detail="Seed must be 128 characters or fewer")
+        random_seed = random_seed or None
+    try:
+        required_players = int(payload.get("required_players") or payload.get("requiredPlayers") or 1)
+    except Exception:
+        required_players = 1
+    required_players = max(1, min(8, required_players))
+    loot_mode = str(payload.get("loot_mode") or payload.get("lootMode") or "frequent_gamble")
+    if loot_mode not in ("frequent_gamble", "rare_treasure", "generous", "scarce", "rare_quality", "frequent", "rare"):
+        loot_mode = "frequent_gamble"
+    camp = Campaign(
+        owner_id=profile.id,
+        name=name,
+        description=description,
+        random_seed=random_seed,
+        required_players=required_players,
+        loot_mode=loot_mode,
+    )
+    db.add(camp)
+    db.flush()
+    # owner is first member
+    member = CampaignMember(campaign_id=camp.id, user_id=profile.id, role="owner")
+    db.add(member)
+    db.commit()
+    db.refresh(camp)
+    return {"campaign": camp.to_dict()}
+
+
+@app.post("/api/campaigns/random-brief")
+def random_campaign_brief(payload: dict, request: Request, db: Session = Depends(get_db)):
+    _resolve_profile(request, db)
+    seed = payload.get("random_seed") or payload.get("seed") or None
+    brief = _random_brief(seed if isinstance(seed, str) else None)
+    # also include aliases used by legacy CampaignForm
+    brief["seed"] = brief["random_seed"]
+    return brief
+
+
+@app.post("/api/campaigns/quick-create")
+def quick_create_campaign(payload: dict, request: Request, db: Session = Depends(get_db)):
+    profile = _resolve_profile(request, db)
+    brief = _random_brief()
+    try:
+        required_players = int(payload.get("required_players") or 1)
+    except Exception:
+        required_players = 1
+    required_players = max(1, min(8, required_players))
+    loot_mode = str(payload.get("loot_mode") or "frequent_gamble")
+    camp = Campaign(
+        owner_id=profile.id,
+        name=brief["name"],
+        description=brief["description"],
+        random_seed=brief["random_seed"],
+        required_players=required_players,
+        loot_mode=loot_mode,
+    )
+    db.add(camp)
+    db.flush()
+    db.add(CampaignMember(campaign_id=camp.id, user_id=profile.id, role="owner"))
+    db.commit()
+    db.refresh(camp)
+    return {"campaign": camp.to_dict(), "brief": brief}
+
+
+@app.get("/api/campaigns/{campaign_id}")
+def get_campaign(campaign_id: str, request: Request, db: Session = Depends(get_db)):
+    profile = _resolve_profile(request, db)
+    cid = _parse_campaign_id(campaign_id)
+    camp = db.get(Campaign, cid)
+    if not camp:
+        raise HTTPException(status_code=404, detail="Campaign not found")
+    if camp.owner_id != profile.id and not _is_campaign_member(db, camp.id, profile.id):
+        raise HTTPException(status_code=403, detail="Not a member of this campaign")
+    return {"campaign": camp.to_dict()}
+
+
+@app.delete("/api/campaigns/{campaign_id}")
+def delete_campaign(campaign_id: str, request: Request, db: Session = Depends(get_db)):
+    profile = _resolve_profile(request, db)
+    cid = _parse_campaign_id(campaign_id)
+    camp = db.get(Campaign, cid)
+    if not camp:
+        raise HTTPException(status_code=404, detail="Campaign not found")
+    if camp.owner_id != profile.id:
+        raise HTTPException(status_code=403, detail="Only the owner can delete this campaign")
+    db.delete(camp)
+    db.commit()
+    return {"ok": True}
+
+
+@app.put("/api/campaigns/{campaign_id}")
+def update_campaign(campaign_id: str, payload: dict, request: Request, db: Session = Depends(get_db)):
+    profile = _resolve_profile(request, db)
+    cid = _parse_campaign_id(campaign_id)
+    camp = db.get(Campaign, cid)
+    if not camp:
+        raise HTTPException(status_code=404, detail="Campaign not found")
+    if camp.owner_id != profile.id:
+        raise HTTPException(status_code=403, detail="Only owner can update")
+    if "name" in payload and payload["name"] is not None:
+        new_name = str(payload["name"]).strip()
+        if not new_name:
+            raise HTTPException(status_code=400, detail="Campaign name is required")
+        if len(new_name) > 128:
+            raise HTTPException(status_code=400, detail="Campaign name must be 128 characters or fewer")
+        camp.name = new_name
+    if "description" in payload:
+        camp.description = payload["description"]
+    if "random_seed" in payload or "seed" in payload:
+        raw_seed = str(payload.get("random_seed") or payload.get("seed") or "").strip()
+        if raw_seed and len(raw_seed) > 128:
+            raise HTTPException(status_code=400, detail="Seed must be 128 characters or fewer")
+        camp.random_seed = raw_seed or None
+    db.commit()
+    db.refresh(camp)
+    return {"campaign": camp.to_dict()}
+
+
+# members / invites
+
+@app.get("/api/campaigns/{campaign_id}/members")
+def list_campaign_members(campaign_id: str, request: Request, db: Session = Depends(get_db)):
+    profile = _resolve_profile(request, db)
+    cid = _parse_campaign_id(campaign_id)
+    camp = db.get(Campaign, cid)
+    if not camp:
+        raise HTTPException(status_code=404, detail="Campaign not found")
+    if camp.owner_id != profile.id and not _is_campaign_member(db, cid, profile.id):
+        raise HTTPException(status_code=403, detail="Not a member")
+    members = db.execute(select(CampaignMember).where(CampaignMember.campaign_id == cid)).scalars().all()
+    out = []
+    for m in members:
+        prof = db.get(Profile, m.user_id)
+        out.append({
+            "user_id": str(m.user_id),
+            "username": prof.username if prof else "adventurer",
+            "email": prof.email if prof else None,
+            "role": m.role,
+        })
+    return {"members": out}
+
+
+@app.get("/api/campaigns/{campaign_id}/characters")
+def list_campaign_characters(campaign_id: str, request: Request, db: Session = Depends(get_db)):
+    _resolve_profile(request, db)
+    # stub: no campaign-characters yet
+    return {"characters": []}
+
+
+@app.get("/api/campaigns/{campaign_id}/invites")
+def get_campaign_invite(campaign_id: str, request: Request, db: Session = Depends(get_db)):
+    profile = _resolve_profile(request, db)
+    cid = _parse_campaign_id(campaign_id)
+    camp = db.get(Campaign, cid)
+    if not camp:
+        raise HTTPException(status_code=404, detail="Campaign not found")
+    if camp.owner_id != profile.id:
+        raise HTTPException(status_code=403, detail="Only owner can view invite")
+    inv = db.get(CampaignInvite, cid)
+    if not inv:
+        return {"code": None}
+    return {"code": inv.code}
+
+
+@app.post("/api/campaigns/{campaign_id}/invites")
+def create_campaign_invite(campaign_id: str, request: Request, db: Session = Depends(get_db)):
+    profile = _resolve_profile(request, db)
+    cid = _parse_campaign_id(campaign_id)
+    camp = db.get(Campaign, cid)
+    if not camp:
+        raise HTTPException(status_code=404, detail="Campaign not found")
+    if camp.owner_id != profile.id:
+        raise HTTPException(status_code=403, detail="Only owner can create invite")
+    existing = db.get(CampaignInvite, cid)
+    if existing:
+        return {"code": existing.code}
+    # ensure unique code
+    for _ in range(5):
+        code = _generate_invite_code()
+        if not db.execute(select(CampaignInvite).where(CampaignInvite.code == code)).scalars().first():
+            inv = CampaignInvite(campaign_id=cid, code=code)
+            db.add(inv)
+            db.commit()
+            return {"code": code}
+    raise HTTPException(status_code=500, detail="Failed to generate invite")
+
+
+@app.get("/api/invites/lookup")
+def lookup_invite(code: str, request: Request, db: Session = Depends(get_db)):
+    _resolve_profile(request, db)
+    clean = code.strip().upper()
+    if not clean:
+        raise HTTPException(status_code=400, detail="Code required")
+    inv = db.execute(select(CampaignInvite).where(CampaignInvite.code == clean)).scalars().first()
+    if not inv:
+        raise HTTPException(status_code=404, detail="Invite not found")
+    camp = db.get(Campaign, inv.campaign_id)
+    if not camp:
+        raise HTTPException(status_code=404, detail="Campaign not found")
+    return {"campaign_id": str(camp.id), "campaign": camp.to_dict()}
+
+
+@app.post("/api/campaigns/{campaign_id}/join")
+def join_campaign(campaign_id: str, payload: dict, request: Request, db: Session = Depends(get_db)):
+    profile = _resolve_profile(request, db)
+    cid = _parse_campaign_id(campaign_id)
+    camp = db.get(Campaign, cid)
+    if not camp:
+        raise HTTPException(status_code=404, detail="Campaign not found")
+    code = str(payload.get("code") or "").strip().upper()
+    if not code:
+        raise HTTPException(status_code=400, detail="Invite code required")
+    inv = db.get(CampaignInvite, cid)
+    if not inv or inv.code != code:
+        # also allow lookup by code matching any campaign
+        inv2 = db.execute(select(CampaignInvite).where(CampaignInvite.code == code)).scalars().first()
+        if not inv2 or inv2.campaign_id != cid:
+            raise HTTPException(status_code=403, detail="Invalid invite code")
+    if not _is_campaign_member(db, cid, profile.id):
+        db.add(CampaignMember(campaign_id=cid, user_id=profile.id, role="player"))
+        db.commit()
+    return {"ok": True, "campaign": camp.to_dict()}
+
+
+# ── sessions stubs (so lobby doesn't 500) ─────────────────────────────────
+@app.post("/api/campaigns/{campaign_id}/sessions")
+def stub_start_session(campaign_id: str, request: Request, db: Session = Depends(get_db)):
+    raise HTTPException(status_code=501, detail="Sessions not yet implemented")
+
+@app.get("/api/campaigns/{campaign_id}/world")
+def stub_get_world(campaign_id: str, request: Request, db: Session = Depends(get_db)):
+    return {"world": None}
+
+@app.get("/api/campaigns/{campaign_id}/encounter-maps/current")
+def stub_encounter_map(campaign_id: str, request: Request, db: Session = Depends(get_db)):
+    return {"map": None}
 
 
 # ── Character chat (SSE via opencode_go) ─────────────────────────────────

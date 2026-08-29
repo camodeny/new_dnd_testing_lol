@@ -55,6 +55,7 @@ export default function HomePage() {
   const handleCampaignCreated = (campaign: Campaign) => {
     setCampaignList((prev) => [campaign, ...prev])
     setActiveModal(null)
+    router.push(`/campaigns/${campaign.id}`)
   }
 
   const openDelete = (campaign: Campaign) => {
@@ -87,7 +88,7 @@ export default function HomePage() {
     try {
       const data = await campaignMembers.lookupInvite(clean)
       setActiveModal(null)
-      router.push(`/join/${(data as { campaign_id?: number }).campaign_id ?? ''}?code=${encodeURIComponent(clean.toUpperCase())}`)
+      router.push(`/join/${(data as { campaign_id?: string }).campaign_id ?? ''}?code=${encodeURIComponent(clean.toUpperCase())}`)
     } catch (err) {
       setJoinError((err as Error).message || 'Failed to locate campaign. Check your code and try again.')
     } finally {
@@ -193,7 +194,7 @@ export default function HomePage() {
                 key={campaign.id}
                 campaign={campaign}
                 onDelete={
-                  user?.id === campaign.owner_id
+                  String(user?.id) === String(campaign.owner_id ?? campaign.user_id)
                     ? (e: React.MouseEvent) => { e.preventDefault(); openDelete(campaign) }
                     : null
                 }

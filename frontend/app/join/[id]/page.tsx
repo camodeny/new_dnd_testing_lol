@@ -39,7 +39,7 @@ export default function CampaignJoinPage() {
     setJoining(true)
     setError('')
     try {
-      await campaignMembers.joinCampaign(Number(id), code)
+      await campaignMembers.joinCampaign(String(id), code)
       setJoined(true)
       setTimeout(() => router.push(`/campaigns/${id}`), 1500)
     } catch (err) {

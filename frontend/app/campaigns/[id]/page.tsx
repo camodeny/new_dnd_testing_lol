@@ -35,7 +35,7 @@ export default function CampaignViewPage() {
   const { user } = useAuthContext()
   const router = useRouter()
 
-  const [campaign, setCampaign] = useState<(Campaign & { active_session?: Session | null; world?: unknown; user_id?: number }) | null>(null)
+  const [campaign, setCampaign] = useState<(Campaign & { active_session?: Session | null; world?: unknown; user_id?: string }) | null>(null)
   const [characters, setCharacters] = useState<Character[]>([])
   const [session, setSession] = useState<Session | null>(null)
   const [messages, setMessages] = useState<Message[]>([])
@@ -52,8 +52,8 @@ export default function CampaignViewPage() {
     if (!id) return
     try {
       const [campData, charData] = await Promise.all([
-        campaignsApi.get(Number(id)) as Promise<{ campaign: Campaign & { active_session?: Session | null; user_id?: number } }>,
-        campaignMembers.listCharacters(Number(id)),
+        campaignsApi.get(String(id)) as Promise<{ campaign: Campaign & { active_session?: Session | null; user_id?: string } }>,
+        campaignMembers.listCharacters(String(id)),
       ])
 
       const camp = campData.campaign
@@ -67,7 +67,7 @@ export default function CampaignViewPage() {
         const [sessionData, propData, mapData] = await Promise.all([
           sessionsApi.get(activeSession.id, { limit: SESSION_MESSAGE_PAGE_SIZE }).catch(() => ({ session: null, messages: [] })),
           proposalsApi.list(activeSession.id).catch(() => ({ proposals: [] })),
-          encounterMaps.getCurrent(Number(id)).catch(() => ({ map: null })),
+          encounterMaps.getCurrent(String(id)).catch(() => ({ map: null })),
         ])
         setMessages((sessionData as { messages?: Message[] }).messages ?? [])
         setHasOlderMessages(Boolean((sessionData as { has_more_messages?: boolean }).has_more_messages))
@@ -124,7 +124,7 @@ export default function CampaignViewPage() {
   const handleStartSession = useCallback(async () => {
     if (!id) return
     try {
-      const data = await sessionsApi.start(Number(id)) as { session: Session }
+      const data = await sessionsApi.start(String(id)) as { session: Session }
       setSession(data.session)
       setMessages([])
       setMode('session')
@@ -167,7 +167,7 @@ export default function CampaignViewPage() {
   if (error && !campaign) return <ErrorMessage message={error} />
   if (!campaign) return <ErrorMessage message="Campaign not found." />
 
-  const isOwner = campaign.user_id === user?.id
+  const isOwner = (campaign.owner_id ?? campaign.user_id) === user?.id
   const currentCharacter = characters.find((c) => String(c.id) === String((user as { character_id?: number | string } | null)?.character_id)) ?? characters[0] ?? null
 
   if (mode === 'lobby') {
