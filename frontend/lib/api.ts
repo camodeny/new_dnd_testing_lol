@@ -88,9 +88,11 @@ export const campaigns = {
     id: string | number,
     expectedRevision: number,
     changes: Record<string, unknown>,
+    idempotencyKey: string,
   ) => apiFetch<{ campaign: import('@/types').Campaign; event: unknown }>(`/campaigns/${id}`, {
     method: 'PUT',
     body: JSON.stringify({ ...changes, expected_revision: expectedRevision }),
+    headers: { 'Idempotency-Key': idempotencyKey },
   }),
   delete: (id: string | number) => apiFetch(`/campaigns/${id}`, { method: 'DELETE' }),
   export: (id: string | number) => apiBlob(`/campaigns/${id}/export`),
@@ -112,10 +114,11 @@ export const campaigns = {
 export const characters = {
   list: () => apiFetch<{ characters: import('@/types').Character[] }>('/characters'),
   get: (id: number | string) => apiFetch<{ character: import('@/types').Character }>(`/characters/${id}`),
-  create: (payload: Record<string, unknown>) =>
+  create: (payload: Record<string, unknown>, idempotencyKey: string) =>
     apiFetch<{ character: import('@/types').Character }>('/characters', {
       method: 'POST',
       body: JSON.stringify(payload),
+      headers: { 'Idempotency-Key': idempotencyKey },
     }),
   update: (id: number | string, payload: Record<string, unknown>) =>
     apiFetch<{ character: import('@/types').Character }>(`/characters/${id}`, {

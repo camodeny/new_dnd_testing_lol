@@ -151,6 +151,7 @@ export default function CharacterFormPage({ initial, aiPatch, onAiPatchApplied, 
   const [error, setError] = useState('')
   const [saving, setSaving] = useState(false)
   const formRef = useRef<HTMLFormElement>(null)
+  const createCommandKeyRef = useRef<string | null>(null)
   const isEdit = Boolean(initial?.id)
   const activePage = CHARACTER_FORM_PAGES[activePageIndex]
 
@@ -257,7 +258,11 @@ export default function CharacterFormPage({ initial, aiPatch, onAiPatchApplied, 
       const payload = toCharacterPayload(draft)
       const response = isEdit && initial?.id
         ? await charactersApi.update(initial.id, payload)
-        : await charactersApi.create(payload)
+        : await charactersApi.create(
+            payload,
+            createCommandKeyRef.current ??= crypto.randomUUID(),
+          )
+      createCommandKeyRef.current = null
       onSaved(response.character)
     } catch (caught) {
       setError(caught instanceof Error ? caught.message : 'Something went wrong')
