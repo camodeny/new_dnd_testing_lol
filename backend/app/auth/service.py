@@ -88,14 +88,6 @@ def _resolve_with_token(db: Session, token: str) -> Profile:
     email = payload.get("email")
     md = payload.get("user_metadata") or {}
     username = md.get("username") or md.get("full_name") or md.get("name")
-    # Ensure auth.users row exists for FK (CI vanilla Postgres)
-    try:
-        from sqlalchemy import text as _text
-
-        db.execute(_text("INSERT INTO auth.users (id) VALUES (:id) ON CONFLICT (id) DO NOTHING"), {"id": uid})
-        db.flush()
-    except Exception:
-        pass
     prof = Profile(id=uid, email=email, username=username)
     db.add(prof)
     db.commit()
