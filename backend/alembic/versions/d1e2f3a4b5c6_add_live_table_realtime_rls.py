@@ -116,24 +116,40 @@ def upgrade() -> None:
               END
               $func$;
 
-              -- Ensure RLS is enabled on realtime.messages (required for policies to apply).
-              -- Supabase enables this by default, but enforce idempotently.
               PERFORM 1 FROM pg_tables WHERE schemaname='realtime' AND tablename='messages';
               IF FOUND THEN
-                EXECUTE 'ALTER TABLE realtime.messages ENABLE ROW LEVEL SECURITY';
+                -- Current Supabase docs (post Realtime v2.112.7, 2026-07-14) say RLS is already
+                -- enabled on realtime.messages and you should NOT run
+                -- ALTER TABLE realtime.messages ENABLE ROW LEVEL SECURITY.
+                -- See: https://supabase.com/docs/guides/realtime/authorization
+                --      https://supabase.com/changelog/realtime-schema-locked-down-against-modification
+                -- Only manage policies. Also ensure dashboard Realtime setting
+                -- "Allow public access" is disabled so private-only joins are enforced
+                -- (https://supabase.com/docs/guides/realtime/authorization).
 
                 -- Drop existing live-table policy if re-running migration
                 DROP POLICY IF EXISTS "live_table_private_select" ON realtime.messages;
                 DROP POLICY IF EXISTS "live_table_private_insert" ON realtime.messages;
 
-                -- SELECT: clients may only receive messages for topics they can subscribe to.
+                -- SELECT: scoped positively to live-table broadcast topics only.
+                -- Permissive RLS policies OR together, so a policy with
+                -- "NOT LIKE 'live-table:%' OR can_subscribe(...)" would grant every
+                -- authenticated user SELECT for all non-live-table topics, silently
+                -- widening unrelated Realtime features. This policy instead grants
+                -- ONLY live-table broadcast topics where can_subscribe is true, and
+                -- is scoped to extension='broadcast' so postgres_changes/presence
+                -- topics are governed by their own policies.
+                -- Correct columns per https://supabase.com/docs/guides/realtime/authorization:
+                --   realtime.topic() helper + realtime.messages.extension
                 CREATE POLICY "live_table_private_select"
                 ON realtime.messages FOR SELECT TO authenticated
                 USING (
-                  -- Non-live-table topics are not governed by this policy (allow other features)
-                  realtime.topic() NOT LIKE 'live-table:%'
-                  AND realtime.topic() NOT LIKE 'realtime:live-table:%'
-                  OR public.can_subscribe_live_table(realtime.topic())
+                  (
+                    (select realtime.topic()) LIKE 'live-table:campaign:%:thread:%'
+                    OR (select realtime.topic()) LIKE 'realtime:live-table:campaign:%:thread:%'
+                  )
+                  AND public.can_subscribe_live_table((select realtime.topic()))
+                  AND realtime.messages.extension in ('broadcast')
                 );
 
                 -- INSERT: only service_role should publish; authenticated users may not

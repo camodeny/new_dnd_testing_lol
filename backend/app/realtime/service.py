@@ -419,15 +419,18 @@ def reconcile_buffered_events(
 ) -> list[dict[str, Any]]:
     """Filter buffered realtime events to those newer than the snapshot.
 
-    Snapshot's high water is ``reconciliation.history_high_water_mark`` or
-    ``reconciliation.snapshot_sequence`` or ``revision``. For DM chunks we use
-    dm_state.last_sequence. Generic: keep events with sequence > high_water.
-
-    This implements the snapshot→subscribe race fix: subscribe first, buffer,
-    then fetch snapshot, then drop buffered events already in snapshot.
+    Stream-scoped reconciliation (issue #198 review):
+    - Submissions: sequence > history_high_water_mark (or revision).
+    - DM chunks: per-stream last_sequence — only the active stream's high water
+      matters; stale chunks for an old stream or completed streams are dropped.
+    - DM status/thinking: per-stream — keep only if stream_id matches the
+      active stream or is a new stream not yet in snapshot; never keep a
+      stale status for stream A when snapshot now has stream B active, even if
+      the event is non-sequenced, to avoid regressing B's projection.
+    - Unknown DM stream_ids (new streams created after snapshot) are kept —
+      they are strictly newer than snapshot.
     """
     _inc("reconciliation_events")
-    # Resolve high water — max of history high water and revision for safety
     recon = snapshot.get("reconciliation", {}) if isinstance(snapshot, dict) else {}
     high_water = recon.get("history_high_water_mark")
     if high_water is None:
@@ -441,21 +444,69 @@ def reconcile_buffered_events(
     except Exception:
         hw = 0
 
-    # Also consider dm high water for dm chunk types
     dm_state = snapshot.get("dm_state", {}) if isinstance(snapshot, dict) else {}
     dm_hw = dm_state.get("last_sequence")
     try:
         dm_hw_int = int(dm_hw) if dm_hw is not None else -1
     except Exception:
         dm_hw_int = -1
+    active_stream_id = None
+    try:
+        active_stream_id = str(dm_state.get("stream_id")) if dm_state.get("stream_id") else None
+        # Some snapshots expose active stream via dm_state.stream_id or id — handle both
+        if not active_stream_id and dm_state.get("id"):
+            active_stream_id = str(dm_state.get("id"))
+    except Exception:
+        active_stream_id = None
+    # Completed stream ids for drop logic
+    dm_messages = snapshot.get("dm_messages", []) if isinstance(snapshot, dict) else []
+    completed_ids: set[str] = set()
+    completed_last: dict[str, int] = {}
+    if isinstance(dm_messages, list):
+        for m in dm_messages:
+            if isinstance(m, dict) and m.get("id"):
+                sid = str(m["id"])
+                completed_ids.add(sid)
+                # Store last_sequence if present, else infer from chunk_count-1
+                ls = m.get("last_sequence")
+                if ls is not None:
+                    try:
+                        completed_last[sid] = int(ls)
+                    except Exception:
+                        pass
+                elif m.get("chunk_count") is not None:
+                    try:
+                        completed_last[sid] = int(m["chunk_count"]) - 1
+                    except Exception:
+                        pass
+                # Also handle stream_id alias
+                if m.get("stream_id"):
+                    completed_ids.add(str(m["stream_id"]))
 
     filtered: list[dict[str, Any]] = []
     for ev in buffered:
         t = ev.get("type")
         seq = ev.get("sequence")
+        stream_id = str(ev.get("stream_id")) if ev.get("stream_id") else None
+
+        # Non-sequenced DM status/thinking: still stream-scoped
+        if t in ("dm.status", "dm.thinking") and seq is None:
+            if stream_id is None:
+                filtered.append(ev)
+                continue
+            # Keep only if stream matches active or is new (not in completed)
+            if active_stream_id and stream_id == active_stream_id:
+                filtered.append(ev)
+            elif stream_id not in completed_ids and stream_id != active_stream_id:
+                # New stream not yet in snapshot — keep (strictly newer)
+                filtered.append(ev)
+            else:
+                # Stale status for old completed stream or old active -> drop to avoid regressing B
+                continue
+            continue
+
         if seq is None:
-            # Keep non-sequenced events (e.g. thinking, status) — they are
-            # idempotent by event_id and safe to deliver after snapshot.
+            # Generic non-sequenced (e.g. revision) — keep if not DM status handled above
             filtered.append(ev)
             continue
         try:
@@ -463,10 +514,37 @@ def reconcile_buffered_events(
         except Exception:
             filtered.append(ev)
             continue
+
         if t == "dm.chunk":
-            if seq_int > dm_hw_int:
+            # Stream-scoped chunk reconciliation
+            if stream_id is None:
+                # No stream id — fallback to old global check
+                if seq_int > dm_hw_int:
+                    filtered.append(ev)
+                continue
+            if active_stream_id and stream_id == active_stream_id:
+                if seq_int > dm_hw_int:
+                    filtered.append(ev)
+            elif stream_id in completed_ids:
+                # Completed stream: check per-stream high water if known, else drop
+                cl = completed_last.get(stream_id, -1)
+                # For completed, any buffered chunk with seq > completed_last would be newer than snapshot?
+                # But completed streams should not receive new chunks after completion, so drop duplicates.
+                # Keep only if strictly newer than completed's last (would indicate missed chunk before snapshot's finalization)
+                # However snapshot's dm_messages already includes final_text, so buffered chunk for completed is stale.
+                # We drop unless seq > completed_last and completed_last is known and chunk not in snapshot.
+                # Since snapshot's final_text already authoritative, safest is drop.
+                # But to support missed chunk that snapshot missed (snapshot taken before chunk commit), we would need
+                # to keep if seq > completed_last. That case is when snapshot's completed_last is stale.
+                # For safety, keep if seq > cl and cl != -1, else drop.
+                if cl != -1 and seq_int > cl:
+                    filtered.append(ev)
+                # else drop (stale)
+            else:
+                # Unknown stream (new stream B created after snapshot) — keep
                 filtered.append(ev)
         else:
+            # Submissions etc.
             if seq_int > hw:
                 filtered.append(ev)
     return filtered

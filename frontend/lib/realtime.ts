@@ -126,12 +126,13 @@ export interface SnapshotForRealtime {
 
 /**
  * Filter buffered realtime events to those strictly newer than the snapshot.
- * Implements the snapshot→subscribe race fix: subscribe first (buffering),
- * then fetch snapshot, then drop buffered events already contained in snapshot.
+ * Stream-scoped reconciliation — never let a stale status/chunk for stream A
+ * mutate stream B after a rollover during the subscribe→snapshot race.
  *
- * For submission events: keep only sequence > history_high_water_mark
- * For dm.chunk: keep only sequence > dm_state.last_sequence
- * For non-sequenced events (thinking/status): keep all (idempotent by event_id)
+ * - Submissions: sequence > history_high_water_mark
+ * - DM chunks: per-stream last_sequence (active stream only; stale stream ids dropped)
+ * - DM status/thinking: per-stream — keep only if stream matches active or is new (not in completed)
+ * - Unknown DM stream_ids (new streams created after snapshot) are kept
  */
 export function reconcileBufferedEvents(
   snapshot: SnapshotForRealtime,
@@ -141,18 +142,51 @@ export function reconcileBufferedEvents(
   let highWater = recon.history_high_water_mark
   if (highWater == null) highWater = recon.snapshot_sequence
   if (highWater == null) highWater = recon.snapshot_revision
-  if (highWater == null) highWater = snapshot.revision ?? 0
+  if (highWater == null) highWater = snapshot.reconciliation?.snapshot_revision ?? snapshot.revision ?? 0
   const hw = typeof highWater === 'number' ? highWater : Number(highWater) || 0
 
-  const dmHwRaw = snapshot.dm_state?.last_sequence
+  const dmState = snapshot.dm_state
+  const dmHwRaw = dmState?.last_sequence
   const dmHw = typeof dmHwRaw === 'number' ? dmHwRaw : dmHwRaw != null ? Number(dmHwRaw) : -1
+  const activeStreamId = dmState?.stream_id ? String(dmState.stream_id) : dmState?.id ? String(dmState.id) : null
+  const completedIds = new Set<string>((snapshot.dm_messages ?? []).map((m) => String(m.id)))
+  // Also include stream_id alias if present
+  for (const m of snapshot.dm_messages ?? []) {
+    const sid = (m as unknown as { stream_id?: string }).stream_id
+    if (sid) completedIds.add(String(sid))
+  }
 
   return buffered.filter((ev) => {
+    const t = ev.type
     const seq = ev.sequence
-    if (seq == null) return true // non-sequenced: keep (dedupe handles idempotency)
+    const streamId = ev.stream_id ? String(ev.stream_id) : null
+
+    // DM status/thinking without sequence are still stream-scoped
+    if ((t === 'dm.status' || t === 'dm.thinking') && seq == null) {
+      if (!streamId) return true
+      if (activeStreamId && streamId === activeStreamId) return true
+      if (!completedIds.has(streamId) && streamId !== activeStreamId) return true // new stream
+      return false // stale status for old completed/active stream
+    }
+
+    if (seq == null) return true // generic non-sequenced (revision etc.)
+
     const n = typeof seq === 'number' ? seq : Number(seq)
     if (Number.isNaN(n)) return true
-    if (ev.type === 'dm.chunk') return n > dmHw
+
+    if (t === 'dm.chunk') {
+      if (!streamId) return n > dmHw
+      if (activeStreamId && streamId === activeStreamId) return n > dmHw
+      if (completedIds.has(streamId)) {
+        // Completed stream: any chunk after snapshot is stale (snapshot already has final_text)
+        // Only keep if somehow newer than completed (should not happen), but we drop to avoid regressing B.
+        // Check if we have last_sequence for completed - without it, drop.
+        return false
+      }
+      // Unknown stream (new stream B created after snapshot) — keep
+      return true
+    }
+
     return n > hw
   })
 }

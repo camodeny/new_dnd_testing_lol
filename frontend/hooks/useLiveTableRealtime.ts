@@ -186,18 +186,35 @@ export function useLiveTableRealtime(opts: UseLiveTableRealtimeOptions) {
             nextDmState = { ...nextDmState, visible_text: cur + ev.text, last_sequence: ev.sequence ?? nextDmState.last_sequence, chunk_count: (nextDmState.chunk_count ?? 0) + 1 }
           }
         } else if (ev.type === 'dm.status' || ev.type === 'dm.thinking') {
-          nextStatus = ev
-          if (ev.type === 'dm.status' && ev.status) {
-            // DM status may carry final visible_text / completion — update dmState to converge
-            if (nextDmState) {
-              nextDmState = {
-                ...nextDmState,
-                status: String(ev.status),
-                streaming: ev.status === 'streaming',
-                last_sequence: (ev as { last_sequence?: number }).last_sequence ?? nextDmState.last_sequence,
-                chunk_count: (ev as { chunk_count?: number }).chunk_count ?? nextDmState.chunk_count,
-                visible_text: (ev as { visible_text?: string }).visible_text ?? nextDmState.visible_text,
+          const evSid = ev.stream_id ? String(ev.stream_id) : null
+          const activeSid = nextDmState?.stream_id ? String(nextDmState.stream_id) : null
+          // Never let a status for stream A mutate stream B's projection
+          if (evSid && activeSid && evSid !== activeSid) {
+            // Stale status for old stream — keep as nextStatus for observability but do not mutate dmState
+            // Only update nextStatus if it belongs to the active stream to avoid UI showing wrong turn's status
+            if (ev.type === 'dm.thinking') {
+              // thinking events are transient; drop stale ones entirely
+            } else {
+              // For completed status, we still don't mutate active B's state
+            }
+          } else {
+            nextStatus = ev
+            if (ev.type === 'dm.status' && ev.status && nextDmState) {
+              // Only mutate dmState when stream matches (or dmState is null and this is new stream's status)
+              if (!activeSid || evSid === activeSid) {
+                nextDmState = {
+                  ...nextDmState,
+                  status: String(ev.status),
+                  streaming: ev.status === 'streaming',
+                  last_sequence: (ev as { last_sequence?: number }).last_sequence ?? nextDmState.last_sequence,
+                  chunk_count: (ev as { chunk_count?: number }).chunk_count ?? nextDmState.chunk_count,
+                  visible_text: (ev as { visible_text?: string }).visible_text ?? nextDmState.visible_text,
+                  stream_id: evSid ?? nextDmState.stream_id,
+                }
               }
+            } else if (ev.type === 'dm.thinking' && !activeSid) {
+              // Edge: thinking for new stream when no active — keep as status
+              nextStatus = ev
             }
           }
         }
@@ -219,7 +236,7 @@ export function useLiveTableRealtime(opts: UseLiveTableRealtimeOptions) {
   // Build a channel subscription; returns the channel handle
   const buildChannel = useCallback(
     (channelName: string) => {
-      const ch = supabase.channel(channelName, { config: { private: true } } as unknown as Record<string, unknown>)
+      const ch = supabase.channel(channelName, { config: { private: true } } as unknown as never)
 
       const handleBroadcast = (payload: { payload: RealtimeEvent }) => {
         const ev = (payload.payload ?? payload) as RealtimeEvent
