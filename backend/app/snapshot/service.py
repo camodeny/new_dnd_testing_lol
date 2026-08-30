@@ -89,26 +89,35 @@ def _ensure_repeatable_read(db: Session) -> None:
     SQLite (used in unit tests) does not support SET TRANSACTION — best-effort
     fallback is plain `READ COMMITTED` which is already single-connection
     serializable in the in-memory test harness.
+
+    On Postgres, any failure to establish the consistent snapshot must fail
+    closed — returning a supposedly authoritative snapshot under READ COMMITTED
+    would recreate the exact race this fix is meant to prevent.
     """
+    bind = db.get_bind() if hasattr(db, "get_bind") else db.bind
+    if bind is None:
+        return
+    dialect = getattr(bind, "dialect", None)
+    if dialect is None or dialect.name != "postgresql":
+        return
+    # Postgres path — failures must not degrade silently to READ COMMITTED.
     try:
-        bind = db.get_bind() if hasattr(db, "get_bind") else db.bind
-        if bind is None:
-            return
-        dialect = getattr(bind, "dialect", None)
-        if dialect is None or dialect.name != "postgresql":
-            return
         # SET TRANSACTION must be the first statement of a transaction.
         # resolve_profile and other pre-snapshot reads may have already started
         # one on this session, so close it first.
         if db.in_transaction():
             db.rollback()
         db.execute(text("SET TRANSACTION ISOLATION LEVEL REPEATABLE READ READ ONLY"))
-    except Exception:
-        # Best-effort: SQLite in tests will fail here; rollback to leave session usable.
+    except Exception as exc:
         try:
             db.rollback()
         except Exception:
             pass
+        logger.warning(
+            "snapshot repeatable-read setup failed campaign_projection_error=%s",
+            exc,
+        )
+        raise SnapshotProjectionError("Failed to establish consistent snapshot") from exc
 
 
 def _resolve_thread_readonly(

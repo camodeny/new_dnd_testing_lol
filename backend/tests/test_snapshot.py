@@ -303,3 +303,42 @@ def test_snapshot_includes_hooks_for_future_surfaces(api):
     assert "extensions" in snap
     assert "reconciliation" in snap
     assert "meta" in snap
+
+
+def test_snapshot_fails_closed_when_repeatable_read_setup_fails(api, monkeypatch):
+    """Regression: Postgres REPEATABLE READ setup failure must not degrade to 200/READ COMMITTED."""
+    client, factory, campaign_id, _, _ = api
+    import app.snapshot.service as svc
+
+    def failing_ensure(db):
+        raise svc.SnapshotProjectionError("mock postgres setup failure")
+
+    monkeypatch.setattr(svc, "_ensure_repeatable_read", failing_ensure)
+    r = client.get(f"/api/campaigns/{campaign_id}/snapshot")
+    assert r.status_code == 500
+    assert r.status_code != 200
+    # Failure is surfaced as clear projection error, not a stale snapshot
+    assert "Failed to build snapshot" in r.text
+
+
+def test_snapshot_postgres_setup_failure_raises_projection_error(monkeypatch):
+    """Unit: Postgres SET TRANSACTION failure must raise SnapshotProjectionError, not degrade."""
+    import app.snapshot.service as svc
+    from unittest.mock import MagicMock
+    from sqlalchemy.orm import Session
+
+    mock_db = MagicMock(spec=Session)
+    mock_bind = MagicMock()
+    mock_bind.dialect.name = "postgresql"
+    mock_db.get_bind.return_value = mock_bind
+    mock_db.in_transaction.return_value = False
+
+    def fake_execute(stmt, *a, **k):
+        if "SET TRANSACTION" in str(stmt):
+            raise RuntimeError("postgres SET TRANSACTION failed")
+        return MagicMock()
+
+    mock_db.execute.side_effect = fake_execute
+
+    with pytest.raises(svc.SnapshotProjectionError, match="Failed to establish consistent snapshot"):
+        svc._ensure_repeatable_read(mock_db)
