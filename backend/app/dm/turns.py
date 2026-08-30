@@ -244,7 +244,12 @@ def coordinate_turn(
         )
         return None
 
-    # Short serialization: lock active turn row if it exists
+    # Short serialization: serialize on stable campaign row before checking/inserting
+    # (prevents two concurrent "no active turn" inserts from both succeeding)
+    try:
+        db.execute(select(Campaign).where(Campaign.id == campaign_id).with_for_update())
+    except Exception:
+        pass
     active = _get_active_turn_for_update(db, campaign_id, tid)
 
     # No active turn → create new logical turn from all unresolved submissions.
@@ -269,29 +274,36 @@ def coordinate_turn(
             assembly_window_start=window_start,
             assembly_window_end=window_end,
         )
-        db.add(turn)
+        # Isolate candidate insert in savepoint so IntegrityError does not roll back caller's outer txn
+        # (e.g. submission + IdempotentCommand when commit=False)
+        if db.new or db.dirty or db.deleted:
+            try:
+                db.flush()
+            except Exception:
+                pass
+        _insert_succeeded = False
         try:
-            db.flush()
+            with db.begin_nested():
+                db.add(turn)
+                db.flush()
+            _insert_succeeded = True
         except IntegrityError:
             # Concurrent inserter won the unique-active race; re-read winner
-            db.rollback()
-            # Re-fetch campaign revision after rollback
-            campaign = db.get(Campaign, campaign_id)
-            source_revision = int(campaign.revision) if campaign and campaign.revision is not None else source_revision
+            # (savepoint rolled back automatically; outer txn intact)
+            try:
+                db.expunge(turn)
+            except Exception:
+                pass
             active_retry = _get_active_turn_for_update(db, campaign_id, tid)
             if active_retry is not None:
-                # Re-run coordination against winner (no recursion: handle as pending expansion)
-                # We need to re-collect unresolved in new tx context
                 unresolved_retry = _collect_unresolved_submissions(db, campaign_id, tid)
-                # Delegate to pending-expansion path by setting active and falling through
                 active = active_retry
                 unresolved = unresolved_retry
             else:
-                # No retry winner found (should not happen), re-raise
                 raise
 
         # If we did not hit the IntegrityError path, create attempt
-        if active is None:
+        if active is None and _insert_succeeded:
             attempt = DmTurnAttempt(
                 id=uuid.uuid4(),
                 turn_id=turn.id,
@@ -850,15 +862,22 @@ def mark_attempt_failed(
     return attempt
 
 
-def recover_stuck_attempts(db: Session, *, lease_seconds: int = 300, commit: bool = True) -> int:
-    """Recover attempts left in running without completion (worker crash)."""
+def recover_stuck_attempts(
+    db: Session, *, campaign_id: uuid.UUID | None = None, lease_seconds: int = 300, commit: bool = True
+) -> int:
+    """Recover attempts left in running without completion (worker crash).
+
+    When ``campaign_id`` is given, only attempts for that campaign are recovered
+    (prevents cross-campaign reset from a path-scoped recover endpoint).
+    """
     cutoff = _now() - timedelta(seconds=lease_seconds)
-    candidates = db.execute(
-        select(DmTurnAttempt).where(
-            DmTurnAttempt.status == ATTEMPT_RUNNING,
-            DmTurnAttempt.started_at < cutoff,
-        )
-    ).scalars().all()
+    q = select(DmTurnAttempt).where(
+        DmTurnAttempt.status == ATTEMPT_RUNNING,
+        DmTurnAttempt.started_at < cutoff,
+    )
+    if campaign_id is not None:
+        q = q.where(DmTurnAttempt.campaign_id == campaign_id)
+    candidates = db.execute(q).scalars().all()
     count = 0
     for attempt in candidates:
         turn = db.get(DmTurn, attempt.turn_id)

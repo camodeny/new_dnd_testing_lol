@@ -119,10 +119,28 @@ def start_streaming(campaign_id: str, turn_id: str, payload: dict, request: Requ
         aid = uuid.UUID(str(attempt_id_raw))
     except ValueError as exc:
         raise HTTPException(status_code=422, detail="Invalid attempt_id") from exc
-    from app.dm.turns import AttemptSupersededError, mark_streaming_started
+    from app.dm.turns import AttemptSupersededError, get_turn, mark_streaming_started
+
+    # Verify turn belongs to path campaign (prevents cross-campaign mutation via known UUID)
+    turn_check = get_turn(db, tid)
+    if turn_check is None or str(turn_check.campaign_id) != str(campaign.id):
+        raise HTTPException(status_code=404, detail="Turn not found")
+    # Preserve private-thread authorization semantics
+    try:
+        t_uuid = parse_thread_id(turn_check.thread_id)
+        assert_can_read_thread(db, campaign.id, t_uuid, profile.id)
+    except ThreadNotFoundError as exc:
+        raise HTTPException(status_code=404, detail="Thread not found") from exc
+    except ThreadAuthorizationError:
+        raise HTTPException(status_code=404, detail="Thread not found") from exc
+    except Exception as exc:
+        raise HTTPException(status_code=404, detail="Thread not found") from exc
 
     try:
         turn, attempt = mark_streaming_started(db, tid, aid)
+        # Re-verify after mutation that turn still belongs to path campaign
+        if str(turn.campaign_id) != str(campaign.id):
+            raise HTTPException(status_code=404, detail="Turn not found")
         return {"turn": turn.to_dict(), "attempt": attempt.to_dict()}
     except AttemptSupersededError as exc:
         raise HTTPException(status_code=409, detail=str(exc)) from exc
@@ -146,6 +164,20 @@ def commit_dm_turn_endpoint(campaign_id: str, turn_id: str, payload: dict, reque
         aid = uuid.UUID(str(attempt_id_raw))
     except ValueError as exc:
         raise HTTPException(status_code=422, detail="Invalid attempt_id") from exc
+    from app.dm.turns import get_turn
+
+    turn_check = get_turn(db, tid)
+    if turn_check is None or str(turn_check.campaign_id) != str(campaign.id):
+        raise HTTPException(status_code=404, detail="Turn not found")
+    try:
+        t_uuid = parse_thread_id(turn_check.thread_id)
+        assert_can_read_thread(db, campaign.id, t_uuid, profile.id)
+    except ThreadNotFoundError as exc:
+        raise HTTPException(status_code=404, detail="Thread not found") from exc
+    except ThreadAuthorizationError:
+        raise HTTPException(status_code=404, detail="Thread not found") from exc
+    except Exception as exc:
+        raise HTTPException(status_code=404, detail="Thread not found") from exc
     from app.dm.turns import AttemptSupersededError, StaleRevisionError, TurnConflictError
     from app.campaigns.events import RevisionConflictError
 
@@ -185,6 +217,8 @@ def commit_dm_turn_endpoint(campaign_id: str, turn_id: str, payload: dict, reque
             operation_id=operation_id,
             actor_id=profile.id,
         )
+        if str(turn.campaign_id) != str(campaign.id):
+            raise HTTPException(status_code=404, detail="Turn not found")
         return {"turn": turn.to_dict(), "attempt": attempt.to_dict(), "event": event.to_dict() if hasattr(event, "to_dict") else None}
     except AttemptSupersededError as exc:
         raise HTTPException(status_code=409, detail=str(exc)) from exc
@@ -212,5 +246,5 @@ def recover_stuck(campaign_id: str, payload: dict, request: Request, db: Session
         raise HTTPException(status_code=422, detail="lease_seconds must be an integer")
     from app.dm.turns import recover_stuck_attempts
 
-    recovered = recover_stuck_attempts(db, lease_seconds=lease)
+    recovered = recover_stuck_attempts(db, campaign_id=campaign.id, lease_seconds=lease)
     return {"recovered": recovered}

@@ -333,3 +333,101 @@ def test_concurrent_supersession_uses_cas():
         assert str(t3.id) == str(t1.id)
         assert str(a3.id) == str(a2.id)
         assert a3.attempt_number == 2
+
+
+def test_concurrent_submission_plus_coordination_does_not_rollback_outer(tmp_path):
+    """Two genuinely concurrent submission+coordination tx should not lose submissions on unique-constraint race.
+
+    Each thread does accept_submission + coordinate_turn(commit=False) inside a single
+    outer transaction (simulating execute_http_idempotent's callback). The loser of the
+    unique-active race must not roll back its outer submission via a full db.rollback().
+    """
+    import threading
+    import time
+
+    db_file = tmp_path / "concurrent_sub_coord.sqlite"
+    eng = create_engine(f"sqlite:///{db_file}", connect_args={"check_same_thread": False, "timeout": 10})
+    Base.metadata.create_all(bind=eng)
+    Fac2 = sessionmaker(bind=eng, expire_on_commit=False)
+    owner = uuid.uuid4()
+    other = uuid.uuid4()
+    with Fac2() as db:
+        db.add_all([Profile(id=owner, email="owner@example.com"), Profile(id=other, email="other@example.com")])
+        cid = uuid.uuid4()
+        db.add(Campaign(id=cid, owner_id=owner, name="RaceCamp", revision=0))
+        db.flush()
+        db.add(CampaignMember(campaign_id=cid, user_id=owner, role="owner"))
+        db.add(CampaignMember(campaign_id=cid, user_id=other, role="player"))
+        db.commit()
+        thread = get_or_create_campaign_thread(db, cid, created_by=owner)
+        db.commit()
+        tid = str(thread.id)
+
+    errors = []
+    turn_ids = []
+
+    def submit_and_coordinate(user_id, content):
+        try:
+            with Fac2() as db:
+                # Simulate outer submission transaction (like execute_http_idempotent callback)
+                sub = accept_submission(db, campaign_id=cid, user_id=user_id, raw_content=content, segments=[{"type": "ic", "text": content}], thread_id=tid)
+                # coordinate with flush-only (commit=False) — outer will commit
+                coord = coordinate_turn(db, cid, tid, commit=False)
+                db.commit()
+                if coord:
+                    turn_ids.append(str(coord[0].id))
+        except Exception as e:
+            errors.append(e)
+
+    t1 = threading.Thread(target=lambda: submit_and_coordinate(owner, "concurrent A"))
+    t2 = threading.Thread(target=lambda: submit_and_coordinate(other, "concurrent B"))
+    t1.start()
+    time.sleep(0.02)
+    t2.start()
+    t1.join()
+    t2.join()
+
+    assert not errors, f"concurrent submit+coord should not error, got {errors}"
+    # Both submissions must be durable despite race
+    with Fac2() as db:
+        subs = db.execute(select(models.PlayerSubmission).where(models.PlayerSubmission.campaign_id == cid)).scalars().all()
+        assert len(subs) == 2, f"both submissions must survive outer rollback, got {len(subs)}"
+        turns = db.execute(select(models.DmTurn).where(models.DmTurn.campaign_id == cid)).scalars().all()
+        active = [t for t in turns if t.status in ("pending", "streaming", "failed_visible")]
+        assert len(active) == 1, f"only one active turn despite race, got {len(active)}"
+        assert set(active[0].submission_ids) == {str(s.id) for s in subs}
+
+
+def test_recover_filters_by_campaign():
+    Fac, cid, owner, _p2, tid = _setup_campaign()
+    Fac2, cid2, owner2, _p22, tid2 = _setup_campaign()
+    # Create stuck running attempt in each campaign
+    for FacX, cidx, tidx, oid in [(Fac, cid, tid, owner), (Fac2, cid2, tid2, owner2)]:
+        with FacX() as db:
+            s = accept_submission(db, campaign_id=cidx, user_id=oid, raw_content="stuck", segments=[{"type": "ic", "text": "stuck"}], thread_id=tidx)
+            db.commit()
+            _, a = coordinate_turn(db, cidx, tidx)
+            from app.dm.turns import mark_attempt_running
+
+            mark_attempt_running(db, a.id)
+            # make it look stuck
+            with FacX() as db2:
+                att = db2.get(models.DmTurnAttempt, a.id)
+                att.started_at = datetime.now(timezone.utc) - timedelta(seconds=1000)
+                db2.commit()
+
+    # Recover only first campaign
+    with Fac() as db:
+        n = recover_stuck_attempts(db, campaign_id=cid, lease_seconds=300)
+        assert n == 1
+    # Second campaign's stuck attempt should remain
+    with Fac2() as db:
+        from app.dm.turns import ATTEMPT_PREPARED, ATTEMPT_RUNNING
+
+        attempts = db.execute(select(models.DmTurnAttempt).where(models.DmTurnAttempt.campaign_id == cid2)).scalars().all()
+        assert any(a.status == ATTEMPT_RUNNING for a in attempts)
+        assert not any(a.status == ATTEMPT_PREPARED and a.campaign_id == cid2 and "Recovered" in (a.last_error or "") for a in attempts)
+    # Recover second explicitly
+    with Fac2() as db:
+        n2 = recover_stuck_attempts(db, campaign_id=cid2, lease_seconds=300)
+        assert n2 == 1
