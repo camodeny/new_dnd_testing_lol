@@ -28,7 +28,7 @@ from app.runtime.threads import (
     resolve_thread_id,
 )
 from database import get_db
-from models import Campaign, CampaignThreadMember, PlayerSubmissionSegment
+from models import Campaign, CampaignThreadMember, PlayerSubmission, PlayerSubmissionSegment
 
 router = APIRouter()
 logger = logging.getLogger(__name__)
@@ -122,7 +122,7 @@ def create_player_submission(
         ).order_by(PlayerSubmissionSegment.position).all()
         return {"submission": submission.to_dict(stored_segments)}
 
-    return execute_http_idempotent(
+    result = execute_http_idempotent(
         db,
         response,
         actor_id=profile.id,
@@ -133,6 +133,25 @@ def create_player_submission(
         payload=payload,
         execute=_execute,
     )
+    # Live-table Realtime projection — best-effort after authoritative commit.
+    # Never roll back DB on publish failure (#198 failure/recovery).
+    try:
+        sub_dict = result.get("submission") if isinstance(result, dict) else None
+        if sub_dict and sub_dict.get("id"):
+            try:
+                sub_id = uuid.UUID(str(sub_dict["id"]))
+                db_sub = db.get(PlayerSubmission, sub_id)  # type: ignore[attr-defined]
+                if db_sub is not None:
+                    segs = db.query(PlayerSubmissionSegment).filter_by(submission_id=db_sub.id).order_by(PlayerSubmissionSegment.position).all()  # type: ignore[attr-defined]
+                    from app.realtime.service import publish_submission_created
+
+                    publish_submission_created(db, db_sub, segments=segs)
+            except Exception as pub_exc:
+                logger.warning("realtime publish after submission failed submission_id=%s error=%s", sub_dict.get("id"), pub_exc)
+    except Exception:
+        # Outer guard — never affect authoritative response.
+        pass
+    return result
 
 
 @router.get("/api/campaigns/{campaign_id}/submissions")

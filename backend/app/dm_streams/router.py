@@ -143,6 +143,13 @@ def create_dm_stream(campaign_id: str, payload: dict, request: Request, db: Sess
     except ValueError as exc:
         raise HTTPException(status_code=422, detail=str(exc)) from exc
 
+    # Realtime DM status (streaming) — best-effort after commit.
+    try:
+        from app.realtime.service import publish_dm_status
+
+        publish_dm_status(db, stream, visible_text="")
+    except Exception as pub_exc:
+        logger.warning("realtime publish after stream create failed stream_id=%s error=%s", stream.id, pub_exc)
     return {"stream": stream.to_dict(), "chunks": [], "visible_text": ""}
 
 
@@ -199,6 +206,13 @@ def append_dm_chunk(campaign_id: str, stream_id: str, payload: dict, request: Re
         db.rollback()
         raise HTTPException(status_code=422, detail=str(exc)) from exc
 
+    # Realtime chunk projection — best-effort after commit (never rolls back DB).
+    try:
+        from app.realtime.service import publish_dm_chunk_created
+
+        publish_dm_chunk_created(db, stream, chunk)
+    except Exception as pub_exc:
+        logger.warning("realtime publish after chunk failed stream_id=%s seq=%s error=%s", sid, sequence, pub_exc)
     # Not reporting as visible until persistence succeeded — commit succeeded.
     return {"chunk": chunk.to_dict(), "stream": stream.to_dict()}
 
@@ -262,6 +276,13 @@ def complete_dm_stream(campaign_id: str, stream_id: str, payload: dict, request:
         raise HTTPException(status_code=409, detail=str(exc)) from exc
     chunks = list_chunks(db, sid)
     visible_text = "".join(c.text for c in chunks)
+    # Realtime status projection — best-effort after commit.
+    try:
+        from app.realtime.service import publish_dm_status
+
+        publish_dm_status(db, stream, visible_text=visible_text)
+    except Exception as pub_exc:
+        logger.warning("realtime publish after complete failed stream_id=%s error=%s", sid, pub_exc)
     return {"stream": stream.to_dict(), "chunks": [c.to_dict() for c in chunks], "visible_text": visible_text, "final_text": stream.final_text}
 
 
