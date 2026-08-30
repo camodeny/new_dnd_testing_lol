@@ -9,11 +9,14 @@ Guarantees:
   redelivery is safe (lease expiry / sweeper).
 - Exhausted/terminal jobs stay durably inspectable and replayable.
 - Manual replay reuses the same logical idempotency.
-- Atomic committed claim prevents concurrent side effects; next_attempt_at enforced.
+- Atomic committed claim + claim_token fencing prevents concurrent side effects;
+  next_attempt_at enforced; heartbeat renewal prevents live-work reclamation
+  while fencing protects genuinely crashed ownership.
 """
 from __future__ import annotations
 
 import logging
+import threading
 import time
 import uuid
 from datetime import datetime, timedelta, timezone
@@ -283,18 +286,73 @@ def execute_worker_job(
     assert rec is not None and rec.status == RUNNING, f"claim succeeded but status={rec.status if rec else None}"
     assert rec.claim_token == claim_token, "claim token mismatch after claim"
 
-    # Invoke handler with timing (outside claim transaction)
-    # Handler side effects MUST be idempotent on job_id (e.g. PK=job_id or
-    # check ledger before mutating) so lease-expiry overlap cannot duplicate
-    # external effects. Ledger commit is fenced by claim_token.
-    t0 = time.monotonic()
+    # Heartbeat prevents live-work reclamation: while handler runs, renew lease
+    # so a healthy long-running handler is not concurrently re-executed.
+    # Fencing (claim_token) still protects against genuinely lost ownership.
+    stop_event = threading.Event()
+    heartbeat_thread = None
+    bind = None
     try:
-        result = handler(envelope)
+        bind = db.get_bind()  # type: ignore[attr-defined]
+    except Exception:
+        try:
+            bind = getattr(db, "bind", None)
+        except Exception:
+            bind = None
+    if bind is not None:
+        hb_interval = max(0.05, lease_seconds * 0.4)
+        # Use claim_token captured above
+        _hb_token = claim_token
+        _hb_job_id = envelope.job_id
+        _hb_lease = lease_seconds
+
+        def _heartbeat():
+            while not stop_event.wait(hb_interval):
+                try:
+                    from sqlalchemy.orm import sessionmaker as _Sess
+
+                    S = _Sess(bind=bind, expire_on_commit=False)  # type: ignore[arg-type]
+                    hb_db = S()
+                    try:
+                        ok = renew_worker_lease(hb_db, _hb_job_id, _hb_token, lease_seconds=_hb_lease)  # type: ignore[arg-type]
+                        if not ok:
+                            break
+                    finally:
+                        try:
+                            hb_db.close()
+                        except Exception:
+                            pass
+                except Exception:
+                    continue
+
+        heartbeat_thread = threading.Thread(target=_heartbeat, daemon=True)
+        heartbeat_thread.start()
+
+    # Invoke handler with timing (outside claim transaction)
+    # Handler side effects SHOULD be idempotent on job_id, but heartbeat now
+    # prevents healthy long-running handlers from being reclaimed at all.
+    t0 = time.monotonic()
+    handler_result = None
+    handler_exc: BaseException | None = None
+    try:
+        handler_result = handler(envelope)
         # Validate result is JSON-serializable
         import json
-        json.dumps(result, default=str)
+        json.dumps(handler_result, default=str)
+    except BaseException as exc:  # noqa: B902
+        handler_exc = exc
+    finally:
+        # Stop heartbeat before fenced commit
+        stop_event.set()
+        if heartbeat_thread is not None:
+            try:
+                heartbeat_thread.join(timeout=1.0)
+            except Exception:
+                pass
+
+    if handler_exc is None:
         elapsed_ms = int((time.monotonic() - t0) * 1000)
-        payload_result = result if isinstance(result, (dict, list)) else {"result": result}
+        payload_result = handler_result if isinstance(handler_result, (dict, list)) else {"result": handler_result}
         # Fenced completion: only succeed if we still own the lease
         completed_at = datetime.now(timezone.utc)
         upd = db.execute(
@@ -338,90 +396,90 @@ def execute_worker_job(
         )
         return rec.result, False
 
-    except BaseException as exc:
-        elapsed_ms = int((time.monotonic() - t0) * 1000)
-        error_class = classify_fn(exc)
-        # Need fresh rec for error handling
+    # Handler raised — record failure fenced by token
+    elapsed_ms = int((time.monotonic() - t0) * 1000)
+    error_class = classify_fn(handler_exc)  # type: ignore[arg-type]
+    # Need fresh rec for error handling
+    try:
+        db.expire_all()
+    except Exception:
+        pass
+    rec = db.get(WorkerExecution, envelope.job_id)
+    if rec is None:
+        raise handler_exc  # type: ignore[misc]
+    # If we already lost ownership, don't overwrite new owner's state
+    if rec.claim_token != claim_token:
+        db.rollback()
         try:
             db.expire_all()
         except Exception:
             pass
-        rec = db.get(WorkerExecution, envelope.job_id)
-        if rec is None:
-            raise
-        # If we already lost ownership, don't overwrite new owner's state
-        if rec.claim_token != claim_token:
-            db.rollback()
-            try:
-                db.expire_all()
-            except Exception:
-                pass
-            fresh = db.get(WorkerExecution, envelope.job_id)
-            logger.warning("worker lease lost on error job_id=%s error=%s fresh_status=%s", envelope.job_id, exc, fresh.status if fresh else None)
-            # If fresh already succeeded, return it; otherwise propagate original error but don't mark failed
-            if fresh and fresh.status == SUCCEEDED and fresh.result is not None:
-                return fresh.result, True
-            raise
+        fresh = db.get(WorkerExecution, envelope.job_id)
+        logger.warning("worker lease lost on error job_id=%s error=%s fresh_status=%s", envelope.job_id, handler_exc, fresh.status if fresh else None)
+        # If fresh already succeeded, return it; otherwise propagate original error but don't mark failed
+        if fresh and fresh.status == SUCCEEDED and fresh.result is not None:
+            return fresh.result, True
+        raise handler_exc  # type: ignore[misc]
 
-        # We still own the claim — record failure fenced by token
-        rec.processing_duration_ms = elapsed_ms
-        rec.last_error = f"{type(exc).__name__}: {exc}"[:2000]
-        rec.error_class = error_class
-        rec.completed_at = None
+    # We still own the claim — record failure fenced by token
+    rec.processing_duration_ms = elapsed_ms
+    rec.last_error = f"{type(handler_exc).__name__}: {handler_exc}"[:2000]
+    rec.error_class = error_class
+    rec.completed_at = None
 
-        if error_class == TERMINAL:
-            upd = db.execute(
-                update(WorkerExecution)
-                .where(WorkerExecution.id == envelope.job_id, WorkerExecution.claim_token == claim_token)
-                .values(status=DEAD_LETTER, next_attempt_at=None, started_at=None, claim_token=None, last_error=rec.last_error, error_class=error_class, processing_duration_ms=elapsed_ms)
-                .execution_options(synchronize_session=False)
-            )
-            if upd.rowcount:
-                db.commit()
-            else:
-                db.rollback()
-            logger.warning(
-                "worker terminal job_id=%s type=%s attempt=%s error=%s trace=%s",
-                envelope.job_id, envelope.job_type, rec.attempts, rec.last_error[:200], envelope.trace_id or "-",
-            )
-            raise
-
-        # Retriable path: check exhaustion
-        if rec.attempts >= rec.max_attempts:
-            upd = db.execute(
-                update(WorkerExecution)
-                .where(WorkerExecution.id == envelope.job_id, WorkerExecution.claim_token == claim_token)
-                .values(status=DEAD_LETTER, next_attempt_at=None, started_at=None, claim_token=None, last_error=rec.last_error, error_class=error_class, processing_duration_ms=elapsed_ms)
-                .execution_options(synchronize_session=False)
-            )
-            if upd.rowcount:
-                db.commit()
-            else:
-                db.rollback()
-            logger.warning(
-                "worker exhausted job_id=%s type=%s attempts=%s max=%s -> dead_letter trace=%s",
-                envelope.job_id, envelope.job_type, rec.attempts, rec.max_attempts, envelope.trace_id or "-",
-            )
-            raise TerminalError(f"Job {envelope.job_id} exhausted after {rec.attempts} attempts: {exc}") from exc
-
-        # Schedule retry with backoff
-        delay = backoff_fn(rec.attempts)
-        next_at = datetime.now(timezone.utc) + timedelta(seconds=delay)
+    if error_class == TERMINAL:
         upd = db.execute(
             update(WorkerExecution)
             .where(WorkerExecution.id == envelope.job_id, WorkerExecution.claim_token == claim_token)
-            .values(status=FAILED, next_attempt_at=next_at, started_at=None, claim_token=None, last_error=rec.last_error, error_class=error_class, processing_duration_ms=elapsed_ms)
+            .values(status=DEAD_LETTER, next_attempt_at=None, started_at=None, claim_token=None, last_error=rec.last_error, error_class=error_class, processing_duration_ms=elapsed_ms)
             .execution_options(synchronize_session=False)
         )
         if upd.rowcount:
             db.commit()
         else:
             db.rollback()
-        logger.info(
-            "worker retriable job_id=%s type=%s attempt=%s next_in=%.1fs error=%s trace=%s",
-            envelope.job_id, envelope.job_type, rec.attempts, delay, rec.last_error[:200], envelope.trace_id or "-",
+        logger.warning(
+            "worker terminal job_id=%s type=%s attempt=%s error=%s trace=%s",
+            envelope.job_id, envelope.job_type, rec.attempts, rec.last_error[:200], envelope.trace_id or "-",
         )
-        raise
+        raise handler_exc  # type: ignore[misc]
+
+    # Retriable path: check exhaustion
+    if rec.attempts >= rec.max_attempts:
+        upd = db.execute(
+            update(WorkerExecution)
+            .where(WorkerExecution.id == envelope.job_id, WorkerExecution.claim_token == claim_token)
+            .values(status=DEAD_LETTER, next_attempt_at=None, started_at=None, claim_token=None, last_error=rec.last_error, error_class=error_class, processing_duration_ms=elapsed_ms)
+            .execution_options(synchronize_session=False)
+        )
+        if upd.rowcount:
+            db.commit()
+        else:
+            db.rollback()
+        logger.warning(
+            "worker exhausted job_id=%s type=%s attempts=%s max=%s -> dead_letter trace=%s",
+            envelope.job_id, envelope.job_type, rec.attempts, rec.max_attempts, envelope.trace_id or "-",
+        )
+        raise TerminalError(f"Job {envelope.job_id} exhausted after {rec.attempts} attempts: {handler_exc}") from handler_exc  # type: ignore[misc]
+
+    # Schedule retry with backoff
+    delay = backoff_fn(rec.attempts)
+    next_at = datetime.now(timezone.utc) + timedelta(seconds=delay)
+    upd = db.execute(
+        update(WorkerExecution)
+        .where(WorkerExecution.id == envelope.job_id, WorkerExecution.claim_token == claim_token)
+        .values(status=FAILED, next_attempt_at=next_at, started_at=None, claim_token=None, last_error=rec.last_error, error_class=error_class, processing_duration_ms=elapsed_ms)
+        .execution_options(synchronize_session=False)
+    )
+    if upd.rowcount:
+        db.commit()
+    else:
+        db.rollback()
+    logger.info(
+        "worker retriable job_id=%s type=%s attempt=%s next_in=%.1fs error=%s trace=%s",
+        envelope.job_id, envelope.job_type, rec.attempts, delay, rec.last_error[:200], envelope.trace_id or "-",
+    )
+    raise handler_exc  # type: ignore[misc]
 
 
 # ── Failed-work / dead-letter ledger ────────────────────────────────────────
@@ -482,8 +540,32 @@ def replay_failed_job(
     return rec
 
 
+def renew_worker_lease(db: Session, job_id: uuid.UUID, claim_token: str, *, lease_seconds: int = 300) -> bool:
+    """Renew RUNNING lease for a healthy worker; fails if ownership lost.
+
+    Returns True if lease renewed (still owner), False if claim no longer
+    owned (stolen or no longer RUNNING). Heartbeat uses this.
+    """
+    now = datetime.now(timezone.utc)
+    result = db.execute(
+        update(WorkerExecution)
+        .where(WorkerExecution.id == job_id, WorkerExecution.claim_token == claim_token, WorkerExecution.status == RUNNING)
+        .values(started_at=now, updated_at=now)
+        .execution_options(synchronize_session=False)
+    )
+    if result.rowcount:
+        db.commit()
+        return True
+    db.rollback()
+    return False
+
+
 def recover_stuck_executions(db: Session, *, lease_seconds: int = 300, commit: bool = True) -> int:
-    """Sweeper: reset RUNNING executions whose lease expired (worker crash before completion)."""
+    """Sweeper: reset RUNNING executions whose lease expired (worker crash before completion).
+
+    Healthy workers renew their lease via heartbeat, so expiry implies
+    genuine crash/abandonment, not slow execution.
+    """
     cutoff = datetime.now(timezone.utc) - timedelta(seconds=lease_seconds)
     result = db.execute(
         update(WorkerExecution)

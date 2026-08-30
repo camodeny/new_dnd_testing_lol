@@ -247,38 +247,36 @@ def test_dead_letter_remains_inspectable_and_replayable():
     assert dup2 is True and res2 == res
 
 
-def test_lease_expiry_overlap_claim_fencing_and_idempotent_handler(tmp_path):
-    """Slow handler longer than lease: second steals after expiry, first's
-    fenced completion is discarded, side effects remain idempotent on job_id."""
+def test_lease_expiry_overlap_heartbeat_prevents_live_reclamation(tmp_path):
+    """Heartbeat prevents a healthy long-running handler from being reclaimed.
+
+    Lease 0.2s < handler 0.5s but heartbeat renews lease, so second delivery
+    while first is still live is blocked as still_running (not stolen).
+    Fencing remains as backup for genuinely crashed workers (see crash test).
+    """
     db_file = tmp_path / "lease_overlap.sqlite"
     eng = create_engine(f"sqlite:///{db_file}", connect_args={"check_same_thread": False, "timeout": 10})
     Base.metadata.create_all(bind=eng)
     Fac = sessionmaker(bind=eng, expire_on_commit=False)
 
     env = new_envelope(job_type="lease.overlap", payload={"v": 1}, job_id=uuid.uuid4())
-    # Idempotent side-effect table keyed by job_id (simulates durable consumer dedupe)
-    side_effects: dict[str, int] = {}
+    calls: list[int] = []
     lock = threading.Lock()
     results: list[tuple] = []
     errors: list[Exception] = []
 
-    def idempotent_handler(e):
-        # Durably idempotent: only first writer wins (PK-like)
-        jid = str(e.job_id)
+    def handler(e):
         with lock:
-            if jid not in side_effects:
-                side_effects[jid] = 1
-            # else already done — idempotent, don't duplicate
-        time.sleep(0.5)  # longer than lease
-        with lock:
-            return {"side_effect_count": side_effects[jid], "job_id": jid}
+            calls.append(1)
+        time.sleep(0.5)  # longer than lease 0.2, but heartbeat should keep lease alive
+        return {"ok": True}
 
     def worker(delay: float):
         time.sleep(delay)
         try:
             db = Fac()
-            # lease 0.2s < handler 0.5s, so second can steal while first still running
-            results.append(execute_worker_job(db, env, idempotent_handler, lease_seconds=0.2))
+            # lease 0.2s < handler 0.5s — without heartbeat this would be stealable
+            results.append(execute_worker_job(db, env, handler, lease_seconds=0.2))
         except Exception as ex:
             errors.append(ex)
 
@@ -289,21 +287,72 @@ def test_lease_expiry_overlap_claim_fencing_and_idempotent_handler(tmp_path):
     t1.join()
     t2.join()
 
-    # One handler stole the lease; fencing means only one ledger success
-    # Side effect remains idempotent (count 1, not 2)
-    assert side_effects[str(env.job_id)] == 1, f"side effect must be idempotent, got {side_effects}"
-    # Exactly one success, the other lost ownership
-    successes = [r for r in results if isinstance(r, tuple) and r[1] is False]
-    assert len(successes) == 1, f"expected exactly one ledger success, got results={results} errors={errors}"
-    # Second thread either succeeded or was blocked as duplicate after first succeeded
-    # In this fencing case, first's completion is discarded, second succeeds
-    # Final ledger must be succeeded
+    # Heartbeat must prevent second handler from running at all
+    assert len(calls) == 1, f"heartbeat should prevent duplicate execution, got calls={len(calls)}"
+    assert len(results) == 1 and results[0][1] is False
+    assert len(errors) == 1
+    assert isinstance(errors[0], RuntimeError) and "still running" in str(errors[0])
+
+    # Fencing still protects crashed case: inserted RUNNING with old started_at and no heartbeat is reclaimable
+    # (covered by test_crash_lease_allows_redelivery_after_expiry)
+    # Final ledger must be succeeded, duplicate returns cached
     db = Fac()
     rec = db.get(WorkerExecution, env.job_id)
     assert rec.status == "succeeded"
-    assert rec.result["side_effect_count"] == 1
-    # Duplicate delivery after overlap returns cached result without extra side effect
-    before = side_effects[str(env.job_id)]
-    res, dup = execute_worker_job(db, env, idempotent_handler, lease_seconds=0.2)
+    before = len(calls)
+    res, dup = execute_worker_job(db, env, handler, lease_seconds=0.2)
     assert dup is True
-    assert side_effects[str(env.job_id)] == before
+    assert len(calls) == before
+
+
+def test_fencing_prevents_crashed_worker_overwrite(tmp_path):
+    """If a worker crashes after lease stolen, its fenced completion is discarded."""
+    db_file = tmp_path / "fencing.sqlite"
+    eng = create_engine(f"sqlite:///{db_file}", connect_args={"check_same_thread": False, "timeout": 10})
+    Base.metadata.create_all(bind=eng)
+    Fac = sessionmaker(bind=eng, expire_on_commit=False)
+
+    env = new_envelope(job_type="fencing.test", payload={}, job_id=uuid.uuid4())
+    # Simulate first claim stolen: insert RUNNING with old token, then second steals
+    # First worker's token is stale; its completion must be fenced.
+    from datetime import datetime, timezone, timedelta
+
+    db = Fac()
+    # First claims with token A but crashes before commit (no heartbeat, old lease)
+    old_token = "old-token-123"
+    db.add(
+        WorkerExecution(
+            id=env.job_id,
+            job_type=env.job_type,
+            status="running",
+            attempts=1,
+            max_attempts=5,
+            started_at=datetime.now(timezone.utc) - timedelta(seconds=1000),
+            claim_token=old_token,
+        )
+    )
+    db.commit()
+    # Second steals with new token (simulates new claim after expiry)
+    from app.worker.executor import renew_worker_lease, execute_worker_job as _exec
+
+    # Use normal execute to steal (lease 0.2, old started_at far past)
+    def handler(e):
+        return {"from": "second"}
+
+    db2 = Fac()
+    res, dup = _exec(db2, env, handler, lease_seconds=0.2)
+    assert res["from"] == "second" and dup is False
+
+    # Now first (stale token) tries to complete — should be fenced (no overwrite)
+    # Simulate stale completion attempt directly
+    from sqlalchemy import update as _upd
+
+    stale_upd = db.execute(
+        _upd(WorkerExecution)
+        .where(WorkerExecution.id == env.job_id, WorkerExecution.claim_token == old_token, WorkerExecution.status == "running")
+        .values(status="succeeded", result={"from": "stale"})
+    )
+    assert stale_upd.rowcount == 0, "stale token must not overwrite new owner's succeeded row"
+    db.rollback()
+    rec = db.get(WorkerExecution, env.job_id)
+    assert rec.result["from"] == "second"

@@ -18,6 +18,7 @@ from app.worker.executor import (  # noqa: F401
     list_failed_work,
     list_retryable_failed,
     recover_stuck_executions,
+    renew_worker_lease,
     replay_failed_job,
 )
 
@@ -40,5 +41,6 @@ __all__ = [
     "list_failed_work",
     "list_retryable_failed",
     "recover_stuck_executions",
+    "renew_worker_lease",
     "replay_failed_job",
 ]

@@ -17,25 +17,10 @@ depends_on = None
 
 
 def upgrade() -> None:
-    # Add claim_token if not exists
-    with op.batch_alter_table("worker_executions") as batch:
-        try:
-            batch.add_column(sa.Column("claim_token", sa.String(64), nullable=True))
-        except Exception:
-            pass
-    try:
-        op.create_index("ix_worker_executions_claim_token", "worker_executions", ["claim_token"])
-    except Exception:
-        pass
+    op.add_column("worker_executions", sa.Column("claim_token", sa.String(64), nullable=True))
+    op.create_index("ix_worker_executions_claim_token", "worker_executions", ["claim_token"])
 
 
 def downgrade() -> None:
-    try:
-        op.drop_index("ix_worker_executions_claim_token", table_name="worker_executions")
-    except Exception:
-        pass
-    with op.batch_alter_table("worker_executions") as batch:
-        try:
-            batch.drop_column("claim_token")
-        except Exception:
-            pass
+    op.drop_index("ix_worker_executions_claim_token", table_name="worker_executions")
+    op.drop_column("worker_executions", "claim_token")
