@@ -15,6 +15,7 @@ import uuid
 from datetime import datetime, timezone
 
 import pytest
+from fastapi.testclient import TestClient
 from sqlalchemy import create_engine, select, text
 from sqlalchemy.orm import Session, sessionmaker
 from sqlalchemy.pool import StaticPool
@@ -25,7 +26,7 @@ if not hasattr(SQLiteTypeCompiler, "_patched_jsonb"):
     SQLiteTypeCompiler.visit_JSONB = lambda self, type_, **kw: "JSON"  # type: ignore
     SQLiteTypeCompiler._patched_jsonb = True  # type: ignore
 
-from database import Base
+from database import Base, get_db
 
 # Import after patch to ensure models import uses patched compiler
 import models  # noqa: E402
@@ -35,7 +36,7 @@ from app.campaigns.events import (  # noqa: E402
     list_campaign_events,
     update_campaign_derived,
 )
-from models import Campaign, CampaignDomainEvent, Profile  # noqa: E402
+from models import Campaign, CampaignDomainEvent, CampaignMember, Profile  # noqa: E402
 
 
 def _sqlite_engine():
@@ -399,3 +400,53 @@ def test_missing_campaign_raises_value_error():
     with pytest.raises(ValueError, match="not found"):
         commit_campaign_mutation(db, fake, expected_revision=0, event_type="test")
     db.close()
+
+
+def test_campaign_update_http_contract_requires_and_checks_revision(monkeypatch):
+    from app.deps.auth import MOCK_USER_ID
+    from main import app
+
+    eng = _sqlite_engine()
+    factory = sessionmaker(bind=eng)
+    campaign_id = uuid.uuid4()
+    with factory() as db:
+        db.add(Profile(id=MOCK_USER_ID, email="mock@example.com"))
+        db.add(Campaign(id=campaign_id, owner_id=MOCK_USER_ID, name="Before"))
+        db.add(CampaignMember(campaign_id=campaign_id, user_id=MOCK_USER_ID, role="owner"))
+        db.commit()
+
+    def override_db():
+        with factory() as db:
+            yield db
+
+    monkeypatch.setenv("ALLOW_MOCK_AUTH", "true")
+    app.dependency_overrides[get_db] = override_db
+    try:
+        client = TestClient(app)
+        missing = client.put(
+            f"/api/campaigns/{campaign_id}",
+            json={"name": "No revision", "operation_id": "missing-revision"},
+        )
+        assert missing.status_code == 400
+        assert missing.json()["detail"] == "expected_revision is required"
+
+        success = client.put(
+            f"/api/campaigns/{campaign_id}",
+            json={"name": "After", "expected_revision": 0, "operation_id": "update-1"},
+        )
+        assert success.status_code == 200
+        assert success.json()["campaign"]["revision"] == 1
+        assert success.json()["event"]["sequence"] == 1
+
+        stale = client.put(
+            f"/api/campaigns/{campaign_id}",
+            json={"name": "Stale", "expected_revision": 0, "operation_id": "update-2"},
+        )
+        assert stale.status_code == 409
+        assert stale.headers["X-Current-Revision"] == "1"
+
+        events = client.get(f"/api/campaigns/{campaign_id}/events")
+        assert events.status_code == 200
+        assert [event["sequence"] for event in events.json()["events"]] == [1]
+    finally:
+        app.dependency_overrides.clear()
