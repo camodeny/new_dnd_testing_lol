@@ -57,12 +57,27 @@ alembic current
 
 `scripts/migrate.py` prefers `POSTGRES_URL_NON_POOLING`/`SUPABASE_DB_URL` over pooled runtime URLs, logs the `alembic_version` before and after, and exits non-zero on failure with full traceback. A failed migration leaves the previous app/DB state intact (migrations run in a transaction) and the Vercel build fails, blocking promotion. No fallback to `create_all()` is performed in production. Multiple API instances never attempt DDL because migrations only run in this single deploy step.
 
-CI example:
+CI example (also see `.github/workflows/ci.yml` and `scripts/ci/`):
 
 ```bash
+# Equivalent to CI — run locally to reproduce failures without GitHub Actions
+./scripts/ci/backend.sh                    # lint + unit/integration tests (no DB)
+DATABASE_URL=postgresql://ci_test:ci_test@localhost:5432/ci_test ./scripts/ci/backend.sh  # with disposable Postgres + migrations
+./scripts/ci/frontend.sh                   # lint + typecheck + build
+
+# Direct equivalents
 DATABASE_URL="$POSTGRES_URL" python -m scripts.migrate || exit 1
+ALLOW_MOCK_AUTH=true python -m pytest tests/ -v
 # only then deploy to Vercel / restart containers
 ```
+
+## CI
+
+` .github/workflows/ci.yml` is the required PR CI (jobs `backend`, `frontend`). It provisions a disposable Postgres service, runs `python -m scripts.migrate` against a clean DB, then `pytest`, and runs `eslint`/`tsc`/`next build`. Branch protection should require `backend` + `frontend`.
+
+Canonical local commands mirror CI: `scripts/ci/backend.sh` and `scripts/ci/frontend.sh` — workflow delegates to these scripts so local and CI use the same logic.
+
+Heavier suites (#267 one-shot, #270 fault-injection, #273 combat regression) should be added as separate `workflow_dispatch` / `schedule` jobs or new workflows reusing the same `setup-python`/`setup-node`/postgres service conventions — do not add paid model calls or production credentials to the required PR path.
 
 ## Auth
 `auth.py` verifies Supabase JWT via JWKS (`{SUPABASE_URL}/auth/v1/.well-known/jwks.json`) with `HS256` fallback. Frontend sends `Authorization: Bearer <supabase access_token>` — see `frontend/lib/supabase.ts`.
