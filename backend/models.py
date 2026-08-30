@@ -172,6 +172,71 @@ class CampaignMember(Base):
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now(), nullable=False)
 
 
+class CampaignThread(Base):
+    """Durable thread identity for live-table messaging — issue #195.
+
+    One shared ``campaign`` thread per campaign is the default audience;
+    additional ``private`` threads hold explicit participant lists.  Ownership
+    never grants implicit private access — callers must be explicit members.
+    """
+
+    __tablename__ = "campaign_threads"
+    __table_args__ = (
+        UniqueConstraint("campaign_id", "id", name="uq_campaign_threads_campaign_id"),
+        CheckConstraint("thread_type IN ('campaign', 'private')", name="ck_campaign_threads_type"),
+    )
+
+    id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    campaign_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("campaigns.id", ondelete="CASCADE"), nullable=False, index=True
+    )
+    thread_type: Mapped[str] = mapped_column(String(32), nullable=False, default="campaign", server_default="campaign")
+    title: Mapped[str | None] = mapped_column(String(128), nullable=True)
+    created_by: Mapped[uuid.UUID | None] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("profiles.id", ondelete="RESTRICT"), nullable=True, index=True
+    )
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now(), nullable=False)
+
+    def to_dict(self, *, include_members: bool = False, members=None):
+        result = {
+            "id": str(self.id),
+            "campaign_id": str(self.campaign_id),
+            "thread_type": self.thread_type,
+            "title": self.title,
+            "created_by": str(self.created_by) if self.created_by else None,
+            "created_at": self.created_at.isoformat() if self.created_at else None,
+        }
+        if include_members and members is not None:
+            result["members"] = [m.to_dict() for m in members]
+        return result
+
+
+class CampaignThreadMember(Base):
+    """Explicit audience membership for a thread — revocation is deletion."""
+
+    __tablename__ = "campaign_thread_members"
+    __table_args__ = (
+        UniqueConstraint("thread_id", "user_id", name="uq_campaign_thread_members_identity"),
+    )
+
+    thread_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("campaign_threads.id", ondelete="CASCADE"), primary_key=True
+    )
+    user_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("profiles.id", ondelete="CASCADE"), primary_key=True
+    )
+    role: Mapped[str] = mapped_column(String(16), nullable=False, default="member", server_default="member")
+    joined_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now(), nullable=False)
+
+    def to_dict(self):
+        return {
+            "thread_id": str(self.thread_id),
+            "user_id": str(self.user_id),
+            "role": self.role,
+            "joined_at": self.joined_at.isoformat() if self.joined_at else None,
+        }
+
+
 class PlayerSubmission(Base):
     """A durably accepted player contribution, before any AI interpretation."""
 
