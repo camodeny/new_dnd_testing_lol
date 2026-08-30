@@ -9,6 +9,7 @@ from sqlalchemy import and_, or_, select, update
 from sqlalchemy.orm import Session
 
 from models import Outbox
+from app.observability.tracing import current_trace_id
 
 logger = logging.getLogger(__name__)
 
@@ -27,6 +28,7 @@ def enqueue_outbox(
     aggregate_id: uuid.UUID | str | None = None,
     campaign_id: uuid.UUID | str | None = None,
     operation_id: str | None = None,
+    trace_id: str | None = None,
     outbox_id: uuid.UUID | None = None,
     commit: bool = True,
 ) -> Outbox:
@@ -47,6 +49,7 @@ def enqueue_outbox(
         campaign_id=campaign_id,
         event_type=event_type.strip(),
         operation_id=operation_id,
+        trace_id=trace_id or current_trace_id(),
         payload=payload,
         status=PENDING,
         attempts=0,
@@ -211,6 +214,21 @@ def list_unpublished(db: Session, *, limit: int = 100) -> list[Outbox]:
     )
 
 
+def envelope_for_outbox(record: Outbox):
+    """Translate the durable relay record without losing correlation lineage."""
+    from app.queue.adapter import new_envelope
+    return new_envelope(
+        job_id=record.id,
+        job_type=record.event_type,
+        campaign_id=record.campaign_id,
+        aggregate_id=record.aggregate_id,
+        operation_id=record.operation_id,
+        idempotency_key=str(record.id),
+        trace_id=record.trace_id,
+        payload=record.payload,
+    )
+
+
 def commit_with_outbox(
     db: Session,
     *,
@@ -220,6 +238,7 @@ def commit_with_outbox(
     aggregate_id: uuid.UUID | None = None,
     campaign_id: uuid.UUID | None = None,
     operation_id: str | None = None,
+    trace_id: str | None = None,
     commit: bool = True,
     mutate: callable | None = None,
 ) -> Outbox:
@@ -240,6 +259,7 @@ def commit_with_outbox(
             aggregate_id=aggregate_id,
             campaign_id=campaign_id,
             operation_id=operation_id,
+            trace_id=trace_id,
             commit=commit,
         )
     except Exception:
