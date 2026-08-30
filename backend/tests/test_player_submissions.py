@@ -148,7 +148,8 @@ def test_server_rejects_unowned_thread_and_audience_claims(api):
         json={"content": "secret", "thread_id": "private-anyone", "audience": "private"},
         headers={"Idempotency-Key": "forged-thread"},
     )
-    assert response.status_code == 403
+    # #195: forged/unauthorized threads fail closed and are hidden as 404
+    assert response.status_code == 404
 
 
 def test_non_member_cannot_submit(monkeypatch, api):
