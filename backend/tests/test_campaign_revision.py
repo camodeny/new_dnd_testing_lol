@@ -12,6 +12,7 @@ Covers all acceptance criteria:
 from __future__ import annotations
 
 import uuid
+from datetime import datetime, timezone
 
 import pytest
 from sqlalchemy import create_engine, select, text
@@ -199,10 +200,10 @@ def test_non_fictional_derived_update_does_not_advance_revision():
     # fictional mutation to get to revision 1
     commit_campaign_mutation(db, cid, expected_revision=0, event_type="campaign.fictional")
 
-    # derived update (e.g. description via derived path) must not bump
-    fresh = update_campaign_derived(db, cid, description="derived index update")
+    # derived metadata update must not bump
+    derived_timestamp = datetime.now(timezone.utc)
+    fresh = update_campaign_derived(db, cid, updated_at=derived_timestamp)
     assert fresh.revision == 1
-    assert fresh.description == "derived index update"
 
     # another fictional mutation should still require revision 1 and go to 2
     _, evt = commit_campaign_mutation(db, cid, expected_revision=1, event_type="campaign.fictional2")
@@ -213,6 +214,19 @@ def test_non_fictional_derived_update_does_not_advance_revision():
     events = list_campaign_events(db, cid)
     assert len(events) == 2
     assert all(e.sequence in (1, 2) for e in events)
+    db.close()
+
+
+def test_derived_update_rejects_fictional_campaign_fields():
+    eng = _sqlite_engine()
+    S = sessionmaker(bind=eng)
+    db = S()
+    camp = _new_campaign(db)
+
+    unchanged = update_campaign_derived(db, camp.id, name="revision bypass")
+
+    assert unchanged.name == "Test Campaign"
+    assert unchanged.revision == 0
     db.close()
 
 
@@ -315,6 +329,39 @@ def test_event_visibility_and_provenance_hooks():
     d = evt.to_dict()
     assert d["visibility"] == "private"
     assert d["provenance"]["source"] == "ai_dm"
+    db.close()
+
+
+def test_event_reads_filter_private_events_to_the_actor():
+    eng = _sqlite_engine()
+    S = sessionmaker(bind=eng)
+    db = S()
+    camp = _new_campaign(db)
+    actor = camp.owner_id
+    other_viewer = uuid.uuid4()
+
+    commit_campaign_mutation(
+        db,
+        camp.id,
+        expected_revision=0,
+        event_type="campaign.public",
+        actor_id=actor,
+        visibility="public",
+    )
+    commit_campaign_mutation(
+        db,
+        camp.id,
+        expected_revision=1,
+        event_type="campaign.private",
+        actor_id=actor,
+        visibility="private",
+        payload={"secret": True},
+    )
+
+    actor_events = list_campaign_events(db, camp.id, viewer_id=actor)
+    other_events = list_campaign_events(db, camp.id, viewer_id=other_viewer)
+    assert [event.event_type for event in actor_events] == ["campaign.public", "campaign.private"]
+    assert [event.event_type for event in other_events] == ["campaign.public"]
     db.close()
 
 

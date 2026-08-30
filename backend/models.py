@@ -11,7 +11,7 @@ If you prefer to use `auth.users` directly without a mirror, point FKs there —
 import uuid
 from datetime import datetime
 
-from sqlalchemy import Boolean, DateTime, ForeignKey, Integer, String, Text, func
+from sqlalchemy import Boolean, DateTime, ForeignKey, Integer, String, Text, UniqueConstraint, func
 from sqlalchemy.dialects.postgresql import JSONB, UUID
 from sqlalchemy.orm import Mapped, mapped_column
 
@@ -94,20 +94,12 @@ class CampaignDomainEvent(Base):
 
     __tablename__ = "campaign_domain_events"
     __table_args__ = (
-        # Campaign-scoped monotonic ordering; also prevents duplicate sequence assignment.
-        # UniqueConstraint ensures deterministic ordering under concurrency.
-        # Primary error is sqlite/postgres compatible.
-        # Defined as table arg for clarity.
-        # The sequence equals the resulting campaign.revision after the mutation.
-        # Index for ordered history queries.
-        # Note: immutability is enforced at application level (no updates/deletes) and
-        # can be hardened with DB triggers/RV later.
-        __import__("sqlalchemy").UniqueConstraint("campaign_id", "sequence", name="uq_campaign_domain_events_campaign_sequence"),
+        UniqueConstraint("campaign_id", "sequence", name="uq_campaign_domain_events_campaign_sequence"),
     )
 
     id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
     campaign_id: Mapped[uuid.UUID] = mapped_column(
-        UUID(as_uuid=True), ForeignKey("campaigns.id", ondelete="CASCADE"), nullable=False, index=True
+        UUID(as_uuid=True), ForeignKey("campaigns.id", ondelete="RESTRICT"), nullable=False, index=True
     )
     # Monotonically ordered within a campaign; 1-indexed (first event is 1).
     sequence: Mapped[int] = mapped_column(Integer, nullable=False)
@@ -116,7 +108,7 @@ class CampaignDomainEvent(Base):
     operation_id: Mapped[str | None] = mapped_column(String(128), nullable=True)
     # Actor who caused the mutation (profile id) — provenance hook.
     actor_id: Mapped[uuid.UUID | None] = mapped_column(
-        UUID(as_uuid=True), ForeignKey("profiles.id", ondelete="SET NULL"), nullable=True, index=True
+        UUID(as_uuid=True), ForeignKey("profiles.id", ondelete="RESTRICT"), nullable=True, index=True
     )
     # Targets / affected entities (free-form JSONB, e.g. ["entity_id", ...] or {"targets": [...]})
     targets: Mapped[dict | list | None] = mapped_column(JSONB, nullable=True)

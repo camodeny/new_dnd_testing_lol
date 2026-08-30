@@ -34,7 +34,7 @@ import logging
 import uuid
 from typing import Callable, Optional
 
-from sqlalchemy import select, update
+from sqlalchemy import or_, select, update
 from sqlalchemy.orm import Session
 
 from models import Campaign, CampaignDomainEvent
@@ -114,19 +114,11 @@ def commit_campaign_mutation(
     if expected_revision is None or expected_revision < 0:
         raise ValueError("expected_revision must be a non-negative integer")
 
-    # Use SELECT FOR UPDATE where available (postgres); sqlite ignores it gracefully
-    # if we try/except. Fallback is to rely on atomic UPDATE WHERE revision = expected.
-    # We do both: first lock, then conditional increment.
-
-    # 1) Lock campaign row (best-effort)
-    campaign: Campaign | None = None
-    try:
-        campaign = db.execute(
-            select(Campaign).where(Campaign.id == campaign_id).with_for_update()
-        ).scalars().first()
-    except Exception:
-        # with_for_update may not be supported; fallback without lock
-        campaign = db.execute(select(Campaign).where(Campaign.id == campaign_id)).scalars().first()
+    # Lock the campaign row. SQLite ignores FOR UPDATE in unit tests; Postgres
+    # serializes competing writers before the conditional revision update below.
+    campaign = db.execute(
+        select(Campaign).where(Campaign.id == campaign_id).with_for_update()
+    ).scalars().first()
 
     if campaign is None:
         raise ValueError(f"Campaign {campaign_id} not found")
@@ -233,7 +225,8 @@ def commit_campaign_mutation(
         db.refresh(event)
 
     logger.info(
-        "campaign mutation committed campaign_id=%s prior=%s new=%s op=%s event_type=%s event_id=%s",
+        "campaign mutation %s campaign_id=%s prior=%s new=%s op=%s event_type=%s event_id=%s",
+        "committed" if commit else "staged",
         campaign_id,
         prior,
         new_revision,
@@ -279,9 +272,9 @@ def update_campaign_derived(
 
     prior_revision = int(campaign.revision) if campaign.revision is not None else 0
 
-    # Only allow non-fictional fields — by default we still apply any provided
-    # campaign column except revision/id/owner_id/created_at, but we NEVER bump revision.
-    allowed = {c.name for c in Campaign.__table__.columns} - {"id", "owner_id", "revision", "created_at"}
+    # Campaign currently has one derived metadata field. Keep this explicit so
+    # fictional fields cannot accidentally bypass revision ordering.
+    allowed = {"updated_at"}
     applied = {}
     for k, v in fields.items():
         if k in allowed:
@@ -311,14 +304,22 @@ def list_campaign_events(
     db: Session,
     campaign_id: uuid.UUID,
     *,
+    viewer_id: uuid.UUID | None = None,
     limit: int = 100,
     offset: int = 0,
 ) -> list[CampaignDomainEvent]:
     """Ordered history for a campaign (sequence asc)."""
+    query = select(CampaignDomainEvent).where(CampaignDomainEvent.campaign_id == campaign_id)
+    if viewer_id is not None:
+        query = query.where(
+            or_(
+                CampaignDomainEvent.visibility == "public",
+                CampaignDomainEvent.actor_id == viewer_id,
+            )
+        )
     return list(
         db.execute(
-            select(CampaignDomainEvent)
-            .where(CampaignDomainEvent.campaign_id == campaign_id)
+            query
             .order_by(CampaignDomainEvent.sequence.asc())
             .limit(limit)
             .offset(offset)
