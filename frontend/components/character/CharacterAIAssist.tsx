@@ -1,7 +1,8 @@
 'use client'
 
-import { useState } from 'react'
+import { useEffect, useState } from 'react'
 import Button from '@/components/common/Button'
+import MarkdownContent from '@/components/common/MarkdownContent'
 import type { CharacterDraft } from './characterFormConfig'
 
 interface Props {
@@ -9,6 +10,7 @@ interface Props {
   characterId?: string
   draftCharacter?: Record<string, unknown> | CharacterDraft | null
   activePage?: string | null
+  clearTrigger?: number
 }
 
 const EXAMPLES = [
@@ -97,12 +99,52 @@ function mockGenerate(prompt: string): Partial<CharacterDraft> {
 
 type ChatMsg = { role: 'ai' | 'user'; content: string }
 
-export default function CharacterAIAssist({ onGenerated, characterId = 'new', draftCharacter, activePage }: Props) {
-  const [messages, setMessages] = useState<ChatMsg[]>([
-    { role: 'ai', content: "Hey! I can help you build your D&D 5e sheet — just describe who you imagine (e.g. 'grumpy dwarf cleric who loves ale' or 'shy half-elf druid, level 2'). I'll draft the stats and you can tweak everything before saving." },
-  ])
+const WELCOME: ChatMsg = { role: 'ai', content: "Hey! I can help you build your D&D 5e sheet — just describe who you imagine (e.g. 'grumpy dwarf cleric who loves ale' or 'shy half-elf druid, level 2'). I'll draft the stats and you can tweak everything before saving." }
+
+export default function CharacterAIAssist({ onGenerated, characterId = 'new', draftCharacter, activePage, clearTrigger }: Props) {
+  const [messages, setMessages] = useState<ChatMsg[]>([WELCOME])
   const [input, setInput] = useState('')
   const [loading, setLoading] = useState(false)
+
+  useEffect(() => {
+    if (clearTrigger) setMessages([WELCOME])
+  }, [clearTrigger])
+
+  useEffect(() => {
+    let cancelled = false
+    async function loadHistory() {
+      const token = typeof window !== 'undefined' ? localStorage.getItem('token') : null
+      const backendBase =
+        (typeof process !== 'undefined' && (process.env.NEXT_PUBLIC_BACKEND_URL as string | undefined)) ||
+        (typeof window !== 'undefined' && window.location.hostname === 'localhost' ? 'http://localhost:5889' : '')
+      const chatUrl = backendBase
+        ? `${backendBase.replace(/\/$/, '')}/api/characters/${encodeURIComponent(characterId)}/chat`
+        : `/api/characters/${encodeURIComponent(characterId)}/chat`
+      try {
+        const res = await fetch(chatUrl, {
+          headers: token ? { Authorization: `Bearer ${token}` } : {},
+        })
+        if (!res.ok) return
+        const data = await res.json()
+        if (cancelled) return
+        if (Array.isArray(data.messages) && data.messages.length > 0) {
+          const mapped: ChatMsg[] = data.messages.map((m: { role: string; content: string }) => ({
+            role: m.role === 'assistant' ? 'ai' : 'user',
+            content: m.content,
+          }))
+          setMessages(mapped as ChatMsg[])
+        } else {
+          setMessages([WELCOME])
+        }
+      } catch {
+        // keep welcome
+      }
+    }
+    loadHistory()
+    return () => {
+      cancelled = true
+    }
+  }, [characterId])
 
   const handleSend = async () => {
     const text = input.trim()
@@ -119,7 +161,7 @@ export default function CharacterAIAssist({ onGenerated, characterId = 'new', dr
     // bypass Next rewrites for SSE to avoid buffering; hit backend directly when local
     const backendBase =
       (typeof process !== 'undefined' && (process.env.NEXT_PUBLIC_BACKEND_URL as string | undefined)) ||
-      (typeof window !== 'undefined' && window.location.hostname === 'localhost' ? 'http://localhost:8000' : '')
+      (typeof window !== 'undefined' && window.location.hostname === 'localhost' ? 'http://localhost:5889' : '')
     const chatUrl = backendBase
       ? `${backendBase.replace(/\/$/, '')}/api/characters/${encodeURIComponent(characterId)}/chat`
       : `/api/characters/${encodeURIComponent(characterId)}/chat`
@@ -199,7 +241,7 @@ export default function CharacterAIAssist({ onGenerated, characterId = 'new', dr
         }
       }
 
-      if (!fullText) {
+      if (!fullText && !gotPatch) {
         setMessages((m) => {
           const copy = [...m]
           if (copy[aiIndex] && copy[aiIndex].role === 'ai') {
@@ -245,7 +287,7 @@ export default function CharacterAIAssist({ onGenerated, characterId = 'new', dr
         {messages.map((msg, i) => (
           <div key={i} className={`character-ai-chat__bubble is-${msg.role}`}>
             <span className="character-ai-chat__bubble-role">{msg.role === 'ai' ? 'AI' : 'You'}</span>
-            <p>{msg.content}</p>
+            {msg.role === 'ai' ? <MarkdownContent content={msg.content} /> : <p>{msg.content}</p>}
           </div>
         ))}
         {loading && messages[messages.length - 1]?.role !== 'ai' && <div className="character-ai-chat__bubble is-ai is-typing"><span>AI</span><p>Drafting…</p></div>}

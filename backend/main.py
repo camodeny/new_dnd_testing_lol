@@ -14,7 +14,7 @@ from sqlalchemy import text
 
 from auth import get_current_profile
 from database import Base, db_healthcheck, engine, get_database_url, get_db
-from models import Campaign, CampaignInvite, CampaignMember, Character, Dnd5eCharacterSheet, Profile
+from models import Campaign, CampaignInvite, CampaignMember, Character, CharacterChatMessage as DbChatMessage, Dnd5eCharacterSheet, Profile
 
 load_dotenv()
 
@@ -262,6 +262,18 @@ def create_character(request: Request, payload: dict, db: Session = Depends(get_
         db.add(sheet)
         db.commit()
         db.refresh(char)
+        # transfer draft chat (NULL namespace) to new character so history follows the created character and next /new is clean
+        try:
+            from sqlalchemy import update as sa_update
+
+            db.execute(
+                sa_update(DbChatMessage)
+                .where(DbChatMessage.owner_id == profile.id, DbChatMessage.character_id.is_(None))
+                .values(character_id=char.id)
+            )
+            db.commit()
+        except Exception as e:
+            logger.warning("failed to transfer draft chat: %s", e)
         # refresh sheet
         sheet = db.execute(select(Dnd5eCharacterSheet).where(Dnd5eCharacterSheet.character_id == char.id)).scalars().first()
     except Exception as e:
@@ -662,18 +674,30 @@ CHARACTER_CHAT_SYSTEM = (
     "Ask clarifying questions if the idea is vague."
 )
 
-PATCH_SYSTEM = (
-    "You are a D&D 5e character sheet patch extractor. Given a conversation about a character, "
-    "return ONLY valid JSON with keys: form_patch (object), active_page (string or null). "
-    "form_patch should contain ONLY fields you are confident about for the CharacterDraft shape. "
-    "Valid top-level keys: name, player_name, race, subrace, alignment, background, experience_points, "
-    "total_level, ability_scores (strength/dexterity/constitution/intelligence/wisdom/charisma 3-20), "
-    "combat (max_hp, current_hp, temp_hp, armor_class, initiative_bonus, speed), "
-    "general (proficiency_bonus, passive_perception etc), spellcasting, currency, personality (personality_traits, ideals, bonds, flaws), "
-    "appearance (age,height,weight,eyes,skin,hair,character_appearance), background_details (backstory, allies_organizations etc), "
-    "and lists: classes [{class_name, subclass, level, hit_die_type}], skills, saving_throws, proficiencies, features, weapons, equipment, spells, resources, companions, conditions. "
-    "Omit uncertain fields. active_page is one of identity, scores, combat, magic_gear, story or null - choose the most relevant step for the current idea."
-)
+CHARACTER_PATCH_TOOL = {
+    "type": "function",
+    "function": {
+        "name": "apply_character_patch",
+        "description": "Apply a patch to the D&D character draft form. Call when you have confident fields to fill in.",
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "form_patch": {
+                    "type": "object",
+                    "description": "Partial CharacterDraft with only confident fields. Valid keys: name, player_name, race, subrace, alignment, background, experience_points, total_level, ability_scores {strength/dexterity/constitution/intelligence/wisdom/charisma 3-20}, combat {max_hp, current_hp, temp_hp, armor_class, initiative_bonus, speed}, general {proficiency_bonus, passive_perception etc}, spellcasting, currency, personality {personality_traits, ideals, bonds, flaws}, appearance {age,height,weight,eyes,skin,hair,character_appearance}, background_details {backstory, allies_organizations etc}, and lists: classes [{class_name, subclass, level, hit_die_type}], skills, saving_throws, proficiencies, features, weapons, equipment, spells, resources, companions, conditions.",
+                    "additionalProperties": True,
+                },
+                "active_page": {
+                    "type": "string",
+                    "enum": ["identity", "scores", "combat", "magic_gear", "story"],
+                    "description": "Most relevant form step for current idea",
+                },
+            },
+            "required": ["form_patch"],
+            "additionalProperties": False,
+        },
+    },
+}
 
 
 class CharacterChatMessage(BaseModel):
@@ -708,7 +732,40 @@ def _build_chat_messages(req: CharacterChatRequest) -> list[dict]:
     return msgs
 
 
-def _character_chat_sync_generator(req: CharacterChatRequest):
+def _resolve_character_uuid(character_id: str) -> uuid_lib.UUID | None:
+    if character_id == "new":
+        return None
+    try:
+        return uuid_lib.UUID(character_id)
+    except ValueError:
+        raise HTTPException(status_code=404, detail="Invalid character id")
+
+
+def _save_chat_message(owner_id: uuid_lib.UUID, character_uuid: uuid_lib.UUID | None, role: str, content: str):
+    try:
+        from database import SessionLocal
+
+        if SessionLocal is None:
+            return
+        db = SessionLocal()
+        try:
+            msg = DbChatMessage(
+                owner_id=owner_id,
+                character_id=character_uuid,
+                role=role,
+                content=content,
+            )
+            db.add(msg)
+            db.commit()
+        finally:
+            db.close()
+    except Exception as e:
+        logger.warning("failed to save chat message: %s", e)
+
+
+def _character_chat_sync_generator(
+    req: CharacterChatRequest, owner_id: uuid_lib.UUID, character_uuid: uuid_lib.UUID | None
+):
     try:
         from llm_providers import ProviderRequest, provider_registry
     except Exception as e:
@@ -724,60 +781,121 @@ def _character_chat_sync_generator(req: CharacterChatRequest):
         yield f"event: error\ndata: {json.dumps({'error': str(e)})}\n\n"
         return
 
-    # --- stream chat message (true streaming) ---
     full_text = ""
+    has_patch = False
+    pending_patch: dict | None = None
+    pending_active: str | None = None
     try:
         from llm_providers import ProviderRequest as PR, stream_chat
 
         pr = PR(
             messages=messages,
             model=model,
-            stream=True,
+            tools=[CHARACTER_PATCH_TOOL],
+            tool_choice="auto",
+            allow_thinking=False,
             timeout_seconds=60,
+            stream=True,
         )
+        pending_tool_calls: list = []
         for ev in stream_chat(adapter, pr):
             if ev.kind == "token" and ev.text:
                 full_text += ev.text
                 yield f"data: {json.dumps({'type': 'token', 'text': ev.text})}\n\n"
+            elif ev.kind == "tool_call" and ev.tool_call:
+                pending_tool_calls.append(ev.tool_call)
             elif ev.kind == "done":
                 break
+        for tc in pending_tool_calls:
+            try:
+                args_raw = tc.arguments
+                if isinstance(args_raw, str):
+                    args = json.loads(args_raw) if args_raw else {}
+                elif isinstance(args_raw, dict):
+                    args = args_raw
+                else:
+                    args = {}
+                if not isinstance(args, dict):
+                    continue
+                patch = args.get("form_patch") if isinstance(args.get("form_patch"), dict) else None
+                if patch is None:
+                    patch = {k: v for k, v in args.items() if k != "active_page"}
+                ap = args.get("active_page")
+                active_page = ap if ap in ("identity", "scores", "combat", "magic_gear", "story") else None
+                if patch:
+                    has_patch = True
+                    pending_patch = patch
+                    pending_active = active_page
+                    yield f"data: {json.dumps({'type': 'patch', 'patch': patch, 'active_page': active_page})}\n\n"
+                    break
+            except Exception as e:
+                logger.warning("patch tool parse failed: %s", e)
+        if has_patch and not full_text:
+            canonical = "Draft applied to the form \u2192 review the steps and hit Create when ready."
+            full_text = canonical
+            yield f"data: {json.dumps({'type': 'token', 'text': canonical})}\n\n"
+        if not full_text and not has_patch:
+            fallback = "I had trouble reaching the AI, but I can still help \u2014 tell me more about your character idea."
+            full_text = fallback
+            yield f"data: {json.dumps({'type': 'token', 'text': fallback})}\n\n"
     except Exception as e:
-        logger.exception("character chat stream failed")
+        logger.exception("character chat failed")
         yield f"event: error\ndata: {json.dumps({'error': str(e)})}\n\n"
-        if not full_text:
-            full_text = "I had trouble reaching the AI, but I can still help — tell me more about your character idea."
-            # send fallback as token so UI shows something
-            yield f"data: {json.dumps({'type': 'token', 'text': full_text})}\n\n"
-
-    # --- extract patch via second LLM call (json mode, blocking but fast) ---
-    try:
-        from llm_providers import ProviderRequest as PR, execute_chat
-
-        patch_messages = [
-            {"role": "system", "content": PATCH_SYSTEM},
-            {"role": "user", "content": f"Conversation:\nUser: {req.content}\nAssistant: {full_text}\n\nCurrent draft: {json.dumps(req.draft_character or {})[:3000]}\n\nReturn form_patch + active_page."},
-        ]
-        pr = PR(
-            messages=patch_messages,
-            model=model,
-            json_mode=True,
-            timeout_seconds=30,
-        )
-        resp = execute_chat(adapter, pr)
-        try:
-            parsed = json.loads(resp.content) if resp.content else {}
-        except Exception:
-            parsed = {}
-        if isinstance(parsed, dict):
-            patch = parsed.get("form_patch") if isinstance(parsed.get("form_patch"), dict) else {}
-            ap = parsed.get("active_page")
-            active_page = ap if ap in ("identity", "scores", "combat", "magic_gear", "story") else None
-            if patch:
-                yield f"data: {json.dumps({'type': 'patch', 'patch': patch, 'active_page': active_page})}\n\n"
-    except Exception as e:
-        logger.warning("patch extraction failed: %s", e)
+        fallback = "I had trouble reaching the AI, but I can still help — tell me more about your character idea."
+        full_text = fallback
+        yield f"data: {json.dumps({'type': 'token', 'text': fallback})}\n\n"
+    finally:
+        if full_text:
+            _save_chat_message(owner_id, character_uuid, "assistant", full_text)
 
     yield f"data: {json.dumps({'type': 'done'})}\n\n"
+
+
+@app.get("/api/characters/{character_id}/chat")
+def get_character_chat(character_id: str, request: Request, db: Session = Depends(get_db)):
+    profile = _resolve_profile(request, db)
+    character_uuid = _resolve_character_uuid(character_id)
+    if character_uuid is not None:
+        char = db.get(Character, character_uuid)
+        if not char or char.owner_id != profile.id:
+            raise HTTPException(status_code=404, detail="Character not found")
+    msgs = (
+        db.execute(
+            select(DbChatMessage)
+            .where(
+                DbChatMessage.owner_id == profile.id,
+                DbChatMessage.character_id == character_uuid,
+            )
+            .order_by(DbChatMessage.created_at.asc())
+        )
+        .scalars()
+        .all()
+    )
+    return {
+        "messages": [
+            {"role": m.role, "content": m.content, "created_at": m.created_at.isoformat() if m.created_at else None}
+            for m in msgs
+        ]
+    }
+
+
+@app.delete("/api/characters/{character_id}/chat")
+def delete_character_chat(character_id: str, request: Request, db: Session = Depends(get_db)):
+    profile = _resolve_profile(request, db)
+    character_uuid = _resolve_character_uuid(character_id)
+    if character_uuid is not None:
+        char = db.get(Character, character_uuid)
+        if not char or char.owner_id != profile.id:
+            raise HTTPException(status_code=404, detail="Character not found")
+    from sqlalchemy import delete as sa_delete
+
+    db.execute(
+        sa_delete(DbChatMessage).where(
+            DbChatMessage.owner_id == profile.id, DbChatMessage.character_id == character_uuid
+        )
+    )
+    db.commit()
+    return {"ok": True}
 
 
 @app.post("/api/characters/{character_id}/chat")
@@ -787,19 +905,20 @@ async def character_chat(character_id: str, req: CharacterChatRequest, request: 
 
     - character_id: "new" for unsaved draft, or existing character UUID (ownership validated)
     - streams tokens via text/event-stream: {type:"token", text} + {type:"patch", patch} + {type:"done"}
+    - persists user + assistant messages for refresh persistence
     """
     profile = _resolve_profile(request, db)
-    if character_id != "new":
-        try:
-            cid = uuid_lib.UUID(character_id)
-        except ValueError:
-            raise HTTPException(status_code=404, detail="Invalid character id")
-        char = db.get(Character, cid)
+    character_uuid = _resolve_character_uuid(character_id)
+    if character_uuid is not None:
+        char = db.get(Character, character_uuid)
         if not char or char.owner_id != profile.id:
             raise HTTPException(status_code=404, detail="Character not found")
 
+    # persist user message before streaming (so history survives even if stream fails)
+    _save_chat_message(profile.id, character_uuid, "user", req.content)
+
     return StreamingResponse(
-        _character_chat_sync_generator(req),
+        _character_chat_sync_generator(req, profile.id, character_uuid),
         media_type="text/event-stream",
         headers={
             "Cache-Control": "no-cache",

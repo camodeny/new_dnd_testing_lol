@@ -131,8 +131,9 @@ class NormalizedChatResponse:
 
 @dataclass
 class NormalizedStreamEvent:
-    kind: str  # 'token' | 'done'
+    kind: str  # 'token' | 'tool_call' | 'done'
     text: str = ''
+    tool_call: Optional[NormalizedToolCall] = None
 
 
 class ProviderError(Exception):
@@ -335,6 +336,7 @@ class LLMProviderAdapter:
         return ''
 
     def iter_stream_events(self, response) -> Iterable[NormalizedStreamEvent]:
+        tool_calls: dict[int, dict] = {}
         for line in response.iter_lines(decode_unicode=True):
             if not line:
                 continue
@@ -345,12 +347,36 @@ class LLMProviderAdapter:
                 break
             try:
                 chunk = json.loads(data_str)
-                delta = (chunk.get('choices') or [{}])[0].get('delta') or {}
+                choice = (chunk.get('choices') or [{}])[0]
+                delta = choice.get('delta') or {}
                 content = delta.get('content') or ''
+                # tool call deltas (chat completions)
+                for tc in delta.get('tool_calls') or []:
+                    idx = tc.get('index', 0)
+                    cur = tool_calls.get(idx, {"id": None, "name": None, "arguments": ""})
+                    if tc.get('id'):
+                        cur["id"] = tc.get('id')
+                    fn = tc.get('function') or {}
+                    if fn.get('name'):
+                        cur["name"] = fn.get('name')
+                    if fn.get('arguments'):
+                        cur["arguments"] += fn.get('arguments')
+                    tool_calls[idx] = cur
+                # also handle finish with tool_calls in choice.message (rare)
+                msg = choice.get('message') or {}
+                for tc in msg.get('tool_calls') or []:
+                    idx = len(tool_calls)
+                    fn = tc.get('function') or {}
+                    tool_calls[idx] = {"id": tc.get('id'), "name": fn.get('name'), "arguments": fn.get('arguments') or ""}
             except (json.JSONDecodeError, IndexError, KeyError):
                 continue
             if content:
                 yield NormalizedStreamEvent(kind='token', text=content)
+        for tc in tool_calls.values():
+            yield NormalizedStreamEvent(
+                kind='tool_call',
+                tool_call=NormalizedToolCall(id=tc.get('id'), name=tc.get('name'), arguments=tc.get('arguments') or "", raw=tc),
+            )
         yield NormalizedStreamEvent(kind='done')
 
     # -- error classification -------------------------------------------
@@ -579,6 +605,8 @@ class OpenCodeGoAdapter(LLMProviderAdapter):
         )
 
     def iter_stream_events(self, response):
+        tool_calls: dict[str, dict] = {}
+        current_call_id: str | None = None
         for line in response.iter_lines(decode_unicode=True):
             if not line or not line.startswith('data: '):
                 continue
@@ -589,8 +617,50 @@ class OpenCodeGoAdapter(LLMProviderAdapter):
                 event = json.loads(data_str)
             except json.JSONDecodeError:
                 continue
-            if event.get('type') == 'response.output_text.delta' and event.get('delta'):
+            t = event.get('type')
+            if t == 'response.output_text.delta' and event.get('delta'):
                 yield NormalizedStreamEvent(kind='token', text=str(event['delta']))
+            elif t == 'response.output_item.added':
+                item = event.get('item') or {}
+                if item.get('type') == 'function_call':
+                    cid = str(item.get('call_id') or item.get('id') or len(tool_calls))
+                    tool_calls[cid] = {"id": cid, "name": item.get('name'), "arguments": item.get('arguments') or ""}
+                    current_call_id = cid
+            elif t == 'response.function_call_arguments.delta':
+                delta = event.get('delta') or ""
+                cid = str(event.get('item_id') or event.get('call_id') or current_call_id or len(tool_calls))
+                if cid in tool_calls:
+                    tool_calls[cid]["arguments"] += str(delta)
+                elif current_call_id and current_call_id in tool_calls:
+                    tool_calls[current_call_id]["arguments"] += str(delta)
+                else:
+                    tool_calls[cid] = {"id": cid, "name": None, "arguments": str(delta)}
+                    current_call_id = cid
+            elif t == 'response.output_item.done':
+                item = event.get('item') or {}
+                if item.get('type') == 'function_call':
+                    cid = str(item.get('call_id') or item.get('id') or current_call_id or "")
+                    if cid and cid in tool_calls:
+                        if item.get('name'):
+                            tool_calls[cid]["name"] = item.get('name')
+                        if item.get('arguments'):
+                            tool_calls[cid]["arguments"] = item.get('arguments')
+                    elif item.get('name'):
+                        cid = str(item.get('call_id') or item.get('id') or len(tool_calls))
+                        tool_calls[cid] = {"id": cid, "name": item.get('name'), "arguments": item.get('arguments') or ""}
+            elif t == 'response.completed':
+                # some providers bundle final output with function calls
+                resp = event.get('response') or {}
+                for item in resp.get('output') or []:
+                    if isinstance(item, dict) and item.get('type') == 'function_call':
+                        cid = str(item.get('call_id') or item.get('id') or len(tool_calls))
+                        if cid not in tool_calls:
+                            tool_calls[cid] = {"id": cid, "name": item.get('name'), "arguments": item.get('arguments') or ""}
+        for tc in tool_calls.values():
+            yield NormalizedStreamEvent(
+                kind='tool_call',
+                tool_call=NormalizedToolCall(id=tc.get('id'), name=tc.get('name'), arguments=tc.get('arguments') or "", raw=tc),
+            )
         yield NormalizedStreamEvent(kind='done')
 
 
