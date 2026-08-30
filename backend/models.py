@@ -163,6 +163,57 @@ class IdempotentCommand(Base):
     completed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
 
 
+class Outbox(Base):
+    """Transactional outbox — issue #190.
+
+    Authoritative state + domain event + outbox writes commit atomically.
+    Relay publishes via stable id (outbox id) for idempotent downstream handling.
+    """
+
+    __tablename__ = "outbox"
+    __table_args__ = (
+        # no hard uniqueness — duplicates are acceptable but operation_id aids dedupe
+    )
+
+    id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    aggregate_type: Mapped[str] = mapped_column(String(64), nullable=False, default="campaign", server_default="campaign")
+    aggregate_id: Mapped[uuid.UUID | None] = mapped_column(UUID(as_uuid=True), nullable=True, index=True)
+    campaign_id: Mapped[uuid.UUID | None] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("campaigns.id", ondelete="SET NULL"), nullable=True, index=True
+    )
+    event_type: Mapped[str] = mapped_column(String(128), nullable=False)
+    operation_id: Mapped[str | None] = mapped_column(String(128), nullable=True, index=True)
+    payload: Mapped[dict | None] = mapped_column(JSONB, nullable=True)
+    status: Mapped[str] = mapped_column(String(16), nullable=False, default="pending", server_default="pending")
+    attempts: Mapped[int] = mapped_column(Integer, nullable=False, default=0, server_default="0")
+    next_attempt_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    claimed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    claimed_by: Mapped[str | None] = mapped_column(String(128), nullable=True)
+    published_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    last_error: Mapped[str | None] = mapped_column(Text, nullable=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now(), nullable=False)
+    updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now(), onupdate=func.now(), nullable=False)
+
+    def to_dict(self):
+        return {
+            "id": str(self.id),
+            "aggregate_type": self.aggregate_type,
+            "aggregate_id": str(self.aggregate_id) if self.aggregate_id else None,
+            "campaign_id": str(self.campaign_id) if self.campaign_id else None,
+            "event_type": self.event_type,
+            "operation_id": self.operation_id,
+            "payload": self.payload,
+            "status": self.status,
+            "attempts": self.attempts,
+            "next_attempt_at": self.next_attempt_at.isoformat() if self.next_attempt_at else None,
+            "claimed_at": self.claimed_at.isoformat() if self.claimed_at else None,
+            "claimed_by": self.claimed_by,
+            "published_at": self.published_at.isoformat() if self.published_at else None,
+            "last_error": self.last_error,
+            "created_at": self.created_at.isoformat() if self.created_at else None,
+        }
+
+
 class CampaignMember(Base):
     __tablename__ = "campaign_members"
 
