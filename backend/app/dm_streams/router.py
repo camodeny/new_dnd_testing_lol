@@ -1,5 +1,6 @@
 """DM stream transport — issue #197."""
 import logging
+import os
 import uuid
 
 from fastapi import APIRouter, Depends, HTTPException, Request
@@ -11,7 +12,6 @@ from app.runtime.threads import (
     ThreadAuthorizationError,
     ThreadNotFoundError,
     assert_can_read_thread,
-    assert_can_write_thread,
     get_campaign_thread,
     parse_thread_id,
     resolve_thread_id,
@@ -53,13 +53,45 @@ def _authorized_campaign(db: Session, campaign_id: str, user_id: uuid.UUID) -> C
     return campaign
 
 
-def _resolve_thread_for_stream(db: Session, campaign: Campaign, raw_thread_id, user_id: uuid.UUID) -> uuid.UUID:
+def _is_dm_writer(campaign: Campaign, profile, request: Request) -> bool:
+    """DM/server-only writer check — issue #197 review.
+
+    Only the campaign owner (DM) or an internal worker may mutate streams.
+    Players — even members of the thread — cannot forge DM narration.
+    Worker authentication uses a shared header token if configured, to allow
+    the queue worker to act without impersonating the owner.
+    """
+    if campaign.owner_id == profile.id:
+        return True
+    # Internal worker token (server-to-server). Env not set = no worker path.
+    token = request.headers.get("x-worker-token") or request.headers.get("x-internal-token") or request.headers.get("x-dm-worker-token")
+    expected = os.getenv("DM_STREAM_WORKER_TOKEN") or os.getenv("WORKER_INTERNAL_TOKEN") or os.getenv("INTERNAL_WORKER_TOKEN")
+    if expected and token and token == expected:
+        return True
+    return False
+
+
+def _require_dm_writer(campaign: Campaign, profile, request: Request) -> None:
+    if not _is_dm_writer(campaign, profile, request):
+        logger.info("dm_stream write denied campaign_id=%s user_id=%s reason=not_dm_writer", campaign.id, profile.id)
+        raise HTTPException(status_code=403, detail="Only the DM/campaign owner can mutate DM streams")
+
+
+def _resolve_thread_for_stream(db: Session, campaign: Campaign, raw_thread_id, profile, request: Request) -> uuid.UUID:
     raw = raw_thread_id if raw_thread_id is not None else "main"
     try:
-        tid = resolve_thread_id(db, campaign.id, str(raw) if raw else "main", created_by=user_id)
+        # Resolve thread id (creates shared thread if needed). This is the same
+        # durable resolution used for player submissions, but DM streams do not
+        # reuse player write auth — they require explicit DM/worker authorization.
+        tid = resolve_thread_id(db, campaign.id, str(raw) if raw else "main", created_by=profile.id)
         db.commit()
-        assert_can_write_thread(db, campaign.id, tid, user_id)
+        # Verify thread exists and viewer can at least read it (privacy: owner
+        # without private membership still fails closed, per #195 invariant).
+        assert_can_read_thread(db, campaign.id, tid, profile.id)
+        _require_dm_writer(campaign, profile, request)
         return tid
+    except HTTPException:
+        raise
     except ThreadNotFoundError as exc:
         raise HTTPException(status_code=404, detail="Thread not found") from exc
     except ThreadAuthorizationError as exc:
@@ -73,7 +105,7 @@ def create_dm_stream(campaign_id: str, payload: dict, request: Request, db: Sess
 
     raw_thread = payload.get("thread_id", payload.get("threadId", "main"))
     try:
-        thread_id = _resolve_thread_for_stream(db, campaign, raw_thread, profile.id)
+        thread_id = _resolve_thread_for_stream(db, campaign, raw_thread, profile, request)
     except HTTPException:
         raise
     except Exception as exc:
@@ -128,13 +160,15 @@ def append_dm_chunk(campaign_id: str, stream_id: str, payload: dict, request: Re
     if stream is None or stream.campaign_id != campaign.id:
         raise HTTPException(status_code=404, detail="Stream not found")
 
-    # Auth: same thread authorization as turn
+    # Auth: DM stream mutations are DM/worker-only — players cannot forge narration.
+    # Read-level thread auth still applies for visibility, but write auth is distinct.
     try:
-        assert_can_write_thread(db, campaign.id, stream.thread_id, profile.id)
+        assert_can_read_thread(db, campaign.id, stream.thread_id, profile.id)
     except ThreadNotFoundError as exc:
         raise HTTPException(status_code=404, detail="Thread not found") from exc
     except ThreadAuthorizationError as exc:
         raise HTTPException(status_code=403, detail=str(exc)) from exc
+    _require_dm_writer(campaign, profile, request)
 
     sequence = payload.get("sequence")
     text = payload.get("text", payload.get("chunk", payload.get("content", "")))
@@ -212,11 +246,12 @@ def complete_dm_stream(campaign_id: str, stream_id: str, payload: dict, request:
     if stream is None or stream.campaign_id != campaign.id:
         raise HTTPException(status_code=404, detail="Stream not found")
     try:
-        assert_can_write_thread(db, campaign.id, stream.thread_id, profile.id)
+        assert_can_read_thread(db, campaign.id, stream.thread_id, profile.id)
     except ThreadNotFoundError as exc:
         raise HTTPException(status_code=404, detail="Thread not found") from exc
     except ThreadAuthorizationError as exc:
         raise HTTPException(status_code=403, detail=str(exc)) from exc
+    _require_dm_writer(campaign, profile, request)
     reason = str(payload.get("reason", payload.get("completion_reason", "completed"))) if payload else "completed"
     try:
         stream = complete_stream(db, sid, completion_reason=reason)
@@ -242,11 +277,12 @@ def abandon_dm_stream(campaign_id: str, stream_id: str, payload: dict, request: 
     if stream is None or stream.campaign_id != campaign.id:
         raise HTTPException(status_code=404, detail="Stream not found")
     try:
-        assert_can_write_thread(db, campaign.id, stream.thread_id, profile.id)
+        assert_can_read_thread(db, campaign.id, stream.thread_id, profile.id)
     except ThreadNotFoundError as exc:
         raise HTTPException(status_code=404, detail="Thread not found") from exc
     except ThreadAuthorizationError as exc:
         raise HTTPException(status_code=403, detail=str(exc)) from exc
+    _require_dm_writer(campaign, profile, request)
     reason = str(payload.get("reason", payload.get("abandonment_reason", "abandoned"))) if payload else "abandoned"
     try:
         # allow explicit failed status via payload

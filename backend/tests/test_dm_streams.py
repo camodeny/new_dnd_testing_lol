@@ -316,3 +316,80 @@ def test_snapshot_shows_active_stream_and_reconstructs_visible_text(api):
     r_snap2 = client.get(f"/api/campaigns/{campaign_id}/snapshot")
     assert r_snap2.json()["dm_state"]["streaming"] is False
     assert any(m["id"] == sid for m in r_snap2.json()["dm_messages"])
+
+
+def test_player_can_read_but_cannot_mutate_dm_streams(api, monkeypatch):
+    """Review feedback: ordinary player can read an authorized stream but
+    cannot create, append, complete, abandon, or fail one."""
+    client, factory, campaign_id, member_id, _ = api
+    # Owner creates and partially fills a stream
+    r = client.post(f"/api/campaigns/{campaign_id}/dm-streams", json={"turn_id": "t-player-read", "attempt_id": "a-player-read"})
+    assert r.status_code == 201
+    sid = r.json()["stream"]["id"]
+    r2 = client.post(f"/api/campaigns/{campaign_id}/dm-streams/{sid}/chunks", json={"sequence": 0, "text": "owner narration"})
+    assert r2.status_code == 201
+    # Switch auth to ordinary campaign member (player)
+    monkeypatch.setattr("app.dm_streams.router.resolve_profile", lambda req, db: db.get(Profile, member_id))
+    import app.snapshot.router as smr
+    monkeypatch.setattr(smr, "resolve_profile", lambda req, db: db.get(Profile, member_id))
+    # Player can read the stream and snapshot
+    r_read = client.get(f"/api/campaigns/{campaign_id}/dm-streams/{sid}")
+    assert r_read.status_code == 200, r_read.text
+    assert r_read.json()["visible_text"] == "owner narration"
+    r_list = client.get(f"/api/campaigns/{campaign_id}/dm-streams?thread_id=main")
+    assert r_list.status_code == 200
+    r_snap = client.get(f"/api/campaigns/{campaign_id}/snapshot")
+    assert r_snap.status_code == 200
+    # Player cannot create a new DM stream
+    r_create = client.post(f"/api/campaigns/{campaign_id}/dm-streams", json={"turn_id": "t-forged", "attempt_id": "a-forged"})
+    assert r_create.status_code == 403
+    # Player cannot append to existing stream
+    r_append = client.post(f"/api/campaigns/{campaign_id}/dm-streams/{sid}/chunks", json={"sequence": 1, "text": "forged"})
+    assert r_append.status_code == 403
+    # Player cannot complete/abandon/fail
+    r_complete = client.post(f"/api/campaigns/{campaign_id}/dm-streams/{sid}/complete", json={})
+    assert r_complete.status_code == 403
+    r_abandon = client.post(f"/api/campaigns/{campaign_id}/dm-streams/{sid}/abandon", json={"reason": "forged"})
+    assert r_abandon.status_code == 403
+    r_fail = client.post(f"/api/campaigns/{campaign_id}/dm-streams/{sid}/abandon", json={"status": "failed", "reason": "forged"})
+    assert r_fail.status_code == 403
+    # Verify no forgery persisted
+    monkeypatch.setattr("app.dm_streams.router.resolve_profile", lambda req, db: db.get(Profile, MOCK_USER_ID))
+    monkeypatch.setattr(smr, "resolve_profile", lambda req, db: db.get(Profile, MOCK_USER_ID))
+    r_verify = client.get(f"/api/campaigns/{campaign_id}/dm-streams/{sid}")
+    assert r_verify.json()["visible_text"] == "owner narration"
+    assert len(r_verify.json()["chunks"]) == 1
+
+
+def test_internal_worker_token_can_mutate_when_owner_not_caller(api, monkeypatch):
+    """Worker/internal token path allows server-authorized mutation without owner impersonation."""
+    client, factory, campaign_id, member_id, _ = api
+    monkeypatch.setenv("DM_STREAM_WORKER_TOKEN", "secret-worker-token")
+    # Act as ordinary player but present worker token
+    monkeypatch.setattr("app.dm_streams.router.resolve_profile", lambda req, db: db.get(Profile, member_id))
+    import app.snapshot.router as smr
+    monkeypatch.setattr(smr, "resolve_profile", lambda req, db: db.get(Profile, member_id))
+    # Without token, player is blocked
+    r_no_token = client.post(f"/api/campaigns/{campaign_id}/dm-streams", json={"turn_id": "t-worker-no", "attempt_id": "a-worker-no"})
+    assert r_no_token.status_code == 403
+    # With correct worker token, allowed
+    r = client.post(
+        f"/api/campaigns/{campaign_id}/dm-streams",
+        json={"turn_id": "t-worker", "attempt_id": "a-worker"},
+        headers={"x-worker-token": "secret-worker-token"},
+    )
+    assert r.status_code == 201, r.text
+    sid = r.json()["stream"]["id"]
+    r2 = client.post(
+        f"/api/campaigns/{campaign_id}/dm-streams/{sid}/chunks",
+        json={"sequence": 0, "text": "worker text"},
+        headers={"x-worker-token": "secret-worker-token"},
+    )
+    assert r2.status_code == 201
+    r3 = client.post(
+        f"/api/campaigns/{campaign_id}/dm-streams/{sid}/complete",
+        json={},
+        headers={"x-worker-token": "secret-worker-token"},
+    )
+    assert r3.status_code == 200
+    assert r3.json()["stream"]["status"] == "completed"
