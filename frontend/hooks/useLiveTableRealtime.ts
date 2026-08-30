@@ -21,6 +21,7 @@ import { supabase } from '@/lib/supabase'
 import { apiFetch } from '@/lib/api'
 import {
   dedupeEvents,
+  deriveDmState,
   getRealtimeClientMetrics,
   incRealtimeMetric,
   liveTableChannel,
@@ -177,13 +178,19 @@ export function useLiveTableRealtime(opts: UseLiveTableRealtimeOptions) {
         } else if (ev.type === 'dm.chunk') {
           const sid = String(ev.stream_id ?? 'unknown')
           const arr = nextChunks.get(sid) ?? []
-          if (!arr.some((c) => c.event_id === ev.event_id)) {
-            nextChunks.set(sid, sortEventsBySequence([...arr, ev]))
-          }
-          // Also extend authoritative visible_text incrementally for live rendering
-          if (nextDmState && String(nextDmState.stream_id) === sid && typeof ev.text === 'string') {
-            const cur = typeof nextDmState.visible_text === 'string' ? nextDmState.visible_text : ''
-            nextDmState = { ...nextDmState, visible_text: cur + ev.text, last_sequence: ev.sequence ?? nextDmState.last_sequence, chunk_count: (nextDmState.chunk_count ?? 0) + 1 }
+          const alreadyIncorporated =
+            arr.some((c) => c.event_id === ev.event_id) ||
+            (typeof ev.sequence === 'number' && arr.some((c) => c.sequence === ev.sequence && String(c.stream_id) === sid))
+          if (alreadyIncorporated) {
+            incRealtimeMetric('duplicateDeliveries', 1)
+          } else {
+            const newArr = sortEventsBySequence([...arr, ev])
+            nextChunks.set(sid, newArr)
+            if (nextDmState && String(nextDmState.stream_id) === sid) {
+              const base = snapshotRef.current?.dm_state ?? null
+              const derived = deriveDmState(base, newArr)
+              if (derived) nextDmState = derived
+            }
           }
         } else if (ev.type === 'dm.status' || ev.type === 'dm.thinking') {
           const evSid = ev.stream_id ? String(ev.stream_id) : null

@@ -217,6 +217,48 @@ export function applyEventsToMessages(
   return out.sort((a, b) => a.sequence - b.sequence)
 }
 
+/**
+ * Derive DM visible_text / last_sequence / chunk_count from authoritative snapshot base
+ * plus sorted incremental chunks that are newer than the snapshot. Only contiguous
+ * chunks from baseLast+1 are incorporated — gaps are buffered until the missing
+ * sequence arrives, and duplicates are ignored. This makes the derived state
+ * sequence-aware and persistently deduped, handling duplicate and 7-before-6 cases.
+ */
+export function deriveDmState(
+  base: DmStateForRealtime | null | undefined,
+  chunks: RealtimeEvent[],
+): DmStateForRealtime | null {
+  if (!base) return base ?? null
+  const baseText = typeof base.visible_text === 'string' ? base.visible_text : ''
+  const baseLastRaw = base.last_sequence
+  const baseLast = typeof baseLastRaw === 'number' ? baseLastRaw : baseLastRaw != null ? Number(baseLastRaw) : -1
+  const baseCount = typeof base.chunk_count === 'number' ? base.chunk_count : 0
+  const sorted = sortEventsBySequence(dedupeEvents(chunks))
+  let curText = baseText
+  let expected = Number.isFinite(baseLast) ? baseLast + 1 : 0
+  let contiguousCount = 0
+  let lastContiguous = baseLast
+  for (const ch of sorted) {
+    const seq = typeof ch.sequence === 'number' ? ch.sequence : Number(ch.sequence)
+    if (Number.isNaN(seq)) continue
+    if (seq === expected) {
+      curText += typeof ch.text === 'string' ? ch.text : ''
+      expected++
+      contiguousCount++
+      lastContiguous = seq
+    } else if (seq > expected) {
+      break // gap
+    }
+    // seq < expected is duplicate/old — skip
+  }
+  return {
+    ...base,
+    visible_text: curText,
+    last_sequence: lastContiguous >= 0 ? lastContiguous : base.last_sequence,
+    chunk_count: baseCount + contiguousCount,
+  }
+}
+
 // ── Observability counters (module-local, mirrors backend metrics) ──────
 
 let _metrics = {
