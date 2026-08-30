@@ -15,6 +15,8 @@ SUPABASE_JWT_SECRET=...
 
 Alembic is configured in `alembic/env.py` to read `DATABASE_URL`/`POSTGRES_URL`/`POSTGRES_PRISMA_URL`/`SUPABASE_DB_URL` (same as `database.py`).
 
+### Local development
+
 ```bash
 # create a new migration after editing models.py
 alembic revision --autogenerate -m "add campaigns"
@@ -22,8 +24,9 @@ alembic revision --autogenerate -m "add campaigns"
 # preview SQL without touching DB
 alembic upgrade --sql head
 
-# apply to Supabase (needs DATABASE_URL set)
+# apply to Supabase/local DB (needs DATABASE_URL set)
 alembic upgrade head
+# or: python -m scripts.migrate
 
 # check status / history
 alembic current
@@ -32,7 +35,29 @@ alembic history
 
 Initial migration `001_create_profiles` creates `public.profiles` mirroring `auth.users`. It matches `schema.sql` for manual use in Supabase SQL Editor.
 
-**Deploys are self-migrating:** `main.py:lifespan` calls `_run_migrations()` on every cold start (`alembic upgrade head` via `alembic.ini`). No manual `alembic upgrade head` needed — Vercel just needs `DATABASE_URL`/`POSTGRES_URL` in Runtime env. If Alembic fails, it falls back to `Base.metadata.create_all()` and logs a warning. For local dev you can still run `alembic upgrade head` manually.
+### Production deploys (Vercel + Supabase)
+
+Application startup **never** runs migrations or `Base.metadata.create_all()` — see `main.py:lifespan`.
+
+Deploys must apply migrations explicitly **before** serving traffic:
+
+```bash
+# from backend/ with production DATABASE_URL / POSTGRES_URL set
+python -m scripts.migrate
+# equivalent: alembic upgrade head
+
+# verify
+alembic current
+```
+
+`scripts/migrate.py` logs the `alembic_version` before and after, and exits non-zero on failure with full traceback. A failed migration leaves the previous app/DB state intact (migrations run in a transaction) and the deploy must be treated as unhealthy — do not promote. No fallback to `create_all()` is performed in production. Multiple API instances never attempt DDL concurrently because DDL only runs in this single deploy step (Alembic also acquires a row lock on `alembic_version` if run concurrently).
+
+CI example:
+
+```bash
+DATABASE_URL="$POSTGRES_URL" python -m scripts.migrate || exit 1
+# only then deploy to Vercel / restart containers
+```
 
 ## Auth
 `auth.py` verifies Supabase JWT via JWKS (`{SUPABASE_URL}/auth/v1/.well-known/jwks.json`) with `HS256` fallback. Frontend sends `Authorization: Bearer <supabase access_token>` — see `frontend/lib/supabase.ts`.
