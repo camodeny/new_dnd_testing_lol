@@ -11,7 +11,7 @@ If you prefer to use `auth.users` directly without a mirror, point FKs there —
 import uuid
 from datetime import datetime
 
-from sqlalchemy import Boolean, CheckConstraint, DateTime, ForeignKey, Index, Integer, String, Text, UniqueConstraint, func, text
+from sqlalchemy import Boolean, CheckConstraint, DateTime, Float, ForeignKey, Index, Integer, String, Text, UniqueConstraint, func, text
 from sqlalchemy.dialects.postgresql import JSONB, UUID
 from sqlalchemy.orm import Mapped, mapped_column
 
@@ -106,6 +106,7 @@ class CampaignDomainEvent(Base):
     event_type: Mapped[str] = mapped_column(String(64), nullable=False)
     # Source operation idempotency/observability hook (e.g. client-supplied op id or server-generated).
     operation_id: Mapped[str | None] = mapped_column(String(128), nullable=True)
+    trace_id: Mapped[str | None] = mapped_column(String(64), nullable=True, index=True)
     # Actor who caused the mutation (profile id) — provenance hook.
     actor_id: Mapped[uuid.UUID | None] = mapped_column(
         UUID(as_uuid=True), ForeignKey("profiles.id", ondelete="RESTRICT"), nullable=True, index=True
@@ -126,6 +127,7 @@ class CampaignDomainEvent(Base):
             "sequence": self.sequence,
             "event_type": self.event_type,
             "operation_id": self.operation_id,
+            "trace_id": self.trace_id,
             "actor_id": str(self.actor_id) if self.actor_id else None,
             "targets": self.targets,
             "payload": self.payload,
@@ -183,6 +185,7 @@ class Outbox(Base):
     )
     event_type: Mapped[str] = mapped_column(String(128), nullable=False)
     operation_id: Mapped[str | None] = mapped_column(String(128), nullable=True, index=True)
+    trace_id: Mapped[str | None] = mapped_column(String(64), nullable=True, index=True)
     payload: Mapped[dict | None] = mapped_column(JSONB, nullable=True)
     status: Mapped[str] = mapped_column(String(16), nullable=False, default="pending", server_default="pending")
     attempts: Mapped[int] = mapped_column(Integer, nullable=False, default=0, server_default="0")
@@ -202,6 +205,7 @@ class Outbox(Base):
             "campaign_id": str(self.campaign_id) if self.campaign_id else None,
             "event_type": self.event_type,
             "operation_id": self.operation_id,
+            "trace_id": self.trace_id,
             "payload": self.payload,
             "status": self.status,
             "attempts": self.attempts,
@@ -281,6 +285,57 @@ class WorkerExecution(Base):
         }
 
 
+class OperationTrace(Base):
+    """Durable milestones for one logical operation; content-free by default."""
+
+    __tablename__ = "operation_traces"
+
+    trace_id: Mapped[str] = mapped_column(String(64), primary_key=True)
+    operation_id: Mapped[str] = mapped_column(String(128), nullable=False, index=True)
+    campaign_id: Mapped[uuid.UUID | None] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("campaigns.id", ondelete="SET NULL"), nullable=True, index=True
+    )
+    submitted_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    accepted_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    worker_started_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    first_visible_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    narration_completed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    resolved_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    status: Mapped[str] = mapped_column(String(32), nullable=False, default="submitted", server_default="submitted")
+    telemetry_dropped: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False, server_default="false")
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now(), nullable=False)
+    updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now(), onupdate=func.now(), nullable=False)
+
+
+class AIRun(Base):
+    """Provider-independent AI attempt accounting, separate from game state."""
+
+    __tablename__ = "ai_runs"
+
+    id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    trace_id: Mapped[str] = mapped_column(String(64), nullable=False, index=True)
+    operation_id: Mapped[str] = mapped_column(String(128), nullable=False, index=True)
+    parent_run_id: Mapped[uuid.UUID | None] = mapped_column(UUID(as_uuid=True), nullable=True)
+    logical_operation: Mapped[str] = mapped_column(String(128), nullable=False)
+    role: Mapped[str] = mapped_column(String(64), nullable=False)
+    provider: Mapped[str] = mapped_column(String(64), nullable=False)
+    model: Mapped[str] = mapped_column(String(128), nullable=False)
+    attempt: Mapped[int] = mapped_column(Integer, nullable=False, default=1)
+    classification: Mapped[str] = mapped_column(String(16), nullable=False)  # primary | recovery
+    billable: Mapped[bool] = mapped_column(Boolean, nullable=False, default=True)
+    status: Mapped[str] = mapped_column(String(16), nullable=False, default="running")
+    started_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    first_token_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    completed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    input_tokens: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    output_tokens: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    cost_usd: Mapped[float | None] = mapped_column(Float, nullable=True)
+    result_code: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    error_type: Mapped[str | None] = mapped_column(String(128), nullable=True)
+    content_metadata: Mapped[dict | None] = mapped_column(JSONB, nullable=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now(), nullable=False)
+
+
 class CampaignMember(Base):
     __tablename__ = "campaign_members"
 
@@ -294,7 +349,7 @@ class CampaignThread(Base):
     """Durable thread identity for live-table messaging — issue #195.
 
     One shared ``campaign`` thread per campaign is the default audience;
-    additional ``private`` threads hold explicit participant lists.  Ownership
+    additional ``private`` threads hold explicit participant lists. Ownership
     never grants implicit private access — callers must be explicit members.
     """
 

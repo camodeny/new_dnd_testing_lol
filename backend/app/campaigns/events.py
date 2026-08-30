@@ -187,12 +187,15 @@ def commit_campaign_mutation(
     db.flush()
 
     # 2) Insert immutable domain event with sequence == new_revision
+    from app.observability.tracing import current_trace_id
+
     event = CampaignDomainEvent(
         id=uuid.uuid4(),
         campaign_id=campaign_id,
         sequence=new_revision,
         event_type=event_type.strip(),
         operation_id=operation_id,
+        trace_id=current_trace_id(),
         actor_id=actor_id,
         targets=targets,
         payload=payload,
@@ -221,7 +224,6 @@ def commit_campaign_mutation(
     if outbox_event_type:
         # lazy import to avoid circular
         from models import Outbox as _Outbox
-
         ob = _Outbox(
             id=uuid.uuid4(),
             aggregate_type="campaign",
@@ -229,6 +231,7 @@ def commit_campaign_mutation(
             campaign_id=campaign_id,
             event_type=outbox_event_type,
             operation_id=outbox_operation_id or operation_id,
+            trace_id=current_trace_id(),
             payload=outbox_payload if outbox_payload is not None else payload,
             status="pending",
             attempts=0,

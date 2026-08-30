@@ -165,6 +165,9 @@ def new_envelope(
     job_id: uuid.UUID | None = None,
 ) -> WorkerEnvelope:
     """Create envelope with identifiers only; validates no snapshot."""
+    if trace_id is None:
+        from app.observability.tracing import current_trace_id
+        trace_id = current_trace_id()
     return WorkerEnvelope(
         job_id=job_id or uuid.uuid4(),
         job_type=job_type,

@@ -9,6 +9,7 @@ from contextlib import asynccontextmanager
 from dotenv import load_dotenv
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
+from app.observability.tracing import TraceMiddleware
 
 load_dotenv()
 
@@ -35,6 +36,7 @@ def create_app() -> FastAPI:
         allow_methods=["*"],
         allow_headers=["*"],
     )
+    app.add_middleware(TraceMiddleware)
 
     # Import routers lazily to avoid import cycles at module load time
     # if domain modules ever import factory for typing.
@@ -44,6 +46,7 @@ def create_app() -> FastAPI:
     from app.characters.router import router as characters_router
     from app.health.router import router as health_router
     from app.runtime.router import router as runtime_router
+    from app.observability.router import router as observability_router
     from app.world.router import router as world_router
 
     app.include_router(health_router)
@@ -53,6 +56,6 @@ def create_app() -> FastAPI:
     app.include_router(campaigns_router)
     app.include_router(world_router)
     app.include_router(runtime_router)
+    app.include_router(observability_router)
 
     return app
-

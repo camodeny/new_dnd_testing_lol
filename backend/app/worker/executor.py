@@ -28,6 +28,7 @@ from sqlalchemy.orm import Session
 
 from app.queue.envelope import WorkerEnvelope
 from models import WorkerExecution
+from app.observability.tracing import trace_context
 
 logger = logging.getLogger(__name__)
 
@@ -335,7 +336,8 @@ def execute_worker_job(
     handler_result = None
     handler_exc: BaseException | None = None
     try:
-        handler_result = handler(envelope)
+        with trace_context(envelope.trace_id, envelope.operation_id):
+            handler_result = handler(envelope)
         # Validate result is JSON-serializable
         import json
         json.dumps(handler_result, default=str)
