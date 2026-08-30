@@ -1,7 +1,7 @@
 """add transactional outbox — issue 190
 
 Revision ID: e5f6a7b8c9d0
-Revises: d4e8f1a7b2c9
+Revises: f6a8b2c1d4e5
 """
 
 from typing import Sequence, Union
@@ -11,14 +11,12 @@ import sqlalchemy as sa
 from sqlalchemy.dialects import postgresql
 
 revision: str = "e5f6a7b8c9d0"
-down_revision: Union[str, Sequence[str], None] = "d4e8f1a7b2c9"
+down_revision: Union[str, Sequence[str], None] = "f6a8b2c1d4e5"
 branch_labels = None
 depends_on = None
 
 
 def upgrade() -> None:
-    if "outbox" in set(sa.inspect(op.get_bind()).get_table_names()):
-        return
     op.create_table(
         "outbox",
         sa.Column("id", postgresql.UUID(as_uuid=True), nullable=False),
