@@ -115,10 +115,30 @@ def get_trace(db: Session, trace_id: str) -> dict | None:
         "output_tokens": run.output_tokens, "cost_usd": run.cost_usd} for run in runs]}
 
 
-def fail_soft(callback, *args, **kwargs):
-    """Telemetry boundary: never let observability failure break gameplay."""
+def fail_soft(callback, *args, marker_session_factory=None, trace_id: str | None = None, **kwargs):
+    """Run telemetry without breaking gameplay, durably flagging a dropped write.
+
+    ``marker_session_factory`` must create an independent session so marking a
+    telemetry failure can neither commit nor roll back the gameplay transaction.
+    """
     try:
         return callback(*args, **kwargs)
     except Exception as exc:
         structured_log(logger, logging.ERROR, "telemetry_dropped", error_type=type(exc).__name__)
+        dropped_trace_id = trace_id or current_trace_id()
+        if marker_session_factory is not None and dropped_trace_id:
+            try:
+                with marker_session_factory() as marker_db:
+                    record = marker_db.get(OperationTrace, dropped_trace_id)
+                    if record is not None:
+                        record.telemetry_dropped = True
+                        marker_db.commit()
+            except Exception as marker_exc:
+                structured_log(
+                    logger,
+                    logging.ERROR,
+                    "telemetry_drop_marker_failed",
+                    error_type=type(marker_exc).__name__,
+                    dropped_trace_id=dropped_trace_id,
+                )
         return None

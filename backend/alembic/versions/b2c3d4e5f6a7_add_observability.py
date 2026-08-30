@@ -22,6 +22,10 @@ def upgrade() -> None:
     if "trace_id" not in outbox_columns:
         op.add_column("outbox", sa.Column("trace_id", sa.String(64), nullable=True))
         op.create_index("ix_outbox_trace_id", "outbox", ["trace_id"])
+    event_columns = {column["name"] for column in inspector.get_columns("campaign_domain_events")}
+    if "trace_id" not in event_columns:
+        op.add_column("campaign_domain_events", sa.Column("trace_id", sa.String(64), nullable=True))
+        op.create_index("ix_campaign_domain_events_trace_id", "campaign_domain_events", ["trace_id"])
     tables = set(inspector.get_table_names())
     if "operation_traces" not in tables:
         op.create_table(
@@ -73,5 +77,7 @@ def upgrade() -> None:
 def downgrade() -> None:
     op.drop_table("ai_runs")
     op.drop_table("operation_traces")
+    op.drop_index("ix_campaign_domain_events_trace_id", table_name="campaign_domain_events")
+    op.drop_column("campaign_domain_events", "trace_id")
     op.drop_index("ix_outbox_trace_id", table_name="outbox")
     op.drop_column("outbox", "trace_id")

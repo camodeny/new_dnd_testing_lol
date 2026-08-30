@@ -7,17 +7,19 @@ from datetime import datetime, timedelta, timezone
 from sqlalchemy import create_engine
 from sqlalchemy.dialects.sqlite.base import SQLiteTypeCompiler
 from sqlalchemy.orm import sessionmaker
+from sqlalchemy.pool import StaticPool
 
 if not hasattr(SQLiteTypeCompiler, "_patched_jsonb"):
     SQLiteTypeCompiler.visit_JSONB = lambda self, type_, **kw: "JSON"  # type: ignore
     SQLiteTypeCompiler._patched_jsonb = True  # type: ignore
 
 from database import Base
-from app.observability.service import begin_operation, finish_ai_run, get_trace, mark_milestone, start_ai_run
-from app.observability.tracing import structured_log, trace_context
+from app.campaigns.events import commit_campaign_mutation
+from app.observability.service import begin_operation, fail_soft, finish_ai_run, get_trace, mark_milestone, start_ai_run
+from app.observability.tracing import current_trace_id, structured_log, trace_context
 from app.outbox.service import enqueue_outbox, envelope_for_outbox
-from app.worker.executor import RetriableError, execute_worker_job
-from models import AIRun, WorkerExecution
+from app.worker.executor import execute_worker_job
+from models import AIRun, Campaign, CampaignDomainEvent, OperationTrace, Outbox, Profile, WorkerExecution
 
 
 def _db():
@@ -86,3 +88,58 @@ def test_structured_logging_drops_private_content(caplog):
         structured_log(logging.getLogger("test"), logging.INFO, "ai_call", prompt="secret", content="private", model="x")
     assert "secret" not in caplog.text and "private" not in caplog.text
     assert "safe-trace" in caplog.text and '"model": "x"' in caplog.text
+
+
+def test_trace_id_validation_matches_persisted_64_character_limit():
+    boundary = "a" * 64
+    with trace_context(boundary):
+        assert current_trace_id() == boundary
+    with trace_context("b" * 65):
+        generated = current_trace_id()
+        assert generated != "b" * 65
+        assert len(generated) == 32
+
+
+def test_campaign_domain_event_and_outbox_share_trace_lineage():
+    db = _db()
+    owner_id = uuid.uuid4()
+    campaign_id = uuid.uuid4()
+    db.add(Profile(id=owner_id, email="owner@example.com"))
+    db.add(Campaign(id=campaign_id, owner_id=owner_id, name="Trace test"))
+    db.commit()
+
+    with trace_context("domain-trace", "domain-operation"):
+        _, event = commit_campaign_mutation(
+            db,
+            campaign_id,
+            0,
+            event_type="campaign.tested",
+            operation_id="domain-operation",
+            outbox_event_type="campaign.tested",
+        )
+    persisted = db.get(CampaignDomainEvent, event.id)
+    assert persisted.trace_id == "domain-trace"
+    assert envelope_for_outbox(db.query(Outbox).one()).trace_id == "domain-trace"
+
+
+def test_fail_soft_durably_marks_dropped_telemetry_without_raising():
+    engine = create_engine(
+        "sqlite://",
+        connect_args={"check_same_thread": False},
+        poolclass=StaticPool,
+    )
+    Base.metadata.create_all(engine)
+    factory = sessionmaker(bind=engine)
+    with factory() as db:
+        begin_operation(db, trace_id="dropped-trace", operation_id="dropped-op")
+
+    result = fail_soft(
+        lambda: (_ for _ in ()).throw(RuntimeError("telemetry unavailable")),
+        marker_session_factory=factory,
+        trace_id="dropped-trace",
+    )
+    assert result is None
+    with factory() as db:
+        summary = get_trace(db, "dropped-trace")
+        assert summary["telemetry_complete"] is False
+        assert db.get(OperationTrace, "dropped-trace").telemetry_dropped is True

@@ -12,12 +12,14 @@ from starlette.middleware.base import BaseHTTPMiddleware
 
 _trace_id = contextvars.ContextVar("trace_id", default=None)
 _operation_id = contextvars.ContextVar("operation_id", default=None)
-_VALID_ID = re.compile(r"^[A-Za-z0-9._:-]{1,128}$")
+_VALID_TRACE_ID = re.compile(r"^[A-Za-z0-9._:-]{1,64}$")
+_VALID_OPERATION_ID = re.compile(r"^[A-Za-z0-9._:-]{1,128}$")
 
 
-def _valid(value: str | None) -> str | None:
+def _valid(value: str | None, *, max_length: int = 64) -> str | None:
     value = (value or "").strip()
-    return value if _VALID_ID.fullmatch(value) else None
+    pattern = _VALID_TRACE_ID if max_length == 64 else _VALID_OPERATION_ID
+    return value if pattern.fullmatch(value) else None
 
 
 def current_trace_id() -> str | None:
@@ -31,7 +33,7 @@ def current_operation_id() -> str | None:
 @contextlib.contextmanager
 def trace_context(trace_id: str | None = None, operation_id: str | None = None):
     trace_token = _trace_id.set(_valid(trace_id) or uuid.uuid4().hex)
-    operation_token = _operation_id.set(_valid(operation_id))
+    operation_token = _operation_id.set(_valid(operation_id, max_length=128))
     try:
         yield _trace_id.get()
     finally:
@@ -42,7 +44,7 @@ def trace_context(trace_id: str | None = None, operation_id: str | None = None):
 class TraceMiddleware(BaseHTTPMiddleware):
     async def dispatch(self, request, call_next):
         supplied_trace = _valid(request.headers.get("X-Trace-ID"))
-        supplied_operation = _valid(request.headers.get("X-Operation-ID"))
+        supplied_operation = _valid(request.headers.get("X-Operation-ID"), max_length=128)
         with trace_context(supplied_trace, supplied_operation) as trace_id:
             request.state.trace_id = trace_id
             request.state.operation_id = supplied_operation

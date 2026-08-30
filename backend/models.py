@@ -106,6 +106,7 @@ class CampaignDomainEvent(Base):
     event_type: Mapped[str] = mapped_column(String(64), nullable=False)
     # Source operation idempotency/observability hook (e.g. client-supplied op id or server-generated).
     operation_id: Mapped[str | None] = mapped_column(String(128), nullable=True)
+    trace_id: Mapped[str | None] = mapped_column(String(64), nullable=True, index=True)
     # Actor who caused the mutation (profile id) — provenance hook.
     actor_id: Mapped[uuid.UUID | None] = mapped_column(
         UUID(as_uuid=True), ForeignKey("profiles.id", ondelete="RESTRICT"), nullable=True, index=True
@@ -126,6 +127,7 @@ class CampaignDomainEvent(Base):
             "sequence": self.sequence,
             "event_type": self.event_type,
             "operation_id": self.operation_id,
+            "trace_id": self.trace_id,
             "actor_id": str(self.actor_id) if self.actor_id else None,
             "targets": self.targets,
             "payload": self.payload,
