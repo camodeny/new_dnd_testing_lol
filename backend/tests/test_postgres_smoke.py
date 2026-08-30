@@ -91,6 +91,13 @@ def test_disposable_postgres_migrated_schema_usable():
     pid = uuid.uuid4()
     cid = uuid.uuid4()
     with Session() as db:
+        # Vanilla Postgres has FK profiles.id -> auth.users.id (Supabase). Ensure
+        # the stub auth.users row exists before inserting profile (idempotent).
+        try:
+            db.execute(text("INSERT INTO auth.users (id) VALUES (:id) ON CONFLICT (id) DO NOTHING"), {"id": pid})
+            db.flush()
+        except Exception:
+            pass
         # Use raw Profile/Campaign to avoid triggering app business logic that might
         # depend on SQLite-specific behavior.
         profile = models.Profile(id=pid, email=f"ci-smoke-{pid.hex[:8]}@example.com")
