@@ -120,7 +120,30 @@ def create_player_submission(
         stored_segments = db.query(PlayerSubmissionSegment).filter_by(
             submission_id=submission.id
         ).order_by(PlayerSubmissionSegment.position).all()
-        return {"submission": submission.to_dict(stored_segments)}
+        result = {"submission": submission.to_dict(stored_segments)}
+        # Coordinate DM turn assembly — issue #200. Best-effort: coordination
+        # failures (e.g. stream boundary) are logged but do not fail submission
+        # acceptance. The submission is durably stored; DM turn will be
+        # observable via the dm-turns API.
+        try:
+            from app.dm.turns import StreamBoundaryError, TurnConflictError, coordinate_turn
+
+            coord = coordinate_turn(db, campaign.id, thread_id_str, audience=audience)
+            if coord is not None:
+                turn, attempt = coord
+                result["dm_turn"] = turn.to_dict()
+                result["dm_attempt"] = attempt.to_dict()
+        except (StreamBoundaryError, TurnConflictError) as exc:
+            logger.info(
+                "player_submission dm_turn coordination deferred campaign_id=%s thread_id=%s reason=%s",
+                campaign.id, thread_id_str, exc,
+            )
+        except Exception as exc:  # pragma: no cover — observability only
+            logger.warning(
+                "player_submission dm_turn coordination error campaign_id=%s thread_id=%s error=%s",
+                campaign.id, thread_id_str, exc,
+            )
+        return result
 
     result = execute_http_idempotent(
         db,
