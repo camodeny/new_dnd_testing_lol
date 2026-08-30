@@ -9,6 +9,7 @@ import os
 import pathlib
 import re
 import importlib
+import runpy
 import sys
 from unittest.mock import MagicMock, patch
 
@@ -154,6 +155,37 @@ def test_migration_url_prefers_non_pooling_connection(monkeypatch):
     monkeypatch.setenv("POSTGRES_URL_NON_POOLING", "postgresql://direct/migrations")
 
     assert migrate_mod.get_migration_database_url() == "postgresql://direct/migrations"
+
+
+def test_alembic_env_honors_runner_selected_direct_url(monkeypatch):
+    """Exercise migrate -> Alembic Config -> env.py with pooled + direct URLs."""
+    import alembic
+    from alembic.config import Config
+    import scripts.migrate as migrate_mod
+
+    monkeypatch.setenv("POSTGRES_URL", "postgresql://pooled/runtime")
+    monkeypatch.setenv("POSTGRES_URL_NON_POOLING", "postgresql://direct/migrations")
+    selected_url = migrate_mod.get_migration_database_url()
+
+    cfg = Config()
+    cfg.set_main_option("sqlalchemy.url", selected_url)
+    fake_context = MagicMock()
+    fake_context.config = cfg
+    fake_context.is_offline_mode.return_value = False
+    fake_engine = MagicMock()
+    captured = {}
+
+    def capture_engine(configuration, **kwargs):
+        captured["url"] = configuration["sqlalchemy.url"]
+        return fake_engine
+
+    env_path = pathlib.Path(__file__).parent.parent / "alembic" / "env.py"
+    with patch.object(alembic, "context", fake_context):
+        with patch("sqlalchemy.engine_from_config", side_effect=capture_engine):
+            runpy.run_path(str(env_path), run_name="test_alembic_env")
+
+    assert captured["url"] == "postgresql://direct/migrations"
+    assert captured["url"] != "postgresql://pooled/runtime"
 
 
 def test_explicit_migrate_script_logs_before_after(capsys=None):
