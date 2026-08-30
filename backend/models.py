@@ -11,7 +11,7 @@ If you prefer to use `auth.users` directly without a mirror, point FKs there —
 import uuid
 from datetime import datetime
 
-from sqlalchemy import Boolean, CheckConstraint, DateTime, ForeignKey, Integer, String, Text, UniqueConstraint, func
+from sqlalchemy import Boolean, CheckConstraint, DateTime, ForeignKey, Index, Integer, String, Text, UniqueConstraint, func, text
 from sqlalchemy.dialects.postgresql import JSONB, UUID
 from sqlalchemy.orm import Mapped, mapped_column
 
@@ -182,8 +182,14 @@ class CampaignThread(Base):
 
     __tablename__ = "campaign_threads"
     __table_args__ = (
-        UniqueConstraint("campaign_id", "id", name="uq_campaign_threads_campaign_id"),
         CheckConstraint("thread_type IN ('campaign', 'private')", name="ck_campaign_threads_type"),
+        Index(
+            "uq_campaign_threads_one_campaign_per_campaign",
+            "campaign_id",
+            unique=True,
+            postgresql_where=text("thread_type = 'campaign'"),
+            sqlite_where=text("thread_type = 'campaign'"),
+        ),
     )
 
     id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)

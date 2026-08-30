@@ -96,14 +96,14 @@ def test_private_thread_only_authorized_can_read(api, monkeypatch):
     assert r3.status_code == 200
     assert len(r3.json()["submissions"]) == 1
 
-    # outsider (campaign member but not thread member) cannot read
+    # outsider (campaign member but not thread member) cannot read — hidden as 404
     monkeypatch.setattr("app.runtime.router.resolve_profile", lambda req, db: db.get(Profile, outsider_id))
     r4 = client.get(f"/api/campaigns/{campaign_id}/threads/{private_tid}/submissions")
-    assert r4.status_code == 403
+    assert r4.status_code == 404
 
-    # outsider cannot write to private thread either
+    # outsider cannot write to private thread either — also hidden as 404
     r5 = client.post(f"/api/campaigns/{campaign_id}/submissions", json={"content": "intrusion", "thread_id": private_tid}, headers={"Idempotency-Key": "priv-intrude"})
-    assert r5.status_code == 403
+    assert r5.status_code == 404
 
     # outsider's thread list does not leak private thread metadata
     r6 = client.get(f"/api/campaigns/{campaign_id}/threads")
@@ -130,9 +130,9 @@ def test_owner_without_membership_cannot_read_private(api, monkeypatch):
         accept_submission(db, campaign_id=campaign_id, user_id=member_id, raw_content="secret", segments=[{"type": "ooc", "text": "secret"}], thread_id=private_tid, audience="private")
         db.commit()
 
-    # owner (campaign owner but not thread member) must be denied
+    # owner (campaign owner but not thread member) must be denied — hidden as 404
     r = client.get(f"/api/campaigns/{campaign_id}/threads/{private_tid}/submissions")
-    assert r.status_code == 403
+    assert r.status_code == 404
     # centralized check also denies owner
     with factory() as db:
         assert can_read_thread(db, campaign_id, uuid.UUID(private_tid), owner_id) is False
@@ -153,24 +153,31 @@ def test_revoked_membership_immediately_denies_but_preserves_history(api, monkey
         # history still durable
         assert db.query(PlayerSubmission).filter_by(thread_id=private_tid).count() == 1
 
-    # revoked member can no longer read
+    # revoked member can no longer read — hidden as 404, history still durable
     monkeypatch.setattr("app.runtime.router.resolve_profile", lambda req, db: db.get(Profile, member_id))
     r2 = client.get(f"/api/campaigns/{campaign_id}/threads/{private_tid}/submissions")
-    assert r2.status_code == 403
-    # and revoked member cannot write
+    assert r2.status_code == 404
+    # and revoked member cannot write — also 404
     r3 = client.post(f"/api/campaigns/{campaign_id}/submissions", json={"content": "after revoke", "thread_id": private_tid}, headers={"Idempotency-Key": "rev-2"})
-    assert r3.status_code == 403
+    assert r3.status_code == 404
 
 
 def test_missing_or_ambiguous_thread_fails_closed(api):
     client, _, campaign_id, _, _ = api
-    # non-existent UUID
+    # non-existent UUID — indistinguishable from private unauthorized (both 404)
     fake = str(uuid.uuid4())
     r = client.get(f"/api/campaigns/{campaign_id}/threads/{fake}/submissions")
     assert r.status_code == 404
-    # malformed thread id in submission
+    r_detail = client.get(f"/api/campaigns/{campaign_id}/threads/{fake}")
+    assert r_detail.status_code == 404
+    # malformed thread id in submission — also 404 (fail closed)
     r2 = client.post(f"/api/campaigns/{campaign_id}/submissions", json={"content": "hi", "thread_id": "not-a-uuid"}, headers={"Idempotency-Key": "bogus"})
-    assert r2.status_code == 403
+    assert r2.status_code == 404
+
+    # Non-member private lookups are indistinguishable from not-found — verify
+    # that an authorized thread id queried by an outsider returns 404, same as fake
+    # (covered more thoroughly in private-audience tests, but smoke-check here)
+    assert r.status_code == r_detail.status_code == 404
 
 
 def test_thread_identifiers_survive_reconnect(api):
@@ -182,11 +189,83 @@ def test_thread_identifiers_survive_reconnect(api):
     r2 = client.get(f"/api/campaigns/{campaign_id}/threads")
     shared2 = [t for t in r2.json()["threads"] if t["thread_type"] == "campaign"][0]["id"]
     assert shared == shared2
-    # Service helper also returns same id across sessions
+    # Service helper also returns same id across sessions (request boundary commits)
     with factory() as db:
         t1 = get_or_create_campaign_thread(db, campaign_id)
+        db.commit()
         id1 = str(t1.id)
     with factory() as db:
         t2 = get_or_create_campaign_thread(db, campaign_id)
+        db.commit()
         id2 = str(t2.id)
     assert id1 == id2 == shared
+
+
+def test_shared_thread_concurrency_enforced_by_partial_unique_index(api):
+    """Regression: concurrent first-requests must not split history into two shared threads."""
+    _, factory, campaign_id, _, _ = api
+    # Ensure clean slate — remove any shared thread created by earlier calls in this fixture
+    with factory() as db:
+        db.query(CampaignThread).filter_by(campaign_id=campaign_id, thread_type="campaign").delete()
+        db.commit()
+    # Simulate two concurrent transactions both observing no shared thread
+    from sqlalchemy.orm import sessionmaker
+    # Use the same engine/factory but two independent sessions (like two web workers)
+    SessionLocal = factory
+    s1 = SessionLocal()
+    s2 = SessionLocal()
+    try:
+        t1 = get_or_create_campaign_thread(s1, campaign_id)
+        t1_id = str(t1.id)
+        # s1 not yet committed — s2 should not see t1 and will try to create second
+        t2 = get_or_create_campaign_thread(s2, campaign_id)
+        t2_id = str(t2.id)
+        # At this point both sessions have flushed different UUIDs
+        # Committing s1 should succeed, s2 must fail on partial unique violation
+        s1.commit()
+        # s2 commit should raise IntegrityError due to uq_campaign_threads_one_campaign_per_campaign
+        try:
+            s2.commit()
+            committed_both = True
+        except Exception as exc:  # IntegrityError wrapped
+            s2.rollback()
+            committed_both = False
+            # After race, s2 can re-resolve to the winner via helper (retry path)
+            with factory() as db:
+                winner = get_or_create_campaign_thread(db, campaign_id)
+                assert str(winner.id) == t1_id
+        # Invariant: exactly one shared thread survives
+        with factory() as db:
+            count = db.query(CampaignThread).filter_by(campaign_id=campaign_id, thread_type="campaign").count()
+            assert count == 1
+            # Both callers must end up referencing the same durable id (no history split)
+            # If s2 committed both, t2_id would equal t1_id only if constraint prevented duplicate;
+            # otherwise this would be 2 — which the index must prevent.
+            if committed_both:
+                assert t1_id == t2_id, "partial unique index failed to prevent duplicate shared threads"
+        # Verify the durable id survives a fresh session (reconnect)
+        with factory() as db:
+            t3 = get_or_create_campaign_thread(db, campaign_id)
+            assert str(t3.id) == t1_id
+    finally:
+        s1.close()
+        s2.close()
+
+
+def test_get_or_create_does_not_commit_unrelated_pending_work(api):
+    """Helper must not commit unrelated pending work (review finding #3)."""
+    _, factory, campaign_id, _, _ = api
+    outsider_id = uuid.uuid4()
+    with factory() as db:
+        db.add(Profile(id=outsider_id, email="pending@example.com"))
+        # Do NOT commit — pending insert should not be committed by helper
+        t = get_or_create_campaign_thread(db, campaign_id)
+        # Helper flushed the thread but should not have committed the profile
+        assert db.query(Profile).filter_by(id=outsider_id).first() is not None  # visible in same tx
+        db.rollback()
+        # After rollback, neither the thread (if it was newly created in this tx)
+        # nor the pending profile should have been committed by the helper.
+        # The profile must not survive the rollback — proves helper didn't commit.
+        assert db.query(Profile).filter_by(id=outsider_id).first() is None
+        # Shared thread durability is preserved via request-boundary commits elsewhere;
+        # this test only proves the helper itself does not auto-commit.

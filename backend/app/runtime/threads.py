@@ -9,6 +9,7 @@ import logging
 import uuid
 
 from sqlalchemy import select
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
 from app.campaigns.service import is_campaign_member
@@ -54,6 +55,14 @@ def is_thread_member(db: Session, thread_id: uuid.UUID, user_id: uuid.UUID) -> b
 def get_or_create_campaign_thread(
     db: Session, campaign_id: uuid.UUID, *, created_by: uuid.UUID | None = None
 ) -> CampaignThread:
+    """Return the durable shared thread, creating it if needed.
+
+    Does NOT commit — transaction ownership stays at the request boundary.
+    Concurrency is enforced by a partial unique index
+    (uq_campaign_threads_one_campaign_per_campaign). A concurrent creation
+    that wins the race raises IntegrityError on flush, which we catch and
+    re-resolve to the winner.
+    """
     existing = db.execute(
         select(CampaignThread).where(
             CampaignThread.campaign_id == campaign_id,
@@ -73,25 +82,20 @@ def get_or_create_campaign_thread(
         created_by=created_by or campaign.owner_id,
     )
     db.add(thread)
-    db.flush()
-    # Flush alone does not survive session close when no outer commit follows
-    # (e.g. pure list call). Commit here so the durable id survives reconnects.
     try:
-        db.commit()
-    except Exception:
+        db.flush()
+    except IntegrityError:
         db.rollback()
         # Re-query after race — another request may have created it concurrently
-        existing = db.execute(
+        winner = db.execute(
             select(CampaignThread).where(
                 CampaignThread.campaign_id == campaign_id,
                 CampaignThread.thread_type == "campaign",
             )
         ).scalars().first()
-        if existing is not None:
-            return existing
+        if winner is not None:
+            return winner
         raise
-    # Re-attach after commit for continued use in same request session
-    db.refresh(thread)
     return thread
 
 
@@ -190,11 +194,22 @@ def can_write_thread(db: Session, campaign_id: uuid.UUID, thread_id: uuid.UUID, 
     return can_read_thread(db, campaign_id, thread_id, user_id)
 
 
+def _hide_private_not_found(thread: CampaignThread | None, user_id: uuid.UUID) -> bool:
+    """True if this is a private thread existence that must be hidden (→ 404)."""
+    return thread is not None and thread.thread_type == "private"
+
+
 def assert_can_read_thread(db: Session, campaign_id: uuid.UUID, thread_id: uuid.UUID, user_id: uuid.UUID) -> CampaignThread:
     thread = get_campaign_thread(db, campaign_id, thread_id)
     if thread is None:
         raise ThreadNotFoundError("Thread not found")
     if not can_read_thread(db, campaign_id, thread_id, user_id):
+        if _hide_private_not_found(thread, user_id):
+            logger.info(
+                "thread read denied campaign_id=%s thread_id=%s user_id=%s reason=not_thread_member hide_as_not_found",
+                campaign_id, thread_id, user_id,
+            )
+            raise ThreadNotFoundError("Thread not found")
         raise ThreadAuthorizationError("Not authorized to access this thread")
     return thread
 
@@ -204,6 +219,12 @@ def assert_can_write_thread(db: Session, campaign_id: uuid.UUID, thread_id: uuid
     if thread is None:
         raise ThreadNotFoundError("Thread not found")
     if not can_write_thread(db, campaign_id, thread_id, user_id):
+        if _hide_private_not_found(thread, user_id):
+            logger.info(
+                "thread write denied campaign_id=%s thread_id=%s user_id=%s reason=not_thread_member hide_as_not_found",
+                campaign_id, thread_id, user_id,
+            )
+            raise ThreadNotFoundError("Thread not found")
         raise ThreadAuthorizationError("Not authorized to write to this thread")
     return thread
 

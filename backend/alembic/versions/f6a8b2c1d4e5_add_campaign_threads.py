@@ -28,10 +28,12 @@ def upgrade() -> None:
         sa.ForeignKeyConstraint(["campaign_id"], ["campaigns.id"], ondelete="CASCADE"),
         sa.ForeignKeyConstraint(["created_by"], ["profiles.id"], ondelete="RESTRICT"),
         sa.PrimaryKeyConstraint("id"),
-        sa.UniqueConstraint("campaign_id", "id", name="uq_campaign_threads_campaign_id"),
     )
     op.create_index("ix_campaign_threads_campaign_id", "campaign_threads", ["campaign_id"])
     op.create_index("ix_campaign_threads_created_by", "campaign_threads", ["created_by"])
+    # Enforce exactly one shared campaign thread per campaign — concurrency invariant.
+    # Partial unique index: only rows where thread_type='campaign' compete.
+    op.execute(sa.text("CREATE UNIQUE INDEX uq_campaign_threads_one_campaign_per_campaign ON campaign_threads (campaign_id) WHERE thread_type = 'campaign'"))
 
     op.create_table(
         "campaign_thread_members",
@@ -80,6 +82,7 @@ def upgrade() -> None:
 
 def downgrade() -> None:
     op.drop_table("campaign_thread_members")
+    op.execute(sa.text("DROP INDEX IF EXISTS uq_campaign_threads_one_campaign_per_campaign"))
     op.drop_index("ix_campaign_threads_created_by", table_name="campaign_threads")
     op.drop_index("ix_campaign_threads_campaign_id", table_name="campaign_threads")
     op.drop_table("campaign_threads")

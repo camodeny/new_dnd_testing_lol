@@ -66,13 +66,16 @@ def create_player_submission(
         resolved_thread_id = resolve_thread_id(
             db, campaign.id, raw_thread, created_by=profile.id
         )
+        # Commit durable shared-thread creation at request boundary (helper no longer commits)
+        db.commit()
         # Centralized write authorization (shared = campaign membership, private = explicit thread membership)
+        # Private existence is hidden as 404 — see threads.assert_can_write_thread
         assert_can_write_thread(db, campaign.id, resolved_thread_id, profile.id)
         thread = get_campaign_thread(db, campaign.id, resolved_thread_id)
         audience = "campaign" if thread and thread.thread_type == "campaign" else "private"
     except ThreadNotFoundError as exc:
         logger.info("player_submission rejected campaign_id=%s reason=thread_not_found thread_id=%s", campaign.id, raw_thread)
-        raise HTTPException(status_code=403, detail="Thread not found or not authorized") from exc
+        raise HTTPException(status_code=404, detail="Thread not found") from exc
     except ThreadAuthorizationError as exc:
         logger.info("player_submission rejected campaign_id=%s reason=thread_not_authorized thread_id=%s user_id=%s", campaign.id, raw_thread, profile.id)
         raise HTTPException(status_code=403, detail="Not authorized for this thread") from exc
@@ -140,11 +143,13 @@ def get_player_submissions(campaign_id: str, request: Request, db: Session = Dep
     raw_thread = request.query_params.get("thread_id", "main")
     try:
         resolved = resolve_thread_id(db, campaign.id, raw_thread, created_by=profile.id)
+        db.commit()
+        assert_can_read_thread(db, campaign.id, resolved, profile.id)
     except ThreadNotFoundError as exc:
         raise HTTPException(status_code=404, detail="Thread not found") from exc
-    if not can_read_thread(db, campaign.id, resolved, profile.id):
+    except ThreadAuthorizationError as exc:
         logger.info("thread history denied campaign_id=%s thread_id=%s user_id=%s", campaign.id, resolved, profile.id)
-        raise HTTPException(status_code=403, detail="Not authorized to read this thread")
+        raise HTTPException(status_code=403, detail="Not authorized to read this thread") from exc
     return {"submissions": list_submissions(db, campaign.id, thread_id=str(resolved)), "thread_id": str(resolved)}
 
 
@@ -157,6 +162,7 @@ def list_campaign_threads(campaign_id: str, request: Request, db: Session = Depe
     campaign = _authorized_campaign(db, campaign_id, profile.id)
     # Ensure shared thread exists so its id survives reconnects
     get_or_create_campaign_thread(db, campaign.id, created_by=profile.id)
+    db.commit()
     threads = list_threads_for_user(db, campaign.id, profile.id)
     return {"threads": [t.to_dict() for t in threads]}
 
