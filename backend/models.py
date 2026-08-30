@@ -11,7 +11,7 @@ If you prefer to use `auth.users` directly without a mirror, point FKs there —
 import uuid
 from datetime import datetime
 
-from sqlalchemy import Boolean, DateTime, ForeignKey, Integer, String, Text, func
+from sqlalchemy import Boolean, DateTime, ForeignKey, Integer, String, Text, UniqueConstraint, func
 from sqlalchemy.dialects.postgresql import JSONB, UUID
 from sqlalchemy.orm import Mapped, mapped_column
 
@@ -57,6 +57,9 @@ class Campaign(Base):
     random_seed: Mapped[str | None] = mapped_column(String(128), nullable=True)
     required_players: Mapped[int] = mapped_column(Integer, nullable=False, default=1)
     loot_mode: Mapped[str] = mapped_column(String(32), nullable=False, default="frequent_gamble")
+    # Monotonic fictional revision — incremented exactly once per authoritative fictional mutation.
+    # See campaign_events.py commit_campaign_mutation().
+    revision: Mapped[int] = mapped_column(Integer, nullable=False, default=0, server_default="0")
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now(), nullable=False)
     updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now(), onupdate=func.now(), nullable=False)
 
@@ -72,8 +75,63 @@ class Campaign(Base):
             "required_players": self.required_players,
             "loot_mode": self.loot_mode,
             "loot_drop_rate": self.loot_mode,
+            "revision": self.revision,
             "created_at": self.created_at.isoformat() if self.created_at else None,
             "updated_at": self.updated_at.isoformat() if self.updated_at else None,
+        }
+
+
+class CampaignDomainEvent(Base):
+    """Immutable domain-event persistence — issue #188.
+
+    Every authoritative fictional mutation commits one row with a campaign-scoped
+    monotonic sequence (== resulting Campaign.revision). Current-state tables remain
+    authoritative for reads; events provide provenance/history, not full sourcing.
+
+    Visibility/provenance fields are hooks for later enforcement; reads must
+    eventually respect them but this issue only ensures the columns exist.
+    """
+
+    __tablename__ = "campaign_domain_events"
+    __table_args__ = (
+        UniqueConstraint("campaign_id", "sequence", name="uq_campaign_domain_events_campaign_sequence"),
+    )
+
+    id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    campaign_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("campaigns.id", ondelete="RESTRICT"), nullable=False, index=True
+    )
+    # Monotonically ordered within a campaign; 1-indexed (first event is 1).
+    sequence: Mapped[int] = mapped_column(Integer, nullable=False)
+    event_type: Mapped[str] = mapped_column(String(64), nullable=False)
+    # Source operation idempotency/observability hook (e.g. client-supplied op id or server-generated).
+    operation_id: Mapped[str | None] = mapped_column(String(128), nullable=True)
+    # Actor who caused the mutation (profile id) — provenance hook.
+    actor_id: Mapped[uuid.UUID | None] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("profiles.id", ondelete="RESTRICT"), nullable=True, index=True
+    )
+    # Targets / affected entities (free-form JSONB, e.g. ["entity_id", ...] or {"targets": [...]})
+    targets: Mapped[dict | list | None] = mapped_column(JSONB, nullable=True)
+    payload: Mapped[dict | None] = mapped_column(JSONB, nullable=True)
+    # Visibility hook for later projection policy (e.g. public/private/dm_only).
+    visibility: Mapped[str] = mapped_column(String(32), nullable=False, default="public", server_default="public")
+    # Free-form provenance (source, causal chain, etc.)
+    provenance: Mapped[dict | None] = mapped_column(JSONB, nullable=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now(), nullable=False)
+
+    def to_dict(self):
+        return {
+            "id": str(self.id),
+            "campaign_id": str(self.campaign_id),
+            "sequence": self.sequence,
+            "event_type": self.event_type,
+            "operation_id": self.operation_id,
+            "actor_id": str(self.actor_id) if self.actor_id else None,
+            "targets": self.targets,
+            "payload": self.payload,
+            "visibility": self.visibility,
+            "provenance": self.provenance,
+            "created_at": self.created_at.isoformat() if self.created_at else None,
         }
 
 

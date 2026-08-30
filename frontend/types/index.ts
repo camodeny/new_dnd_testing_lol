@@ -12,6 +12,7 @@ export interface Campaign {
   loot_drop_rate?: string
   loot_mode?: string
   required_players?: number
+  revision: number
   created_at: string
   updated_at?: string
   owner_id: string

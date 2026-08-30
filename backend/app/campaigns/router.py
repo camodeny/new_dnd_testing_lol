@@ -5,6 +5,11 @@ from fastapi import APIRouter, Depends, HTTPException, Request
 from sqlalchemy import select
 from sqlalchemy.orm import Session
 
+from app.campaigns.events import (
+    RevisionConflictError,
+    commit_campaign_mutation,
+    list_campaign_events,
+)
 from app.campaigns.service import (
     generate_invite_code,
     is_campaign_member,
@@ -124,6 +129,8 @@ def delete_campaign(campaign_id: str, request: Request, db: Session = Depends(ge
         raise HTTPException(status_code=404, detail="Campaign not found")
     if camp.owner_id != profile.id:
         raise HTTPException(status_code=403, detail="Only the owner can delete this campaign")
+    if list_campaign_events(db, cid, limit=1):
+        raise HTTPException(status_code=409, detail="Campaigns with domain-event history cannot be deleted")
     db.delete(camp)
     db.commit()
     return {"ok": True}
@@ -141,21 +148,128 @@ def update_campaign(campaign_id: str, payload: dict, request: Request, db: Sessi
         raise HTTPException(status_code=404, detail="Campaign not found")
     if camp.owner_id != profile.id:
         raise HTTPException(status_code=403, detail="Only owner can update")
+    changes = {}
     if "name" in payload and payload["name"] is not None:
         try:
-            camp.name = validate_campaign_name(str(payload["name"]))
+            changes["name"] = validate_campaign_name(str(payload["name"]))
         except ValueError as e:
             raise HTTPException(status_code=400, detail=str(e))
     if "description" in payload:
-        camp.description = payload["description"]
+        changes["description"] = payload["description"]
     if "random_seed" in payload or "seed" in payload:
         try:
-            camp.random_seed = validate_seed(payload.get("random_seed") or payload.get("seed") or "")
+            changes["random_seed"] = validate_seed(payload.get("random_seed") or payload.get("seed") or "")
         except ValueError as e:
             raise HTTPException(status_code=400, detail=str(e))
-    db.commit()
-    db.refresh(camp)
-    return {"campaign": camp.to_dict()}
+    if "expected_revision" not in payload:
+        raise HTTPException(status_code=400, detail="expected_revision is required")
+    try:
+        expected_revision = int(payload["expected_revision"])
+    except (TypeError, ValueError):
+        raise HTTPException(status_code=400, detail="expected_revision must be an integer")
+
+    def _mutate(campaign: Campaign):
+        for field, value in changes.items():
+            setattr(campaign, field, value)
+
+    try:
+        campaign, event = commit_campaign_mutation(
+            db,
+            cid,
+            expected_revision,
+            event_type="campaign.settings_updated",
+            operation_id=str(payload.get("operation_id") or "").strip() or None,
+            actor_id=profile.id,
+            payload={"changes": changes},
+            mutate=_mutate,
+        )
+    except RevisionConflictError as e:
+        raise HTTPException(
+            status_code=409,
+            detail=str(e),
+            headers={"X-Current-Revision": str(e.actual_revision)},
+        )
+    return {"campaign": campaign.to_dict(), "event": event.to_dict()}
+
+
+@router.post("/api/campaigns/{campaign_id}/mutations")
+def commit_campaign_mutation_endpoint(campaign_id: str, payload: dict, request: Request, db: Session = Depends(get_db)):
+    profile = resolve_profile(request, db)
+    try:
+        cid = parse_campaign_id(campaign_id)
+    except ValueError:
+        raise HTTPException(status_code=404, detail="Invalid campaign id")
+    camp = db.get(Campaign, cid)
+    if not camp:
+        raise HTTPException(status_code=404, detail="Campaign not found")
+    if camp.owner_id != profile.id:
+        raise HTTPException(status_code=403, detail="Only the owner can mutate this campaign")
+    if "expected_revision" not in payload:
+        raise HTTPException(status_code=400, detail="expected_revision is required")
+    try:
+        expected = int(payload["expected_revision"])
+    except (TypeError, ValueError):
+        raise HTTPException(status_code=400, detail="expected_revision must be an integer")
+    event_type = str(payload.get("event_type") or payload.get("type") or "").strip()
+    if not event_type:
+        raise HTTPException(status_code=400, detail="event_type is required")
+    operation_id = payload.get("operation_id") or payload.get("operationId")
+    if operation_id is not None:
+        operation_id = str(operation_id).strip() or None
+    visibility = str(payload.get("visibility") or "public").strip() or "public"
+    provenance = payload.get("provenance")
+    targets = payload.get("targets")
+    event_payload = payload.get("payload")
+    mutate_fields = payload.get("mutate") if isinstance(payload.get("mutate"), dict) else None
+
+    def _mutate(campaign: Campaign):
+        if not mutate_fields:
+            return
+        if "name" in mutate_fields and mutate_fields["name"] is not None:
+            try:
+                campaign.name = validate_campaign_name(str(mutate_fields["name"]))
+            except ValueError as e:
+                raise HTTPException(status_code=400, detail=str(e))
+        if "description" in mutate_fields:
+            campaign.description = mutate_fields["description"]
+
+    try:
+        campaign, event = commit_campaign_mutation(
+            db,
+            cid,
+            expected,
+            event_type=event_type,
+            payload=event_payload if isinstance(event_payload, dict) else ({"data": event_payload} if event_payload is not None else None),
+            operation_id=operation_id,
+            actor_id=profile.id,
+            targets=targets,
+            visibility=visibility,
+            provenance=provenance if isinstance(provenance, dict) else None,
+            mutate=_mutate if mutate_fields else None,
+        )
+    except RevisionConflictError as e:
+        raise HTTPException(
+            status_code=409,
+            detail=str(e),
+            headers={"X-Current-Revision": str(e.actual_revision), "X-Expected-Revision": str(e.expected_revision)},
+        )
+    return {"campaign": campaign.to_dict(), "event": event.to_dict()}
+
+
+@router.get("/api/campaigns/{campaign_id}/events")
+def list_campaign_domain_events(campaign_id: str, request: Request, db: Session = Depends(get_db)):
+    profile = resolve_profile(request, db)
+    try:
+        cid = parse_campaign_id(campaign_id)
+    except ValueError:
+        raise HTTPException(status_code=404, detail="Invalid campaign id")
+    camp = db.get(Campaign, cid)
+    if not camp:
+        raise HTTPException(status_code=404, detail="Campaign not found")
+    if camp.owner_id != profile.id and not is_campaign_member(db, cid, profile.id):
+        raise HTTPException(status_code=403, detail="Not a member of this campaign")
+    events = list_campaign_events(db, cid, viewer_id=profile.id, limit=200)
+    return {"events": [event.to_dict() for event in events], "revision": camp.revision}
 
 
 @router.get("/api/campaigns/{campaign_id}/members")
@@ -269,4 +383,3 @@ def join_campaign(campaign_id: str, payload: dict, request: Request, db: Session
         db.add(CampaignMember(campaign_id=cid, user_id=profile.id, role="player"))
         db.commit()
     return {"ok": True, "campaign": camp.to_dict()}
-
