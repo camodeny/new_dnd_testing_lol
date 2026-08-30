@@ -81,12 +81,20 @@ def get_or_create_campaign_thread(
         title="Campaign",
         created_by=created_by or campaign.owner_id,
     )
-    db.add(thread)
-    try:
+    # Isolate the insert/race recovery so a benign shared-thread race does not
+    # discard unrelated pending work in the caller's session. Flush any
+    # pre-existing pending changes outside the savepoint first.
+    if db.new or db.dirty or db.deleted:
+        # Flush unrelated pending work outside the race savepoint; this makes
+        # it part of the outer transaction and immune to the savepoint rollback.
         db.flush()
+    try:
+        with db.begin_nested():
+            db.add(thread)
+            db.flush()
     except IntegrityError:
-        db.rollback()
-        # Re-query after race — another request may have created it concurrently
+        # Savepoint rolled back automatically; outer transaction and its
+        # unrelated pending work remain intact.
         winner = db.execute(
             select(CampaignThread).where(
                 CampaignThread.campaign_id == campaign_id,

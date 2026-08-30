@@ -269,3 +269,51 @@ def test_get_or_create_does_not_commit_unrelated_pending_work(api):
         assert db.query(Profile).filter_by(id=outsider_id).first() is None
         # Shared thread durability is preserved via request-boundary commits elsewhere;
         # this test only proves the helper itself does not auto-commit.
+
+
+def test_get_or_create_preserves_pending_work_through_shared_thread_race(api):
+    """Savepoint isolation: a benign shared-thread uniqueness race must not roll back unrelated pending work."""
+    _, factory, campaign_id, _, _ = api
+    # Ensure a winner shared thread is already committed
+    with factory() as db:
+        winner = get_or_create_campaign_thread(db, campaign_id)
+        db.commit()
+        winner_id = str(winner.id)
+    # New session with unrelated pending work that must survive a forced race
+    with factory() as db:
+        pending_id = uuid.uuid4()
+        db.add(Profile(id=pending_id, email="race-pending@example.com"))
+        # Force the helper's initial select to miss (simulating a concurrent race where
+        # the winner was not yet visible), so the helper attempts a duplicate insert
+        # that will hit the partial unique index and be recovered via savepoint.
+        original_execute = db.execute
+        first_select = True
+
+        def fake_execute(stmt, *args, **kwargs):
+            nonlocal first_select
+            # The helper's first query is the existing-check select; fake it as empty
+            # Subsequent queries (the winner re-resolve) must hit the real DB.
+            if first_select:
+                # Heuristic: the first select in this session is the race-miss
+                first_select = False
+                class FakeResult:
+                    def scalars(self):
+                        return self
+
+                    def first(self):
+                        return None
+
+                return FakeResult()
+            return original_execute(stmt, *args, **kwargs)
+
+        db.execute = fake_execute  # type: ignore
+        result = get_or_create_campaign_thread(db, campaign_id)
+        assert str(result.id) == winner_id
+        # Unrelated pending work must still be pending and committable — savepoint
+        # must not have rolled it back.
+        assert db.query(Profile).filter_by(id=pending_id).first() is not None
+        db.commit()
+    # Verify pending survived outer commit and shared-thread invariant still holds
+    with factory() as db:
+        assert db.get(Profile, pending_id) is not None
+        assert db.query(CampaignThread).filter_by(campaign_id=campaign_id, thread_type="campaign").count() == 1
