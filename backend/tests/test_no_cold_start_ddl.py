@@ -157,6 +157,14 @@ def test_migration_url_prefers_non_pooling_connection(monkeypatch):
     assert migrate_mod.get_migration_database_url() == "postgresql://direct/migrations"
 
 
+def test_migration_url_normalizes_legacy_postgres_scheme(monkeypatch):
+    import scripts.migrate as migrate_mod
+
+    monkeypatch.setenv("POSTGRES_URL_NON_POOLING", "postgres://direct/migrations")
+
+    assert migrate_mod.get_migration_database_url() == "postgresql://direct/migrations"
+
+
 def test_alembic_env_honors_runner_selected_direct_url(monkeypatch):
     """Exercise migrate -> Alembic Config -> env.py with pooled + direct URLs."""
     import alembic

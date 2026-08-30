@@ -57,6 +57,8 @@ def get_migration_database_url() -> str:
     ):
         value = os.environ.get(key)
         if value:
+            if value.startswith("postgres://"):
+                value = value.replace("postgres://", "postgresql://", 1)
             return value
     return ""
 
