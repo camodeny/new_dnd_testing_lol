@@ -12,7 +12,7 @@ mutations against an expected campaign revision. Guarantees:
 Observability: logs campaign_id, prior/new revision, operation_id, conflict.
 
 Usage:
-    from campaign_events import commit_campaign_mutation, RevisionConflictError
+    from app.campaigns.events import commit_campaign_mutation, RevisionConflictError
 
     def mutate(campaign):
         campaign.name = "New Name"

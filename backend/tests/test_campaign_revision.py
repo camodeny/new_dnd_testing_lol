@@ -29,7 +29,7 @@ from database import Base
 
 # Import after patch to ensure models import uses patched compiler
 import models  # noqa: E402
-from campaign_events import (  # noqa: E402
+from app.campaigns.events import (  # noqa: E402
     RevisionConflictError,
     commit_campaign_mutation,
     list_campaign_events,

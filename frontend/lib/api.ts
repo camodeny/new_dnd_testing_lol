@@ -84,8 +84,14 @@ export const campaigns = {
       method: 'POST',
       body: JSON.stringify(payload),
     }),
-  update: (id: string | number, payload: Record<string, unknown>) =>
-    apiFetch(`/campaigns/${id}`, { method: 'PUT', body: JSON.stringify(payload) }),
+  update: (
+    id: string | number,
+    expectedRevision: number,
+    changes: Record<string, unknown>,
+  ) => apiFetch<{ campaign: import('@/types').Campaign; event: unknown }>(`/campaigns/${id}`, {
+    method: 'PUT',
+    body: JSON.stringify({ ...changes, expected_revision: expectedRevision }),
+  }),
   delete: (id: string | number) => apiFetch(`/campaigns/${id}`, { method: 'DELETE' }),
   export: (id: string | number) => apiBlob(`/campaigns/${id}/export`),
   randomBrief: (payload: Record<string, unknown> = {}) =>
