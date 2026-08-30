@@ -346,3 +346,87 @@ def test_visibility_projection_deterministic():
     p2 = public_projection(c)
     assert p1 == p2
     assert all("dm_private_context" not in b for b in p1["beats"])
+
+
+def test_public_projection_is_allowlisted_sentinel_secret_recursive():
+    # Sentinel must appear nowhere in the projected JSON, even recursively
+    sentinel_claim = "SENTINEL_DM_PRIVATE_CLAIM_9f3a1b_secret_hidden_canon"
+    sentinel_effect = "SENTINEL_STAGED_EFFECT_7c2e8d_payload_secret"
+    sentinel_evidence = "SENTINEL_EVIDENCE_4a1f9c_query_secret"
+    sentinel_input = "SENTINEL_ADJ_INPUT_b7d6e2_private_segment"
+    sentinel_context = "SENTINEL_PRIVATE_CONTEXT_e5a8c1_hidden_truth"
+    c = normalize_contract({
+        "contract_version": CONTRACT_VERSION,
+        "mode": "respond",
+        "reason": "x",
+        "beats": [
+            {"id": "beat_1", "type": "narration", "claims": [
+                {"text": "Public fact visible.", "claim_kind": "observation", "origin": "established_state", "visibility": "public"},
+                {"text": sentinel_claim, "claim_kind": "observation", "origin": "dm_adjudication", "visibility": "dm_private"},
+            ]},
+            {"id": "beat_2", "type": "npc_dialogue", "speaker_ref": {"type": "npc", "id": "npc:keeper"}, "speaker_public_name": "Keeper",
+             "claims": [{"text": "Greeting traveler.", "claim_kind": "npc_utterance", "actor_ref": {"type": "npc", "id": "npc:keeper"}, "origin": "dm_adjudication"}],
+             "truth_status": "deceptive", "dm_private_context": sentinel_context},
+        ],
+        "staged_effects": [
+            {"id": "effect_1", "effect_type": "record_world_event", "arguments": {"event_type": "secret_event", "summary": sentinel_effect, "visibility": "dm_private", "payload": {"secret": sentinel_effect}}},
+        ],
+        "new_entities": [{"temp_id": "tmp_npc_1", "kind": "npc", "public_name": "a stranger"}],
+        "adjudication_input": {"submission_ids": ["sub_1"], "segments": [{"position": 0, "segment_type": "ic", "text": sentinel_input}]},
+        "open_player_choice": "What do you do?",
+        "narration_hints": {"max_words": 90},
+    })
+    # Need_evidence case with sentinel — validated separately but projection must also hide evidence_requests
+    c2 = normalize_contract({
+        "contract_version": CONTRACT_VERSION, "mode": "need_evidence", "reason": "need",
+        "beats": [], "evidence_requests": [{"id": "evidence_1", "tool": "search_campaign_memory", "query": sentinel_evidence}],
+        "safe_prelude": "Checking...",
+    })
+    for contract in (c, c2):
+        proj = public_projection(contract)
+        blob = json.dumps(proj, ensure_ascii=False)
+        for secret in (sentinel_claim, sentinel_effect, sentinel_evidence, sentinel_input, sentinel_context):
+            assert secret not in blob, f"sentinel leaked: {secret!r} in {blob}"
+        # allowlist invariants: internal lanes must be absent
+        assert "staged_effects" not in proj
+        assert "evidence_requests" not in proj
+        assert "adjudication_input" not in proj
+        assert "new_entities" not in proj
+        assert "reason" not in proj
+        # dm_private claims must be filtered — only public claim remains in beat_1
+        if contract.mode == "respond":
+            assert len(proj["beats"]) == 2  # beat_1 filtered to single public claim, beat_2 retained (public utterance)
+            assert proj["beats"][0]["claims"][0]["text"] == "Public fact visible."
+            assert all("visibility" not in claim for beat in proj["beats"] for claim in beat["claims"])
+            assert all("origin" not in claim for beat in proj["beats"] for claim in beat["claims"])
+            assert all("dm_private_context" not in beat for beat in proj["beats"])
+            assert all("truth_status" not in beat for beat in proj["beats"])
+
+
+def test_public_projection_filters_entirely_private_beats():
+    sentinel = "SENTINEL_ONLY_PRIVATE_BEAT_abc123"
+    c = normalize_contract({
+        "contract_version": CONTRACT_VERSION, "mode": "respond", "reason": "x",
+        "beats": [
+            {"id": "beat_1", "type": "narration", "claims": [{"text": sentinel, "claim_kind": "observation", "origin": "dm_adjudication", "visibility": "dm_private"}]},
+            {"id": "beat_2", "type": "narration", "claims": [{"text": "Visible public fact.", "claim_kind": "observation", "origin": "established_state", "visibility": "public"}]},
+        ],
+    })
+    proj = public_projection(c)
+    blob = json.dumps(proj)
+    assert sentinel not in blob
+    assert len(proj["beats"]) == 1
+    assert proj["beats"][0]["id"] == "beat_2"
+
+
+def test_public_projection_strips_internal_roll_fields():
+    c = normalize_contract({
+        "contract_version": CONTRACT_VERSION, "mode": "await_roll", "reason": "roll",
+        "beats": [{"id": "beat_1", "type": "narration", "claims": [{"text": "Make a check.", "claim_kind": "roll_instruction", "origin": "dm_adjudication"}]}],
+        "roll_request": {"request_id": "roll_1", "character_id": "char:1", "roll_kind": "check", "ability_or_skill": "Investigation", "label": "Investigation check", "advantage_state": "normal", "reason_public": "Inspect seal", "dc_private": 15},
+    })
+    proj = public_projection(c)
+    assert "dc_private" not in json.dumps(proj)
+    assert "character_id" not in json.dumps(proj)
+    assert proj["roll_request"]["reason_public"] == "Inspect seal"
+    assert proj["roll_request"]["label"] == "Investigation check"

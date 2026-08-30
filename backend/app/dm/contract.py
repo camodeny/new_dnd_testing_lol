@@ -646,36 +646,95 @@ def parse_contract(raw: Any) -> DmTurnContractV1:
 
 
 def public_projection(contract: DmTurnContractV1) -> dict[str, Any]:
-    """Deterministic public / audience-safe projection.
+    """Deterministic allowlisted public / audience-safe projection.
 
-    Strips private material so the expander never sees hidden context:
-    - dm_private_context
-    - dc_private on roll requests
-    - staging arguments that remain internal until commit (pass-through for now but
-      nothing private beyond dc should leak)
-    - evidence/trigger provenance is retained? No — strip to avoid leaking
-      private source ids; keep only claim text + public refs. For now keep
-      evidence_refs as they are non-sensitive source ids; strip only dm_private_context/dc_private.
+    Only fields explicitly intended for the player-facing narration/expander
+    lane are included. Everything else — adjudication input, staged effects,
+    evidence requests, new-entity proposals, private claims, private
+    beat context, provenance lanes, and private roll thresholds — is removed
+    wholesale so hidden canon cannot leak.
+
+    Invariant: any ``Claim.visibility == \"dm_private\"`` or any internal
+    payload containing a sentinel secret will be absent from ``json.dumps``
+    of the returned dict (see sentinel-secret test).
     """
-    data = contract.model_dump(mode="json")
-    # Strip dm_private_context from beats
-    for beat in data.get("beats") or []:
-        beat.pop("dm_private_context", None)
-        # keep truth_status (useful for audit?) but strip private interpretation;
-        # public packet intentionally does NOT expose truth_status per legacy packet;
-        # we keep it here for observability and let expander ignore it. To match
-        # acceptance "projection can remove hidden material deterministically", we
-        # remove truth_status from public as well? Legacy removed truth_status.
-        # Keep it stripped for true public.
-        # Remove truth_status from public projection (private adjudicator context)
-        beat.pop("truth_status", None)
-    # Strip private DC from roll
-    rr = data.get("roll_request")
-    if isinstance(rr, dict):
-        rr.pop("dc_private", None)
-        # also strip internal ids that are not player-visible
-        # keep label/reason public
-    return data
+    result: dict[str, Any] = {
+        "contract_version": contract.contract_version,
+        "mode": contract.mode,
+    }
+
+    # Audience-visible intent / hints (mode-specific)
+    if contract.mode == "table_chat" and contract.table_chat_intent is not None:
+        result["table_chat_intent"] = contract.table_chat_intent
+    if contract.mode == "need_evidence" and contract.safe_prelude is not None:
+        result["safe_prelude"] = contract.safe_prelude
+    if contract.mode == "clarify":
+        if contract.clarify_question is not None:
+            result["clarify_question"] = contract.clarify_question
+        # open_player_choice is audience-visible in clarify as well
+    if contract.open_player_choice is not None:
+        result["open_player_choice"] = contract.open_player_choice
+    if contract.narration_hints is not None:
+        result["narration_hints"] = contract.narration_hints.model_dump(mode="json")
+
+    # Beats — filtered to public claims only, with private beat fields removed
+    public_beats: list[dict[str, Any]] = []
+    for beat in contract.beats:
+        public_claims: list[dict[str, Any]] = []
+        for claim in beat.claims:
+            if claim.visibility == "dm_private":
+                continue
+            pub_claim: dict[str, Any] = {
+                "text": claim.text,
+                "claim_kind": claim.claim_kind,
+            }
+            if claim.actor_ref is not None:
+                pub_claim["actor_ref"] = claim.actor_ref.model_dump(mode="json")
+            if claim.target_refs:
+                pub_claim["target_refs"] = [r.model_dump(mode="json") for r in claim.target_refs]
+            if claim.topic_refs:
+                pub_claim["topic_refs"] = [r.model_dump(mode="json") for r in claim.topic_refs]
+            if claim.location_ref is not None:
+                pub_claim["location_ref"] = claim.location_ref.model_dump(mode="json")
+            # roll_outcome linking id is player-visible; origin/provenance/evidence are internal
+            if claim.claim_kind == "roll_outcome" and claim.roll_request_id:
+                pub_claim["roll_request_id"] = claim.roll_request_id
+            public_claims.append(pub_claim)
+        if not public_claims:
+            # Entire beat was private — drop deterministically
+            continue
+        pub_beat: dict[str, Any] = {
+            "id": beat.id,
+            "type": beat.type,
+            "claims": public_claims,
+        }
+        if beat.speaker_ref is not None:
+            pub_beat["speaker_ref"] = beat.speaker_ref.model_dump(mode="json")
+        if beat.speaker_public_name is not None:
+            pub_beat["speaker_public_name"] = beat.speaker_public_name
+        if beat.delivery is not None:
+            pub_beat["delivery"] = beat.delivery
+        # truth_status / dm_private_context deliberately omitted
+        public_beats.append(pub_beat)
+    result["beats"] = public_beats
+
+    # Roll request — allowlisted public fields only
+    if contract.roll_request is not None:
+        rr = contract.roll_request
+        result["roll_request"] = {
+            "request_id": rr.request_id,
+            "roll_kind": rr.roll_kind,
+            "ability_or_skill": rr.ability_or_skill,
+            "label": rr.label,
+            "advantage_state": rr.advantage_state,
+            "reason_public": rr.reason_public,
+        }
+        # dc_private, character_id deliberately omitted
+
+    # Explicitly omitted (internal, never audience-visible):
+    # - reason, adjudication_input, new_entities, staged_effects,
+    #   evidence_requests, and any dm_private payloads
+    return result
 
 
 def contract_json_schema() -> dict[str, Any]:
