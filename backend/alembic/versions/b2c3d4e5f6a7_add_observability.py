@@ -1,7 +1,7 @@
 """add end-to-end runtime observability — issue 192
 
 Revision ID: b2c3d4e5f6a7
-Revises: f0a1b2c3d4e5
+Revises: f1a2b3c4d5e6
 """
 from typing import Sequence, Union
 
@@ -10,7 +10,7 @@ import sqlalchemy as sa
 from sqlalchemy.dialects import postgresql
 
 revision: str = "b2c3d4e5f6a7"
-down_revision: Union[str, Sequence[str], None] = "f0a1b2c3d4e5"
+down_revision: Union[str, Sequence[str], None] = "f1a2b3c4d5e6"
 branch_labels = None
 depends_on = None
 
