@@ -77,7 +77,10 @@ def quick_create_campaign(payload: dict, request: Request, db: Session = Depends
     profile = resolve_profile(request, db)
     brief = random_brief()
     required_players = normalize_required_players(payload.get("required_players"))
-    loot_mode = normalize_loot_mode(payload.get("loot_mode"))
+    # Preserve previous behavior: keep any supplied string verbatim, only default
+    # when missing. Normalization of unknown values to frequent_gamble is only
+    # for the main create path, not quick-create (behavior-preserving refactor).
+    loot_mode = str(payload.get("loot_mode") or "frequent_gamble")
     camp = Campaign(
         owner_id=profile.id,
         name=brief["name"],

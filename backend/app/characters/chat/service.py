@@ -118,7 +118,7 @@ def character_chat_sync_generator(
     req: CharacterChatRequest, owner_id: uuid_lib.UUID, character_uuid: uuid_lib.UUID | None
 ):
     try:
-        from llm_providers import provider_registry
+        from app.providers import provider_registry
     except Exception as e:
         yield f"event: error\ndata: {json.dumps({'error': f'llm_providers not available: {e}'})}\n\n"
         return
@@ -135,7 +135,7 @@ def character_chat_sync_generator(
     full_text = ""
     has_patch = False
     try:
-        from llm_providers import ProviderRequest as PR, stream_chat
+        from app.providers import ProviderRequest as PR, stream_chat
 
         pr = PR(
             messages=messages,

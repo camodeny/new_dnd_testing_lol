@@ -21,24 +21,24 @@ one shared Postgres/database layer (`backend/database.py`, `backend/models.py`).
 | `app/providers` | LLM provider adapters — re-exports `llm_providers` without workflow branching |
 | `app/observability` | Structured logging, tracing hooks, TTFT helpers (see #192) |
 | `app/health` | Health / hello / db ping |
-| `app/auth` | Auth config + `/api/me` (Supabase JWT -> profile) |
-| `app/deps` | Shared FastAPI dependencies (e.g. `resolve_profile`) |
+| `app/auth` | Auth config + `/api/me` (transport) + `app/auth/service.py` pure profile/JWT resolution (application) |
+| `app/deps` | Transport adapters that extract `Request` headers and map errors to HTTP (e.g. `resolve_profile(Request) -> Profile`) |
 | `app/infrastructure` | Thin re-export / documentation for the shared DB layer |
 
 ## Dependency direction
 
 ```
-transport (app/*/router.py, FastAPI)
-   -> application (app/*/service.py, app/deps/*)
+transport (app/*/router.py, app/deps/*, FastAPI Request/APIRouter/HTTPException)
+   -> application (app/*/service.py, app/auth/service.py, app/campaigns/service.py)
    -> domain (app/rules/*, models.py pure helpers, value objects)
-   -> infrastructure (database.py, providers, observability)
+   -> infrastructure (database.py, auth.py verify_supabase_jwt, providers, observability)
 ```
 
 Rules:
-- **Domain / application MUST NOT import `fastapi`** (`Request`, `APIRouter`, `HTTPException` is allowed only at the application boundary; pure domain helpers take plain values).
-- **Provider adapters remain isolated**: gameplay workflows use `app.providers` / `provider_registry` and `stream_chat`/`execute_chat` abstractions; they never `if provider == "openrouter"` branch (see `llm_providers.py:1`).
+- **Domain / application MUST NOT import `fastapi`** (`Request`, `APIRouter`, `HTTPException`). Pure helpers take plain values (e.g. `auth_header: str | None`, `token: str`) and raise `ValueError`; transport adapters translate `ValueError` → `HTTPException`. See `app/auth/service.py` (pure) vs `app/deps/auth.py` (transport).
+- **Provider adapters remain isolated**: gameplay workflows import from `app.providers` (`provider_registry`, `stream_chat`, `ProviderRequest`) and never branch on provider names or import `llm_providers` directly. `app.providers` is the mock seam for tests (see `app/characters/chat/service.py:118`).
 - **One deployable**: no new services or ports; all routers are mounted on the single `FastAPI` instance in `app/factory.py`.
-- New gameplay modules must be importable without importing any `router` module (no circular `router -> service -> router`).
+- New gameplay modules must be importable without importing any `router` or `app/deps/*` module (no circular `router -> service -> router`).
 
 ## Adding a new gameplay route
 
