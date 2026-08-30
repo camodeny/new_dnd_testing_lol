@@ -7,7 +7,8 @@
     },
     "backend": {
       "root": "backend/",
-      "entrypoint": "main:app"
+      "entrypoint": "main:app",
+      "buildCommand": "bash scripts/vercel-migrate.sh"
     }
   },
   "rewrites": [

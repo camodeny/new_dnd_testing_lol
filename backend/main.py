@@ -13,7 +13,7 @@ from pydantic import BaseModel, Field
 from sqlalchemy import text
 
 from auth import get_current_profile
-from database import Base, db_healthcheck, engine, get_database_url, get_db
+from database import db_healthcheck, engine, get_db
 from models import Campaign, CampaignInvite, CampaignMember, Character, CharacterChatMessage as DbChatMessage, Dnd5eCharacterSheet, Profile
 
 load_dotenv()
@@ -24,53 +24,15 @@ from sqlalchemy import select
 
 logger = logging.getLogger(__name__)
 
-
-def _run_migrations():
-    """Run `alembic upgrade head` on startup when DATABASE_URL is set.
-
-    This makes deploys self-migrating — no manual `alembic upgrade head` needed.
-    Uses Alembic's Python API (same as CLI) and is safe to run concurrently;
-    Alembic acquires a row lock on alembic_version.
-    """
-    db_url = get_database_url()
-    if not db_url:
-        logger.info("Skipping migrations — DATABASE_URL not set")
-        return
-    try:
-        from alembic.config import Config
-        from alembic import command
-
-        alembic_ini = os.path.join(os.path.dirname(__file__), "alembic.ini")
-        if not os.path.exists(alembic_ini):
-            logger.warning("alembic.ini not found at %s — falling back to create_all", alembic_ini)
-            Base.metadata.create_all(bind=engine)
-            return
-
-        cfg = Config(alembic_ini)
-        cfg.set_main_option("sqlalchemy.url", db_url.replace("%", "%%"))
-        # Ensure backend/ is on path for env.py imports when running from Vercel's wd
-        cfg.set_main_option("script_location", os.path.join(os.path.dirname(__file__), "alembic"))
-        command.upgrade(cfg, "head")
-        logger.info("Alembic migrations applied (head)")
-    except Exception as e:
-        # Don't crash boot — log and fallback to create_all so health still works
-        logger.warning("Alembic upgrade failed (%s) — falling back to create_all: %s", type(e).__name__, e)
-        try:
-            if engine is not None:
-                Base.metadata.create_all(bind=engine)
-        except Exception as ce:
-            logger.warning("create_all fallback also failed: %s", ce)
-
 APP_NAME = "dnd-backend"
 APP_VERSION = "0.1.0"
 
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    # Auto-migrate on boot so deploys don't require manual `alembic upgrade head`.
-    # Checks DATABASE_URL/POSTGRES_URL inside _run_migrations so it works even if
-    # engine was None at import time (e.g. env injected after module load).
-    _run_migrations()
+    # Migrations are applied explicitly via `alembic upgrade head` or
+    # `python -m scripts.migrate` — never during application startup.
+    # See backend/README.md and backend/scripts/migrate.py.
     yield
 
 

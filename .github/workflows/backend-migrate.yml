@@ -1,0 +1,90 @@
+name: Backend Migration Gate
+
+# Verification for the single production migration gate in Vercel.
+# This workflow never connects to production or invokes a second migration.
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - "backend/**"
+      - ".github/workflows/backend-migrate.yml"
+  pull_request:
+    branches: [main]
+    paths:
+      - "backend/**"
+      - ".github/workflows/backend-migrate.yml"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  verify-no-cold-start-ddl:
+    name: Verify no cold-start DDL
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Install dependencies
+        working-directory: backend
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+          pip install pytest httpx
+      - name: Run cold-start DDL guard tests
+        working-directory: backend
+        env:
+          ALLOW_MOCK_AUTH: "true"
+        run: python -m pytest tests/test_no_cold_start_ddl.py -v
+
+  forced-failure-gate:
+    name: Forced migration failure blocks promotion
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Install dependencies
+        working-directory: backend
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+      - name: Verify missing DB URL fails
+        working-directory: backend
+        run: |
+          set +e
+          # Ensure no DB URL — migrate must exit non-zero
+          env -u POSTGRES_URL -u POSTGRES_PRISMA_URL -u POSTGRES_URL_NON_POOLING -u DATABASE_URL \
+            python -m scripts.migrate; RC=$?
+          set -e
+          if [ $RC -eq 0 ]; then
+            echo "ERROR: migrate should fail without DB URL" >&2
+            exit 1
+          fi
+          echo "OK: migrate correctly failed without DB URL (rc=$RC)"
+
+      - name: Verify forced Alembic failure blocks release
+        working-directory: backend
+        run: |
+          python -c "
+          from unittest.mock import patch
+          import scripts.migrate
+          # Force alembic.command.upgrade to raise
+          with patch('scripts.migrate.get_migration_database_url', return_value='postgresql://user:pass@localhost/dbname'):
+              with patch('alembic.command.upgrade', side_effect=RuntimeError('forced migration failure for gate verification')):
+                  with patch('scripts.migrate._get_current_revision', return_value='test_before'):
+                      rc = scripts.migrate.main()
+                      assert rc != 0, f'Expected non-zero on forced failure, got {rc}'
+                      print(f'OK: forced Alembic failure correctly returned rc={rc} and would block promotion')
+          "
+
+      - name: Verify Vercel production gate script exists and is executable
+        run: |
+          test -x backend/scripts/vercel-migrate.sh || (echo "vercel-migrate.sh not executable" >&2; exit 1)
+          grep -q "VERCEL_ENV.*production" backend/scripts/vercel-migrate.sh || (echo "vercel-migrate.sh must gate on VERCEL_ENV=production" >&2; exit 1)
+          grep -q "scripts.migrate" backend/scripts/vercel-migrate.sh || (echo "vercel-migrate.sh must invoke scripts.migrate" >&2; exit 1)
+          echo "OK: Vercel gate script correctly gates on production and invokes migrate"

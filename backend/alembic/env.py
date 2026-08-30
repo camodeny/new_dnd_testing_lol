@@ -14,7 +14,7 @@ config = context.config
 # Interpret the config file for Python logging.
 # This line sets up loggers basically.
 if config.config_file_name is not None:
-    fileConfig(config.config_file_name)
+    fileConfig(config.config_file_name, disable_existing_loggers=False)
 
 # Ensure backend/ is on sys.path so `import models` works when alembic is run from backend/
 sys.path.insert(0, os.path.dirname(os.path.dirname(__file__)))
@@ -24,19 +24,25 @@ from database import Base  # noqa: E402
 import models  # noqa: E402, F401 — ensure all models are imported
 target_metadata = Base.metadata
 
-# Override sqlalchemy.url from env (new integration: POSTGRES_URL, POSTGRES_PRISMA_URL, POSTGRES_URL_NON_POOLING)
+# Honor an explicit Alembic Config URL first. scripts/migrate.py selects the
+# direct migration connection and passes it through this option. Standalone
+# Alembic commands fall back to the same direct-first environment priority.
 def _get_database_url() -> str | None:
+    configured_url = config.get_main_option("sqlalchemy.url")
+    if configured_url == "driver://user:pass@localhost/dbname":
+        configured_url = None
     url = (
-        os.getenv("POSTGRES_URL")
-        or os.getenv("POSTGRES_PRISMA_URL")
+        configured_url
         or os.getenv("POSTGRES_URL_NON_POOLING")
+        or os.getenv("SUPABASE_DB_URL")
         or os.getenv("DATABASE_URL")
-        or config.get_main_option("sqlalchemy.url")
+        or os.getenv("POSTGRES_PRISMA_URL")
+        or os.getenv("POSTGRES_URL")
     )
     if url and url.startswith("postgres://"):
         url = url.replace("postgres://", "postgresql://", 1)
     # fallback placeholder for `alembic revision --autogenerate` without DB (offline)
-    if not url or url == "driver://user:pass@localhost/dbname":
+    if not url:
         return None
     return url
 
@@ -87,7 +93,9 @@ def run_migrations_online() -> None:
     db_url = _get_database_url()
     if not db_url:
         raise RuntimeError(
-            "POSTGRES_URL not set — set POSTGRES_URL / POSTGRES_PRISMA_URL / POSTGRES_URL_NON_POOLING in env or alembic.ini sqlalchemy.url"
+            "No migration database URL set — configure sqlalchemy.url, "
+            "POSTGRES_URL_NON_POOLING, SUPABASE_DB_URL, DATABASE_URL, "
+            "POSTGRES_PRISMA_URL, or POSTGRES_URL"
         )
 
     connectable = engine_from_config(
