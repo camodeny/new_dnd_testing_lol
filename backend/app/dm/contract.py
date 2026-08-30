@@ -58,15 +58,12 @@ class InputSegment(StrictModel):
 class AdjudicationInput(StrictModel):
     """Machine representation of the adjudication input set for this turn.
 
-    Unlike legacy free-form prose concatenation, this contract preserves
-    per-segment IC/OOC identity, per-submission ordering, and source
-    submission IDs so validators can reason about agency without re-parsing
-    rendered text.
+    This contract preserves per-segment IC/OOC identity, per-submission
+    ordering, and source submission IDs so validators can reason about agency
+    without re-parsing rendered text. Segments are authoritative.
     """
     submission_ids: list[str] = Field(default_factory=list, max_length=32, description="Ordered submission UUID strings included")
     segments: list[InputSegment] = Field(default_factory=list, max_length=64)
-    # Optional free-form raw for backwards compat / audit; segments are authoritative.
-    raw_text: str | None = Field(default=None, max_length=8000)
 
     @field_validator("submission_ids")
     @classmethod
@@ -80,7 +77,7 @@ class AdjudicationInput(StrictModel):
 # ── Entity refs: existing vs temporary are structurally distinct ─────────────
 
 EntityType = Literal["character", "npc", "location", "object", "entity"]
-_TEMP_PREFIXES = ("tmp_", "new_npc_", "temp_")
+_TEMP_PREFIXES = ("tmp_", "temp_")
 
 class EntityRef(StrictModel):
     """Reference to an *existing* canonical entity that already exists in context.
@@ -118,7 +115,7 @@ class NewEntityProposal(StrictModel):
     Structural distinction from EntityRef (``id``) is intentionally field-name
     based so ``extra=forbid`` rejects cross-lane confusion.
     """
-    temp_id: str = Field(description="Ephemeral handle, e.g. tmp_npc_1 or new_npc_1")
+    temp_id: str = Field(description="Ephemeral handle, e.g. tmp_npc_1")
     kind: Literal["npc"] = Field(description="Only NPC introduction is supported in v1")
     public_name: str = Field(min_length=1, max_length=160)
     role: str | None = Field(default=None, max_length=160)
@@ -129,8 +126,8 @@ class NewEntityProposal(StrictModel):
     @classmethod
     def _valid_temp_id(cls, v: str) -> str:
         s = v.strip()
-        if not re.fullmatch(r"(tmp_npc_[A-Za-z0-9_-]+|new_npc_[A-Za-z0-9_-]+|tmp_[a-z]+_[A-Za-z0-9_-]+)", s):
-            raise ValueError("temp_id must be like tmp_npc_1, new_npc_1, or tmp_<kind>_<id>")
+        if not re.fullmatch(r"(tmp_npc_[A-Za-z0-9_-]+|tmp_[a-z]+_[A-Za-z0-9_-]+)", s):
+            raise ValueError("temp_id must be like tmp_npc_1 or tmp_<kind>_<id>")
         return s
 
     @field_validator("location_ref")
@@ -593,7 +590,7 @@ def _validation_code_from_pydantic(exc: Exception) -> str:
 def normalize_contract(raw: Any) -> DmTurnContractV1:
     """Parse and normalize a raw contract dict.
 
-    - Enforces ``contract_version == dm_turn_contract_v1``.
+    - Enforces ``contract_version == dm_turn_contract_v1`` (single canonical field).
     - Strictly rejects unknown fields (fail-closed).
     - Applies per-mode structural validation.
     - Fills normalization defaults (e.g., unknown truth → safe private_context).
@@ -602,8 +599,7 @@ def normalize_contract(raw: Any) -> DmTurnContractV1:
     if not isinstance(raw, dict):
         raise ContractValidationError("not_an_object", "Contract must be a JSON object")
 
-    version = raw.get("contract_version") or raw.get("schema_version") or raw.get("version")
-    # Friendly alias: legacy prototype used schema_version; v1 canonical is contract_version.
+    version = raw.get("contract_version")
     if version is None:
         raise ContractValidationError("missing_contract_version", "contract_version is required (dm_turn_contract_v1)")
     if version != CONTRACT_VERSION:
@@ -612,9 +608,6 @@ def normalize_contract(raw: Any) -> DmTurnContractV1:
             f"Unsupported contract_version {version!r}; expected {CONTRACT_VERSION}",
             details={"got": version, "expected": CONTRACT_VERSION},
         )
-    # Normalize legacy alias before pydantic
-    if "schema_version" in raw and "contract_version" not in raw:
-        raw = {**raw, "contract_version": raw["schema_version"]}
 
     try:
         contract = DmTurnContractV1.model_validate(raw)

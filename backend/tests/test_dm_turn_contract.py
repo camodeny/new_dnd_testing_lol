@@ -173,13 +173,20 @@ def test_existing_vs_temp_entity_refs_structurally_distinct():
         "new_entities": [{"temp_id": "tmp_npc_1", "kind": "npc", "public_name": "a dock clerk"}],
     })
     assert c.new_entities[0].temp_id == "tmp_npc_1"
-    # also accepts new_npc_ legacy prefix
+    # New entity also accepts generic tmp_<kind> form
     c2 = normalize_contract({
         "contract_version": CONTRACT_VERSION, "mode": "respond", "reason": "x",
         "beats": [{"id": "beat_1", "type": "narration", "claims": [_base_beat_claim()]}],
-        "new_entities": [{"temp_id": "new_npc_1", "kind": "npc", "public_name": "keeper"}],
+        "new_entities": [{"temp_id": "tmp_guard_2", "kind": "npc", "public_name": "a guard"}],
     })
-    assert c2.new_entities[0].temp_id == "new_npc_1"
+    assert c2.new_entities[0].temp_id == "tmp_guard_2"
+    # Legacy new_npc_ prefix is no longer accepted
+    with pytest.raises(ContractValidationError):
+        normalize_contract({
+            "contract_version": CONTRACT_VERSION, "mode": "respond", "reason": "x",
+            "beats": [{"id": "beat_1", "type": "narration", "claims": [_base_beat_claim()]}],
+            "new_entities": [{"temp_id": "new_npc_1", "kind": "npc", "public_name": "keeper"}],
+        })
     # Existing EntityRef must not use temp prefix
     with pytest.raises(ContractValidationError):
         normalize_contract({
