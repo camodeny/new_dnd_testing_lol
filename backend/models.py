@@ -491,6 +491,103 @@ class PlayerSubmissionSegment(Base):
         return {"position": self.position, "type": self.segment_type, "text": self.text}
 
 
+class DMStream(Base):
+    """Durable DM stream — issue #197.
+
+    One logical turn attempt maps to one stream. Chunks are appended
+    idempotently in ordered sequence. A completed stream materializes a
+    final display representation via concatenated chunk text; abandoned/failed
+    streams remain auditable but are excluded from canonical completed history.
+    """
+
+    __tablename__ = "dm_streams"
+    __table_args__ = (
+        UniqueConstraint("turn_id", "attempt_id", name="uq_dm_streams_turn_attempt"),
+        CheckConstraint("status IN ('streaming', 'completed', 'abandoned', 'failed')", name="ck_dm_streams_status"),
+        Index("ix_dm_streams_campaign_thread", "campaign_id", "thread_id"),
+    )
+
+    id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    campaign_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("campaigns.id", ondelete="CASCADE"), nullable=False, index=True
+    )
+    thread_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("campaign_threads.id", ondelete="CASCADE"), nullable=False, index=True
+    )
+    turn_id: Mapped[str] = mapped_column(String(64), nullable=False, index=True)
+    attempt_id: Mapped[str] = mapped_column(String(64), nullable=False, index=True)
+    status: Mapped[str] = mapped_column(String(16), nullable=False, default="streaming", server_default="streaming")
+    audience: Mapped[str] = mapped_column(String(32), nullable=False, default="campaign", server_default="campaign")
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now(), nullable=False)
+    updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now(), onupdate=func.now(), nullable=False)
+    first_chunk_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    last_chunk_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    completed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    abandoned_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    chunk_count: Mapped[int] = mapped_column(Integer, nullable=False, default=0, server_default="0")
+    total_bytes: Mapped[int] = mapped_column(Integer, nullable=False, default=0, server_default="0")
+    last_sequence: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    completion_reason: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    abandonment_reason: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    trace_id: Mapped[str | None] = mapped_column(String(64), nullable=True, index=True)
+    operation_id: Mapped[str | None] = mapped_column(String(128), nullable=True, index=True)
+    final_text: Mapped[str | None] = mapped_column(Text, nullable=True)
+
+    def to_dict(self, *, include_final: bool = True):
+        return {
+            "id": str(self.id),
+            "campaign_id": str(self.campaign_id),
+            "thread_id": str(self.thread_id),
+            "turn_id": self.turn_id,
+            "attempt_id": self.attempt_id,
+            "status": self.status,
+            "audience": self.audience,
+            "created_at": self.created_at.isoformat() if self.created_at else None,
+            "updated_at": self.updated_at.isoformat() if self.updated_at else None,
+            "first_chunk_at": self.first_chunk_at.isoformat() if self.first_chunk_at else None,
+            "last_chunk_at": self.last_chunk_at.isoformat() if self.last_chunk_at else None,
+            "completed_at": self.completed_at.isoformat() if self.completed_at else None,
+            "abandoned_at": self.abandoned_at.isoformat() if self.abandoned_at else None,
+            "chunk_count": self.chunk_count,
+            "total_bytes": self.total_bytes,
+            "last_sequence": self.last_sequence,
+            "completion_reason": self.completion_reason,
+            "abandonment_reason": self.abandonment_reason,
+            "trace_id": self.trace_id,
+            "operation_id": self.operation_id,
+            "final_text": self.final_text if include_final else None,
+        }
+
+
+class DMStreamChunk(Base):
+    """Ordered persisted chunk — one visible text fragment."""
+
+    __tablename__ = "dm_stream_chunks"
+    __table_args__ = (
+        UniqueConstraint("stream_id", "sequence", name="uq_dm_stream_chunks_stream_sequence"),
+        CheckConstraint("sequence >= 0", name="ck_dm_stream_chunks_nonnegative_sequence"),
+    )
+
+    id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    stream_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("dm_streams.id", ondelete="CASCADE"), nullable=False, index=True
+    )
+    sequence: Mapped[int] = mapped_column(Integer, nullable=False)
+    text: Mapped[str] = mapped_column(Text, nullable=False)
+    byte_length: Mapped[int] = mapped_column(Integer, nullable=False)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now(), nullable=False)
+
+    def to_dict(self):
+        return {
+            "id": str(self.id),
+            "stream_id": str(self.stream_id),
+            "sequence": self.sequence,
+            "text": self.text,
+            "byte_length": self.byte_length,
+            "created_at": self.created_at.isoformat() if self.created_at else None,
+        }
+
+
 class CampaignInvite(Base):
     __tablename__ = "campaign_invites"
 
