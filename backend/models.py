@@ -250,6 +250,7 @@ class WorkerExecution(Base):
     started_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     completed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     processing_duration_ms: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    claim_token: Mapped[str | None] = mapped_column(String(64), nullable=True, index=True)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now(), nullable=False)
     updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now(), onupdate=func.now(), nullable=False)
 
@@ -275,6 +276,7 @@ class WorkerExecution(Base):
             "started_at": self.started_at.isoformat() if self.started_at else None,
             "completed_at": self.completed_at.isoformat() if self.completed_at else None,
             "processing_duration_ms": self.processing_duration_ms,
+            "claim_token": self.claim_token,
             "created_at": self.created_at.isoformat() if self.created_at else None,
         }
 

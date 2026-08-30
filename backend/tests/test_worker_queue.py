@@ -245,3 +245,65 @@ def test_dead_letter_remains_inspectable_and_replayable():
     # Duplicate after replay deduped
     res2, dup2 = execute_worker_job(db, env, fixed)
     assert dup2 is True and res2 == res
+
+
+def test_lease_expiry_overlap_claim_fencing_and_idempotent_handler(tmp_path):
+    """Slow handler longer than lease: second steals after expiry, first's
+    fenced completion is discarded, side effects remain idempotent on job_id."""
+    db_file = tmp_path / "lease_overlap.sqlite"
+    eng = create_engine(f"sqlite:///{db_file}", connect_args={"check_same_thread": False, "timeout": 10})
+    Base.metadata.create_all(bind=eng)
+    Fac = sessionmaker(bind=eng, expire_on_commit=False)
+
+    env = new_envelope(job_type="lease.overlap", payload={"v": 1}, job_id=uuid.uuid4())
+    # Idempotent side-effect table keyed by job_id (simulates durable consumer dedupe)
+    side_effects: dict[str, int] = {}
+    lock = threading.Lock()
+    results: list[tuple] = []
+    errors: list[Exception] = []
+
+    def idempotent_handler(e):
+        # Durably idempotent: only first writer wins (PK-like)
+        jid = str(e.job_id)
+        with lock:
+            if jid not in side_effects:
+                side_effects[jid] = 1
+            # else already done — idempotent, don't duplicate
+        time.sleep(0.5)  # longer than lease
+        with lock:
+            return {"side_effect_count": side_effects[jid], "job_id": jid}
+
+    def worker(delay: float):
+        time.sleep(delay)
+        try:
+            db = Fac()
+            # lease 0.2s < handler 0.5s, so second can steal while first still running
+            results.append(execute_worker_job(db, env, idempotent_handler, lease_seconds=0.2))
+        except Exception as ex:
+            errors.append(ex)
+
+    t1 = threading.Thread(target=lambda: worker(0))
+    t2 = threading.Thread(target=lambda: worker(0.25))
+    t1.start()
+    t2.start()
+    t1.join()
+    t2.join()
+
+    # One handler stole the lease; fencing means only one ledger success
+    # Side effect remains idempotent (count 1, not 2)
+    assert side_effects[str(env.job_id)] == 1, f"side effect must be idempotent, got {side_effects}"
+    # Exactly one success, the other lost ownership
+    successes = [r for r in results if isinstance(r, tuple) and r[1] is False]
+    assert len(successes) == 1, f"expected exactly one ledger success, got results={results} errors={errors}"
+    # Second thread either succeeded or was blocked as duplicate after first succeeded
+    # In this fencing case, first's completion is discarded, second succeeds
+    # Final ledger must be succeeded
+    db = Fac()
+    rec = db.get(WorkerExecution, env.job_id)
+    assert rec.status == "succeeded"
+    assert rec.result["side_effect_count"] == 1
+    # Duplicate delivery after overlap returns cached result without extra side effect
+    before = side_effects[str(env.job_id)]
+    res, dup = execute_worker_job(db, env, idempotent_handler, lease_seconds=0.2)
+    assert dup is True
+    assert side_effects[str(env.job_id)] == before
