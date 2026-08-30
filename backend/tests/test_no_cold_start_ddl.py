@@ -111,7 +111,7 @@ def test_explicit_migrate_script_exists_and_exits_nonzero_without_db_url(monkeyp
     # Import migrate and patch get_database_url to return empty
     import scripts.migrate as migrate_mod
 
-    monkeypatch.setattr(migrate_mod, "get_database_url", lambda: "")
+    monkeypatch.setattr(migrate_mod, "get_migration_database_url", lambda: "")
 
     rc = migrate_mod.main()
     assert rc != 0, "migrate must exit non-zero when DB URL is missing"
@@ -122,7 +122,7 @@ def test_explicit_migrate_forced_alembic_failure_blocks_release(monkeypatch):
     import scripts.migrate as migrate_mod
 
     # Patch DB URL to a dummy so we reach alembic step, then force upgrade to fail
-    monkeypatch.setattr(migrate_mod, "get_database_url", lambda: "postgresql://user:pass@localhost/dbname")
+    monkeypatch.setattr(migrate_mod, "get_migration_database_url", lambda: "postgresql://user:pass@localhost/dbname")
     # Avoid real DB round-trip for before/after revision
     monkeypatch.setattr(migrate_mod, "_get_current_revision", lambda url: "test_before")
 
@@ -144,6 +144,16 @@ def test_vercel_production_gate_script_exists_and_gates_on_production():
     assert "Skipping" in src, "gate must skip migrations for non-production (preview)"
     # Must fail build on migration failure
     assert "exit 1" in src or "exit $RC" in src, "gate must fail build when migration fails"
+
+
+def test_migration_url_prefers_non_pooling_connection(monkeypatch):
+    import scripts.migrate as migrate_mod
+
+    monkeypatch.setenv("POSTGRES_URL", "postgresql://pooled/runtime")
+    monkeypatch.setenv("DATABASE_URL", "postgresql://generic/database")
+    monkeypatch.setenv("POSTGRES_URL_NON_POOLING", "postgresql://direct/migrations")
+
+    assert migrate_mod.get_migration_database_url() == "postgresql://direct/migrations"
 
 
 def test_explicit_migrate_script_logs_before_after(capsys=None):

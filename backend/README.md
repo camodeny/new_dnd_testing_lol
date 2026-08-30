@@ -42,12 +42,12 @@ Application startup **never** runs migrations or `Base.metadata.create_all()` �
 Deploys must apply migrations explicitly **before** serving traffic. This is wired as a single controlled gate before Vercel production promotion (previews do not race):
 
 - **Vercel gate:** `vercel.json` sets `backend.buildCommand` to `bash scripts/vercel-migrate.sh`. That script checks `VERCEL_ENV=production` — only production runs `python -m scripts.migrate`; preview/development skip. A non-zero exit fails the Vercel build, preventing promotion.
-- **GitHub gate:** `.github/workflows/backend-migrate.yml` runs the same `python -m scripts.migrate` on `push` to `main` (with `backend/**` changes) against the production DB and includes a forced-failure verification that the release path stops. It also verifies `vercel-migrate.sh` gates correctly.
+- **GitHub verification:** `.github/workflows/backend-migrate.yml` proves cold starts perform no DDL, forced migration failures return non-zero, and the Vercel gate is wired correctly. It never runs against production, so there is only one production DDL invocation.
 
 Manual equivalent:
 
 ```bash
-# from backend/ with production DATABASE_URL / POSTGRES_URL set
+# from backend/ with POSTGRES_URL_NON_POOLING (preferred) or another DB URL set
 python -m scripts.migrate
 # equivalent: alembic upgrade head
 
@@ -55,7 +55,7 @@ python -m scripts.migrate
 alembic current
 ```
 
-`scripts/migrate.py` logs the `alembic_version` before and after, and exits non-zero on failure with full traceback. A failed migration leaves the previous app/DB state intact (migrations run in a transaction) and the deploy is treated as unhealthy — Vercel build fails or the GitHub `production-migrate` job fails, blocking promotion. No fallback to `create_all()` is performed in production. Multiple API instances never attempt DDL concurrently because DDL only runs in this single deploy step (Alembic also acquires a row lock on `alembic_version` if run concurrently).
+`scripts/migrate.py` prefers `POSTGRES_URL_NON_POOLING`/`SUPABASE_DB_URL` over pooled runtime URLs, logs the `alembic_version` before and after, and exits non-zero on failure with full traceback. A failed migration leaves the previous app/DB state intact (migrations run in a transaction) and the Vercel build fails, blocking promotion. No fallback to `create_all()` is performed in production. Multiple API instances never attempt DDL because migrations only run in this single deploy step.
 
 CI example:
 

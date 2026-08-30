@@ -9,11 +9,11 @@ Usage:
               DATABASE_URL=... python scripts/migrate.py
 
   Production (Vercel/Supabase):
-              DATABASE_URL="$POSTGRES_URL" python -m scripts.migrate
+              POSTGRES_URL_NON_POOLING="..." python -m scripts.migrate
               # exit code !=0 means migration failed — do not promote the release
 
 This script:
-- resolves DATABASE_URL from the same env keys as database.py / alembic/env.py
+- prefers a direct/non-pooling migration URL over pooled runtime URLs
 - logs alembic_version before and after
 - runs `alembic upgrade head` via the Alembic Python API
 - exits non-zero and logs failure details on error (no silent fallback to create_all)
@@ -29,8 +29,6 @@ import traceback
 # Ensure backend/ is importable when run as `python scripts/migrate.py`
 sys.path.insert(0, os.path.dirname(os.path.dirname(__file__)))
 
-from database import get_database_url  # noqa: E402
-
 logger = logging.getLogger("migrate")
 # Use a dedicated handler so Alembic's fileConfig (which resets root logging
 # to WARNING) does not suppress our INFO logs after `command.upgrade`.
@@ -42,6 +40,25 @@ logger.setLevel(logging.INFO)
 logger.propagate = False
 # Also configure root for any early logs before alembic reconfigures it
 logging.basicConfig(level=logging.INFO, format="%(levelname)s [%(name)s] %(message)s")
+
+
+def get_migration_database_url() -> str:
+    """Resolve a migration connection, preferring direct/session endpoints.
+
+    Runtime traffic can use Supavisor's pooled URL, but Alembic needs a stable
+    session and should use the non-pooling connection whenever one is supplied.
+    """
+    for key in (
+        "POSTGRES_URL_NON_POOLING",
+        "SUPABASE_DB_URL",
+        "DATABASE_URL",
+        "POSTGRES_PRISMA_URL",
+        "POSTGRES_URL",
+    ):
+        value = os.environ.get(key)
+        if value:
+            return value
+    return ""
 
 
 def _get_current_revision(db_url: str) -> str | None:
@@ -65,11 +82,11 @@ def _get_current_revision(db_url: str) -> str | None:
 
 
 def main() -> int:
-    db_url = get_database_url()
+    db_url = get_migration_database_url()
     if not db_url:
         logger.error(
-            "No database URL found. Set POSTGRES_URL, POSTGRES_PRISMA_URL, "
-            "POSTGRES_URL_NON_POOLING, or DATABASE_URL."
+            "No database URL found. Set POSTGRES_URL_NON_POOLING, SUPABASE_DB_URL, "
+            "DATABASE_URL, POSTGRES_PRISMA_URL, or POSTGRES_URL."
         )
         return 1
 
