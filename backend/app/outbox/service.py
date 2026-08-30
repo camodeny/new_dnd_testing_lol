@@ -225,17 +225,82 @@ def commit_with_outbox(
 ) -> Outbox:
     """Enqueue outbox atomically with optional mutate callback in same transaction.
 
-    If mutate raises, outbox is rolled back too.
+    If mutate raises (even after flushing dirty state), the transaction is
+    rolled back so a caller that catches the exception cannot later commit
+    the dirty state without the required outbox obligation.
     """
-    if mutate is not None:
-        mutate()
-    return enqueue_outbox(
-        db,
-        event_type=event_type,
-        payload=payload,
-        aggregate_type=aggregate_type,
-        aggregate_id=aggregate_id,
-        campaign_id=campaign_id,
-        operation_id=operation_id,
-        commit=commit,
+    try:
+        if mutate is not None:
+            mutate()
+        return enqueue_outbox(
+            db,
+            event_type=event_type,
+            payload=payload,
+            aggregate_type=aggregate_type,
+            aggregate_id=aggregate_id,
+            campaign_id=campaign_id,
+            operation_id=operation_id,
+            commit=commit,
+        )
+    except Exception:
+        # Ensure session is clean even if mutate() flushed before raising.
+        try:
+            db.rollback()
+        except Exception:
+            pass
+        raise
+
+
+def process_outbox_batch(
+    db: Session,
+    *,
+    publish: callable,
+    batch_size: int = 10,
+    claimed_by: str = "relay",
+    lease_seconds: int = 300,
+    retry_delay_seconds: int = 60,
+) -> dict:
+    """Relay boundary: claim -> publish -> ack / failure -> retry.
+
+    Args:
+        db: Session for outbox table.
+        publish: Callable[[Outbox], None] — adapter to queue/workflow.
+                 Raise on transient failure. Must be idempotent on stable
+                 outbox.id (duplicate publish is acceptable).
+        batch_size: max records to claim per invocation.
+        claimed_by: relay identity for observability/lease.
+        lease_seconds: claim lease for sweeper recovery.
+        retry_delay_seconds: delay before failed record becomes retryable.
+
+    Returns:
+        dict with claimed/succeeded/failed counts.
+
+    Crash safety: records are claimed in a committed transaction before
+    publish. If the process crashes before ack, the lease expires and
+    recover_expired_claims / next claim reclaims the record.
+    """
+    claimed = claim_outbox_batch(
+        db, batch_size=batch_size, claimed_by=claimed_by, lease_seconds=lease_seconds, commit=True
     )
+    succeeded = 0
+    failed = 0
+    for rec in claimed:
+        try:
+            publish(rec)
+        except Exception as e:
+            mark_failed(
+                db, rec.id, str(e) or e.__class__.__name__, retry_delay_seconds=retry_delay_seconds, commit=True
+            )
+            failed += 1
+            logger.warning("outbox relay publish failed id=%s error=%s", rec.id, e)
+            continue
+        ack_published(db, rec.id, commit=True)
+        succeeded += 1
+    logger.info(
+        "outbox relay batch claimed=%s succeeded=%s failed=%s by=%s",
+        len(claimed),
+        succeeded,
+        failed,
+        claimed_by,
+    )
+    return {"claimed": len(claimed), "succeeded": succeeded, "failed": failed}
