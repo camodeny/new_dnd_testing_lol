@@ -20,6 +20,19 @@ depends_on: Union[str, Sequence[str], None] = None
 
 def upgrade() -> None:
     """Upgrade schema."""
+    # Supabase provides auth.users; vanilla Postgres (CI disposable DB) does not.
+    # Create the schema and a minimal stub so the FK below can be created on a
+    # clean database and the same Alembic path works in CI (#286).
+    op.execute(sa.text("CREATE SCHEMA IF NOT EXISTS auth"))
+    op.execute(
+        sa.text(
+            """
+            CREATE TABLE IF NOT EXISTS auth.users (
+                id UUID PRIMARY KEY
+            )
+            """
+        )
+    )
     # profiles mirrors auth.users.id — Supabase recommends a public table for app data
     op.create_table(
         "profiles",

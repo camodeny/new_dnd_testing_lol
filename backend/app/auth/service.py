@@ -25,6 +25,17 @@ def _get_or_create_mock_profile(db: Session) -> Profile:
     profile = db.get(Profile, MOCK_USER_ID)
     if not profile:
         try:
+            # Vanilla Postgres (CI disposable DB) has a stub auth.users that must
+            # contain the profile id for the FK. Supabase already has it; for
+            # CI we ensure it exists (idempotent).
+            try:
+                from sqlalchemy import text
+
+                db.execute(text("INSERT INTO auth.users (id) VALUES (:id) ON CONFLICT (id) DO NOTHING"), {"id": MOCK_USER_ID})
+                db.flush()
+            except Exception:
+                # auth schema may not exist on older DBs or SQLite (which ignores FK)
+                pass
             profile = Profile(id=MOCK_USER_ID, email="camdenpendergrass@gmail.com", username="dev")
             db.add(profile)
             db.commit()
