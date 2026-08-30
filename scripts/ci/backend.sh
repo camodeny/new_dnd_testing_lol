@@ -22,9 +22,21 @@ fi
 
 # If a test DB URL is available, verify the explicit migration path (issue #187/#286).
 # CI always provides this via the postgres service. Locally it's optional.
+# The disposable Postgres service does not use SSL, so CI URLs must carry
+# ?sslmode=disable to remain compatible with backend/database.py (which
+# appends sslmode=require when no sslmode is present). Without it, any
+# test that uses the real app DB stack would fail to connect.
 DB_URL="${POSTGRES_URL_NON_POOLING:-${POSTGRES_URL:-${DATABASE_URL:-}}}"
 if [[ -n "$DB_URL" ]]; then
   echo "== backend: migrate disposable DB =="
+  # Ensure CI URL is explicitly sslmode=disable for the disposable service.
+  if [[ "$DB_URL" == *"ci_test"* && "$DB_URL" != *"sslmode="* ]]; then
+    if [[ "$DB_URL" == *"?"* ]]; then
+      DB_URL="${DB_URL}&sslmode=disable"
+    else
+      DB_URL="${DB_URL}?sslmode=disable"
+    fi
+  fi
   export DATABASE_URL="$DB_URL"
   export POSTGRES_URL_NON_POOLING="$DB_URL"
   # Wait briefly for postgres service to be ready (service healthcheck covers most cases)
