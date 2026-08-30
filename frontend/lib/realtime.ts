@@ -87,11 +87,41 @@ export interface SnapshotReconciliation {
   realtime_resume_token?: string
 }
 
+export interface DmStateForRealtime {
+  status: string
+  streaming: boolean
+  active_turn?: string | null
+  turn_id?: string | null
+  attempt_id?: string | null
+  stream_id?: string | null
+  last_sequence?: number | null
+  chunk_count?: number
+  visible_text?: string
+  started_at?: string | null
+  first_chunk_at?: string | null
+  last_chunk_at?: string | null
+  trace_id?: string | null
+  [key: string]: unknown
+}
+
+export interface DmMessageForRealtime {
+  id: string
+  turn_id: string
+  attempt_id: string
+  final_text: string
+  status: string
+  completed_at?: string | null
+  [key: string]: unknown
+}
+
 export interface SnapshotForRealtime {
   revision?: number
   reconciliation?: SnapshotReconciliation
-  dm_state?: { last_sequence?: number | null; status?: string }
-  history?: { messages?: Array<{ id: string; sequence: number }> }
+  dm_state?: DmStateForRealtime | null
+  dm_messages?: DmMessageForRealtime[]
+  history?: { messages?: Array<{ id: string; sequence: number; raw_content?: string; thread_id?: string; segments?: unknown[] }> }
+  active_thread_id?: string
+  campaign?: { id: string; revision: number }
 }
 
 /**

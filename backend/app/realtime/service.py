@@ -233,10 +233,15 @@ class SupabaseRealtimePublisher(RealtimePublisher):
     def publish(self, channel: str, event: str, payload: dict[str, Any]) -> bool:
         _inc("publish_attempts")
         url = os.getenv("SUPABASE_URL") or os.getenv("NEXT_PUBLIC_SUPABASE_URL") or ""
-        key = os.getenv("SUPABASE_SERVICE_ROLE_KEY") or os.getenv("SUPABASE_ANON_KEY") or ""
+        # Private broadcast must use service_role — anon cannot publish to private channels
+        # and would be an audience-safety bypass. Intentionally no anon fallback.
+        key = os.getenv("SUPABASE_SERVICE_ROLE_KEY") or ""
         if not url or not key:
             _inc("publish_successes")
-            logger.info("realtime publish skipped (no Supabase config) channel=%s event=%s", channel, event)
+            if not key and url:
+                logger.warning("realtime publish skipped (SUPABASE_SERVICE_ROLE_KEY missing — private broadcast requires service_role) channel=%s event=%s", channel, event)
+            else:
+                logger.info("realtime publish skipped (no Supabase config) channel=%s event=%s", channel, event)
             return True
         # Lazy import so tests without httpx don't fail import.
         try:

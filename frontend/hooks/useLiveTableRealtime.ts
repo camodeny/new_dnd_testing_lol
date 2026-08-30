@@ -7,15 +7,13 @@
  * - Only audience-authorized private channels are subscribed (server via /realtime/authorize).
  * - Stable event_id / dedupe_key used to drop duplicate deliveries.
  * - Out-of-order events tolerated (buffer + sort by sequence before apply).
- * - Snapshot is authoritative: a client that misses events re-fetches snapshot and converges.
+ * - Snapshot is authoritative: a client that misses events re-fetches snapshot and converges
+ *   exactly (messages + DM active visible_text + completed DM messages).
  * - Snapshot→subscribe race has no gap: we subscribe first (buffer), then snapshot, then reconcile.
- * - Reconnect automatically re-snapshots/reconciles instead of assuming stream is complete.
+ * - Reconnect automatically re-snapshots/reconciles and resubscribes the channel instead of
+ *   assuming the event stream is complete. If a dm.chunk was missed, the fresh snapshot's
+ *   dm_state.visible_text already contains it and reconciliation drops the stale buffered copy.
  * - Realtime failure never blocks submission acceptance — snapshot remains usable alone.
- *
- * Usage:
- *   const { messages, dmChunks, revision, connected, refresh } = useLiveTableRealtime({
- *     campaignId, threadId, enabled: !!campaignId
- *   })
  */
 
 import { useCallback, useEffect, useRef, useState } from 'react'
@@ -28,6 +26,8 @@ import {
   liveTableChannel,
   reconcileBufferedEvents,
   sortEventsBySequence,
+  type DmMessageForRealtime,
+  type DmStateForRealtime,
   type RealtimeEvent,
   type SnapshotForRealtime,
 } from '@/lib/realtime'
@@ -36,13 +36,14 @@ interface UseLiveTableRealtimeOptions {
   campaignId: string | null
   threadId: string | null
   enabled?: boolean
-  // Optional pre-fetched snapshot to seed from; if omitted we fetch.
-  initialSnapshot?: SnapshotForRealtime & { history?: { messages?: unknown[] } }
+  initialSnapshot?: SnapshotForRealtime
 }
 
 interface LiveTableState {
   messages: RealtimeEvent[]
-  dmChunks: Map<string, RealtimeEvent[]> // streamId -> chunks
+  dmState: DmStateForRealtime | null
+  dmMessages: DmMessageForRealtime[]
+  dmChunks: Map<string, RealtimeEvent[]> // incremental chunks newer than snapshot
   dmStatus: RealtimeEvent | null
   revision: number | null
   realtimeResumeToken: string | null
@@ -50,17 +51,49 @@ interface LiveTableState {
   error: string | null
 }
 
+function snapshotToMessageEvents(snap: SnapshotForRealtime, campaignId: string, threadId: string): RealtimeEvent[] {
+  const msgs = snap.history?.messages ?? []
+  return msgs.map((m) => ({
+    type: 'submission.created',
+    event_id: `submission:${m.id}`,
+    campaign_id: campaignId,
+    thread_id: threadId,
+    sequence: m.sequence,
+    id: m.id,
+    raw_content: (m as { raw_content?: string }).raw_content,
+    segments: (m as { segments?: RealtimeEvent['segments'] }).segments,
+    dedupe_key: m.id,
+  }))
+}
+
 export function useLiveTableRealtime(opts: UseLiveTableRealtimeOptions) {
   const { campaignId, threadId, enabled = true, initialSnapshot } = opts
 
-  const [state, setState] = useState<LiveTableState>({
-    messages: [],
-    dmChunks: new Map(),
-    dmStatus: null,
-    revision: initialSnapshot?.revision ?? null,
-    realtimeResumeToken: initialSnapshot?.reconciliation?.realtime_resume_token ?? null,
-    connected: false,
-    error: null,
+  const [state, setState] = useState<LiveTableState>(() => {
+    if (initialSnapshot && campaignId && threadId) {
+      return {
+        messages: snapshotToMessageEvents(initialSnapshot, campaignId, threadId),
+        dmState: initialSnapshot.dm_state ?? null,
+        dmMessages: initialSnapshot.dm_messages ?? [],
+        dmChunks: new Map(),
+        dmStatus: null,
+        revision: initialSnapshot.revision ?? null,
+        realtimeResumeToken: initialSnapshot.reconciliation?.realtime_resume_token ?? null,
+        connected: false,
+        error: null,
+      }
+    }
+    return {
+      messages: [],
+      dmState: null,
+      dmMessages: [],
+      dmChunks: new Map(),
+      dmStatus: null,
+      revision: initialSnapshot?.revision ?? null,
+      realtimeResumeToken: initialSnapshot?.reconciliation?.realtime_resume_token ?? null,
+      connected: false,
+      error: null,
+    }
   })
 
   const bufferedRef = useRef<RealtimeEvent[]>([])
@@ -68,37 +101,58 @@ export function useLiveTableRealtime(opts: UseLiveTableRealtimeOptions) {
   const channelRef = useRef<ReturnType<typeof supabase.channel> | null>(null)
   const isMountedRef = useRef(true)
   const reconnectAttemptsRef = useRef(0)
+  const campaignIdRef = useRef(campaignId)
+  const threadIdRef = useRef(threadId)
+  campaignIdRef.current = campaignId
+  threadIdRef.current = threadId
 
-  // Snapshot fetch (authoritative, retryable)
-  const fetchSnapshot = useCallback(async (): Promise<SnapshotForRealtime | null> => {
-    if (!campaignId) return null
-    const params = new URLSearchParams()
-    if (threadId) params.set('thread_id', threadId)
-    const qs = params.toString() ? `?${params}` : ''
-    try {
-      const snap = await apiFetch<{
-        revision: number
-        reconciliation: SnapshotForRealtime['reconciliation']
-        history: { messages: Array<{ id: string; sequence: number; raw_content?: string }> }
-        dm_state: SnapshotForRealtime['dm_state']
-        dm_messages: unknown[]
-      }>(`/campaigns/${campaignId}/snapshot${qs}`)
-      snapshotRef.current = snap as SnapshotForRealtime
+  // Authoritative snapshot adoption — replaces full client projection first
+  const adoptSnapshot = useCallback(
+    (snap: SnapshotForRealtime) => {
+      if (!campaignIdRef.current || !threadIdRef.current) return
+      const cid = campaignIdRef.current
+      const tid = threadIdRef.current
+      snapshotRef.current = snap
+      const msgs = snapshotToMessageEvents(snap, cid, tid)
       setState((prev) => ({
         ...prev,
-        revision: (snap as { revision: number }).revision ?? prev.revision,
-        realtimeResumeToken: (snap as { reconciliation: { realtime_resume_token: string } }).reconciliation?.realtime_resume_token ?? null,
+        revision: snap.revision ?? prev.revision,
+        realtimeResumeToken: snap.reconciliation?.realtime_resume_token ?? prev.realtimeResumeToken,
+        messages: msgs,
+        dmState: snap.dm_state ?? null,
+        dmMessages: snap.dm_messages ?? [],
+        // Clear incremental chunks — snapshot's visible_text is authoritative.
+        // New chunks strictly newer than snapshot will repopulate this map.
+        dmChunks: new Map(),
+        dmStatus: null,
+        error: null,
       }))
       incRealtimeMetric('snapshotCatchups')
-      return snap as unknown as SnapshotForRealtime
+    },
+    [],
+  )
+
+  // Snapshot fetch (authoritative, retryable) — adopts immediately
+  const fetchSnapshotAndAdopt = useCallback(async (): Promise<SnapshotForRealtime | null> => {
+    const cid = campaignIdRef.current
+    const tid = threadIdRef.current
+    if (!cid) return null
+    const params = new URLSearchParams()
+    if (tid) params.set('thread_id', tid)
+    const qs = params.toString() ? `?${params}` : ''
+    try {
+      const snap = await apiFetch<SnapshotForRealtime>(`/campaigns/${cid}/snapshot${qs}`)
+      adoptSnapshot(snap)
+      return snap
     } catch (e) {
       const msg = (e as Error).message ?? 'snapshot fetch failed'
       if (isMountedRef.current) setState((prev) => ({ ...prev, error: msg }))
       return null
     }
-  }, [campaignId, threadId])
+  }, [adoptSnapshot])
 
   // Apply a batch of events (dedupe + sort + merge into state)
+  // Assumes snapshot already adopted; caller must reconcile first.
   const applyEvents = useCallback((events: RealtimeEvent[]) => {
     if (!events.length) return
     const deduped = dedupeEvents(events)
@@ -111,6 +165,7 @@ export function useLiveTableRealtime(opts: UseLiveTableRealtimeOptions) {
       const nextChunks = new Map(prev.dmChunks)
       let nextStatus = prev.dmStatus
       let nextRevision = prev.revision
+      let nextDmState = prev.dmState ? { ...prev.dmState } : prev.dmState
 
       for (const ev of sorted) {
         if (ev.type === 'submission.created') {
@@ -122,12 +177,29 @@ export function useLiveTableRealtime(opts: UseLiveTableRealtimeOptions) {
         } else if (ev.type === 'dm.chunk') {
           const sid = String(ev.stream_id ?? 'unknown')
           const arr = nextChunks.get(sid) ?? []
-          // dedupe chunk by event_id within stream
           if (!arr.some((c) => c.event_id === ev.event_id)) {
             nextChunks.set(sid, sortEventsBySequence([...arr, ev]))
           }
+          // Also extend authoritative visible_text incrementally for live rendering
+          if (nextDmState && String(nextDmState.stream_id) === sid && typeof ev.text === 'string') {
+            const cur = typeof nextDmState.visible_text === 'string' ? nextDmState.visible_text : ''
+            nextDmState = { ...nextDmState, visible_text: cur + ev.text, last_sequence: ev.sequence ?? nextDmState.last_sequence, chunk_count: (nextDmState.chunk_count ?? 0) + 1 }
+          }
         } else if (ev.type === 'dm.status' || ev.type === 'dm.thinking') {
           nextStatus = ev
+          if (ev.type === 'dm.status' && ev.status) {
+            // DM status may carry final visible_text / completion — update dmState to converge
+            if (nextDmState) {
+              nextDmState = {
+                ...nextDmState,
+                status: String(ev.status),
+                streaming: ev.status === 'streaming',
+                last_sequence: (ev as { last_sequence?: number }).last_sequence ?? nextDmState.last_sequence,
+                chunk_count: (ev as { chunk_count?: number }).chunk_count ?? nextDmState.chunk_count,
+                visible_text: (ev as { visible_text?: string }).visible_text ?? nextDmState.visible_text,
+              }
+            }
+          }
         }
         if (typeof ev.revision === 'number') nextRevision = Math.max(nextRevision ?? 0, ev.revision)
         if (typeof ev.sequence === 'number' && ev.type === 'revision') nextRevision = Math.max(nextRevision ?? 0, ev.sequence)
@@ -138,10 +210,44 @@ export function useLiveTableRealtime(opts: UseLiveTableRealtimeOptions) {
         messages: sortEventsBySequence(nextMessages) as RealtimeEvent[],
         dmChunks: nextChunks,
         dmStatus: nextStatus,
+        dmState: nextDmState,
         revision: nextRevision,
       }
     })
   }, [])
+
+  // Build a channel subscription; returns the channel handle
+  const buildChannel = useCallback(
+    (channelName: string) => {
+      const ch = supabase.channel(channelName, { config: { private: true } } as unknown as Record<string, unknown>)
+
+      const handleBroadcast = (payload: { payload: RealtimeEvent }) => {
+        const ev = (payload.payload ?? payload) as RealtimeEvent
+        bufferedRef.current.push(ev)
+        if (snapshotRef.current) {
+          const reconciled = reconcileBufferedEvents(snapshotRef.current, [ev])
+          if (reconciled.length) {
+            incRealtimeMetric('reconciliationEvents')
+            applyEvents(reconciled)
+          } else {
+            incRealtimeMetric('reconciliationEvents')
+          }
+        }
+      }
+
+      try {
+        ch.on('broadcast' as never, { event: 'submission.created' } as never, handleBroadcast as never)
+        ch.on('broadcast' as never, { event: 'dm.chunk' } as never, handleBroadcast as never)
+        ch.on('broadcast' as never, { event: 'dm.status' } as never, handleBroadcast as never)
+        ch.on('broadcast' as never, { event: 'dm.thinking' } as never, handleBroadcast as never)
+        ch.on('broadcast' as never, { event: 'revision' } as never, handleBroadcast as never)
+      } catch {
+        // fallback to postgres_changes if broadcast signature differs
+      }
+      return ch
+    },
+    [applyEvents],
+  )
 
   // Subscription lifecycle — subscribe first, then snapshot, then reconcile (race-safe)
   useEffect(() => {
@@ -153,11 +259,11 @@ export function useLiveTableRealtime(opts: UseLiveTableRealtimeOptions) {
     isMountedRef.current = true
     bufferedRef.current = []
     let cancelled = false
+    let currentChannel: ReturnType<typeof supabase.channel> | null = null
 
-    async function authorizeAndSubscribe() {
-      // Audience check: ask backend if we may subscribe to this private channel.
-      // Private existence hidden as 404 — unauthorized clients cannot learn the channel.
+    const doSubscribe = async () => {
       const channelName = liveTableChannel(campaignId!, threadId!)
+      // Audience check: server preflight (UX) — actual enforcement is DB RLS on realtime.messages
       try {
         await apiFetch(`/campaigns/${campaignId}/realtime/authorize`, {
           method: 'POST',
@@ -166,182 +272,114 @@ export function useLiveTableRealtime(opts: UseLiveTableRealtimeOptions) {
       } catch (e) {
         const status = (e as { status?: number }).status
         const msg =
-          status === 404
-            ? 'Thread not found'
-            : status === 403
-              ? 'Not authorized for this thread'
-              : (e as Error).message ?? 'Realtime authorization failed'
+          status === 404 ? 'Thread not found' : status === 403 ? 'Not authorized for this thread' : (e as Error).message ?? 'Realtime authorization failed'
         if (!cancelled && isMountedRef.current) setState((prev) => ({ ...prev, error: msg, connected: false }))
-        return
+        return false
       }
-      if (cancelled) return
+      if (cancelled) return false
 
-      // Subscribe first — buffer events immediately, even before snapshot fetch.
-      const ch = supabase.channel(channelName, { config: { private: true } } as unknown as Record<string, unknown>)
-      // Supabase broadcast pattern: event 'broadcast' with { event: type }
-      try {
-        // Broadcast events (server publishes via broadcast)
-        ch.on('broadcast' as never, { event: 'submission.created' } as never, (payload: { payload: RealtimeEvent }) => {
-          const ev = (payload.payload ?? payload) as RealtimeEvent
-          bufferedRef.current.push(ev)
-          // If snapshot already fetched, apply immediately (still deduped)
-          if (snapshotRef.current) {
-            const reconciled = reconcileBufferedEvents(snapshotRef.current, [ev])
-            if (reconciled.length) {
-              incRealtimeMetric('reconciliationEvents')
-              applyEvents(reconciled)
-            } else {
-              // Event already in snapshot — drop (race case), count as reconciliation
-              incRealtimeMetric('reconciliationEvents')
-            }
-          }
-        })
-        ch.on('broadcast' as never, { event: 'dm.chunk' } as never, (payload: { payload: RealtimeEvent }) => {
-          const ev = (payload.payload ?? payload) as RealtimeEvent
-          bufferedRef.current.push(ev)
-          if (snapshotRef.current) {
-            const reconciled = reconcileBufferedEvents(snapshotRef.current, [ev])
-            if (reconciled.length) applyEvents(reconciled)
-          }
-        })
-        ch.on('broadcast' as never, { event: 'dm.status' } as never, (payload: { payload: RealtimeEvent }) => {
-          const ev = (payload.payload ?? payload) as RealtimeEvent
-          bufferedRef.current.push(ev)
-          if (snapshotRef.current) applyEvents([ev])
-        })
-        ch.on('broadcast' as never, { event: 'dm.thinking' } as never, (payload: { payload: RealtimeEvent }) => {
-          const ev = (payload.payload ?? payload) as RealtimeEvent
-          bufferedRef.current.push(ev)
-          if (snapshotRef.current) applyEvents([ev])
-        })
-        ch.on('broadcast' as never, { event: 'revision' } as never, (payload: { payload: RealtimeEvent }) => {
-          const ev = (payload.payload ?? payload) as RealtimeEvent
-          bufferedRef.current.push(ev)
-          if (snapshotRef.current) applyEvents([ev])
-        })
-      } catch {
-        // If broadcast .on signature differs, fall back to postgres_changes (still private via RLS)
-      }
-
-      // Also listen to postgres changes if configured (durability fallback) — optional
-      try {
-        // no-op if not using postgres_changes; kept for completeness
-      } catch { /* ignore */ }
-
-      channelRef.current = ch as unknown as ReturnType<typeof supabase.channel>
+      currentChannel = buildChannel(channelName) as unknown as ReturnType<typeof supabase.channel>
+      channelRef.current = currentChannel
 
       const onStatusChange = (status: string) => {
         if (cancelled) return
         if (status === 'SUBSCRIBED') {
           if (isMountedRef.current) setState((prev) => ({ ...prev, connected: true, error: null }))
           incRealtimeMetric('subscriptionCount')
+          reconnectAttemptsRef.current = 0
         } else if (status === 'CHANNEL_ERROR' || status === 'TIMED_OUT' || status === 'CLOSED') {
           if (isMountedRef.current) setState((prev) => ({ ...prev, connected: false }))
-          // Reconnect auto re-snapshots/reconciles
           if (!cancelled) {
             reconnectAttemptsRef.current += 1
             incRealtimeMetric('reconnectCount')
-            // Backoff then resubscribe + re-snapshot
+            const backoff = Math.min(1000 * 2 ** reconnectAttemptsRef.current, 15000)
             setTimeout(async () => {
               if (cancelled || !isMountedRef.current) return
-              const snap = await fetchSnapshot()
-              if (snap && bufferedRef.current.length) {
-                const reconciled = reconcileBufferedEvents(snap, bufferedRef.current)
-                if (reconciled.length) applyEvents(reconciled)
-                bufferedRef.current = []
+              // Explicitly rebuild the channel (supabase-js does not always auto-resubscribe private channels)
+              try {
+                if (currentChannel) {
+                  try {
+                    supabase.removeChannel(currentChannel as unknown as Parameters<typeof supabase.removeChannel>[0])
+                  } catch {
+                    try {
+                      ;(currentChannel as unknown as { unsubscribe: () => void }).unsubscribe()
+                    } catch { /* ignore */ }
+                  }
+                }
+              } catch { /* ignore */ }
+              currentChannel = null
+              channelRef.current = null
+              bufferedRef.current = []
+              const ok = await doSubscribe()
+              if (ok) {
+                const snap = await fetchSnapshotAndAdopt()
+                if (snap && bufferedRef.current.length) {
+                  const reconciled = reconcileBufferedEvents(snap, bufferedRef.current)
+                  if (reconciled.length) applyEvents(reconciled)
+                  bufferedRef.current = []
+                }
               }
-            }, Math.min(1000 * 2 ** reconnectAttemptsRef.current, 15000))
+            }, backoff)
           }
         }
       }
 
       try {
-        ch.subscribe(onStatusChange as never)
+        ;(currentChannel as unknown as { subscribe: (cb: (s: string) => void) => void }).subscribe(onStatusChange as never)
       } catch {
-        // supabase-js v2: .subscribe(callback)
         try {
-          ;(ch as unknown as { subscribe: (cb: (s: string) => void) => void }).subscribe(onStatusChange)
+          ;(currentChannel as unknown as { subscribe: (cb: (s: string) => void) => unknown }).subscribe(onStatusChange)
         } catch { /* ignore */ }
       }
 
-      // Now fetch snapshot (after subscribe, so no gap)
-      const snap = await fetchSnapshot()
-      if (cancelled || !snap) return
+      // Now fetch snapshot (after subscribe, so no gap) — adoption replaces state
+      const snap = await fetchSnapshotAndAdopt()
+      if (cancelled || !snap) return true // subscribed, even if snapshot failed; snapshot remains retryable
 
       // Reconcile any events that arrived between subscribe and snapshot response
       if (bufferedRef.current.length) {
         const reconciled = reconcileBufferedEvents(snap, bufferedRef.current)
         incRealtimeMetric('reconciliationEvents')
         if (reconciled.length) applyEvents(reconciled)
-        // Clear buffer of events already reconciled; keep future buffer live
-        // We keep only events that were reconciled + new ones will arrive via handler.
-        // To avoid double-apply, clear handled ones and keep empty for live path.
         bufferedRef.current = []
-        // Seed state from snapshot history messages that aren't yet in realtime
-        // (snapshot is authoritative; realtime supplements it)
-        const snapMessages = (snap as unknown as { history?: { messages?: Array<{ id: string; sequence: number; raw_content?: string }> } }).history?.messages
-        if (Array.isArray(snapMessages) && snapMessages.length) {
-          const asEvents: RealtimeEvent[] = snapMessages.map((m) => ({
-            type: 'submission.created',
-            event_id: `submission:${m.id}`,
-            campaign_id: campaignId!,
-            thread_id: threadId!,
-            sequence: m.sequence,
-            id: m.id,
-            raw_content: m.raw_content,
-            dedupe_key: m.id,
-          }))
-          // Only add those not already present
-          applyEvents(asEvents)
-        }
-      } else {
-        // No buffered events — seed from snapshot
-        const snapMessages = (snap as unknown as { history?: { messages?: Array<{ id: string; sequence: number; raw_content?: string }> } }).history?.messages
-        if (Array.isArray(snapMessages) && snapMessages.length) {
-          const asEvents: RealtimeEvent[] = snapMessages.map((m) => ({
-            type: 'submission.created',
-            event_id: `submission:${m.id}`,
-            campaign_id: campaignId!,
-            thread_id: threadId!,
-            sequence: m.sequence,
-            id: m.id,
-            raw_content: m.raw_content,
-            dedupe_key: m.id,
-          }))
-          applyEvents(asEvents)
-        }
       }
+      return true
     }
 
-    authorizeAndSubscribe()
+    doSubscribe()
 
     return () => {
       cancelled = true
       isMountedRef.current = false
+      if (currentChannel) {
+        try {
+          supabase.removeChannel(currentChannel as unknown as Parameters<typeof supabase.removeChannel>[0])
+        } catch {
+          try {
+            ;(currentChannel as unknown as { unsubscribe: () => void }).unsubscribe()
+          } catch { /* ignore */ }
+        }
+        currentChannel = null
+      }
       if (channelRef.current) {
         try {
           supabase.removeChannel(channelRef.current as unknown as Parameters<typeof supabase.removeChannel>[0])
-        } catch {
-          try {
-            ;(channelRef.current as unknown as { unsubscribe: () => void }).unsubscribe()
-          } catch { /* ignore */ }
-        }
+        } catch { /* ignore */ }
         channelRef.current = null
       }
     }
-  }, [campaignId, threadId, enabled, fetchSnapshot, applyEvents])
+  }, [campaignId, threadId, enabled, buildChannel, fetchSnapshotAndAdopt, applyEvents])
 
   const refresh = useCallback(async () => {
-    const snap = await fetchSnapshot()
+    const snap = await fetchSnapshotAndAdopt()
     if (snap && bufferedRef.current.length) {
       const reconciled = reconcileBufferedEvents(snap, bufferedRef.current)
       if (reconciled.length) applyEvents(reconciled)
       bufferedRef.current = []
     }
     return snap
-  }, [fetchSnapshot, applyEvents])
+  }, [fetchSnapshotAndAdopt, applyEvents])
 
-  // Expose helper to manually ingest an event (for tests / fallback polling)
   const ingest = useCallback(
     (ev: RealtimeEvent | RealtimeEvent[]) => {
       const arr = Array.isArray(ev) ? ev : [ev]
@@ -357,6 +395,8 @@ export function useLiveTableRealtime(opts: UseLiveTableRealtimeOptions) {
 
   return {
     messages: state.messages,
+    dmState: state.dmState,
+    dmMessages: state.dmMessages,
     dmChunks: state.dmChunks,
     dmStatus: state.dmStatus,
     revision: state.revision,
