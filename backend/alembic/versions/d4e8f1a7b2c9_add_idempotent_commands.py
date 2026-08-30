@@ -1,7 +1,7 @@
 """add durable idempotent command records — issue 189
 
 Revision ID: d4e8f1a7b2c9
-Revises: c9f5a2e6b1d4
+Revises: d3a7c1e9f2b6
 """
 
 from typing import Sequence, Union
@@ -11,7 +11,7 @@ import sqlalchemy as sa
 from sqlalchemy.dialects import postgresql
 
 revision: str = "d4e8f1a7b2c9"
-down_revision: Union[str, Sequence[str], None] = "c9f5a2e6b1d4"
+down_revision: Union[str, Sequence[str], None] = "d3a7c1e9f2b6"
 branch_labels = None
 depends_on = None
 

@@ -33,6 +33,11 @@ def canonical_payload_hash(payload: object) -> str:
     return hashlib.sha256(encoded).hexdigest()
 
 
+def _json_safe_result(result: dict | list) -> dict | list:
+    """Normalize UUID/datetime values before persisting and returning a result."""
+    return json.loads(json.dumps(result, ensure_ascii=False, default=str))
+
+
 def execute_idempotent_command(
     db: Session,
     *,
@@ -93,6 +98,7 @@ def execute_idempotent_command(
         result = execute()
         if not isinstance(result, (dict, list)):
             raise TypeError("Idempotent command result must be a JSON object or array")
+        result = _json_safe_result(result)
         record.result = result
         record.status = "completed"
         record.completed_at = datetime.now(timezone.utc)

@@ -1,7 +1,7 @@
 """Campaigns transport — APIRouter. Depends on service layer for domain logic."""
 import uuid as uuid_lib
 
-from fastapi import APIRouter, Depends, HTTPException, Request
+from fastapi import APIRouter, Depends, HTTPException, Request, Response
 from sqlalchemy import select
 from sqlalchemy.orm import Session
 
@@ -21,6 +21,7 @@ from app.campaigns.service import (
     validate_seed,
 )
 from app.deps.auth import resolve_profile
+from app.deps.idempotency import execute_http_idempotent, require_idempotency_key
 from database import get_db
 from models import Campaign, CampaignInvite, CampaignMember, Profile
 
@@ -137,7 +138,13 @@ def delete_campaign(campaign_id: str, request: Request, db: Session = Depends(ge
 
 
 @router.put("/api/campaigns/{campaign_id}")
-def update_campaign(campaign_id: str, payload: dict, request: Request, db: Session = Depends(get_db)):
+def update_campaign(
+    campaign_id: str,
+    payload: dict,
+    request: Request,
+    response: Response,
+    db: Session = Depends(get_db),
+):
     profile = resolve_profile(request, db)
     try:
         cid = parse_campaign_id(campaign_id)
@@ -167,21 +174,38 @@ def update_campaign(campaign_id: str, payload: dict, request: Request, db: Sessi
         expected_revision = int(payload["expected_revision"])
     except (TypeError, ValueError):
         raise HTTPException(status_code=400, detail="expected_revision must be an integer")
+    operation_id = str(payload.get("operation_id") or "").strip() or None
+    idempotency_key = require_idempotency_key(request, operation_id)
 
     def _mutate(campaign: Campaign):
         for field, value in changes.items():
             setattr(campaign, field, value)
 
-    try:
+    def _execute():
         campaign, event = commit_campaign_mutation(
             db,
             cid,
             expected_revision,
             event_type="campaign.settings_updated",
-            operation_id=str(payload.get("operation_id") or "").strip() or None,
+            operation_id=operation_id or idempotency_key,
             actor_id=profile.id,
             payload={"changes": changes},
             mutate=_mutate,
+            commit=False,
+        )
+        return {"campaign": campaign.to_dict(), "event": event.to_dict()}
+
+    try:
+        return execute_http_idempotent(
+            db,
+            response,
+            actor_id=profile.id,
+            idempotency_key=idempotency_key,
+            command_type="campaign.settings_updated",
+            scope_type="campaign",
+            scope_id=cid,
+            payload=payload,
+            execute=_execute,
         )
     except RevisionConflictError as e:
         raise HTTPException(
@@ -189,11 +213,16 @@ def update_campaign(campaign_id: str, payload: dict, request: Request, db: Sessi
             detail=str(e),
             headers={"X-Current-Revision": str(e.actual_revision)},
         )
-    return {"campaign": campaign.to_dict(), "event": event.to_dict()}
 
 
 @router.post("/api/campaigns/{campaign_id}/mutations")
-def commit_campaign_mutation_endpoint(campaign_id: str, payload: dict, request: Request, db: Session = Depends(get_db)):
+def commit_campaign_mutation_endpoint(
+    campaign_id: str,
+    payload: dict,
+    request: Request,
+    response: Response,
+    db: Session = Depends(get_db),
+):
     profile = resolve_profile(request, db)
     try:
         cid = parse_campaign_id(campaign_id)
@@ -216,6 +245,7 @@ def commit_campaign_mutation_endpoint(campaign_id: str, payload: dict, request: 
     operation_id = payload.get("operation_id") or payload.get("operationId")
     if operation_id is not None:
         operation_id = str(operation_id).strip() or None
+    idempotency_key = require_idempotency_key(request, operation_id)
     visibility = str(payload.get("visibility") or "public").strip() or "public"
     provenance = payload.get("provenance")
     targets = payload.get("targets")
@@ -233,19 +263,34 @@ def commit_campaign_mutation_endpoint(campaign_id: str, payload: dict, request: 
         if "description" in mutate_fields:
             campaign.description = mutate_fields["description"]
 
-    try:
+    def _execute():
         campaign, event = commit_campaign_mutation(
             db,
             cid,
             expected,
             event_type=event_type,
             payload=event_payload if isinstance(event_payload, dict) else ({"data": event_payload} if event_payload is not None else None),
-            operation_id=operation_id,
+            operation_id=operation_id or idempotency_key,
             actor_id=profile.id,
             targets=targets,
             visibility=visibility,
             provenance=provenance if isinstance(provenance, dict) else None,
             mutate=_mutate if mutate_fields else None,
+            commit=False,
+        )
+        return {"campaign": campaign.to_dict(), "event": event.to_dict()}
+
+    try:
+        return execute_http_idempotent(
+            db,
+            response,
+            actor_id=profile.id,
+            idempotency_key=idempotency_key,
+            command_type="campaign.mutation",
+            scope_type="campaign",
+            scope_id=cid,
+            payload=payload,
+            execute=_execute,
         )
     except RevisionConflictError as e:
         raise HTTPException(
@@ -253,7 +298,6 @@ def commit_campaign_mutation_endpoint(campaign_id: str, payload: dict, request: 
             detail=str(e),
             headers={"X-Current-Revision": str(e.actual_revision), "X-Expected-Revision": str(e.expected_revision)},
         )
-    return {"campaign": campaign.to_dict(), "event": event.to_dict()}
 
 
 @router.get("/api/campaigns/{campaign_id}/events")

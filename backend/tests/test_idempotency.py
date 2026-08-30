@@ -18,7 +18,7 @@ if not hasattr(SQLiteTypeCompiler, "_patched_jsonb"):
     SQLiteTypeCompiler._patched_jsonb = True  # type: ignore
 
 from database import Base, get_db  # noqa: E402
-from idempotency import (  # noqa: E402
+from app.idempotency import (  # noqa: E402
     IdempotencyConflictError,
     execute_idempotent_command,
 )
@@ -131,7 +131,8 @@ def test_concurrent_duplicates_only_execute_once(tmp_path):
 
 
 def test_duplicate_http_retry_returns_same_campaign_event(monkeypatch):
-    from main import MOCK_USER_ID, app
+    from app.deps.auth import MOCK_USER_ID
+    from main import app
 
     engine = create_engine(
         "sqlite://", connect_args={"check_same_thread": False},
@@ -173,5 +174,87 @@ def test_duplicate_http_retry_returns_same_campaign_event(monkeypatch):
             json={**body, "mutate": {"name": "Different"}}, headers=headers,
         )
         assert mismatch.status_code == 409
+    finally:
+        app.dependency_overrides.clear()
+
+
+def test_campaign_put_retry_replays_after_revision_advanced(monkeypatch):
+    from app.deps.auth import MOCK_USER_ID
+    from main import app
+
+    engine = create_engine(
+        "sqlite://", connect_args={"check_same_thread": False}, poolclass=StaticPool
+    )
+    Base.metadata.create_all(engine)
+    factory = sessionmaker(bind=engine)
+    campaign_id = uuid.uuid4()
+    with factory() as db:
+        db.add(Profile(id=MOCK_USER_ID, email="mock@example.com"))
+        db.add(Campaign(id=campaign_id, owner_id=MOCK_USER_ID, name="Before"))
+        db.add(CampaignMember(campaign_id=campaign_id, user_id=MOCK_USER_ID, role="owner"))
+        db.commit()
+
+    def override_db():
+        with factory() as db:
+            yield db
+
+    monkeypatch.setenv("ALLOW_MOCK_AUTH", "true")
+    app.dependency_overrides[get_db] = override_db
+    try:
+        client = TestClient(app)
+        body = {"expected_revision": 0, "name": "After"}
+        headers = {"Idempotency-Key": "campaign-put-retry"}
+        first = client.put(f"/api/campaigns/{campaign_id}", json=body, headers=headers)
+        second = client.put(f"/api/campaigns/{campaign_id}", json=body, headers=headers)
+
+        assert first.status_code == second.status_code == 200
+        assert first.json() == second.json()
+        assert first.json()["campaign"]["revision"] == 1
+        assert first.headers["X-Idempotent-Replay"] == "false"
+        assert second.headers["X-Idempotent-Replay"] == "true"
+    finally:
+        app.dependency_overrides.clear()
+
+
+def test_character_create_is_a_real_user_scoped_idempotent_command(monkeypatch):
+    from app.deps.auth import MOCK_USER_ID
+    from main import app
+    from models import Character
+
+    engine = create_engine(
+        "sqlite://", connect_args={"check_same_thread": False}, poolclass=StaticPool
+    )
+    Base.metadata.create_all(engine)
+    factory = sessionmaker(bind=engine)
+    with factory() as db:
+        db.add(Profile(id=MOCK_USER_ID, email="mock@example.com"))
+        db.commit()
+
+    def override_db():
+        with factory() as db:
+            yield db
+
+    monkeypatch.setenv("ALLOW_MOCK_AUTH", "true")
+    app.dependency_overrides[get_db] = override_db
+    try:
+        client = TestClient(app)
+        body = {"name": "Idempotent Hero", "system": "dnd5e"}
+        headers = {"Idempotency-Key": "character-create-retry"}
+        first = client.post("/api/characters", json=body, headers=headers)
+        second = client.post("/api/characters", json=body, headers=headers)
+
+        assert first.status_code == second.status_code == 200
+        assert first.json() == second.json()
+        assert first.headers["X-Idempotent-Replay"] == "false"
+        assert second.headers["X-Idempotent-Replay"] == "true"
+        with factory() as db:
+            assert db.scalar(select(func.count()).select_from(Character)) == 1
+            command = db.execute(
+                select(IdempotentCommand).where(
+                    IdempotentCommand.command_type == "character.create"
+                )
+            ).scalars().one()
+            assert command.scope_type == "user"
+            assert command.scope_id == str(MOCK_USER_ID)
     finally:
         app.dependency_overrides.clear()

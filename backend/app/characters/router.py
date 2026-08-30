@@ -2,12 +2,13 @@
 import logging
 import uuid as uuid_lib
 
-from fastapi import APIRouter, Depends, HTTPException, Request
-from sqlalchemy import select
+from fastapi import APIRouter, Depends, HTTPException, Request, Response
+from sqlalchemy import select, update as sa_update
 from sqlalchemy.orm import Session
 
 from app.characters.service import character_with_sheet
 from app.deps.auth import resolve_profile
+from app.deps.idempotency import execute_http_idempotent, require_idempotency_key
 from database import get_db
 from models import Character, Dnd5eCharacterSheet
 from models import CharacterChatMessage as DbChatMessage
@@ -28,37 +29,49 @@ def list_characters(request: Request, db: Session = Depends(get_db)):
 
 
 @router.post("/api/characters")
-def create_character(request: Request, payload: dict, db: Session = Depends(get_db)):
+def create_character(
+    request: Request,
+    response: Response,
+    payload: dict,
+    db: Session = Depends(get_db),
+):
     profile = resolve_profile(request, db)
-    name = payload.get("name") or payload.get("character_name") or "Unnamed Hero"
-    char = Character(owner_id=profile.id, name=name, system=payload.get("system") or "dnd5e")
-    db.add(char)
-    db.flush()
-    try:
-        sheet = Dnd5eCharacterSheet.from_frontend(payload, owner_id=profile.id)
-        sheet.character_id = char.id
-        if not sheet.character_name:
-            sheet.character_name = name
-        db.add(sheet)
-        db.commit()
-        db.refresh(char)
-        try:
-            from sqlalchemy import update as sa_update
+    operation_id = str(payload.get("operation_id") or "").strip() or None
+    idempotency_key = require_idempotency_key(request, operation_id)
 
+    def _execute():
+        try:
+            name = payload.get("name") or payload.get("character_name") or "Unnamed Hero"
+            char = Character(owner_id=profile.id, name=name, system=payload.get("system") or "dnd5e")
+            db.add(char)
+            db.flush()
+            sheet = Dnd5eCharacterSheet.from_frontend(payload, owner_id=profile.id)
+            sheet.character_id = char.id
+            if not sheet.character_name:
+                sheet.character_name = name
+            db.add(sheet)
             db.execute(
                 sa_update(DbChatMessage)
                 .where(DbChatMessage.owner_id == profile.id, DbChatMessage.character_id.is_(None))
                 .values(character_id=char.id)
             )
-            db.commit()
-        except Exception as e:
-            logger.warning("failed to transfer draft chat: %s", e)
-        sheet = db.execute(select(Dnd5eCharacterSheet).where(Dnd5eCharacterSheet.character_id == char.id)).scalars().first()
-    except Exception as e:
-        db.rollback()
-        logger.exception("create character failed")
-        raise HTTPException(status_code=400, detail=str(e))
-    return {"character": character_with_sheet(db, char)}
+            db.flush()
+            return {"character": character_with_sheet(db, char)}
+        except Exception as exc:
+            logger.exception("create character failed")
+            raise ValueError(str(exc)) from exc
+
+    return execute_http_idempotent(
+        db,
+        response,
+        actor_id=profile.id,
+        idempotency_key=idempotency_key,
+        command_type="character.create",
+        scope_type="user",
+        scope_id=profile.id,
+        payload=payload,
+        execute=_execute,
+    )
 
 
 @router.get("/api/characters/{character_id}")
@@ -124,4 +137,3 @@ def delete_character(character_id: str, request: Request, db: Session = Depends(
     db.delete(char)
     db.commit()
     return {"ok": True}
-
