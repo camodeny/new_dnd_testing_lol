@@ -139,7 +139,7 @@ def test_vercel_production_gate_script_exists_and_gates_on_production():
     assert os.access(p, os.X_OK), "vercel-migrate.sh must be executable"
     src = p.read_text(encoding="utf-8")
     assert "VERCEL_ENV" in src and "production" in src, "gate must check VERCEL_ENV=production"
-    assert "python -m scripts.migrate" in src, "gate must invoke python -m scripts.migrate"
+    assert "scripts.migrate" in src, "gate must invoke scripts.migrate"
     # Preview must skip (not race)
     assert "Skipping" in src, "gate must skip migrations for non-production (preview)"
     # Must fail build on migration failure

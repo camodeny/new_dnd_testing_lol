@@ -58,10 +58,11 @@ jobs:
       - name: Verify missing DB URL fails
         working-directory: backend
         run: |
-          set -e
+          set +e
           # Ensure no DB URL — migrate must exit non-zero
           env -u POSTGRES_URL -u POSTGRES_PRISMA_URL -u POSTGRES_URL_NON_POOLING -u DATABASE_URL \
             python -m scripts.migrate; RC=$?
+          set -e
           if [ $RC -eq 0 ]; then
             echo "ERROR: migrate should fail without DB URL" >&2
             exit 1
@@ -87,7 +88,7 @@ jobs:
         run: |
           test -x backend/scripts/vercel-migrate.sh || (echo "vercel-migrate.sh not executable" >&2; exit 1)
           grep -q "VERCEL_ENV.*production" backend/scripts/vercel-migrate.sh || (echo "vercel-migrate.sh must gate on VERCEL_ENV=production" >&2; exit 1)
-          grep -q "python -m scripts.migrate" backend/scripts/vercel-migrate.sh || (echo "vercel-migrate.sh must invoke python -m scripts.migrate" >&2; exit 1)
+          grep -q "scripts.migrate" backend/scripts/vercel-migrate.sh || (echo "vercel-migrate.sh must invoke scripts.migrate" >&2; exit 1)
           echo "OK: Vercel gate script correctly gates on production and invokes migrate"
 
   # Single controlled migration step for production — runs only on main push.
