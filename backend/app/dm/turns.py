@@ -233,8 +233,19 @@ def coordinate_turn(
     campaign = db.get(Campaign, campaign_id)
     if campaign is None:
         raise ValueError(f"Campaign {campaign_id} not found")
-    source_revision = int(campaign.revision) if campaign.revision is not None else 0
     tid = str(thread_id)
+
+    # Short serialization: acquire stable campaign row lock BEFORE collecting
+    # authoritative unresolved set, so a concurrent committer's submissions
+    # are visible after we acquire the lock (Postgres READ COMMITTED).
+    # This prevents dropping A when B collected {B} before waiting on lock.
+    try:
+        db.execute(select(Campaign).where(Campaign.id == campaign_id).with_for_update())
+        # Re-read campaign to see revision after any waiter
+        db.refresh(campaign)
+    except Exception:
+        pass
+    source_revision = int(campaign.revision) if campaign.revision is not None else 0
 
     unresolved = _collect_unresolved_submissions(db, campaign_id, tid)
     if not unresolved:
@@ -244,12 +255,6 @@ def coordinate_turn(
         )
         return None
 
-    # Short serialization: serialize on stable campaign row before checking/inserting
-    # (prevents two concurrent "no active turn" inserts from both succeeding)
-    try:
-        db.execute(select(Campaign).where(Campaign.id == campaign_id).with_for_update())
-    except Exception:
-        pass
     active = _get_active_turn_for_update(db, campaign_id, tid)
 
     # No active turn → create new logical turn from all unresolved submissions.

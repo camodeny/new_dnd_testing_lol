@@ -398,6 +398,80 @@ def test_concurrent_submission_plus_coordination_does_not_rollback_outer(tmp_pat
         assert set(active[0].submission_ids) == {str(s.id) for s in subs}
 
 
+def test_postgres_read_committed_visibility_not_dropped(tmp_path):
+    """Postgres READ COMMITTED regression: B must not drop A when collecting before lock.
+
+    Race: A accepts {A}, acquires campaign lock, creates turn {A}. While A holds the
+    lock, B accepts {B} and would collect {B} before waiting (old bug). After A
+    commits, B acquires lock — with the fix it re-collects after lock and sees
+    {A,B}, superseding to {A,B} instead of replacing with {B}.
+    """
+    import threading
+    import time
+
+    db_file = tmp_path / "visibility_race.sqlite"
+    eng = create_engine(f"sqlite:///{db_file}", connect_args={"check_same_thread": False, "timeout": 10})
+    Base.metadata.create_all(bind=eng)
+    Fac2 = sessionmaker(bind=eng, expire_on_commit=False)
+    owner = uuid.uuid4()
+    other = uuid.uuid4()
+    with Fac2() as db:
+        db.add_all([Profile(id=owner, email="owner@example.com"), Profile(id=other, email="other@example.com")])
+        cid = uuid.uuid4()
+        db.add(Campaign(id=cid, owner_id=owner, name="VisCamp", revision=0))
+        db.flush()
+        db.add(CampaignMember(campaign_id=cid, user_id=owner, role="owner"))
+        db.add(CampaignMember(campaign_id=cid, user_id=other, role="player"))
+        db.commit()
+        thread = get_or_create_campaign_thread(db, cid, created_by=owner)
+        db.commit()
+        tid = str(thread.id)
+
+    barrier = threading.Barrier(2)
+    errors = []
+
+    def submit_a():
+        try:
+            with Fac2() as db:
+                sub_a = accept_submission(db, campaign_id=cid, user_id=owner, raw_content="A", segments=[{"type": "ic", "text": "A"}], thread_id=tid)
+                # Signal that A is accepted but not yet committed past lock
+                barrier.wait(timeout=5)
+                # Acquire lock and create turn (collect after lock now)
+                coord = coordinate_turn(db, cid, tid, commit=False)
+                db.commit()
+        except Exception as e:
+            errors.append(e)
+
+    def submit_b():
+        try:
+            barrier.wait(timeout=5)
+            # Small delay to ensure A is inside coordinate_turn holding/pursuing lock
+            time.sleep(0.05)
+            with Fac2() as db:
+                sub_b = accept_submission(db, campaign_id=cid, user_id=other, raw_content="B", segments=[{"type": "ic", "text": "B"}], thread_id=tid)
+                coord = coordinate_turn(db, cid, tid, commit=False)
+                db.commit()
+        except Exception as e:
+            errors.append(e)
+
+    t_a = threading.Thread(target=submit_a)
+    t_b = threading.Thread(target=submit_b)
+    t_a.start()
+    t_b.start()
+    t_a.join()
+    t_b.join()
+
+    assert not errors, f"visibility race should not error, got {errors}"
+    with Fac2() as db:
+        subs = db.execute(select(models.PlayerSubmission).where(models.PlayerSubmission.campaign_id == cid)).scalars().all()
+        assert len(subs) == 2
+        turns = db.execute(select(models.DmTurn).where(models.DmTurn.campaign_id == cid)).scalars().all()
+        active = [t for t in turns if t.status in ("pending", "streaming", "failed_visible")]
+        assert len(active) == 1
+        # Critical: final input set must contain BOTH, not just B (the stale pre-lock set)
+        assert set(active[0].submission_ids) == {str(s.id) for s in subs}, f"dropped submission: got {active[0].submission_ids} expected {[str(s.id) for s in subs]}"
+
+
 def test_recover_filters_by_campaign():
     Fac, cid, owner, _p2, tid = _setup_campaign()
     Fac2, cid2, owner2, _p22, tid2 = _setup_campaign()

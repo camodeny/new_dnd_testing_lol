@@ -131,7 +131,7 @@ def start_streaming(campaign_id: str, turn_id: str, payload: dict, request: Requ
         assert_can_read_thread(db, campaign.id, t_uuid, profile.id)
     except ThreadNotFoundError as exc:
         raise HTTPException(status_code=404, detail="Thread not found") from exc
-    except ThreadAuthorizationError:
+    except ThreadAuthorizationError as exc:
         raise HTTPException(status_code=404, detail="Thread not found") from exc
     except Exception as exc:
         raise HTTPException(status_code=404, detail="Thread not found") from exc
@@ -174,7 +174,7 @@ def commit_dm_turn_endpoint(campaign_id: str, turn_id: str, payload: dict, reque
         assert_can_read_thread(db, campaign.id, t_uuid, profile.id)
     except ThreadNotFoundError as exc:
         raise HTTPException(status_code=404, detail="Thread not found") from exc
-    except ThreadAuthorizationError:
+    except ThreadAuthorizationError as exc:
         raise HTTPException(status_code=404, detail="Thread not found") from exc
     except Exception as exc:
         raise HTTPException(status_code=404, detail="Thread not found") from exc
