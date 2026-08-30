@@ -20,32 +20,51 @@ def utcnow() -> datetime:
     return datetime.now(timezone.utc)
 
 
-def begin_operation(db: Session, *, operation_id: str | None = None, trace_id: str | None = None,
-                    campaign_id=None, submitted_at: datetime | None = None, commit: bool = True) -> OperationTrace:
+def _telemetry_write(session_factory, write):
+    """Own a short telemetry transaction and return a detached result.
+
+    Accepting a factory—not a Session—is intentional: instrumentation can
+    neither commit nor poison a caller's gameplay transaction.
+    """
+    if isinstance(session_factory, Session):
+        raise TypeError("telemetry writes require a dedicated session factory, not a Session")
+    with session_factory() as db:
+        try:
+            result = write(db)
+            db.commit()
+            db.refresh(result)
+            db.expunge(result)
+            return result
+        except Exception:
+            db.rollback()
+            raise
+
+
+def begin_operation(session_factory, *, operation_id: str | None = None, trace_id: str | None = None,
+                    campaign_id=None, submitted_at: datetime | None = None) -> OperationTrace:
     trace_id = trace_id or current_trace_id() or uuid.uuid4().hex
     operation_id = operation_id or current_operation_id() or trace_id
-    record = db.get(OperationTrace, trace_id)
-    if record is None:
-        record = OperationTrace(trace_id=trace_id, operation_id=operation_id, campaign_id=campaign_id,
-                                submitted_at=submitted_at or utcnow(), status="submitted")
-        db.add(record)
-    if commit:
-        db.commit(); db.refresh(record)
-    return record
+    def write(db):
+        record = db.get(OperationTrace, trace_id)
+        if record is None:
+            record = OperationTrace(trace_id=trace_id, operation_id=operation_id, campaign_id=campaign_id,
+                                    submitted_at=submitted_at or utcnow(), status="submitted")
+            db.add(record)
+        return record
+    return _telemetry_write(session_factory, write)
 
 
-def mark_milestone(db: Session, trace_id: str, milestone: str, *, at: datetime | None = None,
-                   commit: bool = True) -> OperationTrace:
+def mark_milestone(session_factory, trace_id: str, milestone: str, *, at: datetime | None = None) -> OperationTrace:
     if milestone not in MILESTONES:
         raise ValueError(f"unknown milestone: {milestone}")
-    record = db.get(OperationTrace, trace_id)
-    if record is None:
-        raise LookupError(f"trace {trace_id} has no submission record")
-    setattr(record, f"{milestone}_at", at or utcnow())
-    record.status = milestone
-    if commit:
-        db.commit(); db.refresh(record)
-    return record
+    def write(db):
+        record = db.get(OperationTrace, trace_id)
+        if record is None:
+            raise LookupError(f"trace {trace_id} has no submission record")
+        setattr(record, f"{milestone}_at", at or utcnow())
+        record.status = milestone
+        return record
+    return _telemetry_write(session_factory, write)
 
 
 def _ms(start: datetime | None, end: datetime | None) -> int | None:
@@ -67,10 +86,10 @@ def trace_summary(record: OperationTrace) -> dict:
     }
 
 
-def start_ai_run(db: Session, *, logical_operation: str, role: str, provider: str, model: str,
+def start_ai_run(session_factory, *, logical_operation: str, role: str, provider: str, model: str,
                  attempt: int = 1, classification: str = "primary", billable: bool | None = None,
                  trace_id: str | None = None, operation_id: str | None = None,
-                 parent_run_id=None, content_metadata: dict | None = None, commit: bool = True) -> AIRun:
+                 parent_run_id=None, content_metadata: dict | None = None) -> AIRun:
     if classification not in {"primary", "recovery"}:
         raise ValueError("classification must be primary or recovery")
     if attempt < 1:
@@ -84,24 +103,21 @@ def start_ai_run(db: Session, *, logical_operation: str, role: str, provider: st
                 provider=provider, model=model, attempt=attempt, classification=classification,
                 billable=(classification == "primary") if billable is None else billable,
                 status="running", started_at=utcnow(), content_metadata=content_metadata)
-    db.add(run)
-    if commit:
-        db.commit(); db.refresh(run)
-    return run
+    return _telemetry_write(session_factory, lambda db: (db.add(run), run)[1])
 
 
-def finish_ai_run(db: Session, run_id, *, status: str = "succeeded", first_token_at=None,
+def finish_ai_run(session_factory, run_id, *, status: str = "succeeded", first_token_at=None,
                   input_tokens=None, output_tokens=None, cost_usd=None, result_code=None,
-                  error_type=None, commit: bool = True) -> AIRun:
-    run = db.get(AIRun, run_id)
-    if run is None:
-        raise LookupError(f"AI run {run_id} not found")
-    run.status = status; run.completed_at = utcnow(); run.first_token_at = first_token_at
-    run.input_tokens = input_tokens; run.output_tokens = output_tokens; run.cost_usd = cost_usd
-    run.result_code = result_code; run.error_type = error_type
-    if commit:
-        db.commit(); db.refresh(run)
-    return run
+                  error_type=None) -> AIRun:
+    def write(db):
+        run = db.get(AIRun, run_id)
+        if run is None:
+            raise LookupError(f"AI run {run_id} not found")
+        run.status = status; run.completed_at = utcnow(); run.first_token_at = first_token_at
+        run.input_tokens = input_tokens; run.output_tokens = output_tokens; run.cost_usd = cost_usd
+        run.result_code = result_code; run.error_type = error_type
+        return run
+    return _telemetry_write(session_factory, write)
 
 
 def get_trace(db: Session, trace_id: str) -> dict | None:
