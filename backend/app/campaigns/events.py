@@ -83,6 +83,9 @@ def commit_campaign_mutation(
     provenance: dict | None = None,
     mutate: Optional[Callable[[Campaign], None]] = None,
     commit: bool = True,
+    outbox_event_type: str | None = None,
+    outbox_payload: dict | None = None,
+    outbox_operation_id: str | None = None,
 ) -> tuple[Campaign, CampaignDomainEvent]:
     """Commit an authoritative fictional mutation transactionally.
 
@@ -213,6 +216,25 @@ def commit_campaign_mutation(
             e,
         )
         raise
+
+    # 3) Optionally enqueue outbox atomically in same transaction (issue #190)
+    if outbox_event_type:
+        # lazy import to avoid circular
+        from models import Outbox as _Outbox
+
+        ob = _Outbox(
+            id=uuid.uuid4(),
+            aggregate_type="campaign",
+            aggregate_id=campaign_id,
+            campaign_id=campaign_id,
+            event_type=outbox_event_type,
+            operation_id=outbox_operation_id or operation_id,
+            payload=outbox_payload if outbox_payload is not None else payload,
+            status="pending",
+            attempts=0,
+        )
+        db.add(ob)
+        db.flush()
 
     if commit:
         try:
