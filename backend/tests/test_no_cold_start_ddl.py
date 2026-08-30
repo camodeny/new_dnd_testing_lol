@@ -117,6 +117,35 @@ def test_explicit_migrate_script_exists_and_exits_nonzero_without_db_url(monkeyp
     assert rc != 0, "migrate must exit non-zero when DB URL is missing"
 
 
+def test_explicit_migrate_forced_alembic_failure_blocks_release(monkeypatch):
+    """Forced Alembic failure must return non-zero so the deploy gate blocks promotion."""
+    import scripts.migrate as migrate_mod
+
+    # Patch DB URL to a dummy so we reach alembic step, then force upgrade to fail
+    monkeypatch.setattr(migrate_mod, "get_database_url", lambda: "postgresql://user:pass@localhost/dbname")
+    # Avoid real DB round-trip for before/after revision
+    monkeypatch.setattr(migrate_mod, "_get_current_revision", lambda url: "test_before")
+
+    with patch("alembic.command.upgrade", side_effect=RuntimeError("forced migration failure for gate verification")):
+        rc = migrate_mod.main()
+        assert rc != 0, "migrate must exit non-zero on forced Alembic failure — release must be blocked"
+
+
+def test_vercel_production_gate_script_exists_and_gates_on_production():
+    """Vercel build gate must run migrations only for production (single controlled step)."""
+    p = pathlib.Path(__file__).parent.parent / "scripts" / "vercel-migrate.sh"
+    assert p.exists(), "backend/scripts/vercel-migrate.sh must exist (Vercel production gate)"
+    # Must be executable
+    assert os.access(p, os.X_OK), "vercel-migrate.sh must be executable"
+    src = p.read_text(encoding="utf-8")
+    assert "VERCEL_ENV" in src and "production" in src, "gate must check VERCEL_ENV=production"
+    assert "python -m scripts.migrate" in src, "gate must invoke python -m scripts.migrate"
+    # Preview must skip (not race)
+    assert "Skipping" in src, "gate must skip migrations for non-production (preview)"
+    # Must fail build on migration failure
+    assert "exit 1" in src or "exit $RC" in src, "gate must fail build when migration fails"
+
+
 def test_explicit_migrate_script_logs_before_after(capsys=None):
     """Sanity: migrate script is importable and has main()."""
     import scripts.migrate as migrate_mod
