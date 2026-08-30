@@ -604,6 +604,15 @@ class DmTurn(Base):
     __table_args__ = (
         Index("ix_dm_turns_campaign_thread_status", "campaign_id", "thread_id", "status"),
         Index("ix_dm_turns_campaign_status", "campaign_id", "status"),
+        # CAS: at most one active (pending/streaming/failed_visible) turn per thread
+        Index(
+            "uq_dm_turns_active_per_thread",
+            "campaign_id",
+            "thread_id",
+            unique=True,
+            postgresql_where=text("status IN ('pending','streaming','failed_visible')"),
+            sqlite_where=text("status IN ('pending','streaming','failed_visible')"),
+        ),
     )
 
     id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)

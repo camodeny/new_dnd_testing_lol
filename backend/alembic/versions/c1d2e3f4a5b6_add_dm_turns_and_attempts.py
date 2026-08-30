@@ -1,7 +1,7 @@
 """add durable DM turn/attempt state machine — issue 200
 
 Revision ID: c1d2e3f4a5b6
-Revises: b2c3d4e5f6a7
+Revises: c8d9e0f1a2b3
 """
 
 from typing import Sequence, Union
@@ -11,7 +11,7 @@ import sqlalchemy as sa
 from sqlalchemy.dialects import postgresql
 
 revision: str = "c1d2e3f4a5b6"
-down_revision: Union[str, Sequence[str], None] = "b2c3d4e5f6a7"
+down_revision: Union[str, Sequence[str], None] = "c8d9e0f1a2b3"
 branch_labels = None
 depends_on = None
 
@@ -45,6 +45,13 @@ def upgrade() -> None:
     op.create_index("ix_dm_turns_status", "dm_turns", ["status"])
     op.create_index("ix_dm_turns_campaign_thread_status", "dm_turns", ["campaign_id", "thread_id", "status"])
     op.create_index("ix_dm_turns_campaign_status", "dm_turns", ["campaign_id", "status"])
+    # CAS: at most one active turn per thread (pending/streaming/failed_visible)
+    op.execute(
+        sa.text(
+            "CREATE UNIQUE INDEX uq_dm_turns_active_per_thread ON dm_turns (campaign_id, thread_id) "
+            "WHERE status IN ('pending','streaming','failed_visible')"
+        )
+    )
 
     op.create_table(
         "dm_turn_attempts",
@@ -98,6 +105,7 @@ def downgrade() -> None:
     op.drop_index("ix_dm_turn_attempts_campaign_id", table_name="dm_turn_attempts")
     op.drop_index("ix_dm_turn_attempts_turn_id", table_name="dm_turn_attempts")
     op.drop_table("dm_turn_attempts")
+    op.execute(sa.text("DROP INDEX IF EXISTS uq_dm_turns_active_per_thread"))
     op.drop_index("ix_dm_turns_campaign_status", table_name="dm_turns")
     op.drop_index("ix_dm_turns_campaign_thread_status", table_name="dm_turns")
     op.drop_index("ix_dm_turns_status", table_name="dm_turns")

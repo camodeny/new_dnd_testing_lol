@@ -16,8 +16,10 @@ DmTurnAttempt.status: prepared | running | superseded | streaming | succeeded | 
 Coordinator
 -----------
 Decides when unresolved (accepted) submissions for a campaign+thread form a
-candidate turn. Called after each accepted submission. No long-held DB locks;
-optimistic revision check only at commit time.
+candidate turn. Called after each accepted submission. Uses a short
+SELECT ... FOR UPDATE serialization around assembly/current-attempt
+transition (not a long lock across model work) and optimistic revision
+check only at commit time.
 
 Security: assembly only includes submissions authorized for the turn's
 audience/thread (thread_id equality).
@@ -34,7 +36,8 @@ import uuid
 from datetime import datetime, timedelta, timezone
 from typing import Any
 
-from sqlalchemy import select
+from sqlalchemy import select, update
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
 from models import Campaign, DmTurn, DmTurnAttempt, PlayerSubmission
@@ -119,14 +122,7 @@ def _now() -> datetime:
 def _collect_unresolved_submissions(
     db: Session, campaign_id: uuid.UUID, thread_id: str
 ) -> list[PlayerSubmission]:
-    """All accepted submissions for this campaign+thread, ordered by sequence.
-
-    Only submissions authorized for this thread are returned; authorization is
-    enforced upstream (PlayerSubmission.thread_id is server-derived, not trusted
-    from arbitrary client claims). Caller must ensure thread_id is already
-    resolved to a durable thread the actor is authorized to see.
-    """
-    # Normalize thread_id to string as stored
+    """All accepted submissions for this campaign+thread, ordered by sequence."""
     tid = str(thread_id)
     rows = db.execute(
         select(PlayerSubmission)
@@ -141,11 +137,7 @@ def _collect_unresolved_submissions(
 
 
 def get_active_turn(db: Session, campaign_id: uuid.UUID, thread_id: str) -> DmTurn | None:
-    """Most recent turn in blocking/pending state for this campaign+thread.
-
-    Returns the turn that would block new assembly if streaming/failed_visible,
-    or the pending turn that may be expanded pre-stream.
-    """
+    """Most recent turn in blocking/pending state for this campaign+thread."""
     tid = str(thread_id)
     turn = db.execute(
         select(DmTurn)
@@ -154,6 +146,29 @@ def get_active_turn(db: Session, campaign_id: uuid.UUID, thread_id: str) -> DmTu
         .limit(1)
     ).scalars().first()
     return turn
+
+
+def _get_active_turn_for_update(db: Session, campaign_id: uuid.UUID, thread_id: str) -> DmTurn | None:
+    """Lock-aware fetch of active turn for CAS serialization.
+
+    Uses FOR UPDATE where the dialect supports it; SQLite in tests silently
+    ignores it which is acceptable for single-threaded test execution.
+    The partial unique index on (campaign_id, thread_id) where active
+    provides the concurrent-insert safety net even without row locking.
+    """
+    tid = str(thread_id)
+    # Try FOR UPDATE, fall back to plain read if dialect does not support it
+    try:
+        return db.execute(
+            select(DmTurn)
+            .where(DmTurn.campaign_id == campaign_id, DmTurn.thread_id == tid, DmTurn.status.in_(list(ACTIVE_TURN_STATUSES)))
+            .order_by(DmTurn.created_at.desc())
+            .limit(1)
+            .with_for_update()
+        ).scalars().first()
+    except Exception:
+        # SQLite or any dialect that rejects FOR UPDATE in this context
+        return get_active_turn(db, campaign_id, thread_id)
 
 
 def get_turn(db: Session, turn_id: uuid.UUID) -> DmTurn | None:
@@ -172,15 +187,7 @@ def list_turns(db: Session, campaign_id: uuid.UUID, thread_id: str | None = None
 
 
 def _has_blocking_turn(db: Session, campaign_id: uuid.UUID, thread_id: str, exclude_turn_id: uuid.UUID | None = None) -> DmTurn | None:
-    """Whether any streaming/failed_visible turn blocks advancing.
-
-    Per spec: "A campaign cannot advance to a conflicting later DM resolution
-    while a visible partial turn remains unresolved." We enforce per
-    campaign+thread (most precise) and also globally per campaign as safety.
-
-    For the test suite we block when any streaming/failed_visible turn exists
-    for the same campaign+thread.
-    """
+    """Whether any streaming/failed_visible turn blocks advancing."""
     tid = str(thread_id)
     q = select(DmTurn).where(
         DmTurn.campaign_id == campaign_id,
@@ -200,11 +207,20 @@ def coordinate_turn(
     campaign_id: uuid.UUID,
     thread_id: str,
     audience: str = "campaign",
+    *,
+    commit: bool = True,
 ) -> tuple[DmTurn, DmTurnAttempt] | None:
     """Decide when unresolved submissions form a candidate turn.
 
-    Call after each accepted submission (or periodically). No long-held DB lock;
-    work is executed outside the transaction and committed via optimistic revision.
+    Transaction ownership is at the caller's boundary. By default ``commit=True``
+    for standalone/test usage (commits internally). When called from inside
+    ``execute_http_idempotent()``'s callback (e.g. submission acceptance), pass
+    ``commit=False`` so the outer idempotency layer commits the submission +
+    turn + ``IdempotentCommand`` atomically (flush-only here).
+
+    Uses a short FOR UPDATE serialization around active-turn read and a
+    partial unique index on active turns to prevent concurrent inserts from
+    creating competing pending turns (CAS, not a long lock across model work).
 
     Returns (turn, current_attempt) if a turn is active/created, None if no
     unresolved submissions.
@@ -212,13 +228,6 @@ def coordinate_turn(
     Raises:
         TurnConflictError: if a streaming/failed_visible turn blocks new turns.
         StreamBoundaryError: if new submissions would alter a post-stream input set.
-
-    Observability: logs assembly_window, included submissions, invalidation reason,
-    source revision conflicts, waiting vs executing time.
-
-    Audience/thread safety: only submissions with matching thread_id are included;
-    thread_id is server-resolved and authorization-checked upstream, so callers do
-    not need to re-check audience here, but we record it for audit.
     """
     start_wait = time.monotonic()
     campaign = db.get(Campaign, campaign_id)
@@ -235,24 +244,14 @@ def coordinate_turn(
         )
         return None
 
-    # If a blocking turn exists for this thread, new turns cannot advance yet.
-    # But the existing blocked turn itself is still the candidate — callers that
-    # requested coordination for that thread should get the blocking turn back,
-    # not a new one. We only block *new* turn creation, not re-assembly of the
-    # blocked turn. The streaming boundary is checked below when attempting to
-    # expand a pending turn; distinct-forcing of "no new turn while streaming"
-    # is correct for threads that would otherwise create a second logical turn.
-    active = get_active_turn(db, campaign_id, tid)
+    # Short serialization: lock active turn row if it exists
+    active = _get_active_turn_for_update(db, campaign_id, tid)
 
     # No active turn → create new logical turn from all unresolved submissions.
     if active is None:
-        # Double-check no global blocking turn would be conflicting? Conservatively
-        # block if any streaming/failed_visible turn exists for same campaign+thread
-        # (already checked above: active is None means no blocking turn).
         sub_ids = [str(s.id) for s in unresolved]
         window_start = min(s.accepted_at for s in unresolved if s.accepted_at) if unresolved[0].accepted_at else _now()
         window_end = max(s.accepted_at for s in unresolved if s.accepted_at) if unresolved[0].accepted_at else _now()
-        # Ensure timestamps are timezone-aware
         if window_start.tzinfo is None:
             window_start = window_start.replace(tzinfo=timezone.utc)
         if window_end.tzinfo is None:
@@ -271,66 +270,77 @@ def coordinate_turn(
             assembly_window_end=window_end,
         )
         db.add(turn)
-        db.flush()
-
-        attempt = DmTurnAttempt(
-            id=uuid.uuid4(),
-            turn_id=turn.id,
-            attempt_number=1,
-            status=ATTEMPT_PREPARED,
-            campaign_id=campaign_id,
-            thread_id=tid,
-            audience=audience,
-            source_revision=source_revision,
-            input_set_revision=1,
-            submission_ids=list(sub_ids),
-            assembly_window_start=window_start,
-            assembly_window_end=window_end,
-        )
-        db.add(attempt)
-        db.flush()
-        turn.current_attempt_id = attempt.id
-        db.flush()
-        db.commit()
-        db.refresh(turn)
-        db.refresh(attempt)
-
-        waiting_ms = int((time.monotonic() - start_wait) * 1000)
-        # Store waiting time for observability
-        turn.time_waiting_ms = waiting_ms
-        # Commit waiting time without extra lock
         try:
             db.flush()
-            db.commit()
-        except Exception:
+        except IntegrityError:
+            # Concurrent inserter won the unique-active race; re-read winner
             db.rollback()
+            # Re-fetch campaign revision after rollback
+            campaign = db.get(Campaign, campaign_id)
+            source_revision = int(campaign.revision) if campaign and campaign.revision is not None else source_revision
+            active_retry = _get_active_turn_for_update(db, campaign_id, tid)
+            if active_retry is not None:
+                # Re-run coordination against winner (no recursion: handle as pending expansion)
+                # We need to re-collect unresolved in new tx context
+                unresolved_retry = _collect_unresolved_submissions(db, campaign_id, tid)
+                # Delegate to pending-expansion path by setting active and falling through
+                active = active_retry
+                unresolved = unresolved_retry
+            else:
+                # No retry winner found (should not happen), re-raise
+                raise
 
-        logger.info(
-            "dm_turn created campaign_id=%s thread_id=%s turn_id=%s attempt_id=%s source_revision=%s input_set_revision=1 "
-            "submission_count=%s submission_ids=%s assembly_window_start=%s assembly_window_end=%s time_waiting_ms=%s",
-            campaign_id, tid, turn.id, attempt.id, source_revision, len(sub_ids), sub_ids,
-            window_start.isoformat(), window_end.isoformat(), waiting_ms,
-        )
-        return turn, attempt
+        # If we did not hit the IntegrityError path, create attempt
+        if active is None:
+            attempt = DmTurnAttempt(
+                id=uuid.uuid4(),
+                turn_id=turn.id,
+                attempt_number=1,
+                status=ATTEMPT_PREPARED,
+                campaign_id=campaign_id,
+                thread_id=tid,
+                audience=audience,
+                source_revision=source_revision,
+                input_set_revision=1,
+                submission_ids=list(sub_ids),
+                assembly_window_start=window_start,
+                assembly_window_end=window_end,
+            )
+            db.add(attempt)
+            db.flush()
+            turn.current_attempt_id = attempt.id
+            waiting_ms = int((time.monotonic() - start_wait) * 1000)
+            turn.time_waiting_ms = waiting_ms
+            db.flush()
+            if commit:
+                db.commit()
+                db.refresh(turn)
+                db.refresh(attempt)
+            else:
+                # Keep in session for outer commit; still refresh from flush state where possible
+                try:
+                    db.flush()
+                except Exception:
+                    pass
+            logger.info(
+                "dm_turn created campaign_id=%s thread_id=%s turn_id=%s attempt_id=%s source_revision=%s input_set_revision=1 "
+                "submission_count=%s submission_ids=%s assembly_window_start=%s assembly_window_end=%s time_waiting_ms=%s",
+                campaign_id, tid, turn.id, attempt.id, source_revision, len(sub_ids), sub_ids,
+                window_start.isoformat(), window_end.isoformat(), waiting_ms,
+            )
+            return turn, attempt
+        # else we had a concurrent winner; fall through to pending handling below
+        # (active now points to winner, unresolved refreshed)
 
     # Active turn exists. If it is streaming/failed_visible, it blocks expansion.
     if active.status in BLOCKING_TURN_STATUSES:
-        # Active is the blocking turn itself. If unresolved submissions are exactly
-        # those already in the blocking turn, then coordinator is just re-reporting
-        # the active turn (even post-stream, the same submissions form the turn).
-        # Only when *new* submissions have arrived beyond the committed input set
-        # should we enforce the stream boundary.
         active_ids = set(active.submission_ids or [])
         new_ids = [str(s.id) for s in unresolved]
         if set(new_ids) == active_ids:
             cur = db.get(DmTurnAttempt, active.current_attempt_id) if active.current_attempt_id else None
-            # Re-check if attempt still exists; if not, treat as no work
             if cur is None:
-                # No current attempt (should not happen) — return turn as is
                 return active, None  # type: ignore[return-value]
             return active, cur
-        # New eligible submissions arrived after streaming started.
-        # Spec: "Once the first visible chunk commits, the turn input set cannot silently change."
         cur = db.get(DmTurnAttempt, active.current_attempt_id) if active.current_attempt_id else None
         if cur and cur.status in (ATTEMPT_STREAMING, ATTEMPT_SUCCEEDED, ATTEMPT_FAILED_VISIBLE):
             logger.warning(
@@ -339,7 +349,6 @@ def coordinate_turn(
                 campaign_id, tid, active.id, cur.id, sorted(active_ids), sorted(set(new_ids)), source_revision,
             )
             raise StreamBoundaryError(active.id, cur.id)
-        # Even if attempt not yet marked streaming but turn is, treat as boundary
         logger.warning(
             "dm_turn blocked_by_streaming campaign_id=%s thread_id=%s blocking_turn_id=%s status=%s new_submission_count=%s",
             campaign_id, tid, active.id, active.status, len(new_ids),
@@ -353,7 +362,6 @@ def coordinate_turn(
     new_ids_ordered = [str(s.id) for s in unresolved]
 
     if new_ids_set == active_ids:
-        # No change — return existing turn/attempt, no invalidation.
         cur = db.get(DmTurnAttempt, active.current_attempt_id) if active.current_attempt_id else None
         logger.info(
             "dm_turn coordinator no_change campaign_id=%s thread_id=%s turn_id=%s attempt_id=%s submission_count=%s",
@@ -362,21 +370,26 @@ def coordinate_turn(
         return active, cur  # type: ignore[return-value]
 
     # Input set expanded pre-stream — must supersede old attempt, create new one.
-    cur_attempt = db.get(DmTurnAttempt, active.current_attempt_id) if active.current_attempt_id else None
+    # Lock current attempt for CAS
+    cur_attempt = None
+    if active.current_attempt_id:
+        try:
+            cur_attempt = db.execute(
+                select(DmTurnAttempt).where(DmTurnAttempt.id == active.current_attempt_id).with_for_update()
+            ).scalars().first()
+        except Exception:
+            cur_attempt = db.get(DmTurnAttempt, active.current_attempt_id)
     if cur_attempt is None:
-        # No current attempt (should not happen); create one with expanded set
         logger.warning("dm_turn pending_without_attempt campaign_id=%s thread_id=%s turn_id=%s", campaign_id, tid, active.id)
-        # Fall through to creating new attempt without supersession
         new_rev = active.input_set_revision + 1
         window_start = active.assembly_window_start or _now()
-        # Compute new window end as latest unresolved
         window_end = max(s.accepted_at for s in unresolved if s.accepted_at) if unresolved[0].accepted_at else _now()
         if window_end and window_end.tzinfo is None:
             window_end = window_end.replace(tzinfo=timezone.utc)
         new_attempt = DmTurnAttempt(
             id=uuid.uuid4(),
             turn_id=active.id,
-            attempt_number=(cur_attempt.attempt_number + 1) if cur_attempt else 1,
+            attempt_number=1,
             status=ATTEMPT_PREPARED,
             campaign_id=campaign_id,
             thread_id=tid,
@@ -393,11 +406,12 @@ def coordinate_turn(
         active.input_set_revision = new_rev
         active.current_attempt_id = new_attempt.id
         active.assembly_window_end = window_end
-        active.source_revision = source_revision  # refresh to latest campaign revision for new attempt lineage
+        active.source_revision = source_revision
         db.flush()
-        db.commit()
-        db.refresh(active)
-        db.refresh(new_attempt)
+        if commit:
+            db.commit()
+            db.refresh(active)
+            db.refresh(new_attempt)
         logger.info(
             "dm_turn superseded_no_prior_attempt campaign_id=%s thread_id=%s turn_id=%s new_attempt_id=%s "
             "input_set_revision=%s submission_count=%s submission_ids=%s source_revision=%s invalidation_reason=new_eligible_submission_pre_stream",
@@ -405,7 +419,6 @@ def coordinate_turn(
         )
         return active, new_attempt
 
-    # If current attempt already streaming, cannot supersede
     if cur_attempt.status == ATTEMPT_STREAMING or active.streaming_started_at is not None:
         logger.warning(
             "dm_turn stream_boundary_blocked campaign_id=%s thread_id=%s turn_id=%s attempt_id=%s status=%s input_set_revision=%s",
@@ -414,8 +427,6 @@ def coordinate_turn(
         raise StreamBoundaryError(active.id, cur_attempt.id)
 
     if cur_attempt.status not in PRE_STREAM_ATTEMPT_STATUSES:
-        # Already superseded/failed — treat as pending but need new attempt anyway
-        # Allow creating new attempt if prior was failed before streaming (retry)
         if cur_attempt.status in (ATTEMPT_FAILED, ATTEMPT_DISCARDED):
             pass
         else:
@@ -425,13 +436,28 @@ def coordinate_turn(
             )
             raise StreamBoundaryError(active.id, cur_attempt.id)
 
-    # Safe to supersede pre-stream attempt.
+    # Safe to supersede pre-stream attempt — CAS: ensure we still own current_attempt_id
+    # Use conditional update to prevent concurrent supersession from creating duplicate lineage
+    # We already hold FOR UPDATE on cur_attempt and active, so this is serialized.
     old_attempt_id = cur_attempt.id
     old_status = cur_attempt.status
+    # Verify still current after lock
+    db.refresh(active)
+    if str(active.current_attempt_id) != str(old_attempt_id):
+        # Lost race: another transaction superseded first
+        # Re-read new current and retry as no_change or supersede again
+        logger.info("dm_turn supersede_race_lost campaign_id=%s thread_id=%s turn_id=%s expected_current=%s actual_current=%s",
+                    campaign_id, tid, active.id, old_attempt_id, active.current_attempt_id)
+        # Re-collect to see if we still need expansion
+        cur_retry = db.get(DmTurnAttempt, active.current_attempt_id) if active.current_attempt_id else None
+        if cur_retry and set(cur_retry.submission_ids or []) == new_ids_set:
+            return active, cur_retry
+        # Otherwise treat as concurrent supersession succeeded; caller can retry outer coordination
+        raise StreamBoundaryError(active.id, old_attempt_id)
+
     cur_attempt.status = ATTEMPT_SUPERSEDED
     cur_attempt.invalidation_reason = "new_eligible_submission_pre_stream"
     cur_attempt.invalidated_at = _now()
-    # Note: we do not mutate campaign truth; supersession is metadata only.
 
     window_start = active.assembly_window_start or cur_attempt.assembly_window_start or _now()
     window_end = max(s.accepted_at for s in unresolved if s.accepted_at) if unresolved[0].accepted_at else _now()
@@ -459,22 +485,17 @@ def coordinate_turn(
     db.add(new_attempt)
     db.flush()
 
-    # Update turn to point to new attempt and expand submission set.
     active.submission_ids = list(new_ids_ordered)
     active.input_set_revision = new_rev
     active.current_attempt_id = new_attempt.id
     active.assembly_window_end = window_end
-    # source_revision for turn remains original for audit, but we also keep
-    # attempt-level source_revision as the current campaign revision at supersession.
-    # For observability we log both.
-
     db.flush()
-    db.commit()
-    db.refresh(active)
-    db.refresh(cur_attempt)
-    db.refresh(new_attempt)
-
     waiting_ms = int((time.monotonic() - start_wait) * 1000)
+    if commit:
+        db.commit()
+        db.refresh(active)
+        db.refresh(cur_attempt)
+        db.refresh(new_attempt)
     logger.info(
         "dm_turn superseded campaign_id=%s thread_id=%s turn_id=%s old_attempt_id=%s old_status=%s new_attempt_id=%s "
         "attempt_number=%s input_set_revision=%s submission_count=%s submission_ids=%s source_revision=%s "
@@ -500,27 +521,20 @@ def mark_streaming_started(db: Session, turn_id: uuid.UUID, attempt_id: uuid.UUI
     the turn input set cannot silently change."
 
     Idempotent: if already streaming with same attempt, returns without error.
-
-    Args:
-        db: Session
-        turn_id: logical turn id
-        attempt_id: attempt that is starting streaming
-
-    Returns:
-        (turn, attempt) after transition to streaming.
-
-    Raises:
-        ValueError: if turn/attempt not found or mismatched.
-        AttemptSupersededError: if attempt was already superseded pre-stream.
+    Uses FOR UPDATE + CAS to ensure only the current attempt can become streaming.
     """
-    turn = db.get(DmTurn, turn_id)
-    attempt = db.get(DmTurnAttempt, attempt_id)
+    # Lock both rows for CAS
+    try:
+        turn = db.execute(select(DmTurn).where(DmTurn.id == turn_id).with_for_update()).scalars().first()
+        attempt = db.execute(select(DmTurnAttempt).where(DmTurnAttempt.id == attempt_id).with_for_update()).scalars().first()
+    except Exception:
+        turn = db.get(DmTurn, turn_id)
+        attempt = db.get(DmTurnAttempt, attempt_id)
     if turn is None or attempt is None:
         raise ValueError(f"Turn {turn_id} or attempt {attempt_id} not found")
     if str(attempt.turn_id) != str(turn.id):
         raise ValueError(f"Attempt {attempt_id} does not belong to turn {turn_id}")
 
-    # Idempotent: already streaming with same attempt
     if turn.status == TURN_STREAMING and str(turn.streaming_attempt_id) == str(attempt_id) and attempt.status == ATTEMPT_STREAMING:
         return turn, attempt
 
@@ -531,24 +545,47 @@ def mark_streaming_started(db: Session, turn_id: uuid.UUID, attempt_id: uuid.UUI
     if turn.status not in (TURN_PENDING,):
         raise ValueError(f"Turn {turn_id} cannot transition to streaming from status {turn.status}")
     if str(turn.current_attempt_id) != str(attempt_id):
-        # Attempt is not current — likely superseded by newer pre-stream input.
-        # Treat as superseded discard path.
         raise AttemptSupersededError(attempt_id, "superseded_by_newer_attempt_pre_stream")
 
+    # CAS: atomically verify still current and pending via conditional update
     now = _now()
-    turn.status = TURN_STREAMING
-    turn.streaming_started_at = now
-    turn.streaming_attempt_id = attempt.id
-    attempt.status = ATTEMPT_STREAMING
-    attempt.streaming_started_at = now
-    # Also ensure attempt started_at is set (execution started)
-    if attempt.started_at is None:
-        attempt.started_at = now
+    # Use update with WHERE to ensure we haven't been superseded between read and write
+    result = db.execute(
+        update(DmTurn)
+        .where(DmTurn.id == turn_id, DmTurn.status == TURN_PENDING, DmTurn.current_attempt_id == attempt_id)
+        .values(status=TURN_STREAMING, streaming_started_at=now, streaming_attempt_id=attempt_id, updated_at=now)
+        .execution_options(synchronize_session=False)
+    )
+    if result.rowcount == 0:
+        db.rollback()
+        # Re-read to determine cause
+        fresh_turn = db.get(DmTurn, turn_id)
+        fresh_attempt = db.get(DmTurnAttempt, attempt_id)
+        if fresh_attempt and fresh_attempt.status == ATTEMPT_SUPERSEDED:
+            raise AttemptSupersededError(attempt_id, fresh_attempt.invalidation_reason)
+        if fresh_turn and str(fresh_turn.current_attempt_id) != str(attempt_id):
+            raise AttemptSupersededError(attempt_id, "superseded_by_newer_attempt_pre_stream")
+        raise ValueError(f"Turn {turn_id} CAS failed for streaming transition (status={fresh_turn.status if fresh_turn else 'unknown'})")
 
-    db.flush()
+    result2 = db.execute(
+        update(DmTurnAttempt)
+        .where(DmTurnAttempt.id == attempt_id, DmTurnAttempt.status.in_([ATTEMPT_PREPARED, ATTEMPT_RUNNING]))
+        .values(status=ATTEMPT_STREAMING, streaming_started_at=now, started_at=attempt.started_at or now, updated_at=now)
+        .execution_options(synchronize_session=False)
+    )
+    if result2.rowcount == 0:
+        db.rollback()
+        raise ValueError(f"Attempt {attempt_id} CAS failed for streaming transition")
+
     db.commit()
     db.refresh(turn)
     db.refresh(attempt)
+    # Ensure in-memory reflects streaming
+    turn.status = TURN_STREAMING
+    turn.streaming_started_at = now
+    turn.streaming_attempt_id = attempt_id
+    attempt.status = ATTEMPT_STREAMING
+    attempt.streaming_started_at = now
 
     logger.info(
         "dm_turn streaming_started campaign_id=%s thread_id=%s turn_id=%s attempt_id=%s source_revision=%s input_set_revision=%s submission_ids=%s",
@@ -558,12 +595,7 @@ def mark_streaming_started(db: Session, turn_id: uuid.UUID, attempt_id: uuid.UUI
 
 
 def mark_attempt_running(db: Session, attempt_id: uuid.UUID, worker_job_id: uuid.UUID | None = None) -> DmTurnAttempt:
-    """Mark attempt as running (worker claimed). Recoverable if worker crashes.
-
-    Does not hold DB locks; caller should ensure attempt is still current.
-
-    Observability: records waiting vs executing time.
-    """
+    """Mark attempt as running (worker claimed). Recoverable if worker crashes."""
     attempt = db.get(DmTurnAttempt, attempt_id)
     if attempt is None:
         raise ValueError(f"Attempt {attempt_id} not found")
@@ -598,71 +630,53 @@ def commit_turn(
 ) -> tuple[DmTurn, DmTurnAttempt, Any]:
     """Commit a DM turn's authoritative effects with optimistic revision validation.
 
-    Uses the same semantics as commit_campaign_mutation: stale expected_revision
-    fails without partially mutating state. This satisfies:
-    "Stale source-revision attempts cannot commit over newer authoritative state."
-
-    Also enforces TurnConflictError if another streaming/failed_visible turn for the
-    same campaign/thread would be conflicting. And ensures the attempt is still
-    the current, not-superseded attempt; obsolete attempts are discarded harmlessly.
-
-    Args:
-        db: Session
-        turn_id: logical turn id
-        attempt_id: attempt id (must be current and streaming/succeeded-eligible)
-        expected_revision: campaign revision the attempt expects (defaults to attempt.source_revision)
-        mutate: optional callable receiving Campaign to apply state changes within transaction
-        event_type, payload, operation_id, actor_id: forwarded to commit_campaign_mutation
-
-    Returns:
-        (turn, attempt, event) where event is the domain event or None if no fictional mutation.
-
-    Raises:
-        AttemptSupersededError: if attempt was superseded pre-stream (harmless discard).
-        StreamBoundaryError: if attempt not in committed input set.
-        StaleRevisionError / RevisionConflictError: if source revision is stale.
-        TurnConflictError: if another visible partial turn blocks advancing.
+    Only the committed streaming current attempt can be committed (CAS).
+    Stale source-revision attempts are rejected without mutating campaign truth.
     """
     from app.campaigns.events import RevisionConflictError, commit_campaign_mutation
 
-    turn = db.get(DmTurn, turn_id)
-    attempt = db.get(DmTurnAttempt, attempt_id)
+    # Lock for CAS
+    try:
+        turn = db.execute(select(DmTurn).where(DmTurn.id == turn_id).with_for_update()).scalars().first()
+        attempt = db.execute(select(DmTurnAttempt).where(DmTurnAttempt.id == attempt_id).with_for_update()).scalars().first()
+    except Exception:
+        turn = db.get(DmTurn, turn_id)
+        attempt = db.get(DmTurnAttempt, attempt_id)
     if turn is None or attempt is None:
         raise ValueError(f"Turn {turn_id} or attempt {attempt_id} not found")
     if str(attempt.turn_id) != str(turn.id):
         raise ValueError(f"Attempt {attempt_id} does not belong to turn {turn_id}")
 
-    # Obsolete attempt check: if attempt was superseded pre-stream, its result is discarded.
-    # Worker may still finish model execution but must not commit.
-    if attempt.status == ATTEMPT_SUPERSEDED or str(turn.current_attempt_id) != str(attempt_id):
-        # Check if superseded flag
-        if attempt.status == ATTEMPT_SUPERSEDED or str(turn.current_attempt_id) != str(attempt_id):
-            logger.info(
-                "dm_turn commit_discarded_superseded campaign_id=%s thread_id=%s turn_id=%s attempt_id=%s current_attempt_id=%s status=%s invalidation_reason=%s",
-                turn.campaign_id, turn.thread_id, turn.id, attempt.id, turn.current_attempt_id, attempt.status, attempt.invalidation_reason,
-            )
-            attempt.status = ATTEMPT_DISCARDED if attempt.status != ATTEMPT_SUPERSEDED else ATTEMPT_SUPERSEDED
+    # Obsolete attempt check — must be current streaming attempt
+    if str(turn.current_attempt_id) != str(attempt_id):
+        logger.info(
+            "dm_turn commit_discarded_superseded campaign_id=%s thread_id=%s turn_id=%s attempt_id=%s current_attempt_id=%s status=%s invalidation_reason=%s",
+            turn.campaign_id, turn.thread_id, turn.id, attempt.id, turn.current_attempt_id, attempt.status, attempt.invalidation_reason,
+        )
+        # Mark as discarded if not already terminal
+        if attempt.status not in (ATTEMPT_SUCCEEDED, ATTEMPT_FAILED_VISIBLE, ATTEMPT_SUPERSEDED):
+            attempt.status = ATTEMPT_DISCARDED
             attempt.last_error = f"Discarded superseded attempt; current attempt is {turn.current_attempt_id}"
             attempt.error_class = "superseded"
-            # Ensure committed even though we discard
             try:
                 db.flush()
                 db.commit()
             except Exception:
                 db.rollback()
-            raise AttemptSupersededError(attempt_id, attempt.invalidation_reason)
+        raise AttemptSupersededError(attempt_id, attempt.invalidation_reason)
 
-    # Must have passed stream-start boundary to commit authoritative effects.
-    # For tests that commit without explicit streaming, allow prepared/running as well
-    # but warn — real flow should have called mark_streaming_started first.
-    if attempt.status not in (ATTEMPT_STREAMING, ATTEMPT_RUNNING, ATTEMPT_PREPARED, ATTEMPT_SUCCEEDED):
-        raise ValueError(f"Attempt {attempt_id} status {attempt.status} cannot commit")
+    if attempt.status == ATTEMPT_SUPERSEDED:
+        raise AttemptSupersededError(attempt_id, attempt.invalidation_reason)
+
+    # Only streaming attempt can commit authoritative effects — this is the commitment boundary
+    if attempt.status != ATTEMPT_STREAMING or turn.status != TURN_STREAMING:
+        raise ValueError(f"Attempt {attempt_id} status {attempt.status} / turn {turn_id} status {turn.status} cannot commit; must be streaming (stream-start boundary)")
+    if str(turn.streaming_attempt_id) != str(attempt_id):
+        raise ValueError(f"Attempt {attempt_id} is not the streaming attempt for turn {turn_id}")
 
     # Ensure turn is not blocked by another visible partial turn (for a different turn id)
     blocking = _has_blocking_turn(db, turn.campaign_id, turn.thread_id, exclude_turn_id=turn.id)
     if blocking is not None:
-        # If the blocking turn is *this* turn, it's okay (we are streaming). Otherwise conflict.
-        # _has_blocking_turn already excluded this turn, so any result here is a different turn.
         logger.warning(
             "dm_turn commit_blocked_by_visible_turn campaign_id=%s thread_id=%s turn_id=%s blocking_turn_id=%s blocking_status=%s",
             turn.campaign_id, turn.thread_id, turn.id, blocking.id, blocking.status,
@@ -676,22 +690,15 @@ def commit_turn(
         raise ValueError(f"Campaign {turn.campaign_id} not found")
     actual = int(campaign.revision) if campaign.revision is not None else 0
     if int(expected) != actual:
-        # Stale source revision — do not mutate campaign truth, mark attempt failed
         logger.warning(
             "dm_turn stale_source_revision_conflict campaign_id=%s thread_id=%s turn_id=%s attempt_id=%s expected=%s actual=%s source_revision=%s",
             turn.campaign_id, turn.thread_id, turn.id, attempt.id, expected, actual, attempt.source_revision,
         )
         attempt.last_error = f"Stale source_revision: expected {expected}, actual {actual}"
-        attempt.error_class = "stale_revision"
+        attempt.error_class = "stale_revision_visible"
         attempt.completed_at = _now()
-        # Keep turn in pending/streaming so it can be retried with refreshed revision
-        # Mark attempt as failed (recoverable) — not failed_visible unless it had streamed
-        if attempt.status == ATTEMPT_STREAMING or turn.status == TURN_STREAMING:
-            attempt.status = ATTEMPT_FAILED_VISIBLE
-            turn.status = TURN_FAILED_VISIBLE
-            attempt.error_class = "stale_revision_visible"
-        else:
-            attempt.status = ATTEMPT_FAILED
+        attempt.status = ATTEMPT_FAILED_VISIBLE
+        turn.status = TURN_FAILED_VISIBLE
         try:
             db.flush()
             db.commit()
@@ -699,9 +706,6 @@ def commit_turn(
             db.rollback()
         raise StaleRevisionError(turn.campaign_id, int(expected), actual, attempt.id)
 
-    # All guards passed — perform authoritative mutation via campaign revision helper.
-    # This increments campaign revision exactly once and creates an immutable domain event.
-    # Use commit=False so we can update turn/attempt atomically in same txn.
     execute_start = time.monotonic()
     try:
         campaign_after, event = commit_campaign_mutation(
@@ -716,28 +720,31 @@ def commit_turn(
             commit=False,
         )
     except RevisionConflictError as exc:
-        # Map to stale revision observability — commit_campaign_mutation already rolled back
         logger.warning(
             "dm_turn revision_conflict_on_commit campaign_id=%s thread_id=%s turn_id=%s attempt_id=%s expected=%s actual=%s",
             turn.campaign_id, turn.thread_id, turn.id, attempt.id, exc.expected_revision, exc.actual_revision,
         )
         db.rollback()
-        attempt.last_error = str(exc)
-        attempt.error_class = "revision_conflict"
-        attempt.completed_at = _now()
-        if attempt.status == ATTEMPT_STREAMING or turn.status == TURN_STREAMING:
+        # Re-lock after rollback
+        try:
+            turn = db.execute(select(DmTurn).where(DmTurn.id == turn_id).with_for_update()).scalars().first()
+            attempt = db.execute(select(DmTurnAttempt).where(DmTurnAttempt.id == attempt_id).with_for_update()).scalars().first()
+        except Exception:
+            turn = db.get(DmTurn, turn_id)
+            attempt = db.get(DmTurnAttempt, attempt_id)
+        if attempt and turn:
+            attempt.last_error = str(exc)
+            attempt.error_class = "revision_conflict"
+            attempt.completed_at = _now()
             attempt.status = ATTEMPT_FAILED_VISIBLE
             turn.status = TURN_FAILED_VISIBLE
-        else:
-            attempt.status = ATTEMPT_FAILED
-        try:
-            db.flush()
-            db.commit()
-        except Exception:
-            db.rollback()
+            try:
+                db.flush()
+                db.commit()
+            except Exception:
+                db.rollback()
         raise StaleRevisionError(turn.campaign_id, exc.expected_revision, exc.actual_revision, attempt.id) from exc
 
-    # Success path: mark turn and attempt as succeeded, resolve submissions
     now = _now()
     turn.status = TURN_SUCCEEDED
     turn.resolved_at = now
@@ -749,10 +756,8 @@ def commit_turn(
     attempt.last_error = None
     attempt.error_class = None
 
-    # Resolve included submissions: mark as resolved so future turns don't re-include them.
     if attempt.submission_ids:
         try:
-            # submission_ids are UUID strings
             sub_uuids = [uuid.UUID(s) for s in (attempt.submission_ids or [])]
             rows = db.execute(
                 select(PlayerSubmission).where(PlayerSubmission.id.in_(sub_uuids))
@@ -761,7 +766,6 @@ def commit_turn(
                 row.resolution_status = "resolved"
                 row.resolved_at = now
         except Exception as e:
-            # Non-fatal: log but don't fail commit
             logger.warning("dm_turn failed to resolve submissions turn_id=%s error=%s", turn.id, e)
 
     db.flush()
@@ -784,31 +788,20 @@ def commit_turn(
 
 
 def discard_superseded_result(db: Session, attempt_id: uuid.UUID, reason: str = "superseded") -> DmTurnAttempt | None:
-    """Handle an obsolete attempt that finished model execution after supersession.
-
-    Per spec: "Obsolete attempts can finish model execution harmlessly but their
-    result is discarded." This marks the attempt as discarded without mutating
-    campaign truth and is safe to call even if attempt was running.
-
-    Returns the updated attempt or None if not found.
-    """
+    """Handle an obsolete attempt that finished model execution after supersession."""
     attempt = db.get(DmTurnAttempt, attempt_id)
     if attempt is None:
         return None
     turn = db.get(DmTurn, attempt.turn_id) if attempt.turn_id else None
-    # Only discard if attempt is not current or is superseded
     if turn and str(turn.current_attempt_id) == str(attempt_id) and attempt.status not in (ATTEMPT_SUPERSEDED, ATTEMPT_DISCARDED):
-        # Still current — not obsolete
         logger.info("dm_turn discard_skipped_still_current attempt_id=%s turn_id=%s status=%s", attempt_id, attempt.turn_id, attempt.status)
         return attempt
     if attempt.status in (ATTEMPT_SUCCEEDED, ATTEMPT_FAILED_VISIBLE):
-        # Already terminal — don't override
         return attempt
     attempt.status = ATTEMPT_DISCARDED
     attempt.last_error = f"Discarded obsolete attempt: {reason}"
     attempt.error_class = "superseded"
     attempt.completed_at = _now()
-    # Do not mutate turn or campaign.
     try:
         db.flush()
         db.commit()
@@ -827,13 +820,7 @@ def mark_attempt_failed(
     error_class: str = "retriable",
     visible: bool = False,
 ) -> DmTurnAttempt | None:
-    """Mark attempt as failed; if visible, turn becomes failed_visible and blocks advancing.
-
-    Worker crash/recovery uses this to mark failures before retry.
-
-    Args:
-        visible: whether failure occurred after visible streaming started (blocks next turn)
-    """
+    """Mark attempt as failed; if visible, turn becomes failed_visible and blocks advancing."""
     attempt = db.get(DmTurnAttempt, attempt_id)
     if attempt is None:
         return None
@@ -864,18 +851,7 @@ def mark_attempt_failed(
 
 
 def recover_stuck_attempts(db: Session, *, lease_seconds: int = 300, commit: bool = True) -> int:
-    """Recover attempts left in running without completion (worker crash).
-
-    Resets running attempts whose lease expired to prepared for safe retry.
-    Streaming attempts are left as-is (they are visible and require explicit
-    recovery/retry policy per spec, not silent auto-retry that would duplicate
-    visible output).
-
-    Returns number recovered.
-
-    This leaves turn/attempt state recoverable and retryable per:
-    "Worker crash leaves turn/attempt state recoverable and retryable."
-    """
+    """Recover attempts left in running without completion (worker crash)."""
     cutoff = _now() - timedelta(seconds=lease_seconds)
     candidates = db.execute(
         select(DmTurnAttempt).where(
@@ -885,7 +861,6 @@ def recover_stuck_attempts(db: Session, *, lease_seconds: int = 300, commit: boo
     ).scalars().all()
     count = 0
     for attempt in candidates:
-        # Do not auto-recover streaming attempts — they are visible
         turn = db.get(DmTurn, attempt.turn_id)
         if turn and turn.status == TURN_STREAMING:
             continue
@@ -906,4 +881,3 @@ def recover_stuck_attempts(db: Session, *, lease_seconds: int = 300, commit: boo
     if count:
         logger.info("dm_turn recover_stuck total_recovered=%s lease_seconds=%s", count, lease_seconds)
     return count
-

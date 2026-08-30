@@ -128,7 +128,9 @@ def create_player_submission(
         try:
             from app.dm.turns import StreamBoundaryError, TurnConflictError, coordinate_turn
 
-            coord = coordinate_turn(db, campaign.id, thread_id_str, audience=audience)
+            # Flush-only: transaction ownership stays at the outer idempotency
+            # boundary (submission + IdempotentCommand + turn) commit atomically.
+            coord = coordinate_turn(db, campaign.id, thread_id_str, audience=audience, commit=False)
             if coord is not None:
                 turn, attempt = coord
                 result["dm_turn"] = turn.to_dict()

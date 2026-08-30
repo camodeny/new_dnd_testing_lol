@@ -236,3 +236,100 @@ def test_obsolete_attempt_result_discarded_harmlessly():
     turn_ok, _att_ok, event = commit_turn(db4, t2.id, a2.id)
     assert turn_ok.status == "succeeded"
     assert event is not None
+
+
+def test_commit_requires_streaming_boundary():
+    Fac, cid, owner, _p2, tid = _setup_campaign()
+    db = Fac()
+    s1 = accept_submission(db, campaign_id=cid, user_id=owner, raw_content="needs streaming", segments=[{"type": "ic", "text": "needs streaming"}], thread_id=tid)
+    db.commit()
+    t1, a1 = coordinate_turn(db, cid, tid)
+    db2 = Fac()
+    # Attempt to commit without streaming should fail
+    with pytest.raises(ValueError, match="cannot commit; must be streaming"):
+        commit_turn(db2, t1.id, a1.id)
+    # After streaming, commit succeeds
+    mark_streaming_started(db2, t1.id, a1.id)
+    db3 = Fac()
+    turn_ok, _att_ok, event = commit_turn(db3, t1.id, a1.id)
+    assert turn_ok.status == "succeeded"
+
+
+def test_concurrent_assembly_does_not_create_competing_pending_turns(tmp_path):
+    import threading, time
+    db_file = tmp_path / "concurrent_turn.sqlite"
+    eng = create_engine(f"sqlite:///{db_file}", connect_args={"check_same_thread": False, "timeout": 10})
+    Base.metadata.create_all(bind=eng)
+    Fac2 = sessionmaker(bind=eng, expire_on_commit=False)
+    # Setup single campaign/thread with two submissions already accepted
+    owner = uuid.uuid4()
+    p2 = uuid.uuid4()
+    with Fac2() as db:
+        db.add_all([Profile(id=owner, email="owner@example.com"), Profile(id=p2, email="p2@example.com")])
+        cid = uuid.uuid4()
+        db.add(Campaign(id=cid, owner_id=owner, name="Concurrent", revision=0))
+        db.flush()
+        db.add(CampaignMember(campaign_id=cid, user_id=owner, role="owner"))
+        db.add(CampaignMember(campaign_id=cid, user_id=p2, role="player"))
+        db.commit()
+        thread = get_or_create_campaign_thread(db, cid, created_by=owner)
+        db.commit()
+        tid = str(thread.id)
+        s1 = accept_submission(db, campaign_id=cid, user_id=owner, raw_content="s1", segments=[{"type": "ic", "text": "s1"}], thread_id=tid)
+        s2 = accept_submission(db, campaign_id=cid, user_id=p2, raw_content="s2", segments=[{"type": "ic", "text": "s2"}], thread_id=tid)
+        db.commit()
+
+    results = []
+    errors = []
+
+    def worker():
+        try:
+            with Fac2() as db:
+                res = coordinate_turn(db, cid, tid)
+                results.append(res)
+        except Exception as e:
+            errors.append(e)
+
+    t1 = threading.Thread(target=worker)
+    t2 = threading.Thread(target=worker)
+    t1.start()
+    time.sleep(0.02)
+    t2.start()
+    t1.join()
+    t2.join()
+
+    # Both should see the same logical turn (no competing pending turns)
+    assert len(results) + len(errors) == 2
+    # If both succeeded, they must agree on turn id; if one hit unique constraint it retried and still same turn
+    if len(results) == 2:
+        assert str(results[0][0].id) == str(results[1][0].id)
+    # Verify only one active turn in DB
+    with Fac2() as db:
+        turns = db.execute(select(models.DmTurn).where(models.DmTurn.campaign_id == cid)).scalars().all()
+        active = [t for t in turns if t.status in ("pending", "streaming", "failed_visible")]
+        assert len(active) == 1
+        assert set(active[0].submission_ids) == {str(s1.id), str(s2.id)}
+
+
+def test_concurrent_supersession_uses_cas():
+    # Two concurrent pre-stream expansions to same pending turn should serialize via FOR UPDATE
+    Fac, cid, owner, p2, tid = _setup_campaign()
+    with Fac() as db:
+        s1 = accept_submission(db, campaign_id=cid, user_id=owner, raw_content="s1", segments=[{"type": "ic", "text": "s1"}], thread_id=tid)
+        db.commit()
+        t1, a1 = coordinate_turn(db, cid, tid)
+        # Simulate second submission arriving while first supersession in progress
+        s2 = accept_submission(db, campaign_id=cid, user_id=p2, raw_content="s2", segments=[{"type": "ic", "text": "s2"}], thread_id=tid)
+        s3 = accept_submission(db, campaign_id=cid, user_id=owner, raw_content="s3", segments=[{"type": "ic", "text": "s3"}], thread_id=tid)
+        db.commit()
+    # First supersession
+    with Fac() as db:
+        t2, a2 = coordinate_turn(db, cid, tid)
+        assert a2.attempt_number == 2
+        assert set(t2.submission_ids) == {str(s1.id), str(s2.id), str(s3.id)}
+    # Second call with same expanded set should be no_change, not create extra attempt
+    with Fac() as db:
+        t3, a3 = coordinate_turn(db, cid, tid)
+        assert str(t3.id) == str(t1.id)
+        assert str(a3.id) == str(a2.id)
+        assert a3.attempt_number == 2

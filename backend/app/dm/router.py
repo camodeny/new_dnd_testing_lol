@@ -35,26 +35,38 @@ def _authorized_campaign(db: Session, campaign_id: str, user_id: uuid.UUID) -> C
     return campaign
 
 
+def _require_owner(campaign: Campaign, user_id: uuid.UUID):
+    if campaign.owner_id != user_id:
+        raise HTTPException(status_code=403, detail="Only the campaign owner can perform this DM lifecycle action")
+
+
 @router.get("/api/campaigns/{campaign_id}/dm-turns")
 def list_dm_turns(campaign_id: str, request: Request, db: Session = Depends(get_db)):
     profile = resolve_profile(request, db)
     campaign = _authorized_campaign(db, campaign_id, profile.id)
     thread_raw = request.query_params.get("thread_id") or request.query_params.get("threadId")
-    thread_id = None
+    from app.dm.turns import list_turns
+
     if thread_raw:
         try:
             tid = resolve_thread_id(db, campaign.id, thread_raw, created_by=profile.id)
             db.commit()
             assert_can_read_thread(db, campaign.id, tid, profile.id)
-            thread_id = str(tid)
+            turns = list_turns(db, campaign.id, thread_id=str(tid), limit=200)
+            return {"turns": [t.to_dict() for t in turns]}
         except ThreadNotFoundError as exc:
             raise HTTPException(status_code=404, detail="Thread not found") from exc
         except ThreadAuthorizationError as exc:
             raise HTTPException(status_code=403, detail="Not authorized for this thread") from exc
-    from app.dm.turns import list_turns
+    # No thread filter: return only turns for threads the user is authorized to see
+    # (prevents private-turn metadata leakage)
+    from app.runtime.threads import list_threads_for_user
 
-    turns = list_turns(db, campaign.id, thread_id=thread_id, limit=200)
-    return {"turns": [t.to_dict() for t in turns]}
+    visible_threads = list_threads_for_user(db, campaign.id, profile.id)
+    visible_ids = {str(t.id) for t in visible_threads}
+    all_turns = list_turns(db, campaign.id, thread_id=None, limit=200)
+    filtered = [t for t in all_turns if str(t.thread_id) in visible_ids]
+    return {"turns": [t.to_dict() for t in filtered]}
 
 
 @router.get("/api/campaigns/{campaign_id}/dm-turns/{turn_id}")
@@ -70,13 +82,18 @@ def get_dm_turn(campaign_id: str, turn_id: str, request: Request, db: Session = 
     turn = get_turn(db, tid)
     if turn is None or str(turn.campaign_id) != str(campaign.id):
         raise HTTPException(status_code=404, detail="Turn not found")
-    # Thread authorization for the turn's audience/thread
+    # Strict per-turn thread authorization — private turn metadata must not leak
     try:
         t_uuid = parse_thread_id(turn.thread_id)
+    except Exception as exc:
+        raise HTTPException(status_code=404, detail="Thread not found") from exc
+    try:
         assert_can_read_thread(db, campaign.id, t_uuid, profile.id)
-    except Exception:
-        # If thread_id is unparsable, fall back to campaign membership (already checked)
-        pass
+    except ThreadNotFoundError as exc:
+        raise HTTPException(status_code=404, detail="Thread not found") from exc
+    except ThreadAuthorizationError as exc:
+        # Hide private existence as 404
+        raise HTTPException(status_code=404, detail="Thread not found") from exc
     from sqlalchemy import select
     from models import DmTurnAttempt
 
@@ -90,6 +107,7 @@ def get_dm_turn(campaign_id: str, turn_id: str, request: Request, db: Session = 
 def start_streaming(campaign_id: str, turn_id: str, payload: dict, request: Request, db: Session = Depends(get_db)):
     profile = resolve_profile(request, db)
     campaign = _authorized_campaign(db, campaign_id, profile.id)
+    _require_owner(campaign, profile.id)
     try:
         tid = uuid.UUID(turn_id)
     except ValueError as exc:
@@ -116,6 +134,7 @@ def start_streaming(campaign_id: str, turn_id: str, payload: dict, request: Requ
 def commit_dm_turn_endpoint(campaign_id: str, turn_id: str, payload: dict, request: Request, db: Session = Depends(get_db)):
     profile = resolve_profile(request, db)
     campaign = _authorized_campaign(db, campaign_id, profile.id)
+    _require_owner(campaign, profile.id)
     try:
         tid = uuid.UUID(turn_id)
     except ValueError as exc:
