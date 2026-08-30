@@ -87,13 +87,12 @@ class VercelQueueAdapter(QueueAdapter):
     def publish(self, envelope: WorkerEnvelope) -> str:
         if not isinstance(envelope, WorkerEnvelope):
             raise TypeError("envelope must be WorkerEnvelope")
-        # If not configured, behave as logged no-op (safe for local without Vercel)
+        # Production misconfiguration must fail loudly — silent success would drop work.
         if not self.api_url or not self._api_token:
-            logger.info(
-                "queue publish vercel (stub) job_id=%s type=%s campaign=%s trace=%s queue=%s",
-                envelope.job_id, envelope.job_type, envelope.campaign_id or "-", envelope.trace_id or "-", self.queue_name,
+            raise RuntimeError(
+                "Vercel queue not configured: set VERCEL_QUEUE_URL and VERCEL_QUEUE_TOKEN "
+                f"(job_id={envelope.job_id} queue={self.queue_name})"
             )
-            return str(envelope.job_id)
 
         # Real Vercel Queues HTTP publish (best-effort)
         import json

@@ -9,6 +9,7 @@ Guarantees:
   redelivery is safe (lease expiry / sweeper).
 - Exhausted/terminal jobs stay durably inspectable and replayable.
 - Manual replay reuses the same logical idempotency.
+- Atomic committed claim prevents concurrent side effects; next_attempt_at enforced.
 """
 from __future__ import annotations
 
@@ -18,7 +19,8 @@ import uuid
 from datetime import datetime, timedelta, timezone
 from typing import Any, Callable
 
-from sqlalchemy import and_, func, or_, select, update
+from sqlalchemy import func, select, update
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
 from app.queue.envelope import WorkerEnvelope
@@ -87,7 +89,8 @@ def compute_backoff(attempt: int, base_seconds: float = 2.0, max_seconds: float 
 # ── Execution record helpers ────────────────────────────────────────────────
 
 
-def _get_or_create_execution(db: Session, envelope: WorkerEnvelope, *, max_attempts: int = 5) -> WorkerExecution:
+def _ensure_execution_exists(db: Session, envelope: WorkerEnvelope, *, max_attempts: int = 5) -> WorkerExecution:
+    """Get or insert execution row; handles concurrent insert via unique PK."""
     rec = db.get(WorkerExecution, envelope.job_id)
     if rec is not None:
         return rec
@@ -107,8 +110,60 @@ def _get_or_create_execution(db: Session, envelope: WorkerEnvelope, *, max_attem
         trace_id=envelope.trace_id,
     )
     db.add(rec)
-    db.flush()
+    try:
+        db.flush()
+        db.commit()
+        db.refresh(rec)
+    except IntegrityError:
+        # Concurrent inserter won; read its row
+        db.rollback()
+        rec = db.get(WorkerExecution, envelope.job_id)
+        if rec is None:
+            raise
     return rec
+
+
+def _atomic_claim(db: Session, job_id: uuid.UUID, *, lease_seconds: int, trace_id: str | None) -> bool:
+    """Try to atomically transition row to RUNNING and commit.
+
+    Succeeds only if row is:
+    - pending, or
+    - failed where next_attempt_at is due, or
+    - running but lease expired (crash recovery)
+
+    Returns True if claim acquired (committed), False otherwise.
+    """
+    now = datetime.now(timezone.utc)
+    cutoff = now - timedelta(seconds=lease_seconds)
+    # Build condition as SQL expression via update WHERE
+    # Use raw update with rowcount check; condition mirrors spec.
+    result = db.execute(
+        update(WorkerExecution)
+        .where(WorkerExecution.id == job_id)
+        .where(
+            (WorkerExecution.status == PENDING)
+            | (
+                (WorkerExecution.status == FAILED)
+                & ((WorkerExecution.next_attempt_at == None) | (WorkerExecution.next_attempt_at <= now))  # noqa
+            )
+            | (
+                (WorkerExecution.status == RUNNING) & (WorkerExecution.started_at < cutoff)
+            )
+        )
+        .values(
+            status=RUNNING,
+            started_at=now,
+            attempts=WorkerExecution.attempts + 1,
+            updated_at=now,
+            **({"trace_id": trace_id} if trace_id else {}),
+        )
+        .execution_options(synchronize_session=False)
+    )
+    if result.rowcount:
+        db.commit()
+        return True
+    db.rollback()
+    return False
 
 
 # ── Core execution ──────────────────────────────────────────────────────────
@@ -125,43 +180,52 @@ def execute_worker_job(
     backoff: Callable[[int], float] | None = None,
     commit: bool = True,
 ) -> tuple[Any, bool]:
-    """Execute a worker job idempotently.
+    """Execute a worker job idempotently with atomic claim.
 
-    Args:
-        db: Session
-        envelope: logical job envelope (job_id is dedupe key)
-        handler: callable(envelope) -> result (JSON-serializable)
-        max_attempts: after this many retriable failures job becomes dead_letter
-        lease_seconds: running lease for crash detection
-        classify: override error classification hook
-        backoff: override backoff hook
-        commit: whether to commit (False lets caller manage txn)
-
-    Returns:
-        (result, is_duplicate)  — duplicate True means existing succeeded result returned
-        For failed/retriable without success, raises after recording failure state.
-
-    Duplicate semantics: if record is already succeeded, return its result immediately
-    without invoking handler, guaranteeing no duplicate side effects.
+    Claim is committed before handler side effects so concurrent deliveries
+    cannot both run the handler. next_attempt_at is enforced.
     """
     classify_fn = classify or classify_error
     backoff_fn = backoff or compute_backoff
     now = datetime.now(timezone.utc)
 
-    rec = _get_or_create_execution(db, envelope, max_attempts=max_attempts)
+    rec = _ensure_execution_exists(db, envelope, max_attempts=max_attempts)
+    # Ensure we see latest committed state; other concurrent claim may have updated row
+    try:
+        db.expire_all()
+    except Exception:
+        pass
+    rec = db.get(WorkerExecution, envelope.job_id)
+    assert rec is not None
+    # Apply max_attempts override for this invocation if needed
+    if rec.max_attempts != max_attempts:
+        rec.max_attempts = max_attempts
+        db.add(rec)
+        db.commit()
+        db.refresh(rec)
 
-    # Duplicate success: at-least-once delivery must not duplicate effects
+    # Fast-path: already succeeded -> duplicate without claim
     if rec.status == SUCCEEDED and rec.result is not None:
         logger.info("worker duplicate_hit job_id=%s type=%s trace=%s", envelope.job_id, envelope.job_type, envelope.trace_id or "-")
         return rec.result, True
 
-    # Terminal/dead_letter: do not auto-execute; caller must replay explicitly
     if rec.status == DEAD_LETTER:
         logger.warning("worker dead_letter_hit job_id=%s type=%s", envelope.job_id, envelope.job_type)
-        # Still raise to surface terminal, but record is inspectable
         raise TerminalError(f"Job {envelope.job_id} is in dead_letter (terminal); replay required")
 
-    # Crash recovery: if RUNNING but lease not expired, treat as in-progress duplicate
+    # Enforce next_attempt_at before attempting claim: early redelivery must wait
+    if rec.status == FAILED and rec.next_attempt_at is not None:
+        nxt = rec.next_attempt_at
+        if nxt.tzinfo is None:
+            nxt = nxt.replace(tzinfo=timezone.utc)
+        if nxt > now:
+            remaining = (nxt - now).total_seconds()
+            logger.info("worker early_retry job_id=%s next_in=%.1fs", envelope.job_id, remaining)
+            raise RuntimeError(
+                f"Job {envelope.job_id} retry not ready; next_attempt_at in {remaining:.1f}s"
+            )
+
+    # If still running and lease not expired, block concurrent execution
     if rec.status == RUNNING and rec.started_at is not None:
         started = rec.started_at
         if started.tzinfo is None:
@@ -169,21 +233,54 @@ def execute_worker_job(
         age = (now - started).total_seconds()
         if age < lease_seconds:
             logger.info("worker still_running job_id=%s age=%.1fs", envelope.job_id, age)
-            # Caller should wait / redeliver later; don't double-execute
             raise RuntimeError(f"Job {envelope.job_id} still running (age {age:.1f}s); redelivery should retry later")
-        else:
-            logger.warning("worker lease_expired job_id=%s age=%.1fs -> allowing redelivery", envelope.job_id, age)
-            # fall through to retry
 
-    # Mark running
-    rec.status = RUNNING
-    rec.started_at = now
-    rec.attempts = (rec.attempts or 0) + 1
-    rec.trace_id = envelope.trace_id or rec.trace_id
-    rec.updated_at = now
-    db.flush()
+    # Atomic committed claim before side effects
+    claimed = _atomic_claim(db, envelope.job_id, lease_seconds=lease_seconds, trace_id=envelope.trace_id)
+    if not claimed:
+        # Claim failed: diagnose why (concurrent winner, early retry, still running, already succeeded)
+        # Session may have stale identity map after failed UPDATE (synchronize disabled)
+        try:
+            db.expire_all()
+        except Exception:
+            pass
+        fresh = db.get(WorkerExecution, envelope.job_id)
+        if fresh is None:
+            raise RuntimeError(f"Job {envelope.job_id} claim failed: row disappeared")
+        if fresh.status == SUCCEEDED and fresh.result is not None:
+            logger.info("worker duplicate_hit after claim race job_id=%s", envelope.job_id)
+            return fresh.result, True
+        if fresh.status == DEAD_LETTER:
+            raise TerminalError(f"Job {envelope.job_id} is in dead_letter (terminal); replay required")
+        if fresh.status == RUNNING and fresh.started_at is not None:
+            started = fresh.started_at
+            if started.tzinfo is None:
+                started = started.replace(tzinfo=timezone.utc)
+            age = (now - started).total_seconds()
+            if age < lease_seconds:
+                raise RuntimeError(f"Job {envelope.job_id} still running (age {age:.1f}s); redelivery should retry later")
+            # else lease expired but we still lost race: let caller retry
+            raise RuntimeError(f"Job {envelope.job_id} claim race lost; retry")
+        if fresh.status == FAILED and fresh.next_attempt_at is not None:
+            nxt = fresh.next_attempt_at
+            if nxt.tzinfo is None:
+                nxt = nxt.replace(tzinfo=timezone.utc)
+            if nxt > now:
+                remaining = (nxt - now).total_seconds()
+                raise RuntimeError(f"Job {envelope.job_id} retry not ready; next_attempt_at in {remaining:.1f}s")
+        # Generic concurrent claim loss
+        raise RuntimeError(f"Job {envelope.job_id} claim failed (status={fresh.status}); concurrent delivery won")
 
-    # Invoke handler with timing
+    # Re-fetch claimed row (now RUNNING, attempts incremented)
+    # UPDATE was done with synchronize_session=False, so expire cache
+    try:
+        db.expire_all()
+    except Exception:
+        pass
+    rec = db.get(WorkerExecution, envelope.job_id)
+    assert rec is not None and rec.status == RUNNING, f"claim succeeded but status={rec.status if rec else None}"
+
+    # Invoke handler with timing (outside claim transaction)
     t0 = time.monotonic()
     try:
         result = handler(envelope)
@@ -198,10 +295,9 @@ def execute_worker_job(
         rec.last_error = None
         rec.error_class = None
         rec.next_attempt_at = None
-        db.flush()
-        if commit:
-            db.commit()
-            db.refresh(rec)
+        db.add(rec)
+        db.commit()
+        db.refresh(rec)
         logger.info(
             "worker succeeded job_id=%s type=%s attempt=%s duration_ms=%s trace=%s",
             envelope.job_id, envelope.job_type, rec.attempts, elapsed_ms, envelope.trace_id or "-",
@@ -211,6 +307,9 @@ def execute_worker_job(
     except BaseException as exc:
         elapsed_ms = int((time.monotonic() - t0) * 1000)
         error_class = classify_fn(exc)
+        # Need fresh rec for error handling (might have been expired session)
+        rec = db.get(WorkerExecution, envelope.job_id)
+        assert rec is not None
         rec.processing_duration_ms = elapsed_ms
         rec.last_error = f"{type(exc).__name__}: {exc}"[:2000]
         rec.error_class = error_class
@@ -219,10 +318,10 @@ def execute_worker_job(
         if error_class == TERMINAL:
             rec.status = DEAD_LETTER
             rec.next_attempt_at = None
-            db.flush()
-            if commit:
-                db.commit()
-                db.refresh(rec)
+            rec.started_at = None
+            db.add(rec)
+            db.commit()
+            db.refresh(rec)
             logger.warning(
                 "worker terminal job_id=%s type=%s attempt=%s error=%s trace=%s",
                 envelope.job_id, envelope.job_type, rec.attempts, rec.last_error[:200], envelope.trace_id or "-",
@@ -233,10 +332,10 @@ def execute_worker_job(
         if rec.attempts >= rec.max_attempts:
             rec.status = DEAD_LETTER
             rec.next_attempt_at = None
-            db.flush()
-            if commit:
-                db.commit()
-                db.refresh(rec)
+            rec.started_at = None
+            db.add(rec)
+            db.commit()
+            db.refresh(rec)
             logger.warning(
                 "worker exhausted job_id=%s type=%s attempts=%s max=%s -> dead_letter trace=%s",
                 envelope.job_id, envelope.job_type, rec.attempts, rec.max_attempts, envelope.trace_id or "-",
@@ -248,10 +347,9 @@ def execute_worker_job(
         rec.status = FAILED
         rec.next_attempt_at = datetime.now(timezone.utc) + timedelta(seconds=delay)
         rec.started_at = None
-        db.flush()
-        if commit:
-            db.commit()
-            db.refresh(rec)
+        db.add(rec)
+        db.commit()
+        db.refresh(rec)
         logger.info(
             "worker retriable job_id=%s type=%s attempt=%s next_in=%.1fs error=%s trace=%s",
             envelope.job_id, envelope.job_type, rec.attempts, delay, rec.last_error[:200], envelope.trace_id or "-",
@@ -306,10 +404,12 @@ def replay_failed_job(
         rec.attempts = 0
     # keep payload/trace for replay; bump updated_at
     rec.updated_at = datetime.now(timezone.utc)
-    db.flush()
+    db.add(rec)
     if commit:
         db.commit()
         db.refresh(rec)
+    else:
+        db.flush()
     logger.info("worker replay job_id=%s type=%s attempts=%s", job_id, rec.job_type, rec.attempts)
     return rec
 
@@ -321,10 +421,13 @@ def recover_stuck_executions(db: Session, *, lease_seconds: int = 300, commit: b
         update(WorkerExecution)
         .where(WorkerExecution.status == RUNNING, WorkerExecution.started_at < cutoff)
         .values(status=PENDING, started_at=None, next_attempt_at=None)
+        .execution_options(synchronize_session=False)
     )
     if result.rowcount:
         if commit:
             db.commit()
+        else:
+            db.flush()
         logger.info("worker sweeper recovered %s stuck executions", result.rowcount)
     return result.rowcount or 0
 
