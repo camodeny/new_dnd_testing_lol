@@ -67,10 +67,13 @@ def get_live_table_snapshot(
             limit=limit_val,
             cursor=cursor,
         )
-        # Commit durable shared-thread creation if helper flushed a new thread.
-        # Snapshot itself is read-only, but the shared thread side effect must
-        # be durable so its id survives reconnects.
-        db.commit()
+        # Read-only projection — no commit. Rollback any REPEATABLE READ
+        # read-only transaction so the session is clean for reuse.
+        try:
+            if db.in_transaction():
+                db.rollback()
+        except Exception:
+            pass
     except SnapshotNotFoundError as exc:
         logger.info(
             "snapshot not_found campaign_id=%s viewer_id=%s thread_id=%s",

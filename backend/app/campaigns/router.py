@@ -64,6 +64,19 @@ def create_campaign(payload: dict, request: Request, db: Session = Depends(get_d
     db.flush()
     member = CampaignMember(campaign_id=camp.id, user_id=profile.id, role="owner")
     db.add(member)
+    db.flush()
+    # Create durable shared thread on campaign creation — snapshot GET is retrieval-only (#196)
+    from models import CampaignThread
+
+    db.add(
+        CampaignThread(
+            id=uuid_lib.uuid4(),
+            campaign_id=camp.id,
+            thread_type="campaign",
+            title="Campaign",
+            created_by=profile.id,
+        )
+    )
     db.commit()
     db.refresh(camp)
     return {"campaign": camp.to_dict()}
@@ -98,6 +111,18 @@ def quick_create_campaign(payload: dict, request: Request, db: Session = Depends
     db.add(camp)
     db.flush()
     db.add(CampaignMember(campaign_id=camp.id, user_id=profile.id, role="owner"))
+    db.flush()
+    from models import CampaignThread as _CampaignThread
+
+    db.add(
+        _CampaignThread(
+            id=uuid_lib.uuid4(),
+            campaign_id=camp.id,
+            thread_type="campaign",
+            title="Campaign",
+            created_by=profile.id,
+        )
+    )
     db.commit()
     db.refresh(camp)
     return {"campaign": camp.to_dict(), "brief": brief}

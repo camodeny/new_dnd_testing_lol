@@ -25,7 +25,7 @@ import uuid
 from datetime import datetime, timezone
 from typing import Any
 
-from sqlalchemy import func, select
+from sqlalchemy import func, select, text
 from sqlalchemy.orm import Session
 
 from app.runtime.threads import (
@@ -33,12 +33,10 @@ from app.runtime.threads import (
     ThreadNotFoundError,
     can_read_thread,
     get_campaign_thread,
-    get_or_create_campaign_thread,
     list_threads_for_user,
     parse_thread_id,
-    resolve_thread_id,
 )
-from models import Campaign, PlayerSubmission, PlayerSubmissionSegment
+from models import Campaign, CampaignThread, PlayerSubmission, PlayerSubmissionSegment
 
 logger = logging.getLogger(__name__)
 
@@ -79,6 +77,65 @@ class SnapshotNotFoundError(LookupError):
 
 class SnapshotProjectionError(RuntimeError):
     pass
+
+
+def _ensure_repeatable_read(db: Session) -> None:
+    """Enter REPEATABLE READ so all reads describe the same point in time (#196).
+
+    Postgres `READ COMMITTED` allows writers to commit between separate SELECTs,
+    producing a campaign/revision from T1 and history from T2. A single
+    REPEATABLE READ transaction guarantees one consistent DB snapshot for
+    campaign, threads, history, and reconciliation metadata.
+    SQLite (used in unit tests) does not support SET TRANSACTION — best-effort
+    fallback is plain `READ COMMITTED` which is already single-connection
+    serializable in the in-memory test harness.
+    """
+    try:
+        bind = db.get_bind() if hasattr(db, "get_bind") else db.bind
+        if bind is None:
+            return
+        dialect = getattr(bind, "dialect", None)
+        if dialect is None or dialect.name != "postgresql":
+            return
+        # SET TRANSACTION must be the first statement of a transaction.
+        # resolve_profile and other pre-snapshot reads may have already started
+        # one on this session, so close it first.
+        if db.in_transaction():
+            db.rollback()
+        db.execute(text("SET TRANSACTION ISOLATION LEVEL REPEATABLE READ READ ONLY"))
+    except Exception:
+        # Best-effort: SQLite in tests will fail here; rollback to leave session usable.
+        try:
+            db.rollback()
+        except Exception:
+            pass
+
+
+def _resolve_thread_readonly(
+    db: Session, campaign_id: uuid.UUID, raw_thread_id: str | None
+) -> uuid.UUID:
+    """Resolve thread identifier without durable side effects.
+
+    Unlike `app.runtime.threads.resolve_thread_id`, this does NOT lazily
+    create the shared campaign thread. Campaign creation is the sole writer
+    of the shared thread (see `app/campaigns/router.py`), so GET remains
+    retryable without side effects as required by #196.
+    """
+    if not raw_thread_id or raw_thread_id == "main":
+        thread = db.execute(
+            select(CampaignThread).where(
+                CampaignThread.campaign_id == campaign_id,
+                CampaignThread.thread_type == "campaign",
+            )
+        ).scalars().first()
+        if thread is None:
+            raise SnapshotNotFoundError("Shared thread not found")
+        return thread.id
+    tid = parse_thread_id(raw_thread_id)
+    thread = get_campaign_thread(db, campaign_id, tid)
+    if thread is None:
+        raise SnapshotNotFoundError("Thread not found")
+    return thread.id
 
 
 # ── core service ────────────────────────────────────────────────────────────
@@ -180,8 +237,14 @@ def build_live_table_snapshot(
     """Build authoritative live-table snapshot for viewer.
 
     This is a pure read projection — never mutates campaign revision or
-    inserts outbox/domain events. Thread creation for the shared thread is
-    the only durable write, committed by the caller (router) if needed.
+    inserts outbox/domain events. The shared campaign thread is created once
+    at campaign creation (see `app/campaigns/router.py`), so this read is
+    side-effect-free and retryable.
+
+    All DB reads run in a single REPEATABLE READ snapshot (Postgres) so
+    campaign, threads, history, and reconciliation metadata describe the
+    same point in time even if writers commit between statements. On SQLite
+    (tests) this degrades to the single-connection serializable harness.
 
     Raises:
         SnapshotNotFoundError: campaign or thread not found (private threads
@@ -189,10 +252,10 @@ def build_live_table_snapshot(
         SnapshotAuthorizationError: not authorized to read campaign/thread.
         ValueError: invalid pagination.
         SnapshotProjectionError: partial failure (caller should map to 500
-            rather than returning a misleading partial snapshot).
+             rather than returning a misleading partial snapshot).
     """
     started = time.monotonic()
-    # Resolve limit early for validation
+    # Resolve limit early for validation (before entering REPEATABLE READ)
     try:
         resolved_limit = _normalize_limit(limit) if limit is not None else DEFAULT_LIMIT
     except ValueError as exc:
@@ -204,6 +267,9 @@ def build_live_table_snapshot(
             decode_cursor(cursor)
         except ValueError as exc:
             raise ValueError(str(exc)) from exc
+
+    # Enter consistent snapshot before any DB SELECT in this projection.
+    _ensure_repeatable_read(db)
 
     try:
         campaign = db.get(Campaign, campaign_id)
@@ -221,14 +287,14 @@ def build_live_table_snapshot(
             )
             raise SnapshotAuthorizationError("Not a member of this campaign")
 
-        # Resolve thread id (durably, but don't commit here)
+        # Resolve thread id without side effects (shared thread must already exist)
         raw_thread = thread_id if thread_id is not None else "main"
         try:
-            resolved_tid = resolve_thread_id(db, campaign_id, raw_thread, created_by=viewer_id)
+            resolved_tid = _resolve_thread_readonly(db, campaign_id, raw_thread)
+        except SnapshotNotFoundError:
+            raise
         except ThreadNotFoundError as exc:
             raise SnapshotNotFoundError(str(exc)) from exc
-        except ThreadAuthorizationError as exc:
-            raise SnapshotAuthorizationError(str(exc)) from exc
 
         # Centralized thread authorization (private threads hidden as 404)
         try:
@@ -241,10 +307,6 @@ def build_live_table_snapshot(
         except ThreadAuthorizationError as exc:
             # Should have been mapped to not found, but defensive
             raise SnapshotAuthorizationError(str(exc)) from exc
-
-        # Ensure durable shared-thread existence is flushed; router will commit.
-        # For snapshot callers that use service directly in tests, thread is visible
-        # within same transaction; outer commit persists it if newly created.
 
         # Revision is authoritative
         revision = int(campaign.revision) if campaign.revision is not None else 0
