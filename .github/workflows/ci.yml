@@ -46,6 +46,7 @@ jobs:
       DATABASE_URL: postgresql://ci_test:ci_test@localhost:5432/ci_test?sslmode=disable
       POSTGRES_URL_NON_POOLING: postgresql://ci_test:ci_test@localhost:5432/ci_test?sslmode=disable
       ALLOW_MOCK_AUTH: "true"
+      NODE_ENV: "test"
 
     steps:
       - uses: actions/checkout@v4
