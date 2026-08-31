@@ -50,8 +50,15 @@ interface LiveTableState {
   revision: number | null
   realtimeResumeToken: string | null
   connected: boolean
+  hasSnapshot: boolean
+  phase: LiveTablePhase
+  historyCursor: string | null
+  hasOlderMessages: boolean
+  loadingOlder: boolean
   error: string | null
 }
+
+export type LiveTablePhase = 'idle' | 'loading' | 'live' | 'reconnecting' | 'reconciling' | 'error'
 
 function snapshotToMessageEvents(snap: SnapshotForRealtime, campaignId: string, threadId: string): RealtimeEvent[] {
   const msgs = snap.history?.messages ?? []
@@ -64,6 +71,9 @@ function snapshotToMessageEvents(snap: SnapshotForRealtime, campaignId: string, 
     id: m.id,
     raw_content: (m as { raw_content?: string }).raw_content,
     segments: (m as { segments?: RealtimeEvent['segments'] }).segments,
+    user_id: m.user_id,
+    character_id: m.character_id,
+    accepted_at: m.accepted_at,
     dedupe_key: m.id,
   }))
 }
@@ -82,6 +92,11 @@ export function useLiveTableRealtime(opts: UseLiveTableRealtimeOptions) {
         revision: initialSnapshot.revision ?? null,
         realtimeResumeToken: initialSnapshot.reconciliation?.realtime_resume_token ?? null,
         connected: false,
+        hasSnapshot: true,
+        phase: 'reconnecting',
+        historyCursor: initialSnapshot.history?.pagination?.next_cursor ?? null,
+        hasOlderMessages: Boolean(initialSnapshot.history?.pagination?.has_more),
+        loadingOlder: false,
         error: null,
       }
     }
@@ -94,6 +109,11 @@ export function useLiveTableRealtime(opts: UseLiveTableRealtimeOptions) {
       revision: initialSnapshot?.revision ?? null,
       realtimeResumeToken: initialSnapshot?.reconciliation?.realtime_resume_token ?? null,
       connected: false,
+      hasSnapshot: false,
+      phase: enabled ? 'loading' : 'idle',
+      historyCursor: null,
+      hasOlderMessages: false,
+      loadingOlder: false,
       error: null,
     }
   })
@@ -106,6 +126,7 @@ export function useLiveTableRealtime(opts: UseLiveTableRealtimeOptions) {
   const terminalStreamIdsRef = useRef<Set<string>>(new Set())
   const campaignIdRef = useRef(campaignId)
   const threadIdRef = useRef(threadId)
+  const historyCursorRef = useRef<string | null>(initialSnapshot?.history?.pagination?.next_cursor ?? null)
   campaignIdRef.current = campaignId
   threadIdRef.current = threadId
 
@@ -116,6 +137,7 @@ export function useLiveTableRealtime(opts: UseLiveTableRealtimeOptions) {
       const cid = campaignIdRef.current
       const tid = threadIdRef.current
       snapshotRef.current = snap
+      historyCursorRef.current = snap.history?.pagination?.next_cursor ?? null
       // Keep runtime terminal knowledge — snapshot's completed streams are terminal, plus any
       // in-memory terminals (abandoned/failed absent from dm_messages) remain
       for (const m of snap.dm_messages ?? []) {
@@ -131,6 +153,10 @@ export function useLiveTableRealtime(opts: UseLiveTableRealtimeOptions) {
         ...prev,
         revision: snap.revision ?? prev.revision,
         realtimeResumeToken: snap.reconciliation?.realtime_resume_token ?? prev.realtimeResumeToken,
+        hasSnapshot: true,
+        phase: prev.connected ? 'live' : 'reconnecting',
+        historyCursor: historyCursorRef.current,
+        hasOlderMessages: Boolean(snap.history?.pagination?.has_more),
         messages: msgs,
         dmState: snap.dm_state ?? null,
         dmMessages: snap.dm_messages ?? [],
@@ -153,13 +179,22 @@ export function useLiveTableRealtime(opts: UseLiveTableRealtimeOptions) {
     const params = new URLSearchParams()
     if (tid) params.set('thread_id', tid)
     const qs = params.toString() ? `?${params}` : ''
+    if (isMountedRef.current) {
+      setState((prev) => ({ ...prev, phase: prev.hasSnapshot ? 'reconciling' : 'loading', error: null }))
+    }
     try {
       const snap = await apiFetch<SnapshotForRealtime>(`/campaigns/${cid}/snapshot${qs}`)
       adoptSnapshot(snap)
       return snap
     } catch (e) {
       const msg = (e as Error).message ?? 'snapshot fetch failed'
-      if (isMountedRef.current) setState((prev) => ({ ...prev, error: msg }))
+      if (isMountedRef.current) {
+        setState((prev) => ({
+          ...prev,
+          error: msg,
+          phase: prev.hasSnapshot ? 'reconnecting' : 'error',
+        }))
+      }
       return null
     }
   }, [adoptSnapshot])
@@ -280,6 +315,14 @@ export function useLiveTableRealtime(opts: UseLiveTableRealtimeOptions) {
             incRealtimeMetric('reconciliationEvents')
           }
         }
+        if (ev.type === 'dm.status' && ['completed', 'abandoned', 'failed'].includes(String(ev.status))) {
+          void fetchSnapshotAndAdopt().then((snap) => {
+            if (!snap || !bufferedRef.current.length) return
+            const reconciled = reconcileBufferedEvents(snap, bufferedRef.current)
+            if (reconciled.length) applyEvents(reconciled)
+            bufferedRef.current = []
+          })
+        }
       }
 
       try {
@@ -293,18 +336,37 @@ export function useLiveTableRealtime(opts: UseLiveTableRealtimeOptions) {
       }
       return ch
     },
-    [applyEvents],
+    [applyEvents, fetchSnapshotAndAdopt],
   )
 
   // Subscription lifecycle — subscribe first, then snapshot, then reconcile (race-safe)
   useEffect(() => {
     if (!enabled || !campaignId || !threadId) {
-      setState((prev) => ({ ...prev, connected: false }))
+      setState((prev) => ({ ...prev, connected: false, phase: 'idle' }))
       return
     }
 
     isMountedRef.current = true
     bufferedRef.current = []
+    snapshotRef.current = null
+    terminalStreamIdsRef.current = new Set()
+    historyCursorRef.current = null
+    setState({
+      messages: [],
+      dmState: null,
+      dmMessages: [],
+      dmChunks: new Map(),
+      dmStatus: null,
+      revision: null,
+      realtimeResumeToken: null,
+      connected: false,
+      hasSnapshot: false,
+      phase: 'loading',
+      historyCursor: null,
+      hasOlderMessages: false,
+      loadingOlder: false,
+      error: null,
+    })
     let cancelled = false
     let currentChannel: ReturnType<typeof supabase.channel> | null = null
 
@@ -320,7 +382,14 @@ export function useLiveTableRealtime(opts: UseLiveTableRealtimeOptions) {
         const status = (e as { status?: number }).status
         const msg =
           status === 404 ? 'Thread not found' : status === 403 ? 'Not authorized for this thread' : (e as Error).message ?? 'Realtime authorization failed'
-        if (!cancelled && isMountedRef.current) setState((prev) => ({ ...prev, error: msg, connected: false }))
+        if (!cancelled && isMountedRef.current) {
+          setState((prev) => ({
+            ...prev,
+            error: msg,
+            connected: false,
+            phase: prev.hasSnapshot ? 'reconnecting' : 'error',
+          }))
+        }
         return false
       }
       if (cancelled) return false
@@ -331,11 +400,24 @@ export function useLiveTableRealtime(opts: UseLiveTableRealtimeOptions) {
       const onStatusChange = (status: string) => {
         if (cancelled) return
         if (status === 'SUBSCRIBED') {
-          if (isMountedRef.current) setState((prev) => ({ ...prev, connected: true, error: null }))
+          if (isMountedRef.current) {
+            setState((prev) => ({
+              ...prev,
+              connected: true,
+              error: null,
+              phase: prev.hasSnapshot ? 'live' : 'loading',
+            }))
+          }
           incRealtimeMetric('subscriptionCount')
           reconnectAttemptsRef.current = 0
         } else if (status === 'CHANNEL_ERROR' || status === 'TIMED_OUT' || status === 'CLOSED') {
-          if (isMountedRef.current) setState((prev) => ({ ...prev, connected: false }))
+          if (isMountedRef.current) {
+            setState((prev) => ({
+              ...prev,
+              connected: false,
+              phase: prev.hasSnapshot ? 'reconnecting' : 'loading',
+            }))
+          }
           if (!cancelled) {
             reconnectAttemptsRef.current += 1
             incRealtimeMetric('reconnectCount')
@@ -427,6 +509,39 @@ export function useLiveTableRealtime(opts: UseLiveTableRealtimeOptions) {
     return snap
   }, [fetchSnapshotAndAdopt, applyEvents])
 
+  const loadOlder = useCallback(async () => {
+    const cid = campaignIdRef.current
+    const tid = threadIdRef.current
+    const cursor = historyCursorRef.current
+    if (!cid || !tid || !cursor) return null
+    if (isMountedRef.current) setState((prev) => ({ ...prev, loadingOlder: true }))
+    const params = new URLSearchParams({ thread_id: tid, cursor })
+    try {
+      const page = await apiFetch<SnapshotForRealtime>(`/campaigns/${cid}/snapshot?${params}`)
+      if (!isMountedRef.current) return page
+      const older = snapshotToMessageEvents(page, cid, tid)
+      historyCursorRef.current = page.history?.pagination?.next_cursor ?? null
+      setState((prev) => {
+        const existing = new Set(prev.messages.map((message) => String(message.id ?? message.event_id)))
+        return {
+          ...prev,
+          messages: sortEventsBySequence([
+            ...older.filter((message) => !existing.has(String(message.id ?? message.event_id))),
+            ...prev.messages,
+          ]),
+          historyCursor: historyCursorRef.current,
+          hasOlderMessages: Boolean(page.history?.pagination?.has_more),
+          loadingOlder: false,
+        }
+      })
+      return page
+    } catch (e) {
+      const msg = (e as Error).message ?? 'Failed to load earlier messages'
+      if (isMountedRef.current) setState((prev) => ({ ...prev, loadingOlder: false, error: msg }))
+      return null
+    }
+  }, [])
+
   const ingest = useCallback(
     (ev: RealtimeEvent | RealtimeEvent[]) => {
       const arr = Array.isArray(ev) ? ev : [ev]
@@ -449,8 +564,13 @@ export function useLiveTableRealtime(opts: UseLiveTableRealtimeOptions) {
     revision: state.revision,
     realtimeResumeToken: state.realtimeResumeToken,
     connected: state.connected,
+    hasSnapshot: state.hasSnapshot,
+    phase: state.phase,
+    hasOlderMessages: state.hasOlderMessages,
+    loadingOlder: state.loadingOlder,
     error: state.error,
     refresh,
+    loadOlder,
     ingest,
     metrics: getRealtimeClientMetrics(),
   }

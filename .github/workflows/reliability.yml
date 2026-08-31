@@ -1,0 +1,79 @@
+name: Reliability
+
+# Issue #270: deterministic destructive tests against synthetic data only.
+# This is separate from required PR CI and follows its Python/Postgres setup.
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: "17 8 * * *"
+
+permissions:
+  contents: read
+
+concurrency:
+  group: reliability-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  fault-injection:
+    name: fault-injection
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    services:
+      postgres:
+        image: postgres:16-alpine
+        env:
+          POSTGRES_USER: ci_test
+          POSTGRES_PASSWORD: ci_test
+          POSTGRES_DB: ci_test
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd pg_isready
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
+
+    env:
+      DATABASE_URL: postgresql://ci_test:ci_test@localhost:5432/ci_test?sslmode=disable
+      POSTGRES_URL_NON_POOLING: postgresql://ci_test:ci_test@localhost:5432/ci_test?sslmode=disable
+      FAULT_TEST_DATABASE_URL: postgresql://ci_test:ci_test@localhost:5432/ci_test?sslmode=disable
+      FAULT_ARTIFACT_PATH: /tmp/reliability-artifacts/fault-diagnostics.jsonl
+      ALLOW_MOCK_AUTH: "true"
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+          cache-dependency-path: backend/requirements.txt
+
+      - name: Install backend dependencies
+        working-directory: backend
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+          pip install pytest httpx
+
+      - name: Migrate disposable database
+        working-directory: backend
+        run: python -m scripts.migrate
+
+      - name: Run fault-injection suite
+        working-directory: backend
+        run: |
+          mkdir -p /tmp/reliability-artifacts
+          set -o pipefail
+          python -m pytest -p no:xonsh -p no:cacheprovider tests/reliability -v \
+            --junitxml=/tmp/reliability-artifacts/pytest-junit.xml \
+            2>&1 | tee /tmp/reliability-artifacts/pytest.log
+
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: reliability-fault-injection-${{ github.run_id }}
+          path: /tmp/reliability-artifacts/
+          if-no-files-found: error
+          retention-days: 14

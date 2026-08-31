@@ -31,7 +31,6 @@ from sqlalchemy.orm import Session
 from app.runtime.threads import (
     ThreadAuthorizationError,
     ThreadNotFoundError,
-    can_read_thread,
     get_campaign_thread,
     list_threads_for_user,
     parse_thread_id,
@@ -346,6 +345,27 @@ def build_live_table_snapshot(
             )
         ) or 0
 
+        # Durable player-owned rolls are part of the authoritative reconnect
+        # projection. Hidden thresholds and private result details are only
+        # included for the campaign owner (the AI-DM runtime authority).
+        from app.rolls.service import get_fulfillment
+        from models import PlayerRollRequest
+
+        roll_rows = db.execute(
+            select(PlayerRollRequest).where(
+                PlayerRollRequest.campaign_id == campaign_id,
+                PlayerRollRequest.thread_id == thread_id_str,
+            ).order_by(PlayerRollRequest.requested_at, PlayerRollRequest.id)
+        ).scalars().all()
+        roll_requests: list[dict] = []
+        for roll_row in roll_rows:
+            roll_item = roll_row.to_dict(include_private=campaign.owner_id == viewer_id)
+            fulfillment = get_fulfillment(db, roll_row.id)
+            roll_item["fulfillment"] = fulfillment.to_dict(
+                include_private=campaign.owner_id == viewer_id or roll_row.requested_user_id == viewer_id
+            ) if fulfillment else None
+            roll_requests.append(roll_item)
+
         # DM stream state — issue #197 durable stream chunks
         # Completed streams become canonical history; streaming ones are active.
         # Abandoned/failed are excluded from canonical view but remain auditable via dm_streams API.
@@ -477,6 +497,7 @@ def build_live_table_snapshot(
             },
             "dm_state": dm_state,
             "dm_messages": dm_messages,
+            "roll_requests": roll_requests,
             # Hook for later structured surfaces (combat, shops, etc.)
             "surfaces": {},
             # Backward-compatible alias

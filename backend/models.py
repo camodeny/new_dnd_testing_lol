@@ -47,6 +47,16 @@ class Profile(Base):
 
 class Campaign(Base):
     __tablename__ = "campaigns"
+    __table_args__ = (
+        CheckConstraint(
+            "status IN ('lobby', 'starting', 'active', 'archived')",
+            name="ck_campaigns_lifecycle_status",
+        ),
+        CheckConstraint(
+            "required_players BETWEEN 1 AND 6",
+            name="ck_campaigns_required_players_launch_range",
+        ),
+    )
 
     id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
     owner_id: Mapped[uuid.UUID] = mapped_column(
@@ -55,8 +65,13 @@ class Campaign(Base):
     name: Mapped[str] = mapped_column(String(128), nullable=False)
     description: Mapped[str | None] = mapped_column(Text, nullable=True)
     random_seed: Mapped[str | None] = mapped_column(String(128), nullable=True)
-    required_players: Mapped[int] = mapped_column(Integer, nullable=False, default=1)
-    loot_mode: Mapped[str] = mapped_column(String(32), nullable=False, default="frequent_gamble")
+    status: Mapped[str] = mapped_column(String(16), nullable=False, default="lobby", server_default="lobby")
+    theme: Mapped[str | None] = mapped_column(String(128), nullable=True)
+    brief: Mapped[str | None] = mapped_column(Text, nullable=True)
+    difficulty: Mapped[str] = mapped_column(String(16), nullable=False, default="medium", server_default="medium")
+    required_players: Mapped[int] = mapped_column(Integer, nullable=False, default=1, server_default="1")
+    content_boundaries: Mapped[dict] = mapped_column(JSONB, nullable=False, default=dict, server_default=text("'{}'"))
+    loot_mode: Mapped[str] = mapped_column(String(32), nullable=False, default="frequent_gamble", server_default="frequent_gamble")
     # Monotonic fictional revision — incremented exactly once per authoritative fictional mutation.
     # See campaign_events.py commit_campaign_mutation().
     revision: Mapped[int] = mapped_column(Integer, nullable=False, default=0, server_default="0")
@@ -72,7 +87,12 @@ class Campaign(Base):
             "name": self.name,
             "description": self.description,
             "random_seed": self.random_seed,
+            "status": self.status,
+            "theme": self.theme,
+            "brief": self.brief,
+            "difficulty": self.difficulty,
             "required_players": self.required_players,
+            "content_boundaries": self.content_boundaries or {},
             "loot_mode": self.loot_mode,
             "loot_drop_rate": self.loot_mode,
             "revision": self.revision,
@@ -610,8 +630,8 @@ class DmTurn(Base):
             "campaign_id",
             "thread_id",
             unique=True,
-            postgresql_where=text("status IN ('pending','streaming','failed_visible')"),
-            sqlite_where=text("status IN ('pending','streaming','failed_visible')"),
+            postgresql_where=text("status IN ('pending','awaiting_roll','streaming','failed_visible')"),
+            sqlite_where=text("status IN ('pending','awaiting_roll','streaming','failed_visible')"),
         ),
     )
 
@@ -721,10 +741,26 @@ class DmTurnAttempt(Base):
     started_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     completed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     result: Mapped[dict | None] = mapped_column(JSONB, nullable=True)
+    # Immutable evidence copied from fulfilled player-owned rolls when this
+    # attempt resumes the same logical turn after an awaiting_roll boundary.
+    roll_evidence: Mapped[list | None] = mapped_column(JSONB, nullable=False, default=list)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now(), nullable=False)
     updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now(), onupdate=func.now(), nullable=False)
 
-    def to_dict(self):
+    def to_dict(self, *, include_private_roll_evidence: bool = False):
+        evidence = self.roll_evidence or []
+        if not include_private_roll_evidence:
+            evidence = []
+            for source in self.roll_evidence or []:
+                item = dict(source)
+                item.pop("dc_private", None)
+                fulfillment = item.get("fulfillment")
+                if isinstance(fulfillment, dict) and fulfillment.get("visibility") == "private":
+                    item["fulfillment"] = {
+                        key: fulfillment.get(key)
+                        for key in ("id", "roll_request_id", "submitted_by", "source", "visibility", "submitted_at")
+                    }
+                evidence.append(item)
         return {
             "id": str(self.id),
             "turn_id": str(self.turn_id),
@@ -749,8 +785,116 @@ class DmTurnAttempt(Base):
             "started_at": self.started_at.isoformat() if self.started_at else None,
             "completed_at": self.completed_at.isoformat() if self.completed_at else None,
             "result": self.result,
+            "roll_evidence": evidence,
             "created_at": self.created_at.isoformat() if self.created_at else None,
         }
+
+
+class PlayerRollRequest(Base):
+    """A durable request for a human-controlled character's roll — issue #204."""
+
+    __tablename__ = "player_roll_requests"
+    __table_args__ = (
+        UniqueConstraint("turn_id", "request_key", name="uq_player_roll_requests_turn_key"),
+        CheckConstraint(
+            "status IN ('pending','fulfilled','cancelled','replaced')",
+            name="ck_player_roll_requests_status",
+        ),
+        CheckConstraint(
+            "roll_kind IN ('check','save','attack','ability','initiative','other')",
+            name="ck_player_roll_requests_kind",
+        ),
+        CheckConstraint(
+            "advantage_state IN ('normal','advantage','disadvantage')",
+            name="ck_player_roll_requests_advantage",
+        ),
+        Index("ix_player_roll_requests_campaign_thread_status", "campaign_id", "thread_id", "status"),
+        Index("ix_player_roll_requests_player_status", "requested_user_id", "status"),
+    )
+
+    id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    campaign_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("campaigns.id", ondelete="CASCADE"), nullable=False, index=True
+    )
+    thread_id: Mapped[str] = mapped_column(String(128), nullable=False, index=True)
+    turn_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("dm_turns.id", ondelete="CASCADE"), nullable=False, index=True
+    )
+    attempt_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("dm_turn_attempts.id", ondelete="CASCADE"), nullable=False, index=True
+    )
+    request_key: Mapped[str] = mapped_column(String(48), nullable=False)
+    requested_user_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("profiles.id", ondelete="RESTRICT"), nullable=False, index=True
+    )
+    character_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("characters.id", ondelete="RESTRICT"), nullable=False, index=True
+    )
+    roll_kind: Mapped[str] = mapped_column(String(24), nullable=False)
+    ability_or_skill: Mapped[str] = mapped_column(String(64), nullable=False)
+    label: Mapped[str] = mapped_column(String(120), nullable=False)
+    advantage_state: Mapped[str] = mapped_column(String(16), nullable=False, default="normal", server_default="normal")
+    reason_public: Mapped[str] = mapped_column(String(600), nullable=False)
+    dc_private: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    status: Mapped[str] = mapped_column(String(16), nullable=False, default="pending", server_default="pending", index=True)
+    replacement_of_id: Mapped[uuid.UUID | None] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("player_roll_requests.id", ondelete="SET NULL"), nullable=True
+    )
+    requested_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now(), nullable=False)
+    fulfilled_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    cancelled_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+
+    def to_dict(self, *, include_private: bool = False):
+        value = {
+            "id": str(self.id), "campaign_id": str(self.campaign_id), "thread_id": self.thread_id,
+            "turn_id": str(self.turn_id), "attempt_id": str(self.attempt_id), "request_key": self.request_key,
+            "requested_user_id": str(self.requested_user_id), "character_id": str(self.character_id),
+            "roll_kind": self.roll_kind, "ability_or_skill": self.ability_or_skill, "label": self.label,
+            "advantage_state": self.advantage_state, "reason_public": self.reason_public, "status": self.status,
+            "replacement_of_id": str(self.replacement_of_id) if self.replacement_of_id else None,
+            "requested_at": self.requested_at.isoformat() if self.requested_at else None,
+            "fulfilled_at": self.fulfilled_at.isoformat() if self.fulfilled_at else None,
+            "cancelled_at": self.cancelled_at.isoformat() if self.cancelled_at else None,
+        }
+        if include_private:
+            value["dc_private"] = self.dc_private
+        return value
+
+
+class PlayerRollFulfillment(Base):
+    """The single player-supplied result for a roll request."""
+
+    __tablename__ = "player_roll_fulfillments"
+    __table_args__ = (
+        UniqueConstraint("roll_request_id", name="uq_player_roll_fulfillments_request"),
+        CheckConstraint("source IN ('app','physical')", name="ck_player_roll_fulfillments_source"),
+        CheckConstraint("visibility IN ('public','private')", name="ck_player_roll_fulfillments_visibility"),
+    )
+
+    id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    roll_request_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("player_roll_requests.id", ondelete="CASCADE"), nullable=False, index=True
+    )
+    submitted_by: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("profiles.id", ondelete="RESTRICT"), nullable=False, index=True
+    )
+    source: Mapped[str] = mapped_column(String(16), nullable=False)
+    visibility: Mapped[str] = mapped_column(String(16), nullable=False, default="public", server_default="public")
+    raw_rolls: Mapped[list | None] = mapped_column(JSONB, nullable=False, default=list)
+    modifier: Mapped[int] = mapped_column(Integer, nullable=False, default=0, server_default="0")
+    total: Mapped[int] = mapped_column(Integer, nullable=False)
+    raw_metadata: Mapped[dict | None] = mapped_column(JSONB, nullable=True)
+    submitted_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now(), nullable=False)
+
+    def to_dict(self, *, include_private: bool = False):
+        value = {
+            "id": str(self.id), "roll_request_id": str(self.roll_request_id),
+            "submitted_by": str(self.submitted_by), "source": self.source,
+            "visibility": self.visibility, "submitted_at": self.submitted_at.isoformat() if self.submitted_at else None,
+        }
+        if include_private or self.visibility == "public":
+            value.update(raw_rolls=self.raw_rolls or [], modifier=self.modifier, total=self.total, raw_metadata=self.raw_metadata)
+        return value
 
 
 class CampaignInvite(Base):
