@@ -47,12 +47,14 @@ logger = logging.getLogger(__name__)
 # ── Statuses ────────────────────────────────────────────────────────────────
 
 TURN_PENDING = "pending"
+TURN_AWAITING_ROLL = "awaiting_roll"
 TURN_STREAMING = "streaming"
 TURN_SUCCEEDED = "succeeded"
 TURN_FAILED_VISIBLE = "failed_visible"
 
 ATTEMPT_PREPARED = "prepared"
 ATTEMPT_RUNNING = "running"
+ATTEMPT_AWAITING_ROLL = "awaiting_roll"
 ATTEMPT_SUPERSEDED = "superseded"
 ATTEMPT_STREAMING = "streaming"
 ATTEMPT_SUCCEEDED = "succeeded"
@@ -60,8 +62,8 @@ ATTEMPT_FAILED = "failed"
 ATTEMPT_FAILED_VISIBLE = "failed_visible"
 ATTEMPT_DISCARDED = "discarded"
 
-ACTIVE_TURN_STATUSES = {TURN_PENDING, TURN_STREAMING, TURN_FAILED_VISIBLE}
-BLOCKING_TURN_STATUSES = {TURN_STREAMING, TURN_FAILED_VISIBLE}
+ACTIVE_TURN_STATUSES = {TURN_PENDING, TURN_AWAITING_ROLL, TURN_STREAMING, TURN_FAILED_VISIBLE}
+BLOCKING_TURN_STATUSES = {TURN_AWAITING_ROLL, TURN_STREAMING, TURN_FAILED_VISIBLE}
 PRE_STREAM_ATTEMPT_STATUSES = {ATTEMPT_PREPARED, ATTEMPT_RUNNING}
 
 
@@ -552,6 +554,10 @@ def mark_streaming_started(db: Session, turn_id: uuid.UUID, attempt_id: uuid.UUI
     if str(attempt.turn_id) != str(turn.id):
         raise ValueError(f"Attempt {attempt_id} does not belong to turn {turn_id}")
 
+    from app.rolls.service import has_pending_rolls
+    if has_pending_rolls(db, turn.id):
+        raise ValueError(f"Turn {turn_id} has pending player-owned rolls and cannot stream outcome narration")
+
     if turn.status == TURN_STREAMING and str(turn.streaming_attempt_id) == str(attempt_id) and attempt.status == ATTEMPT_STREAMING:
         return turn, attempt
 
@@ -663,6 +669,10 @@ def commit_turn(
         raise ValueError(f"Turn {turn_id} or attempt {attempt_id} not found")
     if str(attempt.turn_id) != str(turn.id):
         raise ValueError(f"Attempt {attempt_id} does not belong to turn {turn_id}")
+
+    from app.rolls.service import has_pending_rolls
+    if has_pending_rolls(db, turn.id):
+        raise ValueError(f"Turn {turn_id} has pending player-owned rolls and cannot commit an outcome")
 
     # Obsolete attempt check — must be current streaming attempt
     if str(turn.current_attempt_id) != str(attempt_id):

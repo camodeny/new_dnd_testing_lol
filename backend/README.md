@@ -61,23 +61,45 @@ CI example (also see `.github/workflows/ci.yml` and `scripts/ci/`):
 
 ```bash
 # Equivalent to CI — run locally to reproduce failures without GitHub Actions
-./scripts/ci/backend.sh                    # lint + unit/integration tests (no DB)
-DATABASE_URL=postgresql://ci_test:ci_test@localhost:5432/ci_test ./scripts/ci/backend.sh  # with disposable Postgres + migrations
+./scripts/ci/backend.sh                    # static checks + DB-independent tests
+DATABASE_URL='postgresql://ci_test:ci_test@localhost:5432/ci_test?sslmode=disable' ./scripts/ci/backend.sh  # full suite + migrations
 ./scripts/ci/frontend.sh                   # lint + typecheck + build
 
 # Direct equivalents
 DATABASE_URL="$POSTGRES_URL" python -m scripts.migrate || exit 1
-ALLOW_MOCK_AUTH=true python -m pytest tests/ -v
+ALLOW_MOCK_AUTH=true NODE_ENV=test python -m pytest tests/ -v
 # only then deploy to Vercel / restart containers
 ```
 
 ## CI
 
-` .github/workflows/ci.yml` is the required PR CI (jobs `backend`, `frontend`). It provisions a disposable Postgres service, runs `python -m scripts.migrate` against a clean DB, then `pytest`, and runs `eslint`/`tsc`/`next build`. Branch protection should require `backend` + `frontend`.
+`.github/workflows/ci.yml` is the required PR CI (jobs `backend`, `frontend`). The backend job runs focused Ruff correctness checks, provisions a disposable Postgres service, runs `python -m scripts.migrate` against a clean DB, then runs the complete test suite. The frontend job runs `eslint`/`tsc`/`next build`. Branch protection should require `backend` + `frontend`.
 
-Canonical local commands mirror CI: `scripts/ci/backend.sh` and `scripts/ci/frontend.sh` — workflow delegates to these scripts so local and CI use the same logic.
+Canonical local commands mirror CI: `scripts/ci/backend.sh` and `scripts/ci/frontend.sh` — workflow delegates to these scripts so local and CI use the same logic. Without a database URL, the backend command skips migration and tests marked `postgres`; supplying a disposable Postgres URL runs migrations and the complete suite, as required in CI. Never point this command at a durable or production database.
 
 Heavier suites (#267 one-shot, #270 fault-injection, #273 combat regression) should be added as separate `workflow_dispatch` / `schedule` jobs or new workflows reusing the same `setup-python`/`setup-node`/postgres service conventions — do not add paid model calls or production credentials to the required PR path.
 
 ## Auth
 `auth.py` verifies Supabase JWT via JWKS (`{SUPABASE_URL}/auth/v1/.well-known/jwks.json`) with `HS256` fallback. Frontend sends `Authorization: Bearer <supabase access_token>` — see `frontend/lib/supabase.ts`.
+
+Mock authentication is disabled by default and fails closed. It requires
+*both* `ALLOW_MOCK_AUTH=true` (backend-only; `NEXT_PUBLIC_MOCK_USER` is ignored
+for authorization) *and* an explicit non-production environment marker:
+`NODE_ENV=development|test` or `VERCEL_ENV=development|preview`. Missing or
+unknown deployment metadata (e.g., no `VERCEL_ENV`/`NODE_ENV` on a self-hosted
+public host) is denied even if `ALLOW_MOCK_AUTH` is accidentally copied from a
+local `.env`. Processes marked `VERCEL_ENV=production` or `NODE_ENV=production`
+(whitespace/case-insensitive) refuse mock auth unconditionally. When enabled,
+unauthenticated requests use the shared mock profile, but any present
+`Authorization: Bearer …` header is still fully verified and invalid tokens are
+rejected (401). The frontend `NEXT_PUBLIC_MOCK_USER=true` only controls its own
+mock-user UI state and does not authorize backend requests.
+
+Supported local/test setup:
+
+```bash
+# local dev
+ALLOW_MOCK_AUTH=true NODE_ENV=development uvicorn main:app --reload
+# automated tests / CI
+ALLOW_MOCK_AUTH=true NODE_ENV=test pytest
+```

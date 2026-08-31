@@ -420,6 +420,7 @@ def test_campaign_update_http_contract_requires_and_checks_revision(monkeypatch)
             yield db
 
     monkeypatch.setenv("ALLOW_MOCK_AUTH", "true")
+    monkeypatch.setenv("NODE_ENV", "test")
     app.dependency_overrides[get_db] = override_db
     try:
         client = TestClient(app)

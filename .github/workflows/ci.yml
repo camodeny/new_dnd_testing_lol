@@ -46,6 +46,7 @@ jobs:
       DATABASE_URL: postgresql://ci_test:ci_test@localhost:5432/ci_test?sslmode=disable
       POSTGRES_URL_NON_POOLING: postgresql://ci_test:ci_test@localhost:5432/ci_test?sslmode=disable
       ALLOW_MOCK_AUTH: "true"
+      NODE_ENV: "test"
 
     steps:
       - uses: actions/checkout@v4
@@ -54,16 +55,17 @@ jobs:
         with:
           python-version: "3.12"
           cache: pip
-          cache-dependency-path: backend/requirements.txt
+          cache-dependency-path: |
+            backend/requirements.txt
+            backend/requirements-dev.txt
 
       - name: Install backend deps
         working-directory: backend
         run: |
           python -m pip install --upgrade pip
-          pip install -r requirements.txt
-          pip install pytest httpx
+          pip install -r requirements-dev.txt
 
-      - name: Backend checks (lint + migrate + tests)
+      - name: Backend checks (static + migrate + tests)
         run: set -o pipefail; bash scripts/ci/backend.sh 2>&1 | tee /tmp/pytest-backend.log
 
       - uses: actions/upload-artifact@v4

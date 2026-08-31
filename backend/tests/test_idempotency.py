@@ -152,6 +152,7 @@ def test_duplicate_http_retry_returns_same_campaign_event(monkeypatch):
             yield db
 
     monkeypatch.setenv("ALLOW_MOCK_AUTH", "true")
+    monkeypatch.setenv("NODE_ENV", "test")
     app.dependency_overrides[get_db] = override_db
     try:
         client = TestClient(app)
@@ -199,6 +200,7 @@ def test_campaign_put_retry_replays_after_revision_advanced(monkeypatch):
             yield db
 
     monkeypatch.setenv("ALLOW_MOCK_AUTH", "true")
+    monkeypatch.setenv("NODE_ENV", "test")
     app.dependency_overrides[get_db] = override_db
     try:
         client = TestClient(app)
@@ -235,6 +237,7 @@ def test_character_create_is_a_real_user_scoped_idempotent_command(monkeypatch):
             yield db
 
     monkeypatch.setenv("ALLOW_MOCK_AUTH", "true")
+    monkeypatch.setenv("NODE_ENV", "test")
     app.dependency_overrides[get_db] = override_db
     try:
         client = TestClient(app)
