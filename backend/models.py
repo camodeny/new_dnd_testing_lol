@@ -588,6 +588,171 @@ class DMStreamChunk(Base):
         }
 
 
+class DmTurn(Base):
+    """Durable logical DM turn — issue #200.
+
+    One logical turn may consume multiple player submissions that arrived
+    within the same unresolved fictional moment (same campaign+thread/audience).
+    The turn records the exact included submissions, the campaign revision
+    observed at assembly, and the input-set revision for auditability.
+    Streaming establishes a commitment boundary: once first visible chunk is
+    committed, the input set cannot silently change. A campaign cannot advance
+    to a conflicting later turn while a visible partial turn remains unresolved.
+    """
+
+    __tablename__ = "dm_turns"
+    __table_args__ = (
+        Index("ix_dm_turns_campaign_thread_status", "campaign_id", "thread_id", "status"),
+        Index("ix_dm_turns_campaign_status", "campaign_id", "status"),
+        # CAS: at most one active (pending/streaming/failed_visible) turn per thread
+        Index(
+            "uq_dm_turns_active_per_thread",
+            "campaign_id",
+            "thread_id",
+            unique=True,
+            postgresql_where=text("status IN ('pending','streaming','failed_visible')"),
+            sqlite_where=text("status IN ('pending','streaming','failed_visible')"),
+        ),
+    )
+
+    id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    campaign_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("campaigns.id", ondelete="CASCADE"), nullable=False, index=True
+    )
+    # Durable thread id as stored in player_submissions.thread_id (UUID string).
+    thread_id: Mapped[str] = mapped_column(String(128), nullable=False, index=True)
+    audience: Mapped[str] = mapped_column(String(32), nullable=False, default="campaign", server_default="campaign")
+    # pending | streaming | succeeded | failed_visible | superseded
+    status: Mapped[str] = mapped_column(String(32), nullable=False, default="pending", server_default="pending", index=True)
+    # Campaign revision observed when the turn's input set was assembled (optimistic check at commit).
+    source_revision: Mapped[int] = mapped_column(Integer, nullable=False)
+    # Monotonic within this turn: increments each time included submissions expand pre-stream.
+    input_set_revision: Mapped[int] = mapped_column(Integer, nullable=False, default=1, server_default="1")
+    # Canonical ordered list of submission UUID strings included in the current input set.
+    submission_ids: Mapped[list | None] = mapped_column(JSONB, nullable=False, default=list)
+    current_attempt_id: Mapped[uuid.UUID | None] = mapped_column(
+        UUID(as_uuid=True), nullable=True, index=True
+    )
+    streaming_attempt_id: Mapped[uuid.UUID | None] = mapped_column(
+        UUID(as_uuid=True), nullable=True
+    )
+    # Observability: assembly window and timing.
+    assembly_window_start: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    assembly_window_end: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    streaming_started_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    resolved_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    # Time spent waiting for additional input before execution vs executing.
+    time_waiting_ms: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    time_executing_ms: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now(), nullable=False)
+    updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now(), onupdate=func.now(), nullable=False)
+
+    def to_dict(self):
+        return {
+            "id": str(self.id),
+            "campaign_id": str(self.campaign_id),
+            "thread_id": self.thread_id,
+            "audience": self.audience,
+            "status": self.status,
+            "source_revision": self.source_revision,
+            "input_set_revision": self.input_set_revision,
+            "submission_ids": self.submission_ids or [],
+            "current_attempt_id": str(self.current_attempt_id) if self.current_attempt_id else None,
+            "streaming_attempt_id": str(self.streaming_attempt_id) if self.streaming_attempt_id else None,
+            "assembly_window_start": self.assembly_window_start.isoformat() if self.assembly_window_start else None,
+            "assembly_window_end": self.assembly_window_end.isoformat() if self.assembly_window_end else None,
+            "streaming_started_at": self.streaming_started_at.isoformat() if self.streaming_started_at else None,
+            "resolved_at": self.resolved_at.isoformat() if self.resolved_at else None,
+            "time_waiting_ms": self.time_waiting_ms,
+            "time_executing_ms": self.time_executing_ms,
+            "created_at": self.created_at.isoformat() if self.created_at else None,
+            "updated_at": self.updated_at.isoformat() if self.updated_at else None,
+        }
+
+
+class DmTurnAttempt(Base):
+    """One attempt to resolve a logical DmTurn — issue #200.
+
+    Attempts are lineage-linked: a new attempt supersedes a prior prepared/running
+    attempt when additional eligible submissions arrive pre-stream. Once streaming
+    starts, supersession is forbidden. Stale attempts that finish after supersession
+    are discarded harmlessly (no campaign mutation). Worker crash leaves the attempt
+    in running/prepared so recovery can retry.
+    """
+
+    __tablename__ = "dm_turn_attempts"
+    __table_args__ = (
+        UniqueConstraint("turn_id", "attempt_number", name="uq_dm_turn_attempts_turn_number"),
+        Index("ix_dm_turn_attempts_turn_status", "turn_id", "status"),
+        Index("ix_dm_turn_attempts_campaign_status", "campaign_id", "status"),
+    )
+
+    id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    turn_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("dm_turns.id", ondelete="CASCADE"), nullable=False, index=True
+    )
+    attempt_number: Mapped[int] = mapped_column(Integer, nullable=False)
+    # prepared | running | superseded | streaming | succeeded | failed | failed_visible | discarded
+    status: Mapped[str] = mapped_column(String(32), nullable=False, default="prepared", server_default="prepared", index=True)
+    campaign_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("campaigns.id", ondelete="CASCADE"), nullable=False, index=True
+    )
+    thread_id: Mapped[str] = mapped_column(String(128), nullable=False, index=True)
+    audience: Mapped[str] = mapped_column(String(32), nullable=False, default="campaign", server_default="campaign")
+    source_revision: Mapped[int] = mapped_column(Integer, nullable=False)
+    input_set_revision: Mapped[int] = mapped_column(Integer, nullable=False)
+    submission_ids: Mapped[list | None] = mapped_column(JSONB, nullable=False, default=list)
+    # Lineage: parent attempt that was superseded to create this one.
+    parent_attempt_id: Mapped[uuid.UUID | None] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("dm_turn_attempts.id", ondelete="SET NULL"), nullable=True
+    )
+    worker_job_id: Mapped[uuid.UUID | None] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("worker_executions.id", ondelete="SET NULL"), nullable=True, index=True
+    )
+    invalidation_reason: Mapped[str | None] = mapped_column(String(256), nullable=True)
+    invalidated_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    streaming_started_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    last_error: Mapped[str | None] = mapped_column(Text, nullable=True)
+    error_class: Mapped[str | None] = mapped_column(String(32), nullable=True)
+    # Observability: assembly window for this specific attempt.
+    assembly_window_start: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    assembly_window_end: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    processing_duration_ms: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    started_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    completed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    result: Mapped[dict | None] = mapped_column(JSONB, nullable=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now(), nullable=False)
+    updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now(), onupdate=func.now(), nullable=False)
+
+    def to_dict(self):
+        return {
+            "id": str(self.id),
+            "turn_id": str(self.turn_id),
+            "attempt_number": self.attempt_number,
+            "status": self.status,
+            "campaign_id": str(self.campaign_id),
+            "thread_id": self.thread_id,
+            "audience": self.audience,
+            "source_revision": self.source_revision,
+            "input_set_revision": self.input_set_revision,
+            "submission_ids": self.submission_ids or [],
+            "parent_attempt_id": str(self.parent_attempt_id) if self.parent_attempt_id else None,
+            "worker_job_id": str(self.worker_job_id) if self.worker_job_id else None,
+            "invalidation_reason": self.invalidation_reason,
+            "invalidated_at": self.invalidated_at.isoformat() if self.invalidated_at else None,
+            "streaming_started_at": self.streaming_started_at.isoformat() if self.streaming_started_at else None,
+            "last_error": self.last_error,
+            "error_class": self.error_class,
+            "assembly_window_start": self.assembly_window_start.isoformat() if self.assembly_window_start else None,
+            "assembly_window_end": self.assembly_window_end.isoformat() if self.assembly_window_end else None,
+            "processing_duration_ms": self.processing_duration_ms,
+            "started_at": self.started_at.isoformat() if self.started_at else None,
+            "completed_at": self.completed_at.isoformat() if self.completed_at else None,
+            "result": self.result,
+            "created_at": self.created_at.isoformat() if self.created_at else None,
+        }
+
+
 class CampaignInvite(Base):
     __tablename__ = "campaign_invites"
 

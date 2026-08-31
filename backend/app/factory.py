@@ -51,6 +51,7 @@ def create_app() -> FastAPI:
     from app.world.router import router as world_router
     from app.dm_streams.router import router as dm_streams_router
     from app.realtime.router import router as realtime_router
+    from app.dm.router import router as dm_router
 
     app.include_router(health_router)
     app.include_router(auth_router)
@@ -63,5 +64,6 @@ def create_app() -> FastAPI:
     app.include_router(observability_router)
     app.include_router(dm_streams_router)
     app.include_router(realtime_router)
+    app.include_router(dm_router)
 
     return app
