@@ -81,3 +81,12 @@ Heavier suites (#267 one-shot, #270 fault-injection, #273 combat regression) sho
 
 ## Auth
 `auth.py` verifies Supabase JWT via JWKS (`{SUPABASE_URL}/auth/v1/.well-known/jwks.json`) with `HS256` fallback. Frontend sends `Authorization: Bearer <supabase access_token>` — see `frontend/lib/supabase.ts`.
+
+Mock authentication is disabled by default and fails closed when deployment
+metadata is missing. For local development or automated tests, opt in on the
+backend process with `ALLOW_MOCK_AUTH=true`; unauthenticated requests then use
+the shared mock profile, while malformed or invalid bearer tokens are still
+rejected. `NEXT_PUBLIC_MOCK_USER=true` only selects the frontend's mock-user
+behavior and does not enable the backend bypass. Never set `ALLOW_MOCK_AUTH` on
+a public deployment. Processes marked with `VERCEL_ENV=production` or
+`NODE_ENV=production` refuse mock authentication even if the flag is present.

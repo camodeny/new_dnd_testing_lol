@@ -50,13 +50,18 @@ def _get_or_create_mock_profile(db: Session) -> Profile:
 
 
 def is_mock_auth_allowed() -> bool:
-    if os.getenv("ALLOW_MOCK_AUTH", "").strip().lower() in ("1", "true", "yes", "on"):
-        return True
-    if os.getenv("NEXT_PUBLIC_MOCK_USER", "").strip().lower() in ("1", "true"):
-        return True
-    if os.getenv("VERCEL_ENV") == "production":
+    # A production marker always wins over the development/test escape hatch.
+    # This prevents a copied local environment file from disabling auth in a
+    # production deployment.
+    if os.getenv("VERCEL_ENV", "").strip().lower() == "production":
         return False
-    return os.getenv("VERCEL_ENV") is None and os.getenv("NODE_ENV") != "production"
+    if os.getenv("NODE_ENV", "").strip().lower() == "production":
+        return False
+
+    # Fail closed when deployment metadata is absent or unfamiliar. Only the
+    # backend-owned flag may opt a development/test process into mock auth;
+    # NEXT_PUBLIC_MOCK_USER controls frontend behavior and is not authorization.
+    return os.getenv("ALLOW_MOCK_AUTH", "").strip().lower() in ("1", "true", "yes", "on")
 
 
 def _resolve_with_token(db: Session, token: str) -> Profile:
