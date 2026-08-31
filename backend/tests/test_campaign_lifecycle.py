@@ -255,3 +255,92 @@ def test_active_and_archived_transitions_lock_membership_and_invalid_edges(api):
     with factory() as db:
         persisted = db.get(Campaign, uuid.UUID(cid))
         assert (persisted.status, persisted.revision) == ("archived", 3)
+
+
+def test_required_players_rejects_bool_float_and_out_of_range(api):
+    client, _, _, _, _, _ = api
+    # bool is not an integer — must be rejected, not coerced to 0/1
+    for invalid in (True, False, 0, 7, 8, 2.5, 3.0, "2.5", "  ", "many"):
+        response = client.post(
+            "/api/campaigns", json={"name": "Invalid", "required_players": invalid}
+        )
+        assert response.status_code == 400, f"expected 400 for required_players={invalid!r}: {response.text}"
+    # update path also validates strictly
+    campaign = _create(client, required_players=2)
+    cid = campaign["id"]
+    for invalid in (True, 2.5, 0):
+        resp = client.put(
+            f"/api/campaigns/{cid}",
+            json={"expected_revision": 0, "required_players": invalid},
+            headers={"Idempotency-Key": f"bad-players-{invalid}"},
+        )
+        assert resp.status_code == 400, resp.text
+    # valid edges remain
+    for ok in (1, 6, "3", 2):
+        campaign2 = _create(client, name=f"Ok {ok}", required_players=ok)
+        assert 1 <= campaign2["required_players"] <= 6
+
+
+def test_content_boundaries_structural_validation(api):
+    client, _, _, _, _, _ = api
+    # valid structural cases
+    ok = _create(
+        client,
+        name="ok boundaries",
+        content_boundaries={"lines": ["harm to children"], "veils": ["romance"]},
+    )
+    assert ok["content_boundaries"] == {"lines": ["harm to children"], "veils": ["romance"]}
+    # invalid: not a dict, nested dict, non-string list entries, overly long keys
+    for invalid in (
+        ["not", "object"],
+        {"lines": {"nested": "dict"}},
+        {"lines": [123]},
+        {"lines": [""]},
+        {"x" * 129: ["ok"]},
+        {"lines": ["a" * 501]},
+        {k: ["ok"] for k in [str(i) for i in range(33)]},
+    ):
+        resp = client.post("/api/campaigns", json={"name": "Invalid", "content_boundaries": invalid})
+        assert resp.status_code == 400, f"expected 400 for boundaries={invalid!r}: {resp.text}"
+    # update path also enforces
+    campaign = _create(client, required_players=1)
+    bad = client.put(
+        f"/api/campaigns/{campaign['id']}",
+        json={"expected_revision": 0, "content_boundaries": {"lines": [123]}},
+        headers={"Idempotency-Key": "bad-boundaries"},
+    )
+    assert bad.status_code == 400
+
+
+def test_non_owner_cannot_change_lifecycle_or_settings(api):
+    client, _, actor, owner_id, member_id, _ = api
+    campaign = _create(client, required_players=1)
+    cid = campaign["id"]
+    actor["id"] = member_id
+    lifecycle_denied = _transition(client, cid, 0, "starting", "non-owner-start")
+    assert lifecycle_denied.status_code == 403
+    settings_denied = client.put(
+        f"/api/campaigns/{cid}",
+        json={"expected_revision": 0, "theme": "hijack"},
+        headers={"Idempotency-Key": "non-owner-settings"},
+    )
+    assert settings_denied.status_code == 403
+    # removal and invite revocation also owner-only
+    actor["id"] = owner_id
+    # create invite for later revocation test (owner succeeds)
+    assert client.post(f"/api/campaigns/{cid}/invites").status_code == 200
+    actor["id"] = member_id
+    remove_denied = client.request(
+        "DELETE",
+        f"/api/campaigns/{cid}/members/{owner_id}",
+        json={"expected_revision": 0},
+        headers={"Idempotency-Key": "non-owner-remove"},
+    )
+    assert remove_denied.status_code == 403
+    revoke_denied = client.request(
+        "DELETE",
+        f"/api/campaigns/{cid}/invites",
+        json={"expected_revision": 0},
+        headers={"Idempotency-Key": "non-owner-revoke"},
+    )
+    assert revoke_denied.status_code == 403

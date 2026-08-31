@@ -84,6 +84,18 @@ def validate_seed(raw) -> str | None:
 def normalize_required_players(val) -> int:
     if isinstance(val, bool):
         raise ValueError("Required players must be an integer from 1 to 6")
+    if isinstance(val, float):
+        raise ValueError("Required players must be an integer from 1 to 6")
+    # Reject non-integral numeric strings like "2.5" explicitly via strict integer parsing;
+    # int("2.5") already raises, but we also guard string floats early for clarity.
+    if isinstance(val, str):
+        stripped = val.strip()
+        if stripped == "":
+            raise ValueError("Required players must be an integer from 1 to 6")
+        # Allow optional leading +/- but require pure integer digits after
+        test = stripped.lstrip("+-")
+        if not test.isdigit():
+            raise ValueError("Required players must be an integer from 1 to 6")
     try:
         n = int(val) if val is not None else 1
     except (TypeError, ValueError):
@@ -123,6 +135,31 @@ def validate_content_boundaries(val) -> dict:
         raise ValueError("Content boundaries must be a JSON object")
     if len(json.dumps(val, ensure_ascii=False, separators=(",", ":"))) > 16_384:
         raise ValueError("Content boundaries must be 16384 characters or fewer")
+    if len(val) > 32:
+        raise ValueError("Content boundaries must have at most 32 entries")
+    for key, value in val.items():
+        if not isinstance(key, str) or not key.strip():
+            raise ValueError("Content boundaries keys must be non-empty strings")
+        if len(key) > 128:
+            raise ValueError("Content boundaries key must be 128 characters or fewer")
+        if isinstance(value, str):
+            if len(value) > 2000:
+                raise ValueError("Content boundaries string values must be 2000 characters or fewer")
+        elif isinstance(value, list):
+            if len(value) > 64:
+                raise ValueError("Content boundaries lists must have at most 64 entries")
+            for entry in value:
+                if not isinstance(entry, str):
+                    raise ValueError("Content boundaries list entries must be strings")
+                if len(entry) > 500:
+                    raise ValueError("Content boundaries list entries must be 500 characters or fewer")
+                if len(entry.strip()) == 0:
+                    raise ValueError("Content boundaries list entries must be non-empty strings")
+        elif isinstance(value, dict):
+            # Nested objects not allowed — keep boundaries structurally flat for generation.
+            raise ValueError("Content boundaries values must be strings or arrays of strings")
+        elif value is not None:
+            raise ValueError("Content boundaries values must be strings or arrays of strings")
     return val
 
 
