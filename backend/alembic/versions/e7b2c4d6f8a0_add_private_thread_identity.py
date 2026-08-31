@@ -1,7 +1,7 @@
 """add idempotent private gameplay thread identity — issue 247
 
 Revision ID: e7b2c4d6f8a0
-Revises: c1d2e3f4a5b6
+Revises: a8d4f2c6e1b9
 """
 from typing import Sequence, Union
 
@@ -10,7 +10,7 @@ import sqlalchemy as sa
 
 
 revision: str = "e7b2c4d6f8a0"
-down_revision: Union[str, Sequence[str], None] = "c1d2e3f4a5b6"
+down_revision: Union[str, Sequence[str], None] = "a8d4f2c6e1b9"
 branch_labels = None
 depends_on = None
 
