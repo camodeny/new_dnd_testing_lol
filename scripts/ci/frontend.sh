@@ -20,5 +20,8 @@ npm run lint
 echo "== frontend: typecheck (tsc) =="
 npm run typecheck
 
+echo "== frontend: tests (vitest) =="
+npm run test
+
 echo "== frontend: build (next build) =="
 npm run build

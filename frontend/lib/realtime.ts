@@ -259,6 +259,72 @@ export function deriveDmState(
   }
 }
 
+/**
+ * Next DM state after a status event, handling A→B rollover.
+ * If status is for a new streaming stream B not in completed and mismatched with active A,
+ * it replaces active state; stale old-stream statuses are dropped.
+ */
+export function nextDmStateForStatus(
+  current: DmStateForRealtime | null,
+  event: RealtimeEvent,
+  snapshot: SnapshotForRealtime | null,
+): DmStateForRealtime | null {
+  const evSid = event.stream_id ? String(event.stream_id) : null
+  const activeSid = current?.stream_id ? String(current.stream_id) : null
+  const status = String(event.status ?? '')
+  const completedIds = new Set<string>((snapshot?.dm_messages ?? []).map((m) => String(m.id)))
+  for (const m of snapshot?.dm_messages ?? []) {
+    const sid2 = (m as unknown as { stream_id?: string }).stream_id
+    if (sid2) completedIds.add(String(sid2))
+  }
+
+  if (evSid && activeSid && evSid !== activeSid) {
+    if (status === 'streaming' && !completedIds.has(evSid)) {
+      // New stream B — establish
+      return {
+        status: 'streaming',
+        streaming: true,
+        stream_id: evSid,
+        turn_id: event.turn_id ? String(event.turn_id) : null,
+        attempt_id: event.attempt_id ? String(event.attempt_id) : null,
+        visible_text: typeof (event as { visible_text?: string }).visible_text === 'string' ? (event as { visible_text?: string }).visible_text! : '',
+        last_sequence: (event as { last_sequence?: number | null }).last_sequence ?? null,
+        chunk_count: typeof (event as { chunk_count?: number }).chunk_count === 'number' ? (event as { chunk_count?: number }).chunk_count! : 0,
+        trace_id: (event as { trace_id?: string }).trace_id ?? null,
+      } as unknown as DmStateForRealtime
+    }
+    return current // stale old
+  }
+
+  if (!current && evSid) {
+    // No active, new status establishes
+    return {
+      status: status || 'streaming',
+      streaming: status === 'streaming',
+      stream_id: evSid,
+      turn_id: event.turn_id ? String(event.turn_id) : null,
+      attempt_id: event.attempt_id ? String(event.attempt_id) : null,
+      visible_text: typeof (event as { visible_text?: string }).visible_text === 'string' ? (event as { visible_text?: string }).visible_text! : '',
+      last_sequence: (event as { last_sequence?: number | null }).last_sequence ?? null,
+      chunk_count: typeof (event as { chunk_count?: number }).chunk_count === 'number' ? (event as { chunk_count?: number }).chunk_count! : 0,
+    } as unknown as DmStateForRealtime
+  }
+
+  if (!current) return current
+
+  if (activeSid && evSid !== activeSid) return current // mismatched non-streaming status
+
+  return {
+    ...current,
+    status,
+    streaming: status === 'streaming',
+    last_sequence: (event as { last_sequence?: number | null }).last_sequence ?? current.last_sequence,
+    chunk_count: typeof (event as { chunk_count?: number }).chunk_count === 'number' ? (event as { chunk_count?: number }).chunk_count! : current.chunk_count,
+    visible_text: typeof (event as { visible_text?: string }).visible_text === 'string' ? (event as { visible_text?: string }).visible_text! : current.visible_text,
+    stream_id: evSid ?? current.stream_id,
+  } as unknown as DmStateForRealtime
+}
+
 // ── Observability counters (module-local, mirrors backend metrics) ──────
 
 let _metrics = {

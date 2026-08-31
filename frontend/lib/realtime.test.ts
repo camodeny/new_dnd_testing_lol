@@ -2,6 +2,7 @@ import { describe, it, expect } from 'vitest'
 import {
   dedupeEvents,
   deriveDmState,
+  nextDmStateForStatus,
   reconcileBufferedEvents,
   sortEventsBySequence,
   type RealtimeEvent,
@@ -106,6 +107,64 @@ describe('realtime helpers — dedupe/out-of-order/stream-scoped', () => {
       chunks.push({ type: 'dm.chunk', event_id: 'c6', campaign_id: 'c', thread_id: 't', stream_id: 's1', sequence: 6, text: 'a' })
       state = deriveDmState(base, chunks)
       expect(state?.visible_text).toBe('hello abc')
+    })
+  })
+
+  describe('nextDmStateForStatus — A→B rollover', () => {
+    const snapWithACompleted: SnapshotForRealtime = {
+      dm_messages: [{ id: 'stream-A', turn_id: 'tA', attempt_id: 'aA', final_text: 'old', status: 'completed' } as any],
+      dm_state: { status: 'streaming', streaming: true, stream_id: 'stream-A', last_sequence: 5, visible_text: 'A text', chunk_count: 6 } as any,
+      history: { messages: [] },
+    }
+    // Actually after A completes, snapshot would have A completed in dm_messages and B not yet active;
+    // but for hook's in-memory state, dmState is A streaming then A completed
+    it('A-active snapshot → A completed → B streaming switches active', () => {
+      let dmState: any = { status: 'streaming', streaming: true, stream_id: 'stream-A', last_sequence: 5, visible_text: 'A ', chunk_count: 6 }
+      const snapForACompleted: SnapshotForRealtime = {
+        dm_state: dmState,
+        dm_messages: [],
+        history: { messages: [] },
+      }
+      // A completed
+      const aCompleted: RealtimeEvent = { type: 'dm.status', event_id: 'sA', campaign_id: 'c', thread_id: 't', stream_id: 'stream-A', status: 'completed', last_sequence: 5 } as any
+      dmState = nextDmStateForStatus(dmState, aCompleted, snapForACompleted)!
+      expect(dmState.stream_id).toBe('stream-A')
+      expect(dmState.status).toBe('completed')
+
+      // Snapshot now would have A completed, but our in-memory dmState is still A completed
+      // Now B streaming arrives — should replace
+      const snapWithACompletedNow: SnapshotForRealtime = {
+        dm_state: dmState,
+        dm_messages: [{ id: 'stream-A', turn_id: 'tA', attempt_id: 'aA', final_text: 'A ', status: 'completed' } as any],
+        history: { messages: [] },
+      }
+      const bStreaming: RealtimeEvent = { type: 'dm.status', event_id: 'sB', campaign_id: 'c', thread_id: 't', stream_id: 'stream-B', status: 'streaming', visible_text: '', last_sequence: null, chunk_count: 0 } as any
+      const next = nextDmStateForStatus(dmState, bStreaming, snapWithACompletedNow)
+      expect(next?.stream_id).toBe('stream-B')
+      expect(next?.status).toBe('streaming')
+      expect(next?.visible_text).toBe('')
+    })
+
+    it('stale A completed after snapshot already has B active does not regress B', () => {
+      const dmStateB: any = { status: 'streaming', streaming: true, stream_id: 'stream-B', last_sequence: 0, visible_text: '', chunk_count: 0 }
+      const snapWithBActive: SnapshotForRealtime = {
+        dm_state: dmStateB,
+        dm_messages: [{ id: 'stream-A', turn_id: 'tA', attempt_id: 'aA', final_text: 'old', status: 'completed' } as any],
+        history: { messages: [] },
+      }
+      const staleA: RealtimeEvent = { type: 'dm.status', event_id: 'sA2', campaign_id: 'c', thread_id: 't', stream_id: 'stream-A', status: 'completed' } as any
+      const next = nextDmStateForStatus(dmStateB, staleA, snapWithBActive)
+      // stale A should not mutate B
+      expect(next).toBe(dmStateB)
+      expect(next?.stream_id).toBe('stream-B')
+    })
+
+    it('idle snapshot → B streaming establishes B', () => {
+      const snapIdle: SnapshotForRealtime = { dm_state: { status: 'idle', streaming: false, stream_id: null } as any, dm_messages: [], history: { messages: [] } }
+      const bStreaming: RealtimeEvent = { type: 'dm.status', event_id: 'sB', campaign_id: 'c', thread_id: 't', stream_id: 'stream-B', status: 'streaming', visible_text: '' } as any
+      const next = nextDmStateForStatus(null, bStreaming, snapIdle)
+      expect(next?.stream_id).toBe('stream-B')
+      expect(next?.status).toBe('streaming')
     })
   })
 })

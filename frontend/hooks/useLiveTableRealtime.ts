@@ -25,6 +25,7 @@ import {
   getRealtimeClientMetrics,
   incRealtimeMetric,
   liveTableChannel,
+  nextDmStateForStatus,
   reconcileBufferedEvents,
   sortEventsBySequence,
   type DmMessageForRealtime,
@@ -195,33 +196,36 @@ export function useLiveTableRealtime(opts: UseLiveTableRealtimeOptions) {
         } else if (ev.type === 'dm.status' || ev.type === 'dm.thinking') {
           const evSid = ev.stream_id ? String(ev.stream_id) : null
           const activeSid = nextDmState?.stream_id ? String(nextDmState.stream_id) : null
-          // Never let a status for stream A mutate stream B's projection
           if (evSid && activeSid && evSid !== activeSid) {
-            // Stale status for old stream — keep as nextStatus for observability but do not mutate dmState
-            // Only update nextStatus if it belongs to the active stream to avoid UI showing wrong turn's status
-            if (ev.type === 'dm.thinking') {
-              // thinking events are transient; drop stale ones entirely
-            } else {
-              // For completed status, we still don't mutate active B's state
-            }
-          } else {
-            nextStatus = ev
-            if (ev.type === 'dm.status' && ev.status && nextDmState) {
-              // Only mutate dmState when stream matches (or dmState is null and this is new stream's status)
-              if (!activeSid || evSid === activeSid) {
-                nextDmState = {
-                  ...nextDmState,
-                  status: String(ev.status),
-                  streaming: ev.status === 'streaming',
-                  last_sequence: (ev as { last_sequence?: number }).last_sequence ?? nextDmState.last_sequence,
-                  chunk_count: (ev as { chunk_count?: number }).chunk_count ?? nextDmState.chunk_count,
-                  visible_text: (ev as { visible_text?: string }).visible_text ?? nextDmState.visible_text,
-                  stream_id: evSid ?? nextDmState.stream_id,
+            // Mismatched stream — only a new streaming status for B should replace A
+            if (ev.type === 'dm.status' && String(ev.status) === 'streaming') {
+              const next = nextDmStateForStatus(nextDmState, ev, snapshotRef.current)
+              if (next && String(next.stream_id) === evSid) {
+                nextDmState = next
+                nextStatus = ev
+                const existingChunks = nextChunks.get(evSid) ?? []
+                if (existingChunks.length) {
+                  const derived = deriveDmState(nextDmState, existingChunks)
+                  if (derived) nextDmState = derived
                 }
               }
-            } else if (ev.type === 'dm.thinking' && !activeSid) {
-              // Edge: thinking for new stream when no active — keep as status
+            }
+            // stale thinking/completed for old stream — drop
+          } else {
+            // Same stream or no active — use helper (handles creation from idle)
+            const prevState = nextDmState
+            const next = nextDmStateForStatus(nextDmState, ev, snapshotRef.current)
+            // nextDmStateForStatus returns current if stale; detect change
+            if (next !== prevState) {
+              nextDmState = next
               nextStatus = ev
+            } else if (!activeSid || evSid === activeSid) {
+              // Status for active stream or thinking — keep as nextStatus
+              nextStatus = ev
+              if (nextDmState && ev.type === 'dm.status' && ev.status) {
+                // ensure status fields are updated (helper already did, but keep for thinking)
+                nextDmState = next!
+              }
             }
           }
         }
