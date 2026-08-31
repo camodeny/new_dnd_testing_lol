@@ -1,7 +1,7 @@
 """add durable DM turn/attempt state machine — issue 200
 
 Revision ID: c1d2e3f4a5b6
-Revises: c8d9e0f1a2b3
+Revises: d1e2f3a4b5c6
 """
 
 from typing import Sequence, Union
@@ -11,7 +11,7 @@ import sqlalchemy as sa
 from sqlalchemy.dialects import postgresql
 
 revision: str = "c1d2e3f4a5b6"
-down_revision: Union[str, Sequence[str], None] = "c8d9e0f1a2b3"
+down_revision: Union[str, Sequence[str], None] = "d1e2f3a4b5c6"
 branch_labels = None
 depends_on = None
 
