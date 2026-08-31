@@ -26,6 +26,9 @@ export interface RealtimeEvent {
   // payload specifics
   id?: string
   raw_content?: string
+  user_id?: string
+  character_id?: string | null
+  accepted_at?: string | null
   segments?: Array<{ type: 'ic' | 'ooc'; text: string }>
   text?: string
   stream_id?: string

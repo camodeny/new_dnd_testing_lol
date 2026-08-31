@@ -164,6 +164,28 @@ export const campaignMembers = {
     }),
 }
 
+// ── Live-table gameplay threads ──────────────────────────────────────────
+
+export const gameplayThreads = {
+  list: (campaignId: string | number) =>
+    apiFetch<{ threads: import('@/types').CampaignThread[] }>(`/campaigns/${campaignId}/threads`),
+  getOrCreateDm: (campaignId: string | number) =>
+    apiFetch<{ thread: import('@/types').CampaignThread; created: boolean }>(`/campaigns/${campaignId}/threads/dm`, {
+      method: 'POST',
+    }),
+  getOrCreateDirect: (campaignId: string | number, participantId: string) =>
+    apiFetch<{ thread: import('@/types').CampaignThread; created: boolean }>(`/campaigns/${campaignId}/threads/direct`, {
+      method: 'POST',
+      body: JSON.stringify({ participant_id: participantId }),
+    }),
+  submit: (campaignId: string | number, threadId: string, content: string, operationId: string) =>
+    apiFetch(`/campaigns/${campaignId}/submissions`, {
+      method: 'POST',
+      body: JSON.stringify({ thread_id: threadId, content, operation_id: operationId }),
+      headers: { 'Idempotency-Key': operationId },
+    }),
+}
+
 // ── Sessions ──────────────────────────────────────────────────────────────
 
 export const sessions = {

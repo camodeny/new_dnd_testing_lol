@@ -45,7 +45,6 @@ def api(monkeypatch):
             yield db
 
     monkeypatch.setenv("ALLOW_MOCK_AUTH", "true")
-    monkeypatch.setenv("NODE_ENV", "test")
     app.dependency_overrides[get_db] = override_db
     try:
         yield TestClient(app), factory, campaign_id, member_id, outsider_id
@@ -116,6 +115,65 @@ def test_private_thread_only_authorized_can_read(api, monkeypatch):
     monkeypatch.setattr("app.runtime.router.resolve_profile", lambda req, db: db.get(Profile, member_id))
     r7 = client.get(f"/api/campaigns/{campaign_id}/threads")
     assert private_tid in [t["id"] for t in r7.json()["threads"]]
+
+
+def test_ai_dm_thread_is_idempotent_and_private_from_owner_and_other_players(api, monkeypatch):
+    client, factory, campaign_id, member_id, outsider_id = api
+
+    monkeypatch.setattr("app.runtime.router.resolve_profile", lambda req, db: db.get(Profile, member_id))
+    first = client.post(f"/api/campaigns/{campaign_id}/threads/dm")
+    retry = client.post(f"/api/campaigns/{campaign_id}/threads/dm")
+
+    assert first.status_code == retry.status_code == 200
+    assert first.json()["created"] is True
+    assert retry.json()["created"] is False
+    assert first.json()["thread"]["id"] == retry.json()["thread"]["id"]
+    assert first.json()["thread"]["private_kind"] == "dm"
+    assert [m["user_id"] for m in first.json()["thread"]["members"]] == [str(member_id)]
+    private_tid = first.json()["thread"]["id"]
+
+    with factory() as db:
+        assert db.query(CampaignThread).filter_by(
+            campaign_id=campaign_id, private_kind="dm", private_key=f"dm:{member_id}"
+        ).count() == 1
+
+    # Campaign ownership is not a private-thread bypass.
+    monkeypatch.setattr("app.runtime.router.resolve_profile", lambda req, db: db.get(Profile, MOCK_USER_ID))
+    owner_read = client.get(f"/api/campaigns/{campaign_id}/threads/{private_tid}")
+    assert owner_read.status_code == 404
+
+    monkeypatch.setattr("app.runtime.router.resolve_profile", lambda req, db: db.get(Profile, outsider_id))
+    other_player_read = client.get(f"/api/campaigns/{campaign_id}/threads/{private_tid}")
+    assert other_player_read.status_code == 404
+    assert private_tid not in [t["id"] for t in client.get(f"/api/campaigns/{campaign_id}/threads").json()["threads"]]
+
+
+def test_direct_thread_is_idempotent_for_pair_and_visible_only_to_pair(api, monkeypatch):
+    client, _, campaign_id, member_id, outsider_id = api
+
+    monkeypatch.setattr("app.runtime.router.resolve_profile", lambda req, db: db.get(Profile, member_id))
+    first = client.post(
+        f"/api/campaigns/{campaign_id}/threads/direct",
+        json={"participant_id": str(outsider_id)},
+    )
+    assert first.status_code == 200
+    private_tid = first.json()["thread"]["id"]
+    assert first.json()["thread"]["private_kind"] == "direct"
+
+    # The reverse direction resolves to the same logical pair.
+    monkeypatch.setattr("app.runtime.router.resolve_profile", lambda req, db: db.get(Profile, outsider_id))
+    reverse = client.post(
+        f"/api/campaigns/{campaign_id}/threads/direct",
+        json={"participant_id": str(member_id)},
+    )
+    assert reverse.status_code == 200
+    assert reverse.json()["created"] is False
+    assert reverse.json()["thread"]["id"] == private_tid
+
+    # The campaign owner was not selected and cannot discover or read the thread.
+    monkeypatch.setattr("app.runtime.router.resolve_profile", lambda req, db: db.get(Profile, MOCK_USER_ID))
+    assert client.get(f"/api/campaigns/{campaign_id}/threads/{private_tid}").status_code == 404
+    assert private_tid not in [t["id"] for t in client.get(f"/api/campaigns/{campaign_id}/threads").json()["threads"]]
 
 
 def test_owner_without_membership_cannot_read_private(api, monkeypatch):

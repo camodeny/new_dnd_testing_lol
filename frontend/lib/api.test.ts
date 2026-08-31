@@ -111,6 +111,7 @@ describe('exported API surface', () => {
       'campaigns',
       'characters',
       'encounterMaps',
+      'gameplayThreads',
       'sessions',
       'world',
     ])
@@ -139,6 +140,12 @@ describe('exported API surface', () => {
       'listCharacters',
       'listMembers',
       'lookupInvite',
+    ])
+    expect(Object.keys(api.gameplayThreads).sort()).toEqual([
+      'getOrCreateDirect',
+      'getOrCreateDm',
+      'list',
+      'submit',
     ])
     expect(Object.keys(api.sessions)).toEqual(['start'])
     expect(Object.keys(api.world)).toEqual(['get'])

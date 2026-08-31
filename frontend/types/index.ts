@@ -74,6 +74,24 @@ export interface CampaignMember {
   is_ready?: boolean
 }
 
+export interface CampaignThreadMember {
+  thread_id: string
+  user_id: string
+  role: 'member'
+  joined_at?: string
+}
+
+export interface CampaignThread {
+  id: string
+  campaign_id: string
+  thread_type: 'campaign' | 'private'
+  private_kind?: 'dm' | 'direct' | null
+  title?: string | null
+  created_by?: string | null
+  created_at?: string | null
+  members?: CampaignThreadMember[]
+}
+
 export interface CampaignWorld {
   id: number
   campaign_id: number

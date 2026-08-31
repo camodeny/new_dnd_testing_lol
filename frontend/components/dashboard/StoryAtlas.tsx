@@ -3,7 +3,10 @@
 import { useState, useRef, useEffect } from 'react'
 import { useRouter } from 'next/navigation'
 import MarkdownContent from '@/components/common/MarkdownContent'
-import type { Campaign, Character, Session, Message, EncounterMap, User } from '@/types'
+import PrivateThreadConversation from '@/components/dashboard/PrivateThreadConversation'
+import { campaignMembers, gameplayThreads } from '@/lib/api'
+import { privateThreadLabel, upsertVisibleThread } from '@/lib/privateThreads'
+import type { Campaign, CampaignMember, CampaignThread, Character, Session, Message, EncounterMap, User } from '@/types'
 
 interface StoryAtlasProps {
   campaign: Campaign & { user_id?: string }
@@ -61,7 +64,13 @@ export default function StoryAtlas({
   const router = useRouter()
   const [input, setInput] = useState('')
   const [sending, setSending] = useState(false)
-  const [mobileTab, setMobileTab] = useState<'chat' | 'party'>('chat')
+  const [mobileTab, setMobileTab] = useState<'threads' | 'chat' | 'party'>('chat')
+  const [threadMembers, setThreadMembers] = useState<CampaignMember[]>([])
+  const [privateThreads, setPrivateThreads] = useState<CampaignThread[]>([])
+  const [activePrivateThread, setActivePrivateThread] = useState<CampaignThread | null>(null)
+  const [directParticipantId, setDirectParticipantId] = useState('')
+  const [threadActionPending, setThreadActionPending] = useState(false)
+  const [threadError, setThreadError] = useState('')
   const messagesEndRef = useRef<HTMLDivElement>(null)
   const messagesContainerRef = useRef<HTMLDivElement>(null)
   const lastMessageIdRef = useRef<string | null>(null)
@@ -73,6 +82,57 @@ export default function StoryAtlas({
     }
     lastMessageIdRef.current = lastMessageId
   }, [messages, aiThinking, activeDmText])
+
+  useEffect(() => {
+    let cancelled = false
+    Promise.all([
+      gameplayThreads.list(campaign.id),
+      campaignMembers.listMembers(campaign.id),
+    ]).then(([threadData, memberData]) => {
+      if (cancelled) return
+      setPrivateThreads(threadData.threads.filter((thread) => thread.thread_type === 'private'))
+      setThreadMembers(memberData.members)
+    }).catch((error) => {
+      if (!cancelled) setThreadError((error as Error).message)
+    })
+    return () => { cancelled = true }
+  }, [campaign.id])
+
+  const openPrivateThread = (thread: CampaignThread) => {
+    setActivePrivateThread(thread)
+    setThreadError('')
+    setMobileTab('chat')
+  }
+
+  const openAiDmThread = async () => {
+    setThreadActionPending(true)
+    setThreadError('')
+    try {
+      const { thread } = await gameplayThreads.getOrCreateDm(campaign.id)
+      setPrivateThreads((current) => upsertVisibleThread(current, thread))
+      openPrivateThread(thread)
+    } catch (error) {
+      setThreadError((error as Error).message)
+    } finally {
+      setThreadActionPending(false)
+    }
+  }
+
+  const openDirectThread = async () => {
+    if (!directParticipantId) return
+    setThreadActionPending(true)
+    setThreadError('')
+    try {
+      const { thread } = await gameplayThreads.getOrCreateDirect(campaign.id, directParticipantId)
+      setPrivateThreads((current) => upsertVisibleThread(current, thread))
+      setDirectParticipantId('')
+      openPrivateThread(thread)
+    } catch (error) {
+      setThreadError((error as Error).message)
+    } finally {
+      setThreadActionPending(false)
+    }
+  }
 
   const handleLoadOlder = async () => {
     const container = messagesContainerRef.current
@@ -109,7 +169,7 @@ export default function StoryAtlas({
 
   return (
     <div className="dashboard-page">
-      <div className={`dashboard-layout${mobileTab === 'party' ? ' mobile-tab-party' : ' mobile-tab-chat'}`}>
+      <div className={`dashboard-layout mobile-tab-${mobileTab}`}>
         {/* Left sidebar */}
         <aside className="dashboard-left">
           <div className="campaign-logo-header">
@@ -135,6 +195,54 @@ export default function StoryAtlas({
               </button>
             </div>
           </nav>
+
+          <section className="private-thread-nav" aria-labelledby="private-thread-heading">
+            <div className="private-thread-nav-heading">
+              <span className="sidebar-nav-label" id="private-thread-heading">Conversations</span>
+              <i className="bi bi-shield-lock" aria-hidden="true" />
+            </div>
+            <button
+              type="button"
+              className={`private-thread-nav-item${activePrivateThread === null ? ' active' : ''}`}
+              onClick={() => { setActivePrivateThread(null); setMobileTab('chat') }}
+            >
+              <i className="bi bi-people-fill" aria-hidden="true" />
+              <span><strong>Campaign table</strong><small>Shared with the party</small></span>
+            </button>
+            {privateThreads.map((thread) => (
+              <button
+                type="button"
+                className={`private-thread-nav-item${activePrivateThread?.id === thread.id ? ' active' : ''}`}
+                key={thread.id}
+                onClick={() => openPrivateThread(thread)}
+              >
+                <i className={thread.private_kind === 'dm' ? 'bi bi-stars' : 'bi bi-person-lock'} aria-hidden="true" />
+                <span>
+                  <strong>{currentUser ? privateThreadLabel(thread, threadMembers, currentUser.id) : 'Private'}</strong>
+                  <small>{thread.private_kind === 'dm' ? 'Private with AI DM' : 'Private player chat'}</small>
+                </span>
+              </button>
+            ))}
+            {!privateThreads.some((thread) => thread.private_kind === 'dm') && (
+              <button type="button" className="private-thread-create" disabled={!currentUser || threadActionPending} onClick={() => void openAiDmThread()}>
+                <i className="bi bi-stars" aria-hidden="true" /> Private with AI DM
+              </button>
+            )}
+            {currentUser && threadMembers.filter((member) => member.user_id !== currentUser.id).length > 0 && (
+              <div className="private-thread-direct-create">
+                <select aria-label="Player for private conversation" value={directParticipantId} onChange={(event) => setDirectParticipantId(event.target.value)}>
+                  <option value="">Choose a player…</option>
+                  {threadMembers.filter((member) => member.user_id !== currentUser.id).map((member) => (
+                    <option value={member.user_id} key={member.user_id}>{member.username}</option>
+                  ))}
+                </select>
+                <button type="button" aria-label="Open private player conversation" disabled={!directParticipantId || threadActionPending} onClick={() => void openDirectThread()}>
+                  <i className="bi bi-plus-lg" aria-hidden="true" />
+                </button>
+              </div>
+            )}
+            {threadError && <p className="private-thread-nav-error" role="alert">{threadError}</p>}
+          </section>
 
           {/* Party roster */}
           {characters.length > 0 && (
@@ -167,6 +275,16 @@ export default function StoryAtlas({
 
         {/* Center: chat */}
         <div className="dashboard-center">
+          {activePrivateThread && currentUser ? (
+            <PrivateThreadConversation
+              campaignId={campaign.id}
+              thread={activePrivateThread}
+              members={threadMembers}
+              currentUser={currentUser}
+              onClose={() => setActivePrivateThread(null)}
+              onError={setThreadError}
+            />
+          ) : (
           <div className="session-panel" style={{ display: 'flex', flexDirection: 'column', height: '100%' }}>
             {/* Top header */}
             <header className="dashboard-top-header" style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', gap: 12 }}>
@@ -310,6 +428,7 @@ export default function StoryAtlas({
               </div>
             )}
           </div>
+          )}
         </div>
 
         {/* Right sidebar */}
@@ -349,6 +468,14 @@ export default function StoryAtlas({
 
       {/* Mobile bottom nav */}
       <nav className="mobile-bottom-nav" aria-label="Mobile navigation">
+        <button
+          type="button"
+          className={`mobile-nav-item${mobileTab === 'threads' ? ' active' : ''}`}
+          onClick={() => setMobileTab('threads')}
+        >
+          <i className="bi bi-chat-square-lock" aria-hidden="true" />
+          <span>Threads</span>
+        </button>
         <button
           type="button"
           className={`mobile-nav-item${mobileTab === 'chat' ? ' active' : ''}`}
