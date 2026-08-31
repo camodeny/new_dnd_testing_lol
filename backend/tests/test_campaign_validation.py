@@ -1,6 +1,7 @@
 """Regression: campaign name is limited to 128 chars at API boundary."""
 import os
 os.environ["ALLOW_MOCK_AUTH"] = "true"
+os.environ["NODE_ENV"] = "test"
 
 from fastapi.testclient import TestClient
 from main import app

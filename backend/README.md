@@ -67,7 +67,7 @@ DATABASE_URL=postgresql://ci_test:ci_test@localhost:5432/ci_test ./scripts/ci/ba
 
 # Direct equivalents
 DATABASE_URL="$POSTGRES_URL" python -m scripts.migrate || exit 1
-ALLOW_MOCK_AUTH=true python -m pytest tests/ -v
+ALLOW_MOCK_AUTH=true NODE_ENV=test python -m pytest tests/ -v
 # only then deploy to Vercel / restart containers
 ```
 
@@ -81,3 +81,25 @@ Heavier suites (#267 one-shot, #270 fault-injection, #273 combat regression) sho
 
 ## Auth
 `auth.py` verifies Supabase JWT via JWKS (`{SUPABASE_URL}/auth/v1/.well-known/jwks.json`) with `HS256` fallback. Frontend sends `Authorization: Bearer <supabase access_token>` — see `frontend/lib/supabase.ts`.
+
+Mock authentication is disabled by default and fails closed. It requires
+*both* `ALLOW_MOCK_AUTH=true` (backend-only; `NEXT_PUBLIC_MOCK_USER` is ignored
+for authorization) *and* an explicit non-production environment marker:
+`NODE_ENV=development|test` or `VERCEL_ENV=development|preview`. Missing or
+unknown deployment metadata (e.g., no `VERCEL_ENV`/`NODE_ENV` on a self-hosted
+public host) is denied even if `ALLOW_MOCK_AUTH` is accidentally copied from a
+local `.env`. Processes marked `VERCEL_ENV=production` or `NODE_ENV=production`
+(whitespace/case-insensitive) refuse mock auth unconditionally. When enabled,
+unauthenticated requests use the shared mock profile, but any present
+`Authorization: Bearer …` header is still fully verified and invalid tokens are
+rejected (401). The frontend `NEXT_PUBLIC_MOCK_USER=true` only controls its own
+mock-user UI state and does not authorize backend requests.
+
+Supported local/test setup:
+
+```bash
+# local dev
+ALLOW_MOCK_AUTH=true NODE_ENV=development uvicorn main:app --reload
+# automated tests / CI
+ALLOW_MOCK_AUTH=true NODE_ENV=test pytest
+```
