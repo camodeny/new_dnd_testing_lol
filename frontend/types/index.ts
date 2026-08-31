@@ -56,8 +56,8 @@ export interface Session {
 }
 
 export interface Message {
-  id: number
-  session_id: number
+  id: number | string
+  session_id: number | string
   role: 'player' | 'dm' | 'system'
   content: string
   created_at: string
