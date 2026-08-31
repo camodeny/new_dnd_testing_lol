@@ -4,6 +4,7 @@ import os
 import pytest
 
 os.environ["ALLOW_MOCK_AUTH"] = "true"
+os.environ["NODE_ENV"] = "test"
 
 from fastapi.testclient import TestClient
 from main import app
@@ -43,7 +44,6 @@ def test_update_name_129_rejected():
         upd = client.put(f"/api/campaigns/{cid}", json={"name": "b" * 129})
         assert upd.status_code == 400
         assert "128" in upd.json().get("detail", "")
-        # ensure original name unchanged
         got = client.get(f"/api/campaigns/{cid}")
         assert got.json()["campaign"]["name"] == name
     finally:
