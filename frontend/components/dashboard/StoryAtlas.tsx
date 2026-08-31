@@ -16,9 +16,14 @@ interface StoryAtlasProps {
   encounterMap: EncounterMap | null
   aiThinking: boolean
   aiThinkingStatus: string
+  activeDmText?: string
+  liveStatus?: 'idle' | 'loading' | 'live' | 'reconnecting' | 'reconciling' | 'error'
+  liveError?: string | null
+  loadingOlderMessages?: boolean
   isOwner: boolean
   onSendMessage: (content: string) => Promise<void>
   onLoadOlderMessages: () => Promise<void>
+  onRetryLiveTable?: () => Promise<unknown>
   onStartSession: () => Promise<void>
   onEncounterMapChange: (map: EncounterMap | null) => void
   onExitToCampaigns: () => void
@@ -42,9 +47,14 @@ export default function StoryAtlas({
   currentCharacter,
   aiThinking,
   aiThinkingStatus,
+  activeDmText = '',
+  liveStatus = 'idle',
+  liveError = null,
+  loadingOlderMessages = false,
   isOwner,
   onSendMessage,
   onLoadOlderMessages,
+  onRetryLiveTable,
   onStartSession,
   onExitToCampaigns,
 }: StoryAtlasProps) {
@@ -53,10 +63,25 @@ export default function StoryAtlas({
   const [sending, setSending] = useState(false)
   const [mobileTab, setMobileTab] = useState<'chat' | 'party'>('chat')
   const messagesEndRef = useRef<HTMLDivElement>(null)
+  const messagesContainerRef = useRef<HTMLDivElement>(null)
+  const lastMessageIdRef = useRef<string | null>(null)
 
   useEffect(() => {
-    messagesEndRef.current?.scrollIntoView({ behavior: 'smooth' })
-  }, [messages.length, aiThinking])
+    const lastMessageId = messages.length ? String(messages[messages.length - 1].id) : null
+    if (lastMessageId !== lastMessageIdRef.current || activeDmText) {
+      messagesEndRef.current?.scrollIntoView({ behavior: lastMessageIdRef.current ? 'smooth' : 'auto' })
+    }
+    lastMessageIdRef.current = lastMessageId
+  }, [messages, aiThinking, activeDmText])
+
+  const handleLoadOlder = async () => {
+    const container = messagesContainerRef.current
+    const previousHeight = container?.scrollHeight ?? 0
+    await onLoadOlderMessages()
+    requestAnimationFrame(() => {
+      if (container) container.scrollTop += container.scrollHeight - previousHeight
+    })
+  }
 
   const handleSend = async () => {
     const content = input.trim()
@@ -153,15 +178,28 @@ export default function StoryAtlas({
             </header>
 
             {/* Messages */}
-            <div className="session-messages" style={{ flex: 1, overflowY: 'auto', padding: '22px clamp(18px, 4.5vw, 72px) 0' }}>
+            <div ref={messagesContainerRef} className="session-messages" style={{ flex: 1, overflowY: 'auto', padding: '22px clamp(18px, 4.5vw, 72px) 0' }}>
+              {(liveStatus === 'reconnecting' || liveStatus === 'reconciling') && (
+                <div role="status" style={{ textAlign: 'center', marginBottom: 12, color: 'var(--text-dim)', fontSize: '0.72rem' }}>
+                  {liveStatus === 'reconciling' ? 'Reconciling with the live table…' : 'Reconnecting to the live table…'}
+                </div>
+              )}
+              {liveError && messages.length > 0 && (
+                <div role="alert" style={{ textAlign: 'center', marginBottom: 12, color: 'var(--ember-hover)', fontSize: '0.72rem' }}>
+                  Live updates are unavailable. Your loaded table is preserved.{onRetryLiveTable && (
+                    <> <button type="button" className="btn btn-secondary small" onClick={() => void onRetryLiveTable()}>Retry</button></>
+                  )}
+                </div>
+              )}
               {hasOlderMessages && (
                 <div style={{ textAlign: 'center', marginBottom: 16 }}>
                   <button
                     type="button"
                     className="btn btn-secondary small"
-                    onClick={onLoadOlderMessages}
+                    onClick={handleLoadOlder}
+                    disabled={loadingOlderMessages}
                   >
-                    Load earlier messages
+                    {loadingOlderMessages ? 'Loading…' : 'Load earlier messages'}
                   </button>
                 </div>
               )}
@@ -214,7 +252,7 @@ export default function StoryAtlas({
                 </div>
               ))}
 
-              {aiThinking && (
+              {(aiThinking || activeDmText) && (
                 <div className="session-msg" style={{ display: 'flex', alignItems: 'flex-start', gap: 12, maxWidth: 900, width: '100%', marginInline: 'auto' }}>
                   <div style={{
                     width: 38, height: 38, borderRadius: '50%', flexShrink: 0,
@@ -224,10 +262,13 @@ export default function StoryAtlas({
                   }}>DM</div>
                   <div style={{ flex: 1, padding: '4px 0' }}>
                     <div style={{ fontWeight: 700, color: 'var(--text-bright)', marginBottom: 4, fontSize: '0.82rem' }}>Dungeon Master</div>
-                    <div style={{ color: 'var(--text-dim)', fontSize: '0.84rem', display: 'flex', alignItems: 'center', gap: 8 }}>
-                      <span className="app-loading-mark" style={{ fontSize: '0.8rem' }}>✦</span>
-                      {aiThinkingStatus || 'Thinking…'}
-                    </div>
+                    {activeDmText && <MarkdownContent content={activeDmText} />}
+                    {aiThinking && (
+                      <div style={{ color: 'var(--text-dim)', fontSize: '0.84rem', display: 'flex', alignItems: 'center', gap: 8 }}>
+                        <span className="app-loading-mark" style={{ fontSize: '0.8rem' }}>✦</span>
+                        {aiThinkingStatus || (activeDmText ? 'Writing…' : 'Thinking…')}
+                      </div>
+                    )}
                   </div>
                 </div>
               )}
