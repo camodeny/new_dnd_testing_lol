@@ -181,7 +181,6 @@ def _fetch_history(
         except ValueError as exc:
             raise ValueError(f"Invalid cursor: {cursor}") from exc
 
-    # Fetch limit+1 to detect has_more
     base_q = select(PlayerSubmission).where(
         PlayerSubmission.campaign_id == campaign_id,
         PlayerSubmission.thread_id == thread_id,
@@ -189,20 +188,16 @@ def _fetch_history(
     if cursor_seq is not None:
         base_q = base_q.where(PlayerSubmission.sequence < cursor_seq)
 
-    # Order DESC to get window, then reverse to ASC for response
     rows = db.execute(
         base_q.order_by(PlayerSubmission.sequence.desc()).limit(limit + 1)
     ).scalars().all()
 
     has_more = len(rows) > limit
-    window = rows[:limit]
-    # window currently DESC; reverse for asc
-    window = list(reversed(window))
+    window = list(reversed(rows[:limit]))
 
     if not window:
         return [], None, False
 
-    # fetch segments for window
     ids = [r.id for r in window]
     segs = db.execute(
         select(PlayerSubmissionSegment).where(
@@ -214,22 +209,7 @@ def _fetch_history(
         by_sub[s.submission_id].append(s)
 
     messages = [r.to_dict(by_sub[r.id]) for r in window]
-
-    next_cursor = None
-    if has_more:
-        # Oldest sequence in window is next cursor
-        smallest = window[0].sequence
-        next_cursor = encode_cursor(smallest)
-    elif cursor_seq is not None and not has_more:
-        # No more older history
-        next_cursor = None
-    # If no cursor and not has_more, also no next_cursor
-    # For consistency, when we had to paginate, the next cursor points to oldest.
-    # Client can use it to fetch older.
-    # If window is empty, no cursor.
-    # For has_more case, next_cursor set. Otherwise None.
-    # Also need to handle case where first page had more — already set.
-
+    next_cursor = encode_cursor(window[0].sequence) if has_more else None
     return messages, next_cursor, has_more
 
 
@@ -242,41 +222,19 @@ def build_live_table_snapshot(
     limit: int | None = None,
     cursor: str | None = None,
 ) -> dict[str, Any]:
-    """Build authoritative live-table snapshot for viewer.
-
-    This is a pure read projection — never mutates campaign revision or
-    inserts outbox/domain events. The shared campaign thread is created once
-    at campaign creation (see `app/campaigns/router.py`), so this read is
-    side-effect-free and retryable.
-
-    All DB reads run in a single REPEATABLE READ snapshot (Postgres) so
-    campaign, threads, history, and reconciliation metadata describe the
-    same point in time even if writers commit between statements. On SQLite
-    (tests) this degrades to the single-connection serializable harness.
-
-    Raises:
-        SnapshotNotFoundError: campaign or thread not found (private threads
-            hidden as 404 when unauthorized).
-        SnapshotAuthorizationError: not authorized to read campaign/thread.
-        ValueError: invalid pagination.
-        SnapshotProjectionError: partial failure (caller should map to 500
-             rather than returning a misleading partial snapshot).
-    """
+    """Build authoritative live-table snapshot for viewer."""
     started = time.monotonic()
-    # Resolve limit early for validation (before entering REPEATABLE READ)
     try:
         resolved_limit = _normalize_limit(limit) if limit is not None else DEFAULT_LIMIT
     except ValueError as exc:
         raise ValueError(str(exc)) from exc
 
-    # Validate pagination cursor early
     if cursor is not None:
         try:
             decode_cursor(cursor)
         except ValueError as exc:
             raise ValueError(str(exc)) from exc
 
-    # Enter consistent snapshot before any DB SELECT in this projection.
     _ensure_repeatable_read(db)
 
     try:
@@ -284,7 +242,6 @@ def build_live_table_snapshot(
         if campaign is None:
             raise SnapshotNotFoundError("Campaign not found")
 
-        # Campaign membership check (owner implicitly member)
         from app.campaigns.service import is_campaign_member
 
         is_member = campaign.owner_id == viewer_id or is_campaign_member(db, campaign_id, viewer_id)
@@ -295,7 +252,6 @@ def build_live_table_snapshot(
             )
             raise SnapshotAuthorizationError("Not a member of this campaign")
 
-        # Resolve thread id without side effects (shared thread must already exist)
         raw_thread = thread_id if thread_id is not None else "main"
         try:
             resolved_tid = _resolve_thread_readonly(db, campaign_id, raw_thread)
@@ -304,40 +260,28 @@ def build_live_table_snapshot(
         except ThreadNotFoundError as exc:
             raise SnapshotNotFoundError(str(exc)) from exc
 
-        # Centralized thread authorization (private threads hidden as 404)
         try:
             from app.runtime.threads import assert_can_read_thread
-
             thread = assert_can_read_thread(db, campaign_id, resolved_tid, viewer_id)
         except ThreadNotFoundError as exc:
-            # Private existence hidden as not found
             raise SnapshotNotFoundError(str(exc)) from exc
         except ThreadAuthorizationError as exc:
-            # Should have been mapped to not found, but defensive
             raise SnapshotAuthorizationError(str(exc)) from exc
 
-        # Revision is authoritative
         revision = int(campaign.revision) if campaign.revision is not None else 0
-
-        # Visible threads for this viewer (hooks for structured surfaces later)
         visible_threads = list_threads_for_user(db, campaign_id, viewer_id)
 
-        # History window (visibility already enforced by thread auth — all messages
-        # in an authorized thread are visible to its members)
         thread_id_str = str(resolved_tid)
         messages, next_cursor, has_more = _fetch_history(
             db, campaign_id, thread_id_str, resolved_limit, cursor
         )
 
-        # High-water mark for reconciliation (max sequence in thread overall)
         high_water = db.scalar(
             select(func.max(PlayerSubmission.sequence)).where(
                 PlayerSubmission.campaign_id == campaign_id,
                 PlayerSubmission.thread_id == thread_id_str,
             )
         )
-        # high_water can be None if no messages
-        # Also count total visible for observability (not returned as full list)
         total_visible = db.scalar(
             select(func.count()).select_from(PlayerSubmission).where(
                 PlayerSubmission.campaign_id == campaign_id,
@@ -345,21 +289,31 @@ def build_live_table_snapshot(
             )
         ) or 0
 
-        # DM stream state — issue #197 durable stream chunks
-        # Completed streams become canonical history; streaming ones are active.
-        # Abandoned/failed are excluded from canonical view but remain auditable via dm_streams API.
+        from app.rolls.service import get_fulfillment
+        from models import PlayerRollRequest
+
+        roll_rows = db.execute(
+            select(PlayerRollRequest).where(
+                PlayerRollRequest.campaign_id == campaign_id,
+                PlayerRollRequest.thread_id == thread_id_str,
+            ).order_by(PlayerRollRequest.requested_at, PlayerRollRequest.id)
+        ).scalars().all()
+        roll_requests: list[dict] = []
+        for roll_row in roll_rows:
+            roll_item = roll_row.to_dict(include_private=campaign.owner_id == viewer_id)
+            fulfillment = get_fulfillment(db, roll_row.id)
+            roll_item["fulfillment"] = fulfillment.to_dict(
+                include_private=campaign.owner_id == viewer_id or roll_row.requested_user_id == viewer_id
+            ) if fulfillment else None
+            roll_requests.append(roll_item)
+
         dm_messages: list[dict] = []
         dm_state: dict[str, Any] = {
-            "status": "idle",
-            "streaming": False,
-            "active_turn": None,
-            "turn_id": None,
-            "started_at": None,
+            "status": "idle", "streaming": False, "active_turn": None,
+            "turn_id": None, "started_at": None,
         }
         try:
             from models import DMStream, DMStreamChunk
-
-            # Active streaming stream (most recent) for this thread
             dm_active = db.execute(
                 select(DMStream)
                 .where(
@@ -379,35 +333,23 @@ def build_live_table_snapshot(
                 ).scalars().all()
                 visible_text = "".join(c.text for c in active_chunks)
                 dm_state = {
-                    "status": "streaming",
-                    "streaming": True,
-                    "active_turn": dm_active.turn_id,
-                    "turn_id": dm_active.turn_id,
-                    "attempt_id": dm_active.attempt_id,
-                    "stream_id": str(dm_active.id),
+                    "status": "streaming", "streaming": True,
+                    "active_turn": dm_active.turn_id, "turn_id": dm_active.turn_id,
+                    "attempt_id": dm_active.attempt_id, "stream_id": str(dm_active.id),
                     "started_at": dm_active.created_at.isoformat() if dm_active.created_at else None,
                     "first_chunk_at": dm_active.first_chunk_at.isoformat() if dm_active.first_chunk_at else None,
                     "last_chunk_at": dm_active.last_chunk_at.isoformat() if dm_active.last_chunk_at else None,
-                    "chunk_count": dm_active.chunk_count,
-                    "total_bytes": dm_active.total_bytes,
-                    "last_sequence": dm_active.last_sequence,
-                    "visible_text": visible_text,
+                    "chunk_count": dm_active.chunk_count, "total_bytes": dm_active.total_bytes,
+                    "last_sequence": dm_active.last_sequence, "visible_text": visible_text,
                     "trace_id": dm_active.trace_id,
                 }
             else:
                 dm_state = {
-                    "status": "idle",
-                    "streaming": False,
-                    "active_turn": None,
-                    "turn_id": None,
-                    "attempt_id": None,
-                    "stream_id": None,
-                    "started_at": None,
-                    "chunk_count": 0,
-                    "visible_text": "",
+                    "status": "idle", "streaming": False, "active_turn": None,
+                    "turn_id": None, "attempt_id": None, "stream_id": None,
+                    "started_at": None, "chunk_count": 0, "visible_text": "",
                 }
 
-            # Completed DM messages (canonical history) — ordered by completion time
             dm_completed_rows = db.execute(
                 select(DMStream)
                 .where(
@@ -419,42 +361,25 @@ def build_live_table_snapshot(
             ).scalars().all()
             dm_messages = []
             for s in dm_completed_rows:
-                # Prefer materialized final_text, fallback to chunk reconstruction
                 if s.final_text is not None:
-                    text = s.final_text
+                    final_text = s.final_text
                 else:
-                    ch = db.execute(
+                    chunks = db.execute(
                         select(DMStreamChunk).where(DMStreamChunk.stream_id == s.id).order_by(DMStreamChunk.sequence.asc())
                     ).scalars().all()
-                    text = "".join(c.text for c in ch)
+                    final_text = "".join(c.text for c in chunks)
                 dm_messages.append({
-                    "id": str(s.id),
-                    "turn_id": s.turn_id,
-                    "attempt_id": s.attempt_id,
-                    "thread_id": str(s.thread_id),
-                    "status": s.status,
-                    "final_text": text,
-                    "chunk_count": s.chunk_count,
+                    "id": str(s.id), "turn_id": s.turn_id, "attempt_id": s.attempt_id,
+                    "thread_id": str(s.thread_id), "status": s.status,
+                    "final_text": final_text, "chunk_count": s.chunk_count,
                     "total_bytes": s.total_bytes,
                     "completed_at": s.completed_at.isoformat() if s.completed_at else None,
                     "created_at": s.created_at.isoformat() if s.created_at else None,
                 })
         except Exception as exc:
-            # DM stream projection must not break snapshot — fail closed is snapshot projection error,
-            # but broken dm_streams should not take down entire snapshot. Log and fallback to idle.
             logger.warning("dm_state projection failed campaign_id=%s thread_id=%s error=%s", campaign_id, thread_id_str, exc)
-            # keep initialized idle dm_state/dm_messages
 
-        # Reconciliation metadata — allows client to fetch snapshot then subscribe
-        # realtime without a gap. The resume token encodes revision + high water.
-        # If high_water is None, resume token is just revision.
         realtime_resume_token = f"{revision}:{high_water or 0}"
-
-        # Cursor for next older fetch
-        history_cursor = next_cursor
-        # The cursor that was used to fetch this window (for client echo)
-        request_cursor = cursor
-
         generated_at = datetime.now(timezone.utc).isoformat()
 
         snapshot: dict[str, Any] = {
@@ -477,7 +402,7 @@ def build_live_table_snapshot(
                 "messages": messages,
                 "pagination": {
                     "limit": resolved_limit,
-                    "cursor": request_cursor,
+                    "cursor": cursor,
                     "next_cursor": next_cursor,
                     "has_more": has_more,
                     "total_visible": total_visible,
@@ -485,15 +410,14 @@ def build_live_table_snapshot(
             },
             "dm_state": dm_state,
             "dm_messages": dm_messages,
-            # Hook for later structured surfaces (combat, shops, etc.)
+            "roll_requests": roll_requests,
             "surfaces": {},
-            # Backward-compatible alias
             "extensions": {},
             "reconciliation": {
                 "snapshot_revision": revision,
                 "snapshot_sequence": revision,
-                "history_cursor": history_cursor,
-                "request_cursor": request_cursor,
+                "history_cursor": next_cursor,
+                "request_cursor": cursor,
                 "history_high_water_mark": high_water,
                 "history_total": total_visible,
                 "realtime_resume_token": realtime_resume_token,
@@ -511,13 +435,11 @@ def build_live_table_snapshot(
             "snapshot built campaign_id=%s viewer_id=%s thread_id=%s revision=%s latency_ms=%.2f payload_bytes=%s message_count=%s has_more=%s",
             campaign_id, viewer_id, thread_id_str, revision, latency_ms, payload_size, len(messages), has_more,
         )
-
         return snapshot
 
     except (SnapshotNotFoundError, SnapshotAuthorizationError, ValueError):
         raise
     except Exception as exc:
-        # Any unexpected error during projection must not return a partial snapshot
         logger.warning(
             "snapshot projection failed campaign_id=%s viewer_id=%s error=%s",
             campaign_id, viewer_id, exc,

@@ -52,18 +52,10 @@ export function useAuth() {
           return
         }
       }
-      // No supabase session — try legacy token flow (back-compat) then mark unauthenticated
-      try {
-        const controller = new AbortController()
-        const timer = setTimeout(() => controller.abort(), 5000)
-        const data = await auth.me(controller.signal)
-        clearTimeout(timer)
-        if (!cancelled) setUser(data.user)
-      } catch {
-        localStorage.removeItem('token')
-        if (!cancelled) setUser(null)
-      } finally {
-        if (!cancelled) setLoading(false)
+      localStorage.removeItem('token')
+      if (!cancelled) {
+        setUser(null)
+        setLoading(false)
       }
     })
 
@@ -90,11 +82,6 @@ export function useAuth() {
       await supabase.auth.signOut()
     } catch {
       // fall through
-    }
-    try {
-      await auth.logout()
-    } catch {
-      // Clear client state even if server request fails.
     }
     localStorage.removeItem('token')
     setUser(null)

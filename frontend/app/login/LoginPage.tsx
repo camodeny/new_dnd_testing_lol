@@ -18,8 +18,6 @@ export default function LoginPage({ onLogin }: LoginPageProps) {
   const [success, setSuccess] = useState('')
   const [loading, setLoading] = useState(false)
   useEffect(() => {
-    let ignore = false
-
     const params = new URLSearchParams(window.location.search)
     const authError = params.get('auth_error')
     if (authError) {
@@ -29,8 +27,6 @@ export default function LoginPage({ onLogin }: LoginPageProps) {
       const nextUrl = `${window.location.pathname}${nextSearch ? `?${nextSearch}` : ''}${window.location.hash}`
       window.history.replaceState({}, '', nextUrl)
     }
-
-    return () => { ignore = true }
   }, [])
 
   const handleSubmit = async (e: React.FormEvent) => {
@@ -81,13 +77,7 @@ export default function LoginPage({ onLogin }: LoginPageProps) {
           onLogin({ id: u.id as unknown as number, username: (u.user_metadata?.username as string) ?? u.email?.split('@')[0] ?? username, email: u.email ?? undefined } as unknown as User)
         }
       } else {
-        // Fallback: backend custom auth (if SUPABASE not configured yet)
-        const { auth } = await import('@/lib/api')
-        const data = isRegistering
-          ? await auth.register(username, password)
-          : await auth.login(username, password)
-        if (data.token) localStorage.setItem('token', data.token)
-        onLogin(data.user)
+        throw new Error('Authentication is not configured. Set the public Supabase URL and key.')
       }
     } catch (err) {
       setError((err as Error).message)

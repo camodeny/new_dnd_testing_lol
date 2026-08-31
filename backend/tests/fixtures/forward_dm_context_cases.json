@@ -1,0 +1,9 @@
+[
+  {"name": "solo", "submission_segments": ["ic"], "expected_inputs": 1},
+  {"name": "multiplayer_mixed_ic_ooc", "submission_segments": ["ic", "ooc", "ic"], "expected_inputs": 2},
+  {"name": "hidden_npc_truth", "lane": "knowledge_visibility", "narration_excludes": "npc-secret"},
+  {"name": "private_audience", "visibility": "private", "expected_included": true},
+  {"name": "post_turn_lag", "lane": "recent_unprocessed_history", "expected_source": "campaign_domain_event"},
+  {"name": "repair_directive", "lane": "repair_directives", "expected_included": true},
+  {"name": "context_budget_pressure", "expected_optional_omission": true}
+]

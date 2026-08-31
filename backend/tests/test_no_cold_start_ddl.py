@@ -50,6 +50,7 @@ def test_lifespan_does_not_trigger_ddl():
         del sys.modules["main"]
     # Allow mock auth so import doesn't need DB
     os.environ["ALLOW_MOCK_AUTH"] = "true"
+    os.environ["NODE_ENV"] = "test"
 
     import main as main_mod
     import database
@@ -81,6 +82,7 @@ def test_concurrent_lifespans_do_not_trigger_ddl():
     if "main" in sys.modules:
         del sys.modules["main"]
     os.environ["ALLOW_MOCK_AUTH"] = "true"
+    os.environ["NODE_ENV"] = "test"
     import main as main_mod
     import database
 
