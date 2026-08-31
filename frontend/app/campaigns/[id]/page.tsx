@@ -1,24 +1,24 @@
 'use client'
 
-import { useEffect, useState, useCallback } from 'react'
+import { useEffect, useState, useCallback, useMemo } from 'react'
 import { useParams, useRouter } from 'next/navigation'
 import { useAuthContext } from '@/contexts/AuthContext'
 import {
   campaigns as campaignsApi,
   campaignMembers,
   sessions as sessionsApi,
-  legacyLiveTable,
   encounterMaps,
+  apiFetch,
 } from '@/lib/api'
+import { useLiveTableRealtime } from '@/hooks/useLiveTableRealtime'
+import { activeDmText, projectLiveTableMessages } from '@/lib/liveTableProjection'
 import Loading from '@/components/common/Loading'
 import ErrorMessage from '@/components/common/ErrorMessage'
 import CampaignLobby from '@/components/dashboard/CampaignLobby'
 import StoryAtlas from '@/components/dashboard/StoryAtlas'
-import type { Campaign, Character, Session, Message, EncounterMap } from '@/types'
+import type { Campaign, Character, Session, EncounterMap } from '@/types'
 
 type CampaignMode = 'lobby' | 'planning' | 'world-building' | 'session'
-
-const SESSION_MESSAGE_PAGE_SIZE = 50
 
 function determineCampaignMode(
   campaign: Campaign & { active_session?: Session | null; world?: unknown },
@@ -37,37 +37,50 @@ export default function CampaignViewPage() {
   const [campaign, setCampaign] = useState<(Campaign & { active_session?: Session | null; world?: unknown; user_id?: string }) | null>(null)
   const [characters, setCharacters] = useState<Character[]>([])
   const [session, setSession] = useState<Session | null>(null)
-  const [messages, setMessages] = useState<Message[]>([])
-  const [hasOlderMessages, setHasOlderMessages] = useState(false)
+  const [activeThreadId, setActiveThreadId] = useState<string | null>(null)
   const [encounterMap, setEncounterMap] = useState<EncounterMap | null>(null)
   const [loading, setLoading] = useState(true)
   const [error, setError] = useState('')
   const [mode, setMode] = useState<CampaignMode | null>(null)
-  const [aiThinking, setAiThinking] = useState(false)
-  const [aiThinkingStatus, setAiThinkingStatus] = useState('')
+
+  const currentCharacter = characters.find((c) => String(c.id) === String((user as { character_id?: number | string } | null)?.character_id)) ?? characters[0] ?? null
+  const liveTable = useLiveTableRealtime({
+    campaignId: id ? String(id) : null,
+    threadId: activeThreadId,
+    enabled: Boolean(session && activeThreadId),
+  })
+  const messages = useMemo(() => projectLiveTableMessages({
+    submissions: liveTable.messages,
+    dmMessages: liveTable.dmMessages,
+    characters,
+    currentUser: user,
+    sessionId: session?.id,
+  }), [liveTable.messages, liveTable.dmMessages, characters, user, session?.id])
+  const streamingDmText = activeDmText(liveTable.dmState, liveTable.dmMessages)
+  const aiThinking = Boolean(liveTable.dmState?.streaming || liveTable.dmStatus?.type === 'dm.thinking')
+  const aiThinkingStatus = typeof liveTable.dmStatus?.status === 'string' ? liveTable.dmStatus.status : ''
 
   const loadData = useCallback(async () => {
     if (!id) return
     try {
-      const [campData, charData] = await Promise.all([
+      const [campData, charData, channelData] = await Promise.all([
         campaignsApi.get(String(id)) as Promise<{ campaign: Campaign & { active_session?: Session | null; user_id?: string } }>,
         campaignMembers.listCharacters(String(id)),
+        apiFetch<{ channels: Array<{ thread_id: string; thread_type: string }> }>(`/campaigns/${id}/realtime/channels`),
       ])
 
       const camp = campData.campaign
       setCampaign(camp)
       setCharacters(charData.characters ?? [])
+      const campaignThread = channelData.channels.find((channel) => channel.thread_type === 'campaign')
+      if (!campaignThread) throw new Error('The campaign live table is not available.')
+      setActiveThreadId(campaignThread.thread_id)
 
       const activeSession = camp.active_session ?? null
 
       if (activeSession) {
         setSession(activeSession)
-        const [sessionData, mapData] = await Promise.all([
-          legacyLiveTable.get(activeSession.id, { limit: SESSION_MESSAGE_PAGE_SIZE }).catch(() => ({ session: null, messages: [] })),
-          encounterMaps.getCurrent(String(id)).catch(() => ({ map: null })),
-        ])
-        setMessages((sessionData as { messages?: Message[] }).messages ?? [])
-        setHasOlderMessages(Boolean((sessionData as { has_more_messages?: boolean }).has_more_messages))
+        const mapData = await encounterMaps.getCurrent(String(id)).catch(() => ({ map: null }))
         setEncounterMap((mapData as { map: EncounterMap | null }).map)
         setMode('session')
       } else {
@@ -84,45 +97,11 @@ export default function CampaignViewPage() {
     loadData()
   }, [loadData])
 
-  // SSE stream for live messages during a session
-  useEffect(() => {
-    if (!session?.id) return
-    const url = legacyLiveTable.streamUrl(session.id)
-    const evtSource = new EventSource(url)
-
-    evtSource.onmessage = (e) => {
-      try {
-        const payload = JSON.parse(e.data)
-        if (payload.type === 'message') {
-          setMessages((prev) => {
-            const exists = prev.some((m) => m.id === payload.message?.id)
-            return exists ? prev : [...prev, payload.message]
-          })
-          setAiThinking(false)
-          setAiThinkingStatus('')
-        } else if (payload.type === 'thinking') {
-          setAiThinking(true)
-          setAiThinkingStatus(payload.status ?? '')
-        } else if (payload.type === 'done') {
-          setAiThinking(false)
-          setAiThinkingStatus('')
-        }
-      } catch { /* non-JSON ping */ }
-    }
-
-    evtSource.onerror = () => {
-      setAiThinking(false)
-    }
-
-    return () => evtSource.close()
-  }, [session?.id])
-
   const handleStartSession = useCallback(async () => {
     if (!id) return
     try {
       const data = await sessionsApi.start(String(id)) as { session: Session }
       setSession(data.session)
-      setMessages([])
       setMode('session')
     } catch (err) {
       setError((err as Error).message)
@@ -130,34 +109,31 @@ export default function CampaignViewPage() {
   }, [id])
 
   const handleSendMessage = useCallback(async (content: string) => {
-    if (!session?.id) return
+    if (!id || !session?.id || !activeThreadId) return
     try {
-      await legacyLiveTable.sendMessage(session.id, content)
+      const idempotencyKey =
+        typeof crypto !== 'undefined' && typeof crypto.randomUUID === 'function'
+          ? crypto.randomUUID()
+          : `${Date.now()}-${Math.random().toString(36).slice(2)}`
+      await apiFetch(`/campaigns/${id}/submissions`, {
+        method: 'POST',
+        headers: { 'Idempotency-Key': idempotencyKey },
+        body: JSON.stringify({
+          content,
+          thread_id: activeThreadId,
+          character_id: currentCharacter?.id ?? null,
+        }),
+      })
+      await liveTable.refresh()
     } catch (err) {
       setError((err as Error).message)
+      throw err
     }
-  }, [session?.id])
+  }, [id, session?.id, activeThreadId, currentCharacter?.id, liveTable.refresh])
 
   const handleLoadOlderMessages = useCallback(async () => {
-    if (!session?.id || !hasOlderMessages) return
-    const oldest = messages[0]
-    if (!oldest) return
-    try {
-      const data = await legacyLiveTable.getMessages(session.id, {
-        limit: SESSION_MESSAGE_PAGE_SIZE,
-        beforeId: Number(oldest.id),
-      })
-      const older = (data as { messages?: Message[] }).messages ?? []
-      if (older.length) {
-        setMessages((prev) => {
-          const existing = new Set(prev.map((m) => m.id))
-          return [...older.filter((m) => !existing.has(m.id)), ...prev]
-        })
-      }
-    } catch (err) {
-      setError((err as Error).message)
-    }
-  }, [session?.id, hasOlderMessages, messages])
+    await liveTable.loadOlder()
+  }, [liveTable])
 
   // Genuine solo campaigns (required_players <= 1) skip the multiplayer holding page
   // Must be before any early returns to preserve hook order
@@ -174,7 +150,6 @@ export default function CampaignViewPage() {
   if (!campaign) return <ErrorMessage message="Campaign not found." />
 
   const isOwner = (campaign.owner_id ?? campaign.user_id) === user?.id
-  const currentCharacter = characters.find((c) => String(c.id) === String((user as { character_id?: number | string } | null)?.character_id)) ?? characters[0] ?? null
 
   if (mode === 'lobby') {
     return (
@@ -281,36 +256,58 @@ export default function CampaignViewPage() {
     )
   }
 
+  const liveError = liveTable.error
+  const liveStatus = liveTable.phase
+  const showTableLoadError = !liveTable.hasSnapshot && liveTable.phase === 'error' && !!liveError
+  const combinedError = showTableLoadError ? liveError! : error
+
   return (
     <>
-      {error && (
+      {combinedError && (
         <div style={{
           position: 'fixed', top: 14, left: '50%', transform: 'translateX(-50%)',
           zIndex: 1200, width: 'min(540px, calc(100% - 32px))', margin: 0,
           borderColor: 'rgba(209, 107, 72, 0.36)', background: 'rgba(55, 29, 24, 0.96)',
           color: '#f4c6b6', boxShadow: '0 18px 44px rgba(0, 0, 0, 0.32)',
         }} className="error-message">
-          {error}
+          {combinedError}
+          {showTableLoadError && (
+            <> <button type="button" className="btn btn-secondary small" onClick={() => void liveTable.refresh()} style={{ marginLeft: 8 }}>Retry</button></>
+          )}
         </div>
       )}
-      <StoryAtlas
-        campaign={campaign}
-        characters={characters}
-        session={session}
-        messages={messages}
-        hasOlderMessages={hasOlderMessages}
-        currentUser={user}
-        currentCharacter={currentCharacter}
-        encounterMap={encounterMap}
-        aiThinking={aiThinking}
-        aiThinkingStatus={aiThinkingStatus}
-        isOwner={isOwner}
-        onSendMessage={handleSendMessage}
-        onLoadOlderMessages={handleLoadOlderMessages}
-        onStartSession={handleStartSession}
-        onEncounterMapChange={setEncounterMap}
-        onExitToCampaigns={() => router.push('/')}
-      />
+      {showTableLoadError && liveTable.hasSnapshot === false ? (
+        <div style={{ display: 'grid', placeItems: 'center', minHeight: '60vh', padding: 32, textAlign: 'center' }}>
+          <div>
+            <p style={{ color: 'var(--text-dim)', marginBottom: 16 }}>Live table failed to load.</p>
+            <button type="button" className="btn btn-primary" onClick={() => void liveTable.refresh()}>Retry</button>
+          </div>
+        </div>
+      ) : (
+        <StoryAtlas
+          campaign={campaign}
+          characters={characters}
+          session={session}
+          messages={messages}
+          hasOlderMessages={liveTable.hasOlderMessages}
+          currentUser={user}
+          currentCharacter={currentCharacter}
+          encounterMap={encounterMap}
+          aiThinking={aiThinking}
+          aiThinkingStatus={aiThinkingStatus}
+          activeDmText={streamingDmText}
+          liveStatus={liveStatus}
+          liveError={liveError}
+          loadingOlderMessages={liveTable.loadingOlder}
+          isOwner={isOwner}
+          onSendMessage={handleSendMessage}
+          onLoadOlderMessages={handleLoadOlderMessages}
+          onRetryLiveTable={liveTable.refresh}
+          onStartSession={handleStartSession}
+          onEncounterMapChange={setEncounterMap}
+          onExitToCampaigns={() => router.push('/')}
+        />
+      )}
     </>
   )
 }

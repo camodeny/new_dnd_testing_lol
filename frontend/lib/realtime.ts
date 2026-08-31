@@ -111,6 +111,7 @@ export interface DmMessageForRealtime {
   final_text: string
   status: string
   completed_at?: string | null
+  created_at?: string | null
   [key: string]: unknown
 }
 
@@ -119,7 +120,25 @@ export interface SnapshotForRealtime {
   reconciliation?: SnapshotReconciliation
   dm_state?: DmStateForRealtime | null
   dm_messages?: DmMessageForRealtime[]
-  history?: { messages?: Array<{ id: string; sequence: number; raw_content?: string; thread_id?: string; segments?: unknown[] }> }
+  history?: {
+    messages?: Array<{
+      id: string
+      sequence: number
+      raw_content?: string
+      thread_id?: string
+      user_id?: string
+      character_id?: string | null
+      accepted_at?: string | null
+      segments?: unknown[]
+    }>
+    pagination?: {
+      limit?: number
+      cursor?: string | null
+      next_cursor?: string | null
+      has_more?: boolean
+      total_visible?: number
+    }
+  }
   active_thread_id?: string
   campaign?: { id: string; revision: number }
 }

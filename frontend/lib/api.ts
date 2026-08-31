@@ -70,11 +70,6 @@ export async function apiFetch<T = unknown>(
   return data as T
 }
 
-function getStreamUrl(path: string): string {
-  const token = getToken()
-  return `${API_BASE}${path}?token=${encodeURIComponent(token ?? '')}`
-}
-
 // ── Auth ─────────────────────────────────────────────────────────────────
 
 export const auth = {
@@ -176,33 +171,6 @@ export const sessions = {
     apiFetch<{ session: import('@/types').Session }>(`/campaigns/${campaignId}/sessions`, {
       method: 'POST',
     }),
-}
-
-// The current campaign page still reads the pre-modular live-table contract.
-// Keep those calls explicit until that page moves to snapshots, submissions, and realtime.
-export const legacyLiveTable = {
-  get: (sessionId: number, opts: { limit?: number; beforeId?: number } = {}) => {
-    const params = new URLSearchParams()
-    if (opts.limit) params.set('limit', String(opts.limit))
-    if (opts.beforeId) params.set('before_id', String(opts.beforeId))
-    const qs = params.toString() ? `?${params}` : ''
-    return apiFetch<{ session: import('@/types').Session; messages: import('@/types').Message[] }>(
-      `/sessions/${sessionId}${qs}`,
-    )
-  },
-  streamUrl: (sessionId: number) => getStreamUrl(`/sessions/${sessionId}/stream`),
-  sendMessage: (sessionId: number, content: string, role = 'player') =>
-    apiFetch(`/sessions/${sessionId}/messages`, {
-      method: 'POST',
-      body: JSON.stringify({ content, role }),
-    }),
-  getMessages: (sessionId: number, opts: { limit?: number; beforeId?: number } = {}) => {
-    const params = new URLSearchParams()
-    if (opts.limit) params.set('limit', String(opts.limit))
-    if (opts.beforeId) params.set('before_id', String(opts.beforeId))
-    const qs = params.toString() ? `?${params}` : ''
-    return apiFetch<{ messages: import('@/types').Message[] }>(`/sessions/${sessionId}/messages${qs}`)
-  },
 }
 
 // ── World ───────────────────────────────────────────────────────────────────

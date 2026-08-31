@@ -103,7 +103,7 @@ describe('apiFetch error contract', () => {
 })
 
 describe('exported API surface', () => {
-  it('only exposes registered production groups plus isolated live-table compatibility calls', () => {
+  it('only exposes registered production groups', () => {
     expect(Object.keys(api).sort()).toEqual([
       'apiFetch',
       'auth',
@@ -111,7 +111,6 @@ describe('exported API surface', () => {
       'campaigns',
       'characters',
       'encounterMaps',
-      'legacyLiveTable',
       'sessions',
       'world',
     ])
@@ -144,12 +143,6 @@ describe('exported API surface', () => {
     expect(Object.keys(api.sessions)).toEqual(['start'])
     expect(Object.keys(api.world)).toEqual(['get'])
     expect(Object.keys(api.encounterMaps)).toEqual(['getCurrent'])
-    expect(Object.keys(api.legacyLiveTable).sort()).toEqual([
-      'get',
-      'getMessages',
-      'sendMessage',
-      'streamUrl',
-    ])
   })
 
   it('does not expose removed legacy groups or blob transport', () => {
@@ -164,5 +157,6 @@ describe('exported API surface', () => {
     expect(keys).not.toContain('dev')
     expect(keys).not.toContain('apiBlob')
     expect(keys).not.toContain('getStreamUrl')
+    expect(keys).not.toContain('legacyLiveTable')
   })
 })
