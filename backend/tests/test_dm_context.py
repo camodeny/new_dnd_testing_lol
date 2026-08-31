@@ -142,6 +142,19 @@ def _fixture(name):
     return next(case for case in FIXTURES if case["name"] == name)
 
 
+def _not_applicable_for_empty_stub() -> dict[LaneName, str]:
+    # Until scene/knowledge/clock/canon/combat readers land, fixtures must
+    # explicitly declare those required lanes not_applicable per #202 boundary.
+    return {
+        LaneName.CURRENT_SCENE: "not_applicable",
+        LaneName.KNOWLEDGE_VISIBILITY: "not_applicable",
+        LaneName.CLOCKS_PRESSURES: "not_applicable",
+        LaneName.COMBAT_HOOKS: "not_applicable",
+        LaneName.RELEVANT_CANON: "not_applicable",
+        LaneName.REPAIR_DIRECTIVES: "not_applicable",
+    }
+
+
 def test_solo_fixture_builds_all_named_lanes_and_protected_pc_authority():
     case = _fixture("solo")
     factory, campaign_id, owner, _other, thread_id = _campaign()
@@ -159,7 +172,9 @@ def test_solo_fixture_builds_all_named_lanes_and_protected_pc_authority():
     db.commit()
     _turn, attempt = coordinate_turn(db, campaign_id, thread_id)
 
-    packet = assemble_attempt_context(db, attempt.id)
+    packet = assemble_attempt_context(
+        db, attempt.id, supplemental_status=_not_applicable_for_empty_stub()
+    )
 
     assert [lane.name for lane in packet.lanes] == list(LANE_ORDER)
     inputs = next(lane for lane in packet.lanes if lane.name == LaneName.PLAYER_INPUTS)
@@ -207,7 +222,9 @@ def test_multiplayer_fixture_preserves_exact_mixed_ic_ooc_segments():
     db.commit()
     _turn, attempt = coordinate_turn(db, campaign_id, thread_id)
 
-    packet = assemble_attempt_context(db, attempt.id)
+    packet = assemble_attempt_context(
+        db, attempt.id, supplemental_status=_not_applicable_for_empty_stub()
+    )
     inputs = next(lane for lane in packet.lanes if lane.name == LaneName.PLAYER_INPUTS)
 
     assert len(inputs.records) == case["expected_inputs"]
@@ -337,7 +354,9 @@ def test_post_turn_lag_fixture_keeps_recent_committed_event_directly_available()
     db.commit()
     _turn, attempt = coordinate_turn(db, campaign_id, thread_id)
 
-    packet = assemble_attempt_context(db, attempt.id)
+    packet = assemble_attempt_context(
+        db, attempt.id, supplemental_status=_not_applicable_for_empty_stub()
+    )
     history = next(lane for lane in packet.lanes if lane.name.value == case["lane"])
 
     assert history.records[-1].value["event_id"] == str(event.id)
@@ -463,6 +482,147 @@ def test_required_unavailable_lane_and_stale_attempt_fail_instead_of_guessing():
     db.commit()
     with pytest.raises(MissingAuthoritativeContextError, match="stale"):
         assemble_attempt_context(db, attempt.id)
+
+
+def test_user_scoped_record_does_not_broaden_to_campaign_audience():
+    # Regression for #202 blocker: a record scoped to only A must not be
+    # accepted for a campaign audience [A,B]; _authorized must require subset,
+    # not mere intersection, otherwise shared narration broadens authority.
+    campaign_id, thread_id = str(uuid.uuid4()), str(uuid.uuid4())
+    user_a, user_b = str(uuid.uuid4()), str(uuid.uuid4())
+    scoped = _record(
+        "scoped-to-a",
+        campaign_id=campaign_id,
+        visibility="campaign",
+        user_ids=[user_a],
+        value={"text": "secret for A"},
+    )
+    # Campaign audience includes both A and B.
+    packet = assemble_context_packet(
+        audience=ContextAudience(
+            campaign_id=campaign_id,
+            thread_id=thread_id,
+            audience="campaign",
+            user_ids=[user_a, user_b],
+        ),
+        records={**_empty_records(), LaneName.RELEVANT_CANON: [scoped]},
+    )
+    canon = next(lane for lane in packet.lanes if lane.name == LaneName.RELEVANT_CANON)
+    assert canon.records == []
+    assert any(
+        d.record_id == "scoped-to-a"
+        and d.reason == "not_authorized_for_attempt_audience"
+        for d in packet.observability.budget_decisions
+    )
+    assert "scoped-to-a" not in packet.serialize_for_adjudication()
+    assert "scoped-to-a" not in packet.serialize_for_narration()
+    # Same record *is* authorized when audience is exactly the authorized user.
+    private_packet = assemble_context_packet(
+        audience=ContextAudience(
+            campaign_id=campaign_id,
+            thread_id=thread_id,
+            audience="campaign",
+            user_ids=[user_a],
+        ),
+        records={**_empty_records(), LaneName.RELEVANT_CANON: [scoped]},
+    )
+    canon2 = next(
+        lane for lane in private_packet.lanes if lane.name == LaneName.RELEVANT_CANON
+    )
+    assert len(canon2.records) == 1
+    # Required variant must fail closed, not silently broaden.
+    with pytest.raises(ContextAuthorizationError):
+        assemble_context_packet(
+            audience=ContextAudience(
+                campaign_id=campaign_id,
+                thread_id=thread_id,
+                audience="campaign",
+                user_ids=[user_a, user_b],
+            ),
+            records={
+                **_empty_records(),
+                LaneName.RELEVANT_CANON: [scoped.model_copy(update={"required": True})],
+            },
+        )
+
+
+def test_required_empty_lane_fails_closed_unless_explicit_not_applicable():
+    factory, campaign_id, owner, _other, thread_id = _campaign()
+    db = factory()
+    character = _add_character(db, owner)
+    accept_submission(
+        db,
+        campaign_id=campaign_id,
+        user_id=owner,
+        character_id=character.id,
+        raw_content="I go",
+        segments=[{"type": "ic", "text": "I go"}],
+        thread_id=thread_id,
+    )
+    db.commit()
+    _turn, attempt = coordinate_turn(db, campaign_id, thread_id)
+    # Without explicit not_applicable, empty required lanes (current_scene etc.)
+    # must be unavailable and assemble_attempt_context must fail closed.
+    with pytest.raises(MissingAuthoritativeContextError) as exc_info:
+        assemble_attempt_context(db, attempt.id)
+    assert "current_scene" in str(exc_info.value) or "knowledge_visibility" in str(
+        exc_info.value
+    )
+    # Explicit not_applicable adapter evidence allows success.
+    packet = assemble_attempt_context(
+        db, attempt.id, supplemental_status=_not_applicable_for_empty_stub()
+    )
+    assert packet.lanes[0].name == LaneName.TURN_IDENTITY
+
+
+def test_deterministic_serialization_is_stable_across_input_order():
+    campaign_id, thread_id = str(uuid.uuid4()), str(uuid.uuid4())
+    audience = ContextAudience(
+        campaign_id=campaign_id,
+        thread_id=thread_id,
+        audience="campaign",
+        user_ids=[str(uuid.uuid4())],
+    )
+    rec_a = _record("a", campaign_id=campaign_id, priority=10, value={"n": 1})
+    rec_b = _record("b", campaign_id=campaign_id, priority=90, value={"n": 2})
+    packet1 = assemble_context_packet(
+        audience=audience,
+        records={**_empty_records(), LaneName.RELEVANT_CANON: [rec_a, rec_b]},
+    )
+    packet2 = assemble_context_packet(
+        audience=audience,
+        records={**_empty_records(), LaneName.RELEVANT_CANON: [rec_b, rec_a]},
+    )
+    assert packet1.serialize_for_adjudication() == packet2.serialize_for_adjudication()
+    # Lane order is canonical regardless of dict insertion order.
+    assert [lane.name for lane in packet1.lanes] == list(LANE_ORDER)
+
+
+def test_optional_lane_failure_is_traceable_via_source_errors():
+    campaign_id, thread_id = str(uuid.uuid4()), str(uuid.uuid4())
+    audience = ContextAudience(
+        campaign_id=campaign_id,
+        thread_id=thread_id,
+        audience="campaign",
+        user_ids=[str(uuid.uuid4())],
+    )
+    packet = assemble_context_packet(
+        audience=audience,
+        records=_empty_records(),
+        lane_status={LaneName.COMBAT_HOOKS: "unavailable"},
+        source_errors={LaneName.COMBAT_HOOKS: ["combat reader timeout"]},
+    )
+    lane = next(item for item in packet.lanes if item.name == LaneName.COMBAT_HOOKS)
+    assert lane.authority_status == "unavailable"
+    assert lane.source_errors == ["combat reader timeout"]
+    # Required lane with same status must fail closed.
+    with pytest.raises(MissingAuthoritativeContextError):
+        assemble_context_packet(
+            audience=audience,
+            records=_empty_records(),
+            lane_status={LaneName.CURRENT_SCENE: "unavailable"},
+            source_errors={LaneName.CURRENT_SCENE: ["scene reader timeout"]},
+        )
 
 
 def test_fixture_manifest_covers_every_required_issue_case():

@@ -307,7 +307,7 @@ def _authorized(record: ContextRecord, audience: ContextAudience) -> bool:
         return False
     if scope.thread_ids and audience.thread_id not in scope.thread_ids:
         return False
-    if scope.user_ids and not set(scope.user_ids).intersection(audience.user_ids):
+    if scope.user_ids and not set(audience.user_ids).issubset(set(scope.user_ids)):
         return False
     if record.visibility == "private" and audience.audience != "private":
         return False
@@ -971,19 +971,99 @@ def assemble_attempt_context(
             )
     timings[LaneName.RECENT_HISTORY] = (time.monotonic() - lane_started) * 1000
 
+    # Populate authoritative campaign-level lanes directly from the campaign row.
+    # These are read-only authoritative sources for difficulty / content boundaries;
+    # adapters may still supply supplemental records, but the campaign row is the
+    # source of truth when the columns exist (sequenced after #306 / #240).
+    lane_started = time.monotonic()
+    difficulty = getattr(campaign, "difficulty", None)
+    # Only emit difficulty when the campaign actually carries it; otherwise leave
+    # the lane empty so the required-lane fail-closed logic can surface missing
+    # authority unless an adapter explicitly marks it not_applicable.
+    if difficulty not in (None, ""):
+        records[LaneName.DIFFICULTY].append(
+            ContextRecord(
+                record_id=f"campaign-difficulty:{campaign.id}",
+                required=False,
+                priority=90,
+                value={"difficulty": str(difficulty)},
+                sources=[
+                    _source(
+                        "campaign",
+                        campaign.id,
+                        campaign.revision,
+                        campaign.revision,
+                        field="difficulty",
+                    )
+                ],
+                authorization=scope,
+            )
+        )
+    timings[LaneName.DIFFICULTY] = (time.monotonic() - lane_started) * 1000
+
+    lane_started = time.monotonic()
+    content_boundaries: Any | None = getattr(campaign, "content_boundaries", None)
+    if content_boundaries is not None:
+        # Normalize None vs empty dict/list; structural JSON already validated by
+        # campaign lifecycle (#240) so we just project it here with provenance.
+        records[LaneName.CONTENT_BOUNDARIES].append(
+            ContextRecord(
+                record_id=f"campaign-content-boundaries:{campaign.id}",
+                required=True,
+                priority=90,
+                value={"content_boundaries": content_boundaries},
+                sources=[
+                    _source(
+                        "campaign",
+                        campaign.id,
+                        campaign.revision,
+                        campaign.revision,
+                        field="content_boundaries",
+                    )
+                ],
+                authorization=scope,
+            )
+        )
+    timings[LaneName.CONTENT_BOUNDARIES] = (time.monotonic() - lane_started) * 1000
+
     supplemental_records = supplemental_records or {}
     for key, values in supplemental_records.items():
         name = key if isinstance(key, LaneName) else LaneName(key)
         records[name].extend(list(values))
 
-    # Empty required lanes mean the concept is explicitly not applicable to this
-    # campaign/attempt, rather than silently missing. Adapters can override this.
+    # Required lanes must fail closed when no authoritative source produced a
+    # record.  A genuinely inapplicable concept must be explicitly declared via
+    # supplemental_status (adapter evidence), not silently defaulted.
     statuses: dict[
         LaneName, Literal["authoritative", "not_applicable", "unavailable"]
     ] = {name: "authoritative" for name in LANE_ORDER}
     for name in REQUIRED_LANES:
         if not records[name]:
-            statuses[name] = "not_applicable"
+            statuses[name] = "unavailable"
+    # Protected-PC lanes are only required when a submission actually references
+    # a character. When no PC is relevant the lane is explicitly not applicable,
+    # not missing authority -- this matches the "when relevant" wording of #202.
+    if not character_ids:
+        for pc_lane in (
+            LaneName.PROTECTED_PCS,
+            LaneName.CHARACTER_STATE,
+            LaneName.RULESET_IDENTITY,
+        ):
+            if not records[pc_lane] and pc_lane not in (supplemental_status or {}):
+                statuses[pc_lane] = "not_applicable"
+    # Legacy schema compat: before #240 / #306 the campaigns table has no
+    # content_boundaries/difficulty columns. In that schema the content-boundary
+    # lane is legitimately not applicable rather than missing authority; treat
+    # it as explicit not_applicable when the column is absent and the caller
+    # did not declare a status. This keeps existing fixtures green while
+    # preserving fail-closed for new-schema deployments.
+    if not hasattr(Campaign, "content_boundaries"):
+        if LaneName.CONTENT_BOUNDARIES not in (supplemental_status or {}):
+            statuses[LaneName.CONTENT_BOUNDARIES] = "not_applicable"
+    if not hasattr(Campaign, "difficulty"):
+        if LaneName.DIFFICULTY not in (supplemental_status or {}):
+            # difficulty is not required, but keep status authoritative with zero records
+            statuses[LaneName.DIFFICULTY] = "not_applicable"
     for key, value in (supplemental_status or {}).items():
         statuses[key if isinstance(key, LaneName) else LaneName(key)] = value
 
