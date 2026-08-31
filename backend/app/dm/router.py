@@ -100,7 +100,10 @@ def get_dm_turn(campaign_id: str, turn_id: str, request: Request, db: Session = 
     attempts = db.execute(
         select(DmTurnAttempt).where(DmTurnAttempt.turn_id == tid).order_by(DmTurnAttempt.attempt_number)
     ).scalars().all()
-    return {"turn": turn.to_dict(), "attempts": [a.to_dict() for a in attempts]}
+    return {
+        "turn": turn.to_dict(),
+        "attempts": [a.to_dict(include_private_roll_evidence=campaign.owner_id == profile.id) for a in attempts],
+    }
 
 
 @router.post("/api/campaigns/{campaign_id}/dm-turns/{turn_id}/streaming")
