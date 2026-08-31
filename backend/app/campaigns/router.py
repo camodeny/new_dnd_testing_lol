@@ -1,8 +1,9 @@
 """Campaigns transport — APIRouter. Depends on service layer for domain logic."""
+import logging
 import uuid as uuid_lib
 
 from fastapi import APIRouter, Depends, HTTPException, Request, Response
-from sqlalchemy import select
+from sqlalchemy import delete, func, select
 from sqlalchemy.orm import Session
 
 from app.campaigns.events import (
@@ -18,14 +19,60 @@ from app.campaigns.service import (
     parse_campaign_id,
     random_brief,
     validate_campaign_name,
+    validate_content_boundaries,
+    validate_difficulty,
+    validate_lifecycle_transition,
+    validate_optional_text,
     validate_seed,
 )
 from app.deps.auth import resolve_profile
 from app.deps.idempotency import execute_http_idempotent, require_idempotency_key
 from database import get_db
-from models import Campaign, CampaignInvite, CampaignMember, Profile
+from models import (
+    Campaign,
+    CampaignInvite,
+    CampaignMember,
+    CampaignThread,
+    CampaignThreadMember,
+    Profile,
+)
 
 router = APIRouter()
+logger = logging.getLogger(__name__)
+
+
+def _expected_revision(payload: dict) -> int:
+    if "expected_revision" not in payload:
+        raise HTTPException(status_code=400, detail="expected_revision is required")
+    try:
+        revision = int(payload["expected_revision"])
+    except (TypeError, ValueError):
+        raise HTTPException(status_code=400, detail="expected_revision must be an integer")
+    if revision < 0:
+        raise HTTPException(status_code=400, detail="expected_revision must be a non-negative integer")
+    return revision
+
+
+def _validated_setup(payload: dict, *, creation: bool = False) -> dict:
+    changes = {}
+    try:
+        if creation or "required_players" in payload or "requiredPlayers" in payload:
+            raw = payload.get("required_players", payload.get("requiredPlayers"))
+            changes["required_players"] = normalize_required_players(raw)
+        if creation or "loot_mode" in payload or "lootMode" in payload:
+            raw = payload.get("loot_mode", payload.get("lootMode"))
+            changes["loot_mode"] = normalize_loot_mode(raw)
+        if creation or "difficulty" in payload:
+            changes["difficulty"] = validate_difficulty(payload.get("difficulty"))
+        if "theme" in payload:
+            changes["theme"] = validate_optional_text(payload.get("theme"), field="Theme", max_length=128)
+        if "brief" in payload:
+            changes["brief"] = validate_optional_text(payload.get("brief"), field="Brief", max_length=4000)
+        if creation or "content_boundaries" in payload:
+            changes["content_boundaries"] = validate_content_boundaries(payload.get("content_boundaries"))
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    return changes
 
 
 @router.get("/api/campaigns")
@@ -50,15 +97,13 @@ def create_campaign(payload: dict, request: Request, db: Session = Depends(get_d
         random_seed = validate_seed(payload.get("random_seed") or payload.get("seed"))
     except ValueError as e:
         raise HTTPException(status_code=400, detail=str(e))
-    required_players = normalize_required_players(payload.get("required_players") or payload.get("requiredPlayers"))
-    loot_mode = normalize_loot_mode(payload.get("loot_mode") or payload.get("lootMode"))
+    setup = _validated_setup(payload, creation=True)
     camp = Campaign(
         owner_id=profile.id,
         name=name,
         description=description,
         random_seed=random_seed,
-        required_players=required_players,
-        loot_mode=loot_mode,
+        **setup,
     )
     db.add(camp)
     db.flush()
@@ -95,18 +140,13 @@ def random_campaign_brief(payload: dict, request: Request, db: Session = Depends
 def quick_create_campaign(payload: dict, request: Request, db: Session = Depends(get_db)):
     profile = resolve_profile(request, db)
     brief = random_brief()
-    required_players = normalize_required_players(payload.get("required_players"))
-    # Preserve previous behavior: keep any supplied string verbatim, only default
-    # when missing. Normalization of unknown values to frequent_gamble is only
-    # for the main create path, not quick-create (behavior-preserving refactor).
-    loot_mode = str(payload.get("loot_mode") or "frequent_gamble")
+    setup = _validated_setup(payload, creation=True)
     camp = Campaign(
         owner_id=profile.id,
         name=brief["name"],
         description=brief["description"],
         random_seed=brief["random_seed"],
-        required_players=required_players,
-        loot_mode=loot_mode,
+        **setup,
     )
     db.add(camp)
     db.flush()
@@ -180,7 +220,7 @@ def update_campaign(
         raise HTTPException(status_code=404, detail="Campaign not found")
     if camp.owner_id != profile.id:
         raise HTTPException(status_code=403, detail="Only owner can update")
-    changes = {}
+    changes = _validated_setup(payload)
     if "name" in payload and payload["name"] is not None:
         try:
             changes["name"] = validate_campaign_name(str(payload["name"]))
@@ -193,16 +233,28 @@ def update_campaign(
             changes["random_seed"] = validate_seed(payload.get("random_seed") or payload.get("seed") or "")
         except ValueError as e:
             raise HTTPException(status_code=400, detail=str(e))
-    if "expected_revision" not in payload:
-        raise HTTPException(status_code=400, detail="expected_revision is required")
-    try:
-        expected_revision = int(payload["expected_revision"])
-    except (TypeError, ValueError):
-        raise HTTPException(status_code=400, detail="expected_revision must be an integer")
+    expected_revision = _expected_revision(payload)
+    if not changes:
+        raise HTTPException(status_code=400, detail="At least one campaign setting is required")
     operation_id = str(payload.get("operation_id") or "").strip() or None
     idempotency_key = require_idempotency_key(request, operation_id)
 
     def _mutate(campaign: Campaign):
+        if campaign.status != "lobby":
+            logger.warning(
+                "campaign settings lock rejection campaign_id=%s actor_id=%s status=%s",
+                campaign.id, profile.id, campaign.status,
+            )
+            raise HTTPException(status_code=409, detail="Campaign settings are locked after the lobby")
+        if "required_players" in changes:
+            member_count = db.scalar(
+                select(func.count()).select_from(CampaignMember).where(CampaignMember.campaign_id == campaign.id)
+            ) or 0
+            if changes["required_players"] < member_count:
+                raise HTTPException(
+                    status_code=409,
+                    detail="Required players cannot be lower than current membership; remove members first",
+                )
         for field, value in changes.items():
             setattr(campaign, field, value)
 
@@ -238,6 +290,89 @@ def update_campaign(
             detail=str(e),
             headers={"X-Current-Revision": str(e.actual_revision)},
         )
+
+
+@router.post("/api/campaigns/{campaign_id}/lifecycle")
+def transition_campaign_lifecycle(
+    campaign_id: str,
+    payload: dict,
+    request: Request,
+    response: Response,
+    db: Session = Depends(get_db),
+):
+    profile = resolve_profile(request, db)
+    try:
+        cid = parse_campaign_id(campaign_id)
+    except ValueError:
+        raise HTTPException(status_code=404, detail="Invalid campaign id")
+    campaign = db.get(Campaign, cid)
+    if not campaign:
+        raise HTTPException(status_code=404, detail="Campaign not found")
+    if campaign.owner_id != profile.id:
+        raise HTTPException(status_code=403, detail="Only owner can change campaign lifecycle")
+    expected_revision = _expected_revision(payload)
+    operation_id = str(payload.get("operation_id") or "").strip() or None
+    idempotency_key = require_idempotency_key(request, operation_id)
+    target_raw = payload.get("status")
+
+    def _mutate(locked: Campaign):
+        try:
+            target = validate_lifecycle_transition(locked.status, target_raw)
+        except ValueError as exc:
+            logger.warning(
+                "campaign lifecycle transition rejected campaign_id=%s actor_id=%s from=%s to=%s",
+                locked.id, profile.id, locked.status, target_raw,
+            )
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
+        if target == "starting":
+            member_count = db.scalar(
+                select(func.count()).select_from(CampaignMember).where(CampaignMember.campaign_id == locked.id)
+            ) or 0
+            if member_count < locked.required_players:
+                raise HTTPException(
+                    status_code=409,
+                    detail=f"Campaign requires {locked.required_players} members before starting",
+                )
+        locked.status = target
+
+    def _execute():
+        current = db.get(Campaign, cid)
+        target = str(target_raw or "").strip().lower()
+        campaign_after, event = commit_campaign_mutation(
+            db,
+            cid,
+            expected_revision,
+            event_type=f"campaign.lifecycle.{target or 'invalid'}",
+            operation_id=operation_id or idempotency_key,
+            actor_id=profile.id,
+            payload={"from": current.status if current else None, "to": target},
+            mutate=_mutate,
+            commit=False,
+        )
+        logger.info(
+            "campaign lifecycle transitioned campaign_id=%s actor_id=%s status=%s revision=%s",
+            cid, profile.id, campaign_after.status, campaign_after.revision,
+        )
+        return {"campaign": campaign_after.to_dict(), "event": event.to_dict()}
+
+    try:
+        return execute_http_idempotent(
+            db,
+            response,
+            actor_id=profile.id,
+            idempotency_key=idempotency_key,
+            command_type="campaign.lifecycle.transition",
+            scope_type="campaign",
+            scope_id=cid,
+            payload=payload,
+            execute=_execute,
+        )
+    except RevisionConflictError as exc:
+        raise HTTPException(
+            status_code=409,
+            detail=str(exc),
+            headers={"X-Current-Revision": str(exc.actual_revision)},
+        ) from exc
 
 
 @router.post("/api/campaigns/{campaign_id}/mutations")
@@ -280,6 +415,8 @@ def commit_campaign_mutation_endpoint(
     def _mutate(campaign: Campaign):
         if not mutate_fields:
             return
+        if campaign.status != "lobby":
+            raise HTTPException(status_code=409, detail="Campaign settings are locked after the lobby")
         if "name" in mutate_fields and mutate_fields["name"] is not None:
             try:
                 campaign.name = validate_campaign_name(str(mutate_fields["name"]))
@@ -366,6 +503,90 @@ def list_campaign_members(campaign_id: str, request: Request, db: Session = Depe
     return {"members": out}
 
 
+@router.delete("/api/campaigns/{campaign_id}/members/{user_id}")
+def remove_campaign_member(
+    campaign_id: str,
+    user_id: str,
+    payload: dict,
+    request: Request,
+    response: Response,
+    db: Session = Depends(get_db),
+):
+    profile = resolve_profile(request, db)
+    try:
+        cid = parse_campaign_id(campaign_id)
+        target_id = uuid_lib.UUID(user_id)
+    except ValueError:
+        raise HTTPException(status_code=404, detail="Invalid campaign or user id")
+    campaign = db.get(Campaign, cid)
+    if not campaign:
+        raise HTTPException(status_code=404, detail="Campaign not found")
+    if campaign.owner_id != profile.id:
+        raise HTTPException(status_code=403, detail="Only owner can remove campaign members")
+    if target_id == campaign.owner_id:
+        raise HTTPException(status_code=400, detail="Campaign owner cannot be removed")
+    expected_revision = _expected_revision(payload)
+    operation_id = str(payload.get("operation_id") or "").strip() or None
+    idempotency_key = require_idempotency_key(request, operation_id)
+
+    def _mutate(locked: Campaign):
+        if locked.status != "lobby":
+            logger.warning(
+                "campaign membership removal rejected campaign_id=%s actor_id=%s target_id=%s status=%s",
+                cid, profile.id, target_id, locked.status,
+            )
+            raise HTTPException(status_code=409, detail="Campaign membership is locked after the lobby")
+        member = db.get(CampaignMember, {"campaign_id": cid, "user_id": target_id})
+        if member is None:
+            raise HTTPException(status_code=404, detail="Campaign member not found")
+        db.delete(member)
+        campaign_thread_ids = select(CampaignThread.id).where(CampaignThread.campaign_id == cid)
+        db.execute(
+            delete(CampaignThreadMember).where(
+                CampaignThreadMember.user_id == target_id,
+                CampaignThreadMember.thread_id.in_(campaign_thread_ids),
+            )
+        )
+
+    def _execute():
+        campaign_after, event = commit_campaign_mutation(
+            db,
+            cid,
+            expected_revision,
+            event_type="campaign.member_removed",
+            operation_id=operation_id or idempotency_key,
+            actor_id=profile.id,
+            targets={"user_id": str(target_id)},
+            payload={"user_id": str(target_id)},
+            mutate=_mutate,
+            commit=False,
+        )
+        logger.info(
+            "campaign member removed campaign_id=%s actor_id=%s target_id=%s revision=%s",
+            cid, profile.id, target_id, campaign_after.revision,
+        )
+        return {"ok": True, "campaign": campaign_after.to_dict(), "event": event.to_dict()}
+
+    try:
+        return execute_http_idempotent(
+            db,
+            response,
+            actor_id=profile.id,
+            idempotency_key=idempotency_key,
+            command_type="campaign.member.remove",
+            scope_type="campaign",
+            scope_id=cid,
+            payload={**payload, "user_id": str(target_id)},
+            execute=_execute,
+        )
+    except RevisionConflictError as exc:
+        raise HTTPException(
+            status_code=409,
+            detail=str(exc),
+            headers={"X-Current-Revision": str(exc.actual_revision)},
+        ) from exc
+
+
 @router.get("/api/campaigns/{campaign_id}/characters")
 def list_campaign_characters(campaign_id: str, request: Request, db: Session = Depends(get_db)):
     resolve_profile(request, db)
@@ -402,6 +623,12 @@ def create_campaign_invite(campaign_id: str, request: Request, db: Session = Dep
         raise HTTPException(status_code=404, detail="Campaign not found")
     if camp.owner_id != profile.id:
         raise HTTPException(status_code=403, detail="Only owner can create invite")
+    if camp.status != "lobby":
+        logger.warning(
+            "campaign invite creation rejected campaign_id=%s actor_id=%s status=%s",
+            cid, profile.id, camp.status,
+        )
+        raise HTTPException(status_code=409, detail="Campaign membership is locked after the lobby")
     existing = db.get(CampaignInvite, cid)
     if existing:
         return {"code": existing.code}
@@ -413,6 +640,73 @@ def create_campaign_invite(campaign_id: str, request: Request, db: Session = Dep
             db.commit()
             return {"code": code}
     raise HTTPException(status_code=500, detail="Failed to generate invite")
+
+
+@router.delete("/api/campaigns/{campaign_id}/invites")
+def revoke_campaign_invite(
+    campaign_id: str,
+    payload: dict,
+    request: Request,
+    response: Response,
+    db: Session = Depends(get_db),
+):
+    profile = resolve_profile(request, db)
+    try:
+        cid = parse_campaign_id(campaign_id)
+    except ValueError:
+        raise HTTPException(status_code=404, detail="Invalid campaign id")
+    campaign = db.get(Campaign, cid)
+    if not campaign:
+        raise HTTPException(status_code=404, detail="Campaign not found")
+    if campaign.owner_id != profile.id:
+        raise HTTPException(status_code=403, detail="Only owner can revoke invite")
+    expected_revision = _expected_revision(payload)
+    operation_id = str(payload.get("operation_id") or "").strip() or None
+    idempotency_key = require_idempotency_key(request, operation_id)
+
+    def _mutate(locked: Campaign):
+        if locked.status != "lobby":
+            raise HTTPException(status_code=409, detail="Campaign membership is locked after the lobby")
+        invite = db.get(CampaignInvite, cid)
+        if invite is None:
+            raise HTTPException(status_code=404, detail="Campaign invite not found")
+        db.delete(invite)
+
+    def _execute():
+        campaign_after, event = commit_campaign_mutation(
+            db,
+            cid,
+            expected_revision,
+            event_type="campaign.invite_revoked",
+            operation_id=operation_id or idempotency_key,
+            actor_id=profile.id,
+            mutate=_mutate,
+            commit=False,
+        )
+        logger.info(
+            "campaign invite revoked campaign_id=%s actor_id=%s revision=%s",
+            cid, profile.id, campaign_after.revision,
+        )
+        return {"ok": True, "campaign": campaign_after.to_dict(), "event": event.to_dict()}
+
+    try:
+        return execute_http_idempotent(
+            db,
+            response,
+            actor_id=profile.id,
+            idempotency_key=idempotency_key,
+            command_type="campaign.invite.revoke",
+            scope_type="campaign",
+            scope_id=cid,
+            payload=payload,
+            execute=_execute,
+        )
+    except RevisionConflictError as exc:
+        raise HTTPException(
+            status_code=409,
+            detail=str(exc),
+            headers={"X-Current-Revision": str(exc.actual_revision)},
+        ) from exc
 
 
 @router.get("/api/invites/lookup")
@@ -437,7 +731,9 @@ def join_campaign(campaign_id: str, payload: dict, request: Request, db: Session
         cid = parse_campaign_id(campaign_id)
     except ValueError:
         raise HTTPException(status_code=404, detail="Invalid campaign id")
-    camp = db.get(Campaign, cid)
+    camp = db.execute(
+        select(Campaign).where(Campaign.id == cid).with_for_update()
+    ).scalars().first()
     if not camp:
         raise HTTPException(status_code=404, detail="Campaign not found")
     code = str(payload.get("code") or "").strip().upper()
@@ -448,7 +744,16 @@ def join_campaign(campaign_id: str, payload: dict, request: Request, db: Session
         inv2 = db.execute(select(CampaignInvite).where(CampaignInvite.code == code)).scalars().first()
         if not inv2 or inv2.campaign_id != cid:
             raise HTTPException(status_code=403, detail="Invalid invite code")
-    if not is_campaign_member(db, cid, profile.id):
-        db.add(CampaignMember(campaign_id=cid, user_id=profile.id, role="player"))
-        db.commit()
+    if is_campaign_member(db, cid, profile.id):
+        return {"ok": True, "campaign": camp.to_dict()}
+    if camp.status != "lobby":
+        db.rollback()
+        logger.warning(
+            "campaign join rejected by membership lock campaign_id=%s actor_id=%s status=%s",
+            cid, profile.id, camp.status,
+        )
+        raise HTTPException(status_code=409, detail="Campaign membership is locked after the lobby")
+    db.add(CampaignMember(campaign_id=cid, user_id=profile.id, role="player"))
+    db.commit()
+    logger.info("campaign member joined campaign_id=%s actor_id=%s", cid, profile.id)
     return {"ok": True, "campaign": camp.to_dict()}

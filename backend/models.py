@@ -47,6 +47,16 @@ class Profile(Base):
 
 class Campaign(Base):
     __tablename__ = "campaigns"
+    __table_args__ = (
+        CheckConstraint(
+            "status IN ('lobby', 'starting', 'active', 'archived')",
+            name="ck_campaigns_lifecycle_status",
+        ),
+        CheckConstraint(
+            "required_players BETWEEN 1 AND 6",
+            name="ck_campaigns_required_players_launch_range",
+        ),
+    )
 
     id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
     owner_id: Mapped[uuid.UUID] = mapped_column(
@@ -55,8 +65,13 @@ class Campaign(Base):
     name: Mapped[str] = mapped_column(String(128), nullable=False)
     description: Mapped[str | None] = mapped_column(Text, nullable=True)
     random_seed: Mapped[str | None] = mapped_column(String(128), nullable=True)
-    required_players: Mapped[int] = mapped_column(Integer, nullable=False, default=1)
-    loot_mode: Mapped[str] = mapped_column(String(32), nullable=False, default="frequent_gamble")
+    status: Mapped[str] = mapped_column(String(16), nullable=False, default="lobby", server_default="lobby")
+    theme: Mapped[str | None] = mapped_column(String(128), nullable=True)
+    brief: Mapped[str | None] = mapped_column(Text, nullable=True)
+    difficulty: Mapped[str] = mapped_column(String(16), nullable=False, default="medium", server_default="medium")
+    required_players: Mapped[int] = mapped_column(Integer, nullable=False, default=1, server_default="1")
+    content_boundaries: Mapped[dict] = mapped_column(JSONB, nullable=False, default=dict, server_default=text("'{}'"))
+    loot_mode: Mapped[str] = mapped_column(String(32), nullable=False, default="frequent_gamble", server_default="frequent_gamble")
     # Monotonic fictional revision — incremented exactly once per authoritative fictional mutation.
     # See campaign_events.py commit_campaign_mutation().
     revision: Mapped[int] = mapped_column(Integer, nullable=False, default=0, server_default="0")
@@ -72,7 +87,12 @@ class Campaign(Base):
             "name": self.name,
             "description": self.description,
             "random_seed": self.random_seed,
+            "status": self.status,
+            "theme": self.theme,
+            "brief": self.brief,
+            "difficulty": self.difficulty,
             "required_players": self.required_players,
+            "content_boundaries": self.content_boundaries or {},
             "loot_mode": self.loot_mode,
             "loot_drop_rate": self.loot_mode,
             "revision": self.revision,
