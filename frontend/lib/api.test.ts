@@ -39,6 +39,56 @@ describe('apiFetch error contract', () => {
     )
   })
 
+  it('preserves status and payload for validation-detail arrays', async () => {
+    const payload = {
+      detail: [
+        { loc: ['body', 'name'], msg: 'Field required', type: 'missing' },
+      ],
+    }
+    vi.stubGlobal('fetch', vi.fn().mockResolvedValue(jsonResponse(payload, 422)))
+
+    const error = await api.apiFetch('/campaigns').catch((e) => e)
+    expect(error).toMatchObject({ status: 422, data: payload })
+    expect((error as Error).message).toBe('body.name: Field required')
+  })
+
+  it('handles numeric loc segments and message field', async () => {
+    vi.stubGlobal('fetch', vi.fn().mockResolvedValue(jsonResponse({
+      detail: [
+        { loc: ['body', 'items', 0, 'name'], msg: 'Required', type: 'missing' },
+        { loc: ['body', 'query'], message: 'Invalid query', type: 'value_error' },
+      ],
+    }, 422)))
+
+    await expect(api.apiFetch('/test')).rejects.toThrow(
+      'body.items.0.name: Required; body.query: Invalid query',
+    )
+  })
+
+  it('trims whitespace-only detail and falls back to status', async () => {
+    vi.stubGlobal('fetch', vi.fn().mockResolvedValue(jsonResponse({ detail: '   ' }, 400)))
+    await expect(api.apiFetch('/test')).rejects.toThrow('HTTP 400')
+  })
+
+  it('falls back to HTTP status when detail array is empty', async () => {
+    vi.stubGlobal('fetch', vi.fn().mockResolvedValue(jsonResponse({ detail: [] }, 422)))
+    await expect(api.apiFetch('/test')).rejects.toThrow('HTTP 422')
+  })
+
+  it('prefers detail over error/message fields', async () => {
+    vi.stubGlobal('fetch', vi.fn().mockResolvedValue(jsonResponse({
+      detail: 'Detail wins',
+      error: 'Error fallback',
+      message: 'Message fallback',
+    }, 400)))
+    await expect(api.apiFetch('/test')).rejects.toThrow('Detail wins')
+  })
+
+  it('uses message field when detail is absent', async () => {
+    vi.stubGlobal('fetch', vi.fn().mockResolvedValue(jsonResponse({ message: 'From message field' }, 400)))
+    await expect(api.apiFetch('/test')).rejects.toThrow('From message field')
+  })
+
   it('retains legacy error payload compatibility', async () => {
     vi.stubGlobal('fetch', vi.fn().mockResolvedValue(jsonResponse({ error: 'Legacy failure' }, 400)))
 
@@ -66,12 +116,53 @@ describe('exported API surface', () => {
       'world',
     ])
     expect(Object.keys(api.auth).sort()).toEqual(['getConfig', 'me'])
+    expect(Object.keys(api.campaigns).sort()).toEqual([
+      'create',
+      'delete',
+      'get',
+      'list',
+      'quickCreate',
+      'randomBrief',
+      'update',
+    ])
+    expect(Object.keys(api.characters).sort()).toEqual([
+      'chatStream',
+      'create',
+      'delete',
+      'get',
+      'list',
+      'update',
+    ])
+    expect(Object.keys(api.campaignMembers).sort()).toEqual([
+      'createInvite',
+      'getInvite',
+      'joinCampaign',
+      'listCharacters',
+      'listMembers',
+      'lookupInvite',
+    ])
     expect(Object.keys(api.sessions)).toEqual(['start'])
+    expect(Object.keys(api.world)).toEqual(['get'])
+    expect(Object.keys(api.encounterMaps)).toEqual(['getCurrent'])
     expect(Object.keys(api.legacyLiveTable).sort()).toEqual([
       'get',
       'getMessages',
       'sendMessage',
       'streamUrl',
     ])
+  })
+
+  it('does not expose removed legacy groups or blob transport', () => {
+    const keys = Object.keys(api)
+    expect(keys).not.toContain('planning')
+    expect(keys).not.toContain('proposals')
+    expect(keys).not.toContain('llmPlayers')
+    expect(keys).not.toContain('automation')
+    expect(keys).not.toContain('automationKeys')
+    expect(keys).not.toContain('loot')
+    expect(keys).not.toContain('shops')
+    expect(keys).not.toContain('dev')
+    expect(keys).not.toContain('apiBlob')
+    expect(keys).not.toContain('getStreamUrl')
   })
 })

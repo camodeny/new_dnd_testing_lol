@@ -26,6 +26,15 @@ function errorMessageFrom(value: unknown): string | null {
 }
 
 function createApiError(status: number, data: unknown): ApiError {
+  if (typeof data === 'string') {
+    const trimmed = data.trim()
+    if (trimmed) {
+      const error = new Error(trimmed) as ApiError
+      error.status = status
+      error.data = data
+      return error
+    }
+  }
   const payload = data && typeof data === 'object'
     ? data as { detail?: unknown; error?: unknown; message?: unknown }
     : {}
@@ -196,7 +205,7 @@ export const legacyLiveTable = {
   },
 }
 
-// ── World & planning ──────────────────────────────────────────────────────
+// ── World ───────────────────────────────────────────────────────────────────
 
 export const world = {
   get: (campaignId: string | number) =>
