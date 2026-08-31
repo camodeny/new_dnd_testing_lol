@@ -31,7 +31,6 @@ from sqlalchemy.orm import Session
 from app.runtime.threads import (
     ThreadAuthorizationError,
     ThreadNotFoundError,
-    can_read_thread,
     get_campaign_thread,
     list_threads_for_user,
     parse_thread_id,

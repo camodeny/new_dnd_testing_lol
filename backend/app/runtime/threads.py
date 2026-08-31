@@ -3,6 +3,7 @@
 Centralized, reusable checks for all live-table history reads/writes.
 Privacy is enforced as a data property, not a frontend filter.
 """
+
 from __future__ import annotations
 
 import logging
@@ -37,18 +38,25 @@ def get_thread(db: Session, thread_id: uuid.UUID) -> CampaignThread | None:
     return db.get(CampaignThread, thread_id)
 
 
-def get_campaign_thread(db: Session, campaign_id: uuid.UUID, thread_id: uuid.UUID) -> CampaignThread | None:
-    return db.execute(
-        select(CampaignThread).where(
-            CampaignThread.id == thread_id,
-            CampaignThread.campaign_id == campaign_id,
+def get_campaign_thread(
+    db: Session, campaign_id: uuid.UUID, thread_id: uuid.UUID
+) -> CampaignThread | None:
+    return (
+        db.execute(
+            select(CampaignThread).where(
+                CampaignThread.id == thread_id,
+                CampaignThread.campaign_id == campaign_id,
+            )
         )
-    ).scalars().first()
+        .scalars()
+        .first()
+    )
 
 
 def is_thread_member(db: Session, thread_id: uuid.UUID, user_id: uuid.UUID) -> bool:
     return (
-        db.get(CampaignThreadMember, {"thread_id": thread_id, "user_id": user_id}) is not None
+        db.get(CampaignThreadMember, {"thread_id": thread_id, "user_id": user_id})
+        is not None
     )
 
 
@@ -63,12 +71,16 @@ def get_or_create_campaign_thread(
     that wins the race raises IntegrityError on flush, which we catch and
     re-resolve to the winner.
     """
-    existing = db.execute(
-        select(CampaignThread).where(
-            CampaignThread.campaign_id == campaign_id,
-            CampaignThread.thread_type == "campaign",
+    existing = (
+        db.execute(
+            select(CampaignThread).where(
+                CampaignThread.campaign_id == campaign_id,
+                CampaignThread.thread_type == "campaign",
+            )
         )
-    ).scalars().first()
+        .scalars()
+        .first()
+    )
     if existing is not None:
         return existing
     # Create shared thread — id is durable and survives reconnects
@@ -95,12 +107,16 @@ def get_or_create_campaign_thread(
     except IntegrityError:
         # Savepoint rolled back automatically; outer transaction and its
         # unrelated pending work remain intact.
-        winner = db.execute(
-            select(CampaignThread).where(
-                CampaignThread.campaign_id == campaign_id,
-                CampaignThread.thread_type == "campaign",
+        winner = (
+            db.execute(
+                select(CampaignThread).where(
+                    CampaignThread.campaign_id == campaign_id,
+                    CampaignThread.thread_type == "campaign",
+                )
             )
-        ).scalars().first()
+            .scalars()
+            .first()
+        )
         if winner is not None:
             return winner
         raise
@@ -160,7 +176,9 @@ def create_private_thread(
     db.flush()
     logger.info(
         "thread created campaign_id=%s thread_id=%s thread_type=private member_count=%s",
-        campaign_id, thread.id, len(all_ids),
+        campaign_id,
+        thread.id,
+        len(all_ids),
     )
     return thread
 
@@ -198,18 +216,25 @@ def get_or_create_private_gameplay_thread(
 
     ordered_ids = sorted(str(uid) for uid in all_ids)
     private_key = f"{private_kind}:{':'.join(ordered_ids)}"
-    existing = db.execute(
-        select(CampaignThread).where(
-            CampaignThread.campaign_id == campaign_id,
-            CampaignThread.private_key == private_key,
+    existing = (
+        db.execute(
+            select(CampaignThread).where(
+                CampaignThread.campaign_id == campaign_id,
+                CampaignThread.private_key == private_key,
+            )
         )
-    ).scalars().first()
+        .scalars()
+        .first()
+    )
     if existing is not None:
         if not is_thread_member(db, existing.id, created_by):
             raise ThreadAuthorizationError("Not authorized to access this thread")
         logger.info(
             "thread get_or_create reused campaign_id=%s thread_id=%s private_kind=%s user_id=%s",
-            campaign_id, existing.id, private_kind, created_by,
+            campaign_id,
+            existing.id,
+            private_kind,
+            created_by,
         )
         return existing, False
 
@@ -221,17 +246,25 @@ def get_or_create_private_gameplay_thread(
         title=title,
         created_by=created_by,
     )
+    # Flush unrelated pending work outside the savepoint so a concurrent
+    # private-key race does not discard it (mirrors shared-thread fix).
+    if db.new or db.dirty or db.deleted:
+        db.flush()
     try:
         with db.begin_nested():
             db.add(thread)
             db.flush()
     except IntegrityError:
-        winner = db.execute(
-            select(CampaignThread).where(
-                CampaignThread.campaign_id == campaign_id,
-                CampaignThread.private_key == private_key,
+        winner = (
+            db.execute(
+                select(CampaignThread).where(
+                    CampaignThread.campaign_id == campaign_id,
+                    CampaignThread.private_key == private_key,
+                )
             )
-        ).scalars().first()
+            .scalars()
+            .first()
+        )
         if winner is None:
             raise
         if not is_thread_member(db, winner.id, created_by):
@@ -243,12 +276,17 @@ def get_or_create_private_gameplay_thread(
     db.flush()
     logger.info(
         "thread created campaign_id=%s thread_id=%s private_kind=%s member_count=%s",
-        campaign_id, thread.id, private_kind, len(all_ids),
+        campaign_id,
+        thread.id,
+        private_kind,
+        len(all_ids),
     )
     return thread, True
 
 
-def can_read_thread(db: Session, campaign_id: uuid.UUID, thread_id: uuid.UUID, user_id: uuid.UUID) -> bool:
+def can_read_thread(
+    db: Session, campaign_id: uuid.UUID, thread_id: uuid.UUID, user_id: uuid.UUID
+) -> bool:
     """Centralized read-authorization check.
 
     - Shared ``campaign`` threads: any campaign member (including owner) may read.
@@ -258,29 +296,47 @@ def can_read_thread(db: Session, campaign_id: uuid.UUID, thread_id: uuid.UUID, u
     """
     thread = get_campaign_thread(db, campaign_id, thread_id)
     if thread is None:
-        logger.info("thread read denied campaign_id=%s thread_id=%s reason=not_found", campaign_id, thread_id)
+        logger.info(
+            "thread read denied campaign_id=%s thread_id=%s reason=not_found",
+            campaign_id,
+            thread_id,
+        )
         return False
     if thread.thread_type == "campaign":
         campaign = db.get(Campaign, campaign_id)
         if campaign is None:
             return False
-        authorized = campaign.owner_id == user_id or is_campaign_member(db, campaign_id, user_id)
+        authorized = campaign.owner_id == user_id or is_campaign_member(
+            db, campaign_id, user_id
+        )
         if not authorized:
-            logger.info("thread read denied campaign_id=%s thread_id=%s reason=not_campaign_member", campaign_id, thread_id)
+            logger.info(
+                "thread read denied campaign_id=%s thread_id=%s reason=not_campaign_member",
+                campaign_id,
+                thread_id,
+            )
         return authorized
     if thread.thread_type == "private":
         authorized = is_thread_member(db, thread_id, user_id)
         if not authorized:
             logger.info(
                 "thread read denied campaign_id=%s thread_id=%s user_id=%s reason=not_thread_member",
-                campaign_id, thread_id, user_id,
+                campaign_id,
+                thread_id,
+                user_id,
             )
         return authorized
-    logger.info("thread read denied campaign_id=%s thread_id=%s reason=unknown_thread_type", campaign_id, thread_id)
+    logger.info(
+        "thread read denied campaign_id=%s thread_id=%s reason=unknown_thread_type",
+        campaign_id,
+        thread_id,
+    )
     return False
 
 
-def can_write_thread(db: Session, campaign_id: uuid.UUID, thread_id: uuid.UUID, user_id: uuid.UUID) -> bool:
+def can_write_thread(
+    db: Session, campaign_id: uuid.UUID, thread_id: uuid.UUID, user_id: uuid.UUID
+) -> bool:
     # Writes reuse read authorization — if you cannot read, you cannot write.
     return can_read_thread(db, campaign_id, thread_id, user_id)
 
@@ -290,7 +346,9 @@ def _hide_private_not_found(thread: CampaignThread | None, user_id: uuid.UUID) -
     return thread is not None and thread.thread_type == "private"
 
 
-def assert_can_read_thread(db: Session, campaign_id: uuid.UUID, thread_id: uuid.UUID, user_id: uuid.UUID) -> CampaignThread:
+def assert_can_read_thread(
+    db: Session, campaign_id: uuid.UUID, thread_id: uuid.UUID, user_id: uuid.UUID
+) -> CampaignThread:
     thread = get_campaign_thread(db, campaign_id, thread_id)
     if thread is None:
         raise ThreadNotFoundError("Thread not found")
@@ -298,14 +356,18 @@ def assert_can_read_thread(db: Session, campaign_id: uuid.UUID, thread_id: uuid.
         if _hide_private_not_found(thread, user_id):
             logger.info(
                 "thread read denied campaign_id=%s thread_id=%s user_id=%s reason=not_thread_member hide_as_not_found",
-                campaign_id, thread_id, user_id,
+                campaign_id,
+                thread_id,
+                user_id,
             )
             raise ThreadNotFoundError("Thread not found")
         raise ThreadAuthorizationError("Not authorized to access this thread")
     return thread
 
 
-def assert_can_write_thread(db: Session, campaign_id: uuid.UUID, thread_id: uuid.UUID, user_id: uuid.UUID) -> CampaignThread:
+def assert_can_write_thread(
+    db: Session, campaign_id: uuid.UUID, thread_id: uuid.UUID, user_id: uuid.UUID
+) -> CampaignThread:
     thread = get_campaign_thread(db, campaign_id, thread_id)
     if thread is None:
         raise ThreadNotFoundError("Thread not found")
@@ -313,29 +375,43 @@ def assert_can_write_thread(db: Session, campaign_id: uuid.UUID, thread_id: uuid
         if _hide_private_not_found(thread, user_id):
             logger.info(
                 "thread write denied campaign_id=%s thread_id=%s user_id=%s reason=not_thread_member hide_as_not_found",
-                campaign_id, thread_id, user_id,
+                campaign_id,
+                thread_id,
+                user_id,
             )
             raise ThreadNotFoundError("Thread not found")
         raise ThreadAuthorizationError("Not authorized to write to this thread")
     return thread
 
 
-def list_threads_for_user(db: Session, campaign_id: uuid.UUID, user_id: uuid.UUID) -> list[CampaignThread]:
+def list_threads_for_user(
+    db: Session, campaign_id: uuid.UUID, user_id: uuid.UUID
+) -> list[CampaignThread]:
     """Return only threads the user is authorized to see — hidden thread metadata is not leaked."""
     campaign = db.get(Campaign, campaign_id)
     if campaign is None:
         return []
-    is_member = campaign.owner_id == user_id or is_campaign_member(db, campaign_id, user_id)
+    is_member = campaign.owner_id == user_id or is_campaign_member(
+        db, campaign_id, user_id
+    )
     if not is_member:
         return []
-    all_threads = db.execute(
-        select(CampaignThread).where(CampaignThread.campaign_id == campaign_id).order_by(CampaignThread.created_at)
-    ).scalars().all()
+    all_threads = (
+        db.execute(
+            select(CampaignThread)
+            .where(CampaignThread.campaign_id == campaign_id)
+            .order_by(CampaignThread.created_at)
+        )
+        .scalars()
+        .all()
+    )
     visible: list[CampaignThread] = []
     for thread in all_threads:
         if thread.thread_type == "campaign":
             visible.append(thread)
-        elif thread.thread_type == "private" and is_thread_member(db, thread.id, user_id):
+        elif thread.thread_type == "private" and is_thread_member(
+            db, thread.id, user_id
+        ):
             visible.append(thread)
     return visible
 
