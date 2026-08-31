@@ -34,7 +34,7 @@ def _env_first(*names: str) -> str:
             return v
     return ""
 
-SUPABASE_URL = _env_first("SUPABASE_URL", "NEXT_PUBLIC_SUPABASE_URL").rstrip("/")
+SUPABASE_URL = _env_first("SUPABASE_URL", "NEXT_PUBLIC_SUPABASE_URL").strip().rstrip("/")
 SUPABASE_PUBLISHABLE_KEY = _env_first(
     "SUPABASE_PUBLISHABLE_KEY",
     "NEXT_PUBLIC_SUPABASE_PUBLISHABLE_KEY",
@@ -58,7 +58,7 @@ def _get_jwks_url() -> str | None:
 
 
 def _get_expected_issuer() -> str | None:
-    if not SUPABASE_URL:
+    if not SUPABASE_URL.strip():
         return None
     return f"{SUPABASE_URL}/auth/v1"
 
