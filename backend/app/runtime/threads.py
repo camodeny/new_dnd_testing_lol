@@ -165,6 +165,89 @@ def create_private_thread(
     return thread
 
 
+def get_or_create_private_gameplay_thread(
+    db: Session,
+    *,
+    campaign_id: uuid.UUID,
+    created_by: uuid.UUID,
+    private_kind: str,
+    participant_ids: list[uuid.UUID],
+    title: str,
+) -> tuple[CampaignThread, bool]:
+    """Return one durable AI-DM or direct thread for a logical audience.
+
+    The database-backed private key makes retries and concurrent creation
+    converge on the same thread. The AI DM is the sole DM and is represented
+    by the ``dm`` thread kind, not by a human/profile membership row.
+    """
+    if private_kind not in ("dm", "direct"):
+        raise ValueError("private_kind must be 'dm' or 'direct'")
+
+    all_ids = set(participant_ids) | {created_by}
+    if private_kind == "dm" and all_ids != {created_by}:
+        raise ValueError("AI-DM threads have exactly one player participant")
+    if private_kind == "direct" and len(all_ids) != 2:
+        raise ValueError("Direct threads require exactly two player participants")
+
+    campaign = db.get(Campaign, campaign_id)
+    if campaign is None:
+        raise ThreadNotFoundError("Campaign not found")
+    for uid in all_ids:
+        if campaign.owner_id != uid and not is_campaign_member(db, campaign_id, uid):
+            raise ThreadAuthorizationError(f"User {uid} is not a campaign member")
+
+    ordered_ids = sorted(str(uid) for uid in all_ids)
+    private_key = f"{private_kind}:{':'.join(ordered_ids)}"
+    existing = db.execute(
+        select(CampaignThread).where(
+            CampaignThread.campaign_id == campaign_id,
+            CampaignThread.private_key == private_key,
+        )
+    ).scalars().first()
+    if existing is not None:
+        if not is_thread_member(db, existing.id, created_by):
+            raise ThreadAuthorizationError("Not authorized to access this thread")
+        logger.info(
+            "thread get_or_create reused campaign_id=%s thread_id=%s private_kind=%s user_id=%s",
+            campaign_id, existing.id, private_kind, created_by,
+        )
+        return existing, False
+
+    thread = CampaignThread(
+        campaign_id=campaign_id,
+        thread_type="private",
+        private_kind=private_kind,
+        private_key=private_key,
+        title=title,
+        created_by=created_by,
+    )
+    try:
+        with db.begin_nested():
+            db.add(thread)
+            db.flush()
+    except IntegrityError:
+        winner = db.execute(
+            select(CampaignThread).where(
+                CampaignThread.campaign_id == campaign_id,
+                CampaignThread.private_key == private_key,
+            )
+        ).scalars().first()
+        if winner is None:
+            raise
+        if not is_thread_member(db, winner.id, created_by):
+            raise ThreadAuthorizationError("Not authorized to access this thread")
+        return winner, False
+
+    for uid in all_ids:
+        db.add(CampaignThreadMember(thread_id=thread.id, user_id=uid, role="member"))
+    db.flush()
+    logger.info(
+        "thread created campaign_id=%s thread_id=%s private_kind=%s member_count=%s",
+        campaign_id, thread.id, private_kind, len(all_ids),
+    )
+    return thread, True
+
+
 def can_read_thread(db: Session, campaign_id: uuid.UUID, thread_id: uuid.UUID, user_id: uuid.UUID) -> bool:
     """Centralized read-authorization check.
 

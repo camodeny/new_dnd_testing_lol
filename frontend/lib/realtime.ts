@@ -26,6 +26,8 @@ export interface RealtimeEvent {
   // payload specifics
   id?: string
   raw_content?: string
+  user_id?: string
+  accepted_at?: string
   segments?: Array<{ type: 'ic' | 'ooc'; text: string }>
   text?: string
   stream_id?: string
@@ -119,7 +121,7 @@ export interface SnapshotForRealtime {
   reconciliation?: SnapshotReconciliation
   dm_state?: DmStateForRealtime | null
   dm_messages?: DmMessageForRealtime[]
-  history?: { messages?: Array<{ id: string; sequence: number; raw_content?: string; thread_id?: string; segments?: unknown[] }> }
+  history?: { messages?: Array<{ id: string; sequence: number; raw_content?: string; thread_id?: string; user_id?: string; accepted_at?: string; segments?: unknown[] }> }
   active_thread_id?: string
   campaign?: { id: string; revision: number }
 }

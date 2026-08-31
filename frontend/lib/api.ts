@@ -23,7 +23,7 @@ export async function apiFetch<T = unknown>(
   const data = await res.json().catch(() => ({}))
 
   if (!res.ok) {
-    const err = new Error((data as { error?: string }).error ?? `HTTP ${res.status}`) as ApiError
+    const err = new Error((data as { error?: string; detail?: string }).error ?? (data as { detail?: string }).detail ?? `HTTP ${res.status}`) as ApiError
     err.status = res.status
     err.data = data
     throw err
@@ -43,7 +43,7 @@ export async function apiBlob(
   const res = await fetch(url, { ...options, headers, credentials: 'include' })
   if (!res.ok) {
     const data = await res.json().catch(() => ({}))
-    const err = new Error((data as { error?: string }).error ?? `HTTP ${res.status}`) as ApiError
+    const err = new Error((data as { error?: string; detail?: string }).error ?? (data as { detail?: string }).detail ?? `HTTP ${res.status}`) as ApiError
     err.status = res.status
     err.data = data
     throw err
@@ -163,6 +163,28 @@ export const campaignMembers = {
     apiFetch(`/campaigns/${campaignId}/join`, {
       method: 'POST',
       body: JSON.stringify({ code }),
+    }),
+}
+
+// ── Live-table gameplay threads ──────────────────────────────────────────
+
+export const gameplayThreads = {
+  list: (campaignId: string | number) =>
+    apiFetch<{ threads: import('@/types').CampaignThread[] }>(`/campaigns/${campaignId}/threads`),
+  getOrCreateDm: (campaignId: string | number) =>
+    apiFetch<{ thread: import('@/types').CampaignThread; created: boolean }>(`/campaigns/${campaignId}/threads/dm`, {
+      method: 'POST',
+    }),
+  getOrCreateDirect: (campaignId: string | number, participantId: string) =>
+    apiFetch<{ thread: import('@/types').CampaignThread; created: boolean }>(`/campaigns/${campaignId}/threads/direct`, {
+      method: 'POST',
+      body: JSON.stringify({ participant_id: participantId }),
+    }),
+  submit: (campaignId: string | number, threadId: string, content: string, operationId: string) =>
+    apiFetch(`/campaigns/${campaignId}/submissions`, {
+      method: 'POST',
+      body: JSON.stringify({ thread_id: threadId, content, operation_id: operationId }),
+      headers: { 'Idempotency-Key': operationId },
     }),
 }
 

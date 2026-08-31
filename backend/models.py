@@ -363,6 +363,14 @@ class CampaignThread(Base):
             postgresql_where=text("thread_type = 'campaign'"),
             sqlite_where=text("thread_type = 'campaign'"),
         ),
+        Index(
+            "uq_campaign_threads_private_key",
+            "campaign_id",
+            "private_key",
+            unique=True,
+            postgresql_where=text("private_key IS NOT NULL"),
+            sqlite_where=text("private_key IS NOT NULL"),
+        ),
     )
 
     id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
@@ -370,6 +378,8 @@ class CampaignThread(Base):
         UUID(as_uuid=True), ForeignKey("campaigns.id", ondelete="CASCADE"), nullable=False, index=True
     )
     thread_type: Mapped[str] = mapped_column(String(32), nullable=False, default="campaign", server_default="campaign")
+    private_kind: Mapped[str | None] = mapped_column(String(16), nullable=True)
+    private_key: Mapped[str | None] = mapped_column(String(160), nullable=True)
     title: Mapped[str | None] = mapped_column(String(128), nullable=True)
     created_by: Mapped[uuid.UUID | None] = mapped_column(
         UUID(as_uuid=True), ForeignKey("profiles.id", ondelete="RESTRICT"), nullable=True, index=True
@@ -381,6 +391,7 @@ class CampaignThread(Base):
             "id": str(self.id),
             "campaign_id": str(self.campaign_id),
             "thread_type": self.thread_type,
+            "private_kind": self.private_kind,
             "title": self.title,
             "created_by": str(self.created_by) if self.created_by else None,
             "created_at": self.created_at.isoformat() if self.created_at else None,

@@ -2024,6 +2024,108 @@ a.automation-list-item:focus-visible {
   color: #fff8ee !important;
 }
 
+/* Private gameplay threads */
+.private-thread-nav {
+  display: grid;
+  gap: 7px;
+  margin-top: 22px;
+  padding-top: 18px;
+  border-top: 1px solid var(--border-color);
+}
+
+.private-thread-nav-heading {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  margin-bottom: 3px;
+  color: var(--text-dim);
+}
+
+.private-thread-nav-item,
+.private-thread-create {
+  display: flex;
+  width: 100%;
+  align-items: center;
+  gap: 10px;
+  padding: 10px;
+  border: 1px solid transparent;
+  border-radius: 8px;
+  background: transparent;
+  color: var(--text-muted);
+  text-align: left;
+  cursor: pointer;
+}
+
+.private-thread-nav-item:hover,
+.private-thread-nav-item.active {
+  border-color: rgba(209, 107, 72, .24);
+  background: rgba(209, 107, 72, .08);
+  color: var(--text-bright);
+}
+
+.private-thread-nav-item > i { color: #d98a6c; }
+.private-thread-nav-item > span { display: grid; min-width: 0; gap: 2px; }
+.private-thread-nav-item strong { overflow: hidden; font-size: .76rem; text-overflow: ellipsis; white-space: nowrap; }
+.private-thread-nav-item small { color: var(--text-dim); font-size: .62rem; }
+
+.private-thread-create {
+  justify-content: center;
+  margin-top: 2px;
+  border-color: rgba(238, 228, 212, .12);
+  font-size: .72rem;
+}
+.private-thread-create:hover:not(:disabled) { border-color: rgba(209, 107, 72, .42); color: var(--text-bright); }
+.private-thread-create:disabled { opacity: .5; cursor: wait; }
+
+.private-thread-direct-create { display: grid; grid-template-columns: minmax(0, 1fr) 34px; gap: 6px; }
+.private-thread-direct-create select,
+.private-thread-direct-create button {
+  min-width: 0;
+  min-height: 34px;
+  border: 1px solid var(--border-color);
+  border-radius: 7px;
+  background: var(--bg-input);
+  color: var(--text-muted);
+  font-size: .7rem;
+}
+.private-thread-direct-create select { padding: 0 7px; }
+.private-thread-direct-create button { color: var(--text-bright); cursor: pointer; }
+.private-thread-direct-create button:disabled { opacity: .42; cursor: default; }
+.private-thread-nav-error { margin: 2px 0 0; color: #f1aa91; font-size: .68rem; line-height: 1.4; }
+
+.private-thread-conversation { display: flex; height: 100%; flex-direction: column; }
+.private-thread-header { flex: 0 0 auto; }
+.private-thread-eyebrow { margin-bottom: 4px; color: #da8768; font: 700 .58rem/1 var(--mono); letter-spacing: .1em; text-transform: uppercase; }
+.private-thread-subtitle { margin-top: 3px; color: var(--text-dim); font-size: .69rem; }
+.private-thread-messages { flex: 1; overflow-y: auto; padding: 22px clamp(18px, 4.5vw, 72px) 34px; }
+.private-thread-empty { display: grid; min-height: 100%; place-content: center; place-items: center; color: var(--text-dim); text-align: center; }
+.private-thread-empty i { margin-bottom: 10px; color: #d98a6c; font-size: 1.5rem; }
+.private-thread-empty p { max-width: 320px; margin: 0; font-size: .82rem; }
+.private-thread-reconnect { margin: 0 auto 14px; padding: 8px 12px; border: 1px solid rgba(209, 107, 72, .25); border-radius: 7px; color: #eab09b; font-size: .7rem; }
+.private-thread-message { display: grid !important; grid-template-columns: 38px minmax(0, 1fr); gap: 12px; max-width: 900px; margin-inline: auto; }
+.private-thread-message .session-msg-avatar {
+  display: grid;
+  width: 38px;
+  height: 38px;
+  place-items: center;
+  border: 1px solid var(--border-color);
+  border-radius: 50%;
+  background: rgba(255,255,255,.06);
+  color: var(--text-muted);
+  font-size: .62rem;
+  font-weight: 700;
+}
+.private-thread-message .session-msg-avatar.dm-avatar { background: #542f24; color: #f6d6c6; }
+.private-thread-message-meta { display: flex; align-items: baseline; gap: 8px; margin-bottom: 4px; }
+.private-thread-message-meta strong { color: var(--text-bright); font-size: .8rem; }
+.private-thread-message-meta time,
+.private-thread-message-meta span { color: var(--text-dim); font-size: .65rem; }
+.private-thread-message p { margin: 0; color: var(--text-main); font-size: .86rem; line-height: 1.55; white-space: pre-wrap; }
+.private-thread-message.is-streaming { opacity: .88; }
+.private-thread-input-area { flex: 0 0 auto; }
+.private-thread-input-area .session-input-shell { display: flex; align-items: flex-end; gap: 8px; padding: 8px 10px; }
+.private-thread-input-area textarea { flex: 1; max-height: 180px; padding: 8px; overflow-y: auto; resize: none; border: 0; outline: 0; background: transparent; color: var(--text-bright); font: inherit; }
+
 .mobile-bottom-nav { display: none; }
 
 /* ── Animations ──────────────────────────────────────────────────────── */
@@ -2097,6 +2199,15 @@ a.automation-list-item:focus-visible {
     overflow-y: auto !important;
     border: 0 !important;
   }
+
+  .mobile-tab-threads .dashboard-left,
+  .mobile-tab-chat .dashboard-center,
+  .mobile-tab-party .dashboard-right {
+    display: flex !important;
+  }
+
+  .mobile-tab-threads .dashboard-left,
+  .mobile-tab-party .dashboard-right { flex-direction: column; }
 
   .mobile-bottom-nav {
     position: fixed !important;

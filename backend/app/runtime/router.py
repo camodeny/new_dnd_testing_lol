@@ -21,6 +21,7 @@ from app.runtime.threads import (
     assert_can_write_thread,
     can_read_thread,
     create_private_thread,
+    get_or_create_private_gameplay_thread,
     get_campaign_thread,
     get_or_create_campaign_thread,
     list_threads_for_user,
@@ -128,9 +129,13 @@ def create_player_submission(
         try:
             from app.dm.turns import StreamBoundaryError, TurnConflictError, coordinate_turn
 
-            # Flush-only: transaction ownership stays at the outer idempotency
-            # boundary (submission + IdempotentCommand + turn) commit atomically.
-            coord = coordinate_turn(db, campaign.id, thread_id_str, audience=audience, commit=False)
+            # Direct player conversations do not summon or expose their content
+            # to the AI DM. Shared and AI-DM threads retain normal coordination.
+            coord = None
+            if thread is None or thread.private_kind != "direct":
+                # Flush-only: transaction ownership stays at the outer idempotency
+                # boundary (submission + IdempotentCommand + turn) commit atomically.
+                coord = coordinate_turn(db, campaign.id, thread_id_str, audience=audience, commit=False)
             if coord is not None:
                 turn, attempt = coord
                 result["dm_turn"] = turn.to_dict()
@@ -208,7 +213,65 @@ def list_campaign_threads(campaign_id: str, request: Request, db: Session = Depe
     get_or_create_campaign_thread(db, campaign.id, created_by=profile.id)
     db.commit()
     threads = list_threads_for_user(db, campaign.id, profile.id)
-    return {"threads": [t.to_dict() for t in threads]}
+    result = []
+    for thread in threads:
+        members = db.query(CampaignThreadMember).filter_by(thread_id=thread.id).all()
+        result.append(thread.to_dict(include_members=thread.thread_type == "private", members=members))
+    logger.info(
+        "thread list accessed campaign_id=%s user_id=%s visible_count=%s",
+        campaign.id, profile.id, len(result),
+    )
+    return {"threads": result}
+
+
+def _private_thread_response(db: Session, thread, created: bool):
+    members = db.query(CampaignThreadMember).filter_by(thread_id=thread.id).all()
+    return {
+        "thread": thread.to_dict(include_members=True, members=members),
+        "created": created,
+    }
+
+
+@router.post("/api/campaigns/{campaign_id}/threads/dm")
+def get_or_create_ai_dm_thread(campaign_id: str, request: Request, db: Session = Depends(get_db)):
+    profile = resolve_profile(request, db)
+    campaign = _authorized_campaign(db, campaign_id, profile.id)
+    thread, created = get_or_create_private_gameplay_thread(
+        db,
+        campaign_id=campaign.id,
+        created_by=profile.id,
+        private_kind="dm",
+        participant_ids=[],
+        title="Private with AI DM",
+    )
+    db.commit()
+    return _private_thread_response(db, thread, created)
+
+
+@router.post("/api/campaigns/{campaign_id}/threads/direct")
+def get_or_create_direct_thread(campaign_id: str, payload: dict, request: Request, db: Session = Depends(get_db)):
+    profile = resolve_profile(request, db)
+    campaign = _authorized_campaign(db, campaign_id, profile.id)
+    raw_participant_id = payload.get("participant_id")
+    try:
+        participant_id = uuid.UUID(str(raw_participant_id))
+    except Exception as exc:
+        raise HTTPException(status_code=422, detail="participant_id must be a valid user id") from exc
+    if participant_id == profile.id:
+        raise HTTPException(status_code=422, detail="Choose another player")
+    try:
+        thread, created = get_or_create_private_gameplay_thread(
+            db,
+            campaign_id=campaign.id,
+            created_by=profile.id,
+            private_kind="direct",
+            participant_ids=[participant_id],
+            title="Private player conversation",
+        )
+    except ThreadAuthorizationError as exc:
+        raise HTTPException(status_code=403, detail="That player is not a campaign member") from exc
+    db.commit()
+    return _private_thread_response(db, thread, created)
 
 
 @router.get("/api/campaigns/{campaign_id}/threads/{thread_id}")

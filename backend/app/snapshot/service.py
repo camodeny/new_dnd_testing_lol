@@ -36,7 +36,7 @@ from app.runtime.threads import (
     list_threads_for_user,
     parse_thread_id,
 )
-from models import Campaign, CampaignThread, PlayerSubmission, PlayerSubmissionSegment
+from models import Campaign, CampaignThread, CampaignThreadMember, PlayerSubmission, PlayerSubmissionSegment
 
 logger = logging.getLogger(__name__)
 
@@ -461,7 +461,16 @@ def build_live_table_snapshot(
         snapshot: dict[str, Any] = {
             "campaign": campaign.to_dict(),
             "revision": revision,
-            "threads": [t.to_dict() for t in visible_threads],
+            "threads": [
+                t.to_dict(
+                    include_members=t.thread_type == "private",
+                    members=(
+                        db.query(CampaignThreadMember).filter_by(thread_id=t.id).all()
+                        if t.thread_type == "private" else []
+                    ),
+                )
+                for t in visible_threads
+            ],
             "active_thread_id": thread_id_str,
             "active_thread": thread.to_dict(),
             "history": {

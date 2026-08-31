@@ -63,6 +63,8 @@ function snapshotToMessageEvents(snap: SnapshotForRealtime, campaignId: string, 
     sequence: m.sequence,
     id: m.id,
     raw_content: (m as { raw_content?: string }).raw_content,
+    user_id: m.user_id,
+    accepted_at: m.accepted_at,
     segments: (m as { segments?: RealtimeEvent['segments'] }).segments,
     dedupe_key: m.id,
   }))
