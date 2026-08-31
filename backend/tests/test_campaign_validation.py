@@ -1,11 +1,15 @@
 """Regression: campaign name is limited to 128 chars at API boundary."""
 import os
+
+import pytest
+
 os.environ["ALLOW_MOCK_AUTH"] = "true"
 
 from fastapi.testclient import TestClient
 from main import app
 
 client = TestClient(app)
+pytestmark = pytest.mark.postgres
 
 def _cleanup(campaign_id: str):
     try:

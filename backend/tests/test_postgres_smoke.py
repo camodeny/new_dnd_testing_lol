@@ -19,6 +19,8 @@ import pytest
 from sqlalchemy import create_engine, text
 from sqlalchemy.pool import NullPool
 
+pytestmark = pytest.mark.postgres
+
 def _get_db_url() -> str:
     return (
         os.getenv("POSTGRES_URL_NON_POOLING")

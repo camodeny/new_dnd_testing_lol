@@ -60,10 +60,9 @@ jobs:
         working-directory: backend
         run: |
           python -m pip install --upgrade pip
-          pip install -r requirements.txt
-          pip install pytest httpx
+          pip install -r requirements-dev.txt
 
-      - name: Backend checks (lint + migrate + tests)
+      - name: Backend checks (static + migrate + tests)
         run: set -o pipefail; bash scripts/ci/backend.sh 2>&1 | tee /tmp/pytest-backend.log
 
       - uses: actions/upload-artifact@v4

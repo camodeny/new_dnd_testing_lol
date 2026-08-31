@@ -10,15 +10,17 @@ set -euo pipefail
 ROOT="$(cd "$(dirname "$0")/../.." && pwd)"
 cd "$ROOT/backend"
 
-echo "== backend: python compile check =="
-python3 -m compileall -q app database.py main.py models.py auth.py
-
 echo "== backend: install (if needed) =="
-if ! python3 -c "import fastapi" 2>/dev/null; then
+if ! python3 -c "import fastapi, pytest, ruff" 2>/dev/null; then
   python3 -m pip install --upgrade pip -q
-  pip install -r requirements.txt -q
-  pip install pytest httpx -q
+  python3 -m pip install -r requirements-dev.txt -q
 fi
+
+echo "== backend: static checks (ruff) =="
+# Keep the required gate focused on correctness while the repository's existing
+# style debt is addressed separately. These rules catch syntax errors, invalid
+# control flow, and undefined names; compileall alone cannot catch all of them.
+python3 -m ruff check . --select E9,F63,F7,F82
 
 # If a test DB URL is available, verify the explicit migration path (issue #187/#286).
 # CI always provides this via the postgres service. Locally it's optional.
@@ -50,9 +52,13 @@ if [[ -n "$DB_URL" ]]; then
   echo "== backend: alembic history (head) =="
   alembic history | tail -n 20
 else
-  echo "== backend: no DB URL — skipping disposable-DB migration (set DATABASE_URL to verify) =="
+  echo "== backend: no DB URL — skipping migration and Postgres-marked tests =="
 fi
 
 echo "== backend: pytest =="
 # Disable xonsh plugin that breaks on newer pytest (present in local dev env, not in CI)
-ALLOW_MOCK_AUTH=true python3 -m pytest -p no:xonsh -p no:cacheprovider tests/ -v
+PYTEST_ARGS=(tests/ -v)
+if [[ -z "$DB_URL" ]]; then
+  PYTEST_ARGS+=(-m "not postgres")
+fi
+ALLOW_MOCK_AUTH=true python3 -m pytest -p no:xonsh -p no:cacheprovider "${PYTEST_ARGS[@]}"
