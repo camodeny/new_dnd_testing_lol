@@ -46,6 +46,7 @@ SUPABASE_JWKS_URL = os.getenv("SUPABASE_JWKS_URL", "")
 _jwks_cache: dict | None = None
 _jwks_fetched_at: float = 0
 JWKS_TTL = 600  # 10m
+EXPECTED_AUDIENCE = "authenticated"
 
 
 def _get_jwks_url() -> str | None:
@@ -54,6 +55,12 @@ def _get_jwks_url() -> str | None:
     if SUPABASE_URL:
         return f"{SUPABASE_URL}/auth/v1/.well-known/jwks.json"
     return None
+
+
+def _get_expected_issuer() -> str | None:
+    if not SUPABASE_URL:
+        return None
+    return f"{SUPABASE_URL}/auth/v1"
 
 
 def _fetch_jwks() -> dict | None:
@@ -86,34 +93,40 @@ def verify_supabase_jwt(token: str) -> dict:
     if not token:
         raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Missing token")
 
+    expected_issuer = _get_expected_issuer()
+    if not expected_issuer:
+        # A JWKS override identifies where keys are fetched, not which Supabase
+        # project is trusted. Without the project URL, issuer validation cannot
+        # be performed safely.
+        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Invalid token")
+
     jwks = _fetch_jwks()
-    if not jwks or "keys" not in jwks:
-        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Invalid token (JWKS unavailable)")
+    if not jwks or not isinstance(jwks.get("keys"), list) or not jwks["keys"]:
+        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Invalid token")
 
     try:
         unverified_header = jwt.get_unverified_header(token)
         kid = unverified_header.get("kid")
         key = next((k for k in jwks["keys"] if k.get("kid") == kid), None)
         candidates = [key] if key else jwks["keys"]
-        last_err = None
         for k in candidates:
             try:
                 payload = jwt.decode(
                     token,
                     k,
                     algorithms=["RS256", "RS512", "ES256", "ES512"],
-                    audience="authenticated",
-                    options={"verify_aud": False},
+                    audience=EXPECTED_AUDIENCE,
+                    issuer=expected_issuer,
+                    options={"require_aud": True, "require_iss": True},
                 )
                 return payload
-            except JWTError as e:
-                last_err = e
+            except JWTError:
                 continue
-        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail=f"Invalid token: {last_err}")
+        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Invalid token")
     except HTTPException:
         raise
-    except Exception as e:
-        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail=f"Invalid token: {e}")
+    except Exception:
+        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Invalid token")
 
 
 def get_current_user_payload(authorization: str | None = Header(default=None)) -> dict:
