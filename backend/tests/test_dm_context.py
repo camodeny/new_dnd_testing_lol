@@ -19,7 +19,6 @@ from models import Campaign, CampaignMember, Character, Dnd5eCharacterSheet, Pro
 from app.campaigns.events import commit_campaign_mutation  # noqa: E402
 from app.dm.context import (  # noqa: E402
     AuthorizationScope,
-    ContextAssemblyError,
     ContextAudience,
     ContextAuthorizationError,
     ContextBudget,
@@ -54,21 +53,31 @@ def _campaign(*, private=False):
     factory = sessionmaker(bind=_engine(), expire_on_commit=False)
     db = factory()
     owner, other = uuid.uuid4(), uuid.uuid4()
-    db.add_all([
-        Profile(id=owner, email="owner@example.com"),
-        Profile(id=other, email="other@example.com"),
-    ])
-    campaign = Campaign(id=uuid.uuid4(), owner_id=owner, name="Fixture campaign", revision=0)
+    db.add_all(
+        [
+            Profile(id=owner, email="owner@example.com"),
+            Profile(id=other, email="other@example.com"),
+        ]
+    )
+    campaign = Campaign(
+        id=uuid.uuid4(), owner_id=owner, name="Fixture campaign", revision=0
+    )
     db.add(campaign)
     db.flush()
-    db.add_all([
-        CampaignMember(campaign_id=campaign.id, user_id=owner, role="owner"),
-        CampaignMember(campaign_id=campaign.id, user_id=other, role="player"),
-    ])
+    db.add_all(
+        [
+            CampaignMember(campaign_id=campaign.id, user_id=owner, role="owner"),
+            CampaignMember(campaign_id=campaign.id, user_id=other, role="player"),
+        ]
+    )
     db.commit()
     if private:
         thread = create_private_thread(
-            db, campaign.id, created_by=owner, member_ids=[owner, other], title="Whisper"
+            db,
+            campaign.id,
+            created_by=owner,
+            member_ids=[owner, other],
+            title="Whisper",
         )
     else:
         thread = get_or_create_campaign_thread(db, campaign.id, created_by=owner)
@@ -104,12 +113,19 @@ def _record(
     return ContextRecord(
         record_id=record_id,
         value=value or {"text": record_id},
-        sources=[SourceRef(
-            source_type="fixture", source_id=record_id, source_version="1",
-            campaign_revision=0, provenance={"fixture": True},
-        )],
+        sources=[
+            SourceRef(
+                source_type="fixture",
+                source_id=record_id,
+                source_version="1",
+                campaign_revision=0,
+                provenance={"fixture": True},
+            )
+        ],
         authorization=AuthorizationScope(
-            campaign_id=campaign_id, thread_ids=list(thread_ids), user_ids=list(user_ids)
+            campaign_id=campaign_id,
+            thread_ids=list(thread_ids),
+            user_ids=list(user_ids),
         ),
         visibility=visibility,
         use=use,
@@ -132,8 +148,12 @@ def test_solo_fixture_builds_all_named_lanes_and_protected_pc_authority():
     db = factory()
     character = _add_character(db, owner)
     submission = accept_submission(
-        db, campaign_id=campaign_id, user_id=owner, character_id=character.id,
-        raw_content="I open the door", segments=[{"type": "ic", "text": "I open the door"}],
+        db,
+        campaign_id=campaign_id,
+        user_id=owner,
+        character_id=character.id,
+        raw_content="I open the door",
+        segments=[{"type": "ic", "text": "I open the door"}],
         thread_id=thread_id,
     )
     db.commit()
@@ -145,12 +165,19 @@ def test_solo_fixture_builds_all_named_lanes_and_protected_pc_authority():
     inputs = next(lane for lane in packet.lanes if lane.name == LaneName.PLAYER_INPUTS)
     assert len(inputs.records) == case["expected_inputs"]
     assert inputs.records[0].value["submission_id"] == str(submission.id)
-    protected = next(lane for lane in packet.lanes if lane.name == LaneName.PROTECTED_PCS)
+    protected = next(
+        lane for lane in packet.lanes if lane.name == LaneName.PROTECTED_PCS
+    )
     assert protected.records[0].value == {
-        "character_id": str(character.id), "name": "Aria", "owner_user_id": str(owner),
-        "control_policy": "player_only", "dm_may_not_choose_actions": True,
+        "character_id": str(character.id),
+        "name": "Aria",
+        "owner_user_id": str(owner),
+        "control_policy": "player_only",
+        "dm_may_not_choose_actions": True,
     }
-    assert packet.observability.serialized_bytes == len(packet.serialize_for_adjudication().encode())
+    assert packet.observability.serialized_bytes == len(
+        packet.serialize_for_adjudication().encode()
+    )
     assert all(metric.assembly_ms >= 0 for metric in packet.observability.lanes)
 
 
@@ -159,15 +186,23 @@ def test_multiplayer_fixture_preserves_exact_mixed_ic_ooc_segments():
     factory, campaign_id, owner, other, thread_id = _campaign()
     db = factory()
     first = accept_submission(
-        db, campaign_id=campaign_id, user_id=owner, raw_content="I wave (carefully)",
+        db,
+        campaign_id=campaign_id,
+        user_id=owner,
+        raw_content="I wave (carefully)",
         segments=[
             {"type": "ic", "text": "I wave."},
             {"type": "ooc", "text": "Carefully; I am not surrendering."},
-        ], thread_id=thread_id,
+        ],
+        thread_id=thread_id,
     )
     second = accept_submission(
-        db, campaign_id=campaign_id, user_id=other, raw_content="I watch",
-        segments=[{"type": "ic", "text": "I watch the guard."}], thread_id=thread_id,
+        db,
+        campaign_id=campaign_id,
+        user_id=other,
+        raw_content="I watch",
+        segments=[{"type": "ic", "text": "I watch the guard."}],
+        thread_id=thread_id,
     )
     db.commit()
     _turn, attempt = coordinate_turn(db, campaign_id, thread_id)
@@ -176,21 +211,35 @@ def test_multiplayer_fixture_preserves_exact_mixed_ic_ooc_segments():
     inputs = next(lane for lane in packet.lanes if lane.name == LaneName.PLAYER_INPUTS)
 
     assert len(inputs.records) == case["expected_inputs"]
-    assert [record.value["submission_id"] for record in inputs.records] == [str(first.id), str(second.id)]
-    assert [segment["segment_type"] for segment in inputs.records[0].value["segments"]] == ["ic", "ooc"]
-    assert inputs.records[0].value["segments"][1]["text"] == "Carefully; I am not surrendering."
+    assert [record.value["submission_id"] for record in inputs.records] == [
+        str(first.id),
+        str(second.id),
+    ]
+    assert [
+        segment["segment_type"] for segment in inputs.records[0].value["segments"]
+    ] == ["ic", "ooc"]
+    assert (
+        inputs.records[0].value["segments"][1]["text"]
+        == "Carefully; I am not surrendering."
+    )
 
 
 def test_hidden_npc_truth_is_adjudication_only_and_deterministic():
     case = _fixture("hidden_npc_truth")
     campaign_id, thread_id = str(uuid.uuid4()), str(uuid.uuid4())
     audience = ContextAudience(
-        campaign_id=campaign_id, thread_id=thread_id, audience="campaign", user_ids=[str(uuid.uuid4())]
+        campaign_id=campaign_id,
+        thread_id=thread_id,
+        audience="campaign",
+        user_ids=[str(uuid.uuid4())],
     )
     records = _empty_records()
     secret = _record(
-        case["narration_excludes"], campaign_id=campaign_id, visibility="dm_only",
-        use="adjudication_only", value={"npc_id": "npc-1", "truth": "The guide is the spy."},
+        case["narration_excludes"],
+        campaign_id=campaign_id,
+        visibility="dm_only",
+        use="adjudication_only",
+        value={"npc_id": "npc-1", "truth": "The guide is the spy."},
     )
     records[LaneName.KNOWLEDGE_VISIBILITY] = [secret]
     packet = assemble_context_packet(audience=audience, records=records)
@@ -206,14 +255,24 @@ def test_hidden_npc_truth_is_adjudication_only_and_deterministic():
 
 def test_private_audience_fixture_is_scoped_and_campaign_attempt_cannot_receive_it():
     case = _fixture("private_audience")
-    campaign_id, private_thread, member = str(uuid.uuid4()), str(uuid.uuid4()), str(uuid.uuid4())
+    campaign_id, private_thread, member = (
+        str(uuid.uuid4()),
+        str(uuid.uuid4()),
+        str(uuid.uuid4()),
+    )
     private_record = _record(
-        "private-clue", campaign_id=campaign_id, visibility=case["visibility"],
-        thread_ids=[private_thread], user_ids=[member],
+        "private-clue",
+        campaign_id=campaign_id,
+        visibility=case["visibility"],
+        thread_ids=[private_thread],
+        user_ids=[member],
     )
     private_packet = assemble_context_packet(
         audience=ContextAudience(
-            campaign_id=campaign_id, thread_id=private_thread, audience="private", user_ids=[member]
+            campaign_id=campaign_id,
+            thread_id=private_thread,
+            audience="private",
+            user_ids=[member],
         ),
         records={**_empty_records(), LaneName.RELEVANT_CANON: [private_record]},
     )
@@ -222,22 +281,35 @@ def test_private_audience_fixture_is_scoped_and_campaign_attempt_cannot_receive_
 
     public_packet = assemble_context_packet(
         audience=ContextAudience(
-            campaign_id=campaign_id, thread_id=str(uuid.uuid4()), audience="campaign", user_ids=[member]
+            campaign_id=campaign_id,
+            thread_id=str(uuid.uuid4()),
+            audience="campaign",
+            user_ids=[member],
         ),
         records={**_empty_records(), LaneName.RELEVANT_CANON: [private_record]},
     )
-    canon = next(lane for lane in public_packet.lanes if lane.name == LaneName.RELEVANT_CANON)
+    canon = next(
+        lane for lane in public_packet.lanes if lane.name == LaneName.RELEVANT_CANON
+    )
     assert canon.records == []
-    assert any(d.reason == "not_authorized_for_attempt_audience" for d in public_packet.observability.budget_decisions)
+    assert any(
+        d.reason == "not_authorized_for_attempt_audience"
+        for d in public_packet.observability.budget_decisions
+    )
 
     with pytest.raises(ContextAuthorizationError):
         assemble_context_packet(
             audience=ContextAudience(
-                campaign_id=campaign_id, thread_id=str(uuid.uuid4()), audience="campaign", user_ids=[member]
+                campaign_id=campaign_id,
+                thread_id=str(uuid.uuid4()),
+                audience="campaign",
+                user_ids=[member],
             ),
             records={
                 **_empty_records(),
-                LaneName.RELEVANT_CANON: [private_record.model_copy(update={"required": True})],
+                LaneName.RELEVANT_CANON: [
+                    private_record.model_copy(update={"required": True})
+                ],
             },
         )
 
@@ -247,12 +319,20 @@ def test_post_turn_lag_fixture_keeps_recent_committed_event_directly_available()
     factory, campaign_id, owner, _other, thread_id = _campaign()
     db = factory()
     _campaign_row, event = commit_campaign_mutation(
-        db, campaign_id, expected_revision=0, event_type="scene.door_opened",
-        payload={"door_id": "door-7", "open": True}, visibility="campaign",
+        db,
+        campaign_id,
+        expected_revision=0,
+        event_type="scene.door_opened",
+        payload={"door_id": "door-7", "open": True},
+        visibility="campaign",
     )
     submission = accept_submission(
-        db, campaign_id=campaign_id, user_id=owner, raw_content="I step through",
-        segments=[{"type": "ic", "text": "I step through."}], thread_id=thread_id,
+        db,
+        campaign_id=campaign_id,
+        user_id=owner,
+        raw_content="I step through",
+        segments=[{"type": "ic", "text": "I step through."}],
+        thread_id=thread_id,
     )
     db.commit()
     _turn, attempt = coordinate_turn(db, campaign_id, thread_id)
@@ -270,13 +350,23 @@ def test_repair_directive_fixture_is_separate_and_hidden_from_narration():
     case = _fixture("repair_directive")
     campaign_id, thread_id = str(uuid.uuid4()), str(uuid.uuid4())
     repair = _record(
-        "repair-1", campaign_id=campaign_id, visibility="dm_only", use="adjudication_only",
-        required=True, priority=100,
-        value={"validator": "agency", "directive": "Retry without choosing the PC action."},
+        "repair-1",
+        campaign_id=campaign_id,
+        visibility="dm_only",
+        use="adjudication_only",
+        required=True,
+        priority=100,
+        value={
+            "validator": "agency",
+            "directive": "Retry without choosing the PC action.",
+        },
     )
     packet = assemble_context_packet(
         audience=ContextAudience(
-            campaign_id=campaign_id, thread_id=thread_id, audience="campaign", user_ids=[str(uuid.uuid4())]
+            campaign_id=campaign_id,
+            thread_id=thread_id,
+            audience="campaign",
+            user_ids=[str(uuid.uuid4())],
         ),
         records={**_empty_records(), LaneName.REPAIR_DIRECTIVES: [repair]},
     )
@@ -290,19 +380,28 @@ def test_budget_pressure_fixture_omits_optional_records_but_never_required_autho
     case = _fixture("context_budget_pressure")
     campaign_id, thread_id = str(uuid.uuid4()), str(uuid.uuid4())
     required = _record(
-        "exact-input", campaign_id=campaign_id, required=True, priority=100,
+        "exact-input",
+        campaign_id=campaign_id,
+        required=True,
+        priority=100,
         value={"text": "required " * 80},
     )
     optional = _record(
-        "old-canon", campaign_id=campaign_id, priority=1,
+        "old-canon",
+        campaign_id=campaign_id,
+        priority=1,
         value={"text": "optional " * 500},
     )
     packet = assemble_context_packet(
         audience=ContextAudience(
-            campaign_id=campaign_id, thread_id=thread_id, audience="campaign", user_ids=[str(uuid.uuid4())]
+            campaign_id=campaign_id,
+            thread_id=thread_id,
+            audience="campaign",
+            user_ids=[str(uuid.uuid4())],
         ),
         records={
-            **_empty_records(), LaneName.PLAYER_INPUTS: [required],
+            **_empty_records(),
+            LaneName.PLAYER_INPUTS: [required],
             LaneName.RELEVANT_CANON: [optional],
         },
         budget=ContextBudget(max_bytes=6000, max_tokens=1500),
@@ -310,7 +409,9 @@ def test_budget_pressure_fixture_omits_optional_records_but_never_required_autho
     assert case["expected_optional_omission"] is True
     assert "exact-input" in packet.serialize_for_adjudication()
     assert "old-canon" not in packet.serialize_for_adjudication()
-    omission = next(d for d in packet.observability.budget_decisions if d.record_id == "old-canon")
+    omission = next(
+        d for d in packet.observability.budget_decisions if d.record_id == "old-canon"
+    )
     assert omission.reason == "total_budget_pressure"
 
     with pytest.raises(ContextBudgetError) as exc_info:
@@ -318,7 +419,9 @@ def test_budget_pressure_fixture_omits_optional_records_but_never_required_autho
             audience=packet.audience,
             records={
                 **_empty_records(),
-                LaneName.PLAYER_INPUTS: [required.model_copy(update={"value": {"text": "x" * 8000}})],
+                LaneName.PLAYER_INPUTS: [
+                    required.model_copy(update={"value": {"text": "x" * 8000}})
+                ],
             },
             budget=ContextBudget(max_bytes=2048, max_tokens=512),
         )
@@ -329,11 +432,15 @@ def test_budget_pressure_fixture_omits_optional_records_but_never_required_autho
 def test_required_unavailable_lane_and_stale_attempt_fail_instead_of_guessing():
     campaign_id, thread_id = str(uuid.uuid4()), str(uuid.uuid4())
     audience = ContextAudience(
-        campaign_id=campaign_id, thread_id=thread_id, audience="campaign", user_ids=[str(uuid.uuid4())]
+        campaign_id=campaign_id,
+        thread_id=thread_id,
+        audience="campaign",
+        user_ids=[str(uuid.uuid4())],
     )
     with pytest.raises(MissingAuthoritativeContextError) as exc_info:
         assemble_context_packet(
-            audience=audience, records=_empty_records(),
+            audience=audience,
+            records=_empty_records(),
             lane_status={LaneName.CURRENT_SCENE: "unavailable"},
             source_errors={LaneName.CURRENT_SCENE: ["scene reader timed out"]},
         )
@@ -342,8 +449,12 @@ def test_required_unavailable_lane_and_stale_attempt_fail_instead_of_guessing():
     factory, cid, owner, _other, tid = _campaign()
     db = factory()
     accept_submission(
-        db, campaign_id=cid, user_id=owner, raw_content="Go",
-        segments=[{"type": "ic", "text": "Go"}], thread_id=tid,
+        db,
+        campaign_id=cid,
+        user_id=owner,
+        raw_content="Go",
+        segments=[{"type": "ic", "text": "Go"}],
+        thread_id=tid,
     )
     db.commit()
     _turn, attempt = coordinate_turn(db, cid, tid)
@@ -356,6 +467,11 @@ def test_required_unavailable_lane_and_stale_attempt_fail_instead_of_guessing():
 
 def test_fixture_manifest_covers_every_required_issue_case():
     assert {case["name"] for case in FIXTURES} == {
-        "solo", "multiplayer_mixed_ic_ooc", "hidden_npc_truth", "private_audience",
-        "post_turn_lag", "repair_directive", "context_budget_pressure",
+        "solo",
+        "multiplayer_mixed_ic_ooc",
+        "hidden_npc_truth",
+        "private_audience",
+        "post_turn_lag",
+        "repair_directive",
+        "context_budget_pressure",
     }
