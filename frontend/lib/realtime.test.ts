@@ -194,7 +194,7 @@ describe('realtime helpers — dedupe/out-of-order/stream-scoped', () => {
     })
 
     it('abandoned old stream does not regress new B (absent from dm_messages)', () => {
-      let dmState: any = { status: 'streaming', streaming: true, stream_id: 'stream-B', last_sequence: 0, visible_text: '', chunk_count: 0 }
+      const dmState: any = { status: 'streaming', streaming: true, stream_id: 'stream-B', last_sequence: 0, visible_text: '', chunk_count: 0 }
       const snapWithBActive: SnapshotForRealtime = { dm_state: dmState, dm_messages: [], history: { messages: [] } }
       const runtimeTerminals = new Set<string>(['stream-A']) // A was abandoned, not in dm_messages
       const delayedAStreaming: RealtimeEvent = { type: 'dm.status', event_id: 'sA', campaign_id: 'c', thread_id: 't', stream_id: 'stream-A', status: 'streaming' } as any
