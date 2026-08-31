@@ -77,6 +77,7 @@ REQUIRED_LANES = {
     LaneName.CHARACTER_STATE,
     LaneName.KNOWLEDGE_VISIBILITY,
     LaneName.CONTENT_BOUNDARIES,
+    LaneName.DIFFICULTY,
     LaneName.RULESET_IDENTITY,
 }
 
@@ -972,19 +973,14 @@ def assemble_attempt_context(
     timings[LaneName.RECENT_HISTORY] = (time.monotonic() - lane_started) * 1000
 
     # Populate authoritative campaign-level lanes directly from the campaign row.
-    # These are read-only authoritative sources for difficulty / content boundaries;
-    # adapters may still supply supplemental records, but the campaign row is the
-    # source of truth when the columns exist (sequenced after #306 / #240).
+    # These are read-only authoritative sources for difficulty / content boundaries.
     lane_started = time.monotonic()
-    difficulty = getattr(campaign, "difficulty", None)
-    # Only emit difficulty when the campaign actually carries it; otherwise leave
-    # the lane empty so the required-lane fail-closed logic can surface missing
-    # authority unless an adapter explicitly marks it not_applicable.
+    difficulty = campaign.difficulty
     if difficulty not in (None, ""):
         records[LaneName.DIFFICULTY].append(
             ContextRecord(
                 record_id=f"campaign-difficulty:{campaign.id}",
-                required=False,
+                required=True,
                 priority=90,
                 value={"difficulty": str(difficulty)},
                 sources=[
@@ -1002,10 +998,9 @@ def assemble_attempt_context(
     timings[LaneName.DIFFICULTY] = (time.monotonic() - lane_started) * 1000
 
     lane_started = time.monotonic()
-    content_boundaries: Any | None = getattr(campaign, "content_boundaries", None)
+    content_boundaries: Any | None = campaign.content_boundaries
     if content_boundaries is not None:
-        # Normalize None vs empty dict/list; structural JSON already validated by
-        # campaign lifecycle (#240) so we just project it here with provenance.
+        # Structural JSON already validated by campaign lifecycle (#240).
         records[LaneName.CONTENT_BOUNDARIES].append(
             ContextRecord(
                 record_id=f"campaign-content-boundaries:{campaign.id}",
@@ -1051,19 +1046,6 @@ def assemble_attempt_context(
         ):
             if not records[pc_lane] and pc_lane not in (supplemental_status or {}):
                 statuses[pc_lane] = "not_applicable"
-    # Legacy schema compat: before #240 / #306 the campaigns table has no
-    # content_boundaries/difficulty columns. In that schema the content-boundary
-    # lane is legitimately not applicable rather than missing authority; treat
-    # it as explicit not_applicable when the column is absent and the caller
-    # did not declare a status. This keeps existing fixtures green while
-    # preserving fail-closed for new-schema deployments.
-    if not hasattr(Campaign, "content_boundaries"):
-        if LaneName.CONTENT_BOUNDARIES not in (supplemental_status or {}):
-            statuses[LaneName.CONTENT_BOUNDARIES] = "not_applicable"
-    if not hasattr(Campaign, "difficulty"):
-        if LaneName.DIFFICULTY not in (supplemental_status or {}):
-            # difficulty is not required, but keep status authoritative with zero records
-            statuses[LaneName.DIFFICULTY] = "not_applicable"
     for key, value in (supplemental_status or {}).items():
         statuses[key if isinstance(key, LaneName) else LaneName(key)] = value
 
