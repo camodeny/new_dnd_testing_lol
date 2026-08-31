@@ -55,4 +55,4 @@ fi
 
 echo "== backend: pytest =="
 # Disable xonsh plugin that breaks on newer pytest (present in local dev env, not in CI)
-ALLOW_MOCK_AUTH=true python3 -m pytest -p no:xonsh -p no:cacheprovider tests/ -v
+ALLOW_MOCK_AUTH=true NODE_ENV=test python3 -m pytest -p no:xonsh -p no:cacheprovider tests/ -v

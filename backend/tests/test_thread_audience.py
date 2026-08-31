@@ -45,6 +45,7 @@ def api(monkeypatch):
             yield db
 
     monkeypatch.setenv("ALLOW_MOCK_AUTH", "true")
+    monkeypatch.setenv("NODE_ENV", "test")
     app.dependency_overrides[get_db] = override_db
     try:
         yield TestClient(app), factory, campaign_id, member_id, outsider_id

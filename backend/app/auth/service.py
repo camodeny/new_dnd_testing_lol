@@ -52,16 +52,30 @@ def _get_or_create_mock_profile(db: Session) -> Profile:
 def is_mock_auth_allowed() -> bool:
     # A production marker always wins over the development/test escape hatch.
     # This prevents a copied local environment file from disabling auth in a
-    # production deployment.
-    if os.getenv("VERCEL_ENV", "").strip().lower() == "production":
+    # production deployment. Comparisons are whitespace/case-insensitive so
+    # " Production ", "PRODUCTION", etc. are treated as production.
+    vercel_env = os.getenv("VERCEL_ENV", "").strip().lower()
+    node_env = os.getenv("NODE_ENV", "").strip().lower()
+    if vercel_env == "production":
         return False
-    if os.getenv("NODE_ENV", "").strip().lower() == "production":
+    if node_env == "production":
         return False
 
-    # Fail closed when deployment metadata is absent or unfamiliar. Only the
-    # backend-owned flag may opt a development/test process into mock auth;
-    # NEXT_PUBLIC_MOCK_USER controls frontend behavior and is not authorization.
-    return os.getenv("ALLOW_MOCK_AUTH", "").strip().lower() in ("1", "true", "yes", "on")
+    # Fail closed: backend-only flag is required; frontend flag never authorizes.
+    # NEXT_PUBLIC_MOCK_USER controls frontend UI mocking and is not authorization.
+    allow = os.getenv("ALLOW_MOCK_AUTH", "").strip().lower() in ("1", "true", "yes", "on")
+    if not allow:
+        return False
+
+    # Missing/unknown deployment metadata fails closed even if ALLOW is present.
+    # This prevents a self-hosted public deployment with unset metadata from
+    # becoming fail-open if a local .env with ALLOW_MOCK_AUTH=true is copied.
+    # Supported local/test environments must explicitly opt in via:
+    #   - NODE_ENV=development|test  (generic / CI / local)
+    #   - VERCEL_ENV=development|preview  (Vercel non-prod)
+    if node_env in ("development", "test") or vercel_env in ("development", "preview", "test"):
+        return True
+    return False
 
 
 def _resolve_with_token(db: Session, token: str) -> Profile:
