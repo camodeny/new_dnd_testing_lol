@@ -268,6 +268,7 @@ export function nextDmStateForStatus(
   current: DmStateForRealtime | null,
   event: RealtimeEvent,
   snapshot: SnapshotForRealtime | null,
+  runtimeTerminalIds?: Set<string>,
 ): DmStateForRealtime | null {
   const evSid = event.stream_id ? String(event.stream_id) : null
   const activeSid = current?.stream_id ? String(current.stream_id) : null
@@ -277,10 +278,15 @@ export function nextDmStateForStatus(
     const sid2 = (m as unknown as { stream_id?: string }).stream_id
     if (sid2) completedIds.add(String(sid2))
   }
+  // Runtime terminal knowledge (completed/abandoned/failed seen in-memory) — not yet in snapshot
+  const isTerminal = (id: string) => completedIds.has(id) || (runtimeTerminalIds?.has(id) ?? false)
 
   if (evSid && activeSid && evSid !== activeSid) {
-    if (status === 'streaming' && !completedIds.has(evSid)) {
-      // New stream B — establish
+    if (status === 'streaming' && !isTerminal(evSid)) {
+      // New stream B — establish, but only if B is not older than current.
+      // Use created_at ordering if available, otherwise rely on terminal set to reject old A.
+      // If current is B and delayed A streaming arrives, A will be in terminal set (completed) or
+      // if A was abandoned/failed (absent from dm_messages), runtimeTerminalIds will contain it.
       return {
         status: 'streaming',
         streaming: true,

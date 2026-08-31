@@ -166,5 +166,41 @@ describe('realtime helpers — dedupe/out-of-order/stream-scoped', () => {
       expect(next?.stream_id).toBe('stream-B')
       expect(next?.status).toBe('streaming')
     })
+
+    it('A streaming → A completed → B streaming → delayed A streaming does not regress B (runtime terminal)', () => {
+      let dmState: any = { status: 'streaming', streaming: true, stream_id: 'stream-A', last_sequence: 5, visible_text: 'A ', chunk_count: 6 }
+      const snapAActive: SnapshotForRealtime = { dm_state: dmState, dm_messages: [], history: { messages: [] } }
+      const runtimeTerminals = new Set<string>()
+      // A completed — becomes terminal
+      const aCompleted: RealtimeEvent = { type: 'dm.status', event_id: 'sA-completed', campaign_id: 'c', thread_id: 't', stream_id: 'stream-A', status: 'completed' } as any
+      dmState = nextDmStateForStatus(dmState, aCompleted, snapAActive, runtimeTerminals)!
+      runtimeTerminals.add('stream-A')
+      expect(dmState.status).toBe('completed')
+      // B streaming — new stream, should switch
+      const snapWithACompleted: SnapshotForRealtime = {
+        dm_state: dmState,
+        dm_messages: [{ id: 'stream-A', turn_id: 'tA', attempt_id: 'aA', final_text: 'A ', status: 'completed' } as any],
+        history: { messages: [] },
+      }
+      const bStreaming: RealtimeEvent = { type: 'dm.status', event_id: 'sB', campaign_id: 'c', thread_id: 't', stream_id: 'stream-B', status: 'streaming', visible_text: '' } as any
+      dmState = nextDmStateForStatus(dmState, bStreaming, snapWithACompleted, runtimeTerminals)!
+      expect(dmState.stream_id).toBe('stream-B')
+      // Delayed duplicate A streaming — should be rejected because A is terminal (in runtime set), even though snapshot still has A active? Use old snapshot where A is still active to simulate delayed
+      const snapOldAActive: SnapshotForRealtime = { dm_state: { status: 'streaming', streaming: true, stream_id: 'stream-A', last_sequence: 5 } as any, dm_messages: [], history: { messages: [] } }
+      const delayedAStreaming: RealtimeEvent = { type: 'dm.status', event_id: 'sA-delayed', campaign_id: 'c', thread_id: 't', stream_id: 'stream-A', status: 'streaming' } as any
+      const nextAfterDelayed = nextDmStateForStatus(dmState, delayedAStreaming, snapOldAActive, runtimeTerminals)
+      expect(nextAfterDelayed).toBe(dmState) // should not regress
+      expect(nextAfterDelayed?.stream_id).toBe('stream-B')
+    })
+
+    it('abandoned old stream does not regress new B (absent from dm_messages)', () => {
+      let dmState: any = { status: 'streaming', streaming: true, stream_id: 'stream-B', last_sequence: 0, visible_text: '', chunk_count: 0 }
+      const snapWithBActive: SnapshotForRealtime = { dm_state: dmState, dm_messages: [], history: { messages: [] } }
+      const runtimeTerminals = new Set<string>(['stream-A']) // A was abandoned, not in dm_messages
+      const delayedAStreaming: RealtimeEvent = { type: 'dm.status', event_id: 'sA', campaign_id: 'c', thread_id: 't', stream_id: 'stream-A', status: 'streaming' } as any
+      const next = nextDmStateForStatus(dmState, delayedAStreaming, snapWithBActive, runtimeTerminals)
+      expect(next).toBe(dmState)
+      expect(next?.stream_id).toBe('stream-B')
+    })
   })
 })

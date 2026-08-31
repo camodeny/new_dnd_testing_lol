@@ -103,6 +103,7 @@ export function useLiveTableRealtime(opts: UseLiveTableRealtimeOptions) {
   const channelRef = useRef<ReturnType<typeof supabase.channel> | null>(null)
   const isMountedRef = useRef(true)
   const reconnectAttemptsRef = useRef(0)
+  const terminalStreamIdsRef = useRef<Set<string>>(new Set())
   const campaignIdRef = useRef(campaignId)
   const threadIdRef = useRef(threadId)
   campaignIdRef.current = campaignId
@@ -115,6 +116,16 @@ export function useLiveTableRealtime(opts: UseLiveTableRealtimeOptions) {
       const cid = campaignIdRef.current
       const tid = threadIdRef.current
       snapshotRef.current = snap
+      // Keep runtime terminal knowledge — snapshot's completed streams are terminal, plus any
+      // in-memory terminals (abandoned/failed absent from dm_messages) remain
+      for (const m of snap.dm_messages ?? []) {
+        if (m.id) terminalStreamIdsRef.current.add(String(m.id))
+        const sid2 = (m as unknown as { stream_id?: string }).stream_id
+        if (sid2) terminalStreamIdsRef.current.add(String(sid2))
+      }
+      // If snapshot has no active streaming state, but we have an active state that is now terminal, keep it terminal
+      const snapActiveId = snap.dm_state?.stream_id ? String(snap.dm_state.stream_id) : null
+      // Do not clear terminal set on idle — keep history
       const msgs = snapshotToMessageEvents(snap, cid, tid)
       setState((prev) => ({
         ...prev,
@@ -199,7 +210,7 @@ export function useLiveTableRealtime(opts: UseLiveTableRealtimeOptions) {
           if (evSid && activeSid && evSid !== activeSid) {
             // Mismatched stream — only a new streaming status for B should replace A
             if (ev.type === 'dm.status' && String(ev.status) === 'streaming') {
-              const next = nextDmStateForStatus(nextDmState, ev, snapshotRef.current)
+              const next = nextDmStateForStatus(nextDmState, ev, snapshotRef.current, terminalStreamIdsRef.current)
               if (next && String(next.stream_id) === evSid) {
                 nextDmState = next
                 nextStatus = ev
@@ -214,17 +225,25 @@ export function useLiveTableRealtime(opts: UseLiveTableRealtimeOptions) {
           } else {
             // Same stream or no active — use helper (handles creation from idle)
             const prevState = nextDmState
-            const next = nextDmStateForStatus(nextDmState, ev, snapshotRef.current)
+            const next = nextDmStateForStatus(nextDmState, ev, snapshotRef.current, terminalStreamIdsRef.current)
             // nextDmStateForStatus returns current if stale; detect change
             if (next !== prevState) {
               nextDmState = next
               nextStatus = ev
+              // Track terminal streams so delayed duplicate streaming for old A is rejected after B
+              const terminal = String(ev.status ?? '')
+              if (terminal === 'completed' || terminal === 'abandoned' || terminal === 'failed') {
+                if (evSid) terminalStreamIdsRef.current.add(evSid)
+              }
             } else if (!activeSid || evSid === activeSid) {
               // Status for active stream or thinking — keep as nextStatus
               nextStatus = ev
               if (nextDmState && ev.type === 'dm.status' && ev.status) {
-                // ensure status fields are updated (helper already did, but keep for thinking)
                 nextDmState = next!
+                const terminal = String(ev.status ?? '')
+                if (terminal === 'completed' || terminal === 'abandoned' || terminal === 'failed') {
+                  if (evSid) terminalStreamIdsRef.current.add(evSid)
+                }
               }
             }
           }
