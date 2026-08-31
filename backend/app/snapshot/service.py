@@ -346,16 +346,105 @@ def build_live_table_snapshot(
             )
         ) or 0
 
-        # DM turn/stream state — placeholder hook (issue says include active DM turn/stream state
-        # and hooks for structured surfaces added later). No durable DM turn model yet;
-        # return a stable idle state so clients can rely on shape.
-        dm_state = {
+        # DM stream state — issue #197 durable stream chunks
+        # Completed streams become canonical history; streaming ones are active.
+        # Abandoned/failed are excluded from canonical view but remain auditable via dm_streams API.
+        dm_messages: list[dict] = []
+        dm_state: dict[str, Any] = {
             "status": "idle",
             "streaming": False,
             "active_turn": None,
             "turn_id": None,
             "started_at": None,
         }
+        try:
+            from models import DMStream, DMStreamChunk
+
+            # Active streaming stream (most recent) for this thread
+            dm_active = db.execute(
+                select(DMStream)
+                .where(
+                    DMStream.campaign_id == campaign_id,
+                    DMStream.thread_id == resolved_tid,
+                    DMStream.status == "streaming",
+                )
+                .order_by(DMStream.created_at.desc())
+                .limit(1)
+            ).scalars().first()
+
+            if dm_active is not None:
+                active_chunks = db.execute(
+                    select(DMStreamChunk)
+                    .where(DMStreamChunk.stream_id == dm_active.id)
+                    .order_by(DMStreamChunk.sequence.asc())
+                ).scalars().all()
+                visible_text = "".join(c.text for c in active_chunks)
+                dm_state = {
+                    "status": "streaming",
+                    "streaming": True,
+                    "active_turn": dm_active.turn_id,
+                    "turn_id": dm_active.turn_id,
+                    "attempt_id": dm_active.attempt_id,
+                    "stream_id": str(dm_active.id),
+                    "started_at": dm_active.created_at.isoformat() if dm_active.created_at else None,
+                    "first_chunk_at": dm_active.first_chunk_at.isoformat() if dm_active.first_chunk_at else None,
+                    "last_chunk_at": dm_active.last_chunk_at.isoformat() if dm_active.last_chunk_at else None,
+                    "chunk_count": dm_active.chunk_count,
+                    "total_bytes": dm_active.total_bytes,
+                    "last_sequence": dm_active.last_sequence,
+                    "visible_text": visible_text,
+                    "trace_id": dm_active.trace_id,
+                }
+            else:
+                dm_state = {
+                    "status": "idle",
+                    "streaming": False,
+                    "active_turn": None,
+                    "turn_id": None,
+                    "attempt_id": None,
+                    "stream_id": None,
+                    "started_at": None,
+                    "chunk_count": 0,
+                    "visible_text": "",
+                }
+
+            # Completed DM messages (canonical history) — ordered by completion time
+            dm_completed_rows = db.execute(
+                select(DMStream)
+                .where(
+                    DMStream.campaign_id == campaign_id,
+                    DMStream.thread_id == resolved_tid,
+                    DMStream.status == "completed",
+                )
+                .order_by(DMStream.completed_at.asc().nulls_last(), DMStream.created_at.asc())
+            ).scalars().all()
+            dm_messages = []
+            for s in dm_completed_rows:
+                # Prefer materialized final_text, fallback to chunk reconstruction
+                if s.final_text is not None:
+                    text = s.final_text
+                else:
+                    ch = db.execute(
+                        select(DMStreamChunk).where(DMStreamChunk.stream_id == s.id).order_by(DMStreamChunk.sequence.asc())
+                    ).scalars().all()
+                    text = "".join(c.text for c in ch)
+                dm_messages.append({
+                    "id": str(s.id),
+                    "turn_id": s.turn_id,
+                    "attempt_id": s.attempt_id,
+                    "thread_id": str(s.thread_id),
+                    "status": s.status,
+                    "final_text": text,
+                    "chunk_count": s.chunk_count,
+                    "total_bytes": s.total_bytes,
+                    "completed_at": s.completed_at.isoformat() if s.completed_at else None,
+                    "created_at": s.created_at.isoformat() if s.created_at else None,
+                })
+        except Exception as exc:
+            # DM stream projection must not break snapshot — fail closed is snapshot projection error,
+            # but broken dm_streams should not take down entire snapshot. Log and fallback to idle.
+            logger.warning("dm_state projection failed campaign_id=%s thread_id=%s error=%s", campaign_id, thread_id_str, exc)
+            # keep initialized idle dm_state/dm_messages
 
         # Reconciliation metadata — allows client to fetch snapshot then subscribe
         # realtime without a gap. The resume token encodes revision + high water.
@@ -387,6 +476,7 @@ def build_live_table_snapshot(
                 },
             },
             "dm_state": dm_state,
+            "dm_messages": dm_messages,
             # Hook for later structured surfaces (combat, shops, etc.)
             "surfaces": {},
             # Backward-compatible alias
