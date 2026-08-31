@@ -126,6 +126,7 @@ export function useLiveTableRealtime(opts: UseLiveTableRealtimeOptions) {
   const terminalStreamIdsRef = useRef<Set<string>>(new Set())
   const campaignIdRef = useRef(campaignId)
   const threadIdRef = useRef(threadId)
+  const historyCursorRef = useRef<string | null>(initialSnapshot?.history?.pagination?.next_cursor ?? null)
   campaignIdRef.current = campaignId
   threadIdRef.current = threadId
 
@@ -136,6 +137,7 @@ export function useLiveTableRealtime(opts: UseLiveTableRealtimeOptions) {
       const cid = campaignIdRef.current
       const tid = threadIdRef.current
       snapshotRef.current = snap
+      historyCursorRef.current = snap.history?.pagination?.next_cursor ?? null
       // Keep runtime terminal knowledge — snapshot's completed streams are terminal, plus any
       // in-memory terminals (abandoned/failed absent from dm_messages) remain
       for (const m of snap.dm_messages ?? []) {
@@ -153,7 +155,7 @@ export function useLiveTableRealtime(opts: UseLiveTableRealtimeOptions) {
         realtimeResumeToken: snap.reconciliation?.realtime_resume_token ?? prev.realtimeResumeToken,
         hasSnapshot: true,
         phase: prev.connected ? 'live' : 'reconnecting',
-        historyCursor: snap.history?.pagination?.next_cursor ?? null,
+        historyCursor: historyCursorRef.current,
         hasOlderMessages: Boolean(snap.history?.pagination?.has_more),
         messages: msgs,
         dmState: snap.dm_state ?? null,
@@ -348,6 +350,7 @@ export function useLiveTableRealtime(opts: UseLiveTableRealtimeOptions) {
     bufferedRef.current = []
     snapshotRef.current = null
     terminalStreamIdsRef.current = new Set()
+    historyCursorRef.current = null
     setState({
       messages: [],
       dmState: null,
@@ -509,18 +512,15 @@ export function useLiveTableRealtime(opts: UseLiveTableRealtimeOptions) {
   const loadOlder = useCallback(async () => {
     const cid = campaignIdRef.current
     const tid = threadIdRef.current
-    let cursor: string | null = null
-    setState((prev) => {
-      cursor = prev.historyCursor
-      return cursor ? { ...prev, loadingOlder: true } : prev
-    })
+    const cursor = historyCursorRef.current
     if (!cid || !tid || !cursor) return null
-
+    if (isMountedRef.current) setState((prev) => ({ ...prev, loadingOlder: true }))
     const params = new URLSearchParams({ thread_id: tid, cursor })
     try {
       const page = await apiFetch<SnapshotForRealtime>(`/campaigns/${cid}/snapshot?${params}`)
       if (!isMountedRef.current) return page
       const older = snapshotToMessageEvents(page, cid, tid)
+      historyCursorRef.current = page.history?.pagination?.next_cursor ?? null
       setState((prev) => {
         const existing = new Set(prev.messages.map((message) => String(message.id ?? message.event_id)))
         return {
@@ -529,7 +529,7 @@ export function useLiveTableRealtime(opts: UseLiveTableRealtimeOptions) {
             ...older.filter((message) => !existing.has(String(message.id ?? message.event_id))),
             ...prev.messages,
           ]),
-          historyCursor: page.history?.pagination?.next_cursor ?? null,
+          historyCursor: historyCursorRef.current,
           hasOlderMessages: Boolean(page.history?.pagination?.has_more),
           loadingOlder: false,
         }

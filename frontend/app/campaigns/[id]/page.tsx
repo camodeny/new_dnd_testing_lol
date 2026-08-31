@@ -7,7 +7,6 @@ import {
   campaigns as campaignsApi,
   campaignMembers,
   sessions as sessionsApi,
-  proposals as proposalsApi,
   encounterMaps,
   apiFetch,
 } from '@/lib/api'
@@ -81,11 +80,7 @@ export default function CampaignViewPage() {
 
       if (activeSession) {
         setSession(activeSession)
-        const [propData, mapData] = await Promise.all([
-          proposalsApi.list(activeSession.id).catch(() => ({ proposals: [] })),
-          encounterMaps.getCurrent(String(id)).catch(() => ({ map: null })),
-        ])
-        void propData
+        const mapData = await encounterMaps.getCurrent(String(id)).catch(() => ({ map: null }))
         setEncounterMap((mapData as { map: EncounterMap | null }).map)
         setMode('session')
       } else {
@@ -116,9 +111,13 @@ export default function CampaignViewPage() {
   const handleSendMessage = useCallback(async (content: string) => {
     if (!id || !session?.id || !activeThreadId) return
     try {
+      const idempotencyKey =
+        typeof crypto !== 'undefined' && typeof crypto.randomUUID === 'function'
+          ? crypto.randomUUID()
+          : `${Date.now()}-${Math.random().toString(36).slice(2)}`
       await apiFetch(`/campaigns/${id}/submissions`, {
         method: 'POST',
-        headers: { 'Idempotency-Key': crypto.randomUUID() },
+        headers: { 'Idempotency-Key': idempotencyKey },
         body: JSON.stringify({
           content,
           thread_id: activeThreadId,
@@ -130,7 +129,7 @@ export default function CampaignViewPage() {
       setError((err as Error).message)
       throw err
     }
-  }, [id, session?.id, activeThreadId, currentCharacter?.id, liveTable])
+  }, [id, session?.id, activeThreadId, currentCharacter?.id, liveTable.refresh])
 
   const handleLoadOlderMessages = useCallback(async () => {
     await liveTable.loadOlder()

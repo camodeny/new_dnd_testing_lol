@@ -86,10 +86,13 @@ export default function StoryAtlas({
   const handleSend = async () => {
     const content = input.trim()
     if (!content || sending) return
+    const draft = input
     setInput('')
     setSending(true)
     try {
       await onSendMessage(content)
+    } catch {
+      setInput(draft)
     } finally {
       setSending(false)
     }
