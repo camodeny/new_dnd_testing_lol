@@ -163,9 +163,9 @@ export default function CampaignForm({ onCreated, onCancel }: CampaignFormProps)
             type="number"
             className="input"
             min={1}
-            max={8}
+            max={6}
             value={requiredPlayers}
-            onChange={(e) => setRequiredPlayers(Number(e.target.value))}
+            onChange={(e) => setRequiredPlayers(Math.max(1, Math.min(6, Number(e.target.value) || 1)))}
             disabled={busy}
           />
         </div>
