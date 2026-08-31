@@ -7,15 +7,14 @@ import {
   campaigns as campaignsApi,
   campaignMembers,
   sessions as sessionsApi,
-  world as worldApi,
-  proposals as proposalsApi,
+  legacyLiveTable,
   encounterMaps,
 } from '@/lib/api'
 import Loading from '@/components/common/Loading'
 import ErrorMessage from '@/components/common/ErrorMessage'
 import CampaignLobby from '@/components/dashboard/CampaignLobby'
 import StoryAtlas from '@/components/dashboard/StoryAtlas'
-import type { Campaign, Character, Session, Message, EncounterMap, SheetProposal } from '@/types'
+import type { Campaign, Character, Session, Message, EncounterMap } from '@/types'
 
 type CampaignMode = 'lobby' | 'planning' | 'world-building' | 'session'
 
@@ -40,7 +39,6 @@ export default function CampaignViewPage() {
   const [session, setSession] = useState<Session | null>(null)
   const [messages, setMessages] = useState<Message[]>([])
   const [hasOlderMessages, setHasOlderMessages] = useState(false)
-  const [sheetProposals, setSheetProposals] = useState<SheetProposal[]>([])
   const [encounterMap, setEncounterMap] = useState<EncounterMap | null>(null)
   const [loading, setLoading] = useState(true)
   const [error, setError] = useState('')
@@ -64,14 +62,12 @@ export default function CampaignViewPage() {
 
       if (activeSession) {
         setSession(activeSession)
-        const [sessionData, propData, mapData] = await Promise.all([
-          sessionsApi.get(activeSession.id, { limit: SESSION_MESSAGE_PAGE_SIZE }).catch(() => ({ session: null, messages: [] })),
-          proposalsApi.list(activeSession.id).catch(() => ({ proposals: [] })),
+        const [sessionData, mapData] = await Promise.all([
+          legacyLiveTable.get(activeSession.id, { limit: SESSION_MESSAGE_PAGE_SIZE }).catch(() => ({ session: null, messages: [] })),
           encounterMaps.getCurrent(String(id)).catch(() => ({ map: null })),
         ])
         setMessages((sessionData as { messages?: Message[] }).messages ?? [])
         setHasOlderMessages(Boolean((sessionData as { has_more_messages?: boolean }).has_more_messages))
-        setSheetProposals((propData as { proposals?: SheetProposal[] }).proposals ?? [])
         setEncounterMap((mapData as { map: EncounterMap | null }).map)
         setMode('session')
       } else {
@@ -91,7 +87,7 @@ export default function CampaignViewPage() {
   // SSE stream for live messages during a session
   useEffect(() => {
     if (!session?.id) return
-    const url = sessionsApi.streamUrl(session.id)
+    const url = legacyLiveTable.streamUrl(session.id)
     const evtSource = new EventSource(url)
 
     evtSource.onmessage = (e) => {
@@ -136,7 +132,7 @@ export default function CampaignViewPage() {
   const handleSendMessage = useCallback(async (content: string) => {
     if (!session?.id) return
     try {
-      await sessionsApi.sendMessage(session.id, content)
+      await legacyLiveTable.sendMessage(session.id, content)
     } catch (err) {
       setError((err as Error).message)
     }
@@ -147,7 +143,7 @@ export default function CampaignViewPage() {
     const oldest = messages[0]
     if (!oldest) return
     try {
-      const data = await sessionsApi.getMessages(session.id, {
+      const data = await legacyLiveTable.getMessages(session.id, {
         limit: SESSION_MESSAGE_PAGE_SIZE,
         beforeId: Number(oldest.id),
       })
