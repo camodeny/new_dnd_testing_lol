@@ -31,6 +31,7 @@ contract validates even before the corpus tools land.
 
 from __future__ import annotations
 
+import concurrent.futures
 import logging
 import time
 import uuid
@@ -269,9 +270,29 @@ def _classify_tool_error(exc: BaseException) -> str:
     retriable = ("timeout", "deadline", "temporar", "rate_limit", "unavailable", "connection", "503", "504")
     if isinstance(exc, EvidenceToolError):
         return "retriable"
+    if isinstance(exc, concurrent.futures.TimeoutError) or isinstance(exc, TimeoutError):
+        return "retriable"
     if any(t in name for t in retriable) or any(t in msg for t in retriable):
         return "retriable"
     return "terminal"
+
+
+def _call_with_timeout(
+    handler: Callable,
+    args: tuple[Any, ...],
+    kwargs: dict[str, Any],
+    timeout_s: float | None,
+) -> Any:
+    if timeout_s is None:
+        return handler(*args, **kwargs)
+    # Enforce actual per-tool deadline so a stuck tool cannot hang adjudication.
+    with concurrent.futures.ThreadPoolExecutor(max_workers=1) as pool:
+        fut = pool.submit(handler, *args, **kwargs)
+        try:
+            return fut.result(timeout=timeout_s)
+        except concurrent.futures.TimeoutError as exc:
+            fut.cancel()
+            raise TimeoutError(f"evidence tool timed out after {timeout_s}s") from exc
 
 
 # ── Context lane mediation ───────────────────────────────────────────────────
@@ -394,6 +415,9 @@ def augment_packet_with_evidence(
 
 # ── Execution of one round ───────────────────────────────────────────────────
 
+DEFAULT_TOOL_TIMEOUT_S: float = 2.0
+
+
 def execute_evidence_round(
     requests: list[EvidenceRequest],
     audience: ContextAudience,
@@ -401,7 +425,7 @@ def execute_evidence_round(
     db: Any | None = None,
     tool_handlers: dict[str, Callable[[EvidenceRequest, ContextAudience, Any], EvidenceResult | dict[str, Any]]] | None = None,
     max_retries: int = 1,
-    timeout_s: float | None = None,
+    timeout_s: float | None = DEFAULT_TOOL_TIMEOUT_S,
 ) -> tuple[list[EvidenceResult], EvidenceRoundTrace]:
     """Execute one validated round, with per-request retry on transient failures."""
     t0 = time.monotonic()
@@ -421,10 +445,31 @@ def execute_evidence_round(
         req_t0 = time.monotonic()
         for attempt in range(max_retries + 1):
             try:
-                raw = handler(req, audience, db=db) if _handler_takes_db(handler) else handler(req, audience)
-                # Allow handlers to return plain dicts for convenience
+                _args: tuple[Any, ...]
+                _kwargs: dict[str, Any] = {}
+                if _handler_takes_db(handler):
+                    _args = (req, audience)
+                    _kwargs = {"db": db}
+                else:
+                    _args = (req, audience)
+                raw = _call_with_timeout(handler, _args, _kwargs, timeout_s)
+                # Allow handlers to return plain dicts for convenience — strict validation
                 if isinstance(raw, dict):
-                    # Dict is treated as payload with status inference
+                    # Require explicit visibility/authorization so malformed tool output cannot broaden scope
+                    if "visibility" not in raw:
+                        raise EvidenceValidationError(
+                            f"tool {req.tool} dict result missing required 'visibility' (must be public|campaign|private|dm_only)",
+                            details={"request_id": req.id},
+                        )
+                    visibility = raw["visibility"]
+                    if visibility not in ("public", "campaign", "private", "dm_only"):
+                        raise EvidenceValidationError(
+                            f"tool {req.tool} invalid visibility {visibility!r}",
+                            details={"request_id": req.id},
+                        )
+                    if visibility == "private" and req.tool == "ask_character_sheet":
+                        # private-capable tools must provide private-scoped authorization
+                        pass  # validated below via auth.user_ids
                     status: EvidenceStatus = raw.get("status", "ok")  # type: ignore[assignment]
                     if status not in _VALID_STATUSES:
                         status = "ok"
@@ -448,17 +493,52 @@ def execute_evidence_round(
                                 provenance={"tool": req.tool},
                             )
                         ]
+                    # Strict authorization: missing -> restrictive derived scope (campaign+thread only, no broad user list)
+                    raw_auth = raw.get("authorization")
+                    if raw_auth is None:
+                        # Fail-closed: derive minimal restrictive scope, not broad campaign user list
+                        auth = AuthorizationScope(
+                            campaign_id=audience.campaign_id,
+                            thread_ids=[audience.thread_id],
+                        )
+                    elif isinstance(raw_auth, AuthorizationScope):
+                        auth = raw_auth
+                    elif isinstance(raw_auth, dict):
+                        try:
+                            auth = AuthorizationScope.model_validate(raw_auth)
+                        except Exception as exc:
+                            raise EvidenceValidationError(
+                                f"tool {req.tool} invalid authorization: {exc}",
+                                details={"request_id": req.id},
+                            ) from exc
+                    else:
+                        raise EvidenceValidationError(
+                            f"tool {req.tool} invalid authorization type",
+                            details={"request_id": req.id},
+                        )
+                    # Enforce that auth never broadens beyond attempt audience
+                    if auth.campaign_id != audience.campaign_id:
+                        raise EvidenceValidationError(
+                            f"tool {req.tool} authorization campaign mismatch",
+                            details={"request_id": req.id},
+                        )
+                    if auth.thread_ids and audience.thread_id not in auth.thread_ids:
+                        raise EvidenceValidationError(
+                            f"tool {req.tool} authorization thread not in audience",
+                            details={"request_id": req.id},
+                        )
+                    if visibility == "private" and not auth.user_ids:
+                        raise EvidenceValidationError(
+                            f"tool {req.tool} private visibility requires user-scoped authorization",
+                            details={"request_id": req.id},
+                        )
                     result = EvidenceResult(
                         request_id=req.id,
                         tool=req.tool,
                         status=status,  # type: ignore[arg-type]
                         sources=parsed_sources,
-                        visibility=raw.get("visibility", "campaign"),
-                        authorization=raw.get("authorization") or AuthorizationScope(
-                            campaign_id=audience.campaign_id,
-                            thread_ids=[audience.thread_id],
-                            user_ids=list(audience.user_ids) if audience.audience == "private" else [],
-                        ),
+                        visibility=visibility,  # type: ignore[arg-type]
+                        authorization=auth,
                         payload=raw.get("payload", raw.get("result", raw)),
                         result_count=raw.get("result_count", 1 if status == "ok" else 0),
                         retries=retries,
@@ -494,6 +574,9 @@ def execute_evidence_round(
                 last_exc = None
                 break
             except BaseException as exc:  # noqa: BLE001
+                # Strict metadata errors must fail closed, not be broadened or retried
+                if isinstance(exc, EvidenceValidationError):
+                    raise
                 last_exc = exc
                 kind = _classify_tool_error(exc)
                 if kind == "retriable" and attempt < max_retries:
@@ -576,6 +659,7 @@ def run_bounded_evidence_loop(
     tool_handlers: dict[str, Callable] | None = None,
     max_rounds: int = MAX_EVIDENCE_ROUNDS,
     max_retries_per_request: int = 1,
+    timeout_s: float | None = DEFAULT_TOOL_TIMEOUT_S,
 ) -> tuple[DmTurnContractV1, EvidenceBundle]:
     """Orchestrate adjudicate → evidence → re-adjudicate.
 
@@ -648,6 +732,7 @@ def run_bounded_evidence_loop(
             db=db,
             tool_handlers=tool_handlers,
             max_retries=max_retries_per_request,
+            timeout_s=timeout_s,
         )
         trace.round_index = rounds
         traces.append(trace)
