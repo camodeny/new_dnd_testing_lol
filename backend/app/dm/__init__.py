@@ -20,11 +20,15 @@ from app.dm.contract import (  # noqa: F401
     public_projection,
 )
 from app.dm.turns import (  # noqa: F401
+    ATTEMPT_ABANDONED,
+    TURN_ABANDONED,
     AttemptSupersededError,
     StaleRevisionError,
     StreamBoundaryError,
     TurnConflictError,
+    abandon_visible_attempt,
     commit_turn,
+    commit_turn_with_effects,
     coordinate_turn,
     discard_superseded_result,
     get_attempt,
@@ -34,6 +38,7 @@ from app.dm.turns import (  # noqa: F401
     mark_attempt_running,
     mark_streaming_started,
     recover_stuck_attempts,
+    stage_validated_attempt,
 )
 from app.dm.evidence import (  # noqa: F401
     ALLOWED_TOOLS,

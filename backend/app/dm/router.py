@@ -122,6 +122,7 @@ def start_streaming(campaign_id: str, turn_id: str, payload: dict, request: Requ
         aid = uuid.UUID(str(attempt_id_raw))
     except ValueError as exc:
         raise HTTPException(status_code=422, detail="Invalid attempt_id") from exc
+    stream_id_raw = payload.get("stream_id") or payload.get("streamId")
     from app.dm.turns import AttemptSupersededError, get_turn, mark_streaming_started
 
     # Verify turn belongs to path campaign (prevents cross-campaign mutation via known UUID)
@@ -140,7 +141,7 @@ def start_streaming(campaign_id: str, turn_id: str, payload: dict, request: Requ
         raise HTTPException(status_code=404, detail="Thread not found") from exc
 
     try:
-        turn, attempt = mark_streaming_started(db, tid, aid)
+        turn, attempt = mark_streaming_started(db, tid, aid, stream_id=stream_id_raw)
         # Re-verify after mutation that turn still belongs to path campaign
         if str(turn.campaign_id) != str(campaign.id):
             raise HTTPException(status_code=404, detail="Turn not found")
@@ -231,6 +232,47 @@ def commit_dm_turn_endpoint(campaign_id: str, turn_id: str, payload: dict, reque
         raise HTTPException(status_code=409, detail=str(exc), headers={"X-Current-Revision": str(exc.actual_revision)}) from exc
     except TurnConflictError as exc:
         raise HTTPException(status_code=409, detail=str(exc)) from exc
+    except ValueError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+
+
+@router.post("/api/campaigns/{campaign_id}/dm-turns/{turn_id}/abandon")
+def abandon_dm_turn_endpoint(campaign_id: str, turn_id: str, payload: dict, request: Request, db: Session = Depends(get_db)):
+    profile = resolve_profile(request, db)
+    campaign = _authorized_campaign(db, campaign_id, profile.id)
+    _require_owner(campaign, profile.id)
+    try:
+        tid = uuid.UUID(turn_id)
+    except ValueError as exc:
+        raise HTTPException(status_code=404, detail="Invalid turn id") from exc
+    attempt_id_raw = payload.get("attempt_id")
+    if not attempt_id_raw:
+        raise HTTPException(status_code=422, detail="attempt_id is required")
+    try:
+        aid = uuid.UUID(str(attempt_id_raw))
+    except ValueError as exc:
+        raise HTTPException(status_code=422, detail="Invalid attempt_id") from exc
+    from app.dm.turns import abandon_visible_attempt, get_turn
+
+    turn_check = get_turn(db, tid)
+    if turn_check is None or str(turn_check.campaign_id) != str(campaign.id):
+        raise HTTPException(status_code=404, detail="Turn not found")
+    try:
+        t_uuid = parse_thread_id(turn_check.thread_id)
+        assert_can_read_thread(db, campaign.id, t_uuid, profile.id)
+    except ThreadNotFoundError as exc:
+        raise HTTPException(status_code=404, detail="Thread not found") from exc
+    except ThreadAuthorizationError as exc:
+        raise HTTPException(status_code=404, detail="Thread not found") from exc
+    except Exception as exc:
+        raise HTTPException(status_code=404, detail="Thread not found") from exc
+
+    reason = str(payload.get("reason") or payload.get("abandonment_reason") or "explicit_retry")
+    try:
+        turn, attempt = abandon_visible_attempt(db, tid, aid, reason=reason, actor_id=profile.id)
+        if str(turn.campaign_id) != str(campaign.id):
+            raise HTTPException(status_code=404, detail="Turn not found")
+        return {"turn": turn.to_dict(), "attempt": attempt.to_dict()}
     except ValueError as exc:
         raise HTTPException(status_code=422, detail=str(exc)) from exc
 
