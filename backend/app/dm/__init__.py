@@ -1,4 +1,4 @@
-"""DM turn/attempt + structured contract — issues #200, #201, #203."""
+"""DM turn/attempt + structured contract — issues #200, #201, #203, #205."""
 from app.dm.contract import (  # noqa: F401
     CONTRACT_VERSION,
     DM_TURN_CONTRACT_V1,
@@ -50,4 +50,27 @@ from app.dm.evidence import (  # noqa: F401
     execute_evidence_round,
     run_bounded_evidence_loop,
     validate_evidence_requests,
+)
+from app.dm.validators import (  # noqa: F401
+    AgencyValidator,
+    CanonValidator,
+    ContentBoundaryValidator,
+    EntityValidator,
+    EpistemicValidator,
+    OwnershipValidator,
+    ProvenanceValidator,
+    RepairValidator,
+    RulesValidator,
+    ValidationReport,
+    ValidationViolation,
+    ValidatorError,
+    ValidatorPipeline,
+    ValidatorRejectionError,
+    ValidatorResult,
+    VisibilityValidator,
+    default_pipeline,
+    format_rejection_for_retry,
+    run_with_bounded_regeneration,
+    validate_contract,
+    validate_contract_or_raise,
 )
