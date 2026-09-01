@@ -609,8 +609,14 @@ def _audience_for_attempt(
 
 
 def _sheet_value(sheet: Dnd5eCharacterSheet) -> dict[str, Any]:
-    """Bounded rules-relevant state, excluding biography/notes and other prompt bloat."""
-    return {
+    """Bounded rules-relevant state, excluding biography/notes and other prompt bloat.
+
+    Additive enrichment (issue #224): includes deterministic mechanics derived
+    from the sheet via app.rules.mechanics — always backward-compatible (existing
+    keys unchanged). If mechanics derivation fails, the error is surfaced in
+    ``mechanics_error`` rather than inventing fallback stats.
+    """
+    base: dict[str, Any] = {
         "armor_class": sheet.armor_class,
         "abilities": {
             name: getattr(sheet, name)
@@ -644,6 +650,34 @@ def _sheet_value(sheet: Dnd5eCharacterSheet) -> dict[str, Any]:
         "speed": sheet.speed,
         "spell_slots": sheet.spell_slots or {},
     }
+    # Additive #224 mechanics — try pure derivation, surface error without blocking lane
+    try:
+        from app.rules.mechanics import get_character_mechanics_for_sheet
+
+        m = get_character_mechanics_for_sheet(sheet)
+        # Keep payload bounded: include deterministic derived views gameplay needs,
+        # plus provenance/version for evidence. Full DTO available via evidence tool.
+        base["mechanics"] = {
+            "model_version": m.meta.model_version,
+            "rules_revision": m.meta.rules_revision,
+            "ability_modifiers": {k: v.modifier for k, v in m.abilities.items()},
+            "proficiency": m.proficiency.model_dump(mode="json"),
+            "saves": {k: v.model_dump(mode="json") for k, v in m.saves.items()},
+            "skills": {k: v.model_dump(mode="json") for k, v in m.skills.items()},
+            "passive": {k: v.model_dump(mode="json") for k, v in m.passive.items()},
+            "initiative": m.combat.get("initiative"),
+            "spellcasting": m.spellcasting.model_dump(mode="json"),
+            "validation": m.validation.model_dump(mode="json"),
+            "provenance": m.provenance,
+        }
+        # Expose explicit derived passive for direct lane consumers (no alias knowledge needed)
+        base["passive_perception_derived"] = m.passive["perception"].derived
+        base["passive_perception_effective"] = m.passive["perception"].effective
+    except Exception as exc:  # noqa: BLE001
+        # Fail-closed: surface error, do not invent stats
+        code = getattr(exc, "code", "mechanics_error")
+        base["mechanics_error"] = {"code": code, "message": str(exc)[:400], "field": getattr(exc, "field", None)}
+    return base
 
 
 def assemble_attempt_context(
