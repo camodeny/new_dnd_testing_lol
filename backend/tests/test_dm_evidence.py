@@ -364,7 +364,7 @@ def test_tool_timeout_retry_with_deadline():
     assert bundle.results[0].retries == 1
     assert bundle.results[0].status == "ok"
 
-    # actual deadline enforcement — handler sleeps longer than timeout
+    # actual deadline enforcement — handler sleeps longer than timeout; caller must return at deadline, not after handler finishes
     def slow_handler(req, audience, db=None):
         time.sleep(0.5)
         return EvidenceResult(
@@ -389,10 +389,14 @@ def test_tool_timeout_retry_with_deadline():
             "safe_prelude": "Checking...",
         }
     ).evidence_requests
+    t0 = time.monotonic()
     results, trace = execute_evidence_round(req, aud2, tool_handlers={"get_current_scene": slow_handler}, timeout_s=0.1, max_retries=1)
+    elapsed = time.monotonic() - t0
     assert results[0].status == "tool_failure"
     assert "timed out" in (results[0].error or "").lower()
     assert results[0].retries == 1  # retried once then failed
+    # Must return at deadline (~0.25s = 0.1*2 + backoff 0.05), not after handler sleep (~1.0s)
+    assert elapsed < 0.4, f"timeout did not bound wall time; elapsed={elapsed:.3f}s"
 
 
 def test_loop_limit():
@@ -502,6 +506,30 @@ def test_evidence_tool_failure_triggers_retry_then_failure_handling():
     results, _ = execute_evidence_round(req, aud, tool_handlers={"get_current_scene": always_fail}, timeout_s=1.0, max_retries=1)
     assert results[0].status == "tool_failure"
     assert results[0].retries == 0  # terminal not retried
+
+
+def test_unexpected_handler_result_type_fails_closed():
+    aud = _audience()
+    req = normalize_contract(
+        {
+            "contract_version": CONTRACT_VERSION,
+            "mode": "need_evidence",
+            "reason": "need",
+            "beats": [],
+            "evidence_requests": [{"id": "evidence_1", "tool": "get_current_scene"}],
+            "safe_prelude": "Checking...",
+        }
+    ).evidence_requests
+
+    def string_handler(req, audience, db=None):
+        return "just a string, not typed"
+
+    def int_handler(req, audience, db=None):
+        return 42
+
+    for handler in (string_handler, int_handler):
+        with pytest.raises(EvidenceValidationError):
+            execute_evidence_round(req, aud, tool_handlers={"get_current_scene": handler}, timeout_s=1.0)
 
 
 def test_evidence_results_carry_stable_source_ids():

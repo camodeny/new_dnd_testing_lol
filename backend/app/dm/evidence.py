@@ -286,13 +286,27 @@ def _call_with_timeout(
     if timeout_s is None:
         return handler(*args, **kwargs)
     # Enforce actual per-tool deadline so a stuck tool cannot hang adjudication.
-    with concurrent.futures.ThreadPoolExecutor(max_workers=1) as pool:
-        fut = pool.submit(handler, *args, **kwargs)
+    # Use a daemon thread so caller returns at deadline without waiting for
+    # the hung handler (ThreadPoolExecutor shutdown(wait=True) would still block).
+    import threading
+
+    result: dict[str, Any] = {}
+    error: dict[str, BaseException] = {}
+
+    def _target():
         try:
-            return fut.result(timeout=timeout_s)
-        except concurrent.futures.TimeoutError as exc:
-            fut.cancel()
-            raise TimeoutError(f"evidence tool timed out after {timeout_s}s") from exc
+            result["value"] = handler(*args, **kwargs)
+        except BaseException as exc:  # noqa: BLE001
+            error["exc"] = exc
+
+    thread = threading.Thread(target=_target, daemon=True)
+    thread.start()
+    thread.join(timeout=timeout_s)
+    if thread.is_alive():
+        raise TimeoutError(f"evidence tool timed out after {timeout_s}s")
+    if "exc" in error:
+        raise error["exc"]
+    return result.get("value")
 
 
 # ── Context lane mediation ───────────────────────────────────────────────────
@@ -549,27 +563,10 @@ def execute_evidence_round(
                     result.retries = retries
                     result.latency_ms = (time.monotonic() - req_t0) * 1000
                 else:
-                    # Coerce unexpected return
-                    result = EvidenceResult(
-                        request_id=req.id,
-                        tool=req.tool,
-                        status="unknown",
-                        sources=[
-                            SourceRef(
-                                source_type=_tool_to_source_type(req.tool),
-                                source_id=req.id,
-                                source_version="1",
-                                provenance={"tool": req.tool},
-                            )
-                        ],
-                        visibility="campaign",
-                        authorization=AuthorizationScope(
-                            campaign_id=audience.campaign_id,
-                            thread_ids=[audience.thread_id],
-                        ),
-                        payload=_compact(raw),
-                        retries=retries,
-                        latency_ms=(time.monotonic() - req_t0) * 1000,
+                    # Fail-closed: unexpected handler output bypasses typed interface — reject, do not synthesize visibility
+                    raise EvidenceValidationError(
+                        f"tool {req.tool} returned unexpected result type {type(raw).__name__!r}; must return EvidenceResult or dict with visibility+authorization",
+                        details={"request_id": req.id, "type": type(raw).__name__},
                     )
                 last_exc = None
                 break
