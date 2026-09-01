@@ -66,6 +66,7 @@ class LaneName(str, Enum):
     CONTENT_BOUNDARIES = "content_boundaries"
     DIFFICULTY = "difficulty"
     RULESET_IDENTITY = "ruleset_identity"
+    EVIDENCE_RESULTS = "evidence_results"
 
 
 LANE_ORDER = tuple(LaneName)
