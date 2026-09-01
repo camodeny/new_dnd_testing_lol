@@ -53,6 +53,7 @@ def create_app() -> FastAPI:
     from app.realtime.router import router as realtime_router
     from app.dm.router import router as dm_router
     from app.rolls.router import router as rolls_router
+    from app.rules.router import router as rules_router
 
     app.include_router(health_router)
     app.include_router(auth_router)
@@ -67,5 +68,6 @@ def create_app() -> FastAPI:
     app.include_router(realtime_router)
     app.include_router(dm_router)
     app.include_router(rolls_router)
+    app.include_router(rules_router)
 
     return app
