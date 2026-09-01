@@ -1,4 +1,4 @@
-"""DM turn/attempt + structured contract — issues #200, #201."""
+"""DM turn/attempt + structured contract — issues #200, #201, #203."""
 from app.dm.contract import (  # noqa: F401
     CONTRACT_VERSION,
     DM_TURN_CONTRACT_V1,
@@ -34,4 +34,20 @@ from app.dm.turns import (  # noqa: F401
     mark_attempt_running,
     mark_streaming_started,
     recover_stuck_attempts,
+)
+from app.dm.evidence import (  # noqa: F401
+    ALLOWED_TOOLS,
+    EvidenceBundle,
+    EvidenceLoopLimitError,
+    EvidenceResult,
+    EvidenceRoundTrace,
+    EvidenceToolError,
+    EvidenceValidationError,
+    MAX_EVIDENCE_ROUNDS,
+    MAX_REQUESTS_PER_ROUND,
+    augment_packet_with_evidence,
+    evidence_results_to_records,
+    execute_evidence_round,
+    run_bounded_evidence_loop,
+    validate_evidence_requests,
 )
