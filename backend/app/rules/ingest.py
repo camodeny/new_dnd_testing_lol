@@ -218,6 +218,7 @@ def import_corpus(
     corpus_version: str = CORPUS_VERSION,
     source_url: str = OFFICIAL_SRD_URL,
     source_checksum: str | None = None,
+    source_artifact_hash: str | None = None,
     pinned_inputs: dict | None = None,
     build_id: str | None = None,
     validate_canaries: bool = True,
@@ -225,12 +226,17 @@ def import_corpus(
     """Promotion: validate then write canonical records atomically.
 
     Returns build_id. Raises on validation failure (blocks promotion).
+
+    Immutability (#223): a promoted (corpus_id, corpus_version) is immutable.
+    A second import with the same version but different source/identities/content
+    is rejected — caller must bump corpus_version. Identical re-import is idempotent.
+    Official artifact hash is required and kept distinct from derivative hash.
     """
     bid = build_id or f"build_{uuid.uuid4().hex[:12]}_{int(time.time())}"
     # Structural
     errs = validate_structural(records)
     if errs:
-        _log_import(db, bid, corpus_id, corpus_version, "failed", source_checksum, pinned_inputs, errs, None)
+        _log_import(db, bid, corpus_id, corpus_version, "failed", source_checksum or source_artifact_hash, pinned_inputs, errs, None)
         raise ValueError(f"Import validation failed: {errs}")
     # Canary (5.2.1 proof)
     canary_results = None
@@ -238,12 +244,81 @@ def import_corpus(
         try:
             canary_results = validate_canary(records)
         except ValueError as e:
-            _log_import(db, bid, corpus_id, corpus_version, "failed", source_checksum, pinned_inputs, [str(e)], None)
+            _log_import(db, bid, corpus_id, corpus_version, "failed", source_checksum or source_artifact_hash, pinned_inputs, [str(e)], None)
             raise
 
-    # Determine checksum
-    if source_checksum is None:
-        source_checksum = compute_source_checksum([r.content_hash for r in records])
+    # --- Authoritative provenance: require official artifact hash, keep distinct from derivative ---
+    # source_artifact_hash = hash of the official WotC SRD 5.2.1 artifact bytes (PDF/HTML)
+    # source_checksum   = alias for official hash for backwards compat
+    official_hash = source_artifact_hash or source_checksum
+    if not official_hash:
+        _log_import(db, bid, corpus_id, corpus_version, "failed", None, pinned_inputs, ["Official SRD 5.2.1 artifact checksum (source_artifact_hash) is required for promotion"], canary_results)
+        raise ValueError(
+            "Official SRD 5.2.1 artifact checksum is required — pass source_artifact_hash (hash of the official WotC artifact). "
+            "Derivative dataset hash alone is not sufficient."
+        )
+    # Normalize both fields to official hash
+    source_artifact_hash = official_hash
+    source_checksum = official_hash
+    # Derivative hash is distinct and computed from normalized canonical content
+    derivative_checksum = compute_source_checksum([r.content_hash for r in records])
+    # Keep derivative hash distinct for observability; don't confuse with official
+    if pinned_inputs is None:
+        pinned_inputs = {}
+    else:
+        pinned_inputs = dict(pinned_inputs)
+    pinned_inputs.setdefault("derivative_checksum", derivative_checksum)
+    # If caller mistakenly passed derivative as official, still keep distinct
+    if derivative_checksum == official_hash:
+        # Extremely unlikely unless official artifact is exactly the normalized content list
+        pass
+
+    # --- Immutability check: already-promoted version must not be mutated ---
+    if RulesCorpus is not None:
+        existing = db.get(RulesCorpus, (corpus_id, corpus_version))  # type: ignore
+        if existing is not None:
+            # Fetch existing canonical identities/content for comparison
+            existing_rows = db.execute(
+                _text("SELECT rule_id, source_section_id, content_hash, source_hash FROM rules_sections WHERE corpus_id=:cid AND corpus_version=:ver"),
+                {"cid": corpus_id, "ver": corpus_version},
+            ).fetchall()
+            existing_map = {r[0]: (r[1], r[2], r[3]) for r in existing_rows}
+            new_map = {r.rule_id: (r.source_section_id, r.content_hash, r.source_hash) for r in records}
+            # Compare official provenance and identities
+            is_identical = (
+                existing.source_artifact_hash == source_artifact_hash
+                and existing.source_checksum == source_checksum
+                and set(existing_map.keys()) == set(new_map.keys())
+                and all(existing_map[k] == new_map[k] for k in new_map)
+            )
+            if is_identical:
+                # Idempotent re-import — don't delete/reinsert, preserve build identity
+                existing_build = existing.import_build_id or bid
+                _log_import(db, existing_build, corpus_id, corpus_version, "success", source_checksum, pinned_inputs, None, canary_results)
+                try:
+                    db.commit()
+                except Exception:
+                    pass
+                return existing_build
+            # Different content behind same version — reject to preserve historical citations
+            _log_import(
+                db,
+                bid,
+                corpus_id,
+                corpus_version,
+                "failed",
+                source_checksum,
+                pinned_inputs,
+                [f"Immutable corpus version {corpus_id}/{corpus_version} already promoted with different source/content (existing build {existing.import_build_id}); bump corpus_version or use a new build — refusing to mutate canonical records behind cited version."],
+                canary_results,
+            )
+            try:
+                db.commit()
+            except Exception:
+                pass
+            raise ValueError(
+                f"Immutable corpus version {corpus_id}/{corpus_version} already promoted (build {existing.import_build_id}) with different source/identities/content — refusing to mutate. Bump corpus_version for a new build."
+            )
 
     # Write in transaction
     try:
@@ -350,6 +425,7 @@ def import_fixture_sections(
     corpus_version: str = CORPUS_VERSION,
     source_url: str = OFFICIAL_SRD_URL,
     source_checksum: str | None = None,
+    source_artifact_hash: str | None = None,
     pinned_inputs: dict | None = None,
     validate_canaries: bool = True,
 ) -> tuple[str, list[CanonicalRecord]]:
@@ -360,13 +436,16 @@ def import_fixture_sections(
         corpus_version=corpus_version,
         source_url=source_url,
     )
+    # Prefer explicit artifact hash, fallback to source_checksum alias
+    official = source_artifact_hash or source_checksum
     bid = import_corpus(
         db,
         records,
         corpus_id=corpus_id,
         corpus_version=corpus_version,
         source_url=source_url,
-        source_checksum=source_checksum,
+        source_checksum=official,
+        source_artifact_hash=official,
         pinned_inputs=pinned_inputs,
         validate_canaries=validate_canaries,
     )
@@ -415,4 +494,5 @@ def parse_cantilux_json(data: dict, *, source_checksum: str | None = None) -> li
 
 def import_markdown_text(db: Session, md_text: str, **kwargs) -> tuple[str, list[CanonicalRecord]]:
     raw = _extract_markdown_sections(md_text, document=kwargs.get("document", "srd"))
+    # Ensure official hash is forwarded (kwargs may contain source_artifact_hash/source_checksum)
     return import_fixture_sections(db, raw, **kwargs)

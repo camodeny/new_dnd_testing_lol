@@ -30,8 +30,10 @@ def main():
     p.add_argument("--markdown", help="Path to markdown fallback file")
     p.add_argument("--corpus-id", default=CORPUS_ID)
     p.add_argument("--corpus-version", default=CORPUS_VERSION)
-    p.add_argument("--source-checksum", default=None)
-    p.add_argument("--build-embeddings", action="store_true", help="Rebuild stub embeddings after import")
+    p.add_argument("--source-checksum", default=None, help="DEPRECATED: use --source-artifact-hash (official WotC artifact hash)")
+    p.add_argument("--source-artifact-hash", default=None, help="SHA256 of official WotC SRD 5.2.1 artifact (required)")
+    p.add_argument("--source-artifact-file", default=None, help="Path to official SRD artifact file to hash (PDF/HTML)")
+    p.add_argument("--build-embeddings", action="store_true", help="Rebuild embeddings after import (respects GEMINI_API_KEY)")
     p.add_argument("--validate-canaries", action="store_true", default=True)
     args = p.parse_args()
 
@@ -52,10 +54,20 @@ def main():
     elif args.markdown:
         with open(args.markdown) as f:
             md = f.read()
+        # Resolve official hash
+        official = args.source_artifact_hash or args.source_checksum
+        if args.source_artifact_file:
+            import hashlib
+            official = hashlib.sha256(open(args.source_artifact_file, "rb").read()).hexdigest()
+        if not official:
+            print("ERROR: --source-artifact-hash (or --source-artifact-file) is required for promotion — official WotC artifact hash must be distinct from derivative", file=sys.stderr)
+            sys.exit(2)
+        derivative = compute_source_checksum(md)
+        pinned = {"cantilux_commit": os.getenv("CANTILUX_COMMIT", "unknown"), "source": args.markdown, "derivative_checksum": derivative}
         db = SessionLocal()
         try:
-            bid, recs = import_markdown_text(db, md, corpus_id=args.corpus_id, corpus_version=args.corpus_version)
-            print(f"Imported {len(recs)} sections build={bid}")
+            bid, recs = import_markdown_text(db, md, corpus_id=args.corpus_id, corpus_version=args.corpus_version, source_artifact_hash=official, pinned_inputs=pinned, validate_canaries=args.validate_canaries)
+            print(f"Imported {len(recs)} sections build={bid} official={official[:12]} derivative={derivative[:12]}")
             if args.build_embeddings:
                 ebid = build_embeddings(db, corpus_id=args.corpus_id, corpus_version=args.corpus_version)
                 print(f"Embeddings build={ebid}")
@@ -65,21 +77,33 @@ def main():
     else:
         p.error("one of --fixture, --cantilux-json, --markdown required")
 
-    pinned = {"cantilux_commit": os.getenv("CANTILUX_COMMIT", "unknown"), "source": args.cantilux_json or args.fixture}
+    # Resolve official artifact hash — must be hash of official WotC artifact, not derivative
+    official = args.source_artifact_hash or args.source_checksum
+    if args.source_artifact_file:
+        import hashlib
+        official = hashlib.sha256(open(args.source_artifact_file, "rb").read()).hexdigest()
+    if not official:
+        print("ERROR: --source-artifact-hash (or --source-artifact-file) is required for promotion — official WotC artifact hash must be distinct from derivative", file=sys.stderr)
+        sys.exit(2)
+    derivative = compute_source_checksum(raw)
+    pinned = {"cantilux_commit": os.getenv("CANTILUX_COMMIT", "unknown"), "source": args.cantilux_json or args.fixture, "derivative_checksum": derivative}
+    # Keep official and derivative distinct for observability
+    if official == derivative:
+        print("WARNING: official hash equals derivative hash — ensure official is hash of authoritative WotC artifact, not normalized derivative", file=sys.stderr)
     db = SessionLocal()
     try:
-        checksum = args.source_checksum or compute_source_checksum(raw)
         bid, recs = import_fixture_sections(
             db,
             raw,
             corpus_id=args.corpus_id,
             corpus_version=args.corpus_version,
             source_url=OFFICIAL_SRD_URL,
-            source_checksum=checksum,
+            source_checksum=official,
+            source_artifact_hash=official,
             pinned_inputs=pinned,
             validate_canaries=args.validate_canaries,
         )
-        print(f"Imported {len(recs)} sections build={bid} checksum={checksum[:12]}")
+        print(f"Imported {len(recs)} sections build={bid} official={official[:12]} derivative={derivative[:12]}")
         if args.build_embeddings:
             ebid = build_embeddings(db, corpus_id=args.corpus_id, corpus_version=args.corpus_version)
             print(f"Embeddings build={ebid}")

@@ -54,18 +54,25 @@ def _section_text(section: RulesSection) -> str:
 
 
 def _resolve_provider(embedding_model: str, provider: Any | None):
-    """Auto-resolve Gemini provider when model looks like Gemini."""
+    """Auto-resolve Gemini provider when model looks like Gemini.
+
+    Real models must fail visibly if provider cannot be constructed (e.g. missing
+    GEMINI_API_KEY) — never silently create stub vectors labeled as gemini.
+    Only the explicit stub model may use stub embeddings.
+    """
     if provider is not None:
         return provider
-    # Auto-select Gemini if model is gemini/text-embedding
+    # Only auto-resolve for real embedding models; stub models fall through to stub
     if embedding_model.startswith("gemini") or embedding_model.startswith("text-embedding") or embedding_model.startswith("models/"):
         try:
             from app.rules.gemini import make_gemini_provider
 
-            # Pass model through; gemini.py will normalize to models/...
             return make_gemini_provider(model=embedding_model)
-        except Exception:
-            return None
+        except Exception as exc:
+            raise RuntimeError(
+                f"Embedding model {embedding_model!r} requested but Gemini provider cannot be constructed: {exc}. "
+                f"Set GEMINI_API_KEY or use stub-hash-v1 for tests."
+            ) from exc
     return None
 
 

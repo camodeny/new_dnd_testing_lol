@@ -20,12 +20,15 @@ def upgrade() -> None:
     conn = op.get_bind()
     dialect = conn.dialect.name
 
-    # pgvector extension — best effort, ignore if unavailable (e.g. sqlite tests)
+    # pgvector extension — transaction-safe provisioning.
+    # The CI Postgres image may lack the extension; a failed CREATE EXTENSION
+    # aborts the entire migration transaction (InFailedSqlTransaction). Use a
+    # savepoint and an availability check so the migration can degrade to TEXT
+    # fallback visibly without aborting. Required canonical schema still fails
+    # visibly; only the optional vector index degrades.
+    has_vector_extension = False
     if dialect == "postgresql":
-        try:
-            conn.execute(sa.text("CREATE EXTENSION IF NOT EXISTS vector"))
-        except Exception:
-            pass
+        has_vector_extension = _ensure_vector_extension(conn)
 
     # ── rules_corpora ──────────────────────────────────────────────────
     if not _table_exists(conn, "rules_corpora"):
@@ -96,14 +99,9 @@ def upgrade() -> None:
 
     # ── rules_embeddings (derived, rebuildable) ───────────────────────
     if not _table_exists(conn, "rules_embeddings"):
-        # Use TEXT for embedding in sqlite; vector(1536) in postgres if available
+        # Use TEXT for embedding in sqlite; vector in postgres if available
         if dialect == "postgresql":
-            has_vector = False
-            try:
-                res = conn.execute(sa.text("SELECT 1 FROM pg_extension WHERE extname='vector'")).fetchone()
-                has_vector = res is not None
-            except Exception:
-                has_vector = False
+            has_vector = has_vector_extension
             if has_vector:
                 # Use generic vector (no fixed dim) so Gemini 768/3072 and stub 1536 all work
                 conn.execute(sa.text("""
@@ -196,6 +194,32 @@ def downgrade() -> None:
                 conn.execute(sa.text(f"DROP TABLE IF EXISTS {tbl} CASCADE"))
             except Exception:
                 pass
+
+
+def _ensure_vector_extension(conn) -> bool:
+    """Try to ensure pgvector is available without aborting outer transaction.
+
+    Returns True if vector extension is available/active, False if we must
+    degrade to TEXT fallback. Uses a savepoint so a failed CREATE EXTENSION
+    does not leave the migration transaction in InFailedSqlTransaction.
+    """
+    try:
+        with conn.begin_nested():
+            avail = conn.execute(sa.text("SELECT 1 FROM pg_available_extensions WHERE name='vector'")).fetchone()
+            if not avail:
+                return False
+            has = conn.execute(sa.text("SELECT 1 FROM pg_extension WHERE extname='vector'")).fetchone()
+            if has:
+                return True
+            conn.execute(sa.text("CREATE EXTENSION IF NOT EXISTS vector"))
+            has_after = conn.execute(sa.text("SELECT 1 FROM pg_extension WHERE extname='vector'")).fetchone()
+            return has_after is not None
+    except Exception as exc:
+        # Savepoint rolled back — log visibly but don't abort outer migration
+        # Required canonical tables will still be created; only vector index degrades
+        print(f"WARNING: pgvector extension not available, degrading to TEXT fallback: {exc}")
+        return False
+    return False
 
 
 def _table_exists(conn, name: str) -> bool:

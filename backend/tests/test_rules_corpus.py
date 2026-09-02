@@ -31,6 +31,10 @@ SAMPLE_SECTIONS = [
     {"document": "spells", "heading_path": ["Fireball"], "title": "Fireball", "body": "A bright streak flashes to a point you choose.", "structured_tables": [{"name": "Damage", "rows": [["Level", "Damage"], ["3rd", "8d6"]]}]},
 ]
 
+# Official artifact hash for tests — distinct from derivative hash
+TEST_OFFICIAL_HASH = "a" * 64
+TEST_OFFICIAL_HASH_2 = "b" * 64
+
 @pytest.fixture
 def db():
     engine = create_engine("sqlite://", connect_args={"check_same_thread": False}, poolclass=StaticPool)
@@ -67,11 +71,12 @@ def test_collision_detection_fails_closed():
 
 
 def test_official_metadata_and_checksum_recorded(db):
-    bid, recs = import_fixture_sections(db, SAMPLE_SECTIONS, validate_canaries=False)
+    bid, recs = import_fixture_sections(db, SAMPLE_SECTIONS, source_artifact_hash=TEST_OFFICIAL_HASH, validate_canaries=False)
     corpus = db.get(models.RulesCorpus, (CORPUS_ID, CORPUS_VERSION))
     assert corpus is not None
     assert corpus.source_url == OFFICIAL_SRD_URL
-    assert corpus.source_checksum is not None
+    assert corpus.source_checksum == TEST_OFFICIAL_HASH
+    assert corpus.source_artifact_hash == TEST_OFFICIAL_HASH
     assert corpus.license == LICENSE
     assert corpus.attribution == ATTRIBUTION
     assert corpus.import_build_id == bid
@@ -81,24 +86,43 @@ def test_official_metadata_and_checksum_recorded(db):
     assert row.content_hash is not None
     assert row.source_hash is not None
     assert row.citation_metadata["license"] == "CC BY 4.0"
-    # pinned_inputs stored
+    # pinned_inputs stores derivative distinct from official
     imp = db.get(models.RulesCorpusImport, bid)
     assert imp is not None
     assert imp.status == "success"
+    assert imp.source_checksum == TEST_OFFICIAL_HASH
+    assert imp.pinned_inputs is not None
+    assert "derivative_checksum" in imp.pinned_inputs
+    assert imp.pinned_inputs["derivative_checksum"] != TEST_OFFICIAL_HASH
+
+
+def test_official_artifact_hash_required(db):
+    # No official hash should fail promotion
+    with pytest.raises(ValueError, match="Official SRD.*artifact checksum is required"):
+        import_fixture_sections(db, SAMPLE_SECTIONS, validate_canaries=False)
+    # Hash of normalized content alone must not be treated as official
+    assert db.query(models.RulesCorpus).count() == 0
+
+
+def test_derivative_tamper_cannot_become_canonical_without_official(db):
+    # Even with canary present, missing official hash blocks promotion
+    tampered = [{"document": "playing-the-game", "heading_path": ["Combat"], "title": "Combat", "body": "tampered but contains weapon mastery"}]
+    with pytest.raises(ValueError, match="Official SRD"):
+        import_fixture_sections(db, tampered, validate_canaries=True)
 
 
 def test_canary_validation_catches_stale_52(db):
     # SAMPLE includes weapon mastery -> passes
-    bid, _ = import_fixture_sections(db, SAMPLE_SECTIONS, validate_canaries=True)
+    bid, _ = import_fixture_sections(db, SAMPLE_SECTIONS, source_artifact_hash=TEST_OFFICIAL_HASH, validate_canaries=True)
     assert bid
     # stale without weapon mastery -> fails
     stale = [{"document": "playing-the-game", "heading_path": ["Combat"], "title": "Combat", "body": "old text without canary"}]
     with pytest.raises(ValueError, match="Canary validation"):
-        import_fixture_sections(db, stale, validate_canaries=True)
+        import_fixture_sections(db, stale, source_artifact_hash=TEST_OFFICIAL_HASH, validate_canaries=True)
 
 
 def test_stable_id_lookup_across_restarts(db):
-    bid, recs = import_fixture_sections(db, SAMPLE_SECTIONS, validate_canaries=False)
+    bid, recs = import_fixture_sections(db, SAMPLE_SECTIONS, source_artifact_hash=TEST_OFFICIAL_HASH, validate_canaries=False)
     rid = recs[0].rule_id
     row1 = lookup_by_rule_id(db, rid)
     assert row1 is not None
@@ -111,7 +135,7 @@ def test_stable_id_lookup_across_restarts(db):
 
 
 def test_text_search_results_include_citation_and_version(db):
-    import_fixture_sections(db, SAMPLE_SECTIONS, validate_canaries=False)
+    import_fixture_sections(db, SAMPLE_SECTIONS, source_artifact_hash=TEST_OFFICIAL_HASH, validate_canaries=False)
     hits = hybrid_search(db, "opportunity attacks", limit=5)
     assert len(hits) >= 1
     h = hits[0]
@@ -123,7 +147,7 @@ def test_text_search_results_include_citation_and_version(db):
 
 
 def test_exact_stable_id_lookup_independent_of_search(db):
-    import_fixture_sections(db, SAMPLE_SECTIONS, validate_canaries=False)
+    import_fixture_sections(db, SAMPLE_SECTIONS, source_artifact_hash=TEST_OFFICIAL_HASH, validate_canaries=False)
     # exact lookup works even if FTS would not match paraphrase
     sample = db.query(models.RulesSection).first()
     row = lookup_by_rule_id(db, sample.rule_id)
@@ -135,7 +159,7 @@ def test_exact_stable_id_lookup_independent_of_search(db):
 
 
 def test_natural_language_hybrid_retrieval(db):
-    import_fixture_sections(db, SAMPLE_SECTIONS, validate_canaries=False)
+    import_fixture_sections(db, SAMPLE_SECTIONS, source_artifact_hash=TEST_OFFICIAL_HASH, validate_canaries=False)
     # lexical exact
     lexical = search_lexical(db, "Fireball", limit=5)
     assert any("Fireball" in s.title for s, _ in lexical)
@@ -146,7 +170,7 @@ def test_natural_language_hybrid_retrieval(db):
 
 
 def test_duplicate_concepts_separately_citable(db):
-    import_fixture_sections(db, SAMPLE_SECTIONS, validate_canaries=False)
+    import_fixture_sections(db, SAMPLE_SECTIONS, source_artifact_hash=TEST_OFFICIAL_HASH, validate_canaries=False)
     hits = hybrid_search(db, "opportunity", limit=10)
     # Should have two distinct opportunity entries from different documents
     locators = {h["source_locator"] for h in hits}
@@ -154,7 +178,7 @@ def test_duplicate_concepts_separately_citable(db):
 
 
 def test_embeddings_rebuild_does_not_change_citation(db):
-    import_fixture_sections(db, SAMPLE_SECTIONS, validate_canaries=False)
+    import_fixture_sections(db, SAMPLE_SECTIONS, source_artifact_hash=TEST_OFFICIAL_HASH, validate_canaries=False)
     rows_before = {r.rule_id: r.citation() for r in db.query(models.RulesSection).all()}
     bid1 = build_embeddings(db, embedding_model="stub-hash-v1", build_id="build1")
     bid2 = build_embeddings(db, embedding_model="stub-hash-v2", build_id="build2")
@@ -166,20 +190,29 @@ def test_embeddings_rebuild_does_not_change_citation(db):
 
 
 def test_corpus_update_does_not_silently_change_historical_identity(db):
-    import_fixture_sections(db, SAMPLE_SECTIONS, validate_canaries=False)
+    import_fixture_sections(db, SAMPLE_SECTIONS, source_artifact_hash=TEST_OFFICIAL_HASH, validate_canaries=False)
     orig_ids = {r.rule_id for r in db.query(models.RulesSection).all()}
-    # simulate update: add new section, same old ones remain
+    orig_count = len(orig_ids)
+    # Same version with different content must be rejected (immutable)
     updated = SAMPLE_SECTIONS + [{"document": "playing-the-game", "heading_path": ["New Rule"], "title": "New Rule", "body": "new content weapon mastery"}]
-    import_fixture_sections(db, updated, validate_canaries=False)
-    new_ids = {r.rule_id for r in db.query(models.RulesSection).all()}
-    assert orig_ids.issubset(new_ids)
-    # historical lookup still resolves
+    with pytest.raises(ValueError, match="Immutable corpus version"):
+        import_fixture_sections(db, updated, source_artifact_hash=TEST_OFFICIAL_HASH, validate_canaries=False)
+    # Historical records preserved
+    assert db.query(models.RulesSection).count() == orig_count
     for rid in orig_ids:
         assert lookup_by_rule_id(db, rid) is not None
+    # Bump version with different official hash should succeed and preserve history
+    new_version = CORPUS_VERSION + ".1"
+    import_fixture_sections(db, updated, corpus_version=new_version, source_artifact_hash=TEST_OFFICIAL_HASH_2, validate_canaries=False)
+    # Old version still intact
+    for rid in orig_ids:
+        assert lookup_by_rule_id(db, rid, corpus_version=CORPUS_VERSION) is not None
+    # New version has the extra rule
+    assert db.query(models.RulesSection).filter(models.RulesSection.corpus_version == new_version).count() == orig_count + 1
 
 
 def test_campaign_memory_cannot_overwrite_rules_authority(db):
-    import_fixture_sections(db, SAMPLE_SECTIONS, validate_canaries=False)
+    import_fixture_sections(db, SAMPLE_SECTIONS, source_artifact_hash=TEST_OFFICIAL_HASH, validate_canaries=False)
     # campaign tables exist but are separate; ensure no FK between them
     # attempt to verify rules_sections independent of campaigns
     count = db.query(models.RulesSection).count()
@@ -187,7 +220,7 @@ def test_campaign_memory_cannot_overwrite_rules_authority(db):
 
 
 def test_unsupported_rule_returns_not_found(db):
-    import_fixture_sections(db, SAMPLE_SECTIONS, validate_canaries=False)
+    import_fixture_sections(db, SAMPLE_SECTIONS, source_artifact_hash=TEST_OFFICIAL_HASH, validate_canaries=False)
     assert lookup_by_rule_id(db, "srd521.nonexistent.rule") is None
     aud = _audience()
     req = EvidenceRequest(id="evidence_1", tool="lookup_rule", query="srd521.nonexistent.rule")
@@ -200,7 +233,7 @@ def test_unsupported_rule_returns_not_found(db):
 
 
 def test_evidence_tool_contract_bounded_and_citation_preserved(db):
-    import_fixture_sections(db, SAMPLE_SECTIONS, validate_canaries=False)
+    import_fixture_sections(db, SAMPLE_SECTIONS, source_artifact_hash=TEST_OFFICIAL_HASH, validate_canaries=False)
     aud = _audience()
     sample = db.query(models.RulesSection).first()
     req = EvidenceRequest(id="evidence_1", tool="lookup_rule", query=sample.rule_id)
@@ -246,7 +279,24 @@ def test_import_fails_on_unresolved_collision(db):
 
 
 def test_cc_by_attribution_preserved(db):
-    import_fixture_sections(db, SAMPLE_SECTIONS, validate_canaries=False)
+    import_fixture_sections(db, SAMPLE_SECTIONS, source_artifact_hash=TEST_OFFICIAL_HASH, validate_canaries=False)
     row = db.query(models.RulesSection).first()
     assert "Creative Commons" in row.citation_metadata["attribution"]
     assert row.citation()["license"] == "CC BY 4.0"
+
+
+def test_real_embedding_model_must_not_silently_fallback_to_stub(db, monkeypatch):
+    import_fixture_sections(db, SAMPLE_SECTIONS, source_artifact_hash=TEST_OFFICIAL_HASH, validate_canaries=False)
+    # Ensure no API key present
+    monkeypatch.delenv("GEMINI_API_KEY", raising=False)
+    monkeypatch.delenv("GOOGLE_API_KEY", raising=False)
+    monkeypatch.delenv("GOOGLE_GENAI_API_KEY", raising=False)
+    # Requesting a real model without provider must fail visibly, not create stub labeled as gemini
+    with pytest.raises(RuntimeError, match="GEMINI_API_KEY|Gemini|cannot be constructed"):
+        build_embeddings(db, embedding_model="gemini-embedding-2", embedding_version="1")
+    # No fake gemini rows should exist
+    assert db.query(models.RulesEmbedding).filter(models.RulesEmbedding.embedding_model == "gemini-embedding-2").count() == 0
+    # Explicit stub model should still work
+    bid = build_embeddings(db, embedding_model="stub-hash-v1", build_id="stub1")
+    assert bid == "stub1"
+    assert db.query(models.RulesEmbedding).filter(models.RulesEmbedding.embedding_model == "stub-hash-v1").count() == len(SAMPLE_SECTIONS)
