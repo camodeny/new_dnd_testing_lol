@@ -1,7 +1,7 @@
 """add rules corpus with stable citations — issue #223
 
 Revision ID: f3a1c9d8e2b4
-Revises: e7b2c4d6f8a0
+Revises: a9b8c7d6e5f4
 """
 
 from typing import Sequence, Union
@@ -11,7 +11,7 @@ import sqlalchemy as sa
 from sqlalchemy.dialects import postgresql
 
 revision: str = "f3a1c9d8e2b4"
-down_revision: Union[str, Sequence[str], None] = "e7b2c4d6f8a0"
+down_revision: Union[str, Sequence[str], None] = "a9b8c7d6e5f4"
 branch_labels: Union[str, Sequence[str], None] = None
 depends_on: Union[str, Sequence[str], None] = None
 
