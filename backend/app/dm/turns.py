@@ -661,11 +661,11 @@ def mark_streaming_started(db: Session, turn_id: uuid.UUID, attempt_id: uuid.UUI
             # Also check denormalized counters for legacy
             if not stream.first_chunk_at and (stream.chunk_count or 0) == 0:
                 raise ValueError(f"Streaming requires durable first chunk for stream {parsed_stream_id} — no chunk persisted")
-        # Ensure stream belongs to this turn/attempt (loose check: allow but log)
+        # Ensure stream belongs to this turn/attempt — fail closed (prevents unrelated chunk satisfying boundary)
         if str(stream.turn_id) != str(turn_id) or str(stream.attempt_id) != str(attempt_id):
-            logger.warning(
-                "dm_turn streaming_started stream_mismatch turn_id=%s attempt_id=%s stream_id=%s stream.turn_id=%s stream.attempt_id=%s",
-                turn_id, attempt_id, parsed_stream_id, stream.turn_id, stream.attempt_id,
+            raise ValueError(
+                f"Stream {parsed_stream_id} does not belong to turn {turn_id} attempt {attempt_id} "
+                f"(stream.turn_id={stream.turn_id} stream.attempt_id={stream.attempt_id})"
             )
 
     if attempt.status == ATTEMPT_SUPERSEDED:

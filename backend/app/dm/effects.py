@@ -25,28 +25,45 @@ logger = logging.getLogger(__name__)
 # Visibility ordering for broadening check (least -> most permissive)
 _VISIBILITY_ORDER = {"dm_private": 0, "party_known": 1, "public": 2}
 
+# Effects without explicit visibility are treated as public patches (must not be promoted from private attempts)
+_EFFECT_DEFAULT_VISIBILITY: dict[str, str] = {
+    "update_scene": "public",
+    "propose_sheet_update": "public",
+}
+
+def _is_shared_audience(audience: str) -> bool:
+    return (audience or "campaign") == "campaign"
+
 def _visibility_of(effect: dict[str, Any]) -> str | None:
     args = effect.get("arguments") or {}
-    # Different effect types store visibility in different keys
-    # record_world_event, reveal_fact use "visibility"; update_scene uses no visibility (treated as public patch)
     return args.get("visibility")
 
-def _assert_visibility_not_broadened(effect: dict[str, Any], attempt_audience: str):
+def _effective_visibility(effect: dict[str, Any]) -> str:
     vis = _visibility_of(effect)
-    if vis is None:
+    if vis is not None:
+        return vis
+    eff_type = effect.get("effect_type")
+    return _EFFECT_DEFAULT_VISIBILITY.get(eff_type, "public")
+
+def _assert_visibility_not_broadened(effect: dict[str, Any], attempt_audience: str):
+    """Fail closed if promotion would broaden staged-effect visibility beyond attempt audience.
+
+    - Shared (campaign) attempts may host any effect visibility; private stays private via projection.
+    - Private attempts may only promote dm_private effects. A public/party_known effect (or
+      visibility-less type treated as public) from a private attempt would leak private
+      context to a wider audience and is rejected at commit (issue #206).
+    """
+    effective = _effective_visibility(effect)
+    if effective not in _VISIBILITY_ORDER:
+        raise ValueError(f"Unknown visibility {effective!r} on staged effect {effect.get('id')}")
+    if _is_shared_audience(attempt_audience):
         return
-    # attempt_audience campaign means no broadening beyond effect's own visibility
-    # If attempt is private, promoting a private effect to public is broadening — reject
-    # We treat handler promotion as must not expose dm_private as public
-    # For now, only reject if effect visibility == dm_private and caller would publish as public
-    # This is enforced at narration projection level; here we ensure we don't store dm_private with public event visibility
-    # If effect is dm_private, event visibility must remain not public
-    # Since commit uses visibility from effect, we just log and allow; broadening check is done in validators
-    # Keep stub for extensibility
-    if vis not in _VISIBILITY_ORDER:
-        raise ValueError(f"Unknown visibility {vis!r} on staged effect {effect.get('id')}")
-    # No cross-check against attempt_audience needed beyond logging; keep hook
-    return
+    # Private attempt: only dm_private is non-broadening
+    if effective != "dm_private":
+        raise ValueError(
+            f"Staged effect {effect.get('id')!r} type {effect.get('effect_type')!r} effective visibility {effective!r} "
+            f"would broaden private attempt audience {attempt_audience!r} — only dm_private allowed"
+        )
 
 EffectHandler = Callable[[Session, Campaign, dict[str, Any], DmTurn, DmTurnAttempt], None]
 _REGISTRY: dict[str, EffectHandler] = {}
