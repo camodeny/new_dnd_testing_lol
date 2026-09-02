@@ -915,7 +915,7 @@ def upgrade() -> None:
                     (select realtime.topic()) LIKE 'live-table:campaign:%:thread:%'
                     OR (select realtime.topic()) LIKE 'realtime:live-table:campaign:%:thread:%'
                   )
-                  AND public.can_subscribe_live_table((select realtime.topic()
+                  AND public.can_subscribe_live_table((select realtime.topic()))
                   AND realtime.messages.extension in ('broadcast')
                 );
               END IF;
