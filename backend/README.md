@@ -33,7 +33,7 @@ alembic current
 alembic history
 ```
 
-Initial migration `001_create_profiles` creates `public.profiles` mirroring `auth.users`. It matches `schema.sql` for manual use in Supabase SQL Editor.
+Alembic is the single schema authority. The single baseline migration `001_initial_schema` creates the full schema (including `public.profiles` mirroring `auth.users`). Run `alembic upgrade head` or `python -m scripts.migrate` against a fresh database.
 
 ### Production deploys (Vercel + Supabase)
 
