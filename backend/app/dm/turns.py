@@ -1,4 +1,4 @@
-"""Durable DM turn and turn-attempt state machine — issue #200.
+"""Durable DM turn and turn-attempt state machine — issues #200, #206.
 
 One logical DM turn may consume multiple player submissions that arrived
 in the same unresolved fictional moment (same campaign+thread/audience).
@@ -6,12 +6,16 @@ New eligible submissions invalidate a prepared attempt pre-stream without
 mutating campaign truth. Once the first visible chunk commits,
 the input set is locked. Stale source-revision attempts are discarded
 via optimistic campaign-revision validation. A campaign cannot advance
-past an unresolved streaming/failed-visible turn.
+past an unresolved streaming/failed_visible turn. Staged effects remain
+attempt-local through streaming and become authoritative exactly once
+on successful narration completion (issue #206).
 
 States
 ------
-DmTurn.status: pending | streaming | succeeded | failed_visible
-DmTurnAttempt.status: prepared | running | superseded | streaming | succeeded | failed | failed_visible | discarded
+DmTurn.status: pending | streaming | succeeded | failed_visible | abandoned
+DmTurnAttempt.status: prepared | running | superseded | streaming | succeeded | failed | failed_visible | discarded | abandoned
+
+Three-phase commit (#206): prepared (staged) → streaming/visible (durable chunk) → completed (atomic promotion)
 
 Coordinator
 -----------
@@ -51,6 +55,7 @@ TURN_AWAITING_ROLL = "awaiting_roll"
 TURN_STREAMING = "streaming"
 TURN_SUCCEEDED = "succeeded"
 TURN_FAILED_VISIBLE = "failed_visible"
+TURN_ABANDONED = "abandoned"
 
 ATTEMPT_PREPARED = "prepared"
 ATTEMPT_RUNNING = "running"
@@ -61,10 +66,13 @@ ATTEMPT_SUCCEEDED = "succeeded"
 ATTEMPT_FAILED = "failed"
 ATTEMPT_FAILED_VISIBLE = "failed_visible"
 ATTEMPT_DISCARDED = "discarded"
+ATTEMPT_ABANDONED = "abandoned"
 
 ACTIVE_TURN_STATUSES = {TURN_PENDING, TURN_AWAITING_ROLL, TURN_STREAMING, TURN_FAILED_VISIBLE}
 BLOCKING_TURN_STATUSES = {TURN_AWAITING_ROLL, TURN_STREAMING, TURN_FAILED_VISIBLE}
 PRE_STREAM_ATTEMPT_STATUSES = {ATTEMPT_PREPARED, ATTEMPT_RUNNING}
+VISIBLE_ATTEMPT_STATUSES = {ATTEMPT_STREAMING, ATTEMPT_FAILED_VISIBLE}
+ABANDONED_STATUSES = {ATTEMPT_ABANDONED, TURN_ABANDONED}
 
 
 class TurnConflictError(Exception):
@@ -528,16 +536,84 @@ def coordinate_turn(
     return active, new_attempt
 
 
+# ── Staged effects — issue #206 ─────────────────────────────────────────────
+
+def stage_validated_attempt(
+    db: Session,
+    attempt_id: uuid.UUID,
+    contract: Any,
+) -> DmTurnAttempt:
+    """Persist typed staged effects attach to one attempt without mutating authoritative state.
+
+    Must be called after validator pipeline passes and before streaming. Crash during
+    staging leaves authoritative state untouched. Staged effects remain attempt-local
+    through streaming and are promoted exactly once on successful commit.
+
+    Args:
+        db: Session
+        attempt_id: DmTurnAttempt id (must be prepared/running)
+        contract: DmTurnContractV1 instance or dict with staged_effects
+
+    Returns:
+        Updated DmTurnAttempt with staged_effects + contract_snapshot persisted.
+    """
+    attempt = db.get(DmTurnAttempt, attempt_id)
+    if attempt is None:
+        raise ValueError(f"Attempt {attempt_id} not found")
+    if attempt.status not in (ATTEMPT_PREPARED, ATTEMPT_RUNNING):
+        raise ValueError(f"Attempt {attempt_id} cannot stage effects from status {attempt.status}")
+
+    # Normalize contract to dict + list
+    if hasattr(contract, "model_dump"):
+        contract_dict = contract.model_dump(mode="json")
+        staged = getattr(contract, "staged_effects", []) or []
+        if hasattr(staged, "__iter__") and staged and hasattr(staged[0], "model_dump"):
+            staged_list = [e.model_dump(mode="json") for e in staged]
+        else:
+            staged_list = list(staged)
+    elif isinstance(contract, dict):
+        contract_dict = contract
+        staged_list = contract.get("staged_effects") or []
+    else:
+        raise ValueError("contract must be DmTurnContractV1 or dict")
+
+    # Validate staged_effects against contract invariants (no generic SQLalready validated by contract)
+    # Ensure staged_effects only in respond mode is enforced by contract; here we just persist
+    attempt.staged_effects = staged_list
+    attempt.contract_snapshot = contract_dict
+    # Idempotency key defaults to attempt.id for duplicate commit detection
+    if not attempt.commit_operation_id:
+        attempt.commit_operation_id = str(attempt.id)
+
+    db.flush()
+    try:
+        db.commit()
+        db.refresh(attempt)
+    except Exception:
+        db.rollback()
+        raise
+
+    logger.info(
+        "dm_turn staged_effects_persisted turn_id=%s attempt_id=%s count=%s types=%s commit_operation_id=%s",
+        attempt.turn_id, attempt.id, len(staged_list), [e.get("effect_type") for e in (staged_list or [])], attempt.commit_operation_id,
+    )
+    return attempt
+
+
 # ── Stream-start commitment boundary ────────────────────────────────────────
 
 
-def mark_streaming_started(db: Session, turn_id: uuid.UUID, attempt_id: uuid.UUID) -> tuple[DmTurn, DmTurnAttempt]:
+def mark_streaming_started(db: Session, turn_id: uuid.UUID, attempt_id: uuid.UUID, stream_id: uuid.UUID | str | None = None) -> tuple[DmTurn, DmTurnAttempt]:
     """Establish stream-start commitment boundary for the input set.
 
     After this call, the turn's input set is locked; any new eligible submissions
     will be rejected with StreamBoundaryError until the turn resolves, and a new
     turn cannot be assembled. This implements: "Once the first visible chunk commits,
     the turn input set cannot silently change."
+
+    When stream_id is provided, verifies first durable chunk is persisted before
+    promotion — this enforces the visible-commitment boundary without promoting
+    staged gameplay effects. Staged effects remain attempt-local until atomic commit.
 
     Idempotent: if already streaming with same attempt, returns without error.
     Uses FOR UPDATE + CAS to ensure only the current attempt can become streaming.
@@ -558,8 +634,43 @@ def mark_streaming_started(db: Session, turn_id: uuid.UUID, attempt_id: uuid.UUI
     if has_pending_rolls(db, turn.id):
         raise ValueError(f"Turn {turn_id} has pending player-owned rolls and cannot stream outcome narration")
 
+    # ── Durable chunk boundary (issue #206) — fail closed if missing ───────
+    if stream_id is None or str(stream_id).strip() == "":
+        raise ValueError("stream_id is required — transition to streaming requires durable first chunk")
+
     if turn.status == TURN_STREAMING and str(turn.streaming_attempt_id) == str(attempt_id) and attempt.status == ATTEMPT_STREAMING:
+        # Idempotent — ensure supplied stream matches persisted
+        if attempt.stream_id is not None and str(attempt.stream_id) != str(stream_id):
+            raise ValueError(
+                f"Attempt {attempt_id} already streaming with stream {attempt.stream_id}, cannot switch to {stream_id}"
+            )
         return turn, attempt
+
+    # ── Durable chunk boundary (issue #206) ────────────────────────────────
+    parsed_stream_id: uuid.UUID | None = None
+    try:
+        parsed_stream_id = uuid.UUID(str(stream_id))
+    except ValueError as exc:
+        raise ValueError(f"Invalid stream_id {stream_id}") from exc
+    # Verify stream exists and has at least one durable chunk
+    from models import DMStream, DMStreamChunk
+    stream = db.get(DMStream, parsed_stream_id)
+    if stream is None:
+        raise ValueError(f"Stream {parsed_stream_id} not found")
+    # Check that at least one chunk exists (first visible chunk durably persisted)
+    has_chunk = db.execute(
+        select(DMStreamChunk).where(DMStreamChunk.stream_id == parsed_stream_id).limit(1)
+    ).scalars().first()
+    if has_chunk is None:
+        # Also check denormalized counters for legacy
+        if not stream.first_chunk_at and (stream.chunk_count or 0) == 0:
+            raise ValueError(f"Streaming requires durable first chunk for stream {parsed_stream_id} — no chunk persisted")
+    # Ensure stream belongs to this turn/attempt — fail closed (prevents unrelated chunk satisfying boundary)
+    if str(stream.turn_id) != str(turn_id) or str(stream.attempt_id) != str(attempt_id):
+        raise ValueError(
+            f"Stream {parsed_stream_id} does not belong to turn {turn_id} attempt {attempt_id} "
+            f"(stream.turn_id={stream.turn_id} stream.attempt_id={stream.attempt_id})"
+        )
 
     if attempt.status == ATTEMPT_SUPERSEDED:
         raise AttemptSupersededError(attempt_id, attempt.invalidation_reason)
@@ -590,10 +701,13 @@ def mark_streaming_started(db: Session, turn_id: uuid.UUID, attempt_id: uuid.UUI
             raise AttemptSupersededError(attempt_id, "superseded_by_newer_attempt_pre_stream")
         raise ValueError(f"Turn {turn_id} CAS failed for streaming transition (status={fresh_turn.status if fresh_turn else 'unknown'})")
 
+    attempt_values: dict[str, Any] = dict(status=ATTEMPT_STREAMING, streaming_started_at=now, started_at=attempt.started_at or now, updated_at=now)
+    if parsed_stream_id is not None:
+        attempt_values["stream_id"] = parsed_stream_id
     result2 = db.execute(
         update(DmTurnAttempt)
         .where(DmTurnAttempt.id == attempt_id, DmTurnAttempt.status.in_([ATTEMPT_PREPARED, ATTEMPT_RUNNING]))
-        .values(status=ATTEMPT_STREAMING, streaming_started_at=now, started_at=attempt.started_at or now, updated_at=now)
+        .values(**attempt_values)
         .execution_options(synchronize_session=False)
     )
     if result2.rowcount == 0:
@@ -609,10 +723,14 @@ def mark_streaming_started(db: Session, turn_id: uuid.UUID, attempt_id: uuid.UUI
     turn.streaming_attempt_id = attempt_id
     attempt.status = ATTEMPT_STREAMING
     attempt.streaming_started_at = now
+    if parsed_stream_id is not None:
+        attempt.stream_id = parsed_stream_id
 
     logger.info(
-        "dm_turn streaming_started campaign_id=%s thread_id=%s turn_id=%s attempt_id=%s source_revision=%s input_set_revision=%s submission_ids=%s",
+        "dm_turn streaming_started campaign_id=%s thread_id=%s turn_id=%s attempt_id=%s source_revision=%s input_set_revision=%s submission_ids=%s stream_id=%s staged_effect_count=%s",
         turn.campaign_id, turn.thread_id, turn.id, attempt.id, attempt.source_revision, attempt.input_set_revision, attempt.submission_ids,
+        str(parsed_stream_id) if parsed_stream_id else None,
+        len(attempt.staged_effects or []),
     )
     return turn, attempt
 
@@ -695,13 +813,73 @@ def commit_turn(
     if attempt.status == ATTEMPT_SUPERSEDED:
         raise AttemptSupersededError(attempt_id, attempt.invalidation_reason)
 
-    # Only streaming attempt can commit authoritative effects — this is the commitment boundary
+    # ── Idempotency: duplicate commit short-circuit (issue #206) ─────────────
+    duplicate_op = operation_id or str(attempt.id)
+    # If attempt already succeeded, return existing result without duplicate mutation (idempotent retry)
+    if attempt.status == ATTEMPT_SUCCEEDED and turn.status == TURN_SUCCEEDED:
+        from models import CampaignDomainEvent
+
+        existing = None
+        if attempt.result:
+            try:
+                rid = (attempt.result or {}).get("event_id") or (attempt.result or {}).get("id")
+                if rid:
+                    existing = db.get(CampaignDomainEvent, uuid.UUID(str(rid)))
+            except Exception:
+                existing = None
+        if existing is None:
+            existing = db.execute(
+                select(CampaignDomainEvent).where(CampaignDomainEvent.campaign_id == turn.campaign_id, CampaignDomainEvent.operation_id == duplicate_op)
+            ).scalars().first()
+        if existing is not None:
+            logger.info(
+                "dm_turn duplicate_commit_hit campaign_id=%s turn_id=%s attempt_id=%s operation_id=%s event_id=%s",
+                turn.campaign_id, turn.id, attempt.id, duplicate_op, existing.id,
+            )
+            return turn, attempt, existing
+        # Fallback: already succeeded but no event found — treat as duplicate (should not happen)
+        if attempt.result:
+            logger.info("dm_turn duplicate_commit_hit_no_event turn_id=%s attempt_id=%s", turn.id, attempt.id)
+            # Return with stored result as pseudo-event
+            return turn, attempt, attempt.result
+
+    # Also check for duplicate before any mutation even if attempt not yet marked succeeded (crash-after-commit replay)
+    if duplicate_op:
+        from models import CampaignDomainEvent
+
+        dup_event = db.execute(
+            select(CampaignDomainEvent).where(CampaignDomainEvent.campaign_id == turn.campaign_id, CampaignDomainEvent.operation_id == duplicate_op)
+        ).scalars().first()
+        if dup_event is not None and attempt.status != ATTEMPT_SUCCEEDED:
+            logger.info(
+                "dm_turn duplicate_commit_hit_pre_mark campaign_id=%s turn_id=%s attempt_id=%s operation_id=%s event_id=%s",
+                turn.campaign_id, turn.id, attempt.id, duplicate_op, dup_event.id,
+            )
+            now_dup = _now()
+            if attempt.status == ATTEMPT_STREAMING:
+                attempt.status = ATTEMPT_SUCCEEDED
+                attempt.completed_at = now_dup
+                attempt.result = dup_event.to_dict() if hasattr(dup_event, "to_dict") else {"event_id": str(dup_event.id)}
+            if turn.status == TURN_STREAMING:
+                turn.status = TURN_SUCCEEDED
+                turn.resolved_at = now_dup
+                turn.committed_at = now_dup
+            try:
+                db.flush()
+                db.commit()
+                db.refresh(turn)
+                db.refresh(attempt)
+            except Exception:
+                db.rollback()
+            return turn, attempt, dup_event
+
+    # Only streaming attempt can commit authoritative effects — commitment boundary (after idempotency check)
     if attempt.status != ATTEMPT_STREAMING or turn.status != TURN_STREAMING:
         raise ValueError(f"Attempt {attempt_id} status {attempt.status} / turn {turn_id} status {turn.status} cannot commit; must be streaming (stream-start boundary)")
     if str(turn.streaming_attempt_id) != str(attempt_id):
         raise ValueError(f"Attempt {attempt_id} is not the streaming attempt for turn {turn_id}")
 
-    # Ensure turn is not blocked by another visible partial turn (for a different turn id)
+    # Ensure turn is not blocked by another visible partial turn
     blocking = _has_blocking_turn(db, turn.campaign_id, turn.thread_id, exclude_turn_id=turn.id)
     if blocking is not None:
         logger.warning(
@@ -734,17 +912,47 @@ def commit_turn(
         raise StaleRevisionError(turn.campaign_id, int(expected), actual, attempt.id)
 
     execute_start = time.monotonic()
+    # Build enriched payload that includes staged effects metadata for audit
+    base_payload = payload or {"turn_id": str(turn.id), "attempt_id": str(attempt.id), "submission_ids": attempt.submission_ids or []}
+    # Include staged effect ids/types in payload for observability
+    staged_list = attempt.staged_effects or []
+    if staged_list:
+        base_payload = dict(base_payload)
+        base_payload["staged_effect_ids"] = [e.get("id") for e in staged_list]
+        base_payload["staged_effect_types"] = [e.get("effect_type") for e in staged_list]
+        if attempt.stream_id:
+            base_payload["stream_id"] = str(attempt.stream_id)
+
+    # Wrap mutate to also apply staged effects atomically inside same revision bump
+    def _mutate_with_effects(campaign):
+        # Apply caller-provided mutate first
+        if mutate is not None:
+            mutate(campaign)
+        # Apply staged effects via registry (fail-closed)
+        if staged_list:
+            from app.dm.effects import apply_staged_effects
+
+            apply_staged_effects(db, campaign, staged_list, turn, attempt)
+
+    # Persist commit_operation_id for idempotency
+    if not attempt.commit_operation_id:
+        attempt.commit_operation_id = duplicate_op
+        db.flush()
+
     try:
         campaign_after, event = commit_campaign_mutation(
             db,
             turn.campaign_id,
             expected_revision=int(expected),
             event_type=event_type,
-            payload=payload or {"turn_id": str(turn.id), "attempt_id": str(attempt.id), "submission_ids": attempt.submission_ids},
-            operation_id=operation_id or str(attempt.id),
+            payload=base_payload,
+            operation_id=duplicate_op,
             actor_id=actor_id,
-            mutate=mutate,
+            mutate=_mutate_with_effects,
             commit=False,
+            outbox_event_type="dm.turn_committed",
+            outbox_payload={**base_payload, "operation_id": duplicate_op},
+            outbox_operation_id=duplicate_op,
         )
     except RevisionConflictError as exc:
         logger.warning(
@@ -773,13 +981,16 @@ def commit_turn(
         raise StaleRevisionError(turn.campaign_id, exc.expected_revision, exc.actual_revision, attempt.id) from exc
 
     now = _now()
+    commit_duration_ms = int((time.monotonic() - execute_start) * 1000)
     turn.status = TURN_SUCCEEDED
     turn.resolved_at = now
-    turn.time_executing_ms = int((time.monotonic() - execute_start) * 1000)
+    turn.committed_at = now
+    turn.commit_duration_ms = commit_duration_ms
+    turn.time_executing_ms = commit_duration_ms
     attempt.status = ATTEMPT_SUCCEEDED
     attempt.completed_at = now
     attempt.result = event.to_dict() if hasattr(event, "to_dict") else {"event_id": str(event.id)}
-    attempt.processing_duration_ms = turn.time_executing_ms
+    attempt.processing_duration_ms = commit_duration_ms
     attempt.last_error = None
     attempt.error_class = None
 
@@ -795,6 +1006,18 @@ def commit_turn(
         except Exception as e:
             logger.warning("dm_turn failed to resolve submissions turn_id=%s error=%s", turn.id, e)
 
+    # Mark stream completed if linked
+    if attempt.stream_id:
+        try:
+            from models import DMStream
+            stream = db.get(DMStream, attempt.stream_id)
+            if stream and stream.status == "streaming":
+                stream.status = "completed"
+                stream.completed_at = now
+                stream.completion_reason = "turn_committed"
+        except Exception as e:
+            logger.warning("dm_turn failed to complete stream turn_id=%s stream_id=%s error=%s", turn.id, attempt.stream_id, e)
+
     db.flush()
     db.commit()
     db.refresh(turn)
@@ -804,14 +1027,114 @@ def commit_turn(
 
     logger.info(
         "dm_turn committed campaign_id=%s thread_id=%s turn_id=%s attempt_id=%s new_revision=%s event_id=%s "
-        "input_set_revision=%s submission_count=%s assembly_window_start=%s assembly_window_end=%s time_executing_ms=%s",
+        "input_set_revision=%s submission_count=%s assembly_window_start=%s assembly_window_end=%s time_executing_ms=%s "
+        "staged_effect_count=%s staged_effect_types=%s commit_duration_ms=%s operation_id=%s",
         turn.campaign_id, turn.thread_id, turn.id, attempt.id, campaign_after.revision, event.id,
         attempt.input_set_revision, len(attempt.submission_ids or []),
         turn.assembly_window_start.isoformat() if turn.assembly_window_start else None,
         turn.assembly_window_end.isoformat() if turn.assembly_window_end else None,
         turn.time_executing_ms,
+        len(staged_list), [e.get("effect_type") for e in staged_list], commit_duration_ms, duplicate_op,
     )
     return turn, attempt, event
+
+
+def commit_turn_with_effects(
+    db: Session,
+    turn_id: uuid.UUID,
+    attempt_id: uuid.UUID,
+    expected_revision: int | None = None,
+    event_type: str = "dm.turn_resolved",
+    payload: dict | None = None,
+    operation_id: str | None = None,
+    actor_id: uuid.UUID | None = None,
+) -> tuple[DmTurn, DmTurnAttempt, Any]:
+    """Thin wrapper for staged-effects commit (issue #206). Delegates to commit_turn."""
+    return commit_turn(db, turn_id, attempt_id, expected_revision=expected_revision, mutate=None, event_type=event_type, payload=payload, operation_id=operation_id, actor_id=actor_id)
+
+
+def abandon_visible_attempt(
+    db: Session,
+    turn_id: uuid.UUID,
+    attempt_id: uuid.UUID,
+    reason: str = "explicit_retry",
+    actor_id: uuid.UUID | None = None,
+) -> tuple[DmTurn, DmTurnAttempt]:
+    """Abandon a visible partial attempt without mutating authoritative state (explicit Retry).
+
+    Only streaming/failed_visible attempts can be abandoned. Staged effects remain
+    for audit but are never promoted. The stream is marked abandoned/non-canonical.
+    After abandon, the blocking turn no longer prevents next turn advancement.
+    Idempotent.
+    """
+    try:
+        turn = db.execute(select(DmTurn).where(DmTurn.id == turn_id).with_for_update()).scalars().first()
+        attempt = db.execute(select(DmTurnAttempt).where(DmTurnAttempt.id == attempt_id).with_for_update()).scalars().first()
+    except Exception:
+        turn = db.get(DmTurn, turn_id)
+        attempt = db.get(DmTurnAttempt, attempt_id)
+    if turn is None or attempt is None:
+        raise ValueError(f"Turn {turn_id} or attempt {attempt_id} not found")
+    if str(attempt.turn_id) != str(turn.id):
+        raise ValueError(f"Attempt {attempt_id} does not belong to turn {turn_id}")
+    if str(turn.current_attempt_id) != str(attempt_id):
+        raise ValueError(f"Attempt {attempt_id} is not current for turn {turn_id}")
+
+    if attempt.status == ATTEMPT_ABANDONED and turn.status == TURN_ABANDONED:
+        return turn, attempt
+
+    # Only visible attempts can be abandoned
+    if attempt.status not in (ATTEMPT_STREAMING, ATTEMPT_FAILED_VISIBLE) or turn.status not in (TURN_STREAMING, TURN_FAILED_VISIBLE):
+        raise ValueError(f"Cannot abandon attempt {attempt_id} with status {attempt.status} / turn {turn_id} status {turn.status}; must be streaming/failed_visible")
+
+    now = _now()
+    # Compute visible-but-incomplete duration for observability
+    visible_ms = None
+    if attempt.streaming_started_at:
+        try:
+            visible_ms = int((now - attempt.streaming_started_at).total_seconds() * 1000)
+        except Exception:
+            visible_ms = None
+    elif turn.streaming_started_at:
+        try:
+            visible_ms = int((now - turn.streaming_started_at).total_seconds() * 1000)
+        except Exception:
+            visible_ms = None
+
+    attempt.status = ATTEMPT_ABANDONED
+    attempt.abandoned_at = now
+    attempt.abandonment_reason = reason[:64] if reason else "explicit_retry"
+    attempt.completed_at = now
+    attempt.last_error = f"Abandoned visible attempt: {reason}"
+    attempt.error_class = "abandoned"
+
+    turn.status = TURN_ABANDONED
+    turn.abandoned_at = now
+    turn.abandonment_reason = reason[:64] if reason else "explicit_retry"
+
+    # Mark stream abandoned
+    if attempt.stream_id:
+        try:
+            from models import DMStream
+
+            stream = db.get(DMStream, attempt.stream_id)
+            if stream:
+                stream.status = "abandoned"
+                stream.abandoned_at = now
+                stream.abandonment_reason = reason[:64] if reason else "explicit_retry"
+        except Exception as e:
+            logger.warning("abandon failed to mark stream abandoned turn_id=%s stream_id=%s error=%s", turn_id, attempt.stream_id, e)
+
+    db.flush()
+    db.commit()
+    db.refresh(turn)
+    db.refresh(attempt)
+
+    logger.info(
+        "dm_turn abandoned campaign_id=%s thread_id=%s turn_id=%s attempt_id=%s reason=%s staged_effect_count=%s time_visible_but_incomplete_ms=%s",
+        turn.campaign_id, turn.thread_id, turn.id, attempt.id, reason, len(attempt.staged_effects or []), visible_ms,
+    )
+    return turn, attempt
 
 
 def discard_superseded_result(db: Session, attempt_id: uuid.UUID, reason: str = "superseded") -> DmTurnAttempt | None:

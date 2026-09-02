@@ -14,9 +14,27 @@ if not hasattr(SQLiteTypeCompiler, "_patched_jsonb"):
 
 from database import Base  # noqa: E402
 import models  # noqa: E402
-from models import Campaign, Profile, CampaignMember  # noqa: E402
+from models import Campaign, Profile, CampaignMember, DMStream, DMStreamChunk  # noqa: E402
 from app.runtime.submissions import accept_submission  # noqa: E402
 from app.runtime.threads import get_or_create_campaign_thread  # noqa: E402
+
+
+def _create_stream_with_chunk(db, campaign_id, thread_id_str, turn, attempt, text="The DM begins narration."):
+    """Helper for #206: durable first chunk must exist before streaming boundary."""
+    tid_uuid = uuid.UUID(str(thread_id_str))
+    stream = DMStream(
+        id=uuid.uuid4(), campaign_id=campaign_id, thread_id=tid_uuid,
+        turn_id=str(turn.id), attempt_id=str(attempt.id), status="streaming", audience=turn.audience,
+    )
+    db.add(stream)
+    db.flush()
+    chunk = DMStreamChunk(id=uuid.uuid4(), stream_id=stream.id, sequence=0, text=text, byte_length=len(text.encode("utf-8")))
+    db.add(chunk)
+    stream.first_chunk_at = datetime.now(timezone.utc)
+    stream.chunk_count = 1
+    stream.last_sequence = 0
+    db.flush()
+    return stream
 from app.dm.turns import (  # noqa: E402
     AttemptSupersededError,
     coordinate_turn,
@@ -115,7 +133,9 @@ def test_new_input_after_stream_start_cannot_silently_change_input_set():
     s1 = accept_submission(db, campaign_id=cid, user_id=owner, raw_content="first", segments=[{"type": "ic", "text": "first"}], thread_id=tid)
     db.commit()
     t1, a1 = coordinate_turn(db, cid, tid)
-    mark_streaming_started(db, t1.id, a1.id)
+    stream = _create_stream_with_chunk(db, cid, tid, t1, a1)
+    db.commit()
+    mark_streaming_started(db, t1.id, a1.id, stream_id=stream.id)
     db = Fac()
     s2 = accept_submission(db, campaign_id=cid, user_id=p2, raw_content="late", segments=[{"type": "ic", "text": "late"}], thread_id=tid)
     db.commit()
@@ -133,7 +153,9 @@ def test_stale_source_revision_cannot_commit_over_newer_state():
     s1 = accept_submission(db, campaign_id=cid, user_id=owner, raw_content="action", segments=[{"type": "ic", "text": "action"}], thread_id=tid)
     db.commit()
     t1, a1 = coordinate_turn(db, cid, tid)
-    mark_streaming_started(db, t1.id, a1.id)
+    stream = _create_stream_with_chunk(db, cid, tid, t1, a1)
+    db.commit()
+    mark_streaming_started(db, t1.id, a1.id, stream_id=stream.id)
     db2 = Fac()
     commit_campaign_mutation(db2, cid, expected_revision=0, event_type="campaign.external", payload={"x": 1})
     db3 = Fac()
@@ -151,7 +173,9 @@ def test_campaign_cannot_advance_past_unresolved_streaming_turn():
     s1 = accept_submission(db, campaign_id=cid, user_id=owner, raw_content="first", segments=[{"type": "ic", "text": "first"}], thread_id=tid)
     db.commit()
     t1, a1 = coordinate_turn(db, cid, tid)
-    mark_streaming_started(db, t1.id, a1.id)
+    stream = _create_stream_with_chunk(db, cid, tid, t1, a1)
+    db.commit()
+    mark_streaming_started(db, t1.id, a1.id, stream_id=stream.id)
     db2 = Fac()
     turn2, att2, _event = commit_turn(db2, t1.id, a1.id)
     assert turn2.status == "succeeded"
@@ -186,7 +210,9 @@ def test_worker_crash_leaves_state_recoverable_and_retryable():
     ss = accept_submission(db5, campaign_id=cid2, user_id=owner2, raw_content="s", segments=[{"type": "ic", "text": "s"}], thread_id=tid2)
     db5.commit()
     tt, aa = coordinate_turn(db5, cid2, tid2)
-    mark_streaming_started(db5, tt.id, aa.id)
+    stream2 = _create_stream_with_chunk(db5, cid2, tid2, tt, aa)
+    db5.commit()
+    mark_streaming_started(db5, tt.id, aa.id, stream_id=stream2.id)
     db6 = Fac2()
     aa2 = db6.get(models.DmTurnAttempt, aa.id)
     aa2.started_at = datetime.now(timezone.utc) - timedelta(seconds=1000)
@@ -230,8 +256,10 @@ def test_obsolete_attempt_result_discarded_harmlessly():
     db3 = Fac()
     with pytest.raises(AttemptSupersededError):
         commit_turn(db3, t1.id, a1.id)
-    # new attempt can still commit
-    mark_streaming_started(db3, t2.id, a2.id)
+    # new attempt can still commit — requires durable chunk per #206
+    stream = _create_stream_with_chunk(db3, cid, tid, t2, a2)
+    db3.commit()
+    mark_streaming_started(db3, t2.id, a2.id, stream_id=stream.id)
     db4 = Fac()
     turn_ok, _att_ok, event = commit_turn(db4, t2.id, a2.id)
     assert turn_ok.status == "succeeded"
@@ -248,8 +276,10 @@ def test_commit_requires_streaming_boundary():
     # Attempt to commit without streaming should fail
     with pytest.raises(ValueError, match="cannot commit; must be streaming"):
         commit_turn(db2, t1.id, a1.id)
-    # After streaming, commit succeeds
-    mark_streaming_started(db2, t1.id, a1.id)
+    # After streaming (with durable chunk), commit succeeds
+    stream = _create_stream_with_chunk(db2, cid, tid, t1, a1)
+    db2.commit()
+    mark_streaming_started(db2, t1.id, a1.id, stream_id=stream.id)
     db3 = Fac()
     turn_ok, _att_ok, event = commit_turn(db3, t1.id, a1.id)
     assert turn_ok.status == "succeeded"
@@ -505,3 +535,52 @@ def test_recover_filters_by_campaign():
     with Fac2() as db:
         n2 = recover_stuck_attempts(db, campaign_id=cid2, lease_seconds=300)
         assert n2 == 1
+
+
+def test_streaming_requires_durable_chunk_and_stream_id():
+    """Regression for #206: streaming transition is fail-closed without durable first chunk."""
+    Fac, cid, owner, _p2, tid = _setup_campaign()
+    db = Fac()
+    s1 = accept_submission(db, campaign_id=cid, user_id=owner, raw_content="needs chunk", segments=[{"type": "ic", "text": "needs chunk"}], thread_id=tid)
+    db.commit()
+    t1, a1 = coordinate_turn(db, cid, tid)
+    # Missing stream_id must fail closed (invariant: transition only after durable chunk)
+    with pytest.raises(ValueError, match="stream_id is required"):
+        mark_streaming_started(db, t1.id, a1.id)
+    with pytest.raises(ValueError, match="stream_id is required"):
+        mark_streaming_started(db, t1.id, a1.id, stream_id=None)
+    # Stream exists but no chunk yet -> must also fail
+    tid_uuid = uuid.UUID(tid)
+    stream = DMStream(id=uuid.uuid4(), campaign_id=cid, thread_id=tid_uuid, turn_id=str(t1.id), attempt_id=str(a1.id), status="streaming", audience="campaign")
+    db.add(stream)
+    db.commit()
+    with pytest.raises(ValueError, match="durable first chunk"):
+        mark_streaming_started(db, t1.id, a1.id, stream_id=stream.id)
+    # After durable chunk, succeeds
+    chunk = DMStreamChunk(id=uuid.uuid4(), stream_id=stream.id, sequence=0, text="hello", byte_length=5)
+    db.add(chunk)
+    stream.first_chunk_at = datetime.now(timezone.utc)
+    stream.chunk_count = 1
+    db.commit()
+    turn, attempt = mark_streaming_started(db, t1.id, a1.id, stream_id=stream.id)
+    assert turn.status == "streaming" and attempt.status == "streaming"
+    # Unrelated stream cannot satisfy boundary — mismatched turn/attempt is rejected even with durable chunk
+    Fac2, cid2, owner2, _p22, tid2 = _setup_campaign()
+    db2 = Fac2()
+    s2 = accept_submission(db2, campaign_id=cid2, user_id=owner2, raw_content="x", segments=[{"type": "ic", "text": "x"}], thread_id=tid2)
+    db2.commit()
+    t2, a2 = coordinate_turn(db2, cid2, tid2)
+    tid2_uuid = uuid.UUID(tid2)
+    wrong_stream = DMStream(
+        id=uuid.uuid4(), campaign_id=cid2, thread_id=tid2_uuid,
+        turn_id=str(uuid.uuid4()), attempt_id=str(uuid.uuid4()), status="streaming", audience="campaign",
+    )
+    db2.add(wrong_stream)
+    db2.flush()
+    wrong_chunk = DMStreamChunk(id=uuid.uuid4(), stream_id=wrong_stream.id, sequence=0, text="x", byte_length=1)
+    db2.add(wrong_chunk)
+    wrong_stream.first_chunk_at = datetime.now(timezone.utc)
+    wrong_stream.chunk_count = 1
+    db2.commit()
+    with pytest.raises(ValueError, match="does not belong to turn"):
+        mark_streaming_started(db2, t2.id, a2.id, stream_id=wrong_stream.id)
