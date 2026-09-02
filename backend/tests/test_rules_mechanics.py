@@ -428,6 +428,78 @@ def test_source_version_metadata_present():
     assert m.meta.sheet_version != "unknown"
 
 
+def test_proficiency_override_is_consistent_across_dependent_mechanics():
+    # Level 5 derived prof 3, stored 5 (effective 5). All derived vs effective must be internally consistent.
+    # Fixture: Wis 14 (+2), Int 12 (+1), proficient perception, Arcana proficient, Wis save proficient, spellcasting Int.
+    sheet = FakeSheet(
+        level=5,
+        strength=14,  # +2
+        wisdom=14,  # +2
+        intelligence=12,  # +1
+        dexterity=10,
+        proficiency_bonus=5,  # override: derived 3, effective 5
+        perception_prof=True,
+        arcana_prof=True,
+        wis_save_prof=True,
+        spellcasting_ability="intelligence",
+    )
+    m = get_character_mechanics_for_sheet(sheet)
+    # Proficiency metadata
+    assert m.proficiency.derived == 3
+    assert m.proficiency.effective == 5
+    assert m.proficiency.conflict is True
+    assert m.proficiency.source == "override"
+
+    # Save: Wis save proficient => derived 2+3=5, effective 2+5=7
+    wis_save = m.saves["wisdom"]
+    assert wis_save.derived == 5
+    assert wis_save.effective == 7
+    assert wis_save.modifier == 7
+    assert wis_save.conflict is True  # effective != derived due to proficiency
+    # Non-proficient save unchanged
+    str_save = m.saves["strength"]
+    assert str_save.derived == 2
+    assert str_save.effective == 2
+
+    # Skills: perception proficient => derived 2+3=5, effective 2+5=7
+    perc = m.skills["perception"]
+    assert perc.derived == 5
+    assert perc.effective == 7
+    assert perc.modifier == 7
+    # arcana: int +1 + prof => derived 1+3=4, effective 1+5=6
+    arcana = m.skills["arcana"]
+    assert arcana.derived == 4
+    assert arcana.effective == 6
+    # passive perception derived 10+5=15, effective 10+7=17
+    assert m.passive["perception"].derived == 15
+    assert m.passive["perception"].effective == 17
+
+    # Spell: derived DC 8+3+1=12, effective DC 8+5+1=14 (no explicit override)
+    assert m.spellcasting.save_dc_derived == 12
+    assert m.spellcasting.save_dc_effective == 14
+    assert m.spellcasting.save_dc == 14
+    assert m.spellcasting.attack_bonus_derived == 4  # 3+1
+    assert m.spellcasting.attack_bonus_effective == 6  # 5+1
+    assert m.spellcasting.attack_bonus == 6
+
+    # Focused queries must also reflect effective values, not derived
+    assert query_save_modifier(sheet, "wisdom").modifier == 7
+    assert query_skill_modifier(sheet, "perception").modifier == 7
+    assert query_skill_modifier(sheet, "perception").effective == 7
+    assert query_passive_perception(sheet).effective == 17
+    assert query_passive_perception(sheet).value == 17
+    assert query_spellcasting(sheet).save_dc == 14
+    assert query_spellcasting(sheet).save_dc_effective == 14
+
+    # With explicit skill bonus_override, that override wins over proficiency effective, but derived still tracks proficiency derived
+    sheet2 = FakeSheet(level=5, wisdom=14, proficiency_bonus=5, perception_prof=True, skills=[{"skill_name": "perception", "is_proficient": True, "bonus_override": 99}])
+    m2 = get_character_mechanics_for_sheet(sheet2)
+    # derived still 5 (wis 2 + derived prof 3), effective is explicit 99
+    assert m2.skills["perception"].derived == 5
+    assert m2.skills["perception"].effective == 99
+    assert m2.skills["perception"].override_active is True
+
+
 # ── Evidence handler campaign scoping ────────────────────────────────────
 
 def _setup_campaign_db():

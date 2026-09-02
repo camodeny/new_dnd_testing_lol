@@ -499,6 +499,8 @@ def get_character_mechanics_for_sheet(sheet: Any) -> CharacterMechanics:
         conflict=stored_prof != derived_prof,
         source="override" if stored_prof != derived_prof else "derived",
     )
+    # Effective proficiency is the stored override when present; otherwise derived.
+    effective_prof = stored_prof
 
     # --- Abilities ---
     abilities: dict[str, AbilityDetail] = {}
@@ -522,14 +524,17 @@ def get_character_mechanics_for_sheet(sheet: Any) -> CharacterMechanics:
     skill_profs, skill_overrides = _extract_skill_profs(sheet, warnings, errors)
     expertise = _extract_expertise(sheet)
 
-    # Saves
+    # Saves — derived uses derived proficiency, effective uses effective proficiency
     saves: dict[str, SaveDetail] = {}
     for ab in ALL_ABILITIES:
         prof = ab in save_profs
         derived = ability_mods[ab] + (derived_prof if prof else 0)
+        effective_without_override = ability_mods[ab] + (effective_prof if prof else 0)
         components = {"ability_mod": ability_mods[ab]}
         if prof:
             components["proficiency_bonus"] = derived_prof
+            if effective_prof != derived_prof:
+                components["proficiency_bonus_effective"] = effective_prof
         override = save_overrides.get(ab)
         if override is not None:
             effective = override
@@ -539,9 +544,10 @@ def get_character_mechanics_for_sheet(sheet: Any) -> CharacterMechanics:
             if conflict:
                 warnings.append({"code": "save_override_conflict", "field": f"saving_throws.{ab}", "message": f"override {override} != derived {derived}"})
         else:
-            effective = derived
+            effective = effective_without_override
             override_active = False
-            conflict = False
+            # Conflict with proficiency override propagates as effective != derived
+            conflict = effective != derived
             source = "derived"
         saves[ab] = SaveDetail(
             ability=ab,
@@ -556,18 +562,23 @@ def get_character_mechanics_for_sheet(sheet: Any) -> CharacterMechanics:
             components=components,
         )
 
-    # Skills
+    # Skills — effective respects effective proficiency
     skills: dict[str, SkillDetail] = {}
     for skill, ability in SKILL_ABILITY.items():
         prof = skill in skill_profs
         exp = skill in expertise
         ab_mod = ability_mods[ability]
         derived = ab_mod + (derived_prof if prof else 0) + (derived_prof if exp else 0)
+        effective_without_override = ab_mod + (effective_prof if prof else 0) + (effective_prof if exp else 0)
         components = {"ability_mod": ab_mod}
         if prof:
             components["proficiency_bonus"] = derived_prof
+            if effective_prof != derived_prof:
+                components["proficiency_bonus_effective"] = effective_prof
         if exp:
             components["expertise_bonus"] = derived_prof
+            if effective_prof != derived_prof:
+                components["expertise_bonus_effective"] = effective_prof
         override = skill_overrides.get(skill)
         if override is not None:
             effective = override
@@ -577,9 +588,9 @@ def get_character_mechanics_for_sheet(sheet: Any) -> CharacterMechanics:
             if conflict:
                 warnings.append({"code": "skill_override_conflict", "field": f"skills.{skill}", "message": f"override {override} != derived {derived}"})
         else:
-            effective = derived
+            effective = effective_without_override
             override_active = False
-            conflict = False
+            conflict = effective != derived
             source = "derived"
         skills[skill] = SkillDetail(
             skill=skill,
@@ -596,31 +607,33 @@ def get_character_mechanics_for_sheet(sheet: Any) -> CharacterMechanics:
             components=components,
         )
 
-    # --- Passive Perception ---
+    # --- Passive Perception --- effective respects effective proficiency via skill
     perc = skills["perception"]
     passive_derived = 10 + perc.derived
+    passive_effective_without_override = 10 + perc.effective
     stored_passive = getattr(sheet, "passive_perception", None)
     if stored_passive is not None:
         try:
             stored_pp = int(stored_passive)
             effective_pp = stored_pp
             override_active = stored_pp != passive_derived
-            conflict = stored_pp != passive_derived
+            # Also conflict if proficiency override caused derived != effective
+            conflict = stored_pp != passive_derived or passive_effective_without_override != passive_derived
             source_pp: Literal["derived", "override"] = "override" if override_active else "derived"
-            if conflict:
+            if stored_pp != passive_derived:
                 warnings.append({"code": "passive_override_conflict", "field": "passive_perception", "message": f"stored {stored_pp} != derived {passive_derived}"})
         except Exception:
             warnings.append({"code": "invalid_passive_perception", "field": "passive_perception", "message": f"invalid {stored_passive!r}"})
-            effective_pp = passive_derived
+            effective_pp = passive_effective_without_override
             stored_pp = None
             override_active = False
-            conflict = False
+            conflict = passive_effective_without_override != passive_derived
             source_pp = "derived"
     else:
         stored_pp = None
-        effective_pp = passive_derived
+        effective_pp = passive_effective_without_override
         override_active = False
-        conflict = False
+        conflict = effective_pp != passive_derived
         source_pp = "derived"
 
     passive: dict[str, PassiveDetail] = {
@@ -710,8 +723,8 @@ def get_character_mechanics_for_sheet(sheet: Any) -> CharacterMechanics:
     # --- Attacks / weapons ---
     attacks = _derive_attacks(sheet, warnings, errors)
 
-    # --- Spellcasting ---
-    spellcasting = _derive_spellcasting(sheet, ability_mods, derived_prof, warnings, errors)
+    # --- Spellcasting --- effective respects effective proficiency
+    spellcasting = _derive_spellcasting(sheet, ability_mods, derived_prof, effective_prof, warnings, errors)
 
     # --- Resources / Conditions ---
     resources = _derive_resources(sheet, warnings, errors)
@@ -856,7 +869,7 @@ def _derive_attacks(sheet: Any, warnings: list[dict[str, Any]], errors: list[dic
     return out
 
 
-def _derive_spellcasting(sheet: Any, ability_mods: dict[str, int], derived_prof: int, warnings: list[dict[str, Any]], errors: list[dict[str, Any]]) -> SpellcastingDetail:
+def _derive_spellcasting(sheet: Any, ability_mods: dict[str, int], derived_prof: int, effective_prof: int, warnings: list[dict[str, Any]], errors: list[dict[str, Any]]) -> SpellcastingDetail:
     raw_ability = getattr(sheet, "spellcasting_ability", None)
     ability = _norm_spell_ability(raw_ability) if raw_ability else None
     ab_mod = ability_mods.get(ability) if ability else None
@@ -888,19 +901,23 @@ def _derive_spellcasting(sheet: Any, ability_mods: dict[str, int], derived_prof:
                 else:
                     warnings.append({"code": "invalid_spell_slot_value", "field": f"spell_slots.{lvl_key}", "message": f"invalid {val!r}"})
 
-    # Derived DC / attack
+    # Derived vs effective DC / attack — effective respects effective proficiency
     derived_dc = None
     derived_attack = None
+    effective_dc_without_override = None
+    effective_attack_without_override = None
     if ability and ab_mod is not None:
         derived_dc = 8 + derived_prof + ab_mod
         derived_attack = derived_prof + ab_mod
+        effective_dc_without_override = 8 + effective_prof + ab_mod
+        effective_attack_without_override = effective_prof + ab_mod
 
     stored_dc_raw = getattr(sheet, "spell_save_dc", None)
     stored_attack_raw = getattr(sheet, "spell_attack_bonus", None)
 
-    # DC override handling
+    # DC override handling — effective respects effective proficiency when no explicit override
     dc_override = None
-    dc_effective = derived_dc
+    dc_effective = effective_dc_without_override if effective_dc_without_override is not None else derived_dc
     dc_override_active = False
     dc_conflict = False
     dc_source: Literal["derived", "override", "none"] = "none"
@@ -914,20 +931,19 @@ def _derive_spellcasting(sheet: Any, ability_mods: dict[str, int], derived_prof:
                 dc_conflict = True
                 warnings.append({"code": "spell_dc_override_conflict", "field": "spell_save_dc", "message": f"stored {dc_override} != derived {derived_dc}"})
             elif derived_dc is None:
-                # No ability to derive, stored is authoritative
                 dc_effective = dc_override
                 dc_source = "override"
         except Exception:
             warnings.append({"code": "invalid_spell_save_dc", "field": "spell_save_dc", "message": f"invalid {stored_dc_raw!r}"})
             dc_override = None
-            dc_effective = derived_dc
-            dc_source = "derived" if derived_dc is not None else "none"
+            dc_effective = effective_dc_without_override if effective_dc_without_override is not None else derived_dc
+            dc_source = "derived" if (effective_dc_without_override if effective_dc_without_override is not None else derived_dc) is not None else "none"
     else:
-        dc_effective = derived_dc
-        dc_source = "derived" if derived_dc is not None else "none"
+        dc_effective = effective_dc_without_override if effective_dc_without_override is not None else derived_dc
+        dc_source = "derived" if (effective_dc_without_override if effective_dc_without_override is not None else derived_dc) is not None else "none"
 
     atk_override = None
-    atk_effective = derived_attack
+    atk_effective = effective_attack_without_override if effective_attack_without_override is not None else derived_attack
     atk_override_active = False
     atk_conflict = False
     atk_source: Literal["derived", "override", "none"] = "none"
@@ -943,11 +959,11 @@ def _derive_spellcasting(sheet: Any, ability_mods: dict[str, int], derived_prof:
         except Exception:
             warnings.append({"code": "invalid_spell_attack_bonus", "field": "spell_attack_bonus", "message": f"invalid {stored_attack_raw!r}"})
             atk_override = None
-            atk_effective = derived_attack
-            atk_source = "derived" if derived_attack is not None else "none"
+            atk_effective = effective_attack_without_override if effective_attack_without_override is not None else derived_attack
+            atk_source = "derived" if (effective_attack_without_override if effective_attack_without_override is not None else derived_attack) is not None else "none"
     else:
-        atk_effective = derived_attack
-        atk_source = "derived" if derived_attack is not None else "none"
+        atk_effective = effective_attack_without_override if effective_attack_without_override is not None else derived_attack
+        atk_source = "derived" if (effective_attack_without_override if effective_attack_without_override is not None else derived_attack) is not None else "none"
 
     return SpellcastingDetail(
         ability=ability,
