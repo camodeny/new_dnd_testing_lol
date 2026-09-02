@@ -361,12 +361,8 @@ def _extract_skill_profs(sheet: Any, warnings: list[dict[str, Any]], errors: lis
         if getattr(sheet, col, False):
             profs.add(skill)
 
-    # JSONB list
-    try:
-        items = _parse_jsonb_list(getattr(sheet, "skills", None))
-    except MechanicsError as exc:
-        errors.append({"code": exc.code, "field": "skills", "message": str(exc)})
-        items = []
+    # JSONB list — fail-closed: malformed list invalidates skill derivation
+    items = _parse_jsonb_list(getattr(sheet, "skills", None))
 
     for item in items:
         # alias resolution
@@ -409,11 +405,7 @@ def _extract_save_profs(sheet: Any, warnings: list[dict[str, Any]], errors: list
         if getattr(sheet, col, False):
             profs.add(ability)
 
-    try:
-        items = _parse_jsonb_list(getattr(sheet, "saving_throws", None))
-    except MechanicsError as exc:
-        errors.append({"code": exc.code, "field": "saving_throws", "message": str(exc)})
-        items = []
+    items = _parse_jsonb_list(getattr(sheet, "saving_throws", None))
 
     for item in items:
         raw = None
@@ -483,12 +475,7 @@ def get_character_mechanics_for_sheet(sheet: Any) -> CharacterMechanics:
     except Exception:
         raise MechanicsError("invalid_level", f"level must be int, got {level!r}", field="level")
     if level_int < 1 or level_int > 20:
-        errors.append({"code": "invalid_level", "field": "level", "message": f"level {level_int} outside 1-20"})
-        # Fail-closed for extreme values — block derivation rather than invent
-        if level_int < 1 or level_int > 30:
-            # For DTO we clamp but flag; only raise for absurd values outside 0-50
-            if level_int < 0 or level_int > 50:
-                raise MechanicsError("invalid_level", f"level {level_int} outside 0-50, cannot derive proficiency", field="level")
+        raise MechanicsError("invalid_level", f"level {level_int} outside 1-20", field="level")
 
     derived_prof = proficiency_for_level(max(1, min(level_int, 20)))
 
@@ -525,18 +512,7 @@ def get_character_mechanics_for_sheet(sheet: Any) -> CharacterMechanics:
         except Exception:
             raise MechanicsError("invalid_ability_score", f"ability {ab} must be int, got {raw!r}", field=ab)
         if score < 1 or score > 30:
-            errors.append({"code": "invalid_ability_score", "field": ab, "message": f"{ab} score {score} outside 1-30"})
-            if score < 1 or score > 30:
-                # For gameplay-critical path, raise if truly impossible and sheet would invent stats
-                # We surface error but still derive mod for non-blocking display; callers can check validation.errors
-                pass
-            # clamp for display derivation
-            clamped = max(1, min(score, 30))
-            mod = ability_modifier(clamped)
-            # flag as invalid but still return
-            abilities[ab] = AbilityDetail(score=score, modifier=mod, source="stored")
-            ability_mods[ab] = mod
-            continue
+            raise MechanicsError("invalid_ability_score", f"{ab} score {score} outside 1-30", field=ab)
         mod = ability_modifier(score)
         abilities[ab] = AbilityDetail(score=score, modifier=mod, source="stored")
         ability_mods[ab] = mod
@@ -675,15 +651,13 @@ def get_character_mechanics_for_sheet(sheet: Any) -> CharacterMechanics:
         raise MechanicsError("invalid_hit_points", f"hit points must be int: {exc}", field="hit_points")
 
     if hp_max < 1:
-        errors.append({"code": "invalid_hit_points_max", "field": "hit_points_max", "message": f"max {hp_max} must be >=1"})
-    if hp_cur < 0 or hp_cur > hp_max:
-        # allow 0 HP (down) but not >max; flag but don't invent
-        if hp_cur > hp_max:
-            warnings.append({"code": "hit_points_current_exceeds_max", "field": "hit_points_current", "message": f"current {hp_cur} > max {hp_max}"})
-        if hp_cur < 0:
-            errors.append({"code": "invalid_hit_points_current", "field": "hit_points_current", "message": f"current {hp_cur} <0"})
+        raise MechanicsError("invalid_hit_points_max", f"max {hp_max} must be >=1", field="hit_points_max")
+    if hp_cur < 0:
+        raise MechanicsError("invalid_hit_points_current", f"current {hp_cur} <0", field="hit_points_current")
+    if hp_cur > hp_max:
+        warnings.append({"code": "hit_points_current_exceeds_max", "field": "hit_points_current", "message": f"current {hp_cur} > max {hp_max}"})
     if hp_tmp < 0:
-        errors.append({"code": "invalid_temp_hp", "field": "hit_points_temp", "message": f"temp {hp_tmp} <0"})
+        raise MechanicsError("invalid_temp_hp", f"temp {hp_tmp} <0", field="hit_points_temp")
 
     hp = HPDetail(current=hp_cur, maximum=hp_max, temporary=hp_tmp)
 
@@ -696,7 +670,7 @@ def get_character_mechanics_for_sheet(sheet: Any) -> CharacterMechanics:
     if ac_val < 5 or ac_val > 35:
         warnings.append({"code": "unusual_armor_class", "field": "armor_class", "message": f"AC {ac_val} outside typical 5-35"})
     if speed_val < 0 or speed_val > 500:
-        errors.append({"code": "invalid_speed", "field": "speed", "message": f"speed {speed_val} outside 0-500"})
+        raise MechanicsError("invalid_speed", f"speed {speed_val} outside 0-500", field="speed")
 
     ac = ACDetail(value=ac_val, effective=ac_val, override=None, override_active=False, source="stored")
     speed_details = getattr(sheet, "speed_details", None)
@@ -851,8 +825,7 @@ def _derive_attacks(sheet: Any, warnings: list[dict[str, Any]], errors: list[dic
     if raw is None:
         return []
     if not isinstance(raw, list):
-        errors.append({"code": "malformed_weapons", "field": "weapons", "message": f"weapons must be list, got {type(raw).__name__}"})
-        return []
+        raise MechanicsError("malformed_weapons", f"weapons must be list, got {type(raw).__name__}", field="weapons")
     out: list[AttackDetail] = []
     for item in raw:
         if not isinstance(item, dict):
@@ -893,7 +866,7 @@ def _derive_spellcasting(sheet: Any, ability_mods: dict[str, int], derived_prof:
     slots: dict[str, dict[str, int]] = {}
     if slots_raw is not None:
         if not isinstance(slots_raw, dict):
-            errors.append({"code": "malformed_spell_slots", "field": "spell_slots", "message": f"spell_slots must be dict, got {type(slots_raw).__name__}"})
+            raise MechanicsError("malformed_spell_slots", f"spell_slots must be dict, got {type(slots_raw).__name__}", field="spell_slots")
         else:
             for lvl, val in slots_raw.items():
                 lvl_key = str(lvl)
@@ -1002,8 +975,7 @@ def _derive_resources(sheet: Any, warnings: list[dict[str, Any]], errors: list[d
     if raw is None:
         return []
     if not isinstance(raw, list):
-        errors.append({"code": "malformed_resources", "field": "resources", "message": f"resources must be list, got {type(raw).__name__}"})
-        return []
+        raise MechanicsError("malformed_resources", f"resources must be list, got {type(raw).__name__}", field="resources")
     out: list[ResourceDetail] = []
     for item in raw:
         if not isinstance(item, dict):
@@ -1026,8 +998,7 @@ def _derive_conditions(sheet: Any, warnings: list[dict[str, Any]], errors: list[
     if raw is None:
         return []
     if not isinstance(raw, list):
-        errors.append({"code": "malformed_conditions", "field": "conditions", "message": f"conditions must be list, got {type(raw).__name__}"})
-        return []
+        raise MechanicsError("malformed_conditions", f"conditions must be list, got {type(raw).__name__}", field="conditions")
     out: list[ConditionDetail] = []
     for item in raw:
         if not isinstance(item, dict):

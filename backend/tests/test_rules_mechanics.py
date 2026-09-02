@@ -280,31 +280,89 @@ def test_resources_conditions():
     assert m.conditions[0].condition_name == "Poisoned"
 
 
-def test_malformed_and_invalid_sheet():
-    # invalid ability score outside 1-30 collects error but still derives
-    sheet = FakeSheet(strength=31, level=1)
-    m = get_character_mechanics_for_sheet(sheet)
-    assert any(e["code"] == "invalid_ability_score" for e in m.validation.errors)
+def test_malformed_and_invalid_sheet_blocks_mechanics():
+    # Fail-closed: invalid ability/level/ malformed JSONB must raise MechanicsError, not return DTO with errors
+    with pytest.raises(MechanicsError) as exc:
+        get_character_mechanics_for_sheet(FakeSheet(strength=31, level=1))
+    assert exc.value.code == "invalid_ability_score"
+    assert exc.value.field == "strength"
 
-    # level 0 invalid
-    sheet2 = FakeSheet(level=0)
-    m2 = get_character_mechanics_for_sheet(sheet2)
-    assert any(e["code"] == "invalid_level" for e in m2.validation.errors)
+    with pytest.raises(MechanicsError) as exc:
+        get_character_mechanics_for_sheet(FakeSheet(level=0))
+    assert exc.value.code == "invalid_level"
 
-    # malformed skills not list
-    sheet3 = FakeSheet(skills="notalist")  # type: ignore
-    m3 = get_character_mechanics_for_sheet(sheet3)
-    assert any(e["field"] == "skills" for e in m3.validation.errors)
+    with pytest.raises(MechanicsError) as exc:
+        get_character_mechanics_for_sheet(FakeSheet(skills="notalist"))  # type: ignore
+    assert exc.value.code == "malformed_jsonb"
+    assert "skills" in str(exc.value) or exc.value.code == "malformed_jsonb"
 
-    # malformed spell_slots not dict
-    sheet4 = FakeSheet(spell_slots="bad")  # type: ignore
-    m4 = get_character_mechanics_for_sheet(sheet4)
-    assert any(e["code"] == "malformed_spell_slots" for e in m4.validation.errors)
+    with pytest.raises(MechanicsError) as exc:
+        get_character_mechanics_for_sheet(FakeSheet(spell_slots="bad"))  # type: ignore
+    assert exc.value.code == "malformed_spell_slots"
 
-    # invalid skill name in list is ignored with warning, not error
+    with pytest.raises(MechanicsError):
+        get_character_mechanics_for_sheet(FakeSheet(hit_points_max=0))
+
+    with pytest.raises(MechanicsError):
+        get_character_mechanics_for_sheet(FakeSheet(speed=-5))
+
+    with pytest.raises(MechanicsError):
+        get_character_mechanics_for_sheet(FakeSheet(weapons="bad"))  # type: ignore
+
+    with pytest.raises(MechanicsError):
+        get_character_mechanics_for_sheet(FakeSheet(resources="bad"))  # type: ignore
+
+    # invalid skill name in list is non-blocking warning, not error
     sheet5 = FakeSheet(skills=[{"skill_name": "not_a_skill", "is_proficient": True}])
     m5 = get_character_mechanics_for_sheet(sheet5)
     assert any(w["code"] == "unknown_skill_name" for w in m5.validation.warnings)
+
+
+def test_invalid_sheet_does_not_yield_authoritative_modifier():
+    # Proves that an invalid sheet cannot supply a usable modifier — callers must handle the exception
+    sheet = FakeSheet(strength=50, level=1)
+    with pytest.raises(MechanicsError):
+        query_skill_modifier(sheet, "athletics")
+    with pytest.raises(MechanicsError):
+        query_save_modifier(sheet, "strength")
+    with pytest.raises(MechanicsError):
+        query_passive_perception(sheet)
+    # _sheet_value must surface mechanics_error instead of invented stats
+    from app.dm.context import _sheet_value
+    import datetime
+
+    bad = FakeSheet(strength=50, level=1)
+    # Ensure FakeSheet has required attrs for _sheet_value
+    bad.id = uuid.uuid4()
+    bad.character_id = uuid.uuid4()
+    bad.owner_id = uuid.uuid4()
+    bad.updated_at = datetime.datetime.now(datetime.timezone.utc)
+    bad.character_name = "Bad"
+    bad.conditions = None
+    bad.death_save_successes = 0
+    bad.death_save_failures = 0
+    bad.exhaustion_level = 0
+    bad.hit_points_max = 10
+    bad.hit_points_current = 10
+    bad.hit_points_temp = 0
+    bad.initiative_bonus = 0
+    bad.level = 1
+    bad.strength = 50
+    bad.passive_perception = None
+    bad.proficiency_bonus = 2
+    bad.resources = None
+    bad.saving_throws = None
+    bad.skills = None
+    bad.speed = 30
+    bad.spell_slots = None
+    # ensure all abilities present
+    for ab in ["strength", "dexterity", "constitution", "intelligence", "wisdom", "charisma"]:
+        if not hasattr(bad, ab):
+            setattr(bad, ab, 10)
+    val = _sheet_value(bad)
+    assert "mechanics_error" in val
+    assert val["mechanics_error"]["code"] == "invalid_ability_score"
+    assert "mechanics" not in val
 
 
 def test_creator_round_trip_still_functional():
@@ -368,3 +426,159 @@ def test_source_version_metadata_present():
     assert m.meta.model_version == "mechanics_v1"
     assert m.meta.rules_revision == "2024.5e"
     assert m.meta.sheet_version != "unknown"
+
+
+# ── Evidence handler campaign scoping ────────────────────────────────────
+
+def _setup_campaign_db():
+    from sqlalchemy import create_engine
+    from sqlalchemy.orm import sessionmaker
+    from sqlalchemy.pool import StaticPool
+    from sqlalchemy.dialects.sqlite.base import SQLiteTypeCompiler
+
+    if not hasattr(SQLiteTypeCompiler, "_patched_jsonb"):
+        SQLiteTypeCompiler.visit_JSONB = lambda self, type_, **kw: "JSON"  # type: ignore
+        SQLiteTypeCompiler._patched_jsonb = True  # type: ignore
+    from database import Base  # noqa: E402
+
+    engine = create_engine("sqlite://", connect_args={"check_same_thread": False}, poolclass=StaticPool)
+    Base.metadata.create_all(bind=engine)
+    return sessionmaker(bind=engine, expire_on_commit=False)()
+
+
+def test_evidence_handler_rejects_cross_campaign_character_id():
+    from models import Campaign, CampaignMember, Character, Dnd5eCharacterSheet, Profile  # noqa: E402
+    from app.dm.context import ContextAudience  # noqa: E402
+    from app.dm.contract import EvidenceRequest  # noqa: E402
+    from app.dm.tools.character_sheet import handle_ask_character_sheet  # noqa: E402
+
+    db = _setup_campaign_db()
+    owner_a = uuid.uuid4()
+    owner_b = uuid.uuid4()
+    db.add_all([Profile(id=owner_a, email="a@test.com"), Profile(id=owner_b, email="b@test.com")])
+    camp_a = Campaign(id=uuid.uuid4(), owner_id=owner_a, name="A", revision=0)
+    camp_b = Campaign(id=uuid.uuid4(), owner_id=owner_b, name="B", revision=0)
+    db.add_all([camp_a, camp_b])
+    db.flush()
+    db.add_all([
+        CampaignMember(campaign_id=camp_a.id, user_id=owner_a, role="owner"),
+        CampaignMember(campaign_id=camp_b.id, user_id=owner_b, role="owner"),
+    ])
+    # Character owned by B's owner, associated with B via submission
+    char_b = Character(id=uuid.uuid4(), owner_id=owner_b, system="dnd5e", name="Bob")
+    db.add(char_b)
+    db.flush()
+    sheet_b = Dnd5eCharacterSheet.from_frontend({"name": "Bob", "total_level": 2}, owner_b)
+    sheet_b.character_id = char_b.id
+    db.add(sheet_b)
+    # Submission linking char_b to camp_b (authoritative association)
+    from models import PlayerSubmission, PlayerSubmissionSegment  # noqa: E402
+
+    sub = PlayerSubmission(
+        id=uuid.uuid4(),
+        campaign_id=camp_b.id,
+        user_id=owner_b,
+        character_id=char_b.id,
+        thread_id=str(uuid.uuid4()),
+        audience="campaign",
+        sequence=1,
+        raw_content="hi",
+    )
+    db.add(sub)
+    db.flush()
+    db.add(PlayerSubmissionSegment(submission_id=sub.id, position=0, segment_type="ic", text="hi"))
+    db.commit()
+
+    # Request from camp_a audience asking for char_b via character_id — must be rejected (missing)
+    aud_a = ContextAudience(campaign_id=str(camp_a.id), thread_id=str(uuid.uuid4()), audience="campaign", user_ids=[str(owner_a)])
+    req = EvidenceRequest(id="req1", tool="ask_character_sheet", question="q?", scope="character_id", character_id=str(char_b.id))
+    res = handle_ask_character_sheet(req, aud_a, db=db)
+    assert res.status == "missing"
+    assert res.payload is None
+    # Must not stamp camp_a onto auth with leaked character
+    assert not any(str(char_b.id) in str(s.source_id) for s in res.sources)
+
+
+def test_evidence_handler_party_scope_is_campaign_bound():
+    from models import Campaign, CampaignMember, Character, Dnd5eCharacterSheet, Profile, PlayerSubmission, PlayerSubmissionSegment  # noqa: E402
+    from app.dm.context import ContextAudience  # noqa: E402
+    from app.dm.contract import EvidenceRequest  # noqa: E402
+    from app.dm.tools.character_sheet import handle_ask_character_sheet  # noqa: E402
+
+    db = _setup_campaign_db()
+    owner_a = uuid.uuid4()
+    owner_b = uuid.uuid4()
+    db.add_all([Profile(id=owner_a, email="a2@test.com"), Profile(id=owner_b, email="b2@test.com")])
+    camp_a = Campaign(id=uuid.uuid4(), owner_id=owner_a, name="A2", revision=0)
+    camp_b = Campaign(id=uuid.uuid4(), owner_id=owner_b, name="B2", revision=0)
+    db.add_all([camp_a, camp_b])
+    db.flush()
+    db.add_all([
+        CampaignMember(campaign_id=camp_a.id, user_id=owner_a, role="owner"),
+        CampaignMember(campaign_id=camp_b.id, user_id=owner_b, role="owner"),
+    ])
+    # Two characters, one per campaign
+    char_a = Character(id=uuid.uuid4(), owner_id=owner_a, system="dnd5e", name="AChar")
+    char_b = Character(id=uuid.uuid4(), owner_id=owner_b, system="dnd5e", name="BChar")
+    db.add_all([char_a, char_b])
+    db.flush()
+    for ch, own in [(char_a, owner_a), (char_b, owner_b)]:
+        s = Dnd5eCharacterSheet.from_frontend({"name": ch.name, "total_level": 1}, own)
+        s.character_id = ch.id
+        db.add(s)
+    # Submissions linking each correctly
+    for camp, own, ch in [(camp_a, owner_a, char_a), (camp_b, owner_b, char_b)]:
+        sub = PlayerSubmission(id=uuid.uuid4(), campaign_id=camp.id, user_id=own, character_id=ch.id, thread_id=str(uuid.uuid4()), audience="campaign", sequence=1, raw_content="hi")
+        db.add(sub)
+        db.flush()
+        db.add(PlayerSubmissionSegment(submission_id=sub.id, position=0, segment_type="ic", text="hi"))
+    db.commit()
+
+    # Party scope from camp_a must not leak BChar
+    aud_a = ContextAudience(campaign_id=str(camp_a.id), thread_id=str(uuid.uuid4()), audience="campaign", user_ids=[str(owner_a), str(owner_b)])
+    req_party = EvidenceRequest(id="req_party", tool="ask_character_sheet", question="party?", scope="party")
+    res = handle_ask_character_sheet(req_party, aud_a, db=db)
+    assert res.status == "ok"
+    # Payload should contain only AChar, not BChar — even though audience includes owner_b, BChar is not in camp_a submissions
+    payload_str = str(res.payload)
+    assert "AChar" in payload_str
+    assert "BChar" not in payload_str
+
+
+def test_evidence_handler_invalid_sheet_is_tool_failure_not_ok():
+    from models import Campaign, CampaignMember, Character, Dnd5eCharacterSheet, Profile, PlayerSubmission, PlayerSubmissionSegment  # noqa: E402
+    from app.dm.context import ContextAudience  # noqa: E402
+    from app.dm.contract import EvidenceRequest  # noqa: E402
+    from app.dm.tools.character_sheet import handle_ask_character_sheet  # noqa: E402
+
+    db = _setup_campaign_db()
+    owner = uuid.uuid4()
+    db.add(Profile(id=owner, email="c@test.com"))
+    camp = Campaign(id=uuid.uuid4(), owner_id=owner, name="C", revision=0)
+    db.add(camp)
+    db.flush()
+    db.add(CampaignMember(campaign_id=camp.id, user_id=owner, role="owner"))
+    char = Character(id=uuid.uuid4(), owner_id=owner, system="dnd5e", name="Bad")
+    db.add(char)
+    db.flush()
+    sheet = Dnd5eCharacterSheet.from_frontend({"name": "Bad", "total_level": 1}, owner)
+    sheet.character_id = char.id
+    sheet.strength = 99  # invalid blocks mechanics
+    db.add(sheet)
+    sub = PlayerSubmission(id=uuid.uuid4(), campaign_id=camp.id, user_id=owner, character_id=char.id, thread_id=str(uuid.uuid4()), audience="campaign", sequence=1, raw_content="hi")
+    db.add(sub)
+    db.flush()
+    db.add(PlayerSubmissionSegment(submission_id=sub.id, position=0, segment_type="ic", text="hi"))
+    db.commit()
+
+    aud = ContextAudience(campaign_id=str(camp.id), thread_id=str(uuid.uuid4()), audience="campaign", user_ids=[str(owner)])
+    req = EvidenceRequest(id="req_bad", tool="ask_character_sheet", question="q?", scope="character_id", character_id=str(char.id))
+    res = handle_ask_character_sheet(req, aud, db=db)
+    assert res.status == "tool_failure"
+    assert res.payload is not None
+    assert "error" in str(res.payload) or "error" in res.payload
+    # Must not return ok with usable mechanics
+    if isinstance(res.payload, dict) and "error" not in res.payload:
+        # If single char, payload is error dict
+        assert False, "invalid sheet should not return ok mechanics"
+

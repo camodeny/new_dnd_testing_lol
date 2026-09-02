@@ -2,6 +2,13 @@
 
 Returns the canonical CharacterMechanics DTO via the #203 EvidenceResult
 contract. No LLM math; no frontend JSON re-parsing; authorization-scoped.
+
+Campaign scoping (review fix): targets are resolved through authoritative
+campaign membership, not arbitrary Character UUIDs or all characters owned by
+audience users. A character must be owned by a CampaignMember of the
+requested campaign (and for party/current_player, be associated with the
+campaign via at least one PlayerSubmission when submissions exist). Cross-
+campaign IDs are rejected before any AuthorizationScope is stamped.
 """
 
 from __future__ import annotations
@@ -21,15 +28,75 @@ from app.observability.tracing import structured_log
 logger = logging.getLogger(__name__)
 
 
+def _campaign_member_user_ids(db: Any, campaign_id: uuid.UUID) -> set[uuid.UUID]:
+    from models import CampaignMember
+
+    rows = db.execute(select(CampaignMember.user_id).where(CampaignMember.campaign_id == campaign_id)).scalars().all()
+    return set(rows)
+
+
+def _campaign_character_ids_via_submissions(db: Any, campaign_id: uuid.UUID) -> set[uuid.UUID] | None:
+    """Distinct character_ids that have at least one PlayerSubmission in this campaign.
+
+    Returns None if the campaign has no submissions at all (so caller can fall back
+    to membership-only scoping for pre-submission characters).
+    """
+    from models import PlayerSubmission
+
+    rows = db.execute(
+        select(PlayerSubmission.character_id).where(
+            PlayerSubmission.campaign_id == campaign_id,
+            PlayerSubmission.character_id.is_not(None),
+        ).distinct()
+    ).scalars().all()
+    # distinct returns UUIDs
+    ids = {r for r in rows if r is not None}
+    if not ids:
+        # Check if any submissions exist at all (even without character)
+        any_sub = db.execute(select(PlayerSubmission.id).where(PlayerSubmission.campaign_id == campaign_id).limit(1)).scalar_one_or_none()
+        if any_sub is None:
+            return None  # no submissions yet — no signal
+    return ids
+
+
 def _resolve_character_ids_for_scope(
     request: EvidenceRequest,
     audience: ContextAudience,
     db: Any,
 ) -> list[uuid.UUID]:
     """Resolve evidence scope to concrete character UUIDs, scoped to audience campaign."""
-    from models import CampaignMember, CampaignThreadMember, Character
+    from models import CampaignMember, Character
 
-    # character_id scope — single explicit char
+    try:
+        campaign_uuid = uuid.UUID(str(audience.campaign_id))
+    except Exception:
+        return []
+
+    member_user_ids = _campaign_member_user_ids(db, campaign_uuid)
+    # campaign must exist and have members; otherwise no targets
+    if not member_user_ids:
+        return []
+
+    # Helper to verify a single character is campaign-authorized
+    def _is_campaign_authorized(char: Character) -> bool:
+        if char.owner_id not in member_user_ids:
+            return False
+        # If campaign has submissions, require the character to have appeared in it
+        # (prevents leaking a user's unrelated character from another campaign).
+        # Only enforce when submissions exist; otherwise allow membership-only.
+        campaign_char_ids = _campaign_character_ids_via_submissions(db, campaign_uuid)
+        if campaign_char_ids is not None and len(campaign_char_ids) > 0:
+            # If this character has never submitted in this campaign, it's not yet
+            # authoritative for this campaign — treat as not found for party/current_player,
+            # but for explicit character_id we still reject.
+            if char.id not in campaign_char_ids:
+                # For explicit character_id, reject; for party scopes caller filters differently
+                # We return False here so explicit scope returns empty; party/current_player
+                # will filter via submission set directly.
+                return False
+        return True
+
+    # character_id scope — single explicit char, must be campaign-authorized
     if request.scope == "character_id":
         if request.character_id is None:
             return []
@@ -38,41 +105,53 @@ def _resolve_character_ids_for_scope(
         except Exception:
             return []
         char = db.get(Character, cid)
-        # must belong to requested campaign's context — best effort: if audience campaign set, just return it; auth handled downstream
         if char is None:
+            return []
+        if not _is_campaign_authorized(char):
+            return []
+        # Also enforce audience authorization: for private include_private, owner must be in audience; for campaign, owner must be member (already)
+        if request.include_private and str(char.owner_id) not in audience.user_ids:
+            # Private data requested but character not owned by audience user — not authorized
+            # Let caller handle via status; we still filter out
             return []
         return [cid]
 
-    # party — all campaign members' characters? Return chars whose owner in campaign user set.
-    # We resolve via characters owned by campaign members.
+    # party — all campaign members' characters that are campaign-associated
     if request.scope == "party":
-        # audience.user_ids includes campaign members + owner (see _audience_for_attempt)
-        user_ids = []
-        for uid in audience.user_ids:
-            try:
-                user_ids.append(uuid.UUID(uid))
-            except Exception:
-                continue
-        if not user_ids:
-            return []
-        rows = db.execute(select(Character).where(Character.owner_id.in_(user_ids))).scalars().all()
+        # Prefer submission-linked characters when they exist
+        campaign_char_ids = _campaign_character_ids_via_submissions(db, campaign_uuid)
+        if campaign_char_ids is not None and len(campaign_char_ids) > 0:
+            # Return only submission-linked characters that are owned by members
+            rows = db.execute(select(Character).where(Character.id.in_(campaign_char_ids))).scalars().all()
+            # Double-check owner still member (in case character ownership changed)
+            return [r.id for r in rows if r.owner_id in member_user_ids]
+        # No submissions yet — fall back to characters owned by campaign members (bounded)
+        rows = db.execute(select(Character).where(Character.owner_id.in_(member_user_ids)).limit(8)).scalars().all()
         return [r.id for r in rows]
 
-    # current_player — characters owned by thread members (private) or all campaign members but filtered to submission-relevant?
-    # For generic tool, return calling thread's characters — use thread membership for private, campaign membership for campaign audience.
+    # current_player — characters owned by audience users that are campaign-associated
     if request.scope == "current_player":
-        # If private thread, audience.user_ids is thread members; otherwise campaign members
-        user_ids = []
+        audience_user_ids: set[uuid.UUID] = set()
         for uid in audience.user_ids:
             try:
-                user_ids.append(uuid.UUID(uid))
+                audience_user_ids.add(uuid.UUID(uid))
             except Exception:
                 continue
-        rows = db.execute(select(Character).where(Character.owner_id.in_(user_ids))).scalars().all()
-        # In campaign audience, this would return many — limit to first owner's chars? For evidence, we return all but bounded later.
-        # Bounding: take at most 8 to keep payload bounded
-        ids = [r.id for r in rows][:8]
-        return ids
+        # Intersect with campaign members — audience must be subset, but verify
+        audience_user_ids = audience_user_ids.intersection(member_user_ids)
+        if not audience_user_ids:
+            return []
+        campaign_char_ids = _campaign_character_ids_via_submissions(db, campaign_uuid)
+        if campaign_char_ids is not None and len(campaign_char_ids) > 0:
+            rows = db.execute(
+                select(Character).where(
+                    Character.id.in_(campaign_char_ids),
+                    Character.owner_id.in_(audience_user_ids),
+                )
+            ).scalars().all()
+            return [r.id for r in rows][:8]
+        rows = db.execute(select(Character).where(Character.owner_id.in_(audience_user_ids)).limit(8)).scalars().all()
+        return [r.id for r in rows][:8]
 
     return []
 
@@ -86,6 +165,7 @@ def handle_ask_character_sheet(
     """Evidence handler for ask_character_sheet — returns CharacterMechanics DTO.
 
     Authorization: private sheet data only when audience is private and caller authorized for those user_ids.
+    Campaign scoping is enforced before any AuthorizationScope is stamped.
     """
     t0 = time.monotonic()
 
@@ -102,7 +182,6 @@ def handle_ask_character_sheet(
         )
 
     if db is None:
-        # No DB — cannot resolve; return unknown (keeps loop exercising without crash)
         return EvidenceResult(
             request_id=request.id,
             tool=request.tool,
@@ -115,7 +194,6 @@ def handle_ask_character_sheet(
             latency_ms=(time.monotonic() - t0) * 1000,
         )
 
-    # Authorization gate for private data
     visibility: str = "private" if request.include_private else "campaign"
     if request.include_private and audience.audience != "private":
         return EvidenceResult(
@@ -130,7 +208,6 @@ def handle_ask_character_sheet(
             latency_ms=(time.monotonic() - t0) * 1000,
         )
 
-    # Resolve targets
     character_ids = _resolve_character_ids_for_scope(request, audience, db)
     if not character_ids:
         return EvidenceResult(
@@ -149,7 +226,6 @@ def handle_ask_character_sheet(
             latency_ms=(time.monotonic() - t0) * 1000,
         )
 
-    # Fetch mechanics for each character, bounding output
     from app.rules.mechanics import MechanicsError, get_character_mechanics_for_sheet
     from models import Dnd5eCharacterSheet
 
@@ -158,8 +234,9 @@ def handle_ask_character_sheet(
     auth_user_ids: list[str] = []
     has_error = False
     error_msg: str | None = None
+    has_success = False
 
-    for cid in character_ids[:4]:  # bound to 4 sheets per request
+    for cid in character_ids[:4]:
         sheet = db.execute(
             select(Dnd5eCharacterSheet).where(Dnd5eCharacterSheet.character_id == cid).order_by(Dnd5eCharacterSheet.updated_at.desc())
         ).scalars().first()
@@ -169,6 +246,7 @@ def handle_ask_character_sheet(
             mechanics = get_character_mechanics_for_sheet(sheet)
             dump = mechanics.model_dump(mode="json")
             results_payload.append(dump)
+            has_success = True
             sources.append(SourceRef(
                 source_type="dnd5e_character_sheet",
                 source_id=str(sheet.id),
@@ -176,13 +254,11 @@ def handle_ask_character_sheet(
                 campaign_revision=None,
                 provenance={"tool": request.tool, "character_id": str(cid), "question": request.question or ""},
             ))
-            # For private visibility, authorize to sheet owner
             if visibility == "private":
                 auth_user_ids.append(str(sheet.owner_id))
         except MechanicsError as exc:
             has_error = True
             error_msg = f"mechanics error {exc.code}: {exc}"
-            # Still produce a result with error provenance — caller can distinguish
             sources.append(SourceRef(
                 source_type="dnd5e_character_sheet",
                 source_id=str(sheet.id) if sheet and getattr(sheet, "id", None) else str(cid),
@@ -215,14 +291,12 @@ def handle_ask_character_sheet(
             latency_ms=(time.monotonic() - t0) * 1000,
         )
 
-    # Authorization scope for result — private requires user-scoped auth
     auth = AuthorizationScope(
         campaign_id=audience.campaign_id,
         thread_ids=[audience.thread_id],
         user_ids=sorted(set(auth_user_ids)) if visibility == "private" else [],
     )
     if visibility == "private" and not auth.user_ids:
-        # Fail-closed: private must be user-scoped
         auth = AuthorizationScope(
             campaign_id=audience.campaign_id,
             thread_ids=[audience.thread_id],
@@ -231,19 +305,20 @@ def handle_ask_character_sheet(
 
     latency_ms = (time.monotonic() - t0) * 1000
 
-    # Compact payload already bounded by mechanics size; evidence layer will _compact further
-
     payload: dict[str, Any]
     if len(results_payload) == 1:
         payload = results_payload[0]
     else:
         payload = {"characters": results_payload, "count": len(results_payload)}
 
-    status: str = "ok"
-    if has_error and not any("error" not in p for p in results_payload):
-        status = "tool_failure" if error_msg else "missing"
+    # Fail-closed: if every result is an error, propagate failure; partial success stays ok but errors visible per-character
+    if has_error and not has_success:
+        # All failed due to MechanicsError — block authoritative use
+        status: str = "tool_failure"
     elif has_error:
-        status = "ok"  # partial success — caller sees per-character errors in payload
+        status = "ok"
+    else:
+        status = "ok"
 
     structured_log(
         logger,
