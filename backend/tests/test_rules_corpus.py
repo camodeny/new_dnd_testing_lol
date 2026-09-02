@@ -31,8 +31,9 @@ SAMPLE_SECTIONS = [
     {"document": "spells", "heading_path": ["Fireball"], "title": "Fireball", "body": "A bright streak flashes to a point you choose.", "structured_tables": [{"name": "Damage", "rows": [["Level", "Damage"], ["3rd", "8d6"]]}]},
 ]
 
-# Official artifact hash for tests — distinct from derivative hash
-TEST_OFFICIAL_HASH = "a" * 64
+# Official artifact hash for tests — must match pinned real WotC artifact for 5.2.1
+# Real SHA256 of https://media.dndbeyond.com/compendium-images/srd/5.2/SRD_CC_v5.2.1.pdf
+TEST_OFFICIAL_HASH = "8974902d109d6e63672d7c490bde9ccf052410503d9cfa768237154fbc5e3d87"
 TEST_OFFICIAL_HASH_2 = "b" * 64
 
 @pytest.fixture
@@ -276,6 +277,25 @@ def test_import_fails_on_unresolved_collision(db):
     ]
     with pytest.raises(ValueError, match="Collision"):
         normalize_raw_sections(dup2)
+
+
+def test_promotion_accepts_exact_pinned_hash_and_rejects_mismatch(db):
+    # Exact pinned official hash for 5.2.1 must be accepted
+    bid, _ = import_fixture_sections(db, SAMPLE_SECTIONS, source_artifact_hash=TEST_OFFICIAL_HASH, validate_canaries=False)
+    assert bid
+    # Same version with different official hash (even with canary) must be rejected — binds to pinned artifact
+    tampered = [{"document": "playing-the-game", "heading_path": ["Combat"], "title": "Combat", "body": "tampered but contains weapon mastery"}]
+    with pytest.raises(ValueError, match="Official artifact hash mismatch"):
+        import_fixture_sections(db, tampered, source_artifact_hash="c" * 64, validate_canaries=True)
+    # Derivative hash alone (hash of normalized content) must not be accepted as official for pinned version
+    from app.rules.ingest import compute_source_checksum
+    from app.rules.ids import content_hash
+
+    derivative = compute_source_checksum([content_hash(s["body"]) for s in SAMPLE_SECTIONS])
+    # derivative != pinned, so should be rejected for 5.2.1
+    if derivative != TEST_OFFICIAL_HASH:
+        with pytest.raises(ValueError, match="Official artifact hash mismatch"):
+            import_fixture_sections(db, SAMPLE_SECTIONS, source_artifact_hash=derivative, validate_canaries=False)
 
 
 def test_cc_by_attribution_preserved(db):
