@@ -1,0 +1,7 @@
+{
+  "_comment": "Pinned trusted checksums of official WotC SRD artifacts. Versioned manifest — promotion verifies source_artifact_hash against this. Derivative checksums are stored separately as derivative_checksum in pinned_inputs. Update this file (and metadata.py) when pinning a new official version. For production, replace dummy hash with real SHA256 of SRD_CC_v5.2.1.pdf bytes.",
+  "dnd-srd": {
+    "5.2.1": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+    "5.2.1.1": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+  }
+}

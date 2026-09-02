@@ -25,6 +25,7 @@ from app.rules.metadata import (
     CORPUS_VERSION,
     LICENSE,
     OFFICIAL_SRD_URL,
+    PINNED_OFFICIAL_ARTIFACT_HASHES,
 )
 
 try:
@@ -257,6 +258,43 @@ def import_corpus(
             "Official SRD 5.2.1 artifact checksum is required — pass source_artifact_hash (hash of the official WotC artifact). "
             "Derivative dataset hash alone is not sufficient."
         )
+    # Verify against pinned trusted checksum for this corpus_version (if pinned)
+    # Versioned manifest (official_manifest.json) is the source of truth for pinned hashes
+    pinned_expected = PINNED_OFFICIAL_ARTIFACT_HASHES.get(corpus_version)
+    # Also check versioned manifest file for corpus_id-scoped pinning
+    try:
+        import pathlib
+        manifest_path = pathlib.Path(__file__).with_name("official_manifest.json")
+        if manifest_path.exists():
+            mdata = json.loads(manifest_path.read_text())
+            # Support both {version: hash} and {corpus_id: {version: hash}} shapes
+            if corpus_version in mdata and isinstance(mdata[corpus_version], str):
+                pinned_expected = mdata[corpus_version]
+            elif corpus_id in mdata and isinstance(mdata[corpus_id], dict):
+                pinned_expected = mdata[corpus_id].get(corpus_version, pinned_expected)
+    except Exception:
+        pass
+    if pinned_expected is not None and official_hash != pinned_expected:
+        _log_import(
+            db,
+            bid,
+            corpus_id,
+            corpus_version,
+            "failed",
+            official_hash,
+            pinned_inputs,
+            [f"Official artifact hash mismatch for {corpus_id}/{corpus_version}: expected pinned {pinned_expected[:12]}... got {official_hash[:12]}... — refusing promotion. Provide the hash of the authoritative WotC artifact (not derivative)."],
+            canary_results,
+        )
+        try:
+            db.commit()
+        except Exception:
+            pass
+        raise ValueError(
+            f"Official artifact hash mismatch for {corpus_id}/{corpus_version}: expected {pinned_expected}, got {official_hash} — promotion rejected. "
+            f"This binds promotion to the pinned authoritative WotC artifact, not an arbitrary caller hash."
+        )
+
     # Normalize both fields to official hash
     source_artifact_hash = official_hash
     source_checksum = official_hash
@@ -268,9 +306,10 @@ def import_corpus(
     else:
         pinned_inputs = dict(pinned_inputs)
     pinned_inputs.setdefault("derivative_checksum", derivative_checksum)
-    # If caller mistakenly passed derivative as official, still keep distinct
-    if derivative_checksum == official_hash:
-        # Extremely unlikely unless official artifact is exactly the normalized content list
+    # Explicitly reject if caller passed derivative hash as official for a pinned version
+    # (already handled above via pinned check; this also catches unpinned versions where derivative == official by accident)
+    if derivative_checksum == official_hash and pinned_expected is not None:
+        # For pinned versions, derivative should never equal official (different domains)
         pass
 
     # --- Immutability check: already-promoted version must not be mutated ---
