@@ -25,7 +25,8 @@ def test_migration_preserves_events_when_parent_rows_are_deleted():
     source = MIGRATION.read_text(encoding="utf-8")
     assert "reject_campaign_domain_event_mutation" in source
     # ORM defines FKs with RESTRICT on campaign_domain_events
-    import pathlib, sys
+    import pathlib
+    import sys
 
     sys.path.insert(0, str(pathlib.Path(__file__).parent.parent))
     from database import Base
@@ -34,3 +35,19 @@ def test_migration_preserves_events_when_parent_rows_are_deleted():
     table = Base.metadata.tables["campaign_domain_events"]
     restricts = [c.ondelete for c in table.foreign_keys if c.ondelete == "RESTRICT"]
     assert len(restricts) >= 2
+
+
+def test_baseline_keeps_pre_squash_revision_path_reachable():
+    """A live database at the last pre-squash revision can reach head."""
+    from alembic.config import Config
+    from alembic.script import ScriptDirectory
+
+    backend = Path(__file__).parent.parent
+    config = Config(str(backend / "alembic.ini"))
+    config.set_main_option("script_location", str(backend / "alembic"))
+    script = ScriptDirectory.from_config(config)
+
+    assert script.get_revision("a9b8c7d6e5f4").down_revision is None
+    assert script.get_revision("f3a1c9d8e2b4").down_revision == "a9b8c7d6e5f4"
+    assert script.get_revision("2a04bc8c83ba").down_revision == "f3a1c9d8e2b4"
+    assert script.get_heads() == ["2a04bc8c83ba"]
