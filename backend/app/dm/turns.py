@@ -634,39 +634,43 @@ def mark_streaming_started(db: Session, turn_id: uuid.UUID, attempt_id: uuid.UUI
     if has_pending_rolls(db, turn.id):
         raise ValueError(f"Turn {turn_id} has pending player-owned rolls and cannot stream outcome narration")
 
+    # ── Durable chunk boundary (issue #206) — fail closed if missing ───────
+    if stream_id is None or str(stream_id).strip() == "":
+        raise ValueError("stream_id is required — transition to streaming requires durable first chunk")
+
     if turn.status == TURN_STREAMING and str(turn.streaming_attempt_id) == str(attempt_id) and attempt.status == ATTEMPT_STREAMING:
-        # Idempotent — if stream_id was provided ensure it matches persisted
-        if stream_id is not None and attempt.stream_id is not None and str(attempt.stream_id) != str(stream_id):
-            # Allow same attempt but different stream? treat as already streaming with original stream
-            pass
+        # Idempotent — ensure supplied stream matches persisted
+        if attempt.stream_id is not None and str(attempt.stream_id) != str(stream_id):
+            raise ValueError(
+                f"Attempt {attempt_id} already streaming with stream {attempt.stream_id}, cannot switch to {stream_id}"
+            )
         return turn, attempt
 
     # ── Durable chunk boundary (issue #206) ────────────────────────────────
     parsed_stream_id: uuid.UUID | None = None
-    if stream_id is not None:
-        try:
-            parsed_stream_id = uuid.UUID(str(stream_id))
-        except ValueError as exc:
-            raise ValueError(f"Invalid stream_id {stream_id}") from exc
-        # Verify stream exists and has at least one durable chunk
-        from models import DMStream, DMStreamChunk
-        stream = db.get(DMStream, parsed_stream_id)
-        if stream is None:
-            raise ValueError(f"Stream {parsed_stream_id} not found")
-        # Check that at least one chunk exists (first visible chunk durably persisted)
-        has_chunk = db.execute(
-            select(DMStreamChunk).where(DMStreamChunk.stream_id == parsed_stream_id).limit(1)
-        ).scalars().first()
-        if has_chunk is None:
-            # Also check denormalized counters for legacy
-            if not stream.first_chunk_at and (stream.chunk_count or 0) == 0:
-                raise ValueError(f"Streaming requires durable first chunk for stream {parsed_stream_id} — no chunk persisted")
-        # Ensure stream belongs to this turn/attempt — fail closed (prevents unrelated chunk satisfying boundary)
-        if str(stream.turn_id) != str(turn_id) or str(stream.attempt_id) != str(attempt_id):
-            raise ValueError(
-                f"Stream {parsed_stream_id} does not belong to turn {turn_id} attempt {attempt_id} "
-                f"(stream.turn_id={stream.turn_id} stream.attempt_id={stream.attempt_id})"
-            )
+    try:
+        parsed_stream_id = uuid.UUID(str(stream_id))
+    except ValueError as exc:
+        raise ValueError(f"Invalid stream_id {stream_id}") from exc
+    # Verify stream exists and has at least one durable chunk
+    from models import DMStream, DMStreamChunk
+    stream = db.get(DMStream, parsed_stream_id)
+    if stream is None:
+        raise ValueError(f"Stream {parsed_stream_id} not found")
+    # Check that at least one chunk exists (first visible chunk durably persisted)
+    has_chunk = db.execute(
+        select(DMStreamChunk).where(DMStreamChunk.stream_id == parsed_stream_id).limit(1)
+    ).scalars().first()
+    if has_chunk is None:
+        # Also check denormalized counters for legacy
+        if not stream.first_chunk_at and (stream.chunk_count or 0) == 0:
+            raise ValueError(f"Streaming requires durable first chunk for stream {parsed_stream_id} — no chunk persisted")
+    # Ensure stream belongs to this turn/attempt — fail closed (prevents unrelated chunk satisfying boundary)
+    if str(stream.turn_id) != str(turn_id) or str(stream.attempt_id) != str(attempt_id):
+        raise ValueError(
+            f"Stream {parsed_stream_id} does not belong to turn {turn_id} attempt {attempt_id} "
+            f"(stream.turn_id={stream.turn_id} stream.attempt_id={stream.attempt_id})"
+        )
 
     if attempt.status == ATTEMPT_SUPERSEDED:
         raise AttemptSupersededError(attempt_id, attempt.invalidation_reason)

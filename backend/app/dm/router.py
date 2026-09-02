@@ -123,6 +123,8 @@ def start_streaming(campaign_id: str, turn_id: str, payload: dict, request: Requ
     except ValueError as exc:
         raise HTTPException(status_code=422, detail="Invalid attempt_id") from exc
     stream_id_raw = payload.get("stream_id") or payload.get("streamId")
+    if not stream_id_raw:
+        raise HTTPException(status_code=422, detail="stream_id is required — transition to streaming requires durable first chunk")
     from app.dm.turns import AttemptSupersededError, get_turn, mark_streaming_started
 
     # Verify turn belongs to path campaign (prevents cross-campaign mutation via known UUID)
