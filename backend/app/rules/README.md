@@ -29,4 +29,4 @@
 
 **Observability:** logs: corpus/version/build_id, import failures, checksum, lookup/search latency, exact/lexical/vector path, miss rate, citation IDs, embedding model/version failures, result counts/scores (see `store.py` / `evidence.py` structured logs).
 
-**Migrations:** explicit via `alembic upgrade head` (`f3a1c9d8e2b4_add_rules_corpus.py`), no cold-start DDL per #187.
+**Migrations:** explicit via `alembic upgrade head` (`2a04bc8c83ba_initial_schema.py`), no cold-start DDL per #187.
