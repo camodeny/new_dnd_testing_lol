@@ -1,0 +1,3 @@
+{
+  "_comment": "Explicit checked-in override manifest for ugly/colliding generated IDs. Keys are generated rule_id or source_section_id, values are canonical override. Import fails on unresolved collisions; add intentional entry here instead of random suffix."
+}

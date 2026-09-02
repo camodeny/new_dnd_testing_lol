@@ -64,7 +64,7 @@ MAX_REQUESTS_PER_ROUND: int = 3
 MAX_TOTAL_REQUESTS: int = 9
 
 ALLOWED_TOOLS: frozenset[str] = frozenset(
-    {"ask_character_sheet", "get_current_scene", "search_campaign_memory"}
+    {"ask_character_sheet", "get_current_scene", "search_campaign_memory", "lookup_rule", "search_rules"}
 )
 
 # For forward compatibility, also allow combat/rules hooks as stubs but keep
@@ -167,6 +167,8 @@ def _tool_to_source_type(tool: str) -> str:
         "ask_character_sheet": "dnd5e_character_sheet",
         "get_current_scene": "scene",
         "search_campaign_memory": "campaign_memory",
+        "lookup_rule": "dnd_srd_rule",
+        "search_rules": "dnd_srd_rule",
     }
     return mapping.get(tool, f"evidence_tool:{tool}")
 
@@ -448,7 +450,16 @@ def execute_evidence_round(
     source_ids: list[str] = []
     tool_types: list[str] = []
 
-    handlers = tool_handlers or {}
+    handlers = dict(tool_handlers or {})
+    # Auto-register rules corpus handlers if available (issue #223)
+    if "lookup_rule" not in handlers or "search_rules" not in handlers:
+        try:
+            from app.rules.evidence_tools import TOOL_HANDLERS as _rules_handlers
+
+            for k, v in _rules_handlers.items():
+                handlers.setdefault(k, v)
+        except Exception:
+            pass
 
     for req in requests:
         tool_types.append(req.tool)

@@ -356,7 +356,7 @@ class StagedEffect(StrictModel):
 
 class EvidenceRequest(StrictModel):
     id: str = Field(min_length=1, max_length=48)
-    tool: Literal["ask_character_sheet", "get_current_scene", "search_campaign_memory"] = Field(description="Read-only evidence tool")
+    tool: Literal["ask_character_sheet", "get_current_scene", "search_campaign_memory", "lookup_rule", "search_rules"] = Field(description="Read-only evidence tool")
     question: str | None = Field(default=None, max_length=600)
     scope: Literal["current_player", "party", "character_id"] | None = None
     character_id: str | int | None = None
@@ -383,6 +383,12 @@ class EvidenceRequest(StrictModel):
         elif self.tool == "search_campaign_memory":
             if not self.query or not self.query.strip():
                 raise ValueError("search_campaign_memory requires query")
+        elif self.tool == "lookup_rule":
+            if not (self.query and self.query.strip()) and not (self.question and self.question.strip()):
+                raise ValueError("lookup_rule requires query (rule_id)")
+        elif self.tool == "search_rules":
+            if not (self.query and self.query.strip()) and not (self.question and self.question.strip()):
+                raise ValueError("search_rules requires query")
         return self
 
 
