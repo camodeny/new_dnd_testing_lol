@@ -278,7 +278,7 @@ def test_private_source_does_not_leak_to_campaign_audience():
             sources=[SourceRef(source_type="dnd5e_character_sheet", source_id="sheet:priv", source_version="1")],
             visibility="private",
             authorization=AuthorizationScope(campaign_id=audience.campaign_id, thread_ids=[audience.thread_id], user_ids=[audience.user_ids[0]]),
-            payload={"secret": "123"},
+            payload={"secret": "__PRIVATE_SECRET_7f3a9c__"},
             result_count=1,
         )
 
@@ -299,8 +299,8 @@ def test_private_source_does_not_leak_to_campaign_audience():
             )
         ev_lane = next(l for l in pkt.lanes if l.name == LaneName.EVIDENCE_RESULTS)
         assert len(ev_lane.records) == 0, "private evidence leaked to campaign audience"
-        assert "123" not in pkt.serialize_for_adjudication()
-        assert "123" not in pkt.serialize_for_narration()
+        assert "__PRIVATE_SECRET_7f3a9c__" not in pkt.serialize_for_adjudication()
+        assert "__PRIVATE_SECRET_7f3a9c__" not in pkt.serialize_for_narration()
         return normalize_contract(
             {
                 "contract_version": CONTRACT_VERSION,
