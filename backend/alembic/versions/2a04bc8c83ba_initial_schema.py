@@ -287,7 +287,7 @@ def upgrade() -> None:
     op.create_index("ix_campaign_threads_campaign_id", "campaign_threads", ["campaign_id"])
     op.create_index("uq_campaign_threads_one_campaign_per_campaign", "campaign_threads", ["campaign_id"], unique=True, postgresql_where=sa.text("thread_type = 'campaign'"), sqlite_where=sa.text("thread_type = 'campaign'"))
     op.create_index("ix_campaign_threads_created_by", "campaign_threads", ["created_by"])
-    op.create_index("uq_campaign_threads_private_key", "campaign_threads", ["campaign_id", "private_key"], unique=True, postgresql_where=sa.text("'private_key IS NOT NULL'"), sqlite_where=sa.text("'private_key IS NOT NULL'"))
+    op.create_index("uq_campaign_threads_private_key", "campaign_threads", ["campaign_id", "private_key"], unique=True, postgresql_where=sa.text("private_key IS NOT NULL"), sqlite_where=sa.text("private_key IS NOT NULL"))
 
     op.create_table(
         "character_chat_messages",
