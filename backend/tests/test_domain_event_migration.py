@@ -4,7 +4,7 @@ from pathlib import Path
 
 
 MIGRATION = (
-    Path(__file__).parent.parent / "alembic" / "versions" / "001_initial_schema.py"
+    Path(__file__).parent.parent / "alembic" / "versions" / "2a04bc8c83ba_initial_schema.py"
 )
 
 

@@ -1,6 +1,6 @@
 """initial baseline — squashed pre-alpha history
 
-Revision ID: 001
+Revision ID: 2a04bc8c83ba
 Revises: 
 Create Date: 2026-09-02
 
@@ -15,7 +15,7 @@ import sqlalchemy as sa
 from sqlalchemy.dialects import postgresql
 
 # revision identifiers, used by Alembic.
-revision: str = "001"
+revision: str = "2a04bc8c83ba"
 down_revision: Union[str, Sequence[str], None] = None
 branch_labels: Union[str, Sequence[str], None] = None
 depends_on: Union[str, Sequence[str], None] = None
