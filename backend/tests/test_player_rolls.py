@@ -13,7 +13,7 @@ if not hasattr(SQLiteTypeCompiler, "_patched_jsonb"):
     SQLiteTypeCompiler.visit_JSONB = lambda self, type_, **kw: "JSON"  # type: ignore
     SQLiteTypeCompiler._patched_jsonb = True  # type: ignore
 
-from app.deps.auth import MOCK_USER_ID  # noqa: E402
+from app.auth.service import MOCK_USER_ID  # noqa: E402
 from app.dm.turns import coordinate_turn, mark_streaming_started  # noqa: E402
 from app.rolls.service import RollAuthorizationError, fulfill_roll  # noqa: E402
 from app.runtime.submissions import accept_submission  # noqa: E402

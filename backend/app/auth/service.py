@@ -2,20 +2,23 @@
 
 This module resolves a Profile from a raw Authorization header value (or None)
 plus a DB session. It does not import `fastapi.Request` or `HTTPException`;
-callers in the transport layer (e.g. `app.deps.auth`) convert `ValueError`
-into HTTP responses. This satisfies the dependency rule: domain/application
-must not import transport concerns.
+callers in the transport layer (e.g. `app.deps.auth`) convert
+``app.auth.errors.AuthError`` into HTTP responses. This satisfies the
+dependency rule: domain/application must not import transport concerns.
 
-The Supabase JWT verification itself lives in `backend/auth.py` (infrastructure)
-and may raise `fastapi.HTTPException`; this module catches that and re-raises
-as `ValueError` so the application layer stays transport-agnostic.
+JWT/JWKS verification lives in ``app.auth.jwt`` (also transport-agnostic) and
+raises ``AuthError`` directly; there is a single profile upsert path
+(``upsert_profile``) used by both the token and mock resolution flows.
 """
+
 import os
 import uuid as uuid_lib
 
 from sqlalchemy import select
 from sqlalchemy.orm import Session
 
+from app.auth.errors import AuthError
+from app.auth.jwt import verify_supabase_jwt
 from models import Profile
 
 MOCK_USER_ID = uuid_lib.UUID("23f3b2d1-efb6-4785-9a67-fa7ca57d72a3")
@@ -78,40 +81,56 @@ def is_mock_auth_allowed() -> bool:
     return False
 
 
-def _resolve_with_token(db: Session, token: str) -> Profile:
-    # verify_supabase_jwt lives in infrastructure and raises HTTPException on failure;
-    # convert to ValueError so this module has no FastAPI dependency.
-    try:
-        from auth import verify_supabase_jwt
+def upsert_profile(
+    db: Session,
+    uid: uuid_lib.UUID,
+    *,
+    email: str | None = None,
+    username: str | None = None,
+) -> Profile:
+    """Single upsert path for ``public.profiles``.
 
-        payload = verify_supabase_jwt(token)
-    except Exception as e:  # HTTPException or other
-        # Preserve detail if it's an HTTPException
-        detail = getattr(e, "detail", None)
-        msg = str(detail) if detail is not None else str(e)
-        # Normalise to the messages callers expect
-        if "Invalid token" in msg or "JWKS" in msg:
-            raise ValueError(msg) from e
-        raise ValueError(msg) from e
+    Creates the profile if missing and refreshes email/username when new
+    identity claims arrive. This is the only place that writes ``Profile``
+    rows on auth resolution.
+    """
+    profile = db.get(Profile, uid)
+    if profile:
+        dirty = False
+        if email and profile.email != email:
+            profile.email = email
+            dirty = True
+        if username and not profile.username:
+            profile.username = username
+            dirty = True
+        if dirty:
+            db.commit()
+            db.refresh(profile)
+        return profile
+
+    profile = Profile(id=uid, email=email, username=username)
+    db.add(profile)
+    db.commit()
+    db.refresh(profile)
+    return profile
+
+
+def _resolve_with_token(db: Session, token: str) -> Profile:
+    payload = verify_supabase_jwt(token)
 
     sub = payload.get("sub")
     if not sub:
-        raise ValueError("Token missing sub")
+        raise AuthError("Token missing sub")
     try:
         uid = uuid_lib.UUID(str(sub))
     except ValueError:
-        raise ValueError("Invalid sub format")
-    prof = db.get(Profile, uid)
-    if prof:
-        return prof
+        raise AuthError("Invalid sub format")
+
     email = payload.get("email")
-    md = payload.get("user_metadata") or {}
-    username = md.get("username") or md.get("full_name") or md.get("name")
-    prof = Profile(id=uid, email=email, username=username)
-    db.add(prof)
-    db.commit()
-    db.refresh(prof)
-    return prof
+    user_metadata = payload.get("user_metadata") or {}
+    username = user_metadata.get("username") or user_metadata.get("full_name") or user_metadata.get("name")
+
+    return upsert_profile(db, uid, email=email, username=username)
 
 
 def resolve_profile_pure(db: Session, auth_header: str | None) -> Profile:
@@ -125,7 +144,7 @@ def resolve_profile_pure(db: Session, auth_header: str | None) -> Profile:
         Profile ORM object
 
     Raises:
-        ValueError: with a human-readable message that the transport layer
+        AuthError: with a human-readable message that the transport layer
             should map to HTTP 401 (or 403 where appropriate). Messages are
             kept compatible with the previous ``HTTPException(detail=...)``
             strings so API behavior is preserved.
@@ -134,12 +153,12 @@ def resolve_profile_pure(db: Session, auth_header: str | None) -> Profile:
     if has_credentials:
         header = auth_header.strip()
         if not header.lower().startswith("bearer "):
-            raise ValueError("Invalid Authorization header")
+            raise AuthError("Invalid Authorization header")
         token = header[7:].strip()
         if not token:
-            raise ValueError("Missing token")
+            raise AuthError("Missing token")
         return _resolve_with_token(db, token)
 
     if is_mock_auth_allowed():
         return _get_or_create_mock_profile(db)
-    raise ValueError("Missing Authorization header")
+    raise AuthError("Missing Authorization header")

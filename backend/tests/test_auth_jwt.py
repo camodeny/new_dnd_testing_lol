@@ -5,10 +5,10 @@ from datetime import datetime, timedelta, timezone
 import pytest
 from cryptography.hazmat.primitives import serialization
 from cryptography.hazmat.primitives.asymmetric import rsa
-from fastapi import HTTPException
 from jose import jwk, jwt
 
-import auth
+from app.auth.errors import AuthError
+from app.auth import jwt as auth_jwt
 
 
 PROJECT_URL = "https://test-project.supabase.co"
@@ -35,8 +35,8 @@ def _signing_key(kid: str) -> tuple[bytes, dict]:
 def keys(monkeypatch):
     first_private, first_public = _signing_key("first")
     second_private, second_public = _signing_key("second")
-    monkeypatch.setattr(auth, "SUPABASE_URL", PROJECT_URL)
-    monkeypatch.setattr(auth, "_fetch_jwks", lambda: {"keys": [first_public, second_public]})
+    monkeypatch.setattr(auth_jwt, "SUPABASE_URL", PROJECT_URL)
+    monkeypatch.setattr(auth_jwt, "_fetch_jwks", lambda: {"keys": [first_public, second_public]})
     return {"first": first_private, "second": second_private}
 
 
@@ -55,7 +55,7 @@ def _token(private_key: bytes, kid: str, *, omit: str | None = None, **claim_ove
 
 @pytest.mark.parametrize("kid", ["first", "second"])
 def test_accepts_expected_claims_across_advertised_rotation_keys(keys, kid):
-    payload = auth.verify_supabase_jwt(_token(keys[kid], kid))
+    payload = auth_jwt.verify_supabase_jwt(_token(keys[kid], kid))
 
     assert payload["aud"] == "authenticated"
     assert payload["iss"] == EXPECTED_ISSUER
@@ -75,31 +75,28 @@ def test_rejects_missing_or_unexpected_audience_and_issuer(
 ):
     token = _token(keys["first"], "first", omit=omitted_claim, **claim_overrides)
 
-    with pytest.raises(HTTPException) as exc_info:
-        auth.verify_supabase_jwt(token)
+    with pytest.raises(AuthError) as exc_info:
+        auth_jwt.verify_supabase_jwt(token)
 
-    assert exc_info.value.status_code == 401
-    assert exc_info.value.detail == "Invalid token"
+    assert str(exc_info.value) == "Invalid token"
 
 
 def test_fails_closed_without_configured_supabase_issuer(monkeypatch):
-    monkeypatch.setattr(auth, "SUPABASE_URL", "")
+    monkeypatch.setattr(auth_jwt, "SUPABASE_URL", "")
     monkeypatch.setattr(
-        auth,
+        auth_jwt,
         "_fetch_jwks",
         lambda: pytest.fail("JWKS must not be fetched without a trusted issuer"),
     )
 
-    with pytest.raises(HTTPException) as exc_info:
-        auth.verify_supabase_jwt("untrusted-token")
+    with pytest.raises(AuthError) as exc_info:
+        auth_jwt.verify_supabase_jwt("untrusted-token")
 
-    assert exc_info.value.status_code == 401
-    assert exc_info.value.detail == "Invalid token"
+    assert str(exc_info.value) == "Invalid token"
 
 
 def test_does_not_expose_jwt_library_errors(keys):
-    with pytest.raises(HTTPException) as exc_info:
-        auth.verify_supabase_jwt("not.a.jwt")
+    with pytest.raises(AuthError) as exc_info:
+        auth_jwt.verify_supabase_jwt("not.a.jwt")
 
-    assert exc_info.value.status_code == 401
-    assert exc_info.value.detail == "Invalid token"
+    assert str(exc_info.value) == "Invalid token"

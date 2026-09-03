@@ -131,7 +131,7 @@ def test_concurrent_duplicates_only_execute_once(tmp_path):
 
 
 def test_duplicate_http_retry_returns_same_campaign_event(monkeypatch):
-    from app.deps.auth import MOCK_USER_ID
+    from app.auth.service import MOCK_USER_ID
     from main import app
 
     engine = create_engine(
@@ -180,7 +180,7 @@ def test_duplicate_http_retry_returns_same_campaign_event(monkeypatch):
 
 
 def test_campaign_put_retry_replays_after_revision_advanced(monkeypatch):
-    from app.deps.auth import MOCK_USER_ID
+    from app.auth.service import MOCK_USER_ID
     from main import app
 
     engine = create_engine(
@@ -219,7 +219,7 @@ def test_campaign_put_retry_replays_after_revision_advanced(monkeypatch):
 
 
 def test_character_create_is_a_real_user_scoped_idempotent_command(monkeypatch):
-    from app.deps.auth import MOCK_USER_ID
+    from app.auth.service import MOCK_USER_ID
     from main import app
     from models import Character
 
