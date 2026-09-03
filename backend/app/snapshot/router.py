@@ -39,17 +39,10 @@ def get_live_table_snapshot(
         raise HTTPException(status_code=404, detail="Invalid campaign id")
 
     thread_id = request.query_params.get("thread_id")
-    # Support both thread_id and threadId for compat
-    if thread_id is None:
-        thread_id = request.query_params.get("threadId")
     limit_raw = request.query_params.get("limit")
     cursor = request.query_params.get("cursor")
     if cursor is not None:
         cursor = cursor.strip() or None
-    # Also support before/after legacy? No, just cursor
-    # Support pagination via 'before' as alias for cursor if provided
-    if cursor is None:
-        cursor = request.query_params.get("before")
 
     # Parse limit
     limit_val: int | None = None

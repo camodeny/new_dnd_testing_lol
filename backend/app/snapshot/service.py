@@ -37,7 +37,11 @@ from app.runtime.threads import (
     list_threads_for_user,
     parse_thread_id,
 )
-from models import Campaign, CampaignThread, CampaignThreadMember, PlayerSubmission, PlayerSubmissionSegment
+from models.campaigns import Campaign
+from models.threads import CampaignThread
+from models.threads import CampaignThreadMember
+from models.threads import PlayerSubmission
+from models.threads import PlayerSubmissionSegment
 
 logger = logging.getLogger(__name__)
 
@@ -295,7 +299,7 @@ def build_live_table_snapshot(
         ) or 0
 
         from app.rolls.service import get_fulfillment
-        from models import PlayerRollRequest
+        from models.dm import PlayerRollRequest
 
         roll_rows = db.execute(
             select(PlayerRollRequest).where(
@@ -318,7 +322,8 @@ def build_live_table_snapshot(
             "turn_id": None, "started_at": None,
         }
         try:
-            from models import DMStream, DMStreamChunk
+            from models.dm import DMStream
+            from models.dm import DMStreamChunk
             dm_active = db.execute(
                 select(DMStream)
                 .where(

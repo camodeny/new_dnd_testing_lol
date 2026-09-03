@@ -194,7 +194,7 @@ export default function HomePage() {
                 key={campaign.id}
                 campaign={campaign}
                 onDelete={
-                  String(user?.id) === String(campaign.owner_id ?? campaign.user_id)
+                  String(user?.id) === String(campaign.owner_id)
                     ? (e: React.MouseEvent) => { e.preventDefault(); openDelete(campaign) }
                     : null
                 }

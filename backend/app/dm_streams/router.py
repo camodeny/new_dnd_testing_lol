@@ -34,7 +34,7 @@ from app.dm_streams.service import (
     DMStreamStateError,
 )
 from database import get_db
-from models import Campaign
+from models.campaigns import Campaign
 
 router = APIRouter()
 logger = logging.getLogger(__name__)
@@ -103,7 +103,7 @@ def create_dm_stream(campaign_id: str, payload: dict, request: Request, db: Sess
     profile = resolve_profile(request, db)
     campaign = _authorized_campaign(db, campaign_id, profile.id)
 
-    raw_thread = payload.get("thread_id", payload.get("threadId", "main"))
+    raw_thread = payload.get("thread_id", "main")
     try:
         thread_id = _resolve_thread_for_stream(db, campaign, raw_thread, profile, request)
     except HTTPException:
@@ -114,16 +114,16 @@ def create_dm_stream(campaign_id: str, payload: dict, request: Request, db: Sess
     thread = get_campaign_thread(db, campaign.id, thread_id)
     audience = "campaign" if thread and thread.thread_type == "campaign" else "private"
 
-    turn_id = str(payload.get("turn_id", payload.get("turnId", ""))).strip()
-    attempt_id = str(payload.get("attempt_id", payload.get("attemptId", ""))).strip()
+    turn_id = str(payload.get("turn_id", "")).strip()
+    attempt_id = str(payload.get("attempt_id", "")).strip()
     if not turn_id:
         # auto-generate if not provided
         turn_id = str(uuid.uuid4())
     if not attempt_id:
         attempt_id = str(uuid.uuid4())
 
-    trace_id = payload.get("trace_id") or payload.get("traceId")
-    operation_id = payload.get("operation_id") or payload.get("operationId")
+    trace_id = payload.get("trace_id")
+    operation_id = payload.get("operation_id")
 
     try:
         stream = create_stream(
@@ -325,7 +325,7 @@ def abandon_dm_stream(campaign_id: str, stream_id: str, payload: dict, request: 
 def list_dm_streams(campaign_id: str, request: Request, db: Session = Depends(get_db)):
     profile = resolve_profile(request, db)
     campaign = _authorized_campaign(db, campaign_id, profile.id)
-    raw_thread = request.query_params.get("thread_id", request.query_params.get("threadId"))
+    raw_thread = request.query_params.get("thread_id")
     # require thread_id filter for now; don't leak private threads without filter
     if raw_thread:
         try:

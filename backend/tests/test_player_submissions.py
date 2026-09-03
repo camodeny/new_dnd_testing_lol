@@ -13,18 +13,16 @@ if not hasattr(SQLiteTypeCompiler, "_patched_jsonb"):
     SQLiteTypeCompiler.visit_JSONB = lambda self, type_, **kw: "JSON"  # type: ignore
     SQLiteTypeCompiler._patched_jsonb = True  # type: ignore
 
-from app.deps.auth import MOCK_USER_ID  # noqa: E402
+from app.auth.service import MOCK_USER_ID  # noqa: E402
 from app.runtime.submissions import SubmissionValidationError, parse_tagged_content  # noqa: E402
 from database import Base, get_db  # noqa: E402
 from main import app  # noqa: E402
-from models import (  # noqa: E402
-    Campaign,
-    CampaignMember,
-    IdempotentCommand,
-    PlayerSubmission,
-    PlayerSubmissionSegment,
-    Profile,
-)
+from models.campaigns import Campaign
+from models.campaigns import CampaignMember
+from models.profiles import Profile
+from models.reliability import IdempotentCommand
+from models.threads import PlayerSubmission
+from models.threads import PlayerSubmissionSegment
 
 
 @pytest.fixture

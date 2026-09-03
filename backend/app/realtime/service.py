@@ -43,7 +43,11 @@ from typing import Any
 from sqlalchemy.orm import Session
 
 from app.realtime.channels import live_table_channel
-from models import Campaign, DMStream, DMStreamChunk, PlayerSubmission, PlayerSubmissionSegment
+from models.campaigns import Campaign
+from models.dm import DMStream
+from models.dm import DMStreamChunk
+from models.threads import PlayerSubmission
+from models.threads import PlayerSubmissionSegment
 
 logger = logging.getLogger(__name__)
 

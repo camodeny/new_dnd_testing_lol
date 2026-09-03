@@ -16,7 +16,7 @@ from app.campaigns.service import is_campaign_member, parse_campaign_id
 from app.deps.auth import resolve_profile
 from app.runtime.threads import assert_can_read_thread, parse_thread_id, resolve_thread_id, ThreadNotFoundError, ThreadAuthorizationError
 from database import get_db
-from models import Campaign
+from models.campaigns import Campaign
 
 router = APIRouter()
 logger = logging.getLogger(__name__)
@@ -44,7 +44,7 @@ def _require_owner(campaign: Campaign, user_id: uuid.UUID):
 def list_dm_turns(campaign_id: str, request: Request, db: Session = Depends(get_db)):
     profile = resolve_profile(request, db)
     campaign = _authorized_campaign(db, campaign_id, profile.id)
-    thread_raw = request.query_params.get("thread_id") or request.query_params.get("threadId")
+    thread_raw = request.query_params.get("thread_id")
     from app.dm.turns import list_turns
 
     if thread_raw:
@@ -95,7 +95,7 @@ def get_dm_turn(campaign_id: str, turn_id: str, request: Request, db: Session = 
         # Hide private existence as 404
         raise HTTPException(status_code=404, detail="Thread not found") from exc
     from sqlalchemy import select
-    from models import DmTurnAttempt
+    from models.dm import DmTurnAttempt
 
     attempts = db.execute(
         select(DmTurnAttempt).where(DmTurnAttempt.turn_id == tid).order_by(DmTurnAttempt.attempt_number)
@@ -122,7 +122,7 @@ def start_streaming(campaign_id: str, turn_id: str, payload: dict, request: Requ
         aid = uuid.UUID(str(attempt_id_raw))
     except ValueError as exc:
         raise HTTPException(status_code=422, detail="Invalid attempt_id") from exc
-    stream_id_raw = payload.get("stream_id") or payload.get("streamId")
+    stream_id_raw = payload.get("stream_id")
     if not stream_id_raw:
         raise HTTPException(status_code=422, detail="stream_id is required — transition to streaming requires durable first chunk")
     from app.dm.turns import AttemptSupersededError, get_turn, mark_streaming_started
@@ -207,7 +207,7 @@ def commit_dm_turn_endpoint(campaign_id: str, turn_id: str, payload: dict, reque
             camp.description = mutate_fields["description"]
 
     event_type = str(payload.get("event_type") or "dm.turn_resolved")
-    operation_id = str(payload.get("operation_id") or payload.get("operationId") or "").strip() or None
+    operation_id = str(payload.get("operation_id") or "").strip() or None
 
     from app.dm.turns import commit_turn
 

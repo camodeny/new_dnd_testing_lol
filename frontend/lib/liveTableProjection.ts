@@ -6,7 +6,7 @@ interface ProjectionOptions {
   dmMessages: DmMessageForRealtime[]
   characters: Character[]
   currentUser: User | null
-  sessionId?: number | string
+  sessionId?: string
 }
 
 function timestamp(value: unknown): string {
@@ -18,7 +18,7 @@ export function projectLiveTableMessages({
   dmMessages,
   characters,
   currentUser,
-  sessionId = 0,
+  sessionId = '',
 }: ProjectionOptions): Message[] {
   const players = submissions.map((event): Message => {
     const character = characters.find((candidate) => String(candidate.id) === String(event.character_id ?? ''))

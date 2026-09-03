@@ -22,7 +22,7 @@ from app.realtime.channels import live_table_channel, parse_live_table_channel
 from app.realtime.service import get_realtime_metrics
 from app.runtime.threads import ThreadAuthorizationError, ThreadNotFoundError, assert_can_read_thread, parse_thread_id
 from database import get_db
-from models import Campaign
+from models.campaigns import Campaign
 
 router = APIRouter()
 logger = logging.getLogger(__name__)
@@ -81,7 +81,7 @@ def authorize_realtime_channel(campaign_id: str, payload: dict, request: Request
     campaign = _authorized_campaign(db, campaign_id, profile.id)
 
     channel = payload.get("channel") if isinstance(payload, dict) else None
-    thread_id_raw = payload.get("thread_id") or payload.get("threadId") if isinstance(payload, dict) else None
+    thread_id_raw = payload.get("thread_id") if isinstance(payload, dict) else None
 
     tid: uuid.UUID | None = None
     if thread_id_raw:
@@ -139,7 +139,7 @@ def get_realtime_token(campaign_id: str, request: Request, db: Session = Depends
     """
     profile = resolve_profile(request, db)
     campaign = _authorized_campaign(db, campaign_id, profile.id)
-    thread_id_raw = request.query_params.get("thread_id") or request.query_params.get("threadId")
+    thread_id_raw = request.query_params.get("thread_id")
     from app.snapshot.service import build_live_table_snapshot
 
     try:

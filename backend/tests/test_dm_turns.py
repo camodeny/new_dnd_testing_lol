@@ -13,8 +13,13 @@ if not hasattr(SQLiteTypeCompiler, "_patched_jsonb"):
     SQLiteTypeCompiler._patched_jsonb = True  # type: ignore
 
 from database import Base  # noqa: E402
-import models  # noqa: E402
-from models import Campaign, Profile, CampaignMember, DMStream, DMStreamChunk  # noqa: E402
+from models.dm import DmTurn, DmTurnAttempt
+from models.threads import PlayerSubmission
+from models.campaigns import Campaign
+from models.campaigns import CampaignMember
+from models.dm import DMStream
+from models.dm import DMStreamChunk
+from models.profiles import Profile
 from app.runtime.submissions import accept_submission  # noqa: E402
 from app.runtime.threads import get_or_create_campaign_thread  # noqa: E402
 
@@ -104,7 +109,7 @@ def test_two_player_same_moment_accumulation():
     assert a2.attempt_number == 2
     assert str(a2.parent_attempt_id) == str(a1.id)
     db2 = Fac()
-    old = db2.get(models.DmTurnAttempt, a1.id)
+    old = db2.get(DmTurnAttempt, a1.id)
     assert old.status == "superseded"
     assert old.invalidation_reason == "new_eligible_submission_pre_stream"
     camp = db2.get(Campaign, cid)
@@ -142,7 +147,7 @@ def test_new_input_after_stream_start_cannot_silently_change_input_set():
     with pytest.raises(StreamBoundaryError):
         coordinate_turn(db, cid, tid)
     db3 = Fac()
-    turn = db3.get(models.DmTurn, t1.id)
+    turn = db3.get(DmTurn, t1.id)
     assert turn.submission_ids == [str(s1.id)]
     assert turn.status == "streaming"
 
@@ -195,14 +200,14 @@ def test_worker_crash_leaves_state_recoverable_and_retryable():
     _t1, a1 = coordinate_turn(db, cid, tid)
     mark_attempt_running(db, a1.id)
     db2 = Fac()
-    att = db2.get(models.DmTurnAttempt, a1.id)
+    att = db2.get(DmTurnAttempt, a1.id)
     att.started_at = datetime.now(timezone.utc) - timedelta(seconds=1000)
     db2.commit()
     db3 = Fac()
     recovered = recover_stuck_attempts(db3, lease_seconds=300)
     assert recovered == 1
     db4 = Fac()
-    att2 = db4.get(models.DmTurnAttempt, a1.id)
+    att2 = db4.get(DmTurnAttempt, a1.id)
     assert att2.status == "prepared"
     # Streaming attempts must NOT be auto-recovered (visible partial)
     Fac2, cid2, owner2, _p22, tid2 = _setup_campaign()
@@ -214,13 +219,13 @@ def test_worker_crash_leaves_state_recoverable_and_retryable():
     db5.commit()
     mark_streaming_started(db5, tt.id, aa.id, stream_id=stream2.id)
     db6 = Fac2()
-    aa2 = db6.get(models.DmTurnAttempt, aa.id)
+    aa2 = db6.get(DmTurnAttempt, aa.id)
     aa2.started_at = datetime.now(timezone.utc) - timedelta(seconds=1000)
     db6.commit()
     rec2 = recover_stuck_attempts(db6, lease_seconds=300)
     assert rec2 == 0
     db7 = Fac2()
-    aa3 = db7.get(models.DmTurnAttempt, aa.id)
+    aa3 = db7.get(DmTurnAttempt, aa.id)
     assert aa3.status == "streaming"
 
 
@@ -238,7 +243,7 @@ def test_durable_input_set_and_revisions_are_auditable():
     t2, a2 = coordinate_turn(db, cid, tid)
     assert t2.input_set_revision == 2
     db2 = Fac()
-    old = db2.get(models.DmTurnAttempt, a.id)
+    old = db2.get(DmTurnAttempt, a.id)
     assert old.invalidation_reason == "new_eligible_submission_pre_stream"
 
 
@@ -252,7 +257,7 @@ def test_obsolete_attempt_result_discarded_harmlessly():
     db.commit()
     t2, a2 = coordinate_turn(db, cid, tid)
     # old attempt finishes after supersession — must be discarded, not committed
-    assert a1.status == "superseded" or Fac().get(models.DmTurnAttempt, a1.id).status == "superseded"
+    assert a1.status == "superseded" or Fac().get(DmTurnAttempt, a1.id).status == "superseded"
     db3 = Fac()
     with pytest.raises(AttemptSupersededError):
         commit_turn(db3, t1.id, a1.id)
@@ -335,7 +340,7 @@ def test_concurrent_assembly_does_not_create_competing_pending_turns(tmp_path):
         assert str(results[0][0].id) == str(results[1][0].id)
     # Verify only one active turn in DB
     with Fac2() as db:
-        turns = db.execute(select(models.DmTurn).where(models.DmTurn.campaign_id == cid)).scalars().all()
+        turns = db.execute(select(DmTurn).where(DmTurn.campaign_id == cid)).scalars().all()
         active = [t for t in turns if t.status in ("pending", "streaming", "failed_visible")]
         assert len(active) == 1
         assert set(active[0].submission_ids) == {str(s1.id), str(s2.id)}
@@ -420,9 +425,9 @@ def test_concurrent_submission_plus_coordination_does_not_rollback_outer(tmp_pat
     assert not errors, f"concurrent submit+coord should not error, got {errors}"
     # Both submissions must be durable despite race
     with Fac2() as db:
-        subs = db.execute(select(models.PlayerSubmission).where(models.PlayerSubmission.campaign_id == cid)).scalars().all()
+        subs = db.execute(select(PlayerSubmission).where(PlayerSubmission.campaign_id == cid)).scalars().all()
         assert len(subs) == 2, f"both submissions must survive outer rollback, got {len(subs)}"
-        turns = db.execute(select(models.DmTurn).where(models.DmTurn.campaign_id == cid)).scalars().all()
+        turns = db.execute(select(DmTurn).where(DmTurn.campaign_id == cid)).scalars().all()
         active = [t for t in turns if t.status in ("pending", "streaming", "failed_visible")]
         assert len(active) == 1, f"only one active turn despite race, got {len(active)}"
         assert set(active[0].submission_ids) == {str(s.id) for s in subs}
@@ -493,9 +498,9 @@ def test_postgres_read_committed_visibility_not_dropped(tmp_path):
 
     assert not errors, f"visibility race should not error, got {errors}"
     with Fac2() as db:
-        subs = db.execute(select(models.PlayerSubmission).where(models.PlayerSubmission.campaign_id == cid)).scalars().all()
+        subs = db.execute(select(PlayerSubmission).where(PlayerSubmission.campaign_id == cid)).scalars().all()
         assert len(subs) == 2
-        turns = db.execute(select(models.DmTurn).where(models.DmTurn.campaign_id == cid)).scalars().all()
+        turns = db.execute(select(DmTurn).where(DmTurn.campaign_id == cid)).scalars().all()
         active = [t for t in turns if t.status in ("pending", "streaming", "failed_visible")]
         assert len(active) == 1
         # Critical: final input set must contain BOTH, not just B (the stale pre-lock set)
@@ -516,7 +521,7 @@ def test_recover_filters_by_campaign():
             mark_attempt_running(db, a.id)
             # make it look stuck
             with FacX() as db2:
-                att = db2.get(models.DmTurnAttempt, a.id)
+                att = db2.get(DmTurnAttempt, a.id)
                 att.started_at = datetime.now(timezone.utc) - timedelta(seconds=1000)
                 db2.commit()
 
@@ -528,7 +533,7 @@ def test_recover_filters_by_campaign():
     with Fac2() as db:
         from app.dm.turns import ATTEMPT_PREPARED, ATTEMPT_RUNNING
 
-        attempts = db.execute(select(models.DmTurnAttempt).where(models.DmTurnAttempt.campaign_id == cid2)).scalars().all()
+        attempts = db.execute(select(DmTurnAttempt).where(DmTurnAttempt.campaign_id == cid2)).scalars().all()
         assert any(a.status == ATTEMPT_RUNNING for a in attempts)
         assert not any(a.status == ATTEMPT_PREPARED and a.campaign_id == cid2 and "Recovered" in (a.last_error or "") for a in attempts)
     # Recover second explicitly

@@ -28,14 +28,12 @@ from app.campaigns.service import (
 from app.deps.auth import resolve_profile
 from app.deps.idempotency import execute_http_idempotent, require_idempotency_key
 from database import get_db
-from models import (
-    Campaign,
-    CampaignInvite,
-    CampaignMember,
-    CampaignThread,
-    CampaignThreadMember,
-    Profile,
-)
+from models.campaigns import Campaign
+from models.campaigns import CampaignInvite
+from models.campaigns import CampaignMember
+from models.profiles import Profile
+from models.threads import CampaignThread
+from models.threads import CampaignThreadMember
 
 router = APIRouter()
 logger = logging.getLogger(__name__)
@@ -56,11 +54,11 @@ def _expected_revision(payload: dict) -> int:
 def _validated_setup(payload: dict, *, creation: bool = False) -> dict:
     changes = {}
     try:
-        if creation or "required_players" in payload or "requiredPlayers" in payload:
-            raw = payload.get("required_players", payload.get("requiredPlayers"))
+        if creation or "required_players" in payload:
+            raw = payload.get("required_players")
             changes["required_players"] = normalize_required_players(raw)
-        if creation or "loot_mode" in payload or "lootMode" in payload:
-            raw = payload.get("loot_mode", payload.get("lootMode"))
+        if creation or "loot_mode" in payload:
+            raw = payload.get("loot_mode")
             changes["loot_mode"] = normalize_loot_mode(raw)
         if creation or "difficulty" in payload:
             changes["difficulty"] = validate_difficulty(payload.get("difficulty"))
@@ -94,7 +92,7 @@ def create_campaign(payload: dict, request: Request, db: Session = Depends(get_d
         raise HTTPException(status_code=400, detail=str(e))
     description = payload.get("description")
     try:
-        random_seed = validate_seed(payload.get("random_seed") or payload.get("seed"))
+        random_seed = validate_seed(payload.get("random_seed"))
     except ValueError as e:
         raise HTTPException(status_code=400, detail=str(e))
     setup = _validated_setup(payload, creation=True)
@@ -111,7 +109,7 @@ def create_campaign(payload: dict, request: Request, db: Session = Depends(get_d
     db.add(member)
     db.flush()
     # Create durable shared thread on campaign creation — snapshot GET is retrieval-only (#196)
-    from models import CampaignThread
+    from models.threads import CampaignThread
 
     db.add(
         CampaignThread(
@@ -130,9 +128,8 @@ def create_campaign(payload: dict, request: Request, db: Session = Depends(get_d
 @router.post("/api/campaigns/random-brief")
 def random_campaign_brief(payload: dict, request: Request, db: Session = Depends(get_db)):
     resolve_profile(request, db)
-    seed = payload.get("random_seed") or payload.get("seed") or None
+    seed = payload.get("random_seed") or None
     brief = random_brief(seed if isinstance(seed, str) else None)
-    brief["seed"] = brief["random_seed"]
     return brief
 
 
@@ -152,7 +149,7 @@ def quick_create_campaign(payload: dict, request: Request, db: Session = Depends
     db.flush()
     db.add(CampaignMember(campaign_id=camp.id, user_id=profile.id, role="owner"))
     db.flush()
-    from models import CampaignThread as _CampaignThread
+    from models.threads import CampaignThread as _CampaignThread
 
     db.add(
         _CampaignThread(
@@ -228,9 +225,9 @@ def update_campaign(
             raise HTTPException(status_code=400, detail=str(e))
     if "description" in payload:
         changes["description"] = payload["description"]
-    if "random_seed" in payload or "seed" in payload:
+    if "random_seed" in payload:
         try:
-            changes["random_seed"] = validate_seed(payload.get("random_seed") or payload.get("seed") or "")
+            changes["random_seed"] = validate_seed(payload.get("random_seed") or "")
         except ValueError as e:
             raise HTTPException(status_code=400, detail=str(e))
     expected_revision = _expected_revision(payload)
@@ -402,7 +399,7 @@ def commit_campaign_mutation_endpoint(
     event_type = str(payload.get("event_type") or payload.get("type") or "").strip()
     if not event_type:
         raise HTTPException(status_code=400, detail="event_type is required")
-    operation_id = payload.get("operation_id") or payload.get("operationId")
+    operation_id = payload.get("operation_id")
     if operation_id is not None:
         operation_id = str(operation_id).strip() or None
     idempotency_key = require_idempotency_key(request, operation_id)

@@ -34,7 +34,7 @@ from app.worker import (  # noqa: E402
     list_failed_work,
     replay_failed_job,
 )
-from models import WorkerExecution  # noqa: E402
+from models.reliability import WorkerExecution
 
 
 def _engine(url="sqlite://"):

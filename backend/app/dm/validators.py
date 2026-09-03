@@ -231,12 +231,6 @@ def _known_entities_map_from_packet(packet: ForwardDmContextPacket | None) -> di
     return out
 
 
-def _known_entities_from_packet(packet: ForwardDmContextPacket | None) -> set[tuple[str, str]]:
-    """Back-compat wrapper — returns set of (type, id) for legacy callers."""
-    m = _known_entities_map_from_packet(packet)
-    return {(typ or "entity", fid) for fid, typ in m.items() if typ is not None}
-
-
 # ── Concrete validators ──────────────────────────────────────────────────────
 
 class AgencyValidator:

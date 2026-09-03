@@ -14,7 +14,9 @@ from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
 from app.campaigns.service import is_campaign_member
-from models import Campaign, CampaignThread, CampaignThreadMember
+from models.campaigns import Campaign
+from models.threads import CampaignThread
+from models.threads import CampaignThreadMember
 
 logger = logging.getLogger(__name__)
 

@@ -27,7 +27,7 @@ from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
 from app.queue.envelope import WorkerEnvelope
-from models import WorkerExecution
+from models.reliability import WorkerExecution
 from app.observability.tracing import trace_context
 
 logger = logging.getLogger(__name__)

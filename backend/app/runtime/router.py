@@ -29,12 +29,10 @@ from app.runtime.threads import (
     resolve_thread_id,
 )
 from database import get_db
-from models import (
-    Campaign,
-    CampaignThreadMember,
-    PlayerSubmission,
-    PlayerSubmissionSegment,
-)
+from models.campaigns import Campaign
+from models.threads import CampaignThreadMember
+from models.threads import PlayerSubmission
+from models.threads import PlayerSubmissionSegment
 
 router = APIRouter()
 logger = logging.getLogger(__name__)
@@ -106,17 +104,6 @@ def create_player_submission(
         raise HTTPException(status_code=422, detail=str(exc)) from exc
 
     # Reject client-forged audience mismatches — server derives audience from thread
-    client_audience = str(payload.get("audience", audience))
-    if client_audience not in ("campaign", "private"):
-        client_audience = audience
-    # If client explicitly claims private but thread is campaign, fail closed
-    if (
-        client_audience == "private"
-        and audience == "campaign"
-        and raw_thread not in ("main", "", None)
-    ):
-        # This is the legacy forged-audience path — already handled via thread auth above
-        pass
     thread_id_str = str(resolved_thread_id)
 
     try:

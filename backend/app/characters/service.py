@@ -3,7 +3,8 @@
 from sqlalchemy import select
 from sqlalchemy.orm import Session
 
-from models import Character, Dnd5eCharacterSheet
+from models.characters import Character
+from models.characters import Dnd5eCharacterSheet
 
 
 def character_with_sheet(db: Session, char: Character):
