@@ -14,7 +14,7 @@
 
 **Storage:** `rules_corpora`, `rules_sections` (canonical, + FTS), `rules_section_aliases`, `rules_embeddings` (derived pgvector, rebuildable), `rules_corpus_imports` (provenance). Independent of campaign/world-memory tables.
 
-**Ingest:** `scripts/ingest_rules.py` + `app/rules/ingest.py` — deterministic, versioned, fail-closed. Validates pinned JSON against official checksum, canary `weapon mastery` (5.2.1 addition), collision/alias checks. Promote only on success; log `build_id`, checksum, validation errors.
+**Ingest:** `scripts/ingest_rules.py` + `app/rules/ingest.py` — deterministic, versioned, fail-closed. Validates pinned JSON against the official artifact hash, canary `weapon mastery` (5.2.1 addition), collision/alias checks. Promote only on success; log `build_id`, checksum, validation errors. The trusted official artifact SHA-256 is versioned solely in `app/rules/official_manifest.json` (single source of truth); derivative dataset hashes are stored separately as `derivative_checksum` in `pinned_inputs`.
 
 **Retrieval:** `app/rules/store.py` — exact `lookup_by_rule_id` + bounded hybrid lexical (`tsvector`/`LIKE`) + vector (`pgvector HNSW`, fallback to lexical if unavailable) with RRF fusion; scores are metadata only, citations from canonical records. Duplicate concepts remain separately addressable.
 

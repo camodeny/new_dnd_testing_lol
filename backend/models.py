@@ -830,7 +830,6 @@ class RulesCorpus(Base):
     corpus_id: Mapped[str] = mapped_column(String(64), primary_key=True)
     corpus_version: Mapped[str] = mapped_column(String(32), primary_key=True)
     source_url: Mapped[str] = mapped_column(String(512), nullable=False)
-    source_checksum: Mapped[str | None] = mapped_column(String(128), nullable=True)
     source_artifact_hash: Mapped[str | None] = mapped_column(String(128), nullable=True)
     license: Mapped[str] = mapped_column(String(64), nullable=False, default="CC BY 4.0", server_default="CC BY 4.0")
     attribution: Mapped[str | None] = mapped_column(Text, nullable=True)
@@ -844,7 +843,6 @@ class RulesCorpus(Base):
             "corpus_id": self.corpus_id,
             "corpus_version": self.corpus_version,
             "source_url": self.source_url,
-            "source_checksum": self.source_checksum,
             "source_artifact_hash": self.source_artifact_hash,
             "license": self.license,
             "attribution": self.attribution,
@@ -955,7 +953,7 @@ class RulesCorpusImport(Base):
     corpus_id: Mapped[str] = mapped_column(String(64), nullable=False)
     corpus_version: Mapped[str] = mapped_column(String(32), nullable=False)
     status: Mapped[str] = mapped_column(String(32), nullable=False)
-    source_checksum: Mapped[str | None] = mapped_column(String(128), nullable=True)
+    source_artifact_hash: Mapped[str | None] = mapped_column(String(128), nullable=True)
     pinned_inputs: Mapped[dict | None] = mapped_column(JSONB, nullable=True)
     validation_errors: Mapped[list | dict | None] = mapped_column(JSONB, nullable=True)
     canary_results: Mapped[dict | None] = mapped_column(JSONB, nullable=True)
