@@ -406,7 +406,7 @@ def test_missing_campaign_raises_value_error():
 
 
 def test_campaign_update_http_contract_requires_and_checks_revision(monkeypatch):
-    from app.deps.auth import MOCK_USER_ID
+    from app.auth.service import MOCK_USER_ID
     from main import app
 
     eng = _sqlite_engine()

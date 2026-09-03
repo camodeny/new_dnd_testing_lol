@@ -1,17 +1,19 @@
 """Auth transport — /api/me and /api/auth/config."""
 import os
 
-from fastapi import APIRouter, Depends
+from fastapi import APIRouter, Depends, Request
+from sqlalchemy.orm import Session
 
-from auth import get_current_profile
-from models.profiles import Profile
+from app.deps.auth import resolve_profile
+from database import get_db
 
 router = APIRouter()
 
 
 @router.get("/api/me")
-def me(profile: Profile = Depends(get_current_profile)):
+def me(request: Request, db: Session = Depends(get_db)):
     """Return the authenticated user's profile. Verifies Supabase JWT via Authorization header."""
+    profile = resolve_profile(request, db)
     return {"user": profile.to_dict()}
 
 
@@ -28,4 +30,3 @@ def auth_config():
         "supabase_url": supabase_url or None,
         "supabase_configured": bool(supabase_url and has_key),
     }
-

@@ -1,9 +1,8 @@
-"""Supabase JWT verification for FastAPI.
+"""Supabase JWT/JWKS verification — application/infrastructure, no FastAPI.
 
 Flow:
   frontend (supabase-js) -> login -> Supabase returns JWT (access_token)
   frontend -> `Authorization: Bearer <jwt>` -> backend verifies via Supabase JWKS
-  backend -> upserts `public.profiles` row so the app has a FK target
 
 Env (new Supabase integration only — no legacy fallbacks):
   SUPABASE_URL / NEXT_PUBLIC_SUPABASE_URL
@@ -13,19 +12,19 @@ Env (new Supabase integration only — no legacy fallbacks):
 
 Supabase signs JWTs with RS256/ES256; we fetch JWKS from
 `{SUPABASE_URL}/auth/v1/.well-known/jwks.json`.
+
+This module raises ``app.auth.errors.AuthError`` (never FastAPI's
+``HTTPException``); the transport adapter in ``app.deps.auth`` maps that to an
+HTTP response.
 """
 
 import os
 import time
-import uuid
 
 import httpx
-from fastapi import Depends, Header, HTTPException, status
 from jose import jwt, JWTError
-from sqlalchemy.orm import Session
 
-from database import get_db
-from models.profiles import Profile
+from app.auth.errors import AuthError
 
 def _env_first(*names: str) -> str:
     for n in names:
@@ -33,6 +32,7 @@ def _env_first(*names: str) -> str:
         if v:
             return v
     return ""
+
 
 SUPABASE_URL = _env_first("SUPABASE_URL", "NEXT_PUBLIC_SUPABASE_URL").strip().rstrip("/")
 SUPABASE_PUBLISHABLE_KEY = _env_first(
@@ -88,21 +88,21 @@ def _fetch_jwks() -> dict | None:
 def verify_supabase_jwt(token: str) -> dict:
     """Verify token via JWKS (RS256/ES256).
 
-    Returns decoded payload. Raises HTTPException 401 on failure.
+    Returns decoded payload. Raises ``AuthError`` on failure.
     """
     if not token:
-        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Missing token")
+        raise AuthError("Missing token")
 
     expected_issuer = _get_expected_issuer()
     if not expected_issuer:
         # A JWKS override identifies where keys are fetched, not which Supabase
         # project is trusted. Without the project URL, issuer validation cannot
         # be performed safely.
-        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Invalid token")
+        raise AuthError("Invalid token")
 
     jwks = _fetch_jwks()
     if not jwks or not isinstance(jwks.get("keys"), list) or not jwks["keys"]:
-        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Invalid token")
+        raise AuthError("Invalid token")
 
     try:
         unverified_header = jwt.get_unverified_header(token)
@@ -122,54 +122,8 @@ def verify_supabase_jwt(token: str) -> dict:
                 return payload
             except JWTError:
                 continue
-        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Invalid token")
-    except HTTPException:
+        raise AuthError("Invalid token")
+    except AuthError:
         raise
     except Exception:
-        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Invalid token")
-
-
-def get_current_user_payload(authorization: str | None = Header(default=None)) -> dict:
-    """FastAPI dep that returns the decoded JWT payload."""
-    if not authorization or not authorization.startswith("Bearer "):
-        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Missing Authorization header")
-    token = authorization.removeprefix("Bearer ").strip()
-    return verify_supabase_jwt(token)
-
-
-def get_current_profile(
-    payload: dict = Depends(get_current_user_payload),
-    db: Session = Depends(get_db),
-) -> Profile:
-    """Verify JWT + upsert public.profiles. Returns Profile ORM object."""
-    sub = payload.get("sub")
-    if not sub:
-        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Token missing sub")
-    try:
-        uid = uuid.UUID(str(sub))
-    except ValueError:
-        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Invalid sub format")
-
-    email = payload.get("email")
-    user_metadata = payload.get("user_metadata") or {}
-    username = user_metadata.get("username") or user_metadata.get("full_name") or user_metadata.get("name")
-
-    profile = db.get(Profile, uid)
-    if not profile:
-        profile = Profile(id=uid, email=email, username=username)
-        db.add(profile)
-        db.commit()
-        db.refresh(profile)
-    else:
-        dirty = False
-        if email and profile.email != email:
-            profile.email = email
-            dirty = True
-        if username and not profile.username:
-            profile.username = username
-            dirty = True
-        if dirty:
-            db.commit()
-            db.refresh(profile)
-
-    return profile
+        raise AuthError("Invalid token")
