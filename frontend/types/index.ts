@@ -22,7 +22,7 @@ export interface Campaign {
 }
 
 export interface Character {
-  id: number | string
+  id: string
   name: string
   race?: string
   background?: string
@@ -47,8 +47,8 @@ export interface CharacterClass {
 }
 
 export interface Session {
-  id: number
-  campaign_id: number
+  id: string
+  campaign_id: string
   status: string
   created_at: string
   ended_at?: string
@@ -56,8 +56,8 @@ export interface Session {
 }
 
 export interface Message {
-  id: number | string
-  session_id: number | string
+  id: string
+  session_id: string
   role: 'player' | 'dm' | 'system'
   content: string
   created_at: string
@@ -69,7 +69,7 @@ export interface CampaignMember {
   user_id: string
   username: string
   role: 'owner' | 'player'
-  character_id?: number | string
+  character_id?: string
   character_name?: string
   is_ready?: boolean
 }
@@ -93,16 +93,16 @@ export interface CampaignThread {
 }
 
 export interface CampaignWorld {
-  id: number
-  campaign_id: number
+  id: string
+  campaign_id: string
   public_intro?: string
   world_state?: string
   created_at?: string
 }
 
 export interface EncounterMap {
-  id: number
-  campaign_id: number
+  id: string
+  campaign_id: string
   name?: string
   width?: number
   height?: number
@@ -114,7 +114,7 @@ export interface EncounterMap {
 
 export interface MapPlacement {
   actor_type: string
-  actor_id: number
+  actor_id: string
   col: number
   row: number
   name?: string
@@ -124,89 +124,9 @@ export interface MapPlacement {
 
 export interface InitiativeEntry {
   actor_type: string
-  actor_id: number
+  actor_id: string
   initiative: number
   name?: string
-}
-
-export interface SheetProposal {
-  id: number
-  session_id: number
-  character_id: number | string
-  changes: Record<string, unknown>
-  reason?: string
-  status: 'pending' | 'applied' | 'dismissed'
-}
-
-export interface LlmPlayer {
-  id: number
-  campaign_id: number
-  name: string
-  persona?: string
-  character_id?: number | string
-  character_name?: string
-}
-
-export interface AutomationKey {
-  id: number
-  label?: string
-  key_preview?: string
-  created_at: string
-}
-
-export interface AutomationScenario {
-  id: number
-  name: string
-  description?: string
-  created_at: string
-  snapshot_count?: number
-  run_count?: number
-}
-
-export interface AutomationSnapshot {
-  id: number
-  scenario_id: number
-  label?: string
-  created_at: string
-}
-
-export interface AutomationRun {
-  id: number
-  scenario_id: number
-  snapshot_id?: number
-  status: string
-  turn_count?: number
-  created_at: string
-  ended_at?: string
-}
-
-export interface LootBox {
-  id: number
-  campaign_id: number
-  rarity?: string
-  is_opened: boolean
-  items?: LootItem[]
-}
-
-export interface LootItem {
-  name: string
-  type?: string
-  rarity?: string
-  description?: string
-}
-
-export interface Shop {
-  id: number
-  campaign_id: number
-  name: string
-  items?: ShopItem[]
-}
-
-export interface ShopItem {
-  name: string
-  price?: number
-  currency?: string
-  description?: string
 }
 
 export interface ApiError extends Error {
