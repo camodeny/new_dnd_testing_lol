@@ -219,9 +219,15 @@ def create_player_submission(
                     sub_dict.get("id"),
                     pub_exc,
                 )
-    except Exception:
-        # Outer guard — never affect authoritative response.
-        pass
+    except Exception as exc:
+        # Outer guard — never affect the authoritative response, but never
+        # swallow silently: log a stable degradation reason.
+        logger.warning(
+            "realtime publish guard failed campaign_id=%s thread_id=%s error=%s",
+            campaign.id,
+            thread_id_str,
+            exc,
+        )
     return result
 
 
@@ -325,7 +331,7 @@ def get_or_create_direct_thread(
     raw_participant_id = payload.get("participant_id")
     try:
         participant_id = uuid.UUID(str(raw_participant_id))
-    except Exception as exc:
+    except (ValueError, TypeError, AttributeError) as exc:
         raise HTTPException(
             status_code=422, detail="participant_id must be a valid user id"
         ) from exc
@@ -398,7 +404,7 @@ def create_campaign_thread(
     for mid in raw_members:
         try:
             member_ids.append(uuid.UUID(str(mid)))
-        except Exception as exc:
+        except (ValueError, TypeError, AttributeError) as exc:
             raise HTTPException(
                 status_code=422, detail=f"Invalid member id: {mid}"
             ) from exc

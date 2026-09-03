@@ -8,6 +8,7 @@ import time
 import uuid
 
 from fastapi import APIRouter, Depends, HTTPException, Request
+from sqlalchemy.exc import SQLAlchemyError
 from sqlalchemy.orm import Session
 
 from app.campaigns.service import parse_campaign_id
@@ -65,8 +66,11 @@ def get_live_table_snapshot(
         try:
             if db.in_transaction():
                 db.rollback()
-        except Exception:
-            pass
+        except SQLAlchemyError as exc:
+            logger.warning(
+                "snapshot read-only rollback failed campaign_id=%s viewer_id=%s error=%s",
+                cid, profile.id, exc,
+            )
     except SnapshotNotFoundError as exc:
         logger.info(
             "snapshot not_found campaign_id=%s viewer_id=%s thread_id=%s",

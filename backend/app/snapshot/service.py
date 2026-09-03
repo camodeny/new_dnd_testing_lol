@@ -18,6 +18,7 @@ Dependencies:
 from __future__ import annotations
 
 import base64
+import binascii
 import json
 import logging
 import time
@@ -26,6 +27,7 @@ from datetime import datetime, timezone
 from typing import Any
 
 from sqlalchemy import func, select, text
+from sqlalchemy.exc import SQLAlchemyError
 from sqlalchemy.orm import Session
 
 from app.runtime.threads import (
@@ -60,7 +62,7 @@ def decode_cursor(cursor: str) -> int:
     try:
         raw = base64.urlsafe_b64decode(padded.encode())
         val = int(raw.decode())
-    except Exception as exc:
+    except (ValueError, TypeError, UnicodeDecodeError, binascii.Error) as exc:
         raise ValueError("Invalid cursor") from exc
     if val <= 0:
         raise ValueError("Invalid cursor")
@@ -114,8 +116,11 @@ def _ensure_repeatable_read(db: Session) -> None:
     except Exception as exc:
         try:
             db.rollback()
-        except Exception:
-            pass
+        except SQLAlchemyError as rollback_exc:
+            logger.warning(
+                "snapshot repeatable-read rollback failed error=%s",
+                rollback_exc,
+            )
         logger.warning(
             "snapshot repeatable-read setup failed campaign_projection_error=%s",
             exc,
@@ -156,7 +161,7 @@ def _resolve_thread_readonly(
 def _normalize_limit(raw) -> int:
     try:
         n = int(raw) if raw is not None else DEFAULT_LIMIT
-    except Exception:
+    except (ValueError, TypeError):
         raise ValueError("limit must be an integer")
     if n <= 0 or n > MAX_LIMIT:
         raise ValueError(f"limit must be between 1 and {MAX_LIMIT}")

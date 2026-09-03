@@ -13,6 +13,7 @@ import logging
 import uuid
 
 from fastapi import APIRouter, Depends, HTTPException, Request
+from sqlalchemy.exc import SQLAlchemyError
 from sqlalchemy.orm import Session
 
 from app.campaigns.service import is_campaign_member, parse_campaign_id
@@ -153,8 +154,12 @@ def get_realtime_token(campaign_id: str, request: Request, db: Session = Depends
         try:
             if db.in_transaction():
                 db.rollback()
-        except Exception:
-            pass
+        except SQLAlchemyError as exc:
+            logger.warning(
+                "realtime token read-only rollback failed campaign_id=%s error=%s",
+                campaign.id,
+                exc,
+            )
     except Exception as exc:
         from app.snapshot.service import SnapshotNotFoundError, SnapshotAuthorizationError
 
@@ -172,8 +177,13 @@ def get_realtime_token(campaign_id: str, request: Request, db: Session = Depends
             # only if authorized
             assert_can_read_thread(db, campaign.id, tid_uuid, profile.id)
             channels.append(live_table_channel(campaign.id, tid_uuid))
-        except Exception:
-            pass
+        except (ValueError, ThreadNotFoundError, ThreadAuthorizationError) as exc:
+            logger.info(
+                "realtime token channel omitted campaign_id=%s thread_id=%s reason=%s",
+                campaign.id,
+                active_tid,
+                type(exc).__name__,
+            )
 
     return {
         "channels": channels,
