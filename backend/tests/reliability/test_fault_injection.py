@@ -32,7 +32,7 @@ from app.observability.tracing import trace_context
 from app.queue import InMemoryQueueAdapter
 from app.worker import execute_worker_job
 from database import Base
-from llm_providers import (
+from app.providers import (
     LLMProviderAdapter,
     NormalizedChatResponse,
     ProviderError,
@@ -291,7 +291,7 @@ def test_provider_failure_policy_without_network_or_paid_calls(
         return _Response({"model": "fake-model", "content": "recovered", "usage": {}})
 
     monkeypatch.setattr(requests, "post", fake_post)
-    monkeypatch.setattr("llm_providers.time.sleep", lambda _: None)
+    monkeypatch.setattr("app.providers.transport.time.sleep", lambda _: None)
     request = ProviderRequest(messages=[{"role": "user", "content": "synthetic"}], model="fake-model", max_attempts=3)
 
     if expect_success:
