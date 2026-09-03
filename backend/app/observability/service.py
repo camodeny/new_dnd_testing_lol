@@ -9,7 +9,8 @@ from datetime import datetime, timezone
 from sqlalchemy import select
 from sqlalchemy.orm import Session
 
-from models import AIRun, OperationTrace
+from models.reliability import AIRun
+from models.reliability import OperationTrace
 from .tracing import current_operation_id, current_trace_id, structured_log
 
 logger = logging.getLogger(__name__)

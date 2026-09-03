@@ -16,7 +16,7 @@ import uuid as uuid_lib
 from sqlalchemy import select
 from sqlalchemy.orm import Session
 
-from models import Profile
+from models.profiles import Profile
 
 MOCK_USER_ID = uuid_lib.UUID("23f3b2d1-efb6-4785-9a67-fa7ca57d72a3")
 

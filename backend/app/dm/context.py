@@ -26,19 +26,17 @@ from sqlalchemy import select
 from sqlalchemy.orm import Session
 
 from app.observability.tracing import structured_log
-from models import (
-    Campaign,
-    CampaignDomainEvent,
-    CampaignMember,
-    CampaignThread,
-    CampaignThreadMember,
-    Character,
-    DmTurn,
-    DmTurnAttempt,
-    Dnd5eCharacterSheet,
-    PlayerSubmission,
-    PlayerSubmissionSegment,
-)
+from models.campaigns import Campaign
+from models.campaigns import CampaignDomainEvent
+from models.campaigns import CampaignMember
+from models.characters import Character
+from models.characters import Dnd5eCharacterSheet
+from models.dm import DmTurn
+from models.dm import DmTurnAttempt
+from models.threads import CampaignThread
+from models.threads import CampaignThreadMember
+from models.threads import PlayerSubmission
+from models.threads import PlayerSubmissionSegment
 
 logger = logging.getLogger(__name__)
 

@@ -1112,7 +1112,8 @@ def get_character_mechanics(db: Any, character_id: uuid.UUID | str, *, include_p
 
     # Lazy import to avoid circular
     try:
-        from models import Character, Dnd5eCharacterSheet
+        from models.characters import Character
+        from models.characters import Dnd5eCharacterSheet
     except Exception as exc:
         raise MechanicsError("model_import_failed", str(exc))
 

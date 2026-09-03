@@ -368,7 +368,7 @@ def test_invalid_sheet_does_not_yield_authoritative_modifier():
 def test_creator_round_trip_still_functional():
     """Existing CRUD round-trip: frontend payload → from_frontend → mechanics."""
     import uuid as uuid_lib
-    from models import Dnd5eCharacterSheet
+    from models.characters import Dnd5eCharacterSheet
     owner = uuid_lib.uuid4()
     payload = {
         "name": "Roundtrip Hero",
@@ -519,7 +519,11 @@ def _setup_campaign_db():
 
 
 def test_evidence_handler_rejects_cross_campaign_character_id():
-    from models import Campaign, CampaignMember, Character, Dnd5eCharacterSheet, Profile  # noqa: E402
+    from models.campaigns import Campaign
+    from models.campaigns import CampaignMember
+    from models.characters import Character
+    from models.characters import Dnd5eCharacterSheet
+    from models.profiles import Profile
     from app.dm.context import ContextAudience  # noqa: E402
     from app.dm.contract import EvidenceRequest  # noqa: E402
     from app.dm.tools.character_sheet import handle_ask_character_sheet  # noqa: E402
@@ -544,7 +548,8 @@ def test_evidence_handler_rejects_cross_campaign_character_id():
     sheet_b.character_id = char_b.id
     db.add(sheet_b)
     # Submission linking char_b to camp_b (authoritative association)
-    from models import PlayerSubmission, PlayerSubmissionSegment  # noqa: E402
+    from models.threads import PlayerSubmission
+    from models.threads import PlayerSubmissionSegment
 
     sub = PlayerSubmission(
         id=uuid.uuid4(),
@@ -572,7 +577,13 @@ def test_evidence_handler_rejects_cross_campaign_character_id():
 
 
 def test_evidence_handler_party_scope_is_campaign_bound():
-    from models import Campaign, CampaignMember, Character, Dnd5eCharacterSheet, Profile, PlayerSubmission, PlayerSubmissionSegment  # noqa: E402
+    from models.campaigns import Campaign
+    from models.campaigns import CampaignMember
+    from models.characters import Character
+    from models.characters import Dnd5eCharacterSheet
+    from models.profiles import Profile
+    from models.threads import PlayerSubmission
+    from models.threads import PlayerSubmissionSegment
     from app.dm.context import ContextAudience  # noqa: E402
     from app.dm.contract import EvidenceRequest  # noqa: E402
     from app.dm.tools.character_sheet import handle_ask_character_sheet  # noqa: E402
@@ -618,7 +629,13 @@ def test_evidence_handler_party_scope_is_campaign_bound():
 
 
 def test_evidence_handler_invalid_sheet_is_tool_failure_not_ok():
-    from models import Campaign, CampaignMember, Character, Dnd5eCharacterSheet, Profile, PlayerSubmission, PlayerSubmissionSegment  # noqa: E402
+    from models.campaigns import Campaign
+    from models.campaigns import CampaignMember
+    from models.characters import Character
+    from models.characters import Dnd5eCharacterSheet
+    from models.profiles import Profile
+    from models.threads import PlayerSubmission
+    from models.threads import PlayerSubmissionSegment
     from app.dm.context import ContextAudience  # noqa: E402
     from app.dm.contract import EvidenceRequest  # noqa: E402
     from app.dm.tools.character_sheet import handle_ask_character_sheet  # noqa: E402

@@ -28,14 +28,12 @@ from app.campaigns.service import (
 from app.deps.auth import resolve_profile
 from app.deps.idempotency import execute_http_idempotent, require_idempotency_key
 from database import get_db
-from models import (
-    Campaign,
-    CampaignInvite,
-    CampaignMember,
-    CampaignThread,
-    CampaignThreadMember,
-    Profile,
-)
+from models.campaigns import Campaign
+from models.campaigns import CampaignInvite
+from models.campaigns import CampaignMember
+from models.profiles import Profile
+from models.threads import CampaignThread
+from models.threads import CampaignThreadMember
 
 router = APIRouter()
 logger = logging.getLogger(__name__)
@@ -111,7 +109,7 @@ def create_campaign(payload: dict, request: Request, db: Session = Depends(get_d
     db.add(member)
     db.flush()
     # Create durable shared thread on campaign creation — snapshot GET is retrieval-only (#196)
-    from models import CampaignThread
+    from models.threads import CampaignThread
 
     db.add(
         CampaignThread(
@@ -152,7 +150,7 @@ def quick_create_campaign(payload: dict, request: Request, db: Session = Depends
     db.flush()
     db.add(CampaignMember(campaign_id=camp.id, user_id=profile.id, role="owner"))
     db.flush()
-    from models import CampaignThread as _CampaignThread
+    from models.threads import CampaignThread as _CampaignThread
 
     db.add(
         _CampaignThread(

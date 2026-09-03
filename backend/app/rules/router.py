@@ -6,7 +6,7 @@ from fastapi import APIRouter, Depends, Query, HTTPException
 from sqlalchemy.orm import Session
 from database import get_db
 from app.rules.store import lookup_by_rule_id, hybrid_search
-from models import RulesCorpus
+from models.rules import RulesCorpus
 
 router = APIRouter(prefix="/api/rules", tags=["rules"])
 
@@ -28,7 +28,7 @@ def search(q: str = Query(..., max_length=240), limit: int = Query(5, ge=1, le=2
         import os
 
         if os.getenv("GEMINI_API_KEY") or os.getenv("GOOGLE_API_KEY") or os.getenv("GOOGLE_GENAI_API_KEY"):
-            from models import RulesEmbedding
+            from models.rules import RulesEmbedding
 
             row = db.query(RulesEmbedding.embedding_model).filter(RulesEmbedding.embedding_model.like("gemini%")).order_by(RulesEmbedding.created_at.desc()).first()
             if row:

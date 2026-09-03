@@ -34,7 +34,7 @@ from app.dm_streams.service import (
     DMStreamStateError,
 )
 from database import get_db
-from models import Campaign
+from models.campaigns import Campaign
 
 router = APIRouter()
 logger = logging.getLogger(__name__)

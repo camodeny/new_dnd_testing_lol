@@ -159,7 +159,7 @@ def handle_search_rules(request: EvidenceRequest, audience: ContextAudience, *, 
         if has_gemini_key:
             # Detect most recent Gemini-indexed model in DB to keep query/doc dims aligned
             try:
-                from models import RulesEmbedding
+                from models.rules import RulesEmbedding
 
                 row = db_sess.query(RulesEmbedding.embedding_model).filter(RulesEmbedding.embedding_model.like("gemini%")).order_by(RulesEmbedding.created_at.desc()).first()
                 if row:
