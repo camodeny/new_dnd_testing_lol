@@ -29,7 +29,10 @@ from app.rules.metadata import (
 )
 
 try:
-    from models import RulesCorpus, RulesCorpusImport, RulesSection, RulesSectionAlias
+    from models.rules import RulesCorpus
+    from models.rules import RulesCorpusImport
+    from models.rules import RulesSection
+    from models.rules import RulesSectionAlias
 except Exception:  # allow import without DB in unit tests
     RulesCorpus = RulesCorpusImport = RulesSection = RulesSectionAlias = None  # type: ignore
 

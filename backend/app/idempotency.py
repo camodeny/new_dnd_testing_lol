@@ -13,7 +13,7 @@ from sqlalchemy import select
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
-from models import IdempotentCommand
+from models.reliability import IdempotentCommand
 
 logger = logging.getLogger(__name__)
 

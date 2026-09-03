@@ -11,7 +11,7 @@ import uuid as uuid_lib
 
 from sqlalchemy.orm import Session
 
-from models import CampaignMember
+from models.campaigns import CampaignMember
 
 RANDOM_CAMPAIGN_NAMES = [
     "The Whispering Hollow", "Embers of the Forgotten Keep", "Tides of Shadowfen",

@@ -19,7 +19,7 @@ from sqlalchemy.orm import Session
 
 from app.auth.errors import AuthError
 from app.auth.jwt import verify_supabase_jwt
-from models import Profile
+from models.profiles import Profile
 
 MOCK_USER_ID = uuid_lib.UUID("23f3b2d1-efb6-4785-9a67-fa7ca57d72a3")
 

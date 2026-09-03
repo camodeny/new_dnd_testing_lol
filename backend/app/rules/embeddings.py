@@ -16,7 +16,8 @@ from typing import Any
 
 from sqlalchemy.orm import Session
 
-from models import RulesSection, RulesEmbedding
+from models.rules import RulesSection
+from models.rules import RulesEmbedding
 
 DEFAULT_MODEL = "stub-hash-v1"
 DEFAULT_VERSION = "1"

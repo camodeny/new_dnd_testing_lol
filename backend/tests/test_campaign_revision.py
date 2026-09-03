@@ -36,7 +36,10 @@ from app.campaigns.events import (  # noqa: E402
     list_campaign_events,
     update_campaign_derived,
 )
-from models import Campaign, CampaignDomainEvent, CampaignMember, Profile  # noqa: E402
+from models.campaigns import Campaign
+from models.campaigns import CampaignDomainEvent
+from models.campaigns import CampaignMember
+from models.profiles import Profile
 
 
 def _sqlite_engine():

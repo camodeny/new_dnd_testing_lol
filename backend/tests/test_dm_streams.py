@@ -15,7 +15,12 @@ if not hasattr(SQLiteTypeCompiler, "_patched_jsonb"):
 from app.auth.service import MOCK_USER_ID  # noqa: E402
 from database import Base, get_db  # noqa: E402
 from main import app  # noqa: E402
-from models import Campaign, CampaignMember, CampaignThread, DMStream, DMStreamChunk, Profile  # noqa: E402
+from models.campaigns import Campaign
+from models.campaigns import CampaignMember
+from models.dm import DMStream
+from models.dm import DMStreamChunk
+from models.profiles import Profile
+from models.threads import CampaignThread
 
 
 @pytest.fixture

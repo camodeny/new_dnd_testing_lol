@@ -20,10 +20,14 @@ from app.runtime.submissions import accept_submission  # noqa: E402
 from app.runtime.threads import get_or_create_campaign_thread  # noqa: E402
 from database import Base, get_db  # noqa: E402
 from main import app  # noqa: E402
-from models import (  # noqa: E402
-    Campaign, CampaignMember, Character, DmTurn, DmTurnAttempt,
-    PlayerRollFulfillment, PlayerRollRequest, Profile,
-)
+from models.campaigns import Campaign
+from models.campaigns import CampaignMember
+from models.characters import Character
+from models.dm import DmTurn
+from models.dm import DmTurnAttempt
+from models.dm import PlayerRollFulfillment
+from models.dm import PlayerRollRequest
+from models.profiles import Profile
 
 
 @pytest.fixture

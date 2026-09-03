@@ -26,7 +26,6 @@ from jose import jwt, JWTError
 
 from app.auth.errors import AuthError
 
-
 def _env_first(*names: str) -> str:
     for n in names:
         v = os.getenv(n)

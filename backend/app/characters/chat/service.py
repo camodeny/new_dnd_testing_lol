@@ -96,7 +96,7 @@ def save_chat_message(owner_id: uuid_lib.UUID, character_uuid: uuid_lib.UUID | N
 
         if SessionLocal is None:
             return
-        from models import CharacterChatMessage as DbChatMessage
+        from models.characters import CharacterChatMessage as DbChatMessage
 
         db = SessionLocal()
         try:
@@ -120,7 +120,7 @@ def character_chat_sync_generator(
     try:
         from app.providers import provider_registry
     except Exception as e:
-        yield f"event: error\ndata: {json.dumps({'error': f'llm_providers not available: {e}'})}\n\n"
+        yield f"event: error\ndata: {json.dumps({'error': f'providers not available: {e}'})}\n\n"
         return
 
     model = get_character_chat_model()
