@@ -52,9 +52,7 @@ def upgrade() -> None:
 
     if dialect == "postgresql":
 
-        op.execute(sa.text("CREATE SCHEMA IF NOT EXISTS auth"))
-
-        op.execute(sa.text("CREATE TABLE IF NOT EXISTS auth.users (id UUID PRIMARY KEY)"))
+        _ensure_auth_users_stub(conn)
 
         has_vector = _ensure_vector_extension(conn)
 
@@ -775,13 +773,12 @@ def upgrade() -> None:
                 PRIMARY KEY (rule_id, embedding_model, build_id)
             )
         """))
-        try:
-            conn.execute(sa.text(
-                "CREATE INDEX IF NOT EXISTS ix_rules_embeddings_vector "
-                "ON rules_embeddings USING hnsw (embedding vector_cosine_ops)"
-            ))
-        except Exception:
-            pass
+        _safe_optional_ddl(
+            conn,
+            "CREATE INDEX IF NOT EXISTS ix_rules_embeddings_vector "
+            "ON rules_embeddings USING hnsw (embedding vector_cosine_ops)",
+            "rules_embeddings HNSW index",
+        )
     else:
         op.create_table(
             "rules_embeddings",
@@ -798,15 +795,25 @@ def upgrade() -> None:
             sa.ForeignKeyConstraint(["rule_id"], ["rules_sections.rule_id"], ondelete="CASCADE"),
             sa.PrimaryKeyConstraint("rule_id", "embedding_model", "build_id"),
         )
-    # indexes common to both variants
-    try:
+    # Indexes common to both variants. Optional Postgres indexes run inside a
+    # savepoint so an unsupported index definition cannot poison the release
+    # migration transaction.
+    if dialect == "postgresql":
+        _safe_optional_ddl(
+            conn,
+            "CREATE INDEX IF NOT EXISTS ix_rules_embeddings_corpus "
+            "ON rules_embeddings (corpus_id, corpus_version)",
+            "rules_embeddings corpus index",
+        )
+        _safe_optional_ddl(
+            conn,
+            "CREATE INDEX IF NOT EXISTS ix_rules_embeddings_model_build "
+            "ON rules_embeddings (embedding_model, build_id)",
+            "rules_embeddings model/build index",
+        )
+    else:
         op.create_index("ix_rules_embeddings_corpus", "rules_embeddings", ["corpus_id", "corpus_version"])
-    except Exception:
-        pass
-    try:
         op.create_index("ix_rules_embeddings_model_build", "rules_embeddings", ["embedding_model", "build_id"])
-    except Exception:
-        pass
 
     if dialect != "postgresql":
         return
@@ -922,13 +929,12 @@ def upgrade() -> None:
             END
             $$;
     """))
-    try:
-        conn.execute(sa.text(
-            "CREATE INDEX IF NOT EXISTS ix_rules_sections_fts "
-            "ON rules_sections USING gin (to_tsvector('english', title || ' ' || body))"
-        ))
-    except Exception:
-        pass
+    _safe_optional_ddl(
+        conn,
+        "CREATE INDEX IF NOT EXISTS ix_rules_sections_fts "
+        "ON rules_sections USING gin (to_tsvector('english', title || ' ' || body))",
+        "rules_sections full-text index",
+    )
 
 def downgrade() -> None:
     conn = op.get_bind()
@@ -986,6 +992,24 @@ def downgrade() -> None:
     op.drop_table("ai_runs")
     # Do NOT drop auth.users — managed by Supabase Auth/GoTrue
 
+def _ensure_auth_users_stub(conn) -> None:
+    """Provide auth.users for FK targets without touching managed Supabase auth.
+
+    Real Supabase projects already have auth.users owned by GoTrue; the
+    migration role typically cannot create objects in the auth schema, so
+    only create the stub when the table is actually missing (disposable
+    Postgres / CI, where the role owns the database).
+    """
+    try:
+        exists = conn.execute(sa.text("SELECT to_regclass('auth.users')")).fetchone()
+        if exists and exists[0] is not None:
+            return
+    except Exception:
+        pass
+    op.execute(sa.text("CREATE SCHEMA IF NOT EXISTS auth"))
+    op.execute(sa.text("CREATE TABLE IF NOT EXISTS auth.users (id UUID PRIMARY KEY)"))
+
+
 def _ensure_vector_extension(conn) -> bool:
     """Best-effort pgvector provisioning without aborting transaction."""
     try:
@@ -1010,4 +1034,27 @@ def _ensure_vector_extension(conn) -> bool:
         return bool(has_after)
     except Exception as exc:
         print(f"WARNING: pgvector check failed: {exc}")
+        return False
+
+
+def _safe_optional_ddl(conn, statement: str, label: str) -> bool:
+    """Run optional Postgres DDL without poisoning the migration transaction."""
+    # Alembic's offline MockConnection cannot create savepoints. It only
+    # renders SQL, so emit the statement directly in that mode.
+    begin_nested = getattr(conn, "begin_nested", None)
+    if begin_nested is None:
+        op.execute(sa.text(statement))
+        return True
+
+    savepoint = begin_nested()
+    try:
+        conn.execute(sa.text(statement))
+        savepoint.commit()
+        return True
+    except Exception as exc:
+        try:
+            savepoint.rollback()
+        except Exception:
+            pass
+        print(f"WARNING: skipping optional {label}: {exc}")
         return False
