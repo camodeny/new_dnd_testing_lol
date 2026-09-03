@@ -9,7 +9,7 @@ import { privateThreadLabel, upsertVisibleThread } from '@/lib/privateThreads'
 import type { Campaign, CampaignMember, CampaignThread, Character, Session, Message, EncounterMap, User } from '@/types'
 
 interface StoryAtlasProps {
-  campaign: Campaign & { user_id?: string }
+  campaign: Campaign
   characters: Character[]
   session: Session | null
   messages: Message[]

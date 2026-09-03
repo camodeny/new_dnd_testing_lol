@@ -106,17 +106,6 @@ def create_player_submission(
         raise HTTPException(status_code=422, detail=str(exc)) from exc
 
     # Reject client-forged audience mismatches — server derives audience from thread
-    client_audience = str(payload.get("audience", audience))
-    if client_audience not in ("campaign", "private"):
-        client_audience = audience
-    # If client explicitly claims private but thread is campaign, fail closed
-    if (
-        client_audience == "private"
-        and audience == "campaign"
-        and raw_thread not in ("main", "", None)
-    ):
-        # This is the legacy forged-audience path — already handled via thread auth above
-        pass
     thread_id_str = str(resolved_thread_id)
 
     try:

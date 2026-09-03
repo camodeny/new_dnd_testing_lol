@@ -34,7 +34,7 @@ export default function CampaignViewPage() {
   const { user } = useAuthContext()
   const router = useRouter()
 
-  const [campaign, setCampaign] = useState<(Campaign & { active_session?: Session | null; world?: unknown; user_id?: string }) | null>(null)
+  const [campaign, setCampaign] = useState<(Campaign & { active_session?: Session | null; world?: unknown }) | null>(null)
   const [characters, setCharacters] = useState<Character[]>([])
   const [session, setSession] = useState<Session | null>(null)
   const [activeThreadId, setActiveThreadId] = useState<string | null>(null)
@@ -64,7 +64,7 @@ export default function CampaignViewPage() {
     if (!id) return
     try {
       const [campData, charData, channelData] = await Promise.all([
-        campaignsApi.get(String(id)) as Promise<{ campaign: Campaign & { active_session?: Session | null; user_id?: string } }>,
+        campaignsApi.get(String(id)) as Promise<{ campaign: Campaign & { active_session?: Session | null } }>,
         campaignMembers.listCharacters(String(id)),
         apiFetch<{ channels: Array<{ thread_id: string; thread_type: string }> }>(`/campaigns/${id}/realtime/channels`),
       ])
@@ -149,7 +149,7 @@ export default function CampaignViewPage() {
   if (error && !campaign) return <ErrorMessage message={error} />
   if (!campaign) return <ErrorMessage message="Campaign not found." />
 
-  const isOwner = (campaign.owner_id ?? campaign.user_id) === user?.id
+  const isOwner = campaign.owner_id === user?.id
 
   if (mode === 'lobby') {
     return (
