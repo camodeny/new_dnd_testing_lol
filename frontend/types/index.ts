@@ -9,14 +9,12 @@ export interface Campaign {
   name: string
   description?: string
   random_seed?: string
-  loot_drop_rate?: string
   loot_mode?: string
   required_players?: number
   revision: number
   created_at: string
   updated_at?: string
   owner_id: string
-  user_id?: string
   session_count?: number
   member_count?: number
 }

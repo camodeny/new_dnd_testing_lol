@@ -47,8 +47,6 @@ class Campaign(Base):
         return {
             "id": str(self.id),
             "owner_id": str(self.owner_id),
-            # compat aliases
-            "user_id": str(self.owner_id),
             "name": self.name,
             "description": self.description,
             "random_seed": self.random_seed,
@@ -59,7 +57,6 @@ class Campaign(Base):
             "required_players": self.required_players,
             "content_boundaries": self.content_boundaries or {},
             "loot_mode": self.loot_mode,
-            "loot_drop_rate": self.loot_mode,
             "revision": self.revision,
             "created_at": self.created_at.isoformat() if self.created_at else None,
             "updated_at": self.updated_at.isoformat() if self.updated_at else None,
