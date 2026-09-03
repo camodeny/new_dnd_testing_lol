@@ -16,6 +16,9 @@ app = create_app()
 # New code should import from `database`, `models`, or `app.*` directly.
 try:
     from database import Base, engine, get_db  # noqa: F401
-    from models import Campaign, CampaignInvite, CampaignMember, Character  # noqa: F401
+    from models.campaigns import Campaign
+    from models.campaigns import CampaignInvite
+    from models.campaigns import CampaignMember
+    from models.characters import Character
 except Exception:  # pragma: no cover — import-time side effects may fail in tests without DB
     pass

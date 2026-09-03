@@ -44,7 +44,10 @@ from sqlalchemy import select, update
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
-from models import Campaign, DmTurn, DmTurnAttempt, PlayerSubmission
+from models.campaigns import Campaign
+from models.dm import DmTurn
+from models.dm import DmTurnAttempt
+from models.threads import PlayerSubmission
 
 logger = logging.getLogger(__name__)
 
@@ -653,7 +656,8 @@ def mark_streaming_started(db: Session, turn_id: uuid.UUID, attempt_id: uuid.UUI
     except ValueError as exc:
         raise ValueError(f"Invalid stream_id {stream_id}") from exc
     # Verify stream exists and has at least one durable chunk
-    from models import DMStream, DMStreamChunk
+    from models.dm import DMStream
+    from models.dm import DMStreamChunk
     stream = db.get(DMStream, parsed_stream_id)
     if stream is None:
         raise ValueError(f"Stream {parsed_stream_id} not found")
@@ -817,7 +821,7 @@ def commit_turn(
     duplicate_op = operation_id or str(attempt.id)
     # If attempt already succeeded, return existing result without duplicate mutation (idempotent retry)
     if attempt.status == ATTEMPT_SUCCEEDED and turn.status == TURN_SUCCEEDED:
-        from models import CampaignDomainEvent
+        from models.campaigns import CampaignDomainEvent
 
         existing = None
         if attempt.result:
@@ -845,7 +849,7 @@ def commit_turn(
 
     # Also check for duplicate before any mutation even if attempt not yet marked succeeded (crash-after-commit replay)
     if duplicate_op:
-        from models import CampaignDomainEvent
+        from models.campaigns import CampaignDomainEvent
 
         dup_event = db.execute(
             select(CampaignDomainEvent).where(CampaignDomainEvent.campaign_id == turn.campaign_id, CampaignDomainEvent.operation_id == duplicate_op)
@@ -1009,7 +1013,7 @@ def commit_turn(
     # Mark stream completed if linked
     if attempt.stream_id:
         try:
-            from models import DMStream
+            from models.dm import DMStream
             stream = db.get(DMStream, attempt.stream_id)
             if stream and stream.status == "streaming":
                 stream.status = "completed"
@@ -1115,7 +1119,7 @@ def abandon_visible_attempt(
     # Mark stream abandoned
     if attempt.stream_id:
         try:
-            from models import DMStream
+            from models.dm import DMStream
 
             stream = db.get(DMStream, attempt.stream_id)
             if stream:

@@ -36,7 +36,10 @@ from app.campaigns.events import (  # noqa: E402
     list_campaign_events,
     update_campaign_derived,
 )
-from models import Campaign, CampaignDomainEvent, CampaignMember, Profile  # noqa: E402
+from models.campaigns import Campaign
+from models.campaigns import CampaignDomainEvent
+from models.campaigns import CampaignMember
+from models.profiles import Profile
 
 
 def _sqlite_engine():
@@ -403,7 +406,7 @@ def test_missing_campaign_raises_value_error():
 
 
 def test_campaign_update_http_contract_requires_and_checks_revision(monkeypatch):
-    from app.deps.auth import MOCK_USER_ID
+    from app.auth.service import MOCK_USER_ID
     from main import app
 
     eng = _sqlite_engine()

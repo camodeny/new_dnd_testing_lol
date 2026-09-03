@@ -14,18 +14,16 @@ if not hasattr(SQLiteTypeCompiler, "_patched_jsonb"):
     SQLiteTypeCompiler.visit_JSONB = lambda self, type_, **kw: "JSON"  # type: ignore
     SQLiteTypeCompiler._patched_jsonb = True  # type: ignore
 
-from app.deps.auth import MOCK_USER_ID  # noqa: E402
+from app.auth.service import MOCK_USER_ID  # noqa: E402
 from database import Base, get_db  # noqa: E402
 from main import app  # noqa: E402
-from models import (  # noqa: E402
-    Campaign,
-    CampaignDomainEvent,
-    CampaignInvite,
-    CampaignMember,
-    CampaignThread,
-    CampaignThreadMember,
-    Profile,
-)
+from models.campaigns import Campaign
+from models.campaigns import CampaignDomainEvent
+from models.campaigns import CampaignInvite
+from models.campaigns import CampaignMember
+from models.profiles import Profile
+from models.threads import CampaignThread
+from models.threads import CampaignThreadMember
 
 
 @pytest.fixture

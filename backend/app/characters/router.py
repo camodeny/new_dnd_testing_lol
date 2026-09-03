@@ -10,8 +10,9 @@ from app.characters.service import character_with_sheet
 from app.deps.auth import resolve_profile
 from app.deps.idempotency import execute_http_idempotent, require_idempotency_key
 from database import get_db
-from models import Character, Dnd5eCharacterSheet
-from models import CharacterChatMessage as DbChatMessage
+from models.characters import Character
+from models.characters import Dnd5eCharacterSheet
+from models.characters import CharacterChatMessage as DbChatMessage
 
 logger = logging.getLogger(__name__)
 

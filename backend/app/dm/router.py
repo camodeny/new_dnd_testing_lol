@@ -16,7 +16,7 @@ from app.campaigns.service import is_campaign_member, parse_campaign_id
 from app.deps.auth import resolve_profile
 from app.runtime.threads import assert_can_read_thread, parse_thread_id, resolve_thread_id, ThreadNotFoundError, ThreadAuthorizationError
 from database import get_db
-from models import Campaign
+from models.campaigns import Campaign
 
 router = APIRouter()
 logger = logging.getLogger(__name__)
@@ -95,7 +95,7 @@ def get_dm_turn(campaign_id: str, turn_id: str, request: Request, db: Session = 
         # Hide private existence as 404
         raise HTTPException(status_code=404, detail="Thread not found") from exc
     from sqlalchemy import select
-    from models import DmTurnAttempt
+    from models.dm import DmTurnAttempt
 
     attempts = db.execute(
         select(DmTurnAttempt).where(DmTurnAttempt.turn_id == tid).order_by(DmTurnAttempt.attempt_number)

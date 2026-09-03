@@ -17,7 +17,9 @@ from typing import Any
 from sqlalchemy import text
 from sqlalchemy.orm import Session
 
-from models import RulesSection, RulesCorpus, RulesEmbedding
+from models.rules import RulesSection
+from models.rules import RulesCorpus
+from models.rules import RulesEmbedding
 
 logger = logging.getLogger(__name__)
 
