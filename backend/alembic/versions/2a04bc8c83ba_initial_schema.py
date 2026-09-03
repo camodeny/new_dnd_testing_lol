@@ -2,13 +2,11 @@
 
 Revision ID: 2a04bc8c83ba
 
-Revises: f3a1c9d8e2b4
+Revises: 
 
 Create Date: 2026-09-02
 
-Single baseline replacing the pre-alpha chain per issue #313. The two
-compatibility revisions immediately before this one allow databases that
-were already deployed before the squash to reach the baseline safely.
+Single baseline replacing the pre-alpha chain per issue #313.
 
 Frozen explicit schema — do not import live ORM.
 
@@ -24,7 +22,7 @@ from sqlalchemy.dialects import postgresql
 
 revision: str = "2a04bc8c83ba"
 
-down_revision: Union[str, Sequence[str], None] = "f3a1c9d8e2b4"
+down_revision: Union[str, Sequence[str], None] = None
 
 branch_labels: Union[str, Sequence[str], None] = None
 
@@ -37,14 +35,6 @@ def upgrade() -> None:
     conn = op.get_bind()
 
     dialect = conn.dialect.name if conn is not None else "postgresql"
-
-    # Production may already contain the schema created by the pre-squash
-    # migrations. In that case, only finish the rules-corpus portion here;
-    # recreating the entire baseline would collide with live tables.
-    if dialect == "postgresql" and _has_legacy_schema(conn):
-        has_vector = _ensure_vector_extension(conn)
-        _upgrade_legacy_rules_schema(conn, has_vector)
-        return
 
     # SQLite JSONB patch for frozen explicit tables
 
@@ -1052,192 +1042,3 @@ def _safe_optional_ddl(conn, statement: str, label: str) -> bool:
             pass
         print(f"WARNING: skipping optional {label}: {exc}")
         return False
-
-
-def _table_exists(conn, name: str) -> bool:
-    try:
-        return name in set(sa.inspect(conn).get_table_names())
-    except Exception:
-        return False
-
-
-def _has_legacy_schema(conn) -> bool:
-    """Identify a complete pre-squash application schema."""
-    required = {
-        "profiles",
-        "campaigns",
-        "characters",
-        "dm_turns",
-        "campaign_threads",
-        "player_submissions",
-    }
-    try:
-        tables = set(sa.inspect(conn).get_table_names())
-    except Exception:
-        return False
-    return required.issubset(tables)
-
-
-def _upgrade_legacy_rules_schema(conn, has_vector: bool) -> None:
-    """Complete rules tables for a database created before the squash."""
-    if not _table_exists(conn, "rules_corpora"):
-        op.create_table(
-            "rules_corpora",
-            sa.Column("corpus_id", sa.String(64), nullable=False),
-            sa.Column("corpus_version", sa.String(32), nullable=False),
-            sa.Column("source_url", sa.String(512), nullable=False),
-            sa.Column("source_checksum", sa.String(128), nullable=True),
-            sa.Column("source_artifact_hash", sa.String(128), nullable=True),
-            sa.Column("license", sa.String(64), nullable=False, server_default=sa.text("'CC BY 4.0'")),
-            sa.Column("attribution", sa.Text(), nullable=True),
-            sa.Column("import_build_id", sa.String(64), nullable=True),
-            sa.Column("imported_at", sa.DateTime(timezone=True), server_default=sa.text("now()"), nullable=False),
-            sa.Column("pinned_inputs", postgresql.JSONB(astext_type=sa.Text()), nullable=True),
-            sa.Column("created_at", sa.DateTime(timezone=True), server_default=sa.text("now()"), nullable=False),
-            sa.PrimaryKeyConstraint("corpus_id", "corpus_version"),
-        )
-
-    if not _table_exists(conn, "rules_sections"):
-        op.create_table(
-            "rules_sections",
-            sa.Column("rule_id", sa.String(256), nullable=False),
-            sa.Column("corpus_id", sa.String(64), nullable=False),
-            sa.Column("corpus_version", sa.String(32), nullable=False),
-            sa.Column("source_section_id", sa.String(256), nullable=False),
-            sa.Column("source_locator", sa.String(256), nullable=False),
-            sa.Column("document", sa.String(256), nullable=False),
-            sa.Column("heading_path", postgresql.JSONB(astext_type=sa.Text()), nullable=False, server_default=sa.text("'[]'")),
-            sa.Column("title", sa.String(512), nullable=False),
-            sa.Column("body", sa.Text(), nullable=False),
-            sa.Column("structured_tables", postgresql.JSONB(astext_type=sa.Text()), nullable=True),
-            sa.Column("source_hash", sa.String(128), nullable=True),
-            sa.Column("content_hash", sa.String(128), nullable=True),
-            sa.Column("citation_metadata", postgresql.JSONB(astext_type=sa.Text()), nullable=True),
-            sa.Column("import_build_id", sa.String(64), nullable=True),
-            sa.Column("created_at", sa.DateTime(timezone=True), server_default=sa.text("now()"), nullable=False),
-            sa.PrimaryKeyConstraint("rule_id"),
-            sa.ForeignKeyConstraint(
-                ["corpus_id", "corpus_version"],
-                ["rules_corpora.corpus_id", "rules_corpora.corpus_version"],
-                ondelete="CASCADE",
-            ),
-            sa.UniqueConstraint(
-                "corpus_id",
-                "corpus_version",
-                "source_section_id",
-                name="uq_rules_sections_corpus_source",
-            ),
-        )
-
-    _safe_optional_ddl(
-        conn,
-        "CREATE INDEX IF NOT EXISTS ix_rules_sections_corpus "
-        "ON rules_sections (corpus_id, corpus_version)",
-        "rules_sections corpus index",
-    )
-    _safe_optional_ddl(
-        conn,
-        "CREATE INDEX IF NOT EXISTS ix_rules_sections_source_section_id "
-        "ON rules_sections (source_section_id)",
-        "rules_sections source index",
-    )
-    _safe_optional_ddl(
-        conn,
-        "CREATE INDEX IF NOT EXISTS ix_rules_sections_document "
-        "ON rules_sections (document)",
-        "rules_sections document index",
-    )
-
-    if not _table_exists(conn, "rules_section_aliases"):
-        op.create_table(
-            "rules_section_aliases",
-            sa.Column("alias", sa.String(256), nullable=False),
-            sa.Column("rule_id", sa.String(256), nullable=False),
-            sa.Column("corpus_id", sa.String(64), nullable=False),
-            sa.Column("corpus_version", sa.String(32), nullable=False),
-            sa.Column("reason", sa.String(512), nullable=True),
-            sa.PrimaryKeyConstraint("alias", "corpus_id", "corpus_version"),
-            sa.ForeignKeyConstraint(["rule_id"], ["rules_sections.rule_id"], ondelete="CASCADE"),
-        )
-
-    embeddings_created_with_vector = False
-    if not _table_exists(conn, "rules_embeddings"):
-        if has_vector:
-            conn.execute(sa.text("""
-                CREATE TABLE rules_embeddings (
-                    rule_id VARCHAR(256) NOT NULL REFERENCES rules_sections(rule_id) ON DELETE CASCADE,
-                    corpus_id VARCHAR(64) NOT NULL,
-                    corpus_version VARCHAR(32) NOT NULL,
-                    embedding_model VARCHAR(64) NOT NULL,
-                    embedding_version VARCHAR(32) NOT NULL,
-                    build_id VARCHAR(64) NOT NULL,
-                    embedding vector,
-                    embedding_text TEXT,
-                    chunk_strategy VARCHAR(64),
-                    created_at TIMESTAMPTZ DEFAULT now() NOT NULL,
-                    PRIMARY KEY (rule_id, embedding_model, build_id)
-                )
-            """))
-            embeddings_created_with_vector = True
-        else:
-            op.create_table(
-                "rules_embeddings",
-                sa.Column("rule_id", sa.String(256), sa.ForeignKey("rules_sections.rule_id", ondelete="CASCADE"), nullable=False),
-                sa.Column("corpus_id", sa.String(64), nullable=False),
-                sa.Column("corpus_version", sa.String(32), nullable=False),
-                sa.Column("embedding_model", sa.String(64), nullable=False),
-                sa.Column("embedding_version", sa.String(32), nullable=False),
-                sa.Column("build_id", sa.String(64), nullable=False),
-                sa.Column("embedding", sa.Text(), nullable=True),
-                sa.Column("embedding_text", sa.Text(), nullable=True),
-                sa.Column("chunk_strategy", sa.String(64), nullable=True),
-                sa.Column("created_at", sa.DateTime(timezone=True), server_default=sa.text("now()"), nullable=False),
-                sa.PrimaryKeyConstraint("rule_id", "embedding_model", "build_id"),
-            )
-
-    if embeddings_created_with_vector:
-        _safe_optional_ddl(
-            conn,
-            "CREATE INDEX IF NOT EXISTS ix_rules_embeddings_vector "
-            "ON rules_embeddings USING hnsw (embedding vector_cosine_ops)",
-            "rules_embeddings HNSW index",
-        )
-    _safe_optional_ddl(
-        conn,
-        "CREATE INDEX IF NOT EXISTS ix_rules_embeddings_corpus "
-        "ON rules_embeddings (corpus_id, corpus_version)",
-        "rules_embeddings corpus index",
-    )
-    _safe_optional_ddl(
-        conn,
-        "CREATE INDEX IF NOT EXISTS ix_rules_embeddings_model_build "
-        "ON rules_embeddings (embedding_model, build_id)",
-        "rules_embeddings model/build index",
-    )
-
-    if not _table_exists(conn, "rules_corpus_imports"):
-        op.create_table(
-            "rules_corpus_imports",
-            sa.Column("build_id", sa.String(64), nullable=False),
-            sa.Column("corpus_id", sa.String(64), nullable=False),
-            sa.Column("corpus_version", sa.String(32), nullable=False),
-            sa.Column("status", sa.String(32), nullable=False),
-            sa.Column("source_checksum", sa.String(128), nullable=True),
-            sa.Column("pinned_inputs", postgresql.JSONB(astext_type=sa.Text()), nullable=True),
-            sa.Column("validation_errors", postgresql.JSONB(astext_type=sa.Text()), nullable=True),
-            sa.Column("canary_results", postgresql.JSONB(astext_type=sa.Text()), nullable=True),
-            sa.Column("created_at", sa.DateTime(timezone=True), server_default=sa.text("now()"), nullable=False),
-            sa.PrimaryKeyConstraint("build_id"),
-        )
-    _safe_optional_ddl(
-        conn,
-        "CREATE INDEX IF NOT EXISTS ix_rules_corpus_imports_corpus "
-        "ON rules_corpus_imports (corpus_id, corpus_version)",
-        "rules_corpus_imports corpus index",
-    )
-    _safe_optional_ddl(
-        conn,
-        "CREATE INDEX IF NOT EXISTS ix_rules_sections_fts "
-        "ON rules_sections USING gin (to_tsvector('english', title || ' ' || body))",
-        "rules_sections full-text index",
-    )
