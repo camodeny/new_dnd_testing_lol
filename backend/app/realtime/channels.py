@@ -23,15 +23,12 @@ def live_table_channel(campaign_id: uuid.UUID | str, thread_id: uuid.UUID | str)
     - ``campaign_id`` and ``thread_id`` are lower-cased UUID strings.
     - Never embeds secret content; authorization is enforced server-side.
     - Stable so clients can dedupe/reconcile by channel + event id.
+    - Fail closed: malformed identifiers raise ``ValueError`` rather than
+      emitting a channel name that can never round-trip through
+      :func:`parse_live_table_channel`.
     """
-    cid = str(campaign_id).lower()
-    tid = str(thread_id).lower()
-    # Validate UUID shape but don't require parsing success for forward-compat
-    try:
-        uuid.UUID(cid)
-        uuid.UUID(tid)
-    except Exception:
-        pass
+    cid = uuid.UUID(str(campaign_id))
+    tid = uuid.UUID(str(thread_id))
     return f"live-table:campaign:{cid}:thread:{tid}"
 
 
@@ -48,7 +45,7 @@ def parse_live_table_channel(channel: str) -> tuple[uuid.UUID, uuid.UUID] | None
         cid = uuid.UUID(parts[2])
         tid = uuid.UUID(parts[4])
         return cid, tid
-    except Exception:
+    except (ValueError, AttributeError, TypeError):
         return None
 
 
