@@ -25,7 +25,6 @@ from app.rules.metadata import (
     CORPUS_VERSION,
     LICENSE,
     OFFICIAL_SRD_URL,
-    PINNED_OFFICIAL_ARTIFACT_HASHES,
 )
 
 try:
@@ -203,8 +202,8 @@ def validate_structural(records: list[CanonicalRecord]) -> list[str]:
     return errors
 
 
-def compute_source_checksum(raw_input: Any) -> str:
-    """Deterministic checksum of authoritative source artifact bytes/dict."""
+def compute_sha256(raw_input: Any) -> str:
+    """Deterministic SHA-256 of raw bytes/string/dict (used for derivative hashes)."""
     if isinstance(raw_input, (bytes, bytearray)):
         return hashlib.sha256(bytes(raw_input)).hexdigest()
     if isinstance(raw_input, str):
@@ -214,6 +213,20 @@ def compute_source_checksum(raw_input: Any) -> str:
     return hashlib.sha256(blob.encode("utf-8")).hexdigest()
 
 
+def load_pinned_artifact_hash(corpus_id: str, corpus_version: str) -> str | None:
+    """Load the trusted official artifact hash from the single-source manifest."""
+    import pathlib
+
+    manifest_path = pathlib.Path(__file__).with_name("official_manifest.json")
+    try:
+        mdata = json.loads(manifest_path.read_text())
+    except Exception:
+        return None
+    if isinstance(mdata.get(corpus_id), dict):
+        return mdata[corpus_id].get(corpus_version)
+    return None
+
+
 def import_corpus(
     db: Session,
     records: list[CanonicalRecord],
@@ -221,7 +234,6 @@ def import_corpus(
     corpus_id: str = CORPUS_ID,
     corpus_version: str = CORPUS_VERSION,
     source_url: str = OFFICIAL_SRD_URL,
-    source_checksum: str | None = None,
     source_artifact_hash: str | None = None,
     pinned_inputs: dict | None = None,
     build_id: str | None = None,
@@ -240,7 +252,7 @@ def import_corpus(
     # Structural
     errs = validate_structural(records)
     if errs:
-        _log_import(db, bid, corpus_id, corpus_version, "failed", source_checksum or source_artifact_hash, pinned_inputs, errs, None)
+        _log_import(db, bid, corpus_id, corpus_version, "failed", source_artifact_hash, pinned_inputs, errs, None)
         raise ValueError(f"Import validation failed: {errs}")
     # Canary (5.2.1 proof)
     canary_results = None
@@ -248,35 +260,21 @@ def import_corpus(
         try:
             canary_results = validate_canary(records)
         except ValueError as e:
-            _log_import(db, bid, corpus_id, corpus_version, "failed", source_checksum or source_artifact_hash, pinned_inputs, [str(e)], None)
+            _log_import(db, bid, corpus_id, corpus_version, "failed", source_artifact_hash, pinned_inputs, [str(e)], None)
             raise
 
     # --- Authoritative provenance: require official artifact hash, keep distinct from derivative ---
     # source_artifact_hash = hash of the official WotC SRD 5.2.1 artifact bytes (PDF/HTML)
-    # source_checksum   = alias for official hash for backwards compat
-    official_hash = source_artifact_hash or source_checksum
+    official_hash = source_artifact_hash
     if not official_hash:
         _log_import(db, bid, corpus_id, corpus_version, "failed", None, pinned_inputs, ["Official SRD 5.2.1 artifact checksum (source_artifact_hash) is required for promotion"], canary_results)
         raise ValueError(
             "Official SRD 5.2.1 artifact checksum is required — pass source_artifact_hash (hash of the official WotC artifact). "
             "Derivative dataset hash alone is not sufficient."
         )
-    # Verify against pinned trusted checksum for this corpus_version (if pinned)
-    # Versioned manifest (official_manifest.json) is the source of truth for pinned hashes
-    pinned_expected = PINNED_OFFICIAL_ARTIFACT_HASHES.get(corpus_version)
-    # Also check versioned manifest file for corpus_id-scoped pinning
-    try:
-        import pathlib
-        manifest_path = pathlib.Path(__file__).with_name("official_manifest.json")
-        if manifest_path.exists():
-            mdata = json.loads(manifest_path.read_text())
-            # Support both {version: hash} and {corpus_id: {version: hash}} shapes
-            if corpus_version in mdata and isinstance(mdata[corpus_version], str):
-                pinned_expected = mdata[corpus_version]
-            elif corpus_id in mdata and isinstance(mdata[corpus_id], dict):
-                pinned_expected = mdata[corpus_id].get(corpus_version, pinned_expected)
-    except Exception:
-        pass
+    # Verify against pinned trusted checksum for this corpus_version (if pinned).
+    # Versioned manifest (official_manifest.json) is the single source of truth for pinned hashes.
+    pinned_expected = load_pinned_artifact_hash(corpus_id, corpus_version)
     if pinned_expected is not None and official_hash != pinned_expected:
         _log_import(
             db,
@@ -298,11 +296,10 @@ def import_corpus(
             f"This binds promotion to the pinned authoritative WotC artifact, not an arbitrary caller hash."
         )
 
-    # Normalize both fields to official hash
+    # Normalize the official artifact hash field
     source_artifact_hash = official_hash
-    source_checksum = official_hash
     # Derivative hash is distinct and computed from normalized canonical content
-    derivative_checksum = compute_source_checksum([r.content_hash for r in records])
+    derivative_checksum = compute_sha256([r.content_hash for r in records])
     # Keep derivative hash distinct for observability; don't confuse with official
     if pinned_inputs is None:
         pinned_inputs = {}
@@ -329,14 +326,13 @@ def import_corpus(
             # Compare official provenance and identities
             is_identical = (
                 existing.source_artifact_hash == source_artifact_hash
-                and existing.source_checksum == source_checksum
                 and set(existing_map.keys()) == set(new_map.keys())
                 and all(existing_map[k] == new_map[k] for k in new_map)
             )
             if is_identical:
                 # Idempotent re-import — don't delete/reinsert, preserve build identity
                 existing_build = existing.import_build_id or bid
-                _log_import(db, existing_build, corpus_id, corpus_version, "success", source_checksum, pinned_inputs, None, canary_results)
+                _log_import(db, existing_build, corpus_id, corpus_version, "success", source_artifact_hash, pinned_inputs, None, canary_results)
                 try:
                     db.commit()
                 except Exception:
@@ -349,7 +345,7 @@ def import_corpus(
                 corpus_id,
                 corpus_version,
                 "failed",
-                source_checksum,
+                source_artifact_hash,
                 pinned_inputs,
                 [f"Immutable corpus version {corpus_id}/{corpus_version} already promoted with different source/content (existing build {existing.import_build_id}); bump corpus_version or use a new build — refusing to mutate canonical records behind cited version."],
                 canary_results,
@@ -368,8 +364,7 @@ def import_corpus(
         existing = db.get(RulesCorpus, (corpus_id, corpus_version)) if RulesCorpus else None
         if existing:
             existing.source_url = source_url
-            existing.source_checksum = source_checksum
-            existing.source_artifact_hash = source_checksum
+            existing.source_artifact_hash = source_artifact_hash
             existing.license = LICENSE
             existing.attribution = ATTRIBUTION
             existing.import_build_id = bid
@@ -379,8 +374,7 @@ def import_corpus(
                 corpus_id=corpus_id,
                 corpus_version=corpus_version,
                 source_url=source_url,
-                source_checksum=source_checksum,
-                source_artifact_hash=source_checksum,
+                source_artifact_hash=source_artifact_hash,
                 license=LICENSE,
                 attribution=ATTRIBUTION,
                 import_build_id=bid,
@@ -419,11 +413,11 @@ def import_corpus(
             )
             db.add(sec)
 
-        _log_import(db, bid, corpus_id, corpus_version, "success", source_checksum, pinned_inputs, None, canary_results)
+        _log_import(db, bid, corpus_id, corpus_version, "success", source_artifact_hash, pinned_inputs, None, canary_results)
         db.commit()
     except Exception:
         db.rollback()
-        _log_import(db, bid, corpus_id, corpus_version, "failed", source_checksum, pinned_inputs, ["transaction failed"], canary_results)
+        _log_import(db, bid, corpus_id, corpus_version, "failed", source_artifact_hash, pinned_inputs, ["transaction failed"], canary_results)
         try:
             db.commit()
         except Exception:
@@ -432,7 +426,7 @@ def import_corpus(
     return bid
 
 
-def _log_import(db: Session, build_id: str, corpus_id: str, corpus_version: str, status: str, source_checksum: str | None, pinned_inputs: dict | None, errors: list | None, canary_results: dict | None):
+def _log_import(db: Session, build_id: str, corpus_id: str, corpus_version: str, status: str, source_artifact_hash: str | None, pinned_inputs: dict | None, errors: list | None, canary_results: dict | None):
     if RulesCorpusImport is None:
         return
     try:
@@ -441,7 +435,7 @@ def _log_import(db: Session, build_id: str, corpus_id: str, corpus_version: str,
             corpus_id=corpus_id,
             corpus_version=corpus_version,
             status=status,
-            source_checksum=source_checksum,
+            source_artifact_hash=source_artifact_hash,
             pinned_inputs=pinned_inputs,
             validation_errors=errors,
             canary_results=canary_results,
@@ -466,7 +460,6 @@ def import_fixture_sections(
     corpus_id: str = CORPUS_ID,
     corpus_version: str = CORPUS_VERSION,
     source_url: str = OFFICIAL_SRD_URL,
-    source_checksum: str | None = None,
     source_artifact_hash: str | None = None,
     pinned_inputs: dict | None = None,
     validate_canaries: bool = True,
@@ -478,23 +471,20 @@ def import_fixture_sections(
         corpus_version=corpus_version,
         source_url=source_url,
     )
-    # Prefer explicit artifact hash, fallback to source_checksum alias
-    official = source_artifact_hash or source_checksum
     bid = import_corpus(
         db,
         records,
         corpus_id=corpus_id,
         corpus_version=corpus_version,
         source_url=source_url,
-        source_checksum=official,
-        source_artifact_hash=official,
+        source_artifact_hash=source_artifact_hash,
         pinned_inputs=pinned_inputs,
         validate_canaries=validate_canaries,
     )
     return bid, records
 
 
-def parse_cantilux_json(data: dict, *, source_checksum: str | None = None) -> list[dict]:
+def parse_cantilux_json(data: dict) -> list[dict]:
     """Best-effort extract from Cantilux/dnd-srd-json shape.
 
     Handles various shapes: top-level list, dict with 'sections'/'documents', nested.
@@ -536,5 +526,5 @@ def parse_cantilux_json(data: dict, *, source_checksum: str | None = None) -> li
 
 def import_markdown_text(db: Session, md_text: str, **kwargs) -> tuple[str, list[CanonicalRecord]]:
     raw = _extract_markdown_sections(md_text, document=kwargs.get("document", "srd"))
-    # Ensure official hash is forwarded (kwargs may contain source_artifact_hash/source_checksum)
+    # Ensure official artifact hash is forwarded (kwargs may contain source_artifact_hash)
     return import_fixture_sections(db, raw, **kwargs)

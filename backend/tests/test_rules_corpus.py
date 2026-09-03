@@ -76,7 +76,6 @@ def test_official_metadata_and_checksum_recorded(db):
     corpus = db.get(RulesCorpus, (CORPUS_ID, CORPUS_VERSION))
     assert corpus is not None
     assert corpus.source_url == OFFICIAL_SRD_URL
-    assert corpus.source_checksum == TEST_OFFICIAL_HASH
     assert corpus.source_artifact_hash == TEST_OFFICIAL_HASH
     assert corpus.license == LICENSE
     assert corpus.attribution == ATTRIBUTION
@@ -91,7 +90,7 @@ def test_official_metadata_and_checksum_recorded(db):
     imp = db.get(RulesCorpusImport, bid)
     assert imp is not None
     assert imp.status == "success"
-    assert imp.source_checksum == TEST_OFFICIAL_HASH
+    assert imp.source_artifact_hash == TEST_OFFICIAL_HASH
     assert imp.pinned_inputs is not None
     assert "derivative_checksum" in imp.pinned_inputs
     assert imp.pinned_inputs["derivative_checksum"] != TEST_OFFICIAL_HASH
@@ -288,10 +287,10 @@ def test_promotion_accepts_exact_pinned_hash_and_rejects_mismatch(db):
     with pytest.raises(ValueError, match="Official artifact hash mismatch"):
         import_fixture_sections(db, tampered, source_artifact_hash="c" * 64, validate_canaries=True)
     # Derivative hash alone (hash of normalized content) must not be accepted as official for pinned version
-    from app.rules.ingest import compute_source_checksum
+    from app.rules.ingest import compute_sha256
     from app.rules.ids import content_hash
 
-    derivative = compute_source_checksum([content_hash(s["body"]) for s in SAMPLE_SECTIONS])
+    derivative = compute_sha256([content_hash(s["body"]) for s in SAMPLE_SECTIONS])
     # derivative != pinned, so should be rejected for 5.2.1
     if derivative != TEST_OFFICIAL_HASH:
         with pytest.raises(ValueError, match="Official artifact hash mismatch"):
