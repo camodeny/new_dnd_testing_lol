@@ -52,9 +52,7 @@ def upgrade() -> None:
 
     if dialect == "postgresql":
 
-        op.execute(sa.text("CREATE SCHEMA IF NOT EXISTS auth"))
-
-        op.execute(sa.text("CREATE TABLE IF NOT EXISTS auth.users (id UUID PRIMARY KEY)"))
+        _ensure_auth_users_stub(conn)
 
         has_vector = _ensure_vector_extension(conn)
 
@@ -993,6 +991,24 @@ def downgrade() -> None:
     op.drop_table("profiles")
     op.drop_table("ai_runs")
     # Do NOT drop auth.users — managed by Supabase Auth/GoTrue
+
+def _ensure_auth_users_stub(conn) -> None:
+    """Provide auth.users for FK targets without touching managed Supabase auth.
+
+    Real Supabase projects already have auth.users owned by GoTrue; the
+    migration role typically cannot create objects in the auth schema, so
+    only create the stub when the table is actually missing (disposable
+    Postgres / CI, where the role owns the database).
+    """
+    try:
+        exists = conn.execute(sa.text("SELECT to_regclass('auth.users')")).fetchone()
+        if exists and exists[0] is not None:
+            return
+    except Exception:
+        pass
+    op.execute(sa.text("CREATE SCHEMA IF NOT EXISTS auth"))
+    op.execute(sa.text("CREATE TABLE IF NOT EXISTS auth.users (id UUID PRIMARY KEY)"))
+
 
 def _ensure_vector_extension(conn) -> bool:
     """Best-effort pgvector provisioning without aborting transaction."""
