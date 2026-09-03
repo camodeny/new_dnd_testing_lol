@@ -40,7 +40,11 @@ from llm_providers import (
     TransportHooks,
     execute_chat,
 )
-from models import Campaign, CampaignDomainEvent, Outbox, Profile, WorkerExecution
+from models.campaigns import Campaign
+from models.campaigns import CampaignDomainEvent
+from models.profiles import Profile
+from models.reliability import Outbox
+from models.reliability import WorkerExecution
 from tests.reliability.faults import FaultScenario
 
 

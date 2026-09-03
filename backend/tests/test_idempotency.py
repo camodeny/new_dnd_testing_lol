@@ -22,7 +22,10 @@ from app.idempotency import (  # noqa: E402
     IdempotencyConflictError,
     execute_idempotent_command,
 )
-from models import Campaign, CampaignMember, IdempotentCommand, Profile  # noqa: E402
+from models.campaigns import Campaign
+from models.campaigns import CampaignMember
+from models.profiles import Profile
+from models.reliability import IdempotentCommand
 
 
 def _setup(url: str = "sqlite://"):
@@ -221,7 +224,7 @@ def test_campaign_put_retry_replays_after_revision_advanced(monkeypatch):
 def test_character_create_is_a_real_user_scoped_idempotent_command(monkeypatch):
     from app.deps.auth import MOCK_USER_ID
     from main import app
-    from models import Character
+    from models.characters import Character
 
     engine = create_engine(
         "sqlite://", connect_args={"check_same_thread": False}, poolclass=StaticPool

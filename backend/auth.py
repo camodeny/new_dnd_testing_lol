@@ -25,7 +25,7 @@ from jose import jwt, JWTError
 from sqlalchemy.orm import Session
 
 from database import get_db
-from models import Profile
+from models.profiles import Profile
 
 def _env_first(*names: str) -> str:
     for n in names:

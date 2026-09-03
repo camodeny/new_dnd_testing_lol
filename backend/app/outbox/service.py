@@ -8,7 +8,7 @@ from datetime import datetime, timedelta, timezone
 from sqlalchemy import and_, or_, select, update
 from sqlalchemy.orm import Session
 
-from models import Outbox
+from models.reliability import Outbox
 from app.observability.tracing import current_trace_id
 
 logger = logging.getLogger(__name__)

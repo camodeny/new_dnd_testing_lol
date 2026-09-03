@@ -4,7 +4,7 @@ import os
 from fastapi import APIRouter, Depends
 
 from auth import get_current_profile
-from models import Profile
+from models.profiles import Profile
 
 router = APIRouter()
 

@@ -14,7 +14,8 @@ from app.characters.chat.service import (
 )
 from app.deps.auth import resolve_profile
 from database import get_db
-from models import Character, CharacterChatMessage
+from models.characters import Character
+from models.characters import CharacterChatMessage
 
 router = APIRouter()
 

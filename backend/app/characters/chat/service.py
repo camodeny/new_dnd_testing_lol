@@ -96,7 +96,7 @@ def save_chat_message(owner_id: uuid_lib.UUID, character_uuid: uuid_lib.UUID | N
 
         if SessionLocal is None:
             return
-        from models import CharacterChatMessage as DbChatMessage
+        from models.characters import CharacterChatMessage as DbChatMessage
 
         db = SessionLocal()
         try:
