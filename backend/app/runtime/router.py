@@ -29,12 +29,10 @@ from app.runtime.threads import (
     resolve_thread_id,
 )
 from database import get_db
-from models import (
-    Campaign,
-    CampaignThreadMember,
-    PlayerSubmission,
-    PlayerSubmissionSegment,
-)
+from models.campaigns import Campaign
+from models.threads import CampaignThreadMember
+from models.threads import PlayerSubmission
+from models.threads import PlayerSubmissionSegment
 
 router = APIRouter()
 logger = logging.getLogger(__name__)

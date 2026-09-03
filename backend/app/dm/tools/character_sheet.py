@@ -29,7 +29,7 @@ logger = logging.getLogger(__name__)
 
 
 def _campaign_member_user_ids(db: Any, campaign_id: uuid.UUID) -> set[uuid.UUID]:
-    from models import CampaignMember
+    from models.campaigns import CampaignMember
 
     rows = db.execute(select(CampaignMember.user_id).where(CampaignMember.campaign_id == campaign_id)).scalars().all()
     return set(rows)
@@ -41,7 +41,7 @@ def _campaign_character_ids_via_submissions(db: Any, campaign_id: uuid.UUID) -> 
     Returns None if the campaign has no submissions at all (so caller can fall back
     to membership-only scoping for pre-submission characters).
     """
-    from models import PlayerSubmission
+    from models.threads import PlayerSubmission
 
     rows = db.execute(
         select(PlayerSubmission.character_id).where(
@@ -65,7 +65,8 @@ def _resolve_character_ids_for_scope(
     db: Any,
 ) -> list[uuid.UUID]:
     """Resolve evidence scope to concrete character UUIDs, scoped to audience campaign."""
-    from models import CampaignMember, Character
+    from models.campaigns import CampaignMember
+    from models.characters import Character
 
     try:
         campaign_uuid = uuid.UUID(str(audience.campaign_id))
@@ -227,7 +228,7 @@ def handle_ask_character_sheet(
         )
 
     from app.rules.mechanics import MechanicsError, get_character_mechanics_for_sheet
-    from models import Dnd5eCharacterSheet
+    from models.characters import Dnd5eCharacterSheet
 
     results_payload: list[dict[str, Any]] = []
     sources: list[SourceRef] = []

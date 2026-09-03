@@ -15,7 +15,11 @@ if not hasattr(SQLiteTypeCompiler, "_patched_jsonb"):
     SQLiteTypeCompiler._patched_jsonb = True  # type: ignore
 
 from database import Base  # noqa: E402
-from models import Campaign, CampaignMember, Character, Dnd5eCharacterSheet, Profile  # noqa: E402
+from models.campaigns import Campaign
+from models.campaigns import CampaignMember
+from models.characters import Character
+from models.characters import Dnd5eCharacterSheet
+from models.profiles import Profile
 from app.campaigns.events import commit_campaign_mutation  # noqa: E402
 from app.dm.context import (  # noqa: E402
     AuthorizationScope,

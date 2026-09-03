@@ -13,7 +13,8 @@ from app.rolls.service import (
 )
 from app.runtime.threads import ThreadAuthorizationError, ThreadNotFoundError, assert_can_read_thread, parse_thread_id
 from database import get_db
-from models import DmTurn, PlayerRollRequest
+from models.dm import DmTurn
+from models.dm import PlayerRollRequest
 
 router = APIRouter()
 

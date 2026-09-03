@@ -37,7 +37,8 @@ from typing import Callable, Optional
 from sqlalchemy import or_, select, update
 from sqlalchemy.orm import Session
 
-from models import Campaign, CampaignDomainEvent
+from models.campaigns import Campaign
+from models.campaigns import CampaignDomainEvent
 
 logger = logging.getLogger(__name__)
 
@@ -223,7 +224,7 @@ def commit_campaign_mutation(
     # 3) Optionally enqueue outbox atomically in same transaction (issue #190)
     if outbox_event_type:
         # lazy import to avoid circular
-        from models import Outbox as _Outbox
+        from models.reliability import Outbox as _Outbox
         ob = _Outbox(
             id=uuid.uuid4(),
             aggregate_type="campaign",

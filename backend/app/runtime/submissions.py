@@ -10,7 +10,10 @@ import uuid
 from sqlalchemy import func, select
 from sqlalchemy.orm import Session
 
-from models import Campaign, Character, PlayerSubmission, PlayerSubmissionSegment
+from models.campaigns import Campaign
+from models.characters import Character
+from models.threads import PlayerSubmission
+from models.threads import PlayerSubmissionSegment
 
 logger = logging.getLogger(__name__)
 

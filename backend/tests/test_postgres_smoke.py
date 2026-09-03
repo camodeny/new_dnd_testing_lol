@@ -68,7 +68,8 @@ def test_disposable_postgres_migrated_schema_usable():
         assert isinstance(row[0], str) and len(row[0]) > 0
 
     from sqlalchemy.orm import sessionmaker
-    import models  # noqa: F401
+    from models.campaigns import Campaign
+    from models.profiles import Profile
 
     Session = sessionmaker(bind=engine)
     pid = uuid.uuid4()
@@ -79,21 +80,21 @@ def test_disposable_postgres_migrated_schema_usable():
             db.flush()
         except Exception:
             pass
-        profile = models.Profile(id=pid, email=f"ci-smoke-{pid.hex[:8]}@example.com")
+        profile = Profile(id=pid, email=f"ci-smoke-{pid.hex[:8]}@example.com")
         db.add(profile)
         db.commit()
-        found = db.get(models.Profile, pid)
+        found = db.get(Profile, pid)
         assert found is not None
         assert found.email == profile.email
-        campaign = models.Campaign(id=cid, owner_id=pid, name="ci-smoke-campaign")
+        campaign = Campaign(id=cid, owner_id=pid, name="ci-smoke-campaign")
         db.add(campaign)
         db.commit()
-        found_c = db.get(models.Campaign, cid)
+        found_c = db.get(Campaign, cid)
         assert found_c is not None
         assert found_c.owner_id == pid
         assert found_c.name == "ci-smoke-campaign"
         db.delete(found_c)
         db.delete(found)
         db.commit()
-        assert db.get(models.Campaign, cid) is None
-        assert db.get(models.Profile, pid) is None
+        assert db.get(Campaign, cid) is None
+        assert db.get(Profile, pid) is None

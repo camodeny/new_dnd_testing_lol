@@ -22,7 +22,8 @@ from sqlalchemy import select
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
-from models import DMStream, DMStreamChunk
+from models.dm import DMStream
+from models.dm import DMStreamChunk
 
 logger = logging.getLogger(__name__)
 

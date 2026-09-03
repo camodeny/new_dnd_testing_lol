@@ -21,7 +21,7 @@ from app.realtime.channels import live_table_channel, parse_live_table_channel
 from app.realtime.service import get_realtime_metrics
 from app.runtime.threads import ThreadAuthorizationError, ThreadNotFoundError, assert_can_read_thread, parse_thread_id
 from database import get_db
-from models import Campaign
+from models.campaigns import Campaign
 
 router = APIRouter()
 logger = logging.getLogger(__name__)

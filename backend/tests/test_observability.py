@@ -21,7 +21,13 @@ from app.observability.service import begin_operation, fail_soft, finish_ai_run,
 from app.observability.tracing import current_trace_id, structured_log, trace_context
 from app.outbox.service import enqueue_outbox, envelope_for_outbox
 from app.worker.executor import execute_worker_job
-from models import AIRun, Campaign, CampaignDomainEvent, OperationTrace, Outbox, Profile, WorkerExecution
+from models.campaigns import Campaign
+from models.campaigns import CampaignDomainEvent
+from models.profiles import Profile
+from models.reliability import AIRun
+from models.reliability import OperationTrace
+from models.reliability import Outbox
+from models.reliability import WorkerExecution
 
 
 def _setup():

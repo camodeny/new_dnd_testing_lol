@@ -12,11 +12,16 @@ if not hasattr(SQLiteTypeCompiler, "_patched_jsonb"):
     SQLiteTypeCompiler.visit_JSONB = lambda self, type_, **kw: "JSON"  # type: ignore
     SQLiteTypeCompiler._patched_jsonb = True  # type: ignore
 
-from app.deps.auth import MOCK_USER_ID  # noqa: E402
+from app.auth.service import MOCK_USER_ID  # noqa: E402
 from app.runtime.threads import can_read_thread, get_or_create_campaign_thread  # noqa: E402
 from database import Base, get_db  # noqa: E402
 from main import app  # noqa: E402
-from models import Campaign, CampaignMember, CampaignThread, CampaignThreadMember, PlayerSubmission, Profile  # noqa: E402
+from models.campaigns import Campaign
+from models.campaigns import CampaignMember
+from models.profiles import Profile
+from models.threads import CampaignThread
+from models.threads import CampaignThreadMember
+from models.threads import PlayerSubmission
 
 
 @pytest.fixture
@@ -54,7 +59,6 @@ def api(monkeypatch):
 
 def _auth_as(profile_id):
     from unittest.mock import patch
-    import models as _m
     # Returns a context that monkeypatches resolve_profile to return profile_id
     # Caller uses monkeypatch; this helper constructs Profile retrieval
     return profile_id

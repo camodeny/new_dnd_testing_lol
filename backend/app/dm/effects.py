@@ -18,7 +18,9 @@ from typing import Callable, Any
 
 from sqlalchemy.orm import Session
 
-from models import Campaign, DmTurn, DmTurnAttempt
+from models.campaigns import Campaign
+from models.dm import DmTurn
+from models.dm import DmTurnAttempt
 
 logger = logging.getLogger(__name__)
 
