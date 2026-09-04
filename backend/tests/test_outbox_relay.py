@@ -66,6 +66,8 @@ def test_relay_once_skips_cleanly_without_db(monkeypatch):
 
 def test_cron_endpoint_runs_relay_path(monkeypatch):
     os.environ["ALLOW_MOCK_AUTH"] = "true"
+    monkeypatch.delenv("CRON_SECRET", raising=False)
+    monkeypatch.setenv("ALLOW_INSECURE_CRON", "1")
     factory = _factory()
     with factory() as db:
         enqueue_outbox(db, event_type="turn.resolve", operation_id="op-cron", payload={"n": 2})
@@ -100,6 +102,8 @@ def test_cron_endpoint_runs_relay_path(monkeypatch):
 
 def test_cron_endpoint_publishes_with_injected_adapter(monkeypatch):
     os.environ["ALLOW_MOCK_AUTH"] = "true"
+    monkeypatch.delenv("CRON_SECRET", raising=False)
+    monkeypatch.setenv("ALLOW_INSECURE_CRON", "1")
     factory = _factory()
     with factory() as db:
         enqueue_outbox(db, event_type="turn.resolve", operation_id="op-cron-2", payload={"n": 3})
@@ -150,6 +154,34 @@ def test_cron_secret_enforced(monkeypatch):
         client = TestClient(app)
         assert client.get("/api/cron/outbox-relay").status_code == 401
         assert client.get("/api/cron/outbox-relay", headers={"Authorization": "Bearer s3cret"}).status_code == 200
+    finally:
+        app.dependency_overrides.clear()
+
+
+def test_cron_fails_closed_without_secret_or_bypass(monkeypatch):
+    """Issue #342 — no CRON_SECRET and no explicit bypass: 503, not open."""
+    os.environ["ALLOW_MOCK_AUTH"] = "true"
+    monkeypatch.delenv("CRON_SECRET", raising=False)
+    monkeypatch.delenv("ALLOW_INSECURE_CRON", raising=False)
+    factory = _factory()
+
+    from app.factory import create_app
+
+    app = create_app()
+
+    def override_db():
+        db = factory()
+        try:
+            yield db
+        finally:
+            db.close()
+
+    app.dependency_overrides[get_db] = override_db
+    try:
+        client = TestClient(app)
+        resp = client.get("/api/cron/outbox-relay")
+        assert resp.status_code == 503
+        assert resp.json()["detail"] == "CRON_SECRET is not configured"
     finally:
         app.dependency_overrides.clear()
 

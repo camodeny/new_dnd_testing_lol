@@ -46,18 +46,18 @@ def _engine(url="sqlite://"):
 # ── Adapter ─────────────────────────────────────────────────────────────────
 
 
-def test_vercel_adapter_misconfigured_raises_not_silent_success():
-    va = VercelQueueAdapter(api_url="", queue_name="test")
-    va._api_token = ""
+def test_vercel_adapter_misconfigured_raises_not_silent_success(monkeypatch):
+    for var in ("VERCEL_QUEUE_TOKEN", "VERCEL_OIDC_TOKEN"):
+        monkeypatch.delenv(var, raising=False)
+    va = VercelQueueAdapter(topic="test")
     env = new_envelope(job_type="test.job", payload={"id": "1"})
-    with pytest.raises(RuntimeError, match="Vercel queue not configured"):
+    with pytest.raises(RuntimeError, match="OIDC token unavailable"):
         va.publish(env)
 
 
 def test_vercel_adapter_with_config_does_not_raise_silent(monkeypatch):
     # With explicit config, publish attempts HTTP (we don't assert success, just not silent)
-    va = VercelQueueAdapter(api_url="https://example.invalid", queue_name="q")
-    va._api_token = "tok"
+    va = VercelQueueAdapter(topic="q", token="tok", base_url="https://example.invalid")
     env = new_envelope(job_type="test.job", payload={"id": "1"})
     # Patch urlopen to simulate success
     import urllib.request
