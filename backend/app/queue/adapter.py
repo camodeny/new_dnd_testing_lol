@@ -83,8 +83,7 @@ class VercelQueueAdapter(QueueAdapter):
 
     Configuration (env, matching the official SDK names where they exist):
 
-    - ``VERCEL_QUEUE_TOPIC`` — topic to publish to. Legacy alias
-      ``VERCEL_QUEUE_NAME`` is honored. Default ``worker-queue``.
+    - ``VERCEL_QUEUE_TOPIC`` — topic to publish to. Default ``worker-queue``.
     - ``VERCEL_REGION`` — queue region (``iad1``, ``sfo1``, ...).
       Default ``iad1`` (same fallback as the official SDK).
     - ``VERCEL_QUEUE_BASE_URL`` — fixed base URL or ``{region}`` template
@@ -111,14 +110,13 @@ class VercelQueueAdapter(QueueAdapter):
         self,
         *,
         topic: str | None = None,
-        queue_name: str | None = None,  # legacy alias for topic
         region: str | None = None,
         base_url: str | None = None,
         token: str | None = None,
         deployment_id: str | None = None,
         oidc_token_provider: Callable[[], str | None] | None = None,
     ):
-        resolved_topic = topic or queue_name or os.getenv("VERCEL_QUEUE_TOPIC") or os.getenv("VERCEL_QUEUE_NAME", self.DEFAULT_TOPIC)
+        resolved_topic = topic or os.getenv("VERCEL_QUEUE_TOPIC") or self.DEFAULT_TOPIC
         if not resolved_topic or not self.TOPIC_PATTERN.match(resolved_topic):
             raise ValueError(
                 f"invalid Vercel Queues topic {resolved_topic!r}: must match ^[A-Za-z0-9_\\-]+$"

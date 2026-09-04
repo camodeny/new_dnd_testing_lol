@@ -65,7 +65,6 @@ class _Capture:
 def _clean_env(monkeypatch):
     for var in (
         "VERCEL_QUEUE_TOPIC",
-        "VERCEL_QUEUE_NAME",
         "VERCEL_REGION",
         "VERCEL_QUEUE_BASE_URL",
         "VERCEL_QUEUE_TOKEN",
