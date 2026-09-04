@@ -23,7 +23,28 @@ async def lifespan(app: FastAPI):
     # Migrations are applied explicitly via `alembic upgrade head` or
     # `python -m scripts.migrate` — never during application startup.
     # See backend/README.md and backend/scripts/migrate.py (from #187).
-    yield
+    # Issue #331: optionally run the transactional outbox relay as a
+    # background worker in long-lived runtimes. Disabled by default so
+    # Vercel serverless cold starts stay cheap; enable with
+    # OUTBOX_RELAY_LOOP_ENABLED=1 (serverless uses the /api/cron/outbox-relay
+    # endpoint via Vercel Cron instead). The loop performs no DDL.
+    import asyncio as _asyncio
+    import os as _os
+
+    _task = None
+    if _os.getenv("OUTBOX_RELAY_LOOP_ENABLED", "").lower() in ("1", "true", "yes", "on"):
+        from app.outbox.relay import outbox_relay_background_loop
+
+        _task = _asyncio.create_task(outbox_relay_background_loop())
+    try:
+        yield
+    finally:
+        if _task is not None:
+            _task.cancel()
+            try:
+                await _task
+            except BaseException:
+                pass
 
 
 def create_app() -> FastAPI:
@@ -54,6 +75,7 @@ def create_app() -> FastAPI:
     from app.dm.router import router as dm_router
     from app.rolls.router import router as rolls_router
     from app.rules.router import router as rules_router
+    from app.outbox.router import router as outbox_cron_router
 
     app.include_router(health_router)
     app.include_router(auth_router)
@@ -69,5 +91,6 @@ def create_app() -> FastAPI:
     app.include_router(dm_router)
     app.include_router(rolls_router)
     app.include_router(rules_router)
+    app.include_router(outbox_cron_router)
 
     return app
