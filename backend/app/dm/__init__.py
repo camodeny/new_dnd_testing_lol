@@ -1,4 +1,4 @@
-"""DM turn/attempt + structured contract — issues #200, #201, #203, #205."""
+"""DM turn/attempt + structured contract — issues #200, #201, #203, #205, #207."""
 from app.dm.contract import (  # noqa: F401
     CONTRACT_VERSION,
     DM_TURN_CONTRACT_V1,
@@ -78,4 +78,32 @@ from app.dm.validators import (  # noqa: F401
     run_with_bounded_regeneration,
     validate_contract,
     validate_contract_or_raise,
+)
+from app.dm.narration import (  # noqa: F401
+    NARRATOR_CONTRACT,
+    PROVIDER_DETERMINISTIC,
+    NarratorDeltaStream,
+    NarratorGenerationError,
+    NarratorRequest,
+    NarrationFidelityError,
+    NarrationProjectionError,
+    NarrationResult,
+    NarrationStreamError,
+    StreamingNarratorFn,
+    ValidatedTurnResult,
+    build_narration_projection,
+    build_narrator_prompt,
+    check_narration_fidelity_or_raise,
+    chunk_narration_text,
+    execute_validated_turn,
+    get_narration_metrics,
+    materialize_final_narration,
+    projection_size_bytes,
+    render_deterministic_narration,
+    reset_narration_metrics,
+    resume_narration_stream,
+    serialize_narration_projection,
+    stream_narration,
+    validate_narration_fidelity,
+    validate_narration_incremental,
 )
