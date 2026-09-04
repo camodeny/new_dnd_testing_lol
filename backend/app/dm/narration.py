@@ -16,7 +16,9 @@ Pipeline (critical path optimized for TTFT after validation):
 2. Narrator expands the projection to prose under ``NARRATOR_CONTRACT`` —
    no re-adjudication, no new consequences, no invented voluntary PC action.
    Default is the deterministic template narrator (no provider); an LLM
-   callable with the same ``(projection) -> str`` shape can be injected.
+   callable taking a contract-bound :class:`NarratorRequest` (built prompt +
+   structured projection) can be injected — the service always prepends the
+   contract, so providers cannot receive narration input without it.
 3. ``validate_narration_fidelity(...)`` — pre-commit fidelity gates for
    secret leakage, unsupported additions, PC agency violations, and
    contradiction with the structured result. Failures raise before the
@@ -263,7 +265,22 @@ def render_deterministic_narration(
     return text
 
 
-NarratorFn = Callable[[dict[str, Any]], str]
+@dataclass
+class NarratorRequest:
+    """Typed provider input — contract-bound narration request.
+
+    The service always builds ``prompt`` via :func:`build_narrator_prompt`
+    (``NARRATOR_CONTRACT`` + canonical projection), so a model-backed
+    provider cannot receive narration input without the no-readjudication /
+    no-invention obligations. ``projection`` is included structured for
+    providers that prefer JSON over prompt text.
+    """
+
+    prompt: str
+    projection: dict[str, Any]
+
+
+NarratorFn = Callable[[NarratorRequest], str]
 
 
 # ── 3. Fidelity checks ────────────────────────────────────────────────────────
@@ -369,9 +386,23 @@ def validate_narration_fidelity(
             break
 
     # — Unsupported additions: numbers / consequences / invented speech —
+    # Number grounding comes from the ENTIRE audience-safe projection (all
+    # public fields: beat claims, roll_request.reason_public/label,
+    # open_player_choice, clarify_question, safe_prelude, table_chat_intent),
+    # never from intentionally-private lanes. A legitimate number the
+    # deterministic renderer emits from any public field must not be
+    # rejected as unsupported.
     narration_numbers = set(re.findall(r"\d+", text))
     claim_numbers = set(re.findall(r"\d+", claim_blob))
-    for num in sorted(narration_numbers - claim_numbers):
+    try:
+        allowed_blob = json.dumps(
+            public_projection(contract), ensure_ascii=False, sort_keys=True
+        )
+        projection_numbers = set(re.findall(r"\d+", allowed_blob))
+    except Exception:
+        projection_numbers = set()
+    grounded_numbers = claim_numbers | projection_numbers
+    for num in sorted(narration_numbers - grounded_numbers):
         violations.append({
             "category": "unsupported_addition", "code": "unsupported_number",
             "message": f"Narration introduces number {num!r} absent from structured result",
@@ -588,7 +619,14 @@ def stream_narration(
         if narrator is None:
             narration_text = render_deterministic_narration(projection, contract)
         else:
-            narration_text = narrator(projection)
+            # Contract-bound request: the provider always receives the built
+            # prompt (NARRATOR_CONTRACT + projection), never bare projection.
+            narration_text = narrator(
+                NarratorRequest(
+                    prompt=build_narrator_prompt(projection),
+                    projection=projection,
+                )
+            )
     except (NarrationFidelityError, NarrationProjectionError):
         raise
     except Exception as exc:
@@ -726,6 +764,121 @@ def stream_narration(
         projection_bytes=proj_bytes, provider=provider,
         ttft_ms=ttft_ms, duration_ms=duration_ms,
         chunk_cadence_ms=list(cadence), completed=True,
+    )
+
+
+@dataclass
+class ValidatedTurnResult:
+    """Outcome of running one validated turn through narration to commit."""
+
+    narration: NarrationResult
+    turn: Any
+    attempt: Any
+    event: Any
+
+
+def execute_validated_turn(
+    db: Session,
+    *,
+    turn_id: uuid.UUID,
+    attempt_id: uuid.UUID,
+    contract: DmTurnContractV1,
+    narrator: NarratorFn | None = None,
+    chunk_size: int = 120,
+    provider: str = PROVIDER_DETERMINISTIC,
+    publish_realtime: bool = True,
+    extra_secrets: set[str] | None = None,
+    pc_names: dict[str, str] | None = None,
+    expected_revision: int | None = None,
+    event_type: str = "dm.turn_resolved",
+    operation_id: str | None = None,
+    actor_id: uuid.UUID | None = None,
+    trace_id: str | None = None,
+) -> ValidatedTurnResult:
+    """Run a validated structured turn through narration to final commit.
+
+    Post-validation / pre-final-commit wiring for issue #207 — this is the
+    production call site that takes a validated ``dm_turn_contract_v1``
+    through the narration + durable-stream path:
+
+    1. ``stage_validated_attempt`` — persist staged effects attempt-local
+       (no campaign-truth mutation).
+    2. ``stream_narration`` — fidelity-gate, then persist each chunk durably
+       via #197 BEFORE/with #198 realtime delivery.
+    3. ``mark_streaming_started`` — stream-start commitment boundary over
+       the durable stream (locks the input set).
+    4. ``commit_turn_with_effects`` — atomic promotion + final commit (#206).
+
+    Failure semantics inherit the callees: pre-first-chunk failure
+    (generation/fidelity) leaves no stream and is freely retryable with the
+    same turn/attempt identity; post-first-chunk failure raises
+    ``NarrationStreamError`` with the recoverable partial stream left intact
+    — resume via :func:`resume_narration_stream`, then
+    ``mark_streaming_started`` + ``commit_turn_with_effects`` manually.
+    """
+    from models.dm import DmTurn
+
+    from app.dm.turns import (
+        commit_turn_with_effects,
+        mark_streaming_started,
+        stage_validated_attempt,
+    )
+
+    turn = db.get(DmTurn, turn_id)
+    if turn is None:
+        raise ValueError(f"Turn {turn_id} not found")
+    try:
+        thread_uuid = uuid.UUID(str(turn.thread_id))
+    except (ValueError, TypeError) as exc:
+        raise ValueError(f"Turn {turn_id} has non-UUID thread_id {turn.thread_id!r}") from exc
+
+    staged = stage_validated_attempt(db, attempt_id, contract)
+
+    narration = stream_narration(
+        db,
+        campaign_id=turn.campaign_id,
+        thread_id=thread_uuid,
+        turn_id=str(turn_id),
+        attempt_id=str(attempt_id),
+        contract=contract,
+        narrator=narrator,
+        chunk_size=chunk_size,
+        provider=provider,
+        audience=staged.audience or turn.audience,
+        publish_realtime=publish_realtime,
+        extra_secrets=extra_secrets,
+        pc_names=pc_names,
+        trace_id=trace_id,
+    )
+
+    mark_streaming_started(db, turn_id, attempt_id, stream_id=narration.stream_id)
+
+    submission_ids = list(staged.submission_ids or [])
+    payload = {
+        "turn_id": str(turn_id),
+        "attempt_id": str(attempt_id),
+        "submission_ids": submission_ids,
+        "narration_stream_id": str(narration.stream_id),
+    }
+    final_turn, final_attempt, event = commit_turn_with_effects(
+        db,
+        turn_id,
+        attempt_id,
+        expected_revision=expected_revision,
+        event_type=event_type,
+        payload=payload,
+        operation_id=operation_id,
+        actor_id=actor_id,
+    )
+    structured_log(
+        logger, logging.INFO, "validated_turn_narrated_committed",
+        turn_id=str(turn_id), attempt_id=str(attempt_id),
+        stream_id=str(narration.stream_id),
+        event_id=str(getattr(event, "id", None)),
+        provider=provider,
+    )
+    return ValidatedTurnResult(
+        narration=narration, turn=final_turn, attempt=final_attempt, event=event
     )
 
 

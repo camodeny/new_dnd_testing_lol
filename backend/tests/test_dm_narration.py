@@ -22,12 +22,13 @@ from app.dm.contract import CONTRACT_VERSION, normalize_contract  # noqa: E402
 from app.dm.narration import (  # noqa: E402
     NARRATOR_CONTRACT,
     NarratorGenerationError,
+    NarratorRequest,
     NarrationFidelityError,
-    NarrationStreamError,
     build_narration_projection,
     build_narrator_prompt,
     check_narration_fidelity_or_raise,
     chunk_narration_text,
+    execute_validated_turn,
     get_narration_metrics,
     materialize_final_narration,
     render_deterministic_narration,
@@ -237,7 +238,7 @@ def test_secret_fact_leak_rejected_pre_commit_with_no_persistence(db):
         stream_narration(
             s, campaign_id=camp_id, thread_id=thread_id,
             turn_id=str(uuid.uuid4()), attempt_id=str(uuid.uuid4()),
-            contract=c, narrator=lambda proj: bad,
+            contract=c, narrator=lambda req: bad,
             publish_realtime=False, extra_secrets={secret},
         )
     assert any(v["category"] == "secret_leakage" for v in ei.value.violations)
@@ -355,7 +356,7 @@ def test_pre_first_chunk_failure_retryable_leaves_no_stream(db):
     c = _respond([_narr_beat("Rain drums on the canvas.")])
     turn_id, attempt_id = str(uuid.uuid4()), str(uuid.uuid4())
 
-    def _boom(proj):
+    def _boom(req):
         raise RuntimeError("provider outage")
 
     with pytest.raises(NarratorGenerationError):
@@ -410,3 +411,145 @@ def test_hidden_dc_value_in_narration_rejected_even_if_invented():
     bad = good + " You need a 14 to succeed."
     with pytest.raises(NarrationFidelityError):
         check_narration_fidelity_or_raise(bad, c)
+
+
+# ── provider contract binding (review finding 2) ──────────────────────────
+
+def test_provider_receives_contract_bound_prompt(db):
+    s, camp_id, thread_id = db
+    c = _respond([_narr_beat("Rain drums on the canvas.")])
+    seen: dict = {}
+
+    def _provider(req: NarratorRequest) -> str:
+        seen["prompt"] = req.prompt
+        seen["projection"] = req.projection
+        assert isinstance(req, NarratorRequest)
+        return render_deterministic_narration(req.projection, c)
+
+    res = stream_narration(
+        s, campaign_id=camp_id, thread_id=thread_id,
+        turn_id=str(uuid.uuid4()), attempt_id=str(uuid.uuid4()),
+        contract=c, narrator=_provider, publish_realtime=False,
+        provider="test-llm-v1",
+    )
+    assert res.completed and res.provider == "test-llm-v1"
+    # The provider cannot get model-backed narration without the contract:
+    # the service built the prompt with NARRATOR_CONTRACT prepended.
+    assert NARRATOR_CONTRACT.splitlines()[0] in seen["prompt"]
+    assert "re-adjudicate" in seen["prompt"]
+    assert "Rain drums on the canvas." in seen["prompt"]
+    assert seen["projection"]["beats"][0]["claims"][0]["text"] == "Rain drums on the canvas."
+
+
+# ── number grounding across all public fields (review finding 3) ─────────
+
+def _await_roll_with_numbers():
+    return normalize_contract({
+        "contract_version": CONTRACT_VERSION, "mode": "await_roll", "reason": "uncertain footing",
+        "beats": [_narr_beat(
+            "Loose stones cover the ledge ahead.",
+            kind="roll_instruction", origin="dm_adjudication",
+        )],
+        "roll_request": {
+            "request_id": "roll_1", "roll_kind": "check",
+            "ability_or_skill": "Acrobatics", "label": "Acrobatics check 2",
+            "advantage_state": "normal",
+            "reason_public": "The 3 torches on the ledge gutter in the wind.",
+            "dc_private": 14,
+        },
+        "open_player_choice": "What do you do with the 5 torches?",
+    })
+
+
+def test_numbers_in_roll_and_choice_public_fields_are_grounded():
+    c = _await_roll_with_numbers()
+    text = render_deterministic_narration(build_narration_projection(c), c)
+    assert "3 torches" in text and "Acrobatics check 2" in text and "5 torches" in text
+    assert validate_narration_fidelity(text, c) == []
+    # The hidden DC is still ungrounded — never part of the public projection.
+    with pytest.raises(NarrationFidelityError) as ei:
+        check_narration_fidelity_or_raise(text + " You need a 14 to succeed.", c)
+    assert any(v["code"] == "unsupported_number" for v in ei.value.violations)
+
+
+def test_numbers_in_clarify_question_grounded():
+    c = normalize_contract({
+        "contract_version": CONTRACT_VERSION, "mode": "clarify", "reason": "ambiguous target",
+        "beats": [_narr_beat("The corridor forks into darkness.")],
+        "clarify_question": "Do you take the 2nd left or the 3rd right?",
+    })
+    text = render_deterministic_narration(build_narration_projection(c), c)
+    assert "2nd left" in text and "3rd right" in text
+    assert validate_narration_fidelity(text, c) == []
+
+
+def test_numbers_in_table_chat_intent_grounded():
+    c = normalize_contract({
+        "contract_version": CONTRACT_VERSION, "mode": "table_chat", "reason": "logistics",
+        "beats": [],
+        "table_chat_intent": "Discuss the 4 missing supply packs before continuing.",
+    })
+    text = render_deterministic_narration(build_narration_projection(c), c)
+    assert "4 missing supply packs" in text
+    assert validate_narration_fidelity(text, c) == []
+
+
+def test_numbers_in_safe_prelude_grounded():
+    c = normalize_contract({
+        "contract_version": CONTRACT_VERSION, "mode": "need_evidence", "reason": "memory check",
+        "beats": [],
+        "safe_prelude": "Checking the chronicle for the 6 sealed letters.",
+        "evidence_requests": [{
+            "id": "ev_1", "tool": "search_campaign_memory",
+            "query": "sealed letters",
+        }],
+    })
+    text = render_deterministic_narration(build_narration_projection(c), c)
+    assert "6 sealed letters" in text
+    assert validate_narration_fidelity(text, c) == []
+
+
+# ── post-validation → narration → commit wiring (review finding 1) ───────
+
+def test_execute_validated_turn_runs_narration_to_commit(db):
+    from app.runtime.submissions import accept_submission
+    from app.dm.turns import coordinate_turn
+
+    s, camp_id, thread_id = db
+    tid_str = str(thread_id)
+    user_id = uuid.uuid4()
+    accept_submission(
+        s, campaign_id=camp_id, user_id=user_id,
+        raw_content="I listen at the door.",
+        segments=[{"type": "ic", "text": "I listen at the door."}],
+        thread_id=tid_str,
+    )
+    s.commit()
+    turn, attempt = coordinate_turn(s, camp_id, tid_str)
+    assert turn.status == "pending"
+
+    c = _respond(
+        [_narr_beat("Silence presses against the oak door.")],
+        staged_effects=[{
+            "id": "eff_1", "effect_type": "record_world_event",
+            "arguments": {"event_type": "listened", "summary": "Listened at door", "visibility": "public"},
+        }],
+        open_player_choice="What do you do?",
+    )
+    out = execute_validated_turn(
+        s, turn_id=turn.id, attempt_id=attempt.id, contract=c,
+        publish_realtime=False,
+    )
+    # Narration streamed durably to completion before the final commit.
+    assert out.narration.completed and out.narration.chunk_count >= 1
+    assert out.narration.final_text and "Silence presses" in out.narration.final_text
+    # Stream-start boundary crossed, then atomic final commit.
+    assert out.turn.status == "succeeded"
+    assert out.attempt.status == "succeeded"
+    assert str(out.attempt.stream_id) == str(out.narration.stream_id)
+    assert out.event is not None
+    s.refresh(s.get(Campaign, camp_id))
+    assert s.get(Campaign, camp_id).revision == 1
+    mat = materialize_final_narration(s, out.narration.stream_id)
+    assert mat["final_text"] == out.narration.final_text
+    assert mat["status"] == "completed"
