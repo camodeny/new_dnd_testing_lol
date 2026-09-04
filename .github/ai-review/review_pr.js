@@ -7,7 +7,9 @@ const { chromium } = require("playwright");
 
 const CHATGPT_URL = "https://chatgpt.com/";
 const CHATGPT_PROJECTS_URL = "https://chatgpt.com/projects";
-const PROJECT_ROUTE_RE = /\/g\/[^/]+\/project(?:[/?#]|$)/i;
+// ChatGPT has used both /g/<id>/project and /g/<id>/c/<conversation> for
+// project chats.  Treat either route as a successful project transition.
+const PROJECT_ROUTE_RE = /\/g\/[^/]+\/(?:project|c)(?:[/?#]|$)/i;
 const DEFAULT_PROJECT = "DND AI AUTO";
 const DEFAULT_PROFILE = path.join(os.homedir(), ".aireview-chatgpt-profile");
 const DEFAULT_TIMEOUT_MS = 10 * 60 * 1000;
@@ -70,7 +72,7 @@ async function openProject(page, projectName) {
     10000,
   );
   await project.click();
-  await page.waitForURL(PROJECT_ROUTE_RE, { timeout: 15000 });
+  await page.waitForURL(PROJECT_ROUTE_RE, { timeout: 15000, waitUntil: "commit" });
 }
 
 function composerLocators(page) {
