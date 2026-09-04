@@ -16,29 +16,15 @@ from fastapi import APIRouter, Depends, HTTPException, Request
 from sqlalchemy.exc import SQLAlchemyError
 from sqlalchemy.orm import Session
 
-from app.campaigns.service import is_campaign_member, parse_campaign_id
+from app.campaigns.auth import authorized_campaign
 from app.deps.auth import resolve_profile
 from app.realtime.channels import live_table_channel, parse_live_table_channel
 from app.realtime.service import get_realtime_metrics
 from app.runtime.threads import ThreadAuthorizationError, ThreadNotFoundError, assert_can_read_thread, parse_thread_id
 from database import get_db
-from models.campaigns import Campaign
 
 router = APIRouter()
 logger = logging.getLogger(__name__)
-
-
-def _authorized_campaign(db: Session, campaign_id: str, user_id: uuid.UUID) -> Campaign:
-    try:
-        cid = parse_campaign_id(campaign_id)
-    except ValueError as exc:
-        raise HTTPException(status_code=404, detail="Invalid campaign id") from exc
-    campaign = db.get(Campaign, cid)
-    if campaign is None:
-        raise HTTPException(status_code=404, detail="Campaign not found")
-    if campaign.owner_id != user_id and not is_campaign_member(db, cid, user_id):
-        raise HTTPException(status_code=403, detail="Not a member of this campaign")
-    return campaign
 
 
 @router.get("/api/campaigns/{campaign_id}/realtime/channels")
@@ -50,7 +36,7 @@ def list_realtime_channels(campaign_id: str, request: Request, db: Session = Dep
     Supabase Realtime (`supabase.channel(name).subscribe()`).
     """
     profile = resolve_profile(request, db)
-    campaign = _authorized_campaign(db, campaign_id, profile.id)
+    campaign = authorized_campaign(db, campaign_id, profile.id)
     from app.runtime.threads import list_threads_for_user
 
     threads = list_threads_for_user(db, campaign.id, profile.id)
@@ -78,7 +64,7 @@ def authorize_realtime_channel(campaign_id: str, payload: dict, request: Request
     404 if campaign/thread not found or private thread hidden.
     """
     profile = resolve_profile(request, db)
-    campaign = _authorized_campaign(db, campaign_id, profile.id)
+    campaign = authorized_campaign(db, campaign_id, profile.id)
 
     channel = payload.get("channel") if isinstance(payload, dict) else None
     thread_id_raw = payload.get("thread_id") if isinstance(payload, dict) else None
@@ -138,7 +124,7 @@ def get_realtime_token(campaign_id: str, request: Request, db: Session = Depends
     realtime_resume_token so the client can detect gaps.
     """
     profile = resolve_profile(request, db)
-    campaign = _authorized_campaign(db, campaign_id, profile.id)
+    campaign = authorized_campaign(db, campaign_id, profile.id)
     thread_id_raw = request.query_params.get("thread_id")
     from app.snapshot.service import build_live_table_snapshot
 

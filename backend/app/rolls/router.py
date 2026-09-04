@@ -4,9 +4,9 @@ import uuid
 from fastapi import APIRouter, Depends, HTTPException, Request, Response
 from sqlalchemy.orm import Session
 
+from app.campaigns.auth import authorized_campaign, require_owner
 from app.deps.auth import resolve_profile
 from app.deps.idempotency import execute_http_idempotent, require_idempotency_key
-from app.dm.router import _authorized_campaign, _require_owner
 from app.rolls.service import (
     RollAuthorizationError, RollLifecycleError, cancel_or_replace, fulfill_roll,
     get_fulfillment, list_roll_requests, request_rolls,
@@ -47,8 +47,8 @@ def _request_or_404(db: Session, campaign_id: uuid.UUID, request_id: uuid.UUID) 
 @router.post("/api/campaigns/{campaign_id}/dm-turns/{turn_id}/roll-requests", status_code=201)
 def create_roll_requests(campaign_id: str, turn_id: str, payload: dict, request: Request, response: Response, db: Session = Depends(get_db)):
     profile = resolve_profile(request, db)
-    campaign = _authorized_campaign(db, campaign_id, profile.id)
-    _require_owner(campaign, profile.id)
+    campaign = authorized_campaign(db, campaign_id, profile.id)
+    require_owner(campaign, profile.id)
     tid = _id(turn_id, "turn id")
     turn = _visible_turn(db, campaign.id, tid, profile.id)
     attempt_raw = payload.get("attempt_id")
@@ -82,7 +82,7 @@ def create_roll_requests(campaign_id: str, turn_id: str, payload: dict, request:
 @router.get("/api/campaigns/{campaign_id}/roll-requests")
 def get_roll_requests(campaign_id: str, request: Request, db: Session = Depends(get_db)):
     profile = resolve_profile(request, db)
-    campaign = _authorized_campaign(db, campaign_id, profile.id)
+    campaign = authorized_campaign(db, campaign_id, profile.id)
     thread_filter = request.query_params.get("thread_id")
     rows = list_roll_requests(db, campaign_id=campaign.id, thread_id=thread_filter)
     visible = []
@@ -102,7 +102,7 @@ def get_roll_requests(campaign_id: str, request: Request, db: Session = Depends(
 @router.post("/api/campaigns/{campaign_id}/roll-requests/{roll_request_id}/fulfill")
 def fulfill_roll_request(campaign_id: str, roll_request_id: str, payload: dict, request: Request, response: Response, db: Session = Depends(get_db)):
     profile = resolve_profile(request, db)
-    campaign = _authorized_campaign(db, campaign_id, profile.id)
+    campaign = authorized_campaign(db, campaign_id, profile.id)
     rid = _id(roll_request_id, "roll request id")
     row = _request_or_404(db, campaign.id, rid)
     _visible_turn(db, campaign.id, row.turn_id, profile.id)
@@ -131,8 +131,8 @@ def fulfill_roll_request(campaign_id: str, roll_request_id: str, payload: dict, 
 @router.post("/api/campaigns/{campaign_id}/roll-requests/{roll_request_id}/cancel")
 def cancel_roll_request(campaign_id: str, roll_request_id: str, payload: dict, request: Request, response: Response, db: Session = Depends(get_db)):
     profile = resolve_profile(request, db)
-    campaign = _authorized_campaign(db, campaign_id, profile.id)
-    _require_owner(campaign, profile.id)
+    campaign = authorized_campaign(db, campaign_id, profile.id)
+    require_owner(campaign, profile.id)
     rid = _id(roll_request_id, "roll request id")
     row = _request_or_404(db, campaign.id, rid)
     _visible_turn(db, campaign.id, row.turn_id, profile.id)

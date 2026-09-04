@@ -6,7 +6,7 @@ import uuid
 from fastapi import APIRouter, Depends, HTTPException, Request, Response
 from sqlalchemy.orm import Session
 
-from app.campaigns.service import is_campaign_member, parse_campaign_id
+from app.campaigns.auth import authorized_campaign
 from app.deps.auth import resolve_profile
 from app.deps.idempotency import execute_http_idempotent, require_idempotency_key
 from app.runtime.submissions import (
@@ -29,27 +29,12 @@ from app.runtime.threads import (
     resolve_thread_id,
 )
 from database import get_db
-from models.campaigns import Campaign
 from models.threads import CampaignThreadMember
 from models.threads import PlayerSubmission
 from models.threads import PlayerSubmissionSegment
 
 router = APIRouter()
 logger = logging.getLogger(__name__)
-
-
-def _authorized_campaign(db: Session, campaign_id: str, user_id: uuid.UUID) -> Campaign:
-    try:
-        cid = parse_campaign_id(campaign_id)
-    except ValueError as exc:
-        raise HTTPException(status_code=404, detail="Invalid campaign id") from exc
-    campaign = db.get(Campaign, cid)
-    if campaign is None:
-        raise HTTPException(status_code=404, detail="Campaign not found")
-    if campaign.owner_id != user_id and not is_campaign_member(db, cid, user_id):
-        logger.info("player_submission rejected campaign_id=%s reason=not_member", cid)
-        raise HTTPException(status_code=403, detail="Not a member of this campaign")
-    return campaign
 
 
 @router.post("/api/campaigns/{campaign_id}/submissions", status_code=201)
@@ -61,7 +46,7 @@ def create_player_submission(
     db: Session = Depends(get_db),
 ):
     profile = resolve_profile(request, db)
-    campaign = _authorized_campaign(db, campaign_id, profile.id)
+    campaign = authorized_campaign(db, campaign_id, profile.id)
 
     raw_thread = (
         str(payload.get("thread_id", "main"))
@@ -236,7 +221,7 @@ def get_player_submissions(
     campaign_id: str, request: Request, db: Session = Depends(get_db)
 ):
     profile = resolve_profile(request, db)
-    campaign = _authorized_campaign(db, campaign_id, profile.id)
+    campaign = authorized_campaign(db, campaign_id, profile.id)
     # Optional thread_id query param; defaults to shared campaign thread for backward compat
     raw_thread = request.query_params.get("thread_id", "main")
     try:
@@ -269,7 +254,7 @@ def list_campaign_threads(
     campaign_id: str, request: Request, db: Session = Depends(get_db)
 ):
     profile = resolve_profile(request, db)
-    campaign = _authorized_campaign(db, campaign_id, profile.id)
+    campaign = authorized_campaign(db, campaign_id, profile.id)
     # Ensure shared thread exists so its id survives reconnects
     get_or_create_campaign_thread(db, campaign.id, created_by=profile.id)
     db.commit()
@@ -304,7 +289,7 @@ def get_or_create_ai_dm_thread(
     campaign_id: str, request: Request, db: Session = Depends(get_db)
 ):
     profile = resolve_profile(request, db)
-    campaign = _authorized_campaign(db, campaign_id, profile.id)
+    campaign = authorized_campaign(db, campaign_id, profile.id)
     try:
         thread, created = get_or_create_private_gameplay_thread(
             db,
@@ -327,7 +312,7 @@ def get_or_create_direct_thread(
     campaign_id: str, payload: dict, request: Request, db: Session = Depends(get_db)
 ):
     profile = resolve_profile(request, db)
-    campaign = _authorized_campaign(db, campaign_id, profile.id)
+    campaign = authorized_campaign(db, campaign_id, profile.id)
     raw_participant_id = payload.get("participant_id")
     try:
         participant_id = uuid.UUID(str(raw_participant_id))
@@ -361,7 +346,7 @@ def get_campaign_thread_detail(
     campaign_id: str, thread_id: str, request: Request, db: Session = Depends(get_db)
 ):
     profile = resolve_profile(request, db)
-    campaign = _authorized_campaign(db, campaign_id, profile.id)
+    campaign = authorized_campaign(db, campaign_id, profile.id)
     try:
         tid = parse_thread_id(thread_id)
         assert_can_read_thread(db, campaign.id, tid, profile.id)
@@ -387,7 +372,7 @@ def create_campaign_thread(
     campaign_id: str, payload: dict, request: Request, db: Session = Depends(get_db)
 ):
     profile = resolve_profile(request, db)
-    campaign = _authorized_campaign(db, campaign_id, profile.id)
+    campaign = authorized_campaign(db, campaign_id, profile.id)
     thread_type = str(payload.get("thread_type", "private"))
     if thread_type not in ("private",):
         raise HTTPException(
@@ -431,7 +416,7 @@ def get_thread_submissions(
     campaign_id: str, thread_id: str, request: Request, db: Session = Depends(get_db)
 ):
     profile = resolve_profile(request, db)
-    campaign = _authorized_campaign(db, campaign_id, profile.id)
+    campaign = authorized_campaign(db, campaign_id, profile.id)
     try:
         tid = parse_thread_id(thread_id)
         assert_can_read_thread(db, campaign.id, tid, profile.id)
