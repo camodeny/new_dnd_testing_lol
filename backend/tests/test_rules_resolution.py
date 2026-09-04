@@ -9,9 +9,9 @@ import pytest
 from app.rules.resolution import (
     ResolutionError,
     ResolutionLedger,
+    apply_resolution_consequence,
     combine_advantage,
     resolve_ability_check,
-    resolve_d20_roll,
     resolve_modifier,
     resolve_saving_throw,
     runtime_d20,
@@ -215,7 +215,7 @@ def test_natural_20_and_1_override_total_vs_dc():
 def test_pc_dice_are_supplied_never_generated():
     sheet = hero(wisdom=10)
     with pytest.raises(ResolutionError) as exc:
-        resolve_ability_check(roller="pc", skill="perception", sheet=sheet, dice=None, dc=10)
+        resolve_ability_check(roller="pc", skill="perception", sheet=sheet, dice=None, dc=10, roll_id="p0")
     assert exc.value.code == "missing_player_die"
     res = resolve_ability_check(roller="pc", skill="perception", sheet=sheet, dice=[11], dc=10, roll_id="p1")
     assert res.die_source == "player_supplied"
@@ -287,24 +287,24 @@ def test_hidden_npc_roll_hides_dice_and_total():
 
 def test_missing_inputs_produce_explicit_errors():
     with pytest.raises(ResolutionError) as exc:
-        resolve_ability_check(roller="npc", skill="perception", sheet=None, modifier=None, dice=[10])
+        resolve_ability_check(roller="npc", skill="perception", sheet=None, modifier=None, dice=[10], roll_id="m1")
     assert exc.value.code == "missing_mechanical_input"
 
     sheet = hero()
     with pytest.raises(ResolutionError) as exc:
-        resolve_ability_check(roller="pc", skill="not_a_skill", sheet=sheet, dice=[10])
+        resolve_ability_check(roller="pc", skill="not_a_skill", sheet=sheet, dice=[10], roll_id="m2")
     assert exc.value.code == "unknown_skill"
 
     with pytest.raises(ResolutionError) as exc:
-        resolve_saving_throw(roller="pc", ability="luck", sheet=sheet, dice=[10])
+        resolve_saving_throw(roller="pc", ability="luck", sheet=sheet, dice=[10], roll_id="m3")
     assert exc.value.code == "unknown_ability"
 
     with pytest.raises(ResolutionError) as exc:
-        resolve_ability_check(roller="pc", sheet=sheet, dice=[10])  # neither skill nor ability
+        resolve_ability_check(roller="pc", sheet=sheet, dice=[10], roll_id="m4")  # neither skill nor ability
     assert exc.value.code == "missing_target"
 
     with pytest.raises(ResolutionError) as exc:
-        resolve_ability_check(roller="pc", skill="perception", sheet=FakeSheet(strength=99), dice=[10])
+        resolve_ability_check(roller="pc", skill="perception", sheet=FakeSheet(strength=99), dice=[10], roll_id="m5")
     assert exc.value.code == "invalid_ability_score"  # invalid sheet blocks, never guesses
 
 
@@ -341,3 +341,132 @@ def test_result_carries_audit_provenance():
     assert res.provenance["die_source"] == "player_supplied"
     assert res.provenance["resolution_version"] == "resolution_v1"
     assert res.modifier_components  # input values recorded for audit/explanation
+
+
+# ── HOLD finding 1: hidden-roll nat-flag privacy ──────────────────────────
+
+
+def _hidden_npc_roll(die: int, roll_id: str):
+    return resolve_saving_throw(roller="npc", ability="dexterity", modifier=2,
+                                dice=[die], dc=12, die_visibility="hidden", roll_id=roll_id)
+
+
+def test_hidden_rolls_never_leak_natural_flags_or_die():
+    for die, rid in [(1, "priv-n1"), (20, "priv-n20"), (10, "priv-mid")]:
+        res = _hidden_npc_roll(die, rid)
+        assert (res.is_natural_20, res.is_natural_1) == ((die == 20), (die == 1))  # private model keeps truth
+        public = res.public_projection()
+        assert "is_natural_20" not in public
+        assert "is_natural_1" not in public
+        assert "die_kept" not in public
+        assert "dice_all" not in public
+        assert "total" not in public
+        assert "modifier" not in public
+        assert "success" in public  # only the intended observable outcome
+        assert res.to_event_payload(include_private=False) == public
+        # Nat-1/nat-20 hidden outcomes are indistinguishable from mid values
+        # apart from the allowed success bit: no flag, no die-derivable field.
+        assert set(public) == {"roll_id", "kind", "target", "advantage_state", "success", "status"}
+
+
+def test_public_rolls_keep_natural_flags():
+    sheet = hero(wisdom=10)
+    crit = resolve_ability_check(roller="pc", skill="perception", sheet=sheet,
+                                 dice=[20], dc=100, roll_id="pub-n20")
+    assert crit.public_projection()["is_natural_20"] is True
+    assert crit.public_projection()["is_natural_1"] is False
+    fumble = resolve_ability_check(roller="pc", skill="perception", sheet=sheet,
+                                   dice=[1], dc=1, roll_id="pub-n1")
+    assert fumble.public_projection()["is_natural_1"] is True
+
+
+# ── HOLD finding 2: stable-ID duplicate boundary ──────────────────────────
+
+
+def test_roll_id_is_required_never_minted():
+    sheet = hero(wisdom=10)
+    for bad in (None, "", "   "):
+        with pytest.raises(ResolutionError) as exc:
+            resolve_ability_check(roller="pc", skill="perception", sheet=sheet,
+                                  dice=[10], dc=10, roll_id=bad)
+        assert exc.value.code == "missing_roll_id"
+        assert exc.value.field == "roll_id"
+
+
+def test_retry_without_id_cannot_silently_double_apply():
+    # No fallback identity is minted: the retry raises before any resolution
+    # or consequence runs, so a ledger/DB guard can never see two IDs.
+    applied: list[str] = []
+
+    def attempt(roll_id):
+        res = resolve_ability_check(roller="pc", skill="perception", sheet=hero(wisdom=10),
+                                    dice=[14], dc=10, roll_id=roll_id)
+        applied.append(res.roll_id)
+        return res
+
+    with pytest.raises(ResolutionError) as exc:
+        attempt(None)
+    assert exc.value.code == "missing_roll_id"
+    assert applied == []  # nothing resolved, nothing to apply
+
+
+def _sqlite_db():
+    from sqlalchemy import create_engine
+    from sqlalchemy.dialects.sqlite.base import SQLiteTypeCompiler
+    from sqlalchemy.orm import sessionmaker
+    if not hasattr(SQLiteTypeCompiler, "_patched_jsonb"):
+        SQLiteTypeCompiler.visit_JSONB = lambda self, type_, **kw: "JSON"  # type: ignore
+        SQLiteTypeCompiler._patched_jsonb = True  # type: ignore
+    from database import Base
+    engine = create_engine("sqlite://", connect_args={"check_same_thread": False})
+    Base.metadata.create_all(engine)
+    return sessionmaker(bind=engine)
+
+
+def test_durable_retry_with_same_id_replays_without_reexecuting():
+    import uuid as _uuid
+    from models.profiles import Profile
+    factory = _sqlite_db()
+    actor = _uuid.uuid4()
+    with factory() as db:
+        db.add(Profile(id=actor, email="ledger@example.com"))
+        db.commit()
+    res = resolve_saving_throw(roller="npc", ability="dexterity", modifier=2,
+                               dice=[17], dc=12, die_visibility="hidden", roll_id="durable-roll-1")
+    calls: list[int] = []
+    with factory() as db:
+        first, replayed = apply_resolution_consequence(
+            db, actor_id=actor, scope_type="campaign", scope_id="camp-a",
+            resolution=res, execute=lambda: calls.append(1) or {"applied": res.roll_id})
+        assert replayed is False
+    with factory() as restarted_db:  # new session = restart/worker boundary
+        second, replayed_second = apply_resolution_consequence(
+            restarted_db, actor_id=actor, scope_type="campaign", scope_id="camp-a",
+            resolution=res,
+            execute=lambda: (_ for _ in ()).throw(AssertionError("must not re-execute on retry")))
+        assert replayed_second is True
+    assert first == second == {"applied": "durable-roll-1"}
+    assert calls == [1]
+
+
+def test_durable_same_id_different_payload_is_conflict_not_double_apply():
+    import uuid as _uuid
+    from app.idempotency import IdempotencyConflictError
+    from models.profiles import Profile
+    factory = _sqlite_db()
+    actor = _uuid.uuid4()
+    with factory() as db:
+        db.add(Profile(id=actor, email="conflict@example.com"))
+        db.commit()
+    first = resolve_saving_throw(roller="npc", ability="dexterity", modifier=2,
+                                 dice=[17], dc=12, die_visibility="hidden", roll_id="durable-roll-2")
+    altered = resolve_saving_throw(roller="npc", ability="dexterity", modifier=2,
+                                   dice=[5], dc=12, die_visibility="hidden", roll_id="durable-roll-2")
+    with factory() as db:
+        apply_resolution_consequence(
+            db, actor_id=actor, scope_type="campaign", scope_id="camp-b",
+            resolution=first, execute=lambda: {"applied": True})
+        with pytest.raises(IdempotencyConflictError):
+            apply_resolution_consequence(
+                db, actor_id=actor, scope_type="campaign", scope_id="camp-b",
+                resolution=altered, execute=lambda: {"applied": "tampered"})

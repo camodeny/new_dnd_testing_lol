@@ -14,7 +14,12 @@ Invariants:
 - 2024 D20 Tests: natural 20 auto-succeeds, natural 1 auto-fails (vs a DC).
 - Hidden DCs never appear in public projections or player telemetry.
 - Resolution is pure — safe to retry. Duplicate *application* of one logical
-  roll is guarded by :class:`ResolutionLedger`.
+  roll is guarded by :class:`ResolutionLedger` (process-local, single-worker
+  only) or, durably across restarts/workers, by
+  :func:`apply_resolution_consequence`, which reuses the
+  ``app.idempotency`` durable command record keyed by the stable ``roll_id``.
+  ``roll_id`` is caller-supplied and never minted here so a retry keeps the
+  same identity and cannot bypass the guard.
 - Missing inputs produce :class:`ResolutionError`, never guessed modifiers.
 
 Out of scope: attacks/damage (#226).
@@ -25,7 +30,6 @@ from __future__ import annotations
 import logging
 import secrets
 import time
-import uuid
 from typing import Any, Callable, Literal, Protocol
 
 from pydantic import BaseModel, ConfigDict, Field
@@ -381,7 +385,13 @@ class D20Resolution(StrictModel):
     provenance: dict[str, Any] = Field(default_factory=dict)
 
     def public_projection(self) -> dict[str, Any]:
-        """Observable outcome data: hidden DC/dice stay DM-only unless public."""
+        """Observable outcome data: hidden DC/dice stay DM-only unless public.
+
+        Natural-20/1 flags are die metadata, so they are only exposed when
+        ``die_visibility == "public"``. A hidden roll's projection carries
+        only the intended observable outcome (``success``) — never the flags
+        nor any die-derivable values (dice, kept die, total, modifier).
+        """
         value: dict[str, Any] = {
             "roll_id": self.roll_id,
             "kind": self.kind,
@@ -389,11 +399,10 @@ class D20Resolution(StrictModel):
             "advantage_state": self.advantage_state,
             "success": self.success,
             "status": self.status,
-            "is_natural_20": self.is_natural_20,
-            "is_natural_1": self.is_natural_1,
         }
         if self.die_visibility == "public":
-            value.update(die_kept=self.die_kept, dice_all=list(self.dice_all), total=self.total, modifier=self.modifier)
+            value.update(die_kept=self.die_kept, dice_all=list(self.dice_all), total=self.total, modifier=self.modifier,
+                         is_natural_20=self.is_natural_20, is_natural_1=self.is_natural_1)
         if self.dc_visibility == "public":
             value["dc"] = self.dc
         return value
@@ -405,6 +414,23 @@ class D20Resolution(StrictModel):
 
 
 # ── Core resolution ───────────────────────────────────────────────────────
+
+
+def _require_roll_id(roll_id: str | None) -> str:
+    """Validate the caller-supplied stable logical roll ID.
+
+    IDs are never minted here: the caller creates one ID per logical roll
+    (first attempt) and reuses it on every retry so the duplicate-application
+    guard keeps the same identity. A missing/blank ID raises instead of
+    silently minting a fresh identity that would bypass dedup.
+    """
+    if not isinstance(roll_id, str) or not roll_id.strip() or len(roll_id) > 128:
+        raise ResolutionError(
+            "missing_roll_id",
+            "roll_id is required: supply one stable ID per logical roll and reuse it on retry",
+            field="roll_id",
+        )
+    return roll_id
 
 
 def _validate_dc(dc: int | None) -> int | None:
@@ -441,9 +467,13 @@ def resolve_d20_roll(
     - ``roller="npc"``: ``dice`` may be DM-supplied or runtime-generated.
     - ``advantage_sources`` (2024 cancellation) takes precedence when given;
       otherwise the explicit ``advantage_state`` is used as-is.
+    - ``roll_id`` is required: the caller mints one stable ID per logical
+      roll on first attempt and reuses it on every retry. It is the
+      duplicate-application identity (see :class:`ResolutionLedger` and
+      :func:`apply_resolution_consequence`).
     """
     t0 = time.monotonic()
-    rid = roll_id or uuid.uuid4().hex[:12]
+    rid = _require_roll_id(roll_id)
     invalid_input: str | None = None
     calculation_path = "unresolved"
     logged_state: str = advantage_state or "normal"
@@ -578,11 +608,20 @@ def resolve_saving_throw(**kwargs: Any) -> D20Resolution:
 
 
 class ResolutionLedger:
-    """Guard so one logical roll cannot apply a consequence twice.
+    """Process-local guard so one logical roll cannot apply twice in-process.
 
     Resolution itself is pure (safe to retry); register the ``roll_id`` here
     when its consequence is applied. Returns ``"applied"`` on first use and
     ``"duplicate"`` thereafter.
+
+    Scope warning: this is an opt-in, in-memory ``set``. It does not survive
+    restarts and does not protect across workers/processes, and it is not
+    automatically wired to consequence application — callers must invoke it
+    (or, preferably, the durable boundary below) on the consequence path.
+    For crash-safe / multi-worker idempotency, use
+    :func:`apply_resolution_consequence`, which persists the consumed
+    ``roll_id`` via the existing ``app.idempotency`` durable command record
+    (no new mechanism) and replays the committed consequence on retry.
     """
 
     def __init__(self) -> None:
@@ -599,3 +638,40 @@ class ResolutionLedger:
 
     def __len__(self) -> int:
         return len(self._applied)
+
+
+def apply_resolution_consequence(
+    db: Any,
+    *,
+    actor_id: Any,
+    scope_type: str,
+    scope_id: Any,
+    resolution: D20Resolution,
+    execute: Callable[[], dict | list],
+    command_type: str = "d20_resolution.apply",
+) -> tuple[dict | list, bool]:
+    """Durably apply one logical roll's consequence exactly once.
+
+    Durable/idempotent application boundary for the #225 duplicate-consequence
+    acceptance criterion. Keyed by the stable ``resolution.roll_id``
+    (caller-minted on first attempt, reused on retry) via the existing
+    ``app.idempotency.execute_idempotent_command`` record — no new persistence
+    mechanism. Concurrent workers serialize on the DB unique identity; restarts
+    replay the committed result instead of re-executing. A retry that resolves
+    to materially different dice/modifier payload raises
+    ``IdempotencyConflictError`` rather than double-applying.
+
+    Returns ``(result, replayed)`` where ``replayed`` is True on dedup hits.
+    """
+    from app.idempotency import execute_idempotent_command
+
+    return execute_idempotent_command(
+        db,
+        actor_id=actor_id,
+        idempotency_key=resolution.roll_id,
+        command_type=command_type,
+        scope_type=scope_type,
+        scope_id=scope_id,
+        payload=resolution.model_dump(mode="json"),
+        execute=execute,
+    )
