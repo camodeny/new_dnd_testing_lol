@@ -144,14 +144,36 @@ def _handle_update_scene(db: Session, campaign: Campaign, effect: dict[str, Any]
     if not isinstance(patch, dict):
         raise ValueError(f"Staged effect {effect.get('id')!r} scene_patch must be an object")
     prior = int(campaign.revision) if campaign.revision is not None else 0
+    # Key-presence (not truthiness) patch semantics: an explicit empty list /
+    # dict / string clears state, while an absent key leaves it unchanged.
+    # `patch.get("x") or patch.get("alias")` would treat [] / {} / "" as
+    # absent and silently keep stale state.
+    def _pick(primary: str, alias: str):
+        if primary in patch:
+            return patch[primary]
+        if alias in patch:
+            return patch[alias]
+        return None
+    if "present_actors" in patch:
+        present_actors = patch["present_actors"]
+    elif "present_actor_names" in patch:
+        present_actors = patch["present_actor_names"]
+    else:
+        present_actors = None
+    if "environment" in patch:
+        environment = patch["environment"]
+    elif "state" in patch:
+        environment = patch["state"]
+    else:
+        environment = None
     apply_scene_update_inline(
         db, campaign, new_revision=prior + 1,
         location_entity_id=patch.get("location_entity_id"),
-        location_name=patch.get("location_name") or patch.get("location"),
-        fictional_time=patch.get("fictional_time") or patch.get("time"),
+        location_name=_pick("location_name", "location"),
+        fictional_time=_pick("fictional_time", "time"),
         fictional_time_details=patch.get("fictional_time_details"),
-        present_actors=patch.get("present_actors") or patch.get("present_actor_names"),
-        environment=patch.get("environment") or patch.get("state"),
+        present_actors=present_actors,
+        environment=environment,
         visibility=args.get("visibility") or patch.get("visibility"),
         source_turn_id=turn.id, source_attempt_id=attempt.id,
         operation_id=getattr(attempt, "commit_operation_id", None) or str(attempt.id),

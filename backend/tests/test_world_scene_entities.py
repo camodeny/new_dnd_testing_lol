@@ -276,6 +276,147 @@ def test_failed_entity_commit_leaves_no_half_created_authority():
     assert list_campaign_events(db, cid) == []
 
 
+# ── reviewer HOLD findings (PR #348) ─────────────────────────────────────────
+
+def test_authoritative_entity_event_carries_real_entity_id():
+    Fac, cid, _owner = _setup()
+    db = Fac()
+    npc, evt = create_entity_authoritative(
+        db, cid, 0, entity_type="npc", name="Mira the Guide",
+        operation_id="op-evt-1",
+    )
+    assert evt.payload["entity_id"] == str(npc.id)
+    assert evt.targets["entity_id"] == str(npc.id)
+    assert evt.payload["entity_id"] != ""
+    # Persisted history (re-read from DB) agrees
+    persisted = list_campaign_events(db, cid)[0]
+    assert persisted.payload["entity_id"] == str(npc.id)
+    assert persisted.targets["entity_id"] == str(npc.id)
+
+
+def test_authoritative_scene_event_carries_real_scene_snapshot():
+    Fac, cid, _owner = _setup()
+    db = Fac()
+    scene, evt = set_scene_authoritative(
+        db, cid, 0, location_name="Ember Gate", fictional_time="Day 3, dusk",
+        present_actors=[{"name": "Aria"}], environment={"weather": "ashfall"},
+        operation_id="op-scene-evt",
+    )
+    snap = evt.payload["scene"]
+    assert snap != {}
+    assert snap["location_name"] == "Ember Gate"
+    assert snap["fictional_time"] == "Day 3, dusk"
+    assert snap["present_actors"] == [{"name": "Aria"}]
+    assert snap["environment"] == {"weather": "ashfall"}
+    assert snap == scene.to_dict()
+    persisted = list_campaign_events(db, cid)[0]
+    assert persisted.payload["scene"]["location_name"] == "Ember Gate"
+
+
+def _commit_scene_patch_turn(db, cid, owner, tid, patch):
+    accept_submission(
+        db, campaign_id=cid, user_id=owner, raw_content="The scene shifts",
+        segments=[{"type": "ic", "text": "The scene shifts."}], thread_id=tid,
+    )
+    db.commit()
+    turn, attempt = coordinate_turn(db, cid, tid)
+    attempt.staged_effects = [{
+        "id": f"eff-clear-{turn.id}", "effect_type": "update_scene",
+        "arguments": {"scene_patch": patch, "reason": "clear test"},
+    }]
+    attempt.contract_snapshot = {"contract_version": "dm_turn_contract_v1", "new_entities": [], "staged_effects": []}
+    db.flush()
+    db.commit()
+    stream = _stream(db, turn, attempt)
+    db.commit()
+    mark_streaming_started(db, turn.id, attempt.id, stream_id=stream.id)
+    return commit_turn(db, turn.id, attempt.id)
+
+
+def test_staged_update_scene_empty_values_clear_state():
+    Fac, cid, owner = _setup()
+    db = Fac()
+    set_scene_authoritative(
+        db, cid, 0, location_name="Ember Gate",
+        present_actors=[{"name": "Aria"}, {"name": "Bram"}],
+        environment={"weather": "ashfall"}, operation_id="op-seed",
+    )
+    thread = get_or_create_campaign_thread(db, cid, created_by=owner)
+    db.commit()
+    tid = str(thread.id)
+    _t, _a, event = _commit_scene_patch_turn(
+        db, cid, owner, tid, {"present_actors": [], "environment": {}},
+    )
+    assert event is not None
+    scene = get_current_scene(db, cid)
+    assert scene.present_actors == []
+    assert scene.environment == {}
+    # Location untouched by the patch is preserved
+    assert scene.location_name == "Ember Gate"
+
+
+def test_staged_update_scene_empty_alias_values_clear_state():
+    Fac, cid, owner = _setup()
+    db = Fac()
+    set_scene_authoritative(
+        db, cid, 0, location_name="Ember Gate",
+        present_actors=[{"name": "Aria"}],
+        environment={"light": "torchlight"}, operation_id="op-seed-alias",
+    )
+    thread = get_or_create_campaign_thread(db, cid, created_by=owner)
+    db.commit()
+    tid = str(thread.id)
+    _t, _a, event = _commit_scene_patch_turn(
+        db, cid, owner, tid, {"present_actor_names": [], "state": {}},
+    )
+    assert event is not None
+    scene = get_current_scene(db, cid)
+    assert scene.present_actors == []
+    assert scene.environment == {}
+
+
+def test_create_entity_inline_idempotency_race_returns_winner():
+    from unittest import mock
+
+    import app.world.service as world_service
+    from app.world.service import _find_by_idempotency
+
+    Fac, cid, _owner = _setup()
+    db = Fac()
+    campaign = db.get(Campaign, cid)
+    winner, created = create_entity_inline(
+        db, campaign, entity_type="npc", name="Winner",
+        idempotency_key="race-1",
+    )
+    assert created is True
+    db.commit()
+
+    # Simulate the race window: the precheck SELECT misses (concurrent winner
+    # not yet visible), then the upsert absorbs the unique conflict and the
+    # post-insert lookup finds the winner.
+    real_find = _find_by_idempotency
+    calls = {"n": 0}
+
+    def flaky_find(db_, cid_, key_):
+        calls["n"] += 1
+        if calls["n"] == 1:
+            return None
+        return real_find(db_, cid_, key_)
+
+    with mock.patch.object(world_service, "_find_by_idempotency", side_effect=flaky_find):
+        campaign2 = db.get(Campaign, cid)
+        loser, created2 = create_entity_inline(
+            db, campaign2, entity_type="npc", name="Loser",
+            idempotency_key="race-1",
+        )
+    assert created2 is False
+    assert str(loser.id) == str(winner.id)
+    assert loser.name == "Winner"
+    # Outer transaction was NOT left rollback-only: session still usable.
+    db.commit()
+    assert len(list_entities(db, cid)) == 1
+
+
 def test_scene_update_effect_commits_transactionally_with_turn():
     Fac, cid, owner = _setup()
     db = Fac()

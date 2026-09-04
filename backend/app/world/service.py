@@ -142,6 +142,25 @@ def _find_by_idempotency(
     ).scalars().first()
 
 
+def _dialect_upsert_insert(db: Session):
+    """``INSERT ... ON CONFLICT DO NOTHING`` construct for the bound dialect.
+
+    Postgres and SQLite both support it. Returns None on dialects without
+    upsert support (callers fall back to the savepoint-isolated insert).
+    """
+    try:
+        dialect_name = db.get_bind().dialect.name
+    except Exception:
+        return None
+    if dialect_name == "postgresql":
+        from sqlalchemy.dialects.postgresql import insert as pg_insert
+        return pg_insert
+    if dialect_name == "sqlite":
+        from sqlalchemy.dialects.sqlite import insert as sqlite_insert
+        return sqlite_insert
+    return None
+
+
 def create_entity_inline(
     db: Session,
     campaign: Campaign,
@@ -183,6 +202,53 @@ def create_entity_inline(
             )
             return existing, False
 
+        upsert_insert = _dialect_upsert_insert(db)
+        if upsert_insert is not None:
+            # Exactly-once insert without savepoints: a concurrent inserter's
+            # unique-key race is absorbed by ON CONFLICT DO NOTHING instead of
+            # failing the revision transaction, so the race path is genuinely
+            # recoverable on every backend (Postgres and SQLite alike — no
+            # SAVEPOINT whose release could commit the outer transaction).
+            entity_id = uuid.uuid4()
+            db.execute(
+                upsert_insert(WorldEntity)
+                .values(
+                    id=entity_id,
+                    campaign_id=campaign.id,
+                    entity_type=etype,
+                    name=ename,
+                    summary=str(summary)[:2000] if summary else None,
+                    status=estate,
+                    visibility=evis,
+                    details=dict(details or {}),
+                    source_turn_id=source_turn_id,
+                    source_attempt_id=source_attempt_id,
+                    operation_id=(str(operation_id)[:128] if operation_id else None),
+                    idempotency_key=key,
+                )
+                .on_conflict_do_nothing(index_elements=["campaign_id", "idempotency_key"])
+            )
+            stored = _find_by_idempotency(db, campaign.id, key)
+            if stored is None:  # pragma: no cover — defensive; the row must exist
+                raise RuntimeError(f"idempotent entity insert for key {key!r} left no row")
+            if str(stored.id) == str(entity_id):
+                structured_log(
+                    logger, logging.INFO, "world_entity_created",
+                    campaign_id=str(campaign.id), entity_id=str(stored.id),
+                    entity_type=etype, status=estate, visibility=evis,
+                    source_turn_id=str(source_turn_id) if source_turn_id else None,
+                    source_attempt_id=str(source_attempt_id) if source_attempt_id else None,
+                    operation_id=str(operation_id) if operation_id else None,
+                )
+                return stored, True
+            structured_log(
+                logger, logging.INFO, "world_entity_duplicate_conflict",
+                campaign_id=str(campaign.id), entity_id=str(stored.id),
+                entity_type=stored.entity_type, idempotency_key=key,
+                path="race_winner",
+            )
+            return stored, False
+
     entity = WorldEntity(
         id=uuid.uuid4(),
         campaign_id=campaign.id,
@@ -197,25 +263,42 @@ def create_entity_inline(
         operation_id=(str(operation_id)[:128] if operation_id else None),
         idempotency_key=key,
     )
-    db.add(entity)
-    try:
-        with db.begin_nested():
-            db.flush()
-    except IntegrityError:
-        # Lost a race with a concurrent inserter using the same key —
-        # return the winner instead of duplicating. The savepoint rolls
-        # back only the failed insert; the outer revision transaction
-        # stays intact.
-        winner = _find_by_idempotency(db, campaign.id, key) if key else None
-        if winner is not None:
-            structured_log(
-                logger, logging.INFO, "world_entity_duplicate_conflict",
-                campaign_id=str(campaign.id), entity_id=str(winner.id),
-                entity_type=winner.entity_type, idempotency_key=key,
-                path="race_winner",
-            )
-            return winner, False
-        raise
+    if key is None:
+        # No idempotency constraint can fire — plain flush keeps the outer
+        # transaction's atomicity on every backend.
+        db.add(entity)
+        db.flush()
+    else:
+        # Dialect without upsert support: isolate the candidate insert in a
+        # SAVEPOINT so a unique-key race fails inside (not outside) it —
+        # add() must happen INSIDE because SQLAlchemy flushes pending state
+        # when the nested transaction starts. The savepoint rolls back only
+        # the failed insert; the outer revision transaction stays intact.
+        try:
+            with db.begin_nested():
+                db.add(entity)
+                db.flush()
+        except IntegrityError:
+            # Lost a race with a concurrent inserter using the same key —
+            # return the winner instead of duplicating. Expunge the loser
+            # first so a later autoflush cannot retry the failed insert
+            # (and so the winner lookup below does not flush it either).
+            # Already-detached after the savepoint rollback on some
+            # backends — tolerate that (cf. coordinate_turn).
+            try:
+                db.expunge(entity)
+            except Exception:
+                pass
+            winner = _find_by_idempotency(db, campaign.id, key)
+            if winner is not None:
+                structured_log(
+                    logger, logging.INFO, "world_entity_duplicate_conflict",
+                    campaign_id=str(campaign.id), entity_id=str(winner.id),
+                    entity_type=winner.entity_type, idempotency_key=key,
+                    path="race_winner",
+                )
+                return winner, False
+            raise
     structured_log(
         logger, logging.INFO, "world_entity_created",
         campaign_id=str(campaign.id), entity_id=str(entity.id),
@@ -379,18 +462,30 @@ def create_entity_authoritative(
         )
         holder["entity_id"] = entity.id
 
+    # Payload/targets are built AFTER mutate via builders so the persisted
+    # event carries the real allocated entity_id (building them upfront from
+    # holder would persist entity_id: "").
+    validated_type = validate_entity_type(entity_type)
+    validated_name = validate_entity_name(name)
+
+    def _payload() -> dict[str, Any]:
+        return {
+            "entity_id": str(holder["entity_id"]),
+            "entity_type": validated_type,
+            "name": validated_name,
+            "idempotency_key": key,
+        }
+
+    def _targets() -> dict[str, Any]:
+        return {"entity_id": str(holder["entity_id"])}
+
     campaign_after, event = commit_campaign_mutation(
         db, campaign_id, int(expected_revision),
         event_type="world.entity_created",
-        payload={
-            "entity_id": str(holder.get("entity_id") or ""),
-            "entity_type": validate_entity_type(entity_type),
-            "name": validate_entity_name(name),
-            "idempotency_key": key,
-        },
+        payload_builder=_payload,
         operation_id=operation_id,
         actor_id=actor_id,
-        targets={"entity_id": str(holder.get("entity_id") or "")},
+        targets_builder=_targets,
         visibility="public",
         provenance={"source": "world_api", "idempotency_key": key},
         mutate=_mutate,
@@ -437,8 +532,10 @@ def set_scene_authoritative(
     campaign_after, event = commit_campaign_mutation(
         db, campaign_id, int(expected_revision),
         event_type="world.scene_updated",
-        payload={
-            "scene": holder.get("scene") or {},
+        # Built AFTER mutate so the persisted event carries the real scene
+        # snapshot (building it upfront from holder would persist scene: {}).
+        payload_builder=lambda: {
+            "scene": holder["scene"],
             "location_name": location_name,
             "fictional_time": fictional_time,
         },
