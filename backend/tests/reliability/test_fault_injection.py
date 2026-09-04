@@ -75,8 +75,14 @@ def _seed_campaign(factory):
     campaign_id = uuid.uuid4()
     with factory() as db:
         if db.bind.dialect.name == "postgresql":
-            db.execute(text("INSERT INTO auth.users (id) VALUES (:id) ON CONFLICT DO NOTHING"), {"id": owner_id})
+            db.execute(
+                text("INSERT INTO auth.users (id) VALUES (:id) ON CONFLICT (id) DO NOTHING"),
+                {"id": owner_id},
+            )
+            db.flush()
         db.add(Profile(id=owner_id, email=f"fault-{owner_id}@example.invalid"))
+        db.commit()
+    with factory() as db:
         db.add(Campaign(id=campaign_id, owner_id=owner_id, name="Synthetic reliability campaign"))
         db.commit()
     return campaign_id
