@@ -824,3 +824,185 @@ def test_execute_validated_turn_full_failure_marks_failed_visible_and_locked(db)
     s.commit()
     with pytest.raises(StreamBoundaryError):
         coordinate_turn(s, camp_id, str(thread_id))
+
+
+# ── crash-atomic first-chunk boundary (re-review: single shared commit) ───
+
+def test_chunk0_and_streaming_boundary_share_single_commit(db, monkeypatch):
+    """Transaction-spy: chunk-0 row + boundary share exactly one commit.
+
+    No commit may occur between the chunk-0 flush and the boundary flush
+    (the old crash gap); exactly one commit covers both before the first
+    realtime delivery.
+    """
+    import app.dm.turns as turns_mod
+    import app.dm_streams.service as stream_svc
+    import app.realtime.service as realtime_mod
+
+    s, camp_id, thread_id = db
+    turn, attempt = _coordinated_turn(db, camp_id, thread_id)
+    turn_id, attempt_id = turn.id, attempt.id
+
+    c = _respond(
+        [_narr_beat(
+            "Torchlight flickers on wet stone as the party descends the stair. "
+            "Water drips somewhere in the dark below."
+        )],
+        open_player_choice="What do you do?",
+    )
+
+    events: list[str] = []
+    real_commit = s.commit
+    real_append = stream_svc.append_chunk
+    real_boundary = turns_mod.mark_streaming_started
+    real_publish = realtime_mod.publish_dm_chunk_created
+
+    def _spy_commit(*args, **kwargs):
+        events.append("commit")
+        return real_commit(*args, **kwargs)
+
+    def _spy_append(db_, sid, seq, text):
+        if seq == 0:
+            events.append("append0-flush")
+        return real_append(db_, sid, seq, text)
+
+    def _spy_boundary(db_, tid, aid, stream_id=None, **kw):
+        events.append("boundary-flush")
+        return real_boundary(db_, tid, aid, stream_id=stream_id, **kw)
+
+    def _spy_publish(db_, stream, chunk):
+        events.append(f"publish-seq{chunk.sequence}")
+        return real_publish(db_, stream, chunk)
+
+    monkeypatch.setattr(s, "commit", _spy_commit)
+    monkeypatch.setattr(stream_svc, "append_chunk", _spy_append)
+    monkeypatch.setattr(turns_mod, "mark_streaming_started", _spy_boundary)
+    monkeypatch.setattr(realtime_mod, "publish_dm_chunk_created", _spy_publish)
+
+    out = execute_validated_turn(
+        s, turn_id=turn_id, attempt_id=attempt_id, contract=c,
+        chunk_size=48, publish_realtime=True,
+    )
+    assert out.narration.completed
+
+    ai = events.index("append0-flush")
+    bi = events.index("boundary-flush")
+    pi = events.index("publish-seq0")
+    between = events[ai:pi]
+    # No commit between the chunk flush and the boundary flush (old gap),
+    # and exactly one shared commit before first delivery.
+    assert "commit" not in events[ai:bi + 1]
+    assert between.count("commit") == 1
+    assert events[bi + 1] == "commit"
+
+
+def test_boundary_failure_before_commit_leaves_no_durable_chunk(db, monkeypatch):
+    """Fail at the old crash seam: boundary raises after chunk-0 flush.
+
+    Atomicity requires the chunk to roll back too — no durable chunk 0
+    without the streaming boundary (never prepared+chunked), the attempt
+    stays prepared, and the failure is pre-chunk/retryable.
+    """
+    import app.dm.turns as turns_mod
+    from models.dm import DmTurn, DmTurnAttempt
+
+    s, camp_id, thread_id = db
+    turn, attempt = _coordinated_turn(db, camp_id, thread_id)
+    turn_id, attempt_id = turn.id, attempt.id
+
+    c = _respond(
+        [_narr_beat(
+            "Torchlight flickers on wet stone as the party descends the stair. "
+            "Water drips somewhere in the dark below."
+        )],
+        open_player_choice="What do you do?",
+    )
+
+    def _boom(db_, tid, aid, stream_id=None, **kw):
+        raise RuntimeError("simulated crash between chunk flush and boundary commit")
+
+    monkeypatch.setattr(turns_mod, "mark_streaming_started", _boom)
+    with pytest.raises(NarratorGenerationError):
+        execute_validated_turn(
+            s, turn_id=turn_id, attempt_id=attempt_id, contract=c,
+            chunk_size=48, publish_realtime=False,
+        )
+
+    # Invariant: no durable chunk exists without the streaming boundary.
+    assert s.scalar(select(func.count()).select_from(DMStream)) == 0
+    assert s.scalar(select(func.count()).select_from(DMStreamChunk)) == 0
+    fresh_attempt = s.get(DmTurnAttempt, attempt_id)
+    fresh_turn = s.get(DmTurn, turn_id)
+    assert fresh_attempt.status == "prepared"
+    assert fresh_attempt.stream_id is None
+    assert fresh_turn.status == "pending"
+    assert not (fresh_attempt.status == "prepared" and s.scalar(
+        select(func.count()).select_from(DMStreamChunk)
+    ) > 0)
+
+    # Pre-chunk failure is freely retryable with the same turn/attempt.
+    monkeypatch.undo()
+    out = execute_validated_turn(
+        s, turn_id=turn_id, attempt_id=attempt_id, contract=c,
+        chunk_size=48, publish_realtime=False,
+    )
+    assert out.narration.completed
+    assert s.get(DmTurnAttempt, attempt_id).status == "succeeded"
+
+
+def test_restarted_worker_finds_streaming_locked_never_prepared_chunked(db):
+    """Recovery path: after the atomic chunk-0 commit, a restarted worker
+    finds streaming+locked — never prepared+chunked."""
+    from app.dm.turns import StreamBoundaryError, coordinate_turn, mark_streaming_started
+    from app.runtime.submissions import accept_submission
+    from models.dm import DmTurn, DmTurnAttempt
+
+    s, camp_id, thread_id = db
+    turn, attempt = _coordinated_turn(db, camp_id, thread_id)
+
+    c = _respond(
+        [_narr_beat(
+            "Torchlight flickers on wet stone as the party descends the stair. "
+            "Water drips somewhere in the dark below."
+        )],
+        open_player_choice="What do you do?",
+    )
+
+    def _boundary(db_, sid):
+        mark_streaming_started(db_, turn.id, attempt.id, stream_id=sid, commit=False)
+
+    # Simulated crash/disconnect right after chunk 0's atomic commit: the
+    # partial stream stays recoverable with the boundary already crossed.
+    res = stream_narration(
+        s, campaign_id=camp_id, thread_id=thread_id,
+        turn_id=str(turn.id), attempt_id=str(attempt.id),
+        contract=c, chunk_size=48, publish_realtime=False,
+        on_first_persist_tx=_boundary, max_chunks_to_persist=1,
+    )
+    assert not res.completed and res.chunk_count == 1
+
+    s.expire_all()  # simulate worker restart: re-read durable state fresh
+    fresh_attempt = s.get(DmTurnAttempt, attempt.id)
+    fresh_turn = s.get(DmTurn, turn.id)
+    chunks = s.execute(
+        select(DMStreamChunk).where(DMStreamChunk.stream_id == res.stream_id)
+        .order_by(DMStreamChunk.sequence)
+    ).scalars().all()
+    assert len(chunks) == 1
+    # Boundary crossed atomically with the chunk: streaming+locked.
+    assert fresh_attempt.status == "streaming"
+    assert str(fresh_attempt.stream_id) == str(res.stream_id)
+    assert fresh_turn.status == "streaming"
+    # The #206 failure state (prepared + durable chunks) never occurs.
+    assert not (fresh_attempt.status == "prepared" and len(chunks) > 0)
+
+    # Input set is locked for the restarted worker too.
+    accept_submission(
+        s, campaign_id=camp_id, user_id=uuid.uuid4(),
+        raw_content="Late arrival after restart.",
+        segments=[{"type": "ic", "text": "Late arrival after restart."}],
+        thread_id=str(thread_id),
+    )
+    s.commit()
+    with pytest.raises(StreamBoundaryError):
+        coordinate_turn(s, camp_id, str(thread_id))

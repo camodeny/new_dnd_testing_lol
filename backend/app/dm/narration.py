@@ -33,12 +33,18 @@ Pipeline (critical path optimized for TTFT after validation):
    (``dm_streams`` service) BEFORE/with realtime delivery via #198, so the
    first visible text is recoverable after disconnect. TTFT is measured
    from validated adjudication to first persisted visible chunk.
-   ``on_first_persist`` fires synchronously after chunk 0's durable
-   commit and BEFORE its realtime delivery — the orchestrator uses it to
-   run ``mark_streaming_started`` so the first visible chunk transitions
-   the attempt to streaming/visible and locks the input set (#206).
+    ``on_first_persist`` fires synchronously after chunk 0's durable
+    commit and BEFORE its realtime delivery — the orchestrator uses it to
+    run ``mark_streaming_started`` so the first visible chunk transitions
+    the attempt to streaming/visible and locks the input set (#206).
+    ``on_first_persist_tx`` is the crash-atomic variant: it runs INSIDE the
+    chunk-0 transaction (after the chunk flush, before the single shared
+    commit), must be flush-only (no commit of its own), and shares exactly
+    one commit point with the chunk-0 row + phase transition + input lock,
+    with realtime delivery only after that commit returns — so no crash
+    gap can leave a durable chunk 0 on a still-prepared attempt.
 5. ``materialize_final_narration(...)`` — final display text for history
-   after completion, with chunk provenance retained.
+    after completion, with chunk provenance retained.
 
 The narrator can never apply game-state effects: this module never touches
 ``commit_turn``/``apply_staged_effects``; staged effects stay attempt-local
@@ -672,6 +678,7 @@ def stream_narration(
     max_chunks_to_persist: int | None = None,
     trace_id: str | None = None,
     on_first_persist: Callable[[uuid.UUID], None] | None = None,
+    on_first_persist_tx: Callable[[Session, uuid.UUID], None] | None = None,
 ) -> NarrationResult:
     """Generate, fidelity-gate, and stream narration via durable chunks.
 
@@ -683,13 +690,21 @@ def stream_narration(
     arrival rather than full generation. The authoritative full-output
     fidelity gate runs at provider completion.
 
-    ``on_first_persist`` is invoked synchronously with the new stream id
-    after chunk 0's durable commit and BEFORE its realtime delivery — the
-    hook the orchestrator uses to run ``mark_streaming_started`` (#206
-    stream-start commitment boundary: first visible chunk transitions the
-    attempt to streaming/visible and locks the input set). A hook failure
-    is treated as a post-first-chunk failure (failed-visible partial
-    stream + ``NarrationStreamError``).
+    Crash-atomic first-chunk boundary (#206): when ``on_first_persist_tx``
+    is given, chunk 0's row and the transactional boundary callback commit
+    in the SAME transaction (single atomic commit point); realtime
+    delivery happens only after that commit returns. The callback must be
+    flush-only (no commit of its own) — e.g. ``mark_streaming_started``
+    with ``commit=False``. If it raises, the whole transaction rolls back
+    so no durable chunk 0 can exist without the streaming boundary (the
+    failure is then pre-chunk/retryable).
+
+    ``on_first_persist`` is a post-commit notification invoked with the new
+    stream id after chunk 0's atomic commit and BEFORE its realtime
+    delivery. It must not own the boundary transition (use
+    ``on_first_persist_tx`` for that); if it raises post-commit, the
+    failure is treated as post-first-chunk (failed-visible partial stream
+    + ``NarrationStreamError``) since a durable chunk already exists.
 
     TTFT is measured from ``validated_at`` (validated adjudication moment;
     defaults to now) to the first durably persisted visible chunk. Each
@@ -801,28 +816,67 @@ def stream_narration(
                 stream_id, seq, pub_exc,
             )
 
+    def _durable_chunk_count() -> int:
+        """Chunk rows actually durable in the DB (source of truth for accounting).
+
+        The in-memory ``persisted`` counter can disagree with the DB if a
+        boundary callback raises around the commit point; error-path
+        classification (pre-chunk retryable vs post-chunk failed-visible)
+        must therefore consult durable state, not the counter.
+        """
+        try:
+            from app.dm_streams.service import list_chunks as _list_chunks
+
+            return len(_list_chunks(db, stream_id))
+        except Exception:
+            return persisted
+
     def _persist_piece(piece: str) -> None:
-        """Persist one chunk durably, fire the stream-start boundary, then deliver."""
+        """Persist one chunk durably (atomic chunk-0 boundary), then deliver."""
         nonlocal ttft_ms, last_persist, persisted
         seq = persisted
         chunk = append_chunk(db, stream_id, seq, piece)
+        if seq == 0 and on_first_persist_tx is not None:
+            # Crash-atomic stream-start boundary (#206): chunk-0 row +
+            # prepared→streaming/input-lock transition share ONE commit.
+            # The callback must be flush-only; a raise rolls back the chunk
+            # too, so no durable chunk 0 can exist without the boundary.
+            try:
+                on_first_persist_tx(db, stream_id)
+            except Exception:
+                db.rollback()
+                raise
+        # Single atomic commit point for (chunk row + boundary transition);
+        # realtime delivery happens only after this returns.
         db.commit()  # durable BEFORE delivery — first visible text is recoverable
         db.refresh(stream)
+        # Accounting derives from the successful commit, never ahead of it:
+        # after this point a durable chunk exists even if a post-commit
+        # notification below raises.
+        persisted = seq + 1
         now = time.monotonic()
         if seq == 0:
             ttft_ms = (now - t_validated) * 1000
             _metrics["ttft_ms_samples"].append(ttft_ms)
             if on_first_persist is not None:
-                # Stream-start commitment boundary (#206): runs synchronously
-                # after chunk 0's durable commit and BEFORE its realtime
-                # delivery, so a crash can never leave visible narration on a
-                # still-prepared attempt with an unlocked input set.
-                on_first_persist(stream_id)
+                # Post-commit notification only (must not own the boundary).
+                # A raise here is a post-first-chunk failure: the chunk is
+                # already durable, so the stream is failed-visible.
+                try:
+                    on_first_persist(stream_id)
+                except NarrationStreamError:
+                    _fail_visible_stream("narration_first_persist_failed")
+                    raise
+                except Exception as hook_exc:
+                    _fail_visible_stream("narration_first_persist_failed")
+                    raise NarrationStreamError(
+                        f"Narration stream failed after {persisted} chunk(s): {hook_exc}",
+                        stream_id=stream_id, persisted_chunks=persisted,
+                    ) from hook_exc
         else:
             cadence.append((now - last_persist) * 1000)
             _metrics["chunk_cadence_ms_samples"].append(cadence[-1])
         last_persist = now
-        persisted += 1
         persisted_texts.append(piece)
         _publish_chunk(chunk, seq)
 
@@ -935,12 +989,26 @@ def stream_narration(
         _inc("narrations_failed_post_chunk")
         raise
     except (NarrationFidelityError, NarrationProjectionError, NarratorGenerationError):
-        if persisted == 0:
+        # Classify by durable state, not the in-memory counter: a boundary
+        # callback that raised pre-commit rolls back chunk 0, so durable 0
+        # means nothing was ever visible (retryable); durable > 0 means the
+        # outer failure arrived after visible persistence (failed-visible).
+        durable = _durable_chunk_count()
+        persisted = max(persisted, durable)
+        if durable == 0:
             _delete_invisible_header()
-        _inc("narrations_failed_pre_chunk")
-        raise
+            _inc("narrations_failed_pre_chunk")
+            raise
+        _fail_visible_stream("narration_stream_error")
+        _inc("narrations_failed_post_chunk")
+        raise NarrationStreamError(
+            f"Narration stream failed after {persisted} chunk(s)",
+            stream_id=stream_id, persisted_chunks=persisted,
+        ) from None
     except Exception as exc:
-        if persisted == 0:
+        durable = _durable_chunk_count()
+        persisted = max(persisted, durable)
+        if durable == 0:
             _delete_invisible_header()
             _inc("narrations_failed_pre_chunk")
             if isinstance(exc, NarrationError):
@@ -1048,14 +1116,14 @@ def execute_validated_turn(
 
     1. ``stage_validated_attempt`` — persist staged effects attempt-local
        (no campaign-truth mutation).
-    2. ``stream_narration`` with a first-persist hook — deltas stream from
-       the provider, each incrementally gated and persisted durably via
-       #197 BEFORE/with #198 realtime delivery. Synchronously after chunk
-       0's durable commit (before its realtime delivery) the hook runs
-       ``mark_streaming_started`` — the #206 stream-start commitment
-       boundary over the durable stream (locks the input set at first
-       visibility, so a crash can never leave visible narration on a
-       still-prepared attempt).
+    2. ``stream_narration`` with a crash-atomic first-chunk boundary — deltas
+    stream from the provider, each incrementally gated and persisted
+    durably via #197 BEFORE/with #198 realtime delivery. Chunk 0's row
+    and ``mark_streaming_started`` (commit=False) share ONE atomic commit
+    — the #206 stream-start commitment boundary over the durable stream
+    (locks the input set at first visibility, so a crash can never leave
+    visible narration on a still-prepared attempt); realtime delivery
+    happens only after that commit returns.
     3. ``commit_turn_with_effects`` — atomic promotion + final commit (#206).
 
     Failure semantics inherit the callees: pre-first-chunk failure
@@ -1087,8 +1155,11 @@ def execute_validated_turn(
 
     staged = stage_validated_attempt(db, attempt_id, contract)
 
-    def _on_first_persist(stream_id: uuid.UUID) -> None:
-        mark_streaming_started(db, turn_id, attempt_id, stream_id=stream_id)
+    def _boundary_tx(db_: Session, stream_id_: uuid.UUID) -> None:
+        # Flush-only: shares chunk 0's single atomic commit (no commit here).
+        mark_streaming_started(
+            db_, turn_id, attempt_id, stream_id=stream_id_, commit=False
+        )
 
     try:
         narration = stream_narration(
@@ -1106,7 +1177,7 @@ def execute_validated_turn(
             extra_secrets=extra_secrets,
             pc_names=pc_names,
             trace_id=trace_id,
-            on_first_persist=_on_first_persist,
+            on_first_persist_tx=_boundary_tx,
         )
     except NarrationStreamError:
         # Defined remediation for post-visibility failure: if the

@@ -606,7 +606,7 @@ def stage_validated_attempt(
 # ── Stream-start commitment boundary ────────────────────────────────────────
 
 
-def mark_streaming_started(db: Session, turn_id: uuid.UUID, attempt_id: uuid.UUID, stream_id: uuid.UUID | str | None = None) -> tuple[DmTurn, DmTurnAttempt]:
+def mark_streaming_started(db: Session, turn_id: uuid.UUID, attempt_id: uuid.UUID, stream_id: uuid.UUID | str | None = None, *, commit: bool = True) -> tuple[DmTurn, DmTurnAttempt]:
     """Establish stream-start commitment boundary for the input set.
 
     After this call, the turn's input set is locked; any new eligible submissions
@@ -617,6 +617,11 @@ def mark_streaming_started(db: Session, turn_id: uuid.UUID, attempt_id: uuid.UUI
     When stream_id is provided, verifies first durable chunk is persisted before
     promotion — this enforces the visible-commitment boundary without promoting
     staged gameplay effects. Staged effects remain attempt-local until atomic commit.
+
+    When ``commit`` is False the transition is only flushed (no commit), so a
+    caller can atomically commit it together with the first chunk row in a
+    single transaction (crash-atomic #206 boundary). The caller owns the
+    commit; on CAS failure the current transaction is rolled back.
 
     Idempotent: if already streaming with same attempt, returns without error.
     Uses FOR UPDATE + CAS to ensure only the current attempt can become streaming.
@@ -718,9 +723,15 @@ def mark_streaming_started(db: Session, turn_id: uuid.UUID, attempt_id: uuid.UUI
         db.rollback()
         raise ValueError(f"Attempt {attempt_id} CAS failed for streaming transition")
 
-    db.commit()
-    db.refresh(turn)
-    db.refresh(attempt)
+    if commit:
+        db.commit()
+        db.refresh(turn)
+        db.refresh(attempt)
+    else:
+        # Flush-only: caller atomically commits this together with the first
+        # chunk row (single commit point). Refresh is deferred until after
+        # the caller's commit; in-memory state is set explicitly below.
+        db.flush()
     # Ensure in-memory reflects streaming
     turn.status = TURN_STREAMING
     turn.streaming_started_at = now
