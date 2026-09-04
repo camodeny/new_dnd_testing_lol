@@ -1068,6 +1068,15 @@ def assemble_attempt_context(
         scene_visibility = scene_value.get("visibility") or "campaign"
         if scene_visibility not in {"public", "campaign", "private", "dm_only"}:
             scene_visibility = "campaign"
+        if scene_visibility == "private":
+            # Campaign-level scene state has no thread/user recipient scope,
+            # and ContextRecord rejects scope-less private records — so a
+            # private current scene would make assembly raise. Project it as
+            # dm_only/adjudication-only instead (consistent with the dm_only
+            # handling below and the RECENT_HISTORY lane): assembly succeeds
+            # and narration_projection() can never carry it to a player
+            # audience.
+            scene_visibility = "dm_only"
         records[LaneName.CURRENT_SCENE].append(
             ContextRecord(
                 record_id=f"current-scene:{campaign.id}",

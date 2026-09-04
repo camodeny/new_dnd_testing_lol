@@ -535,7 +535,11 @@ def create_entity_authoritative(
         operation_id=operation_id,
         actor_id=actor_id,
         targets_builder=_targets,
-        visibility="public",
+        # Event visibility follows the record's disclosure level (PR #348
+        # re-review): restricted entities must not leak name/type/id to
+        # ordinary members through the campaign-events endpoint, whose
+        # viewer filter only returns public events to non-actors.
+        visibility=normalize_visibility(visibility),
         provenance={"source": "world_api", "idempotency_key": key},
         mutate=_mutate,
     )
@@ -578,6 +582,14 @@ def set_scene_authoritative(
         )
         holder["scene"] = scene.to_dict()
 
+    def _visibility() -> str:
+        # Event visibility follows the resulting record's disclosure level
+        # (PR #348 re-review): the scene payload carries the full snapshot,
+        # so a restricted scene must not persist a public event readable by
+        # ordinary members. Built AFTER mutate because a None visibility
+        # input preserves the pre-existing scene visibility.
+        return normalize_visibility((holder.get("scene") or {}).get("visibility"))
+
     campaign_after, event = commit_campaign_mutation(
         db, campaign_id, int(expected_revision),
         event_type="world.scene_updated",
@@ -592,6 +604,7 @@ def set_scene_authoritative(
         actor_id=actor_id,
         targets={"campaign_id": str(campaign_id)},
         visibility="public",
+        visibility_builder=_visibility,
         provenance={"source": "world_api"},
         mutate=_mutate,
     )

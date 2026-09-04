@@ -706,3 +706,94 @@ def test_legacy_world_aggregate_and_encounter_stub_removed(world_api):
     client, cid, _owner, _member = world_api
     assert client.get(f"/api/campaigns/{cid}/world").status_code == 404
     assert client.get(f"/api/campaigns/{cid}/encounter-maps/current").status_code == 404
+
+
+def _act_as_all(monkeypatch, profile_id):
+    # World + campaign-events endpoints resolve auth in separate routers.
+    monkeypatch.setattr(
+        "app.world.router.resolve_profile",
+        lambda req, db: db.get(Profile, profile_id),
+    )
+    monkeypatch.setattr(
+        "app.campaigns.router.resolve_profile",
+        lambda req, db: db.get(Profile, profile_id),
+    )
+
+
+def test_restricted_world_events_hidden_from_non_owner_over_http(world_api, monkeypatch):
+    client, cid, owner, member = world_api
+    _act_as_all(monkeypatch, owner)
+    base = f"/api/campaigns/{cid}/world"
+    r = client.post(f"{base}/entities", json={
+        "expected_revision": 0, "entity_type": "npc", "name": "Hidden Blade",
+        "visibility": "dm_only", "details": {"secret": "assassin"},
+        "operation_id": "op-hidden",
+    }, headers={"Idempotency-Key": "op-hidden"})
+    assert r.status_code == 200, r.text
+    r = client.post(f"{base}/entities", json={
+        "expected_revision": 1, "entity_type": "npc", "name": "Quiet Contact",
+        "visibility": "private", "operation_id": "op-private",
+    }, headers={"Idempotency-Key": "op-private"})
+    assert r.status_code == 200, r.text
+    r = client.put(f"{base}/current-scene", json={
+        "expected_revision": 2, "location_name": "Secret Lair",
+        "visibility": "dm_only", "operation_id": "op-scene",
+    }, headers={"Idempotency-Key": "op-scene"})
+    assert r.status_code == 200, r.text
+    # Owner/DM still sees the restricted world events with full payloads.
+    events = client.get(f"/api/campaigns/{cid}/events").json()["events"]
+    world_events = [e for e in events if e["event_type"].startswith("world.")]
+    assert len(world_events) == 3
+    assert {e["visibility"] for e in world_events} == {"dm_only", "private"}
+    blob = str([e["payload"] for e in world_events])
+    assert "Hidden Blade" in blob and "Secret Lair" in blob
+    # Ordinary member: no restricted world data leaks via campaign events.
+    _act_as_all(monkeypatch, member)
+    member_events = client.get(f"/api/campaigns/{cid}/events").json()["events"]
+    assert member_events == []
+    member_blob = str(member_events)
+    assert "Hidden Blade" not in member_blob
+    assert "Quiet Contact" not in member_blob
+    assert "Secret Lair" not in member_blob
+    assert "assassin" not in member_blob
+
+
+def test_private_scene_context_assembly_stays_hidden():
+    from app.dm.context import LaneName, assemble_attempt_context
+
+    Fac, cid, owner = _setup()
+    db = Fac()
+    set_scene_authoritative(
+        db, cid, 0, location_name="Hidden Sanctum", visibility="private",
+        operation_id="op-s",
+    )
+    thread = get_or_create_campaign_thread(db, cid, created_by=owner)
+    db.commit()
+    tid = str(thread.id)
+    accept_submission(
+        db, campaign_id=cid, user_id=owner, raw_content="We sneak in",
+        segments=[{"type": "ic", "text": "We sneak in."}], thread_id=tid,
+    )
+    db.commit()
+    _turn, attempt = coordinate_turn(db, cid, tid)
+    # Must not raise: scope-less private scene state projects as
+    # dm_only/adjudication-only instead of failing ContextRecord validation.
+    packet = assemble_attempt_context(
+        db, attempt.id,
+        supplemental_status={
+            LaneName.KNOWLEDGE_VISIBILITY: "not_applicable",
+            LaneName.CONTENT_BOUNDARIES: "not_applicable",
+            LaneName.DIFFICULTY: "not_applicable",
+        },
+    )
+    lane = next(
+        record for record in packet.lanes if record.name == LaneName.CURRENT_SCENE
+    )
+    assert len(lane.records) == 1
+    assert lane.records[0].visibility == "dm_only"
+    assert lane.records[0].use == "adjudication_only"
+    proj = packet.narration_projection()
+    proj_lane = next(
+        record for record in proj["lanes"] if record["name"] == "current_scene"
+    )
+    assert proj_lane["records"] == []
