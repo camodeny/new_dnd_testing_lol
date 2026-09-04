@@ -84,6 +84,9 @@ def commit_campaign_mutation(
     provenance: dict | None = None,
     mutate: Optional[Callable[[Campaign], None]] = None,
     commit: bool = True,
+    payload_builder: Optional[Callable[[], dict]] = None,
+    targets_builder: Optional[Callable[[], dict | list]] = None,
+    visibility_builder: Optional[Callable[[], str]] = None,
     outbox_event_type: str | None = None,
     outbox_payload: dict | None = None,
     outbox_operation_id: str | None = None,
@@ -105,6 +108,15 @@ def commit_campaign_mutation(
                 Executed within the same transaction after revision bump.
         commit: Whether to commit the transaction (default True). When False,
                 caller controls commit/rollback (useful for composing).
+        payload_builder: Optional zero-arg callable invoked AFTER mutate succeeds
+                to build the event payload from mutation results (e.g. ids
+                allocated inside mutate). Takes precedence over payload.
+        targets_builder: Optional zero-arg callable invoked AFTER mutate succeeds
+                to build event targets. Takes precedence over targets.
+        visibility_builder: Optional zero-arg callable invoked AFTER mutate
+                succeeds to build event visibility from mutation results (e.g.
+                the resulting record's disclosure level). Takes precedence
+                over visibility.
 
     Returns:
         (campaign, event) after commit (campaign.revision == event.sequence).
@@ -187,6 +199,16 @@ def commit_campaign_mutation(
     # Expire to ensure updated_at trigger etc; but not required.
     db.flush()
 
+    # Resolve payload/targets AFTER mutate so events capture mutation results
+    # (e.g. entity ids allocated inside mutate). Builders run here — after the
+    # mutation succeeded but before the event insert — so the immutable event
+    # history reflects what actually happened.
+    resolved_payload = payload_builder() if payload_builder is not None else payload
+    resolved_targets = targets_builder() if targets_builder is not None else targets
+    resolved_visibility = (
+        visibility_builder() if visibility_builder is not None else visibility
+    )
+
     # 2) Insert immutable domain event with sequence == new_revision
     from app.observability.tracing import current_trace_id
 
@@ -198,9 +220,9 @@ def commit_campaign_mutation(
         operation_id=operation_id,
         trace_id=current_trace_id(),
         actor_id=actor_id,
-        targets=targets,
-        payload=payload,
-        visibility=visibility or "public",
+        targets=resolved_targets,
+        payload=resolved_payload,
+        visibility=resolved_visibility or "public",
         provenance=provenance,
     )
     db.add(event)
@@ -233,7 +255,7 @@ def commit_campaign_mutation(
             event_type=outbox_event_type,
             operation_id=outbox_operation_id or operation_id,
             trace_id=current_trace_id(),
-            payload=outbox_payload if outbox_payload is not None else payload,
+            payload=outbox_payload if outbox_payload is not None else resolved_payload,
             status="pending",
             attempts=0,
         )

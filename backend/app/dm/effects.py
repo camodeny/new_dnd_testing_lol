@@ -130,8 +130,56 @@ def _handle_record_world_event(db: Session, campaign: Campaign, effect: dict[str
 
 @register("update_scene")
 def _handle_update_scene(db: Session, campaign: Campaign, effect: dict[str, Any], turn: DmTurn, attempt: DmTurnAttempt):
+    """Apply a bounded scene patch to the authoritative current-scene row.
+
+    Runs inside the turn-commit revision transaction (issue #209): the outer
+    ``commit_campaign_mutation`` owns commit/rollback, so a failed turn
+    commit leaves no half-applied scene. ``new_revision`` is the resulting
+    campaign revision (prior + 1), keeping scene changes in revision order.
+    """
+    from app.world.service import UNSET, apply_scene_update_inline
+
     args = effect.get("arguments") or {}
-    # Stub: scene patches would apply to a current_scene table; for now no-op but validated.
+    patch = args.get("scene_patch") or {}
+    if not isinstance(patch, dict):
+        raise ValueError(f"Staged effect {effect.get('id')!r} scene_patch must be an object")
+    prior = int(campaign.revision) if campaign.revision is not None else 0
+    # Key-presence (not truthiness) patch semantics: an explicit empty list /
+    # dict / string clears state, while an absent key leaves it unchanged.
+    # `patch.get("x") or patch.get("alias")` would treat [] / {} / "" as
+    # absent and silently keep stale state.
+    def _pick(primary: str, alias: str):
+        if primary in patch:
+            return patch[primary]
+        if alias in patch:
+            return patch[alias]
+        return None
+    if "present_actors" in patch:
+        present_actors = patch["present_actors"]
+    elif "present_actor_names" in patch:
+        present_actors = patch["present_actor_names"]
+    else:
+        present_actors = None
+    if "environment" in patch:
+        environment = patch["environment"]
+    elif "state" in patch:
+        environment = patch["state"]
+    else:
+        environment = None
+    apply_scene_update_inline(
+        db, campaign, new_revision=prior + 1,
+        # Key-presence: explicit null clears the canonical location reference
+        # while omission preserves it (same as actors/environment above).
+        location_entity_id=patch["location_entity_id"] if "location_entity_id" in patch else UNSET,
+        location_name=_pick("location_name", "location"),
+        fictional_time=_pick("fictional_time", "time"),
+        fictional_time_details=patch.get("fictional_time_details"),
+        present_actors=present_actors,
+        environment=environment,
+        visibility=args.get("visibility") or patch.get("visibility"),
+        source_turn_id=turn.id, source_attempt_id=attempt.id,
+        operation_id=getattr(attempt, "commit_operation_id", None) or str(attempt.id),
+    )
     logger.info("effect update_scene effect_id=%s reason=%s", effect.get("id"), args.get("reason"))
 
 

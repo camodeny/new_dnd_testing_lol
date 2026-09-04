@@ -110,10 +110,8 @@ describe('exported API surface', () => {
       'campaignMembers',
       'campaigns',
       'characters',
-      'encounterMaps',
       'gameplayThreads',
       'sessions',
-      'world',
     ])
     expect(Object.keys(api.auth).sort()).toEqual(['getConfig', 'me'])
     expect(Object.keys(api.campaigns).sort()).toEqual([
@@ -148,8 +146,6 @@ describe('exported API surface', () => {
       'submit',
     ])
     expect(Object.keys(api.sessions)).toEqual(['start'])
-    expect(Object.keys(api.world)).toEqual(['get'])
-    expect(Object.keys(api.encounterMaps)).toEqual(['getCurrent'])
   })
 
   it('does not expose removed legacy groups or blob transport', () => {
@@ -165,5 +161,7 @@ describe('exported API surface', () => {
     expect(keys).not.toContain('apiBlob')
     expect(keys).not.toContain('getStreamUrl')
     expect(keys).not.toContain('legacyLiveTable')
+    expect(keys).not.toContain('world')
+    expect(keys).not.toContain('encounterMaps')
   })
 })

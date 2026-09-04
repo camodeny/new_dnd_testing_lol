@@ -7,7 +7,6 @@ import {
   campaigns as campaignsApi,
   campaignMembers,
   sessions as sessionsApi,
-  encounterMaps,
   apiFetch,
 } from '@/lib/api'
 import { useLiveTableRealtime } from '@/hooks/useLiveTableRealtime'
@@ -80,8 +79,8 @@ export default function CampaignViewPage() {
 
       if (activeSession) {
         setSession(activeSession)
-        const mapData = await encounterMaps.getCurrent(String(id)).catch(() => ({ map: null }))
-        setEncounterMap((mapData as { map: EncounterMap | null }).map)
+        // No authoritative encounter-map backend (stub removed); map state
+        // stays client-owned via StoryAtlas onEncounterMapChange.
         setMode('session')
       } else {
         setMode((prev) => determineCampaignMode(camp as Campaign & { active_session?: Session | null; world?: unknown }, prev))

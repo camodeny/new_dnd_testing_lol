@@ -1,6 +1,7 @@
 """World / memory / knowledge domain.
 
-Owns campaign world state, encounter maps, and long-term memory.
-Currently stubbed; Epic 2 will add projections and persistence.
+Owns authoritative campaign world state: canonical world entities and the
+current-scene row (issue #209). Reads are viewer-aware (restricted
+visibility is owner-only); there are no legacy aggregate/map stubs.
 """
 
