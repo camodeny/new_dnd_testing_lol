@@ -10,6 +10,7 @@ Gemini Embeddings 2 (gemini-embedding-001) is supported via app.rules.gemini.
 from __future__ import annotations
 
 import hashlib
+import logging
 import os
 import uuid
 from typing import Any
@@ -22,6 +23,8 @@ from models.rules import RulesEmbedding
 DEFAULT_MODEL = "stub-hash-v1"
 DEFAULT_VERSION = "1"
 DEFAULT_DIM = 1536
+
+logger = logging.getLogger(__name__)
 
 # Gemini Embeddings 2 default (can be overridden via GEMINI_EMBEDDING_MODEL)
 GEMINI_DEFAULT_MODEL = "gemini-embedding-2"
@@ -157,6 +160,15 @@ def build_embeddings(
         vectors = provider(texts)
         # Gemini (and other real providers) decide dim; dim param is advisory for stub only
     else:
+        # Explicit degradation: stub vectors are test/offline only and must never
+        # silently stand in for the retrieval path (issue #333).
+        logger.warning(
+            "rules embeddings using stub model=%s version=%s reason=stub_fallback "
+            "count=%d — lexical-only retrieval expected; set GEMINI_API_KEY or pass a real --model",
+            embedding_model,
+            embedding_version,
+            len(sections),
+        )
         vectors = [_stub_embed(t, dim=dim) for t in texts]
 
     for sec, vec in zip(sections, vectors):

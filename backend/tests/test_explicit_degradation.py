@@ -19,12 +19,13 @@ if not hasattr(SQLiteTypeCompiler, "_patched_jsonb"):
     SQLiteTypeCompiler.visit_JSONB = lambda self, type_, **kw: "JSON"  # type: ignore
     SQLiteTypeCompiler._patched_jsonb = True  # type: ignore
 
-from app.deps.auth import MOCK_USER_ID  # noqa: E402
+from app.auth.service import MOCK_USER_ID  # noqa: E402
 from app.realtime.channels import live_table_channel, parse_live_table_channel  # noqa: E402
 from database import Base, get_db  # noqa: E402
 from main import app  # noqa: E402
-import models  # noqa: E402, F401
-from models import Campaign, CampaignMember, Profile  # noqa: E402
+from models.campaigns import Campaign, CampaignMember  # noqa: E402
+from models.profiles import Profile  # noqa: E402
+from models.rules import RulesEmbedding  # noqa: E402
 
 TEST_OFFICIAL_HASH = "8974902d109d6e63672d7c490bde9ccf052410503d9cfa768237154fbc5e3d87"
 
@@ -96,7 +97,7 @@ def test_rules_search_degrades_to_lexical_when_embedding_fails(db, monkeypatch):
     )
     # Seed a gemini embedding row so the search path attempts a live embedding
     db.add(
-        models.RulesEmbedding(
+        RulesEmbedding(
             rule_id=recs[0].rule_id,
             corpus_id="dnd-srd",
             corpus_version="5.2.1",

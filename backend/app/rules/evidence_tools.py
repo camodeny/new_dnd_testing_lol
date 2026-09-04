@@ -9,12 +9,15 @@ from __future__ import annotations
 
 import time
 from typing import Any
+import logging
 
 from app.dm.context import AuthorizationScope, ContextAudience, SourceRef
 from app.dm.contract import EvidenceRequest
 from app.dm.evidence import EvidenceResult, EvidenceValidationError
 from app.rules.store import hybrid_search, lookup_by_rule_id
 from app.rules.metadata import ATTRIBUTION, LICENSE, OFFICIAL_SRD_URL
+
+logger = logging.getLogger(__name__)
 
 
 def _auth(audience: ContextAudience) -> AuthorizationScope:
@@ -149,14 +152,17 @@ def handle_search_rules(request: EvidenceRequest, audience: ContextAudience, *, 
         close = True
     else:
         close = False
-    # Try to embed query via Gemini if configured — best-effort, lexical still works on failure
+    # Try to embed query via Gemini if configured — best-effort, lexical still works on failure.
+    # Stub-labeled vectors are never used for the vector path; degradation is logged.
     query_embedding = None
     embedding_model = None
     try:
         import os
 
         has_gemini_key = bool(os.getenv("GEMINI_API_KEY") or os.getenv("GOOGLE_API_KEY") or os.getenv("GOOGLE_GENAI_API_KEY"))
-        if has_gemini_key:
+        if not has_gemini_key:
+            logger.warning("rules evidence search lexical-only reason=no_gemini_key stub_vectors_ignored")
+        else:
             # Detect most recent Gemini-indexed model in DB to keep query/doc dims aligned
             try:
                 from models.rules import RulesEmbedding
@@ -169,19 +175,23 @@ def handle_search_rules(request: EvidenceRequest, audience: ContextAudience, *, 
                     row = db_sess.query(RulesEmbedding.embedding_model).filter(RulesEmbedding.embedding_model.like("text-embedding%")).first()
                     if row:
                         embedding_model = row[0]
-            except Exception:
-                pass
-            if embedding_model or has_gemini_key:
+            except Exception as exc:
+                logger.warning("rules evidence search embedding lookup failed reason=%s error=%s", type(exc).__name__, exc)
+            if embedding_model is None:
+                logger.warning("rules evidence search lexical-only reason=no_gemini_index stub_vectors_ignored")
+            else:
                 from app.rules.gemini import gemini_embed_query
 
                 # Use detected model or default gemini-embedding-2
                 try:
                     query_embedding = gemini_embed_query(query, model=embedding_model)
-                except Exception:
+                except Exception as exc:
                     # semantic is optional — fall back to lexical only
                     query_embedding = None
-    except Exception:
+                    logger.warning("rules evidence search embedding degraded reason=%s error=%s", type(exc).__name__, exc)
+    except Exception as exc:
         query_embedding = None
+        logger.warning("rules evidence search embedding degraded reason=%s error=%s", type(exc).__name__, exc)
 
     try:
         hits = hybrid_search(db_sess, query, limit=limit, query_embedding=query_embedding, embedding_model=embedding_model)
