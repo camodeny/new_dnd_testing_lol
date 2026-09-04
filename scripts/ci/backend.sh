@@ -31,6 +31,7 @@ if [[ -n "$DB_URL" ]]; then
   fi
   export DATABASE_URL="$DB_URL"
   export POSTGRES_URL_NON_POOLING="$DB_URL"
+  export FAULT_TEST_DATABASE_URL="$DB_URL"
   for i in {1..15}; do
     if python3 -c "import os, psycopg2; psycopg2.connect(os.environ['DATABASE_URL']).close()" 2>/dev/null; then break; fi
     sleep 1
