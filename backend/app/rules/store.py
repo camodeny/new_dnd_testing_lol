@@ -17,6 +17,7 @@ from typing import Any
 from sqlalchemy import text
 from sqlalchemy.orm import Session
 
+from app.rules.gemini import EMBEDDING_DIM
 from models.rules import RulesSection
 from models.rules import RulesCorpus
 from models.rules import RulesEmbedding
@@ -95,9 +96,18 @@ def search_lexical(db: Session, query: str, *, corpus_id: str | None = None, lim
 
 
 def search_vector(db: Session, query_embedding: list[float] | None, *, corpus_id: str | None = None, limit: int = 5, embedding_model: str | None = None) -> list[tuple[RulesSection, float]]:
-    """Vector search if pgvector available and embedding provided; else empty."""
+    """Vector search if pgvector available and embedding provided; else empty.
+
+    Query embeddings must be exactly EMBEDDING_DIM wide (issue #334) —
+    wrong-sized vectors raise instead of silently querying the wrong space.
+    """
     if not query_embedding:
         return []
+    if len(query_embedding) != EMBEDDING_DIM:
+        raise ValueError(
+            f"query embedding has {len(query_embedding)} dims, expected {EMBEDDING_DIM} "
+            "(issue #334: query dim must match the indexed dimension)"
+        )
     dialect = _dialect(db)
     if dialect != "postgresql":
         return []

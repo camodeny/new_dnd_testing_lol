@@ -754,9 +754,11 @@ def upgrade() -> None:
     op.create_index("ix_player_roll_fulfillments_submitted_by", "player_roll_fulfillments", ["submitted_by"])
     op.create_index("ix_player_roll_fulfillments_roll_request_id", "player_roll_fulfillments", ["roll_request_id"])
 
-    # ── rules_embeddings: pgvector vs TEXT fallback (issue #223) ──
+    # ── rules_embeddings: pgvector vs TEXT fallback (issues #223, #334) ──
+    # Single indexed dimension: vector(1536). HNSW requires a dimensioned
+    # column, so an unconstrained `vector` DDL fails HNSW creation here.
     if dialect == "postgresql" and has_vector:
-        # vector type with HNSW index when pgvector available
+        # vector(1536) with mandatory HNSW index when pgvector available
         conn.execute(sa.text("""
             CREATE TABLE IF NOT EXISTS rules_embeddings (
                 rule_id VARCHAR(256) NOT NULL REFERENCES rules_sections(rule_id) ON DELETE CASCADE,
@@ -765,19 +767,20 @@ def upgrade() -> None:
                 embedding_model VARCHAR(64) NOT NULL,
                 embedding_version VARCHAR(32) NOT NULL,
                 build_id VARCHAR(64) NOT NULL,
-                embedding vector,
+                embedding vector(1536),
                 embedding_text TEXT,
                 chunk_strategy VARCHAR(64),
                 created_at TIMESTAMPTZ DEFAULT now() NOT NULL,
                 PRIMARY KEY (rule_id, embedding_model, build_id)
             )
         """))
-        _safe_optional_ddl(
-            conn,
+        # Mandatory, not optional (issue #334): if HNSW cannot be created on
+        # the pgvector branch the migration must fail loudly instead of
+        # warning-and-skipping into an unindexed deployment.
+        conn.execute(sa.text(
             "CREATE INDEX IF NOT EXISTS ix_rules_embeddings_vector "
-            "ON rules_embeddings USING hnsw (embedding vector_cosine_ops)",
-            "rules_embeddings HNSW index",
-        )
+            "ON rules_embeddings USING hnsw (embedding vector_cosine_ops)"
+        ))
     else:
         op.create_table(
             "rules_embeddings",

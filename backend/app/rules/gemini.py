@@ -11,7 +11,7 @@ Implements Google's Embeddings docs correctly:
 Env:
   GEMINI_API_KEY or GOOGLE_API_KEY
   GEMINI_EMBEDDING_MODEL (default: models/gemini-embedding-2)
-  GEMINI_EMBEDDING_DIM (optional outputDimensionality, e.g. 768, 3072)
+  GEMINI_EMBEDDING_DIM (must be 1536 if set — the single indexed dimension)
 
 API: https://generativelanguage.googleapis.com/v1beta/models/{model}:batchEmbedContents
 """
@@ -38,6 +38,13 @@ BATCH_SIZE = 100
 MAX_RETRIES = 3
 TIMEOUT_S = 30.0
 
+# Single production embedding dimension (issue #334). The rules_embeddings
+# column is vector(EMBEDDING_DIM) with a mandatory HNSW index — doc and query
+# embeddings must use exactly this dimension; nothing else is indexed.
+# Must stay <= 2000 (HNSW production cap) and equal app.rules.embeddings
+# DEFAULT_DIM / EMBEDDING_DIM.
+EMBEDDING_DIM = 1536
+
 
 def _api_key() -> str | None:
     return os.getenv("GEMINI_API_KEY") or os.getenv("GOOGLE_API_KEY") or os.getenv("GOOGLE_GENAI_API_KEY")
@@ -50,11 +57,22 @@ def _model_name(raw: str | None) -> str:
     return m
 
 
-def _output_dim() -> int | None:
+def _output_dim() -> int:
+    """Resolved output dimensionality — always EMBEDDING_DIM (issue #334).
+
+    Doc and query embeddings must share the single indexed dimension.
+    An env override requesting anything else fails closed.
+    """
     val = os.getenv("GEMINI_EMBEDDING_DIM") or os.getenv("GEMINI_OUTPUT_DIMENSIONALITY")
-    if val and val.strip().isdigit():
-        return int(val.strip())
-    return None
+    if val is None or not val.strip():
+        return EMBEDDING_DIM
+    raw = val.strip()
+    if not raw.isdigit() or int(raw) != EMBEDDING_DIM:
+        raise ValueError(
+            f"GEMINI_EMBEDDING_DIM={raw!r} rejected — the indexed embedding "
+            f"dimension is fixed at {EMBEDDING_DIM} (issue #334)"
+        )
+    return EMBEDDING_DIM
 
 
 def _is_embedding_2(model_name: str) -> bool:
@@ -116,6 +134,11 @@ def gemini_embed_texts(
         raise RuntimeError("GEMINI_API_KEY (or GOOGLE_API_KEY) not set — cannot embed with Gemini")
     model_name = _model_name(model)
     dim = output_dimensionality if output_dimensionality is not None else _output_dim()
+    if dim != EMBEDDING_DIM:
+        raise ValueError(
+            f"output_dimensionality={dim!r} rejected — the indexed embedding "
+            f"dimension is fixed at {EMBEDDING_DIM} (issue #334)"
+        )
     is_v2 = _is_embedding_2(model_name)
 
     max_chars = 32000 if is_v2 else 8000
@@ -150,10 +173,19 @@ def gemini_embed_texts(
                     vals = e.get("values") or e.get("embedding", {}).get("values") or []
                     if not vals:
                         raise RuntimeError(f"Missing embedding values: {e}")
+                    if len(vals) != dim:
+                        raise ValueError(
+                            f"Gemini returned {len(vals)}-dim embedding, expected {dim} "
+                            "(issue #334: doc/query dims must match the indexed dimension)"
+                        )
                     vectors.append([float(x) for x in vals])
                 last_err = None
                 break
             except Exception as exc:
+                # Dimension mismatches are contract violations, not transient
+                # failures — never retry or wrap them (issue #334).
+                if isinstance(exc, ValueError):
+                    raise
                 last_err = exc
                 msg = str(exc).lower()
                 retryable = any(k in msg for k in ("429", "500", "502", "503", "504", "timeout", "temporar", "unavailable", "retryable"))

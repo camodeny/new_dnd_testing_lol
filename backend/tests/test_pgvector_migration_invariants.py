@@ -99,6 +99,17 @@ def test_vector_extension_embedding_column_and_hnsw():
             f"expected vector column (pgvector branch), got {col[0]!r} "
             "(TEXT fallback branch was taken — extension not available at migrate time)"
         )
+        dim = conn.execute(
+            text(
+                "SELECT format_type(a.atttypid, a.atttypmod) FROM pg_attribute a "
+                "JOIN pg_class t ON t.oid = a.attrelid "
+                "WHERE t.relname='rules_embeddings' AND a.attname='embedding'"
+            )
+        ).scalar()
+        assert dim == "vector(1536)", (
+            f"expected single indexed dimension vector(1536), got {dim!r} "
+            "(issue #334: HNSW requires a dimensioned column)"
+        )
         hnsw = conn.execute(
             text(
                 "SELECT indexname FROM pg_indexes "
