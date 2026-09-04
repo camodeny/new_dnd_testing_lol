@@ -252,9 +252,15 @@ async function main() {
       "Do not merely draft or describe a review in chat, and do not wait for the user to copy or approve the review.",
       "Do not modify files, create commits, merge, close, or otherwise change repository state beyond submitting this review.",
       "Prioritize correctness bugs, security issues, data-loss risks, broken behavior, and missing tests.",
+      "Format the review as pretty GitHub-flavored Markdown and use all GitHub review features you can:",
+      "start with ## Summary and ## Verdict sections, add a findings table with Severity | File:Line | Issue,",
+      "use severity emojis (🔴 Critical, 🟠 High, 🟡 Medium, 🟢 Nit), file and line links, fenced code blocks,",
+      "inline ```suggestion code fixes where possible, task-list checklists, and collapsible <details> for low-priority notes.",
+      "Label the review body as AI-generated.",
       "For each finding include severity, file and line when available, why it matters, and a concrete fix.",
-      "If there are no actionable findings, say so clearly and include a brief summary of what you checked.",
-      "Submit one review comment labeled as an AI-generated review.",
+      "If there are no actionable findings, submit an approving-style review whose body starts with exactly:",
+      "\"No actionable findings. Ready for human review.\" followed by a brief summary of what you checked.",
+      "Submit one review labeled as an AI-generated review.",
     ].join("\n");
 
     await composer.fill(prompt);
