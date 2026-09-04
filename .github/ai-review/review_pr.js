@@ -107,9 +107,15 @@ async function getSendButton(page) {
 
 async function readComposer(composer) {
   try {
-    return (await composer.inputValue()).trim();
+    return (await composer.inputValue({ timeout: 1500 })).trim();
   } catch {
-    return ((await composer.textContent()) || "").trim();
+    try {
+      return ((await composer.textContent({ timeout: 1500 })) || "").trim();
+    } catch {
+      // ChatGPT can replace the composer as soon as a message is submitted.
+      // A missing old locator therefore means submission has progressed.
+      return "";
+    }
   }
 }
 
