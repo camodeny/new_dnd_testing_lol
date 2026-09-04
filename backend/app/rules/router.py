@@ -31,7 +31,12 @@ def search(q: str = Query(..., max_length=240), limit: int = Query(5, ge=1, le=2
     embedding_model = None
     import os
 
-    if os.getenv("GEMINI_API_KEY") or os.getenv("GOOGLE_API_KEY") or os.getenv("GOOGLE_GENAI_API_KEY"):
+    has_key = bool(os.getenv("GEMINI_API_KEY") or os.getenv("GOOGLE_API_KEY") or os.getenv("GOOGLE_GENAI_API_KEY"))
+    if not has_key:
+        # Explicit degradation: no key means lexical-only; stub vectors (if any)
+        # never stand in for the vector path.
+        logger.warning("rules search lexical-only reason=no_gemini_key stub_vectors_ignored")
+    else:
         try:
             from models.rules import RulesEmbedding
 
@@ -53,6 +58,10 @@ def search(q: str = Query(..., max_length=240), limit: int = Query(5, ge=1, le=2
                     except Exception as exc:
                         query_embedding = None
                         logger.warning("rules search embedding degraded reason=%s error=%s", type(exc).__name__, exc)
+            else:
+                # Key is set but no real (gemini-*) index exists: stay lexical-only.
+                # Stub-labeled vectors are never used for the vector path.
+                logger.warning("rules search lexical-only reason=no_gemini_index stub_vectors_ignored")
     hits = hybrid_search(db, q, corpus_id=corpus_id, limit=limit, query_embedding=query_embedding, embedding_model=embedding_model)
     return {"query": q, "limit": limit, "hits": hits, "count": len(hits)}
 

@@ -7,7 +7,7 @@ creep back in.
 import pathlib
 import uuid
 
-from models import Campaign
+from models.campaigns import Campaign
 
 
 def test_campaign_to_dict_uses_canonical_owner_and_loot_fields():

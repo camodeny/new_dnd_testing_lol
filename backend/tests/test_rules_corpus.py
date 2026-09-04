@@ -319,3 +319,66 @@ def test_real_embedding_model_must_not_silently_fallback_to_stub(db, monkeypatch
     bid = build_embeddings(db, embedding_model="stub-hash-v1", build_id="stub1")
     assert bid == "stub1"
     assert db.query(RulesEmbedding).filter(RulesEmbedding.embedding_model == "stub-hash-v1").count() == len(SAMPLE_SECTIONS)
+
+
+def test_ingest_cli_resolves_real_model_when_gemini_configured(monkeypatch):
+    # Issue #333: --build-embeddings must select real embeddings when configured,
+    # never silent stub-hash-v1.
+    import scripts.ingest_rules as ingest_cli
+
+    for var in ("GEMINI_API_KEY", "GOOGLE_API_KEY", "GOOGLE_GENAI_API_KEY", "GEMINI_EMBEDDING_MODEL"):
+        monkeypatch.delenv(var, raising=False)
+    # No key, no flag -> explicit stub fallback with reason
+    model, reason = ingest_cli.resolve_embedding_model(None, None)
+    assert model == "stub-hash-v1"
+    assert "stub" in reason
+    # Gemini key configured -> real model
+    monkeypatch.setenv("GEMINI_API_KEY", "test-key")
+    model, reason = ingest_cli.resolve_embedding_model(None, None)
+    assert model == "gemini-embedding-2"
+    # Explicit --model flag wins over env
+    model, _ = ingest_cli.resolve_embedding_model("text-embedding-004", None)
+    assert model == "text-embedding-004"
+    model, _ = ingest_cli.resolve_embedding_model(None, "gemini-embedding-001")
+    assert model == "gemini-embedding-001"
+    # Alias normalizes to canonical 2
+    model, _ = ingest_cli.resolve_embedding_model("gemini", None)
+    assert model == "gemini-embedding-2"
+
+
+def test_ingest_cli_explicit_model_uses_fake_provider_no_paid_calls(db, monkeypatch):
+    # Issue #333: explicit --model with a fake provider must produce real-labeled
+    # vectors (no stub-hash-v1, no network).
+    import scripts.ingest_rules as ingest_cli
+
+    import_fixture_sections(db, SAMPLE_SECTIONS, source_artifact_hash=TEST_OFFICIAL_HASH, validate_canaries=False)
+    model, _ = ingest_cli.resolve_embedding_model("gemini-embedding-2", None)
+    assert model == "gemini-embedding-2"
+
+    calls: list[list[str]] = []
+
+    def fake_provider(texts: list[str]) -> list[list[float]]:
+        calls.append(texts)
+        return [[0.1, 0.2, 0.3] for _ in texts]
+
+    bid = build_embeddings(db, embedding_model=model, embedding_version="1", build_id="fake1", provider=fake_provider)
+    assert bid == "fake1"
+    assert calls and len(calls[0]) == len(SAMPLE_SECTIONS)
+    rows = db.query(RulesEmbedding).filter(RulesEmbedding.embedding_model == "gemini-embedding-2").all()
+    assert len(rows) == len(SAMPLE_SECTIONS)
+    assert db.query(RulesEmbedding).filter(RulesEmbedding.embedding_model == "stub-hash-v1").count() == 0
+
+
+def test_stub_embeddings_log_explicit_degradation(db, monkeypatch, caplog):
+    # Issue #333: falling back to stubs must log degradation explicitly.
+    import logging
+
+    import_fixture_sections(db, SAMPLE_SECTIONS, source_artifact_hash=TEST_OFFICIAL_HASH, validate_canaries=False)
+    monkeypatch.delenv("GEMINI_API_KEY", raising=False)
+    monkeypatch.delenv("GOOGLE_API_KEY", raising=False)
+    monkeypatch.delenv("GOOGLE_GENAI_API_KEY", raising=False)
+    with caplog.at_level(logging.WARNING, logger="app.rules.embeddings"):
+        bid = build_embeddings(db, embedding_model="stub-hash-v1", build_id="stub-log-1")
+    assert bid == "stub-log-1"
+    assert any("stub" in r.message.lower() and ("lexical" in r.message.lower() or "fallback" in r.message.lower()) for r in caplog.records), \
+        "stub fallback must log explicit degradation"
