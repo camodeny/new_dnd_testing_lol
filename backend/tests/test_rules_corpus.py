@@ -420,7 +420,7 @@ def test_ingest_cli_explicit_model_uses_fake_provider_no_paid_calls(db, monkeypa
 
     def fake_provider(texts: list[str]) -> list[list[float]]:
         calls.append(texts)
-        return [[0.1, 0.2, 0.3] for _ in texts]
+        return [[0.1] * 1536 for _ in texts]
 
     bid = build_embeddings(db, embedding_model=model, embedding_version="1", build_id="fake1", provider=fake_provider)
     assert bid == "fake1"

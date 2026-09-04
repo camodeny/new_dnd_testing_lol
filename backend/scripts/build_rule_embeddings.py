@@ -5,7 +5,7 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(__file__)))
 
 import argparse
 from database import SessionLocal
-from app.rules.embeddings import build_embeddings
+from app.rules.embeddings import EMBEDDING_DIM, build_embeddings
 
 def main():
     p = argparse.ArgumentParser()
@@ -14,7 +14,7 @@ def main():
     p.add_argument("--model", default=None, help="embedding model: stub-hash-v1 (default), gemini-embedding-2 (Gemini Embeddings 2), gemini-embedding-001, text-embedding-004")
     p.add_argument("--version", default="1")
     p.add_argument("--gemini-model", default=None, help="alias for --model when using Gemini")
-    p.add_argument("--dim", type=int, default=None, help="output dimensionality for Gemini (e.g. 768, 3072) — also via GEMINI_EMBEDDING_DIM")
+    p.add_argument("--dim", type=int, default=None, help="output dimensionality for Gemini (must be 1536, the indexed dimension) — also via GEMINI_EMBEDDING_DIM")
     args = p.parse_args()
     # Resolve model: explicit --model > --gemini-model > env > default stub
     import os as _os
@@ -28,6 +28,8 @@ def main():
         else:
             args.model = "stub-hash-v1"
     # Allow dim override via env for Gemini
+    if args.dim is not None and args.dim != EMBEDDING_DIM:
+        p.error(f"--dim {args.dim} rejected — indexed embedding dimension is fixed at {EMBEDDING_DIM} (issue #334)")
     if args.dim is not None:
         _os.environ["GEMINI_EMBEDDING_DIM"] = str(args.dim)
     # Support gemini/text-embedding alias without models/ prefix

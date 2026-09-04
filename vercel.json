@@ -14,7 +14,7 @@
   "crons": [
     {
       "path": "/api/cron/outbox-relay",
-      "schedule": "* * * * *"
+      "schedule": "0 0 * * *"
     }
   ],
   "rewrites": [

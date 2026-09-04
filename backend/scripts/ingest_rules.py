@@ -21,7 +21,7 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(__file__)))
 from database import SessionLocal
 from app.rules.ingest import import_fixture_sections, import_markdown_text, parse_cantilux_json, compute_sha256
 from app.rules.metadata import CORPUS_ID, CORPUS_VERSION, OFFICIAL_SRD_URL
-from app.rules.embeddings import build_embeddings
+from app.rules.embeddings import EMBEDDING_DIM, build_embeddings
 
 logger = logging.getLogger(__name__)
 
@@ -65,11 +65,13 @@ def main():
     p.add_argument("--model", default=None, help="embedding model: gemini-embedding-2 (default when GEMINI_API_KEY set), gemini-embedding-001, text-embedding-004, stub-hash-v1 (offline/test)")
     p.add_argument("--gemini-model", default=None, help="alias for --model when using Gemini")
     p.add_argument("--embedding-version", default="1", help="embedding version tag")
-    p.add_argument("--dim", type=int, default=None, help="output dimensionality for Gemini (e.g. 768, 3072) — also via GEMINI_EMBEDDING_DIM")
+    p.add_argument("--dim", type=int, default=None, help="output dimensionality for Gemini (must be 1536, the indexed dimension) — also via GEMINI_EMBEDDING_DIM")
     p.add_argument("--validate-canaries", action="store_true", default=True)
     args = p.parse_args()
 
     embedding_model, embedding_reason = resolve_embedding_model(args.model, args.gemini_model)
+    if args.dim is not None and args.dim != EMBEDDING_DIM:
+        p.error(f"--dim {args.dim} rejected — indexed embedding dimension is fixed at {EMBEDDING_DIM} (issue #334)")
     if args.dim is not None:
         os.environ["GEMINI_EMBEDDING_DIM"] = str(args.dim)
 
