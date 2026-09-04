@@ -948,6 +948,19 @@ def commit_turn(
             from app.dm.effects import apply_staged_effects
 
             apply_staged_effects(db, campaign, staged_list, turn, attempt)
+        # JIT-promote committed new-entity proposals to durable canonical
+        # identity exactly once (issue #209). Runs in the same revision
+        # transaction: failed commit leaves no half-created authority.
+        # Idempotency key per (attempt, temp_id) makes retries safe.
+        try:
+            from app.world.service import promote_new_entities_from_contract
+
+            promoted = promote_new_entities_from_contract(db, campaign, turn, attempt)
+            if promoted:
+                base_payload["promoted_entity_ids"] = [str(e.id) for e in promoted]
+                base_payload["promoted_entity_types"] = [e.entity_type for e in promoted]
+        except ImportError:
+            pass
 
     # Persist commit_operation_id for idempotency
     if not attempt.commit_operation_id:

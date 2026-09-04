@@ -1054,6 +1054,42 @@ def assemble_attempt_context(
         )
     timings[LaneName.CONTENT_BOUNDARIES] = (time.monotonic() - lane_started) * 1000
 
+    # Authoritative current-scene lane (issue #209): answers current
+    # location/time/present actors without parsing chat history. Absent
+    # scene rows leave the lane empty so #202 fail-closed rules apply.
+    lane_started = time.monotonic()
+    try:
+        from app.world.service import build_current_scene_context_record
+
+        scene_value = build_current_scene_context_record(db, campaign)
+    except Exception:  # noqa: BLE001 — missing tables/rows must not break assembly
+        scene_value = None
+    if scene_value is not None:
+        scene_visibility = scene_value.get("visibility") or "campaign"
+        if scene_visibility not in {"public", "campaign", "private", "dm_only"}:
+            scene_visibility = "campaign"
+        records[LaneName.CURRENT_SCENE].append(
+            ContextRecord(
+                record_id=f"current-scene:{campaign.id}",
+                required=True,
+                priority=90,
+                value=scene_value,
+                sources=[
+                    _source(
+                        "campaign_current_scene",
+                        campaign.id,
+                        scene_value.get("revision", campaign.revision),
+                        campaign.revision,
+                        source_turn_id=scene_value.get("source_turn_id"),
+                        source_attempt_id=scene_value.get("source_attempt_id"),
+                    )
+                ],
+                authorization=scope,
+                visibility=scene_visibility,  # type: ignore[arg-type]
+            )
+        )
+    timings[LaneName.CURRENT_SCENE] = (time.monotonic() - lane_started) * 1000
+
     supplemental_records = supplemental_records or {}
     for key, values in supplemental_records.items():
         name = key if isinstance(key, LaneName) else LaneName(key)
@@ -1099,6 +1135,8 @@ def assemble_attempt_context(
             "characters",
             "dnd5e_character_sheets",
             "campaign_domain_events",
+            "campaign_current_scenes",
+            "world_entities",
         ],
     )
     # Include DB collection in total duration without contaminating deterministic payload.

@@ -38,7 +38,8 @@ def test_migration_preserves_events_when_parent_rows_are_deleted():
 
 
 def test_baseline_is_single_root_revision():
-    """Per #313 the squash is a single root baseline with one head."""
+    """Per #313 the squash is a single root baseline; later issues add
+    linear additive children (never rewrite the baseline)."""
     from alembic.config import Config
     from alembic.script import ScriptDirectory
 
@@ -48,4 +49,14 @@ def test_baseline_is_single_root_revision():
     script = ScriptDirectory.from_config(config)
 
     assert script.get_revision("2a04bc8c83ba").down_revision is None
-    assert script.get_heads() == ["2a04bc8c83ba"]
+    heads = script.get_heads()
+    assert len(heads) == 1, f"migration history must stay linear with one head, got {heads}"
+    # Walk the single chain back to the baseline root (no branches/rewrites).
+    chain = []
+    current = heads[0]
+    while current is not None:
+        chain.append(current)
+        rev = script.get_revision(current)
+        down = rev.down_revision
+        current = down[0] if isinstance(down, tuple) else down
+    assert "2a04bc8c83ba" in chain

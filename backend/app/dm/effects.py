@@ -130,8 +130,32 @@ def _handle_record_world_event(db: Session, campaign: Campaign, effect: dict[str
 
 @register("update_scene")
 def _handle_update_scene(db: Session, campaign: Campaign, effect: dict[str, Any], turn: DmTurn, attempt: DmTurnAttempt):
+    """Apply a bounded scene patch to the authoritative current-scene row.
+
+    Runs inside the turn-commit revision transaction (issue #209): the outer
+    ``commit_campaign_mutation`` owns commit/rollback, so a failed turn
+    commit leaves no half-applied scene. ``new_revision`` is the resulting
+    campaign revision (prior + 1), keeping scene changes in revision order.
+    """
+    from app.world.service import apply_scene_update_inline
+
     args = effect.get("arguments") or {}
-    # Stub: scene patches would apply to a current_scene table; for now no-op but validated.
+    patch = args.get("scene_patch") or {}
+    if not isinstance(patch, dict):
+        raise ValueError(f"Staged effect {effect.get('id')!r} scene_patch must be an object")
+    prior = int(campaign.revision) if campaign.revision is not None else 0
+    apply_scene_update_inline(
+        db, campaign, new_revision=prior + 1,
+        location_entity_id=patch.get("location_entity_id"),
+        location_name=patch.get("location_name") or patch.get("location"),
+        fictional_time=patch.get("fictional_time") or patch.get("time"),
+        fictional_time_details=patch.get("fictional_time_details"),
+        present_actors=patch.get("present_actors") or patch.get("present_actor_names"),
+        environment=patch.get("environment") or patch.get("state"),
+        visibility=args.get("visibility") or patch.get("visibility"),
+        source_turn_id=turn.id, source_attempt_id=attempt.id,
+        operation_id=getattr(attempt, "commit_operation_id", None) or str(attempt.id),
+    )
     logger.info("effect update_scene effect_id=%s reason=%s", effect.get("id"), args.get("reason"))
 
 
