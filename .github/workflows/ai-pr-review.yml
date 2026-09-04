@@ -37,6 +37,10 @@ jobs:
         working-directory: reviewer-source/.github/ai-review
         run: npm ci --ignore-scripts --no-audit --no-fund
 
+      - name: Test reviewer helpers
+        working-directory: reviewer-source/.github/ai-review
+        run: npm test
+
       - name: Ask DND AI to review and submit the PR review
         env:
           PR_URL: ${{ github.event.pull_request.html_url }}
@@ -46,7 +50,18 @@ jobs:
           CHATGPT_PROJECT: DND AI AUTO
           CHATGPT_HEADLESS: "false"
           CHATGPT_RESPONSE_TIMEOUT_MS: "600000"
+          REVIEWER_DIAGNOSTICS_DIR: /tmp/dnd-ai-review-diagnostics-${{ github.run_id }}
         run: |
           set -euo pipefail
+          mkdir -p "$REVIEWER_DIAGNOSTICS_DIR"
           xvfb-run --auto-servernum --server-args="-screen 0 1440x1024x24" \
             node reviewer-source/.github/ai-review/review_pr.js
+
+      - name: Upload reviewer diagnostics
+        if: ${{ always() }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: dnd-ai-review-diagnostics-${{ github.run_id }}
+          path: /tmp/dnd-ai-review-diagnostics-${{ github.run_id }}/
+          if-no-files-found: ignore
+          retention-days: 14

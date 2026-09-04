@@ -3,6 +3,9 @@
   "private": true,
   "version": "1.0.0",
   "type": "commonjs",
+  "scripts": {
+    "test": "node --test review_pr.test.js"
+  },
   "dependencies": {
     "playwright": "1.62.1"
   }
