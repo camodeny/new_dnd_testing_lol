@@ -6,6 +6,7 @@ const path = require("node:path");
 const { chromium } = require("playwright");
 
 const CHATGPT_URL = "https://chatgpt.com/";
+const CHATGPT_PROJECTS_URL = "https://chatgpt.com/projects";
 const PROJECT_ROUTE_RE = /\/g\/[^/]+\/project(?:[/?#]|$)/i;
 const DEFAULT_PROJECT = "DND AI AUTO";
 const DEFAULT_PROFILE = path.join(os.homedir(), ".aireview-chatgpt-profile");
@@ -53,16 +54,10 @@ function findBrowserExecutable() {
 }
 
 async function openProject(page, projectName) {
-  const projects = await firstVisible(
-    [
-      page.getByRole("link", { name: /projects/i }).first(),
-      page.getByRole("button", { name: /projects/i }).first(),
-      page.getByText("Projects", { exact: true }).first(),
-    ],
-    "Projects navigation",
-  );
-  await projects.click();
-  await page.waitForURL(/\/projects(?:[/?#]|$)/i, { timeout: 15000 });
+  // ChatGPT may open Projects in-place without changing the URL after a
+  // sidebar click. Navigate directly to the stable Projects route instead.
+  await page.goto(CHATGPT_PROJECTS_URL, { waitUntil: "domcontentloaded", timeout: 60000 });
+  await waitPastChallenge(page);
 
   const project = await firstVisible(
     [
