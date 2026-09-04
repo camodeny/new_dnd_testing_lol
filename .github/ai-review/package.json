@@ -1,0 +1,9 @@
+{
+  "name": "dnd-ai-pr-reviewer",
+  "private": true,
+  "version": "1.0.0",
+  "type": "commonjs",
+  "dependencies": {
+    "playwright": "1.62.1"
+  }
+}
