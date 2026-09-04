@@ -7,7 +7,7 @@ const { chromium } = require("playwright");
 
 const CHATGPT_URL = "https://chatgpt.com/";
 const PROJECT_ROUTE_RE = /\/g\/[^/]+\/project(?:[/?#]|$)/i;
-const DEFAULT_PROJECT = "DND AI";
+const DEFAULT_PROJECT = "DND AI AUTO";
 const DEFAULT_PROFILE = path.join(os.homedir(), ".aireview-chatgpt-profile");
 const DEFAULT_TIMEOUT_MS = 10 * 60 * 1000;
 

@@ -44,7 +44,7 @@ jobs:
           PR_NUMBER: ${{ github.event.pull_request.number }}
           PR_HEAD_SHA: ${{ github.event.pull_request.head.sha }}
           GITHUB_REPOSITORY: ${{ github.repository }}
-          CHATGPT_PROJECT: DND AI
+          CHATGPT_PROJECT: DND AI AUTO
           CHATGPT_HEADLESS: "false"
           REVIEW_OUTPUT: ${{ runner.temp }}/dnd-ai-review.md
           CHATGPT_RESPONSE_TIMEOUT_MS: "600000"
