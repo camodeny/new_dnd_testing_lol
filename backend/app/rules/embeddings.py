@@ -19,10 +19,14 @@ from sqlalchemy.orm import Session
 
 from models.rules import RulesSection
 from models.rules import RulesEmbedding
+from app.rules.gemini import EMBEDDING_DIM
 
 DEFAULT_MODEL = "stub-hash-v1"
 DEFAULT_VERSION = "1"
-DEFAULT_DIM = 1536
+# Single production embedding dimension (issue #334) — must equal the
+# vector(N) width in the baseline migration and app.rules.gemini.EMBEDDING_DIM.
+DEFAULT_DIM = EMBEDDING_DIM
+assert DEFAULT_DIM == 1536, "indexed embedding dimension must be 1536"
 
 logger = logging.getLogger(__name__)
 
@@ -96,8 +100,15 @@ def build_embeddings(
     provider: optional callable(texts: list[str]) -> list[list[float]] for real embeddings.
     If provider is None and embedding_model looks like a Gemini model, a Gemini provider
     is auto-resolved (requires GEMINI_API_KEY). Otherwise falls back to stub.
+    Every stored vector must be exactly EMBEDDING_DIM wide (issue #334) —
+    wrong-sized vectors raise instead of silently polluting the index.
     Returns build_id.
     """
+    if dim != EMBEDDING_DIM:
+        raise ValueError(
+            f"dim={dim!r} rejected — the indexed embedding dimension is fixed "
+            f"at {EMBEDDING_DIM} (issue #334)"
+        )
     # If build_id not forced, only embed missing to save cost (WHERE NOT EXISTS)
     is_forced_rebuild = build_id is not None
     bid = build_id or f"emb_{uuid.uuid4().hex[:12]}"
@@ -158,7 +169,14 @@ def build_embeddings(
     texts = [_section_text(s) for s in sections]
     if provider:
         vectors = provider(texts)
-        # Gemini (and other real providers) decide dim; dim param is advisory for stub only
+        # Real providers decide values but not width: doc embeddings must be
+        # exactly the indexed dimension (Gemini requests EMBEDDING_DIM).
+        for vec in vectors:
+            if len(vec) != EMBEDDING_DIM:
+                raise ValueError(
+                    f"provider returned {len(vec)}-dim vector, expected {EMBEDDING_DIM} "
+                    "(issue #334: doc/query dims must match the indexed dimension)"
+                )
     else:
         # Explicit degradation: stub vectors are test/offline only and must never
         # silently stand in for the retrieval path (issue #333).
