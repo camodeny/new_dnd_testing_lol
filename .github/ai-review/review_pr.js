@@ -72,7 +72,27 @@ async function openProject(page, projectName) {
     10000,
   );
   await project.click();
-  await page.waitForURL(PROJECT_ROUTE_RE, { timeout: 15000, waitUntil: "commit" });
+
+  // The Projects surface is an SPA and can render the project in place (or
+  // update history after the document commit).  A URL transition is useful
+  // evidence when it happens, but it is not a reliable completion signal.
+  try {
+    await page.waitForURL(PROJECT_ROUTE_RE, { timeout: 15000, waitUntil: "commit" });
+  } catch (error) {
+    if (!PROJECT_ROUTE_RE.test(page.url())) {
+      // The composer is the stronger signal that the project surface is ready
+      // and also covers routes ChatGPT introduces without notice.
+      try {
+        await getComposer(page);
+      } catch {
+        throw new Error(
+          `ChatGPT did not open project "${projectName}". ` +
+            `URL after project click: ${page.url()}`,
+          { cause: error },
+        );
+      }
+    }
+  }
 }
 
 function composerLocators(page) {
