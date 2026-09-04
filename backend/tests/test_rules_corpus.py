@@ -201,14 +201,15 @@ def test_corpus_update_does_not_silently_change_historical_identity(db):
     assert db.query(RulesSection).count() == orig_count
     for rid in orig_ids:
         assert lookup_by_rule_id(db, rid) is not None
-    # Bump version with different official hash should succeed and preserve history
+    # Bump version without a manifest pin must be rejected fail-closed (no bypass via None)
     new_version = CORPUS_VERSION + ".1"
-    import_fixture_sections(db, updated, corpus_version=new_version, source_artifact_hash=TEST_OFFICIAL_HASH_2, validate_canaries=False)
+    with pytest.raises(ValueError, match="No pinned official artifact hash|refusing promotion"):
+        import_fixture_sections(db, updated, corpus_version=new_version, source_artifact_hash=TEST_OFFICIAL_HASH_2, validate_canaries=False)
     # Old version still intact
     for rid in orig_ids:
         assert lookup_by_rule_id(db, rid, corpus_version=CORPUS_VERSION) is not None
-    # New version has the extra rule
-    assert db.query(RulesSection).filter(RulesSection.corpus_version == new_version).count() == orig_count + 1
+    # Unmapped version was not promoted
+    assert db.query(RulesSection).filter(RulesSection.corpus_version == new_version).count() == 0
 
 
 def test_campaign_memory_cannot_overwrite_rules_authority(db):
@@ -295,6 +296,66 @@ def test_promotion_accepts_exact_pinned_hash_and_rejects_mismatch(db):
     if derivative != TEST_OFFICIAL_HASH:
         with pytest.raises(ValueError, match="Official artifact hash mismatch"):
             import_fixture_sections(db, SAMPLE_SECTIONS, source_artifact_hash=derivative, validate_canaries=False)
+
+
+def test_promotion_rejects_unmapped_corpus_version(db):
+    # Unmapped corpus/version must reject promotion instead of bypassing via None
+    with pytest.raises(ValueError, match="No pinned official artifact hash|refusing promotion"):
+        import_fixture_sections(
+            db,
+            SAMPLE_SECTIONS,
+            corpus_id="dnd-srd",
+            corpus_version="9.9.9-unmapped",
+            source_artifact_hash=TEST_OFFICIAL_HASH,
+            validate_canaries=False,
+        )
+    assert db.query(RulesCorpus).count() == 0
+
+
+def test_promotion_rejects_missing_or_corrupt_manifest(db, monkeypatch):
+    from app.rules import ingest as ingest_mod
+
+    import pathlib
+
+    orig_path_cls = pathlib.Path
+
+    class FakePath:
+        def __init__(self, *a, **k):
+            pass
+
+        def with_name(self, name):
+            return self
+
+        def read_text(self, *a, **k):
+            raise FileNotFoundError("no manifest")
+
+    monkeypatch.setattr(pathlib, "Path", FakePath)
+    try:
+        with pytest.raises(ValueError, match="missing/unreadable|refusing promotion"):
+            import_fixture_sections(db, SAMPLE_SECTIONS, source_artifact_hash=TEST_OFFICIAL_HASH, validate_canaries=False)
+    finally:
+        monkeypatch.setattr(pathlib, "Path", orig_path_cls)
+    assert db.query(RulesCorpus).count() == 0
+
+    class CorruptPath:
+        def __init__(self, *a, **k):
+            pass
+
+        def with_name(self, name):
+            return self
+
+        def read_text(self, *a, **k):
+            return "{not valid json"
+
+    monkeypatch.setattr(pathlib, "Path", CorruptPath)
+    try:
+        with pytest.raises(ValueError, match="corrupt|refusing promotion"):
+            ingest_mod.load_pinned_artifact_hash("dnd-srd", "5.2.1")
+        with pytest.raises(ValueError, match="corrupt|refusing promotion"):
+            import_fixture_sections(db, SAMPLE_SECTIONS, source_artifact_hash=TEST_OFFICIAL_HASH, validate_canaries=False)
+    finally:
+        monkeypatch.setattr(pathlib, "Path", orig_path_cls)
+    assert db.query(RulesCorpus).count() == 0
 
 
 def test_cc_by_attribution_preserved(db):
