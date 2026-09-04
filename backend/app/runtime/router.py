@@ -213,6 +213,40 @@ def create_player_submission(
             thread_id_str,
             exc,
         )
+    # Autonomous DM execution handoff — issue #354. The coordinated attempt
+    # above is eligible for immediate execution; kick the sweeper best-effort
+    # without ever failing the authoritative submission response. On
+    # serverless runtimes the /api/cron/dm-execute trigger owns this sweep;
+    # inline execution is an opt-in latency shortcut (DM_INLINE_EXECUTE=1).
+    try:
+        import os as _os
+
+        if _os.getenv("DM_INLINE_EXECUTE", "").lower() in ("1", "true", "yes", "on"):
+            from database import SessionLocal as _SessionLocal
+
+            if _SessionLocal is not None:
+                _sweep_db = _SessionLocal()
+                try:
+                    from app.dm.execution import run_dm_execute_sweep
+
+                    _sweep = run_dm_execute_sweep(_sweep_db, limit=1)
+                    logger.info(
+                        "dm inline execute campaign_id=%s executed=%s failed=%s",
+                        campaign.id,
+                        len(_sweep.get("executed", [])),
+                        len(_sweep.get("failed", [])),
+                    )
+                finally:
+                    try:
+                        _sweep_db.close()
+                    except Exception:
+                        pass
+    except Exception as exc:
+        logger.warning(
+            "dm inline execute guard failed campaign_id=%s error=%s",
+            campaign.id,
+            exc,
+        )
     return result
 
 

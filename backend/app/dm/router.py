@@ -276,3 +276,33 @@ def recover_stuck(campaign_id: str, payload: dict, request: Request, db: Session
 
     recovered = recover_stuck_attempts(db, campaign_id=campaign.id, lease_seconds=lease)
     return {"recovered": recovered}
+
+
+@router.get("/api/cron/dm-execute")
+def dm_execute_cron_get(request: Request, db: Session = Depends(get_db)):
+    """Autonomous DM execution sweep — issue #354.
+
+    Cron trigger (Vercel Cron / scheduler) that claims and executes eligible
+    prepared DM attempts through the production pipeline without manual
+    API/database intervention. Same auth guard as the outbox relay cron:
+    ``CRON_SECRET`` bearer, or ``ALLOW_INSECURE_CRON=1`` local/test bypass.
+    """
+    from app.outbox.router import _require_cron_secret
+
+    _require_cron_secret(request.headers.get("authorization"))
+    from app.dm.execution import run_dm_execute_sweep
+
+    result = run_dm_execute_sweep(db, limit=5)
+    logger.info(
+        "dm execute cron executed=%s failed=%s skipped=%s recovered=%s",
+        len(result.get("executed", [])),
+        len(result.get("failed", [])),
+        len(result.get("skipped", [])),
+        result.get("recovered", 0),
+    )
+    return {"ok": True, "sweep": result}
+
+
+@router.post("/api/cron/dm-execute")
+def dm_execute_cron_post(request: Request, db: Session = Depends(get_db)):
+    return dm_execute_cron_get(request=request, db=db)
