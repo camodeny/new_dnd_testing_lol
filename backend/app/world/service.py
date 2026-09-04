@@ -63,6 +63,22 @@ def normalize_visibility(value: Any, *, default: str = "campaign") -> str:
     return canonical
 
 
+def world_event_visibility(record_visibility: Any) -> str:
+    """Map a world-record disclosure level onto domain-event visibility.
+
+    The campaign-events member-read path only returns ``public`` events to
+    non-actors, while world reads treat both ``public`` and ``campaign``
+    records as member-visible. Collapse both member-visible levels onto the
+    event system's ``public`` value so ordinary members see history for
+    records they can read; ``private``/``dm_only`` pass through unchanged
+    and stay hidden from non-actors via the existing event filter.
+    """
+    normalized = normalize_visibility(record_visibility)
+    if normalized in {"public", "campaign"}:
+        return "public"
+    return normalized
+
+
 def validate_entity_type(value: Any) -> str:
     t = str(value or "").strip().lower()
     if not _ENTITY_TYPE_RE.fullmatch(t or ""):
@@ -539,7 +555,10 @@ def create_entity_authoritative(
         # re-review): restricted entities must not leak name/type/id to
         # ordinary members through the campaign-events endpoint, whose
         # viewer filter only returns public events to non-actors.
-        visibility=normalize_visibility(visibility),
+        # Member-visible world levels (public/campaign) collapse onto the
+        # event system's public value so members see history for records
+        # they can read; private/dm_only stay restricted.
+        visibility=world_event_visibility(visibility),
         provenance={"source": "world_api", "idempotency_key": key},
         mutate=_mutate,
     )
@@ -586,9 +605,11 @@ def set_scene_authoritative(
         # Event visibility follows the resulting record's disclosure level
         # (PR #348 re-review): the scene payload carries the full snapshot,
         # so a restricted scene must not persist a public event readable by
-        # ordinary members. Built AFTER mutate because a None visibility
-        # input preserves the pre-existing scene visibility.
-        return normalize_visibility((holder.get("scene") or {}).get("visibility"))
+        # ordinary members. Member-visible levels (public/campaign) map to
+        # the event system's public value; restricted levels pass through.
+        # Built AFTER mutate because a None visibility input preserves the
+        # pre-existing scene visibility.
+        return world_event_visibility((holder.get("scene") or {}).get("visibility"))
 
     campaign_after, event = commit_campaign_mutation(
         db, campaign_id, int(expected_revision),

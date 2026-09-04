@@ -797,3 +797,62 @@ def test_private_scene_context_assembly_stays_hidden():
         record for record in proj["lanes"] if record["name"] == "current_scene"
     )
     assert proj_lane["records"] == []
+
+
+def test_campaign_visible_world_events_reach_non_owner_over_http(world_api, monkeypatch):
+    # Re-review HOLD (round 4): campaign-visible world records must have
+    # campaign-visible history — a non-owner member reads the record AND its
+    # domain event, while private/dm_only stay invisible in both.
+    client, cid, owner, member = world_api
+    _act_as_all(monkeypatch, owner)
+    base = f"/api/campaigns/{cid}/world"
+    r = client.post(f"{base}/entities", json={
+        "expected_revision": 0, "entity_type": "npc", "name": "Open Ally",
+        "operation_id": "op-open",
+    }, headers={"Idempotency-Key": "op-open"})
+    assert r.status_code == 200, r.text
+    open_id = r.json()["entity"]["id"]
+    r = client.put(f"{base}/current-scene", json={
+        "expected_revision": 1, "location_name": "Ember Gate",
+        "operation_id": "op-scene",
+    }, headers={"Idempotency-Key": "op-scene"})
+    assert r.status_code == 200, r.text
+    # Member-visible world levels map onto the event system's public value.
+    owner_events = [e for e in client.get(f"/api/campaigns/{cid}/events").json()["events"]
+                    if e["event_type"].startswith("world.")]
+    assert len(owner_events) == 2
+    assert {e["visibility"] for e in owner_events} == {"public"}
+    # Non-owner member: world reads succeed AND history events are visible.
+    _act_as_all(monkeypatch, member)
+    assert [e["name"] for e in client.get(f"{base}/entities").json()["entities"]] == ["Open Ally"]
+    assert client.get(f"{base}/entities/{open_id}").status_code == 200
+    assert client.get(f"{base}/current-scene").json()["scene"]["location_name"] == "Ember Gate"
+    member_events = [e for e in client.get(f"/api/campaigns/{cid}/events").json()["events"]
+                     if e["event_type"].startswith("world.")]
+    assert len(member_events) == 2
+    blob = str([e["payload"] for e in member_events])
+    assert "Open Ally" in blob and "Ember Gate" in blob
+    # Restricted records stay invisible in both reads and events.
+    _act_as_all(monkeypatch, owner)
+    r = client.post(f"{base}/entities", json={
+        "expected_revision": 2, "entity_type": "npc", "name": "Hidden Blade",
+        "visibility": "dm_only", "details": {"secret": "assassin"},
+        "operation_id": "op-hidden",
+    }, headers={"Idempotency-Key": "op-hidden"})
+    assert r.status_code == 200, r.text
+    hidden_id = r.json()["entity"]["id"]
+    r = client.post(f"{base}/entities", json={
+        "expected_revision": 3, "entity_type": "npc", "name": "Quiet Contact",
+        "visibility": "private", "operation_id": "op-private",
+    }, headers={"Idempotency-Key": "op-private"})
+    assert r.status_code == 200, r.text
+    _act_as_all(monkeypatch, member)
+    assert [e["name"] for e in client.get(f"{base}/entities").json()["entities"]] == ["Open Ally"]
+    assert client.get(f"{base}/entities/{hidden_id}").status_code == 404
+    member_events = [e for e in client.get(f"/api/campaigns/{cid}/events").json()["events"]
+                     if e["event_type"].startswith("world.")]
+    assert len(member_events) == 2
+    member_blob = str(member_events)
+    assert "Hidden Blade" not in member_blob
+    assert "Quiet Contact" not in member_blob
+    assert "assassin" not in member_blob
