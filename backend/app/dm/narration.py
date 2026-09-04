@@ -15,18 +15,28 @@ Pipeline (critical path optimized for TTFT after validation):
    context. Built on ``public_projection()`` with additional scrub asserts.
 2. Narrator expands the projection to prose under ``NARRATOR_CONTRACT`` —
    no re-adjudication, no new consequences, no invented voluntary PC action.
-   Default is the deterministic template narrator (no provider); an LLM
-   callable taking a contract-bound :class:`NarratorRequest` (built prompt +
-   structured projection) can be injected — the service always prepends the
-   contract, so providers cannot receive narration input without it.
-3. ``validate_narration_fidelity(...)`` — pre-commit fidelity gates for
-   secret leakage, unsupported additions, PC agency violations, and
-   contradiction with the structured result. Failures raise before the
-   first chunk is persisted (freely retryable as uncommitted recovery work).
+   Default is the deterministic template narrator (no provider); a
+   streaming LLM callable taking a contract-bound :class:`NarratorRequest`
+   (built prompt + structured projection) and yielding text deltas can be
+   injected — the service always prepends the contract, so providers cannot
+   receive narration input without it. Each delta is persisted durably as
+   it arrives, so TTFT tracks first-delta arrival, not full generation.
+3. Fidelity gates — cheap incremental gates per delta (``secret_leakage``
+   + ``agency_violation`` on the cumulative visible text, before each
+   durable persist) plus the authoritative full-output validation at
+   provider completion (all categories). A post-delivery full-check
+   failure fails the stream via ``fail_stream`` (partial chunks retained
+   as failed-visible audit, never promoted to history) and the
+   orchestrator marks the attempt failed-visible (see ``mark_attempt_failed``);
+   repair requires a NEW stream on a NEW attempt.
 4. ``stream_narration(...)`` — persists each chunk durably via #197
    (``dm_streams`` service) BEFORE/with realtime delivery via #198, so the
    first visible text is recoverable after disconnect. TTFT is measured
    from validated adjudication to first persisted visible chunk.
+   ``on_first_persist`` fires synchronously after chunk 0's durable
+   commit and BEFORE its realtime delivery — the orchestrator uses it to
+   run ``mark_streaming_started`` so the first visible chunk transitions
+   the attempt to streaming/visible and locks the input set (#206).
 5. ``materialize_final_narration(...)`` — final display text for history
    after completion, with chunk provenance retained.
 
@@ -47,7 +57,7 @@ import re
 import time
 import uuid
 from dataclasses import dataclass, field
-from typing import Any, Callable
+from typing import Any, Callable, Iterable, Iterator
 
 from sqlalchemy.orm import Session
 
@@ -106,10 +116,18 @@ class NarrationStreamError(NarrationError):
 
     code = "narration_stream_failed"
 
-    def __init__(self, message: str, *, stream_id: uuid.UUID | None = None, persisted_chunks: int = 0):
+    def __init__(
+        self,
+        message: str,
+        *,
+        stream_id: uuid.UUID | None = None,
+        persisted_chunks: int = 0,
+        violations: list[dict[str, Any]] | None = None,
+    ):
         super().__init__(message)
         self.stream_id = stream_id
         self.persisted_chunks = persisted_chunks
+        self.violations = violations or []
 
 
 # ── Metrics (process-local observability) ─────────────────────────────────────
@@ -280,7 +298,21 @@ class NarratorRequest:
     projection: dict[str, Any]
 
 
-NarratorFn = Callable[[NarratorRequest], str]
+#: A provider yields narration text deltas (e.g. LLM token batches) as they
+#: are generated. The service persists each delta durably as it arrives, so
+#: time-to-first-visible-chunk tracks first-delta arrival rather than full
+#: generation — the low-TTFT path required by #207.
+NarratorDeltaStream = Iterable[str]
+
+#: Streaming provider contract. A batch provider may still return a plain
+#: ``str``; the service adapts it to a single delta (same interface, same
+#: incremental gates and durable-first persistence).
+StreamingNarratorFn = Callable[[NarratorRequest], Iterable[str]]
+
+#: Accepted provider form: streaming iterable of text deltas, or a batch
+#: ``str`` adapted to a single delta. The deterministic template renderer
+#: (``narrator=None``) flows through the same delta loop.
+NarratorFn = Callable[[NarratorRequest], str | Iterable[str]]
 
 
 # ── 3. Fidelity checks ────────────────────────────────────────────────────────
@@ -481,6 +513,19 @@ def validate_narration_fidelity(
     return violations
 
 
+def _tally_fidelity_violations(violations: list[dict[str, Any]]) -> None:
+    _inc("fidelity_failures")
+    for v in violations:
+        if v["category"] == "secret_leakage":
+            _inc("secret_rejections")
+        elif v["category"] == "agency_violation":
+            _inc("agency_rejections")
+        elif v["category"] == "unsupported_addition":
+            _inc("unsupported_rejections")
+        elif v["category"] == "contradiction":
+            _inc("contradiction_rejections")
+
+
 def check_narration_fidelity_or_raise(
     narration: str,
     contract: DmTurnContractV1,
@@ -492,16 +537,7 @@ def check_narration_fidelity_or_raise(
         narration, contract, extra_secrets=extra_secrets, pc_names=pc_names
     )
     if violations:
-        _inc("fidelity_failures")
-        for v in violations:
-            if v["category"] == "secret_leakage":
-                _inc("secret_rejections")
-            elif v["category"] == "agency_violation":
-                _inc("agency_rejections")
-            elif v["category"] == "unsupported_addition":
-                _inc("unsupported_rejections")
-            elif v["category"] == "contradiction":
-                _inc("contradiction_rejections")
+        _tally_fidelity_violations(violations)
         structured_log(
             logger, logging.WARNING, "narration_fidelity_rejected",
             violation_count=len(violations),
@@ -510,6 +546,68 @@ def check_narration_fidelity_or_raise(
         raise NarrationFidelityError(
             f"Narration rejected: {len(violations)} fidelity violation(s)", violations=violations
         )
+
+
+# ── Incremental fidelity policy (streaming providers) ─────────────────────────
+
+#: Violation categories enforced per delta, before each durable persist.
+#: Cheap fail-fast subset of the full gate: secrets and agency violations
+#: must never become visible, even briefly. The remaining categories
+#: (unsupported additions, contradictions) need whole-output context and
+#: run authoritatively at provider completion.
+_INCREMENTAL_CATEGORIES = ("secret_leakage", "agency_violation")
+
+
+def validate_narration_incremental(
+    narration: str,
+    contract: DmTurnContractV1,
+    *,
+    extra_secrets: set[str] | None = None,
+    pc_names: dict[str, str] | None = None,
+) -> list[dict[str, Any]]:
+    """Cheap per-delta gate over the cumulative visible text.
+
+    Returns the ``secret_leakage`` / ``agency_violation`` subset of
+    :func:`validate_narration_fidelity` — computed by the same function so
+    incremental and full gates cannot disagree on those categories.
+    Pure function — safe to run before each persist.
+    """
+    return [
+        v
+        for v in validate_narration_fidelity(
+            narration, contract, extra_secrets=extra_secrets, pc_names=pc_names
+        )
+        if v["category"] in _INCREMENTAL_CATEGORIES
+    ]
+
+
+def _iter_provider_deltas(
+    narrator: NarratorFn | None,
+    request: NarratorRequest,
+    *,
+    projection: dict[str, Any],
+    contract: DmTurnContractV1,
+) -> Iterator[str]:
+    """Adapt any provider form to a delta stream over the same interface.
+
+    ``None`` runs the deterministic template renderer as a single delta;
+    a batch ``str`` result is adapted to a single delta; an iterable of
+    ``str`` is streamed delta-by-delta. Anything else is a contract
+    violation (``NarratorGenerationError``).
+    """
+    if narrator is None:
+        yield render_deterministic_narration(projection, contract)
+        return
+    result = narrator(request)
+    if isinstance(result, str):
+        yield result
+        return
+    if isinstance(result, Iterable):
+        yield from result
+        return
+    raise NarratorGenerationError(
+        f"Narrator must return str or an iterable of str deltas, got {type(result).__name__}"
+    )
 
 
 # ── 4. Streaming orchestration ────────────────────────────────────────────────
@@ -573,20 +671,45 @@ def stream_narration(
     pc_names: dict[str, str] | None = None,
     max_chunks_to_persist: int | None = None,
     trace_id: str | None = None,
+    on_first_persist: Callable[[uuid.UUID], None] | None = None,
 ) -> NarrationResult:
     """Generate, fidelity-gate, and stream narration via durable chunks.
 
+    The provider is a streaming contract: it yields text deltas (a batch
+    ``str`` is adapted to a single delta; ``None`` runs the deterministic
+    template renderer through the same delta loop). Each delta is
+    incrementally gated (secret/agency) and persisted durably via #197
+    BEFORE its #198 realtime projection, so TTFT tracks first-delta
+    arrival rather than full generation. The authoritative full-output
+    fidelity gate runs at provider completion.
+
+    ``on_first_persist`` is invoked synchronously with the new stream id
+    after chunk 0's durable commit and BEFORE its realtime delivery — the
+    hook the orchestrator uses to run ``mark_streaming_started`` (#206
+    stream-start commitment boundary: first visible chunk transitions the
+    attempt to streaming/visible and locks the input set). A hook failure
+    is treated as a post-first-chunk failure (failed-visible partial
+    stream + ``NarrationStreamError``).
+
     TTFT is measured from ``validated_at`` (validated adjudication moment;
     defaults to now) to the first durably persisted visible chunk. Each
-    chunk is committed via #197 BEFORE its #198 realtime projection, so a
+    chunk is committed via #197 BEFORE its #198 realtime delivery, so a
     disconnect can always reconstruct exactly what became visible.
 
     Failure semantics:
-    - Pre-first-chunk failure (generation/fidelity): nothing persisted,
-      freely retryable; raises ``NarratorGenerationError`` /
-      ``NarrationFidelityError``.
-    - Post-first-chunk failure: raises ``NarrationStreamError`` with the
-      recoverable partial stream left intact (staged effects untouched).
+    - Pre-first-chunk failure (generation/incremental gate/full gate with
+      zero chunks persisted): the never-visible stream header is removed,
+      nothing remains, freely retryable; raises
+      ``NarratorGenerationError`` / ``NarrationFidelityError``.
+    - Post-first-chunk failure (provider error, incremental gate, full
+      gate, or ``on_first_persist`` failure): the stream is failed via
+      ``fail_stream`` with the recoverable partial chunks retained
+      (failed-visible audit, never promoted to history); raises
+      ``NarrationStreamError`` carrying ``stream_id``,
+      ``persisted_chunks``, and ``violations`` where applicable. Staged
+      effects stay untouched. Repair requires a NEW stream on a NEW
+      attempt — resume is impossible once the authoritative text
+      diverges from the persisted prefix.
 
     ``max_chunks_to_persist`` is a crash-simulation hook for tests: persist
     at most N chunks and return the partial stream without completing.
@@ -614,42 +737,13 @@ def stream_narration(
     proj_bytes = projection_size_bytes(projection)
     _metrics["projection_bytes_samples"].append(proj_bytes)
 
-    # — Generation (pre-commit, retryable) —
-    try:
-        if narrator is None:
-            narration_text = render_deterministic_narration(projection, contract)
-        else:
-            # Contract-bound request: the provider always receives the built
-            # prompt (NARRATOR_CONTRACT + projection), never bare projection.
-            narration_text = narrator(
-                NarratorRequest(
-                    prompt=build_narrator_prompt(projection),
-                    projection=projection,
-                )
-            )
-    except (NarrationFidelityError, NarrationProjectionError):
-        raise
-    except Exception as exc:
-        _inc("narrations_failed_pre_chunk")
-        raise NarratorGenerationError(f"Narrator generation failed: {exc}") from exc
-    if not isinstance(narration_text, str):
-        _inc("narrations_failed_pre_chunk")
-        raise NarratorGenerationError("Narrator must return a string")
+    # — Contract-bound provider request (built once, always carries the contract) —
+    request = NarratorRequest(
+        prompt=build_narrator_prompt(projection),
+        projection=projection,
+    )
 
-    # — Fidelity gate (pre-commit, retryable) —
-    try:
-        check_narration_fidelity_or_raise(
-            narration_text, contract, extra_secrets=extra_secrets, pc_names=pc_names
-        )
-    except NarrationFidelityError:
-        _inc("narrations_failed_pre_chunk")
-        raise
-
-    chunks = chunk_narration_text(narration_text, chunk_size=chunk_size)
-    if max_chunks_to_persist is not None:
-        chunks = chunks[:max_chunks_to_persist]
-
-    # — Durable stream + ordered persistence —
+    # — Durable stream header (pre-chunk, never visible until chunk 0) —
     try:
         stream = create_stream(
             db,
@@ -666,55 +760,206 @@ def stream_narration(
         db.rollback()
         _inc("narrations_failed_pre_chunk")
         raise NarratorGenerationError(f"Stream creation failed: {exc}") from exc
+    stream_id = stream.id
 
     ttft_ms = 0.0
     cadence: list[float] = []
     last_persist = time.monotonic()
     persisted = 0
-    try:
-        for seq, piece in enumerate(chunks):
-            chunk = append_chunk(db, stream.id, seq, piece)
-            db.commit()  # durable BEFORE delivery — first visible text is recoverable
-            db.refresh(stream)
-            now = time.monotonic()
-            if seq == 0:
-                ttft_ms = (now - t_validated) * 1000
-                _metrics["ttft_ms_samples"].append(ttft_ms)
-            else:
-                cadence.append((now - last_persist) * 1000)
-                _metrics["chunk_cadence_ms_samples"].append(cadence[-1])
-            last_persist = now
-            persisted += 1
-            if publish_realtime:
-                try:
-                    from app.realtime.service import publish_dm_chunk_created
+    persisted_texts: list[str] = []
+    full_parts: list[str] = []
+    truncated = False
 
-                    publish_dm_chunk_created(db, stream, chunk)
-                except Exception as pub_exc:  # never roll back authoritative state
-                    logger.warning(
-                        "narration realtime chunk publish failed stream_id=%s seq=%s error=%s",
-                        stream.id, seq, pub_exc,
-                    )
-    except Exception as exc:
-        db.rollback()
-        _inc("narrations_failed_post_chunk")
+    def _delete_invisible_header() -> None:
+        """Remove the never-visible header so pre-chunk failure stays retryable."""
         try:
-            fail_stream(db, stream.id, reason="narration_stream_error")
+            db.rollback()
+            header = db.get(stream.__class__, stream_id)
+            if header is not None:
+                db.delete(header)
             db.commit()
         except Exception:
             db.rollback()
+
+    def _fail_visible_stream(reason: str) -> None:
+        try:
+            fail_stream(db, stream_id, reason=reason)
+            db.commit()
+        except Exception:
+            db.rollback()
+
+    def _publish_chunk(persisted_chunk: Any, seq: int) -> None:
+        if not publish_realtime:
+            return
+        try:
+            from app.realtime.service import publish_dm_chunk_created
+
+            publish_dm_chunk_created(db, stream, persisted_chunk)
+        except Exception as pub_exc:  # never roll back authoritative state
+            logger.warning(
+                "narration realtime chunk publish failed stream_id=%s seq=%s error=%s",
+                stream_id, seq, pub_exc,
+            )
+
+    def _persist_piece(piece: str) -> None:
+        """Persist one chunk durably, fire the stream-start boundary, then deliver."""
+        nonlocal ttft_ms, last_persist, persisted
+        seq = persisted
+        chunk = append_chunk(db, stream_id, seq, piece)
+        db.commit()  # durable BEFORE delivery — first visible text is recoverable
+        db.refresh(stream)
+        now = time.monotonic()
+        if seq == 0:
+            ttft_ms = (now - t_validated) * 1000
+            _metrics["ttft_ms_samples"].append(ttft_ms)
+            if on_first_persist is not None:
+                # Stream-start commitment boundary (#206): runs synchronously
+                # after chunk 0's durable commit and BEFORE its realtime
+                # delivery, so a crash can never leave visible narration on a
+                # still-prepared attempt with an unlocked input set.
+                on_first_persist(stream_id)
+        else:
+            cadence.append((now - last_persist) * 1000)
+            _metrics["chunk_cadence_ms_samples"].append(cadence[-1])
+        last_persist = now
+        persisted += 1
+        persisted_texts.append(piece)
+        _publish_chunk(chunk, seq)
+
+    # — Streaming generation + incremental persistence —
+    # Persisted chunks always form a prefix of
+    # ``chunk_narration_text(cumulative_text)``: only whole plan pieces
+    # before the trailing tail are persisted while the provider may still
+    # extend the text, so ``resume_narration_stream`` prefix checks hold.
+    try:
+        deltas = _iter_provider_deltas(
+            narrator, request, projection=projection, contract=contract
+        )
+        it = iter(deltas)
+        exhausted = False
+        while True:
+            try:
+                delta = next(it)
+            except StopIteration:
+                exhausted = True
+                delta = None
+            cumulative = ""
+            if not exhausted:
+                if not isinstance(delta, str):
+                    raise NarratorGenerationError(
+                        "Narrator deltas must be str, "
+                        f"got {type(delta).__name__}"
+                    )
+                if delta:
+                    full_parts.append(delta)
+                    cumulative = "".join(full_parts)
+                    incremental = validate_narration_incremental(
+                        cumulative, contract,
+                        extra_secrets=extra_secrets, pc_names=pc_names,
+                    )
+                    if incremental:
+                        _tally_fidelity_violations(incremental)
+                        if persisted == 0:
+                            _delete_invisible_header()
+                            raise NarrationFidelityError(
+                                "Narration rejected by incremental fidelity gate: "
+                                f"{len(incremental)} violation(s)",
+                                violations=incremental,
+                            )
+                        _fail_visible_stream("narration_incremental_fidelity_failed")
+                        raise NarrationStreamError(
+                            "Narration rejected by incremental fidelity gate "
+                            f"after {persisted} chunk(s)",
+                            stream_id=stream_id, persisted_chunks=persisted,
+                            violations=incremental,
+                        )
+                else:
+                    cumulative = "".join(full_parts)
+            else:
+                cumulative = "".join(full_parts)
+            plan = chunk_narration_text(cumulative, chunk_size=chunk_size) if cumulative else []
+            if exhausted:
+                new_pieces = plan[persisted:]
+            else:
+                # Hold the tail back: it may grow when the next delta arrives.
+                new_pieces = plan[persisted:len(plan) - 1] if len(plan) - 1 > persisted else []
+            if max_chunks_to_persist is not None:
+                room = max_chunks_to_persist - persisted
+                new_pieces = new_pieces[: max(room, 0)]
+            for piece in new_pieces:
+                _persist_piece(piece)
+            if max_chunks_to_persist is not None and persisted >= max_chunks_to_persist and not exhausted:
+                # Simulated crash/disconnect: partial stream stays recoverable.
+                truncated = True
+                break
+            if exhausted:
+                break
+
+        if truncated:
+            duration_ms = (time.monotonic() - t_start) * 1000
+            return NarrationResult(
+                stream_id=stream_id, visible_text=reconstruct_text(db, stream_id),
+                final_text=None, chunk_count=persisted,
+                total_bytes=sum(len(c.encode("utf-8")) for c in persisted_texts),
+                projection_bytes=proj_bytes, provider=provider,
+                ttft_ms=ttft_ms, duration_ms=duration_ms,
+                chunk_cadence_ms=list(cadence), completed=False,
+            )
+
+        narration_text = "".join(full_parts)
+
+        # — Authoritative full-output validation at completion —
+        violations = validate_narration_fidelity(
+            narration_text, contract, extra_secrets=extra_secrets, pc_names=pc_names
+        )
+        if violations:
+            _tally_fidelity_violations(violations)
+            if persisted == 0:
+                _delete_invisible_header()
+                raise NarrationFidelityError(
+                    f"Narration rejected: {len(violations)} fidelity violation(s)",
+                    violations=violations,
+                )
+            # Partial delivery already visible: fail the stream (chunks
+            # retained as failed-visible audit, never promoted to history).
+            # The orchestrator marks the attempt failed-visible; repair
+            # requires a NEW stream on a NEW attempt.
+            _fail_visible_stream("narration_fidelity_failed")
+            raise NarrationStreamError(
+                f"Narration rejected after {persisted} visible chunk(s): "
+                f"{len(violations)} fidelity violation(s)",
+                stream_id=stream_id, persisted_chunks=persisted,
+                violations=violations,
+            )
+    except NarrationStreamError:
+        _inc("narrations_failed_post_chunk")
+        raise
+    except (NarrationFidelityError, NarrationProjectionError, NarratorGenerationError):
+        if persisted == 0:
+            _delete_invisible_header()
+        _inc("narrations_failed_pre_chunk")
+        raise
+    except Exception as exc:
+        if persisted == 0:
+            _delete_invisible_header()
+            _inc("narrations_failed_pre_chunk")
+            if isinstance(exc, NarrationError):
+                raise
+            raise NarratorGenerationError(f"Narrator generation failed: {exc}") from exc
+        _fail_visible_stream("narration_stream_error")
+        _inc("narrations_failed_post_chunk")
         raise NarrationStreamError(
             f"Narration stream failed after {persisted} chunk(s): {exc}",
-            stream_id=stream.id, persisted_chunks=persisted,
+            stream_id=stream_id, persisted_chunks=persisted,
         ) from exc
 
     if max_chunks_to_persist is not None and len(chunk_narration_text(narration_text, chunk_size=chunk_size)) > persisted:
         # Simulated crash/disconnect: partial stream stays recoverable.
         duration_ms = (time.monotonic() - t_start) * 1000
         return NarrationResult(
-            stream_id=stream.id, visible_text=reconstruct_text(db, stream.id),
+            stream_id=stream_id, visible_text=reconstruct_text(db, stream_id),
             final_text=None, chunk_count=persisted,
-            total_bytes=sum(len(c.encode("utf-8")) for c in chunks),
+            total_bytes=sum(len(c.encode("utf-8")) for c in persisted_texts),
             projection_bytes=proj_bytes, provider=provider,
             ttft_ms=ttft_ms, duration_ms=duration_ms,
             chunk_cadence_ms=list(cadence), completed=False,
@@ -803,18 +1048,26 @@ def execute_validated_turn(
 
     1. ``stage_validated_attempt`` — persist staged effects attempt-local
        (no campaign-truth mutation).
-    2. ``stream_narration`` — fidelity-gate, then persist each chunk durably
-       via #197 BEFORE/with #198 realtime delivery.
-    3. ``mark_streaming_started`` — stream-start commitment boundary over
-       the durable stream (locks the input set).
-    4. ``commit_turn_with_effects`` — atomic promotion + final commit (#206).
+    2. ``stream_narration`` with a first-persist hook — deltas stream from
+       the provider, each incrementally gated and persisted durably via
+       #197 BEFORE/with #198 realtime delivery. Synchronously after chunk
+       0's durable commit (before its realtime delivery) the hook runs
+       ``mark_streaming_started`` — the #206 stream-start commitment
+       boundary over the durable stream (locks the input set at first
+       visibility, so a crash can never leave visible narration on a
+       still-prepared attempt).
+    3. ``commit_turn_with_effects`` — atomic promotion + final commit (#206).
 
     Failure semantics inherit the callees: pre-first-chunk failure
-    (generation/fidelity) leaves no stream and is freely retryable with the
-    same turn/attempt identity; post-first-chunk failure raises
-    ``NarrationStreamError`` with the recoverable partial stream left intact
-    — resume via :func:`resume_narration_stream`, then
-    ``mark_streaming_started`` + ``commit_turn_with_effects`` manually.
+    (generation/fidelity) leaves nothing persisted and is freely retryable
+    with the same turn/attempt identity; post-first-chunk failure raises
+    ``NarrationStreamError`` — the failed-visible partial stream is left
+    intact and the attempt is marked failed-visible via
+    ``mark_attempt_failed(visible=True)`` (input set stays locked) when it
+    had already crossed into streaming. Resume a boundary-crossed partial
+    via :func:`resume_narration_stream` (same text only), then
+    ``commit_turn_with_effects`` manually; a fidelity-rejected partial
+    needs a NEW stream on a NEW attempt.
     """
     from models.dm import DmTurn
 
@@ -834,24 +1087,51 @@ def execute_validated_turn(
 
     staged = stage_validated_attempt(db, attempt_id, contract)
 
-    narration = stream_narration(
-        db,
-        campaign_id=turn.campaign_id,
-        thread_id=thread_uuid,
-        turn_id=str(turn_id),
-        attempt_id=str(attempt_id),
-        contract=contract,
-        narrator=narrator,
-        chunk_size=chunk_size,
-        provider=provider,
-        audience=staged.audience or turn.audience,
-        publish_realtime=publish_realtime,
-        extra_secrets=extra_secrets,
-        pc_names=pc_names,
-        trace_id=trace_id,
-    )
+    def _on_first_persist(stream_id: uuid.UUID) -> None:
+        mark_streaming_started(db, turn_id, attempt_id, stream_id=stream_id)
 
-    mark_streaming_started(db, turn_id, attempt_id, stream_id=narration.stream_id)
+    try:
+        narration = stream_narration(
+            db,
+            campaign_id=turn.campaign_id,
+            thread_id=thread_uuid,
+            turn_id=str(turn_id),
+            attempt_id=str(attempt_id),
+            contract=contract,
+            narrator=narrator,
+            chunk_size=chunk_size,
+            provider=provider,
+            audience=staged.audience or turn.audience,
+            publish_realtime=publish_realtime,
+            extra_secrets=extra_secrets,
+            pc_names=pc_names,
+            trace_id=trace_id,
+            on_first_persist=_on_first_persist,
+        )
+    except NarrationStreamError:
+        # Defined remediation for post-visibility failure: if the
+        # stream-start boundary was already crossed, reuse the #206
+        # failed-visible state so the turn keeps blocking its input set
+        # until explicit recovery.
+        try:
+            from models.dm import DmTurnAttempt
+
+            from app.dm.turns import ATTEMPT_STREAMING, mark_attempt_failed
+
+            current = db.get(DmTurnAttempt, attempt_id)
+            if current is not None and current.status == ATTEMPT_STREAMING:
+                mark_attempt_failed(
+                    db, attempt_id,
+                    error="narration_stream_failed",
+                    error_class="retriable",
+                    visible=True,
+                )
+        except Exception as remediation_exc:
+            logger.warning(
+                "validated turn failure remediation failed turn_id=%s attempt_id=%s error=%s",
+                turn_id, attempt_id, remediation_exc,
+            )
+        raise
 
     submission_ids = list(staged.submission_ids or [])
     payload = {

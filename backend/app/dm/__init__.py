@@ -82,12 +82,14 @@ from app.dm.validators import (  # noqa: F401
 from app.dm.narration import (  # noqa: F401
     NARRATOR_CONTRACT,
     PROVIDER_DETERMINISTIC,
+    NarratorDeltaStream,
     NarratorGenerationError,
     NarratorRequest,
     NarrationFidelityError,
     NarrationProjectionError,
     NarrationResult,
     NarrationStreamError,
+    StreamingNarratorFn,
     ValidatedTurnResult,
     build_narration_projection,
     build_narrator_prompt,
@@ -103,4 +105,5 @@ from app.dm.narration import (  # noqa: F401
     serialize_narration_projection,
     stream_narration,
     validate_narration_fidelity,
+    validate_narration_incremental,
 )

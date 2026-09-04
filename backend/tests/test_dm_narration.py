@@ -24,6 +24,7 @@ from app.dm.narration import (  # noqa: E402
     NarratorGenerationError,
     NarratorRequest,
     NarrationFidelityError,
+    NarrationStreamError,
     build_narration_projection,
     build_narrator_prompt,
     check_narration_fidelity_or_raise,
@@ -553,3 +554,273 @@ def test_execute_validated_turn_runs_narration_to_commit(db):
     mat = materialize_final_narration(s, out.narration.stream_id)
     assert mat["final_text"] == out.narration.final_text
     assert mat["status"] == "completed"
+
+
+# ── stream-start boundary at first durable chunk (re-review finding 1) ────
+
+def _coordinated_turn(db, camp_id, thread_id, raw_content="I listen at the door."):
+    from app.runtime.submissions import accept_submission
+    from app.dm.turns import coordinate_turn
+
+    s, _, _ = db
+    user_id = uuid.uuid4()
+    accept_submission(
+        s, campaign_id=camp_id, user_id=user_id,
+        raw_content=raw_content,
+        segments=[{"type": "ic", "text": raw_content}],
+        thread_id=str(thread_id),
+    )
+    s.commit()
+    return coordinate_turn(s, camp_id, str(thread_id))
+
+
+def test_crash_after_chunk0_leaves_visible_attempt_with_locked_input_set(db, monkeypatch):
+    """Failure injection: crash persisting chunk 1.
+
+    Chunk 0's durable commit must already have transitioned the attempt to
+    streaming/visible and locked the input set (via the first-persist hook),
+    so the crash can never leave visible narration on a still-prepared
+    attempt. Remediation marks the streaming attempt failed-visible (#206
+    failure state); the input set stays locked.
+    """
+    import app.dm_streams.service as stream_svc
+    from app.dm.turns import StreamBoundaryError, coordinate_turn
+    from app.dm_streams.service import get_stream
+    from app.runtime.submissions import accept_submission
+    from models.dm import DmTurn, DmTurnAttempt
+
+    s, camp_id, thread_id = db
+    turn, attempt = _coordinated_turn(db, camp_id, thread_id)
+    turn_id, attempt_id = turn.id, attempt.id
+
+    c = _respond(
+        [_narr_beat(
+            "Torchlight flickers on wet stone as the party descends the stair. "
+            "Water drips somewhere in the dark below."
+        )],
+        open_player_choice="What do you do?",
+    )
+    full = render_deterministic_narration(build_narration_projection(c), c)
+    assert len(chunk_narration_text(full, chunk_size=48)) >= 3
+
+    real_append = stream_svc.append_chunk
+
+    def _crash_after_first(db_, sid, seq, text):
+        if seq >= 1:
+            raise RuntimeError("simulated crash after chunk 0")
+        return real_append(db_, sid, seq, text)
+
+    monkeypatch.setattr(stream_svc, "append_chunk", _crash_after_first)
+    with pytest.raises(NarrationStreamError) as ei:
+        execute_validated_turn(
+            s, turn_id=turn_id, attempt_id=attempt_id, contract=c,
+            chunk_size=48, publish_realtime=False,
+        )
+    stream_id = ei.value.stream_id
+    assert stream_id is not None and ei.value.persisted_chunks == 1
+
+    # Chunk 0 is durably visible, retained on the failed stream.
+    assert get_stream(s, stream_id).status == "failed"
+    persisted = s.execute(
+        select(DMStreamChunk).where(DMStreamChunk.stream_id == stream_id)
+        .order_by(DMStreamChunk.sequence)
+    ).scalars().all()
+    assert len(persisted) == 1 and "".join(ch.text for ch in persisted) != ""
+
+    # The boundary was crossed before the crash: attempt left prepared and
+    # carries the visible stream; remediation put it in failed-visible.
+    fresh_attempt = s.get(DmTurnAttempt, attempt_id)
+    fresh_turn = s.get(DmTurn, turn_id)
+    assert str(fresh_attempt.stream_id) == str(stream_id)
+    assert fresh_attempt.status == "failed_visible"
+    assert fresh_turn.status == "failed_visible"
+
+    # Input set is locked: late submissions cannot silently change it.
+    accept_submission(
+        s, campaign_id=camp_id, user_id=uuid.uuid4(),
+        raw_content="I barge in late.",
+        segments=[{"type": "ic", "text": "I barge in late."}],
+        thread_id=str(thread_id),
+    )
+    s.commit()
+    with pytest.raises(StreamBoundaryError):
+        coordinate_turn(s, camp_id, str(thread_id))
+
+
+# ── streaming provider contract + incremental gates (re-review finding 2) ─
+
+def test_streaming_provider_persists_chunk0_before_provider_completion(db):
+    """TTFT: chunk 0 is durably persisted before the provider finishes."""
+    s, camp_id, thread_id = db
+    c = _respond([_narr_beat(
+        "Torchlight flickers on wet stone as the party descends the stair. "
+        "Water drips somewhere in the dark below."
+    )])
+    full = render_deterministic_narration(build_narration_projection(c), c)
+    mid = len(full) // 2
+    assert len(chunk_narration_text(full[:mid], chunk_size=48)) >= 2
+    state = {"completed": False, "saw_completed_at_first_persist": None}
+    seen: dict = {}
+
+    def _provider(req):
+        seen["prompt"] = req.prompt
+        assert isinstance(req, NarratorRequest)
+        yield full[:mid]
+        yield full[mid:]
+
+    def _tracked(req):
+        yield from _provider(req)
+        state["completed"] = True
+
+    def _on_first(sid):
+        state["saw_completed_at_first_persist"] = state["completed"]
+
+    res = stream_narration(
+        s, campaign_id=camp_id, thread_id=thread_id,
+        turn_id=str(uuid.uuid4()), attempt_id=str(uuid.uuid4()),
+        contract=c, narrator=_tracked, chunk_size=48,
+        publish_realtime=False, on_first_persist=_on_first,
+    )
+    assert res.completed and res.visible_text == full and res.final_text == full
+    assert res.chunk_count == len(chunk_narration_text(full, chunk_size=48))
+    # Chunk 0's durable commit (hook) ran while the provider was still open.
+    assert state["saw_completed_at_first_persist"] is False
+    assert state["completed"] is True
+    assert NARRATOR_CONTRACT.splitlines()[0] in seen["prompt"]
+
+
+def test_incremental_gate_rejects_secret_midstream(db):
+    from app.dm_streams.service import get_stream
+
+    s, camp_id, thread_id = db
+    c = _respond([_narr_beat(
+        "Torchlight flickers on wet stone as the party descends the stair."
+    )])
+    delta1 = render_deterministic_narration(build_narration_projection(c), c)
+    assert len(chunk_narration_text(delta1, chunk_size=48)) >= 2
+    secret = "the vault code is moonfall"
+
+    def _leaky(req):
+        yield delta1
+        yield " You recall the vault code is moonfall."
+
+    with pytest.raises(NarrationStreamError) as ei:
+        stream_narration(
+            s, campaign_id=camp_id, thread_id=thread_id,
+            turn_id=str(uuid.uuid4()), attempt_id=str(uuid.uuid4()),
+            contract=c, narrator=_leaky, chunk_size=48,
+            publish_realtime=False, extra_secrets={secret},
+        )
+    assert ei.value.persisted_chunks >= 1
+    assert any(v["category"] == "secret_leakage" for v in ei.value.violations)
+    # Failed-visible partial retained for audit, never completed.
+    assert get_stream(s, ei.value.stream_id).status == "failed"
+    assert len(s.execute(
+        select(DMStreamChunk).where(DMStreamChunk.stream_id == ei.value.stream_id)
+    ).scalars().all()) >= 1
+
+
+def test_incremental_gate_rejects_agency_violation_midstream(db):
+    from app.dm_streams.service import get_stream
+
+    s, camp_id, thread_id = db
+    c = _respond([{
+        "id": "beat_1", "type": "narration",
+        "claims": [{
+            "text": 'Elara declares, "I hold my ground."',
+            "claim_kind": "player_declaration", "origin": "player_transcript",
+            "actor_ref": {"type": "character", "id": "char:elara"},
+            "evidence_refs": ["sub1"], "visibility": "public",
+        }],
+    }])
+    delta1 = (
+        'Elara declares, "I hold my ground." '
+        "The hall is quiet and the torches burn low."
+    )
+    assert len(chunk_narration_text(delta1, chunk_size=48)) >= 2
+
+    def _rogue(req):
+        yield delta1
+        yield " Elara charges the dragon and attacks."
+
+    with pytest.raises(NarrationStreamError) as ei:
+        stream_narration(
+            s, campaign_id=camp_id, thread_id=thread_id,
+            turn_id=str(uuid.uuid4()), attempt_id=str(uuid.uuid4()),
+            contract=c, narrator=_rogue, chunk_size=48,
+            publish_realtime=False, pc_names={"char:elara": "Elara"},
+        )
+    assert ei.value.persisted_chunks >= 1
+    assert any(v["category"] == "agency_violation" for v in ei.value.violations)
+    assert get_stream(s, ei.value.stream_id).status == "failed"
+
+
+def test_full_validation_failure_after_partial_delivery_fails_stream(db):
+    """Full gate catches what incremental gates cannot (unsupported addition).
+
+    Delta 2 passes the cheap per-chunk gates but the complete text fails
+    authoritative validation: the stream is failed (partial retained as
+    failed-visible audit) with violations attached for the repair path.
+    """
+    from app.dm_streams.service import get_stream, reconstruct_text
+
+    s, camp_id, thread_id = db
+    c = _respond([_narr_beat("The goblin snarls and circles.")])
+    delta1 = "The goblin snarls and circles. Dust hangs in the still air. "
+    assert len(chunk_narration_text(delta1, chunk_size=48)) >= 2
+
+    def _overreaching(req):
+        yield delta1
+        yield "It takes 7 damage and dies."
+
+    with pytest.raises(NarrationStreamError) as ei:
+        stream_narration(
+            s, campaign_id=camp_id, thread_id=thread_id,
+            turn_id=str(uuid.uuid4()), attempt_id=str(uuid.uuid4()),
+            contract=c, narrator=_overreaching, chunk_size=48,
+            publish_realtime=False,
+        )
+    assert ei.value.persisted_chunks >= 1
+    assert any(v["code"] == "unsupported_consequence" for v in ei.value.violations)
+    assert get_stream(s, ei.value.stream_id).status == "failed"
+    # The offending text was already delivered — retained, never promoted.
+    assert "dies" in reconstruct_text(s, ei.value.stream_id)
+
+
+def test_execute_validated_turn_full_failure_marks_failed_visible_and_locked(db):
+    """Orchestrator remediation: post-visibility full-gate failure reuses
+    the #206 failed-visible state; the input set stays locked."""
+    from app.dm.turns import StreamBoundaryError, coordinate_turn
+    from app.dm_streams.service import get_stream
+    from app.runtime.submissions import accept_submission
+    from models.dm import DmTurn, DmTurnAttempt
+
+    s, camp_id, thread_id = db
+    turn, attempt = _coordinated_turn(db, camp_id, thread_id)
+    turn_id, attempt_id = turn.id, attempt.id
+    c = _respond([_narr_beat("The goblin snarls and circles.")])
+    delta1 = "The goblin snarls and circles. Dust hangs in the still air. "
+
+    def _overreaching(req):
+        yield delta1
+        yield "It takes 7 damage and dies."
+
+    with pytest.raises(NarrationStreamError) as ei:
+        execute_validated_turn(
+            s, turn_id=turn_id, attempt_id=attempt_id, contract=c,
+            narrator=_overreaching, chunk_size=48, publish_realtime=False,
+        )
+    assert str(s.get(DmTurnAttempt, attempt_id).stream_id) == str(ei.value.stream_id)
+    assert s.get(DmTurnAttempt, attempt_id).status == "failed_visible"
+    assert s.get(DmTurn, turn_id).status == "failed_visible"
+    assert get_stream(s, ei.value.stream_id).status == "failed"
+
+    accept_submission(
+        s, campaign_id=camp_id, user_id=uuid.uuid4(),
+        raw_content="Late arrival.",
+        segments=[{"type": "ic", "text": "Late arrival."}],
+        thread_id=str(thread_id),
+    )
+    s.commit()
+    with pytest.raises(StreamBoundaryError):
+        coordinate_turn(s, camp_id, str(thread_id))
