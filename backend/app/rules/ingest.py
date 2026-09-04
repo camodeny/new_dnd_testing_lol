@@ -213,18 +213,40 @@ def compute_sha256(raw_input: Any) -> str:
     return hashlib.sha256(blob.encode("utf-8")).hexdigest()
 
 
-def load_pinned_artifact_hash(corpus_id: str, corpus_version: str) -> str | None:
-    """Load the trusted official artifact hash from the single-source manifest."""
+def load_pinned_artifact_hash(corpus_id: str, corpus_version: str) -> str:
+    """Load the trusted official artifact hash from the single-source manifest.
+
+    Fail-closed: raises ValueError on missing/unreadable manifest, corrupt JSON,
+    or unmapped corpus/version — callers must refuse promotion, never bypass.
+    """
     import pathlib
 
     manifest_path = pathlib.Path(__file__).with_name("official_manifest.json")
+    manifest_label = "official_manifest.json"
     try:
-        mdata = json.loads(manifest_path.read_text())
-    except Exception:
-        return None
-    if isinstance(mdata.get(corpus_id), dict):
-        return mdata[corpus_id].get(corpus_version)
-    return None
+        raw = manifest_path.read_text()
+    except Exception as e:
+        raise ValueError(
+            f"Rules manifest missing/unreadable at {manifest_label}: {e} — refusing promotion."
+        ) from e
+    try:
+        mdata = json.loads(raw)
+    except Exception as e:
+        raise ValueError(
+            f"Rules manifest corrupt (invalid JSON) at {manifest_label}: {e} — refusing promotion."
+        ) from e
+    entry = mdata.get(corpus_id)
+    if not isinstance(entry, dict) or corpus_version not in entry:
+        raise ValueError(
+            f"No pinned official artifact hash for {corpus_id}/{corpus_version} — refusing promotion. "
+            f"Add pin to {manifest_label} (single source of truth)."
+        )
+    pinned = entry[corpus_version]
+    if not isinstance(pinned, str) or not pinned.strip():
+        raise ValueError(
+            f"Rules manifest corrupt: pinned hash for {corpus_id}/{corpus_version} is not a non-empty string — refusing promotion."
+        )
+    return pinned
 
 
 def import_corpus(
@@ -272,10 +294,29 @@ def import_corpus(
             "Official SRD 5.2.1 artifact checksum is required — pass source_artifact_hash (hash of the official WotC artifact). "
             "Derivative dataset hash alone is not sufficient."
         )
-    # Verify against pinned trusted checksum for this corpus_version (if pinned).
+    # Verify against pinned trusted checksum for this corpus_version (fail-closed).
     # Versioned manifest (official_manifest.json) is the single source of truth for pinned hashes.
-    pinned_expected = load_pinned_artifact_hash(corpus_id, corpus_version)
-    if pinned_expected is not None and official_hash != pinned_expected:
+    # Missing/corrupt manifest or unmapped corpus/version refuses promotion — never bypasses.
+    try:
+        pinned_expected = load_pinned_artifact_hash(corpus_id, corpus_version)
+    except ValueError as e:
+        _log_import(
+            db,
+            bid,
+            corpus_id,
+            corpus_version,
+            "failed",
+            official_hash,
+            pinned_inputs,
+            [str(e)],
+            canary_results,
+        )
+        try:
+            db.commit()
+        except Exception:
+            pass
+        raise
+    if official_hash != pinned_expected:
         _log_import(
             db,
             bid,
@@ -306,11 +347,28 @@ def import_corpus(
     else:
         pinned_inputs = dict(pinned_inputs)
     pinned_inputs.setdefault("derivative_checksum", derivative_checksum)
-    # Explicitly reject if caller passed derivative hash as official for a pinned version
-    # (already handled above via pinned check; this also catches unpinned versions where derivative == official by accident)
-    if derivative_checksum == official_hash and pinned_expected is not None:
-        # For pinned versions, derivative should never equal official (different domains)
-        pass
+    # Explicitly reject if caller passed derivative hash as official.
+    # For pinned versions, derivative should never equal official (different domains).
+    if derivative_checksum == official_hash:
+        _log_import(
+            db,
+            bid,
+            corpus_id,
+            corpus_version,
+            "failed",
+            official_hash,
+            pinned_inputs,
+            [f"Official artifact hash equals derivative checksum for {corpus_id}/{corpus_version} — refusing promotion. Provide the hash of the authoritative WotC artifact (not derivative)."],
+            canary_results,
+        )
+        try:
+            db.commit()
+        except Exception:
+            pass
+        raise ValueError(
+            f"Official artifact hash equals derivative checksum for {corpus_id}/{corpus_version} — promotion rejected. "
+            f"Provide the hash of the authoritative WotC artifact (not derivative)."
+        )
 
     # --- Immutability check: already-promoted version must not be mutated ---
     if RulesCorpus is not None:
