@@ -10,7 +10,6 @@ on:
 
 permissions:
   contents: read
-  pull-requests: write
 
 # There is one persistent browser profile on the Pi, so reviews must be
 # serialized across pull requests.
@@ -38,7 +37,7 @@ jobs:
         working-directory: reviewer-source/.github/ai-review
         run: npm ci --ignore-scripts --no-audit --no-fund
 
-      - name: Ask DND AI for the review
+      - name: Ask DND AI to review and submit the PR review
         env:
           PR_URL: ${{ github.event.pull_request.html_url }}
           PR_NUMBER: ${{ github.event.pull_request.number }}
@@ -46,31 +45,8 @@ jobs:
           GITHUB_REPOSITORY: ${{ github.repository }}
           CHATGPT_PROJECT: DND AI AUTO
           CHATGPT_HEADLESS: "false"
-          REVIEW_OUTPUT: ${{ runner.temp }}/dnd-ai-review.md
           CHATGPT_RESPONSE_TIMEOUT_MS: "600000"
         run: |
           set -euo pipefail
-          rm -f "$REVIEW_OUTPUT"
           xvfb-run --auto-servernum --server-args="-screen 0 1440x1024x24" \
             node reviewer-source/.github/ai-review/review_pr.js
-          test -s "$REVIEW_OUTPUT"
-
-      - name: Post AI review to the pull request
-        env:
-          GH_TOKEN: ${{ github.token }}
-          PR_NUMBER: ${{ github.event.pull_request.number }}
-          GITHUB_REPOSITORY: ${{ github.repository }}
-          GITHUB_API_URL: ${{ github.api_url }}
-          REVIEW_OUTPUT: ${{ runner.temp }}/dnd-ai-review.md
-        run: |
-          set -euo pipefail
-          body="$(cat "$REVIEW_OUTPUT")"
-          body="$(printf '%s\n%s' '<!-- dnd-ai-automated-review -->' "$body")"
-          payload="$(jq -n --arg body "$body" '{body: $body, event: "COMMENT"}')"
-          curl --fail-with-body --silent --show-error \
-            -X POST \
-            -H "Accept: application/vnd.github+json" \
-            -H "Authorization: Bearer $GH_TOKEN" \
-            -H "X-GitHub-Api-Version: 2022-11-28" \
-            "$GITHUB_API_URL/repos/$GITHUB_REPOSITORY/pulls/$PR_NUMBER/reviews" \
-            --data "$payload" >/dev/null
