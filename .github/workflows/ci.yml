@@ -29,7 +29,9 @@ jobs:
     timeout-minutes: 15
     services:
       postgres:
-        image: postgres:16-alpine
+        # pgvector-capable image so the vector/HNSW migration branch is
+        # exercised instead of the TEXT fallback (issue #334).
+        image: pgvector/pgvector:pg16
         env:
           POSTGRES_USER: ci_test
           POSTGRES_PASSWORD: ci_test
