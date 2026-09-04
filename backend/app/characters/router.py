@@ -19,6 +19,21 @@ logger = logging.getLogger(__name__)
 router = APIRouter()
 
 
+def _launch_locking_campaign(db: Session, character_id) -> str | None:
+    """Return campaign id if this character is a locked launch PC (status != lobby)."""
+    from models.campaigns import Campaign, CampaignMember
+
+    rows = db.execute(
+        select(CampaignMember, Campaign)
+        .join(Campaign, Campaign.id == CampaignMember.campaign_id)
+        .where(CampaignMember.selected_character_id == character_id)
+    ).all()
+    for _, camp in rows:
+        if str(getattr(camp, "status", "lobby")) != "lobby":
+            return str(camp.id)
+    return None
+
+
 @router.get("/api/characters")
 def list_characters(request: Request, db: Session = Depends(get_db)):
     profile = resolve_profile(request, db)
@@ -98,6 +113,16 @@ def update_character(character_id: str, payload: dict, request: Request, db: Ses
     char = db.get(Character, cid)
     if not char or char.owner_id != profile.id:
         raise HTTPException(status_code=404, detail="Character not found")
+    locked_campaign = _launch_locking_campaign(db, char.id)
+    if locked_campaign:
+        logger.warning(
+            "character edit rejected character_id=%s actor_id=%s campaign_id=%s reason=launch_locked",
+            char.id, profile.id, locked_campaign,
+        )
+        raise HTTPException(
+            status_code=409,
+            detail="Launch character is locked after campaign start; progression only",
+        )
     new_name = payload.get("name") or payload.get("character_name")
     if new_name:
         char.name = new_name
@@ -135,6 +160,25 @@ def delete_character(character_id: str, request: Request, db: Session = Depends(
     char = db.get(Character, cid)
     if not char or char.owner_id != profile.id:
         raise HTTPException(status_code=404, detail="Character not found")
+    locked_campaign = _launch_locking_campaign(db, char.id)
+    if locked_campaign:
+        logger.warning(
+            "character delete rejected character_id=%s actor_id=%s campaign_id=%s reason=launch_locked",
+            char.id, profile.id, locked_campaign,
+        )
+        raise HTTPException(
+            status_code=409,
+            detail="Launch character is locked after campaign start; progression only",
+        )
+    from models.campaigns import CampaignMember
+
+    lobby_selections = db.execute(
+        select(CampaignMember).where(CampaignMember.selected_character_id == char.id)
+    ).scalars().all()
+    for m in lobby_selections:
+        m.selected_character_id = None
+        m.is_ready = False
+        m.ready_at = None
     db.delete(char)
     db.commit()
     return {"ok": True}
