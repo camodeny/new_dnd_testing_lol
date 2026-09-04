@@ -11,7 +11,7 @@ one shared Postgres/database layer (`backend/database.py`, `backend/models.py`).
 | `app/campaigns` | Campaign aggregate: creation, membership, invites, validation |
 | `app/characters` | Character aggregate + sheet persistence |
 | `app/characters/chat` | Character-creator chat (SSE) — streams via provider abstraction |
-| `app/world` | World / knowledge / memory read stubs (campaign world + encounter maps) |
+| `app/world` | World aggregate: canonical entities + authoritative current scene (viewer-aware reads) |
 | `app/runtime` | Turn/session orchestration stubs (live-table sessions) |
 | `app/rules` | Rules / combat pure domain (no I/O, no FastAPI) — placeholder for Epic 2 |
 | `app/visibility` | Fog / visibility calculations — placeholder |

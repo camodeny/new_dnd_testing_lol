@@ -195,16 +195,7 @@ export const sessions = {
     }),
 }
 
-// ── World ───────────────────────────────────────────────────────────────────
-
-export const world = {
-  get: (campaignId: string | number) =>
-    apiFetch<{ world: import('@/types').CampaignWorld }>(`/campaigns/${campaignId}/world`),
-}
-
 // ── Encounter maps ────────────────────────────────────────────────────────
-
-export const encounterMaps = {
-  getCurrent: (campaignId: string | number) =>
-    apiFetch<{ map: import('@/types').EncounterMap }>(`/campaigns/${campaignId}/encounter-maps/current`),
-}
+// Removed: the encounter-maps/current stub had no authoritative backend
+// (PR #348 re-review). StoryAtlas owns map state client-side via
+// onEncounterMapChange until a real map authority lands.

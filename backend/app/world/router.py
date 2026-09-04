@@ -18,10 +18,15 @@ from app.campaigns.service import is_campaign_member, parse_campaign_id
 from app.deps.auth import resolve_profile
 from app.deps.idempotency import execute_http_idempotent, require_idempotency_key
 from app.world.service import (
+    UNSET,
     create_entity_authoritative,
+    entity_visible_to_viewer,
+    filter_entities_for_viewer,
     get_current_scene,
     get_entity_strict,
+    is_world_authority,
     list_entities,
+    scene_visible_to_viewer,
     set_scene_authoritative,
     validate_entity_name,
     validate_entity_type,
@@ -69,6 +74,12 @@ def api_get_current_scene(campaign_id: str, request: Request, db: Session = Depe
     cid = _parse_campaign(campaign_id)
     camp = _campaign_or_403(db, cid, profile)
     scene = get_current_scene(db, camp.id)
+    # Viewer-aware: ordinary members never receive a restricted scene
+    # verbatim — hide restricted existence as 404 (private-thread pattern).
+    if scene is not None and not scene_visible_to_viewer(
+        scene, is_world_authority(camp, profile.id)
+    ):
+        raise HTTPException(status_code=404, detail="Scene not found")
     return {"scene": scene.to_dict() if scene else None, "revision": camp.revision}
 
 
@@ -87,7 +98,9 @@ def api_set_current_scene(
     idempotency_key = require_idempotency_key(request, operation_id)
 
     kwargs = {
-        "location_entity_id": payload.get("location_entity_id"),
+        # Key-presence (not .get()): explicit null clears the canonical
+        # reference while omission preserves it.
+        "location_entity_id": payload["location_entity_id"] if "location_entity_id" in payload else UNSET,
         "location_name": payload.get("location_name"),
         "fictional_time": payload.get("fictional_time"),
         "fictional_time_details": payload.get("fictional_time_details"),
@@ -141,6 +154,10 @@ def api_list_entities(
         )
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
+    # Viewer-aware: restricted entities are filtered for ordinary members.
+    entities = filter_entities_for_viewer(
+        entities, is_world_authority(camp, profile.id)
+    )
     return {"entities": [e.to_dict() for e in entities], "revision": camp.revision}
 
 
@@ -206,7 +223,7 @@ def api_create_entity(
 def api_get_entity(campaign_id: str, entity_id: str, request: Request, db: Session = Depends(get_db)):
     profile = resolve_profile(request, db)
     cid = _parse_campaign(campaign_id)
-    _campaign_or_403(db, cid, profile)
+    camp = _campaign_or_403(db, cid, profile)
     try:
         eid = uuid_lib.UUID(str(entity_id))
     except ValueError:
@@ -215,27 +232,7 @@ def api_get_entity(campaign_id: str, entity_id: str, request: Request, db: Sessi
         entity = get_entity_strict(db, cid, eid)
     except ValueError:
         raise HTTPException(status_code=404, detail="World entity not found")
+    # Viewer-aware: hide restricted entities from ordinary members as 404.
+    if not entity_visible_to_viewer(entity, is_world_authority(camp, profile.id)):
+        raise HTTPException(status_code=404, detail="World entity not found")
     return {"entity": entity.to_dict()}
-
-
-# ── Backward-compatible aggregate stubs ─────────────────────────────────────
-
-@router.get("/api/campaigns/{campaign_id}/world")
-def api_get_world(campaign_id: str, request: Request, db: Session = Depends(get_db)):
-    profile = resolve_profile(request, db)
-    cid = _parse_campaign(campaign_id)
-    camp = _campaign_or_403(db, cid, profile)
-    scene = get_current_scene(db, camp.id)
-    entities = list_entities(db, camp.id, limit=100)
-    return {
-        "world": {
-            "current_scene": scene.to_dict() if scene else None,
-            "entities": [e.to_dict() for e in entities],
-        },
-        "revision": camp.revision,
-    }
-
-
-@router.get("/api/campaigns/{campaign_id}/encounter-maps/current")
-def stub_encounter_map(campaign_id: str, request: Request, db: Session = Depends(get_db)):
-    return {"map": None}

@@ -137,7 +137,7 @@ def _handle_update_scene(db: Session, campaign: Campaign, effect: dict[str, Any]
     commit leaves no half-applied scene. ``new_revision`` is the resulting
     campaign revision (prior + 1), keeping scene changes in revision order.
     """
-    from app.world.service import apply_scene_update_inline
+    from app.world.service import UNSET, apply_scene_update_inline
 
     args = effect.get("arguments") or {}
     patch = args.get("scene_patch") or {}
@@ -168,7 +168,9 @@ def _handle_update_scene(db: Session, campaign: Campaign, effect: dict[str, Any]
         environment = None
     apply_scene_update_inline(
         db, campaign, new_revision=prior + 1,
-        location_entity_id=patch.get("location_entity_id"),
+        # Key-presence: explicit null clears the canonical location reference
+        # while omission preserves it (same as actors/environment above).
+        location_entity_id=patch["location_entity_id"] if "location_entity_id" in patch else UNSET,
         location_name=_pick("location_name", "location"),
         fictional_time=_pick("fictional_time", "time"),
         fictional_time_details=patch.get("fictional_time_details"),

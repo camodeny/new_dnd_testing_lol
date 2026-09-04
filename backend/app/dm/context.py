@@ -1086,6 +1086,10 @@ def assemble_attempt_context(
                 ],
                 authorization=scope,
                 visibility=scene_visibility,  # type: ignore[arg-type]
+                # Viewer-aware projection: dm_only scene truth is
+                # adjudication-only so narration_projection() can never carry
+                # it to a player audience (mirrors RECENT_HISTORY lane).
+                use="adjudication_only" if scene_visibility == "dm_only" else "narration_eligible",
             )
         )
     timings[LaneName.CURRENT_SCENE] = (time.monotonic() - lane_started) * 1000

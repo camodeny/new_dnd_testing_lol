@@ -44,6 +44,16 @@ SCENE_VISIBILITIES = frozenset({"public", "campaign", "private", "dm_only"})
 # visibility hooks without broadening disclosure.
 _VISIBILITY_ALIASES = {"dm_private": "dm_only", "party_known": "campaign"}
 
+# Visibility values that must never reach an ordinary campaign member
+# (PR #348 re-review): only the campaign owner / DM authority may see them.
+RESTRICTED_VISIBILITIES = frozenset({"private", "dm_only"})
+
+# Sentinel for key-presence patch semantics (PR #348 re-review): distinguishes
+# "field omitted" (preserve) from "explicit null" (clear). Used for
+# location_entity_id so a null clears the canonical reference while omission
+# preserves it — same pattern as the actors/environment clear-state fix.
+UNSET: Any = object()
+
 
 def normalize_visibility(value: Any, *, default: str = "campaign") -> str:
     raw = str(value or default).strip() or default
@@ -74,6 +84,34 @@ def validate_entity_status(value: Any) -> str:
     if s not in ENTITY_STATUSES:
         raise ValueError(f"status must be one of {sorted(ENTITY_STATUSES)}")
     return s
+
+
+# ── Viewer-aware reads (PR #348 re-review) ──────────────────────────────────
+
+def is_world_authority(campaign: Campaign, viewer_id: uuid.UUID) -> bool:
+    """Owner / DM authority sees restricted records; ordinary members do not.
+
+    Mirrors the ``campaign.owner_id == profile.id`` authority check used by
+    the world writers and the private-roll-evidence projection (#247).
+    """
+    return campaign.owner_id == viewer_id
+
+
+def entity_visible_to_viewer(entity: WorldEntity, is_authority: bool) -> bool:
+    return bool(is_authority) or entity.visibility not in RESTRICTED_VISIBILITIES
+
+
+def scene_visible_to_viewer(scene: CampaignCurrentScene, is_authority: bool) -> bool:
+    return bool(is_authority) or scene.visibility not in RESTRICTED_VISIBILITIES
+
+
+def filter_entities_for_viewer(
+    entities: list[WorldEntity], is_authority: bool
+) -> list[WorldEntity]:
+    """Restricted entities are filtered (not redacted) for ordinary members."""
+    if is_authority:
+        return list(entities)
+    return [e for e in entities if e.visibility not in RESTRICTED_VISIBILITIES]
 
 
 # ── Typed reads ─────────────────────────────────────────────────────────────
@@ -315,7 +353,7 @@ def apply_scene_update_inline(
     campaign: Campaign,
     *,
     new_revision: int,
-    location_entity_id: uuid.UUID | str | None = None,
+    location_entity_id: uuid.UUID | str | None | Any = UNSET,
     location_name: str | None = None,
     fictional_time: str | None = None,
     fictional_time_details: dict | None = None,
@@ -330,20 +368,31 @@ def apply_scene_update_inline(
 
     Never deletes durable WorldEntity rows — location_entity_id is only a
     reference. Fictional-time changes are logged for observability.
+
+    Key-presence semantics for the entity reference: UNSET (omitted) preserves
+    the current reference, explicit None clears it, and a value re-points it.
     """
     scene = db.get(CampaignCurrentScene, campaign.id)
     prior_time = scene.fictional_time if scene else None
     prior_location = scene.location_name if scene else None
 
-    loc_eid: uuid.UUID | None = None
-    if location_entity_id:
-        try:
-            loc_eid = location_entity_id if isinstance(location_entity_id, uuid.UUID) else uuid.UUID(str(location_entity_id))
-        except ValueError as exc:
-            raise ValueError(f"Invalid location_entity_id {location_entity_id!r}") from exc
-        ref = db.get(WorldEntity, loc_eid)
-        if ref is None or ref.campaign_id != campaign.id:
-            raise ValueError(f"location_entity_id {loc_eid} not found in campaign {campaign.id}")
+    # Tri-state: UNSET → preserve; None → clear; value → validate + assign.
+    # Truthiness checks would conflate explicit null with omission and let a
+    # location_name change silently retain a stale canonical ID.
+    loc_eid: uuid.UUID | None | Any = UNSET
+    if location_entity_id is not UNSET:
+        if location_entity_id is None or (
+            isinstance(location_entity_id, str) and not location_entity_id.strip()
+        ):
+            loc_eid = None
+        else:
+            try:
+                loc_eid = location_entity_id if isinstance(location_entity_id, uuid.UUID) else uuid.UUID(str(location_entity_id))
+            except ValueError as exc:
+                raise ValueError(f"Invalid location_entity_id {location_entity_id!r}") from exc
+            ref = db.get(WorldEntity, loc_eid)
+            if ref is None or ref.campaign_id != campaign.id:
+                raise ValueError(f"location_entity_id {loc_eid} not found in campaign {campaign.id}")
 
     actors: list | None = None
     if present_actors is not None:
@@ -377,7 +426,7 @@ def apply_scene_update_inline(
         db.add(scene)
         db.flush()
 
-    if loc_eid is not None:
+    if loc_eid is not UNSET:
         scene.location_entity_id = loc_eid
     if location_name is not None:
         scene.location_name = str(location_name).strip() or None
@@ -499,7 +548,7 @@ def set_scene_authoritative(
     campaign_id: uuid.UUID,
     expected_revision: int,
     *,
-    location_entity_id: uuid.UUID | str | None = None,
+    location_entity_id: uuid.UUID | str | None | Any = UNSET,
     location_name: str | None = None,
     fictional_time: str | None = None,
     fictional_time_details: dict | None = None,
