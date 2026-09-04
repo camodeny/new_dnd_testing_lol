@@ -6,7 +6,7 @@ import uuid
 from fastapi import APIRouter, Depends, HTTPException, Request
 from sqlalchemy.orm import Session
 
-from app.campaigns.service import is_campaign_member, parse_campaign_id
+from app.campaigns.auth import authorized_campaign
 from app.deps.auth import resolve_profile
 from app.runtime.threads import (
     ThreadAuthorizationError,
@@ -38,19 +38,6 @@ from models.campaigns import Campaign
 
 router = APIRouter()
 logger = logging.getLogger(__name__)
-
-
-def _authorized_campaign(db: Session, campaign_id: str, user_id: uuid.UUID) -> Campaign:
-    try:
-        cid = parse_campaign_id(campaign_id)
-    except ValueError as exc:
-        raise HTTPException(status_code=404, detail="Invalid campaign id") from exc
-    campaign = db.get(Campaign, cid)
-    if campaign is None:
-        raise HTTPException(status_code=404, detail="Campaign not found")
-    if campaign.owner_id != user_id and not is_campaign_member(db, cid, user_id):
-        raise HTTPException(status_code=403, detail="Not a member of this campaign")
-    return campaign
 
 
 def _is_dm_writer(campaign: Campaign, profile, request: Request) -> bool:
@@ -101,7 +88,7 @@ def _resolve_thread_for_stream(db: Session, campaign: Campaign, raw_thread_id, p
 @router.post("/api/campaigns/{campaign_id}/dm-streams", status_code=201)
 def create_dm_stream(campaign_id: str, payload: dict, request: Request, db: Session = Depends(get_db)):
     profile = resolve_profile(request, db)
-    campaign = _authorized_campaign(db, campaign_id, profile.id)
+    campaign = authorized_campaign(db, campaign_id, profile.id)
 
     raw_thread = payload.get("thread_id", "main")
     try:
@@ -156,7 +143,7 @@ def create_dm_stream(campaign_id: str, payload: dict, request: Request, db: Sess
 @router.post("/api/campaigns/{campaign_id}/dm-streams/{stream_id}/chunks", status_code=201)
 def append_dm_chunk(campaign_id: str, stream_id: str, payload: dict, request: Request, db: Session = Depends(get_db)):
     profile = resolve_profile(request, db)
-    campaign = _authorized_campaign(db, campaign_id, profile.id)
+    campaign = authorized_campaign(db, campaign_id, profile.id)
 
     try:
         sid = uuid.UUID(str(stream_id))
@@ -220,7 +207,7 @@ def append_dm_chunk(campaign_id: str, stream_id: str, payload: dict, request: Re
 @router.get("/api/campaigns/{campaign_id}/dm-streams/{stream_id}")
 def get_dm_stream(campaign_id: str, stream_id: str, request: Request, db: Session = Depends(get_db)):
     profile = resolve_profile(request, db)
-    campaign = _authorized_campaign(db, campaign_id, profile.id)
+    campaign = authorized_campaign(db, campaign_id, profile.id)
     try:
         sid = uuid.UUID(str(stream_id))
     except Exception as exc:
@@ -251,7 +238,7 @@ def get_dm_stream(campaign_id: str, stream_id: str, request: Request, db: Sessio
 @router.post("/api/campaigns/{campaign_id}/dm-streams/{stream_id}/complete")
 def complete_dm_stream(campaign_id: str, stream_id: str, payload: dict, request: Request, db: Session = Depends(get_db)):
     profile = resolve_profile(request, db)
-    campaign = _authorized_campaign(db, campaign_id, profile.id)
+    campaign = authorized_campaign(db, campaign_id, profile.id)
     try:
         sid = uuid.UUID(str(stream_id))
     except Exception as exc:
@@ -289,7 +276,7 @@ def complete_dm_stream(campaign_id: str, stream_id: str, payload: dict, request:
 @router.post("/api/campaigns/{campaign_id}/dm-streams/{stream_id}/abandon")
 def abandon_dm_stream(campaign_id: str, stream_id: str, payload: dict, request: Request, db: Session = Depends(get_db)):
     profile = resolve_profile(request, db)
-    campaign = _authorized_campaign(db, campaign_id, profile.id)
+    campaign = authorized_campaign(db, campaign_id, profile.id)
     try:
         sid = uuid.UUID(str(stream_id))
     except Exception as exc:
@@ -324,7 +311,7 @@ def abandon_dm_stream(campaign_id: str, stream_id: str, payload: dict, request: 
 @router.get("/api/campaigns/{campaign_id}/dm-streams")
 def list_dm_streams(campaign_id: str, request: Request, db: Session = Depends(get_db)):
     profile = resolve_profile(request, db)
-    campaign = _authorized_campaign(db, campaign_id, profile.id)
+    campaign = authorized_campaign(db, campaign_id, profile.id)
     raw_thread = request.query_params.get("thread_id")
     # require thread_id filter for now; don't leak private threads without filter
     if raw_thread:

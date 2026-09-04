@@ -12,38 +12,19 @@ import uuid
 from fastapi import APIRouter, Depends, HTTPException, Request
 from sqlalchemy.orm import Session
 
-from app.campaigns.service import is_campaign_member, parse_campaign_id
+from app.campaigns.auth import authorized_campaign, require_owner
 from app.deps.auth import resolve_profile
 from app.runtime.threads import assert_can_read_thread, parse_thread_id, resolve_thread_id, ThreadNotFoundError, ThreadAuthorizationError
 from database import get_db
-from models.campaigns import Campaign
 
 router = APIRouter()
 logger = logging.getLogger(__name__)
 
 
-def _authorized_campaign(db: Session, campaign_id: str, user_id: uuid.UUID) -> Campaign:
-    try:
-        cid = parse_campaign_id(campaign_id)
-    except ValueError as exc:
-        raise HTTPException(status_code=404, detail="Invalid campaign id") from exc
-    campaign = db.get(Campaign, cid)
-    if campaign is None:
-        raise HTTPException(status_code=404, detail="Campaign not found")
-    if campaign.owner_id != user_id and not is_campaign_member(db, cid, user_id):
-        raise HTTPException(status_code=403, detail="Not a member of this campaign")
-    return campaign
-
-
-def _require_owner(campaign: Campaign, user_id: uuid.UUID):
-    if campaign.owner_id != user_id:
-        raise HTTPException(status_code=403, detail="Only the campaign owner can perform this DM lifecycle action")
-
-
 @router.get("/api/campaigns/{campaign_id}/dm-turns")
 def list_dm_turns(campaign_id: str, request: Request, db: Session = Depends(get_db)):
     profile = resolve_profile(request, db)
-    campaign = _authorized_campaign(db, campaign_id, profile.id)
+    campaign = authorized_campaign(db, campaign_id, profile.id)
     thread_raw = request.query_params.get("thread_id")
     from app.dm.turns import list_turns
 
@@ -72,7 +53,7 @@ def list_dm_turns(campaign_id: str, request: Request, db: Session = Depends(get_
 @router.get("/api/campaigns/{campaign_id}/dm-turns/{turn_id}")
 def get_dm_turn(campaign_id: str, turn_id: str, request: Request, db: Session = Depends(get_db)):
     profile = resolve_profile(request, db)
-    campaign = _authorized_campaign(db, campaign_id, profile.id)
+    campaign = authorized_campaign(db, campaign_id, profile.id)
     try:
         tid = uuid.UUID(turn_id)
     except ValueError as exc:
@@ -109,8 +90,8 @@ def get_dm_turn(campaign_id: str, turn_id: str, request: Request, db: Session = 
 @router.post("/api/campaigns/{campaign_id}/dm-turns/{turn_id}/streaming")
 def start_streaming(campaign_id: str, turn_id: str, payload: dict, request: Request, db: Session = Depends(get_db)):
     profile = resolve_profile(request, db)
-    campaign = _authorized_campaign(db, campaign_id, profile.id)
-    _require_owner(campaign, profile.id)
+    campaign = authorized_campaign(db, campaign_id, profile.id)
+    require_owner(campaign, profile.id)
     try:
         tid = uuid.UUID(turn_id)
     except ValueError as exc:
@@ -157,8 +138,8 @@ def start_streaming(campaign_id: str, turn_id: str, payload: dict, request: Requ
 @router.post("/api/campaigns/{campaign_id}/dm-turns/{turn_id}/commit")
 def commit_dm_turn_endpoint(campaign_id: str, turn_id: str, payload: dict, request: Request, db: Session = Depends(get_db)):
     profile = resolve_profile(request, db)
-    campaign = _authorized_campaign(db, campaign_id, profile.id)
-    _require_owner(campaign, profile.id)
+    campaign = authorized_campaign(db, campaign_id, profile.id)
+    require_owner(campaign, profile.id)
     try:
         tid = uuid.UUID(turn_id)
     except ValueError as exc:
@@ -241,8 +222,8 @@ def commit_dm_turn_endpoint(campaign_id: str, turn_id: str, payload: dict, reque
 @router.post("/api/campaigns/{campaign_id}/dm-turns/{turn_id}/abandon")
 def abandon_dm_turn_endpoint(campaign_id: str, turn_id: str, payload: dict, request: Request, db: Session = Depends(get_db)):
     profile = resolve_profile(request, db)
-    campaign = _authorized_campaign(db, campaign_id, profile.id)
-    _require_owner(campaign, profile.id)
+    campaign = authorized_campaign(db, campaign_id, profile.id)
+    require_owner(campaign, profile.id)
     try:
         tid = uuid.UUID(turn_id)
     except ValueError as exc:
@@ -282,7 +263,7 @@ def abandon_dm_turn_endpoint(campaign_id: str, turn_id: str, payload: dict, requ
 @router.post("/api/campaigns/{campaign_id}/dm-turns/recover")
 def recover_stuck(campaign_id: str, payload: dict, request: Request, db: Session = Depends(get_db)):
     profile = resolve_profile(request, db)
-    campaign = _authorized_campaign(db, campaign_id, profile.id)
+    campaign = authorized_campaign(db, campaign_id, profile.id)
     # Only owner can recover
     if campaign.owner_id != profile.id:
         raise HTTPException(status_code=403, detail="Only owner can recover stuck turns")
