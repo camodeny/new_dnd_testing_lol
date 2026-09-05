@@ -20,7 +20,7 @@ def keys(monkeypatch):
 def test_dm_pinned_to_meta(keys):
     adapter, model, name = resolve_area("dm")
     assert name == "meta"
-    assert model == "muse-spark-1.3-contributor"
+    assert model == "muse-spark-1.3"
     assert adapter.name == "meta"
 
 
