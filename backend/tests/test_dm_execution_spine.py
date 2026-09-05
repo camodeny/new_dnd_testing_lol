@@ -173,15 +173,71 @@ def test_retriable_provider_error_stays_retryable_and_next_run_succeeds(db):
 
     with pytest.raises(TimeoutError, match="503"):
         execute_dm_attempt(s, attempt.id, adjudicate=_flaky, narrator="deterministic")
-    # Pre-visibility transient: attempt back to prepared with the error kept.
+    # Pre-visibility transient: attempt back to prepared with the error kept,
+    # requeued behind ready work via retry backoff.
     fresh_attempt = s.get(DmTurnAttempt, attempt.id)
     assert fresh_attempt.status == "prepared"
     assert fresh_attempt.last_error and "503" in fresh_attempt.last_error
+    assert fresh_attempt.retry_count == 1
+    assert fresh_attempt.next_retry_at is not None
     assert s.get(DmTurn, turn.id).status == "pending"
-    # Next execution retries the same attempt with no manual repair.
+    # Direct execution is not gated by sweep eligibility: the same attempt
+    # recovers with no manual repair once the provider heals.
     result = execute_dm_attempt(s, attempt.id, adjudicate=_flaky, narrator="deterministic")
     assert result.attempt.status == "succeeded"
     assert len(calls) == 2
+
+
+def test_failing_attempt_does_not_starve_newer_prepared_attempt(db):
+    """A backoff-delayed retry must not block the limit=1 cron sweep."""
+    from datetime import datetime, timedelta, timezone
+
+    s, camp_id, thread_id, factory = db
+    owner = s.get(Campaign, camp_id).owner_id
+    other_camp = uuid.uuid4()
+    other_thread = uuid.uuid4()
+    s.add(Profile(id=uuid.uuid4(), email="other@example.com"))
+    s.add(Campaign(id=other_camp, owner_id=owner, name="Second", revision=0))
+    s.add(
+        CampaignThread(
+            id=other_thread,
+            campaign_id=other_camp,
+            thread_type="campaign",
+            created_by=owner,
+        )
+    )
+    s.commit()
+    old_turn, old_attempt = _submit(s, camp_id, thread_id, text="Old failing input.")
+    new_turn, new_attempt = _submit(s, other_camp, other_thread, text="New healthy input.")
+    calls = []
+
+    def _flaky_then_healthy(packet, feedback=None):
+        calls.append(str(packet.audience.campaign_id))
+        if str(packet.audience.campaign_id) == str(camp_id):
+            raise TimeoutError("simulated provider 503 unavailable")
+        return _fake_adjudicate()(packet)
+
+    first = run_dm_execute_sweep(
+        s, limit=1, adjudicate=_flaky_then_healthy, narrator="deterministic"
+    )
+    assert first["executed"] == [] and len(first["failed"]) == 1
+    assert s.get(DmTurnAttempt, old_attempt.id).status == "prepared"
+    assert s.get(DmTurnAttempt, old_attempt.id).next_retry_at is not None
+    # The newer attempt is still eligible and runs on the next sweep.
+    second = run_dm_execute_sweep(
+        s, limit=1, adjudicate=_flaky_then_healthy, narrator="deterministic"
+    )
+    assert second["executed"] == [str(new_attempt.id)], second
+    assert s.get(DmTurnAttempt, new_attempt.id).status == "succeeded"
+    # Once the backoff elapses the original attempt recovers on its own.
+    stale = s.get(DmTurnAttempt, old_attempt.id)
+    stale.next_retry_at = datetime.now(timezone.utc) - timedelta(seconds=1)
+    s.add(stale)
+    s.commit()
+    third = run_dm_execute_sweep(
+        s, limit=1, adjudicate=_fake_adjudicate(), narrator="deterministic"
+    )
+    assert third["executed"] == [str(old_attempt.id)], third
 
 
 def test_missing_provider_config_fails_clearly(db):

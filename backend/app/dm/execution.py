@@ -40,6 +40,12 @@ def _is_config_error(exc: BaseException) -> bool:
     return "_API_KEY is not set" in msg or "_MODEL is not set" in msg
 
 
+def retry_backoff_seconds(retry_count: int) -> int:
+    """Bounded exponential backoff for retriable DM attempts (seconds)."""
+    count = max(1, int(retry_count or 1))
+    return min(30 * (2 ** (count - 1)), 600)
+
+
 def _current_scene_explicitly_absent(db: Session, attempt_id: uuid.UUID) -> bool:
     """True only when positively identified: no scene row established.
 
@@ -450,15 +456,26 @@ def _execute_owned_attempt(
                 or (fresh_turn is not None and fresh_turn.status in ("streaming", "failed_visible"))
             )
             if error_class == RETRIABLE and not crossed:
-                # Pre-visibility transient: keep retryable work. Reset the
-                # claim to prepared (error preserved) so the next cron sweep
-                # or queue redelivery retries without manual repair.
+                # Pre-visibility transient: keep retryable work but requeue it
+                # BEHIND ready work. Reset the claim to prepared with a future
+                # eligibility time (error preserved) so the next cron sweep or
+                # queue redelivery retries without manual repair — without
+                # letting one failing attempt starve newer prepared attempts.
                 if fresh_attempt is not None:
+                    from datetime import datetime, timezone
+                    from datetime import timedelta as _td
+
+                    now = datetime.now(timezone.utc)
+                    retries = int(getattr(fresh_attempt, "retry_count", 0) or 0) + 1
                     fresh_attempt.last_error = f"{type(exc).__name__}: {exc}"[:2000]
                     fresh_attempt.error_class = error_class
                     fresh_attempt.status = ATTEMPT_PREPARED
                     fresh_attempt.started_at = None
                     fresh_attempt.completed_at = None
+                    fresh_attempt.retry_count = retries
+                    fresh_attempt.next_retry_at = now + _td(
+                        seconds=retry_backoff_seconds(retries)
+                    )
                     db.add(fresh_attempt)
                     db.commit()
                 structured_log(
@@ -648,12 +665,27 @@ def _execute_owned_attempt(
 
 
 def find_prepared_attempts(db: Session, *, limit: int = 5):
-    """Oldest prepared attempts eligible for autonomous execution."""
+    """Oldest retry-eligible prepared attempts for autonomous execution.
+
+    Attempts in retry backoff (``next_retry_at`` in the future) are skipped
+    so one failing attempt cannot starve newer prepared work.
+    """
+    from datetime import datetime, timezone
+
+    from sqlalchemy import or_
+
     from models.dm import DmTurnAttempt
 
+    now = datetime.now(timezone.utc)
     q = (
         select(DmTurnAttempt)
-        .where(DmTurnAttempt.status == "prepared")
+        .where(
+            DmTurnAttempt.status == "prepared",
+            or_(
+                DmTurnAttempt.next_retry_at.is_(None),
+                DmTurnAttempt.next_retry_at <= now,
+            ),
+        )
         .order_by(DmTurnAttempt.created_at)
         .limit(max(1, limit))
     )
