@@ -151,6 +151,147 @@ def execute_dm_attempt(db: Session, attempt_id: uuid.UUID, **kwargs):
         return _execute_owned_attempt(db, attempt_id, **kwargs)
 
 
+def _await_roll_prompt_text(contract) -> str:
+    parts: list[str] = []
+    for beat in contract.beats or []:
+        for claim in beat.claims or []:
+            text = (claim.text or "").strip()
+            if text:
+                parts.append(text)
+    return " ".join(parts).strip()
+
+
+def _resolve_roll_participants(db: Session, turn, contract):
+    """Derive (requested_user_id, character_id) for an await_roll contract.
+
+    Prefers the contract's explicit character_id when it names a real
+    character; otherwise falls back to the turn's submission character.
+    """
+    from models.characters import Character
+    from models.threads import PlayerSubmission
+
+    rr = contract.roll_request
+    if rr is not None and rr.character_id not in (None, ""):
+        try:
+            cid = uuid.UUID(str(rr.character_id))
+            char = db.get(Character, cid)
+            if char is not None:
+                return char.owner_id, char.id
+        except (ValueError, TypeError):
+            pass
+    submission_ids = list(turn.submission_ids or [])
+    if submission_ids:
+        as_uuids = []
+        for value in submission_ids:
+            try:
+                as_uuids.append(uuid.UUID(str(value)))
+            except (ValueError, TypeError):
+                continue
+        subs = list(
+            db.scalars(
+                select(PlayerSubmission).where(
+                    PlayerSubmission.id.in_(as_uuids)
+                )
+            ).all()
+        ) if as_uuids else []
+        for sub in subs:
+            if sub.character_id:
+                char = db.get(Character, sub.character_id)
+                if char is not None:
+                    return char.owner_id, char.id
+                return sub.user_id, sub.character_id
+    raise ValueError("await_roll requires a player-owned character to request the roll")
+
+
+def _complete_await_roll(db: Session, *, turn, attempt, contract, trace_id: str):
+    """Persist a player-owned roll request and leave the same turn open."""
+    from app.rolls.service import request_rolls
+
+    requested_user_id, character_id = _resolve_roll_participants(db, turn, contract)
+    rr = contract.roll_request
+    payload = {
+        "request_key": str(rr.request_id),
+        "requested_user_id": requested_user_id,
+        "character_id": character_id,
+        "roll_kind": str(rr.roll_kind),
+        "ability_or_skill": str(rr.ability_or_skill),
+        "label": str(rr.label),
+        "advantage_state": str(rr.advantage_state or "normal"),
+        "reason_public": str(rr.reason_public),
+        "dc_private": rr.dc_private,
+    }
+    rows = request_rolls(
+        db, campaign_id=turn.campaign_id, turn_id=turn.id,
+        attempt_id=attempt.id, requests=[payload],
+    )
+    prompt = _await_roll_prompt_text(contract)
+    if prompt:
+        try:
+            base = dict(attempt.result or {})
+            base["prompt"] = prompt[:1000]
+            attempt.result = base
+            db.add(attempt)
+        except Exception:
+            pass
+    db.commit()
+    db.refresh(turn)
+    db.refresh(attempt)
+    from app.observability.tracing import structured_log
+
+    structured_log(
+        logger, logging.INFO, "dm_execute_await_roll",
+        turn_id=str(turn.id), attempt_id=str(attempt.id),
+        roll_request_ids=[str(r.id) for r in rows], trace_id=trace_id,
+    )
+
+    from dataclasses import dataclass
+
+    @dataclass
+    class AwaitRollResult:
+        turn: object
+        attempt: object
+        roll_requests: list
+        narration: object = None
+        event: object = None
+        mode: str = "await_roll"
+
+    return AwaitRollResult(turn=turn, attempt=attempt, roll_requests=rows)
+
+
+def _complete_silent(db: Session, *, turn, attempt, contract, provider: str, trace_id: str):
+    """Complete a valid silent contract with no visible narration."""
+    from app.dm.turns import stage_validated_attempt
+
+    stage_validated_attempt(db, attempt.id, contract)
+    turn.status = "succeeded"
+    attempt.status = "succeeded"
+    attempt.result = {"mode": "silent"}
+    db.add(turn)
+    db.add(attempt)
+    db.commit()
+    db.refresh(turn)
+    db.refresh(attempt)
+    from app.observability.tracing import structured_log
+
+    structured_log(
+        logger, logging.INFO, "dm_execute_silent",
+        turn_id=str(turn.id), attempt_id=str(attempt.id),
+        provider=provider, trace_id=trace_id,
+    )
+
+    from dataclasses import dataclass
+
+    @dataclass
+    class SilentResult:
+        turn: object
+        attempt: object
+        narration: object = None
+        event: object = None
+        mode: str = "silent"
+
+    return SilentResult(turn=turn, attempt=attempt)
+
+
 def _execute_owned_attempt(
     db: Session,
     attempt_id: uuid.UUID,
@@ -295,6 +436,42 @@ def _execute_owned_attempt(
         _fail_visible(exc)
         raise
 
+    # Mode-aware lifecycle dispatch: non-final modes must not go through
+    # the final narration-and-commit path.
+    if contract.mode == "await_roll":
+        try:
+            return _complete_await_roll(
+                db, turn=turn, attempt=attempt, contract=contract, trace_id=tid,
+            )
+        except Exception as exc:
+            db.rollback()
+            try:
+                from models.dm import DmTurnAttempt as _Att
+
+                current = db.get(_Att, attempt.id)
+                if current is not None and current.status in (ATTEMPT_PREPARED, ATTEMPT_RUNNING):
+                    _fail_visible(exc)
+            except Exception:
+                pass
+            raise
+    if contract.mode == "silent":
+        try:
+            return _complete_silent(
+                db, turn=turn, attempt=attempt, contract=contract,
+                provider=pname or "dm-provider", trace_id=tid,
+            )
+        except Exception as exc:
+            db.rollback()
+            try:
+                from models.dm import DmTurnAttempt as _Att
+
+                current = db.get(_Att, attempt.id)
+                if current is not None and current.status in (ATTEMPT_PREPARED, ATTEMPT_RUNNING):
+                    _fail_visible(exc)
+            except Exception:
+                pass
+            raise
+
     if narrator is None:
         try:
             from app.dm.adjudication import build_provider_narrator
@@ -423,15 +600,25 @@ def handle_dm_turn_execute(envelope, db: Session | None = None) -> dict:
     raw = payload.get("attempt_id") or payload.get("attemptId")
     if not raw:
         raise ValueError("dm.turn.execute envelope payload must include attempt_id")
+
+    def _shape(result) -> dict:
+        narration = getattr(result, "narration", None)
+        stream_id = str(narration.stream_id) if narration is not None else None
+        out: dict = {
+            "attempt_id": str(raw),
+            "turn_id": str(result.turn.id),
+            "stream_id": stream_id,
+        }
+        mode = getattr(result, "mode", None)
+        if mode:
+            out["mode"] = mode
+        return out
+
     if db is not None:
         result = execute_dm_attempt(db, uuid.UUID(str(raw)))
         if result is None:
             return {"attempt_id": str(raw), "skipped": True}
-        return {
-            "attempt_id": str(raw),
-            "turn_id": str(result.turn.id),
-            "stream_id": str(result.narration.stream_id),
-        }
+        return _shape(result)
     from database import SessionLocal
 
     if SessionLocal is None:
@@ -440,11 +627,7 @@ def handle_dm_turn_execute(envelope, db: Session | None = None) -> dict:
         result = execute_dm_attempt(session, uuid.UUID(str(raw)))
         if result is None:
             return {"attempt_id": str(raw), "skipped": True}
-        return {
-            "attempt_id": str(raw),
-            "turn_id": str(result.turn.id),
-            "stream_id": str(result.narration.stream_id),
-        }
+        return _shape(result)
 
 
 def register_dm_worker() -> None:

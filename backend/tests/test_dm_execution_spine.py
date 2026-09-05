@@ -377,6 +377,98 @@ def test_queue_delivery_executes_dm_attempt(db, monkeypatch):
     assert s.get(DmTurnAttempt, attempt.id).status == "succeeded"
 
 
+def test_await_roll_creates_request_and_resumes_on_fulfill(db):
+    """await_roll must persist a roll request, hold the turn open, and resume."""
+    from models.campaigns import CampaignMember
+    from models.characters import Character
+    from models.dm import PlayerRollRequest
+    from app.rolls.service import fulfill_roll, has_pending_rolls
+
+    s, camp_id, thread_id, _ = db
+    owner = s.get(Campaign, camp_id).owner_id
+    s.add(CampaignMember(campaign_id=camp_id, user_id=owner, role="owner"))
+    char = Character(owner_id=owner, name="Hero", system="dnd5e")
+    s.add(char)
+    s.commit()
+    turn, attempt = _submit(s, camp_id, thread_id)
+    char_id = str(char.id)
+
+    def adjudicate(packet, feedback=None):
+        return normalize_contract({
+            "contract_version": CONTRACT_VERSION, "mode": "await_roll",
+            "reason": "uncertain footing",
+            "beats": [{
+                "id": "beat_1", "type": "narration",
+                "claims": [{
+                    "text": "The ledge crumbles beneath your boots.",
+                    "claim_kind": "observation",
+                    "origin": "dm_adjudication", "visibility": "public",
+                }],
+            }],
+            "roll_request": {
+                "request_id": "check_1", "character_id": char_id,
+                "roll_kind": "check",
+                "ability_or_skill": "Acrobatics", "label": "Keep footing",
+                "reason_public": "Roll to keep your footing.",
+            },
+        })
+
+    result = execute_dm_attempt(
+        s, attempt.id, adjudicate=adjudicate, narrator="deterministic"
+    )
+    assert result.mode == "await_roll"
+    assert s.get(DmTurn, turn.id).status == "awaiting_roll"
+    assert s.get(DmTurnAttempt, attempt.id).status == "awaiting_roll"
+    assert has_pending_rolls(s, turn.id)
+    rows = s.execute(
+        select(PlayerRollRequest).where(PlayerRollRequest.turn_id == turn.id)
+    ).scalars().all()
+    assert len(rows) == 1
+    assert rows[0].status == "pending"
+
+    req, _fulfillment, resumed = fulfill_roll(
+        s, request_id=rows[0].id, actor_id=owner,
+        payload={"source": "app", "visibility": "public",
+                 "raw_rolls": [14], "modifier": 2, "total": 16},
+    )
+    s.commit()
+    assert req.status == "fulfilled"
+    assert resumed is not None
+    assert resumed.status == "prepared"
+    assert s.get(DmTurn, turn.id).status == "pending"
+    assert s.get(DmTurn, turn.id).current_attempt_id == resumed.id
+    assert resumed.roll_evidence
+
+
+def test_silent_completes_without_visible_stream(db):
+    """silent must resolve terminally with no fabricated narration."""
+    s, camp_id, thread_id, _ = db
+    turn, attempt = _submit(s, camp_id, thread_id)
+
+    def adjudicate(packet, feedback=None):
+        return normalize_contract({
+            "contract_version": CONTRACT_VERSION, "mode": "silent",
+            "reason": "no output needed", "beats": [],
+        })
+
+    result = execute_dm_attempt(
+        s, attempt.id, adjudicate=adjudicate, narrator="deterministic"
+    )
+    assert result.mode == "silent"
+    assert s.get(DmTurn, turn.id).status == "succeeded"
+    fresh_attempt = s.get(DmTurnAttempt, attempt.id)
+    assert fresh_attempt.status == "succeeded"
+    assert fresh_attempt.stream_id is None
+    from models.dm import DMStream
+
+    streams = s.execute(
+        select(DMStream).where(
+            DMStream.turn_id == str(turn.id)
+        )
+    ).scalars().all()
+    assert streams == []
+
+
 @pytest.mark.postgres
 def test_live_postgres_executor_cannot_be_recovered_after_lease_age(tmp_path):
     import os
