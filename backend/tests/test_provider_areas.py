@@ -33,8 +33,8 @@ def test_narrator_pinned_to_openai(keys):
 
 def test_character_chat_pinned(keys):
     _, model, name = resolve_area("character_chat")
-    assert name == "openai"
-    assert model == "gpt-4o-mini"
+    assert name == "meta"
+    assert model == "muse-spark-1.3-contributor"
 
 
 def test_areas_known(keys):
