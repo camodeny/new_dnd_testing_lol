@@ -134,6 +134,7 @@ def _execute_owned_attempt(
         mark_attempt_running,
     )
     from app.dm.evidence import run_bounded_evidence_loop
+    from app.dm.tools import handle_ask_character_sheet
     from app.dm.validators import default_pipeline, run_with_bounded_regeneration
     from app.dm.narration import (
         NarrationStreamError,
@@ -240,7 +241,7 @@ def _execute_owned_attempt(
 
         final_contract, _bundle = run_bounded_evidence_loop(
             initial_packet=packet, adjudicate=evidence_adjudicate, db=db,
-            tool_handlers=None,
+            tool_handlers={"ask_character_sheet": handle_ask_character_sheet},
         )
         packet = validation_packet
         report = default_pipeline.validate(final_contract, packet)

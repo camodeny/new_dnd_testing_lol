@@ -192,10 +192,20 @@ def test_worker_handler_registered_for_queue_path():
 
 
 @pytest.mark.parametrize("regenerate", [False, True])
-def test_evidence_survives_validation_and_regeneration(db, monkeypatch, regenerate):
-    from tests.test_dm_evidence import _sheet_ok
-    monkeypatch.setattr("app.dm.evidence._default_tool_handler", _sheet_ok)
+def test_evidence_survives_validation_and_regeneration(db, regenerate):
+    from models.campaigns import CampaignMember
+    from models.characters import Character, Dnd5eCharacterSheet
     s, camp_id, thread_id, _ = db
+    owner = s.get(Campaign, camp_id).owner_id
+    s.add(CampaignMember(campaign_id=camp_id, user_id=owner, role="owner"))
+    char = Character(owner_id=owner, name="Hero", system="dnd5e")
+    s.add(char)
+    s.flush()
+    sheet = Dnd5eCharacterSheet.from_frontend({"name": "Hero", "total_level": 1, "armor_class": 15}, owner)
+    sheet.character_id = char.id
+    s.add(sheet)
+    s.commit()
+    sheet_id = str(sheet.id)
     _, attempt = _submit(s, camp_id, thread_id)
     calls = []
 
@@ -208,7 +218,11 @@ def test_evidence_survives_validation_and_regeneration(db, monkeypatch, regenera
                 "evidence_requests": [{"id": "evidence_1", "tool": "ask_character_sheet",
                                        "question": "What is AC?", "scope": "current_player"}],
             })
-        assert any(r.record_id == "evidence:evidence_1" for lane in packet.lanes for r in lane.records)
+        evidence = next(r for lane in packet.lanes for r in lane.records
+                        if r.record_id == "evidence:evidence_1")
+        assert evidence.value["status"] == "ok", evidence.value
+        assert any(source.source_id == sheet_id for source in evidence.sources)
+        assert evidence.value["result"]["combat"]["armor_class"]["value"] == 15
         contract = _fake_adjudicate("AC is 15.")(packet).model_dump(mode="json")
         claim = contract["beats"][0]["claims"][0]
         claim.update(origin="resolver_evidence", evidence_refs=[
