@@ -1,7 +1,7 @@
 """dm attempt retry backoff — issue #354 (additive).
 
 Revision ID: b7e21f4c90d2
-Revises: 9c1d209a44aa
+Revises: 7f3a1c9e241b
 
 Additive only: adds retry_count + next_retry_at to dm_turn_attempts so a
 retriable pre-visibility failure can be requeued behind ready work instead
@@ -15,7 +15,7 @@ from alembic import op
 import sqlalchemy as sa
 
 revision: str = "b7e21f4c90d2"
-down_revision: Union[str, Sequence[str], None] = "9c1d209a44aa"
+down_revision: Union[str, Sequence[str], None] = "7f3a1c9e241b"
 branch_labels: Union[str, Sequence[str], None] = None
 depends_on: Union[str, Sequence[str], None] = None
 
