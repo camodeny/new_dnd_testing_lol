@@ -20,7 +20,7 @@ class MetaAdapter(LLMProviderAdapter):
     name = 'meta'
     env_prefix = 'META'
     default_base_url = 'https://api.meta.ai/v1/chat/completions'
-    default_model = 'muse-spark-1.3'
+    default_model = 'muse-spark-1.3-contributor'
 
     def api_key(self):
         return (

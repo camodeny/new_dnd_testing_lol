@@ -16,7 +16,7 @@ from app.providers.adapters.meta import MetaAdapter
 
 TEXT_PAYLOAD = {
     "id": "resp_123",
-    "model": "muse-spark-1.3",
+    "model": "muse-spark-1.3-contributor",
     "choices": [
         {
             "index": 0,
@@ -32,7 +32,7 @@ TEXT_PAYLOAD = {
 
 TOOL_PAYLOAD = {
     "id": "resp_456",
-    "model": "muse-spark-1.3",
+    "model": "muse-spark-1.3-contributor",
     "choices": [
         {
             "index": 0,
@@ -92,7 +92,7 @@ def test_build_payload_keeps_openai_shape():
 
     payload = MetaAdapter().build_payload(ProviderRequest(
         messages=[{"role": "user", "content": "hi"}],
-        model="muse-spark-1.3",
+        model="muse-spark-1.3-contributor",
         max_tokens=512,
         stream=True,
     ))
@@ -129,11 +129,11 @@ def test_dm_area_uses_direct_model_api_pair(monkeypatch):
     adapter, model, name = resolve_area("dm")
     assert name == "meta"
     assert adapter.base_url() == "https://api.meta.ai/v1/chat/completions"
-    assert model == "muse-spark-1.3"
-    # Gateway aliases must not silently re-enter this path.
-    assert "contributor" not in model
+    assert model == "muse-spark-1.3-contributor"
+    # Gateway/legacy surfaces must not silently re-enter this path.
     assert "llama.com" not in adapter.base_url()
     assert "opencode" not in adapter.base_url()
+    assert "opencode" not in model
 
 
 class _StubPacket:
@@ -154,7 +154,7 @@ def test_dm_contract_via_meta_choices_envelope(monkeypatch):
     })
     envelope = {
         "id": "resp_dm",
-        "model": "muse-spark-1.3",
+        "model": "muse-spark-1.3-contributor",
         "choices": [
             {
                 "index": 0,
