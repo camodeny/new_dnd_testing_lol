@@ -21,9 +21,34 @@ from models.campaigns import Campaign
 from models.campaigns import CampaignDomainEvent
 from models.campaigns import CampaignInvite
 from models.campaigns import CampaignMember
+from models.characters import Character
+from models.characters import Dnd5eCharacterSheet
 from models.profiles import Profile
 from models.threads import CampaignThread
 from models.threads import CampaignThreadMember
+
+
+def _ready_lobby(factory, campaign_id: str, user_ids: list) -> None:
+    """Test setup: give each member a valid owned PC and mark ready (#241)."""
+    from datetime import datetime, timezone
+
+    cid = uuid.UUID(campaign_id)
+    with factory() as db:
+        for uid in user_ids:
+            char = Character(owner_id=uid, name=f"Hero {str(uid)[:8]}", system="dnd5e")
+            db.add(char)
+            db.flush()
+            db.add(Dnd5eCharacterSheet(
+                character_id=char.id, owner_id=uid, character_name=char.name,
+                race="Human", char_class="Fighter", level=1,
+            ))
+            db.flush()
+            member = db.get(CampaignMember, {"campaign_id": cid, "user_id": uid})
+            assert member is not None
+            member.selected_character_id = char.id
+            member.is_ready = True
+            member.ready_at = datetime.now(timezone.utc)
+        db.commit()
 
 
 @pytest.fixture
@@ -110,7 +135,7 @@ def test_launch_settings_are_structured_and_player_range_is_strict(api):
 
 
 def test_lifecycle_is_authoritative_idempotent_and_recoverable(api):
-    client, factory, actor, _, member_id, outsider_id = api
+    client, factory, actor, owner_id, member_id, outsider_id = api
     campaign = _create(client, required_players=2)
     cid = campaign["id"]
     invite = client.post(f"/api/campaigns/{cid}/invites")
@@ -126,6 +151,8 @@ def test_lifecycle_is_authoritative_idempotent_and_recoverable(api):
 
         db.add(CampaignMember(campaign_id=persisted.id, user_id=member_id, role="player"))
         db.commit()
+
+    _ready_lobby(factory, cid, [owner_id, member_id])
 
     started = _transition(client, cid, 0, "starting", "start-ready")
     replay = _transition(client, cid, 0, "starting", "start-ready")
@@ -238,10 +265,11 @@ def test_owner_removal_count_reduction_and_invite_revocation_are_revisioned(api)
 
 
 def test_active_and_archived_transitions_lock_membership_and_invalid_edges(api):
-    client, factory, _, _, _, _ = api
+    client, factory, _, owner_id, _, _ = api
     campaign = _create(client)
     cid = campaign["id"]
     assert _transition(client, cid, 0, "active", "skip-start").status_code == 409
+    _ready_lobby(factory, cid, [owner_id])
     assert _transition(client, cid, 0, "starting", "to-starting").status_code == 200
     assert _transition(client, cid, 1, "active", "to-active").status_code == 200
     assert client.post(f"/api/campaigns/{cid}/invites").status_code == 409

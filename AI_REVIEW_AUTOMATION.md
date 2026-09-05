@@ -9,7 +9,7 @@ This file is the handoff guide for the automated pull-request reviewer. It is in
 - ChatGPT project: `DND AI AUTO`
 - GitHub connector identity that successfully posted the test review: `phazedrl-ai`
 - Self-hosted runner: `raspone-ci` on host `raspone`
-- Latest workflow implementation: commit `d3daf02`
+- Reviewer source: `.github/ai-review/` from the trusted `main` branch
 - Latest verified test: PR #352, run [33841926148](https://github.com/camodeny/new_dnd_testing_lol/actions/runs/33841926148), completed successfully and posted a `COMMENTED` review.
 
 ## What the system does
@@ -31,15 +31,17 @@ The workflow does not extract the assistant response and does not post a second 
 
 - `.github/workflows/ai-pr-review.yml` — trigger, runner, trusted checkout, browser launch, and concurrency control.
 - `.github/ai-review/review_pr.js` — Playwright browser automation and the review prompt.
+- `.github/ai-review/review_pr.test.js` — selector, route, and preflight argument tests.
 - `.github/ai-review/package.json` and `package-lock.json` — Playwright dependency.
 - `AI_REVIEW_AUTOMATION.md` — this handoff document.
+- `AI_REVIEW_FAILURE_MODES.md` — incident record, failure-mode contract, and recovery checks.
 
 There are also local helper files in the T3 workspace, outside the GitHub repository:
 
 - `/Users/cpendergrass/Programming/aireview/send_chatgpt.js` — manual browser-control prompt sender.
 - `/Users/cpendergrass/Programming/aireview/launch_chatgpt.py` — older URL/prompt launcher; it is not used by the GitHub Actions reviewer.
 
-The actual Git repository is currently at `/Users/cpendergrass/Programming/aireview/.work/new_dnd_testing_lol` in the local workspace.
+The local Git checkout used for maintenance is `/Users/cpendergrass/Programming/new_dnd_testing_lol`.
 
 ## Workflow behavior
 
@@ -54,7 +56,15 @@ Draft PRs are skipped. The `dnd-ai-chatgpt-browser` concurrency group serializes
 
 The workflow checks out only `.github/ai-review` from the trusted base branch. Do not change this to execute code from the incoming PR: the self-hosted runner contains an authenticated browser profile, and PR contents are untrusted.
 
+After installing the pinned Playwright dependency, the workflow runs the
+reviewer unit tests before opening ChatGPT.
+
 The Actions token currently has only `contents: read`. It is not used to publish the review.
+
+On failure, the reviewer emits a stage code such as `AUTHENTICATION`,
+`PROJECT_NAVIGATION`, or `RESPONSE_TIMEOUT`. When
+`REVIEWER_DIAGNOSTICS_DIR` is configured, it also writes a redacted
+`reviewer-diagnostics.json`; the workflow uploads that file for 14 days.
 
 ## ChatGPT browser state on raspone
 
@@ -103,7 +113,18 @@ The earlier implementation clicked the sidebar Projects control and waited for a
 https://chatgpt.com/projects
 ```
 
-It then selects the project by visible name and waits for the project route before locating the composer.
+It then selects the project directory grid cell (with scoped row and legacy
+navigation fallbacks) and waits for either the project route or a visible
+composer before continuing. Bare text is not clicked because the sidebar can
+contain a duplicate project label that is not a navigation control.
+
+### PR #356 and PR #357 reviewer failures
+
+Both failures were the duplicate-label project-selection bug described above,
+not an expired ChatGPT session. The persistent reviewer profile on `raspone`
+was signed in; a separate disposable smoke profile had caused a misleading
+earlier auth result. The full incident record and prevention checklist are in
+[AI_REVIEW_FAILURE_MODES.md](AI_REVIEW_FAILURE_MODES.md).
 
 ### Run is pending or queued
 
@@ -124,6 +145,7 @@ From the repository checkout:
 ```bash
 # Check the local reviewer syntax and whitespace
 node --check .github/ai-review/review_pr.js
+npm --prefix .github/ai-review test
 git diff --check
 
 # List recent reviewer runs
@@ -153,8 +175,9 @@ Do not run the production reviewer manually against a real PR unless posting a r
 3. Preserve the project name `DND AI AUTO` unless the ChatGPT project is intentionally renamed.
 4. Prefer stable direct navigation and semantic locators; ChatGPT UI markup can change.
 5. Keep the persistent browser profile outside the repository.
-6. Run syntax and diff checks before pushing.
-7. Test with a deliberately disposable PR, then verify both the Actions conclusion and the GitHub review author/state.
+6. Run syntax, unit, and diff checks before pushing.
+7. Run `review_pr.js --preflight` on `raspone` with the persistent profile after browser/UI changes.
+8. Test with a deliberately disposable PR, then verify both the Actions conclusion and the GitHub review author/state.
 
 ## Relevant official guidance
 

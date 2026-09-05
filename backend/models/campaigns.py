@@ -3,7 +3,7 @@
 import uuid
 from datetime import datetime
 
-from sqlalchemy import CheckConstraint, DateTime, ForeignKey, Integer, String, Text, UniqueConstraint, func, text
+from sqlalchemy import Boolean, CheckConstraint, DateTime, ForeignKey, Integer, String, Text, UniqueConstraint, func, text
 from sqlalchemy.dialects.postgresql import JSONB, UUID
 from sqlalchemy.orm import Mapped, mapped_column
 
@@ -114,10 +114,23 @@ class CampaignDomainEvent(Base):
 
 
 class CampaignMember(Base):
+    """Lobby membership — issue #241.
+
+    One human member = at most one selected player character (owned by that
+    member). Readiness is explicit and reversible before start; campaign start
+    locks the launch assignment (status != lobby rejects selection/readiness
+    changes). Readiness alone never freezes character edits.
+    """
+
     __tablename__ = "campaign_members"
     campaign_id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), ForeignKey("campaigns.id", ondelete="CASCADE"), primary_key=True)
     user_id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), ForeignKey("profiles.id", ondelete="CASCADE"), primary_key=True)
     role: Mapped[str] = mapped_column(String(16), nullable=False, default="player")
+    selected_character_id: Mapped[uuid.UUID | None] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("characters.id", ondelete="SET NULL"), nullable=True, default=None
+    )
+    is_ready: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False, server_default="false")
+    ready_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True, default=None)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now(), nullable=False)
 
 

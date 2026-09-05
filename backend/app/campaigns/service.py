@@ -9,6 +9,7 @@ import secrets
 import string as _string
 import uuid as uuid_lib
 
+from sqlalchemy import select
 from sqlalchemy.orm import Session
 
 from models.campaigns import CampaignMember
@@ -170,3 +171,79 @@ def validate_lifecycle_transition(current: str, target) -> str:
     if target_status not in CAMPAIGN_TRANSITIONS.get(current, frozenset()):
         raise ValueError(f"Campaign cannot transition from {current} to {target_status}")
     return target_status
+
+
+def is_launch_locked(status: str) -> bool:
+    """Launch character assignment is locked once the lobby closes."""
+    return str(status or "").strip().lower() != "lobby"
+
+
+def character_launch_validity(character, sheet) -> dict:
+    """Authoritative character setup/progress — issue #241.
+
+    Valid launch PC requires: non-empty name, non-empty race, and a class
+    (scalar char_class or non-empty classes list). Returns
+    {is_valid, missing, progress}.
+    """
+    missing: list[str] = []
+    name = (getattr(character, "name", "") or "").strip() if character is not None else ""
+    if character is None or not name:
+        missing.append("name")
+    race = (getattr(sheet, "race", None) or "").strip() if sheet is not None else ""
+    if not race:
+        missing.append("race")
+    char_class = (getattr(sheet, "char_class", None) or "").strip() if sheet is not None else ""
+    classes = getattr(sheet, "classes", None) if sheet is not None else None
+    has_class = bool(char_class) or (
+        isinstance(classes, list)
+        and any(isinstance(c, dict) and str(c.get("class_name") or "").strip() for c in classes)
+    )
+    if not has_class:
+        missing.append("class")
+    total = 3
+    completed = total - len(missing)
+    return {
+        "is_valid": not missing,
+        "missing": missing,
+        "progress": {
+            "completed": completed,
+            "total": total,
+            "percent": int(completed * 100 / total),
+        },
+    }
+
+
+def compute_start_eligibility(campaign, members: list, db: Session) -> dict:
+    """Server-side start eligibility from authoritative lobby/character state."""
+    from models.characters import Character, Dnd5eCharacterSheet
+
+    blockers: list[str] = []
+    required = int(getattr(campaign, "required_players", 1) or 1)
+    if len(members) < required:
+        blockers.append(f"Campaign requires {required} members before starting (have {len(members)})")
+    for m in members:
+        label = f"Member {m.user_id}"
+        char_id = getattr(m, "selected_character_id", None)
+        if char_id is None:
+            blockers.append(f"{label} has no selected character")
+            continue
+        char = db.get(Character, char_id)
+        if char is None:
+            blockers.append(f"{label} selected character is missing")
+            continue
+        if char.owner_id != m.user_id:
+            blockers.append(f"{label} selected character is not owned by the member")
+            continue
+        sheet = db.execute(
+            select(Dnd5eCharacterSheet)
+            .where(Dnd5eCharacterSheet.character_id == char.id)
+            .order_by(Dnd5eCharacterSheet.updated_at.desc())
+        ).scalars().first()
+        validity = character_launch_validity(char, sheet)
+        if not validity["is_valid"]:
+            blockers.append(
+                f"{label} character incomplete: missing {', '.join(validity['missing'])}"
+            )
+        if not getattr(m, "is_ready", False):
+            blockers.append(f"{label} is not ready")
+    return {"eligible": not blockers, "blockers": blockers}

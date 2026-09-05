@@ -17,6 +17,7 @@ __pycache__/
 
 # Review evidence
 /legacy_system/review-evidence/
+/.github/ai-review/node_modules/
 
 # Next.js frontend
 /frontend/node_modules
