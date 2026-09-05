@@ -40,6 +40,34 @@ def _is_config_error(exc: BaseException) -> bool:
     return "_API_KEY is not set" in msg or "_MODEL is not set" in msg
 
 
+def _current_scene_explicitly_absent(db: Session, attempt_id: uuid.UUID) -> bool:
+    """True only when positively identified: no scene row established.
+
+    Any source failure (reader error, DB error) returns False so the caller
+    stays fail-closed. A missing scene table during rollout is treated as
+    absent to preserve the pre-migration tolerance.
+    """
+    try:
+        from models.dm import DmTurnAttempt
+        from models.world import CampaignCurrentScene
+
+        attempt = db.get(DmTurnAttempt, attempt_id)
+        if attempt is None:
+            return False
+        scene = db.get(CampaignCurrentScene, attempt.campaign_id)
+        return scene is None
+    except Exception as exc:
+        msg = str(exc).lower()
+        if "no such table" in msg or "does not exist" in msg or "campaign_current_scenes" in msg:
+            logger.warning("dm_execute scene-absence check missing table: %s", exc)
+            try:
+                db.rollback()
+            except Exception:
+                pass
+            return True
+        return False
+
+
 def _assemble_production_context(db: Session, attempt_id: uuid.UUID, *, supplemental_status=None):
     """Assemble the attempt context with explicit first-slice lane scoping.
 
@@ -69,11 +97,22 @@ def _assemble_production_context(db: Session, attempt_id: uuid.UUID, *, suppleme
         except MissingAuthoritativeContextError as exc:
             msg = str(exc)
             downgraded: dict = {}
-            for lane in (LaneName.CURRENT_SCENE, LaneName.KNOWLEDGE_VISIBILITY):
-                key = lane.value
-                if key in msg and lane not in extra and key not in extra:
-                    extra[lane] = "not_applicable"
-                    downgraded[lane] = [f"declared not_applicable: {msg}"[:500]]
+            # current_scene: only downgrade on positively identified absence.
+            # A reader/source failure raises through assemble_attempt_context
+            # directly (fail-closed) or leaves a row present here — both must
+            # NOT become not_applicable.
+            if LaneName.CURRENT_SCENE.value in msg and LaneName.CURRENT_SCENE not in extra \
+                    and LaneName.CURRENT_SCENE.value not in extra:
+                if _current_scene_explicitly_absent(db, attempt_id):
+                    extra[LaneName.CURRENT_SCENE] = "not_applicable"
+                    downgraded[LaneName.CURRENT_SCENE] = [f"declared not_applicable: {msg}"[:500]]
+                else:
+                    raise
+            if LaneName.KNOWLEDGE_VISIBILITY.value in msg \
+                    and LaneName.KNOWLEDGE_VISIBILITY not in extra \
+                    and LaneName.KNOWLEDGE_VISIBILITY.value not in extra:
+                extra[LaneName.KNOWLEDGE_VISIBILITY] = "not_applicable"
+                downgraded[LaneName.KNOWLEDGE_VISIBILITY] = [f"declared not_applicable: {msg}"[:500]]
             if not downgraded:
                 raise
             errors.update(downgraded)

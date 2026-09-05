@@ -267,6 +267,35 @@ def test_two_sessions_only_one_executor_reaches_adjudication(db):
     assert len(calls) == 1
 
 
+def test_scene_reader_failure_fails_closed_without_adjudication(db, monkeypatch):
+    """Scene source failure must never downgrade to not_applicable."""
+    from app.world import service as world_service
+
+    s, camp_id, thread_id, _ = db
+    _, attempt = _submit(s, camp_id, thread_id)
+
+    def _boom(db, campaign, **kwargs):
+        raise RuntimeError("simulated scene reader failure")
+
+    monkeypatch.setattr(
+        world_service, "build_current_scene_context_record", _boom
+    )
+    calls = []
+
+    def adjudicate(packet, feedback=None):
+        calls.append(1)
+        return _fake_adjudicate()(packet)
+
+    with pytest.raises(RuntimeError, match="scene reader failure"):
+        execute_dm_attempt(
+            s, attempt.id, adjudicate=adjudicate, narrator="deterministic"
+        )
+    assert calls == []
+    fresh_attempt = s.get(DmTurnAttempt, attempt.id)
+    assert fresh_attempt.status in ("failed", "failed_visible")
+    assert fresh_attempt.last_error
+
+
 @pytest.mark.postgres
 def test_live_postgres_executor_cannot_be_recovered_after_lease_age(tmp_path):
     import os

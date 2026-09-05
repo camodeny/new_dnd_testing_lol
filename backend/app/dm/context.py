@@ -1062,8 +1062,29 @@ def assemble_attempt_context(
         from app.world.service import build_current_scene_context_record
 
         scene_value = build_current_scene_context_record(db, campaign)
-    except Exception:  # noqa: BLE001 — missing tables/rows must not break assembly
+    except (ImportError, AttributeError) as exc:
+        # Missing scene reader/wiring: lane stays empty so the caller can
+        # decide (explicit not_applicable vs fail-closed). Never fabricate.
+        logger.warning("current_scene reader unavailable: %s", exc)
         scene_value = None
+    except Exception as exc:
+        # Source failure (malformed row, reader regression, DB error):
+        # fail closed — never silently convert to "no scene established".
+        # The only tolerated case is a not-yet-migrated deployment where
+        # the scene table itself does not exist.
+        from sqlalchemy.exc import SQLAlchemyError
+
+        msg = str(exc).lower()
+        is_missing_table = (
+            isinstance(exc, SQLAlchemyError)
+            and ("no such table" in msg or "undefinedtable" in msg.replace(" ", "").replace("_", "")
+                 or "does not exist" in msg or "campaign_current_scenes" in msg)
+        )
+        if is_missing_table:
+            logger.warning("current_scene table missing, treating lane as empty: %s", exc)
+            scene_value = None
+        else:
+            raise
     if scene_value is not None:
         scene_visibility = scene_value.get("visibility") or "campaign"
         if scene_visibility not in {"public", "campaign", "private", "dm_only"}:
