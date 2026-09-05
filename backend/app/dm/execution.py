@@ -259,18 +259,82 @@ def _complete_await_roll(db: Session, *, turn, attempt, contract, trace_id: str)
 
 
 def _complete_silent(db: Session, *, turn, attempt, contract, provider: str, trace_id: str):
-    """Complete a valid silent contract with no visible narration."""
-    from app.dm.turns import stage_validated_attempt
+    """Complete a valid silent contract with no visible narration.
 
-    stage_validated_attempt(db, attempt.id, contract)
+    Zero-visible-output still performs the normal resolved-turn bookkeeping
+    (revision bump + completion event, resolved/committed timestamps,
+    submission resolution) so consumed input is never re-adjudicated.
+    """
+    import time
+    from datetime import datetime, timezone
+
+    from sqlalchemy import select
+
+    from app.campaigns.events import commit_campaign_mutation
+    from app.dm.turns import stage_validated_attempt
+    from models.threads import PlayerSubmission
+
+    staged = stage_validated_attempt(db, attempt.id, contract)
+    _ = staged
+    expected = int(attempt.source_revision)
+    submission_ids = list(attempt.submission_ids or [])
+    duplicate_op = str(attempt.id)
+    base_payload: dict = {
+        "turn_id": str(turn.id),
+        "attempt_id": str(attempt.id),
+        "submission_ids": submission_ids,
+        "mode": "silent",
+    }
+    if not attempt.commit_operation_id:
+        attempt.commit_operation_id = duplicate_op
+        db.flush()
+    execute_start = time.monotonic()
+    campaign_after, event = commit_campaign_mutation(
+        db,
+        turn.campaign_id,
+        expected,
+        event_type="dm.turn_resolved",
+        payload=base_payload,
+        operation_id=duplicate_op,
+        commit=False,
+        outbox_event_type="dm.turn_committed",
+        outbox_payload={**base_payload, "operation_id": duplicate_op},
+        outbox_operation_id=duplicate_op,
+    )
+    now = datetime.now(timezone.utc)
+    commit_duration_ms = int((time.monotonic() - execute_start) * 1000)
     turn.status = "succeeded"
+    turn.resolved_at = now
+    turn.committed_at = now
+    turn.commit_duration_ms = commit_duration_ms
+    turn.time_executing_ms = commit_duration_ms
     attempt.status = "succeeded"
-    attempt.result = {"mode": "silent"}
-    db.add(turn)
-    db.add(attempt)
+    attempt.completed_at = now
+    try:
+        attempt.result = event.to_dict() if hasattr(event, "to_dict") else {"event_id": str(event.id)}
+        attempt.result = {**(attempt.result or {}), "mode": "silent"}
+    except Exception:
+        attempt.result = {"mode": "silent"}
+    attempt.processing_duration_ms = commit_duration_ms
+    attempt.last_error = None
+    attempt.error_class = None
+    if submission_ids:
+        try:
+            sub_uuids = [uuid.UUID(str(s)) for s in submission_ids]
+            rows = db.execute(
+                select(PlayerSubmission).where(PlayerSubmission.id.in_(sub_uuids))
+            ).scalars().all()
+            for row in rows:
+                row.resolution_status = "resolved"
+                row.resolved_at = now
+        except Exception as exc:
+            logger.warning("dm_execute_silent failed to resolve submissions turn_id=%s error=%s", turn.id, exc)
+    db.flush()
     db.commit()
     db.refresh(turn)
     db.refresh(attempt)
+    db.refresh(campaign_after)
+    db.refresh(event)
     from app.observability.tracing import structured_log
 
     structured_log(
@@ -289,7 +353,7 @@ def _complete_silent(db: Session, *, turn, attempt, contract, provider: str, tra
         event: object = None
         mode: str = "silent"
 
-    return SilentResult(turn=turn, attempt=attempt)
+    return SilentResult(turn=turn, attempt=attempt, event=event)
 
 
 def _execute_owned_attempt(
@@ -348,9 +412,61 @@ def _execute_owned_attempt(
         db.rollback()
         return None
 
-    def _fail_visible(exc: BaseException) -> None:
+    def _fail_closed(exc: BaseException) -> None:
+        """Authority/context failure: always visible, never retried blindly.
+
+        A missing-authority or source-reader error will fail identically on
+        every retry until the authority or code is fixed, so resetting to
+        prepared would only burn sweeps. Leave a visible marker instead.
+        """
         error_class = _classify_failure(exc)
         try:
+            mark_attempt_failed(
+                db, attempt.id,
+                error=f"{type(exc).__name__}: {exc}"[:2000],
+                error_class=error_class,
+                visible=True,
+            )
+        except Exception as mark_exc:
+            logger.warning(
+                "dm_execute failure-marking failed attempt_id=%s error=%s",
+                attempt_id, mark_exc,
+            )
+        structured_log(
+            logger, logging.WARNING, "dm_execute_failed",
+            attempt_id=str(attempt_id), turn_id=str(turn_id),
+            error_class=error_class, error=str(exc)[:500], trace_id=tid,
+        )
+
+    def _fail_visible(exc: BaseException) -> None:
+        from app.worker.executor import RETRIABLE
+
+        error_class = _classify_failure(exc)
+        try:
+            fresh_attempt = db.get(DmTurnAttempt, attempt.id)
+            fresh_turn = db.get(DmTurn, turn_id) if turn_id else None
+            crossed = (
+                (fresh_attempt is not None and fresh_attempt.status in ("streaming", "failed_visible"))
+                or (fresh_turn is not None and fresh_turn.status in ("streaming", "failed_visible"))
+            )
+            if error_class == RETRIABLE and not crossed:
+                # Pre-visibility transient: keep retryable work. Reset the
+                # claim to prepared (error preserved) so the next cron sweep
+                # or queue redelivery retries without manual repair.
+                if fresh_attempt is not None:
+                    fresh_attempt.last_error = f"{type(exc).__name__}: {exc}"[:2000]
+                    fresh_attempt.error_class = error_class
+                    fresh_attempt.status = ATTEMPT_PREPARED
+                    fresh_attempt.started_at = None
+                    fresh_attempt.completed_at = None
+                    db.add(fresh_attempt)
+                    db.commit()
+                structured_log(
+                    logger, logging.WARNING, "dm_execute_retryable",
+                    attempt_id=str(attempt_id), turn_id=str(turn_id),
+                    error_class=error_class, error=str(exc)[:500], trace_id=tid,
+                )
+                return
             mark_attempt_failed(
                 db, attempt.id,
                 error=f"{type(exc).__name__}: {exc}"[:2000],
@@ -374,7 +490,7 @@ def _execute_owned_attempt(
         )
     except Exception as exc:
         db.rollback()
-        _fail_visible(exc)
+        _fail_closed(exc)
         raise
 
     # Resolve provider (fail-clear gate lives in adjudication/config).

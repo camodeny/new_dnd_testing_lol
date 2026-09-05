@@ -142,22 +142,46 @@ def test_submission_autonomously_executes_to_persisted_dm_reply(db):
         assert s2.get(DmTurn, turn.id).status == "succeeded"
 
 
-def test_failed_model_execution_leaves_visible_failure_not_stuck_thinking(db):
+def test_terminal_model_execution_leaves_visible_failure_not_stuck_thinking(db):
     s, camp_id, thread_id, _ = db
     turn, attempt = _submit(s, camp_id, thread_id)
 
     def _boom(packet, feedback=None):
-        raise RuntimeError("simulated provider outage")
+        raise ValueError("simulated terminal adjudication poison")
 
-    with pytest.raises(RuntimeError):
+    with pytest.raises(ValueError):
         execute_dm_attempt(s, attempt.id, adjudicate=_boom, narrator="deterministic")
 
     fresh_turn = s.get(DmTurn, turn.id)
     fresh_attempt = s.get(DmTurnAttempt, attempt.id)
     # Observable terminal failure — never permanently pending/running.
     assert fresh_attempt.status in ("failed", "failed_visible")
-    assert fresh_attempt.last_error and "provider outage" in fresh_attempt.last_error
+    assert fresh_attempt.last_error and "terminal adjudication" in fresh_attempt.last_error
     assert fresh_turn.status != "streaming"
+
+
+def test_retriable_provider_error_stays_retryable_and_next_run_succeeds(db):
+    s, camp_id, thread_id, _ = db
+    turn, attempt = _submit(s, camp_id, thread_id)
+    calls = []
+
+    def _flaky(packet, feedback=None):
+        calls.append(1)
+        if len(calls) == 1:
+            raise TimeoutError("simulated provider 503 unavailable")
+        return _fake_adjudicate()(packet)
+
+    with pytest.raises(TimeoutError, match="503"):
+        execute_dm_attempt(s, attempt.id, adjudicate=_flaky, narrator="deterministic")
+    # Pre-visibility transient: attempt back to prepared with the error kept.
+    fresh_attempt = s.get(DmTurnAttempt, attempt.id)
+    assert fresh_attempt.status == "prepared"
+    assert fresh_attempt.last_error and "503" in fresh_attempt.last_error
+    assert s.get(DmTurn, turn.id).status == "pending"
+    # Next execution retries the same attempt with no manual repair.
+    result = execute_dm_attempt(s, attempt.id, adjudicate=_flaky, narrator="deterministic")
+    assert result.attempt.status == "succeeded"
+    assert len(calls) == 2
 
 
 def test_missing_provider_config_fails_clearly(db):
@@ -176,8 +200,10 @@ def test_missing_provider_config_fails_clearly(db):
             execute_dm_attempt(s, attempt.id)
     finally:
         adj_mod.resolve_dm_provider = real_resolve
-    # Visible failure marker, not stuck thinking.
-    assert s.get(DmTurnAttempt, attempt.id).status in ("failed", "failed_visible")
+    # Retriable config failure: back to prepared with the error kept, not stuck.
+    fresh_attempt = s.get(DmTurnAttempt, attempt.id)
+    assert fresh_attempt.status == "prepared"
+    assert fresh_attempt.last_error and "API_KEY" in fresh_attempt.last_error
 
 
 def test_worker_handler_registered_for_queue_path():
@@ -439,11 +465,36 @@ def test_await_roll_creates_request_and_resumes_on_fulfill(db):
     assert s.get(DmTurn, turn.id).current_attempt_id == resumed.id
     assert resumed.roll_evidence
 
+    # The resumed autonomous execution must see the fulfilled die result.
+    seen: dict = {}
+
+    def resumed_adjudicate(packet, feedback=None):
+        for lane in packet.lanes:
+            if lane.name == "evidence_results":
+                for record in lane.records:
+                    if record.record_id == "roll_evidence:check_1":
+                        seen["record"] = record
+        return _fake_adjudicate("You hold your footing.")(packet)
+
+    resumed_result = execute_dm_attempt(
+        s, resumed.id, adjudicate=resumed_adjudicate, narrator="deterministic"
+    )
+    assert resumed_result.attempt.status == "succeeded"
+    assert "record" in seen
+    fulfillment = (seen["record"].value or {}).get("fulfillment") or {}
+    assert fulfillment.get("total") == 16
+    # Private DC data stays adjudication-only, never narration-eligible.
+    assert seen["record"].use == "adjudication_only"
+
 
 def test_silent_completes_without_visible_stream(db):
     """silent must resolve terminally with no fabricated narration."""
+    from models.threads import PlayerSubmission
+
     s, camp_id, thread_id, _ = db
     turn, attempt = _submit(s, camp_id, thread_id)
+    first_submission_ids = list(turn.submission_ids or [])
+    assert len(first_submission_ids) == 1
 
     def adjudicate(packet, feedback=None):
         return normalize_contract({
@@ -455,6 +506,7 @@ def test_silent_completes_without_visible_stream(db):
         s, attempt.id, adjudicate=adjudicate, narrator="deterministic"
     )
     assert result.mode == "silent"
+    assert result.event is not None
     assert s.get(DmTurn, turn.id).status == "succeeded"
     fresh_attempt = s.get(DmTurnAttempt, attempt.id)
     assert fresh_attempt.status == "succeeded"
@@ -467,6 +519,12 @@ def test_silent_completes_without_visible_stream(db):
         )
     ).scalars().all()
     assert streams == []
+    # Consumed input is resolved, so the next turn never re-adjudicates it.
+    first = s.get(PlayerSubmission, uuid.UUID(str(first_submission_ids[0])))
+    assert first.resolution_status == "resolved"
+    next_turn, _ = _submit(s, camp_id, thread_id, text="I press on down the hall.")
+    assert first_submission_ids[0] not in list(next_turn.submission_ids or [])
+    assert len(next_turn.submission_ids or []) == 1
 
 
 @pytest.mark.postgres

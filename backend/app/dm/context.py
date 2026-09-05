@@ -1161,6 +1161,48 @@ def assemble_attempt_context(
         )
     timings[LaneName.CURRENT_SCENE] = (time.monotonic() - lane_started) * 1000
 
+    # Fulfilled player-roll evidence (issue #354): when this attempt resumes
+    # the same logical turn after a roll fulfillment, project the authoritative
+    # die result into the adjudication-only evidence lane. dm_only +
+    # adjudication_only so narration_projection() can never leak totals, DCs,
+    # or private fulfillments to a player audience.
+    for index, item in enumerate(list(getattr(attempt, "roll_evidence", None) or [])):
+        if not isinstance(item, dict):
+            continue
+        request_id = str(item.get("request_key") or item.get("id") or f"roll_{index}")
+        fulfillment = item.get("fulfillment") if isinstance(item.get("fulfillment"), dict) else None
+        version = (
+            fulfillment.get("submitted_at") if fulfillment and fulfillment.get("submitted_at")
+            else item.get("fulfilled_at") or item.get("requested_at") or "unknown"
+        )
+        records[LaneName.EVIDENCE_RESULTS].append(
+            ContextRecord(
+                record_id=f"roll_evidence:{request_id}",
+                required=False,
+                priority=85,
+                value={
+                    "request_key": request_id,
+                    "roll_kind": item.get("roll_kind"),
+                    "ability_or_skill": item.get("ability_or_skill"),
+                    "label": item.get("label"),
+                    "reason_public": item.get("reason_public"),
+                    "dc_private": item.get("dc_private"),
+                    "fulfillment": fulfillment,
+                },
+                sources=[
+                    _source(
+                        "player_roll",
+                        request_id,
+                        version,
+                        campaign.revision,
+                    )
+                ],
+                authorization=scope,
+                visibility="dm_only",  # type: ignore[arg-type]
+                use="adjudication_only",
+            )
+        )
+
     supplemental_records = supplemental_records or {}
     for key, values in supplemental_records.items():
         name = key if isinstance(key, LaneName) else LaneName(key)
@@ -1208,6 +1250,8 @@ def assemble_attempt_context(
             "campaign_domain_events",
             "campaign_current_scenes",
             "world_entities",
+            "player_roll_requests",
+            "player_roll_fulfillments",
         ],
     )
     # Include DB collection in total duration without contaminating deterministic payload.
