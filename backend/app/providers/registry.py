@@ -2,7 +2,7 @@
 
 import os
 
-from app.providers.adapters import OpenCodeGoAdapter, OpenRouterAdapter
+from app.providers.adapters import MetaAdapter, OpenAIAdapter, OpenRouterAdapter
 
 
 class ProviderRegistry:
@@ -54,4 +54,5 @@ class ProviderRegistry:
 
 provider_registry = ProviderRegistry()
 provider_registry.register(OpenRouterAdapter())
-provider_registry.register(OpenCodeGoAdapter())
+provider_registry.register(OpenAIAdapter())
+provider_registry.register(MetaAdapter())

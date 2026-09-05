@@ -9,7 +9,6 @@ from __future__ import annotations
 
 import json
 import logging
-import os
 import uuid
 
 logger = logging.getLogger(__name__)
@@ -39,35 +38,16 @@ HARD RULES:
 5. Staged effects: at most 4 typed effects, none before rolls resolve.
 """
 
-_DM_PROVIDER_DEFAULTS = {
-    "opencode_go": "muse-spark-1.2-contributor",
-}
-
-
 def resolve_dm_provider():
     """Resolve (adapter, model, provider_name) for forward-DM execution.
 
-    Precedence: DM_PROVIDER > LLM_PROVIDER > opencode_go. Model: per-provider
-    ``<PREFIX>_MODEL`` env, else a pinned default. Raises RuntimeError with a
-    deployment-actionable message when required credentials/model are absent
-    (adapter.require_config is the fail-clear gate).
+    Thin wrapper over ``app.providers.resolve_area("dm")`` kept for
+    backwards compatibility. Provider + model are pinned in code
+    (see ``app.providers.areas``); only the API key comes from env.
     """
-    from app.providers import provider_registry
+    from app.providers.areas import resolve_area
 
-    name = (
-        os.getenv("DM_PROVIDER", "").strip()
-        or os.getenv("LLM_PROVIDER", "").strip()
-        or "opencode_go"
-    )
-    adapter = provider_registry.get(name)
-    model = adapter.env_model().strip() if adapter.env_model() else ""
-    if not model:
-        model = _DM_PROVIDER_DEFAULTS.get(adapter.name, "")
-    # Fail clearly when provider credentials/model are absent.
-    adapter.require_config(model or None)
-    if not model:
-        raise RuntimeError(f"{adapter.env_prefix}_MODEL is not set")
-    return adapter, model, adapter.name
+    return resolve_area("dm")
 
 
 def build_forward_dm_messages(packet) -> list[dict]:
@@ -170,13 +150,15 @@ def adjudicate_with_provider(
 def build_provider_narrator(*, adapter=None, model: str | None = None, timeout_seconds: float = 90):
     """Streaming narrator backed by the configured provider.
 
-    Returns a ``StreamingNarratorFn`` taking a contract-bound
+    Resolves the ``narrator`` call area (pinned in code) when
+    adapter/model are not injected. Returns a ``StreamingNarratorFn`` taking a contract-bound
     ``NarratorRequest`` and yielding text deltas via ``stream_chat``.
     """
     from app.providers import ProviderRequest, stream_chat
+    from app.providers.areas import resolve_area
 
     if adapter is None or model is None:
-        resolved_adapter, resolved_model, _ = resolve_dm_provider()
+        resolved_adapter, resolved_model, _ = resolve_area("narrator")
         adapter = adapter or resolved_adapter
         model = model or resolved_model
 

@@ -11,12 +11,15 @@ The implementation is split by responsibility:
 - ``adapters``: provider-specific request/response/stream handling
 - ``transport``: chat/stream execution with transient retry and hooks
 - ``registry``: adapter registration and name resolution
+- ``areas``: per-call-area provider/model resolution (``resolve_area``)
 """
 from app.providers.adapters import (
     LLMProviderAdapter,
-    OpenCodeGoAdapter,
+    MetaAdapter,
+    OpenAIAdapter,
     OpenRouterAdapter,
 )
+from app.providers.areas import AREAS, resolve_area
 from app.providers.config import (
     default_max_attempts,
     retry_base_delay_seconds,
@@ -37,7 +40,8 @@ from app.providers.transport import TransportHooks, execute_chat, stream_chat
 __all__ = [
     "LLMProviderAdapter",
     "OpenRouterAdapter",
-    "OpenCodeGoAdapter",
+    "OpenAIAdapter",
+    "MetaAdapter",
     "ProviderCapabilities",
     "ProviderError",
     "ProviderRequest",
@@ -46,6 +50,8 @@ __all__ = [
     "NormalizedToolCall",
     "ProviderRegistry",
     "provider_registry",
+    "AREAS",
+    "resolve_area",
     "TransportHooks",
     "execute_chat",
     "stream_chat",

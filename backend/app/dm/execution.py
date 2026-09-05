@@ -510,11 +510,13 @@ def _execute_owned_attempt(
         _fail_closed(exc)
         raise
 
-    # Resolve provider (fail-clear gate lives in adjudication/config).
+    # Resolve providers per call area (fail-clear gates live in
+    # adjudication/areas config). Narrator resolves its own pinned area
+    # inside build_provider_narrator.
     adapter = None
     model = None
     pname = provider_name
-    if adjudicate is None or narrator is None:
+    if adjudicate is None:
         try:
             from app.dm.adjudication import resolve_dm_provider
 
@@ -610,7 +612,7 @@ def _execute_owned_attempt(
             from app.dm.adjudication import build_provider_narrator
 
             narrator = build_provider_narrator(
-                adapter=adapter, model=model, timeout_seconds=timeout_seconds,
+                timeout_seconds=timeout_seconds,
             )
         except Exception as exc:
             db.rollback()

@@ -248,7 +248,7 @@ def test_missing_provider_config_fails_clearly(db):
     real_resolve = adj_mod.resolve_dm_provider
 
     def _missing():
-        raise RuntimeError("OPENCODE_GO_API_KEY is not set")
+        raise RuntimeError("OPENAI_API_KEY is not set")
 
     adj_mod.resolve_dm_provider = _missing
     try:
