@@ -412,20 +412,39 @@ def run_dm_execute_sweep(
     return outcome
 
 
-def handle_dm_turn_execute(db: Session, envelope) -> dict:
-    """Queue-worker handler for ``dm.turn.execute`` envelopes."""
+def handle_dm_turn_execute(envelope, db: Session | None = None) -> dict:
+    """Queue-worker handler for ``dm.turn.execute`` envelopes.
+
+    Worker contract is single-argument ``handler(envelope)`` (see
+    ``app.worker.executor.execute_worker_job``); the handler owns its DB
+    session via ``SessionLocal``. ``db`` is an optional seam for tests.
+    """
     payload = getattr(envelope, "payload", None) or {}
     raw = payload.get("attempt_id") or payload.get("attemptId")
     if not raw:
         raise ValueError("dm.turn.execute envelope payload must include attempt_id")
-    result = execute_dm_attempt(db, uuid.UUID(str(raw)))
-    if result is None:
-        return {"attempt_id": str(raw), "skipped": True}
-    return {
-        "attempt_id": str(raw),
-        "turn_id": str(result.turn.id),
-        "stream_id": str(result.narration.stream_id),
-    }
+    if db is not None:
+        result = execute_dm_attempt(db, uuid.UUID(str(raw)))
+        if result is None:
+            return {"attempt_id": str(raw), "skipped": True}
+        return {
+            "attempt_id": str(raw),
+            "turn_id": str(result.turn.id),
+            "stream_id": str(result.narration.stream_id),
+        }
+    from database import SessionLocal
+
+    if SessionLocal is None:
+        raise RuntimeError("SessionLocal is not configured")
+    with SessionLocal() as session:
+        result = execute_dm_attempt(session, uuid.UUID(str(raw)))
+        if result is None:
+            return {"attempt_id": str(raw), "skipped": True}
+        return {
+            "attempt_id": str(raw),
+            "turn_id": str(result.turn.id),
+            "stream_id": str(result.narration.stream_id),
+        }
 
 
 def register_dm_worker() -> None:

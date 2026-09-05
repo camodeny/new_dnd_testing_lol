@@ -332,6 +332,51 @@ def test_scene_db_error_mentioning_table_stays_fail_closed(db, monkeypatch):
     assert fresh_attempt.status in ("failed", "failed_visible")
 
 
+def test_missing_scene_table_still_downgrades(db):
+    """Not-yet-migrated rollout: absent scene relation stays compatible."""
+    from sqlalchemy import text
+
+    s, camp_id, thread_id, _ = db
+    _, attempt = _submit(s, camp_id, thread_id)
+    s.execute(text("DROP TABLE campaign_current_scenes"))
+    result = execute_dm_attempt(
+        s, attempt.id, adjudicate=_fake_adjudicate(), narrator="deterministic"
+    )
+    assert result.attempt.status == "succeeded"
+
+
+def test_queue_delivery_executes_dm_attempt(db, monkeypatch):
+    """Real consume_queue_delivery() path uses the single-arg worker contract."""
+    import uuid as _uuid
+
+    import database
+    import app.dm.execution as exec_mod
+    from app.queue.consumer import consume_queue_delivery
+    from app.queue.envelope import WorkerEnvelope
+
+    s, camp_id, thread_id, factory = db
+    _, attempt = _submit(s, camp_id, thread_id)
+    real_execute = exec_mod.execute_dm_attempt
+    fake_adj = _fake_adjudicate()
+
+    def _patched(session, attempt_id, **kw):
+        kw.setdefault("adjudicate", fake_adj)
+        kw.setdefault("narrator", "deterministic")
+        return real_execute(session, attempt_id, **kw)
+
+    monkeypatch.setattr(exec_mod, "execute_dm_attempt", _patched)
+    monkeypatch.setattr(database, "SessionLocal", factory)
+    env = WorkerEnvelope(
+        job_id=_uuid.uuid4(),
+        job_type=DM_TURN_EXECUTE_JOB,
+        payload={"attempt_id": str(attempt.id)},
+    )
+    result, duplicate = consume_queue_delivery(s, env.to_dict())
+    assert duplicate is False
+    assert result["attempt_id"] == str(attempt.id)
+    assert s.get(DmTurnAttempt, attempt.id).status == "succeeded"
+
+
 @pytest.mark.postgres
 def test_live_postgres_executor_cannot_be_recovered_after_lease_age(tmp_path):
     import os

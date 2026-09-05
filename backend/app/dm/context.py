@@ -1115,6 +1115,10 @@ def assemble_attempt_context(
         # the scene table itself does not exist.
         if is_missing_current_scene_table_error(exc):
             logger.warning("current_scene table missing, treating lane as empty: %s", exc)
+            try:
+                db.rollback()
+            except Exception:
+                pass
             scene_value = None
         else:
             raise
