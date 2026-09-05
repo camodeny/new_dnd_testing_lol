@@ -8,7 +8,8 @@ from app.providers.areas import AREAS, resolve_area
 @pytest.fixture
 def keys(monkeypatch):
     for key in (
-        "OPENAI_API_KEY", "META_API_KEY", "LLAMA_API_KEY", "OPENROUTER_API_KEY",
+        "OPENAI_API_KEY", "META_API_KEY", "LLAMA_API_KEY", "MODEL_API_KEY",
+        "OPENROUTER_API_KEY",
     ):
         monkeypatch.delenv(key, raising=False)
     monkeypatch.setenv("OPENAI_API_KEY", "dummy")

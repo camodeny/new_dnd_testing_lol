@@ -1,9 +1,10 @@
-"""Meta (Llama API) native envelope normalization + DM end-to-end.
+"""Meta Model API (OpenAI-compatible) adapter + DM end-to-end.
 
-Covers the review finding that Meta returns ``completion_message``
-(not OpenAI ``choices``): adapter parsing, native payload params,
-native SSE streaming, and a Meta-shaped response reaching
-``normalize_contract()`` through ``adjudicate_with_provider``.
+Meta serves Muse Spark from ``https://api.meta.ai/v1`` with standard
+``choices`` envelopes, so these tests pin the ``choices[0].message`` /
+``choices[].delta`` shapes and the ``MODEL_API_KEY`` credential, plus a
+Meta-routed response reaching ``normalize_contract()`` through
+``adjudicate_with_provider``.
 """
 
 import json
@@ -12,37 +13,61 @@ import pytest
 
 from app.dm.contract import CONTRACT_VERSION
 from app.providers.adapters.meta import MetaAdapter
-from app.providers.contracts import ProviderError
 
 TEXT_PAYLOAD = {
     "id": "resp_123",
-    "completion_message": {
-        "content": {"type": "text", "text": "The gate stands open."},
-        "role": "assistant",
-        "stop_reason": "stop",
-        "tool_calls": [],
-    },
-    "metrics": [
-        {"metric": "num_completion_tokens", "value": 25, "unit": "tokens"},
-        {"metric": "num_prompt_tokens", "value": 25, "unit": "tokens"},
-        {"metric": "num_total_tokens", "value": 50, "unit": "tokens"},
+    "model": "muse-spark-1.3-contributor",
+    "choices": [
+        {
+            "index": 0,
+            "message": {
+                "role": "assistant",
+                "content": "The gate stands open.",
+            },
+            "finish_reason": "stop",
+        }
     ],
+    "usage": {"prompt_tokens": 25, "completion_tokens": 25, "total_tokens": 50},
 }
 
 TOOL_PAYLOAD = {
     "id": "resp_456",
-    "completion_message": {
-        "content": {"type": "text", "text": ""},
-        "role": "assistant",
-        "stop_reason": "tool_calls",
-        "tool_calls": [
-            {
-                "id": "466d49b7-8641-43bd-844e-ecac6a818974",
-                "function": {"name": "get_weather", "arguments": '{"location":"Menlo Park"}'},
-            }
-        ],
-    },
+    "model": "muse-spark-1.3-contributor",
+    "choices": [
+        {
+            "index": 0,
+            "message": {
+                "role": "assistant",
+                "content": "",
+                "tool_calls": [
+                    {
+                        "id": "call_1",
+                        "type": "function",
+                        "function": {
+                            "name": "inspect_scene",
+                            "arguments": '{"area":"gate"}',
+                        },
+                    }
+                ],
+            },
+            "finish_reason": "tool_calls",
+        }
+    ],
+    "usage": {},
 }
+
+
+def test_effective_url_and_key_aliases(monkeypatch):
+    adapter = MetaAdapter()
+    assert adapter.base_url() == "https://api.meta.ai/v1/chat/completions"
+    monkeypatch.delenv("MODEL_API_KEY", raising=False)
+    monkeypatch.delenv("META_API_KEY", raising=False)
+    monkeypatch.delenv("LLAMA_API_KEY", raising=False)
+    monkeypatch.setenv("MODEL_API_KEY", "m-key")
+    assert adapter.api_key() == "m-key"
+    monkeypatch.delenv("MODEL_API_KEY")
+    monkeypatch.setenv("META_API_KEY", "meta-key")
+    assert adapter.api_key() == "meta-key"
 
 
 def test_parse_text_response():
@@ -51,42 +76,29 @@ def test_parse_text_response():
     assert res.content == "The gate stands open."
     assert res.finish_reason == "stop"
     assert res.tool_calls == []
-    assert res.usage["metrics"][0]["metric"] == "num_completion_tokens"
+    assert res.usage["total_tokens"] == 50
 
 
 def test_parse_tool_calls_response():
     res = MetaAdapter().parse_response(TOOL_PAYLOAD)
-    assert res.content == ""
     assert res.finish_reason == "tool_calls"
     assert len(res.tool_calls) == 1
-    assert res.tool_calls[0].name == "get_weather"
-    assert json.loads(res.tool_calls[0].arguments)["location"] == "Menlo Park"
+    assert res.tool_calls[0].name == "inspect_scene"
+    assert json.loads(res.tool_calls[0].arguments)["area"] == "gate"
 
 
-def test_parse_string_content():
-    payload = {"completion_message": {"content": "plain", "stop_reason": "stop"}}
-    assert MetaAdapter().parse_response(payload).content == "plain"
-
-
-def test_parse_rejects_openai_envelope():
-    with pytest.raises(ProviderError, match="without completion_message"):
-        MetaAdapter().parse_response({"choices": [{"message": {"content": "hi"}}]})
-
-
-def test_build_payload_uses_native_params():
+def test_build_payload_keeps_openai_shape():
     from app.providers.contracts import ProviderRequest
 
     payload = MetaAdapter().build_payload(ProviderRequest(
         messages=[{"role": "user", "content": "hi"}],
-        model="Llama-4-Maverick-17B-128E-Instruct-FP8",
+        model="muse-spark-1.3-contributor",
         max_tokens=512,
         stream=True,
     ))
-    assert payload["max_completion_tokens"] == 512
-    assert "max_tokens" not in payload
+    assert payload["max_tokens"] == 512
+    assert payload["messages"] == [{"role": "user", "content": "hi"}]
     assert payload["stream"] is True
-    assert "parallel_tool_calls" not in payload
-    assert "thinking" not in payload
 
 
 class _FakeStream:
@@ -97,11 +109,12 @@ class _FakeStream:
         return iter(self._lines)
 
 
-def test_iter_stream_events_native_sse():
+def test_iter_stream_events_openai_sse():
     lines = [
-        'data: {"id":"r1","event":{"event_type":"progress","delta":{"text":"The "}}}',
-        'data: {"id":"r1","event":{"event_type":"progress","delta":{"text":"gate"}}}',
-        'data: {"id":"r1","event":{"event_type":"complete"}}',
+        'data: {"choices":[{"delta":{"role":"assistant"},"index":0}]}',
+        'data: {"choices":[{"delta":{"content":"The "},"index":0}]}',
+        'data: {"choices":[{"delta":{"content":"gate"},"index":0}]}',
+        'data: [DONE]',
     ]
     events = list(MetaAdapter().iter_stream_events(_FakeStream(lines)))
     assert [e.text for e in events if e.kind == "token"] == ["The ", "gate"]
@@ -113,11 +126,11 @@ class _StubPacket:
         return "{}"
 
 
-def test_dm_contract_via_meta_envelope(monkeypatch):
+def test_dm_contract_via_meta_choices_envelope(monkeypatch):
     import app.providers as providers_pkg
     from app.dm.adjudication import adjudicate_with_provider
 
-    monkeypatch.setenv("META_API_KEY", "dummy")
+    monkeypatch.setenv("MODEL_API_KEY", "dummy")
     contract_json = json.dumps({
         "contract_version": CONTRACT_VERSION,
         "mode": "silent",
@@ -126,12 +139,15 @@ def test_dm_contract_via_meta_envelope(monkeypatch):
     })
     envelope = {
         "id": "resp_dm",
-        "completion_message": {
-            "content": {"type": "text", "text": contract_json},
-            "role": "assistant",
-            "stop_reason": "stop",
-            "tool_calls": [],
-        },
+        "model": "muse-spark-1.3-contributor",
+        "choices": [
+            {
+                "index": 0,
+                "message": {"role": "assistant", "content": contract_json},
+                "finish_reason": "stop",
+            }
+        ],
+        "usage": {},
     }
 
     def _fake_execute(adapter, request, **kwargs):
