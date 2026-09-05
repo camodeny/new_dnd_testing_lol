@@ -108,9 +108,15 @@ export const campaigns = {
       { method: 'POST', body: JSON.stringify(payload) },
     ),
   quickCreate: (payload: Record<string, unknown> = {}) =>
-    apiFetch<{ campaign: import('@/types').Campaign }>('/campaigns/quick-create', {
+    apiFetch<{ campaign: import('@/types').Campaign }>(`/campaigns/quick-create`, {
       method: 'POST',
       body: JSON.stringify(payload),
+    }),
+  transitionLifecycle: (id: string | number, expectedRevision: number, status: string, idempotencyKey: string) =>
+    apiFetch<{ campaign: import('@/types').Campaign }>(`/campaigns/${id}/lifecycle`, {
+      method: 'POST',
+      body: JSON.stringify({ expected_revision: expectedRevision, status }),
+      headers: { 'Idempotency-Key': idempotencyKey },
     }),
 }
 
@@ -151,6 +157,20 @@ export const campaignMembers = {
     apiFetch<{ characters: import('@/types').Character[] }>(`/campaigns/${campaignId}/characters`),
   listMembers: (campaignId: string | number) =>
     apiFetch<{ members: import('@/types').CampaignMember[] }>(`/campaigns/${campaignId}/members`),
+  getLobby: (campaignId: string | number) =>
+    apiFetch<{ campaign: import('@/types').Campaign; members: import('@/types').CampaignMember[]; eligibility: import('@/types').LobbyEligibility; launch_locked: boolean }>(`/campaigns/${campaignId}/lobby`),
+  selectCharacter: (campaignId: string | number, expectedRevision: number, characterId: string, idempotencyKey: string) =>
+    apiFetch(`/campaigns/${campaignId}/members/me/character`, {
+      method: 'PUT',
+      body: JSON.stringify({ expected_revision: expectedRevision, character_id: characterId }),
+      headers: { 'Idempotency-Key': idempotencyKey },
+    }),
+  setReadiness: (campaignId: string | number, expectedRevision: number, ready: boolean, idempotencyKey: string) =>
+    apiFetch(`/campaigns/${campaignId}/members/me/readiness`, {
+      method: 'PUT',
+      body: JSON.stringify({ expected_revision: expectedRevision, ready }),
+      headers: { 'Idempotency-Key': idempotencyKey },
+    }),
   createInvite: (campaignId: string | number) =>
     apiFetch<{ code: string }>(`/campaigns/${campaignId}/invites`, { method: 'POST' }),
   getInvite: (campaignId: string | number) =>

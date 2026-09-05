@@ -66,10 +66,21 @@ export interface Message {
 export interface CampaignMember {
   user_id: string
   username: string
+  email?: string
   role: 'owner' | 'player'
-  character_id?: string
-  character_name?: string
+  character_id?: string | null
+  selected_character_id?: string | null
+  character_name?: string | null
   is_ready?: boolean
+  ready_at?: string | null
+  character_valid?: boolean
+  character_progress?: { completed: number; total: number; percent: number }
+  character_missing?: string[]
+}
+
+export interface LobbyEligibility {
+  eligible: boolean
+  blockers: string[]
 }
 
 export interface CampaignThreadMember {

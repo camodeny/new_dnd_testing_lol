@@ -121,6 +121,7 @@ describe('exported API surface', () => {
       'list',
       'quickCreate',
       'randomBrief',
+      'transitionLifecycle',
       'update',
     ])
     expect(Object.keys(api.characters).sort()).toEqual([
@@ -134,10 +135,13 @@ describe('exported API surface', () => {
     expect(Object.keys(api.campaignMembers).sort()).toEqual([
       'createInvite',
       'getInvite',
+      'getLobby',
       'joinCampaign',
       'listCharacters',
       'listMembers',
       'lookupInvite',
+      'selectCharacter',
+      'setReadiness',
     ])
     expect(Object.keys(api.gameplayThreads).sort()).toEqual([
       'getOrCreateDirect',

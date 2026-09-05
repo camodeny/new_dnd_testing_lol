@@ -12,8 +12,11 @@ from app.campaigns.events import (
     list_campaign_events,
 )
 from app.campaigns.service import (
+    character_launch_validity,
+    compute_start_eligibility,
     generate_invite_code,
     is_campaign_member,
+    is_launch_locked,
     normalize_loot_mode,
     normalize_required_players,
     parse_campaign_id,
@@ -330,6 +333,22 @@ def transition_campaign_lifecycle(
                     status_code=409,
                     detail=f"Campaign requires {locked.required_players} members before starting",
                 )
+            members = db.execute(
+                select(CampaignMember).where(CampaignMember.campaign_id == locked.id)
+            ).scalars().all()
+            eligibility = compute_start_eligibility(locked, list(members), db)
+            if not eligibility["eligible"]:
+                logger.warning(
+                    "campaign start blocked campaign_id=%s actor_id=%s blockers=%s",
+                    locked.id, profile.id, eligibility["blockers"],
+                )
+                raise HTTPException(
+                    status_code=409,
+                    detail={
+                        "message": "Campaign is not ready to start",
+                        "blockers": eligibility["blockers"],
+                    },
+                )
         locked.status = target
 
     def _execute():
@@ -475,6 +494,51 @@ def list_campaign_domain_events(campaign_id: str, request: Request, db: Session 
     return {"events": [event.to_dict() for event in events], "revision": camp.revision}
 
 
+def _member_lobby_projection(db: Session, camp: Campaign, m: CampaignMember) -> dict:
+    from models.characters import Character, Dnd5eCharacterSheet
+
+    prof = db.get(Profile, m.user_id)
+    projection = {
+        "user_id": str(m.user_id),
+        "username": prof.username if prof else "adventurer",
+        "email": prof.email if prof else None,
+        "role": m.role,
+        "selected_character_id": str(m.selected_character_id) if m.selected_character_id else None,
+        "character_id": str(m.selected_character_id) if m.selected_character_id else None,
+        "character_name": None,
+        "is_ready": bool(m.is_ready),
+        "ready_at": m.ready_at.isoformat() if getattr(m, "ready_at", None) else None,
+        "character_valid": False,
+        "character_progress": {"completed": 0, "total": 3, "percent": 0},
+        "character_missing": [],
+    }
+    if m.selected_character_id:
+        char = db.get(Character, m.selected_character_id)
+        if char is not None:
+            sheet = db.execute(
+                select(Dnd5eCharacterSheet)
+                .where(Dnd5eCharacterSheet.character_id == char.id)
+                .order_by(Dnd5eCharacterSheet.updated_at.desc())
+            ).scalars().first()
+            validity = character_launch_validity(char, sheet)
+            # Public projection only — never secret lore (backstory/notes/etc).
+            char_class = (sheet.char_class if sheet and sheet.char_class else None)
+            classes = (sheet.classes if sheet and sheet.classes else None)
+            projection.update({
+                "character_name": char.name,
+                "character_valid": validity["is_valid"],
+                "character_progress": validity["progress"],
+                "character_missing": validity["missing"],
+                "character_race": sheet.race if sheet else None,
+                "character_class": char_class,
+                "character_classes": classes,
+                "character_level": sheet.level if sheet else None,
+            })
+        else:
+            projection["character_missing"] = ["missing"]
+    return projection
+
+
 @router.get("/api/campaigns/{campaign_id}/members")
 def list_campaign_members(campaign_id: str, request: Request, db: Session = Depends(get_db)):
     profile = resolve_profile(request, db)
@@ -488,16 +552,299 @@ def list_campaign_members(campaign_id: str, request: Request, db: Session = Depe
     if camp.owner_id != profile.id and not is_campaign_member(db, cid, profile.id):
         raise HTTPException(status_code=403, detail="Not a member")
     members = db.execute(select(CampaignMember).where(CampaignMember.campaign_id == cid)).scalars().all()
-    out = []
-    for m in members:
-        prof = db.get(Profile, m.user_id)
-        out.append({
-            "user_id": str(m.user_id),
-            "username": prof.username if prof else "adventurer",
-            "email": prof.email if prof else None,
-            "role": m.role,
-        })
-    return {"members": out}
+    return {"members": [_member_lobby_projection(db, camp, m) for m in members]}
+
+
+@router.get("/api/campaigns/{campaign_id}/lobby")
+def get_campaign_lobby(campaign_id: str, request: Request, db: Session = Depends(get_db)):
+    """Authoritative lobby projection — issue #241."""
+    profile = resolve_profile(request, db)
+    try:
+        cid = parse_campaign_id(campaign_id)
+    except ValueError:
+        raise HTTPException(status_code=404, detail="Invalid campaign id")
+    camp = db.get(Campaign, cid)
+    if not camp:
+        raise HTTPException(status_code=404, detail="Campaign not found")
+    if camp.owner_id != profile.id and not is_campaign_member(db, cid, profile.id):
+        raise HTTPException(status_code=403, detail="Not a member")
+    members = db.execute(select(CampaignMember).where(CampaignMember.campaign_id == cid)).scalars().all()
+    member_list = list(members)
+    eligibility = compute_start_eligibility(camp, member_list, db)
+    return {
+        "campaign": camp.to_dict(),
+        "members": [_member_lobby_projection(db, camp, m) for m in member_list],
+        "eligibility": eligibility,
+        "launch_locked": is_launch_locked(camp.status),
+    }
+
+
+@router.put("/api/campaigns/{campaign_id}/members/me/character")
+def select_own_character(
+    campaign_id: str,
+    payload: dict,
+    request: Request,
+    response: Response,
+    db: Session = Depends(get_db),
+):
+    """Select one owned PC — idempotent, ownership-verified, lobby-only."""
+    from datetime import datetime
+
+    from models.characters import Character
+
+    profile = resolve_profile(request, db)
+    try:
+        cid = parse_campaign_id(campaign_id)
+    except ValueError:
+        raise HTTPException(status_code=404, detail="Invalid campaign id")
+    camp = db.execute(
+        select(Campaign).where(Campaign.id == cid).with_for_update()
+        .execution_options(populate_existing=True)
+    ).scalars().first()
+    if not camp:
+        raise HTTPException(status_code=404, detail="Campaign not found")
+    member = db.get(CampaignMember, {"campaign_id": cid, "user_id": profile.id})
+    if member is None:
+        raise HTTPException(status_code=403, detail="Not a member of this campaign")
+    raw_char = payload.get("character_id")
+    if not raw_char:
+        raise HTTPException(status_code=400, detail="character_id is required")
+    try:
+        char_id = uuid_lib.UUID(str(raw_char))
+    except ValueError:
+        raise HTTPException(status_code=404, detail="Character not found")
+    char = db.get(Character, char_id)
+    if char is None:
+        raise HTTPException(status_code=404, detail="Character not found")
+    if char.owner_id != profile.id:
+        logger.warning(
+            "character selection rejected campaign_id=%s actor_id=%s character_id=%s reason=not_owner",
+            cid, profile.id, char_id,
+        )
+        raise HTTPException(status_code=403, detail="Only your own character can be selected")
+    expected_revision = _expected_revision(payload)
+    operation_id = str(payload.get("operation_id") or "").strip() or None
+    idempotency_key = require_idempotency_key(request, operation_id)
+
+    if is_launch_locked(camp.status):
+        raise HTTPException(status_code=409, detail="Launch character is locked after campaign start")
+
+    if member.selected_character_id == char.id:
+        return {
+            "ok": True,
+            "campaign": camp.to_dict(),
+            "member": _member_lobby_projection(db, camp, member),
+            "idempotent": True,
+        }
+
+    def _mutate(locked: Campaign):
+        if is_launch_locked(locked.status):
+            logger.warning(
+                "character selection rejected campaign_id=%s actor_id=%s status=%s reason=locked",
+                cid, profile.id, locked.status,
+            )
+            raise HTTPException(status_code=409, detail="Launch character is locked after campaign start")
+        current = db.get(CampaignMember, {"campaign_id": cid, "user_id": profile.id})
+        if current is None:
+            raise HTTPException(status_code=403, detail="Not a member of this campaign")
+        # Re-verify ownership inside the mutation so a failed command can never
+        # leave the member pointing at an unauthorized character.
+        fresh = db.get(Character, char_id)
+        if fresh is None:
+            raise HTTPException(status_code=404, detail="Character not found")
+        if fresh.owner_id != profile.id:
+            raise HTTPException(status_code=403, detail="Only your own character can be selected")
+        current.selected_character_id = fresh.id
+        # Selection change requires re-ready.
+        current.is_ready = False
+        current.ready_at = None
+
+    def _execute():
+        campaign_after, event = commit_campaign_mutation(
+            db,
+            cid,
+            expected_revision,
+            event_type="campaign.member_character_selected",
+            operation_id=operation_id or idempotency_key,
+            actor_id=profile.id,
+            targets={"user_id": str(profile.id), "character_id": str(char_id)},
+            payload={"user_id": str(profile.id), "character_id": str(char_id)},
+            mutate=_mutate,
+            commit=False,
+        )
+        logger.info(
+            "character selected campaign_id=%s actor_id=%s character_id=%s revision=%s",
+            cid, profile.id, char_id, campaign_after.revision,
+        )
+        refreshed = db.get(CampaignMember, {"campaign_id": cid, "user_id": profile.id})
+        return {
+            "ok": True,
+            "campaign": campaign_after.to_dict(),
+            "member": _member_lobby_projection(db, campaign_after, refreshed),
+            "event": event.to_dict(),
+        }
+
+    try:
+        return execute_http_idempotent(
+            db, response, actor_id=profile.id, idempotency_key=idempotency_key,
+            command_type="campaign.member.character.select",
+            scope_type="campaign_member", scope_id=f"{cid}:{profile.id}",
+            payload={**payload, "character_id": str(char_id)},
+            execute=_execute,
+        )
+    except RevisionConflictError as exc:
+        raise HTTPException(
+            status_code=409, detail=str(exc),
+            headers={"X-Current-Revision": str(exc.actual_revision)},
+        ) from exc
+
+
+@router.put("/api/campaigns/{campaign_id}/members/me/readiness")
+def set_own_readiness(
+    campaign_id: str,
+    payload: dict,
+    request: Request,
+    response: Response,
+    db: Session = Depends(get_db),
+):
+    """Ready/unready — reversible before start, lobby-only, validity-gated."""
+    from datetime import datetime, timezone
+
+    from models.characters import Character, Dnd5eCharacterSheet
+
+    profile = resolve_profile(request, db)
+    try:
+        cid = parse_campaign_id(campaign_id)
+    except ValueError:
+        raise HTTPException(status_code=404, detail="Invalid campaign id")
+    camp = db.execute(
+        select(Campaign).where(Campaign.id == cid).with_for_update()
+        .execution_options(populate_existing=True)
+    ).scalars().first()
+    if not camp:
+        raise HTTPException(status_code=404, detail="Campaign not found")
+    member = db.get(CampaignMember, {"campaign_id": cid, "user_id": profile.id})
+    if member is None:
+        raise HTTPException(status_code=403, detail="Not a member of this campaign")
+    if "ready" not in payload:
+        raise HTTPException(status_code=400, detail="ready is required")
+    ready = payload["ready"]
+    if not isinstance(ready, bool):
+        raise HTTPException(status_code=400, detail="ready must be a boolean")
+    expected_revision = _expected_revision(payload)
+    operation_id = str(payload.get("operation_id") or "").strip() or None
+    idempotency_key = require_idempotency_key(request, operation_id)
+
+    if is_launch_locked(camp.status):
+        raise HTTPException(status_code=409, detail="Readiness is locked after campaign start")
+
+    if bool(member.is_ready) == ready:
+        return {
+            "ok": True,
+            "campaign": camp.to_dict(),
+            "member": _member_lobby_projection(db, camp, member),
+            "idempotent": True,
+        }
+
+    if ready:
+        char_id = member.selected_character_id
+        if char_id is None:
+            raise HTTPException(status_code=422, detail="Select a character before marking ready")
+        char = db.get(Character, char_id)
+        if char is None or char.owner_id != profile.id:
+            raise HTTPException(status_code=422, detail="Selected character is missing or not owned")
+        sheet = db.execute(
+            select(Dnd5eCharacterSheet)
+            .where(Dnd5eCharacterSheet.character_id == char.id)
+            .order_by(Dnd5eCharacterSheet.updated_at.desc())
+        ).scalars().first()
+        validity = character_launch_validity(char, sheet)
+        if not validity["is_valid"]:
+            logger.warning(
+                "readiness rejected campaign_id=%s actor_id=%s character_id=%s missing=%s",
+                cid, profile.id, char_id, validity["missing"],
+            )
+            raise HTTPException(
+                status_code=422,
+                detail={
+                    "message": f"Character incomplete: missing {', '.join(validity['missing'])}",
+                    "missing": validity["missing"],
+                },
+            )
+
+    def _mutate(locked: Campaign):
+        if is_launch_locked(locked.status):
+            logger.warning(
+                "readiness rejected campaign_id=%s actor_id=%s status=%s reason=locked",
+                cid, profile.id, locked.status,
+            )
+            raise HTTPException(status_code=409, detail="Readiness is locked after campaign start")
+        current = db.get(CampaignMember, {"campaign_id": cid, "user_id": profile.id})
+        if current is None:
+            raise HTTPException(status_code=403, detail="Not a member of this campaign")
+        if ready:
+            char_id = current.selected_character_id
+            char = db.get(Character, char_id) if char_id else None
+            if char is None or char.owner_id != profile.id:
+                raise HTTPException(status_code=422, detail="Selected character is missing or not owned")
+            sheet = db.execute(
+                select(Dnd5eCharacterSheet)
+                .where(Dnd5eCharacterSheet.character_id == char.id)
+                .order_by(Dnd5eCharacterSheet.updated_at.desc())
+            ).scalars().first()
+            validity = character_launch_validity(char, sheet)
+            if not validity["is_valid"]:
+                raise HTTPException(
+                    status_code=422,
+                    detail={
+                        "message": f"Character incomplete: missing {', '.join(validity['missing'])}",
+                        "missing": validity["missing"],
+                    },
+                )
+            current.is_ready = True
+            current.ready_at = datetime.now(timezone.utc)
+        else:
+            current.is_ready = False
+            current.ready_at = None
+
+    def _execute():
+        campaign_after, event = commit_campaign_mutation(
+            db,
+            cid,
+            expected_revision,
+            event_type="campaign.member_ready" if ready else "campaign.member_unready",
+            operation_id=operation_id or idempotency_key,
+            actor_id=profile.id,
+            targets={"user_id": str(profile.id)},
+            payload={"user_id": str(profile.id), "ready": ready},
+            mutate=_mutate,
+            commit=False,
+        )
+        logger.info(
+            "readiness transition campaign_id=%s actor_id=%s ready=%s revision=%s",
+            cid, profile.id, ready, campaign_after.revision,
+        )
+        refreshed = db.get(CampaignMember, {"campaign_id": cid, "user_id": profile.id})
+        return {
+            "ok": True,
+            "campaign": campaign_after.to_dict(),
+            "member": _member_lobby_projection(db, campaign_after, refreshed),
+            "event": event.to_dict(),
+        }
+
+    try:
+        return execute_http_idempotent(
+            db, response, actor_id=profile.id, idempotency_key=idempotency_key,
+            command_type="campaign.member.readiness",
+            scope_type="campaign_member", scope_id=f"{cid}:{profile.id}",
+            payload=payload,
+            execute=_execute,
+        )
+    except RevisionConflictError as exc:
+        raise HTTPException(
+            status_code=409, detail=str(exc),
+            headers={"X-Current-Revision": str(exc.actual_revision)},
+        ) from exc
 
 
 @router.delete("/api/campaigns/{campaign_id}/members/{user_id}")
@@ -586,8 +933,46 @@ def remove_campaign_member(
 
 @router.get("/api/campaigns/{campaign_id}/characters")
 def list_campaign_characters(campaign_id: str, request: Request, db: Session = Depends(get_db)):
-    resolve_profile(request, db)
-    return {"characters": []}
+    """Public launch roster — only approved public character info, no secret lore."""
+    from models.characters import Character, Dnd5eCharacterSheet
+
+    profile = resolve_profile(request, db)
+    try:
+        cid = parse_campaign_id(campaign_id)
+    except ValueError:
+        raise HTTPException(status_code=404, detail="Invalid campaign id")
+    camp = db.get(Campaign, cid)
+    if not camp:
+        raise HTTPException(status_code=404, detail="Campaign not found")
+    if camp.owner_id != profile.id and not is_campaign_member(db, cid, profile.id):
+        raise HTTPException(status_code=403, detail="Not a member")
+    members = db.execute(
+        select(CampaignMember).where(
+            CampaignMember.campaign_id == cid,
+            CampaignMember.selected_character_id.is_not(None),
+        )
+    ).scalars().all()
+    roster = []
+    for m in members:
+        char = db.get(Character, m.selected_character_id)
+        if char is None:
+            continue
+        sheet = db.execute(
+            select(Dnd5eCharacterSheet)
+            .where(Dnd5eCharacterSheet.character_id == char.id)
+            .order_by(Dnd5eCharacterSheet.updated_at.desc())
+        ).scalars().first()
+        roster.append({
+            "character_id": str(char.id),
+            "user_id": str(m.user_id),
+            "name": char.name,
+            "race": sheet.race if sheet else None,
+            "char_class": sheet.char_class if sheet else None,
+            "classes": sheet.classes if sheet else None,
+            "level": sheet.level if sheet else None,
+            "is_ready": bool(m.is_ready),
+        })
+    return {"characters": roster}
 
 
 @router.get("/api/campaigns/{campaign_id}/invites")

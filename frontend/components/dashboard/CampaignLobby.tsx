@@ -1,8 +1,8 @@
 'use client'
 
 import { useState, useCallback, useEffect } from 'react'
-import { campaignMembers as membersApi } from '@/lib/api'
-import type { Campaign, CampaignMember, User } from '@/types'
+import { campaigns as campaignsApi, campaignMembers as membersApi, characters as charactersApi } from '@/lib/api'
+import type { Campaign, CampaignMember, Character, LobbyEligibility, User } from '@/types'
 
 interface CampaignLobbyProps {
   campaign: Campaign
@@ -11,17 +11,52 @@ interface CampaignLobbyProps {
   onBegin: () => void
 }
 
+function newKey(): string {
+  if (typeof crypto !== 'undefined' && typeof crypto.randomUUID === 'function') return crypto.randomUUID()
+  return `${Date.now()}-${Math.random().toString(36).slice(2)}`
+}
+
 export default function CampaignLobby({ campaign, currentUser, isOwner, onBegin }: CampaignLobbyProps) {
   const [members, setMembers] = useState<CampaignMember[]>([])
+  const [eligibility, setEligibility] = useState<LobbyEligibility | null>(null)
+  const [revision, setRevision] = useState<number>(campaign.revision)
+  const [launchLocked, setLaunchLocked] = useState(false)
   const [invite, setInvite] = useState<{ code?: string } | null>(null)
   const [copied, setCopied] = useState(false)
+  const [owned, setOwned] = useState<Character[]>([])
+  const [selectedId, setSelectedId] = useState('')
+  const [busy, setBusy] = useState(false)
+  const [lobbyError, setLobbyError] = useState('')
+
+  const refreshLobby = useCallback(async () => {
+    try {
+      const data = await membersApi.getLobby(campaign.id)
+      setMembers(data.members ?? [])
+      setEligibility(data.eligibility ?? null)
+      setRevision((current) => data.campaign?.revision ?? current)
+      setLaunchLocked(Boolean(data.launch_locked))
+    } catch {
+      setEligibility(null)
+      // Fall back to members-only projection if lobby endpoint is unavailable
+      try {
+        const data = await membersApi.listMembers(campaign.id)
+        setMembers((data as { members?: CampaignMember[] }).members ?? [])
+      } catch { /* no-op */ }
+    }
+  }, [campaign.id])
 
   useEffect(() => {
-    membersApi
-      .listMembers(campaign.id)
-      .then((data) => setMembers((data as { members?: CampaignMember[] }).members ?? []))
+    void refreshLobby()
+    const timer = window.setInterval(() => void refreshLobby(), 2_000)
+    return () => window.clearInterval(timer)
+  }, [refreshLobby])
+
+  useEffect(() => {
+    charactersApi
+      .list()
+      .then((data) => setOwned((data as { characters?: Character[] }).characters ?? []))
       .catch(() => {})
-  }, [campaign.id])
+  }, [])
 
   useEffect(() => {
     if (!isOwner) return
@@ -45,9 +80,63 @@ export default function CampaignLobby({ campaign, currentUser, isOwner, onBegin 
     setTimeout(() => setCopied(false), 2000)
   }, [invite?.code])
 
+  const me = members.find((m) => m.user_id === currentUser?.id) ?? null
+  const myCharId = me?.selected_character_id ?? me?.character_id ?? null
+
+  useEffect(() => {
+    if (myCharId && !selectedId) setSelectedId(myCharId)
+  }, [myCharId, selectedId])
+
+  const handleSelect = useCallback(async () => {
+    if (!selectedId || busy) return
+    setBusy(true)
+    setLobbyError('')
+    try {
+      await membersApi.selectCharacter(campaign.id, revision, selectedId, newKey())
+      await refreshLobby()
+    } catch (err) {
+      await refreshLobby()
+      setLobbyError((err as Error).message)
+    } finally {
+      setBusy(false)
+    }
+  }, [selectedId, busy, campaign.id, revision, refreshLobby])
+
+  const handleReadiness = useCallback(async (ready: boolean) => {
+    if (busy) return
+    setBusy(true)
+    setLobbyError('')
+    try {
+      await membersApi.setReadiness(campaign.id, revision, ready, newKey())
+      await refreshLobby()
+    } catch (err) {
+      await refreshLobby()
+      setLobbyError((err as Error).message)
+    } finally {
+      setBusy(false)
+    }
+  }, [busy, campaign.id, revision, refreshLobby])
+
+  const handleBegin = useCallback(async () => {
+    if (busy || launchLocked || !isOwner || !eligibility?.eligible) return
+    setBusy(true)
+    setLobbyError('')
+    try {
+      const result = await campaignsApi.transitionLifecycle(campaign.id, revision, 'starting', newKey())
+      setRevision(result.campaign.revision)
+      setLaunchLocked(true)
+      onBegin()
+    } catch (err) {
+      await refreshLobby()
+      setLobbyError((err as Error).message)
+    } finally {
+      setBusy(false)
+    }
+  }, [busy, launchLocked, isOwner, eligibility, campaign.id, revision, onBegin, refreshLobby])
+
   const filledSlots = members.length
   const totalSlots = (campaign as { required_players?: number }).required_players ?? members.length
-  const canBegin = isOwner
+  const canBegin = isOwner && (eligibility?.eligible ?? false)
 
   return (
     <div className="lobby-page">
@@ -66,6 +155,61 @@ export default function CampaignLobby({ campaign, currentUser, isOwner, onBegin 
             )}
           </div>
 
+          {/* Character selection / readiness (solo dogfood path) */}
+          <section className="lobby-invite-section" aria-label="Your character">
+            <div className="lobby-section-header">
+              <span className="lobby-section-label">
+                <i className="bi bi-person-badge" aria-hidden="true" /> Your character
+              </span>
+              {me && (
+                <span style={{ fontSize: '0.72rem', color: 'var(--ink-muted)' }}>
+                  {me.is_ready ? 'Ready' : 'Not ready'}
+                  {typeof me.character_progress?.percent === 'number' && ` · ${me.character_progress.percent}%`}
+                </span>
+              )}
+            </div>
+            <div className="lobby-invite-card">
+              {launchLocked ? (
+                <p className="lobby-invite-desc">Launch characters are locked — the campaign has started.</p>
+              ) : (
+                <>
+                  <div style={{ display: 'flex', gap: 8, flexWrap: 'wrap' }}>
+                    <select
+                      aria-label="Select your character"
+                      value={selectedId}
+                      onChange={(e) => setSelectedId(e.target.value)}
+                      disabled={busy || owned.length === 0}
+                      style={{ flex: '1 1 220px', padding: '8px 10px', borderRadius: 8 }}
+                    >
+                      <option value="">{owned.length ? 'Choose a character…' : 'No characters yet — create one first'}</option>
+                      {owned.map((c) => (
+                        <option key={c.id} value={c.id}>{c.name}</option>
+                      ))}
+                    </select>
+                    <button type="button" className="lobby-generate-btn" onClick={handleSelect} disabled={busy || !selectedId}>
+                      Select
+                    </button>
+                    {me?.is_ready ? (
+                      <button type="button" className="lobby-copy-btn" onClick={() => void handleReadiness(false)} disabled={busy}>
+                        Unready
+                      </button>
+                    ) : (
+                      <button type="button" className="lobby-copy-btn" onClick={() => void handleReadiness(true)} disabled={busy || !myCharId}>
+                        Mark ready
+                      </button>
+                    )}
+                  </div>
+                  {me && (me.character_missing?.length ?? 0) > 0 && (
+                    <p className="lobby-invite-hint">Incomplete: missing {me.character_missing!.join(', ')}.</p>
+                  )}
+                  {lobbyError && (
+                    <p className="lobby-invite-hint" role="alert">{lobbyError}</p>
+                  )}
+                </>
+              )}
+            </div>
+          </section>
+
           {/* Right: party section */}
           <section className="lobby-party-section">
             <div className="lobby-section-header">
@@ -80,26 +224,32 @@ export default function CampaignLobby({ campaign, currentUser, isOwner, onBegin 
             </div>
 
             <div className="lobby-players-grid">
-              {members.map((member) => (
-                <div
-                  key={member.user_id}
-                  className={`lobby-player-slot lobby-slot-filled`}
-                >
-                  <div className="lobby-slot-circle">
-                    {member.username?.slice(0, 2).toUpperCase() ?? '?'}
+              {members.map((member) => {
+                const charId = member.selected_character_id ?? member.character_id ?? null
+                return (
+                  <div
+                    key={member.user_id}
+                    className={`lobby-player-slot lobby-slot-filled`}
+                  >
+                    <div className="lobby-slot-circle">
+                      {member.username?.slice(0, 2).toUpperCase() ?? '?'}
+                    </div>
+                    <div className={`lobby-slot-name${member.user_id === currentUser?.id ? ' lobby-slot-you' : ''}`}>
+                      {member.username}
+                      {member.user_id === currentUser?.id && ' (you)'}
+                    </div>
+                    {member.character_name && (
+                      <div className="lobby-slot-role">{member.character_name}</div>
+                    )}
+                    <div style={{ fontSize: '0.7rem', color: member.is_ready ? 'var(--ember-hover)' : 'var(--ink-faint)' }}>
+                      {member.is_ready ? 'Ready' : charId ? 'Not ready' : 'No character'}
+                    </div>
+                    {member.role === 'owner' && (
+                      <span style={{ position: 'absolute', top: 6, right: 6, fontSize: '0.55rem', fontWeight: 800, letterSpacing: '0.08em', textTransform: 'uppercase', padding: '3px 6px', borderRadius: 4, background: 'var(--ember-soft)', color: 'var(--ember-hover)' }}>Host</span>
+                    )}
                   </div>
-                  <div className={`lobby-slot-name${member.user_id === currentUser?.id ? ' lobby-slot-you' : ''}`}>
-                    {member.username}
-                    {member.user_id === currentUser?.id && ' (you)'}
-                  </div>
-                  {member.character_name && (
-                    <div className="lobby-slot-role">{member.character_name}</div>
-                  )}
-                  {member.role === 'owner' && (
-                    <span style={{ position: 'absolute', top: 6, right: 6, fontSize: '0.55rem', fontWeight: 800, letterSpacing: '0.08em', textTransform: 'uppercase', padding: '3px 6px', borderRadius: 4, background: 'var(--ember-soft)', color: 'var(--ember-hover)' }}>Host</span>
-                  )}
-                </div>
-              ))}
+                )
+              })}
 
               {/* Empty slots */}
               {Array.from({ length: Math.max(0, totalSlots - filledSlots) }).map((_, i) => (
@@ -124,6 +274,13 @@ export default function CampaignLobby({ campaign, currentUser, isOwner, onBegin 
                 {filledSlots} of {totalSlots} seat{totalSlots !== 1 ? 's' : ''} filled
               </span>
             </div>
+            {eligibility && !eligibility.eligible && (
+              <ul style={{ marginTop: 8, paddingLeft: 18, color: 'var(--ink-muted)', fontSize: '0.78rem' }}>
+                {eligibility.blockers.map((b) => (
+                  <li key={b}>{b}</li>
+                ))}
+              </ul>
+            )}
           </section>
 
           {/* Invite section */}
@@ -169,9 +326,16 @@ export default function CampaignLobby({ campaign, currentUser, isOwner, onBegin 
           <footer className="lobby-footer">
             <div className="lobby-locked-area">
               {canBegin ? (
-                <button type="button" className="lobby-begin-btn" onClick={onBegin}>
+                <button type="button" className="lobby-begin-btn" onClick={() => void handleBegin()} disabled={busy || launchLocked}>
                   <i className="bi bi-fire" aria-hidden="true" /> Begin adventure
                 </button>
+              ) : isOwner ? (
+                <>
+                  <button type="button" className="lobby-begin-btn lobby-begin-locked" disabled>
+                    <i className="bi bi-lock" aria-hidden="true" /> Not ready to begin
+                  </button>
+                  <p className="lobby-locked-msg">Select a valid character and mark ready before starting.</p>
+                </>
               ) : (
                 <>
                   <button type="button" className="lobby-begin-btn lobby-begin-locked" disabled>
