@@ -35,8 +35,8 @@ export default function CampaignLobby({ campaign, currentUser, isOwner, onBegin 
       setEligibility(data.eligibility ?? null)
       setRevision((current) => data.campaign?.revision ?? current)
       setLaunchLocked(Boolean(data.launch_locked))
-      setLobbyError('')
     } catch {
+      setEligibility(null)
       // Fall back to members-only projection if lobby endpoint is unavailable
       try {
         const data = await membersApi.listMembers(campaign.id)
@@ -47,6 +47,8 @@ export default function CampaignLobby({ campaign, currentUser, isOwner, onBegin 
 
   useEffect(() => {
     void refreshLobby()
+    const timer = window.setInterval(() => void refreshLobby(), 2_000)
+    return () => window.clearInterval(timer)
   }, [refreshLobby])
 
   useEffect(() => {
@@ -93,6 +95,7 @@ export default function CampaignLobby({ campaign, currentUser, isOwner, onBegin 
       await membersApi.selectCharacter(campaign.id, revision, selectedId, newKey())
       await refreshLobby()
     } catch (err) {
+      await refreshLobby()
       setLobbyError((err as Error).message)
     } finally {
       setBusy(false)
@@ -107,6 +110,7 @@ export default function CampaignLobby({ campaign, currentUser, isOwner, onBegin 
       await membersApi.setReadiness(campaign.id, revision, ready, newKey())
       await refreshLobby()
     } catch (err) {
+      await refreshLobby()
       setLobbyError((err as Error).message)
     } finally {
       setBusy(false)
