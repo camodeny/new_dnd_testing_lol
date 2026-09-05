@@ -597,7 +597,10 @@ def select_own_character(
         cid = parse_campaign_id(campaign_id)
     except ValueError:
         raise HTTPException(status_code=404, detail="Invalid campaign id")
-    camp = db.get(Campaign, cid)
+    camp = db.execute(
+        select(Campaign).where(Campaign.id == cid).with_for_update()
+        .execution_options(populate_existing=True)
+    ).scalars().first()
     if not camp:
         raise HTTPException(status_code=404, detail="Campaign not found")
     member = db.get(CampaignMember, {"campaign_id": cid, "user_id": profile.id})
@@ -622,6 +625,9 @@ def select_own_character(
     expected_revision = _expected_revision(payload)
     operation_id = str(payload.get("operation_id") or "").strip() or None
     idempotency_key = require_idempotency_key(request, operation_id)
+
+    if is_launch_locked(camp.status):
+        raise HTTPException(status_code=409, detail="Launch character is locked after campaign start")
 
     if member.selected_character_id == char.id:
         return {
@@ -711,7 +717,10 @@ def set_own_readiness(
         cid = parse_campaign_id(campaign_id)
     except ValueError:
         raise HTTPException(status_code=404, detail="Invalid campaign id")
-    camp = db.get(Campaign, cid)
+    camp = db.execute(
+        select(Campaign).where(Campaign.id == cid).with_for_update()
+        .execution_options(populate_existing=True)
+    ).scalars().first()
     if not camp:
         raise HTTPException(status_code=404, detail="Campaign not found")
     member = db.get(CampaignMember, {"campaign_id": cid, "user_id": profile.id})
@@ -725,6 +734,9 @@ def set_own_readiness(
     expected_revision = _expected_revision(payload)
     operation_id = str(payload.get("operation_id") or "").strip() or None
     idempotency_key = require_idempotency_key(request, operation_id)
+
+    if is_launch_locked(camp.status):
+        raise HTTPException(status_code=409, detail="Readiness is locked after campaign start")
 
     if bool(member.is_ready) == ready:
         return {

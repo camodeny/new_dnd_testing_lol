@@ -24,11 +24,14 @@ def _launch_locking_campaign(db: Session, character_id) -> str | None:
     from models.campaigns import Campaign, CampaignMember
 
     rows = db.execute(
-        select(CampaignMember, Campaign)
-        .join(Campaign, Campaign.id == CampaignMember.campaign_id)
+        select(Campaign)
+        .join(CampaignMember, Campaign.id == CampaignMember.campaign_id)
         .where(CampaignMember.selected_character_id == character_id)
-    ).all()
-    for _, camp in rows:
+        .order_by(Campaign.id)
+        .with_for_update(of=Campaign)
+        .execution_options(populate_existing=True)
+    ).scalars().all()
+    for camp in rows:
         if str(getattr(camp, "status", "lobby")) != "lobby":
             return str(camp.id)
     return None

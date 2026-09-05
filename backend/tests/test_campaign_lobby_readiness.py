@@ -203,6 +203,9 @@ def test_valid_solo_start_eligibility_and_lock(api):
         rev = db.get(Campaign, uuid.UUID(camp["id"])).revision
     assert _select(client, camp["id"], rev, char2, "sel-after-start").status_code == 409
     assert _ready(client, camp["id"], rev, False, "unready-after-start").status_code == 409
+    assert _select(client, camp["id"], rev, char_id, "same-selection-after-start").status_code == 409
+    assert _ready(client, camp["id"], rev, True, "same-ready-after-start").status_code == 409
+    assert client.delete(f"/api/characters/{char_id}").status_code == 409
     edit = client.put(f"/api/characters/{char_id}", json={"race": "Dwarf"})
     assert edit.status_code == 409
 
@@ -236,3 +239,49 @@ def test_failed_start_does_not_lock(api):
     assert failed.status_code == 409
     char2 = _make_character(factory, owner_id, name="Second")
     assert _select(client, camp["id"], 1, char2, "sel-after-fail").status_code == 200
+
+
+@pytest.mark.postgres
+def test_character_mutation_waits_for_launch_commit(tmp_path):
+    """Both direct mutation routes use this guard before changing the character."""
+    import os
+    from concurrent.futures import ThreadPoolExecutor, TimeoutError
+    from threading import Event
+
+    from app.characters.router import _launch_locking_campaign
+    from tests.reliability.test_fault_injection import _safe_engine, _seed_campaign
+
+    if not os.getenv("FAULT_TEST_DATABASE_URL"):
+        pytest.skip("requires disposable Postgres")
+    engine = _safe_engine(tmp_path)
+    factory = sessionmaker(bind=engine, expire_on_commit=False)
+    cid = _seed_campaign(factory)
+    with factory() as db:
+        owner_id = db.get(Campaign, cid).owner_id
+    char_id = uuid.UUID(_make_character(factory, owner_id))
+    with factory() as db:
+        db.add(CampaignMember(campaign_id=cid, user_id=owner_id,
+                              role="owner", selected_character_id=char_id, is_ready=True))
+        db.commit()
+
+    entered = Event()
+
+    def check_mutation():
+        with factory() as db:
+            stale_campaign = db.get(Campaign, cid)
+            assert stale_campaign.status == "lobby"
+            entered.set()
+            return _launch_locking_campaign(db, char_id)
+
+    with ThreadPoolExecutor(max_workers=1) as pool:
+        with factory() as launching:
+            camp = launching.execute(select(Campaign).where(Campaign.id == cid).with_for_update()).scalar_one()
+            camp.status = "starting"
+            launching.flush()
+            future = pool.submit(check_mutation)
+            assert entered.wait(5)
+            with pytest.raises(TimeoutError):
+                future.result(timeout=0.2)
+            launching.commit()
+        assert future.result(timeout=5) == str(cid)
+    engine.dispose()

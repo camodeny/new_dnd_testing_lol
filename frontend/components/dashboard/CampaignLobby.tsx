@@ -1,7 +1,7 @@
 'use client'
 
 import { useState, useCallback, useEffect } from 'react'
-import { campaignMembers as membersApi, characters as charactersApi } from '@/lib/api'
+import { campaigns as campaignsApi, campaignMembers as membersApi, characters as charactersApi } from '@/lib/api'
 import type { Campaign, CampaignMember, Character, LobbyEligibility, User } from '@/types'
 
 interface CampaignLobbyProps {
@@ -33,7 +33,7 @@ export default function CampaignLobby({ campaign, currentUser, isOwner, onBegin 
       const data = await membersApi.getLobby(campaign.id)
       setMembers(data.members ?? [])
       setEligibility(data.eligibility ?? null)
-      setRevision(data.campaign?.revision ?? revision)
+      setRevision((current) => data.campaign?.revision ?? current)
       setLaunchLocked(Boolean(data.launch_locked))
       setLobbyError('')
     } catch {
@@ -43,7 +43,6 @@ export default function CampaignLobby({ campaign, currentUser, isOwner, onBegin 
         setMembers((data as { members?: CampaignMember[] }).members ?? [])
       } catch { /* no-op */ }
     }
-    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [campaign.id])
 
   useEffect(() => {
@@ -113,6 +112,23 @@ export default function CampaignLobby({ campaign, currentUser, isOwner, onBegin 
       setBusy(false)
     }
   }, [busy, campaign.id, revision, refreshLobby])
+
+  const handleBegin = useCallback(async () => {
+    if (busy || launchLocked || !isOwner || !eligibility?.eligible) return
+    setBusy(true)
+    setLobbyError('')
+    try {
+      const result = await campaignsApi.transitionLifecycle(campaign.id, revision, 'starting', newKey())
+      setRevision(result.campaign.revision)
+      setLaunchLocked(true)
+      onBegin()
+    } catch (err) {
+      await refreshLobby()
+      setLobbyError((err as Error).message)
+    } finally {
+      setBusy(false)
+    }
+  }, [busy, launchLocked, isOwner, eligibility, campaign.id, revision, onBegin, refreshLobby])
 
   const filledSlots = members.length
   const totalSlots = (campaign as { required_players?: number }).required_players ?? members.length
@@ -306,7 +322,7 @@ export default function CampaignLobby({ campaign, currentUser, isOwner, onBegin 
           <footer className="lobby-footer">
             <div className="lobby-locked-area">
               {canBegin ? (
-                <button type="button" className="lobby-begin-btn" onClick={onBegin}>
+                <button type="button" className="lobby-begin-btn" onClick={() => void handleBegin()} disabled={busy || launchLocked}>
                   <i className="bi bi-fire" aria-hidden="true" /> Begin adventure
                 </button>
               ) : isOwner ? (
