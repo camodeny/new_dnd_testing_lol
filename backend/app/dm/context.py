@@ -678,6 +678,47 @@ def _sheet_value(sheet: Dnd5eCharacterSheet) -> dict[str, Any]:
     return base
 
 
+def is_missing_current_scene_table_error(exc: BaseException) -> bool:
+    """Strict rollout predicate: the ``campaign_current_scenes`` relation itself is absent.
+
+    Only two exact cases qualify:
+    - SQLite: ``no such table: campaign_current_scenes``.
+    - PostgreSQL: SQLSTATE 42P01 (UndefinedTable) mentioning the relation.
+    Every other DB error (permission denied, missing column, malformed data,
+    etc.) must stay fail-closed even when the statement text names the table.
+    """
+    from sqlalchemy.exc import SQLAlchemyError
+
+    if not isinstance(exc, SQLAlchemyError):
+        return False
+    msg = str(exc).lower()
+    if "campaign_current_scenes" not in msg:
+        return False
+    if "no such table: campaign_current_scenes" in msg:
+        return True
+    chain: list[BaseException] = []
+    seen: set[int] = set()
+    current: BaseException | None = exc
+    while current is not None and id(current) not in seen:
+        seen.add(id(current))
+        chain.append(current)
+        cause = getattr(current, "__cause__", None) or getattr(current, "__context__", None)
+        if isinstance(cause, BaseException):
+            current = cause
+        else:
+            current = None
+    orig = getattr(exc, "orig", None)
+    if isinstance(orig, BaseException) and id(orig) not in seen:
+        chain.append(orig)
+    for err in chain:
+        sqlstate = getattr(err, "sqlstate", None) or getattr(err, "pgcode", None)
+        if sqlstate == "42P01":
+            return True
+        if type(err).__name__ == "UndefinedTable":
+            return True
+    return False
+
+
 def assemble_attempt_context(
     db: Session,
     attempt_id: uuid.UUID,
@@ -1072,15 +1113,7 @@ def assemble_attempt_context(
         # fail closed — never silently convert to "no scene established".
         # The only tolerated case is a not-yet-migrated deployment where
         # the scene table itself does not exist.
-        from sqlalchemy.exc import SQLAlchemyError
-
-        msg = str(exc).lower()
-        is_missing_table = (
-            isinstance(exc, SQLAlchemyError)
-            and ("no such table" in msg or "undefinedtable" in msg.replace(" ", "").replace("_", "")
-                 or "does not exist" in msg or "campaign_current_scenes" in msg)
-        )
-        if is_missing_table:
+        if is_missing_current_scene_table_error(exc):
             logger.warning("current_scene table missing, treating lane as empty: %s", exc)
             scene_value = None
         else:

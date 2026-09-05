@@ -296,6 +296,42 @@ def test_scene_reader_failure_fails_closed_without_adjudication(db, monkeypatch)
     assert fresh_attempt.last_error
 
 
+def test_scene_db_error_mentioning_table_stays_fail_closed(db, monkeypatch):
+    """A non-UndefinedTable DB error naming the scene table must not downgrade."""
+    from sqlalchemy.exc import ProgrammingError
+
+    from app.world import service as world_service
+
+    s, camp_id, thread_id, _ = db
+    _, attempt = _submit(s, camp_id, thread_id)
+
+    def _denied(db, campaign, **kwargs):
+        raise ProgrammingError(
+            "SELECT * FROM campaign_current_scenes",
+            {},
+            Exception(
+                'permission denied for table campaign_current_scenes'
+            ),
+        )
+
+    monkeypatch.setattr(
+        world_service, "build_current_scene_context_record", _denied
+    )
+    calls = []
+
+    def adjudicate(packet, feedback=None):
+        calls.append(1)
+        return _fake_adjudicate()(packet)
+
+    with pytest.raises(ProgrammingError, match="permission denied"):
+        execute_dm_attempt(
+            s, attempt.id, adjudicate=adjudicate, narrator="deterministic"
+        )
+    assert calls == []
+    fresh_attempt = s.get(DmTurnAttempt, attempt.id)
+    assert fresh_attempt.status in ("failed", "failed_visible")
+
+
 @pytest.mark.postgres
 def test_live_postgres_executor_cannot_be_recovered_after_lease_age(tmp_path):
     import os

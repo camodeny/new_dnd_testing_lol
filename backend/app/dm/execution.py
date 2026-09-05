@@ -44,8 +44,9 @@ def _current_scene_explicitly_absent(db: Session, attempt_id: uuid.UUID) -> bool
     """True only when positively identified: no scene row established.
 
     Any source failure (reader error, DB error) returns False so the caller
-    stays fail-closed. A missing scene table during rollout is treated as
-    absent to preserve the pre-migration tolerance.
+    stays fail-closed. Only the exact not-yet-migrated case (missing
+    ``campaign_current_scenes`` relation) is treated as absent, using the
+    same strict predicate as context assembly.
     """
     try:
         from models.dm import DmTurnAttempt
@@ -57,8 +58,9 @@ def _current_scene_explicitly_absent(db: Session, attempt_id: uuid.UUID) -> bool
         scene = db.get(CampaignCurrentScene, attempt.campaign_id)
         return scene is None
     except Exception as exc:
-        msg = str(exc).lower()
-        if "no such table" in msg or "does not exist" in msg or "campaign_current_scenes" in msg:
+        from app.dm.context import is_missing_current_scene_table_error
+
+        if is_missing_current_scene_table_error(exc):
             logger.warning("dm_execute scene-absence check missing table: %s", exc)
             try:
                 db.rollback()
