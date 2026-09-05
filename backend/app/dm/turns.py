@@ -752,18 +752,21 @@ def mark_streaming_started(db: Session, turn_id: uuid.UUID, attempt_id: uuid.UUI
 
 def mark_attempt_running(db: Session, attempt_id: uuid.UUID, worker_job_id: uuid.UUID | None = None) -> DmTurnAttempt:
     """Mark attempt as running (worker claimed). Recoverable if worker crashes."""
-    attempt = db.get(DmTurnAttempt, attempt_id)
-    if attempt is None:
-        raise ValueError(f"Attempt {attempt_id} not found")
-    if attempt.status not in (ATTEMPT_PREPARED,):
-        raise ValueError(f"Attempt {attempt_id} cannot transition to running from {attempt.status}")
     now = _now()
-    attempt.status = ATTEMPT_RUNNING
-    attempt.started_at = now
+    values = {"status": ATTEMPT_RUNNING, "started_at": now}
     if worker_job_id:
-        attempt.worker_job_id = worker_job_id
-    db.flush()
+        values["worker_job_id"] = worker_job_id
+    claimed = db.execute(
+        update(DmTurnAttempt)
+        .where(DmTurnAttempt.id == attempt_id, DmTurnAttempt.status == ATTEMPT_PREPARED)
+        .values(**values)
+        .execution_options(synchronize_session=False)
+    )
+    if claimed.rowcount != 1:
+        db.rollback()
+        raise ValueError(f"Attempt {attempt_id} is missing or is no longer prepared")
     db.commit()
+    attempt = db.get(DmTurnAttempt, attempt_id)
     db.refresh(attempt)
     logger.info("dm_turn attempt_running turn_id=%s attempt_id=%s attempt_number=%s source_revision=%s input_set_revision=%s",
                 attempt.turn_id, attempt.id, attempt.attempt_number, attempt.source_revision, attempt.input_set_revision)
@@ -1246,16 +1249,28 @@ def recover_stuck_attempts(
     candidates = db.execute(q).scalars().all()
     count = 0
     for attempt in candidates:
+        # An expired timestamp alone never authorizes resetting a live executor.
+        if db.get_bind().dialect.name == "postgresql":
+            from app.dm.ownership import try_execution_lock
+            if not try_execution_lock(db, attempt.id):
+                continue
         turn = db.get(DmTurn, attempt.turn_id)
         if turn and turn.status == TURN_STREAMING:
             continue
-        attempt.status = ATTEMPT_PREPARED
-        attempt.started_at = None
-        attempt.worker_job_id = None
-        attempt.last_error = f"Recovered stuck running attempt after {lease_seconds}s lease expiry"
-        count += 1
-        logger.info("dm_turn recovered_stuck attempt_id=%s turn_id=%s", attempt.id, attempt.turn_id)
-    if count and commit:
+        recovered = db.execute(
+            update(DmTurnAttempt)
+            .where(DmTurnAttempt.id == attempt.id,
+                   DmTurnAttempt.status == ATTEMPT_RUNNING,
+                   DmTurnAttempt.started_at < cutoff)
+            .values(status=ATTEMPT_PREPARED, started_at=None, worker_job_id=None,
+                    last_error=f"Recovered stuck running attempt after {lease_seconds}s lease expiry")
+            .execution_options(synchronize_session=False)
+        )
+        if recovered.rowcount:
+            db.expire(attempt)
+            count += 1
+            logger.info("dm_turn recovered_stuck attempt_id=%s turn_id=%s", attempt.id, attempt.turn_id)
+    if commit:
         try:
             db.commit()
         except Exception:

@@ -678,6 +678,47 @@ def _sheet_value(sheet: Dnd5eCharacterSheet) -> dict[str, Any]:
     return base
 
 
+def is_missing_current_scene_table_error(exc: BaseException) -> bool:
+    """Strict rollout predicate: the ``campaign_current_scenes`` relation itself is absent.
+
+    Only two exact cases qualify:
+    - SQLite: ``no such table: campaign_current_scenes``.
+    - PostgreSQL: SQLSTATE 42P01 (UndefinedTable) mentioning the relation.
+    Every other DB error (permission denied, missing column, malformed data,
+    etc.) must stay fail-closed even when the statement text names the table.
+    """
+    from sqlalchemy.exc import SQLAlchemyError
+
+    if not isinstance(exc, SQLAlchemyError):
+        return False
+    msg = str(exc).lower()
+    if "campaign_current_scenes" not in msg:
+        return False
+    if "no such table: campaign_current_scenes" in msg:
+        return True
+    chain: list[BaseException] = []
+    seen: set[int] = set()
+    current: BaseException | None = exc
+    while current is not None and id(current) not in seen:
+        seen.add(id(current))
+        chain.append(current)
+        cause = getattr(current, "__cause__", None) or getattr(current, "__context__", None)
+        if isinstance(cause, BaseException):
+            current = cause
+        else:
+            current = None
+    orig = getattr(exc, "orig", None)
+    if isinstance(orig, BaseException) and id(orig) not in seen:
+        chain.append(orig)
+    for err in chain:
+        sqlstate = getattr(err, "sqlstate", None) or getattr(err, "pgcode", None)
+        if sqlstate == "42P01":
+            return True
+        if type(err).__name__ == "UndefinedTable":
+            return True
+    return False
+
+
 def assemble_attempt_context(
     db: Session,
     attempt_id: uuid.UUID,
@@ -1062,8 +1103,25 @@ def assemble_attempt_context(
         from app.world.service import build_current_scene_context_record
 
         scene_value = build_current_scene_context_record(db, campaign)
-    except Exception:  # noqa: BLE001 — missing tables/rows must not break assembly
+    except (ImportError, AttributeError) as exc:
+        # Missing scene reader/wiring: lane stays empty so the caller can
+        # decide (explicit not_applicable vs fail-closed). Never fabricate.
+        logger.warning("current_scene reader unavailable: %s", exc)
         scene_value = None
+    except Exception as exc:
+        # Source failure (malformed row, reader regression, DB error):
+        # fail closed — never silently convert to "no scene established".
+        # The only tolerated case is a not-yet-migrated deployment where
+        # the scene table itself does not exist.
+        if is_missing_current_scene_table_error(exc):
+            logger.warning("current_scene table missing, treating lane as empty: %s", exc)
+            try:
+                db.rollback()
+            except Exception:
+                pass
+            scene_value = None
+        else:
+            raise
     if scene_value is not None:
         scene_visibility = scene_value.get("visibility") or "campaign"
         if scene_visibility not in {"public", "campaign", "private", "dm_only"}:
@@ -1102,6 +1160,48 @@ def assemble_attempt_context(
             )
         )
     timings[LaneName.CURRENT_SCENE] = (time.monotonic() - lane_started) * 1000
+
+    # Fulfilled player-roll evidence (issue #354): when this attempt resumes
+    # the same logical turn after a roll fulfillment, project the authoritative
+    # die result into the adjudication-only evidence lane. dm_only +
+    # adjudication_only so narration_projection() can never leak totals, DCs,
+    # or private fulfillments to a player audience.
+    for index, item in enumerate(list(getattr(attempt, "roll_evidence", None) or [])):
+        if not isinstance(item, dict):
+            continue
+        request_id = str(item.get("request_key") or item.get("id") or f"roll_{index}")
+        fulfillment = item.get("fulfillment") if isinstance(item.get("fulfillment"), dict) else None
+        version = (
+            fulfillment.get("submitted_at") if fulfillment and fulfillment.get("submitted_at")
+            else item.get("fulfilled_at") or item.get("requested_at") or "unknown"
+        )
+        records[LaneName.EVIDENCE_RESULTS].append(
+            ContextRecord(
+                record_id=f"roll_evidence:{request_id}",
+                required=False,
+                priority=85,
+                value={
+                    "request_key": request_id,
+                    "roll_kind": item.get("roll_kind"),
+                    "ability_or_skill": item.get("ability_or_skill"),
+                    "label": item.get("label"),
+                    "reason_public": item.get("reason_public"),
+                    "dc_private": item.get("dc_private"),
+                    "fulfillment": fulfillment,
+                },
+                sources=[
+                    _source(
+                        "player_roll",
+                        request_id,
+                        version,
+                        campaign.revision,
+                    )
+                ],
+                authorization=scope,
+                visibility="dm_only",  # type: ignore[arg-type]
+                use="adjudication_only",
+            )
+        )
 
     supplemental_records = supplemental_records or {}
     for key, values in supplemental_records.items():
@@ -1150,6 +1250,8 @@ def assemble_attempt_context(
             "campaign_domain_events",
             "campaign_current_scenes",
             "world_entities",
+            "player_roll_requests",
+            "player_roll_fulfillments",
         ],
     )
     # Include DB collection in total duration without contaminating deterministic payload.

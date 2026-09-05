@@ -213,6 +213,25 @@ def create_player_submission(
             thread_id_str,
             exc,
         )
+    # Immediate execution is scoped to this submission's coordinated attempt.
+    # Direct player conversations have no DM attempt and never trigger DM work.
+    try:
+        import os
+
+        attempt_data = result.get("dm_attempt") if isinstance(result, dict) else None
+        if (attempt_data and attempt_data.get("id")
+                and os.getenv("DM_INLINE_EXECUTE", "").lower() in ("1", "true", "yes", "on")):
+            from database import SessionLocal
+            from app.dm.execution import execute_dm_attempt
+
+            if SessionLocal is not None:
+                with SessionLocal() as execution_db:
+                    execute_dm_attempt(execution_db, uuid.UUID(str(attempt_data["id"])))
+    except Exception as exc:
+        logger.warning(
+            "dm inline execute guard failed campaign_id=%s error=%s",
+            campaign.id, exc,
+        )
     return result
 
 

@@ -1,4 +1,18 @@
-"""DM turn/attempt + structured contract — issues #200, #201, #203, #205, #207."""
+"""DM turn/attempt + structured contract — issues #200, #201, #203, #205, #207, #354."""
+from app.dm.adjudication import (  # noqa: F401
+    adjudicate_with_provider,
+    build_forward_dm_messages,
+    build_provider_narrator,
+    resolve_dm_provider,
+)
+from app.dm.execution import (  # noqa: F401
+    DM_TURN_EXECUTE_JOB,
+    execute_dm_attempt,
+    find_prepared_attempts,
+    handle_dm_turn_execute,
+    register_dm_worker,
+    run_dm_execute_sweep,
+)
 from app.dm.contract import (  # noqa: F401
     CONTRACT_VERSION,
     DM_TURN_CONTRACT_V1,
