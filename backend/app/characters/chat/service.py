@@ -5,7 +5,6 @@ consume `provider_registry` and `stream_chat` without branching on provider.
 """
 import json
 import logging
-import os
 import uuid as uuid_lib
 from typing import Optional
 
@@ -62,8 +61,20 @@ class CharacterChatRequest(BaseModel):
     active_page: Optional[str] = None
 
 
-def get_character_chat_model() -> str:
-    return os.getenv("OPENCODE_GO_MODEL", "").strip() or "muse-spark-1.2-contributor"
+def get_character_chat_model(adapter=None) -> str:
+    """Model slug for the ``character_chat`` area (pinned in code).
+
+    When an adapter is passed, its explicit env model wins; otherwise the
+    area pin is returned.
+    """
+    from app.providers.areas import resolve_area
+
+    if adapter is not None:
+        model = (adapter.env_model() or "").strip()
+        if model:
+            return model
+    _, model, _ = resolve_area("character_chat")
+    return model
 
 
 def build_chat_messages(req: CharacterChatRequest) -> list[dict]:
@@ -118,19 +129,14 @@ def character_chat_sync_generator(
     req: CharacterChatRequest, owner_id: uuid_lib.UUID, character_uuid: uuid_lib.UUID | None
 ):
     try:
-        from app.providers import provider_registry
-    except Exception as e:
-        yield f"event: error\ndata: {json.dumps({'error': f'providers not available: {e}'})}\n\n"
-        return
+        from app.providers.areas import resolve_area
 
-    model = get_character_chat_model()
-    messages = build_chat_messages(req)
-
-    try:
-        adapter = provider_registry.get("opencode_go")
+        adapter, model, _ = resolve_area("character_chat")
     except Exception as e:
         yield f"event: error\ndata: {json.dumps({'error': str(e)})}\n\n"
         return
+
+    messages = build_chat_messages(req)
 
     full_text = ""
     has_patch = False
