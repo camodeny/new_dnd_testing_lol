@@ -100,7 +100,17 @@ def _classify_failure(exc: BaseException) -> str:
         return TERMINAL
 
 
-def execute_dm_attempt(
+def execute_dm_attempt(db: Session, attempt_id: uuid.UUID, **kwargs):
+    """Only the owner may claim, execute, or fail this attempt."""
+    from app.dm.ownership import execution_ownership
+
+    with execution_ownership(db, attempt_id) as acquired:
+        if not acquired:
+            return None
+        return _execute_owned_attempt(db, attempt_id, **kwargs)
+
+
+def _execute_owned_attempt(
     db: Session,
     attempt_id: uuid.UUID,
     *,
@@ -148,15 +158,12 @@ def execute_dm_attempt(
     campaign_id = attempt.campaign_id
     turn_id = attempt.turn_id
 
-    # Claim: prepared -> running (recoverable if the worker crashes).
-    if attempt.status == ATTEMPT_PREPARED:
-        try:
-            mark_attempt_running(db, attempt.id)
-        except ValueError:
-            db.rollback()
-            attempt = db.get(DmTurnAttempt, attempt_id)
-    elif attempt.status != ATTEMPT_RUNNING:
-        raise ValueError(f"Attempt {attempt_id} cannot execute from status {attempt.status}")
+    # A caller observing running work must never adopt another worker's claim.
+    try:
+        attempt = mark_attempt_running(db, attempt.id)
+    except ValueError:
+        db.rollback()
+        return None
 
     def _fail_visible(exc: BaseException) -> None:
         error_class = _classify_failure(exc)
@@ -222,10 +229,20 @@ def execute_dm_attempt(
     try:
         # Evidence/tool loop first (no-op when the model never asks for
         # evidence), then strict validation with bounded regeneration.
+        # Preserve the exact packet the last evidence adjudication saw, including
+        # its visibility filtering and per-round budget decisions.
+        validation_packet = packet
+
+        def evidence_adjudicate(enriched_packet):
+            nonlocal validation_packet
+            validation_packet = enriched_packet
+            return adjudicate(enriched_packet)
+
         final_contract, _bundle = run_bounded_evidence_loop(
-            initial_packet=packet, adjudicate=adjudicate, db=db,
+            initial_packet=packet, adjudicate=evidence_adjudicate, db=db,
             tool_handlers=None,
         )
+        packet = validation_packet
         report = default_pipeline.validate(final_contract, packet)
         if report.passed:
             contract = final_contract

@@ -213,39 +213,24 @@ def create_player_submission(
             thread_id_str,
             exc,
         )
-    # Autonomous DM execution handoff — issue #354. The coordinated attempt
-    # above is eligible for immediate execution; kick the sweeper best-effort
-    # without ever failing the authoritative submission response. On
-    # serverless runtimes the /api/cron/dm-execute trigger owns this sweep;
-    # inline execution is an opt-in latency shortcut (DM_INLINE_EXECUTE=1).
+    # Immediate execution is scoped to this submission's coordinated attempt.
+    # Direct player conversations have no DM attempt and never trigger DM work.
     try:
-        import os as _os
+        import os
 
-        if _os.getenv("DM_INLINE_EXECUTE", "").lower() in ("1", "true", "yes", "on"):
-            from database import SessionLocal as _SessionLocal
+        attempt_data = result.get("dm_attempt") if isinstance(result, dict) else None
+        if (attempt_data and attempt_data.get("id")
+                and os.getenv("DM_INLINE_EXECUTE", "").lower() in ("1", "true", "yes", "on")):
+            from database import SessionLocal
+            from app.dm.execution import execute_dm_attempt
 
-            if _SessionLocal is not None:
-                _sweep_db = _SessionLocal()
-                try:
-                    from app.dm.execution import run_dm_execute_sweep
-
-                    _sweep = run_dm_execute_sweep(_sweep_db, limit=1)
-                    logger.info(
-                        "dm inline execute campaign_id=%s executed=%s failed=%s",
-                        campaign.id,
-                        len(_sweep.get("executed", [])),
-                        len(_sweep.get("failed", [])),
-                    )
-                finally:
-                    try:
-                        _sweep_db.close()
-                    except Exception:
-                        pass
+            if SessionLocal is not None:
+                with SessionLocal() as execution_db:
+                    execute_dm_attempt(execution_db, uuid.UUID(str(attempt_data["id"])))
     except Exception as exc:
         logger.warning(
             "dm inline execute guard failed campaign_id=%s error=%s",
-            campaign.id,
-            exc,
+            campaign.id, exc,
         )
     return result
 

@@ -12,7 +12,6 @@ import pytest
 from sqlalchemy import create_engine, select
 from sqlalchemy.dialects.sqlite.base import SQLiteTypeCompiler
 from sqlalchemy.orm import sessionmaker
-from sqlalchemy.pool import StaticPool
 
 if not hasattr(SQLiteTypeCompiler, "_patched_jsonb"):
     SQLiteTypeCompiler.visit_JSONB = lambda self, type_, **kw: "JSON"  # type: ignore
@@ -35,9 +34,9 @@ from app.dm_streams.service import reconstruct_text  # noqa: E402
 
 
 @pytest.fixture
-def db():
+def db(tmp_path):
     engine = create_engine(
-        "sqlite://", connect_args={"check_same_thread": False}, poolclass=StaticPool
+        f"sqlite:///{tmp_path / 'execution.sqlite'}", connect_args={"check_same_thread": False}
     )
     Base.metadata.create_all(engine)
     factory = sessionmaker(bind=engine, expire_on_commit=False)
@@ -67,7 +66,7 @@ def _submit(s, camp_id, thread_id, text="I step into the torchlit hall."):
     accept_submission(
         s,
         campaign_id=camp_id,
-        user_id=uuid.uuid4(),
+        user_id=s.get(Campaign, camp_id).owner_id,
         raw_content=text,
         segments=[{"type": "ic", "text": text}],
         thread_id=str(thread_id),
@@ -190,3 +189,102 @@ def test_worker_handler_registered_for_queue_path():
         job_type = DM_TURN_EXECUTE_JOB
 
     assert resolve_worker_handler(_Env()) is WORKER_HANDLERS[DM_TURN_EXECUTE_JOB]
+
+
+@pytest.mark.parametrize("regenerate", [False, True])
+def test_evidence_survives_validation_and_regeneration(db, monkeypatch, regenerate):
+    from tests.test_dm_evidence import _sheet_ok
+    monkeypatch.setattr("app.dm.evidence._default_tool_handler", _sheet_ok)
+    s, camp_id, thread_id, _ = db
+    _, attempt = _submit(s, camp_id, thread_id)
+    calls = []
+
+    def adjudicate(packet, feedback=None):
+        calls.append(packet)
+        if len(calls) == 1:
+            return normalize_contract({
+                "contract_version": CONTRACT_VERSION, "mode": "need_evidence",
+                "reason": "check sheet", "beats": [], "safe_prelude": "Checking the sheet.",
+                "evidence_requests": [{"id": "evidence_1", "tool": "ask_character_sheet",
+                                       "question": "What is AC?", "scope": "current_player"}],
+            })
+        assert any(r.record_id == "evidence:evidence_1" for lane in packet.lanes for r in lane.records)
+        contract = _fake_adjudicate("AC is 15.")(packet).model_dump(mode="json")
+        claim = contract["beats"][0]["claims"][0]
+        claim.update(origin="resolver_evidence", evidence_refs=[
+            "unknown-source" if regenerate and len(calls) == 2 else "evidence:evidence_1",
+        ])
+        return normalize_contract(contract)
+
+    result = execute_dm_attempt(s, attempt.id, adjudicate=adjudicate, narrator="deterministic")
+    assert result.attempt.status == "succeeded"
+    assert len(calls) == (3 if regenerate else 2)
+
+
+def test_two_sessions_only_one_executor_reaches_adjudication(db):
+    from concurrent.futures import ThreadPoolExecutor
+    from threading import Event
+
+    s, camp_id, thread_id, factory = db
+    _, attempt = _submit(s, camp_id, thread_id)
+    aid = attempt.id
+    entered, release = Event(), Event()
+    calls = []
+
+    def adjudicate(packet, feedback=None):
+        calls.append(1)
+        entered.set()
+        assert release.wait(10)
+        return _fake_adjudicate()(packet)
+
+    def winner():
+        with factory() as worker:
+            return execute_dm_attempt(worker, aid, adjudicate=adjudicate, narrator="deterministic")
+
+    # s retains its stale prepared object while the winning session claims it.
+    with ThreadPoolExecutor(max_workers=1) as pool:
+        future = pool.submit(winner)
+        try:
+            assert entered.wait(5)
+            assert execute_dm_attempt(s, aid, adjudicate=adjudicate, narrator="deterministic") is None
+        finally:
+            release.set()
+        assert future.result(timeout=10).attempt.status == "succeeded"
+    assert len(calls) == 1
+
+
+@pytest.mark.postgres
+def test_live_postgres_executor_cannot_be_recovered_after_lease_age(tmp_path):
+    import os
+    from datetime import datetime, timedelta, timezone
+
+    from app.dm.ownership import execution_ownership
+    from app.dm.turns import mark_attempt_running, recover_stuck_attempts
+    from tests.reliability.test_fault_injection import _safe_engine, _seed_campaign
+
+    if not os.getenv("FAULT_TEST_DATABASE_URL"):
+        pytest.skip("requires disposable Postgres")
+    engine = _safe_engine(tmp_path)
+    factory = sessionmaker(bind=engine, expire_on_commit=False)
+    cid = _seed_campaign(factory)
+    with factory() as db:
+        owner = db.get(Campaign, cid).owner_id
+        thread = CampaignThread(campaign_id=cid, thread_type="campaign", created_by=owner)
+        db.add(thread)
+        db.commit()
+        _, attempt = _submit(db, cid, thread.id)
+        aid = attempt.id
+        with execution_ownership(db, aid) as acquired:
+            assert acquired
+            mark_attempt_running(db, aid)
+            attempt.started_at = datetime.now(timezone.utc) - timedelta(hours=1)
+            db.commit()
+            with factory() as other:
+                # Includes duplicate dispatch and an expired recovery timestamp.
+                assert execute_dm_attempt(other, aid) is None
+                assert recover_stuck_attempts(other, campaign_id=cid, lease_seconds=300) == 0
+                assert other.get(DmTurnAttempt, aid).status == "running"
+        with factory() as other:
+            assert recover_stuck_attempts(other, campaign_id=cid, lease_seconds=300) == 1
+            assert other.get(DmTurnAttempt, aid).status == "prepared"
+    engine.dispose()

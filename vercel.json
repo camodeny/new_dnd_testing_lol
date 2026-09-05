@@ -15,10 +15,6 @@
     {
       "path": "/api/cron/outbox-relay",
       "schedule": "0 0 * * *"
-    },
-    {
-      "path": "/api/cron/dm-execute",
-      "schedule": "*/5 * * * *"
     }
   ],
   "rewrites": [

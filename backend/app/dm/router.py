@@ -282,7 +282,7 @@ def recover_stuck(campaign_id: str, payload: dict, request: Request, db: Session
 def dm_execute_cron_get(request: Request, db: Session = Depends(get_db)):
     """Autonomous DM execution sweep — issue #354.
 
-    Cron trigger (Vercel Cron / scheduler) that claims and executes eligible
+    Cron trigger (Supabase Cron / scheduler) that claims and executes eligible
     prepared DM attempts through the production pipeline without manual
     API/database intervention. Same auth guard as the outbox relay cron:
     ``CRON_SECRET`` bearer, or ``ALLOW_INSECURE_CRON=1`` local/test bypass.
@@ -292,7 +292,7 @@ def dm_execute_cron_get(request: Request, db: Session = Depends(get_db)):
     _require_cron_secret(request.headers.get("authorization"))
     from app.dm.execution import run_dm_execute_sweep
 
-    result = run_dm_execute_sweep(db, limit=5)
+    result = run_dm_execute_sweep(db, limit=1)
     logger.info(
         "dm execute cron executed=%s failed=%s skipped=%s recovered=%s",
         len(result.get("executed", [])),

@@ -380,3 +380,43 @@ def test_get_or_create_preserves_pending_work_through_shared_thread_race(api):
     with factory() as db:
         assert db.get(Profile, pending_id) is not None
         assert db.query(CampaignThread).filter_by(campaign_id=campaign_id, thread_type="campaign").count() == 1
+
+
+def test_inline_execution_targets_new_attempt_and_skips_direct_messages(api, monkeypatch):
+    from app.dm.turns import coordinate_turn
+    from app.runtime.submissions import accept_submission
+    from models.dm import DmTurnAttempt
+
+    client, factory, campaign_id, member_id, _ = api
+    with factory() as db:
+        other = Campaign(owner_id=MOCK_USER_ID, name="Other table")
+        db.add(other)
+        db.flush()
+        thread = get_or_create_campaign_thread(db, other.id)
+        accept_submission(db, campaign_id=other.id, user_id=MOCK_USER_ID,
+                          raw_content="Older pending action", thread_id=str(thread.id),
+                          segments=[{"type": "ic", "text": "Older pending action"}])
+        db.commit()
+        _, old_attempt = coordinate_turn(db, other.id, str(thread.id))
+        old_id = old_attempt.id
+
+    monkeypatch.setenv("DM_INLINE_EXECUTE", "1")
+    monkeypatch.setattr("database.SessionLocal", factory)
+    executed = []
+    monkeypatch.setattr("app.dm.execution.execute_dm_attempt", lambda db, aid: executed.append(aid))
+    response = client.post(f"/api/campaigns/{campaign_id}/submissions",
+                           json={"content": "I enter the hall"}, headers={"Idempotency-Key": "inline-new"})
+    assert response.status_code == 201, response.text
+    assert executed == [uuid.UUID(response.json()["dm_attempt"]["id"])]
+    assert old_id not in executed
+    with factory() as db:
+        assert db.get(DmTurnAttempt, old_id).status == "prepared"
+    direct = client.post(f"/api/campaigns/{campaign_id}/threads/direct",
+                         json={"participant_id": str(member_id)})
+    assert direct.status_code == 200, direct.text
+    response = client.post(f"/api/campaigns/{campaign_id}/submissions",
+                           json={"content": "Private chat", "thread_id": direct.json()["thread"]["id"]},
+                           headers={"Idempotency-Key": "inline-direct"})
+    assert response.status_code == 201, response.text
+    assert "dm_attempt" not in response.json()
+    assert len(executed) == 1
