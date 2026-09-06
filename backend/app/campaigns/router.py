@@ -403,6 +403,10 @@ def solo_bootstrap_campaign(
 
     Pre-alpha scaffold; deleted/replaced by #245/#246. Owner-only, exactly one
     ready member. Idempotent under repeated clicks (state-guarded).
+
+    Transaction boundary: ``run_solo_bootstrap`` is flush-only; the single
+    atomic commit happens in ``execute_http_idempotent``. DM execution is
+    triggered best-effort only after that commit succeeds (never inside).
     """
     from app.campaigns.solo_bootstrap import SoloBootstrapError, run_solo_bootstrap
 
@@ -428,7 +432,7 @@ def solo_bootstrap_campaign(
                 raise HTTPException(status_code=403, detail=msg) from exc
             raise HTTPException(status_code=409, detail=msg) from exc
 
-    return execute_http_idempotent(
+    result = execute_http_idempotent(
         db,
         response,
         actor_id=profile.id,
@@ -439,6 +443,32 @@ def solo_bootstrap_campaign(
         payload=payload,
         execute=_execute,
     )
+    # Post-commit best-effort DM execution: the opening attempt is durable
+    # now, so executing outside the idempotent transaction cannot wedge
+    # retries. Skipped on idempotent replay (already handled) and when no
+    # session factory exists (tests). Provider failures leave the pending
+    # turn as the owed opening turn for the cron sweep.
+    if response.headers.get("X-Idempotent-Replay") != "true":
+        attempt_id = (result.get("dm_attempt") or {}).get("id") if isinstance(result, dict) else None
+        if attempt_id:
+            try:
+                from database import SessionLocal as _SessionLocal
+
+                if _SessionLocal is not None:
+                    with _SessionLocal() as execution_db:
+                        from app.dm.execution import execute_dm_attempt
+
+                        execute_dm_attempt(execution_db, uuid_lib.UUID(str(attempt_id)))
+                    logger.info(
+                        "solo_bootstrap post_commit_execute_attempted campaign_id=%s attempt_id=%s",
+                        cid, attempt_id,
+                    )
+            except Exception as exc:
+                logger.warning(
+                    "solo_bootstrap post_commit_execute_deferred campaign_id=%s attempt_id=%s error=%s",
+                    cid, attempt_id, exc,
+                )
+    return result
 
 
 @router.post("/api/campaigns/{campaign_id}/mutations")

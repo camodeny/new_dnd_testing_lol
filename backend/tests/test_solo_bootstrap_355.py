@@ -179,3 +179,56 @@ def test_solo_bootstrap_requires_ready_character(api):
             select(DmTurn).where(DmTurn.campaign_id == cid)
         ).scalars().all()
         assert turns == []
+
+
+def test_solo_bootstrap_mid_request_failure_leaves_no_partial_state(api, monkeypatch):
+    """Review #360: a failure after lifecycle/scene staging must not wedge retries.
+
+    The bootstrap runs flush-only inside the idempotent command, so a crash
+    before the atomic commit rolls back everything including the in_progress
+    record — retrying the SAME key must succeed instead of 409-looping.
+    """
+    import app.dm.turns as dm_turns
+
+    from models.campaigns import Campaign
+    from models.reliability import IdempotentCommand
+
+    client, factory, actor, owner_id, _ = api
+    campaign = _create(client)
+    _ready_lobby(factory, campaign["id"], [owner_id])
+
+    real_coordinate = dm_turns.coordinate_turn
+    calls = {"n": 0}
+
+    def _fail_once(*args, **kwargs):
+        calls["n"] += 1
+        if calls["n"] == 1:
+            raise RuntimeError("injected failure after scene staging")
+        return real_coordinate(*args, **kwargs)
+
+    monkeypatch.setattr(dm_turns, "coordinate_turn", _fail_once)
+    # coordinate_turn is imported into solo_bootstrap's namespace at call time
+    # (function-level import), so patching app.dm.turns takes effect.
+    with pytest.raises(RuntimeError, match="injected failure"):
+        _bootstrap(client, campaign["id"], "op-fail-once")
+
+    cid = uuid.UUID(campaign["id"])
+    with factory() as db:
+        # No partial bootstrap state committed …
+        assert db.get(Campaign, cid).status == "lobby"
+        assert db.get(CampaignCurrentScene, cid) is None
+        assert db.execute(select(DmTurn).where(DmTurn.campaign_id == cid)).scalars().all() == []
+        # … and no stranded in_progress idempotency record.
+        rows = db.execute(
+            select(IdempotentCommand).where(
+                IdempotentCommand.idempotency_key == "op-fail-once",
+                IdempotentCommand.command_type == "campaign.solo_bootstrap",
+            )
+        ).scalars().all()
+        assert rows == []
+
+    # Same-key retry succeeds end to end.
+    monkeypatch.setattr(dm_turns, "coordinate_turn", real_coordinate)
+    response = _bootstrap(client, campaign["id"], "op-fail-once")
+    assert response.status_code == 200, response.text
+    assert response.json()["campaign"]["status"] == "active"

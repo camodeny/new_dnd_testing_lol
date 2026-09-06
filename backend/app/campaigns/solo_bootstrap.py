@@ -19,6 +19,12 @@ What it does (owner-authorized, solo only):
 - Marks bootstrap origin via event provenance + scene operation_id so the
   scaffold can be removed cleanly when #245/#246 land.
 
+Transaction boundary: every mutation here is flush-only (commit=False).
+The caller — ``execute_http_idempotent()`` — owns the single atomic commit
+of the idempotency record + all bootstrap state. Never commit from inside
+this module and never run the DM executor here; the router triggers
+best-effort execution after the outer commit succeeds.
+
 Does NOT build: parallel /test-dm endpoint, second frontend surface,
 client-only transcript, world graph generation, multiplayer start.
 """
@@ -35,7 +41,6 @@ logger = logging.getLogger(__name__)
 
 # Marker for temporary scaffold state — grep for this when deleting for #245/#246.
 SOLO_BOOTSTRAP_TAG = "solo-bootstrap-355"
-SOLO_BOOTSTRAP_EVENT = "campaign.solo_bootstrap.started"
 OPENING_OOC_TEXT = (
     "[Solo bootstrap #355 pre-alpha] Begin the adventure: "
     "describe the opening scene and ask what I do."
@@ -110,7 +115,7 @@ def _ensure_lifecycle_active(db: Session, campaign, *, actor_id, operation_id: s
             },
             provenance=provenance,
             mutate=_mutate,
-            commit=True,
+            commit=False,
         )
         logger.info(
             "solo_bootstrap lifecycle campaign_id=%s %s->%s revision=%s",
@@ -189,7 +194,7 @@ def _ensure_bootstrap_scene(db: Session, campaign, *, pc_name: str, actor_id, op
             "replaced_by": "#245/#246",
         },
         mutate=_mutate,
-        commit=True,
+        commit=False,
     )
     db.refresh(campaign_after)
     scene = db.get(CampaignCurrentScene, campaign.id)
@@ -228,7 +233,7 @@ def _ensure_opening_turn(db: Session, campaign, *, thread_id_str: str, owner_id,
         audience="campaign",
     )
     db.flush()
-    coord = coordinate_turn(db, campaign.id, thread_id_str, audience="campaign", commit=True)
+    coord = coordinate_turn(db, campaign.id, thread_id_str, audience="campaign", commit=False)
     if coord is None:
         raise SoloBootstrapError("Opening turn coordination produced no turn")
     turn, attempt = coord
@@ -236,23 +241,11 @@ def _ensure_opening_turn(db: Session, campaign, *, thread_id_str: str, owner_id,
         "solo_bootstrap opening_turn campaign_id=%s thread_id=%s turn_id=%s attempt_id=%s submission_id=%s",
         campaign.id, thread_id_str, turn.id, attempt.id, submission.id,
     )
-    # Best-effort autonomous execution: never fail the bootstrap on provider
-    # errors — the pending turn stays observable as the owed opening turn.
-    try:
-        from app.dm.execution import execute_dm_attempt
-
-        execute_dm_attempt(db, attempt.id)
-        logger.info(
-            "solo_bootstrap opening_execute_attempted campaign_id=%s attempt_id=%s",
-            campaign.id, attempt.id,
-        )
-    except Exception as exc:  # observability only — owed turn remains
-        logger.warning(
-            "solo_bootstrap opening_execute_deferred campaign_id=%s attempt_id=%s stage=execute error=%s",
-            campaign.id, attempt.id, exc,
-        )
-    db.refresh(turn)
-    db.refresh(attempt)
+    # No DM execution here: this runs inside the outer idempotent
+    # transaction (flush-only). The router triggers best-effort execution
+    # after the atomic commit; provider failures leave the pending turn as
+    # the owed, observable opening turn.
+    db.flush()
     return turn, attempt, False
 
 
