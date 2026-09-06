@@ -291,8 +291,16 @@ export function useLiveTableRealtime(opts: UseLiveTableRealtimeOptions) {
     }
     const requestSeq = snapshotRequestSeqRef.current + 1
     snapshotRequestSeqRef.current = requestSeq
+    // Scope the response to the campaign/thread that initiated it: a table
+    // switch mid-flight must not project the old table's state as the new one.
+    const requestCid = cid
+    const requestTid = tid
     try {
       const snap = await apiFetch<SnapshotForRealtime>(`/campaigns/${cid}/snapshot${qs}`)
+      if (campaignIdRef.current !== requestCid || threadIdRef.current !== requestTid) {
+        // Stale scope: leave state, generation guard, and event buffer alone.
+        return null
+      }
       if (requestSeq < lastAdoptedSnapshotRequestRef.current) {
         // A newer snapshot was already adopted while this request was in
         // flight: drop it without touching state or the event buffer.

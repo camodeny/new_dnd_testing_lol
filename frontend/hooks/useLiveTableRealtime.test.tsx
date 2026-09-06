@@ -226,4 +226,80 @@ describe('useLiveTableRealtime snapshot fallback', () => {
     })
     container.remove()
   })
+
+  it('drops a snapshot from the previous table after switching campaigns', async () => {
+    const mkSnap = (revision: number, id: string) => ({
+      history: {
+        messages: [
+          {
+            id,
+            sequence: 9,
+            user_id: 'u1',
+            character_id: null,
+            accepted_at: null,
+            raw_content: id,
+            segments: [{ type: 'ooc', text: id }],
+          },
+        ],
+        pagination: { next_cursor: null, has_more: false },
+      },
+      dm_state: null,
+      dm_messages: [],
+      revision,
+    })
+    const deferred: Array<() => void> = []
+    mockedFetch.mockImplementation(async (url: string) => {
+      if (url.includes('/realtime/authorize')) return {}
+      if (url.includes('/snapshot')) {
+        return new Promise((resolve) => {
+          deferred.push(() => resolve(url.includes('/campaigns/A/') ? mkSnap(10, 'a-1') : mkSnap(11, 'b-1')))
+        })
+      }
+      throw new Error(`unexpected ${url}`)
+    })
+    const fakeChannel: Record<string, unknown> = {}
+    fakeChannel.on = (..._args: unknown[]) => fakeChannel
+    fakeChannel.subscribe = (cb: (status: string) => void) => {
+      cb('SUBSCRIBED')
+      return fakeChannel
+    }
+    mockedChannel.mockImplementation(() => fakeChannel as never)
+
+    const seen: { latest: ReturnType<typeof useLiveTableRealtime> | null } = { latest: null }
+    function Harness({ campaignId, threadId }: { campaignId: string; threadId: string }) {
+      seen.latest = useLiveTableRealtime({ campaignId, threadId })
+      return null
+    }
+    const container = document.createElement('div')
+    document.body.appendChild(container)
+    const root = createRoot(container)
+    await act(async () => {
+      root.render(<Harness campaignId="A" threadId="t1" />)
+    })
+    expect(deferred.length).toBe(1)
+
+    // Switch tables while A's snapshot is still in flight.
+    await act(async () => {
+      root.render(<Harness campaignId="B" threadId="t2" />)
+    })
+    expect(deferred.length).toBe(2)
+
+    // B's snapshot resolves and is adopted.
+    await act(async () => {
+      deferred[1]()
+    })
+    expect(seen.latest?.messages.map((m) => m.id)).toEqual(['b-1'])
+
+    // A's stale snapshot resolves last and must be dropped, not projected as B.
+    await act(async () => {
+      deferred[0]()
+    })
+    expect(seen.latest?.messages.map((m) => m.id)).toEqual(['b-1'])
+    expect(seen.latest?.revision).toBe(11)
+
+    await act(async () => {
+      root.unmount()
+    })
+    container.remove()
+  })
 })
