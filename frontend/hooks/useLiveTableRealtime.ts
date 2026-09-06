@@ -121,6 +121,12 @@ export function useLiveTableRealtime(opts: UseLiveTableRealtimeOptions) {
   const bufferedRef = useRef<RealtimeEvent[]>([])
   const snapshotRef = useRef<SnapshotForRealtime | null>(initialSnapshot ?? null)
   const channelRef = useRef<ReturnType<typeof supabase.channel> | null>(null)
+  // Snapshot request generations: overlapping fetches (interval poll vs
+  // reconnect/terminal/refresh) can resolve out of order. Only adopt a
+  // response when no newer successful response was already adopted, so a
+  // slow request can never move the table backward.
+  const snapshotRequestSeqRef = useRef(0)
+  const lastAdoptedSnapshotRequestRef = useRef(0)
   const isMountedRef = useRef(true)
   const reconnectAttemptsRef = useRef(0)
   const terminalStreamIdsRef = useRef<Set<string>>(new Set())
@@ -283,8 +289,16 @@ export function useLiveTableRealtime(opts: UseLiveTableRealtimeOptions) {
     if (isMountedRef.current && !quiet) {
       setState((prev) => ({ ...prev, phase: prev.hasSnapshot ? 'reconciling' : 'loading', error: null }))
     }
+    const requestSeq = snapshotRequestSeqRef.current + 1
+    snapshotRequestSeqRef.current = requestSeq
     try {
       const snap = await apiFetch<SnapshotForRealtime>(`/campaigns/${cid}/snapshot${qs}`)
+      if (requestSeq < lastAdoptedSnapshotRequestRef.current) {
+        // A newer snapshot was already adopted while this request was in
+        // flight: drop it without touching state or the event buffer.
+        return null
+      }
+      lastAdoptedSnapshotRequestRef.current = requestSeq
       adoptSnapshot(snap)
       // Snapshot/subscription race invariant (shared by subscribe, reconnect,
       // refresh, and polling paths): replay broadcasts that arrived while
@@ -359,6 +373,8 @@ export function useLiveTableRealtime(opts: UseLiveTableRealtimeOptions) {
     isMountedRef.current = true
     bufferedRef.current = []
     snapshotRef.current = null
+    snapshotRequestSeqRef.current = 0
+    lastAdoptedSnapshotRequestRef.current = 0
     terminalStreamIdsRef.current = new Set()
     historyCursorRef.current = null
     setState({
