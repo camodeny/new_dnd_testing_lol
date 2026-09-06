@@ -14,10 +14,9 @@ if not hasattr(SQLiteTypeCompiler, "_patched_jsonb"):
     SQLiteTypeCompiler.visit_JSONB = lambda self, type_, **kw: "JSON"  # type: ignore
     SQLiteTypeCompiler._patched_jsonb = True  # type: ignore
 
-os.environ["ALLOW_MOCK_AUTH"] = "true"
 os.environ["NODE_ENV"] = "test"
 
-from app.auth.service import MOCK_USER_ID  # noqa: E402
+from app.auth.service import TEST_USER_ID  # noqa: E402
 from database import Base, get_db  # noqa: E402
 from main import app  # noqa: E402
 from models.profiles import Profile  # noqa: E402
@@ -31,7 +30,7 @@ def client(monkeypatch):
     Base.metadata.create_all(engine)
     factory = sessionmaker(bind=engine, expire_on_commit=False)
     with factory() as db:
-        db.add(Profile(id=MOCK_USER_ID, email="owner@example.com"))
+        db.add(Profile(id=TEST_USER_ID, email="owner@example.com"))
         db.commit()
 
     def override_db():
@@ -40,7 +39,7 @@ def client(monkeypatch):
 
     monkeypatch.setattr(
         "app.campaigns.router.resolve_profile",
-        lambda request, db: db.get(Profile, MOCK_USER_ID),
+        lambda request, db: db.get(Profile, TEST_USER_ID),
     )
     app.dependency_overrides[get_db] = override_db
     try:

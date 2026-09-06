@@ -617,13 +617,13 @@ def test_dm_only_scene_excluded_from_player_narration_projection():
 def world_api(monkeypatch):
     from fastapi.testclient import TestClient
 
-    from app.auth.service import MOCK_USER_ID
+    from app.auth.service import TEST_USER_ID
     from database import get_db
     from main import app
 
     eng = _engine()
     Fac = sessionmaker(bind=eng, expire_on_commit=False)
-    owner = MOCK_USER_ID
+    owner = TEST_USER_ID
     member = uuid.uuid4()
     cid = uuid.uuid4()
     db = Fac()
@@ -643,7 +643,10 @@ def world_api(monkeypatch):
         finally:
             session.close()
 
-    monkeypatch.setenv("ALLOW_MOCK_AUTH", "true")
+    monkeypatch.setattr(
+        "app.world.router.resolve_profile",
+        lambda req, db: db.get(Profile, TEST_USER_ID),
+    )
     app.dependency_overrides[get_db] = override_db
     try:
         yield TestClient(app), cid, owner, member

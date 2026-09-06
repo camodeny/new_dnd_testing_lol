@@ -406,24 +406,27 @@ def test_missing_campaign_raises_value_error():
 
 
 def test_campaign_update_http_contract_requires_and_checks_revision(monkeypatch):
-    from app.auth.service import MOCK_USER_ID
+    from app.auth.service import TEST_USER_ID
     from main import app
 
     eng = _sqlite_engine()
     factory = sessionmaker(bind=eng)
     campaign_id = uuid.uuid4()
     with factory() as db:
-        db.add(Profile(id=MOCK_USER_ID, email="mock@example.com"))
-        db.add(Campaign(id=campaign_id, owner_id=MOCK_USER_ID, name="Before"))
-        db.add(CampaignMember(campaign_id=campaign_id, user_id=MOCK_USER_ID, role="owner"))
+        db.add(Profile(id=TEST_USER_ID, email="mock@example.com"))
+        db.add(Campaign(id=campaign_id, owner_id=TEST_USER_ID, name="Before"))
+        db.add(CampaignMember(campaign_id=campaign_id, user_id=TEST_USER_ID, role="owner"))
         db.commit()
 
     def override_db():
         with factory() as db:
             yield db
 
-    monkeypatch.setenv("ALLOW_MOCK_AUTH", "true")
     monkeypatch.setenv("NODE_ENV", "test")
+    monkeypatch.setattr(
+        "app.campaigns.router.resolve_profile",
+        lambda request, db: db.get(Profile, TEST_USER_ID),
+    )
     app.dependency_overrides[get_db] = override_db
     try:
         client = TestClient(app)

@@ -25,6 +25,10 @@ function determineCampaignMode(
 ): CampaignMode {
   if (currentMode) return currentMode
   if (campaign.active_session) return 'session'
+  // status is the only live-table state that survives refresh (#355):
+  // solo bootstrap leaves the campaign active with a durable thread.
+  if (campaign.status === 'active') return 'session'
+  if (campaign.status === 'starting' && (campaign.required_players ?? 1) <= 1) return 'world-building'
   return 'lobby'
 }
 
@@ -70,7 +74,12 @@ export default function CampaignViewPage() {
 
       const camp = campData.campaign
       setCampaign(camp)
-      setCharacters(charData.characters ?? [])
+      // Launch roster entries carry character_id instead of id — normalize
+      // once so keys, current-character lookup, and projection all match.
+      setCharacters((charData.characters ?? []).map((c) => ({
+        ...c,
+        id: c.id ?? (c as unknown as { character_id?: string }).character_id ?? '',
+      })))
       const campaignThread = channelData.channels.find((channel) => channel.thread_type === 'campaign')
       if (!campaignThread) throw new Error('The campaign live table is not available.')
       setActiveThreadId(campaignThread.thread_id)
@@ -81,6 +90,17 @@ export default function CampaignViewPage() {
         setSession(activeSession)
         // No authoritative encounter-map backend (stub removed); map state
         // stays client-owned via StoryAtlas onEncounterMapChange.
+        setMode('session')
+      } else if (camp.status === 'active') {
+        // Live table survived a refresh: re-enter the session with a
+        // synthetic session handle; the durable thread id comes from
+        // channels above and history from the snapshot hook (#355).
+        setSession({
+          id: `solo-${String(id)}`,
+          campaign_id: String(id),
+          status: 'active',
+          created_at: new Date().toISOString(),
+        })
         setMode('session')
       } else {
         setMode((prev) => determineCampaignMode(camp as Campaign & { active_session?: Session | null; world?: unknown }, prev))
@@ -99,13 +119,36 @@ export default function CampaignViewPage() {
   const handleStartSession = useCallback(async () => {
     if (!id) return
     try {
+      // Solo dogfood path (#355, pre-alpha): bootstrap straight into the
+      // production live-table runtime. Temporary — replaced by #245/#246.
+      const solo = campaign ? (campaign.required_players ?? 1) <= 1 : false
+      if (solo) {
+        const key =
+          typeof crypto !== 'undefined' && typeof crypto.randomUUID === 'function'
+            ? crypto.randomUUID()
+            : `${Date.now()}-${Math.random().toString(36).slice(2)}`
+        const data = await campaignsApi.soloBootstrap(String(id), key) as {
+          campaign: Campaign
+          thread_id: string
+        }
+        setCampaign((prev) => (prev ? { ...prev, ...data.campaign } : prev))
+        if (data.thread_id) setActiveThreadId(data.thread_id)
+        setSession({
+          id: `solo-${String(id)}`,
+          campaign_id: String(id),
+          status: 'active',
+          created_at: new Date().toISOString(),
+        })
+        setMode('session')
+        return
+      }
       const data = await sessionsApi.start(String(id)) as { session: Session }
       setSession(data.session)
       setMode('session')
     } catch (err) {
       setError((err as Error).message)
     }
-  }, [id])
+  }, [id, campaign])
 
   const handleSendMessage = useCallback(async (content: string) => {
     if (!id || !session?.id || !activeThreadId) return

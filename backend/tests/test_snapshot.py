@@ -13,7 +13,7 @@ if not hasattr(SQLiteTypeCompiler, "_patched_jsonb"):
     SQLiteTypeCompiler.visit_JSONB = lambda self, type_, **kw: "JSON"  # type: ignore
     SQLiteTypeCompiler._patched_jsonb = True  # type: ignore
 
-from app.auth.service import MOCK_USER_ID  # noqa: E402
+from app.auth.service import TEST_USER_ID  # noqa: E402
 from database import Base, get_db  # noqa: E402
 from main import app  # noqa: E402
 from models.campaigns import Campaign
@@ -31,7 +31,7 @@ def api(monkeypatch):
     campaign_id = uuid.uuid4()
     member_id = uuid.uuid4()
     outsider_id = uuid.uuid4()
-    owner_id = MOCK_USER_ID
+    owner_id = TEST_USER_ID
     with factory() as db:
         # Use router's campaign creation path to ensure shared thread exists?
         # For this fixture we insert directly and also create shared thread,
@@ -63,8 +63,19 @@ def api(monkeypatch):
         with factory() as db:
             yield db
 
-    monkeypatch.setenv("ALLOW_MOCK_AUTH", "true")
     monkeypatch.setenv("NODE_ENV", "test")
+    monkeypatch.setattr(
+        "app.runtime.router.resolve_profile",
+        lambda request, db: db.get(Profile, TEST_USER_ID),
+    )
+    monkeypatch.setattr(
+        "app.snapshot.router.resolve_profile",
+        lambda request, db: db.get(Profile, TEST_USER_ID),
+    )
+    monkeypatch.setattr(
+        "app.campaigns.router.resolve_profile",
+        lambda request, db: db.get(Profile, TEST_USER_ID),
+    )
     app.dependency_overrides[get_db] = override_db
     try:
         yield TestClient(app), factory, campaign_id, member_id, outsider_id
@@ -79,15 +90,26 @@ def api_via_router(monkeypatch):
     Base.metadata.create_all(engine)
     factory = sessionmaker(bind=engine, expire_on_commit=False)
     with factory() as db:
-        db.add(Profile(id=MOCK_USER_ID, email="owner@example.com"))
+        db.add(Profile(id=TEST_USER_ID, email="owner@example.com"))
         db.commit()
 
     def override_db():
         with factory() as db:
             yield db
 
-    monkeypatch.setenv("ALLOW_MOCK_AUTH", "true")
     monkeypatch.setenv("NODE_ENV", "test")
+    monkeypatch.setattr(
+        "app.runtime.router.resolve_profile",
+        lambda request, db: db.get(Profile, TEST_USER_ID),
+    )
+    monkeypatch.setattr(
+        "app.snapshot.router.resolve_profile",
+        lambda request, db: db.get(Profile, TEST_USER_ID),
+    )
+    monkeypatch.setattr(
+        "app.campaigns.router.resolve_profile",
+        lambda request, db: db.get(Profile, TEST_USER_ID),
+    )
     app.dependency_overrides[get_db] = override_db
     try:
         client = TestClient(app)
@@ -127,7 +149,7 @@ def test_snapshot_reconstructs_current_state_after_disconnected_mutations(api):
     # Simulate disconnection: mutate from another client (different session)
     with factory() as db:
         camp, evt = commit_campaign_mutation(
-            db, campaign_id, expected_revision=0, event_type="campaign.test", operation_id="op1", actor_id=MOCK_USER_ID
+            db, campaign_id, expected_revision=0, event_type="campaign.test", operation_id="op1", actor_id=TEST_USER_ID
         )
         db.commit()
         assert evt.sequence == 1
@@ -138,7 +160,7 @@ def test_snapshot_reconstructs_current_state_after_disconnected_mutations(api):
 
     with factory() as db:
         camp, evt = commit_campaign_mutation(
-            db, campaign_id, expected_revision=1, event_type="campaign.test2", operation_id="op2", actor_id=MOCK_USER_ID
+            db, campaign_id, expected_revision=1, event_type="campaign.test2", operation_id="op2", actor_id=TEST_USER_ID
         )
         db.commit()
         assert evt.sequence == 2
@@ -220,12 +242,12 @@ def test_snapshot_omits_private_data_server_side(api, monkeypatch):
     from app.runtime.submissions import accept_submission
 
     with factory() as db:
-        t = create_private_thread(db, campaign_id=campaign_id, created_by=MOCK_USER_ID, member_ids=[member_id], title="secret")
+        t = create_private_thread(db, campaign_id=campaign_id, created_by=TEST_USER_ID, member_ids=[member_id], title="secret")
         private_id = str(t.id)
         shared = db.scalar(select(CampaignThread).where(CampaignThread.campaign_id == campaign_id, CampaignThread.thread_type == "campaign"))
         shared_id = str(shared.id)
-        accept_submission(db, campaign_id=campaign_id, user_id=MOCK_USER_ID, raw_content="shared msg", segments=[{"type": "ooc", "text": "shared msg"}], thread_id=shared_id, audience="campaign")
-        accept_submission(db, campaign_id=campaign_id, user_id=MOCK_USER_ID, raw_content="private secret", segments=[{"type": "ooc", "text": "private secret"}], thread_id=private_id, audience="private")
+        accept_submission(db, campaign_id=campaign_id, user_id=TEST_USER_ID, raw_content="shared msg", segments=[{"type": "ooc", "text": "shared msg"}], thread_id=shared_id, audience="campaign")
+        accept_submission(db, campaign_id=campaign_id, user_id=TEST_USER_ID, raw_content="private secret", segments=[{"type": "ooc", "text": "private secret"}], thread_id=private_id, audience="private")
         db.commit()
 
     # Owner snapshot of shared thread must not leak private msg

@@ -29,6 +29,7 @@ from app.dm.contract import (  # noqa: F401
     RollRequest,
     StagedEffect,
     contract_json_schema,
+    contract_json_schema_strict,
     normalize_contract,
     parse_contract,
     public_projection,

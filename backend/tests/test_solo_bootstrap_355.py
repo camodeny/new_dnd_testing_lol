@@ -1,0 +1,181 @@
+"""Issue #355 — minimal solo campaign bootstrap into the production live-table runtime."""
+from __future__ import annotations
+
+import uuid
+
+import pytest
+from fastapi.testclient import TestClient
+from sqlalchemy import create_engine, func, select
+from sqlalchemy.dialects.sqlite.base import SQLiteTypeCompiler
+from sqlalchemy.orm import sessionmaker
+from sqlalchemy.pool import StaticPool
+
+if not hasattr(SQLiteTypeCompiler, "_patched_jsonb"):
+    SQLiteTypeCompiler.visit_JSONB = lambda self, type_, **kw: "JSON"  # type: ignore
+    SQLiteTypeCompiler._patched_jsonb = True  # type: ignore
+
+from app.auth.service import TEST_USER_ID  # noqa: E402
+from database import Base, get_db  # noqa: E402
+from main import app  # noqa: E402
+from models.campaigns import CampaignMember  # noqa: E402
+from models.characters import Character  # noqa: E402
+from models.characters import Dnd5eCharacterSheet  # noqa: E402
+from models.dm import DmTurn  # noqa: E402
+from models.profiles import Profile  # noqa: E402
+from models.threads import CampaignThread  # noqa: E402
+from models.world import CampaignCurrentScene  # noqa: E402
+
+
+def _ready_lobby(factory, campaign_id: str, user_ids: list) -> None:
+    from datetime import datetime, timezone
+
+    cid = uuid.UUID(campaign_id)
+    with factory() as db:
+        for uid in user_ids:
+            char = Character(owner_id=uid, name=f"Hero {str(uid)[:8]}", system="dnd5e")
+            db.add(char)
+            db.flush()
+            db.add(Dnd5eCharacterSheet(
+                character_id=char.id, owner_id=uid, character_name=char.name,
+                race="Human", char_class="Fighter", level=1,
+            ))
+            db.flush()
+            member = db.get(CampaignMember, {"campaign_id": cid, "user_id": uid})
+            assert member is not None
+            member.selected_character_id = char.id
+            member.is_ready = True
+            member.ready_at = datetime.now(timezone.utc)
+        db.commit()
+
+
+@pytest.fixture
+def api(monkeypatch):
+    engine = create_engine(
+        "sqlite://", connect_args={"check_same_thread": False}, poolclass=StaticPool
+    )
+    Base.metadata.create_all(engine)
+    factory = sessionmaker(bind=engine, expire_on_commit=False)
+    owner_id = TEST_USER_ID
+    outsider_id = uuid.uuid4()
+    with factory() as db:
+        db.add_all([
+            Profile(id=owner_id, email="owner@example.com"),
+            Profile(id=outsider_id, email="outsider@example.com"),
+        ])
+        db.commit()
+
+    actor = {"id": owner_id}
+
+    def override_db():
+        with factory() as db:
+            yield db
+
+    monkeypatch.setattr(
+        "app.campaigns.router.resolve_profile",
+        lambda request, db: db.get(Profile, actor["id"]),
+    )
+    app.dependency_overrides[get_db] = override_db
+    try:
+        yield TestClient(app), factory, actor, owner_id, outsider_id
+    finally:
+        app.dependency_overrides.clear()
+
+
+def _create(client: TestClient, **overrides) -> dict:
+    payload = {"name": "Solo Bootstrap", "required_players": 1, **overrides}
+    response = client.post("/api/campaigns", json=payload)
+    assert response.status_code == 200, response.text
+    return response.json()["campaign"]
+
+
+def _bootstrap(client: TestClient, campaign_id: str, key: str):
+    return client.post(
+        f"/api/campaigns/{campaign_id}/solo-bootstrap",
+        json={"operation_id": key},
+        headers={"Idempotency-Key": key},
+    )
+
+
+def test_solo_bootstrap_starts_active_table_with_opening_turn(api):
+    client, factory, actor, owner_id, _ = api
+    campaign = _create(client)
+    _ready_lobby(factory, campaign["id"], [owner_id])
+
+    response = _bootstrap(client, campaign["id"], "op-solo-1")
+    assert response.status_code == 200, response.text
+    body = response.json()
+    assert body["campaign"]["status"] == "active"
+    assert body["thread_id"]
+    assert body["dm_turn"]["id"]
+    assert body["dm_attempt"]["id"]
+    assert body["scene"]["location_name"] == "Emberhold Tavern"
+    assert body["solo_bootstrap"] is True
+
+    with factory() as db:
+        cid = uuid.UUID(campaign["id"])
+        scene = db.get(CampaignCurrentScene, cid)
+        assert scene is not None
+        assert (scene.environment or {}).get("bootstrap") == "solo-bootstrap-355"
+        threads = db.execute(
+            select(CampaignThread).where(CampaignThread.campaign_id == cid)
+        ).scalars().all()
+        assert len(threads) == 1
+        turns = db.execute(
+            select(DmTurn).where(DmTurn.campaign_id == cid)
+        ).scalars().all()
+        assert len(turns) == 1
+
+
+def test_solo_bootstrap_duplicate_start_is_idempotent(api):
+    client, factory, actor, owner_id, _ = api
+    campaign = _create(client)
+    _ready_lobby(factory, campaign["id"], [owner_id])
+
+    first = _bootstrap(client, campaign["id"], "op-solo-dup-1")
+    assert first.status_code == 200, first.text
+    # Different key — must still reuse thread + opening turn, not duplicate.
+    second = _bootstrap(client, campaign["id"], "op-solo-dup-2")
+    assert second.status_code == 200, second.text
+    assert second.json()["thread_id"] == first.json()["thread_id"]
+    assert second.json()["dm_turn"]["id"] == first.json()["dm_turn"]["id"]
+
+    with factory() as db:
+        cid = uuid.UUID(campaign["id"])
+        thread_count = db.scalar(
+            select(func.count()).select_from(CampaignThread).where(CampaignThread.campaign_id == cid)
+        )
+        turn_count = db.scalar(
+            select(func.count()).select_from(DmTurn).where(DmTurn.campaign_id == cid)
+        )
+        assert thread_count == 1
+        assert turn_count == 1
+
+
+def test_solo_bootstrap_rejects_non_solo_and_non_owner(api):
+    client, factory, actor, owner_id, outsider_id = api
+    multi = _create(client, name="Multi", required_players=2)
+    _ready_lobby(factory, multi["id"], [owner_id])
+    response = _bootstrap(client, multi["id"], "op-multi")
+    assert response.status_code == 409, response.text
+
+    solo = _create(client, name="Solo2")
+    _ready_lobby(factory, solo["id"], [owner_id])
+    actor["id"] = outsider_id
+    response = _bootstrap(client, solo["id"], "op-outsider")
+    assert response.status_code in (403, 404), response.text
+    actor["id"] = owner_id
+
+
+def test_solo_bootstrap_requires_ready_character(api):
+    client, factory, actor, owner_id, _ = api
+    campaign = _create(client)
+    # No selection/readiness — must stay startable again (409, no side effects).
+    response = _bootstrap(client, campaign["id"], "op-not-ready")
+    assert response.status_code == 409, response.text
+    with factory() as db:
+        cid = uuid.UUID(campaign["id"])
+        assert db.get(CampaignCurrentScene, cid) is None
+        turns = db.execute(
+            select(DmTurn).where(DmTurn.campaign_id == cid)
+        ).scalars().all()
+        assert turns == []

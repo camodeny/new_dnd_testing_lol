@@ -24,7 +24,7 @@ from typing import Any, Callable, Literal, Protocol
 from pydantic import BaseModel, ConfigDict, Field
 
 from app.dm.context import ContextAudience, ForwardDmContextPacket, LaneName
-from app.dm.contract import Claim, DmTurnContractV1
+from app.dm.contract import Claim, ContractValidationError, DmTurnContractV1
 from app.observability.tracing import structured_log
 
 logger = logging.getLogger(__name__)
@@ -1171,18 +1171,44 @@ def run_with_bounded_regeneration(
 
     for attempt in range(max_regenerations + 1):
         feedback: str | None = format_rejection_for_retry(last_report) if last_report else None
-        # Augment packet with repair feedback for packet-aware adjudicators
-        if attempt > 0 and feedback is not None:
-            current_packet = _augment_packet_with_feedback(packet, feedback, last_report.correlation_id if last_report else "retry")  # type: ignore[union-attr]
-            raw = _call_adjudicate(adjudicate, current_packet, feedback)
-        else:
-            raw = _call_adjudicate(adjudicate, current_packet, feedback)
-        if isinstance(raw, dict):
-            contract = norm(raw)
-        elif isinstance(raw, DmTurnContractV1):
-            contract = raw
-        else:
-            raise ValidatorError(f"adjudicate must return contract dict or DmTurnContractV1, got {type(raw)}")
+        try:
+            # Augment packet with repair feedback for packet-aware adjudicators
+            if attempt > 0 and feedback is not None:
+                current_packet = _augment_packet_with_feedback(packet, feedback, last_report.correlation_id if last_report else "retry")  # type: ignore[union-attr]
+                raw = _call_adjudicate(adjudicate, current_packet, feedback)
+            else:
+                raw = _call_adjudicate(adjudicate, current_packet, feedback)
+            if isinstance(raw, dict):
+                contract = norm(raw)
+            elif isinstance(raw, DmTurnContractV1):
+                contract = raw
+            else:
+                raise ValidatorError(f"adjudicate must return contract dict or DmTurnContractV1, got {type(raw)}")
+        except ContractValidationError as exc:
+            # Structurally invalid output never reaches validators — convert to
+            # a synthetic rejection so it retries with explicit feedback
+            # instead of failing on the first shot.
+            last_report = ValidationReport(
+                passed=False,
+                violations=[ValidationViolation(
+                    validator="contract",
+                    category="structure",
+                    code="invalid_contract",
+                    message=str(exc)[:500],
+                )],
+                results=[],
+                regeneration_index=attempt,
+                total_latency_ms=0,
+                correlation_id=str(uuid.uuid4()),
+            )
+            structured_log(
+                logger, logging.WARNING, "validator_regeneration",
+                attempt=attempt, violations=["contract/invalid_contract"],
+                correlation_id=last_report.correlation_id,
+            )
+            if attempt >= max_regenerations:
+                break
+            continue
 
         report = pipe.validate(
             contract, current_packet,

@@ -391,6 +391,56 @@ def transition_campaign_lifecycle(
         ) from exc
 
 
+@router.post("/api/campaigns/{campaign_id}/solo-bootstrap")
+def solo_bootstrap_campaign(
+    campaign_id: str,
+    payload: dict,
+    request: Request,
+    response: Response,
+    db: Session = Depends(get_db),
+):
+    """Minimal solo start into the production live-table runtime — issue #355.
+
+    Pre-alpha scaffold; deleted/replaced by #245/#246. Owner-only, exactly one
+    ready member. Idempotent under repeated clicks (state-guarded).
+    """
+    from app.campaigns.solo_bootstrap import SoloBootstrapError, run_solo_bootstrap
+
+    profile = resolve_profile(request, db)
+    try:
+        cid = parse_campaign_id(campaign_id)
+    except ValueError:
+        raise HTTPException(status_code=404, detail="Invalid campaign id")
+    operation_id = str(payload.get("operation_id") or "").strip() or None
+    idempotency_key = require_idempotency_key(request, operation_id)
+
+    def _execute():
+        try:
+            return run_solo_bootstrap(
+                db, cid, actor_id=profile.id,
+                operation_id=operation_id or idempotency_key,
+            )
+        except SoloBootstrapError as exc:
+            msg = str(exc)
+            if msg == "Campaign not found":
+                raise HTTPException(status_code=404, detail=msg) from exc
+            if msg.startswith("Only the owner"):
+                raise HTTPException(status_code=403, detail=msg) from exc
+            raise HTTPException(status_code=409, detail=msg) from exc
+
+    return execute_http_idempotent(
+        db,
+        response,
+        actor_id=profile.id,
+        idempotency_key=idempotency_key,
+        command_type="campaign.solo_bootstrap",
+        scope_type="campaign",
+        scope_id=cid,
+        payload=payload,
+        execute=_execute,
+    )
+
+
 @router.post("/api/campaigns/{campaign_id}/mutations")
 def commit_campaign_mutation_endpoint(
     campaign_id: str,

@@ -36,8 +36,6 @@ jobs:
           pip install pytest httpx
       - name: Run cold-start DDL guard tests
         working-directory: backend
-        env:
-          ALLOW_MOCK_AUTH: "true"
         run: python -m pytest tests/test_no_cold_start_ddl.py -v
 
   forced-failure-gate:

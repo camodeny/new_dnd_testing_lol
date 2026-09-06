@@ -65,7 +65,25 @@ def build_forward_dm_messages(packet) -> list[dict]:
         "('dm_turn_contract_v1'), mode, reason, beats[], open_player_choice, "
         "narration_hints, adjudication_input, new_entities[], staged_effects[], "
         "evidence_requests[], roll_request, table_chat_intent, safe_prelude, "
-        "clarify_question."
+        "clarify_question. beats is REQUIRED except in need_evidence, "
+        "table_chat, and silent modes: respond needs 1-8 beats, clarify at "
+        "most 2 setup beats. Every beat needs id, type, and 1+ claims; beat "
+        "type is ONLY narration or npc_dialogue, never anything else; never "
+        "emit an empty beats array with mode respond. Every claim is an "
+        "OBJECT, never a bare string: "
+        '{"text": "...", "claim_kind": "observation|world_fact|npc_utterance|'
+        'player_declaration|roll_instruction|roll_outcome", "origin": '
+        '"player_transcript|established_state|resolver_evidence|'
+        'dm_adjudication|roll_adjudication"}. Scene description claims use '
+        'claim_kind=observation with origin=established_state. '
+        'player_declaration claims REQUIRE actor_ref {"type": "character", '
+        '"id": "<speaking PC id from the packet>"} with origin '
+        'player_transcript; when the speaker id is unknown use observation '
+        'with origin dm_adjudication instead of a bare player_declaration. '
+        'open_player_choice is a plain STRING question like "What do you '
+        'do?", never an object. On narration beats, speaker_ref, '
+        'speaker_public_name, truth_status, and dm_private_context must all '
+        'be null (they belong to npc_dialogue beats only).'
     )
     return [
         {"role": "system", "content": FORWARD_DM_SYSTEM + "\n" + schema_hint},
@@ -116,7 +134,7 @@ def adjudicate_with_provider(
     Raises the provider/validation error unchanged so the execution
     orchestrator can mark a visible failure (never fabricate a turn).
     """
-    from app.dm.contract import contract_json_schema, normalize_contract
+    from app.dm.contract import contract_json_schema_strict, normalize_contract
     from app.providers import ProviderRequest, execute_chat
     from app.observability.tracing import structured_log
 
@@ -129,9 +147,12 @@ def adjudicate_with_provider(
     request = ProviderRequest(
         messages=messages,
         model=model,
-        json_schema=contract_json_schema(),
+        json_schema=contract_json_schema_strict(),
         json_schema_name="dm_turn_contract_v1",
         timeout_seconds=timeout_seconds,
+        # Deterministic adjudication: structured contracts need exact schema
+        # adherence, not sampling variance.
+        temperature=0,
     )
     structured_log(
         logger, logging.INFO, "forward_dm_provider_start",

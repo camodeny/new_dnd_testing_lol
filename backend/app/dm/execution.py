@@ -551,6 +551,8 @@ def _execute_owned_attempt(
         # its visibility filtering and per-round budget decisions.
         validation_packet = packet
 
+        from app.dm.contract import ContractValidationError as _ContractValidationError
+
         def evidence_adjudicate(enriched_packet):
             nonlocal validation_packet
             validation_packet = enriched_packet
@@ -566,6 +568,11 @@ def _execute_owned_attempt(
             contract = final_contract
         else:
             contract, report = run_with_bounded_regeneration(adjudicate, packet)
+    except _ContractValidationError:
+        # Structurally invalid first adjudication never reaches validators —
+        # retry through the bounded regen loop with explicit feedback.
+        db.rollback()
+        contract, report = run_with_bounded_regeneration(adjudicate, packet)
     except Exception as exc:
         db.rollback()
         _fail_visible(exc)

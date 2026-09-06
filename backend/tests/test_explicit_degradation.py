@@ -19,7 +19,7 @@ if not hasattr(SQLiteTypeCompiler, "_patched_jsonb"):
     SQLiteTypeCompiler.visit_JSONB = lambda self, type_, **kw: "JSON"  # type: ignore
     SQLiteTypeCompiler._patched_jsonb = True  # type: ignore
 
-from app.auth.service import MOCK_USER_ID  # noqa: E402
+from app.auth.service import TEST_USER_ID  # noqa: E402
 from app.realtime.channels import live_table_channel, parse_live_table_channel  # noqa: E402
 from database import Base, get_db  # noqa: E402
 from main import app  # noqa: E402
@@ -135,10 +135,10 @@ def api(monkeypatch):
     with factory() as db:
         db.add_all(
             [
-                Profile(id=MOCK_USER_ID, email="owner@example.com"),
-                Campaign(id=campaign_id, owner_id=MOCK_USER_ID, name="Table"),
+                Profile(id=TEST_USER_ID, email="owner@example.com"),
+                Campaign(id=campaign_id, owner_id=TEST_USER_ID, name="Table"),
                 CampaignMember(
-                    campaign_id=campaign_id, user_id=MOCK_USER_ID, role="owner"
+                    campaign_id=campaign_id, user_id=TEST_USER_ID, role="owner"
                 ),
             ]
         )
@@ -148,8 +148,11 @@ def api(monkeypatch):
         with factory() as db:
             yield db
 
-    monkeypatch.setenv("ALLOW_MOCK_AUTH", "true")
     monkeypatch.setenv("NODE_ENV", "test")
+    monkeypatch.setattr(
+        "app.runtime.router.resolve_profile",
+        lambda request, db: db.get(Profile, TEST_USER_ID),
+    )
     app.dependency_overrides[get_db] = override_db
     try:
         yield TestClient(app), campaign_id

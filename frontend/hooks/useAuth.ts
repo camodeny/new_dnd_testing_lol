@@ -5,10 +5,14 @@ import { auth } from '@/lib/api'
 import { supabase } from '@/lib/supabase'
 import type { User } from '@/types'
 
-const MOCK_USER: User | null =
-  process.env.NEXT_PUBLIC_MOCK_USER === 'true'
-    ? { id: '23f3b2d1-efb6-4785-9a67-fa7ca57d72a3', username: 'dev', email: 'dev@fireside.local' }
-    : null
+// Local-dev auto-login: signs in with the dev user from env so dogfooding
+// skips the login form. Gated to non-production builds — in a production
+// build these vars are ignored even if present. Never set them in a
+// deployed environment (values bake into the client bundle).
+const DEV_USER_EMAIL = process.env.NEXT_PUBLIC_DEV_USER_EMAIL ?? ''
+const DEV_USER_PASSWORD = process.env.NEXT_PUBLIC_DEV_USER_PASSWORD ?? ''
+const DEV_AUTO_LOGIN =
+  process.env.NODE_ENV !== 'production' && DEV_USER_EMAIL !== '' && DEV_USER_PASSWORD !== ''
 
 function supabaseUserToAppUser(su: { id: string; email?: string | null; user_metadata?: Record<string, unknown> }): User {
   const email = (su.email ?? null) as string | null
@@ -22,16 +26,28 @@ function supabaseUserToAppUser(su: { id: string; email?: string | null; user_met
 }
 
 export function useAuth() {
-  const [user, setUser] = useState<User | null>(MOCK_USER)
-  const [loading, setLoading] = useState(MOCK_USER ? false : true)
+  const [user, setUser] = useState<User | null>(null)
+  const [loading, setLoading] = useState(true)
 
   useEffect(() => {
-    if (MOCK_USER) return
-
     let cancelled = false
 
-    // 1. Check Supabase session first; sync token to localStorage for apiFetch (backend JWT)
-    supabase.auth.getSession().then(async ({ data }) => {
+    const init = async () => {
+      // Dev auto-login first (skipped without env creds or with a session).
+      if (DEV_AUTO_LOGIN) {
+        const { data } = await supabase.auth.getSession()
+        if (!data.session && !cancelled) {
+          const { error } = await supabase.auth.signInWithPassword({
+            email: DEV_USER_EMAIL,
+            password: DEV_USER_PASSWORD,
+          })
+          if (error && !cancelled) {
+            console.error('[auth] dev auto-login failed:', error.message)
+          }
+        }
+      }
+      // Check Supabase session; sync token to localStorage for apiFetch (backend JWT)
+      await supabase.auth.getSession().then(async ({ data }) => {
       const session = data.session
       if (session?.access_token) {
         localStorage.setItem('token', session.access_token)
@@ -58,6 +74,9 @@ export function useAuth() {
         setLoading(false)
       }
     })
+    }
+
+    void init()
 
     // 2. Keep token in sync on refresh / sign-out
     const {

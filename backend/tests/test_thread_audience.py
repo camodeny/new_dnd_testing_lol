@@ -12,7 +12,7 @@ if not hasattr(SQLiteTypeCompiler, "_patched_jsonb"):
     SQLiteTypeCompiler.visit_JSONB = lambda self, type_, **kw: "JSON"  # type: ignore
     SQLiteTypeCompiler._patched_jsonb = True  # type: ignore
 
-from app.auth.service import MOCK_USER_ID  # noqa: E402
+from app.auth.service import TEST_USER_ID  # noqa: E402
 from app.runtime.threads import can_read_thread, get_or_create_campaign_thread  # noqa: E402
 from database import Base, get_db  # noqa: E402
 from main import app  # noqa: E402
@@ -32,7 +32,7 @@ def api(monkeypatch):
     campaign_id = uuid.uuid4()
     member_id = uuid.uuid4()
     outsider_id = uuid.uuid4()
-    owner_id = MOCK_USER_ID
+    owner_id = TEST_USER_ID
     with factory() as db:
         db.add_all([
             Profile(id=owner_id, email="owner@example.com"),
@@ -49,7 +49,10 @@ def api(monkeypatch):
         with factory() as db:
             yield db
 
-    monkeypatch.setenv("ALLOW_MOCK_AUTH", "true")
+    monkeypatch.setattr(
+        "app.runtime.router.resolve_profile",
+        lambda request, db: db.get(Profile, TEST_USER_ID),
+    )
     app.dependency_overrides[get_db] = override_db
     try:
         yield TestClient(app), factory, campaign_id, member_id, outsider_id
@@ -142,7 +145,7 @@ def test_ai_dm_thread_is_idempotent_and_private_from_owner_and_other_players(api
         ).count() == 1
 
     # Campaign ownership is not a private-thread bypass.
-    monkeypatch.setattr("app.runtime.router.resolve_profile", lambda req, db: db.get(Profile, MOCK_USER_ID))
+    monkeypatch.setattr("app.runtime.router.resolve_profile", lambda req, db: db.get(Profile, TEST_USER_ID))
     owner_read = client.get(f"/api/campaigns/{campaign_id}/threads/{private_tid}")
     assert owner_read.status_code == 404
 
@@ -175,14 +178,14 @@ def test_direct_thread_is_idempotent_for_pair_and_visible_only_to_pair(api, monk
     assert reverse.json()["thread"]["id"] == private_tid
 
     # The campaign owner was not selected and cannot discover or read the thread.
-    monkeypatch.setattr("app.runtime.router.resolve_profile", lambda req, db: db.get(Profile, MOCK_USER_ID))
+    monkeypatch.setattr("app.runtime.router.resolve_profile", lambda req, db: db.get(Profile, TEST_USER_ID))
     assert client.get(f"/api/campaigns/{campaign_id}/threads/{private_tid}").status_code == 404
     assert private_tid not in [t["id"] for t in client.get(f"/api/campaigns/{campaign_id}/threads").json()["threads"]]
 
 
 def test_owner_without_membership_cannot_read_private(api, monkeypatch):
     client, factory, campaign_id, member_id, outsider_id = api
-    owner_id = MOCK_USER_ID
+    owner_id = TEST_USER_ID
     # Create private thread between member and outsider — owner NOT included
     with factory() as db:
         from app.runtime.threads import create_private_thread
@@ -389,11 +392,11 @@ def test_inline_execution_targets_new_attempt_and_skips_direct_messages(api, mon
 
     client, factory, campaign_id, member_id, _ = api
     with factory() as db:
-        other = Campaign(owner_id=MOCK_USER_ID, name="Other table")
+        other = Campaign(owner_id=TEST_USER_ID, name="Other table")
         db.add(other)
         db.flush()
         thread = get_or_create_campaign_thread(db, other.id)
-        accept_submission(db, campaign_id=other.id, user_id=MOCK_USER_ID,
+        accept_submission(db, campaign_id=other.id, user_id=TEST_USER_ID,
                           raw_content="Older pending action", thread_id=str(thread.id),
                           segments=[{"type": "ic", "text": "Older pending action"}])
         db.commit()

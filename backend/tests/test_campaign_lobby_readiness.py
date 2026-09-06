@@ -14,7 +14,7 @@ if not hasattr(SQLiteTypeCompiler, "_patched_jsonb"):
     SQLiteTypeCompiler.visit_JSONB = lambda self, type_, **kw: "JSON"  # type: ignore
     SQLiteTypeCompiler._patched_jsonb = True  # type: ignore
 
-from app.auth.service import MOCK_USER_ID  # noqa: E402
+from app.auth.service import TEST_USER_ID  # noqa: E402
 from database import Base, get_db  # noqa: E402
 from main import app  # noqa: E402
 from models.campaigns import Campaign, CampaignMember  # noqa: E402
@@ -29,7 +29,7 @@ def api(monkeypatch):
     )
     Base.metadata.create_all(engine)
     factory = sessionmaker(bind=engine, expire_on_commit=False)
-    owner_id = MOCK_USER_ID
+    owner_id = TEST_USER_ID
     member_id = uuid.uuid4()
     outsider_id = uuid.uuid4()
     with factory() as db:

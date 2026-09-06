@@ -121,6 +121,7 @@ export function useLiveTableRealtime(opts: UseLiveTableRealtimeOptions) {
   const bufferedRef = useRef<RealtimeEvent[]>([])
   const snapshotRef = useRef<SnapshotForRealtime | null>(initialSnapshot ?? null)
   const channelRef = useRef<ReturnType<typeof supabase.channel> | null>(null)
+  const connectedRef = useRef(false)
   const isMountedRef = useRef(true)
   const reconnectAttemptsRef = useRef(0)
   const terminalStreamIdsRef = useRef<Set<string>>(new Set())
@@ -349,6 +350,7 @@ export function useLiveTableRealtime(opts: UseLiveTableRealtimeOptions) {
     isMountedRef.current = true
     bufferedRef.current = []
     snapshotRef.current = null
+    connectedRef.current = false
     terminalStreamIdsRef.current = new Set()
     historyCursorRef.current = null
     setState({
@@ -400,6 +402,7 @@ export function useLiveTableRealtime(opts: UseLiveTableRealtimeOptions) {
       const onStatusChange = (status: string) => {
         if (cancelled) return
         if (status === 'SUBSCRIBED') {
+          connectedRef.current = true
           if (isMountedRef.current) {
             setState((prev) => ({
               ...prev,
@@ -411,6 +414,7 @@ export function useLiveTableRealtime(opts: UseLiveTableRealtimeOptions) {
           incRealtimeMetric('subscriptionCount')
           reconnectAttemptsRef.current = 0
         } else if (status === 'CHANNEL_ERROR' || status === 'TIMED_OUT' || status === 'CLOSED') {
+          connectedRef.current = false
           if (isMountedRef.current) {
             setState((prev) => ({
               ...prev,
@@ -477,9 +481,18 @@ export function useLiveTableRealtime(opts: UseLiveTableRealtimeOptions) {
 
     doSubscribe()
 
+    // Snapshot polling fallback — mock/local sessions have no Supabase auth,
+    // so private realtime channels can never connect. Poll while disconnected
+    // so the table stays usable on the authoritative snapshot alone.
+    const pollId = window.setInterval(() => {
+      if (cancelled || !isMountedRef.current || connectedRef.current) return
+      void fetchSnapshotAndAdopt()
+    }, 5000)
+
     return () => {
       cancelled = true
       isMountedRef.current = false
+      window.clearInterval(pollId)
       if (currentChannel) {
         try {
           supabase.removeChannel(currentChannel as unknown as Parameters<typeof supabase.removeChannel>[0])

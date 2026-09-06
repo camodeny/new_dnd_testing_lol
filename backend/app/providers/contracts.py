@@ -16,6 +16,7 @@ class ProviderCapabilities:
     checking provider or model names.
     """
     supports_json_mode: bool = True
+    supports_strict_json_schema: bool = True
     supports_tool_choice_required: bool = True
     supports_parallel_tool_calls: bool = True
     supports_thinking: bool = False
@@ -39,6 +40,7 @@ class ProviderRequest:
     timeout_seconds: float = 60
     max_attempts: Optional[int] = None
     max_tokens: Optional[int] = None
+    temperature: Optional[float] = None
     stream: bool = False
 
 
