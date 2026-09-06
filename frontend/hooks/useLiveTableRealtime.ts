@@ -121,7 +121,6 @@ export function useLiveTableRealtime(opts: UseLiveTableRealtimeOptions) {
   const bufferedRef = useRef<RealtimeEvent[]>([])
   const snapshotRef = useRef<SnapshotForRealtime | null>(initialSnapshot ?? null)
   const channelRef = useRef<ReturnType<typeof supabase.channel> | null>(null)
-  const connectedRef = useRef(false)
   const isMountedRef = useRef(true)
   const reconnectAttemptsRef = useRef(0)
   const terminalStreamIdsRef = useRef<Set<string>>(new Set())
@@ -172,15 +171,16 @@ export function useLiveTableRealtime(opts: UseLiveTableRealtimeOptions) {
     [],
   )
 
-  // Snapshot fetch (authoritative, retryable) — adopts immediately
-  const fetchSnapshotAndAdopt = useCallback(async (): Promise<SnapshotForRealtime | null> => {
+  // Snapshot fetch (authoritative, retryable) — adopts immediately.
+  // Quiet polls (background fallback) must not flap the phase/error banner.
+  const fetchSnapshotAndAdopt = useCallback(async (quiet = false): Promise<SnapshotForRealtime | null> => {
     const cid = campaignIdRef.current
     const tid = threadIdRef.current
     if (!cid) return null
     const params = new URLSearchParams()
     if (tid) params.set('thread_id', tid)
     const qs = params.toString() ? `?${params}` : ''
-    if (isMountedRef.current) {
+    if (isMountedRef.current && !quiet) {
       setState((prev) => ({ ...prev, phase: prev.hasSnapshot ? 'reconciling' : 'loading', error: null }))
     }
     try {
@@ -189,7 +189,7 @@ export function useLiveTableRealtime(opts: UseLiveTableRealtimeOptions) {
       return snap
     } catch (e) {
       const msg = (e as Error).message ?? 'snapshot fetch failed'
-      if (isMountedRef.current) {
+      if (isMountedRef.current && !quiet) {
         setState((prev) => ({
           ...prev,
           error: msg,
@@ -350,7 +350,6 @@ export function useLiveTableRealtime(opts: UseLiveTableRealtimeOptions) {
     isMountedRef.current = true
     bufferedRef.current = []
     snapshotRef.current = null
-    connectedRef.current = false
     terminalStreamIdsRef.current = new Set()
     historyCursorRef.current = null
     setState({
@@ -402,7 +401,6 @@ export function useLiveTableRealtime(opts: UseLiveTableRealtimeOptions) {
       const onStatusChange = (status: string) => {
         if (cancelled) return
         if (status === 'SUBSCRIBED') {
-          connectedRef.current = true
           if (isMountedRef.current) {
             setState((prev) => ({
               ...prev,
@@ -414,7 +412,6 @@ export function useLiveTableRealtime(opts: UseLiveTableRealtimeOptions) {
           incRealtimeMetric('subscriptionCount')
           reconnectAttemptsRef.current = 0
         } else if (status === 'CHANNEL_ERROR' || status === 'TIMED_OUT' || status === 'CLOSED') {
-          connectedRef.current = false
           if (isMountedRef.current) {
             setState((prev) => ({
               ...prev,
@@ -481,12 +478,15 @@ export function useLiveTableRealtime(opts: UseLiveTableRealtimeOptions) {
 
     doSubscribe()
 
-    // Snapshot polling fallback — mock/local sessions have no Supabase auth,
-    // so private realtime channels can never connect. Poll while disconnected
-    // so the table stays usable on the authoritative snapshot alone.
+    // Snapshot polling fallback — SUBSCRIBED does not mean broadcasts are
+    // delivered (e.g. backend cannot publish without a service-role key, or
+    // mock sessions have no Supabase auth at all). Poll quietly regardless
+    // of connection state so a connected-but-silent channel cannot leave
+    // the table stale; quiet polls never flap the phase/error banner.
     const pollId = window.setInterval(() => {
-      if (cancelled || !isMountedRef.current || connectedRef.current) return
-      void fetchSnapshotAndAdopt()
+      if (cancelled || !isMountedRef.current) return
+      if (typeof document !== 'undefined' && document.hidden) return
+      void fetchSnapshotAndAdopt(true)
     }, 5000)
 
     return () => {
