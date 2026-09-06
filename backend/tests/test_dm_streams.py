@@ -12,7 +12,7 @@ if not hasattr(SQLiteTypeCompiler, "_patched_jsonb"):
     SQLiteTypeCompiler.visit_JSONB = lambda self, type_, **kw: "JSON"  # type: ignore
     SQLiteTypeCompiler._patched_jsonb = True  # type: ignore
 
-from app.auth.service import MOCK_USER_ID  # noqa: E402
+from app.auth.service import TEST_USER_ID  # noqa: E402
 from database import Base, get_db  # noqa: E402
 from main import app  # noqa: E402
 from models.campaigns import Campaign
@@ -31,7 +31,7 @@ def api(monkeypatch):
     campaign_id = uuid.uuid4()
     member_id = uuid.uuid4()
     outsider_id = uuid.uuid4()
-    owner_id = MOCK_USER_ID
+    owner_id = TEST_USER_ID
     with factory() as db:
         db.add_all([
             Profile(id=owner_id, email="owner@example.com"),
@@ -52,8 +52,15 @@ def api(monkeypatch):
         with factory() as db:
             yield db
 
-    monkeypatch.setenv("ALLOW_MOCK_AUTH", "true")
     monkeypatch.setenv("NODE_ENV", "test")
+    monkeypatch.setattr(
+        "app.dm_streams.router.resolve_profile",
+        lambda request, db: db.get(Profile, TEST_USER_ID),
+    )
+    monkeypatch.setattr(
+        "app.snapshot.router.resolve_profile",
+        lambda request, db: db.get(Profile, TEST_USER_ID),
+    )
     app.dependency_overrides[get_db] = override_db
     try:
         yield TestClient(app), factory, campaign_id, member_id, outsider_id
@@ -234,7 +241,7 @@ def test_private_stream_chunks_never_in_shared_projection(api, monkeypatch):
 
     # create private thread between owner and member
     with factory() as db:
-        t = create_private_thread(db, campaign_id=campaign_id, created_by=MOCK_USER_ID, member_ids=[member_id], title="secret-dm")
+        t = create_private_thread(db, campaign_id=campaign_id, created_by=TEST_USER_ID, member_ids=[member_id], title="secret-dm")
         priv_id = str(t.id)
         shared = db.scalar(select(CampaignThread).where(CampaignThread.campaign_id == campaign_id, CampaignThread.thread_type == "campaign"))
         shared_id = str(shared.id)
@@ -360,8 +367,8 @@ def test_player_can_read_but_cannot_mutate_dm_streams(api, monkeypatch):
     r_fail = client.post(f"/api/campaigns/{campaign_id}/dm-streams/{sid}/abandon", json={"status": "failed", "reason": "forged"})
     assert r_fail.status_code == 403
     # Verify no forgery persisted
-    monkeypatch.setattr("app.dm_streams.router.resolve_profile", lambda req, db: db.get(Profile, MOCK_USER_ID))
-    monkeypatch.setattr(smr, "resolve_profile", lambda req, db: db.get(Profile, MOCK_USER_ID))
+    monkeypatch.setattr("app.dm_streams.router.resolve_profile", lambda req, db: db.get(Profile, TEST_USER_ID))
+    monkeypatch.setattr(smr, "resolve_profile", lambda req, db: db.get(Profile, TEST_USER_ID))
     r_verify = client.get(f"/api/campaigns/{campaign_id}/dm-streams/{sid}")
     assert r_verify.json()["visible_text"] == "owner narration"
     assert len(r_verify.json()["chunks"]) == 1

@@ -121,6 +121,12 @@ export function useLiveTableRealtime(opts: UseLiveTableRealtimeOptions) {
   const bufferedRef = useRef<RealtimeEvent[]>([])
   const snapshotRef = useRef<SnapshotForRealtime | null>(initialSnapshot ?? null)
   const channelRef = useRef<ReturnType<typeof supabase.channel> | null>(null)
+  // Snapshot request generations: overlapping fetches (interval poll vs
+  // reconnect/terminal/refresh) can resolve out of order. Only adopt a
+  // response when no newer successful response was already adopted, so a
+  // slow request can never move the table backward.
+  const snapshotRequestSeqRef = useRef(0)
+  const lastAdoptedSnapshotRequestRef = useRef(0)
   const isMountedRef = useRef(true)
   const reconnectAttemptsRef = useRef(0)
   const terminalStreamIdsRef = useRef<Set<string>>(new Set())
@@ -171,36 +177,9 @@ export function useLiveTableRealtime(opts: UseLiveTableRealtimeOptions) {
     [],
   )
 
-  // Snapshot fetch (authoritative, retryable) — adopts immediately
-  const fetchSnapshotAndAdopt = useCallback(async (): Promise<SnapshotForRealtime | null> => {
-    const cid = campaignIdRef.current
-    const tid = threadIdRef.current
-    if (!cid) return null
-    const params = new URLSearchParams()
-    if (tid) params.set('thread_id', tid)
-    const qs = params.toString() ? `?${params}` : ''
-    if (isMountedRef.current) {
-      setState((prev) => ({ ...prev, phase: prev.hasSnapshot ? 'reconciling' : 'loading', error: null }))
-    }
-    try {
-      const snap = await apiFetch<SnapshotForRealtime>(`/campaigns/${cid}/snapshot${qs}`)
-      adoptSnapshot(snap)
-      return snap
-    } catch (e) {
-      const msg = (e as Error).message ?? 'snapshot fetch failed'
-      if (isMountedRef.current) {
-        setState((prev) => ({
-          ...prev,
-          error: msg,
-          phase: prev.hasSnapshot ? 'reconnecting' : 'error',
-        }))
-      }
-      return null
-    }
-  }, [adoptSnapshot])
-
   // Apply a batch of events (dedupe + sort + merge into state)
   // Assumes snapshot already adopted; caller must reconcile first.
+  // Defined before fetchSnapshotAndAdopt so the shared race invariant can use it.
   const applyEvents = useCallback((events: RealtimeEvent[]) => {
     if (!events.length) return
     const deduped = dedupeEvents(events)
@@ -298,6 +277,59 @@ export function useLiveTableRealtime(opts: UseLiveTableRealtimeOptions) {
     })
   }, [])
 
+  // Snapshot fetch (authoritative, retryable) — adopts immediately.
+  // Quiet polls (background fallback) must not flap the phase/error banner.
+  const fetchSnapshotAndAdopt = useCallback(async (quiet = false): Promise<SnapshotForRealtime | null> => {
+    const cid = campaignIdRef.current
+    const tid = threadIdRef.current
+    if (!cid) return null
+    const params = new URLSearchParams()
+    if (tid) params.set('thread_id', tid)
+    const qs = params.toString() ? `?${params}` : ''
+    if (isMountedRef.current && !quiet) {
+      setState((prev) => ({ ...prev, phase: prev.hasSnapshot ? 'reconciling' : 'loading', error: null }))
+    }
+    const requestSeq = snapshotRequestSeqRef.current + 1
+    snapshotRequestSeqRef.current = requestSeq
+    // Scope the response to the campaign/thread that initiated it: a table
+    // switch mid-flight must not project the old table's state as the new one.
+    const requestCid = cid
+    const requestTid = tid
+    try {
+      const snap = await apiFetch<SnapshotForRealtime>(`/campaigns/${cid}/snapshot${qs}`)
+      if (campaignIdRef.current !== requestCid || threadIdRef.current !== requestTid) {
+        // Stale scope: leave state, generation guard, and event buffer alone.
+        return null
+      }
+      if (requestSeq < lastAdoptedSnapshotRequestRef.current) {
+        // A newer snapshot was already adopted while this request was in
+        // flight: drop it without touching state or the event buffer.
+        return null
+      }
+      lastAdoptedSnapshotRequestRef.current = requestSeq
+      adoptSnapshot(snap)
+      // Snapshot/subscription race invariant (shared by subscribe, reconnect,
+      // refresh, and polling paths): replay broadcasts that arrived while
+      // this request was in flight so adoption cannot erase fresher state.
+      if (bufferedRef.current.length) {
+        const reconciled = reconcileBufferedEvents(snap, bufferedRef.current)
+        if (reconciled.length) applyEvents(reconciled)
+        bufferedRef.current = []
+      }
+      return snap
+    } catch (e) {
+      const msg = (e as Error).message ?? 'snapshot fetch failed'
+      if (isMountedRef.current && !quiet) {
+        setState((prev) => ({
+          ...prev,
+          error: msg,
+          phase: prev.hasSnapshot ? 'reconnecting' : 'error',
+        }))
+      }
+      return null
+    }
+  }, [adoptSnapshot, applyEvents])
+
   // Build a channel subscription; returns the channel handle
   const buildChannel = useCallback(
     (channelName: string) => {
@@ -349,6 +381,8 @@ export function useLiveTableRealtime(opts: UseLiveTableRealtimeOptions) {
     isMountedRef.current = true
     bufferedRef.current = []
     snapshotRef.current = null
+    snapshotRequestSeqRef.current = 0
+    lastAdoptedSnapshotRequestRef.current = 0
     terminalStreamIdsRef.current = new Set()
     historyCursorRef.current = null
     setState({
@@ -477,9 +511,21 @@ export function useLiveTableRealtime(opts: UseLiveTableRealtimeOptions) {
 
     doSubscribe()
 
+    // Snapshot polling fallback — SUBSCRIBED does not mean broadcasts are
+    // delivered (e.g. backend cannot publish without a service-role key, or
+    // mock sessions have no Supabase auth at all). Poll quietly regardless
+    // of connection state so a connected-but-silent channel cannot leave
+    // the table stale; quiet polls never flap the phase/error banner.
+    const pollId = window.setInterval(() => {
+      if (cancelled || !isMountedRef.current) return
+      if (typeof document !== 'undefined' && document.hidden) return
+      void fetchSnapshotAndAdopt(true)
+    }, 5000)
+
     return () => {
       cancelled = true
       isMountedRef.current = false
+      window.clearInterval(pollId)
       if (currentChannel) {
         try {
           supabase.removeChannel(currentChannel as unknown as Parameters<typeof supabase.removeChannel>[0])

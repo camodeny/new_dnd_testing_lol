@@ -551,10 +551,19 @@ def _execute_owned_attempt(
         # its visibility filtering and per-round budget decisions.
         validation_packet = packet
 
+        from app.dm.contract import ContractValidationError as _ContractValidationError
+
         def evidence_adjudicate(enriched_packet):
             nonlocal validation_packet
             validation_packet = enriched_packet
-            return adjudicate(enriched_packet)
+            try:
+                return adjudicate(enriched_packet)
+            except _ContractValidationError:
+                # Repair structurally invalid output within the round so
+                # need_evidence mediation stays intact and exhaustion still
+                # funnels through the normal _fail_visible path below.
+                repaired, _ = run_with_bounded_regeneration(adjudicate, enriched_packet)
+                return repaired
 
         final_contract, _bundle = run_bounded_evidence_loop(
             initial_packet=packet, adjudicate=evidence_adjudicate, db=db,

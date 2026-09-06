@@ -50,4 +50,4 @@ PYTEST_ARGS=(tests/ -v)
 if [[ -z "$DB_URL" ]]; then
   PYTEST_ARGS+=(-m "not postgres")
 fi
-ALLOW_MOCK_AUTH=true NODE_ENV=test python3 -m pytest -p no:xonsh -p no:cacheprovider "${PYTEST_ARGS[@]}"
+python3 -m pytest -p no:xonsh -p no:cacheprovider "${PYTEST_ARGS[@]}"

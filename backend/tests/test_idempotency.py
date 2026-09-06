@@ -134,7 +134,7 @@ def test_concurrent_duplicates_only_execute_once(tmp_path):
 
 
 def test_duplicate_http_retry_returns_same_campaign_event(monkeypatch):
-    from app.auth.service import MOCK_USER_ID
+    from app.auth.service import TEST_USER_ID
     from main import app
 
     engine = create_engine(
@@ -145,17 +145,24 @@ def test_duplicate_http_retry_returns_same_campaign_event(monkeypatch):
     factory = sessionmaker(bind=engine)
     campaign_id = uuid.uuid4()
     with factory() as db:
-        db.add(Profile(id=MOCK_USER_ID, email="mock@example.com"))
-        db.add(Campaign(id=campaign_id, owner_id=MOCK_USER_ID, name="Before"))
-        db.add(CampaignMember(campaign_id=campaign_id, user_id=MOCK_USER_ID, role="owner"))
+        db.add(Profile(id=TEST_USER_ID, email="mock@example.com"))
+        db.add(Campaign(id=campaign_id, owner_id=TEST_USER_ID, name="Before"))
+        db.add(CampaignMember(campaign_id=campaign_id, user_id=TEST_USER_ID, role="owner"))
         db.commit()
 
     def override_db():
         with factory() as db:
             yield db
 
-    monkeypatch.setenv("ALLOW_MOCK_AUTH", "true")
     monkeypatch.setenv("NODE_ENV", "test")
+    monkeypatch.setattr(
+        "app.campaigns.router.resolve_profile",
+        lambda request, db: db.get(Profile, TEST_USER_ID),
+    )
+    monkeypatch.setattr(
+        "app.characters.router.resolve_profile",
+        lambda request, db: db.get(Profile, TEST_USER_ID),
+    )
     app.dependency_overrides[get_db] = override_db
     try:
         client = TestClient(app)
@@ -183,7 +190,7 @@ def test_duplicate_http_retry_returns_same_campaign_event(monkeypatch):
 
 
 def test_campaign_put_retry_replays_after_revision_advanced(monkeypatch):
-    from app.auth.service import MOCK_USER_ID
+    from app.auth.service import TEST_USER_ID
     from main import app
 
     engine = create_engine(
@@ -193,17 +200,24 @@ def test_campaign_put_retry_replays_after_revision_advanced(monkeypatch):
     factory = sessionmaker(bind=engine)
     campaign_id = uuid.uuid4()
     with factory() as db:
-        db.add(Profile(id=MOCK_USER_ID, email="mock@example.com"))
-        db.add(Campaign(id=campaign_id, owner_id=MOCK_USER_ID, name="Before"))
-        db.add(CampaignMember(campaign_id=campaign_id, user_id=MOCK_USER_ID, role="owner"))
+        db.add(Profile(id=TEST_USER_ID, email="mock@example.com"))
+        db.add(Campaign(id=campaign_id, owner_id=TEST_USER_ID, name="Before"))
+        db.add(CampaignMember(campaign_id=campaign_id, user_id=TEST_USER_ID, role="owner"))
         db.commit()
 
     def override_db():
         with factory() as db:
             yield db
 
-    monkeypatch.setenv("ALLOW_MOCK_AUTH", "true")
     monkeypatch.setenv("NODE_ENV", "test")
+    monkeypatch.setattr(
+        "app.campaigns.router.resolve_profile",
+        lambda request, db: db.get(Profile, TEST_USER_ID),
+    )
+    monkeypatch.setattr(
+        "app.characters.router.resolve_profile",
+        lambda request, db: db.get(Profile, TEST_USER_ID),
+    )
     app.dependency_overrides[get_db] = override_db
     try:
         client = TestClient(app)
@@ -222,7 +236,7 @@ def test_campaign_put_retry_replays_after_revision_advanced(monkeypatch):
 
 
 def test_character_create_is_a_real_user_scoped_idempotent_command(monkeypatch):
-    from app.auth.service import MOCK_USER_ID
+    from app.auth.service import TEST_USER_ID
     from main import app
     from models.characters import Character
 
@@ -232,15 +246,22 @@ def test_character_create_is_a_real_user_scoped_idempotent_command(monkeypatch):
     Base.metadata.create_all(engine)
     factory = sessionmaker(bind=engine)
     with factory() as db:
-        db.add(Profile(id=MOCK_USER_ID, email="mock@example.com"))
+        db.add(Profile(id=TEST_USER_ID, email="mock@example.com"))
         db.commit()
 
     def override_db():
         with factory() as db:
             yield db
 
-    monkeypatch.setenv("ALLOW_MOCK_AUTH", "true")
     monkeypatch.setenv("NODE_ENV", "test")
+    monkeypatch.setattr(
+        "app.campaigns.router.resolve_profile",
+        lambda request, db: db.get(Profile, TEST_USER_ID),
+    )
+    monkeypatch.setattr(
+        "app.characters.router.resolve_profile",
+        lambda request, db: db.get(Profile, TEST_USER_ID),
+    )
     app.dependency_overrides[get_db] = override_db
     try:
         client = TestClient(app)
@@ -261,6 +282,6 @@ def test_character_create_is_a_real_user_scoped_idempotent_command(monkeypatch):
                 )
             ).scalars().one()
             assert command.scope_type == "user"
-            assert command.scope_id == str(MOCK_USER_ID)
+            assert command.scope_id == str(TEST_USER_ID)
     finally:
         app.dependency_overrides.clear()

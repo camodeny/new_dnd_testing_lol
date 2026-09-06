@@ -2,7 +2,7 @@
 
 Meta serves Muse Spark from ``https://api.meta.ai/v1`` with standard
 ``choices`` envelopes, so these tests pin the ``choices[0].message`` /
-``choices[].delta`` shapes and the ``MODEL_API_KEY`` credential, plus a
+``choices[].delta`` shapes and the ``META_API_KEY`` credential, plus a
 Meta-routed response reaching ``normalize_contract()`` through
 ``adjudicate_with_provider``.
 """
@@ -57,15 +57,12 @@ TOOL_PAYLOAD = {
 }
 
 
-def test_effective_url_and_key_aliases(monkeypatch):
+def test_effective_url_and_key(monkeypatch):
     adapter = MetaAdapter()
     assert adapter.base_url() == "https://api.meta.ai/v1/chat/completions"
-    monkeypatch.delenv("MODEL_API_KEY", raising=False)
     monkeypatch.delenv("META_API_KEY", raising=False)
-    monkeypatch.delenv("LLAMA_API_KEY", raising=False)
-    monkeypatch.setenv("MODEL_API_KEY", "m-key")
-    assert adapter.api_key() == "m-key"
-    monkeypatch.delenv("MODEL_API_KEY")
+    with pytest.raises(RuntimeError, match="META_API_KEY"):
+        adapter.require_config()
     monkeypatch.setenv("META_API_KEY", "meta-key")
     assert adapter.api_key() == "meta-key"
 
@@ -121,11 +118,24 @@ def test_iter_stream_events_openai_sse():
     assert events[-1].kind == "done"
 
 
+def test_meta_json_schema_strict(monkeypatch):
+    """Meta supports strict structured output — schema ships strict:true."""
+    from app.providers.contracts import ProviderRequest
+
+    payload = MetaAdapter().build_payload(ProviderRequest(
+        messages=[{"role": "user", "content": "hi"}],
+        model="muse-spark-1.3-contributor",
+        json_schema={"type": "object", "properties": {"a": {"type": "integer"}}},
+        json_schema_name="t",
+    ))
+    assert payload["response_format"]["json_schema"]["strict"] is True
+
+
 def test_dm_area_uses_direct_model_api_pair(monkeypatch):
     """Provider contract: DM resolves to the exact direct-API URL+model."""
     from app.providers.areas import resolve_area
 
-    monkeypatch.setenv("MODEL_API_KEY", "dummy")
+    monkeypatch.setenv("META_API_KEY", "dummy")
     adapter, model, name = resolve_area("dm")
     assert name == "meta"
     assert adapter.base_url() == "https://api.meta.ai/v1/chat/completions"
@@ -145,7 +155,7 @@ def test_dm_contract_via_meta_choices_envelope(monkeypatch):
     import app.providers as providers_pkg
     from app.dm.adjudication import adjudicate_with_provider
 
-    monkeypatch.setenv("MODEL_API_KEY", "dummy")
+    monkeypatch.setenv("META_API_KEY", "dummy")
     contract_json = json.dumps({
         "contract_version": CONTRACT_VERSION,
         "mode": "silent",

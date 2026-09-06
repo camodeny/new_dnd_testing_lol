@@ -328,6 +328,22 @@ class StagedEffect(StrictModel):
             raise ValueError("staged effect id must match [A-Za-z0-9_-]+")
         return v
 
+    @field_validator("arguments", mode="before")
+    @classmethod
+    def _coerce_arguments(cls, v: Any) -> Any:
+        # Provider-facing strict schemas carry arguments as a JSON-encoded
+        # string (free-form dicts cannot comply with strict mode); parse it
+        # back so the same per-effect-type validation applies.
+        if isinstance(v, str):
+            try:
+                parsed = json.loads(v)
+            except json.JSONDecodeError as e:
+                raise ValueError(f"staged effect arguments must be a JSON-encoded object: {e}") from e
+            if not isinstance(parsed, dict):
+                raise ValueError("staged effect arguments must decode to an object")
+            return parsed
+        return v
+
     @model_validator(mode="after")
     def _validate_args(self) -> "StagedEffect":
         t = self.effect_type
@@ -739,6 +755,44 @@ def public_projection(contract: DmTurnContractV1) -> dict[str, Any]:
 def contract_json_schema() -> dict[str, Any]:
     """Return the JSON Schema for dm_turn_contract_v1 (strict, no additionalProperties)."""
     return DmTurnContractV1.model_json_schema()
+
+
+def contract_json_schema_strict() -> dict[str, Any]:
+    """Provider-facing strict schema for structured-output APIs.
+
+    Strict structured-output dialects require ``required`` to list every key
+    in ``properties`` at every object level, and ``additionalProperties`` to
+    be false on every object. The free-form ``StagedEffect.arguments`` dict
+    cannot comply, so the provider-facing schema carries it as a
+    JSON-encoded string; local normalization parses it back and applies the
+    existing per-effect-type validation unchanged.
+    """
+    import copy
+
+    schema = copy.deepcopy(DmTurnContractV1.model_json_schema())
+    defs = schema.get("$defs", {})
+
+    staged_props = defs.get("StagedEffect", {}).get("properties", {})
+    if isinstance(staged_props.get("arguments"), dict):
+        staged_props["arguments"] = {
+            "type": "string",
+            "description": "JSON-encoded effect arguments object (parsed and validated locally per effect_type)",
+        }
+
+    def _complete(node: Any) -> None:
+        if isinstance(node, dict):
+            props = node.get("properties")
+            if isinstance(props, dict):
+                node["required"] = sorted(props.keys())
+                node.setdefault("additionalProperties", False)
+            for value in node.values():
+                _complete(value)
+        elif isinstance(node, list):
+            for value in node:
+                _complete(value)
+
+    _complete(schema)
+    return schema
 
 
 # For fixture/test helpers: alias version constant

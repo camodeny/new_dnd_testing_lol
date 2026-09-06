@@ -65,7 +65,6 @@ def test_relay_once_skips_cleanly_without_db(monkeypatch):
 
 
 def test_cron_endpoint_runs_relay_path(monkeypatch):
-    os.environ["ALLOW_MOCK_AUTH"] = "true"
     monkeypatch.delenv("CRON_SECRET", raising=False)
     monkeypatch.setenv("ALLOW_INSECURE_CRON", "1")
     factory = _factory()
@@ -101,7 +100,6 @@ def test_cron_endpoint_runs_relay_path(monkeypatch):
 
 
 def test_cron_endpoint_publishes_with_injected_adapter(monkeypatch):
-    os.environ["ALLOW_MOCK_AUTH"] = "true"
     monkeypatch.delenv("CRON_SECRET", raising=False)
     monkeypatch.setenv("ALLOW_INSECURE_CRON", "1")
     factory = _factory()
@@ -134,7 +132,6 @@ def test_cron_endpoint_publishes_with_injected_adapter(monkeypatch):
 
 
 def test_cron_secret_enforced(monkeypatch):
-    os.environ["ALLOW_MOCK_AUTH"] = "true"
     monkeypatch.setenv("CRON_SECRET", "s3cret")
     factory = _factory()
 
@@ -160,7 +157,6 @@ def test_cron_secret_enforced(monkeypatch):
 
 def test_cron_fails_closed_without_secret_or_bypass(monkeypatch):
     """Issue #342 — no CRON_SECRET and no explicit bypass: 503, not open."""
-    os.environ["ALLOW_MOCK_AUTH"] = "true"
     monkeypatch.delenv("CRON_SECRET", raising=False)
     monkeypatch.delenv("ALLOW_INSECURE_CRON", raising=False)
     factory = _factory()
@@ -190,7 +186,6 @@ def test_lifespan_default_does_not_start_relay_or_ddl(monkeypatch):
     monkeypatch.delenv("OUTBOX_RELAY_LOOP_ENABLED", raising=False)
     if "main" in sys.modules:
         del sys.modules["main"]
-    os.environ["ALLOW_MOCK_AUTH"] = "true"
     os.environ["NODE_ENV"] = "test"
     import main as main_mod
     import database

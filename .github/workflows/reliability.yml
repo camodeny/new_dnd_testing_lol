@@ -39,7 +39,6 @@ jobs:
       POSTGRES_URL_NON_POOLING: postgresql://ci_test:ci_test@localhost:5432/ci_test?sslmode=disable
       FAULT_TEST_DATABASE_URL: postgresql://ci_test:ci_test@localhost:5432/ci_test?sslmode=disable
       FAULT_ARTIFACT_PATH: /tmp/reliability-artifacts/fault-diagnostics.jsonl
-      ALLOW_MOCK_AUTH: "true"
 
     steps:
       - uses: actions/checkout@v4

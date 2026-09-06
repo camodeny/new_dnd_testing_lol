@@ -404,3 +404,23 @@ def test_packet_only_retry_fixture():
         assert False
     except TypeError as exc:
         assert "inner failure" in str(exc)
+
+
+def test_structural_normalization_error_retries_with_feedback():
+    # A structurally invalid contract (empty beats in respond mode) must
+    # retry with explicit feedback instead of failing on the first shot.
+    pkt, _, _ = _packet()
+    bad = {"contract_version": CONTRACT_VERSION, "mode": "respond", "reason": "x", "beats": []}
+    good = {"contract_version": CONTRACT_VERSION, "mode": "silent", "reason": "x", "beats": []}
+    calls = []
+
+    def flaky(packet, feedback):
+        calls.append(feedback)
+        return bad if len(calls) == 1 else good
+
+    contract, report = run_with_bounded_regeneration(flaky, pkt, max_regenerations=2)
+    assert report.passed
+    assert contract.mode == "silent"
+    assert len(calls) == 2
+    assert calls[0] is None
+    assert calls[1] is not None and "beats" in calls[1]

@@ -125,6 +125,8 @@ class LLMProviderAdapter:
         }
         if request.max_tokens is not None:
             payload['max_tokens'] = request.max_tokens
+        if request.temperature is not None:
+            payload['temperature'] = request.temperature
         if request.tools:
             payload['tools'] = request.tools
         if options.get('tool_choice') is not None:
@@ -139,7 +141,10 @@ class LLMProviderAdapter:
                 'type': 'json_schema',
                 'json_schema': {
                     'name': request.json_schema_name or 'structured_response',
-                    'strict': True,
+                    # Strict structured output requires a strict-subset
+                    # schema; capability-gated per provider. Local validation
+                    # + bounded regeneration still apply on top.
+                    'strict': bool(capabilities.supports_strict_json_schema),
                     'schema': request.json_schema,
                 },
             }

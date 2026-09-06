@@ -23,7 +23,7 @@ from models.dm import DMStreamChunk, DmTurn, DmTurnAttempt  # noqa: E402
 from models.profiles import Profile  # noqa: E402
 from models.threads import CampaignThread  # noqa: E402
 
-from app.dm.contract import CONTRACT_VERSION, normalize_contract  # noqa: E402
+from app.dm.contract import CONTRACT_VERSION, ContractValidationError, normalize_contract  # noqa: E402
 from app.dm.execution import (  # noqa: E402
     DM_TURN_EXECUTE_JOB,
     execute_dm_attempt,
@@ -618,3 +618,65 @@ def test_live_postgres_executor_cannot_be_recovered_after_lease_age(tmp_path):
             assert recover_stuck_attempts(other, campaign_id=cid, lease_seconds=300) == 1
             assert other.get(DmTurnAttempt, aid).status == "prepared"
     engine.dispose()
+
+
+def test_structural_error_repairs_inside_round_and_mediates_evidence(db):
+    """PR #360 review: a structurally invalid adjudication must heal inside
+    the evidence round — need_evidence mediation and tools still run, and the
+    turn commits normally."""
+    from models.campaigns import CampaignMember
+    from models.characters import Character, Dnd5eCharacterSheet
+    s, camp_id, thread_id, _ = db
+    owner = s.get(Campaign, camp_id).owner_id
+    s.add(CampaignMember(campaign_id=camp_id, user_id=owner, role="owner"))
+    char = Character(owner_id=owner, name="Hero", system="dnd5e")
+    s.add(char)
+    s.flush()
+    sheet = Dnd5eCharacterSheet.from_frontend({"name": "Hero", "total_level": 1, "armor_class": 15}, owner)
+    sheet.character_id = char.id
+    s.add(sheet)
+    s.commit()
+    _, attempt = _submit(s, camp_id, thread_id)
+    calls = []
+
+    def adjudicate(packet, feedback=None):
+        calls.append(feedback)
+        if len(calls) == 1:
+            # Simulates a structurally invalid provider output (normalize fails).
+            raise ContractValidationError("contract_validation_failed", "respond requires 1-8 beats")
+        if len(calls) == 2:
+            return normalize_contract({
+                "contract_version": CONTRACT_VERSION, "mode": "need_evidence",
+                "reason": "check sheet", "beats": [], "safe_prelude": "Checking the sheet.",
+                "evidence_requests": [{"id": "evidence_1", "tool": "ask_character_sheet",
+                                       "question": "What is AC?", "scope": "current_player"}],
+            })
+        contract = _fake_adjudicate("AC is 15.")(packet).model_dump(mode="json")
+        claim = contract["beats"][0]["claims"][0]
+        claim.update(origin="resolver_evidence", evidence_refs=["evidence:evidence_1"])
+        return normalize_contract(contract)
+
+    result = execute_dm_attempt(s, attempt.id, adjudicate=adjudicate, narrator="deterministic")
+    assert result.attempt.status == "succeeded"
+    # invalid first shot repaired in-round, need_evidence round mediated tools,
+    # final respond committed: without in-round repair the first raise would
+    # propagate and fail the attempt instead.
+    assert len(calls) == 3
+
+
+def test_structural_exhaustion_fails_visibly_not_running(db):
+    """PR #360 review: when every regeneration is structurally invalid, the
+    attempt must fail visibly (or requeue) — never stay stuck in running."""
+    from app.dm.validators import ValidatorRejectionError
+    s, camp_id, thread_id, _ = db
+    _, attempt = _submit(s, camp_id, thread_id)
+
+    def _always_broken(packet, feedback=None):
+        raise ContractValidationError("contract_validation_failed", "respond requires 1-8 beats")
+
+    with pytest.raises(ValidatorRejectionError):
+        execute_dm_attempt(s, attempt.id, adjudicate=_always_broken, narrator="deterministic")
+    fresh_attempt = s.get(DmTurnAttempt, attempt.id)
+    assert fresh_attempt.status in ("failed", "failed_visible")
+    assert fresh_attempt.last_error
+    assert s.get(DmTurn, attempt.turn_id).status != "streaming"

@@ -118,6 +118,14 @@ export const campaigns = {
       body: JSON.stringify({ expected_revision: expectedRevision, status }),
       headers: { 'Idempotency-Key': idempotencyKey },
     }),
+  // Pre-alpha solo bootstrap into the production live-table runtime (#355).
+  // Temporary scaffold — deleted/replaced by #245/#246.
+  soloBootstrap: (id: string | number, idempotencyKey: string) =>
+    apiFetch<{ campaign: import('@/types').Campaign; thread_id: string }>(`/campaigns/${id}/solo-bootstrap`, {
+      method: 'POST',
+      body: JSON.stringify({ operation_id: idempotencyKey }),
+      headers: { 'Idempotency-Key': idempotencyKey },
+    }),
 }
 
 // ── Characters ────────────────────────────────────────────────────────────

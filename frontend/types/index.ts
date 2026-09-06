@@ -15,6 +15,7 @@ export interface Campaign {
   created_at: string
   updated_at?: string
   owner_id: string
+  status?: string
   session_count?: number
   member_count?: number
 }

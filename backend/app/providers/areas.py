@@ -2,8 +2,7 @@
 
 Provider + model are set in code per call area — no env overrides for
 either. Only API keys come from the environment
-(``OPENAI_API_KEY``, ``META_API_KEY`` / ``LLAMA_API_KEY``,
-``OPENROUTER_API_KEY``).
+(``OPENAI_API_KEY``, ``META_API_KEY``, ``OPENROUTER_API_KEY``).
 
   dm             — forward-DM adjudication
   narrator       — streaming turn narration (prose expander)

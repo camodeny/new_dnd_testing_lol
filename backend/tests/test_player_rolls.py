@@ -13,7 +13,7 @@ if not hasattr(SQLiteTypeCompiler, "_patched_jsonb"):
     SQLiteTypeCompiler.visit_JSONB = lambda self, type_, **kw: "JSON"  # type: ignore
     SQLiteTypeCompiler._patched_jsonb = True  # type: ignore
 
-from app.auth.service import MOCK_USER_ID  # noqa: E402
+from app.auth.service import TEST_USER_ID  # noqa: E402
 from app.dm.turns import coordinate_turn, mark_streaming_started  # noqa: E402
 from app.rolls.service import RollAuthorizationError, fulfill_roll  # noqa: E402
 from app.runtime.submissions import accept_submission  # noqa: E402
@@ -35,7 +35,7 @@ def roll_api(monkeypatch):
     engine = create_engine("sqlite://", connect_args={"check_same_thread": False}, poolclass=StaticPool)
     Base.metadata.create_all(engine)
     factory = sessionmaker(bind=engine, expire_on_commit=False)
-    owner = MOCK_USER_ID
+    owner = TEST_USER_ID
     player = uuid.uuid4()
     outsider = uuid.uuid4()
     campaign_id = uuid.uuid4()
@@ -69,7 +69,6 @@ def roll_api(monkeypatch):
         raw = request.headers.get("X-Test-User")
         return db.get(Profile, uuid.UUID(raw)) if raw else db.get(Profile, owner)
 
-    monkeypatch.setenv("ALLOW_MOCK_AUTH", "true")
     monkeypatch.setattr("app.rolls.router.resolve_profile", resolve_test_profile)
     monkeypatch.setattr("app.snapshot.router.resolve_profile", resolve_test_profile)
     app.dependency_overrides[get_db] = override_db

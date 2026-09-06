@@ -14,7 +14,7 @@ if not hasattr(SQLiteTypeCompiler, "_patched_jsonb"):
     SQLiteTypeCompiler.visit_JSONB = lambda self, type_, **kw: "JSON"  # type: ignore
     SQLiteTypeCompiler._patched_jsonb = True  # type: ignore
 
-from app.auth.service import MOCK_USER_ID  # noqa: E402
+from app.auth.service import TEST_USER_ID  # noqa: E402
 from database import Base, get_db  # noqa: E402
 from main import app  # noqa: E402
 from models.campaigns import Campaign
@@ -58,7 +58,7 @@ def api(monkeypatch):
     )
     Base.metadata.create_all(engine)
     factory = sessionmaker(bind=engine, expire_on_commit=False)
-    owner_id = MOCK_USER_ID
+    owner_id = TEST_USER_ID
     member_id = uuid.uuid4()
     outsider_id = uuid.uuid4()
     with factory() as db:
@@ -176,7 +176,7 @@ def test_lifecycle_is_authoritative_idempotent_and_recoverable(api):
     existing_member_retry = client.post(f"/api/campaigns/{cid}/join", json={"code": code})
     assert existing_member_retry.status_code == 200
 
-    actor["id"] = MOCK_USER_ID
+    actor["id"] = TEST_USER_ID
     recovered = _transition(client, cid, 1, "lobby", "recover-lobby")
     assert recovered.status_code == 200
     assert recovered.json()["campaign"]["status"] == "lobby"
