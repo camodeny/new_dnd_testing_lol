@@ -232,3 +232,89 @@ def test_solo_bootstrap_mid_request_failure_leaves_no_partial_state(api, monkeyp
     response = _bootstrap(client, campaign["id"], "op-fail-once")
     assert response.status_code == 200, response.text
     assert response.json()["campaign"]["status"] == "active"
+
+
+def test_solo_bootstrap_revision_race_converges_on_retry(api, monkeypatch):
+    """Review #360: a revision-conflict loser rolls back and retries once,
+    converging via reuse instead of surfacing a 409 for a duplicate start."""
+    import app.campaigns.events as campaign_events
+
+    from app.campaigns.events import RevisionConflictError
+
+    client, factory, actor, owner_id, _ = api
+    campaign = _create(client)
+    _ready_lobby(factory, campaign["id"], [owner_id])
+
+    real_commit = campaign_events.commit_campaign_mutation
+    calls = {"n": 0}
+
+    def _race_once(*args, **kwargs):
+        calls["n"] += 1
+        if calls["n"] == 1:
+            # Simulate a concurrent winner committing first.
+            raise RevisionConflictError(
+                uuid.UUID(campaign["id"]), 0, 1, "op-race",
+            )
+        return real_commit(*args, **kwargs)
+
+    monkeypatch.setattr(campaign_events, "commit_campaign_mutation", _race_once)
+    response = _bootstrap(client, campaign["id"], "op-race")
+    assert response.status_code == 200, response.text
+    body = response.json()
+    assert body["campaign"]["status"] == "active"
+    assert body["dm_turn"]["id"]
+
+    with factory() as db:
+        cid = uuid.UUID(campaign["id"])
+        assert db.scalar(
+            select(func.count()).select_from(CampaignThread).where(CampaignThread.campaign_id == cid)
+        ) == 1
+        assert db.scalar(
+            select(func.count()).select_from(DmTurn).where(DmTurn.campaign_id == cid)
+        ) == 1
+
+
+def test_solo_bootstrap_ignores_unrelated_lobby_history(api):
+    """Review #360: a pre-existing unrelated lobby turn must not suppress
+    the bootstrap opening — the returned turn must include it."""
+    from app.campaigns.solo_bootstrap import OPENING_OOC_TEXT
+
+    from models.threads import PlayerSubmission
+
+    client, factory, actor, owner_id, _ = api
+    campaign = _create(client)
+    _ready_lobby(factory, campaign["id"], [owner_id])
+
+    from app.dm.turns import coordinate_turn
+    from app.runtime.submissions import accept_submission
+
+    cid = uuid.UUID(campaign["id"])
+    with factory() as db:
+        thread = db.execute(
+            select(CampaignThread).where(CampaignThread.campaign_id == cid)
+        ).scalars().first()
+        assert thread is not None
+        accept_submission(
+            db, campaign_id=cid, user_id=owner_id,
+            raw_content="Scouting ahead before we begin.",
+            segments=[{"type": "ooc", "text": "Scouting ahead before we begin."}],
+            thread_id=str(thread.id), audience="campaign",
+        )
+        db.commit()
+        unrelated, _ = coordinate_turn(db, cid, str(thread.id), commit=True)
+        unrelated_id = str(unrelated.id)
+        db.commit()
+
+    response = _bootstrap(client, campaign["id"], "op-unrelated-history")
+    assert response.status_code == 200, response.text
+    body = response.json()
+    assert body["campaign"]["status"] == "active"
+    with factory() as db:
+        opening = db.execute(
+            select(PlayerSubmission).where(
+                PlayerSubmission.campaign_id == cid,
+                PlayerSubmission.raw_content == OPENING_OOC_TEXT,
+            )
+        ).scalars().first()
+        assert opening is not None
+        assert str(opening.id) in (body["dm_turn"]["submission_ids"] or [])

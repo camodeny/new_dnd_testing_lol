@@ -206,21 +206,59 @@ def _ensure_bootstrap_scene(db: Session, campaign, *, pc_name: str, actor_id, op
 
 
 def _ensure_opening_turn(db: Session, campaign, *, thread_id_str: str, owner_id, character_id, operation_id: str):
-    """Create the opening submission + DM turn once; reuse any existing turn."""
-    from app.dm.turns import coordinate_turn, list_turns
+    """Create the opening submission + DM turn once; reuse only bootstrap provenance.
+
+    Reuse is keyed to the bootstrap opening submission (deterministic
+    ``OPENING_OOC_TEXT``), never to merely "a turn exists": unrelated lobby
+    history must not suppress the required opening. If live turn state makes
+    a new turn impossible, fail explicitly instead of substituting history.
+    """
+    from sqlalchemy import select as _select
+
+    from app.dm.turns import (
+        StreamBoundaryError,
+        TurnConflictError,
+        coordinate_turn,
+        get_attempt,
+        list_turns,
+    )
     from app.runtime.submissions import accept_submission
+    from models.threads import PlayerSubmission
 
-    existing_turns = list_turns(db, campaign.id, thread_id=thread_id_str, limit=5)
-    if existing_turns:
-        from app.dm.turns import get_attempt
+    def _turn_for_submission(submission_id) -> tuple | None:
+        for candidate in list_turns(db, campaign.id, thread_id=thread_id_str, limit=20):
+            if str(submission_id) in [str(s) for s in (candidate.submission_ids or [])]:
+                attempt = get_attempt(db, candidate.current_attempt_id) if candidate.current_attempt_id else None
+                return candidate, attempt
+        return None
 
-        turn = existing_turns[0]
-        attempt = get_attempt(db, turn.current_attempt_id) if turn.current_attempt_id else None
-        logger.info(
-            "solo_bootstrap opening_turn_reused campaign_id=%s thread_id=%s turn_id=%s",
-            campaign.id, thread_id_str, turn.id,
-        )
-        return turn, attempt, True
+    opening = db.execute(
+        _select(PlayerSubmission).where(
+            PlayerSubmission.campaign_id == campaign.id,
+            PlayerSubmission.thread_id == thread_id_str,
+            PlayerSubmission.raw_content == OPENING_OOC_TEXT,
+        ).order_by(PlayerSubmission.sequence.asc()).limit(1)
+    ).scalars().first()
+    if opening is not None:
+        found = _turn_for_submission(opening.id)
+        if found is not None:
+            turn, attempt = found
+            logger.info(
+                "solo_bootstrap opening_turn_reused campaign_id=%s thread_id=%s turn_id=%s",
+                campaign.id, thread_id_str, turn.id,
+            )
+            return turn, attempt, True
+        # Opening submission exists but its turn is gone (e.g. abandoned):
+        # coordinate a fresh turn around it.
+        try:
+            coord = coordinate_turn(db, campaign.id, thread_id_str, audience="campaign", commit=False)
+        except (TurnConflictError, StreamBoundaryError) as exc:
+            raise SoloBootstrapError(
+                f"Solo bootstrap opening is blocked by live turn state: {exc}"
+            ) from exc
+        if coord is None:
+            raise SoloBootstrapError("Opening turn coordination produced no turn")
+        return coord[0], coord[1], False
 
     submission = accept_submission(
         db,
@@ -233,7 +271,12 @@ def _ensure_opening_turn(db: Session, campaign, *, thread_id_str: str, owner_id,
         audience="campaign",
     )
     db.flush()
-    coord = coordinate_turn(db, campaign.id, thread_id_str, audience="campaign", commit=False)
+    try:
+        coord = coordinate_turn(db, campaign.id, thread_id_str, audience="campaign", commit=False)
+    except (TurnConflictError, StreamBoundaryError) as exc:
+        raise SoloBootstrapError(
+            f"Solo bootstrap opening is blocked by live turn state: {exc}"
+        ) from exc
     if coord is None:
         raise SoloBootstrapError("Opening turn coordination produced no turn")
     turn, attempt = coord
@@ -256,7 +299,33 @@ def run_solo_bootstrap(
     actor_id,
     operation_id: str,
 ):
-    """Owner-authorized solo bootstrap. Returns response dict. Raises on misuse."""
+    """Owner-authorized solo bootstrap. Returns response dict. Raises on misuse.
+
+    Flush-only: the caller owns the atomic commit. Concurrent different-key
+    starts serialize on the campaign row; a revision-conflict loser rolls
+    back and retries once, converging via the reuse paths below (the winner
+    either committed everything or nothing).
+    """
+    from app.campaigns.events import RevisionConflictError
+
+    try:
+        return _run_once(db, campaign_id, actor_id=actor_id, operation_id=operation_id)
+    except RevisionConflictError:
+        db.rollback()
+        logger.info(
+            "solo_bootstrap revision_race_retry campaign_id=%s actor_id=%s op=%s",
+            campaign_id, actor_id, operation_id,
+        )
+        return _run_once(db, campaign_id, actor_id=actor_id, operation_id=operation_id)
+
+
+def _run_once(
+    db: Session,
+    campaign_id,
+    *,
+    actor_id,
+    operation_id: str,
+):
     from sqlalchemy import select as _select
 
     from app.campaigns.service import compute_start_eligibility
@@ -269,6 +338,14 @@ def run_solo_bootstrap(
         raise SoloBootstrapError("Campaign not found")
     if campaign.owner_id != actor_id:
         raise SoloBootstrapError("Only the owner can start the solo bootstrap")
+    # Serialize concurrent different-key starts on the campaign row: the
+    # winner commits first and the loser re-reads canonical state after it.
+    # (No-op where the dialect ignores row locks; the revision guard plus the
+    # run-level retry above still converge.)
+    db.execute(
+        _select(Campaign).where(Campaign.id == campaign.id).with_for_update()
+    )
+    db.refresh(campaign)
     members = db.execute(
         _select(CampaignMember).where(CampaignMember.campaign_id == campaign.id)
     ).scalars().all()
