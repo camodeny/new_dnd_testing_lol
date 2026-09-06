@@ -171,37 +171,9 @@ export function useLiveTableRealtime(opts: UseLiveTableRealtimeOptions) {
     [],
   )
 
-  // Snapshot fetch (authoritative, retryable) — adopts immediately.
-  // Quiet polls (background fallback) must not flap the phase/error banner.
-  const fetchSnapshotAndAdopt = useCallback(async (quiet = false): Promise<SnapshotForRealtime | null> => {
-    const cid = campaignIdRef.current
-    const tid = threadIdRef.current
-    if (!cid) return null
-    const params = new URLSearchParams()
-    if (tid) params.set('thread_id', tid)
-    const qs = params.toString() ? `?${params}` : ''
-    if (isMountedRef.current && !quiet) {
-      setState((prev) => ({ ...prev, phase: prev.hasSnapshot ? 'reconciling' : 'loading', error: null }))
-    }
-    try {
-      const snap = await apiFetch<SnapshotForRealtime>(`/campaigns/${cid}/snapshot${qs}`)
-      adoptSnapshot(snap)
-      return snap
-    } catch (e) {
-      const msg = (e as Error).message ?? 'snapshot fetch failed'
-      if (isMountedRef.current && !quiet) {
-        setState((prev) => ({
-          ...prev,
-          error: msg,
-          phase: prev.hasSnapshot ? 'reconnecting' : 'error',
-        }))
-      }
-      return null
-    }
-  }, [adoptSnapshot])
-
   // Apply a batch of events (dedupe + sort + merge into state)
   // Assumes snapshot already adopted; caller must reconcile first.
+  // Defined before fetchSnapshotAndAdopt so the shared race invariant can use it.
   const applyEvents = useCallback((events: RealtimeEvent[]) => {
     if (!events.length) return
     const deduped = dedupeEvents(events)
@@ -298,6 +270,43 @@ export function useLiveTableRealtime(opts: UseLiveTableRealtimeOptions) {
       }
     })
   }, [])
+
+  // Snapshot fetch (authoritative, retryable) — adopts immediately.
+  // Quiet polls (background fallback) must not flap the phase/error banner.
+  const fetchSnapshotAndAdopt = useCallback(async (quiet = false): Promise<SnapshotForRealtime | null> => {
+    const cid = campaignIdRef.current
+    const tid = threadIdRef.current
+    if (!cid) return null
+    const params = new URLSearchParams()
+    if (tid) params.set('thread_id', tid)
+    const qs = params.toString() ? `?${params}` : ''
+    if (isMountedRef.current && !quiet) {
+      setState((prev) => ({ ...prev, phase: prev.hasSnapshot ? 'reconciling' : 'loading', error: null }))
+    }
+    try {
+      const snap = await apiFetch<SnapshotForRealtime>(`/campaigns/${cid}/snapshot${qs}`)
+      adoptSnapshot(snap)
+      // Snapshot/subscription race invariant (shared by subscribe, reconnect,
+      // refresh, and polling paths): replay broadcasts that arrived while
+      // this request was in flight so adoption cannot erase fresher state.
+      if (bufferedRef.current.length) {
+        const reconciled = reconcileBufferedEvents(snap, bufferedRef.current)
+        if (reconciled.length) applyEvents(reconciled)
+        bufferedRef.current = []
+      }
+      return snap
+    } catch (e) {
+      const msg = (e as Error).message ?? 'snapshot fetch failed'
+      if (isMountedRef.current && !quiet) {
+        setState((prev) => ({
+          ...prev,
+          error: msg,
+          phase: prev.hasSnapshot ? 'reconnecting' : 'error',
+        }))
+      }
+      return null
+    }
+  }, [adoptSnapshot, applyEvents])
 
   // Build a channel subscription; returns the channel handle
   const buildChannel = useCallback(
