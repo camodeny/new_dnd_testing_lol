@@ -431,6 +431,15 @@ def solo_bootstrap_campaign(
             if msg.startswith("Only the owner"):
                 raise HTTPException(status_code=403, detail=msg) from exc
             raise HTTPException(status_code=409, detail=msg) from exc
+        except RevisionConflictError as exc:
+            # Concurrent-start loser: the whole idempotent command (including
+            # its record) rolled back atomically, so retrying the same key
+            # is a fresh command that converges via reuse.
+            raise HTTPException(
+                status_code=409,
+                detail="Concurrent campaign start conflicted; retry the request",
+                headers={"X-Current-Revision": str(exc.actual_revision)},
+            ) from exc
 
     result = execute_http_idempotent(
         db,

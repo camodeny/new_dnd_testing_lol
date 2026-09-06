@@ -302,30 +302,12 @@ def run_solo_bootstrap(
     """Owner-authorized solo bootstrap. Returns response dict. Raises on misuse.
 
     Flush-only: the caller owns the atomic commit. Concurrent different-key
-    starts serialize on the campaign row; a revision-conflict loser rolls
-    back and retries once, converging via the reuse paths below (the winner
-    either committed everything or nothing).
+    starts serialize on the campaign row below, so a revision conflict inside
+    here is unexpected — it aborts the whole idempotent command (no partial
+    state, no stranded record) and the client retries the same key, which
+    then converges via the reuse paths. Never roll back or retry in here:
+    the outer transaction owns the idempotency record.
     """
-    from app.campaigns.events import RevisionConflictError
-
-    try:
-        return _run_once(db, campaign_id, actor_id=actor_id, operation_id=operation_id)
-    except RevisionConflictError:
-        db.rollback()
-        logger.info(
-            "solo_bootstrap revision_race_retry campaign_id=%s actor_id=%s op=%s",
-            campaign_id, actor_id, operation_id,
-        )
-        return _run_once(db, campaign_id, actor_id=actor_id, operation_id=operation_id)
-
-
-def _run_once(
-    db: Session,
-    campaign_id,
-    *,
-    actor_id,
-    operation_id: str,
-):
     from sqlalchemy import select as _select
 
     from app.campaigns.service import compute_start_eligibility

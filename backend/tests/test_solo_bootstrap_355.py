@@ -234,12 +234,15 @@ def test_solo_bootstrap_mid_request_failure_leaves_no_partial_state(api, monkeyp
     assert response.json()["campaign"]["status"] == "active"
 
 
-def test_solo_bootstrap_revision_race_converges_on_retry(api, monkeypatch):
-    """Review #360: a revision-conflict loser rolls back and retries once,
-    converging via reuse instead of surfacing a 409 for a duplicate start."""
+def test_solo_bootstrap_revision_race_aborts_cleanly_then_reconverges(api, monkeypatch):
+    """Review #360: a revision-conflict loser aborts the whole idempotent
+    command (no partial state, no stranded record); retrying the SAME key is
+    a fresh command that converges, and a further retry replays it."""
     import app.campaigns.events as campaign_events
 
     from app.campaigns.events import RevisionConflictError
+    from models.campaigns import Campaign
+    from models.reliability import IdempotentCommand
 
     client, factory, actor, owner_id, _ = api
     campaign = _create(client)
@@ -258,17 +261,42 @@ def test_solo_bootstrap_revision_race_converges_on_retry(api, monkeypatch):
         return real_commit(*args, **kwargs)
 
     monkeypatch.setattr(campaign_events, "commit_campaign_mutation", _race_once)
-    response = _bootstrap(client, campaign["id"], "op-race")
-    assert response.status_code == 200, response.text
-    body = response.json()
-    assert body["campaign"]["status"] == "active"
-    assert body["dm_turn"]["id"]
+    conflicted = _bootstrap(client, campaign["id"], "op-race")
+    assert conflicted.status_code == 409, conflicted.text
 
+    cid = uuid.UUID(campaign["id"])
     with factory() as db:
-        cid = uuid.UUID(campaign["id"])
-        assert db.scalar(
-            select(func.count()).select_from(CampaignThread).where(CampaignThread.campaign_id == cid)
-        ) == 1
+        # Aborted atomically: still lobby, no artifacts, no stranded record.
+        assert db.get(Campaign, cid).status == "lobby"
+        assert db.get(CampaignCurrentScene, cid) is None
+        assert db.execute(select(DmTurn).where(DmTurn.campaign_id == cid)).scalars().all() == []
+        assert db.execute(
+            select(IdempotentCommand).where(
+                IdempotentCommand.idempotency_key == "op-race",
+                IdempotentCommand.command_type == "campaign.solo_bootstrap",
+            )
+        ).scalars().all() == []
+
+    # Same-key retry converges end to end with exactly one completed record.
+    retry = _bootstrap(client, campaign["id"], "op-race")
+    assert retry.status_code == 200, retry.text
+    assert retry.json()["campaign"]["status"] == "active"
+    with factory() as db:
+        rows = db.execute(
+            select(IdempotentCommand).where(
+                IdempotentCommand.idempotency_key == "op-race",
+                IdempotentCommand.command_type == "campaign.solo_bootstrap",
+            )
+        ).scalars().all()
+        assert len(rows) == 1
+        assert rows[0].status == "completed"
+
+    # Third same-key call replays without side effects.
+    replay = _bootstrap(client, campaign["id"], "op-race")
+    assert replay.status_code == 200, replay.text
+    assert replay.headers.get("X-Idempotent-Replay") == "true"
+    assert replay.json()["dm_turn"]["id"] == retry.json()["dm_turn"]["id"]
+    with factory() as db:
         assert db.scalar(
             select(func.count()).select_from(DmTurn).where(DmTurn.campaign_id == cid)
         ) == 1
