@@ -217,6 +217,11 @@ def _known_entities_map_from_packet(packet: ForwardDmContextPacket | None) -> di
             for rec in lane.records:
                 v = rec.value
                 if isinstance(v, dict):
+                    # The scene reader supplies its canonical location as a
+                    # foreign key, not as a top-level entity record. Never
+                    # treat campaign IDs or names as entity authority.
+                    if lane.name == LaneName.CURRENT_SCENE and v.get("location_entity_id"):
+                        out[str(v["location_entity_id"]).strip().lower()] = "location"
                     for k in ("entity_type", "type"):
                         t = v.get(k)
                         eid = v.get("entity_id") or v.get("id")

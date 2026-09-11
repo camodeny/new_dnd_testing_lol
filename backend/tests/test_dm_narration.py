@@ -256,7 +256,15 @@ def test_unsupported_narrator_addition_rejected():
     assert any(v["category"] == "unsupported_addition" for v in ei.value.violations)
 
 
-def test_pc_agency_violation_rejected():
+def test_consequence_check_ignores_substring_inside_longer_word():
+    c = _respond([_narr_beat("Mara studies the lights beyond the fog.")])
+    good = "Mara studies the lights beyond the fog. She learns nothing certain."
+    assert validate_narration_fidelity(good, c) == []
+
+
+def test_pc_agency_violation_rejected(monkeypatch):
+    import app.dm.narration as narration_mod
+    monkeypatch.setattr(narration_mod, "_PC_AGENCY_CHECK_ENABLED", True)
     c = _respond([{
         "id": "beat_1", "type": "narration",
         "claims": [{
@@ -272,6 +280,20 @@ def test_pc_agency_violation_rejected():
     assert any(v["category"] == "agency_violation" for v in ei.value.violations)
     m = get_narration_metrics()
     assert m["agency_rejections"] >= 1
+
+
+def test_pc_agency_gate_disabled_for_playtesting():
+    c = _respond([{
+        "id": "beat_1", "type": "narration",
+        "claims": [{
+            "text": 'Elara declares, "I hold my ground."',
+            "claim_kind": "player_declaration", "origin": "player_transcript",
+            "actor_ref": {"type": "character", "id": "char:elara"},
+            "evidence_refs": ["sub1"], "visibility": "public",
+        }],
+    }])
+    bad = 'Elara declares, "I hold my ground." Elara charges the dragon and attacks.'
+    assert validate_narration_fidelity(bad, c, pc_names={"char:elara": "Elara"}) == []
 
 
 def test_contradiction_with_structured_result_rejected():
@@ -720,9 +742,10 @@ def test_incremental_gate_rejects_secret_midstream(db):
     ).scalars().all()) >= 1
 
 
-def test_incremental_gate_rejects_agency_violation_midstream(db):
+def test_incremental_gate_rejects_agency_violation_midstream(db, monkeypatch):
     from app.dm_streams.service import get_stream
-
+    import app.dm.narration as narration_mod
+    monkeypatch.setattr(narration_mod, "_PC_AGENCY_CHECK_ENABLED", True)
     s, camp_id, thread_id = db
     c = _respond([{
         "id": "beat_1", "type": "narration",

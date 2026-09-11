@@ -44,6 +44,7 @@ interface UseLiveTableRealtimeOptions {
 interface LiveTableState {
   messages: RealtimeEvent[]
   dmState: DmStateForRealtime | null
+  rollRequests: NonNullable<SnapshotForRealtime['roll_requests']>
   dmMessages: DmMessageForRealtime[]
   dmChunks: Map<string, RealtimeEvent[]> // incremental chunks newer than snapshot
   dmStatus: RealtimeEvent | null
@@ -87,6 +88,7 @@ export function useLiveTableRealtime(opts: UseLiveTableRealtimeOptions) {
         messages: snapshotToMessageEvents(initialSnapshot, campaignId, threadId),
         dmState: initialSnapshot.dm_state ?? null,
         dmMessages: initialSnapshot.dm_messages ?? [],
+        rollRequests: initialSnapshot.roll_requests ?? [],
         dmChunks: new Map(),
         dmStatus: null,
         revision: initialSnapshot.revision ?? null,
@@ -104,6 +106,7 @@ export function useLiveTableRealtime(opts: UseLiveTableRealtimeOptions) {
       messages: [],
       dmState: null,
       dmMessages: [],
+      rollRequests: [],
       dmChunks: new Map(),
       dmStatus: null,
       revision: initialSnapshot?.revision ?? null,
@@ -166,6 +169,7 @@ export function useLiveTableRealtime(opts: UseLiveTableRealtimeOptions) {
         messages: msgs,
         dmState: snap.dm_state ?? null,
         dmMessages: snap.dm_messages ?? [],
+        rollRequests: snap.roll_requests ?? [],
         // Clear incremental chunks — snapshot's visible_text is authoritative.
         // New chunks strictly newer than snapshot will repopulate this map.
         dmChunks: new Map(),
@@ -389,6 +393,7 @@ export function useLiveTableRealtime(opts: UseLiveTableRealtimeOptions) {
       messages: [],
       dmState: null,
       dmMessages: [],
+      rollRequests: [],
       dmChunks: new Map(),
       dmStatus: null,
       revision: null,
@@ -605,6 +610,7 @@ export function useLiveTableRealtime(opts: UseLiveTableRealtimeOptions) {
     messages: state.messages,
     dmState: state.dmState,
     dmMessages: state.dmMessages,
+    rollRequests: state.rollRequests,
     dmChunks: state.dmChunks,
     dmStatus: state.dmStatus,
     revision: state.revision,

@@ -1,5 +1,6 @@
 'use client'
 
+import DmTurnControls from '@/components/dashboard/DmTurnControls'
 import { useEffect, useState, useCallback, useMemo } from 'react'
 import { useParams, useRouter } from 'next/navigation'
 import { useAuthContext } from '@/contexts/AuthContext'
@@ -338,6 +339,8 @@ export default function CampaignViewPage() {
           aiThinking={aiThinking}
           aiThinkingStatus={aiThinkingStatus}
           activeDmText={streamingDmText}
+          turnControls={<DmTurnControls key={`${id}:${activeThreadId}`} campaignId={String(id)} dmState={liveTable.dmState}
+            rolls={liveTable.rollRequests} userId={user?.id} refresh={liveTable.refresh} />}
           liveStatus={liveStatus}
           liveError={liveError}
           loadingOlderMessages={liveTable.loadingOlder}

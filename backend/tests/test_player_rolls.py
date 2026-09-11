@@ -69,12 +69,14 @@ def roll_api(monkeypatch):
         raw = request.headers.get("X-Test-User")
         return db.get(Profile, uuid.UUID(raw)) if raw else db.get(Profile, owner)
 
+    executed = []
+    monkeypatch.setattr("app.dm.recovery.execute_committed_attempt", executed.append)
     monkeypatch.setattr("app.rolls.router.resolve_profile", resolve_test_profile)
     monkeypatch.setattr("app.snapshot.router.resolve_profile", resolve_test_profile)
     app.dependency_overrides[get_db] = override_db
     try:
         yield {
-            "client": TestClient(app), "factory": factory, "campaign_id": campaign_id, "thread_id": str(thread.id),
+            "client": TestClient(app), "factory": factory, "executed": executed, "campaign_id": campaign_id, "thread_id": str(thread.id),
             "owner": owner, "player": player, "outsider": outsider, "owner_character": owner_character,
             "player_character": player_character, "turn_id": turn.id, "attempt_id": attempt.id,
         }
@@ -120,6 +122,7 @@ def test_normal_roll_duplicate_retry_resumes_same_logical_turn(roll_api):
     assert first.status_code == 200, first.text
     assert first.headers["X-Idempotent-Replay"] == "false"
     resumed = first.json()["resumed_attempt"]
+    assert ctx["executed"] == [resumed["id"]]
     assert resumed["turn_id"] == str(ctx["turn_id"])
     assert resumed["roll_evidence"][0]["fulfillment"]["total"] == 17
     retry = ctx["client"].post(
@@ -229,3 +232,28 @@ def test_service_rejects_other_human_without_mutating_request(roll_api):
         db.rollback()
     with ctx["factory"]() as db:
         assert db.get(PlayerRollRequest, uuid.UUID(row["id"])).status == "pending"
+
+
+def test_retry_endpoint_authorization_idempotency_and_post_commit_execution(roll_api, monkeypatch):
+    ctx = roll_api
+    monkeypatch.setattr('app.dm.router.resolve_profile', lambda request, db: db.get(
+        Profile, uuid.UUID(request.headers.get('X-Test-User', str(TEST_USER_ID)))))
+    with ctx['factory']() as db:
+        db.get(DmTurn, ctx['turn_id']).status = 'failed_visible'
+        db.get(DmTurnAttempt, ctx['attempt_id']).status = 'failed_visible'
+        db.commit()
+    path = f'/api/campaigns/{ctx["campaign_id"]}/dm-turns/{ctx["turn_id"]}/retry'
+    body = {'attempt_id': str(ctx['attempt_id'])}
+    denied = ctx['client'].post(path, json=body, headers={'Idempotency-Key': 'denied', 'X-Test-User': str(ctx['player'])})
+    assert denied.status_code == 403
+    first = ctx['client'].post(path, json=body, headers={'Idempotency-Key': 'retry'})
+    assert first.status_code == 200, first.text
+    replay = ctx['client'].post(path, json=body, headers={'Idempotency-Key': 'retry'})
+    other_key = ctx['client'].post(path, json=body, headers={'Idempotency-Key': 'retry-another-click'})
+    assert first.json() == replay.json() == other_key.json()
+    with ctx['factory']() as db:
+        assert db.query(DmTurnAttempt).filter_by(turn_id=ctx['turn_id']).count() == 2
+        fresh = db.get(DmTurnAttempt, uuid.UUID(first.json()['attempt_id']))
+        assert fresh.status == 'prepared'
+        assert fresh.submission_ids == db.get(DmTurnAttempt, ctx['attempt_id']).submission_ids
+    assert set(ctx['executed']) == {first.json()['attempt_id']}
