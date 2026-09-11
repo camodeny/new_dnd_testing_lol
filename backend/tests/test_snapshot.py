@@ -370,3 +370,31 @@ def test_snapshot_postgres_setup_failure_raises_projection_error(monkeypatch):
 
     with pytest.raises(svc.SnapshotProjectionError, match="Failed to establish consistent snapshot"):
         svc._ensure_repeatable_read(mock_db)
+
+
+@pytest.mark.parametrize('turn_status,attempt_status,expected', [
+    ('pending', 'prepared', 'pending'), ('pending', 'running', 'thinking'),
+    ('awaiting_roll', 'awaiting_roll', 'awaiting_roll'),
+    ('failed_visible', 'failed_visible', 'failed_visible'),
+])
+def test_snapshot_projects_unstreamed_turn_lifecycle(api, turn_status, attempt_status, expected):
+    client, factory, campaign_id, _, _ = api
+    from models.dm import DmTurn, DmTurnAttempt
+    with factory() as db:
+        thread = db.execute(select(CampaignThread).where(CampaignThread.campaign_id == campaign_id)).scalars().first()
+        turn = DmTurn(id=uuid.uuid4(), campaign_id=campaign_id, thread_id=str(thread.id),
+                      audience='campaign', status=turn_status, source_revision=0, input_set_revision=1, submission_ids=[])
+        db.add(turn); db.flush()
+        attempt = DmTurnAttempt(id=uuid.uuid4(), turn_id=turn.id, campaign_id=campaign_id,
+            thread_id=str(thread.id), audience='campaign', status=attempt_status, attempt_number=1,
+            source_revision=0, input_set_revision=1, submission_ids=[], last_error='secret provider diagnostics')
+        db.add(attempt); db.flush(); turn.current_attempt_id = attempt.id
+        turn_id = str(turn.id)
+        db.commit()
+    response = client.get(f'/api/campaigns/{campaign_id}/snapshot')
+    assert response.status_code == 200
+    state = response.json()['dm_state']
+    assert state['status'] == expected
+    assert state['turn_id'] == turn_id
+    assert state['can_retry'] == (expected == 'failed_visible')
+    assert 'secret provider diagnostics' not in response.text

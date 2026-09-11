@@ -1,7 +1,7 @@
 """HTTP transport for durable player-owned roll requests — issue #204."""
 import uuid
 
-from fastapi import APIRouter, Depends, HTTPException, Request, Response
+from fastapi import APIRouter, BackgroundTasks, Depends, HTTPException, Request, Response
 from sqlalchemy.orm import Session
 
 from app.campaigns.auth import authorized_campaign, require_owner
@@ -100,7 +100,7 @@ def get_roll_requests(campaign_id: str, request: Request, db: Session = Depends(
 
 
 @router.post("/api/campaigns/{campaign_id}/roll-requests/{roll_request_id}/fulfill")
-def fulfill_roll_request(campaign_id: str, roll_request_id: str, payload: dict, request: Request, response: Response, db: Session = Depends(get_db)):
+def fulfill_roll_request(campaign_id: str, roll_request_id: str, payload: dict, request: Request, response: Response, background_tasks: BackgroundTasks, db: Session = Depends(get_db)):
     profile = resolve_profile(request, db)
     campaign = authorized_campaign(db, campaign_id, profile.id)
     rid = _id(roll_request_id, "roll request id")
@@ -121,11 +121,16 @@ def fulfill_roll_request(campaign_id: str, roll_request_id: str, payload: dict, 
         except RollLifecycleError as exc:
             raise HTTPException(status_code=409 if "status" in str(exc) else 422, detail=str(exc)) from exc
 
-    return execute_http_idempotent(
+    result = execute_http_idempotent(
         db, response, actor_id=profile.id, idempotency_key=key,
         command_type="player_roll.fulfill", scope_type="roll_request", scope_id=rid,
         payload=payload, execute=execute,
     )
+    resumed = result.get("resumed_attempt")
+    if resumed:
+        from app.dm.recovery import execute_committed_attempt
+        background_tasks.add_task(execute_committed_attempt, resumed["id"])
+    return result
 
 
 @router.post("/api/campaigns/{campaign_id}/roll-requests/{roll_request_id}/cancel")

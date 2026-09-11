@@ -359,6 +359,26 @@ def build_live_table_snapshot(
                     "turn_id": None, "attempt_id": None, "stream_id": None,
                     "started_at": None, "chunk_count": 0, "visible_text": "",
                 }
+                from models.dm import DmTurn, DmTurnAttempt
+                from app.dm.turns import ACTIVE_TURN_STATUSES
+
+                turn = db.execute(select(DmTurn).where(
+                    DmTurn.campaign_id == campaign_id,
+                    DmTurn.thread_id == thread_id_str,
+                    DmTurn.status.in_(ACTIVE_TURN_STATUSES),
+                ).order_by(DmTurn.created_at.desc()).limit(1)).scalars().first()
+                if turn is not None:
+                    attempt = db.get(DmTurnAttempt, turn.current_attempt_id) if turn.current_attempt_id else None
+                    status = turn.status
+                    if status == "pending" and attempt is not None and attempt.status == "running":
+                        status = "thinking"
+                    dm_state.update({
+                        "status": status, "active_turn": str(turn.id), "turn_id": str(turn.id),
+                        "attempt_id": str(turn.current_attempt_id) if turn.current_attempt_id else None,
+                        "started_at": turn.created_at.isoformat() if turn.created_at else None,
+                        "can_retry": status == "failed_visible" and not turn.streaming_started_at and campaign.owner_id == viewer_id,
+                        "message": "The AI DM could not finish this turn. Your action is saved." if status == "failed_visible" else None,
+                    })
 
             dm_completed_rows = db.execute(
                 select(DMStream)
@@ -388,6 +408,7 @@ def build_live_table_snapshot(
                 })
         except Exception as exc:
             logger.warning("dm_state projection failed campaign_id=%s thread_id=%s error=%s", campaign_id, thread_id_str, exc)
+            raise SnapshotProjectionError("Failed to project DM turn state") from exc
 
         realtime_resume_token = f"{revision}:{high_water or 0}"
         generated_at = datetime.now(timezone.utc).isoformat()

@@ -118,7 +118,18 @@ export interface DmMessageForRealtime {
   [key: string]: unknown
 }
 
+export interface PlayerRollForRealtime {
+  id: string
+  requested_user_id: string
+  character_id: string
+  status: string
+  label: string
+  reason_public: string
+  advantage_state: string
+}
+
 export interface SnapshotForRealtime {
+  roll_requests?: PlayerRollForRealtime[]
   revision?: number
   reconciliation?: SnapshotReconciliation
   dm_state?: DmStateForRealtime | null

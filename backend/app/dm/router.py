@@ -9,7 +9,7 @@ commit) for integration tests and the worker runtime.
 import logging
 import uuid
 
-from fastapi import APIRouter, Depends, HTTPException, Request
+from fastapi import APIRouter, BackgroundTasks, Depends, HTTPException, Request, Response
 from sqlalchemy.orm import Session
 
 from app.campaigns.auth import authorized_campaign, require_owner
@@ -19,6 +19,39 @@ from database import get_db
 
 router = APIRouter()
 logger = logging.getLogger(__name__)
+
+
+@router.post("/api/campaigns/{campaign_id}/dm-turns/{turn_id}/retry")
+def retry_adjudication(campaign_id: str, turn_id: str, payload: dict, request: Request,
+                       response: Response, background_tasks: BackgroundTasks, db: Session = Depends(get_db)):
+    from app.deps.idempotency import execute_http_idempotent, require_idempotency_key
+    from app.dm.recovery import retry_failed_adjudication, execute_committed_attempt
+    from models.dm import DmTurn
+    profile = resolve_profile(request, db)
+    campaign = authorized_campaign(db, campaign_id, profile.id)
+    require_owner(campaign, profile.id)
+    try:
+        tid, aid = uuid.UUID(turn_id), uuid.UUID(str(payload.get("attempt_id")))
+    except ValueError as exc:
+        raise HTTPException(status_code=422, detail="Valid turn and attempt IDs are required") from exc
+    turn = db.get(DmTurn, tid)
+    if turn is None or turn.campaign_id != campaign.id:
+        raise HTTPException(status_code=404, detail="Turn not found")
+    try:
+        assert_can_read_thread(db, campaign.id, parse_thread_id(turn.thread_id), profile.id)
+    except (ThreadNotFoundError, ThreadAuthorizationError) as exc:
+        raise HTTPException(status_code=404, detail="Turn not found") from exc
+    key = require_idempotency_key(request, payload.get("operation_id"))
+    def execute():
+        try:
+            updated, attempt = retry_failed_adjudication(db, campaign.id, tid, aid)
+        except ValueError as exc:
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
+        return {"turn_id": str(updated.id), "attempt_id": str(attempt.id)}
+    result = execute_http_idempotent(db, response, actor_id=profile.id, idempotency_key=key,
+        command_type="dm_turn.retry", scope_type="dm_turn", scope_id=tid, payload=payload, execute=execute)
+    background_tasks.add_task(execute_committed_attempt, result["attempt_id"])
+    return result
 
 
 @router.get("/api/campaigns/{campaign_id}/dm-turns")

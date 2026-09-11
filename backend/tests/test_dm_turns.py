@@ -589,3 +589,55 @@ def test_streaming_requires_durable_chunk_and_stream_id():
     db2.commit()
     with pytest.raises(ValueError, match="does not belong to turn"):
         mark_streaming_started(db2, t2.id, a2.id, stream_id=wrong_stream.id)
+
+
+def test_retry_failed_adjudication_keeps_original_input_and_replays_once():
+    from app.dm.recovery import retry_failed_adjudication
+    Fac, cid, owner, _, tid = _setup_campaign()
+    with Fac() as db:
+        original = accept_submission(db, campaign_id=cid, user_id=owner, raw_content='I inspect the fog',
+                                     segments=[{'type': 'ooc', 'text': 'I inspect the fog'}], thread_id=tid)
+        db.commit()
+        turn, old = coordinate_turn(db, cid, tid)
+        turn.status = old.status = 'failed_visible'
+        old.staged_effects = [{'id': 'uncommitted'}]
+        db.commit()
+        accept_submission(db, campaign_id=cid, user_id=owner, raw_content='I leave',
+                          segments=[{'type': 'ooc', 'text': 'I leave'}], thread_id=tid)
+        db.commit()
+        _, fresh = retry_failed_adjudication(db, cid, turn.id, old.id)
+        db.commit()
+        _, replay = retry_failed_adjudication(db, cid, turn.id, old.id)
+        assert replay.id == fresh.id
+        assert fresh.submission_ids == [str(original.id)]
+        assert fresh.staged_effects == []
+        assert fresh.parent_attempt_id == old.id
+        assert old.status == 'abandoned'
+        assert turn.status == 'pending'
+        assert db.query(DmTurnAttempt).filter_by(turn_id=turn.id).count() == 2
+        with pytest.raises(ValueError, match='current failed'):
+            retry_failed_adjudication(db, cid, turn.id, fresh.id)
+
+
+def test_retry_rejects_partial_output_and_preserves_roll_evidence():
+    from app.dm.recovery import retry_failed_adjudication
+    Fac, cid, owner, _, tid = _setup_campaign()
+    with Fac() as db:
+        accept_submission(db, campaign_id=cid, user_id=owner, raw_content='I inspect',
+                          segments=[{'type': 'ooc', 'text': 'I inspect'}], thread_id=tid)
+        db.commit()
+        turn, old = coordinate_turn(db, cid, tid)
+        turn.status = old.status = 'failed_visible'
+        old.streaming_started_at = datetime.now(timezone.utc)
+        db.commit()
+        with pytest.raises(ValueError, match='partial narration'):
+            retry_failed_adjudication(db, cid, turn.id, old.id)
+        assert old.status == 'failed_visible'
+        old.streaming_started_at = None
+        old.roll_evidence = [{'request_key': 'check', 'fulfillment': {'total': 12}}]
+        db.commit()
+        _, fresh = retry_failed_adjudication(db, cid, turn.id, old.id)
+        assert fresh.roll_evidence == old.roll_evidence
+        db.rollback()
+        assert db.get(DmTurnAttempt, old.id).status == 'failed_visible'
+        assert db.query(DmTurnAttempt).filter_by(turn_id=turn.id).count() == 1

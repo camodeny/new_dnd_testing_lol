@@ -1,6 +1,6 @@
 'use client'
 
-import { useState, useRef, useEffect } from 'react'
+import { useState, useRef, useEffect, type ReactNode } from 'react'
 import { useRouter } from 'next/navigation'
 import MarkdownContent from '@/components/common/MarkdownContent'
 import PrivateThreadConversation from '@/components/dashboard/PrivateThreadConversation'
@@ -19,6 +19,7 @@ interface StoryAtlasProps {
   encounterMap: EncounterMap | null
   aiThinking: boolean
   aiThinkingStatus: string
+  turnControls?: ReactNode
   activeDmText?: string
   liveStatus?: 'idle' | 'loading' | 'live' | 'reconnecting' | 'reconciling' | 'error'
   liveError?: string | null
@@ -50,6 +51,7 @@ export default function StoryAtlas({
   currentCharacter,
   aiThinking,
   aiThinkingStatus,
+  turnControls,
   activeDmText = '',
   liveStatus = 'idle',
   liveError = null,
@@ -312,6 +314,7 @@ export default function StoryAtlas({
                   )}
                 </div>
               )}
+              {turnControls}
               {hasOlderMessages && (
                 <div style={{ textAlign: 'center', marginBottom: 16 }}>
                   <button

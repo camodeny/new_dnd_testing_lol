@@ -1,6 +1,7 @@
 'use client'
 
 import { useMemo, useState } from 'react'
+import DmTurnControls from '@/components/dashboard/DmTurnControls'
 import MarkdownContent from '@/components/common/MarkdownContent'
 import { useLiveTableRealtime } from '@/hooks/useLiveTableRealtime'
 import { gameplayThreads } from '@/lib/api'
@@ -107,6 +108,8 @@ export default function PrivateThreadConversation({
       </header>
 
       <div className="session-messages private-thread-messages">
+        {isAiDmThread && <DmTurnControls key={thread.id} campaignId={campaignId} dmState={realtime.dmState}
+          rolls={realtime.rollRequests} userId={currentUser.id} refresh={realtime.refresh} />}
         {realtime.error && (
           <div className="private-thread-reconnect" role="status">
             Reconnecting from the private snapshot. {realtime.error}

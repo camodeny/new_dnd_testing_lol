@@ -424,3 +424,26 @@ def test_structural_normalization_error_retries_with_feedback():
     assert len(calls) == 2
     assert calls[0] is None
     assert calls[1] is not None and "beats" in calls[1]
+
+
+def test_current_scene_location_is_typed_identity_authority():
+    cid, location_id = str(uuid.uuid4()), str(uuid.uuid4())
+    scene = ContextRecord(
+        record_id=f"current-scene:{cid}",
+        value={"campaign_id": cid, "location_entity_id": location_id, "location_name": "Tavern"},
+        sources=[SourceRef(source_type="campaign_current_scene", source_id=cid, source_version="1")],
+        authorization=AuthorizationScope(campaign_id=cid),
+    )
+    packet, _, _ = _packet(campaign_id=cid, extra_records={LaneName.CURRENT_SCENE: [scene]},
+                           extra_status={LaneName.CURRENT_SCENE: "authoritative"})
+    from app.dm.validators import EntityValidator
+    validator = EntityValidator()
+    def contract(ref):
+        return _base([{"id": "scene", "type": "narration", "claims": [{
+            "text": "Fog lies beyond the tavern.", "claim_kind": "observation",
+            "origin": "established_state", "topic_refs": [ref],
+        }]}])
+    assert validator.validate(contract({"type": "location", "id": location_id}), packet).passed
+    for ref in [{"type": "npc", "id": location_id}, {"type": "location", "id": cid},
+                {"type": "location", "id": "Tavern"}, {"type": "location", "id": str(uuid.uuid4())}]:
+        assert not validator.validate(contract(ref), packet).passed
