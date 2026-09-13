@@ -637,10 +637,12 @@ def repair_missing_post_turn_runs(db: Session, *, limit: int = 20) -> list[str]:
     This is the recovery source for eager trigger-staging failures swallowed
     by the savepoint in ``commit_campaign_mutation``: the event commits, no
     run row exists, and without this repair the range would stay outstanding
-    forever when play stops. Repair uses threshold=1 (any outstanding work
-    qualifies) because the batch policy already had its chance at commit
-    time — convergence outranks batching here. ``maybe_trigger_post_turn``
-    still dedupes against any live run for the same range.
+    forever when play stops. Repair preserves the configured batch policy
+    (``POST_TURN_BATCH_SIZE``): intentionally sub-threshold work stays batched
+    — repair only recreates what the normal policy would have triggered.
+    This still converges staging failures because outstanding work only grows,
+    so a range stranded at/above threshold still qualifies at repair time.
+    ``maybe_trigger_post_turn`` dedupes against any live run for the range.
     """
     from sqlalchemy import func as _func
 
@@ -680,7 +682,7 @@ def repair_missing_post_turn_runs(db: Session, *, limit: int = 20) -> list[str]:
             continue
         try:
             with db.begin_nested():
-                run = maybe_trigger_post_turn(db, cid, trigger=NORMAL, threshold=1, commit=False)
+                run = maybe_trigger_post_turn(db, cid, trigger=NORMAL, commit=False)
                 db.flush()
             if run is not None:
                 repaired.append(str(run.id))

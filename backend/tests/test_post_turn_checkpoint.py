@@ -561,3 +561,20 @@ def test_cas_loser_retired_not_reswept(tmp_path):
         assert db.get(PostTurnCheckpoint, cid).processed_through_sequence == 5
         sweep = run_post_turn_sweep(db, limit=10)
         assert sweep["executed"] == [] and sweep["failed"] == []
+
+
+def test_sweep_preserves_batch_policy_for_sub_threshold():
+    """Intentionally sub-threshold work stays batched: 2 events + sweep
+    creates no run and leaves the checkpoint at 0."""
+    F = _factory()
+    db = F()
+    c = _campaign(db)
+    for i in range(2):
+        _commit(db, c.id, i)
+    sweep = run_post_turn_sweep(db, limit=5)
+    assert sweep["repaired"] == [] and sweep["executed"] == [] and sweep["failed"] == []
+    from models.post_turn import PostTurnRun as _Run
+    assert db.execute(select(_Run).where(_Run.campaign_id == c.id)).scalars().first() is None
+    _cp = db.get(PostTurnCheckpoint, c.id)
+    assert _cp is None or _cp.processed_through_sequence == 0
+    db.close()
