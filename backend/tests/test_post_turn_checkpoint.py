@@ -13,6 +13,7 @@ if not hasattr(SQLiteTypeCompiler, "_patched_jsonb"):
     SQLiteTypeCompiler._patched_jsonb = True  # type: ignore
 
 from database import Base  # noqa: E402
+from database import get_db as _get_db  # noqa: E402
 import models  # noqa: E402, F401
 from app.campaigns.events import commit_campaign_mutation  # noqa: E402
 from app.post_turn.service import (  # noqa: E402
@@ -24,6 +25,7 @@ from app.post_turn.service import (  # noqa: E402
     mark_post_turn_skipped,
     maybe_trigger_post_turn,
     run_post_turn_range,
+    run_post_turn_sweep,
     should_trigger_post_turn,
 )
 from app.queue.envelope import WorkerEnvelope  # noqa: E402
@@ -38,6 +40,16 @@ def _factory():
     eng = create_engine("sqlite://", connect_args={"check_same_thread": False}, poolclass=StaticPool)
     Base.metadata.create_all(bind=eng)
     return sessionmaker(bind=eng, expire_on_commit=False)
+
+
+import pytest as _pytest  # noqa: E402
+
+
+@_pytest.fixture(autouse=True)
+def _no_auto_trigger(monkeypatch):
+    """Unit tests drive the service directly; the wired auto-trigger path is
+    covered by the dedicated integration test below."""
+    monkeypatch.setenv("POST_TURN_AUTO_TRIGGER", "0")
 
 
 def _campaign(db, rev0=True):
@@ -245,3 +257,164 @@ def test_observability_status():
     assert st2["checkpoint"] == 4
     assert st2["outstanding"]["outstanding"] == 0
     db.close()
+
+
+def test_non_prefix_range_refused_without_advancing():
+    """Checkpoint 4 + range 6-8 must not skip sequence 5."""
+    F = _factory()
+    db = F()
+    c = _campaign(db)
+    for i in range(5):
+        _commit(db, c.id, i)
+    run = maybe_trigger_post_turn(db, c.id, trigger="force")
+    run_post_turn_range(db, c.id, 1, 5, run_id=run.id)
+    assert db.get(PostTurnCheckpoint, c.id).processed_through_sequence == 5
+    # Fabricate a non-prefix run 7-8 (as a tampered/stale delivery would).
+    from models.post_turn import PostTurnRun as _Run
+    bad = _Run(campaign_id=c.id, from_sequence=7, to_sequence=8, trigger="force", status="pending")
+    db.add(bad)
+    db.commit()
+    db.refresh(bad)
+    with _pytest.raises(RuntimeError, match="not the next outstanding prefix"):
+        run_post_turn_range(db, c.id, 7, 8, run_id=bad.id)
+    db.expire_all()
+    assert db.get(PostTurnCheckpoint, c.id).processed_through_sequence == 5
+    assert db.get(_Run, bad.id).status == "failed"
+    db.close()
+
+
+def test_handler_rejects_payload_mismatch_and_missing_run():
+    F = _factory()
+    db = F()
+    c = _campaign(db)
+    for i in range(2):
+        _commit(db, c.id, i)
+    run = maybe_trigger_post_turn(db, c.id, trigger="force")
+    # Payload range contradicting the durable run is rejected.
+    env = WorkerEnvelope(job_id=run.id, job_type="post_turn.process", campaign_id=c.id,
+                         payload={"run_id": str(run.id), "campaign_id": str(c.id),
+                                  "from_sequence": 99, "to_sequence": 100, "trigger": "force"})
+    with _pytest.raises(ValueError, match="does not match durable run"):
+        handle_post_turn_envelope(env, db)
+    db.rollback()
+    # Payload run_id contradicting the envelope job id is rejected.
+    env2 = WorkerEnvelope(job_id=run.id, job_type="post_turn.process", campaign_id=c.id,
+                          payload={"run_id": str(uuid.uuid4()), "campaign_id": str(c.id),
+                                   "from_sequence": 1, "to_sequence": 2, "trigger": "force"})
+    with _pytest.raises(ValueError, match="does not match envelope job_id"):
+        handle_post_turn_envelope(env2, db)
+    # No durable run at all is rejected (payload is a locator, not authority).
+    env3 = WorkerEnvelope(job_id=uuid.uuid4(), job_type="post_turn.process", campaign_id=c.id,
+                          payload={"run_id": None, "campaign_id": str(c.id),
+                                   "from_sequence": 1, "to_sequence": 2, "trigger": "force"})
+    # run_id None -> falls back to job_id; run missing -> ValueError
+    env3.payload.pop("run_id")
+    with _pytest.raises(ValueError, match="not found"):
+        handle_post_turn_envelope(env3, db)
+    db.rollback()
+    assert db.get(PostTurnCheckpoint, c.id).processed_through_sequence == 0
+    db.close()
+
+
+def test_concurrent_duplicate_triggers_share_one_run(tmp_path):
+    """Two racing triggers for the same range dedupe instead of raising."""
+    import threading
+    from sqlalchemy import create_engine as _ce
+    db_file = tmp_path / "post_turn_race.sqlite"
+    eng = _ce(f"sqlite:///{db_file}", connect_args={"check_same_thread": False, "timeout": 10})
+    Base.metadata.create_all(bind=eng)
+    Fac = sessionmaker(bind=eng, expire_on_commit=False)
+    with Fac() as db:
+        c = _campaign(db)
+        cid = c.id
+        for i in range(4):
+            _commit(db, cid, i)
+    results, errors = [], []
+
+    def _trigger():
+        try:
+            with Fac() as db:
+                r = maybe_trigger_post_turn(db, cid, trigger="force")
+                results.append(str(r.id) if r else None)
+        except Exception as e:  # noqa: BLE001
+            errors.append(e)
+
+    threads = [threading.Thread(target=_trigger) for _ in range(4)]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join()
+    assert not errors, f"racing triggers raised: {errors}"
+    assert len(results) == 4 and len(set(results)) == 1
+
+
+def test_production_wiring_commit_relay_consume(monkeypatch):
+    """Integration: commit gameplay only; auto-trigger -> relay -> worker."""
+    monkeypatch.setenv("POST_TURN_AUTO_TRIGGER", "1")
+    import database
+    from app.outbox.relay import run_outbox_relay_once
+    from app.queue import InMemoryQueueAdapter
+    from app.queue.consumer import consume_queue_delivery
+
+    F = _factory()
+    monkeypatch.setattr(database, "SessionLocal", F)
+    queue = InMemoryQueueAdapter()
+    with F() as db:
+        c = _campaign(db)
+        cid = c.id
+        # Production path: only commit_campaign_mutation, never the service.
+        for i in range(4):
+            commit_campaign_mutation(db, cid, expected_revision=i, event_type="game.play",
+                                     payload={"n": i}, operation_id=f"wire-{i}")
+        # Auto-trigger created the run + outbox atomically with the 4th event.
+        assert db.get(PostTurnCheckpoint, cid).processed_through_sequence == 0
+        status = get_post_turn_status(db, cid)
+        assert status["outstanding"]["outstanding"] == 4
+        assert status["run_attempts"] == 1
+    with F() as db:
+        relay = run_outbox_relay_once(db=db, adapter=queue, claimed_by="wire-test")
+        assert relay["succeeded"] == 1
+    assert queue.depth() == 1
+    with F() as db:
+        result, dup = consume_queue_delivery(db, queue.peek_all()[0].to_dict())
+        assert dup is False and result["processed_through"] == 4
+    with F() as db:
+        assert db.get(PostTurnCheckpoint, cid).processed_through_sequence == 4
+
+
+def test_post_turn_sweep_cron_endpoint(monkeypatch):
+    """Cron sweep executes pending runs through the worker fence."""
+    monkeypatch.setenv("ALLOW_INSECURE_CRON", "1")
+    monkeypatch.delenv("CRON_SECRET", raising=False)
+    from fastapi.testclient import TestClient
+    from app.factory import create_app
+
+    F = _factory()
+    with F() as db:
+        c = _campaign(db)
+        cid = c.id
+        for i in range(2):
+            _commit(db, cid, i)
+        run = maybe_trigger_post_turn(db, cid, trigger="force")
+        assert run is not None
+
+    app = create_app()
+
+    def override_db():
+        db = F()
+        try:
+            yield db
+        finally:
+            db.close()
+
+    app.dependency_overrides[_get_db] = override_db
+    try:
+        client = TestClient(app)
+        resp = client.get("/api/cron/post-turn")
+    finally:
+        app.dependency_overrides.clear()
+    assert resp.status_code == 200
+    assert resp.json()["ok"] is True
+    assert len(resp.json()["sweep"]["executed"]) == 1
+    with F() as db:
+        assert db.get(PostTurnCheckpoint, cid).processed_through_sequence == 2

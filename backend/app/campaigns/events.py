@@ -263,6 +263,25 @@ def commit_campaign_mutation(
         db.flush()
 
     if commit:
+        # Best-effort post-turn batch evaluation (issue #216) in the SAME
+        # transaction via savepoint: the run + outbox rows commit atomically
+        # with the event, while a trigger failure rolls back to the savepoint
+        # and never breaks the authoritative mutation. Missed evaluations are
+        # harmless — the next mutation re-evaluates cumulatively from the
+        # durable checkpoint. Skipped entirely in compose mode (commit=False).
+        try:
+            from app.post_turn.service import auto_trigger_enabled, maybe_trigger_post_turn
+
+            if auto_trigger_enabled():
+                with db.begin_nested():
+                    maybe_trigger_post_turn(db, campaign_id, operation_id=operation_id, commit=False)
+        except Exception as e:
+            logger.warning(
+                "post-turn auto-trigger skipped campaign_id=%s op=%s error=%s",
+                campaign_id,
+                operation_id or "-",
+                e,
+            )
         try:
             db.commit()
         except Exception:

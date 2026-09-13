@@ -11,6 +11,7 @@ from typing import Sequence, Union
 
 from alembic import op
 import sqlalchemy as sa
+from sqlalchemy.dialects import postgresql
 
 revision: str = "c4d216e8901a"
 down_revision: Union[str, Sequence[str], None] = "b7e21f4c90d2"
@@ -41,7 +42,7 @@ def upgrade() -> None:
         sa.Column("operation_id", sa.String(length=128), nullable=True, index=True),
         sa.Column("trace_id", sa.String(length=64), nullable=True, index=True),
         sa.Column("idempotency_key", sa.String(length=255), nullable=True, index=True),
-        sa.Column("result", sa.JSON(), nullable=True),
+        sa.Column("result", postgresql.JSONB(astext_type=sa.Text()), nullable=True),
         sa.Column("created_at", sa.DateTime(timezone=True), server_default=sa.func.now(), nullable=False),
         sa.Column("updated_at", sa.DateTime(timezone=True), server_default=sa.func.now(), nullable=False),
         sa.Column("completed_at", sa.DateTime(timezone=True), nullable=True),

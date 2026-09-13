@@ -33,8 +33,9 @@ from typing import Any, Callable
 
 logger = logging.getLogger(__name__)
 
-#: Business handlers keyed by envelope job_type. Empty until the owning
-#: feature registers a real worker (see module docstring).
+#: Business handlers keyed by envelope job_type. Features register their
+#: workers here (e.g. dm.turn.execute, post_turn.process); the push-consumer
+#: trigger itself stays deferred (see module docstring).
 WORKER_HANDLERS: dict[str, Callable[..., Any]] = {}
 
 
