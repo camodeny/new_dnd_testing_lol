@@ -312,18 +312,18 @@ def run_post_turn_range(
     consolidate_fn: Callable[[list[CampaignDomainEvent]], dict] | None = None,
     commit: bool = True,
 ) -> dict:
-    """Consolidate one range and advance the checkpoint (prefix-only).
+    """Consolidate one range and advance the checkpoint (convergent).
 
-    Authority rules (no committed sequence is ever silently skipped):
-    - if to_sequence <= checkpoint: duplicate replay, no side effects.
-    - the range MUST start at exactly checkpoint+1; any other advancing
-      range is refused without moving the checkpoint (retry converges via
-      a fresh cumulative trigger once the missing prefix is consolidated).
-    - the checkpoint update itself is conditional on
-      processed_through == from_sequence-1, so a concurrent winner is
-      detected instead of overwritten.
-    Idempotent: duplicate delivery returns duplicate without side effects.
-    On failure the checkpoint is unchanged and the run is marked failed.
+    Authority rule (no committed sequence is ever silently skipped): the
+    EFFECTIVE range always starts at exactly checkpoint+1. A stale cumulative
+    run whose stored from_sequence is behind the checkpoint is trimmed to the
+    still-outstanding suffix instead of failing forever; a range reaching past
+    the checkpoint backfills the gap first. Advancement is conditional on
+    processed_through == effective_from-1, so a concurrent winner is detected
+    instead of overwritten.
+    Idempotent: a fully-processed range returns duplicate without side
+    effects. On failure the checkpoint is unchanged and the run is marked
+    failed with the reason; a fresh cumulative trigger converges later.
     """
     cp = get_checkpoint(db, campaign_id, commit=False)
     processed = int(cp.processed_through_sequence or 0)
@@ -398,34 +398,40 @@ def run_post_turn_range(
                 except Exception:
                     pass
 
-    # Prefix gate: the checkpoint is an authority boundary — only the next
-    # outstanding prefix may advance it. Anything else is refused BEFORE any
-    # side effect so a non-prefix range can never skip committed gameplay.
-    if from_sequence != processed + 1:
-        err = RuntimeError(
-            f"post-turn range {from_sequence}-{to_sequence} is not the next outstanding prefix "
-            f"(checkpoint={processed}); refusing to advance"
-        )
-        _fail(err)
-        logger.warning("post_turn non_prefix campaign=%s range=%s-%s checkpoint=%s", campaign_id, from_sequence, to_sequence, processed)
-        raise err
+    # Convergent effective range: trim any already-processed prefix so stale
+    # cumulative runs (1-5..1-8 queued while 1-4 was pending) converge instead
+    # of stalling once an earlier prefix wins. The effective range ALWAYS
+    # starts at checkpoint+1, so advancement can never skip a committed
+    # sequence — a range reaching past the checkpoint backfills the gap first.
+    effective_from = max(from_sequence, processed + 1)
+    if effective_from > to_sequence:
+        logger.info("post_turn duplicate campaign=%s range=%s-%s checkpoint=%s", campaign_id, from_sequence, to_sequence, processed)
+        if run is not None and run.status not in ("succeeded", "skipped"):
+            run.status = "succeeded"
+            run.completed_at = datetime.now(timezone.utc)
+            if commit:
+                db.commit()
+            else:
+                db.flush()
+        return {"duplicate": True, "from_sequence": from_sequence, "to_sequence": to_sequence,
+                "processed_through": processed}
 
     try:
-        events = _validate_range_contiguous(db, campaign_id, from_sequence, to_sequence)
+        events = _validate_range_contiguous(db, campaign_id, effective_from, to_sequence)
         if consolidate_fn is not None:
             patch = consolidate_fn(events)
         else:
             # Placeholder consolidation (content out of scope): record span.
-            patch = {"processed_span": [from_sequence, to_sequence], "event_count": len(events)}
+            patch = {"processed_span": [effective_from, to_sequence], "event_count": len(events)}
         if not isinstance(patch, dict):
             raise RuntimeError("consolidate_fn must return a dict")
 
-        # Prefix-conditional advancement: exactly one executor wins; a
-        # concurrent winner yields rowcount 0 and is handled below.
+        # Prefix-conditional advancement on the EFFECTIVE start: exactly one
+        # executor wins; a concurrent winner yields rowcount 0 (handled below).
         result = db.execute(
             update(PostTurnCheckpoint)
             .where(PostTurnCheckpoint.campaign_id == campaign_id,
-                   PostTurnCheckpoint.processed_through_sequence == from_sequence - 1)
+                   PostTurnCheckpoint.processed_through_sequence == effective_from - 1)
             .values(processed_through_sequence=to_sequence,
                     updated_by_run_id=run.id if run is not None else None,
                     updated_at=datetime.now(timezone.utc))

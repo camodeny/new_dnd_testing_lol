@@ -15,6 +15,10 @@
     {
       "path": "/api/cron/outbox-relay",
       "schedule": "0 0 * * *"
+    },
+    {
+      "path": "/api/cron/post-turn",
+      "schedule": "*/5 * * * *"
     }
   ],
   "rewrites": [

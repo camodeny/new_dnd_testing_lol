@@ -259,27 +259,81 @@ def test_observability_status():
     db.close()
 
 
-def test_non_prefix_range_refused_without_advancing():
-    """Checkpoint 4 + range 6-8 must not skip sequence 5."""
+def test_stale_range_trims_to_outstanding_suffix():
+    """A range starting past the checkpoint backfills instead of skipping.
+
+    Checkpoint 5 + stored range 7-8 processes the effective suffix 6-8, so
+    no committed sequence is skipped and the checkpoint converges to 8.
+    """
     F = _factory()
     db = F()
     c = _campaign(db)
-    for i in range(5):
+    for i in range(8):
         _commit(db, c.id, i)
     run = maybe_trigger_post_turn(db, c.id, trigger="force")
-    run_post_turn_range(db, c.id, 1, 5, run_id=run.id)
-    assert db.get(PostTurnCheckpoint, c.id).processed_through_sequence == 5
-    # Fabricate a non-prefix run 7-8 (as a tampered/stale delivery would).
+    assert (run.from_sequence, run.to_sequence) == (1, 8)
+    # Advance only the 1-5 prefix via a dedicated run row.
     from models.post_turn import PostTurnRun as _Run
-    bad = _Run(campaign_id=c.id, from_sequence=7, to_sequence=8, trigger="force", status="pending")
-    db.add(bad)
+    prefix = _Run(campaign_id=c.id, from_sequence=1, to_sequence=5, trigger="force", status="pending")
+    db.add(prefix)
     db.commit()
-    db.refresh(bad)
-    with _pytest.raises(RuntimeError, match="not the next outstanding prefix"):
-        run_post_turn_range(db, c.id, 7, 8, run_id=bad.id)
+    out = run_post_turn_range(db, c.id, 1, 5, run_id=prefix.id)
+    assert out["processed_through"] == 5
+    # The stale full-range run now trims to 6-8 and converges.
+    out2 = run_post_turn_range(db, c.id, 1, 8, run_id=run.id)
+    assert out2["duplicate"] is False
+    assert out2["result"]["processed_span"] == [6, 8]
+    assert out2["processed_through"] == 8
     db.expire_all()
-    assert db.get(PostTurnCheckpoint, c.id).processed_through_sequence == 5
-    assert db.get(_Run, bad.id).status == "failed"
+    assert db.get(PostTurnCheckpoint, c.id).processed_through_sequence == 8
+    db.close()
+
+
+def test_backlog_before_first_worker_converges_without_new_play():
+    """Runs 1-4..1-8 queued before any worker runs: after 1-4 succeeds, the
+    sweep converges the rest to checkpoint 8 with no new gameplay."""
+    F = _factory()
+    db = F()
+    c = _campaign(db)
+    for i in range(4):
+        _commit(db, c.id, i)
+    run_a = maybe_trigger_post_turn(db, db.get(Campaign, c.id).id, trigger="force")
+    for i in range(4, 8):
+        _commit(db, c.id, i)
+        maybe_trigger_post_turn(db, c.id, trigger="force")
+    # Execute only the first run, then let the sweep converge the backlog.
+    run_post_turn_range(db, c.id, 1, 4, run_id=run_a.id)
+    assert db.get(PostTurnCheckpoint, c.id).processed_through_sequence == 4
+    sweep = run_post_turn_sweep(db, limit=10)
+    assert not sweep["failed"], sweep["failed"]
+    db.expire_all()
+    assert db.get(PostTurnCheckpoint, c.id).processed_through_sequence == 8
+    db.close()
+
+
+def test_commit_false_outer_transaction_stages_trigger_atomically(monkeypatch):
+    """The HTTP idempotency shape (commit=False + outer commit) still emits
+    the run + outbox rows in the same transaction as the event."""
+    monkeypatch.setenv("POST_TURN_AUTO_TRIGGER", "1")
+    F = _factory()
+    db = F()
+    c = _campaign(db)
+    for i in range(4):
+        commit_campaign_mutation(db, c.id, expected_revision=i, event_type="game.play",
+                                 payload={"n": i}, operation_id=f"outer-{i}", commit=False)
+    # Nothing committed yet — but the 4th staged event must have staged a run.
+    from models.post_turn import PostTurnRun as _Run
+    staged = db.execute(
+        select(_Run).where(_Run.campaign_id == c.id, _Run.from_sequence == 1, _Run.to_sequence == 4)
+    ).scalars().first()
+    assert staged is not None
+    assert db.get(Outbox, staged.id) is not None
+    # The single outer commit persists event + run + outbox together.
+    db.commit()
+    db.expire_all()
+    assert db.execute(
+        select(_Run).where(_Run.campaign_id == c.id, _Run.from_sequence == 1, _Run.to_sequence == 4)
+    ).scalars().first() is not None
     db.close()
 
 
