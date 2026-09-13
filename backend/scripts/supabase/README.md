@@ -1,4 +1,6 @@
-# DM execution scheduling
+# Cron scheduling (Supabase pg_cron + pg_net)
+
+## DM execution
 
 Use Supabase Cron (`pg_cron`) and `pg_net` to POST to the authenticated
 `/api/cron/dm-execute` endpoint every minute. The endpoint claims at most one
@@ -39,3 +41,19 @@ refresh reconstructs it. To remove the schedule, run
 
 References: [Supabase Cron](https://supabase.com/docs/guides/cron/quickstart),
 [scheduled HTTP calls and Vault](https://supabase.com/docs/guides/functions/schedule-functions).
+
+## Post-turn sweep (issue #216)
+
+Same pattern for the authenticated `/api/cron/post-turn` endpoint, every
+minute. The endpoint executes up to 5 pending post-turn runs per request
+through the idempotent worker fence (`WorkerExecution` keyed on run id), so
+concurrent or duplicate deliveries converge instead of duplicating work.
+Queue push delivery stays deferred; this minute sweep is the fast production
+execution path. (Vercel Hobby only allows daily crons, so the Vercel
+schedule is not used for post-turn.)
+
+After deploying #216, in Vault create `post_turn_base_url` with the public
+HTTPS backend origin and `post_turn_cron_secret` with the backend's
+`CRON_SECRET`. Run `schedule_post_turn.sql` in the SQL editor. Re-running
+updates the named job. Like the DM schedule, this is explicit environment
+setup outside Alembic. To remove: `SELECT cron.unschedule('dnd-post-turn');`.
