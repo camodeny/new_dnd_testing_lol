@@ -618,3 +618,53 @@ def test_checkpoint_insert_race_preserves_outer_mutation(monkeypatch):
     assert len(db.execute(select(CampaignDomainEvent).where(CampaignDomainEvent.campaign_id == cid)).scalars().all()) == 4
     assert db.get(PostTurnCheckpoint, cid).processed_through_sequence == 0
     db.close()
+
+
+def test_normal_trigger_suppresses_overlapping_runs_while_lagging(monkeypatch):
+    """8 events with auto-trigger and no worker: only 1-4 and 1-8 are
+    created (no one-per-message 1-5/1-6/1-7), and the sweep converges to 8."""
+    monkeypatch.setenv("POST_TURN_AUTO_TRIGGER", "1")
+    from models.post_turn import PostTurnRun as _Run
+    F = _factory()
+    with F() as db:
+        c = _campaign(db)
+        cid = c.id
+        for i in range(8):
+            commit_campaign_mutation(db, cid, expected_revision=i, event_type="game.play",
+                                     payload={"n": i}, operation_id=f"lag-{i}")
+        spans = sorted((r.from_sequence, r.to_sequence)
+                       for r in db.execute(select(_Run).where(_Run.campaign_id == cid)).scalars().all())
+        assert spans == [(1, 4), (1, 8)], f"overlapping per-message runs: {spans}"
+    with F() as db:
+        sweep = run_post_turn_sweep(db, limit=10)
+        assert not sweep["failed"], sweep["failed"]
+    with F() as db:
+        assert db.get(PostTurnCheckpoint, cid).processed_through_sequence == 8
+
+
+def test_audited_skip_reuses_failed_same_span_run():
+    """A poison range stuck failed can still be resolved: skipping its exact
+    span reuses the durable row (history preserved) instead of colliding."""
+    from models.post_turn import PostTurnRun as _Run
+    F = _factory()
+    db = F()
+    c = _campaign(db)
+    for i in range(4):
+        _commit(db, c.id, i)
+    run = maybe_trigger_post_turn(db, c.id, trigger="force")
+
+    def _boom(events):
+        raise RuntimeError("poison span")
+
+    with _pytest.raises(RuntimeError):
+        run_post_turn_range(db, c.id, 1, 4, run_id=run.id, consolidate_fn=_boom)
+    db.expire_all()
+    assert db.get(_Run, run.id).status == "failed"
+    skipped = mark_post_turn_skipped(db, c.id, 4, "operator reviewed poison span")
+    assert skipped.id == run.id
+    assert skipped.status == "skipped"
+    assert skipped.result["reason"] == "operator reviewed poison span"
+    assert skipped.result["previous_status"] == "failed"
+    db.expire_all()
+    assert db.get(PostTurnCheckpoint, c.id).processed_through_sequence == 4
+    db.close()

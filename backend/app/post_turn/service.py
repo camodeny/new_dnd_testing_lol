@@ -154,6 +154,40 @@ def get_outstanding_range(db: Session, campaign_id: uuid.UUID) -> dict:
     }
 
 
+# Maximum worker attempts before a failed run stops suppressing coverage.
+POST_TURN_MAX_ATTEMPTS = 5
+
+
+def _live_coverage_to(db: Session, campaign_id: uuid.UUID) -> int:
+    """Highest sequence already covered by a live (retryable) run.
+
+    Live = pending, running, or failed still under the attempt budget. A
+    dead (exhausted) run no longer counts as coverage — the next trigger
+    replaces it.
+    """
+    to_seq = db.execute(
+        select(func.max(PostTurnRun.to_sequence)).where(
+            PostTurnRun.campaign_id == campaign_id,
+            (PostTurnRun.status.in_(("pending", "running")))
+            | ((PostTurnRun.status == "failed") & (PostTurnRun.attempts < POST_TURN_MAX_ATTEMPTS)),
+        )
+    ).scalar()
+    return int(to_seq) if to_seq is not None else 0
+
+
+def _count_relevant_since(db: Session, campaign_id: uuid.UUID, since_seq: int, upto_seq: int) -> int:
+    """Relevant events with sequence in (since_seq, upto_seq]."""
+    if upto_seq <= since_seq:
+        return 0
+    rows = db.execute(
+        select(CampaignDomainEvent.event_type)
+        .where(CampaignDomainEvent.campaign_id == campaign_id,
+               CampaignDomainEvent.sequence > since_seq,
+               CampaignDomainEvent.sequence <= upto_seq)
+    ).all()
+    return sum(1 for (et,) in rows if is_post_turn_relevant(et))
+
+
 def should_trigger_post_turn(outstanding_relevant: int, trigger: str = NORMAL, *, threshold: int | None = None) -> bool:
     if outstanding_relevant <= 0:
         return False
@@ -181,6 +215,12 @@ def maybe_trigger_post_turn(
     Returns the run (new or existing duplicate) or None when below threshold.
     The run id is reused as the outbox id / worker job_id for end-to-end
     idempotency.
+
+    NORMAL triggers measure the threshold against relevant events NEW since
+    the latest live-run coverage (not the whole checkpoint gap), so a lagging
+    checkpoint does not enqueue one overlapping run per message — the created
+    run itself is still cumulative from checkpoint+1 so failed gaps stay
+    authoritative. FORCE/CRITICAL bypass the batching gate.
     """
     if trigger not in (NORMAL, FORCE, CRITICAL):
         raise ValueError(f"unknown trigger {trigger!r}")
@@ -190,6 +230,15 @@ def maybe_trigger_post_turn(
     if not should_trigger_post_turn(span["relevant"], trigger, threshold=threshold):
         return None
     from_seq, to_seq = span["from_sequence"], span["to_sequence"]
+
+    if trigger == NORMAL:
+        th = threshold if threshold is not None else get_batch_threshold()
+        covered_to = max(_live_coverage_to(db, campaign_id), from_seq - 1)
+        fresh = _count_relevant_since(db, campaign_id, covered_to, to_seq)
+        if fresh < th:
+            logger.info("post_turn suppressed campaign=%s covered_to=%s fresh=%s threshold=%s",
+                        campaign_id, covered_to, fresh, th)
+            return None
 
     # Duplicate trigger for the same logical range reuses the existing run.
     existing = db.execute(
@@ -570,7 +619,14 @@ def mark_post_turn_skipped(
     commit: bool = True,
 ) -> PostTurnRun:
     """Explicit audited decision to skip ahead — the only way to permanently
-    skip a committed sequence. Requires a non-empty reason."""
+    skip a committed sequence. Requires a non-empty reason.
+
+    Reuses the durable run row when one already exists for the exact skipped
+    span (e.g. a poison range stuck failed/pending): the row is transitioned
+    to skipped with its attempt/failure history preserved in the audit
+    record, so the escape hatch is never blocked by the range uniqueness
+    constraint.
+    """
     if not reason or not reason.strip():
         raise ValueError("an explicit audited reason is required to skip post-turn sequences")
     cp = get_checkpoint(db, campaign_id, commit=False)
@@ -580,19 +636,39 @@ def mark_post_turn_skipped(
     max_seq = get_max_sequence(db, campaign_id)
     if to_sequence > max_seq:
         raise ValueError(f"to_sequence {to_sequence} exceeds max committed sequence {max_seq}")
-    run = PostTurnRun(
-        id=uuid.uuid4(),
-        campaign_id=campaign_id,
-        from_sequence=processed + 1,
-        to_sequence=to_sequence,
-        trigger=ADMIN_SKIP,
-        status="skipped",
-        operation_id=f"admin-skip:{actor_id}" if actor_id else "admin-skip",
-        result={"reason": reason.strip(), "actor_id": str(actor_id) if actor_id else None},
-        completed_at=datetime.now(timezone.utc),
-    )
-    db.add(run)
-    db.flush()
+    audit = {"reason": reason.strip(), "actor_id": str(actor_id) if actor_id else None}
+    run = db.execute(
+        select(PostTurnRun).where(
+            PostTurnRun.campaign_id == campaign_id,
+            PostTurnRun.from_sequence == processed + 1,
+            PostTurnRun.to_sequence == to_sequence,
+        )
+    ).scalars().first()
+    if run is not None:
+        audit["previous_status"] = run.status
+        audit["previous_attempts"] = int(run.attempts or 0)
+        audit["previous_failure_reason"] = run.failure_reason
+        run.trigger = ADMIN_SKIP
+        run.status = "skipped"
+        run.operation_id = f"admin-skip:{actor_id}" if actor_id else "admin-skip"
+        run.result = audit
+        run.completed_at = datetime.now(timezone.utc)
+        db.add(run)
+        db.flush()
+    else:
+        run = PostTurnRun(
+            id=uuid.uuid4(),
+            campaign_id=campaign_id,
+            from_sequence=processed + 1,
+            to_sequence=to_sequence,
+            trigger=ADMIN_SKIP,
+            status="skipped",
+            operation_id=f"admin-skip:{actor_id}" if actor_id else "admin-skip",
+            result=audit,
+            completed_at=datetime.now(timezone.utc),
+        )
+        db.add(run)
+        db.flush()
     db.execute(
         update(PostTurnCheckpoint)
         .where(PostTurnCheckpoint.campaign_id == campaign_id,
