@@ -472,3 +472,92 @@ def test_post_turn_sweep_cron_endpoint(monkeypatch):
     assert len(resp.json()["sweep"]["executed"]) == 1
     with F() as db:
         assert db.get(PostTurnCheckpoint, cid).processed_through_sequence == 2
+
+
+def test_swallowed_trigger_stage_recovers_via_scheduled_repair(monkeypatch):
+    """Eager staging fails at the threshold commit; with no further play,
+    only the scheduled path (repair + sweep) converges the checkpoint."""
+    import app.post_turn.service as _svc
+
+    real_trigger = _svc.maybe_trigger_post_turn
+    blocked = {"fail": True}
+
+    def _flaky(db, *args, **kwargs):
+        if blocked["fail"]:
+            raise RuntimeError("staging boom")
+        return real_trigger(db, *args, **kwargs)
+
+    monkeypatch.setenv("POST_TURN_AUTO_TRIGGER", "1")
+    monkeypatch.setattr(_svc, "maybe_trigger_post_turn", _flaky)
+    # events.py binds the name lazily at call time, so patch the re-export too.
+    F = _factory()
+    with F() as db:
+        c = _campaign(db)
+        cid = c.id
+        for i in range(4):
+            commit_campaign_mutation(db, cid, expected_revision=i, event_type="game.play",
+                                     payload={"n": i}, operation_id=f"swallow-{i}")
+        # Events committed despite staging failures; no run exists.
+        _cp = db.get(PostTurnCheckpoint, cid)
+        assert _cp is None or _cp.processed_through_sequence == 0
+        from models.post_turn import PostTurnRun as _Run
+        assert db.execute(select(_Run).where(_Run.campaign_id == cid)).scalars().first() is None
+    # Staging recovers; no more gameplay — only the scheduled path runs.
+    blocked["fail"] = False
+    with F() as db:
+        sweep = run_post_turn_sweep(db, limit=5)
+        assert sweep["repaired"], "repair must create the missing run"
+        assert not sweep["failed"], sweep["failed"]
+    with F() as db:
+        assert db.get(PostTurnCheckpoint, cid).processed_through_sequence == 4
+
+
+def test_cas_loser_retired_not_reswept(tmp_path):
+    """True CAS loss: A=1-4 validates at cp=0 then blocks in consolidation
+    while an admin skip advances cp to 5. On release A loses the CAS but is
+    fully covered: retired succeeded, never reswept."""
+    import threading
+    from sqlalchemy import create_engine as _ce
+    from models.post_turn import PostTurnRun as _Run
+    db_file = tmp_path / "post_turn_cas.sqlite"
+    eng = _ce(f"sqlite:///{db_file}", connect_args={"check_same_thread": False, "timeout": 10})
+    Base.metadata.create_all(bind=eng)
+    Fac = sessionmaker(bind=eng, expire_on_commit=False)
+    with Fac() as db:
+        c = _campaign(db)
+        cid = c.id
+        for i in range(4):
+            _commit(db, cid, i)
+        run_a = maybe_trigger_post_turn(db, cid, trigger="force")
+        assert (run_a.from_sequence, run_a.to_sequence) == (1, 4)
+        run_a_id = run_a.id
+        _commit(db, cid, 4)  # 5th event: skip target exists, no new run
+    release, entered = threading.Event(), threading.Event()
+
+    def _slow_consolidate(events):
+        entered.set()
+        assert release.wait(timeout=15), "consolidate released"
+        return {"processed_span": [1, 4], "event_count": len(events)}
+
+    errors = []
+
+    def _run_a():
+        try:
+            with Fac() as db:
+                run_post_turn_range(db, cid, 1, 4, run_id=run_a_id, consolidate_fn=_slow_consolidate)
+        except Exception as e:  # noqa: BLE001
+            errors.append(e)
+
+    t = threading.Thread(target=_run_a)
+    t.start()
+    assert entered.wait(timeout=15), "worker A entered consolidation"
+    with Fac() as db:
+        mark_post_turn_skipped(db, cid, 5, "operator reviewed span")
+    release.set()
+    t.join(timeout=20)
+    assert not errors, f"worker A raised: {errors}"
+    with Fac() as db:
+        assert db.get(_Run, run_a_id).status == "succeeded"
+        assert db.get(PostTurnCheckpoint, cid).processed_through_sequence == 5
+        sweep = run_post_turn_sweep(db, limit=10)
+        assert sweep["executed"] == [] and sweep["failed"] == []

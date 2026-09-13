@@ -377,6 +377,13 @@ def run_post_turn_range(
         run.status = "running"
         run.attempts = (run.attempts or 0) + 1
         db.flush()
+    if commit:
+        # Durable progress marker AND lock release: consolidation below can be
+        # slow (model calls), and must not hold a database transaction open
+        # while it runs — otherwise concurrent executors block on row/page
+        # locks instead of converging via the CAS update. Authority still
+        # rests solely on the prefix-conditional checkpoint UPDATE.
+        db.commit()
 
     def _fail(exc: BaseException) -> None:
         try:
@@ -418,6 +425,11 @@ def run_post_turn_range(
 
     try:
         events = _validate_range_contiguous(db, campaign_id, effective_from, to_sequence)
+        if commit:
+            # Close the read transaction: consolidation runs lock-free so a
+            # concurrent executor (or admin skip) is never blocked behind it.
+            # Objects stay usable (sessions use expire_on_commit=False).
+            db.commit()
         if consolidate_fn is not None:
             patch = consolidate_fn(events)
         else:
@@ -442,6 +454,18 @@ def run_post_turn_range(
             fresh_cp = db.get(PostTurnCheckpoint, campaign_id)
             fresh_processed = int(fresh_cp.processed_through_sequence or 0) if fresh_cp else processed
             if to_sequence <= fresh_processed:
+                # Fully covered by the winner: retire this run row as
+                # succeeded/duplicate so the sweep stops reselecting it.
+                loser = db.get(PostTurnRun, run.id) if run is not None else None
+                if loser is not None and loser.status not in ("succeeded", "skipped"):
+                    loser.status = "succeeded"
+                    loser.failure_reason = None
+                    loser.result = {"duplicate": True, "covered_by_checkpoint": fresh_processed}
+                    loser.completed_at = datetime.now(timezone.utc)
+                    if commit:
+                        db.commit()
+                    else:
+                        db.flush()
                 return {"duplicate": True, "from_sequence": from_sequence, "to_sequence": to_sequence,
                         "processed_through": fresh_processed}
             err = RuntimeError(
@@ -605,6 +629,68 @@ def get_post_turn_status(db: Session, campaign_id: uuid.UUID) -> dict:
 # ── Cron sweep driver ──────────────────────────────────────────────────────
 
 
+def repair_missing_post_turn_runs(db: Session, *, limit: int = 20) -> list[str]:
+    """Durable repair: discover campaigns whose checkpoint trails committed
+    gameplay but have no live run covering the outstanding suffix, and create
+    the missing cumulative run.
+
+    This is the recovery source for eager trigger-staging failures swallowed
+    by the savepoint in ``commit_campaign_mutation``: the event commits, no
+    run row exists, and without this repair the range would stay outstanding
+    forever when play stops. Repair uses threshold=1 (any outstanding work
+    qualifies) because the batch policy already had its chance at commit
+    time — convergence outranks batching here. ``maybe_trigger_post_turn``
+    still dedupes against any live run for the same range.
+    """
+    from sqlalchemy import func as _func
+
+    max_seqs = dict(
+        db.execute(
+            select(CampaignDomainEvent.campaign_id, _func.max(CampaignDomainEvent.sequence)).group_by(
+                CampaignDomainEvent.campaign_id
+            )
+        ).all()
+    )
+    if not max_seqs:
+        return []
+    checkpoints = dict(
+        db.execute(
+            select(PostTurnCheckpoint.campaign_id, PostTurnCheckpoint.processed_through_sequence).where(
+                PostTurnCheckpoint.campaign_id.in_(list(max_seqs.keys()))
+            )
+        ).all()
+    )
+    live = {
+        (r.campaign_id, r.to_sequence)
+        for r in db.execute(
+            select(PostTurnRun).where(
+                PostTurnRun.campaign_id.in_(list(max_seqs.keys())),
+                PostTurnRun.status.in_(("pending", "running", "failed")),
+            )
+        ).scalars().all()
+    }
+    repaired: list[str] = []
+    for cid, max_seq in sorted(max_seqs.items(), key=lambda kv: str(kv[0])):
+        if len(repaired) >= max(1, limit):
+            break
+        processed = int(checkpoints.get(cid, 0) or 0)
+        if int(max_seq) <= processed:
+            continue
+        if (cid, int(max_seq)) in live:
+            continue
+        try:
+            with db.begin_nested():
+                run = maybe_trigger_post_turn(db, cid, trigger=NORMAL, threshold=1, commit=False)
+                db.flush()
+            if run is not None:
+                repaired.append(str(run.id))
+        except Exception as exc:  # noqa: BLE001 — repair must survive bad campaigns
+            logger.warning("post_turn repair failed campaign=%s error=%s", cid, exc)
+    if repaired:
+        logger.info("post_turn repair created %s missing runs", len(repaired))
+    return repaired
+
+
 def _envelope_for_run(run: PostTurnRun):
     """Build the worker envelope for a durable run (locator only)."""
     from app.queue.adapter import new_envelope
@@ -627,16 +713,37 @@ def _envelope_for_run(run: PostTurnRun):
     )
 
 
-def run_post_turn_sweep(db: Session, *, limit: int = 5, max_attempts: int = 5) -> dict:
+def run_post_turn_sweep(db: Session, *, limit: int = 5, max_attempts: int = 5, lease_seconds: int = 300) -> dict:
     """Execute outstanding post-turn runs through the worker layer.
 
-    Production consumption path (mirrors the dm-execute cron sweep): claims
-    pending runs — plus failed runs still under the attempt budget, whose
-    worker-level backoff is enforced by ``execute_worker_job`` — and runs
-    each through the idempotent worker fence. Queue push delivery (when a
+    Production consumption path (mirrors the dm-execute cron sweep): first
+    repair campaigns whose checkpoint trails gameplay with no live run
+    (eager trigger-staging failures), then claim pending runs — plus failed
+    runs still under the attempt budget (worker-level backoff enforced by
+    ``execute_worker_job``) and ``running`` runs whose lease expired
+    (executor crash between the running marker and the CAS commit; the
+    prefix-conditional update makes re-execution safe) — and run each
+    through the idempotent worker fence. Queue push delivery (when a
     subscriber is configured) converges on the same run rows via job_id.
     """
+    from datetime import timedelta as _timedelta
+
     from app.worker.executor import execute_worker_job
+
+    try:
+        repaired = repair_missing_post_turn_runs(db)
+        try:
+            db.commit()
+        except Exception:
+            try:
+                db.rollback()
+            except Exception:
+                pass
+            repaired = []
+    except Exception as exc:  # noqa: BLE001 — repair must not block execution
+        logger.warning("post_turn sweep repair phase failed: %s", exc)
+        repaired = []
+    stale_cutoff = datetime.now(timezone.utc) - _timedelta(seconds=max(60, lease_seconds))
 
     candidates = list(
         db.execute(
@@ -644,6 +751,7 @@ def run_post_turn_sweep(db: Session, *, limit: int = 5, max_attempts: int = 5) -
             .where(
                 (PostTurnRun.status == "pending")
                 | ((PostTurnRun.status == "failed") & (PostTurnRun.attempts < max_attempts))
+                | ((PostTurnRun.status == "running") & (PostTurnRun.updated_at < stale_cutoff))
             )
             .order_by(PostTurnRun.created_at.asc())
             .limit(max(1, limit))
@@ -662,5 +770,5 @@ def run_post_turn_sweep(db: Session, *, limit: int = 5, max_attempts: int = 5) -
             db.rollback()
             logger.warning("post_turn sweep run_failed run=%s error=%s", run.id, exc)
             failed.append({"run_id": str(run.id), "error": str(exc)[:300]})
-    logger.info("post_turn sweep executed=%s failed=%s skipped=%s", len(executed), len(failed), len(skipped))
-    return {"executed": executed, "failed": failed, "skipped": skipped}
+    logger.info("post_turn sweep repaired=%s executed=%s failed=%s", len(repaired), len(executed), len(failed))
+    return {"repaired": repaired, "executed": executed, "failed": failed, "skipped": skipped}
