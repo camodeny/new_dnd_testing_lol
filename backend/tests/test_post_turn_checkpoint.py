@@ -31,6 +31,7 @@ from app.post_turn.service import (  # noqa: E402
 from app.queue.envelope import WorkerEnvelope  # noqa: E402
 from app.worker.executor import execute_worker_job  # noqa: E402
 from models.campaigns import Campaign  # noqa: E402
+from models.campaigns import CampaignDomainEvent  # noqa: E402
 from models.post_turn import PostTurnCheckpoint, PostTurnRun  # noqa: E402
 from models.profiles import Profile  # noqa: E402
 from models.reliability import Outbox  # noqa: E402
@@ -577,4 +578,43 @@ def test_sweep_preserves_batch_policy_for_sub_threshold():
     assert db.execute(select(_Run).where(_Run.campaign_id == c.id)).scalars().first() is None
     _cp = db.get(PostTurnCheckpoint, c.id)
     assert _cp is None or _cp.processed_through_sequence == 0
+    db.close()
+
+
+def test_checkpoint_insert_race_preserves_outer_mutation(monkeypatch):
+    """A duplicate checkpoint insert inside the atomic hook must recover via
+    savepoint — never a full rollback. Stages 4 gameplay mutations in the
+    caller-owned commit=False (idempotent HTTP) shape with the first
+    checkpoint lookup forced to miss while the row exists, then proves the
+    outer event/revision writes still commit."""
+    from sqlalchemy.orm import Session as _Session
+
+    monkeypatch.setenv("POST_TURN_AUTO_TRIGGER", "1")
+    F = _factory()
+    db = F()
+    c = _campaign(db)
+    cid = c.id
+    # A concurrent coordinator already created the checkpoint.
+    assert get_checkpoint(db, cid).processed_through_sequence == 0
+    # Force the insert-race path once: first lookup misses, insert collides.
+    real_get = _Session.get
+    missed = {"n": 0}
+
+    def _flaky_get(self, entity, ident=None, *args, **kwargs):
+        if entity is PostTurnCheckpoint and missed["n"] == 0:
+            missed["n"] += 1
+            return None
+        return real_get(self, entity, ident, *args, **kwargs)
+
+    monkeypatch.setattr(_Session, "get", _flaky_get)
+    for i in range(4):
+        commit_campaign_mutation(db, cid, expected_revision=i, event_type="game.play",
+                                 payload={"n": i}, operation_id=f"race-{i}", commit=False)
+    assert missed["n"] == 1, "race path must have been exercised"
+    # The caller-owned outer commit (idempotency layer) persists everything.
+    db.commit()
+    db.expire_all()
+    assert db.get(Campaign, cid).revision == 4
+    assert len(db.execute(select(CampaignDomainEvent).where(CampaignDomainEvent.campaign_id == cid)).scalars().all()) == 4
+    assert db.get(PostTurnCheckpoint, cid).processed_through_sequence == 0
     db.close()

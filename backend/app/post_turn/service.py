@@ -83,18 +83,26 @@ def get_checkpoint(db: Session, campaign_id: uuid.UUID, *, commit: bool = True) 
     if rec is not None:
         return rec
     rec = PostTurnCheckpoint(campaign_id=campaign_id, processed_through_sequence=0)
-    db.add(rec)
     try:
-        db.flush()
-        if commit:
-            db.commit()
-            db.refresh(rec)
+        # Savepoint-local recovery: a concurrent creator wins the insert race
+        # while our read missed. The add MUST be inside the savepoint so the
+        # loser is expelled on rollback instead of being re-flushed afterwards.
+        # NEVER a full Session.rollback() here — this runs inside the atomic
+        # mutation hook, where rolling back the outer transaction would discard
+        # the authoritative event/revision (and, in the commit=False HTTP path,
+        # the idempotency record) while the swallowed post-turn error lets the
+        # caller continue as if committed.
+        with db.begin_nested():
+            db.add(rec)
+            db.flush()
     except IntegrityError:
-        db.rollback()
         existing = db.get(PostTurnCheckpoint, campaign_id)
         if existing is None:
             raise
         return existing
+    if commit:
+        db.commit()
+        db.refresh(rec)
     return rec
 
 
@@ -344,7 +352,8 @@ def run_post_turn_range(
     run: PostTurnRun | None = db.get(PostTurnRun, run_id) if run_id is not None else None
     if run is None:
         # Direct call without a trigger record (tests/sweep): create the
-        # durable run row keyed by job/run id when available.
+        # durable run row keyed by job/run id when available. Add inside the
+        # savepoint so a race loser is expelled, not re-flushed afterwards.
         run = PostTurnRun(
             id=run_id or uuid.uuid4(),
             campaign_id=campaign_id,
@@ -355,9 +364,9 @@ def run_post_turn_range(
             operation_id=operation_id,
             idempotency_key=f"post-turn:{campaign_id}:{from_sequence}-{to_sequence}",
         )
-        db.add(run)
         try:
             with db.begin_nested():
+                db.add(run)
                 db.flush()
         except IntegrityError:
             # Same logical range already recorded — reuse it.
