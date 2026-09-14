@@ -211,7 +211,7 @@ def _handle_assert_fact(db: Session, campaign: Campaign, effect: dict[str, Any],
 
     args = effect.get("arguments") or {}
     operation_id = getattr(attempt, "commit_operation_id", None) or str(attempt.id)
-    idempotency_key = args.get("idempotency_key") or _default_effect_key(attempt, effect)
+    idempotency_key = _resolve_effect_key(attempt, effect)
     supersedes = args.get("supersedes_fact_id")
     if supersedes:
         supersede_fact_inline(
@@ -244,7 +244,7 @@ def _handle_upsert_relation(db: Session, campaign: Campaign, effect: dict[str, A
 
     args = effect.get("arguments") or {}
     operation_id = getattr(attempt, "commit_operation_id", None) or str(attempt.id)
-    idempotency_key = args.get("idempotency_key") or _default_effect_key(attempt, effect)
+    idempotency_key = _resolve_effect_key(attempt, effect)
     supersedes = args.get("supersedes_relation_id")
     if supersedes:
         # Key-presence: absent object keys inherit the prior reference;
@@ -301,6 +301,37 @@ def _default_effect_key(attempt: DmTurnAttempt, effect: dict[str, Any]) -> str:
     if len(base) <= 128:
         return base
     return f"eff:{hashlib.sha256(base.encode('utf-8')).hexdigest()}"
+
+
+def _scoped_effect_key(attempt: DmTurnAttempt, key: str) -> str:
+    """Scope an explicit staged-effect key to its attempt.
+
+    The durable uniqueness scope is campaign-wide, so a bare explicit key
+    could collide with an older turn's key: the later write would return the
+    older row as a duplicate and the turn would commit without storing the
+    new record. Prefixing with the attempt UUID keeps same-attempt retries
+    idempotent (matches the ``jit:{attempt_id}:{temp_id}`` convention from
+    #209) while preventing cross-turn aliasing. Overlong composites fall
+    back to a deterministic sha256 namespace so retries stay stable.
+    """
+    base = f"{attempt.id}:{key}"
+    if len(base) <= 128:
+        return base
+    return f"eff:{hashlib.sha256(base.encode('utf-8')).hexdigest()}"
+
+
+def _resolve_effect_key(attempt: DmTurnAttempt, effect: dict[str, Any]) -> str:
+    """Durable idempotency key for one staged knowledge effect.
+
+    Explicit caller keys are honored but attempt-scoped; otherwise the
+    generated attempt/effect namespace applies. Both branches stay within
+    the 128-char durable key bound.
+    """
+    args = effect.get("arguments") or {}
+    explicit = str(args.get("idempotency_key") or "").strip()
+    if explicit:
+        return _scoped_effect_key(attempt, explicit)
+    return _default_effect_key(attempt, effect)
 
 
 def list_registered_effect_types() -> list[str]:

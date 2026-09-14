@@ -932,6 +932,52 @@ def test_shared_explicit_key_across_effects_rejected():
     assert len(normalize_contract(ok).staged_effects) == 2
 
 
+def test_explicit_staged_key_reused_across_turns_stays_distinct():
+    Fac, cid, owner = _setup()
+    db = Fac()
+    mara, guild, _rev = _entities(db, cid, 0)
+    thread = get_or_create_campaign_thread(db, cid, created_by=owner)
+    db.commit()
+    tid = str(thread.id)
+
+    def _commit_turn_with(content, relation_type, object_label):
+        accept_submission(
+            db, campaign_id=cid, user_id=owner, raw_content=content,
+            segments=[{"type": "ic", "text": content}], thread_id=tid,
+        )
+        db.commit()
+        turn, attempt = coordinate_turn(db, cid, tid)
+        attempt.staged_effects = [
+            {"id": "eff-f", "effect_type": "assert_fact", "arguments": {
+                "content": content, "epistemic_state": "claimed",
+                "visibility": "campaign", "idempotency_key": "rumor",
+            }},
+            {"id": "eff-r", "effect_type": "upsert_relation", "arguments": {
+                "subject_entity_id": str(mara.id), "relation_type": relation_type,
+                "object_entity_id": str(guild.id) if object_label is None else None,
+                "object_label": object_label, "visibility": "campaign",
+                "idempotency_key": "bond",
+            }},
+        ]
+        attempt.contract_snapshot = {"contract_version": "dm_turn_contract_v1", "new_entities": [], "staged_effects": []}
+        db.flush()
+        db.commit()
+        stream = _stream(db, turn, attempt)
+        db.commit()
+        mark_streaming_started(db, turn.id, attempt.id, stream_id=stream.id)
+        return commit_turn(db, turn.id, attempt.id)
+
+    _t1, _a1, event1 = _commit_turn_with("First rumor.", "knows", None)
+    assert event1 is not None
+    # A later turn reusing the same explicit keys must store its own records,
+    # not collapse onto the older turn's rows as false duplicates.
+    _t2, _a2, event2 = _commit_turn_with("Second rumor.", "owes", "a debt")
+    assert event2 is not None
+    assert str(event2.id) != str(event1.id)
+    assert sorted(f.content for f in list_facts(db, cid)) == ["First rumor.", "Second rumor."]
+    assert sorted(r.relation_type for r in list_relations(db, cid)) == ["knows", "owes"]
+
+
 @pytest.fixture
 def knowledge_api(monkeypatch):
     from fastapi.testclient import TestClient
