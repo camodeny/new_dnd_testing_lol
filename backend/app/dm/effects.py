@@ -27,10 +27,14 @@ logger = logging.getLogger(__name__)
 # Visibility ordering for broadening check (least -> most permissive)
 _VISIBILITY_ORDER = {"dm_private": 0, "party_known": 1, "public": 2}
 
-# Effects without explicit visibility are treated as public patches (must not be promoted from private attempts)
+# Effects without explicit visibility are treated as public patches (must not be promoted from private attempts).
+# Relation/fact assertions default to dm_only (fail-closed): a bare claim stays
+# restricted unless the contract explicitly widens it (issue #210).
 _EFFECT_DEFAULT_VISIBILITY: dict[str, str] = {
     "update_scene": "public",
     "propose_sheet_update": "public",
+    "assert_fact": "dm_private",
+    "upsert_relation": "dm_private",
 }
 
 def _is_shared_audience(audience: str) -> bool:
@@ -40,10 +44,15 @@ def _visibility_of(effect: dict[str, Any]) -> str | None:
     args = effect.get("arguments") or {}
     return args.get("visibility")
 
+# World-record visibility vocabulary (issues #209/#210) maps onto the
+# staged-effect broadening check without widening disclosure: restricted
+# stays restricted, member-visible stays member-visible.
+_EFFECT_VISIBILITY_ALIASES = {"dm_only": "dm_private", "campaign": "party_known", "private": "dm_private"}
+
 def _effective_visibility(effect: dict[str, Any]) -> str:
     vis = _visibility_of(effect)
     if vis is not None:
-        return vis
+        return _EFFECT_VISIBILITY_ALIASES.get(str(vis), str(vis))
     eff_type = effect.get("effect_type")
     return _EFFECT_DEFAULT_VISIBILITY.get(eff_type, "public")
 
@@ -187,6 +196,87 @@ def _handle_update_scene(db: Session, campaign: Campaign, effect: dict[str, Any]
 def _handle_reveal_fact(db: Session, campaign: Campaign, effect: dict[str, Any], turn: DmTurn, attempt: DmTurnAttempt):
     args = effect.get("arguments") or {}
     logger.info("effect reveal_fact effect_id=%s item_type=%s item_id=%s visibility=%s", effect.get("id"), args.get("item_type"), args.get("item_id"), args.get("visibility"))
+
+
+@register("assert_fact")
+def _handle_assert_fact(db: Session, campaign: Campaign, effect: dict[str, Any], turn: DmTurn, attempt: DmTurnAttempt):
+    """Assert or supersede one durable epistemic fact inside the turn-commit txn.
+
+    Runs inside the outer ``commit_campaign_mutation`` (issue #210): failed
+    commits roll back both the version insert and any prior lifecycle flip,
+    so failed updates never partially supersede prior active truth.
+    """
+    from app.world.knowledge import create_fact_inline, supersede_fact_inline
+
+    args = effect.get("arguments") or {}
+    operation_id = getattr(attempt, "commit_operation_id", None) or str(attempt.id)
+    key_parts = [str(operation_id), str(effect.get("id"))]
+    idempotency_key = args.get("idempotency_key") or ":".join(key_parts)
+    supersedes = args.get("supersedes_fact_id")
+    if supersedes:
+        supersede_fact_inline(
+            db, campaign, supersedes,
+            content=args.get("content"),
+            entity_refs=args.get("entity_refs"),
+            epistemic_state=args.get("epistemic_state"),
+            visibility=args.get("visibility"),
+            provenance=args.get("provenance"),
+            source_turn_id=turn.id, source_attempt_id=attempt.id,
+            operation_id=operation_id, idempotency_key=str(idempotency_key)[:128],
+        )
+    else:
+        create_fact_inline(
+            db, campaign, content=args.get("content") or "",
+            entity_refs=args.get("entity_refs"),
+            epistemic_state=args.get("epistemic_state") or "claimed",
+            visibility=args.get("visibility"),
+            provenance=args.get("provenance"),
+            source_turn_id=turn.id, source_attempt_id=attempt.id,
+            operation_id=operation_id, idempotency_key=str(idempotency_key)[:128],
+        )
+    logger.info("effect assert_fact effect_id=%s epistemic=%s supersedes=%s", effect.get("id"), args.get("epistemic_state"), supersedes)
+
+
+@register("upsert_relation")
+def _handle_upsert_relation(db: Session, campaign: Campaign, effect: dict[str, Any], turn: DmTurn, attempt: DmTurnAttempt):
+    """Create or supersede one durable world relation inside the turn-commit txn."""
+    from app.world.knowledge import create_relation_inline, supersede_relation_inline
+
+    args = effect.get("arguments") or {}
+    operation_id = getattr(attempt, "commit_operation_id", None) or str(attempt.id)
+    idempotency_key = args.get("idempotency_key") or ":".join([str(operation_id), str(effect.get("id"))])
+    supersedes = args.get("supersedes_relation_id")
+    if supersedes:
+        # Key-presence: absent object keys inherit the prior reference;
+        # explicit null clears it (clear_object clears both sides at once).
+        from app.world.service import UNSET as _UNSET
+        supersede_relation_inline(
+            db, campaign, supersedes,
+            subject_entity_id=args.get("subject_entity_id"),
+            relation_type=args.get("relation_type"),
+            object_entity_id=args["object_entity_id"] if "object_entity_id" in args else _UNSET,
+            object_label=args["object_label"] if "object_label" in args else _UNSET,
+            epistemic_state=args.get("epistemic_state"),
+            visibility=args.get("visibility"),
+            provenance=args.get("provenance"),
+            clear_object=bool(args.get("clear_object", False)),
+            source_turn_id=turn.id, source_attempt_id=attempt.id,
+            operation_id=operation_id, idempotency_key=str(idempotency_key)[:128],
+        )
+    else:
+        create_relation_inline(
+            db, campaign,
+            subject_entity_id=args.get("subject_entity_id"),
+            relation_type=args.get("relation_type") or "",
+            object_entity_id=args.get("object_entity_id"),
+            object_label=args.get("object_label"),
+            epistemic_state=args.get("epistemic_state") or "claimed",
+            visibility=args.get("visibility"),
+            provenance=args.get("provenance"),
+            source_turn_id=turn.id, source_attempt_id=attempt.id,
+            operation_id=operation_id, idempotency_key=str(idempotency_key)[:128],
+        )
+    logger.info("effect upsert_relation effect_id=%s type=%s supersedes=%s", effect.get("id"), args.get("relation_type"), supersedes)
 
 
 @register("propose_sheet_update")
