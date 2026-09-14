@@ -249,18 +249,19 @@ def api_list_relations(
     profile = resolve_profile(request, db)
     cid = _parse_campaign(campaign_id)
     camp = _campaign_or_403(db, cid, profile)
+    authority = is_world_authority(camp, profile.id)
     try:
         relations = list_relations(
             db, camp.id, subject_entity_id=subject_entity_id,
             object_entity_id=object_entity_id, entity_id=entity_id,
             relation_type=relation_type, epistemic_state=epistemic_state,
             include_history=include_history, limit=limit,
+            exclude_restricted=not authority,
         )
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
-    relations = filter_relations_for_viewer(
-        relations, is_world_authority(camp, profile.id)
-    )
+    # Defense in depth: SQL already excluded restricted rows for members.
+    relations = filter_relations_for_viewer(relations, authority)
     return {"relations": [r.to_dict() for r in relations], "revision": camp.revision}
 
 
@@ -422,14 +423,17 @@ def api_list_facts(
     profile = resolve_profile(request, db)
     cid = _parse_campaign(campaign_id)
     camp = _campaign_or_403(db, cid, profile)
+    authority = is_world_authority(camp, profile.id)
     try:
         facts = list_facts(
             db, camp.id, entity_id=entity_id, epistemic_state=epistemic_state,
             include_history=include_history, limit=limit,
+            exclude_restricted=not authority,
         )
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
-    facts = filter_facts_for_viewer(facts, is_world_authority(camp, profile.id))
+    # Defense in depth: SQL already excluded restricted rows for members.
+    facts = filter_facts_for_viewer(facts, authority)
     return {"facts": [f.to_dict() for f in facts], "revision": camp.revision}
 
 

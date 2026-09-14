@@ -1023,6 +1023,46 @@ def test_mixed_explicit_and_generated_keys_stay_disjoint():
     assert sorted(r.relation_type for r in list_relations(db, cid)) == ["knows", "owes"]
 
 
+def test_restricted_rows_do_not_mask_visible_rows_under_limit():
+    Fac, cid, _owner = _setup()
+    db = Fac()
+    mara, guild, rev = _entities(db, cid, 0)
+    # Hidden rows sort before the visible ones (created first).
+    cur = rev
+    for i in range(3):
+        create_relation_authoritative(
+            db, cid, cur, subject_entity_id=mara.id,
+            relation_type=f"hidden_rel_{i}", object_label=f"secret {i}",
+            visibility="dm_only", operation_id=f"op-hidden-rel-{i}",
+        )
+        cur += 1
+        create_fact_authoritative(
+            db, cid, cur, content=f"Secret {i}.",
+            visibility="dm_only", operation_id=f"op-hidden-fact-{i}",
+        )
+        cur += 1
+    # One visible row of each kind, last in created_at order.
+    rel, _ = create_relation_authoritative(
+        db, cid, cur, subject_entity_id=mara.id, relation_type="works_for",
+        object_entity_id=guild.id, visibility="campaign",
+        operation_id="op-open-rel",
+    )
+    cur += 1
+    fact, _ = create_fact_authoritative(
+        db, cid, cur, content="The market opens at dawn.",
+        visibility="campaign", operation_id="op-open-fact",
+    )
+    # Member-equivalent query: hidden rows must not consume the window —
+    # the visible row is returned at both the default limit and limit=1.
+    assert [str(r.id) for r in list_relations(db, cid, exclude_restricted=True)] == [str(rel.id)]
+    assert [str(r.id) for r in list_relations(db, cid, exclude_restricted=True, limit=1)] == [str(rel.id)]
+    assert [str(f.id) for f in list_facts(db, cid, exclude_restricted=True)] == [str(fact.id)]
+    assert [str(f.id) for f in list_facts(db, cid, exclude_restricted=True, limit=1)] == [str(fact.id)]
+    # Authority view is unchanged (all rows, hidden first).
+    assert len(list_relations(db, cid)) == 4
+    assert len(list_facts(db, cid)) == 4
+
+
 @pytest.fixture
 def knowledge_api(monkeypatch):
     from fastapi.testclient import TestClient

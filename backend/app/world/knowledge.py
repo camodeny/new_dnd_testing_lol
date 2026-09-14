@@ -308,8 +308,14 @@ def list_relations(
     status: str | None = None,
     include_history: bool = False,
     limit: int = 100,
+    exclude_restricted: bool = False,
 ) -> list[WorldRelation]:
     q = select(WorldRelation).where(WorldRelation.campaign_id == campaign_id)
+    if exclude_restricted:
+        # Viewer predicate belongs BEFORE ordering/limiting: filtering
+        # restricted rows after LIMIT would let hidden rows consume the
+        # result window and mask later visible rows for ordinary members.
+        q = q.where(WorldRelation.visibility.notin_(list(RESTRICTED_VISIBILITIES)))
     if status is not None:
         q = q.where(WorldRelation.status == validate_record_status(status))
     elif not include_history:
@@ -346,8 +352,13 @@ def list_facts(
     status: str | None = None,
     include_history: bool = False,
     limit: int = 100,
+    exclude_restricted: bool = False,
 ) -> list[WorldFact]:
     q = select(WorldFact).where(WorldFact.campaign_id == campaign_id)
+    if exclude_restricted:
+        # See list_relations: visibility must filter before LIMIT so hidden
+        # rows cannot mask visible rows for ordinary members.
+        q = q.where(WorldFact.visibility.notin_(list(RESTRICTED_VISIBILITIES)))
     if status is not None:
         q = q.where(WorldFact.status == validate_record_status(status))
     elif not include_history:
