@@ -309,12 +309,15 @@ def _scoped_effect_key(attempt: DmTurnAttempt, key: str) -> str:
     The durable uniqueness scope is campaign-wide, so a bare explicit key
     could collide with an older turn's key: the later write would return the
     older row as a duplicate and the turn would commit without storing the
-    new record. Prefixing with the attempt UUID keeps same-attempt retries
+    new record.     Prefixing with the attempt UUID keeps same-attempt retries
     idempotent (matches the ``jit:{attempt_id}:{temp_id}`` convention from
-    #209) while preventing cross-turn aliasing. Overlong composites fall
-    back to a deterministic sha256 namespace so retries stay stable.
+    #209) while preventing cross-turn aliasing. The ``x:`` domain tag keeps
+    this namespace disjoint from generated ``{attempt.id}:{effect_id}`` keys
+    so an explicit key equal to another effect's ID can never alias it.
+    Overlong composites fall back to a deterministic sha256 namespace so
+    retries stay stable.
     """
-    base = f"{attempt.id}:{key}"
+    base = f"x:{attempt.id}:{key}"
     if len(base) <= 128:
         return base
     return f"eff:{hashlib.sha256(base.encode('utf-8')).hexdigest()}"
