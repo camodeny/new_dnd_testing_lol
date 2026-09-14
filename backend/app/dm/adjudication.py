@@ -208,15 +208,18 @@ def adjudicate_with_failover(
     trace_id: str | None = None,
     adapter=None,
     model: str | None = None,
+    is_retry: bool = False,
 ):
     """Adjudicate through the role policy path with bounded failover.
 
     Primary first, then same-model alternate providers, then only
     explicitly approved different-model fallbacks. Every candidate is
     gated by ``policy.is_model_approved`` — unapproved substitution
-    raises rather than executes. Recovery attempts (index > 0) are
-    recorded as non-billable AI runs when ``db`` is given; the primary is
-    ``primary``/billable.
+    raises rather than executes. Recovery attempts (failover index > 0,
+    or any call with ``is_retry=True`` for an explicit-Retry attempt) are
+    recorded as non-billable AI runs when ``db`` is given; only a first
+    try's primary call is ``primary``/billable. Runs are finished
+    (succeeded/failed) instead of left running.
 
     Returns ``(contract, path_info)`` where path_info holds
     ``provider``/``model``/``attempt_index``/``failover_reasons``.
@@ -275,12 +278,16 @@ def adjudicate_with_failover(
             failover_reasons.append(reason)
             role_policy.record_failover_attempt(reason, provider_name, candidate_model)
             continue
-        classification = "primary" if index == 0 else "recovery"
+        classification = "recovery" if (index > 0 or is_retry) else "primary"
+        ai_run = None
         if db is not None:
             try:
-                from app.observability.service import record_ai_run_inline
+                from app.observability.service import (
+                    finish_ai_run_inline,
+                    record_ai_run_inline,
+                )
 
-                record_ai_run_inline(
+                ai_run = record_ai_run_inline(
                     db, logical_operation="forward_dm_adjudicate",
                     role=role, provider=cand_adapter.name, model=cand_model,
                     attempt=index + 1, classification=classification,
@@ -290,7 +297,7 @@ def adjudicate_with_failover(
                 if classification == "recovery":
                     role_policy.record_recovery_run(billable=False)
             except Exception:
-                pass
+                ai_run = None
         try:
             from app.dm.contract import contract_json_schema_strict, normalize_contract
 
@@ -310,6 +317,14 @@ def adjudicate_with_failover(
             raw = parse_contract_json(response.content)
             contract = normalize_contract(raw)
             ttft_added = (time.monotonic() - t_start) * 1000 if index > 0 else 0.0
+            if ai_run is not None:
+                try:
+                    from app.observability.service import finish_ai_run_inline
+
+                    finish_ai_run_inline(db, ai_run.id, status="succeeded",
+                                         result_code="contract_ok")
+                except Exception:
+                    pass
             structured_log(
                 logger, logging.INFO, "forward_dm_provider_contract",
                 provider=cand_adapter.name, model=cand_model,
@@ -323,6 +338,14 @@ def adjudicate_with_failover(
             }
         except Exception as exc:
             last_exc = exc
+            if ai_run is not None:
+                try:
+                    from app.observability.service import finish_ai_run_inline
+
+                    finish_ai_run_inline(db, ai_run.id, status="failed",
+                                         error_type=type(exc).__name__[:128])
+                except Exception:
+                    pass
             cls, reason = role_policy.classify_execution_failure(exc)
             failover_reasons.append(reason)
             role_policy.record_failover_attempt(

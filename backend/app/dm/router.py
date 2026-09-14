@@ -99,9 +99,22 @@ def continue_stream(campaign_id: str, turn_id: str, stream_id: str, payload: dic
     gate; on success the attempt/turn finalize and staged effects promote
     via the normal commit path. Failures return generic messages without
     infrastructure details.
+
+    Crash safety: recovery commits stream progress through the gameplay
+    session, which can durably persist the outer ``in_progress`` idempotency
+    record before the result exists. A same-key retry that finds such a
+    stranded record converges via gameplay state instead of 409-looping:
+    success returns the converged result, otherwise recovery re-runs
+    (``recover_partial_stream`` is resumable) and the stuck record is
+    cleared after convergence so the key self-heals.
     """
-    from app.deps.idempotency import execute_http_idempotent, require_idempotency_key
+    from app.deps.idempotency import require_idempotency_key
     from app.dm.recovery import recover_partial_stream
+    from app.idempotency import (
+        IdempotencyConflictError,
+        IdempotencyInProgressError,
+        execute_idempotent_command,
+    )
     from models.dm import DmTurn
     profile = resolve_profile(request, db)
     campaign = authorized_campaign(db, campaign_id, profile.id)
@@ -121,21 +134,92 @@ def continue_stream(campaign_id: str, turn_id: str, stream_id: str, payload: dic
     if not continued:
         raise HTTPException(status_code=422, detail="continued_text is required")
     key = require_idempotency_key(request, payload.get("operation_id"))
+
+    def _shape(final_turn, final_attempt, event) -> dict:
+        return {"turn_id": str(final_turn.id), "attempt_id": str(final_attempt.id),
+                "stream_id": str(sid),
+                "event_id": str(getattr(event, "id", None))}
+
     def execute():
         try:
-            final_turn, final_attempt, event = recover_partial_stream(
-                db, campaign.id, tid, sid, continued, actor_id=profile.id,
-            )
+            return _shape(*recover_partial_stream(
+                db, campaign.id, tid, sid, continued, actor_id=profile.id))
         except LookupError as exc:
             raise HTTPException(status_code=404, detail="Turn not found") from exc
         except ValueError as exc:
             raise HTTPException(status_code=409, detail="The storyteller faltered. You can retry this turn.") from exc
-        return {"turn_id": str(final_turn.id), "attempt_id": str(final_attempt.id),
-                "stream_id": str(sid),
-                "event_id": str(getattr(event, "id", None))}
-    return execute_http_idempotent(db, response, actor_id=profile.id, idempotency_key=key,
-        command_type="dm_turn.recover_partial_stream", scope_type="dm_turn", scope_id=tid,
-        payload={"continued_text": continued[:4000]}, execute=execute)
+
+    def _converged_result():
+        """Converge a stranded same-key retry via gameplay state."""
+        from models.dm import DmTurnAttempt
+
+        fresh_turn = db.get(DmTurn, tid)
+        if fresh_turn is not None and fresh_turn.status == "succeeded":
+            fresh_attempt = (db.get(DmTurnAttempt, fresh_turn.current_attempt_id)
+                             if fresh_turn.current_attempt_id else None)
+            if fresh_attempt is not None and fresh_attempt.status == "succeeded":
+                result = dict(fresh_attempt.result or {})
+                return {"turn_id": str(fresh_turn.id),
+                        "attempt_id": str(fresh_attempt.id),
+                        "stream_id": str(sid),
+                        "event_id": str(result.get("event_id") or result.get("id") or "")}
+        # Prior attempt crashed mid-recovery: re-run (resumable) outside the
+        # stranded record, then clear it so the key self-heals.
+        try:
+            final_turn, final_attempt, event = recover_partial_stream(
+                db, campaign.id, tid, sid, continued, actor_id=profile.id)
+        except LookupError as exc:
+            raise HTTPException(status_code=404, detail="Turn not found") from exc
+        except ValueError as exc:
+            raise HTTPException(status_code=409, detail="The storyteller faltered. You can retry this turn.") from exc
+        _clear_stuck_recovery_record(db, profile.id, key, tid)
+        return _shape(final_turn, final_attempt, event)
+
+    try:
+        result, replayed = execute_idempotent_command(
+            db, actor_id=profile.id, idempotency_key=key,
+            command_type="dm_turn.recover_partial_stream", scope_type="dm_turn",
+            scope_id=tid, payload={"continued_text": continued[:4000]},
+            execute=execute,
+        )
+    except IdempotencyConflictError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+    except IdempotencyInProgressError:
+        result, replayed = _converged_result(), True
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    response.headers["X-Idempotent-Replay"] = "true" if replayed else "false"
+    return result
+
+
+def _clear_stuck_recovery_record(db: Session, actor_id, key: str, tid) -> None:
+    """Remove a crashed ``in_progress`` recovery record for this key.
+
+    Only the exact non-completed record for this command identity is
+    removed, and only after gameplay state converged — completed results
+    are never touched.
+    """
+    from sqlalchemy import delete
+
+    from models.reliability import IdempotentCommand
+
+    try:
+        db.execute(
+            delete(IdempotentCommand).where(
+                IdempotentCommand.actor_id == actor_id,
+                IdempotentCommand.idempotency_key == key,
+                IdempotentCommand.command_type == "dm_turn.recover_partial_stream",
+                IdempotentCommand.scope_type == "dm_turn",
+                IdempotentCommand.scope_id == str(tid),
+                IdempotentCommand.status != "completed",
+            )
+        )
+        db.commit()
+    except Exception:
+        try:
+            db.rollback()
+        except Exception:
+            pass
 
 
 @router.get("/api/campaigns/{campaign_id}/dm-turns")

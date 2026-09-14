@@ -152,18 +152,40 @@ def record_ai_run_inline(db: Session, *, logical_operation: str, role: str,
         completed_at=utcnow() if status != "running" else None,
         error_type=error_type, result_code=result_code,
     )
+    # Savepoint, never a session rollback: a telemetry failure must not
+    # roll back unrelated caller gameplay work or release its locks.
     try:
-        db.add(run)
-        db.flush()
+        with db.begin_nested():
+            db.add(run)
+            db.flush()
         return run
     except Exception:
-        try:
-            db.rollback()
-        except Exception:
-            pass
         structured_log(logger, logging.ERROR, "telemetry_dropped",
                        error_type="ai_run_inline_failed")
         return None  # type: ignore[return-value]
+
+
+def finish_ai_run_inline(db: Session, run_id, *, status: str = "succeeded",
+                         result_code: str | None = None,
+                         error_type: str | None = None) -> None:
+    """Finish an inline AI run on the caller's session (fail-soft).
+
+    Savepoint-contained like :func:`record_ai_run_inline`.
+    """
+    try:
+        with db.begin_nested():
+            run = db.get(AIRun, run_id)
+            if run is None:
+                return
+            run.status = status
+            run.completed_at = utcnow()
+            run.result_code = result_code
+            run.error_type = error_type
+            db.add(run)
+            db.flush()
+    except Exception:
+        structured_log(logger, logging.ERROR, "telemetry_dropped",
+                       error_type="ai_run_finish_inline_failed")
 
 
 def get_trace(db: Session, trace_id: str) -> dict | None:

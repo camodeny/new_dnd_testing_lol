@@ -584,6 +584,10 @@ def _execute_owned_attempt(
                 contract, info = _failover(
                     packet, db=db, role="forward_dm",
                     timeout_seconds=timeout_seconds, trace_id=tid,
+                    # Explicit-Retry attempts carry retry lineage: even the
+                    # first provider call is recovery/non-billable so failed
+                    # work is never double-charged.
+                    is_retry=getattr(attempt, "parent_attempt_id", None) is not None,
                 )
                 path_info.update(info)
                 return contract

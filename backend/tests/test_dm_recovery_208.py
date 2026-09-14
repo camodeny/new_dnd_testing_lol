@@ -339,6 +339,115 @@ def test_recover_partial_stream_completes_turn_and_promotes_effects(db):
     for sid in (final_attempt.submission_ids or []):
         row = s.get(PlayerSubmission, uuid.UUID(str(sid)))
         assert row.resolution_status == "resolved"
+    # Same-key retry after convergence returns the converged result.
+    again_turn, again_attempt, _ = recover_partial_stream(
+        s, camp_id, turn.id, stream_id, LONG_TEXT, actor_id=owner)
+    assert again_turn.status == "succeeded"
+    assert again_attempt.status == "succeeded"
+
+
+def _crash_after_chunks(s, stream_id, full_text, *, chunks_to_append="all"):
+    """Simulate a crash mid-recovery: persist chunks + optionally complete,
+    without finalizing the turn."""
+    from app.dm.narration import chunk_narration_text
+    from app.dm_streams.service import (
+        append_chunk,
+        complete_stream,
+        list_chunks,
+        reopen_failed_stream,
+    )
+
+    reopen_failed_stream(s, stream_id, reason="test_crash_sim")
+    existing = list_chunks(s, stream_id)
+    plan = chunk_narration_text(full_text, chunk_size=120)
+    missing = list(range(len(existing), len(plan)))
+    if chunks_to_append != "all":
+        missing = missing[:chunks_to_append]
+    for seq in missing:
+        append_chunk(s, stream_id, seq, plan[seq])
+    s.commit()
+    if chunks_to_append == "all":
+        complete_stream(s, stream_id)
+        s.commit()
+
+
+def test_recover_converges_after_crash_past_completion(db):
+    """Crash after stream completion but before turn commit converges."""
+    from app.dm.recovery import recover_partial_stream
+
+    s, camp_id, thread_id, _ = db
+    owner = s.get(Campaign, camp_id).owner_id
+    turn, attempt, stream_id = _failed_partial(s, camp_id, thread_id)
+    _crash_after_chunks(s, stream_id, LONG_TEXT, chunks_to_append="all")
+    assert s.get(DmTurn, turn.id).status == "failed_visible"
+    final_turn, final_attempt, event = recover_partial_stream(
+        s, camp_id, turn.id, stream_id, LONG_TEXT, actor_id=owner)
+    assert final_turn.status == "succeeded"
+    assert final_attempt.status == "succeeded"
+    assert event is not None
+
+
+def test_recover_converges_after_crash_mid_suffix(db):
+    """Crash after some recovered chunks converges without duplication."""
+    from app.dm.recovery import recover_partial_stream
+    from app.dm_streams.service import list_chunks
+
+    s, camp_id, thread_id, _ = db
+    owner = s.get(Campaign, camp_id).owner_id
+    turn, attempt, stream_id = _failed_partial(s, camp_id, thread_id)
+    before = len(list_chunks(s, stream_id))
+    _crash_after_chunks(s, stream_id, LONG_TEXT, chunks_to_append=1)
+    assert len(list_chunks(s, stream_id)) == before + 1
+    final_turn, final_attempt, _ = recover_partial_stream(
+        s, camp_id, turn.id, stream_id, LONG_TEXT, actor_id=owner)
+    assert final_turn.status == "succeeded"
+    assert final_attempt.status == "succeeded"
+    from app.dm_streams.service import reconstruct_text
+
+    assert reconstruct_text(s, stream_id) == LONG_TEXT
+
+
+def test_explicit_retry_executes_as_non_billable_recovery(db, monkeypatch):
+    """A fresh explicit-Retry attempt records recovery/non-billable AIRuns."""
+    import json
+
+    from app.dm.recovery import retry_failed_adjudication
+    from models.reliability import AIRun
+
+    s, camp_id, thread_id, _ = db
+    turn, attempt = _submit(s, camp_id, thread_id)
+
+    def _boom(packet, feedback=None):
+        raise ValueError("terminal poison")
+
+    with pytest.raises(ValueError):
+        execute_dm_attempt(s, attempt.id, adjudicate=_boom,
+                           narrator="deterministic")
+    assert s.get(DmTurnAttempt, attempt.id).status in ("failed", "failed_visible")
+    _, fresh = retry_failed_adjudication(s, camp_id, turn.id, attempt.id)
+    s.commit()
+
+    contract_json = json.dumps(_contract().model_dump(mode="json"))
+
+    def _fake_execute(adapter, request):
+        return _ok_response(contract_json)
+
+    monkeypatch.setattr("app.dm.adjudication.resolve_dm_provider",
+                        lambda: (_FakeAdapter("primary"), "model-x", "primary"))
+    monkeypatch.setattr(role_policy, "execution_path",
+                        lambda role: [("primary", "model-x")])
+    monkeypatch.setattr(role_policy, "is_model_approved", lambda r, p, m: True)
+    import app.providers as providers_pkg
+
+    monkeypatch.setattr(providers_pkg, "execute_chat", _fake_execute)
+
+    result = execute_dm_attempt(s, fresh.id, narrator="deterministic")
+    assert result.attempt.status == "succeeded"
+    runs = s.execute(select(AIRun)).scalars().all()
+    assert runs, "retry execution must record AI runs"
+    assert all(r.classification == "recovery" for r in runs)
+    assert all(r.billable is False for r in runs)
+    assert all(r.status == "succeeded" for r in runs)
 
 
 def test_recover_partial_stream_rejects_cross_campaign_stream(db):

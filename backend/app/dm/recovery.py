@@ -198,17 +198,24 @@ def recover_partial_stream(db, campaign_id, turn_id, stream_id, continued_text,
         raise LookupError("Stream not found")
 
     contract = normalize_contract(dict(old.contract_snapshot))
-    try:
-        reopen_failed_stream(db, stream.id, reason="partial_recovery")
-        narration = continue_partial_stream(
-            db, stream.id, continued_text, contract, publish_realtime=True,
-        )
-    except DMStreamStateError as exc:
-        # Abandoned/completed streams cannot recover — explicit Retry instead.
-        raise ValueError(f"Stream cannot recover: {exc}") from exc
-    except NarrationError as exc:
-        # Fidelity or stream failure: generic retryable outcome, details in logs.
-        raise ValueError(f"Continued narration rejected: {exc}") from exc
+    if stream.status == "completed":
+        # Crash after stream completion but before turn commit: the durable
+        # final text is server-known — accept only an exact match and skip
+        # straight to finalization (no rewrite, no re-gate of new input).
+        if continued_text != (stream.final_text or ""):
+            raise ValueError("Continued narration does not match the completed stream")
+    else:
+        try:
+            reopen_failed_stream(db, stream.id, reason="partial_recovery")
+            narration = continue_partial_stream(
+                db, stream.id, continued_text, contract, publish_realtime=True,
+            )
+        except DMStreamStateError as exc:
+            # Abandoned streams cannot recover — explicit Retry instead.
+            raise ValueError(f"Stream cannot recover: {exc}") from exc
+        except NarrationError as exc:
+            # Fidelity or stream failure: generic retryable outcome, details in logs.
+            raise ValueError(f"Continued narration rejected: {exc}") from exc
     mark_recovered_streaming(db, turn.id, old.id)
     submission_ids = list(old.submission_ids or [])
     payload = {
@@ -225,8 +232,8 @@ def recover_partial_stream(db, campaign_id, turn_id, stream_id, continued_text,
         actor_id=actor_id,
     )
     logger.info(
-        "dm_retry partial_stream_recovered turn_id=%s attempt_id=%s stream_id=%s event_id=%s chunks=%s",
-        turn.id, old.id, stream.id, getattr(event, "id", None), narration.chunk_count,
+        "dm_retry partial_stream_recovered turn_id=%s attempt_id=%s stream_id=%s event_id=%s",
+        turn.id, old.id, stream.id, getattr(event, "id", None),
     )
     return final_turn, final_attempt, event
 
