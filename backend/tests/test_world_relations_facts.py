@@ -7,7 +7,7 @@ from datetime import datetime, timezone
 from types import SimpleNamespace
 
 import pytest
-from sqlalchemy import create_engine
+from sqlalchemy import create_engine, select
 from sqlalchemy.dialects.sqlite.base import SQLiteTypeCompiler
 from sqlalchemy.orm import sessionmaker
 from sqlalchemy.pool import StaticPool
@@ -38,6 +38,7 @@ from app.world.knowledge import (  # noqa: E402
     list_relations_for_entity,
     relation_visible_to_viewer,
     supersede_fact_authoritative,
+    supersede_fact_inline,
     supersede_relation_authoritative,
     supersede_relation_inline,
 )
@@ -575,6 +576,186 @@ def test_contract_validates_new_knowledge_effect_types():
     }
     contract = normalize_contract(raw)
     assert [e.effect_type for e in contract.staged_effects] == ["assert_fact", "upsert_relation"]
+
+
+# ── review round 1: regression tests ────────────────────────────────────────
+
+def test_concurrent_fact_insert_loser_leaves_winner_refs_intact():
+    from unittest import mock
+
+    import app.world.knowledge as knowledge
+    from app.world.knowledge import _find_fact_by_idempotency
+    from models.world import WorldFactEntityRef
+
+    Fac, cid, _owner = _setup()
+    db = Fac()
+    mara, guild, _rev = _entities(db, cid, 0)
+    campaign = db.get(Campaign, cid)
+    winner, created = create_fact_inline(
+        db, campaign, content="Mara serves the Guild.",
+        entity_refs=[mara.id], epistemic_state="confirmed",
+        visibility="campaign", idempotency_key="fact-race-1",
+    )
+    assert created is True
+    db.commit()
+
+    # Simulate the race window: the precheck SELECT misses, the upsert
+    # absorbs the unique conflict, and the post-insert lookup finds the
+    # winner. The loser references a DIFFERENT entity.
+    real_find = _find_fact_by_idempotency
+    calls = {"n": 0}
+
+    def flaky_find(db_, cid_, key_):
+        calls["n"] += 1
+        if calls["n"] == 1:
+            return None
+        return real_find(db_, cid_, key_)
+
+    with mock.patch.object(knowledge, "_find_fact_by_idempotency", side_effect=flaky_find):
+        loser, created2 = create_fact_inline(
+            db, db.get(Campaign, cid), content="Guild owns Mara (loser).",
+            entity_refs=[guild.id], epistemic_state="suspected",
+            visibility="campaign", idempotency_key="fact-race-1",
+        )
+    assert created2 is False
+    assert str(loser.id) == str(winner.id)
+    # Winner payload untouched and its lookup index still matches it.
+    assert loser.content == "Mara serves the Guild."
+    assert loser.entity_refs == [str(mara.id)]
+    ref_rows = db.execute(
+        select(WorldFactEntityRef).where(WorldFactEntityRef.fact_id == winner.id)
+    ).scalars().all()
+    assert [str(r.entity_id) for r in ref_rows] == [str(mara.id)]
+    db.commit()
+    assert len(list_facts(db, cid, include_history=True)) == 1
+
+
+def test_inline_supersede_retry_after_commit_returns_existing_version():
+    Fac, cid, _owner = _setup()
+    db = Fac()
+    mara, guild, rev = _entities(db, cid, 0)
+    rel, _ = create_relation_authoritative(
+        db, cid, rev, subject_entity_id=mara.id, relation_type="works_for",
+        object_entity_id=guild.id, operation_id="op-r1",
+    )
+    new, created = supersede_relation_inline(
+        db, db.get(Campaign, cid), rel.id, epistemic_state="confirmed",
+        operation_id="op-r-sup",
+    )
+    assert created is True
+    db.commit()
+    # Exact retry after the prior flipped to superseded: idempotent, no raise.
+    same, created2 = supersede_relation_inline(
+        db, db.get(Campaign, cid), rel.id, epistemic_state="confirmed",
+        operation_id="op-r-sup",
+    )
+    assert created2 is False
+    assert str(same.id) == str(new.id)
+    db.commit()
+
+    fact, _ = create_fact_authoritative(
+        db, cid, rev + 1, content="The vault is sealed.",
+        operation_id="op-f1",
+    )
+    new_fact, fcreated = supersede_fact_inline(
+        db, db.get(Campaign, cid), fact.id, epistemic_state="confirmed",
+        operation_id="op-f-sup",
+    )
+    assert fcreated is True
+    db.commit()
+    same_fact, fcreated2 = supersede_fact_inline(
+        db, db.get(Campaign, cid), fact.id, epistemic_state="confirmed",
+        operation_id="op-f-sup",
+    )
+    assert fcreated2 is False
+    assert str(same_fact.id) == str(new_fact.id)
+
+
+def test_supersede_idempotency_key_collision_fails_closed():
+    Fac, cid, _owner = _setup()
+    db = Fac()
+    mara, guild, rev = _entities(db, cid, 0)
+    campaign = db.get(Campaign, cid)
+    rel_a, _ = create_relation_authoritative(
+        db, cid, rev, subject_entity_id=mara.id, relation_type="works_for",
+        object_entity_id=guild.id, operation_id="op-ra",
+    )
+    rel_b, _ = create_relation_authoritative(
+        db, cid, rev + 1, subject_entity_id=mara.id, relation_type="owes",
+        object_label="a debt", operation_id="op-rb",
+    )
+    supersede_relation_inline(
+        db, campaign, rel_a.id, epistemic_state="confirmed",
+        operation_id="op-shared-key",
+    )
+    db.commit()
+    # Same key reused against a DIFFERENT prior: fail closed, not mislinked.
+    with pytest.raises(ValueError):
+        supersede_relation_inline(
+            db, db.get(Campaign, cid), rel_b.id, epistemic_state="confirmed",
+            operation_id="op-shared-key",
+        )
+    db.rollback()
+    assert get_relation_strict(db, cid, rel_b.id).status == "active"
+
+
+def test_new_version_status_superseded_is_rejected():
+    Fac, cid, _owner = _setup()
+    db = Fac()
+    mara, guild, rev = _entities(db, cid, 0)
+    rel, _ = create_relation_authoritative(
+        db, cid, rev, subject_entity_id=mara.id, relation_type="works_for",
+        object_entity_id=guild.id, operation_id="op-r1",
+    )
+    with pytest.raises(ValueError):
+        supersede_relation_inline(
+            db, db.get(Campaign, cid), rel.id, new_status="superseded",
+            operation_id="op-r-bad",
+        )
+    db.rollback()
+    fact, _ = create_fact_authoritative(
+        db, cid, rev + 1, content="The vault is sealed.",
+        operation_id="op-f1",
+    )
+    with pytest.raises(ValueError):
+        supersede_fact_inline(
+            db, db.get(Campaign, cid), fact.id, new_status="superseded",
+            operation_id="op-f-bad",
+        )
+    db.rollback()
+    assert get_relation_strict(db, cid, rel.id).status == "active"
+    assert len(list_relations(db, cid, include_history=True)) == 1
+    assert len(list_facts(db, cid, include_history=True)) == 1
+
+
+def test_overlong_object_label_rejected_not_truncated():
+    Fac, cid, _owner = _setup()
+    db = Fac()
+    mara, _, rev = _entities(db, cid, 0)
+    campaign = db.get(Campaign, cid)
+    long_label = "x" * 257
+    with pytest.raises(ValueError):
+        create_relation_inline(
+            db, campaign, subject_entity_id=mara.id, relation_type="owes",
+            object_label=long_label, operation_id="op-long",
+        )
+    db.rollback()
+    # 256-char boundary is accepted verbatim.
+    ok_label = "y" * 256
+    rel, created = create_relation_inline(
+        db, db.get(Campaign, cid), subject_entity_id=mara.id,
+        relation_type="owes", object_label=ok_label, operation_id="op-ok",
+    )
+    assert created is True
+    assert rel.object_label == ok_label
+    db.commit()
+    with pytest.raises(ValueError):
+        supersede_relation_inline(
+            db, db.get(Campaign, cid), rel.id, object_label=long_label,
+            operation_id="op-long-sup",
+        )
+    db.rollback()
+    assert get_relation_strict(db, cid, rel.id).object_label == ok_label
 
 
 @pytest.fixture

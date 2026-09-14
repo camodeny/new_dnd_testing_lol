@@ -62,6 +62,8 @@ __all__ = [
     "validate_relation_type",
     "validate_epistemic_state",
     "validate_record_status",
+    "validate_new_version_status",
+    "validate_object_label",
     "validate_fact_content",
     "relation_visible_to_viewer",
     "fact_visible_to_viewer",
@@ -123,6 +125,36 @@ def validate_fact_content(value: Any) -> str:
     if len(text) > 2000:
         raise ValueError("fact content must be 2000 characters or fewer")
     return text
+
+
+def validate_object_label(value: Any) -> str | None:
+    """Durable relation labels are rejected when overlong, never truncated.
+
+    Returns None for absent/blank input (callers decide whether a missing
+    label is acceptable); raises for values exceeding the 256-char column.
+    """
+    if value is None:
+        return None
+    label = str(value).strip()
+    if not label:
+        return None
+    if len(label) > 256:
+        raise ValueError("object_label must be 256 characters or fewer")
+    return label
+
+
+def validate_new_version_status(value: Any) -> str:
+    """Lifecycle gate for newly-created versions.
+
+    ``superseded`` is reserved for prior rows that actually have a successor
+    (assigned internally); a new version may only be ``active`` current truth
+    or ``retracted`` terminal state. Otherwise the chain ends in a row that
+    claims a successor it does not have and can never be superseded later.
+    """
+    s = validate_record_status(value)
+    if s == "superseded":
+        raise ValueError('new version status must be "active" or "retracted", not "superseded"')
+    return s
 
 
 def _coerce_uuid(value: Any, *, field: str) -> uuid.UUID:
@@ -419,6 +451,26 @@ def _find_fact_by_idempotency(
     ).scalars().first()
 
 
+def _verify_supersede_dup(
+    dup_supersedes_id: uuid.UUID | None, prior_id: uuid.UUID, key: str, *, kind: str
+) -> None:
+    """Fail closed when a supersede idempotency key collides across operations.
+
+    A duplicate hit is only a safe retry when it actually supersedes the same
+    prior row; otherwise the key was reused for a different logical operation
+    and accepting it would silently attach history to the wrong chain.
+    """
+    if dup_supersedes_id is None or str(dup_supersedes_id) != str(prior_id):
+        structured_log(
+            logger, logging.WARNING, "world_supersede_key_collision",
+            prior_id=str(prior_id), idempotency_key=key, kind=kind,
+        )
+        raise ValueError(
+            f"idempotency_key {key!r} already supersedes a different {kind}; "
+            "use a fresh key for a new supersession"
+        )
+
+
 def _dialect_upsert_insert(db: Session):
     try:
         dialect_name = db.get_bind().dialect.name
@@ -606,7 +658,7 @@ def create_relation_inline(
     obj: WorldEntity | None = None
     if object_entity_id is not None:
         obj = _resolve_world_entity(db, campaign.id, object_entity_id, role="object")
-    label = str(object_label).strip()[:256] if object_label and str(object_label).strip() else None
+    label = validate_object_label(object_label)
     if obj is None and not label:
         raise ValueError("relation requires object_entity_id or object_label")
     source_event = _resolve_source_event(db, campaign.id, source_event_id)
@@ -666,26 +718,31 @@ def supersede_relation_inline(
     insert + prior flip share the caller's transaction (atomic with the
     source turn / revision commit).
     """
+    # Load the prior first (read-only, no lifecycle mutation) so a duplicate
+    # retry can be matched against it; the active-state gate runs AFTER the
+    # idempotency lookup so an exact retry succeeds instead of failing on the
+    # now-superseded prior.
     prior = get_relation_strict(db, campaign.id, _coerce_uuid(prior_relation_id, field="prior_relation_id"))
-    if prior.status != "active":
-        raise ValueError(f"relation {prior.id} is {prior.status}, only active relations can be superseded")
     key = _normalize_idempotency_key(idempotency_key or operation_id)
     if idempotency_key:
         key = _normalize_idempotency_key(idempotency_key)
     if key:
         dup = _find_relation_by_idempotency(db, campaign.id, key)
         if dup is not None:
+            _verify_supersede_dup(dup.supersedes_id, prior.id, key, kind="relation")
             structured_log(
                 logger, logging.INFO, "world_relation_duplicate_conflict",
                 campaign_id=str(campaign.id), relation_id=str(dup.id),
                 idempotency_key=key, path="supersede_precheck",
             )
             return dup, False
+    if prior.status != "active":
+        raise ValueError(f"relation {prior.id} is {prior.status}, only active relations can be superseded")
 
     # ── Validate everything before touching prior lifecycle ──────────────
     rtype = validate_relation_type(relation_type) if relation_type is not None else prior.relation_type
     epistemic = validate_epistemic_state(epistemic_state) if epistemic_state is not None else prior.epistemic_state
-    status = validate_record_status(new_status)
+    status = validate_new_version_status(new_status)
     vis = normalize_visibility(visibility) if visibility is not None else prior.visibility
     subject = (
         _resolve_world_entity(db, campaign.id, subject_entity_id, role="subject")
@@ -709,7 +766,7 @@ def supersede_relation_inline(
     if object_label is UNSET:
         label: str | None = None if clear_object else prior.object_label
     elif object_label is not None:
-        label = str(object_label).strip()[:256] or None
+        label = validate_object_label(object_label)
     else:
         label = None
     if obj is None and not label:
@@ -822,14 +879,18 @@ def create_fact_inline(
             stored = _find_fact_by_idempotency(db, campaign.id, key)
             if stored is None:  # pragma: no cover — defensive
                 raise RuntimeError(f"idempotent fact insert for key {key!r} left no row")
-            _sync_fact_refs(db, campaign, stored, resolved_refs)
             if str(stored.id) != str(row_id):
+                # Lost the race: return the winner untouched. Its join index
+                # and entity_refs must NOT be rewritten with this loser's
+                # refs, or entity lookup would point at entities the winning
+                # fact never referenced.
                 structured_log(
                     logger, logging.INFO, "world_fact_duplicate_conflict",
                     campaign_id=str(campaign.id), fact_id=str(stored.id),
                     idempotency_key=key, path="race_winner",
                 )
                 return stored, False
+            _sync_fact_refs(db, campaign, stored, resolved_refs)
             structured_log(
                 logger, logging.INFO, "world_fact_asserted",
                 campaign_id=str(campaign.id), fact_id=str(stored.id),
@@ -913,25 +974,29 @@ def supersede_fact_inline(
     Validation precedes any lifecycle mutation so failures leave the prior
     active truth untouched.
     """
+    # Read-only prior load first: the active-state gate runs AFTER the
+    # idempotency lookup so an exact retry succeeds instead of failing on the
+    # now-superseded prior.
     prior = get_fact_strict(db, campaign.id, _coerce_uuid(prior_fact_id, field="prior_fact_id"))
-    if prior.status != "active":
-        raise ValueError(f"fact {prior.id} is {prior.status}, only active facts can be superseded")
     key = _normalize_idempotency_key(idempotency_key or operation_id)
     if idempotency_key:
         key = _normalize_idempotency_key(idempotency_key)
     if key:
         dup = _find_fact_by_idempotency(db, campaign.id, key)
         if dup is not None:
+            _verify_supersede_dup(dup.supersedes_id, prior.id, key, kind="fact")
             structured_log(
                 logger, logging.INFO, "world_fact_duplicate_conflict",
                 campaign_id=str(campaign.id), fact_id=str(dup.id),
                 idempotency_key=key, path="supersede_precheck",
             )
             return dup, False
+    if prior.status != "active":
+        raise ValueError(f"fact {prior.id} is {prior.status}, only active facts can be superseded")
 
     text = validate_fact_content(content) if content is not None else prior.content
     epistemic = validate_epistemic_state(epistemic_state) if epistemic_state is not None else prior.epistemic_state
-    status = validate_record_status(new_status)
+    status = validate_new_version_status(new_status)
     vis = normalize_visibility(visibility) if visibility is not None else prior.visibility
     if entity_refs is not None:
         resolved_refs = _resolve_fact_entity_refs(db, campaign.id, entity_refs)
@@ -1006,15 +1071,6 @@ def supersede_fact_inline(
 
 
 # ── Authoritative writers (bump campaign revision + emit domain event) ───────
-
-def _relation_event_payload(row_id: uuid.UUID, relation: WorldRelation | None) -> dict:
-    return {
-        "relation_id": str(row_id),
-        "subject_entity_id": str(relation.subject_entity_id) if relation else None,
-        "relation_type": relation.relation_type if relation else None,
-        "epistemic_state": relation.epistemic_state if relation else None,
-    }
-
 
 def create_relation_authoritative(
     db: Session,
@@ -1109,6 +1165,11 @@ def supersede_relation_authoritative(
     if key:
         existing = _find_relation_by_idempotency(db, campaign_id, key)
         if existing is not None:
+            _verify_supersede_dup(
+                existing.supersedes_id,
+                _coerce_uuid(prior_relation_id, field="prior_relation_id"),
+                key, kind="relation",
+            )
             structured_log(
                 logger, logging.INFO, "world_relation_duplicate_conflict",
                 campaign_id=str(campaign_id), relation_id=str(existing.id),
@@ -1242,6 +1303,11 @@ def supersede_fact_authoritative(
     if key:
         existing = _find_fact_by_idempotency(db, campaign_id, key)
         if existing is not None:
+            _verify_supersede_dup(
+                existing.supersedes_id,
+                _coerce_uuid(prior_fact_id, field="prior_fact_id"),
+                key, kind="fact",
+            )
             structured_log(
                 logger, logging.INFO, "world_fact_duplicate_conflict",
                 campaign_id=str(campaign_id), fact_id=str(existing.id),
