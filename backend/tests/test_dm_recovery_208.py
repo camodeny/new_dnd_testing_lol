@@ -340,10 +340,12 @@ def test_recover_partial_stream_completes_turn_and_promotes_effects(db):
         row = s.get(PlayerSubmission, uuid.UUID(str(sid)))
         assert row.resolution_status == "resolved"
     # Same-key retry after convergence returns the converged result.
-    again_turn, again_attempt, _ = recover_partial_stream(
+    again_turn, again_attempt, again_event = recover_partial_stream(
         s, camp_id, turn.id, stream_id, LONG_TEXT, actor_id=owner)
     assert again_turn.status == "succeeded"
     assert again_attempt.status == "succeeded"
+    assert getattr(again_event, "id", None) == getattr(event, "id", None)
+    assert str(getattr(again_event, "id", None)) != str(stream_id)
 
 
 def _crash_after_chunks(s, stream_id, full_text, *, chunks_to_append="all"):
@@ -508,6 +510,79 @@ def test_recover_partial_stream_rejects_divergent_and_unfaithful_text(db):
                                visible + " You take 10 damage.",
                                actor_id=owner)
     assert s.get(DmTurnAttempt, attempt.id).status == "failed_visible"
+
+
+# ── Idempotency identity + takeover lease (endpoint contract) ────────────────
+
+def test_recovery_digest_distinguishes_text_past_char_4000(db):
+    """Payloads differing only after character 4,000 are distinct commands."""
+    from app.idempotency import (
+        IdempotencyConflictError,
+        execute_idempotent_command,
+    )
+
+    s, camp_id, _, _ = db
+    owner = s.get(Campaign, camp_id).owner_id
+    sid = str(uuid.uuid4())
+    scope = str(uuid.uuid4())
+    first = {"stream_id": sid, "continued_text": "a" * 4000 + "A"}
+    second = {"stream_id": sid, "continued_text": "a" * 4000 + "B"}
+    execute_idempotent_command(
+        s, actor_id=owner, idempotency_key="k-4000", command_type="t",
+        scope_type="dm_turn", scope_id=scope,
+        payload=first, execute=lambda: {"ok": True},
+    )
+    with pytest.raises(IdempotencyConflictError):
+        execute_idempotent_command(
+            s, actor_id=owner, idempotency_key="k-4000", command_type="t",
+            scope_type="dm_turn", scope_id=scope,
+            payload=second, execute=lambda: {"ok": True},
+        )
+
+
+def _plant_recovery_record(s, owner, key, tid, *, age_seconds):
+    from datetime import datetime, timedelta, timezone
+
+    from models.reliability import IdempotentCommand
+
+    record = IdempotentCommand(
+        actor_id=owner, idempotency_key=key,
+        command_type="dm_turn.recover_partial_stream", scope_type="dm_turn",
+        scope_id=str(tid), payload_hash="x" * 64, status="in_progress",
+    )
+    s.add(record)
+    s.commit()
+    backdated = datetime.now(timezone.utc) - timedelta(seconds=age_seconds)
+    record.created_at = backdated.replace(tzinfo=None)
+    s.add(record)
+    s.commit()
+    return record
+
+
+def test_takeover_blocked_while_recovery_active(db):
+    """A fresh in_progress record means active work: stay serialized."""
+    from fastapi import HTTPException
+
+    from app.dm.router import _require_stale_recovery_record
+
+    s, camp_id, thread_id, _ = db
+    owner = s.get(Campaign, camp_id).owner_id
+    turn, _ = _submit(s, camp_id, thread_id)
+    _plant_recovery_record(s, owner, "k-active", turn.id, age_seconds=5)
+    with pytest.raises(HTTPException) as exc_info:
+        _require_stale_recovery_record(s, owner, "k-active", turn.id)
+    assert exc_info.value.status_code == 409
+
+
+def test_takeover_allowed_for_stale_record(db):
+    """A provably stale in_progress record may be taken over."""
+    from app.dm.router import _require_stale_recovery_record
+
+    s, camp_id, thread_id, _ = db
+    owner = s.get(Campaign, camp_id).owner_id
+    turn, _ = _submit(s, camp_id, thread_id)
+    _plant_recovery_record(s, owner, "k-stale", turn.id, age_seconds=3600)
+    _require_stale_recovery_record(s, owner, "k-stale", turn.id)  # no raise
 
 
 # ── Exhaustion: generic retryable failure, no infra details ───────────────────

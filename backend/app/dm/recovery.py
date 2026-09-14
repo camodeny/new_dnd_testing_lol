@@ -143,6 +143,37 @@ def retry_narration_only(db, campaign_id, turn_id, attempt_id):
     )
 
 
+def _find_recovery_event(db, turn, attempt):
+    """Resolve the committed domain event for a recovered turn.
+
+    Prefers the attempt's stored result, then the idempotent commit lookup
+    by (campaign, operation_id). Returns None only if neither resolves.
+    """
+    result = dict(attempt.result or {})
+    event_id = result.get("event_id") or result.get("id")
+    if event_id:
+        try:
+            from models.campaigns import CampaignDomainEvent
+
+            event = db.get(CampaignDomainEvent, uuid.UUID(str(event_id)))
+            if event is not None:
+                return event
+        except (ValueError, TypeError):
+            pass
+    try:
+        from models.campaigns import CampaignDomainEvent
+
+        duplicate_op = attempt.commit_operation_id or str(attempt.id)
+        return db.execute(
+            select(CampaignDomainEvent).where(
+                CampaignDomainEvent.campaign_id == turn.campaign_id,
+                CampaignDomainEvent.operation_id == duplicate_op,
+            )
+        ).scalars().first()
+    except Exception:
+        return None
+
+
 def recover_partial_stream(db, campaign_id, turn_id, stream_id, continued_text,
                            *, actor_id=None):
     """Recover a failed partial stream through the full turn state machine.
@@ -187,9 +218,11 @@ def recover_partial_stream(db, campaign_id, turn_id, stream_id, continued_text,
     old = db.get(DmTurnAttempt, turn.current_attempt_id)
     if old is None:
         raise LookupError("Stream not found")
-    # Duplicate delivery after a completed recovery: return current state.
+    # Duplicate delivery after a completed recovery: return current state
+    # with the ORIGINAL committed domain event (never the stream row —
+    # callers shape event_id from this).
     if turn.status == "succeeded" and old.status == "succeeded":
-        return turn, old, stream
+        return turn, old, _find_recovery_event(db, turn, old)
     if old.status != "failed_visible" or turn.status != "failed_visible":
         raise ValueError("Only the current failed attempt can recover")
     if not old.contract_snapshot:
