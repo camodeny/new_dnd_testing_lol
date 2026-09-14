@@ -199,6 +199,143 @@ def adjudicate_with_provider(
     return contract
 
 
+def adjudicate_with_failover(
+    packet,
+    *,
+    db=None,
+    role: str = "forward_dm",
+    timeout_seconds: float = 90,
+    trace_id: str | None = None,
+    adapter=None,
+    model: str | None = None,
+):
+    """Adjudicate through the role policy path with bounded failover.
+
+    Primary first, then same-model alternate providers, then only
+    explicitly approved different-model fallbacks. Every candidate is
+    gated by ``policy.is_model_approved`` — unapproved substitution
+    raises rather than executes. Recovery attempts (index > 0) are
+    recorded as non-billable AI runs when ``db`` is given; the primary is
+    ``primary``/billable.
+
+    Returns ``(contract, path_info)`` where path_info holds
+    ``provider``/``model``/``attempt_index``/``failover_reasons``.
+    """
+    import time
+
+    from app.providers import ProviderRequest, execute_chat
+    from app.providers import policy as role_policy
+    from app.observability.tracing import structured_log
+
+    tid = trace_id or str(uuid.uuid4())
+    t_start = time.monotonic()
+    policy = role_policy.get_role_policy(role)
+
+    if adapter is not None and model is not None:
+        # Injected seam (tests): single pinned attempt, no failover chain.
+        if not role_policy.is_model_approved(role, adapter.name, model):
+            raise RuntimeError(
+                f"Unapproved model substitution blocked for role {role!r}: "
+                f"{adapter.name}/{model}"
+            )
+        contract = adjudicate_with_provider(
+            packet, adapter=adapter, model=model,
+            timeout_seconds=timeout_seconds, trace_id=tid,
+        )
+        return contract, {
+            "provider": adapter.name, "model": model,
+            "attempt_index": 0, "failover_reasons": [],
+            "ttft_added_ms": 0.0,
+        }
+
+    path = role_policy.execution_path(role)
+    failover_reasons: list[str] = []
+    last_exc: BaseException | None = None
+    for index, (provider_name, candidate_model) in enumerate(path):
+        if not role_policy.is_model_approved(role, provider_name, candidate_model):
+            # Defense in depth: execution_path should never yield these.
+            raise RuntimeError(
+                f"Unapproved model substitution blocked for role {role!r}: "
+                f"{provider_name}/{candidate_model}"
+            )
+        try:
+            if index == 0:
+                # Primary resolves through the canonical seam so existing
+                # config gates and test hooks on resolve_dm_provider hold.
+                cand_adapter, cand_model, _ = resolve_dm_provider()
+            else:
+                from app.providers.registry import provider_registry
+
+                cand_adapter = provider_registry.get(provider_name)
+                cand_adapter.require_config(candidate_model)
+                cand_model = candidate_model
+        except Exception as exc:
+            last_exc = exc
+            reason = f"config_unavailable:{provider_name}"
+            failover_reasons.append(reason)
+            role_policy.record_failover_attempt(reason, provider_name, candidate_model)
+            continue
+        classification = "primary" if index == 0 else "recovery"
+        if db is not None:
+            try:
+                from app.observability.service import record_ai_run_inline
+
+                record_ai_run_inline(
+                    db, logical_operation="forward_dm_adjudicate",
+                    role=role, provider=cand_adapter.name, model=cand_model,
+                    attempt=index + 1, classification=classification,
+                    billable=(classification == "primary"),
+                    trace_id=tid,
+                )
+                if classification == "recovery":
+                    role_policy.record_recovery_run(billable=False)
+            except Exception:
+                pass
+        try:
+            from app.dm.contract import contract_json_schema_strict, normalize_contract
+
+            messages = build_forward_dm_messages(packet)
+            request = ProviderRequest(
+                messages=messages, model=cand_model,
+                json_schema=contract_json_schema_strict(),
+                json_schema_name="dm_turn_contract_v1",
+                timeout_seconds=timeout_seconds, temperature=0,
+            )
+            structured_log(
+                logger, logging.INFO, "forward_dm_provider_start",
+                provider=cand_adapter.name, model=cand_model,
+                trace_id=tid, attempt=index + 1, classification=classification,
+            )
+            response = execute_chat(cand_adapter, request)
+            raw = parse_contract_json(response.content)
+            contract = normalize_contract(raw)
+            ttft_added = (time.monotonic() - t_start) * 1000 if index > 0 else 0.0
+            structured_log(
+                logger, logging.INFO, "forward_dm_provider_contract",
+                provider=cand_adapter.name, model=cand_model,
+                mode=contract.mode, trace_id=tid,
+                failover_reasons=failover_reasons,
+            )
+            return contract, {
+                "provider": cand_adapter.name, "model": cand_model,
+                "attempt_index": index, "failover_reasons": list(failover_reasons),
+                "ttft_added_ms": ttft_added,
+            }
+        except Exception as exc:
+            last_exc = exc
+            cls, reason = role_policy.classify_execution_failure(exc)
+            failover_reasons.append(reason)
+            role_policy.record_failover_attempt(
+                reason, cand_adapter.name, cand_model
+            )
+            if cls == "terminal" or index >= len(path) - 1:
+                break
+            continue
+    assert last_exc is not None
+    role_policy.record_exhausted()
+    raise last_exc
+
+
 def build_provider_narrator(*, adapter=None, model: str | None = None, timeout_seconds: float = 90):
     """Streaming narrator backed by the configured provider.
 

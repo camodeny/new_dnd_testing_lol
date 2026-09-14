@@ -54,6 +54,93 @@ def retry_adjudication(campaign_id: str, turn_id: str, payload: dict, request: R
     return result
 
 
+@router.post("/api/campaigns/{campaign_id}/dm-turns/{turn_id}/retry-narration")
+def retry_narration(campaign_id: str, turn_id: str, payload: dict, request: Request,
+                    response: Response, background_tasks: BackgroundTasks, db: Session = Depends(get_db)):
+    """Narration-independent retry reusing the preserved structured result."""
+    from app.deps.idempotency import execute_http_idempotent, require_idempotency_key
+    from app.dm.recovery import retry_narration_only, execute_committed_attempt
+    from models.dm import DmTurn
+    profile = resolve_profile(request, db)
+    campaign = authorized_campaign(db, campaign_id, profile.id)
+    require_owner(campaign, profile.id)
+    try:
+        tid, aid = uuid.UUID(turn_id), uuid.UUID(str(payload.get("attempt_id")))
+    except ValueError as exc:
+        raise HTTPException(status_code=422, detail="Valid turn and attempt IDs are required") from exc
+    turn = db.get(DmTurn, tid)
+    if turn is None or turn.campaign_id != campaign.id:
+        raise HTTPException(status_code=404, detail="Turn not found")
+    try:
+        assert_can_read_thread(db, campaign.id, parse_thread_id(turn.thread_id), profile.id)
+    except (ThreadNotFoundError, ThreadAuthorizationError) as exc:
+        raise HTTPException(status_code=404, detail="Turn not found") from exc
+    key = require_idempotency_key(request, payload.get("operation_id"))
+    def execute():
+        try:
+            updated, attempt = retry_narration_only(db, campaign.id, tid, aid)
+        except ValueError as exc:
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
+        return {"turn_id": str(updated.id), "attempt_id": str(attempt.id)}
+    result = execute_http_idempotent(db, response, actor_id=profile.id, idempotency_key=key,
+        command_type="dm_turn.retry_narration", scope_type="dm_turn", scope_id=tid, payload=payload, execute=execute)
+    background_tasks.add_task(execute_committed_attempt, result["attempt_id"])
+    return result
+
+
+@router.post("/api/campaigns/{campaign_id}/dm-turns/{turn_id}/streams/{stream_id}/continue")
+def continue_stream(campaign_id: str, turn_id: str, stream_id: str, payload: dict, request: Request, db: Session = Depends(get_db)):
+    """Resume or semantically continue a partial visible stream.
+
+    Body: {"continued_text": "..."}. Direct same-text resume is attempted
+    first; divergent text must preserve the persisted visible prefix and
+    pass the fidelity gate (otherwise 409 with a generic message).
+    """
+    from app.dm.narration import continue_partial_stream, resume_narration_stream
+    from models.dm import DmTurn
+    profile = resolve_profile(request, db)
+    campaign = authorized_campaign(db, campaign_id, profile.id)
+    require_owner(campaign, profile.id)
+    try:
+        tid, sid = uuid.UUID(turn_id), uuid.UUID(stream_id)
+    except ValueError as exc:
+        raise HTTPException(status_code=422, detail="Valid turn and stream IDs are required") from exc
+    turn = db.get(DmTurn, tid)
+    if turn is None or turn.campaign_id != campaign.id:
+        raise HTTPException(status_code=404, detail="Turn not found")
+    continued = str(payload.get("continued_text") or "")
+    if not continued:
+        raise HTTPException(status_code=422, detail="continued_text is required")
+    try:
+        result = resume_narration_stream(db, sid, continued)
+        return {"stream_id": str(result.stream_id), "method": "direct_resume",
+                "visible_text": result.visible_text}
+    except ValueError:
+        pass
+    # Semantic continuation needs the validated contract.
+    from models.dm import DmTurnAttempt
+    from sqlalchemy import select as _select
+    attempt = None
+    if turn.current_attempt_id is not None:
+        attempt = db.get(DmTurnAttempt, turn.current_attempt_id)
+    contract = None
+    if attempt is not None and attempt.contract_snapshot:
+        try:
+            from app.dm.contract import normalize_contract as _normalize
+
+            contract = _normalize(dict(attempt.contract_snapshot))
+        except Exception as exc:
+            raise HTTPException(status_code=409, detail="The storyteller faltered. You can retry this turn.") from exc
+    if contract is None:
+        raise HTTPException(status_code=409, detail="The storyteller faltered. You can retry this turn.")
+    try:
+        result = continue_partial_stream(db, sid, continued, contract)
+        return {"stream_id": str(result.stream_id), "method": "semantic_continuation",
+                "visible_text": result.visible_text}
+    except ValueError as exc:
+        raise HTTPException(status_code=409, detail="The storyteller faltered. You can retry this turn.") from exc
+
+
 @router.get("/api/campaigns/{campaign_id}/dm-turns")
 def list_dm_turns(campaign_id: str, request: Request, db: Session = Depends(get_db)):
     profile = resolve_profile(request, db)

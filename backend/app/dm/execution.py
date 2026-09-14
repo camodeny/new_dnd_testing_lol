@@ -1,12 +1,21 @@
-"""Autonomous DM-turn execution spine — issue #354.
+"""Autonomous DM-turn execution spine — issues #354, #208.
 
 Handoff from coordinated ``prepared`` attempts to real model-backed execution
 through the production pipeline:
 
   claim (``mark_attempt_running``) → ``assemble_attempt_context`` →
-  provider adjudication (``app.dm.adjudication``) → evidence/tool loop →
+  provider adjudication (``app.dm.adjudication`` with role-aware failover
+  via ``app.providers.policy``) → evidence/tool loop →
   validation with bounded regeneration → ``execute_validated_turn``
   (stage → durable stream narration → atomic commit) → realtime projection.
+
+#208 hardening on the same spine (no parallel stack): same-model
+alternate-provider failover, explicitly-approved different-model fallback
+only, unified retryable/terminal classification, narration-only survival
+via contract_snapshot, partial-stream resume/continuation, generic
+player-visible retry on exhaustion, and non-billable recovery AI runs.
+There is no degraded emergency DM mode: exhausted recovery stops with a
+generic retryable failure rather than narrating an incomplete result.
 
 Failures never fabricate a turn: any terminal error marks the attempt failed
 (visible, so the live table shows a failure instead of stuck "thinking") and
@@ -137,6 +146,15 @@ def _assemble_production_context(db: Session, attempt_id: uuid.UUID, *, suppleme
 
 def _classify_failure(exc: BaseException) -> str:
     """Map execution failures to attempt error_class (retriable default)."""
+    from app.providers import policy as role_policy
+
+    if isinstance(exc, RuntimeError) and "Unapproved model substitution" in str(exc):
+        return "terminal"
+    try:
+        cls, _reason = role_policy.classify_execution_failure(exc)
+        return cls
+    except Exception:
+        pass
     from app.worker.executor import TERMINAL, classify_error
 
     if _is_config_error(exc):
@@ -145,6 +163,31 @@ def _classify_failure(exc: BaseException) -> str:
         return classify_error(exc)
     except Exception:
         return TERMINAL
+
+
+def _attach_public_retry_marker(db: Session, attempt_id: uuid.UUID) -> None:
+    """Attach a generic player-visible retry marker without infra details.
+
+    Internal diagnostics stay in ``last_error``/logs; ``result.public_error``
+    is the only player-facing surface and never includes provider, model,
+    status code, or exception text.
+    """
+    from app.providers import policy as role_policy
+
+    from models.dm import DmTurnAttempt
+
+    try:
+        attempt = db.get(DmTurnAttempt, attempt_id)
+        if attempt is None:
+            return
+        base = dict(attempt.result or {})
+        base["public_error"] = role_policy.GENERIC_RETRYABLE_MESSAGE
+        base["retryable"] = True
+        attempt.result = base
+        db.add(attempt)
+        db.flush()
+    except Exception:
+        pass
 
 
 def execute_dm_attempt(db: Session, attempt_id: uuid.UUID, **kwargs):
@@ -490,6 +533,14 @@ def _execute_owned_attempt(
                 error_class=error_class,
                 visible=True,
             )
+            try:
+                _attach_public_retry_marker(db, attempt.id)
+                db.commit()
+            except Exception:
+                try:
+                    db.rollback()
+                except Exception:
+                    pass
         except Exception as mark_exc:
             logger.warning(
                 "dm_execute failure-marking failed attempt_id=%s error=%s",
@@ -512,16 +563,30 @@ def _execute_owned_attempt(
 
     # Resolve providers per call area (fail-clear gates live in
     # adjudication/areas config). Narrator resolves its own pinned area
-    # inside build_provider_narrator.
+    # inside build_provider_narrator. #208: adjudication runs through the
+    # role-aware failover path on the same spine (no parallel stack).
     adapter = None
     model = None
     pname = provider_name
+    path_info: dict = {}
     if adjudicate is None:
         try:
-            from app.dm.adjudication import resolve_dm_provider
+            from app.providers import policy as _role_policy
 
-            adapter, model, resolved = resolve_dm_provider()
-            pname = pname or resolved
+            _path = _role_policy.execution_path("forward_dm")
+            pname = pname or _path[0][0]
+            model = _path[0][1]
+
+            def adjudicate(packet, feedback=None):  # type: ignore[misc]
+                from app.dm.adjudication import adjudicate_with_failover as _failover
+
+                _ = feedback  # feedback reaches the model via regeneration packet
+                contract, info = _failover(
+                    packet, db=db, role="forward_dm",
+                    timeout_seconds=timeout_seconds, trace_id=tid,
+                )
+                path_info.update(info)
+                return contract
         except Exception as exc:
             db.rollback()
             _fail_visible(exc)
@@ -534,47 +599,63 @@ def _execute_owned_attempt(
         provider=pname, model=model, trace_id=tid,
     )
 
-    if adjudicate is None:
-        def adjudicate(packet, feedback=None):  # type: ignore[misc]
-            from app.dm.adjudication import adjudicate_with_provider
+    # Narration-only retry (#208): a fresh explicit-Retry attempt carrying a
+    # preserved valid contract_snapshot skips adjudication and goes straight
+    # to narration+commit. Staged effects are re-staged from the snapshot
+    # (never copied as committed truth).
+    _snapshot_contract = None
+    _reuse_snapshot = (
+        getattr(attempt, "contract_snapshot", None) is not None
+        and getattr(attempt, "parent_attempt_id", None) is not None
+    )
+    if _reuse_snapshot:
+        try:
+            from app.dm.contract import normalize_contract as _normalize_snapshot
 
-            _ = feedback  # feedback reaches the model via regeneration packet
-            return adjudicate_with_provider(
-                packet, adapter=adapter, model=model,
-                timeout_seconds=timeout_seconds, trace_id=tid,
+            _snapshot_contract = _normalize_snapshot(dict(attempt.contract_snapshot))
+            structured_log(
+                logger, logging.INFO, "dm_execute_narration_retry",
+                turn_id=str(turn_id), attempt_id=str(attempt.id),
+                trace_id=tid,
             )
+        except Exception:
+            _snapshot_contract = None
+            _reuse_snapshot = False
 
     try:
-        # Evidence/tool loop first (no-op when the model never asks for
-        # evidence), then strict validation with bounded regeneration.
-        # Preserve the exact packet the last evidence adjudication saw, including
-        # its visibility filtering and per-round budget decisions.
-        validation_packet = packet
-
-        from app.dm.contract import ContractValidationError as _ContractValidationError
-
-        def evidence_adjudicate(enriched_packet):
-            nonlocal validation_packet
-            validation_packet = enriched_packet
-            try:
-                return adjudicate(enriched_packet)
-            except _ContractValidationError:
-                # Repair structurally invalid output within the round so
-                # need_evidence mediation stays intact and exhaustion still
-                # funnels through the normal _fail_visible path below.
-                repaired, _ = run_with_bounded_regeneration(adjudicate, enriched_packet)
-                return repaired
-
-        final_contract, _bundle = run_bounded_evidence_loop(
-            initial_packet=packet, adjudicate=evidence_adjudicate, db=db,
-            tool_handlers={"ask_character_sheet": handle_ask_character_sheet},
-        )
-        packet = validation_packet
-        report = default_pipeline.validate(final_contract, packet)
-        if report.passed:
-            contract = final_contract
+        if _snapshot_contract is not None:
+            contract = _snapshot_contract
         else:
-            contract, report = run_with_bounded_regeneration(adjudicate, packet)
+            # Evidence/tool loop first (no-op when the model never asks for
+            # evidence), then strict validation with bounded regeneration.
+            # Preserve the exact packet the last evidence adjudication saw, including
+            # its visibility filtering and per-round budget decisions.
+            validation_packet = packet
+
+            from app.dm.contract import ContractValidationError as _ContractValidationError
+
+            def evidence_adjudicate(enriched_packet):
+                nonlocal validation_packet
+                validation_packet = enriched_packet
+                try:
+                    return adjudicate(enriched_packet)
+                except _ContractValidationError:
+                    # Repair structurally invalid output within the round so
+                    # need_evidence mediation stays intact and exhaustion still
+                    # funnels through the normal _fail_visible path below.
+                    repaired, _ = run_with_bounded_regeneration(adjudicate, enriched_packet)
+                    return repaired
+
+            final_contract, _bundle = run_bounded_evidence_loop(
+                initial_packet=packet, adjudicate=evidence_adjudicate, db=db,
+                tool_handlers={"ask_character_sheet": handle_ask_character_sheet},
+            )
+            packet = validation_packet
+            report = default_pipeline.validate(final_contract, packet)
+            if report.passed:
+                contract = final_contract
+            else:
+                contract, report = run_with_bounded_regeneration(adjudicate, packet)
     except Exception as exc:
         db.rollback()
         _fail_visible(exc)
@@ -645,7 +726,26 @@ def _execute_owned_attempt(
         )
     except NarrationStreamError as exc:
         # Post-visibility remediation already applied inside
-        # execute_validated_turn; just observe.
+        # execute_validated_turn. The valid structured packet survives in
+        # attempt.contract_snapshot so narration can retry independently
+        # without re-adjudication.
+        try:
+            from models.dm import DmTurnAttempt as _Att2
+
+            current = db.get(_Att2, attempt.id)
+            if current is not None:
+                base = dict(current.result or {})
+                base["narration_retry_available"] = True
+                base["partial_stream_id"] = str(exc.stream_id) if exc.stream_id else None
+                current.result = base
+                db.add(current)
+                _attach_public_retry_marker(db, attempt.id)
+                db.commit()
+        except Exception:
+            try:
+                db.rollback()
+            except Exception:
+                pass
         structured_log(
             logger, logging.WARNING, "dm_execute_stream_failed",
             turn_id=str(turn_id), attempt_id=str(attempt.id),
@@ -670,7 +770,11 @@ def _execute_owned_attempt(
         logger, logging.INFO, "dm_execute_complete",
         turn_id=str(result.turn.id), attempt_id=str(result.attempt.id),
         stream_id=str(result.narration.stream_id),
-        provider=pname, model=model, trace_id=tid,
+        provider=path_info.get("provider") or pname,
+        model=path_info.get("model") or model,
+        failover_reasons=path_info.get("failover_reasons") or [],
+        ttft_added_ms=path_info.get("ttft_added_ms") or 0.0,
+        trace_id=tid,
     )
     return result
 

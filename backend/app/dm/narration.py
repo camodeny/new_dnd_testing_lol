@@ -1263,6 +1263,87 @@ def resume_narration_stream(
     suffix, then materializes the final narration. Idempotent: already
     persisted chunks are re-used, never duplicated.
     """
+    from app.providers import policy as role_policy
+
+    result = _resume_stream_suffix(
+        db, stream_id, full_text,
+        chunk_size=chunk_size, publish_realtime=publish_realtime,
+        completion_reason="narration_resumed",
+    )
+    role_policy.record_partial_resume("direct_resume")
+    return result
+
+
+def continue_partial_stream(
+    db: Session,
+    stream_id: uuid.UUID,
+    continued_text: str,
+    contract: DmTurnContractV1,
+    *,
+    chunk_size: int = 120,
+    publish_realtime: bool = True,
+    extra_secrets: set[str] | None = None,
+    pc_names: dict[str, str] | None = None,
+) -> NarrationResult:
+    """Semantically continue a partial visible stream without contradiction.
+
+    Direct resume handles the same-text case. When regeneration diverges,
+    this continues from the persisted visible prefix: ``continued_text``
+    MUST start with the exact persisted visible text (players already saw
+    it — it cannot be rewritten), and the full continuation must pass the
+    authoritative fidelity gate against the validated contract. Only the
+    missing suffix is persisted; no chunk is ever rewritten.
+
+    Raises ``ValueError`` when the prefix diverges (caller must Retry
+    fresh instead) and ``NarrationFidelityError`` /
+    ``NarrationStreamError`` on gate failure.
+    """
+    from app.dm_streams.service import reconstruct_text
+    from app.providers import policy as role_policy
+
+    visible = reconstruct_text(db, stream_id)
+    if not (continued_text or "").startswith(visible):
+        raise ValueError(
+            "Continued narration contradicts the persisted visible prefix — "
+            "cannot continue automatically; use explicit Retry"
+        )
+    check_narration_fidelity_or_raise(
+        continued_text, contract,
+        extra_secrets=extra_secrets, pc_names=pc_names,
+    )
+    result = _resume_stream_suffix(
+        db, stream_id, continued_text,
+        chunk_size=chunk_size, publish_realtime=publish_realtime,
+        completion_reason="narration_continued",
+    )
+    role_policy.record_partial_resume("semantic_continuation")
+    return result
+
+
+def build_continuation_prompt(projection: dict[str, Any], visible_prefix: str) -> str:
+    """Build a regeneration prompt constrained to continue the prefix.
+
+    The persisted prefix is quoted verbatim with an instruction to continue
+    exactly from it without contradicting or restating it differently.
+    """
+    base = build_narrator_prompt(projection)
+    return (
+        base + "\nALREADY VISIBLE (do not rewrite, contradict, or restate):\n"
+        + (visible_prefix or "")[:4000]
+        + "\nContinue exactly from the visible text above."
+    )
+
+
+def _resume_stream_suffix(
+    db: Session,
+    stream_id: uuid.UUID,
+    full_text: str,
+    *,
+    chunk_size: int = 120,
+    publish_realtime: bool = True,
+    completion_reason: str = "narration_resumed",
+) -> NarrationResult:
+    """Shared suffix-persist + complete for resume/continuation."""
     from app.dm_streams.service import (
         append_chunk,
         complete_stream,
@@ -1305,7 +1386,7 @@ def resume_narration_stream(
                     "narration resume publish failed stream_id=%s seq=%s error=%s",
                     stream_id, seq, pub_exc,
                 )
-    stream = complete_stream(db, stream_id, completion_reason="narration_resumed")
+    stream = complete_stream(db, stream_id, completion_reason=completion_reason)
     db.commit()
     db.refresh(stream)
     if publish_realtime:

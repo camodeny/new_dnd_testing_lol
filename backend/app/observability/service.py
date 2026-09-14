@@ -121,6 +121,51 @@ def finish_ai_run(session_factory, run_id, *, status: str = "succeeded", first_t
     return _telemetry_write(session_factory, write)
 
 
+def record_ai_run_inline(db: Session, *, logical_operation: str, role: str,
+                         provider: str, model: str, attempt: int = 1,
+                         classification: str = "primary",
+                         billable: bool | None = None,
+                         trace_id: str | None = None,
+                         operation_id: str | None = None,
+                         status: str = "running",
+                         error_type: str | None = None,
+                         result_code: str | None = None) -> AIRun:
+    """Record an AI run on the caller's gameplay session (fail-soft).
+
+    Unlike :func:`start_ai_run` (own telemetry transaction), this writes
+    into the given gameplay ``Session`` via flush-only so recovery
+    accounting commits atomically with the turn it describes. Callers must
+    tolerate a best-effort failure: returns the run or None.
+    """
+    import uuid as _uuid
+
+    if classification not in {"primary", "recovery"}:
+        raise ValueError("classification must be primary or recovery")
+    resolved_billable = (classification == "primary") if billable is None else billable
+    run = AIRun(
+        trace_id=trace_id or current_trace_id() or _uuid.uuid4().hex,
+        operation_id=operation_id or current_operation_id() or _uuid.uuid4().hex,
+        logical_operation=logical_operation, role=role,
+        provider=provider, model=model, attempt=int(attempt or 1),
+        classification=classification, billable=resolved_billable,
+        status=status, started_at=utcnow(),
+        completed_at=utcnow() if status != "running" else None,
+        error_type=error_type, result_code=result_code,
+    )
+    try:
+        db.add(run)
+        db.flush()
+        return run
+    except Exception:
+        try:
+            db.rollback()
+        except Exception:
+            pass
+        structured_log(logger, logging.ERROR, "telemetry_dropped",
+                       error_type="ai_run_inline_failed")
+        return None  # type: ignore[return-value]
+
+
 def get_trace(db: Session, trace_id: str) -> dict | None:
     record = db.get(OperationTrace, trace_id)
     if record is None:
