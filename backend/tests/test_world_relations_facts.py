@@ -1063,6 +1063,59 @@ def test_restricted_rows_do_not_mask_visible_rows_under_limit():
     assert len(list_facts(db, cid)) == 4
 
 
+def test_widening_supersession_drops_restricted_metadata():
+    Fac, cid, _owner = _setup()
+    db = Fac()
+    mara, guild, rev = _entities(db, cid, 0)
+    secrets = {
+        "provenance": {"source": "npc_utterance", "dm_private_context": "Mara lies about the retreat."},
+        "details": {"dm_note": "Guild is broke."},
+        "grants": {"dm_only_flag": True},
+    }
+    fact, _ = create_fact_authoritative(
+        db, cid, rev, content="Mara guards the bridge.",
+        entity_refs=[mara.id], epistemic_state="false",
+        visibility="dm_only", operation_id="op-f-secret",
+        **secrets,
+    )
+    rel, _ = create_relation_authoritative(
+        db, cid, rev + 1, subject_entity_id=mara.id, relation_type="spies_for",
+        object_entity_id=guild.id, visibility="dm_only",
+        operation_id="op-r-secret", **secrets,
+    )
+    # Widen to member-visible without explicit metadata: successor keeps
+    # only the record itself, never the prior DM-only context.
+    open_fact, _ = supersede_fact_authoritative(
+        db, cid, rev + 2, fact.id, content="Mara guards the bridge.",
+        epistemic_state="believed", visibility="campaign",
+        operation_id="op-f-open",
+    )
+    assert open_fact.provenance == {}
+    assert open_fact.details == {}
+    assert open_fact.grants == {}
+    open_rel, _ = supersede_relation_authoritative(
+        db, cid, rev + 3, rel.id, epistemic_state="believed",
+        visibility="campaign", operation_id="op-r-open",
+    )
+    assert open_rel.provenance == {}
+    assert open_rel.details == {}
+    # Prior history still preserves the secrets for the DM.
+    assert get_relation_strict(db, cid, rel.id).provenance["dm_private_context"].startswith("Mara lies")
+    # Explicitly supplied metadata on a widening supersession is kept.
+    open_fact2, _ = supersede_fact_authoritative(
+        db, cid, rev + 4, open_fact.id, epistemic_state="confirmed",
+        provenance={"source": "dm_adjudication", "note": "party witnessed it"},
+        operation_id="op-f-open2",
+    )
+    assert open_fact2.provenance == {"source": "dm_adjudication", "note": "party witnessed it"}
+    # Non-widening supersession still inherits.
+    still_open, _ = supersede_fact_authoritative(
+        db, cid, rev + 5, open_fact2.id,
+        epistemic_state="confirmed", operation_id="op-f-same",
+    )
+    assert still_open.provenance == {"source": "dm_adjudication", "note": "party witnessed it"}
+
+
 @pytest.fixture
 def knowledge_api(monkeypatch):
     from fastapi.testclient import TestClient
@@ -1147,3 +1200,45 @@ def test_knowledge_reads_are_viewer_aware_over_http(knowledge_api, monkeypatch):
     assert client.get(f"{base}/facts").json()["facts"] == []
     assert client.get(f"{base}/facts/{fact_id}").status_code == 404
     assert client.get(f"{base}/relations/{rel_id}").status_code == 200
+
+
+def test_widened_successor_hides_prior_secrets_from_member_over_http(knowledge_api, monkeypatch):
+    client, cid, owner, member = knowledge_api
+    base = f"/api/campaigns/{cid}/world"
+    r = client.post(f"{base}/entities", json={
+        "expected_revision": 0, "entity_type": "npc", "name": "Mara",
+        "operation_id": "op-mara",
+    }, headers={"Idempotency-Key": "op-mara"})
+    assert r.status_code == 200, r.text
+    mara_id = r.json()["entity"]["id"]
+    # DM-only fact carrying secret provenance/details.
+    r = client.post(f"{base}/facts", json={
+        "expected_revision": 1, "content": "Mara guards the bridge.",
+        "entity_refs": [mara_id], "epistemic_state": "false",
+        "visibility": "dm_only",
+        "provenance": {"source": "npc_utterance", "dm_private_context": "Mara lies about the retreat."},
+        "details": {"dm_note": "s3cr3t-note"},
+        "operation_id": "op-fact-secret",
+    }, headers={"Idempotency-Key": "op-fact-secret"})
+    assert r.status_code == 200, r.text
+    fact_id = r.json()["fact"]["id"]
+    # Owner widens to campaign-visible without supplying metadata.
+    r = client.post(f"{base}/facts/{fact_id}/supersede", json={
+        "expected_revision": 2, "epistemic_state": "believed",
+        "visibility": "campaign", "operation_id": "op-fact-open",
+    }, headers={"Idempotency-Key": "op-fact-open"})
+    assert r.status_code == 200, r.text
+    open_id = r.json()["fact"]["id"]
+    # Ordinary member sees the record but none of the prior secrets.
+    monkeypatch.setattr(
+        "app.world.router.resolve_profile",
+        lambda req, db: db.get(Profile, member),
+    )
+    facts = client.get(f"{base}/facts").json()["facts"]
+    assert [f["id"] for f in facts] == [open_id]
+    single = client.get(f"{base}/facts/{open_id}").json()["fact"]
+    blob = str(single)
+    assert "retreat" not in blob
+    assert "s3cr3t-note" not in blob
+    assert single["provenance"] == {}
+    assert single["details"] == {}

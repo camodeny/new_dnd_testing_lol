@@ -482,6 +482,20 @@ def _verify_supersede_dup(
         )
 
 
+def _widening_visibility(prior_visibility: str, new_visibility: str) -> bool:
+    """Whether a supersession crosses restricted → member-visible.
+
+    When it does, prior ``provenance``/``details``/``grants`` must NOT be
+    inherited: those fields are serialized verbatim by ``to_dict()``, so
+    inherited DM-only metadata would become readable by ordinary members
+    even when the caller only intended to reveal the new record itself.
+    """
+    return (
+        prior_visibility in RESTRICTED_VISIBILITIES
+        and new_visibility not in RESTRICTED_VISIBILITIES
+    )
+
+
 def _dialect_upsert_insert(db: Session):
     try:
         dialect_name = db.get_bind().dialect.name
@@ -784,9 +798,21 @@ def supersede_relation_inline(
         raise ValueError("relation requires object_entity_id or object_label")
     source_event = _resolve_source_event(db, campaign.id, source_event_id)
     turn_id, attempt_id = _resolve_source_turn_refs(source_turn_id, source_attempt_id)
-    merged_provenance = {**(prior.provenance or {}), **_normalize_provenance(provenance)}
-    merged_details = dict(details) if details is not None else dict(prior.details or {})
-    merged_grants = _normalize_grants(grants) if grants is not None else dict(prior.grants or {})
+    if _widening_visibility(prior.visibility, vis):
+        # Restricted → member-visible: keep only explicitly supplied
+        # metadata so prior DM-only context cannot leak into the visible row.
+        merged_provenance = _normalize_provenance(provenance)
+        merged_details = dict(details or {})
+        merged_grants = _normalize_grants(grants)
+        structured_log(
+            logger, logging.INFO, "world_restricted_metadata_dropped",
+            campaign_id=str(campaign.id), prior_relation_id=str(prior.id),
+            prior_visibility=prior.visibility, visibility=vis,
+        )
+    else:
+        merged_provenance = {**(prior.provenance or {}), **_normalize_provenance(provenance)}
+        merged_details = dict(details) if details is not None else dict(prior.details or {})
+        merged_grants = _normalize_grants(grants) if grants is not None else dict(prior.grants or {})
 
     row, created = _insert_relation_row(
         db, campaign,
@@ -1015,9 +1041,21 @@ def supersede_fact_inline(
         resolved_refs = _resolve_fact_entity_refs(db, campaign.id, list(prior.entity_refs or []))
     source_event = _resolve_source_event(db, campaign.id, source_event_id)
     turn_id, attempt_id = _resolve_source_turn_refs(source_turn_id, source_attempt_id)
-    merged_provenance = {**(prior.provenance or {}), **_normalize_provenance(provenance)}
-    merged_details = dict(details) if details is not None else dict(prior.details or {})
-    merged_grants = _normalize_grants(grants) if grants is not None else dict(prior.grants or {})
+    if _widening_visibility(prior.visibility, vis):
+        # Restricted → member-visible: keep only explicitly supplied
+        # metadata so prior DM-only context cannot leak into the visible row.
+        merged_provenance = _normalize_provenance(provenance)
+        merged_details = dict(details or {})
+        merged_grants = _normalize_grants(grants)
+        structured_log(
+            logger, logging.INFO, "world_restricted_metadata_dropped",
+            campaign_id=str(campaign.id), prior_fact_id=str(prior.id),
+            prior_visibility=prior.visibility, visibility=vis,
+        )
+    else:
+        merged_provenance = {**(prior.provenance or {}), **_normalize_provenance(provenance)}
+        merged_details = dict(details) if details is not None else dict(prior.details or {})
+        merged_grants = _normalize_grants(grants) if grants is not None else dict(prior.grants or {})
 
     row = WorldFact(
         id=uuid.uuid4(),
