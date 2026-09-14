@@ -206,7 +206,12 @@ def recover_partial_stream(db, campaign_id, turn_id, stream_id, continued_text,
     """
     from app.dm.contract import normalize_contract
     from app.dm.narration import NarrationError, continue_partial_stream
-    from app.dm.turns import commit_turn_with_effects, mark_recovered_streaming
+    from app.dm.turns import (
+        StaleRevisionError,
+        TurnConflictError,
+        commit_turn_with_effects,
+        mark_recovered_streaming,
+    )
     from app.dm_streams.service import (
         DMStreamStateError,
         get_stream,
@@ -275,13 +280,19 @@ def recover_partial_stream(db, campaign_id, turn_id, stream_id, continued_text,
         "narration_stream_id": str(stream.id),
         "recovery": "partial_stream_continuation",
     }
-    final_turn, final_attempt, event = commit_turn_with_effects(
-        db, turn.id, old.id,
-        payload=payload,
-        operation_id=old.commit_operation_id or str(old.id),
-        actor_id=actor_id,
-        commit=commit,
-    )
+    try:
+        final_turn, final_attempt, event = commit_turn_with_effects(
+            db, turn.id, old.id,
+            payload=payload,
+            operation_id=old.commit_operation_id or str(old.id),
+            actor_id=actor_id,
+            commit=commit,
+        )
+    except (StaleRevisionError, TurnConflictError) as exc:
+        # Legitimate stale-revision/blocked recovery: generic retryable
+        # outcome (callers map ValueError to 409), never a 500. Details stay
+        # in logs; the atomic commit=False path rolls everything back.
+        raise ValueError(f"Recovery cannot commit: {exc}") from exc
     logger.info(
         "dm_retry partial_stream_recovered turn_id=%s attempt_id=%s stream_id=%s event_id=%s",
         turn.id, old.id, stream.id, getattr(event, "id", None),

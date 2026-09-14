@@ -348,6 +348,9 @@ def test_recover_partial_stream_completes_turn_and_promotes_effects(db):
     assert str(getattr(again_event, "id", None)) != str(stream_id)
 
 
+# ── Atomicity: crash at any boundary leaves nothing durable ─────────────────
+
+
 def _crash_after_chunks(s, stream_id, full_text, *, chunks_to_append="all"):
     """Simulate a crash mid-recovery: persist chunks + optionally complete,
     without finalizing the turn."""
@@ -512,7 +515,68 @@ def test_recover_partial_stream_rejects_divergent_and_unfaithful_text(db):
     assert s.get(DmTurnAttempt, attempt.id).status == "failed_visible"
 
 
-# ── Atomicity: crash at any boundary leaves nothing durable ─────────────────
+# ── Narration failover through the role policy ──────────────────────────────
+
+def test_narration_failover_uses_next_candidate_pre_token(db, monkeypatch):
+    import app.providers as providers_pkg
+    from app.dm.adjudication import build_provider_narrator
+    from app.dm.narration import NarratorRequest
+    from app.providers import registry as reg
+    from app.providers.contracts import NormalizedStreamEvent, ProviderError
+    from models.reliability import AIRun
+
+    s, _, _, _ = db
+    calls = []
+
+    def _fake_stream(adapter, request):
+        calls.append(adapter.name)
+        if len(calls) == 1:
+            raise ProviderError("rate limited", kind="http", status_code=429,
+                                retryable=True)
+        yield NormalizedStreamEvent(kind="token", text="hello ")
+        yield NormalizedStreamEvent(kind="token", text="world")
+
+    monkeypatch.setattr(providers_pkg, "stream_chat", _fake_stream)
+    monkeypatch.setattr(role_policy, "execution_path",
+                        lambda role: [("p1", "m"), ("p2", "m")])
+    monkeypatch.setattr(role_policy, "is_model_approved", lambda r, p, m: True)
+    monkeypatch.setattr(reg.provider_registry, "get", lambda name: _FakeAdapter(name))
+    monkeypatch.setattr("app.providers.areas.resolve_area",
+                        lambda area: (_FakeAdapter("p1"), "m", "p1"))
+
+    narrate = build_provider_narrator(db=s)
+    text = "".join(narrate(NarratorRequest(prompt="p", projection={})))
+    assert text == "hello world"
+    assert calls == ["p1", "p2"]
+    runs = {r.provider: r for r in s.execute(select(AIRun)).scalars().all()}
+    assert runs["p1"].classification == "primary"
+    assert runs["p1"].billable is True
+    assert runs["p1"].status == "failed"
+    assert runs["p2"].classification == "recovery"
+    assert runs["p2"].billable is False
+    assert runs["p2"].status == "succeeded"
+
+
+def test_narration_unapproved_substitution_blocked():
+    from app.dm.adjudication import build_provider_narrator
+
+    with pytest.raises(RuntimeError, match="Unapproved model substitution"):
+        build_provider_narrator(adapter=_FakeAdapter("evil"), model="bad-model")
+
+
+def test_recover_partial_stream_maps_stale_revision_to_retryable(db):
+    from app.dm.recovery import recover_partial_stream
+
+    s, camp_id, thread_id, _ = db
+    turn, attempt, stream_id = _failed_partial(s, camp_id, thread_id)
+    camp = s.get(Campaign, camp_id)
+    camp.revision = int(camp.revision or 0) + 1
+    s.add(camp)
+    s.commit()
+    with pytest.raises(ValueError):
+        recover_partial_stream(s, camp_id, turn.id, stream_id, LONG_TEXT,
+                               actor_id=camp.owner_id)
+    assert s.get(DmTurn, turn.id).status == "failed_visible"
 
 def test_recovery_digest_distinguishes_text_past_char_4000(db):
     """Untruncated recovery payloads differing only after char 4,000 conflict."""

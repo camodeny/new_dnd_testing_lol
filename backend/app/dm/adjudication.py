@@ -359,39 +359,161 @@ def adjudicate_with_failover(
     raise last_exc
 
 
-def build_provider_narrator(*, adapter=None, model: str | None = None, timeout_seconds: float = 90):
-    """Streaming narrator backed by the configured provider.
+def build_provider_narrator(
+    *,
+    adapter=None,
+    model: str | None = None,
+    timeout_seconds: float = 90,
+    db=None,
+    trace_id: str | None = None,
+    role: str = "narration",
+    is_retry: bool = False,
+):
+    """Streaming narrator backed by the role-policy provider path.
 
-    Resolves the ``narrator`` call area (pinned in code) when
-    adapter/model are not injected. Returns a ``StreamingNarratorFn`` taking a contract-bound
-    ``NarratorRequest`` and yielding text deltas via ``stream_chat``.
+    Resolves candidates through the ``narration`` role policy: primary
+    first, then same-model alternate providers, then only explicitly
+    approved different-model fallbacks (unapproved substitution raises and
+    is never executed). Returns a ``StreamingNarratorFn`` taking a
+    contract-bound ``NarratorRequest`` and yielding text deltas.
+
+    Failover preserves the visible-prefix invariant: provider switching
+    happens ONLY before the first visible token. Once tokens flow, the
+    provider is pinned; later failures propagate to the normal
+    post-visibility handling (fidelity-gated continuation, never silent
+    provider switching mid-stream).
+
+    Failover attempts are recorded as non-billable recovery AI runs when
+    ``db`` is given (as is narration on an explicit-retry attempt).
     """
     from app.providers import ProviderRequest, stream_chat
-    from app.providers.areas import resolve_area
+    from app.providers import policy as role_policy
+    from app.observability.tracing import structured_log
 
-    if adapter is None or model is None:
-        resolved_adapter, resolved_model, _ = resolve_area("narrator")
-        adapter = adapter or resolved_adapter
-        model = model or resolved_model
+    tid = trace_id or str(uuid.uuid4())
+    if adapter is not None and model is not None:
+        if not role_policy.is_model_approved(role, adapter.name, model):
+            raise RuntimeError(
+                f"Unapproved model substitution blocked for role {role!r}: "
+                f"{adapter.name}/{model}"
+            )
+        candidates = [(adapter, model)]
+    else:
+        path = role_policy.execution_path(role)
+        candidates = []
+        first_error: BaseException | None = None
+        for provider_name, candidate_model in path:
+            if not role_policy.is_model_approved(role, provider_name, candidate_model):
+                raise RuntimeError(
+                    f"Unapproved model substitution blocked for role {role!r}: "
+                    f"{provider_name}/{candidate_model}"
+                )
+            try:
+                if adapter is not None or model is not None:
+                    raise RuntimeError(
+                        "Provide both adapter and model, or neither (policy path)"
+                    )
+                if len(candidates) == 0 and provider_name == path[0][0]:
+                    from app.providers.areas import resolve_area
+
+                    area = role_policy.ROLE_AREA.get(role, role)
+                    cand_adapter, cand_model, _ = resolve_area(area)
+                else:
+                    from app.providers.registry import provider_registry
+
+                    cand_adapter = provider_registry.get(provider_name)
+                    cand_adapter.require_config(candidate_model)
+                    cand_model = candidate_model
+                candidates.append((cand_adapter, cand_model))
+            except Exception as exc:
+                if first_error is None:
+                    first_error = exc
+                role_policy.record_failover_attempt(
+                    f"config_unavailable:{provider_name}", provider_name,
+                    candidate_model,
+                )
+                continue
+        if not candidates:
+            raise first_error if first_error is not None else RuntimeError(
+                f"No narration provider available for role {role!r}"
+            )
 
     def _narrate(narrator_request) -> object:
         prompt = getattr(narrator_request, "prompt", "")
-        pr = ProviderRequest(
-            messages=[
-                {"role": "system", "content": prompt},
-                {"role": "user", "content": "Expand the structured turn above into table narration."},
-            ],
-            model=model,
-            timeout_seconds=timeout_seconds,
-            stream=True,
-        )
-        deltas: list[str] = []
 
         def _gen():
-            for event in stream_chat(adapter, pr):
-                if event.kind == "token" and event.text:
-                    deltas.append(event.text)
-                    yield event.text
+            failover_reasons: list[str] = []
+            for index, (cand_adapter, cand_model) in enumerate(candidates):
+                classification = (
+                    "recovery" if (index > 0 or is_retry) else "primary"
+                )
+                ai_run = None
+                if db is not None:
+                    try:
+                        from app.observability.service import record_ai_run_inline
+
+                        ai_run = record_ai_run_inline(
+                            db, logical_operation="narration_stream",
+                            role=role, provider=cand_adapter.name,
+                            model=cand_model, attempt=index + 1,
+                            classification=classification,
+                            billable=(classification == "primary"),
+                            trace_id=tid,
+                        )
+                    except Exception:
+                        ai_run = None
+                pr = ProviderRequest(
+                    messages=[
+                        {"role": "system", "content": prompt},
+                        {"role": "user", "content": "Expand the structured turn above into table narration."},
+                    ],
+                    model=cand_model,
+                    timeout_seconds=timeout_seconds,
+                    stream=True,
+                )
+                structured_log(
+                    logger, logging.INFO, "narration_provider_start",
+                    provider=cand_adapter.name, model=cand_model,
+                    trace_id=tid, attempt=index + 1,
+                    classification=classification,
+                )
+                emitted = False
+                try:
+                    for event in stream_chat(cand_adapter, pr):
+                        if event.kind == "token" and event.text:
+                            emitted = True
+                            yield event.text
+                    if ai_run is not None:
+                        try:
+                            from app.observability.service import finish_ai_run_inline
+
+                            finish_ai_run_inline(db, ai_run.id, status="succeeded",
+                                                 result_code="stream_ok")
+                        except Exception:
+                            pass
+                    return
+                except Exception as exc:
+                    if ai_run is not None:
+                        try:
+                            from app.observability.service import finish_ai_run_inline
+
+                            finish_ai_run_inline(db, ai_run.id, status="failed",
+                                                 error_type=type(exc).__name__[:128])
+                        except Exception:
+                            pass
+                    cls, reason = role_policy.classify_execution_failure(exc)
+                    failover_reasons.append(reason)
+                    role_policy.record_failover_attempt(
+                        reason, cand_adapter.name, cand_model
+                    )
+                    # Pre-first-token retryable failure: next approved
+                    # candidate. After visibility, never switch providers
+                    # mid-stream — propagate for continuation handling.
+                    if not emitted and cls == "retriable" and index < len(candidates) - 1:
+                        continue
+                    raise
+            # Unreachable: loop either returns or raises.
+            raise RuntimeError("Narration provider path exhausted without result")
 
         # stream_chat is a generator; return the iterable for the delta loop.
         return _gen()

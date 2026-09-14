@@ -725,6 +725,7 @@ def _execute_owned_attempt(
 
             narrator = build_provider_narrator(
                 timeout_seconds=timeout_seconds,
+                db=db, trace_id=tid, is_retry=_is_explicit_retry,
             )
         except Exception as exc:
             db.rollback()
