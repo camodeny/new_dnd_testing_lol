@@ -45,6 +45,7 @@ from app.world.service import (
     world_event_visibility,
 )
 from models.campaigns import Campaign, CampaignDomainEvent
+from models.dm import DmTurn, DmTurnAttempt
 from models.world import (
     EPISTEMIC_STATES,
     RECORD_STATUSES,
@@ -243,15 +244,47 @@ def _resolve_source_event(
 
 
 def _resolve_source_turn_refs(
-    source_turn_id: Any, source_attempt_id: Any
+    db: Session,
+    campaign_id: uuid.UUID,
+    source_turn_id: Any,
+    source_attempt_id: Any,
 ) -> tuple[uuid.UUID | None, uuid.UUID | None]:
-    # Turn/attempt rows live in the DM domain; the knowledge layer records the
-    # linkage as UUIDs without cross-importing that domain. Malformed UUIDs
-    # still fail closed here.
-    return (
-        _coerce_optional_uuid(source_turn_id, field="source_turn_id"),
-        _coerce_optional_uuid(source_attempt_id, field="source_attempt_id"),
-    )
+    """Resolve turn/attempt provenance against the campaign (fail closed).
+
+    A durable record must never claim a source turn/attempt that does not
+    exist, belongs to another campaign, or (when both are supplied) do not
+    belong together.
+    """
+    turn_id = _coerce_optional_uuid(source_turn_id, field="source_turn_id")
+    attempt_id = _coerce_optional_uuid(source_attempt_id, field="source_attempt_id")
+    if turn_id is not None:
+        turn = db.get(DmTurn, turn_id)
+        if turn is None or turn.campaign_id != campaign_id:
+            structured_log(
+                logger, logging.WARNING, "world_provenance_resolution_failed",
+                campaign_id=str(campaign_id), source_turn_id=str(turn_id),
+                reason="turn_not_in_campaign",
+            )
+            raise ValueError(f"source_turn {turn_id} not found in campaign {campaign_id}")
+    if attempt_id is not None:
+        attempt = db.get(DmTurnAttempt, attempt_id)
+        if attempt is None or attempt.campaign_id != campaign_id:
+            structured_log(
+                logger, logging.WARNING, "world_provenance_resolution_failed",
+                campaign_id=str(campaign_id), source_attempt_id=str(attempt_id),
+                reason="attempt_not_in_campaign",
+            )
+            raise ValueError(f"source_attempt {attempt_id} not found in campaign {campaign_id}")
+        if turn_id is not None and str(attempt.turn_id) != str(turn_id):
+            structured_log(
+                logger, logging.WARNING, "world_provenance_resolution_failed",
+                campaign_id=str(campaign_id), source_turn_id=str(turn_id),
+                source_attempt_id=str(attempt_id), reason="attempt_turn_mismatch",
+            )
+            raise ValueError(
+                f"source_attempt {attempt_id} does not belong to source_turn {turn_id}"
+            )
+    return turn_id, attempt_id
 
 
 # ── Viewer-aware reads ──────────────────────────────────────────────────────
@@ -687,7 +720,7 @@ def create_relation_inline(
     if obj is None and not label:
         raise ValueError("relation requires object_entity_id or object_label")
     source_event = _resolve_source_event(db, campaign.id, source_event_id)
-    turn_id, attempt_id = _resolve_source_turn_refs(source_turn_id, source_attempt_id)
+    turn_id, attempt_id = _resolve_source_turn_refs(db, campaign.id, source_turn_id, source_attempt_id)
 
     row, created = _insert_relation_row(
         db, campaign,
@@ -797,7 +830,7 @@ def supersede_relation_inline(
     if obj is None and not label:
         raise ValueError("relation requires object_entity_id or object_label")
     source_event = _resolve_source_event(db, campaign.id, source_event_id)
-    turn_id, attempt_id = _resolve_source_turn_refs(source_turn_id, source_attempt_id)
+    turn_id, attempt_id = _resolve_source_turn_refs(db, campaign.id, source_turn_id, source_attempt_id)
     if _widening_visibility(prior.visibility, vis):
         # Restricted → member-visible: keep only explicitly supplied
         # metadata so prior DM-only context cannot leak into the visible row.
@@ -878,7 +911,7 @@ def create_fact_inline(
 
     resolved_refs = _resolve_fact_entity_refs(db, campaign.id, entity_refs)
     source_event = _resolve_source_event(db, campaign.id, source_event_id)
-    turn_id, attempt_id = _resolve_source_turn_refs(source_turn_id, source_attempt_id)
+    turn_id, attempt_id = _resolve_source_turn_refs(db, campaign.id, source_turn_id, source_attempt_id)
 
     if key:
         dup = _find_fact_by_idempotency(db, campaign.id, key)
@@ -1040,7 +1073,7 @@ def supersede_fact_inline(
     else:
         resolved_refs = _resolve_fact_entity_refs(db, campaign.id, list(prior.entity_refs or []))
     source_event = _resolve_source_event(db, campaign.id, source_event_id)
-    turn_id, attempt_id = _resolve_source_turn_refs(source_turn_id, source_attempt_id)
+    turn_id, attempt_id = _resolve_source_turn_refs(db, campaign.id, source_turn_id, source_attempt_id)
     if _widening_visibility(prior.visibility, vis):
         # Restricted → member-visible: keep only explicitly supplied
         # metadata so prior DM-only context cannot leak into the visible row.

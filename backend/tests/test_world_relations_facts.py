@@ -399,13 +399,22 @@ def test_lookup_by_canonical_entity_and_source_refs():
     # By source domain event.
     by_event = list_records_for_source_event(db, cid, rel_evt.id)
     assert [str(f.id) for f in by_event["facts"]] == [str(fact.id)]
-    # Facts/relations record their source turn.
-    turn_id = uuid.uuid4()
+    # Facts/relations record their source turn/attempt (real rows).
+    thread = get_or_create_campaign_thread(db, cid, created_by=_owner)
+    db.commit()
+    src_tid = str(thread.id)
+    accept_submission(
+        db, campaign_id=cid, user_id=_owner, raw_content="Source material",
+        segments=[{"type": "ic", "text": "Source material."}], thread_id=src_tid,
+    )
+    db.commit()
+    src_turn, src_attempt = coordinate_turn(db, cid, src_tid)
     fact2, _ = create_fact_authoritative(
         db, cid, rev + 2, content="Turn-sourced rumor.",
-        source_turn_id=turn_id, operation_id="op-fact-turn",
+        source_turn_id=src_turn.id, source_attempt_id=src_attempt.id,
+        operation_id="op-fact-turn",
     )
-    by_turn = list_records_for_source_turn(db, cid, turn_id)
+    by_turn = list_records_for_source_turn(db, cid, src_turn.id)
     assert [str(f.id) for f in by_turn["facts"]] == [str(fact2.id)]
     # Unknown source event fails closed.
     with pytest.raises(ValueError):
@@ -413,6 +422,82 @@ def test_lookup_by_canonical_entity_and_source_refs():
             db, cid, rev + 3, content="Bogus provenance.",
             source_event_id=uuid.uuid4(), operation_id="op-fact-bogus",
         )
+    db.rollback()
+
+
+def test_source_turn_attempt_refs_fail_closed():
+    from models.dm import DmTurn, DmTurnAttempt
+
+    Fac, cid, owner = _setup()
+    db = Fac()
+    thread = get_or_create_campaign_thread(db, cid, created_by=owner)
+    db.commit()
+    tid = str(thread.id)
+    accept_submission(
+        db, campaign_id=cid, user_id=owner, raw_content="Material",
+        segments=[{"type": "ic", "text": "Material."}], thread_id=tid,
+    )
+    db.commit()
+    turn1, attempt1 = coordinate_turn(db, cid, tid)
+    # A second turn/attempt pair in the same campaign (manual rows on a
+    # distinct thread to respect the active-turn uniqueness index).
+    other_tid = str(uuid.uuid4())
+    turn2 = DmTurn(
+        id=uuid.uuid4(), campaign_id=cid, thread_id=other_tid, audience="campaign",
+        status="pending", source_revision=0, input_set_revision=1, submission_ids=[],
+    )
+    db.add(turn2)
+    db.flush()
+    attempt2 = DmTurnAttempt(
+        id=uuid.uuid4(), turn_id=turn2.id, attempt_number=1, campaign_id=cid,
+        thread_id=tid, source_revision=0, input_set_revision=1, submission_ids=[],
+    )
+    db.add(attempt2)
+    db.flush()
+    # A turn from another campaign (manual rows).
+    other_camp = Campaign(id=uuid.uuid4(), owner_id=owner, name="Other", revision=0)
+    db.add(other_camp)
+    db.flush()
+    foreign_turn = DmTurn(
+        id=uuid.uuid4(), campaign_id=other_camp.id, thread_id=tid,
+        audience="campaign", status="pending", source_revision=0,
+        input_set_revision=1, submission_ids=[],
+    )
+    db.add(foreign_turn)
+    db.flush()
+    campaign = db.get(Campaign, cid)
+
+    # Nonexistent turn fails closed.
+    with pytest.raises(ValueError):
+        create_fact_inline(
+            db, campaign, content="Ghost source.",
+            source_turn_id=uuid.uuid4(), operation_id="op-ghost-turn",
+        )
+    db.rollback()
+    # Cross-campaign turn fails closed.
+    with pytest.raises(ValueError):
+        create_fact_inline(
+            db, db.get(Campaign, cid), content="Foreign source.",
+            source_turn_id=foreign_turn.id, operation_id="op-foreign-turn",
+        )
+    db.rollback()
+    # Mismatched attempt/turn pair fails closed.
+    with pytest.raises(ValueError):
+        create_fact_inline(
+            db, db.get(Campaign, cid), content="Mismatched source.",
+            source_turn_id=turn1.id, source_attempt_id=attempt2.id,
+            operation_id="op-mismatch",
+        )
+    db.rollback()
+    # Matched pair succeeds.
+    fact, created = create_fact_inline(
+        db, db.get(Campaign, cid), content="Sourced rumor.",
+        source_turn_id=turn1.id, source_attempt_id=attempt1.id,
+        operation_id="op-matched",
+    )
+    assert created is True
+    assert fact.source_turn_id == turn1.id
+    assert fact.source_attempt_id == attempt1.id
 
 
 # ── visibility fail-closed ──────────────────────────────────────────────────
