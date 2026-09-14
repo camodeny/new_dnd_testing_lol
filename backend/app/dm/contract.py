@@ -603,6 +603,17 @@ class DmTurnContractV1(StrictModel):
         effect_ids = [e.id for e in (self.staged_effects or [])]
         if len(effect_ids) != len(set(effect_ids)):
             raise ValueError("staged_effect ids must be unique")
+        # Explicit per-effect idempotency keys override the generated
+        # attempt.id + effect.id namespace (issue #210), so duplicates here
+        # would collapse distinct writes into one durable key and silently
+        # drop the later effect while the turn still commits successfully.
+        explicit_keys = [
+            str((e.arguments or {}).get("idempotency_key") or "").strip()
+            for e in (self.staged_effects or [])
+        ]
+        explicit_keys = [k for k in explicit_keys if k]
+        if len(explicit_keys) != len(set(explicit_keys)):
+            raise ValueError("staged_effect explicit idempotency keys must be unique")
 
         # Global cross-field: new_entities only in respond
         if self.new_entities and m != "respond":

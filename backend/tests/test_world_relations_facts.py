@@ -866,6 +866,72 @@ def test_duplicate_staged_effect_ids_rejected_before_commit():
     db.rollback()
 
 
+def test_shared_explicit_key_across_effects_rejected():
+    from app.dm.contract import ContractValidationError, normalize_contract
+    from app.dm.turns import stage_validated_attempt
+
+    def _contract_facts():
+        return {
+            "contract_version": "dm_turn_contract_v1",
+            "mode": "respond", "reason": "shared key",
+            "beats": [{"id": "beat_1", "type": "narration", "claims": [{
+                "text": "Mara nods.", "claim_kind": "observation",
+                "origin": "dm_adjudication",
+            }]}],
+            "staged_effects": [
+                {"id": "eff-fact-a", "effect_type": "assert_fact",
+                 "arguments": {"content": "First rumor.", "idempotency_key": "shared-key"}},
+                {"id": "eff-fact-b", "effect_type": "assert_fact",
+                 "arguments": {"content": "Second rumor.", "idempotency_key": "shared-key"}},
+            ],
+        }
+
+    def _contract_relations(gid):
+        return {
+            "contract_version": "dm_turn_contract_v1",
+            "mode": "respond", "reason": "shared key",
+            "beats": [{"id": "beat_1", "type": "narration", "claims": [{
+                "text": "Mara nods.", "claim_kind": "observation",
+                "origin": "dm_adjudication",
+            }]}],
+            "staged_effects": [
+                {"id": "eff-rel-a", "effect_type": "upsert_relation", "arguments": {
+                    "subject_entity_id": gid, "relation_type": "knows",
+                    "object_label": "a", "idempotency_key": "shared-rel-key"}},
+                {"id": "eff-rel-b", "effect_type": "upsert_relation", "arguments": {
+                    "subject_entity_id": gid, "relation_type": "owes",
+                    "object_label": "b", "idempotency_key": "shared-rel-key"}},
+            ],
+        }
+
+    # Distinct IDs but one shared explicit key: rejected for both tables.
+    with pytest.raises(ContractValidationError):
+        normalize_contract(_contract_facts())
+    with pytest.raises(ContractValidationError):
+        normalize_contract(_contract_relations(str(uuid.uuid4())))
+
+    # Staging guard mirrors the invariant for raw dicts.
+    Fac, cid, owner = _setup()
+    db = Fac()
+    thread = get_or_create_campaign_thread(db, cid, created_by=owner)
+    db.commit()
+    tid = str(thread.id)
+    accept_submission(
+        db, campaign_id=cid, user_id=owner, raw_content="Shared",
+        segments=[{"type": "ic", "text": "Shared."}], thread_id=tid,
+    )
+    db.commit()
+    _turn, attempt = coordinate_turn(db, cid, tid)
+    with pytest.raises(ValueError, match="idempotency keys must be unique"):
+        stage_validated_attempt(db, attempt.id, _contract_facts())
+    db.rollback()
+
+    # Distinct explicit keys still validate.
+    ok = _contract_facts()
+    ok["staged_effects"][1]["arguments"]["idempotency_key"] = "other-key"
+    assert len(normalize_contract(ok).staged_effects) == 2
+
+
 @pytest.fixture
 def knowledge_api(monkeypatch):
     from fastapi.testclient import TestClient

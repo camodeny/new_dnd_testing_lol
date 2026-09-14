@@ -587,12 +587,23 @@ def stage_validated_attempt(
     # derive from attempt.id + effect.id, so duplicates would silently drop
     # later same-type writes at commit.
     seen_ids: set[str] = set()
+    seen_keys: set[str] = set()
     for eff in staged_list:
-        eid = eff.id if hasattr(eff, "id") else (eff.get("id") if isinstance(eff, dict) else None)
+        if isinstance(eff, dict):
+            eid, args = eff.get("id"), eff.get("arguments") or {}
+        else:
+            eid, args = getattr(eff, "id", None), getattr(eff, "arguments", None) or {}
+        if not isinstance(args, dict):
+            args = args.model_dump(mode="json") if hasattr(args, "model_dump") else {}
         eid = str(eid) if eid is not None else ""
         if not eid or eid in seen_ids:
             raise ValueError("staged_effect ids must be unique")
         seen_ids.add(eid)
+        xkey = str((args or {}).get("idempotency_key") or "").strip()
+        if xkey:
+            if xkey in seen_keys:
+                raise ValueError("staged_effect explicit idempotency keys must be unique")
+            seen_keys.add(xkey)
     attempt.staged_effects = staged_list
     attempt.contract_snapshot = contract_dict
     # Idempotency key defaults to attempt.id for duplicate commit detection
