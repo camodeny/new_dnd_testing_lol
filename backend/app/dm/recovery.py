@@ -143,6 +143,94 @@ def retry_narration_only(db, campaign_id, turn_id, attempt_id):
     )
 
 
+def recover_partial_stream(db, campaign_id, turn_id, stream_id, continued_text,
+                           *, actor_id=None):
+    """Recover a failed partial stream through the full turn state machine.
+
+    Single orchestration helper for partial-stream recovery (HTTP route +
+    any future trigger): scope-check → fidelity-gated continuation →
+    recovered-streaming transition → ``commit_turn_with_effects`` (staged
+    effects promoted exactly once with the normal idempotency/revision
+    guards). Caller-supplied text ALWAYS goes through the contract fidelity
+    gate; there is no ungated resume path for untrusted input.
+
+    Raises ``LookupError`` when the stream/turn is not found or not scoped
+    to the authorized campaign/turn/attempt (callers map to 404), and
+    ``ValueError`` when the text diverges or the turn cannot recover
+    (callers map to a generic retryable 409).
+    """
+    from app.dm.contract import normalize_contract
+    from app.dm.narration import NarrationError, continue_partial_stream
+    from app.dm.turns import commit_turn_with_effects, mark_recovered_streaming
+    from app.dm_streams.service import (
+        DMStreamStateError,
+        get_stream,
+        reopen_failed_stream,
+    )
+
+    campaign = db.execute(select(Campaign).where(Campaign.id == campaign_id).with_for_update()
+                          .execution_options(populate_existing=True)).scalars().one()
+    turn = db.execute(select(DmTurn).where(DmTurn.id == turn_id, DmTurn.campaign_id == campaign_id).with_for_update()
+                      .execution_options(populate_existing=True)).scalars().first()
+    if turn is None:
+        raise LookupError("Turn not found")
+    stream = get_stream(db, stream_id)
+    # Scope the stream to the authorized route context BEFORE any mutation:
+    # a stream from another campaign/turn/attempt can never be continued here.
+    if (
+        stream is None
+        or str(stream.campaign_id) != str(campaign.id)
+        or str(stream.turn_id) != str(turn.id)
+        or str(stream.attempt_id) != str(turn.current_attempt_id)
+    ):
+        raise LookupError("Stream not found")
+    old = db.get(DmTurnAttempt, turn.current_attempt_id)
+    if old is None:
+        raise LookupError("Stream not found")
+    # Duplicate delivery after a completed recovery: return current state.
+    if turn.status == "succeeded" and old.status == "succeeded":
+        return turn, old, stream
+    if old.status != "failed_visible" or turn.status != "failed_visible":
+        raise ValueError("Only the current failed attempt can recover")
+    if not old.contract_snapshot:
+        raise ValueError("No preserved structured result — use full explicit Retry")
+    if str(old.stream_id) != str(stream.id):
+        raise LookupError("Stream not found")
+
+    contract = normalize_contract(dict(old.contract_snapshot))
+    try:
+        reopen_failed_stream(db, stream.id, reason="partial_recovery")
+        narration = continue_partial_stream(
+            db, stream.id, continued_text, contract, publish_realtime=True,
+        )
+    except DMStreamStateError as exc:
+        # Abandoned/completed streams cannot recover — explicit Retry instead.
+        raise ValueError(f"Stream cannot recover: {exc}") from exc
+    except NarrationError as exc:
+        # Fidelity or stream failure: generic retryable outcome, details in logs.
+        raise ValueError(f"Continued narration rejected: {exc}") from exc
+    mark_recovered_streaming(db, turn.id, old.id)
+    submission_ids = list(old.submission_ids or [])
+    payload = {
+        "turn_id": str(turn.id),
+        "attempt_id": str(old.id),
+        "submission_ids": submission_ids,
+        "narration_stream_id": str(stream.id),
+        "recovery": "partial_stream_continuation",
+    }
+    final_turn, final_attempt, event = commit_turn_with_effects(
+        db, turn.id, old.id,
+        payload=payload,
+        operation_id=old.commit_operation_id or str(old.id),
+        actor_id=actor_id,
+    )
+    logger.info(
+        "dm_retry partial_stream_recovered turn_id=%s attempt_id=%s stream_id=%s event_id=%s chunks=%s",
+        turn.id, old.id, stream.id, getattr(event, "id", None), narration.chunk_count,
+    )
+    return final_turn, final_attempt, event
+
+
 def execute_committed_attempt(attempt_id):
     """Best-effort post-response execution; prepared work stays sweepable."""
     from database import SessionLocal

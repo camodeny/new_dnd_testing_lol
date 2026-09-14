@@ -276,6 +276,131 @@ def test_partial_stream_resume_and_semantic_continuation(db):
                                 publish_realtime=False)
 
 
+# ── Partial recovery endpoint logic (recover_partial_stream) ────────────────
+
+LONG_TEXT = ("Torchlight gutters as something stirs beyond the arch. " * 12
+             + "What do you do?")
+
+
+def _failed_partial(s, camp_id, thread_id, text=LONG_TEXT, effect=None):
+    """Build a failed_visible turn/attempt with a failed partial stream."""
+    from app.dm.narration import stream_narration
+    from app.dm.turns import mark_attempt_failed, stage_validated_attempt
+    from app.dm_streams.service import fail_stream
+
+    turn, attempt = _submit(s, camp_id, thread_id, text="I step forward.")
+    contract = _contract(text)
+    if effect is not None:
+        d = contract.model_dump(mode="json")
+        d["staged_effects"] = [effect]
+        contract = normalize_contract(d)
+    stage_validated_attempt(s, attempt.id, contract)
+    partial = stream_narration(
+        s, campaign_id=camp_id, thread_id=thread_id, turn_id=str(turn.id),
+        attempt_id=str(attempt.id), contract=contract, narrator=None,
+        chunk_size=120, provider="deterministic-template-v1",
+        publish_realtime=False, max_chunks_to_persist=1,
+    )
+    assert partial.completed is False
+    fail_stream(s, partial.stream_id, reason="test_injected_failure")
+    s.commit()
+    attempt.stream_id = partial.stream_id
+    s.add(attempt)
+    s.commit()
+    mark_attempt_failed(s, attempt.id, error="injected stream failure",
+                        error_class="retriable", visible=True)
+    return s.get(DmTurn, turn.id), s.get(DmTurnAttempt, attempt.id), partial.stream_id
+
+
+def test_recover_partial_stream_completes_turn_and_promotes_effects(db):
+    from app.dm.recovery import recover_partial_stream
+
+    s, camp_id, thread_id, _ = db
+    owner = s.get(Campaign, camp_id).owner_id
+    turn, attempt, stream_id = _failed_partial(
+        s, camp_id, thread_id,
+        effect={"id": "eff-1", "effect_type": "record_world_event",
+                "arguments": {"event_type": "test_event",
+                              "summary": "recovery test event",
+                              "visibility": "dm_private"}},
+    )
+    assert attempt.staged_effects, "setup must stage an effect to prove promotion"
+    final_turn, final_attempt, event = recover_partial_stream(
+        s, camp_id, turn.id, stream_id, LONG_TEXT, actor_id=owner)
+    assert final_turn.status == "succeeded"
+    assert final_attempt.status == "succeeded"
+    assert event is not None
+    from app.dm_streams.service import get_stream
+
+    assert get_stream(s, stream_id).status == "completed"
+    # Consumed input resolved so it is never re-adjudicated.
+    from models.threads import PlayerSubmission
+
+    for sid in (final_attempt.submission_ids or []):
+        row = s.get(PlayerSubmission, uuid.UUID(str(sid)))
+        assert row.resolution_status == "resolved"
+
+
+def test_recover_partial_stream_rejects_cross_campaign_stream(db):
+    from app.dm.recovery import recover_partial_stream
+
+    s, camp_id, thread_id, _ = db
+    owner = s.get(Campaign, camp_id).owner_id
+    other_camp = uuid.uuid4()
+    other_thread = uuid.uuid4()
+    s.add(Profile(id=uuid.uuid4(), email="other@example.com"))
+    s.add(Campaign(id=other_camp, owner_id=owner, name="Other", revision=0))
+    s.add(CampaignThread(id=other_thread, campaign_id=other_camp,
+                         thread_type="campaign", created_by=owner))
+    s.commit()
+    turn, _, _ = _failed_partial(s, camp_id, thread_id)
+    _, _, foreign_stream = _failed_partial(s, other_camp, other_thread)
+    with pytest.raises(LookupError):
+        recover_partial_stream(s, camp_id, turn.id, foreign_stream, LONG_TEXT,
+                               actor_id=owner)
+    # Nothing mutated by the rejected recovery.
+    assert s.get(DmTurn, turn.id).status == "failed_visible"
+
+
+def test_recover_partial_stream_rejects_stale_attempt_stream(db):
+    from app.dm.recovery import recover_partial_stream, retry_failed_adjudication
+
+    s, camp_id, thread_id, _ = db
+    owner = s.get(Campaign, camp_id).owner_id
+    turn, _, _ = _failed_partial(s, camp_id, thread_id)
+    # Supersede the failed attempt with an explicit Retry: the old stream is
+    # now scoped to a non-current attempt and can never be continued here.
+    _, fresh = retry_failed_adjudication(
+        s, camp_id, turn.id, s.get(DmTurn, turn.id).current_attempt_id)
+    s.commit()
+    old_stream = s.get(DmTurnAttempt, fresh.parent_attempt_id).stream_id
+    assert old_stream is not None
+    with pytest.raises(LookupError):
+        recover_partial_stream(s, camp_id, turn.id, old_stream, LONG_TEXT,
+                               actor_id=owner)
+    assert s.get(DmTurn, turn.id).status == "pending"
+
+
+def test_recover_partial_stream_rejects_divergent_and_unfaithful_text(db):
+    from app.dm.recovery import recover_partial_stream
+
+    s, camp_id, thread_id, _ = db
+    owner = s.get(Campaign, camp_id).owner_id
+    turn, attempt, stream_id = _failed_partial(s, camp_id, thread_id)
+    with pytest.raises(ValueError):
+        recover_partial_stream(s, camp_id, turn.id, stream_id,
+                               "A completely different story.", actor_id=owner)
+    # Prefix-preserving but unfaithful: invented number + consequence.
+    from app.dm_streams.service import reconstruct_text
+
+    visible = reconstruct_text(s, stream_id)
+    with pytest.raises(ValueError):
+        recover_partial_stream(s, camp_id, turn.id, stream_id,
+                               visible + " You take 10 damage.",
+                               actor_id=owner)
+    assert s.get(DmTurnAttempt, attempt.id).status == "failed_visible"
+
+
 # ── Exhaustion: generic retryable failure, no infra details ───────────────────
 
 def test_exhausted_recovery_shows_generic_retry_without_infra_details(db):

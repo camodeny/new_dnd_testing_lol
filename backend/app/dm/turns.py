@@ -750,6 +750,70 @@ def mark_streaming_started(db: Session, turn_id: uuid.UUID, attempt_id: uuid.UUI
     return turn, attempt
 
 
+def mark_recovered_streaming(
+    db: Session, turn_id: uuid.UUID, attempt_id: uuid.UUID, *, commit: bool = True
+) -> tuple[DmTurn, DmTurnAttempt]:
+    """Repair a failed-visible turn/attempt back to streaming after recovery.
+
+    Only for the partial-stream recovery path: the attempt must be the
+    current failed-visible attempt with a completed stream and a preserved
+    valid ``contract_snapshot``. New input can never enter through here
+    (input set stays locked); the only exit is the normal
+    ``commit_turn_with_effects``. Raises ``ValueError`` otherwise.
+    """
+    try:
+        turn = db.execute(select(DmTurn).where(DmTurn.id == turn_id).with_for_update()).scalars().first()
+        attempt = db.execute(select(DmTurnAttempt).where(DmTurnAttempt.id == attempt_id).with_for_update()).scalars().first()
+    except Exception:
+        turn = db.get(DmTurn, turn_id)
+        attempt = db.get(DmTurnAttempt, attempt_id)
+    if turn is None or attempt is None:
+        raise ValueError(f"Turn {turn_id} or attempt {attempt_id} not found")
+    if str(attempt.turn_id) != str(turn.id):
+        raise ValueError(f"Attempt {attempt_id} does not belong to turn {turn_id}")
+    if str(turn.current_attempt_id) != str(attempt_id):
+        raise ValueError(f"Attempt {attempt_id} is not current for turn {turn_id}")
+    if attempt.status != ATTEMPT_FAILED_VISIBLE or turn.status != TURN_FAILED_VISIBLE:
+        raise ValueError(
+            f"Attempt {attempt_id} status {attempt.status} / turn {turn_id} status {turn.status} "
+            "cannot recover; must be failed_visible"
+        )
+    if not attempt.contract_snapshot:
+        raise ValueError(f"Attempt {attempt_id} has no preserved structured result to recover")
+    if attempt.stream_id is None:
+        raise ValueError(f"Attempt {attempt_id} has no stream to recover")
+    from models.dm import DMStream
+
+    stream = db.get(DMStream, attempt.stream_id)
+    if stream is None or stream.status != "completed":
+        raise ValueError(f"Attempt {attempt_id} stream is not completed; cannot recover")
+    now = _now()
+    attempt.status = ATTEMPT_STREAMING
+    attempt.last_error = None
+    attempt.error_class = None
+    attempt.completed_at = None
+    turn.status = TURN_STREAMING
+    if turn.streaming_attempt_id is None:
+        turn.streaming_attempt_id = attempt_id
+    if attempt.streaming_started_at is None:
+        attempt.streaming_started_at = now
+    if turn.streaming_started_at is None:
+        turn.streaming_started_at = now
+    db.add(attempt)
+    db.add(turn)
+    if commit:
+        db.commit()
+        db.refresh(turn)
+        db.refresh(attempt)
+    else:
+        db.flush()
+    logger.info(
+        "dm_turn recovered_streaming turn_id=%s attempt_id=%s stream_id=%s",
+        turn.id, attempt.id, attempt.stream_id,
+    )
+    return turn, attempt
+
+
 def mark_attempt_running(db: Session, attempt_id: uuid.UUID, worker_job_id: uuid.UUID | None = None) -> DmTurnAttempt:
     """Mark attempt as running (worker claimed). Recoverable if worker crashes."""
     now = _now()
