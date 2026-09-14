@@ -758,6 +758,66 @@ def test_overlong_object_label_rejected_not_truncated():
     assert get_relation_strict(db, cid, rel.id).object_label == ok_label
 
 
+def test_long_operation_id_keeps_same_type_effects_distinct():
+    from app.dm.effects import _default_effect_key
+
+    Fac, cid, owner = _setup()
+    db = Fac()
+    mara, guild, _rev = _entities(db, cid, 0)
+    # Unit level: derived keys stay bounded and distinct per effect.
+    attempt_ns = SimpleNamespace(id=uuid.uuid4())
+    key_a = _default_effect_key(attempt_ns, {"id": "eff-fact-a"})
+    key_b = _default_effect_key(attempt_ns, {"id": "eff-fact-b"})
+    assert key_a != key_b
+    assert len(key_a) <= 128 and len(key_b) <= 128
+
+    # Turn level: a max-length commit_operation_id must not collapse two
+    # same-type effects into one durable key (the second write would be
+    # silently skipped as a false duplicate while the turn reports success).
+    thread = get_or_create_campaign_thread(db, cid, created_by=owner)
+    db.commit()
+    tid = str(thread.id)
+    accept_submission(
+        db, campaign_id=cid, user_id=owner, raw_content="Two rumors",
+        segments=[{"type": "ic", "text": "Two rumors."}], thread_id=tid,
+    )
+    db.commit()
+    turn, attempt = coordinate_turn(db, cid, tid)
+    attempt.commit_operation_id = "x" * 128
+    attempt.staged_effects = [
+        {"id": "eff-fact-a", "effect_type": "assert_fact", "arguments": {
+            "content": "First rumor.", "epistemic_state": "claimed",
+            "visibility": "campaign",
+        }},
+        {"id": "eff-fact-b", "effect_type": "assert_fact", "arguments": {
+            "content": "Second rumor.", "epistemic_state": "claimed",
+            "visibility": "campaign",
+        }},
+        {"id": "eff-rel-a", "effect_type": "upsert_relation", "arguments": {
+            "subject_entity_id": str(mara.id), "relation_type": "knows",
+            "object_entity_id": str(guild.id), "visibility": "campaign",
+        }},
+        {"id": "eff-rel-b", "effect_type": "upsert_relation", "arguments": {
+            "subject_entity_id": str(mara.id), "relation_type": "owes",
+            "object_label": "a debt", "visibility": "campaign",
+        }},
+    ]
+    attempt.contract_snapshot = {"contract_version": "dm_turn_contract_v1", "new_entities": [], "staged_effects": []}
+    db.flush()
+    db.commit()
+    stream = _stream(db, turn, attempt)
+    db.commit()
+    mark_streaming_started(db, turn.id, attempt.id, stream_id=stream.id)
+    _t, _a, event = commit_turn(db, turn.id, attempt.id)
+    assert event is not None
+    facts = sorted(list_facts(db, cid), key=lambda f: f.content)
+    assert [f.content for f in facts] == ["First rumor.", "Second rumor."]
+    assert len({f.idempotency_key for f in facts}) == 2
+    relations = sorted(list_relations(db, cid), key=lambda r: r.relation_type)
+    assert [r.relation_type for r in relations] == ["knows", "owes"]
+    assert len({r.idempotency_key for r in relations}) == 2
+
+
 @pytest.fixture
 def knowledge_api(monkeypatch):
     from fastapi.testclient import TestClient

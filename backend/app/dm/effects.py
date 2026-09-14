@@ -13,6 +13,7 @@ disclosure when promoted.
 
 from __future__ import annotations
 
+import hashlib
 import logging
 from typing import Callable, Any
 
@@ -210,8 +211,7 @@ def _handle_assert_fact(db: Session, campaign: Campaign, effect: dict[str, Any],
 
     args = effect.get("arguments") or {}
     operation_id = getattr(attempt, "commit_operation_id", None) or str(attempt.id)
-    key_parts = [str(operation_id), str(effect.get("id"))]
-    idempotency_key = args.get("idempotency_key") or ":".join(key_parts)
+    idempotency_key = args.get("idempotency_key") or _default_effect_key(attempt, effect)
     supersedes = args.get("supersedes_fact_id")
     if supersedes:
         supersede_fact_inline(
@@ -222,7 +222,7 @@ def _handle_assert_fact(db: Session, campaign: Campaign, effect: dict[str, Any],
             visibility=args.get("visibility"),
             provenance=args.get("provenance"),
             source_turn_id=turn.id, source_attempt_id=attempt.id,
-            operation_id=operation_id, idempotency_key=str(idempotency_key)[:128],
+            operation_id=operation_id, idempotency_key=idempotency_key,
         )
     else:
         create_fact_inline(
@@ -232,7 +232,7 @@ def _handle_assert_fact(db: Session, campaign: Campaign, effect: dict[str, Any],
             visibility=args.get("visibility"),
             provenance=args.get("provenance"),
             source_turn_id=turn.id, source_attempt_id=attempt.id,
-            operation_id=operation_id, idempotency_key=str(idempotency_key)[:128],
+            operation_id=operation_id, idempotency_key=idempotency_key,
         )
     logger.info("effect assert_fact effect_id=%s epistemic=%s supersedes=%s", effect.get("id"), args.get("epistemic_state"), supersedes)
 
@@ -244,7 +244,7 @@ def _handle_upsert_relation(db: Session, campaign: Campaign, effect: dict[str, A
 
     args = effect.get("arguments") or {}
     operation_id = getattr(attempt, "commit_operation_id", None) or str(attempt.id)
-    idempotency_key = args.get("idempotency_key") or ":".join([str(operation_id), str(effect.get("id"))])
+    idempotency_key = args.get("idempotency_key") or _default_effect_key(attempt, effect)
     supersedes = args.get("supersedes_relation_id")
     if supersedes:
         # Key-presence: absent object keys inherit the prior reference;
@@ -261,7 +261,7 @@ def _handle_upsert_relation(db: Session, campaign: Campaign, effect: dict[str, A
             provenance=args.get("provenance"),
             clear_object=bool(args.get("clear_object", False)),
             source_turn_id=turn.id, source_attempt_id=attempt.id,
-            operation_id=operation_id, idempotency_key=str(idempotency_key)[:128],
+            operation_id=operation_id, idempotency_key=idempotency_key,
         )
     else:
         create_relation_inline(
@@ -274,7 +274,7 @@ def _handle_upsert_relation(db: Session, campaign: Campaign, effect: dict[str, A
             visibility=args.get("visibility"),
             provenance=args.get("provenance"),
             source_turn_id=turn.id, source_attempt_id=attempt.id,
-            operation_id=operation_id, idempotency_key=str(idempotency_key)[:128],
+            operation_id=operation_id, idempotency_key=idempotency_key,
         )
     logger.info("effect upsert_relation effect_id=%s type=%s supersedes=%s", effect.get("id"), args.get("relation_type"), supersedes)
 
@@ -283,6 +283,24 @@ def _handle_upsert_relation(db: Session, campaign: Campaign, effect: dict[str, A
 def _handle_propose_sheet_update(db: Session, campaign: Campaign, effect: dict[str, Any], turn: DmTurn, attempt: DmTurnAttempt):
     args = effect.get("arguments") or {}
     logger.info("effect propose_sheet_update effect_id=%s character_id=%s changes=%s", effect.get("id"), args.get("character_id"), len(args.get("changes") or []))
+
+
+def _default_effect_key(attempt: DmTurnAttempt, effect: dict[str, Any]) -> str:
+    """Bounded collision-resistant default idempotency key for one staged effect.
+
+    Keys derive from the attempt UUID (36 chars) plus the effect ID, so the
+    effect identity can never be truncated away — unlike slicing a
+    ``commit_operation_id``-prefixed composite back to 128 chars, which
+    collapses distinct same-type effects to one key when the operation ID is
+    long and silently drops later writes as false duplicates. Overlong
+    composites (unvalidated effect IDs) fall back to a sha256 namespace.
+    Explicit caller-supplied keys are never rewritten by this helper.
+    """
+    effect_id = str(effect.get("id") or "unknown")
+    base = f"{attempt.id}:{effect_id}"
+    if len(base) <= 128:
+        return base
+    return f"eff:{hashlib.sha256(base.encode('utf-8')).hexdigest()}"
 
 
 def list_registered_effect_types() -> list[str]:
