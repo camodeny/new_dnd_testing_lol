@@ -465,6 +465,9 @@ def test_source_turn_attempt_refs_fail_closed():
     )
     db.add(foreign_turn)
     db.flush()
+    # Commit the manual provenance rows: later fail-closed rollbacks in this
+    # test must not wipe the fixtures themselves.
+    db.commit()
     campaign = db.get(Campaign, cid)
 
     # Nonexistent turn fails closed.
@@ -498,6 +501,60 @@ def test_source_turn_attempt_refs_fail_closed():
     assert created is True
     assert fact.source_turn_id == turn1.id
     assert fact.source_attempt_id == attempt1.id
+    db.commit()
+
+    # Supersession validates the post-inheritance pair: re-pointing only the
+    # turn inherits the old attempt (and vice versa) — both fail closed.
+    with pytest.raises(ValueError):
+        supersede_fact_inline(
+            db, db.get(Campaign, cid), fact.id, source_turn_id=turn2.id,
+            operation_id="op-half-turn",
+        )
+    db.rollback()
+    with pytest.raises(ValueError):
+        supersede_fact_inline(
+            db, db.get(Campaign, cid), fact.id, source_attempt_id=attempt2.id,
+            operation_id="op-half-attempt",
+        )
+    db.rollback()
+    new_fact, fcreated = supersede_fact_inline(
+        db, db.get(Campaign, cid), fact.id,
+        source_turn_id=turn2.id, source_attempt_id=attempt2.id,
+        operation_id="op-full-repoint",
+    )
+    assert fcreated is True
+    assert new_fact.source_turn_id == turn2.id
+    assert new_fact.source_attempt_id == attempt2.id
+    db.commit()
+
+    # Same rule for relations.
+    mara, _, rrev = _entities(db, cid, int(db.get(Campaign, cid).revision))
+    rel, _ = create_relation_authoritative(
+        db, cid, rrev,
+        subject_entity_id=mara.id, relation_type="knows",
+        object_label="someone", source_turn_id=turn1.id,
+        source_attempt_id=attempt1.id, operation_id="op-r-src",
+    )
+    with pytest.raises(ValueError):
+        supersede_relation_inline(
+            db, db.get(Campaign, cid), rel.id, source_turn_id=turn2.id,
+            operation_id="op-r-half-turn",
+        )
+    db.rollback()
+    with pytest.raises(ValueError):
+        supersede_relation_inline(
+            db, db.get(Campaign, cid), rel.id, source_attempt_id=attempt2.id,
+            operation_id="op-r-half-attempt",
+        )
+    db.rollback()
+    new_rel, rcreated = supersede_relation_inline(
+        db, db.get(Campaign, cid), rel.id,
+        source_turn_id=turn2.id, source_attempt_id=attempt2.id,
+        operation_id="op-r-full-repoint",
+    )
+    assert rcreated is True
+    assert new_rel.source_turn_id == turn2.id
+    assert new_rel.source_attempt_id == attempt2.id
 
 
 # ── visibility fail-closed ──────────────────────────────────────────────────

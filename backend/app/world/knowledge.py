@@ -830,7 +830,15 @@ def supersede_relation_inline(
     if obj is None and not label:
         raise ValueError("relation requires object_entity_id or object_label")
     source_event = _resolve_source_event(db, campaign.id, source_event_id)
-    turn_id, attempt_id = _resolve_source_turn_refs(db, campaign.id, source_turn_id, source_attempt_id)
+    # Validate the EFFECTIVE pair (explicit values with prior inheritance
+    # applied first): validating only the supplied halves and then inheriting
+    # the omitted half could persist a turn/attempt pair that never belonged
+    # together. Re-pointing one half requires re-pointing both.
+    turn_id, attempt_id = _resolve_source_turn_refs(
+        db, campaign.id,
+        source_turn_id if source_turn_id is not None else prior.source_turn_id,
+        source_attempt_id if source_attempt_id is not None else prior.source_attempt_id,
+    )
     if _widening_visibility(prior.visibility, vis):
         # Restricted → member-visible: keep only explicitly supplied
         # metadata so prior DM-only context cannot leak into the visible row.
@@ -855,8 +863,8 @@ def supersede_relation_inline(
         supersedes_id=prior.id,
         visibility=vis, grants=merged_grants,
         provenance=merged_provenance, details=merged_details,
-        source_turn_id=turn_id or prior.source_turn_id,
-        source_attempt_id=attempt_id or prior.source_attempt_id,
+        source_turn_id=turn_id,
+        source_attempt_id=attempt_id,
         source_event_id=source_event or prior.source_event_id,
         operation_id=(str(operation_id)[:128] if operation_id else None),
         idempotency_key=key,
@@ -1073,7 +1081,13 @@ def supersede_fact_inline(
     else:
         resolved_refs = _resolve_fact_entity_refs(db, campaign.id, list(prior.entity_refs or []))
     source_event = _resolve_source_event(db, campaign.id, source_event_id)
-    turn_id, attempt_id = _resolve_source_turn_refs(db, campaign.id, source_turn_id, source_attempt_id)
+    # Effective pair first (see supersede_relation_inline): re-pointing one
+    # half of the turn/attempt provenance requires re-pointing both.
+    turn_id, attempt_id = _resolve_source_turn_refs(
+        db, campaign.id,
+        source_turn_id if source_turn_id is not None else prior.source_turn_id,
+        source_attempt_id if source_attempt_id is not None else prior.source_attempt_id,
+    )
     if _widening_visibility(prior.visibility, vis):
         # Restricted → member-visible: keep only explicitly supplied
         # metadata so prior DM-only context cannot leak into the visible row.
@@ -1103,8 +1117,8 @@ def supersede_fact_inline(
         grants=merged_grants,
         provenance=merged_provenance,
         details=merged_details,
-        source_turn_id=turn_id or prior.source_turn_id,
-        source_attempt_id=attempt_id or prior.source_attempt_id,
+        source_turn_id=turn_id,
+        source_attempt_id=attempt_id,
         source_event_id=source_event or prior.source_event_id,
         operation_id=(str(operation_id)[:128] if operation_id else None),
         idempotency_key=key,
