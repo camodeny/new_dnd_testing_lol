@@ -8,6 +8,7 @@ import time
 import uuid
 
 from sqlalchemy import func, select
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
 from models.campaigns import Campaign
@@ -125,32 +126,54 @@ def accept_submission(
         if character is None or character.owner_id != user_id:
             raise SubmissionValidationError("character_id must identify one of your characters")
 
-    prior = db.scalar(
-        select(func.max(PlayerSubmission.sequence)).where(
-            PlayerSubmission.campaign_id == campaign_id,
-            PlayerSubmission.thread_id == thread_id,
+    prior = None
+    submission = None
+    # Bounded sequence re-allocation: the campaign row lock serializes this
+    # on Postgres, but SQLite ignores FOR UPDATE, so two concurrent
+    # acceptances can read the same max(sequence). On a sequence conflict,
+    # back off briefly (lets the winner commit) and recompute — never fail
+    # a player's submission on a transient allocation race.
+    for allocation_attempt in range(3):
+        prior = db.scalar(
+            select(func.max(PlayerSubmission.sequence)).where(
+                PlayerSubmission.campaign_id == campaign_id,
+                PlayerSubmission.thread_id == thread_id,
+            )
+        ) or 0
+        submission = PlayerSubmission(
+            campaign_id=campaign_id,
+            user_id=user_id,
+            character_id=character_id,
+            thread_id=thread_id,
+            audience=audience,
+            sequence=prior + 1,
+            raw_content=raw_content,
+            resolution_status="accepted",
         )
-    ) or 0
-    submission = PlayerSubmission(
-        campaign_id=campaign_id,
-        user_id=user_id,
-        character_id=character_id,
-        thread_id=thread_id,
-        audience=audience,
-        sequence=prior + 1,
-        raw_content=raw_content,
-        resolution_status="accepted",
-    )
-    db.add(submission)
-    db.flush()
-    for position, segment in enumerate(segments):
-        db.add(PlayerSubmissionSegment(
-            submission_id=submission.id,
-            position=position,
-            segment_type=segment["type"],
-            text=segment["text"],
-        ))
-    db.flush()
+        try:
+            with db.begin_nested():
+                db.add(submission)
+                db.flush()
+                for position, segment in enumerate(segments):
+                    db.add(PlayerSubmissionSegment(
+                        submission_id=submission.id,
+                        position=position,
+                        segment_type=segment["type"],
+                        text=segment["text"],
+                    ))
+                db.flush()
+            break
+        except IntegrityError as exc:
+            if "sequence" not in str(getattr(exc, "orig", exc)).lower() \
+                    or allocation_attempt >= 2:
+                raise
+            logger.info(
+                "player_submission sequence race campaign_id=%s thread_id=%s "
+                "sequence=%s retry=%s",
+                campaign_id, thread_id, prior + 1, allocation_attempt + 1,
+            )
+            time.sleep(0.05 * (allocation_attempt + 1))
+    assert submission is not None
     logger.info(
         "player_submission accepted campaign_id=%s thread_id=%s submission_id=%s sequence=%s "
         "segment_count=%s segment_types=%s latency_ms=%.2f",
