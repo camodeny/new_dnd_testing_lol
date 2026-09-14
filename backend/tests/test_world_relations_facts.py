@@ -818,6 +818,54 @@ def test_long_operation_id_keeps_same_type_effects_distinct():
     assert len({r.idempotency_key for r in relations}) == 2
 
 
+def test_duplicate_staged_effect_ids_rejected_before_commit():
+    from app.dm.contract import ContractValidationError, normalize_contract
+    from app.dm.turns import stage_validated_attempt
+
+    raw = {
+        "contract_version": "dm_turn_contract_v1",
+        "mode": "respond", "reason": "dup ids",
+        "beats": [{"id": "beat_1", "type": "narration", "claims": [{
+            "text": "Mara nods.", "claim_kind": "observation",
+            "origin": "dm_adjudication",
+        }]}],
+        "staged_effects": [
+            {"id": "eff-1", "effect_type": "assert_fact", "arguments": {
+                "content": "First rumor.",
+            }},
+            {"id": "eff-1", "effect_type": "assert_fact", "arguments": {
+                "content": "Second rumor.",
+            }},
+        ],
+    }
+    with pytest.raises(ContractValidationError):
+        normalize_contract(raw)
+
+    # The staging layer guards the raw-dict path too.
+    Fac, cid, owner = _setup()
+    db = Fac()
+    thread = get_or_create_campaign_thread(db, cid, created_by=owner)
+    db.commit()
+    tid = str(thread.id)
+    accept_submission(
+        db, campaign_id=cid, user_id=owner, raw_content="Dup",
+        segments=[{"type": "ic", "text": "Dup."}], thread_id=tid,
+    )
+    db.commit()
+    _turn, attempt = coordinate_turn(db, cid, tid)
+    with pytest.raises(ValueError, match="unique"):
+        stage_validated_attempt(db, attempt.id, {
+            "contract_version": "dm_turn_contract_v1",
+            "staged_effects": [
+                {"id": "eff-1", "effect_type": "assert_fact",
+                 "arguments": {"content": "First rumor."}},
+                {"id": "eff-1", "effect_type": "assert_fact",
+                 "arguments": {"content": "Second rumor."}},
+            ],
+        })
+    db.rollback()
+
+
 @pytest.fixture
 def knowledge_api(monkeypatch):
     from fastapi.testclient import TestClient

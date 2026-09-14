@@ -582,6 +582,17 @@ def stage_validated_attempt(
 
     # Validate staged_effects against contract invariants (no generic SQLalready validated by contract)
     # Ensure staged_effects only in respond mode is enforced by contract; here we just persist
+    # Effect-ID uniqueness is re-checked here (not just in contract validation)
+    # because callers may stage from a raw dict: downstream idempotency keys
+    # derive from attempt.id + effect.id, so duplicates would silently drop
+    # later same-type writes at commit.
+    seen_ids: set[str] = set()
+    for eff in staged_list:
+        eid = eff.id if hasattr(eff, "id") else (eff.get("id") if isinstance(eff, dict) else None)
+        eid = str(eid) if eid is not None else ""
+        if not eid or eid in seen_ids:
+            raise ValueError("staged_effect ids must be unique")
+        seen_ids.add(eid)
     attempt.staged_effects = staged_list
     attempt.contract_snapshot = contract_dict
     # Idempotency key defaults to attempt.id for duplicate commit detection

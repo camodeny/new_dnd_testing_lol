@@ -596,6 +596,14 @@ class DmTurnContractV1(StrictModel):
             if self.table_chat_intent is not None or self.safe_prelude is not None or self.clarify_question is not None:
                 raise ValueError("unsupported must not have table_chat_intent/safe_prelude/clarify_question")
 
+        # Staged-effect IDs must be unique: downstream idempotency keys
+        # derive from attempt.id + effect.id (issue #210), so duplicate IDs
+        # would collapse distinct writes into one key and silently drop the
+        # later effect while the turn still commits successfully.
+        effect_ids = [e.id for e in (self.staged_effects or [])]
+        if len(effect_ids) != len(set(effect_ids)):
+            raise ValueError("staged_effect ids must be unique")
+
         # Global cross-field: new_entities only in respond
         if self.new_entities and m != "respond":
             raise ValueError("new_entities only valid in respond mode")
