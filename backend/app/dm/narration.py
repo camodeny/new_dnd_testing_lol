@@ -1284,6 +1284,7 @@ def continue_partial_stream(
     publish_realtime: bool = True,
     extra_secrets: set[str] | None = None,
     pc_names: dict[str, str] | None = None,
+    commit: bool = True,
 ) -> NarrationResult:
     """Semantically continue a partial visible stream without contradiction.
 
@@ -1313,7 +1314,11 @@ def continue_partial_stream(
     )
     result = _resume_stream_suffix(
         db, stream_id, continued_text,
-        chunk_size=chunk_size, publish_realtime=publish_realtime,
+        chunk_size=chunk_size,
+        # Realtime delivery requires durability first: when the caller owns
+        # the commit (commit=False), delivery is deferred to after commit.
+        publish_realtime=publish_realtime and commit,
+        commit=commit,
         completion_reason="narration_continued",
     )
     role_policy.record_partial_resume("semantic_continuation")
@@ -1341,6 +1346,7 @@ def _resume_stream_suffix(
     *,
     chunk_size: int = 120,
     publish_realtime: bool = True,
+    commit: bool = True,
     completion_reason: str = "narration_resumed",
 ) -> NarrationResult:
     """Shared suffix-persist + complete for resume/continuation."""
@@ -1370,7 +1376,10 @@ def _resume_stream_suffix(
     last = time.monotonic()
     for seq in range(len(existing), len(plan)):
         chunk = append_chunk(db, stream_id, seq, plan[seq])
-        db.commit()
+        if commit:
+            db.commit()
+        else:
+            db.flush()
         db.refresh(stream)
         now = time.monotonic()
         cadence.append((now - last) * 1000)
@@ -1387,7 +1396,10 @@ def _resume_stream_suffix(
                     stream_id, seq, pub_exc,
                 )
     stream = complete_stream(db, stream_id, completion_reason=completion_reason)
-    db.commit()
+    if commit:
+        db.commit()
+    else:
+        db.flush()
     db.refresh(stream)
     if publish_realtime:
         try:

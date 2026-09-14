@@ -565,6 +565,24 @@ def _execute_owned_attempt(
     # adjudication/areas config). Narrator resolves its own pinned area
     # inside build_provider_narrator. #208: adjudication runs through the
     # role-aware failover path on the same spine (no parallel stack).
+    # Explicit-retry lineage for accounting: only attempts whose parent was
+    # abandoned via explicit Retry count as recovery/non-billable. Ordinary
+    # pre-stream supersession also creates parented attempts, but those are
+    # first-try executions (primary/billable).
+    _is_explicit_retry = False
+    _retry_parent_id = getattr(attempt, "parent_attempt_id", None)
+    if _retry_parent_id is not None:
+        try:
+            from models.dm import DmTurnAttempt as _ParentAtt
+
+            _parent = db.get(_ParentAtt, _retry_parent_id)
+            _is_explicit_retry = (
+                _parent is not None
+                and _parent.status == "abandoned"
+                and (_parent.abandonment_reason or "") == "explicit_retry"
+            )
+        except Exception:
+            _is_explicit_retry = False
     adapter = None
     model = None
     pname = provider_name
@@ -587,7 +605,7 @@ def _execute_owned_attempt(
                     # Explicit-Retry attempts carry retry lineage: even the
                     # first provider call is recovery/non-billable so failed
                     # work is never double-charged.
-                    is_retry=getattr(attempt, "parent_attempt_id", None) is not None,
+                    is_retry=_is_explicit_retry,
                 )
                 path_info.update(info)
                 return contract

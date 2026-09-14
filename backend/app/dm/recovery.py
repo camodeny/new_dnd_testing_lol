@@ -138,6 +138,15 @@ def retry_narration_only(db, campaign_id, turn_id, attempt_id):
         raise ValueError("Only the current failed attempt can be retried")
     if not old.contract_snapshot:
         raise ValueError("No preserved structured result — use full explicit Retry")
+    if int(old.source_revision) != int(campaign.revision):
+        # Authoritative state advanced since the failed adjudication: the
+        # preserved contract was computed against stale state and must not
+        # be narrated/committed under the new revision. Full explicit Retry
+        # re-adjudicates against current state instead.
+        raise ValueError(
+            "Campaign state advanced since the failed attempt — "
+            "use full explicit Retry to re-adjudicate"
+        )
     return _fresh_attempt_from_old(
         db, campaign=campaign, turn=turn, old=old, reuse_contract=True
     )
@@ -175,7 +184,7 @@ def _find_recovery_event(db, turn, attempt):
 
 
 def recover_partial_stream(db, campaign_id, turn_id, stream_id, continued_text,
-                           *, actor_id=None):
+                           *, actor_id=None, commit: bool = True):
     """Recover a failed partial stream through the full turn state machine.
 
     Single orchestration helper for partial-stream recovery (HTTP route +
@@ -184,6 +193,11 @@ def recover_partial_stream(db, campaign_id, turn_id, stream_id, continued_text,
     effects promoted exactly once with the normal idempotency/revision
     guards). Caller-supplied text ALWAYS goes through the contract fidelity
     gate; there is no ungated resume path for untrusted input.
+
+    With ``commit=False`` every step is flush-only and the caller owns the
+    single atomic commit — the mode the idempotent HTTP route uses so a
+    crash can never leave half-committed recovery state beside a durable
+    ``in_progress`` command record. Any failure rolls everything back.
 
     Raises ``LookupError`` when the stream/turn is not found or not scoped
     to the authorized campaign/turn/attempt (callers map to 404), and
@@ -241,7 +255,10 @@ def recover_partial_stream(db, campaign_id, turn_id, stream_id, continued_text,
         try:
             reopen_failed_stream(db, stream.id, reason="partial_recovery")
             narration = continue_partial_stream(
-                db, stream.id, continued_text, contract, publish_realtime=True,
+                db, stream.id, continued_text, contract,
+                # Realtime delivery requires durability first: flush-only
+                # mode defers delivery until after the outer commit.
+                publish_realtime=commit, commit=commit,
             )
         except DMStreamStateError as exc:
             # Abandoned streams cannot recover — explicit Retry instead.
@@ -249,7 +266,7 @@ def recover_partial_stream(db, campaign_id, turn_id, stream_id, continued_text,
         except NarrationError as exc:
             # Fidelity or stream failure: generic retryable outcome, details in logs.
             raise ValueError(f"Continued narration rejected: {exc}") from exc
-    mark_recovered_streaming(db, turn.id, old.id)
+    mark_recovered_streaming(db, turn.id, old.id, commit=commit)
     submission_ids = list(old.submission_ids or [])
     payload = {
         "turn_id": str(turn.id),
@@ -263,6 +280,7 @@ def recover_partial_stream(db, campaign_id, turn_id, stream_id, continued_text,
         payload=payload,
         operation_id=old.commit_operation_id or str(old.id),
         actor_id=actor_id,
+        commit=commit,
     )
     logger.info(
         "dm_retry partial_stream_recovered turn_id=%s attempt_id=%s stream_id=%s event_id=%s",

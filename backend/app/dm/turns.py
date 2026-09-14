@@ -850,11 +850,16 @@ def commit_turn(
     payload: dict | None = None,
     operation_id: str | None = None,
     actor_id: uuid.UUID | None = None,
+    commit: bool = True,
 ) -> tuple[DmTurn, DmTurnAttempt, Any]:
     """Commit a DM turn's authoritative effects with optimistic revision validation.
 
     Only the committed streaming current attempt can be committed (CAS).
     Stale source-revision attempts are rejected without mutating campaign truth.
+
+    With ``commit=False`` the commit is flush-only so a caller (e.g. partial-
+    stream recovery inside an idempotent command) can atomically commit it
+    together with preceding recovery writes in a single transaction.
     """
     from app.campaigns.events import RevisionConflictError, commit_campaign_mutation
 
@@ -948,7 +953,8 @@ def commit_turn(
                 turn.committed_at = now_dup
             try:
                 db.flush()
-                db.commit()
+                if commit:
+                    db.commit()
                 db.refresh(turn)
                 db.refresh(attempt)
             except Exception:
@@ -988,7 +994,8 @@ def commit_turn(
         turn.status = TURN_FAILED_VISIBLE
         try:
             db.flush()
-            db.commit()
+            if commit:
+                db.commit()
         except Exception:
             db.rollback()
         raise StaleRevisionError(turn.campaign_id, int(expected), actual, attempt.id)
@@ -1070,7 +1077,8 @@ def commit_turn(
             turn.status = TURN_FAILED_VISIBLE
             try:
                 db.flush()
-                db.commit()
+                if commit:
+                    db.commit()
             except Exception:
                 db.rollback()
         raise StaleRevisionError(turn.campaign_id, exc.expected_revision, exc.actual_revision, attempt.id) from exc
@@ -1114,7 +1122,8 @@ def commit_turn(
             logger.warning("dm_turn failed to complete stream turn_id=%s stream_id=%s error=%s", turn.id, attempt.stream_id, e)
 
     db.flush()
-    db.commit()
+    if commit:
+        db.commit()
     db.refresh(turn)
     db.refresh(attempt)
     db.refresh(campaign_after)
@@ -1143,9 +1152,10 @@ def commit_turn_with_effects(
     payload: dict | None = None,
     operation_id: str | None = None,
     actor_id: uuid.UUID | None = None,
+    commit: bool = True,
 ) -> tuple[DmTurn, DmTurnAttempt, Any]:
     """Thin wrapper for staged-effects commit (issue #206). Delegates to commit_turn."""
-    return commit_turn(db, turn_id, attempt_id, expected_revision=expected_revision, mutate=None, event_type=event_type, payload=payload, operation_id=operation_id, actor_id=actor_id)
+    return commit_turn(db, turn_id, attempt_id, expected_revision=expected_revision, mutate=None, event_type=event_type, payload=payload, operation_id=operation_id, actor_id=actor_id, commit=commit)
 
 
 def abandon_visible_attempt(

@@ -100,23 +100,15 @@ def continue_stream(campaign_id: str, turn_id: str, stream_id: str, payload: dic
     via the normal commit path. Failures return generic messages without
     infrastructure details.
 
-    Crash safety: recovery commits stream progress through the gameplay
-    session, which can durably persist the outer ``in_progress`` idempotency
-    record before the result exists. A same-key retry that finds such a
-    stranded record converges via gameplay state instead of 409-looping —
-    but ONLY when the record is provably stale (older than
-    ``RECOVERY_TAKEOVER_LEASE_SECONDS``); a fresh record means a recovery
-    is still actively running and the retry stays serialized with 409 +
-    Retry-After. After a takeover converges, the stuck record is cleared so
-    the key self-heals.
+    Atomicity: recovery runs flush-only inside the idempotent command, so
+    the command row, stream progress, and turn commit persist in ONE commit.
+    A crash can never leave half-committed recovery state beside a durable
+    ``in_progress`` record — retrying the same key cleanly re-executes.
+    Realtime delivery happens after that commit returns (never before
+    durability), via a best-effort post-commit status publish.
     """
-    from app.deps.idempotency import require_idempotency_key
+    from app.deps.idempotency import execute_http_idempotent, require_idempotency_key
     from app.dm.recovery import recover_partial_stream
-    from app.idempotency import (
-        IdempotencyConflictError,
-        IdempotencyInProgressError,
-        execute_idempotent_command,
-    )
     from models.dm import DmTurn
     profile = resolve_profile(request, db)
     campaign = authorized_campaign(db, campaign_id, profile.id)
@@ -147,136 +139,45 @@ def continue_stream(campaign_id: str, turn_id: str, stream_id: str, payload: dic
 
     def execute():
         try:
-            return _shape(*recover_partial_stream(
-                db, campaign.id, tid, sid, continued, actor_id=profile.id))
-        except LookupError as exc:
-            raise HTTPException(status_code=404, detail="Turn not found") from exc
-        except ValueError as exc:
-            raise HTTPException(status_code=409, detail="The storyteller faltered. You can retry this turn.") from exc
-
-    def _converged_result():
-        """Converge a stranded same-key retry via gameplay state."""
-        from models.dm import DmTurnAttempt
-
-        fresh_turn = db.get(DmTurn, tid)
-        if fresh_turn is not None and fresh_turn.status == "succeeded":
-            fresh_attempt = (db.get(DmTurnAttempt, fresh_turn.current_attempt_id)
-                             if fresh_turn.current_attempt_id else None)
-            if fresh_attempt is not None and fresh_attempt.status == "succeeded":
-                result = dict(fresh_attempt.result or {})
-                return {"turn_id": str(fresh_turn.id),
-                        "attempt_id": str(fresh_attempt.id),
-                        "stream_id": str(sid),
-                        "event_id": str(result.get("event_id") or result.get("id") or "")}
-        # Prior attempt crashed mid-recovery: re-run (resumable) outside the
-        # stranded record, then clear it so the key self-heals.
-        try:
             final_turn, final_attempt, event = recover_partial_stream(
-                db, campaign.id, tid, sid, continued, actor_id=profile.id)
+                db, campaign.id, tid, sid, continued, actor_id=profile.id,
+                commit=False,
+            )
         except LookupError as exc:
             raise HTTPException(status_code=404, detail="Turn not found") from exc
         except ValueError as exc:
             raise HTTPException(status_code=409, detail="The storyteller faltered. You can retry this turn.") from exc
-        _clear_stuck_recovery_record(db, profile.id, key, tid)
         return _shape(final_turn, final_attempt, event)
 
     # Full semantic identity: stream + complete text. Only the digest is
     # persisted, so nothing is truncated — requests differing anywhere
     # (even past character 4,000) are distinct commands.
-    idempotency_payload = {"stream_id": str(sid), "continued_text": continued}
-    try:
-        result, replayed = execute_idempotent_command(
-            db, actor_id=profile.id, idempotency_key=key,
-            command_type="dm_turn.recover_partial_stream", scope_type="dm_turn",
-            scope_id=tid, payload=idempotency_payload,
-            execute=execute,
-        )
-    except IdempotencyConflictError as exc:
-        raise HTTPException(status_code=409, detail=str(exc)) from exc
-    except IdempotencyInProgressError:
-        _require_stale_recovery_record(db, profile.id, key, tid)
-        result, replayed = _converged_result(), True
-    except ValueError as exc:
-        raise HTTPException(status_code=400, detail=str(exc)) from exc
-    response.headers["X-Idempotent-Replay"] = "true" if replayed else "false"
+    result = execute_http_idempotent(
+        db, response, actor_id=profile.id, idempotency_key=key,
+        command_type="dm_turn.recover_partial_stream", scope_type="dm_turn",
+        scope_id=tid, payload={"stream_id": str(sid), "continued_text": continued},
+        execute=execute,
+    )
+    if response.headers.get("X-Idempotent-Replay") != "true":
+        _publish_recovery_status(db, sid)
     return result
 
 
-RECOVERY_TAKEOVER_LEASE_SECONDS = 300
+def _publish_recovery_status(db: Session, stream_id) -> None:
+    """Best-effort post-commit realtime status for a recovered stream."""
+    import logging as _logging
 
-
-def _recovery_record_age_seconds(record, *, now=None) -> float:
-    """Age of an idempotency record in seconds (naive timestamps = UTC)."""
-    from datetime import datetime, timezone
-
-    now = now or datetime.now(timezone.utc)
-    created = record.created_at
-    if created is not None and created.tzinfo is None:
-        created = created.replace(tzinfo=timezone.utc)
-    if created is None:
-        return 0.0
-    return max(0.0, (now - created).total_seconds())
-
-
-def _require_stale_recovery_record(db: Session, actor_id, key: str, tid) -> None:
-    """Allow takeover of an in_progress recovery only when provably stale.
-
-    A fresh record means a recovery may still be actively running (its row
-    becomes visible after the first chunk commit) — taking over would run
-    recovery concurrently and could delete the active command record. Fresh
-    duplicates stay serialized with 409 + Retry-After.
-    """
-    from sqlalchemy import select
-
-    from models.reliability import IdempotentCommand
-
-    record = db.execute(
-        select(IdempotentCommand).where(
-            IdempotentCommand.actor_id == actor_id,
-            IdempotentCommand.idempotency_key == key,
-            IdempotentCommand.command_type == "dm_turn.recover_partial_stream",
-            IdempotentCommand.scope_type == "dm_turn",
-            IdempotentCommand.scope_id == str(tid),
-        )
-    ).scalars().first()
-    if record is None or record.status == "completed":
-        return
-    if _recovery_record_age_seconds(record) < RECOVERY_TAKEOVER_LEASE_SECONDS:
-        raise HTTPException(
-            status_code=409,
-            detail="Recovery is already running; retry",
-            headers={"Retry-After": "1"},
-        )
-
-
-def _clear_stuck_recovery_record(db: Session, actor_id, key: str, tid) -> None:
-    """Remove a crashed ``in_progress`` recovery record for this key.
-
-    Only the exact non-completed record for this command identity is
-    removed, and only after gameplay state converged — completed results
-    are never touched.
-    """
-    from sqlalchemy import delete
-
-    from models.reliability import IdempotentCommand
-
+    _logger = _logging.getLogger(__name__)
     try:
-        db.execute(
-            delete(IdempotentCommand).where(
-                IdempotentCommand.actor_id == actor_id,
-                IdempotentCommand.idempotency_key == key,
-                IdempotentCommand.command_type == "dm_turn.recover_partial_stream",
-                IdempotentCommand.scope_type == "dm_turn",
-                IdempotentCommand.scope_id == str(tid),
-                IdempotentCommand.status != "completed",
-            )
-        )
-        db.commit()
-    except Exception:
-        try:
-            db.rollback()
-        except Exception:
-            pass
+        from app.dm_streams.service import get_stream
+        from app.realtime.service import publish_dm_status
+
+        stream = get_stream(db, stream_id)
+        if stream is not None and stream.status == "completed":
+            publish_dm_status(db, stream, visible_text=stream.final_text)
+    except Exception as exc:
+        _logger.warning("recovery realtime publish failed stream_id=%s error=%s",
+                        stream_id, exc)
 
 
 @router.get("/api/campaigns/{campaign_id}/dm-turns")

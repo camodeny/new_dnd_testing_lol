@@ -512,10 +512,10 @@ def test_recover_partial_stream_rejects_divergent_and_unfaithful_text(db):
     assert s.get(DmTurnAttempt, attempt.id).status == "failed_visible"
 
 
-# ── Idempotency identity + takeover lease (endpoint contract) ────────────────
+# ── Atomicity: crash at any boundary leaves nothing durable ─────────────────
 
 def test_recovery_digest_distinguishes_text_past_char_4000(db):
-    """Payloads differing only after character 4,000 are distinct commands."""
+    """Untruncated recovery payloads differing only after char 4,000 conflict."""
     from app.idempotency import (
         IdempotencyConflictError,
         execute_idempotent_command,
@@ -539,50 +539,137 @@ def test_recovery_digest_distinguishes_text_past_char_4000(db):
             payload=second, execute=lambda: {"ok": True},
         )
 
+@pytest.mark.parametrize("fault", ["after_completion", "after_transition", "after_staging"])
+def test_recovery_crash_boundary_leaves_nothing_durable(db, monkeypatch, fault):
+    """With flush-only recovery, a crash after completion/transition/staging
+    persists nothing: retry converges to exactly one commit."""
+    from app.dm.recovery import recover_partial_stream
+    from app.dm_streams.service import list_chunks, reconstruct_text
 
-def _plant_recovery_record(s, owner, key, tid, *, age_seconds):
-    from datetime import datetime, timedelta, timezone
+    s, camp_id, thread_id, _ = db
+    owner = s.get(Campaign, camp_id).owner_id
+    turn, attempt, stream_id = _failed_partial(s, camp_id, thread_id)
+    chunks_before = len(list_chunks(s, stream_id))
 
-    from models.reliability import IdempotentCommand
+    if fault == "after_completion":
+        import app.dm.narration as narration_mod
 
-    record = IdempotentCommand(
-        actor_id=owner, idempotency_key=key,
-        command_type="dm_turn.recover_partial_stream", scope_type="dm_turn",
-        scope_id=str(tid), payload_hash="x" * 64, status="in_progress",
+        real_continue = narration_mod.continue_partial_stream
+
+        def _fail(*a, **k):
+            real_continue(*a, **k)
+            raise RuntimeError("crash after stream completion")
+
+        monkeypatch.setattr(narration_mod, "continue_partial_stream", _fail)
+    elif fault == "after_transition":
+        import app.dm.turns as turns_mod
+
+        real_mark = turns_mod.mark_recovered_streaming
+
+        def _fail(*a, **k):
+            real_mark(*a, **k)
+            raise RuntimeError("crash after recovered-streaming transition")
+
+        monkeypatch.setattr(turns_mod, "mark_recovered_streaming", _fail)
+    else:
+        import app.dm.turns as turns_mod
+
+        def _fail(*a, **k):
+            raise RuntimeError("crash during effect/event staging")
+
+        monkeypatch.setattr(turns_mod, "commit_turn_with_effects", _fail)
+
+    with pytest.raises(RuntimeError, match="crash"):
+        recover_partial_stream(s, camp_id, turn.id, stream_id, LONG_TEXT,
+                               actor_id=owner, commit=False)
+    s.rollback()
+    # Nothing durable: stream still failed with original prefix, turn failed.
+    from app.dm_streams.service import get_stream
+
+    assert get_stream(s, stream_id).status == "failed"
+    assert len(list_chunks(s, stream_id)) == chunks_before
+    assert reconstruct_text(s, stream_id) != LONG_TEXT
+    assert s.get(DmTurn, turn.id).status == "failed_visible"
+    assert s.get(DmTurnAttempt, attempt.id).status == "failed_visible"
+    # Retry converges to exactly one successful commit.
+    monkeypatch.undo()
+    final_turn, final_attempt, event = recover_partial_stream(
+        s, camp_id, turn.id, stream_id, LONG_TEXT, actor_id=owner)
+    assert final_turn.status == "succeeded"
+    assert final_attempt.status == "succeeded"
+    assert event is not None
+
+
+def test_narration_only_retry_rejects_advanced_revision(db):
+    """A snapshot computed against stale state must not narrate/commit."""
+    from app.dm.recovery import retry_narration_only
+
+    s, camp_id, thread_id, _ = db
+    turn, attempt = _submit(s, camp_id, thread_id)
+
+    def _good(packet, feedback=None):
+        return _contract()
+
+    def _boom_narrator(request):
+        raise RuntimeError("narrator exploded pre-chunk")
+
+    with pytest.raises(RuntimeError, match="narrator exploded"):
+        execute_dm_attempt(s, attempt.id, adjudicate=_good, narrator=_boom_narrator)
+    from app.dm.turns import mark_attempt_failed
+
+    mark_attempt_failed(s, attempt.id, error="x", error_class="retriable", visible=True)
+    camp = s.get(Campaign, camp_id)
+    camp.revision = int(camp.revision or 0) + 1
+    s.add(camp)
+    s.commit()
+    with pytest.raises(ValueError, match="state advanced"):
+        retry_narration_only(s, camp_id, turn.id, attempt.id)
+
+
+def test_superseded_attempt_executes_as_primary_billable(db, monkeypatch):
+    """Ordinary pre-stream supersession is first-try work: primary/billable."""
+    import json
+
+    from models.reliability import AIRun
+
+    s, camp_id, thread_id, _ = db
+    turn, old = _submit(s, camp_id, thread_id)
+    child = DmTurnAttempt(
+        id=uuid.uuid4(), turn_id=turn.id, campaign_id=camp_id,
+        thread_id=turn.thread_id, audience=turn.audience,
+        attempt_number=old.attempt_number + 1, parent_attempt_id=old.id,
+        status="prepared", source_revision=turn.source_revision,
+        input_set_revision=turn.input_set_revision,
+        submission_ids=list(old.submission_ids or []),
     )
-    s.add(record)
+    s.add(child)
+    old.status = "superseded"
+    old.invalidation_reason = "new_eligible_submission_pre_stream"
+    turn.current_attempt_id = child.id
+    s.add(old)
+    s.add(turn)
     s.commit()
-    backdated = datetime.now(timezone.utc) - timedelta(seconds=age_seconds)
-    record.created_at = backdated.replace(tzinfo=None)
-    s.add(record)
-    s.commit()
-    return record
 
+    contract_json = json.dumps(_contract().model_dump(mode="json"))
 
-def test_takeover_blocked_while_recovery_active(db):
-    """A fresh in_progress record means active work: stay serialized."""
-    from fastapi import HTTPException
+    def _fake_execute(adapter, request):
+        return _ok_response(contract_json)
 
-    from app.dm.router import _require_stale_recovery_record
+    monkeypatch.setattr("app.dm.adjudication.resolve_dm_provider",
+                        lambda: (_FakeAdapter("primary"), "model-x", "primary"))
+    monkeypatch.setattr(role_policy, "execution_path",
+                        lambda role: [("primary", "model-x")])
+    monkeypatch.setattr(role_policy, "is_model_approved", lambda r, p, m: True)
+    import app.providers as providers_pkg
 
-    s, camp_id, thread_id, _ = db
-    owner = s.get(Campaign, camp_id).owner_id
-    turn, _ = _submit(s, camp_id, thread_id)
-    _plant_recovery_record(s, owner, "k-active", turn.id, age_seconds=5)
-    with pytest.raises(HTTPException) as exc_info:
-        _require_stale_recovery_record(s, owner, "k-active", turn.id)
-    assert exc_info.value.status_code == 409
+    monkeypatch.setattr(providers_pkg, "execute_chat", _fake_execute)
 
-
-def test_takeover_allowed_for_stale_record(db):
-    """A provably stale in_progress record may be taken over."""
-    from app.dm.router import _require_stale_recovery_record
-
-    s, camp_id, thread_id, _ = db
-    owner = s.get(Campaign, camp_id).owner_id
-    turn, _ = _submit(s, camp_id, thread_id)
-    _plant_recovery_record(s, owner, "k-stale", turn.id, age_seconds=3600)
-    _require_stale_recovery_record(s, owner, "k-stale", turn.id)  # no raise
+    result = execute_dm_attempt(s, child.id, narrator="deterministic")
+    assert result.attempt.status == "succeeded"
+    runs = s.execute(select(AIRun)).scalars().all()
+    assert runs
+    assert all(r.classification == "primary" for r in runs)
+    assert all(r.billable is True for r in runs)
 
 
 # ── Exhaustion: generic retryable failure, no infra details ───────────────────
