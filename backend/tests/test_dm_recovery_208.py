@@ -830,6 +830,101 @@ def test_automatic_retry_executes_as_non_billable_recovery(db, monkeypatch):
     assert all(r.status == "succeeded" or r.status == "failed" for r in runs)
 
 
+def test_failed_runs_survive_gameplay_rollback(db, monkeypatch):
+    """Terminal provider failure rolls gameplay back, but the failed
+    primary/failover AIRuns stay durably in the ledger — including when no
+    trailing gameplay commit follows (direct adjudication call)."""
+    from app.dm.adjudication import adjudicate_with_failover
+    from app.providers.contracts import ProviderError
+    from models.reliability import AIRun
+
+    s, camp_id, thread_id, factory = db
+    turn, attempt = _submit(s, camp_id, thread_id)
+    packet = _load_packet(s, attempt.id)
+
+    def _always_terminal(adapter, request):
+        raise ProviderError("bad request", kind="http", status_code=400,
+                            retryable=False)
+
+    monkeypatch.setattr("app.dm.adjudication.resolve_dm_provider",
+                        lambda: (_FakeAdapter("primary"), "model-x", "primary"))
+    monkeypatch.setattr(role_policy, "execution_path",
+                        lambda role: [("primary", "model-x")])
+    monkeypatch.setattr(role_policy, "is_model_approved", lambda r, p, m: True)
+    import app.providers as providers_pkg
+
+    monkeypatch.setattr(providers_pkg, "execute_chat", _always_terminal)
+
+    with pytest.raises(ProviderError):
+        adjudicate_with_failover(packet, db=s)
+    s.rollback()  # no trailing gameplay commit: rows must still be durable
+    # A fresh session (post-crash view) sees only committed telemetry.
+    s.close()
+    with factory() as fresh:
+        runs = fresh.execute(select(AIRun)).scalars().all()
+    assert runs, "failed provider attempts must remain in the ledger"
+    assert all(r.status == "failed" for r in runs)
+    assert any(r.classification == "primary" and r.billable is True for r in runs)
+
+    with factory() as s2:
+        turn2, attempt2 = _submit(s2, camp_id, thread_id)
+        with pytest.raises(ProviderError):
+            execute_dm_attempt(s2, attempt2.id, narrator="deterministic")
+        assert s2.get(DmTurnAttempt, attempt2.id).status in ("failed", "failed_visible")
+    with factory() as fresh2:
+        runs2 = fresh2.execute(select(AIRun)).scalars().all()
+    assert len(runs2) > len(runs)
+
+
+@pytest.mark.postgres
+def test_failed_runs_durable_on_postgres(monkeypatch):
+    """Production behavior: savepoint-flushed telemetry does NOT survive a
+    gameplay rollback on Postgres, so accounting must use its own
+    transaction. Uses a stub packet — no gameplay state needed."""
+    import os
+
+    url = os.getenv("FAULT_TEST_DATABASE_URL")
+    if not url:
+        pytest.skip("requires disposable Postgres")
+    from sqlalchemy import create_engine
+    from sqlalchemy.orm import sessionmaker
+
+    from app.dm.adjudication import adjudicate_with_failover
+    from app.providers.contracts import ProviderError
+    from models.reliability import AIRun
+
+    eng = create_engine(url)
+    Fac = sessionmaker(bind=eng, expire_on_commit=False)
+    tid = f"trace-{uuid.uuid4().hex}"
+
+    class _StubPacket:
+        def model_dump(self, mode="json"):
+            return {"stub": True}
+
+    def _always_terminal(adapter, request):
+        raise ProviderError("bad request", kind="http", status_code=400,
+                            retryable=False)
+
+    monkeypatch.setattr("app.dm.adjudication.resolve_dm_provider",
+                        lambda: (_FakeAdapter("primary"), "model-x", "primary"))
+    monkeypatch.setattr(role_policy, "execution_path",
+                        lambda role: [("primary", "model-x")])
+    monkeypatch.setattr(role_policy, "is_model_approved", lambda r, p, m: True)
+    import app.providers as providers_pkg
+
+    monkeypatch.setattr(providers_pkg, "execute_chat", _always_terminal)
+
+    with Fac() as s:
+        with pytest.raises(ProviderError):
+            adjudicate_with_failover(_StubPacket(), db=s, trace_id=tid)
+        s.rollback()
+    with Fac() as fresh:
+        runs = fresh.execute(
+            select(AIRun).where(AIRun.trace_id == tid)).scalars().all()
+    assert runs, "failed runs must be durable independently of rollback"
+    assert all(r.status == "failed" for r in runs)
+
+
 def test_superseded_attempt_executes_as_primary_billable(db, monkeypatch):
     """Ordinary pre-stream supersession is first-try work: primary/billable."""
     import json

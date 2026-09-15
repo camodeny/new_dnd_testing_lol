@@ -233,6 +233,16 @@ def adjudicate_with_failover(
     tid = trace_id or str(uuid.uuid4())
     t_start = time.monotonic()
     policy = role_policy.get_role_policy(role)
+    # Independent telemetry transaction: AI-run rows must survive gameplay
+    # rollback so failed attempts keep their recovery/billing attribution.
+    telemetry = None
+    if db is not None:
+        try:
+            from app.observability.service import telemetry_factory_for
+
+            telemetry = telemetry_factory_for(db)
+        except Exception:
+            telemetry = None
 
     if adapter is not None and model is not None:
         # Injected seam (tests): single pinned attempt, no failover chain.
@@ -280,15 +290,12 @@ def adjudicate_with_failover(
             continue
         classification = "recovery" if (index > 0 or is_retry) else "primary"
         ai_run = None
-        if db is not None:
+        if telemetry is not None:
             try:
-                from app.observability.service import (
-                    finish_ai_run_inline,
-                    record_ai_run_inline,
-                )
+                from app.observability.service import start_ai_run
 
-                ai_run = record_ai_run_inline(
-                    db, logical_operation="forward_dm_adjudicate",
+                ai_run = start_ai_run(
+                    telemetry, logical_operation="forward_dm_adjudicate",
                     role=role, provider=cand_adapter.name, model=cand_model,
                     attempt=index + 1, classification=classification,
                     billable=(classification == "primary"),
@@ -317,12 +324,12 @@ def adjudicate_with_failover(
             raw = parse_contract_json(response.content)
             contract = normalize_contract(raw)
             ttft_added = (time.monotonic() - t_start) * 1000 if index > 0 else 0.0
-            if ai_run is not None:
+            if ai_run is not None and telemetry is not None:
                 try:
-                    from app.observability.service import finish_ai_run_inline
+                    from app.observability.service import finish_ai_run
 
-                    finish_ai_run_inline(db, ai_run.id, status="succeeded",
-                                         result_code="contract_ok")
+                    finish_ai_run(telemetry, ai_run.id, status="succeeded",
+                                  result_code="contract_ok")
                 except Exception:
                     pass
             structured_log(
@@ -338,12 +345,12 @@ def adjudicate_with_failover(
             }
         except Exception as exc:
             last_exc = exc
-            if ai_run is not None:
+            if ai_run is not None and telemetry is not None:
                 try:
-                    from app.observability.service import finish_ai_run_inline
+                    from app.observability.service import finish_ai_run
 
-                    finish_ai_run_inline(db, ai_run.id, status="failed",
-                                         error_type=type(exc).__name__[:128])
+                    finish_ai_run(telemetry, ai_run.id, status="failed",
+                                  error_type=type(exc).__name__[:128])
                 except Exception:
                     pass
             cls, reason = role_policy.classify_execution_failure(exc)
@@ -398,6 +405,16 @@ def build_provider_narrator(
     from app.observability.tracing import structured_log
 
     tid = trace_id or str(uuid.uuid4())
+    # Independent telemetry transaction (see adjudication path): narration
+    # runs survive gameplay rollback.
+    telemetry = None
+    if db is not None:
+        try:
+            from app.observability.service import telemetry_factory_for
+
+            telemetry = telemetry_factory_for(db)
+        except Exception:
+            telemetry = None
     if adapter is not None and model is not None:
         if not role_policy.is_model_approved(role, adapter.name, model):
             raise RuntimeError(
@@ -482,12 +499,12 @@ def build_provider_narrator(
                     "recovery" if (path_index > 0 or is_retry) else "primary"
                 )
                 ai_run = None
-                if db is not None:
+                if telemetry is not None:
                     try:
-                        from app.observability.service import record_ai_run_inline
+                        from app.observability.service import start_ai_run
 
-                        ai_run = record_ai_run_inline(
-                            db, logical_operation="narration_stream",
+                        ai_run = start_ai_run(
+                            telemetry, logical_operation="narration_stream",
                             role=role, provider=cand_adapter.name,
                             model=cand_model, attempt=path_index + 1,
                             classification=classification,
@@ -517,22 +534,22 @@ def build_provider_narrator(
                         if event.kind == "token" and event.text:
                             yielded_downstream = True
                             yield event.text
-                    if ai_run is not None:
+                    if ai_run is not None and telemetry is not None:
                         try:
-                            from app.observability.service import finish_ai_run_inline
+                            from app.observability.service import finish_ai_run
 
-                            finish_ai_run_inline(db, ai_run.id, status="succeeded",
-                                                 result_code="stream_ok")
+                            finish_ai_run(telemetry, ai_run.id, status="succeeded",
+                                          result_code="stream_ok")
                         except Exception:
                             pass
                     return
                 except Exception as exc:
-                    if ai_run is not None:
+                    if ai_run is not None and telemetry is not None:
                         try:
-                            from app.observability.service import finish_ai_run_inline
+                            from app.observability.service import finish_ai_run
 
-                            finish_ai_run_inline(db, ai_run.id, status="failed",
-                                                 error_type=type(exc).__name__[:128])
+                            finish_ai_run(telemetry, ai_run.id, status="failed",
+                                          error_type=type(exc).__name__[:128])
                         except Exception:
                             pass
                     cls, reason = role_policy.classify_execution_failure(exc)

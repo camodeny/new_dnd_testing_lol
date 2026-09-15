@@ -121,71 +121,26 @@ def finish_ai_run(session_factory, run_id, *, status: str = "succeeded", first_t
     return _telemetry_write(session_factory, write)
 
 
-def record_ai_run_inline(db: Session, *, logical_operation: str, role: str,
-                         provider: str, model: str, attempt: int = 1,
-                         classification: str = "primary",
-                         billable: bool | None = None,
-                         trace_id: str | None = None,
-                         operation_id: str | None = None,
-                         status: str = "running",
-                         error_type: str | None = None,
-                         result_code: str | None = None) -> AIRun:
-    """Record an AI run on the caller's gameplay session (fail-soft).
+def telemetry_factory_for(db: Session):
+    """Derive an independent telemetry session factory from a Session.
 
-    Unlike :func:`start_ai_run` (own telemetry transaction), this writes
-    into the given gameplay ``Session`` via flush-only so recovery
-    accounting commits atomically with the turn it describes. Callers must
-    tolerate a best-effort failure: returns the run or None.
-    """
-    import uuid as _uuid
-
-    if classification not in {"primary", "recovery"}:
-        raise ValueError("classification must be primary or recovery")
-    resolved_billable = (classification == "primary") if billable is None else billable
-    run = AIRun(
-        trace_id=trace_id or current_trace_id() or _uuid.uuid4().hex,
-        operation_id=operation_id or current_operation_id() or _uuid.uuid4().hex,
-        logical_operation=logical_operation, role=role,
-        provider=provider, model=model, attempt=int(attempt or 1),
-        classification=classification, billable=resolved_billable,
-        status=status, started_at=utcnow(),
-        completed_at=utcnow() if status != "running" else None,
-        error_type=error_type, result_code=result_code,
-    )
-    # Savepoint, never a session rollback: a telemetry failure must not
-    # roll back unrelated caller gameplay work or release its locks.
-    try:
-        with db.begin_nested():
-            db.add(run)
-            db.flush()
-        return run
-    except Exception:
-        structured_log(logger, logging.ERROR, "telemetry_dropped",
-                       error_type="ai_run_inline_failed")
-        return None  # type: ignore[return-value]
-
-
-def finish_ai_run_inline(db: Session, run_id, *, status: str = "succeeded",
-                         result_code: str | None = None,
-                         error_type: str | None = None) -> None:
-    """Finish an inline AI run on the caller's session (fail-soft).
-
-    Savepoint-contained like :func:`record_ai_run_inline`.
+    Sessions it creates own short transactions (see :func:`start_ai_run`),
+    so AI-run accounting survives gameplay rollback — failed provider
+    attempts stay in the ledger even when the turn execution rolls back.
+    Returns None when no bind is available (callers skip accounting).
     """
     try:
-        with db.begin_nested():
-            run = db.get(AIRun, run_id)
-            if run is None:
-                return
-            run.status = status
-            run.completed_at = utcnow()
-            run.result_code = result_code
-            run.error_type = error_type
-            db.add(run)
-            db.flush()
+        bind = db.get_bind()
     except Exception:
-        structured_log(logger, logging.ERROR, "telemetry_dropped",
-                       error_type="ai_run_finish_inline_failed")
+        return None
+    if bind is None:
+        return None
+    try:
+        from sqlalchemy.orm import sessionmaker
+
+        return sessionmaker(bind=bind, expire_on_commit=False)
+    except Exception:
+        return None
 
 
 def get_trace(db: Session, trace_id: str) -> dict | None:
