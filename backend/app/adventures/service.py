@@ -214,11 +214,22 @@ def start_adventure(
     if len(clean_title) > MAX_TITLE_LEN:
         raise ValueError(f"Adventure title must be at most {MAX_TITLE_LEN} characters")
     try:
+        # populate_existing: the request session may already hold this
+        # Campaign from a pre-lock read; without repopulation the lock
+        # query returns the same stale instance and the cursor below would
+        # be derived from a pre-concurrency revision.
         campaign = db.execute(
-            select(Campaign).where(Campaign.id == campaign_id).with_for_update()
+            select(Campaign).where(Campaign.id == campaign_id)
+            .with_for_update()
+            .execution_options(populate_existing=True)
         ).scalars().first()
     except Exception:
         campaign = db.get(Campaign, campaign_id)
+        if campaign is not None:
+            try:
+                db.refresh(campaign)
+            except Exception:
+                pass
     if campaign is None:
         raise AdventureNotFoundError(f"Campaign {campaign_id} not found")
     existing = get_current_adventure(db, campaign_id)

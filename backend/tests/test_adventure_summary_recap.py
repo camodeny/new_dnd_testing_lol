@@ -606,7 +606,13 @@ def test_unknown_visibility_matches_event_feed_fail_closed(api):
 def test_open_cursor_excludes_concurrent_pre_insert_event(api, monkeypatch):
     """A mutation committing between the route's initial campaign read and
     adventure insertion must not enter the new arc: the default cursor
-    derives from the locked campaign revision inside start_adventure."""
+    derives from the locked (repopulated) campaign revision inside
+    start_adventure.
+
+    The racing mutation commits through a genuinely separate session so the
+    request session holds a stale Campaign in its identity map — the exact
+    case the lock + repopulation must defeat.
+    """
     import sqlalchemy as sa
 
     import app.adventures.service as _adventure_service
@@ -618,13 +624,14 @@ def test_open_cursor_excludes_concurrent_pre_insert_event(api, monkeypatch):
     real_start = _adventure_service.start_adventure
 
     def _racing_start(db, campaign_id, title, **kw):
-        camp_row = db.get(Campaign, campaign_id)
-        commit_campaign_mutation(
-            db, campaign_id, int(camp_row.revision),
-            event_type="dm.narration",
-            payload={"summary": "racing happening at the gate"},
-            operation_id="seed-race-1", visibility="public",
-        )
+        with factory() as other:
+            camp_row = other.get(Campaign, campaign_id)
+            commit_campaign_mutation(
+                other, campaign_id, int(camp_row.revision),
+                event_type="dm.narration",
+                payload={"summary": "racing happening at the gate"},
+                operation_id="seed-race-1", visibility="public",
+            )
         return real_start(db, campaign_id, title, **kw)
 
     monkeypatch.setattr(
