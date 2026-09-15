@@ -12,5 +12,6 @@ from app.adventures.service import (  # noqa: F401
     handle_adventure_closing,
     list_adventures,
     register_adventure_worker,
+    run_adventure_closing_sweep,
     start_adventure,
 )

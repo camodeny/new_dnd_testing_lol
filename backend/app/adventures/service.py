@@ -331,11 +331,13 @@ def complete_adventure(
 
     def _payload() -> dict:
         adv = completed["adventure"]
+        # Player-readable lifecycle data only: the DM's completion reason
+        # stays on the owner-visible adventure row, never in the public
+        # domain-event feed (issue #260 security).
         return {
             "adventure_id": str(adv.id),
             "title": adv.title,
             "outcome": adv.outcome,
-            "reason": adv.reason,
             "public_summary": adv.public_summary,
             "source_turn_id": str(adv.source_turn_id) if adv.source_turn_id else None,
             "source_event_id": str(adv.source_event_id) if adv.source_event_id else None,
@@ -477,6 +479,86 @@ def register_adventure_worker() -> None:
     from app.queue.consumer import WORKER_HANDLERS
 
     WORKER_HANDLERS[ADVENTURE_CLOSING_JOB] = handle_adventure_closing
+
+
+def _envelope_for_adventure(adventure: Adventure):
+    """Build the closing-work envelope for an adventure (locator only).
+
+    job_id is the adventure id: one closing job per adventure, so sweeps,
+    queue redelivery, and manual replays converge idempotently.
+    """
+    from app.queue.adapter import new_envelope
+
+    return new_envelope(
+        job_id=adventure.id,
+        job_type=ADVENTURE_CLOSING_JOB,
+        campaign_id=adventure.campaign_id,
+        aggregate_id=adventure.campaign_id,
+        operation_id=adventure.operation_id,
+        idempotency_key=str(adventure.id),
+        payload={
+            "adventure_id": str(adventure.id),
+            "campaign_id": str(adventure.campaign_id),
+            "outcome": adventure.outcome,
+            "operation_id": adventure.operation_id,
+        },
+    )
+
+
+def run_adventure_closing_sweep(db: Session, *, limit: int = 5, max_attempts: int = 5) -> dict:
+    """Drive pending adventure closing work through the idempotent worker fence.
+
+    Production consumption path for ``adventure.closing`` (mirrors the
+    post-turn sweep): picks up completed adventures whose best-effort
+    closing follow-ups have not succeeded yet — pending, or failed under
+    the attempt budget — and runs each through ``execute_worker_job``.
+    Queue push delivery (when a subscriber is configured) converges on the
+    same adventure rows via job_id. A failed sweep never invalidates the
+    already-committed narrative completion.
+    """
+    from app.worker.executor import execute_worker_job
+
+    candidates = list(
+        db.execute(
+            select(Adventure)
+            .where(
+                Adventure.status == "completed",
+                (Adventure.closing_status == "pending")
+                | (
+                    (Adventure.closing_status == "failed")
+                    & (Adventure.closing_attempts < max_attempts)
+                ),
+            )
+            .order_by(Adventure.completed_at.asc().nulls_last(), Adventure.created_at.asc())
+            .limit(max(1, limit))
+        )
+        .scalars()
+        .all()
+    )
+    executed: list[str] = []
+    failed: list[dict] = []
+    for adventure in candidates:
+        try:
+            env = _envelope_for_adventure(adventure)
+            execute_worker_job(
+                db, env, lambda e, _db=db: handle_adventure_closing(e, _db),
+                max_attempts=max_attempts,
+            )
+            executed.append(str(adventure.id))
+        except Exception as exc:  # noqa: BLE001 — sweep must survive bad adventures
+            try:
+                db.rollback()
+            except Exception:
+                pass
+            logger.warning(
+                "adventure closing sweep failed adventure_id=%s error=%s",
+                adventure.id, exc,
+            )
+            failed.append({"adventure_id": str(adventure.id), "error": str(exc)[:300]})
+    logger.info(
+        "adventure closing sweep executed=%s failed=%s", len(executed), len(failed)
+    )
+    return {"executed": executed, "failed": failed}
 
 
 register_adventure_worker()

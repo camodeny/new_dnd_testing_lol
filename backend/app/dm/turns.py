@@ -1044,13 +1044,16 @@ def commit_turn(
         )
         if adventure_completion_args is not None and event_type == "dm.turn_resolved":
             event_type = "adventure.completed"
+            # Player-readable lifecycle data only — the DM's completion
+            # reason stays on the owner-visible adventure row, never in the
+            # public domain-event feed (issue #260 security).
             base_payload["adventure_completion"] = {
                 "outcome": adventure_completion_args.get("outcome"),
-                "reason": adventure_completion_args.get("reason"),
                 "public_summary": adventure_completion_args.get("public_summary"),
                 "adventure_id": adventure_completion_args.get("adventure_id"),
             }
             base_payload["outcome"] = adventure_completion_args.get("outcome")
+            base_payload["public_summary"] = adventure_completion_args.get("public_summary")
             base_payload["source_turn_id"] = str(turn.id)
 
     # Wrap mutate to also apply staged effects atomically inside same revision bump

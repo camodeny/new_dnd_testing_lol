@@ -560,3 +560,93 @@ def test_concurrent_start_backstop_enforced_by_database(setup):
         db.rollback()
     with factory() as db:
         assert len(list_adventures(db, camp_id)) == 1
+
+
+def test_member_event_feed_hides_dm_reason(api):
+    import json
+
+    from models.campaigns import CampaignMember
+
+    client, factory, actor = api
+    camp = client.post("/api/campaigns", json={"name": "Leak campaign"}).json()["campaign"]
+    cid = camp["id"]
+    member_id = uuid.uuid4()
+    with factory() as db:
+        db.add(Profile(id=member_id, email="member@example.com"))
+        db.add(CampaignMember(campaign_id=uuid.UUID(cid), user_id=member_id, role="player"))
+        db.commit()
+
+    secret = "DM-only: the castellan poisoned the well."
+    started = client.post(
+        f"/api/campaigns/{cid}/adventures",
+        json={"title": "Well arc"},
+        headers={"Idempotency-Key": "adv-leak-start"},
+    )
+    assert started.status_code == 200, started.text
+    revision = client.get(f"/api/campaigns/{cid}").json()["campaign"]["revision"]
+    done = client.post(
+        f"/api/campaigns/{cid}/adventures/current/complete",
+        json={
+            "expected_revision": revision,
+            "outcome": "failure",
+            "reason": secret,
+            "public_summary": "The town falls ill.",
+        },
+        headers={"Idempotency-Key": "adv-leak-done"},
+    )
+    assert done.status_code == 200, done.text
+
+    actor["id"] = member_id
+    feed = client.get(f"/api/campaigns/{cid}/events").json()
+    assert feed["events"], "completion event must stay member-visible"
+    blob = json.dumps(feed)
+    assert secret not in blob
+    assert "castellan" not in blob
+    completed = [e for e in feed["events"] if e["event_type"] == "adventure.completed"]
+    assert len(completed) == 1
+    assert completed[0]["payload"]["outcome"] == "failure"
+    assert completed[0]["payload"]["public_summary"] == "The town falls ill."
+    assert "reason" not in completed[0]["payload"]
+
+
+def test_closing_consumed_through_production_queue_path(setup, monkeypatch):
+    import database
+    from app.queue.adapter import new_envelope
+    from app.queue.consumer import consume_queue_delivery
+
+    factory, camp_id, _owner = setup
+    monkeypatch.setattr(database, "SessionLocal", factory)
+    with factory() as db:
+        start_adventure(db, camp_id, "Queue arc")
+    adv, _event = _complete(factory, camp_id, "victory", "op-queue")
+    with factory() as db:
+        assert db.get(Adventure, adv.id).closing_status == "pending"
+        env = new_envelope(
+            job_id=adv.id,
+            job_type="adventure.closing",
+            campaign_id=camp_id,
+            aggregate_id=camp_id,
+            operation_id="op-queue",
+            payload={"adventure_id": str(adv.id), "campaign_id": str(camp_id)},
+        )
+        result, dup = consume_queue_delivery(db, env.to_dict())
+        assert dup is False and result["ok"] is True
+    with factory() as db:
+        assert db.get(Adventure, adv.id).closing_status == "succeeded"
+
+
+def test_closing_sweep_converges_pending_work(setup):
+    from app.adventures.service import run_adventure_closing_sweep
+
+    factory, camp_id, _owner = setup
+    with factory() as db:
+        start_adventure(db, camp_id, "Sweep arc")
+    adv, _event = _complete(factory, camp_id, "retreat", "op-sweep")
+    with factory() as db:
+        sweep = run_adventure_closing_sweep(db, limit=10)
+        assert sweep["executed"] == [str(adv.id)]
+        assert sweep["failed"] == []
+    with factory() as db:
+        assert db.get(Adventure, adv.id).closing_status == "succeeded"
+        # Second sweep finds nothing to do.
+        assert run_adventure_closing_sweep(db)["executed"] == []
