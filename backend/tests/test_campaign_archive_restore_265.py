@@ -439,6 +439,53 @@ def test_dm_execution_defers_while_archived(api):
         assert db.get(DmTurnAttempt, attempt_id).status == "prepared"
 
 
+def test_archive_refused_while_dm_streaming_but_allowed_when_prepared(api):
+    """Archive serializes with visible execution: streaming blocks, prepared defers."""
+    from datetime import datetime, timezone
+
+    from models.dm import DmTurn, DmTurnAttempt
+
+    client, factory, _, owner_id, _, _ = api
+    campaign = _drive_to_active(client, factory, owner_id)
+    cid = campaign["id"]
+    rev = campaign["revision"]
+    with factory() as db:
+        thread = db.execute(
+            select(CampaignThread).where(
+                CampaignThread.campaign_id == uuid.UUID(cid),
+                CampaignThread.thread_type == "campaign",
+            )
+        ).scalars().first()
+        turn = DmTurn(
+            campaign_id=uuid.UUID(cid), thread_id=str(thread.id), status="pending",
+            source_revision=rev, submission_ids=[],
+        )
+        db.add(turn)
+        db.flush()
+        attempt = DmTurnAttempt(
+            turn_id=turn.id, attempt_number=1, status="running",
+            campaign_id=uuid.UUID(cid), thread_id=str(thread.id),
+            source_revision=rev, input_set_revision=rev, submission_ids=[],
+            started_at=datetime.now(timezone.utc),
+        )
+        db.add(attempt)
+        db.flush()
+        turn.current_attempt_id = attempt.id
+        db.commit()
+        attempt_id, turn_id = attempt.id, turn.id
+
+    blocked = _transition(client, cid, rev, "archived", "archive-streaming")
+    assert blocked.status_code == 409, blocked.text
+    assert _get(client, cid)["status"] == "active"
+
+    # A merely prepared attempt defers instead of blocking dormancy.
+    with factory() as db:
+        db.get(DmTurnAttempt, attempt_id).status = "prepared"
+        db.commit()
+    assert _transition(client, cid, rev, "archived", "archive-1").status_code == 200
+    assert _transition(client, cid, rev + 1, "active", "restore-1").status_code == 200
+
+
 def test_failed_restore_transaction_leaves_archived_state_intact(api):
     client, factory, _, owner_id, _, _ = api
     campaign = _drive_to_active(client, factory, owner_id)
@@ -535,8 +582,19 @@ def test_roll_writes_rejected_while_archived(api):
     assert create.status_code == 201, create.text
     roll_id = create.json()["roll_requests"][0]["id"]
     assert _transition(client, cid, rev, "archived", "archive-1").status_code == 200
-
     body = {"source": "app", "raw_rolls": [14], "modifier": 3, "total": 17, "visibility": "public"}
+    # New roll requests cannot be raised on a dormant table either.
+    second = client.post(
+        f"/api/campaigns/{cid}/dm-turns/{turn_id}/roll-requests",
+        json={"attempt_id": str(attempt_id), "requests": [{
+            "request_key": "late-check", "requested_user_id": str(owner_id),
+            "character_id": str(char_id), "roll_kind": "check",
+            "ability_or_skill": "Perception", "label": "Perception check",
+            "advantage_state": "normal", "reason_public": "Listen at the door",
+        }]},
+        headers={"Idempotency-Key": "request-archived"},
+    )
+    assert second.status_code == 409, second.text
     assert client.post(
         f"/api/campaigns/{cid}/roll-requests/{roll_id}/fulfill", json=body,
         headers={"Idempotency-Key": "fulfill-archived"},

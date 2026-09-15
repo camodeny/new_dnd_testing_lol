@@ -496,6 +496,26 @@ def run_post_turn_range(
             logger.warning("post_turn archive check failed campaign=%s error=%s", campaign_id, exc)
             return False
 
+    def _campaign_is_archived_locked() -> bool:
+        """Final dormancy decision serialized with the lifecycle row.
+
+        Archive/restore commits hold this same Campaign row lock, so once
+        acquired, archive cannot commit between this check and the checkpoint
+        CAS below: either archive won first (we see archived and retire) or
+        we hold the lock through the CAS (archive waits, then sees the
+        advanced checkpoint and backfills nothing it shouldn't). Consistent
+        lock order everywhere is campaign row first, checkpoint row second.
+        """
+        try:
+            locked = db.execute(
+                select(Campaign).where(Campaign.id == campaign_id).with_for_update()
+                .execution_options(populate_existing=True)
+            ).scalars().first()
+            return locked is not None and str(locked.status or "").lower() == "archived"
+        except Exception as exc:
+            logger.warning("post_turn locked archive check failed campaign=%s error=%s", campaign_id, exc)
+            return False
+
     def _retire_skipped(reason: str) -> dict:
         logger.info(
             "post_turn skipped campaign=%s range=%s-%s reason=%s",
@@ -534,7 +554,7 @@ def run_post_turn_range(
         if not isinstance(patch, dict):
             raise RuntimeError("consolidate_fn must return a dict")
 
-        if _campaign_is_archived():
+        if _campaign_is_archived_locked():
             # Issue #265 — archive won during consolidation: the patch must
             # not advance the checkpoint. Retire the run; the range is
             # backfilled after restore.

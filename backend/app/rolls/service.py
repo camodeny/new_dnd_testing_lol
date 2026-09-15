@@ -69,6 +69,21 @@ def _lock_turn_attempt(db: Session, turn_id: uuid.UUID, attempt_id: uuid.UUID) -
     return turn, attempt
 
 
+def _lock_campaign_row(db: Session, campaign_id: uuid.UUID) -> Campaign | None:
+    """Lock the campaign lifecycle row — issue #265.
+
+    Archive/restore serializes on this same row via commit_campaign_mutation,
+    so holding the lock until commit means a roll write that observed
+    ``active`` cannot commit after archive has committed (and vice versa).
+    Consistent lock order everywhere is request/turn locks first, then the
+    campaign row; archive only ever takes the campaign row.
+    """
+    return db.execute(
+        select(Campaign).where(Campaign.id == campaign_id).with_for_update()
+        .execution_options(populate_existing=True)
+    ).scalars().first()
+
+
 def _validate_request(db: Session, campaign_id: uuid.UUID, payload: dict) -> dict:
     key = _text(payload, "request_key", 48)
     if not re.fullmatch(r"[A-Za-z0-9_-]+", key):
@@ -113,11 +128,12 @@ def request_rolls(
     turn, attempt = _lock_turn_attempt(db, turn_id, attempt_id)
     if turn.campaign_id != campaign_id:
         raise RollLifecycleError("Turn not found")
-    # Issue #265 — roll writes advance the table; refuse them on the locked
-    # turn once the campaign is dormant.
+    # Issue #265 — roll writes advance the table; serialize with the
+    # campaign lifecycle row so a write that observed active cannot commit
+    # after archive has committed.
     from app.campaigns.service import require_playable_campaign
 
-    require_playable_campaign(db.get(Campaign, campaign_id))
+    require_playable_campaign(_lock_campaign_row(db, campaign_id))
     if turn.status not in {"pending", "awaiting_roll"} or attempt.status not in {"prepared", "running", "awaiting_roll"}:
         raise RollLifecycleError("Current attempt cannot request rolls from its present state")
     values = [_validate_request(db, campaign_id, item) for item in requests]
@@ -195,7 +211,7 @@ def fulfill_roll(db: Session, *, request_id: uuid.UUID, actor_id: uuid.UUID, pay
         raise RollLifecycleError("Roll request not found")
     from app.campaigns.service import require_playable_campaign
 
-    require_playable_campaign(db.get(Campaign, req.campaign_id))
+    require_playable_campaign(_lock_campaign_row(db, req.campaign_id))
     if req.requested_user_id != actor_id:
         logger.warning("player_roll invalid_attempt request_id=%s actor_id=%s reason=unauthorized", request_id, actor_id)
         raise RollAuthorizationError("Only the requested character's controller may fulfill this roll")
@@ -249,7 +265,7 @@ def cancel_or_replace(db: Session, *, request_id: uuid.UUID, replacement: dict |
         raise RollLifecycleError("Roll request not found")
     from app.campaigns.service import require_playable_campaign
 
-    require_playable_campaign(db.get(Campaign, req.campaign_id))
+    require_playable_campaign(_lock_campaign_row(db, req.campaign_id))
     if req.status != "pending":
         raise RollLifecycleError(f"Roll request cannot be changed from status {req.status}")
     turn = db.get(DmTurn, req.turn_id)
