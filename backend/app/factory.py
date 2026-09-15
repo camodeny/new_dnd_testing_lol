@@ -75,6 +75,7 @@ def create_app() -> FastAPI:
     from app.dm.router import router as dm_router
     from app.rolls.router import router as rolls_router
     from app.rules.router import router as rules_router
+    from app.adventures.router import router as adventures_router
     from app.outbox.router import router as outbox_cron_router
     from app.post_turn.router import router as post_turn_cron_router
 
@@ -83,6 +84,7 @@ def create_app() -> FastAPI:
     app.include_router(characters_router)
     app.include_router(chat_router)
     app.include_router(campaigns_router)
+    app.include_router(adventures_router)
     app.include_router(world_router)
     app.include_router(runtime_router)
     app.include_router(snapshot_router)
