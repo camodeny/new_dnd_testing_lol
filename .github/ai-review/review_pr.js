@@ -484,6 +484,7 @@ async function main() {
       "Do not merely draft or describe a review in chat, and do not wait for the user to copy or approve the review.",
       "Do not modify files, create commits, merge, close, or otherwise change repository state beyond submitting this review.",
       "Prioritize correctness bugs, security issues, data-loss risks, broken behavior, and missing tests.",
+      "Do not request an extensive regression test suite; only flag missing tests for real bugs found, and keep test suggestions minimal and high-value.",
       "Format the review as pretty GitHub-flavored Markdown and use all GitHub review features you can:",
       "start with ## Summary and ## Verdict sections, add a findings table with Severity | File:Line | Issue,",
       "use severity emojis (🔴 Critical, 🟠 High, 🟡 Medium, 🟢 Nit), file and line links, fenced code blocks,",
