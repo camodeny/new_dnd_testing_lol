@@ -28,7 +28,10 @@ depends_on: Union[str, Sequence[str], None] = None
 # every post-migration open/completion path binds explicit cursors.
 #
 # - START: estimate the arc opening as the first domain event at/after the
-#   adventure's opened timestamp (COALESCE 0 when no event qualifies).
+#   adventure's opened timestamp. When no such event exists yet (active
+#   adventure with an event-free arc at deploy time), fall back to the
+#   campaign's next sequence (max + 1) so the scope begins at deploy instead
+#   of silently degrading to full history (0).
 # - END: bind completed rows to their linked completion event
 #   (domain-event sequence == resulting campaign revision by invariant).
 # Kept as importable constants so the focused migration test executes the
@@ -37,7 +40,10 @@ BACKFILL_START_SQL = (
     "UPDATE adventures AS a SET start_sequence = COALESCE(("
     "SELECT MIN(e2.sequence) FROM campaign_domain_events AS e2 "
     "WHERE e2.campaign_id = a.campaign_id AND e2.created_at >= a.started_at"
-    "), 0) WHERE a.start_sequence = 0"
+    "), ("
+    "SELECT COALESCE(MAX(e3.sequence), 0) + 1 FROM campaign_domain_events AS e3 "
+    "WHERE e3.campaign_id = a.campaign_id"
+    ")) WHERE a.start_sequence = 0"
 )
 BACKFILL_END_SQL = (
     "UPDATE adventures AS a SET end_sequence = e.sequence, end_revision = e.sequence "

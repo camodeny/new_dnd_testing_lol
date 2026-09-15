@@ -556,8 +556,27 @@ def test_migration_backfills_legacy_source_bounds():
     assert "MIN(e2.sequence)" in src
     assert "e2.created_at >= a.started_at" in src
     assert "WHERE a.start_sequence = 0" in src
+    assert "COALESCE(MAX(e3.sequence), 0) + 1" in src
     assert "a.source_event_id = e.id" in src
     assert "a.end_sequence IS NULL" in src
+
+
+def _backfill_sql():
+    """Load the migration's exact deploy-time backfill SQL."""
+    import importlib.util
+    from pathlib import Path
+
+    spec = importlib.util.spec_from_file_location(
+        "legacy_migration_d3a263a1f263",
+        str(
+            Path(__file__).parent.parent / "alembic" / "versions"
+            / "d3a263a1f263_adventure_summary_recap_263.py"
+        ),
+    )
+    assert spec is not None and spec.loader is not None
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module.BACKFILL_START_SQL, module.BACKFILL_END_SQL
 
 
 def test_active_legacy_adventure_backfill_excludes_pre_open_events(api):
@@ -568,9 +587,6 @@ def test_active_legacy_adventure_backfill_excludes_pre_open_events(api):
     migration's own backfill SQL, then completes and asserts the derived
     summary excludes pre-open history.
     """
-    import importlib.util
-    from pathlib import Path
-
     import sqlalchemy as sa
 
     from app.campaigns.events import commit_campaign_mutation
@@ -612,19 +628,10 @@ def test_active_legacy_adventure_backfill_excludes_pre_open_events(api):
         )
         db.commit()
     # Execute the migration's exact deploy-time SQL.
-    spec = importlib.util.spec_from_file_location(
-        "legacy_migration_d3a263a1f263",
-        str(
-            Path(__file__).parent.parent / "alembic" / "versions"
-            / "d3a263a1f263_adventure_summary_recap_263.py"
-        ),
-    )
-    assert spec is not None and spec.loader is not None
-    module = importlib.util.module_from_spec(spec)
-    spec.loader.exec_module(module)
+    start_sql, end_sql = _backfill_sql()
     with factory() as db:
-        db.execute(sa.text(module.BACKFILL_START_SQL))
-        db.execute(sa.text(module.BACKFILL_END_SQL))
+        db.execute(sa.text(start_sql))
+        db.execute(sa.text(end_sql))
         db.commit()
         assert int(db.get(Adventure, uuid.UUID(adv["id"])).start_sequence) > 0
     with factory() as db:
@@ -642,6 +649,63 @@ def test_active_legacy_adventure_backfill_excludes_pre_open_events(api):
     assert "middle happening" in historical
     assert "fresh happening" in historical
     assert "ancient happening" not in historical
+
+
+def test_active_legacy_adventure_without_events_starts_at_next_sequence(api):
+    """No-event-at-migration edge: an active legacy adventure opened after
+    the campaign's latest event must backfill to the next sequence (not 0),
+    so post-deploy history stays in scope while pre-open history is out."""
+    import sqlalchemy as sa
+
+    from app.campaigns.events import commit_campaign_mutation
+    from datetime import datetime, timezone
+
+    client, factory, actor, owner = api
+    camp = _campaign(client)
+    cid = uuid.UUID(camp["id"])
+    with factory() as db:
+        camp_row = db.get(Campaign, cid)
+        commit_campaign_mutation(
+            db, cid, int(camp_row.revision),
+            event_type="dm.narration",
+            payload={"summary": "elder happening at the old chapel"},
+            operation_id="seed-elder-1", visibility="public",
+        )
+        elder = db.execute(
+            sa.select(CampaignDomainEvent).where(
+                CampaignDomainEvent.campaign_id == cid
+            ).order_by(CampaignDomainEvent.sequence.asc())
+        ).scalars().first()
+        elder.created_at = datetime(2020, 1, 1, tzinfo=timezone.utc)
+        db.commit()
+    adv = _open(client, camp["id"], key="op-open-legacy-noevent")
+    with factory() as db:
+        adv_row = db.get(Adventure, uuid.UUID(adv["id"]))
+        adv_row.start_sequence = 0
+        adv_row.started_at = datetime(2021, 1, 1, tzinfo=timezone.utc)
+        db.commit()
+    start_sql, end_sql = _backfill_sql()
+    with factory() as db:
+        db.execute(sa.text(start_sql))
+        db.execute(sa.text(end_sql))
+        db.commit()
+        # No event qualified at deploy time: scope begins at the next
+        # sequence (campaign max 1 + 1), never full history.
+        assert int(db.get(Adventure, uuid.UUID(adv["id"])).start_sequence) == 2
+    with factory() as db:
+        camp_row = db.get(Campaign, cid)
+        rev = int(camp_row.revision)
+        commit_campaign_mutation(
+            db, cid, rev,
+            event_type="dm.narration",
+            payload={"summary": "dawn happening at the far chapel"},
+            operation_id="seed-dawn-1", visibility="public",
+        )
+        rev2 = int(db.get(Campaign, cid).revision)
+    out = _complete(client, camp["id"], adv["id"], rev2, "op-complete-legacy-noevent")
+    historical = out["summary"]["historical_text"] or ""
+    assert "dawn happening" in historical
+    assert "elder happening" not in historical
 
 
 def test_legacy_completed_row_finalizes_from_source_event_not_max(api):
