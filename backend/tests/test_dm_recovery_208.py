@@ -789,6 +789,47 @@ def test_narration_only_retry_rejects_advanced_revision(db):
         retry_narration_only(s, camp_id, turn.id, attempt.id)
 
 
+def test_automatic_retry_executes_as_non_billable_recovery(db, monkeypatch):
+    """A retryable pre-visible failure requeues the same attempt; the next
+    sweep's run is recovery/non-billable, not fresh primary work."""
+    import json
+
+    from app.providers.contracts import ProviderError
+    from models.reliability import AIRun
+
+    s, camp_id, thread_id, _ = db
+    turn, attempt = _submit(s, camp_id, thread_id)
+    contract_json = json.dumps(_contract().model_dump(mode="json"))
+    calls = []
+
+    def _flaky_execute(adapter, request):
+        calls.append(1)
+        if len(calls) == 1:
+            raise ProviderError("timeout", kind="timeout", retryable=True)
+        return _ok_response(contract_json)
+
+    monkeypatch.setattr("app.dm.adjudication.resolve_dm_provider",
+                        lambda: (_FakeAdapter("primary"), "model-x", "primary"))
+    monkeypatch.setattr(role_policy, "execution_path",
+                        lambda role: [("primary", "model-x")])
+    monkeypatch.setattr(role_policy, "is_model_approved", lambda r, p, m: True)
+    import app.providers as providers_pkg
+
+    monkeypatch.setattr(providers_pkg, "execute_chat", _flaky_execute)
+
+    with pytest.raises(ProviderError):
+        execute_dm_attempt(s, attempt.id, narrator="deterministic")
+    assert s.get(DmTurnAttempt, attempt.id).status == "prepared"
+    assert s.get(DmTurnAttempt, attempt.id).retry_count == 1
+    result = execute_dm_attempt(s, attempt.id, narrator="deterministic")
+    assert result.attempt.status == "succeeded"
+    runs = sorted(s.execute(select(AIRun)).scalars().all(), key=lambda r: r.attempt)
+    assert len(runs) == 2
+    assert runs[0].classification == "primary" and runs[0].billable is True
+    assert runs[1].classification == "recovery" and runs[1].billable is False
+    assert all(r.status == "succeeded" or r.status == "failed" for r in runs)
+
+
 def test_superseded_attempt_executes_as_primary_billable(db, monkeypatch):
     """Ordinary pre-stream supersession is first-try work: primary/billable."""
     import json

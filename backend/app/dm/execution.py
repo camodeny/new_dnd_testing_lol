@@ -583,6 +583,10 @@ def _execute_owned_attempt(
             )
         except Exception:
             _is_explicit_retry = False
+    # Automatic same-attempt retries (a pre-visibility transient requeued
+    # with retry_count > 0) are recovery work too.
+    _is_recovery_retry = _is_explicit_retry or int(
+        getattr(attempt, "retry_count", 0) or 0) > 0
     adapter = None
     model = None
     pname = provider_name
@@ -605,7 +609,7 @@ def _execute_owned_attempt(
                     # Explicit-Retry attempts carry retry lineage: even the
                     # first provider call is recovery/non-billable so failed
                     # work is never double-charged.
-                    is_retry=_is_explicit_retry,
+                    is_retry=_is_recovery_retry,
                 )
                 path_info.update(info)
                 return contract
@@ -725,7 +729,7 @@ def _execute_owned_attempt(
 
             narrator = build_provider_narrator(
                 timeout_seconds=timeout_seconds,
-                db=db, trace_id=tid, is_retry=_is_explicit_retry,
+                db=db, trace_id=tid, is_retry=_is_recovery_retry,
             )
         except Exception as exc:
             db.rollback()
