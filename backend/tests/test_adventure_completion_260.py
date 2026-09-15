@@ -351,6 +351,48 @@ def test_staged_effect_completes_adventure_in_turn_commit(setup):
         assert db.get(Campaign, camp_id).status == "active"
 
 
+def test_staged_effect_completion_binds_exact_source_range(setup):
+    """Staged-DM completions finalize AFTER the authoritative event exists.
+
+    The derived summary's end cursor must equal the promoted
+    adventure.completed event sequence / campaign revision — not the
+    pre-commit values visible inside the effect handler.
+    """
+    from models.campaigns import AdventureSummary
+    from models.dm import DmTurn
+    from models.threads import CampaignThread
+
+    factory, camp_id, owner = setup
+    thread_id = uuid.uuid4()
+    with factory() as db:
+        db.add(CampaignThread(id=thread_id, campaign_id=camp_id, thread_type="campaign", created_by=owner))
+        adv = start_adventure(db, camp_id, "Range arc")
+        adv_id = adv.id
+        turn, attempt = _streaming_turn_with_completion_effect(db, camp_id, thread_id)
+        turn_id, attempt_id = turn.id, attempt.id
+        db.commit()
+    with factory() as db:
+        from app.dm.turns import commit_turn
+
+        turn, attempt, event = commit_turn(db, turn_id, attempt_id)
+        db.commit()
+        assert event.event_type == "adventure.completed"
+        event_seq = int(event.sequence)
+        camp_rev = int(db.get(Campaign, camp_id).revision)
+    with factory() as db:
+        adv = db.get(Adventure, adv_id)
+        assert adv.status == "completed"
+        assert adv.source_event_id is not None
+        assert adv.end_sequence == event_seq
+        assert adv.end_revision == camp_rev
+        row = db.execute(
+            select(AdventureSummary).where(AdventureSummary.adventure_id == adv_id)
+        ).scalars().first()
+        assert row is not None and row.status == "current"
+        assert row.source_event_to == event_seq
+        assert "Range arc" in (row.historical_text or "")
+
+
 def test_staged_effect_duplicate_retry_is_idempotent(setup):
     from models.threads import CampaignThread
 
