@@ -497,7 +497,7 @@ def run_adventure_closing_sweep(db: Session, *, limit: int = 5, max_attempts: in
     from sqlalchemy import or_ as _or_
 
     from app.outbox.service import ack_published, envelope_for_outbox, mark_failed
-    from app.worker.executor import execute_worker_job
+    from app.worker.executor import TerminalError, execute_worker_job
     from models.reliability import Outbox
 
     now = _datetime.now(_timezone.utc)
@@ -526,6 +526,22 @@ def run_adventure_closing_sweep(db: Session, *, limit: int = 5, max_attempts: in
             )
             ack_published(db, row.id)
             executed.append(str(row.id))
+        except TerminalError as exc:
+            # The worker ledger durably owns the terminal outcome
+            # (dead_letter): retire the transport row so a poisoned job can
+            # never be reselected or starve newer closing work. The
+            # adventure itself stays completed; only best-effort closing
+            # remains failed and inspectable.
+            try:
+                db.rollback()
+            except Exception:
+                pass
+            ack_published(db, row.id)
+            logger.warning(
+                "adventure closing sweep retired terminal outbox_id=%s error=%s",
+                row.id, exc,
+            )
+            failed.append({"outbox_id": str(row.id), "error": str(exc)[:300], "terminal": True})
         except Exception as exc:  # noqa: BLE001 — sweep must survive bad rows
             try:
                 db.rollback()

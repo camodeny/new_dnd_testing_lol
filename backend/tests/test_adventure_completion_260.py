@@ -655,3 +655,58 @@ def test_closing_sweep_converges_pending_work(setup):
         assert db.get(Outbox, row.id).status == "published"
         # Second sweep finds nothing to do.
         assert run_adventure_closing_sweep(db)["executed"] == []
+
+
+def test_terminal_closing_job_retires_without_starving_newer_work(setup, monkeypatch):
+    import app.adventures.service as svc
+    from app.adventures.service import run_adventure_closing_sweep
+    from models.reliability import Outbox
+
+    factory, camp_id, _owner = setup
+    with factory() as db:
+        start_adventure(db, camp_id, "Poison arc")
+    adv_a, _ = _complete(factory, camp_id, "death", "op-poison")
+    with factory() as db:
+        start_adventure(db, camp_id, "Fresh arc")
+    adv_b, _ = _complete(factory, camp_id, "victory", "op-fresh")
+
+    real_followups = svc._run_closing_followups
+
+    def _flaky(db, adventure):
+        if str(adventure.id) == str(adv_a.id):
+            raise RuntimeError("recap store offline")
+        return real_followups(db, adventure)
+
+    monkeypatch.setattr(svc, "_run_closing_followups", _flaky)
+
+    def _rows(db):
+        return {
+            str(r.id): r.status
+            for r in db.execute(select(Outbox).where(Outbox.event_type == "adventure.closing"))
+            .scalars().all()
+        }
+
+    with factory() as db:
+        # Oldest-first with limit=1 hits the poisoned row: exhaustion is
+        # terminal, so the transport row retires instead of requeueing.
+        first = run_adventure_closing_sweep(db, limit=1, max_attempts=1)
+        assert first["executed"] == []
+        assert len(first["failed"]) == 1 and first["failed"][0]["terminal"] is True
+        statuses = _rows(db)
+        assert len(statuses) == 2
+        assert all(s == "published" for s in statuses.values()) is False
+        retired = [k for k, v in statuses.items() if v == "published"]
+        assert len(retired) == 1
+    with factory() as db:
+        # The terminal row is never reselected; the newer job still runs.
+        second = run_adventure_closing_sweep(db, limit=10)
+        assert len(second["executed"]) == 1
+        assert second["failed"] == []
+        assert db.get(Adventure, adv_b.id).closing_status == "succeeded"
+    with factory() as db:
+        third = run_adventure_closing_sweep(db, limit=10)
+        assert third["executed"] == [] and third["failed"] == []
+        # Narrative completion stands; only best-effort closing failed.
+        poisoned = db.get(Adventure, adv_a.id)
+        assert poisoned.status == "completed" and poisoned.outcome == "death"
+        assert poisoned.closing_status == "failed"
