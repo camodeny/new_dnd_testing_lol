@@ -1,7 +1,7 @@
 """adventure lifecycle — issue #260 (additive).
 
 Revision ID: f3a1c9260d26
-Revises: c41d210f9a07, c4d216e8901a (merge + additive)
+Revises: d266c0de2660 (rebased onto main after #369 merge)
 
 Additive only: lightweight adventure/arc records linked to campaigns.
 Does not touch existing tables.
@@ -14,7 +14,7 @@ import sqlalchemy as sa
 from sqlalchemy.dialects import postgresql
 
 revision: str = "f3a1c9260d26"
-down_revision: Union[str, Sequence[str], None] = ("c41d210f9a07", "c4d216e8901a")
+down_revision: Union[str, Sequence[str], None] = "d266c0de2660"
 branch_labels: Union[str, Sequence[str], None] = None
 depends_on: Union[str, Sequence[str], None] = None
 

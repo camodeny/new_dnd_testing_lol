@@ -252,3 +252,74 @@ class Adventure(Base):
             "started_at": self.started_at.isoformat() if self.started_at else None,
             "completed_at": self.completed_at.isoformat() if self.completed_at else None,
         }
+
+
+class CampaignPcLifecycle(Base):
+    """Replacement-character lifecycle — issue #266.
+
+    One row per (campaign, player character). Launch PCs backfill to
+    ``active`` on first touch; death/retirement flips the row to a terminal
+    ``dead``/``retired`` state that is never deleted — the dead PC's sheet,
+    inventory, and world relationships stay intact as historical canon.
+
+    A replacement PC gets its own ``active`` row linked to the fallen PC via
+    ``replacement_of_character_id`` (and the reverse ``replaced_by`` pointer
+    on the dead row) plus an ``introduction_status`` so the AI DM introduces
+    the newcomer through normal forward-DM play (domain events surface in
+    RECENT_HISTORY) instead of silently teleporting them into the party.
+    """
+
+    __tablename__ = "campaign_pc_lifecycles"
+    __table_args__ = (
+        CheckConstraint(
+            "status IN ('active', 'dead', 'retired')",
+            name="ck_pc_lifecycles_status",
+        ),
+        CheckConstraint(
+            "introduction_status IN ('na', 'pending_introduction', 'introduced')",
+            name="ck_pc_lifecycles_introduction_status",
+        ),
+    )
+
+    campaign_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("campaigns.id", ondelete="CASCADE"), primary_key=True
+    )
+    character_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("characters.id", ondelete="CASCADE"), primary_key=True
+    )
+    user_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("profiles.id", ondelete="CASCADE"), nullable=False, index=True
+    )
+    status: Mapped[str] = mapped_column(String(16), nullable=False, default="active", server_default="active")
+    cause: Mapped[str | None] = mapped_column(Text, nullable=True)
+    died_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    is_tpk: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False, server_default="false")
+    replaced_by_character_id: Mapped[uuid.UUID | None] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("characters.id", ondelete="SET NULL"), nullable=True, default=None
+    )
+    replacement_of_character_id: Mapped[uuid.UUID | None] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("characters.id", ondelete="SET NULL"), nullable=True, default=None
+    )
+    introduction_status: Mapped[str] = mapped_column(
+        String(24), nullable=False, default="na", server_default="na"
+    )
+    introduced_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now(), nullable=False)
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now(), onupdate=func.now(), nullable=False
+    )
+
+    def to_dict(self):
+        return {
+            "campaign_id": str(self.campaign_id),
+            "character_id": str(self.character_id),
+            "user_id": str(self.user_id),
+            "status": self.status,
+            "cause": self.cause,
+            "died_at": self.died_at.isoformat() if self.died_at else None,
+            "is_tpk": bool(self.is_tpk),
+            "replaced_by_character_id": str(self.replaced_by_character_id) if self.replaced_by_character_id else None,
+            "replacement_of_character_id": str(self.replacement_of_character_id) if self.replacement_of_character_id else None,
+            "introduction_status": self.introduction_status,
+            "introduced_at": self.introduced_at.isoformat() if self.introduced_at else None,
+        }
