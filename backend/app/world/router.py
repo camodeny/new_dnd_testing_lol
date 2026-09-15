@@ -17,6 +17,23 @@ from app.campaigns.events import RevisionConflictError
 from app.campaigns.service import is_campaign_member, parse_campaign_id
 from app.deps.auth import resolve_profile
 from app.deps.idempotency import execute_http_idempotent, require_idempotency_key
+from app.world.knowledge import (
+    create_fact_authoritative,
+    create_relation_authoritative,
+    fact_visible_to_viewer,
+    filter_facts_for_viewer,
+    filter_relations_for_viewer,
+    get_fact_strict,
+    get_relation_strict,
+    list_facts,
+    list_relations,
+    relation_visible_to_viewer,
+    supersede_fact_authoritative,
+    supersede_relation_authoritative,
+    validate_epistemic_state,
+    validate_fact_content,
+    validate_relation_type,
+)
 from app.world.service import (
     UNSET,
     create_entity_authoritative,
@@ -211,6 +228,346 @@ def api_create_entity(
             db, response, actor_id=profile.id, idempotency_key=idempotency_key,
             command_type="world.entity_created", scope_type="campaign", scope_id=cid,
             payload=payload, execute=_execute,
+        )
+    except RevisionConflictError as exc:
+        raise HTTPException(
+            status_code=409, detail=str(exc),
+            headers={"X-Current-Revision": str(exc.actual_revision)},
+        ) from exc
+
+
+# ── Relations (issue #210) ──────────────────────────────────────────────────
+
+@router.get("/api/campaigns/{campaign_id}/world/relations")
+def api_list_relations(
+    campaign_id: str, request: Request, db: Session = Depends(get_db),
+    subject_entity_id: str | None = None, object_entity_id: str | None = None,
+    entity_id: str | None = None, relation_type: str | None = None,
+    epistemic_state: str | None = None, include_history: bool = False,
+    limit: int = 100,
+):
+    profile = resolve_profile(request, db)
+    cid = _parse_campaign(campaign_id)
+    camp = _campaign_or_403(db, cid, profile)
+    authority = is_world_authority(camp, profile.id)
+    try:
+        relations = list_relations(
+            db, camp.id, subject_entity_id=subject_entity_id,
+            object_entity_id=object_entity_id, entity_id=entity_id,
+            relation_type=relation_type, epistemic_state=epistemic_state,
+            include_history=include_history, limit=limit,
+            exclude_restricted=not authority,
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    # Defense in depth: SQL already excluded restricted rows for members.
+    relations = filter_relations_for_viewer(relations, authority)
+    return {"relations": [r.to_dict() for r in relations], "revision": camp.revision}
+
+
+@router.post("/api/campaigns/{campaign_id}/world/relations")
+def api_create_relation(
+    campaign_id: str, payload: dict, request: Request, response: Response,
+    db: Session = Depends(get_db),
+):
+    profile = resolve_profile(request, db)
+    cid = _parse_campaign(campaign_id)
+    camp = _campaign_or_403(db, cid, profile)
+    if camp.owner_id != profile.id:
+        raise HTTPException(status_code=403, detail="Only the owner can create world relations")
+    expected = _expected_revision(payload)
+    operation_id = str(payload.get("operation_id") or "").strip() or None
+    idempotency_key = require_idempotency_key(request, operation_id or payload.get("idempotency_key"))
+    try:
+        validate_relation_type(payload.get("relation_type"))
+        if payload.get("epistemic_state") is not None:
+            validate_epistemic_state(payload.get("epistemic_state"))
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+    def _execute():
+        try:
+            relation, event = create_relation_authoritative(
+                db, cid, expected,
+                subject_entity_id=payload.get("subject_entity_id"),
+                relation_type=payload.get("relation_type") or "",
+                object_entity_id=payload.get("object_entity_id"),
+                object_label=payload.get("object_label"),
+                epistemic_state=payload.get("epistemic_state") or "claimed",
+                visibility=payload.get("visibility"),
+                grants=payload.get("grants") if isinstance(payload.get("grants"), dict) else None,
+                provenance=payload.get("provenance") if isinstance(payload.get("provenance"), dict) else None,
+                details=payload.get("details") if isinstance(payload.get("details"), dict) else None,
+                operation_id=operation_id or idempotency_key,
+                actor_id=profile.id,
+                idempotency_key=str(payload.get("idempotency_key") or operation_id or idempotency_key),
+            )
+        except RevisionConflictError as exc:
+            raise HTTPException(
+                status_code=409, detail=str(exc),
+                headers={"X-Current-Revision": str(exc.actual_revision)},
+            ) from exc
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+        return {
+            "relation": relation.to_dict(),
+            "event": event.to_dict() if event else None,
+            "duplicate": event is None,
+        }
+
+    try:
+        return execute_http_idempotent(
+            db, response, actor_id=profile.id, idempotency_key=idempotency_key,
+            command_type="world.relation_created", scope_type="campaign", scope_id=cid,
+            payload=payload, execute=_execute,
+        )
+    except RevisionConflictError as exc:
+        raise HTTPException(
+            status_code=409, detail=str(exc),
+            headers={"X-Current-Revision": str(exc.actual_revision)},
+        ) from exc
+
+
+@router.get("/api/campaigns/{campaign_id}/world/relations/{relation_id}")
+def api_get_relation(campaign_id: str, relation_id: str, request: Request, db: Session = Depends(get_db)):
+    profile = resolve_profile(request, db)
+    cid = _parse_campaign(campaign_id)
+    camp = _campaign_or_403(db, cid, profile)
+    try:
+        rid = uuid_lib.UUID(str(relation_id))
+    except ValueError:
+        raise HTTPException(status_code=404, detail="Invalid relation id")
+    try:
+        relation = get_relation_strict(db, cid, rid)
+    except ValueError:
+        raise HTTPException(status_code=404, detail="World relation not found")
+    if not relation_visible_to_viewer(relation, is_world_authority(camp, profile.id)):
+        raise HTTPException(status_code=404, detail="World relation not found")
+    return {"relation": relation.to_dict()}
+
+
+@router.post("/api/campaigns/{campaign_id}/world/relations/{relation_id}/supersede")
+def api_supersede_relation(
+    campaign_id: str, relation_id: str, payload: dict, request: Request, response: Response,
+    db: Session = Depends(get_db),
+):
+    profile = resolve_profile(request, db)
+    cid = _parse_campaign(campaign_id)
+    camp = _campaign_or_403(db, cid, profile)
+    if camp.owner_id != profile.id:
+        raise HTTPException(status_code=403, detail="Only the owner can supersede world relations")
+    try:
+        rid = uuid_lib.UUID(str(relation_id))
+    except ValueError:
+        raise HTTPException(status_code=404, detail="Invalid relation id")
+    expected = _expected_revision(payload)
+    operation_id = str(payload.get("operation_id") or "").strip() or None
+    idempotency_key = require_idempotency_key(request, operation_id or payload.get("idempotency_key"))
+
+    def _execute():
+        try:
+            from app.world.service import UNSET as _UNSET
+            relation, event = supersede_relation_authoritative(
+                db, cid, expected, rid,
+                subject_entity_id=payload.get("subject_entity_id"),
+                relation_type=payload.get("relation_type"),
+                # Key-presence: explicit null clears the object side while
+                # omission inherits the prior reference.
+                object_entity_id=payload["object_entity_id"] if "object_entity_id" in payload else _UNSET,
+                object_label=payload["object_label"] if "object_label" in payload else _UNSET,
+                epistemic_state=payload.get("epistemic_state"),
+                new_status=payload.get("new_status") or "active",
+                visibility=payload.get("visibility"),
+                grants=payload.get("grants") if isinstance(payload.get("grants"), dict) else None,
+                provenance=payload.get("provenance") if isinstance(payload.get("provenance"), dict) else None,
+                details=payload.get("details") if isinstance(payload.get("details"), dict) else None,
+                clear_object=bool(payload.get("clear_object", False)),
+                operation_id=operation_id or idempotency_key,
+                actor_id=profile.id,
+                idempotency_key=str(payload.get("idempotency_key") or operation_id or idempotency_key),
+            )
+        except RevisionConflictError as exc:
+            raise HTTPException(
+                status_code=409, detail=str(exc),
+                headers={"X-Current-Revision": str(exc.actual_revision)},
+            ) from exc
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+        return {
+            "relation": relation.to_dict(),
+            "event": event.to_dict() if event else None,
+            "duplicate": event is None,
+        }
+
+    try:
+        return execute_http_idempotent(
+            db, response, actor_id=profile.id, idempotency_key=idempotency_key,
+            command_type="world.relation_superseded", scope_type="campaign", scope_id=cid,
+            payload={**payload, "prior_relation_id": str(rid)}, execute=_execute,
+        )
+    except RevisionConflictError as exc:
+        raise HTTPException(
+            status_code=409, detail=str(exc),
+            headers={"X-Current-Revision": str(exc.actual_revision)},
+        ) from exc
+
+
+# ── Facts (issue #210) ──────────────────────────────────────────────────────
+
+@router.get("/api/campaigns/{campaign_id}/world/facts")
+def api_list_facts(
+    campaign_id: str, request: Request, db: Session = Depends(get_db),
+    entity_id: str | None = None, epistemic_state: str | None = None,
+    include_history: bool = False, limit: int = 100,
+):
+    profile = resolve_profile(request, db)
+    cid = _parse_campaign(campaign_id)
+    camp = _campaign_or_403(db, cid, profile)
+    authority = is_world_authority(camp, profile.id)
+    try:
+        facts = list_facts(
+            db, camp.id, entity_id=entity_id, epistemic_state=epistemic_state,
+            include_history=include_history, limit=limit,
+            exclude_restricted=not authority,
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    # Defense in depth: SQL already excluded restricted rows for members.
+    facts = filter_facts_for_viewer(facts, authority)
+    return {"facts": [f.to_dict() for f in facts], "revision": camp.revision}
+
+
+@router.post("/api/campaigns/{campaign_id}/world/facts")
+def api_create_fact(
+    campaign_id: str, payload: dict, request: Request, response: Response,
+    db: Session = Depends(get_db),
+):
+    profile = resolve_profile(request, db)
+    cid = _parse_campaign(campaign_id)
+    camp = _campaign_or_403(db, cid, profile)
+    if camp.owner_id != profile.id:
+        raise HTTPException(status_code=403, detail="Only the owner can assert world facts")
+    expected = _expected_revision(payload)
+    operation_id = str(payload.get("operation_id") or "").strip() or None
+    idempotency_key = require_idempotency_key(request, operation_id or payload.get("idempotency_key"))
+    try:
+        validate_fact_content(payload.get("content"))
+        if payload.get("epistemic_state") is not None:
+            validate_epistemic_state(payload.get("epistemic_state"))
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+    def _execute():
+        try:
+            fact, event = create_fact_authoritative(
+                db, cid, expected,
+                content=payload.get("content") or "",
+                entity_refs=payload.get("entity_refs"),
+                epistemic_state=payload.get("epistemic_state") or "claimed",
+                visibility=payload.get("visibility"),
+                grants=payload.get("grants") if isinstance(payload.get("grants"), dict) else None,
+                provenance=payload.get("provenance") if isinstance(payload.get("provenance"), dict) else None,
+                details=payload.get("details") if isinstance(payload.get("details"), dict) else None,
+                operation_id=operation_id or idempotency_key,
+                actor_id=profile.id,
+                idempotency_key=str(payload.get("idempotency_key") or operation_id or idempotency_key),
+            )
+        except RevisionConflictError as exc:
+            raise HTTPException(
+                status_code=409, detail=str(exc),
+                headers={"X-Current-Revision": str(exc.actual_revision)},
+            ) from exc
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+        return {
+            "fact": fact.to_dict(),
+            "event": event.to_dict() if event else None,
+            "duplicate": event is None,
+        }
+
+    try:
+        return execute_http_idempotent(
+            db, response, actor_id=profile.id, idempotency_key=idempotency_key,
+            command_type="world.fact_asserted", scope_type="campaign", scope_id=cid,
+            payload=payload, execute=_execute,
+        )
+    except RevisionConflictError as exc:
+        raise HTTPException(
+            status_code=409, detail=str(exc),
+            headers={"X-Current-Revision": str(exc.actual_revision)},
+        ) from exc
+
+
+@router.get("/api/campaigns/{campaign_id}/world/facts/{fact_id}")
+def api_get_fact(campaign_id: str, fact_id: str, request: Request, db: Session = Depends(get_db)):
+    profile = resolve_profile(request, db)
+    cid = _parse_campaign(campaign_id)
+    camp = _campaign_or_403(db, cid, profile)
+    try:
+        fid = uuid_lib.UUID(str(fact_id))
+    except ValueError:
+        raise HTTPException(status_code=404, detail="Invalid fact id")
+    try:
+        fact = get_fact_strict(db, cid, fid)
+    except ValueError:
+        raise HTTPException(status_code=404, detail="World fact not found")
+    if not fact_visible_to_viewer(fact, is_world_authority(camp, profile.id)):
+        raise HTTPException(status_code=404, detail="World fact not found")
+    return {"fact": fact.to_dict()}
+
+
+@router.post("/api/campaigns/{campaign_id}/world/facts/{fact_id}/supersede")
+def api_supersede_fact(
+    campaign_id: str, fact_id: str, payload: dict, request: Request, response: Response,
+    db: Session = Depends(get_db),
+):
+    profile = resolve_profile(request, db)
+    cid = _parse_campaign(campaign_id)
+    camp = _campaign_or_403(db, cid, profile)
+    if camp.owner_id != profile.id:
+        raise HTTPException(status_code=403, detail="Only the owner can supersede world facts")
+    try:
+        fid = uuid_lib.UUID(str(fact_id))
+    except ValueError:
+        raise HTTPException(status_code=404, detail="Invalid fact id")
+    expected = _expected_revision(payload)
+    operation_id = str(payload.get("operation_id") or "").strip() or None
+    idempotency_key = require_idempotency_key(request, operation_id or payload.get("idempotency_key"))
+
+    def _execute():
+        try:
+            fact, event = supersede_fact_authoritative(
+                db, cid, expected, fid,
+                content=payload.get("content"),
+                entity_refs=payload.get("entity_refs"),
+                epistemic_state=payload.get("epistemic_state"),
+                new_status=payload.get("new_status") or "active",
+                visibility=payload.get("visibility"),
+                grants=payload.get("grants") if isinstance(payload.get("grants"), dict) else None,
+                provenance=payload.get("provenance") if isinstance(payload.get("provenance"), dict) else None,
+                details=payload.get("details") if isinstance(payload.get("details"), dict) else None,
+                operation_id=operation_id or idempotency_key,
+                actor_id=profile.id,
+                idempotency_key=str(payload.get("idempotency_key") or operation_id or idempotency_key),
+            )
+        except RevisionConflictError as exc:
+            raise HTTPException(
+                status_code=409, detail=str(exc),
+                headers={"X-Current-Revision": str(exc.actual_revision)},
+            ) from exc
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+        return {
+            "fact": fact.to_dict(),
+            "event": event.to_dict() if event else None,
+            "duplicate": event is None,
+        }
+
+    try:
+        return execute_http_idempotent(
+            db, response, actor_id=profile.id, idempotency_key=idempotency_key,
+            command_type="world.fact_superseded", scope_type="campaign", scope_id=cid,
+            payload={**payload, "prior_fact_id": str(fid)}, execute=_execute,
         )
     except RevisionConflictError as exc:
         raise HTTPException(

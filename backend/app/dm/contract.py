@@ -277,6 +277,8 @@ STAGED_EFFECT_TYPES = (
     "update_scene",
     "reveal_fact",
     "propose_sheet_update",
+    "assert_fact",
+    "upsert_relation",
 )
 
 class RecordWorldEventArgs(StrictModel):
@@ -296,6 +298,38 @@ class RevealFactArgs(StrictModel):
     visibility: Literal["public", "party_known", "dm_private"]
     reason: str = Field(min_length=1, max_length=400)
 
+class AssertFactArgs(StrictModel):
+    """Durable epistemic fact assertion — issue #210.
+
+    A bare claim stores as non-``confirmed`` epistemic state by default, so a
+    player/NPC utterance never becomes objective truth implicitly.
+    ``supersedes_fact_id`` creates a new version preserving history.
+    """
+    content: str = Field(min_length=1, max_length=2000)
+    epistemic_state: Literal["confirmed", "false", "believed", "suspected", "claimed", "unknown", "retconned"] = "claimed"
+    visibility: Literal["public", "campaign", "private", "dm_only", "party_known", "dm_private"] = "dm_only"
+    entity_refs: list[str] = Field(default_factory=list, max_length=24)
+    provenance: dict[str, Any] | None = None
+    supersedes_fact_id: str | None = Field(default=None, max_length=160)
+    idempotency_key: str | None = Field(default=None, max_length=128)
+
+class UpsertRelationArgs(StrictModel):
+    """Durable world-relation write — issue #210.
+
+    Creates a new relation version, or supersedes ``supersedes_relation_id``
+    (history preserved, never destructively overwritten).
+    """
+    subject_entity_id: str = Field(min_length=1, max_length=160)
+    relation_type: str = Field(min_length=2, max_length=64)
+    object_entity_id: str | None = Field(default=None, max_length=160)
+    object_label: str | None = Field(default=None, max_length=256)
+    epistemic_state: Literal["confirmed", "false", "believed", "suspected", "claimed", "unknown", "retconned"] = "claimed"
+    visibility: Literal["public", "campaign", "private", "dm_only", "party_known", "dm_private"] = "dm_only"
+    provenance: dict[str, Any] | None = None
+    supersedes_relation_id: str | None = Field(default=None, max_length=160)
+    clear_object: bool = False
+    idempotency_key: str | None = Field(default=None, max_length=128)
+
 class ProposeSheetUpdateArgs(StrictModel):
     character_id: str | int = Field(description="Durable character id; proposal remains pending")
     reason: str = Field(min_length=1, max_length=400)
@@ -313,12 +347,12 @@ class ProposeSheetUpdateArgs(StrictModel):
                 raise ValueError("operation must be add|subtract|set")
         return v
 
-StagedEffectArgs = RecordWorldEventArgs | UpdateSceneArgs | RevealFactArgs | ProposeSheetUpdateArgs
+StagedEffectArgs = RecordWorldEventArgs | UpdateSceneArgs | RevealFactArgs | ProposeSheetUpdateArgs | AssertFactArgs | UpsertRelationArgs
 
 class StagedEffect(StrictModel):
     """One typed, non-generic staged effect.  Must not encode arbitrary SQL."""
     id: str = Field(min_length=1, max_length=48)
-    effect_type: Literal["record_world_event", "update_scene", "reveal_fact", "propose_sheet_update"] = Field(description="Typed effect; no generic SQL capability")
+    effect_type: Literal["record_world_event", "update_scene", "reveal_fact", "propose_sheet_update", "assert_fact", "upsert_relation"] = Field(description="Typed effect; no generic SQL capability")
     arguments: dict[str, Any] = Field(description="Effect-specific payload validated by effect_type")
 
     @field_validator("id")
@@ -358,6 +392,10 @@ class StagedEffect(StrictModel):
                 RevealFactArgs.model_validate(args)
             elif t == "propose_sheet_update":
                 ProposeSheetUpdateArgs.model_validate(args)
+            elif t == "assert_fact":
+                AssertFactArgs.model_validate(args)
+            elif t == "upsert_relation":
+                UpsertRelationArgs.model_validate(args)
         except Exception as e:
             raise ValueError(f"arguments invalid for effect_type={t}: {e}") from e
         # Generic SQL guard: reject any argument that looks like raw SQL / db mutation
@@ -557,6 +595,25 @@ class DmTurnContractV1(StrictModel):
                 raise ValueError("unsupported must not have evidence_requests, roll_request, staged_effects, or new_entities")
             if self.table_chat_intent is not None or self.safe_prelude is not None or self.clarify_question is not None:
                 raise ValueError("unsupported must not have table_chat_intent/safe_prelude/clarify_question")
+
+        # Staged-effect IDs must be unique: downstream idempotency keys
+        # derive from attempt.id + effect.id (issue #210), so duplicate IDs
+        # would collapse distinct writes into one key and silently drop the
+        # later effect while the turn still commits successfully.
+        effect_ids = [e.id for e in (self.staged_effects or [])]
+        if len(effect_ids) != len(set(effect_ids)):
+            raise ValueError("staged_effect ids must be unique")
+        # Explicit per-effect idempotency keys override the generated
+        # attempt.id + effect.id namespace (issue #210), so duplicates here
+        # would collapse distinct writes into one durable key and silently
+        # drop the later effect while the turn still commits successfully.
+        explicit_keys = [
+            str((e.arguments or {}).get("idempotency_key") or "").strip()
+            for e in (self.staged_effects or [])
+        ]
+        explicit_keys = [k for k in explicit_keys if k]
+        if len(explicit_keys) != len(set(explicit_keys)):
+            raise ValueError("staged_effect explicit idempotency keys must be unique")
 
         # Global cross-field: new_entities only in respond
         if self.new_entities and m != "respond":
