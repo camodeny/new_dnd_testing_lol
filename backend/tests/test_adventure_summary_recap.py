@@ -22,7 +22,7 @@ if not hasattr(SQLiteTypeCompiler, "_patched_jsonb"):
 from app.auth.service import TEST_USER_ID  # noqa: E402
 from database import Base, get_db  # noqa: E402
 from main import app  # noqa: E402
-from models.adventures import Adventure, AdventureSummary  # noqa: E402
+from models.campaigns import Adventure, AdventureSummary  # noqa: E402
 from models.campaigns import Campaign, CampaignMember  # noqa: E402
 from models.profiles import Profile  # noqa: E402
 
@@ -411,7 +411,7 @@ def test_player_members_cannot_perform_dm_declared_mutations(api):
         actor["id"] = owner
     with factory() as db:
         assert int(db.get(Campaign, uuid.UUID(camp["id"])).revision) == rev0
-        assert db.get(Adventure, uuid.UUID(adv["id"])).status == "open"
+        assert db.get(Adventure, uuid.UUID(adv["id"])).status == "active"
 
 
 def test_default_source_range_excludes_pre_open_event(api):

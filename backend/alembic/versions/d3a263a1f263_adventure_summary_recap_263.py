@@ -1,10 +1,11 @@
-"""adventure lifecycle + derived summary/recap — issue #263 (additive).
+"""adventure derived summary/recap — issue #263 (additive).
 
 Revision ID: d3a263a1f263
-Revises: c4d216e8901a, c41d210f9a07 (merge — both were heads)
+Revises: f3a1c9260d26 (issue #260 adventure lifecycle — the canonical
+adventures table; this revision only extends it)
 
-Additive only: creates adventures + adventure_summaries. Does not touch
-existing tables.
+Additive only: adds the summary source-range columns to ``adventures`` and
+creates ``adventure_summaries``. Never creates a second adventures table.
 """
 
 from typing import Sequence, Union
@@ -14,40 +15,19 @@ import sqlalchemy as sa
 from sqlalchemy.dialects import postgresql
 
 revision: str = "d3a263a1f263"
-down_revision: Union[str, Sequence[str], None] = ("c4d216e8901a", "c41d210f9a07")
+down_revision: Union[str, Sequence[str], None] = "f3a1c9260d26"
 branch_labels: Union[str, Sequence[str], None] = None
 depends_on: Union[str, Sequence[str], None] = None
 
 
 def upgrade() -> None:
-    op.create_table(
+    # Source-range boundary for derived summaries on the canonical #260 table.
+    op.add_column(
         "adventures",
-        sa.Column("id", postgresql.UUID(as_uuid=True), primary_key=True),
-        sa.Column("campaign_id", postgresql.UUID(as_uuid=True), sa.ForeignKey("campaigns.id", ondelete="CASCADE"), nullable=False, index=True),
-        sa.Column("title", sa.String(length=256), nullable=False, server_default="Untitled Adventure"),
-        sa.Column("status", sa.String(length=16), nullable=False, server_default="open"),
-        sa.Column("outcome", sa.String(length=32), nullable=True),
-        sa.Column("outcome_reason", sa.Text(), nullable=True),
-        sa.Column("source_turn_id", postgresql.UUID(as_uuid=True), nullable=True),
-        sa.Column("source_attempt_id", postgresql.UUID(as_uuid=True), nullable=True),
-        sa.Column("source_event_id", postgresql.UUID(as_uuid=True), nullable=True),
         sa.Column("start_sequence", sa.Integer(), nullable=False, server_default=sa.text("0")),
-        sa.Column("end_sequence", sa.Integer(), nullable=True),
-        sa.Column("end_revision", sa.Integer(), nullable=True),
-        sa.Column("operation_id", sa.String(length=128), nullable=True),
-        sa.Column("idempotency_key", sa.String(length=128), nullable=True),
-        sa.Column("extra", postgresql.JSONB(astext_type=sa.Text()), nullable=True),
-        sa.Column("created_at", sa.DateTime(timezone=True), server_default=sa.func.now(), nullable=False),
-        sa.Column("completed_at", sa.DateTime(timezone=True), nullable=True),
-        sa.UniqueConstraint("campaign_id", "idempotency_key", name="uq_adventures_campaign_idempotency"),
-        sa.CheckConstraint("status IN ('open', 'completed')", name="ck_adventures_status"),
-        sa.CheckConstraint(
-            "outcome IS NULL OR outcome IN "
-            "('victory','defeat','retreat','capture','tpk','villain_victory','draw','pyrrhic_victory')",
-            name="ck_adventures_outcome",
-        ),
     )
-    op.create_index("ix_adventures_campaign_status", "adventures", ["campaign_id", "status"])
+    op.add_column("adventures", sa.Column("end_sequence", sa.Integer(), nullable=True))
+    op.add_column("adventures", sa.Column("end_revision", sa.Integer(), nullable=True))
     op.create_table(
         "adventure_summaries",
         sa.Column("id", postgresql.UUID(as_uuid=True), primary_key=True),
@@ -83,5 +63,6 @@ def upgrade() -> None:
 def downgrade() -> None:
     op.drop_index("ix_adventure_summaries_campaign", table_name="adventure_summaries")
     op.drop_table("adventure_summaries")
-    op.drop_index("ix_adventures_campaign_status", table_name="adventures")
-    op.drop_table("adventures")
+    op.drop_column("adventures", "end_revision")
+    op.drop_column("adventures", "end_sequence")
+    op.drop_column("adventures", "start_sequence")

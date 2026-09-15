@@ -11,7 +11,7 @@ type Adventure = {
   title: string
   status: string
   outcome: string | null
-  outcome_reason: string | null
+  public_summary: string | null
 }
 
 type RecapResponse = {
@@ -68,7 +68,7 @@ export default function ReviewAdventurePage() {
       <h1 className="mt-1 text-2xl font-bold">{recap.adventure.title}</h1>
       <p className="mt-1 text-sm text-gray-600">
         Outcome: {recap.adventure.outcome ?? '—'}
-        {recap.adventure.outcome_reason ? ` — ${recap.adventure.outcome_reason}` : ''}
+        {recap.adventure.public_summary ? ` — ${recap.adventure.public_summary}` : ''}
       </p>
       {recap.stale_warning && (
         <div role="alert" className="mt-4 rounded border border-amber-400 bg-amber-50 p-3 text-sm">

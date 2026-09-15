@@ -1,1 +1,23 @@
-"""Adventure domain — issue #263 (AI-only DM, single canonical path)."""
+"""Adventure lifecycle — issue #260, derived summaries — issue #263."""
+from app.adventures.service import (  # noqa: F401
+    ADVENTURE_CLOSING_JOB,
+    ADVENTURE_OUTCOMES,
+    AdventureAlreadyActiveError,
+    AdventureAlreadyCompletedError,
+    AdventureError,
+    AdventureNotFoundError,
+    build_historical_text,
+    build_recap_text,
+    complete_adventure,
+    complete_adventure_inline,
+    generate_summary,
+    get_adventure,
+    get_current_adventure,
+    handle_adventure_closing,
+    list_adventures,
+    mark_stale,
+    project_recap,
+    register_adventure_worker,
+    run_adventure_closing_sweep,
+    start_adventure,
+)
