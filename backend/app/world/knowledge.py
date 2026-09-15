@@ -1205,6 +1205,9 @@ def create_relation_authoritative(
     holder: dict[str, Any] = {}
 
     def _mutate(campaign: Campaign):
+        from app.campaigns.service import require_playable_campaign
+
+        require_playable_campaign(campaign)
         row, _ = create_relation_inline(
             db, campaign, subject_entity_id=subject_entity_id, relation_type=relation_type,
             object_entity_id=object_entity_id, object_label=object_label,
@@ -1276,6 +1279,9 @@ def supersede_relation_authoritative(
     holder: dict[str, Any] = {}
 
     def _mutate(campaign: Campaign):
+        from app.campaigns.service import require_playable_campaign
+
+        require_playable_campaign(campaign)
         row, _ = supersede_relation_inline(
             db, campaign, prior_relation_id,
             operation_id=operation_id, idempotency_key=key, **kwargs,
@@ -1346,6 +1352,9 @@ def create_fact_authoritative(
     holder: dict[str, Any] = {}
 
     def _mutate(campaign: Campaign):
+        from app.campaigns.service import require_playable_campaign
+
+        require_playable_campaign(campaign)
         row, _ = create_fact_inline(
             db, campaign, content=content, entity_refs=entity_refs,
             epistemic_state=epistemic_state, visibility=visibility, grants=grants,
@@ -1414,6 +1423,9 @@ def supersede_fact_authoritative(
     holder: dict[str, Any] = {}
 
     def _mutate(campaign: Campaign):
+        from app.campaigns.service import require_playable_campaign
+
+        require_playable_campaign(campaign)
         row, _ = supersede_fact_inline(
             db, campaign, prior_fact_id,
             operation_id=operation_id, idempotency_key=key, **kwargs,

@@ -224,6 +224,13 @@ def maybe_trigger_post_turn(
     """
     if trigger not in (NORMAL, FORCE, CRITICAL):
         raise ValueError(f"unknown trigger {trigger!r}")
+    camp = db.get(Campaign, campaign_id)
+    if camp is not None and str(camp.status or "").lower() == "archived":
+        # Issue #265 — dormancy freezes fictional time/clocks/NPC plans: no
+        # new autonomous work is enqueued while archived. The checkpoint is
+        # untouched, so post-restore triggers backfill the gap cumulatively.
+        logger.info("post_turn trigger suppressed campaign=%s reason=archived", campaign_id)
+        return None
     span = get_outstanding_range(db, campaign_id)
     if span["outstanding"] <= 0:
         return None
@@ -481,7 +488,58 @@ def run_post_turn_range(
         return {"duplicate": True, "from_sequence": from_sequence, "to_sequence": to_sequence,
                 "processed_through": processed}
 
+    def _campaign_is_archived() -> bool:
+        try:
+            fresh = db.get(Campaign, campaign_id)
+            return fresh is not None and str(fresh.status or "").lower() == "archived"
+        except Exception as exc:
+            logger.warning("post_turn archive check failed campaign=%s error=%s", campaign_id, exc)
+            return False
+
+    def _campaign_is_archived_locked() -> bool:
+        """Final dormancy decision serialized with the lifecycle row.
+
+        Archive/restore commits hold this same Campaign row lock, so once
+        acquired, archive cannot commit between this check and the checkpoint
+        CAS below: either archive won first (we see archived and retire) or
+        we hold the lock through the CAS (archive waits, then sees the
+        advanced checkpoint and backfills nothing it shouldn't). Consistent
+        lock order everywhere is campaign row first, checkpoint row second.
+        """
+        try:
+            locked = db.execute(
+                select(Campaign).where(Campaign.id == campaign_id).with_for_update()
+                .execution_options(populate_existing=True)
+            ).scalars().first()
+            return locked is not None and str(locked.status or "").lower() == "archived"
+        except Exception as exc:
+            logger.warning("post_turn locked archive check failed campaign=%s error=%s", campaign_id, exc)
+            return False
+
+    def _retire_skipped(reason: str) -> dict:
+        logger.info(
+            "post_turn skipped campaign=%s range=%s-%s reason=%s",
+            campaign_id, effective_from, to_sequence, reason,
+        )
+        if run is not None and run.status not in ("succeeded", "skipped"):
+            run.status = "skipped"
+            run.failure_reason = None
+            run.result = {"skipped": True, "reason": reason}
+            run.completed_at = datetime.now(timezone.utc)
+            if commit:
+                db.commit()
+            else:
+                db.flush()
+        return {"skipped": True, "reason": reason,
+                "from_sequence": from_sequence, "to_sequence": to_sequence,
+                "processed_through": processed}
+
     try:
+        if _campaign_is_archived():
+            # Issue #265 — a run enqueued before archiving must not
+            # consolidate while dormant. The checkpoint is unchanged so the
+            # range is backfilled after restore; only the run row retires.
+            return _retire_skipped("campaign_archived")
         events = _validate_range_contiguous(db, campaign_id, effective_from, to_sequence)
         if commit:
             # Close the read transaction: consolidation runs lock-free so a
@@ -495,6 +553,12 @@ def run_post_turn_range(
             patch = {"processed_span": [effective_from, to_sequence], "event_count": len(events)}
         if not isinstance(patch, dict):
             raise RuntimeError("consolidate_fn must return a dict")
+
+        if _campaign_is_archived_locked():
+            # Issue #265 — archive won during consolidation: the patch must
+            # not advance the checkpoint. Retire the run; the range is
+            # backfilled after restore.
+            return _retire_skipped("campaign_archived_at_commit")
 
         # Prefix-conditional advancement on the EFFECTIVE start: exactly one
         # executor wins; a concurrent winner yields rowcount 0 (handled below).

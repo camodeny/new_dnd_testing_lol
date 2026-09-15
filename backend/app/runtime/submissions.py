@@ -120,6 +120,11 @@ def accept_submission(
     ).scalars().first()
     if campaign is None:
         raise SubmissionValidationError("Campaign not found")
+    # Issue #265 — re-check on the locked row: a concurrent archive that won
+    # the row lock after the transport-level check must still refuse the write.
+    from app.campaigns.service import require_playable_campaign
+
+    require_playable_campaign(campaign)
 
     if character_id is not None:
         character = db.get(Character, character_id)

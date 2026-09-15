@@ -232,6 +232,12 @@ def start_adventure(
                 pass
     if campaign is None:
         raise AdventureNotFoundError(f"Campaign {campaign_id} not found")
+    # Archive dormancy (issue #265): no new adventure may open on a frozen
+    # table. Guarded on the locked row so a concurrent archive cannot slip
+    # past a transport-level check.
+    from app.campaigns.service import require_playable_campaign
+
+    require_playable_campaign(campaign)
     existing = get_current_adventure(db, campaign_id)
     if existing is not None:
         raise AdventureAlreadyActiveError(campaign_id, existing.id)
@@ -400,6 +406,9 @@ def complete_adventure(
     completed: dict[str, Adventure] = {}
 
     def _mutate(locked: Campaign):
+        from app.campaigns.service import require_playable_campaign
+
+        require_playable_campaign(locked)
         adv = db.get(Adventure, adventure.id)
         if adv is None:
             raise AdventureNotFoundError(f"Adventure {adventure.id} not found")

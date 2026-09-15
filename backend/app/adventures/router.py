@@ -33,7 +33,11 @@ from app.adventures.service import (
     project_recap,
 )
 from app.campaigns.events import RevisionConflictError
-from app.campaigns.service import is_campaign_member, parse_campaign_id
+from app.campaigns.service import (
+    CampaignArchivedError,
+    is_campaign_member,
+    parse_campaign_id,
+)
 from app.deps.auth import resolve_profile
 from app.deps.idempotency import execute_http_idempotent, require_idempotency_key
 from database import get_db
@@ -177,6 +181,8 @@ def complete_adventure_endpoint(
                     status_code=409, detail=str(exc),
                     headers={"X-Current-Revision": str(exc.actual_revision)},
                 )
+            if isinstance(exc, CampaignArchivedError):
+                raise HTTPException(status_code=409, detail=str(exc)) from exc
             raise HTTPException(status_code=400, detail=str(exc))
         # Bind the authoritative end cursor and derive the summary through the
         # shared finalizer (same step every completion path runs; best-effort,

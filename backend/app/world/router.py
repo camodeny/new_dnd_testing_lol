@@ -14,7 +14,7 @@ from fastapi import APIRouter, Depends, HTTPException, Request, Response
 from sqlalchemy.orm import Session
 
 from app.campaigns.events import RevisionConflictError
-from app.campaigns.service import is_campaign_member, parse_campaign_id
+from app.campaigns.service import CampaignArchivedError, is_campaign_member, parse_campaign_id
 from app.deps.auth import resolve_profile
 from app.deps.idempotency import execute_http_idempotent, require_idempotency_key
 from app.world.knowledge import (
@@ -71,6 +71,20 @@ def _parse_campaign(campaign_id: str) -> uuid_lib.UUID:
         raise HTTPException(status_code=404, detail="Invalid campaign id")
 
 
+def _require_playable(camp: Campaign) -> None:
+    """Reject fictional writes while a campaign is archived (issue #265).
+
+    Reads stay available for authorized review/history; only mutations that
+    could advance fictional time, clocks, or NPC plans are frozen.
+    """
+    if str(camp.status or "").lower() == "archived":
+        logger.info("world mutation rejected campaign_id=%s reason=archived", camp.id)
+        raise HTTPException(
+            status_code=409,
+            detail="Campaign is archived; restore it before continuing play",
+        )
+
+
 def _expected_revision(payload: dict) -> int:
     if "expected_revision" not in payload:
         raise HTTPException(status_code=400, detail="expected_revision is required")
@@ -110,6 +124,7 @@ def api_set_current_scene(
     camp = _campaign_or_403(db, cid, profile)
     if camp.owner_id != profile.id:
         raise HTTPException(status_code=403, detail="Only the owner can update the current scene")
+    _require_playable(camp)
     expected = _expected_revision(payload)
     operation_id = str(payload.get("operation_id") or "").strip() or None
     idempotency_key = require_idempotency_key(request, operation_id)
@@ -137,6 +152,8 @@ def api_set_current_scene(
                 status_code=409, detail=str(exc),
                 headers={"X-Current-Revision": str(exc.actual_revision)},
             ) from exc
+        except CampaignArchivedError as exc:
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
         except ValueError as exc:
             raise HTTPException(status_code=400, detail=str(exc)) from exc
         return {"scene": scene.to_dict(), "event": event.to_dict(), "revision": scene.revision}
@@ -188,6 +205,7 @@ def api_create_entity(
     camp = _campaign_or_403(db, cid, profile)
     if camp.owner_id != profile.id:
         raise HTTPException(status_code=403, detail="Only the owner can create world entities")
+    _require_playable(camp)
     expected = _expected_revision(payload)
     operation_id = str(payload.get("operation_id") or "").strip() or None
     idempotency_key = require_idempotency_key(request, operation_id or payload.get("idempotency_key"))
@@ -215,6 +233,8 @@ def api_create_entity(
                 status_code=409, detail=str(exc),
                 headers={"X-Current-Revision": str(exc.actual_revision)},
             ) from exc
+        except CampaignArchivedError as exc:
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
         except ValueError as exc:
             raise HTTPException(status_code=400, detail=str(exc)) from exc
         return {
@@ -275,6 +295,7 @@ def api_create_relation(
     camp = _campaign_or_403(db, cid, profile)
     if camp.owner_id != profile.id:
         raise HTTPException(status_code=403, detail="Only the owner can create world relations")
+    _require_playable(camp)
     expected = _expected_revision(payload)
     operation_id = str(payload.get("operation_id") or "").strip() or None
     idempotency_key = require_idempotency_key(request, operation_id or payload.get("idempotency_key"))
@@ -307,6 +328,8 @@ def api_create_relation(
                 status_code=409, detail=str(exc),
                 headers={"X-Current-Revision": str(exc.actual_revision)},
             ) from exc
+        except CampaignArchivedError as exc:
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
         except ValueError as exc:
             raise HTTPException(status_code=400, detail=str(exc)) from exc
         return {
@@ -356,6 +379,7 @@ def api_supersede_relation(
     camp = _campaign_or_403(db, cid, profile)
     if camp.owner_id != profile.id:
         raise HTTPException(status_code=403, detail="Only the owner can supersede world relations")
+    _require_playable(camp)
     try:
         rid = uuid_lib.UUID(str(relation_id))
     except ValueError:
@@ -391,6 +415,8 @@ def api_supersede_relation(
                 status_code=409, detail=str(exc),
                 headers={"X-Current-Revision": str(exc.actual_revision)},
             ) from exc
+        except CampaignArchivedError as exc:
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
         except ValueError as exc:
             raise HTTPException(status_code=400, detail=str(exc)) from exc
         return {
@@ -447,6 +473,7 @@ def api_create_fact(
     camp = _campaign_or_403(db, cid, profile)
     if camp.owner_id != profile.id:
         raise HTTPException(status_code=403, detail="Only the owner can assert world facts")
+    _require_playable(camp)
     expected = _expected_revision(payload)
     operation_id = str(payload.get("operation_id") or "").strip() or None
     idempotency_key = require_idempotency_key(request, operation_id or payload.get("idempotency_key"))
@@ -477,6 +504,8 @@ def api_create_fact(
                 status_code=409, detail=str(exc),
                 headers={"X-Current-Revision": str(exc.actual_revision)},
             ) from exc
+        except CampaignArchivedError as exc:
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
         except ValueError as exc:
             raise HTTPException(status_code=400, detail=str(exc)) from exc
         return {
@@ -526,6 +555,7 @@ def api_supersede_fact(
     camp = _campaign_or_403(db, cid, profile)
     if camp.owner_id != profile.id:
         raise HTTPException(status_code=403, detail="Only the owner can supersede world facts")
+    _require_playable(camp)
     try:
         fid = uuid_lib.UUID(str(fact_id))
     except ValueError:
@@ -555,6 +585,8 @@ def api_supersede_fact(
                 status_code=409, detail=str(exc),
                 headers={"X-Current-Revision": str(exc.actual_revision)},
             ) from exc
+        except CampaignArchivedError as exc:
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
         except ValueError as exc:
             raise HTTPException(status_code=400, detail=str(exc)) from exc
         return {

@@ -519,6 +519,9 @@ def create_entity_authoritative(
     holder: dict[str, Any] = {}
 
     def _mutate(campaign: Campaign):
+        from app.campaigns.service import require_playable_campaign
+
+        require_playable_campaign(campaign)
         entity, _ = create_entity_inline(
             db, campaign, entity_type=entity_type, name=name, summary=summary,
             status=status, visibility=visibility, details=details,
@@ -589,6 +592,9 @@ def set_scene_authoritative(
     holder: dict[str, Any] = {}
 
     def _mutate(campaign: Campaign):
+        from app.campaigns.service import require_playable_campaign
+
+        require_playable_campaign(campaign)
         # new_revision is prior+1 — mirrors commit_campaign_mutation's bump.
         prior = int(campaign.revision) if campaign.revision is not None else 0
         scene = apply_scene_update_inline(

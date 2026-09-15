@@ -660,6 +660,27 @@ def mark_streaming_started(db: Session, turn_id: uuid.UUID, attempt_id: uuid.UUI
     if str(attempt.turn_id) != str(turn.id):
         raise ValueError(f"Attempt {attempt_id} does not belong to turn {turn_id}")
 
+    # Issue #265 — first-visible boundary participates in lifecycle
+    # serialization: lock the campaign row (the same lock archive/restore
+    # holds) and refuse dormancy crossings. Chunk 0 and this decision share
+    # one commit, so archive can neither slip between check and persist nor
+    # strand visible output on an archived table. Lock order is turn/attempt
+    # rows first, campaign row second — archive only takes the campaign row.
+    from app.campaigns.service import require_playable_campaign
+
+    try:
+        from models.campaigns import Campaign as _Campaign
+
+        _locked_campaign = db.execute(
+            select(_Campaign).where(_Campaign.id == turn.campaign_id).with_for_update()
+            .execution_options(populate_existing=True)
+        ).scalars().first()
+    except Exception:
+        from models.campaigns import Campaign as _CampaignFallback
+
+        _locked_campaign = db.get(_CampaignFallback, turn.campaign_id)
+    require_playable_campaign(_locked_campaign)
+
     from app.rolls.service import has_pending_rolls
     if has_pending_rolls(db, turn.id):
         raise ValueError(f"Turn {turn_id} has pending player-owned rolls and cannot stream outcome narration")

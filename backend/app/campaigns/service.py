@@ -31,7 +31,11 @@ CAMPAIGN_TRANSITIONS = {
     "lobby": frozenset({"starting", "archived"}),
     "starting": frozenset({"lobby", "active", "archived"}),
     "active": frozenset({"archived"}),
-    "archived": frozenset(),
+    # Issue #265 — restore reactivates the exact same persistent campaign
+    # (same ID/world/canon, no reseed). Archive is dormancy, not closure.
+    # Restore always returns to the pre-archive status recorded on the
+    # archive event, so archiving can never bypass start eligibility.
+    "archived": frozenset({"lobby", "starting", "active"}),
 }
 DIFFICULTIES = frozenset({"easy", "medium", "hard", "deadly"})
 LOOT_MODES = frozenset({
@@ -176,6 +180,31 @@ def validate_lifecycle_transition(current: str, target) -> str:
 def is_launch_locked(status: str) -> bool:
     """Launch character assignment is locked once the lobby closes."""
     return str(status or "").strip().lower() != "lobby"
+
+
+def is_archived(campaign) -> bool:
+    """True when the campaign is dormant (issue #265)."""
+    return str(getattr(campaign, "status", "") or "").strip().lower() == "archived"
+
+
+class CampaignArchivedError(ValueError):
+    """Raised when a fictional write targets an archived (dormant) campaign.
+
+    Subclasses ValueError so existing validation handlers keep working;
+    routers map it explicitly to HTTP 409 (conflict with dormancy).
+    """
+
+
+def require_playable_campaign(campaign) -> None:
+    """Reject fictional writes while a campaign is archived.
+
+    Archive freezes fictional time/clocks/NPC plans: no new submissions,
+    world mutations, or autonomous execution may advance an archived table.
+    Call on the locked campaign row inside the mutation transaction so a
+    concurrent archive cannot slip past an earlier transport-level check.
+    """
+    if is_archived(campaign):
+        raise CampaignArchivedError("Campaign is archived; restore it before continuing play")
 
 
 def character_launch_validity(character, sheet) -> dict:

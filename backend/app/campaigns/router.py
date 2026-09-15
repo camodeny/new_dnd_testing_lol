@@ -1,6 +1,7 @@
 """Campaigns transport — APIRouter. Depends on service layer for domain logic."""
 import logging
 import uuid as uuid_lib
+from datetime import datetime, timezone
 
 from fastapi import APIRouter, Depends, HTTPException, Request, Response
 from sqlalchemy import delete, func, select
@@ -9,9 +10,12 @@ from sqlalchemy.orm import Session
 from app.campaigns.events import (
     RevisionConflictError,
     commit_campaign_mutation,
+    has_domain_event,
+    latest_domain_event,
     list_campaign_events,
 )
 from app.campaigns.service import (
+    CampaignArchivedError,
     character_launch_validity,
     compute_start_eligibility,
     generate_invite_code,
@@ -21,6 +25,7 @@ from app.campaigns.service import (
     normalize_required_players,
     parse_campaign_id,
     random_brief,
+    require_playable_campaign,
     validate_campaign_name,
     validate_content_boundaries,
     validate_difficulty,
@@ -78,12 +83,20 @@ def _validated_setup(payload: dict, *, creation: bool = False) -> dict:
 
 
 @router.get("/api/campaigns")
-def list_campaigns(request: Request, db: Session = Depends(get_db)):
+def list_campaigns(request: Request, db: Session = Depends(get_db), include_archived: bool = False):
+    """Active campaign surfaces — issue #265.
+
+    Archived campaigns are dormant and hidden by default; authorized
+    review/history access passes ``?include_archived=true``. Detail,
+    snapshot, events, and member reads stay available to members regardless.
+    """
     profile = resolve_profile(request, db)
     member_rows = db.execute(select(CampaignMember.campaign_id).where(CampaignMember.user_id == profile.id)).scalars().all()
     member_ids = set(member_rows)
     rows = db.execute(select(Campaign).order_by(Campaign.updated_at.desc())).scalars().all()
     visible = [c for c in rows if c.owner_id == profile.id or c.id in member_ids]
+    if not include_archived:
+        visible = [c for c in visible if str(c.status or "").lower() != "archived"]
     return {"campaigns": [c.to_dict() for c in visible]}
 
 
@@ -181,7 +194,15 @@ def get_campaign(campaign_id: str, request: Request, db: Session = Depends(get_d
         raise HTTPException(status_code=404, detail="Campaign not found")
     if camp.owner_id != profile.id and not is_campaign_member(db, camp.id, profile.id):
         raise HTTPException(status_code=403, detail="Not a member of this campaign")
-    return {"campaign": camp.to_dict()}
+    # Issue #265 — restore target is derived server-side from the authoritative
+    # archive event, never reconstructed from the truncated (limit-200) events
+    # feed. Only set while archived.
+    restore_from: str | None = None
+    if str(camp.status or "").lower() == "archived":
+        archive_event = latest_domain_event(db, cid, "campaign.lifecycle.archived")
+        prior = (archive_event.payload or {}).get("from") if archive_event else None
+        restore_from = prior if prior in ("lobby", "starting", "active") else None
+    return {"campaign": camp.to_dict(), "restore_from": restore_from}
 
 
 @router.delete("/api/campaigns/{campaign_id}")
@@ -293,6 +314,54 @@ def update_campaign(
         )
 
 
+def _archived_duration_seconds(db: Session, cid: uuid_lib.UUID) -> float | None:
+    """Wall-clock seconds since the latest archive event (issue #265).
+
+    Fictional time is frozen while archived, so this duration only feeds
+    observability — it never advances fictional clocks or NPC plans.
+    """
+    try:
+        event = latest_domain_event(db, cid, "campaign.lifecycle.archived")
+        if event is None or event.created_at is None:
+            return None
+        archived_at = event.created_at
+        if archived_at.tzinfo is None:
+            archived_at = archived_at.replace(tzinfo=timezone.utc)
+        return max(0.0, (datetime.now(timezone.utc) - archived_at).total_seconds())
+    except Exception as exc:
+        logger.warning("campaign archived duration unavailable campaign_id=%s error=%s", cid, exc)
+        return None
+
+
+def _verify_restored_projection(db: Session, cid: uuid_lib.UUID) -> str:
+    """Read-only post-restore projection check — issue #265.
+
+    Verifies the live-table snapshot inputs survived dormancy (shared thread,
+    thread/member presence). Never mutates: a projection failure here is only
+    logged, since the authoritative restored state is already committed and
+    reconnect/snapshot recovers the read model.
+    """
+    try:
+        shared = db.execute(
+            select(CampaignThread).where(
+                CampaignThread.campaign_id == cid,
+                CampaignThread.thread_type == "campaign",
+            )
+        ).scalars().first()
+        threads = db.scalar(
+            select(func.count()).select_from(CampaignThread).where(CampaignThread.campaign_id == cid)
+        ) or 0
+        members = db.scalar(
+            select(func.count()).select_from(CampaignMember).where(CampaignMember.campaign_id == cid)
+        ) or 0
+        if shared is None:
+            return "degraded:shared_thread_missing"
+        return f"ok:threads={threads}:members={members}"
+    except Exception as exc:
+        logger.warning("campaign restore projection verify failed campaign_id=%s error=%s", cid, exc)
+        return "unknown:verify_failed"
+
+
 @router.post("/api/campaigns/{campaign_id}/lifecycle")
 def transition_campaign_lifecycle(
     campaign_id: str,
@@ -313,8 +382,9 @@ def transition_campaign_lifecycle(
         raise HTTPException(status_code=403, detail="Only owner can change campaign lifecycle")
     expected_revision = _expected_revision(payload)
     operation_id = str(payload.get("operation_id") or "").strip() or None
-    idempotency_key = require_idempotency_key(request, operation_id)
     target_raw = payload.get("status")
+    target = str(target_raw or "").strip().lower()
+    idempotency_key = require_idempotency_key(request, operation_id)
 
     def _mutate(locked: Campaign):
         try:
@@ -350,19 +420,89 @@ def transition_campaign_lifecycle(
                         "blockers": eligibility["blockers"],
                     },
                 )
+        if target == "archived":
+            # Issue #265 — never strand visible output mid-stream: archive is
+            # rejected while a DM attempt is running or streaming, or its turn
+            # is streaming. Prepared and pending work simply defers and resumes
+            # after restore, so it never blocks dormancy. Stuck running claims
+            # do not block forever: recover_stuck_attempts resets expired
+            # claims to prepared (only after proving the executor is dead via
+            # the advisory execution lock), which unblocks a later archive.
+            # Dormancy itself never infers executor death from timestamps.
+            from models.dm import DmTurn as _DmTurn, DmTurnAttempt as _DmAttempt
+
+            _streaming_turn = db.execute(
+                select(_DmTurn.id).where(
+                    _DmTurn.campaign_id == locked.id,
+                    _DmTurn.status == "streaming",
+                ).limit(1)
+            ).scalars().first()
+            _inflight_attempt = db.execute(
+                select(_DmAttempt.id).where(
+                    _DmAttempt.campaign_id == locked.id,
+                    _DmAttempt.status.in_(("running", "streaming")),
+                ).limit(1)
+            ).scalars().first()
+            if _inflight_attempt is not None or _streaming_turn is not None:
+                logger.warning(
+                    "campaign archive rejected campaign_id=%s actor_id=%s reason=dm_streaming",
+                    locked.id, profile.id,
+                )
+                raise HTTPException(
+                    status_code=409,
+                    detail="A DM turn is currently streaming; retry archive shortly",
+                )
+        if locked.status == "archived":
+            # Issue #265 — restore returns the campaign to its pre-archive
+            # status, so archiving can never bypass start eligibility.
+            # _mutate runs inside the atomic revision-guarded transaction, so
+            # a failed restore leaves the archived state intact.
+            archive_event = latest_domain_event(db, locked.id, "campaign.lifecycle.archived")
+            prior = (archive_event.payload or {}).get("from") if archive_event else None
+            if prior not in ("lobby", "starting", "active"):
+                logger.warning(
+                    "campaign restore rejected campaign_id=%s actor_id=%s reason=unknown_pre_archive_status",
+                    locked.id, profile.id,
+                )
+                raise HTTPException(status_code=409, detail="Campaign cannot be restored: pre-archive status unknown")
+            if target != prior:
+                logger.warning(
+                    "campaign restore rejected campaign_id=%s actor_id=%s to=%s pre_archive=%s",
+                    locked.id, profile.id, target, prior,
+                )
+                raise HTTPException(
+                    status_code=409,
+                    detail=f"Restore returns the campaign to its pre-archive status ({prior})",
+                )
+            # Status-only reactivation: same campaign ID/world/canon — no
+            # reseed, no duplicate clocks/NPCs/threads/characters.
         locked.status = target
 
     def _execute():
         current = db.get(Campaign, cid)
-        target = str(target_raw or "").strip().lower()
+        requested = str(target_raw or "").strip().lower()
+        if current is not None and requested == str(current.status or "").lower():
+            # Issue #265 — idempotent archive/restore convergence: a duplicate
+            # command under a different idempotency key lands on the already
+            # correct lifecycle state without a revision bump or new event.
+            # Same-key replays short-circuit in the idempotency layer above
+            # before reaching here. Restores only converge when the campaign
+            # was actually archived before; anything else falls through to
+            # the strict transition validation (409).
+            if requested == "archived" or has_domain_event(db, cid, "campaign.lifecycle.archived"):
+                logger.info(
+                    "campaign lifecycle duplicate campaign_id=%s actor_id=%s status=%s revision=%s",
+                    cid, profile.id, current.status, current.revision,
+                )
+                return {"campaign": current.to_dict(), "converged": True, "duplicate": True}
         campaign_after, event = commit_campaign_mutation(
             db,
             cid,
             expected_revision,
-            event_type=f"campaign.lifecycle.{target or 'invalid'}",
+            event_type=f"campaign.lifecycle.{requested or 'invalid'}",
             operation_id=operation_id or idempotency_key,
             actor_id=profile.id,
-            payload={"from": current.status if current else None, "to": target},
+            payload={"from": current.status if current else None, "to": requested},
             mutate=_mutate,
             commit=False,
         )
@@ -372,8 +512,9 @@ def transition_campaign_lifecycle(
         )
         return {"campaign": campaign_after.to_dict(), "event": event.to_dict()}
 
+    source_status = campaign.status
     try:
-        return execute_http_idempotent(
+        result = execute_http_idempotent(
             db,
             response,
             actor_id=profile.id,
@@ -385,11 +526,46 @@ def transition_campaign_lifecycle(
             execute=_execute,
         )
     except RevisionConflictError as exc:
+        logger.warning(
+            "campaign lifecycle failed campaign_id=%s actor_id=%s from=%s to=%s reason=revision_conflict",
+            cid, profile.id, source_status, target,
+        )
         raise HTTPException(
             status_code=409,
             detail=str(exc),
             headers={"X-Current-Revision": str(exc.actual_revision)},
         ) from exc
+    except HTTPException as exc:
+        logger.warning(
+            "campaign lifecycle failed campaign_id=%s actor_id=%s from=%s to=%s status=%s",
+            cid, profile.id, source_status, target, exc.status_code,
+        )
+        raise
+    after = result.get("campaign", {}) if isinstance(result, dict) else {}
+    if isinstance(result, dict) and result.get("converged"):
+        logger.info(
+            "campaign lifecycle duplicate campaign_id=%s actor_id=%s status=%s revision=%s",
+            cid, profile.id, after.get("status"), after.get("revision"),
+        )
+        return result
+    if target == "archived":
+        # Dormancy, not deletion: status-only transition, all durable
+        # campaign/world/character/thread state preserved by construction
+        # (_mutate flips status and nothing else).
+        logger.info(
+            "campaign archived campaign_id=%s actor_id=%s from=%s to=%s revision=%s",
+            cid, profile.id, source_status, after.get("status"), after.get("revision"),
+        )
+    elif source_status == "archived":
+        duration_s = _archived_duration_seconds(db, cid)
+        projection = _verify_restored_projection(db, cid)
+        logger.info(
+            "campaign restored campaign_id=%s actor_id=%s from=archived to=%s revision=%s "
+            "duration_archived_s=%s projection_restoration=%s",
+            cid, profile.id, after.get("status"), after.get("revision"),
+            duration_s, projection,
+        )
+    return result
 
 
 @router.post("/api/campaigns/{campaign_id}/solo-bootstrap")
@@ -519,6 +695,10 @@ def commit_campaign_mutation_endpoint(
     mutate_fields = payload.get("mutate") if isinstance(payload.get("mutate"), dict) else None
 
     def _mutate(campaign: Campaign):
+        # Archive dormancy (issue #265): even event-only mutations bump the
+        # revision and append to the event stream, so the guard runs
+        # unconditionally on the locked row before any lobby-setting checks.
+        require_playable_campaign(campaign)
         if not mutate_fields:
             return
         if campaign.status != "lobby":
@@ -532,20 +712,23 @@ def commit_campaign_mutation_endpoint(
             campaign.description = mutate_fields["description"]
 
     def _execute():
-        campaign, event = commit_campaign_mutation(
-            db,
-            cid,
-            expected,
-            event_type=event_type,
-            payload=event_payload if isinstance(event_payload, dict) else ({"data": event_payload} if event_payload is not None else None),
-            operation_id=operation_id or idempotency_key,
-            actor_id=profile.id,
-            targets=targets,
-            visibility=visibility,
-            provenance=provenance if isinstance(provenance, dict) else None,
-            mutate=_mutate if mutate_fields else None,
-            commit=False,
-        )
+        try:
+            campaign, event = commit_campaign_mutation(
+                db,
+                cid,
+                expected,
+                event_type=event_type,
+                payload=event_payload if isinstance(event_payload, dict) else ({"data": event_payload} if event_payload is not None else None),
+                operation_id=operation_id or idempotency_key,
+                actor_id=profile.id,
+                targets=targets,
+                visibility=visibility,
+                provenance=provenance if isinstance(provenance, dict) else None,
+                mutate=_mutate,
+                commit=False,
+            )
+        except CampaignArchivedError as exc:
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
         return {"campaign": campaign.to_dict(), "event": event.to_dict()}
 
     try:
@@ -1238,6 +1421,9 @@ def declare_pc_death(
 
     def _execute():
         def _mutate(locked: Campaign):
+            # Archive dormancy (issue #265): frozen canon, checked on the
+            # locked row inside the serialized mutation.
+            require_playable_campaign(locked)
             try:
                 row = _declare(
                     db, locked, char_id,
@@ -1251,23 +1437,26 @@ def declare_pc_death(
             _mutate.result = row
 
         _mutate.result = None  # type: ignore[attr-defined]
-        campaign_after, event = commit_campaign_mutation(
-            db,
-            cid,
-            expected_revision,
-            event_type=f"campaign.pc_{target_status}",
-            operation_id=operation_id or idempotency_key,
-            actor_id=profile.id,
-            targets={"character_id": str(char_id)},
-            payload_builder=lambda: {
-                "character_id": str(char_id),
-                "status": _mutate.result.status,  # type: ignore[attr-defined]
-                "cause": _mutate.result.cause,  # type: ignore[attr-defined]
-                "is_tpk": bool(_mutate.result.is_tpk),  # type: ignore[attr-defined]
-            },
-            mutate=_mutate,
-            commit=False,
-        )
+        try:
+            campaign_after, event = commit_campaign_mutation(
+                db,
+                cid,
+                expected_revision,
+                event_type=f"campaign.pc_{target_status}",
+                operation_id=operation_id or idempotency_key,
+                actor_id=profile.id,
+                targets={"character_id": str(char_id)},
+                payload_builder=lambda: {
+                    "character_id": str(char_id),
+                    "status": _mutate.result.status,  # type: ignore[attr-defined]
+                    "cause": _mutate.result.cause,  # type: ignore[attr-defined]
+                    "is_tpk": bool(_mutate.result.is_tpk),  # type: ignore[attr-defined]
+                },
+                mutate=_mutate,
+                commit=False,
+            )
+        except CampaignArchivedError as exc:
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
         logger.info(
             "pc death declared campaign_id=%s actor_id=%s character_id=%s status=%s revision=%s",
             cid, profile.id, char_id, _mutate.result.status, campaign_after.revision,  # type: ignore[attr-defined]
@@ -1334,6 +1523,9 @@ def activate_pc_replacement(
 
     def _execute():
         def _mutate(locked: Campaign):
+            # Archive dormancy (issue #265): frozen canon, checked on the
+            # locked row inside the serialized mutation.
+            require_playable_campaign(locked)
             try:
                 fresh_member = db.get(CampaignMember, {"campaign_id": cid, "user_id": profile.id})
                 if fresh_member is None:
@@ -1346,22 +1538,25 @@ def activate_pc_replacement(
                 raise HTTPException(status_code=exc.status_code, detail=str(exc)) from exc
 
         _mutate.result = None  # type: ignore[attr-defined]
-        campaign_after, event = commit_campaign_mutation(
-            db,
-            cid,
-            expected_revision,
-            event_type="campaign.pc_replaced",
-            operation_id=operation_id or idempotency_key,
-            actor_id=profile.id,
-            targets_builder=lambda: {
-                "user_id": str(profile.id),
-                "dead_character_id": _mutate.result["dead_character_id"],  # type: ignore[attr-defined]
-                "new_character_id": _mutate.result["new_character_id"],  # type: ignore[attr-defined]
-            },
-            payload_builder=lambda: dict(_mutate.result),  # type: ignore[attr-defined]
-            mutate=_mutate,
-            commit=False,
-        )
+        try:
+            campaign_after, event = commit_campaign_mutation(
+                db,
+                cid,
+                expected_revision,
+                event_type="campaign.pc_replaced",
+                operation_id=operation_id or idempotency_key,
+                actor_id=profile.id,
+                targets_builder=lambda: {
+                    "user_id": str(profile.id),
+                    "dead_character_id": _mutate.result["dead_character_id"],  # type: ignore[attr-defined]
+                    "new_character_id": _mutate.result["new_character_id"],  # type: ignore[attr-defined]
+                },
+                payload_builder=lambda: dict(_mutate.result),  # type: ignore[attr-defined]
+                mutate=_mutate,
+                commit=False,
+            )
+        except CampaignArchivedError as exc:
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
         logger.info(
             "pc replacement activated campaign_id=%s actor_id=%s dead=%s new=%s revision=%s",
             cid, profile.id,
@@ -1419,30 +1614,36 @@ def introduce_pc_replacement(
 
     def _execute():
         def _mutate(locked: Campaign):
+            # Archive dormancy (issue #265): frozen canon, checked on the
+            # locked row inside the serialized mutation.
+            require_playable_campaign(locked)
             try:
                 _mutate.result = _introduce(db, locked, char_id, actor_id=profile.id)  # type: ignore[attr-defined]
             except PcLifecycleError as exc:
                 raise HTTPException(status_code=exc.status_code, detail=str(exc)) from exc
 
         _mutate.result = None  # type: ignore[attr-defined]
-        campaign_after, event = commit_campaign_mutation(
-            db,
-            cid,
-            expected_revision,
-            event_type="campaign.pc_introduced",
-            operation_id=operation_id or idempotency_key,
-            actor_id=profile.id,
-            targets={"character_id": str(char_id)},
-            payload_builder=lambda: {
-                "character_id": str(char_id),
-                "replacement_of_character_id": (
-                    str(_mutate.result.replacement_of_character_id)  # type: ignore[attr-defined]
-                    if _mutate.result.replacement_of_character_id else None  # type: ignore[attr-defined]
-                ),
-            },
-            mutate=_mutate,
-            commit=False,
-        )
+        try:
+            campaign_after, event = commit_campaign_mutation(
+                db,
+                cid,
+                expected_revision,
+                event_type="campaign.pc_introduced",
+                operation_id=operation_id or idempotency_key,
+                actor_id=profile.id,
+                targets={"character_id": str(char_id)},
+                payload_builder=lambda: {
+                    "character_id": str(char_id),
+                    "replacement_of_character_id": (
+                        str(_mutate.result.replacement_of_character_id)  # type: ignore[attr-defined]
+                        if _mutate.result.replacement_of_character_id else None  # type: ignore[attr-defined]
+                    ),
+                },
+                mutate=_mutate,
+                commit=False,
+            )
+        except CampaignArchivedError as exc:
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
         logger.info(
             "pc replacement introduced campaign_id=%s actor_id=%s character_id=%s revision=%s",
             cid, profile.id, char_id, campaign_after.revision,
@@ -1610,6 +1811,8 @@ def start_adventure_endpoint(
             )
         except AdventureAlreadyActiveError as exc:
             raise HTTPException(status_code=409, detail=str(exc)) from exc
+        except CampaignArchivedError as exc:
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
         except ValueError as exc:
             raise HTTPException(status_code=400, detail=str(exc)) from exc
         # Committed atomically with the idempotency record by execute_http_idempotent.
@@ -1678,6 +1881,8 @@ def complete_adventure_endpoint(
                     status_code=409, detail=str(exc),
                     headers={"X-Current-Revision": str(exc.actual_revision)},
                 ) from exc
+            if isinstance(exc, CampaignArchivedError):
+                raise HTTPException(status_code=409, detail=str(exc)) from exc
             raise HTTPException(status_code=400, detail=str(exc)) from exc
         # Shared #263 finalization: bind the authoritative end cursor and
         # derive the summary on this path too (best-effort; the response
