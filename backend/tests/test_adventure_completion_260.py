@@ -397,6 +397,7 @@ def api(monkeypatch):
     with factory() as db:
         db.add(Profile(id=TEST_USER_ID, email="owner@example.com"))
         db.commit()
+    actor = {"id": TEST_USER_ID}
 
     def override_db():
         with factory() as db:
@@ -404,17 +405,17 @@ def api(monkeypatch):
 
     monkeypatch.setattr(
         "app.campaigns.router.resolve_profile",
-        lambda request, db: db.get(Profile, TEST_USER_ID),
+        lambda request, db: db.get(Profile, actor["id"]),
     )
     app.dependency_overrides[get_db] = override_db
     try:
-        yield TestClient(app), factory
+        yield TestClient(app), factory, actor
     finally:
         app.dependency_overrides.clear()
 
 
 def test_adventure_api_lifecycle(api):
-    client, _factory = api
+    client, _factory, _actor = api
     camp = client.post("/api/campaigns", json={"name": "API campaign"}).json()["campaign"]
     cid = camp["id"]
 
@@ -490,3 +491,72 @@ def test_adventure_api_lifecycle(api):
     assert bad.status_code == 400
     listed2 = client.get(f"/api/campaigns/{cid}/adventures").json()
     assert listed2["current_adventure_id"] == again.json()["adventure"]["id"]
+
+
+def test_member_sees_only_public_adventure_fields(api):
+    from models.campaigns import CampaignMember
+
+    client, factory, actor = api
+    camp = client.post("/api/campaigns", json={"name": "Spoiler campaign"}).json()["campaign"]
+    cid = camp["id"]
+    member_id = uuid.uuid4()
+    with factory() as db:
+        db.add(Profile(id=member_id, email="member@example.com"))
+        db.add(CampaignMember(campaign_id=uuid.UUID(cid), user_id=member_id, role="player"))
+        db.commit()
+
+    client.post(
+        f"/api/campaigns/{cid}/adventures",
+        json={"title": "Secret arc", "metadata": {"dm_notes": "the butler did it"}},
+        headers={"Idempotency-Key": "adv-spoiler-start"},
+    )
+    revision = client.get(f"/api/campaigns/{cid}").json()["campaign"]["revision"]
+    client.post(
+        f"/api/campaigns/{cid}/adventures/current/complete",
+        json={
+            "expected_revision": revision,
+            "outcome": "capture",
+            "reason": "DM-only: the traitor is the castellan.",
+            "public_summary": "The party wakes in chains.",
+        },
+        headers={"Idempotency-Key": "adv-spoiler-done"},
+    )
+
+    # Owner sees the full record.
+    owner_view = client.get(f"/api/campaigns/{cid}/adventures").json()["adventures"][0]
+    assert owner_view["reason"] == "DM-only: the traitor is the castellan."
+    assert owner_view["metadata"] == {"dm_notes": "the butler did it"}
+    assert owner_view["source_turn_id"] is None
+    assert "source_event_id" in owner_view
+
+    # Members see identity + outcome + public summary only.
+    actor["id"] = member_id
+    member_view = client.get(f"/api/campaigns/{cid}/adventures").json()["adventures"][0]
+    assert member_view["title"] == "Secret arc"
+    assert member_view["outcome"] == "capture"
+    assert member_view["public_summary"] == "The party wakes in chains."
+    for hidden in ("reason", "metadata", "source_turn_id", "source_event_id",
+                   "operation_id", "closing_status", "closing_attempts", "closing_error"):
+        assert hidden not in member_view, hidden
+
+
+def test_concurrent_start_backstop_enforced_by_database(setup):
+    from sqlalchemy.exc import IntegrityError
+
+    from models.campaigns import Adventure as AdventureModel
+
+    factory, camp_id, _owner = setup
+    with factory() as db:
+        first = start_adventure(db, camp_id, "First arc")
+        assert first.status == "active"
+        # Simulate a loser that passed the application check before the
+        # winner inserted: the partial unique index rejects the row.
+        rogue = AdventureModel(
+            id=uuid.uuid4(), campaign_id=camp_id, title="Rogue arc", status="active",
+        )
+        db.add(rogue)
+        with pytest.raises(IntegrityError):
+            db.flush()
+        db.rollback()
+    with factory() as db:
+        assert len(list_adventures(db, camp_id)) == 1

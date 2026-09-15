@@ -52,7 +52,17 @@ def upgrade() -> None:
             name="ck_adventures_closing_status",
         ),
     )
+    # One active adventure per campaign (partial unique index backstop for
+    # concurrent starts; the service also serializes on the campaign row).
+    op.create_index(
+        "uq_adventures_one_active_per_campaign",
+        "adventures",
+        ["campaign_id"],
+        unique=True,
+        postgresql_where=sa.text("status = 'active'"),
+    )
 
 
 def downgrade() -> None:
+    op.drop_index("uq_adventures_one_active_per_campaign", table_name="adventures")
     op.drop_table("adventures")

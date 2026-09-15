@@ -141,13 +141,26 @@ def start_adventure(
     commit: bool = True,
     adventure_metadata: dict | None = None,
 ) -> Adventure:
-    """Open a new adventure arc. Fails if one is already active."""
+    """Open a new adventure arc. Fails if one is already active.
+
+    The campaign row is locked for the check-then-insert so concurrent
+    starts serialize; the partial unique index
+    ``uq_adventures_one_active_per_campaign`` is the final backstop and a
+    unique violation is mapped to :class:`AdventureAlreadyActiveError`.
+    """
+    from sqlalchemy.exc import IntegrityError
+
     clean_title = (title or "").strip()
     if not clean_title:
         raise ValueError("Adventure title is required")
     if len(clean_title) > MAX_TITLE_LEN:
         raise ValueError(f"Adventure title must be at most {MAX_TITLE_LEN} characters")
-    campaign = db.get(Campaign, campaign_id)
+    try:
+        campaign = db.execute(
+            select(Campaign).where(Campaign.id == campaign_id).with_for_update()
+        ).scalars().first()
+    except Exception:
+        campaign = db.get(Campaign, campaign_id)
     if campaign is None:
         raise AdventureNotFoundError(f"Campaign {campaign_id} not found")
     existing = get_current_adventure(db, campaign_id)
@@ -161,7 +174,19 @@ def start_adventure(
         adventure_metadata=adventure_metadata,
     )
     db.add(adventure)
-    db.flush()
+    try:
+        db.flush()
+    except IntegrityError as exc:
+        db.rollback()
+        logger.warning(
+            "adventure concurrent start rejected campaign_id=%s error=%s",
+            campaign_id, exc,
+        )
+        # Re-read the winner for an actionable error.
+        winner = get_current_adventure(db, campaign_id)
+        raise AdventureAlreadyActiveError(
+            campaign_id, winner.id if winner is not None else adventure.id
+        ) from exc
     if commit:
         db.commit()
         db.refresh(adventure)

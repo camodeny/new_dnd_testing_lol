@@ -3,7 +3,7 @@
 import uuid
 from datetime import datetime
 
-from sqlalchemy import Boolean, CheckConstraint, DateTime, ForeignKey, Integer, String, Text, UniqueConstraint, func, text
+from sqlalchemy import Boolean, CheckConstraint, DateTime, ForeignKey, Index, Integer, String, Text, UniqueConstraint, func, text
 from sqlalchemy.dialects.postgresql import JSONB, UUID
 from sqlalchemy.orm import Mapped, mapped_column
 
@@ -172,6 +172,15 @@ class Adventure(Base):
         # Idempotency: one completion operation closes at most one adventure
         # record per campaign; retries hit the same row.
         UniqueConstraint("campaign_id", "operation_id", name="uq_adventures_campaign_operation"),
+        # Lifecycle invariant: at most one active adventure per campaign,
+        # enforced in PostgreSQL so concurrent starts cannot both insert.
+        Index(
+            "uq_adventures_one_active_per_campaign",
+            "campaign_id",
+            unique=True,
+            postgresql_where=text("status = 'active'"),
+            sqlite_where=text("status = 'active'"),
+        ),
     )
 
     id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
@@ -223,4 +232,23 @@ class Adventure(Base):
             "completed_at": self.completed_at.isoformat() if self.completed_at else None,
             "created_at": self.created_at.isoformat() if self.created_at else None,
             "updated_at": self.updated_at.isoformat() if self.updated_at else None,
+        }
+
+    def to_public_dict(self):
+        """Player-safe projection — issue #260.
+
+        Members see the arc identity, its outcome, and the player-visible
+        summary. The DM's completion reason, arbitrary metadata, turn/event
+        provenance ids, operation ids, and closing-work bookkeeping stay
+        owner-visible only.
+        """
+        return {
+            "id": str(self.id),
+            "campaign_id": str(self.campaign_id),
+            "title": self.title,
+            "status": self.status,
+            "outcome": self.outcome,
+            "public_summary": self.public_summary,
+            "started_at": self.started_at.isoformat() if self.started_at else None,
+            "completed_at": self.completed_at.isoformat() if self.completed_at else None,
         }

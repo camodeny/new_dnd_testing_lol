@@ -1270,11 +1270,16 @@ def list_adventures_endpoint(campaign_id: str, request: Request, db: Session = D
     _require_adventure_reader(db, campaign, profile)
     adventures = list_adventures(db, campaign.id)
     current = get_current_adventure(db, campaign.id)
+    # Only the player-visible summary leaves the table for members; the
+    # DM's reason, metadata, provenance ids, and closing bookkeeping stay
+    # owner-visible (issue #260 security).
+    is_owner = campaign.owner_id == profile.id
+    serialize = (lambda a: a.to_dict()) if is_owner else (lambda a: a.to_public_dict())
     return {
         "campaign_id": str(campaign.id),
         "campaign_status": campaign.status,
         "current_adventure_id": str(current.id) if current else None,
-        "adventures": [a.to_dict() for a in adventures],
+        "adventures": [serialize(a) for a in adventures],
     }
 
 
