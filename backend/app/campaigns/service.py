@@ -187,15 +187,24 @@ def is_archived(campaign) -> bool:
     return str(getattr(campaign, "status", "") or "").strip().lower() == "archived"
 
 
+class CampaignArchivedError(ValueError):
+    """Raised when a fictional write targets an archived (dormant) campaign.
+
+    Subclasses ValueError so existing validation handlers keep working;
+    routers map it explicitly to HTTP 409 (conflict with dormancy).
+    """
+
+
 def require_playable_campaign(campaign) -> None:
     """Reject fictional writes while a campaign is archived.
 
     Archive freezes fictional time/clocks/NPC plans: no new submissions,
     world mutations, or autonomous execution may advance an archived table.
-    Raises ValueError so routers map it to HTTP 409 (conflict with dormancy).
+    Call on the locked campaign row inside the mutation transaction so a
+    concurrent archive cannot slip past an earlier transport-level check.
     """
     if is_archived(campaign):
-        raise ValueError("Campaign is archived; restore it before continuing play")
+        raise CampaignArchivedError("Campaign is archived; restore it before continuing play")
 
 
 def character_launch_validity(character, sheet) -> dict:

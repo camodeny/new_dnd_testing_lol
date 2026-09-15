@@ -5,6 +5,7 @@ from fastapi import APIRouter, BackgroundTasks, Depends, HTTPException, Request,
 from sqlalchemy.orm import Session
 
 from app.campaigns.auth import authorized_campaign, require_owner
+from app.campaigns.service import CampaignArchivedError
 from app.deps.auth import resolve_profile
 from app.deps.idempotency import execute_http_idempotent, require_idempotency_key
 from app.rolls.service import (
@@ -69,6 +70,8 @@ def create_roll_requests(campaign_id: str, turn_id: str, payload: dict, request:
         try:
             rows = request_rolls(db, campaign_id=campaign.id, turn_id=turn.id, attempt_id=attempt_id, requests=raw_requests)
             return {"roll_requests": [row.to_dict(include_private=True) for row in rows], "turn_id": str(turn.id)}
+        except CampaignArchivedError as exc:
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
         except RollLifecycleError as exc:
             raise HTTPException(status_code=422, detail=str(exc)) from exc
 
@@ -118,6 +121,8 @@ def fulfill_roll_request(campaign_id: str, roll_request_id: str, payload: dict, 
             }
         except RollAuthorizationError as exc:
             raise HTTPException(status_code=403, detail=str(exc)) from exc
+        except CampaignArchivedError as exc:
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
         except RollLifecycleError as exc:
             raise HTTPException(status_code=409 if "status" in str(exc) else 422, detail=str(exc)) from exc
 
@@ -154,6 +159,8 @@ def cancel_roll_request(campaign_id: str, roll_request_id: str, payload: dict, r
                 "replacement": created[0].to_dict(include_private=True) if created else None,
                 "resumed_attempt": resumed.to_dict() if resumed else None,
             }
+        except CampaignArchivedError as exc:
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
         except RollLifecycleError as exc:
             raise HTTPException(status_code=409 if "status" in str(exc) else 422, detail=str(exc)) from exc
 

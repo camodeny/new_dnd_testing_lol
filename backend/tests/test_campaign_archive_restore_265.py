@@ -83,6 +83,7 @@ def api(monkeypatch):
         "app.world.router",
         "app.runtime.router",
         "app.snapshot.router",
+        "app.rolls.router",
     ):
         monkeypatch.setattr(
             f"{module}.resolve_profile",
@@ -352,9 +353,44 @@ def test_archived_table_freezes_fictional_time(api):
     with factory() as db:
         max_seq = get_max_sequence(db, uuid.UUID(cid))
         result = run_post_turn_range(db, uuid.UUID(cid), 1, max_seq)
-        assert result.get("duplicate") is not True or True  # converges either way
+        assert result.get("skipped") is not True
         db.commit()
+    with factory() as db:
+        assert get_checkpoint(db, uuid.UUID(cid)).processed_through_sequence == max_seq
     assert _set_scene(client, cid, rev + 2, "scene-3", fictional_time="Day 8").status_code == 200
+
+
+def test_post_turn_checkpoint_cannot_advance_after_concurrent_archive(api):
+    """CAS-time re-check: archive committed during consolidation retires the run."""
+    from app.post_turn.service import get_checkpoint, get_max_sequence, run_post_turn_range
+
+    client, factory, _, owner_id, _, _ = api
+    campaign = _drive_to_active(client, factory, owner_id)
+    cid = campaign["id"]
+
+    def archive_mid_consolidation(events):
+        from sqlalchemy import update as _update
+
+        with factory() as other:
+            other.execute(
+                _update(Campaign)
+                .where(Campaign.id == uuid.UUID(cid))
+                .values(status="archived")
+            )
+            other.commit()
+        return {"processed_span": [1, len(events)], "event_count": len(events)}
+
+    with factory() as db:
+        max_seq = get_max_sequence(db, uuid.UUID(cid))
+        assert max_seq and max_seq > 0
+        result = run_post_turn_range(
+            db, uuid.UUID(cid), 1, max_seq, consolidate_fn=archive_mid_consolidation
+        )
+        assert result.get("skipped") is True
+        assert result.get("reason") == "campaign_archived_at_commit"
+        db.commit()
+    with factory() as db:
+        assert get_checkpoint(db, uuid.UUID(cid)).processed_through_sequence == 0
 
 
 def test_dm_execution_defers_while_archived(api):
@@ -438,6 +474,111 @@ def test_restore_returns_pre_archive_status(api):
     restored = _transition(client, cid, 1, "lobby", "restore-lobby")
     assert restored.status_code == 200, restored.text
     assert restored.json()["campaign"]["status"] == "lobby"
+
+
+def test_campaign_detail_reports_server_side_restore_target(api):
+    client, factory, _, owner_id, _, _ = api
+    campaign = _drive_to_active(client, factory, owner_id)
+    cid = campaign["id"]
+    rev = campaign["revision"]
+    assert client.get(f"/api/campaigns/{cid}").json()["restore_from"] is None
+    assert _transition(client, cid, rev, "archived", "archive-1").status_code == 200
+    assert client.get(f"/api/campaigns/{cid}").json()["restore_from"] == "active"
+    assert _transition(client, cid, rev + 1, "active", "restore-1").status_code == 200
+    assert client.get(f"/api/campaigns/{cid}").json()["restore_from"] is None
+
+
+def test_roll_writes_rejected_while_archived(api):
+    from app.dm.turns import coordinate_turn
+    from app.runtime.submissions import accept_submission
+
+    client, factory, _, owner_id, _, _ = api
+    campaign = _drive_to_active(client, factory, owner_id)
+    cid = campaign["id"]
+    rev = campaign["revision"]
+    with factory() as db:
+        member = db.execute(
+            select(CampaignMember).where(
+                CampaignMember.campaign_id == uuid.UUID(cid),
+                CampaignMember.user_id == owner_id,
+            )
+        ).scalars().first()
+        char_id = member.selected_character_id
+        thread = db.execute(
+            select(CampaignThread).where(
+                CampaignThread.campaign_id == uuid.UUID(cid),
+                CampaignThread.thread_type == "campaign",
+            )
+        ).scalars().first()
+        accept_submission(
+            db, campaign_id=uuid.UUID(cid), user_id=owner_id, character_id=char_id,
+            raw_content="I inspect the door",
+            segments=[{"type": "ic", "text": "I inspect the door"}],
+            thread_id=str(thread.id),
+        )
+        turn, attempt = coordinate_turn(db, uuid.UUID(cid), str(thread.id))
+        db.commit()
+        turn_id, attempt_id = turn.id, attempt.id
+    create = client.post(
+        f"/api/campaigns/{cid}/dm-turns/{turn_id}/roll-requests",
+        json={
+            "attempt_id": str(attempt_id),
+            "requests": [{
+                "request_key": "owner-check", "requested_user_id": str(owner_id),
+                "character_id": str(char_id), "roll_kind": "check",
+                "ability_or_skill": "Investigation", "label": "Investigation check",
+                "advantage_state": "normal", "reason_public": "Inspect the door",
+            }],
+        },
+        headers={"Idempotency-Key": "request-rolls"},
+    )
+    assert create.status_code == 201, create.text
+    roll_id = create.json()["roll_requests"][0]["id"]
+    assert _transition(client, cid, rev, "archived", "archive-1").status_code == 200
+
+    body = {"source": "app", "raw_rolls": [14], "modifier": 3, "total": 17, "visibility": "public"}
+    assert client.post(
+        f"/api/campaigns/{cid}/roll-requests/{roll_id}/fulfill", json=body,
+        headers={"Idempotency-Key": "fulfill-archived"},
+    ).status_code == 409
+    assert client.post(
+        f"/api/campaigns/{cid}/roll-requests/{roll_id}/cancel", json={},
+        headers={"Idempotency-Key": "cancel-archived"},
+    ).status_code == 409
+
+    # Restored table fulfills the exact same pending request.
+    assert _transition(client, cid, rev + 1, "active", "restore-1").status_code == 200
+    fulfilled = client.post(
+        f"/api/campaigns/{cid}/roll-requests/{roll_id}/fulfill", json=body,
+        headers={"Idempotency-Key": "fulfill-restored"},
+    )
+    assert fulfilled.status_code == 200, fulfilled.text
+
+
+def test_locked_row_recheck_rejects_late_submission(api):
+    """Service-level guard: accept_submission refuses archived campaigns."""
+    from app.campaigns.service import CampaignArchivedError
+    from app.runtime.submissions import accept_submission
+
+    client, factory, _, owner_id, _, _ = api
+    campaign = _drive_to_active(client, factory, owner_id)
+    cid = campaign["id"]
+    rev = campaign["revision"]
+    assert _transition(client, cid, rev, "archived", "archive-1").status_code == 200
+    with factory() as db:
+        thread = db.execute(
+            select(CampaignThread).where(
+                CampaignThread.campaign_id == uuid.UUID(cid),
+                CampaignThread.thread_type == "campaign",
+            )
+        ).scalars().first()
+        with pytest.raises(CampaignArchivedError):
+            accept_submission(
+                db, campaign_id=uuid.UUID(cid), user_id=owner_id,
+                raw_content="Too late", segments=[{"type": "ic", "text": "Too late"}],
+                thread_id=str(thread.id),
+            )
+        db.rollback()
 
 
 def test_only_owner_may_archive_or_restore_and_access_never_broadens(api):

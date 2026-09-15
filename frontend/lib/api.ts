@@ -121,16 +121,15 @@ export const campaigns = {
       body: JSON.stringify({ expected_revision: expectedRevision, status }),
       headers: { 'Idempotency-Key': idempotencyKey },
     }),
-  // Issue #265 — restore returns the campaign to its pre-archive status, so
-  // discover the target from the latest archive event before transitioning.
+  // Issue #265 — restore target is derived server-side from the
+  // authoritative archive event (the events feed is truncated), surfaced on
+  // campaign detail as `restore_from` while archived.
   restoreTarget: async (id: string | number): Promise<string> => {
-    const data = await apiFetch<{ events: { event_type: string; payload?: { from?: string } }[] }>(
-      `/campaigns/${id}/events`,
-    )
-    const archived = [...(data.events ?? [])]
-      .reverse()
-      .find((e) => e.event_type === 'campaign.lifecycle.archived')
-    const from = archived?.payload?.from
+    const data = await apiFetch<{
+      campaign: import('@/types').Campaign
+      restore_from?: string | null
+    }>(`/campaigns/${id}`)
+    const from = data.restore_from
     if (from !== 'lobby' && from !== 'starting' && from !== 'active') {
       throw new Error('Campaign cannot be restored: pre-archive status unknown.')
     }

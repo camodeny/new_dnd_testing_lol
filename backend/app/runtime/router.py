@@ -7,6 +7,7 @@ from fastapi import APIRouter, Depends, HTTPException, Request, Response
 from sqlalchemy.orm import Session
 
 from app.campaigns.auth import authorized_campaign
+from app.campaigns.service import CampaignArchivedError
 from app.deps.auth import resolve_profile
 from app.deps.idempotency import execute_http_idempotent, require_idempotency_key
 from app.runtime.submissions import (
@@ -128,6 +129,8 @@ def create_player_submission(
                 thread_id=thread_id_str,
                 audience=audience,
             )
+        except CampaignArchivedError as exc:
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
         except SubmissionValidationError as exc:
             raise HTTPException(status_code=422, detail=str(exc)) from exc
         stored_segments = (

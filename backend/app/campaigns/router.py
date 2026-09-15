@@ -191,7 +191,15 @@ def get_campaign(campaign_id: str, request: Request, db: Session = Depends(get_d
         raise HTTPException(status_code=404, detail="Campaign not found")
     if camp.owner_id != profile.id and not is_campaign_member(db, camp.id, profile.id):
         raise HTTPException(status_code=403, detail="Not a member of this campaign")
-    return {"campaign": camp.to_dict()}
+    # Issue #265 — restore target is derived server-side from the authoritative
+    # archive event, never reconstructed from the truncated (limit-200) events
+    # feed. Only set while archived.
+    restore_from: str | None = None
+    if str(camp.status or "").lower() == "archived":
+        archive_event = latest_domain_event(db, cid, "campaign.lifecycle.archived")
+        prior = (archive_event.payload or {}).get("from") if archive_event else None
+        restore_from = prior if prior in ("lobby", "starting", "active") else None
+    return {"campaign": camp.to_dict(), "restore_from": restore_from}
 
 
 @router.delete("/api/campaigns/{campaign_id}")

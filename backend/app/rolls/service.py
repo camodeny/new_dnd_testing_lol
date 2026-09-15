@@ -113,6 +113,11 @@ def request_rolls(
     turn, attempt = _lock_turn_attempt(db, turn_id, attempt_id)
     if turn.campaign_id != campaign_id:
         raise RollLifecycleError("Turn not found")
+    # Issue #265 — roll writes advance the table; refuse them on the locked
+    # turn once the campaign is dormant.
+    from app.campaigns.service import require_playable_campaign
+
+    require_playable_campaign(db.get(Campaign, campaign_id))
     if turn.status not in {"pending", "awaiting_roll"} or attempt.status not in {"prepared", "running", "awaiting_roll"}:
         raise RollLifecycleError("Current attempt cannot request rolls from its present state")
     values = [_validate_request(db, campaign_id, item) for item in requests]
@@ -188,6 +193,9 @@ def fulfill_roll(db: Session, *, request_id: uuid.UUID, actor_id: uuid.UUID, pay
     req = db.execute(select(PlayerRollRequest).where(PlayerRollRequest.id == request_id).with_for_update()).scalars().first()
     if req is None:
         raise RollLifecycleError("Roll request not found")
+    from app.campaigns.service import require_playable_campaign
+
+    require_playable_campaign(db.get(Campaign, req.campaign_id))
     if req.requested_user_id != actor_id:
         logger.warning("player_roll invalid_attempt request_id=%s actor_id=%s reason=unauthorized", request_id, actor_id)
         raise RollAuthorizationError("Only the requested character's controller may fulfill this roll")
@@ -239,6 +247,9 @@ def cancel_or_replace(db: Session, *, request_id: uuid.UUID, replacement: dict |
     req = db.execute(select(PlayerRollRequest).where(PlayerRollRequest.id == request_id).with_for_update()).scalars().first()
     if req is None:
         raise RollLifecycleError("Roll request not found")
+    from app.campaigns.service import require_playable_campaign
+
+    require_playable_campaign(db.get(Campaign, req.campaign_id))
     if req.status != "pending":
         raise RollLifecycleError(f"Roll request cannot be changed from status {req.status}")
     turn = db.get(DmTurn, req.turn_id)

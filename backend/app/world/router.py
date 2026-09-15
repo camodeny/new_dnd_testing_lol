@@ -14,7 +14,7 @@ from fastapi import APIRouter, Depends, HTTPException, Request, Response
 from sqlalchemy.orm import Session
 
 from app.campaigns.events import RevisionConflictError
-from app.campaigns.service import is_campaign_member, parse_campaign_id
+from app.campaigns.service import CampaignArchivedError, is_campaign_member, parse_campaign_id
 from app.deps.auth import resolve_profile
 from app.deps.idempotency import execute_http_idempotent, require_idempotency_key
 from app.world.knowledge import (
@@ -152,6 +152,8 @@ def api_set_current_scene(
                 status_code=409, detail=str(exc),
                 headers={"X-Current-Revision": str(exc.actual_revision)},
             ) from exc
+        except CampaignArchivedError as exc:
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
         except ValueError as exc:
             raise HTTPException(status_code=400, detail=str(exc)) from exc
         return {"scene": scene.to_dict(), "event": event.to_dict(), "revision": scene.revision}
@@ -231,6 +233,8 @@ def api_create_entity(
                 status_code=409, detail=str(exc),
                 headers={"X-Current-Revision": str(exc.actual_revision)},
             ) from exc
+        except CampaignArchivedError as exc:
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
         except ValueError as exc:
             raise HTTPException(status_code=400, detail=str(exc)) from exc
         return {
@@ -324,6 +328,8 @@ def api_create_relation(
                 status_code=409, detail=str(exc),
                 headers={"X-Current-Revision": str(exc.actual_revision)},
             ) from exc
+        except CampaignArchivedError as exc:
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
         except ValueError as exc:
             raise HTTPException(status_code=400, detail=str(exc)) from exc
         return {
@@ -409,6 +415,8 @@ def api_supersede_relation(
                 status_code=409, detail=str(exc),
                 headers={"X-Current-Revision": str(exc.actual_revision)},
             ) from exc
+        except CampaignArchivedError as exc:
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
         except ValueError as exc:
             raise HTTPException(status_code=400, detail=str(exc)) from exc
         return {
@@ -496,6 +504,8 @@ def api_create_fact(
                 status_code=409, detail=str(exc),
                 headers={"X-Current-Revision": str(exc.actual_revision)},
             ) from exc
+        except CampaignArchivedError as exc:
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
         except ValueError as exc:
             raise HTTPException(status_code=400, detail=str(exc)) from exc
         return {
@@ -575,6 +585,8 @@ def api_supersede_fact(
                 status_code=409, detail=str(exc),
                 headers={"X-Current-Revision": str(exc.actual_revision)},
             ) from exc
+        except CampaignArchivedError as exc:
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
         except ValueError as exc:
             raise HTTPException(status_code=400, detail=str(exc)) from exc
         return {

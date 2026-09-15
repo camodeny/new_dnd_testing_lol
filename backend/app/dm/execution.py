@@ -707,6 +707,49 @@ def _execute_owned_attempt(
         _fail_visible(exc)
         raise
 
+    # Issue #265 — dormancy re-check at the first durable visibility
+    # boundary. Archive may have committed during adjudication/validation;
+    # persisting a stream, roll-await, or silent completion afterwards would
+    # advance an archived table. Defer instead: reset the claim to prepared
+    # (no failure marker — dormancy is not failure) so the post-restore sweep
+    # resumes the exact same attempt.
+    _archived_now = False
+    try:
+        from models.campaigns import Campaign as _Campaign
+
+        _fresh_campaign = db.get(_Campaign, campaign_id)
+        _archived_now = (
+            _fresh_campaign is not None
+            and str(_fresh_campaign.status or "").lower() == "archived"
+        )
+    except Exception as exc:
+        logger.warning("dm_execute archive re-check failed attempt_id=%s error=%s", attempt.id, exc)
+    if _archived_now:
+        try:
+            db.rollback()
+        except Exception:
+            pass
+        try:
+            from models.dm import DmTurnAttempt as _AttArchived
+
+            _current = db.get(_AttArchived, attempt.id)
+            if _current is not None and _current.status == ATTEMPT_RUNNING:
+                _current.status = ATTEMPT_PREPARED
+                _current.started_at = None
+                _current.last_error = "CampaignArchived: deferred until restore"
+                db.add(_current)
+                db.commit()
+        except Exception:
+            try:
+                db.rollback()
+            except Exception:
+                pass
+        logger.info(
+            "dm_execute deferred attempt_id=%s campaign_id=%s reason=archived_at_visibility_boundary",
+            attempt.id, campaign_id,
+        )
+        return None
+
     # Mode-aware lifecycle dispatch: non-final modes must not go through
     # the final narration-and-commit path.
     if contract.mode == "await_roll":
