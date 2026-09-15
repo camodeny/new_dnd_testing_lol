@@ -360,7 +360,11 @@ def generate_summary(
             raise RuntimeError("summary generator unavailable (injected failure)")
         events = _source_events(db, adventure)
         historical = build_historical_text(adventure, events)
-        visible = [ev for ev in events if _event_visible_to(ev, actor_id)]
+        # Stored recap is the PUBLIC baseline only: it must never embed one
+        # viewer's actor-visible private content, because cached text could
+        # otherwise cross viewers. Per-viewer private projection happens at
+        # read time in project_recap().
+        visible = [ev for ev in events if _event_visible_to(ev, None)]
         recap = build_recap_text(adventure, visible)
         leaked = _validate_no_leak(recap, events)
         if leaked:
@@ -448,25 +452,31 @@ def project_recap(
 ) -> dict:
     """Player-facing recap projection with per-viewer visibility filtering.
 
-    Re-projects against current source events at read time so a stale or
-    repaired canon cannot leak through a cached recap: if the stored recap
-    fails revalidation, only the safe re-projected text is returned.
+    The recap text is ALWAYS freshly built for the requesting viewer from
+    currently visible source events — cached text from another actor's
+    generation is never served cross-viewer. If the stored row is stale or
+    failed, the live projection carries a warning instead of being silently
+    presented as current.
     """
     events = _source_events(db, adventure)
     visible = [ev for ev in events if _event_visible_to(ev, viewer_id)]
-    safe_recap = build_recap_text(adventure, visible)
-    stored = row.recap_text or ""
-    leaked = _validate_no_leak(stored, events) if stored else []
-    if row.status != "current" or leaked:
-        text = safe_recap
-        warning = (
-            "Recap is being rebuilt; showing a live projection of visible events."
-            if row.status != "current"
-            else "Stored recap withheld by leak validation; showing a live projection."
+    text = build_recap_text(adventure, visible)
+    # Defense in depth: the freshly built text derives solely from visible
+    # sources, so this must always pass; a failure means a builder bug.
+    leaked = _validate_no_leak(text, events)
+    if leaked:
+        row.leak_failures = int(row.leak_failures or 0) + 1
+        logger.warning(
+            "recap projection leak adventure_id=%s viewer=%s tokens=%s",
+            adventure.id, viewer_id, leaked[:8],
         )
-    else:
-        text = stored
-        warning = None
+        public_only = [ev for ev in events if not _is_hidden(ev)]
+        text = build_recap_text(adventure, public_only)
+    warning = (
+        "Recap is being rebuilt; showing a live projection of visible events."
+        if row.status != "current"
+        else None
+    )
     row.views = int(row.views or 0) + 1
     db.flush()
     return {

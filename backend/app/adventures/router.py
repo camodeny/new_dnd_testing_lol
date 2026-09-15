@@ -41,6 +41,17 @@ def _require_member(db: Session, camp: Campaign, profile) -> None:
         raise HTTPException(status_code=403, detail="Not a member of this campaign")
 
 
+def _require_owner(camp: Campaign, profile) -> None:
+    """DM-declared lifecycle mutations are owner/DM-only.
+
+    Ordinary campaign members (role=player) may read the recap projection
+    but must never complete adventures, choose outcomes, or drive
+    repair/regeneration of canonical derived state.
+    """
+    if camp.owner_id != profile.id:
+        raise HTTPException(status_code=403, detail="Only the campaign owner (DM) can perform this action")
+
+
 def _parse_ids(campaign_id: str, adventure_id: str | None = None):
     try:
         cid = parse_campaign_id(campaign_id)
@@ -76,11 +87,14 @@ def open_adventure(campaign_id: str, payload: dict, request: Request, db: Sessio
     profile = resolve_profile(request, db)
     cid, _ = _parse_ids(campaign_id)
     camp = _campaign_or_404(db, cid)
-    _require_member(db, camp, profile)
+    _require_owner(camp, profile)
     body = payload or {}
     raw_start = body.get("start_sequence")
     try:
-        start_sequence = int(raw_start) if raw_start is not None else int(camp.revision or 0)
+        # Default boundary is the NEXT event after the current cursor: event
+        # sequence equals the resulting campaign revision, so the event at
+        # sequence R already happened before the adventure opened.
+        start_sequence = int(raw_start) if raw_start is not None else int(camp.revision or 0) + 1
     except (TypeError, ValueError):
         raise HTTPException(status_code=400, detail="start_sequence must be an integer")
     if start_sequence < 0:
@@ -119,7 +133,7 @@ def complete_adventure_endpoint(
     profile = resolve_profile(request, db)
     cid, aid = _parse_ids(campaign_id, adventure_id)
     camp = _campaign_or_404(db, cid)
-    _require_member(db, camp, profile)
+    _require_owner(camp, profile)
     adv = _adventure_or_404(db, cid, aid)
     if adv.status == "completed":
         row = db.execute(
@@ -187,11 +201,16 @@ def _opt_uuid(raw) -> uuid_lib.UUID | None:
 
 @router.get("/api/campaigns/{campaign_id}/adventures/{adventure_id}/summary")
 def get_summary(campaign_id: str, adventure_id: str, request: Request, db: Session = Depends(get_db)):
-    """Durable historical summary (derived; events/facts outrank it)."""
+    """Durable historical summary (derived; events/facts outrank it).
+
+    Owner/DM-only: the historical summary compresses hidden source evidence
+    (dm_only/private) for retrieval/context. Members use the /recap
+    projection, which is visibility-filtered.
+    """
     profile = resolve_profile(request, db)
     cid, aid = _parse_ids(campaign_id, adventure_id)
     camp = _campaign_or_404(db, cid)
-    _require_member(db, camp, profile)
+    _require_owner(camp, profile)
     adv = _adventure_or_404(db, cid, aid)
     row = _summary_or_404(db, adv)
     return {"adventure": adv.to_dict(), "summary": row.to_dict()}
@@ -221,7 +240,7 @@ def retry_generate(campaign_id: str, adventure_id: str, payload: dict, request: 
     profile = resolve_profile(request, db)
     cid, aid = _parse_ids(campaign_id, adventure_id)
     camp = _campaign_or_404(db, cid)
-    _require_member(db, camp, profile)
+    _require_owner(camp, profile)
     adv = _adventure_or_404(db, cid, aid)
     body = payload or {}
     row = generate_summary(
@@ -239,7 +258,7 @@ def mark_stale_endpoint(
     profile = resolve_profile(request, db)
     cid, aid = _parse_ids(campaign_id, adventure_id)
     camp = _campaign_or_404(db, cid)
-    _require_member(db, camp, profile)
+    _require_owner(camp, profile)
     adv = _adventure_or_404(db, cid, aid)
     body = payload or {}
     try:

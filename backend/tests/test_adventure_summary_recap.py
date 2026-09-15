@@ -23,7 +23,7 @@ from app.auth.service import TEST_USER_ID  # noqa: E402
 from database import Base, get_db  # noqa: E402
 from main import app  # noqa: E402
 from models.adventures import Adventure, AdventureSummary  # noqa: E402
-from models.campaigns import Campaign  # noqa: E402
+from models.campaigns import Campaign, CampaignMember  # noqa: E402
 from models.profiles import Profile  # noqa: E402
 
 import models as _models  # noqa: E402,F401  # register all tables
@@ -92,6 +92,17 @@ def _seed_events(factory, campaign_id: str, revision_start: int = 0):
         )
     with factory() as db:
         return int(db.get(Campaign, cid).revision)
+
+
+def _make_member(factory, campaign_id: str) -> uuid.UUID:
+    """Add a second player member (role=player) to the campaign."""
+    uid = uuid.uuid4()
+    with factory() as db:
+        db.add(Profile(id=uid, email=f"player-{uid.hex[:8]}@example.com"))
+        db.flush()
+        db.add(CampaignMember(campaign_id=uuid.UUID(campaign_id), user_id=uid, role="player"))
+        db.commit()
+    return uid
 
 
 def _open(client: TestClient, cid: str, key: str = "op-open-1") -> dict:
@@ -296,3 +307,145 @@ def test_villain_victory_and_outcome_validation(api):
         headers={"Idempotency-Key": "op-bad"},
     )
     assert r.status_code == 400
+
+
+def test_historical_summary_is_owner_only_while_recap_is_member_visible(api):
+    client, factory, actor, owner = api
+    camp = _campaign(client)
+    member = _make_member(factory, camp["id"])
+    _seed_events(factory, camp["id"])
+    with factory() as db:
+        rev = int(db.get(Campaign, uuid.UUID(camp["id"])).revision)
+    adv = _open(client, camp["id"], key="op-open-owneronly")
+    _complete(client, camp["id"], adv["id"], rev, "op-complete-owneronly")
+    actor["id"] = member
+    try:
+        denied = client.get(f"/api/campaigns/{camp['id']}/adventures/{adv['id']}/summary")
+        assert denied.status_code == 403, denied.text
+        recap = client.get(f"/api/campaigns/{camp['id']}/adventures/{adv['id']}/recap")
+        assert recap.status_code == 200, recap.text
+        assert "zxqv-secret-phylactery" not in recap.json()["recap_text"]
+    finally:
+        actor["id"] = owner
+
+
+def test_recap_is_viewer_scoped_private_actor_event_does_not_cross_viewers(api):
+    from app.campaigns.events import commit_campaign_mutation
+
+    client, factory, actor, owner = api
+    camp = _campaign(client)
+    member_a = _make_member(factory, camp["id"])
+    member_b = _make_member(factory, camp["id"])
+    cid = uuid.UUID(camp["id"])
+    with factory() as db:
+        camp_row = db.get(Campaign, cid)
+        rev = int(camp_row.revision)
+        commit_campaign_mutation(
+            db, cid, rev,
+            event_type="dm.narration",
+            payload={"summary": "the king arrives at dawn"},
+            operation_id="seed-king-public", visibility="public",
+        )
+        commit_campaign_mutation(
+            db, cid, rev + 1,
+            event_type="dm.secret",
+            payload={"summary": "the king is ill"},
+            operation_id="seed-king-private", visibility="private",
+            actor_id=member_a,
+        )
+    with factory() as db:
+        rev = int(db.get(Campaign, cid).revision)
+    adv = _open(client, camp["id"], key="op-open-scope")
+    _complete(client, camp["id"], adv["id"], rev, "op-complete-scope")
+    # Viewer B (not the private actor): no leak, even though every 4+ char
+    # token overlaps public text.
+    actor["id"] = member_b
+    try:
+        recap_b = client.get(f"/api/campaigns/{camp['id']}/adventures/{adv['id']}/recap")
+        assert recap_b.status_code == 200, recap_b.text
+        assert "ill" not in recap_b.json()["recap_text"]
+        assert "arrives at dawn" in recap_b.json()["recap_text"]
+    finally:
+        actor["id"] = owner
+    # Viewer A (the private actor): individualized projection includes it.
+    actor["id"] = member_a
+    try:
+        recap_a = client.get(f"/api/campaigns/{camp['id']}/adventures/{adv['id']}/recap")
+        assert recap_a.status_code == 200, recap_a.text
+        assert "the king is ill" in recap_a.json()["recap_text"]
+    finally:
+        actor["id"] = owner
+
+
+def test_player_members_cannot_perform_dm_declared_mutations(api):
+    client, factory, actor, owner = api
+    camp = _campaign(client)
+    member = _make_member(factory, camp["id"])
+    with factory() as db:
+        rev0 = int(db.get(Campaign, uuid.UUID(camp["id"])).revision)
+    actor["id"] = member
+    try:
+        assert client.post(
+            f"/api/campaigns/{camp['id']}/adventures",
+            json={"title": "Sneaky", "operation_id": "op-sneak"},
+        ).status_code == 403
+    finally:
+        actor["id"] = owner
+    adv = _open(client, camp["id"], key="op-open-owned")
+    actor["id"] = member
+    try:
+        assert client.post(
+            f"/api/campaigns/{camp['id']}/adventures/{adv['id']}/complete",
+            json={"expected_revision": rev0, "outcome": "victory", "operation_id": "op-sneak2"},
+            headers={"Idempotency-Key": "op-sneak2"},
+        ).status_code == 403
+        assert client.post(
+            f"/api/campaigns/{camp['id']}/adventures/{adv['id']}/summaries/generate",
+            json={},
+        ).status_code == 403
+        assert client.post(
+            f"/api/campaigns/{camp['id']}/adventures/{adv['id']}/summaries/mark-stale",
+            json={"reason": "x"},
+        ).status_code == 403
+    finally:
+        actor["id"] = owner
+    with factory() as db:
+        assert int(db.get(Campaign, uuid.UUID(camp["id"])).revision) == rev0
+        assert db.get(Adventure, uuid.UUID(adv["id"])).status == "open"
+
+
+def test_default_source_range_excludes_pre_open_event(api):
+    from app.campaigns.events import commit_campaign_mutation
+
+    client, factory, actor, owner = api
+    camp = _campaign(client)
+    cid = uuid.UUID(camp["id"])
+    with factory() as db:
+        camp_row = db.get(Campaign, cid)
+        commit_campaign_mutation(
+            db, cid, int(camp_row.revision),
+            event_type="dm.narration",
+            payload={"summary": "pre-open happening at the old chapel"},
+            operation_id="seed-pre-open", visibility="public",
+        )
+    # Open WITHOUT explicit start_sequence: defaults to post-cursor boundary.
+    r = client.post(
+        f"/api/campaigns/{cid}/adventures",
+        json={"title": "Boundary Test", "operation_id": "op-open-boundary"},
+    )
+    assert r.status_code == 200, r.text
+    adv = r.json()["adventure"]
+    with factory() as db:
+        camp_row = db.get(Campaign, cid)
+        rev = int(camp_row.revision)
+        commit_campaign_mutation(
+            db, cid, rev,
+            event_type="dm.narration",
+            payload={"summary": "post-open happening at the new chapel"},
+            operation_id="seed-post-open", visibility="public",
+        )
+        rev2 = int(db.get(Campaign, cid).revision)
+    out = _complete(client, camp["id"], adv["id"], rev2, "op-complete-boundary")
+    historical = out["summary"]["historical_text"] or ""
+    assert "post-open happening" in historical
+    assert "pre-open happening" not in historical
