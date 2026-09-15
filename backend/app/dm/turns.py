@@ -1033,6 +1033,25 @@ def commit_turn(
         base_payload["staged_effect_types"] = [e.get("effect_type") for e in staged_list]
         if attempt.stream_id:
             base_payload["stream_id"] = str(attempt.stream_id)
+        # A staged adventure completion promotes the turn commit to the
+        # adventure.completed domain event (issue #260): the turn IS the
+        # authoritative provenance for the DM's completion decision. Only
+        # the default turn event type is promoted — explicit callers keep
+        # their event type.
+        adventure_completion_args = next(
+            (e.get("arguments") or {} for e in staged_list if e.get("effect_type") == "complete_adventure"),
+            None,
+        )
+        if adventure_completion_args is not None and event_type == "dm.turn_resolved":
+            event_type = "adventure.completed"
+            base_payload["adventure_completion"] = {
+                "outcome": adventure_completion_args.get("outcome"),
+                "reason": adventure_completion_args.get("reason"),
+                "public_summary": adventure_completion_args.get("public_summary"),
+                "adventure_id": adventure_completion_args.get("adventure_id"),
+            }
+            base_payload["outcome"] = adventure_completion_args.get("outcome")
+            base_payload["source_turn_id"] = str(turn.id)
 
     # Wrap mutate to also apply staged effects atomically inside same revision bump
     def _mutate_with_effects(campaign):
@@ -1107,6 +1126,37 @@ def commit_turn(
 
     now = _now()
     commit_duration_ms = int((time.monotonic() - execute_start) * 1000)
+    # Link the authoritative event back onto the completed adventure for
+    # turn/event provenance (issue #260). Strictly additive bookkeeping —
+    # never breaks the commit.
+    if event_type == "adventure.completed":
+        try:
+            from models.campaigns import Adventure as _Adventure
+
+            _completed_adv = None
+            _explicit_aid = (base_payload.get("adventure_completion") or {}).get("adventure_id")
+            if _explicit_aid:
+                try:
+                    _completed_adv = db.get(_Adventure, uuid.UUID(str(_explicit_aid)))
+                except ValueError:
+                    _completed_adv = None
+            if _completed_adv is None:
+                _completed_adv = (
+                    db.execute(
+                        select(_Adventure).where(
+                            _Adventure.campaign_id == turn.campaign_id,
+                            _Adventure.status == "completed",
+                            _Adventure.source_turn_id == turn.id,
+                        )
+                    )
+                    .scalars()
+                    .first()
+                )
+            if _completed_adv is not None and _completed_adv.source_event_id is None:
+                _completed_adv.source_event_id = event.id
+                db.flush()
+        except Exception as e:
+            logger.warning("dm_turn failed to link adventure event turn_id=%s error=%s", turn.id, e)
     turn.status = TURN_SUCCEEDED
     turn.resolved_at = now
     turn.committed_at = now
