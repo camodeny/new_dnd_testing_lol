@@ -379,12 +379,10 @@ def _handle_complete_adventure(db: Session, campaign: Campaign, effect: dict[str
         status="pending",
         attempts=0,
     ))
-    # Shared #263 finalization: bind the end cursor (latest visible event) and
-    # derive the summary for staged-DM completions too. Best-effort: failures
-    # are recorded, never break the turn commit.
-    from app.adventures.service import finalize_adventure_derived as _finalize
-
-    _finalize(db, adventure)
+    # Derived summary finalization happens post-commit in the turn commit
+    # path (issue #263): the authoritative completion event/revision only
+    # exists after commit_campaign_mutation returns, so binding the end
+    # cursor here would permanently truncate the range by one step.
     db.flush()
     logger.info(
         "effect complete_adventure effect_id=%s adventure_id=%s outcome=%s op=%s",

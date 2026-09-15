@@ -6,6 +6,8 @@ adventures table; this revision only extends it)
 
 Additive only: adds the summary source-range columns to ``adventures`` and
 creates ``adventure_summaries``. Never creates a second adventures table.
+Includes a data backfill binding deterministic source bounds for completed
+legacy rows (from their linked completion event); see inline comment.
 """
 
 from typing import Sequence, Union
@@ -58,6 +60,33 @@ def upgrade() -> None:
         sa.CheckConstraint("status IN ('pending', 'current', 'stale', 'failed')", name="ck_adventure_summaries_status"),
     )
     op.create_index("ix_adventure_summaries_campaign", "adventure_summaries", ["campaign_id"])
+    # Backfill deterministic source bounds for adventures created before range
+    # tracking existed (issue #260 rows). Only rows that provably predate this
+    # revision are touched: completed rows with a linked completion event but
+    # no end cursor (every post-migration completion path binds the end
+    # cursor, so these can only be legacy rows).
+    #
+    # - end_sequence/end_revision come from the linked completion event
+    #   (domain-event sequence == resulting campaign revision by invariant).
+    # - start_sequence is estimated as the first event at/after the
+    #   adventure's opened timestamp. New arcs always record their cursor at
+    #   open time, so this heuristic never rewrites them.
+    # Adventures still active keep start_sequence=0 (unknown arc start means
+    # full-history scope until they complete through a tracked path).
+    op.execute(
+        sa.text(
+            "UPDATE adventures AS a SET "
+            "end_sequence = e.sequence, "
+            "end_revision = e.sequence, "
+            "start_sequence = COALESCE(("
+            "SELECT MIN(e2.sequence) FROM campaign_domain_events AS e2 "
+            "WHERE e2.campaign_id = a.campaign_id AND e2.created_at >= a.started_at"
+            "), 0) "
+            "FROM campaign_domain_events AS e "
+            "WHERE a.source_event_id = e.id "
+            "AND a.status = 'completed' AND a.end_sequence IS NULL"
+        )
+    )
 
 
 def downgrade() -> None:

@@ -945,15 +945,35 @@ def finalize_adventure_derived(
     from models.campaigns import CampaignDomainEvent as _DomainEvent
 
     try:
+        _from_source_event = False
         if event_sequence is None:
-            event_sequence = db.execute(
-                select(_func.max(_DomainEvent.sequence)).where(
-                    _DomainEvent.campaign_id == adventure.campaign_id
-                )
-            ).scalar()
+            # Prefer the adventure's own authoritative completion event
+            # (deterministic for legacy/repair rows); fall back to the latest
+            # visible sequence only when no completion event is linked.
+            if adventure.source_event_id is not None:
+                _src = db.execute(
+                    select(_DomainEvent.sequence).where(
+                        _DomainEvent.id == adventure.source_event_id
+                    )
+                ).scalar()
+                if _src is not None:
+                    event_sequence = int(_src)
+                    _from_source_event = True
+            if event_sequence is None:
+                event_sequence = db.execute(
+                    select(_func.max(_DomainEvent.sequence)).where(
+                        _DomainEvent.campaign_id == adventure.campaign_id
+                    )
+                ).scalar()
         if revision is None:
-            camp = db.get(_Campaign, adventure.campaign_id)
-            revision = camp.revision if camp is not None else None
+            if _from_source_event and event_sequence is not None:
+                # Domain-event sequence == resulting campaign revision, so a
+                # source-event-derived end pins both bounds exactly even when
+                # later events exist (legacy repair case).
+                revision = int(event_sequence)
+            else:
+                camp = db.get(_Campaign, adventure.campaign_id)
+                revision = camp.revision if camp is not None else None
         if event_sequence is not None:
             adventure.end_sequence = int(event_sequence)
         if revision is not None:

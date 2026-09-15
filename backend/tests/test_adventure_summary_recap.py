@@ -535,3 +535,57 @@ def test_recap_keeps_viewer_authorized_private_tokens(api):
         assert "moonstone sigil revealed" in recap_a.json()["recap_text"]
     finally:
         actor["id"] = owner
+
+
+def test_migration_backfills_legacy_source_bounds():
+    """d3a263a1f263 must bind deterministic bounds for pre-existing rows:
+    end cursor from the linked completion event, guarded to legacy rows
+    (end unset), with a timestamp-correlated start estimate."""
+    from pathlib import Path
+
+    src = (
+        Path(__file__).parent.parent / "alembic" / "versions"
+        / "d3a263a1f263_adventure_summary_recap_263.py"
+    ).read_text(encoding="utf-8")
+    assert "a.source_event_id = e.id" in src
+    assert "a.end_sequence IS NULL" in src
+    assert "MIN(e2.sequence)" in src
+
+
+def test_legacy_completed_row_finalizes_from_source_event_not_max(api):
+    """Repair of a legacy completed row (no end cursor) must not absorb
+    post-completion events: the end binds to its own completion event."""
+    from app.adventures.service import finalize_adventure_derived
+    from app.campaigns.events import commit_campaign_mutation
+
+    client, factory, actor, owner = api
+    camp = _campaign(client)
+    cid = uuid.UUID(camp["id"])
+    _seed_events(factory, camp["id"])
+    with factory() as db:
+        rev = int(db.get(Campaign, cid).revision)
+    adv = _open(client, camp["id"], key="op-open-legacy")
+    _complete(client, camp["id"], adv["id"], rev, "op-complete-legacy")
+    with factory() as db:
+        adv_row = db.get(Adventure, uuid.UUID(adv["id"]))
+        completion_seq = int(adv_row.end_sequence)
+        # Simulate a pre-migration row: bounds never bound...
+        adv_row.end_sequence = None
+        adv_row.end_revision = None
+        # ...and the campaign continued afterwards.
+        camp_row = db.get(Campaign, cid)
+        commit_campaign_mutation(
+            db, cid, int(camp_row.revision),
+            event_type="campaign.continued",
+            payload={"summary": "later happenings at the far gate"},
+            operation_id="seed-far-gate", visibility="public",
+        )
+        db.commit()
+    with factory() as db:
+        adv_row = db.get(Adventure, uuid.UUID(adv["id"]))
+        row = finalize_adventure_derived(db, adv_row)
+        db.commit()
+        assert int(adv_row.end_sequence) == completion_seq
+        assert int(adv_row.end_revision) == completion_seq
+        assert row is not None and row.status == "current"
+        assert "far gate" not in (row.historical_text or "")

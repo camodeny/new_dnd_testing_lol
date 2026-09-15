@@ -1198,6 +1198,27 @@ def commit_turn(
             if _completed_adv is not None and _completed_adv.source_event_id is None:
                 _completed_adv.source_event_id = event.id
                 db.flush()
+                # Shared #263 finalization, post-commit: the authoritative
+                # completion event and campaign revision exist only now, so
+                # the end cursor binds exactly (event.sequence ==
+                # campaign revision by invariant). Best-effort: derived-work
+                # failures are recorded, never break the turn commit.
+                try:
+                    from app.adventures.service import (
+                        finalize_adventure_derived as _finalize,
+                    )
+
+                    _finalize(
+                        db, _completed_adv,
+                        event_sequence=event.sequence,
+                        revision=campaign_after.revision,
+                    )
+                    db.flush()
+                except Exception as e:
+                    logger.warning(
+                        "dm_turn failed to finalize adventure summary turn_id=%s error=%s",
+                        turn.id, e,
+                    )
         except Exception as e:
             logger.warning("dm_turn failed to link adventure event turn_id=%s error=%s", turn.id, e)
     turn.status = TURN_SUCCEEDED
