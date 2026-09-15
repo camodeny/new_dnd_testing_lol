@@ -564,6 +564,105 @@ def test_narration_unapproved_substitution_blocked():
         build_provider_narrator(adapter=_FakeAdapter("evil"), model="bad-model")
 
 
+def _provider_narrator_mocks(monkeypatch, *, path, fail_first=None):
+    """Mock the narration policy path + streaming transport.
+
+    fail_first: exception instance raised by the first provider after
+    yielding ``fail_first_prefix`` (None = raise before any yield).
+    """
+    import app.providers as providers_pkg
+    from app.providers import registry as reg
+    from app.providers.contracts import NormalizedStreamEvent
+
+    calls = []
+    state = {"prefix": ""}
+
+    def _fake_stream(adapter, request):
+        calls.append(adapter.name)
+        if fail_first is not None and adapter.name == path[0][0]:
+            if state["prefix"]:
+                yield NormalizedStreamEvent(kind="token", text=state["prefix"])
+            raise fail_first
+        for piece in state["pieces"]:
+            yield NormalizedStreamEvent(kind="token", text=piece)
+
+    monkeypatch.setattr(providers_pkg, "stream_chat", _fake_stream)
+    monkeypatch.setattr(role_policy, "execution_path", lambda role: list(path))
+    monkeypatch.setattr(role_policy, "is_model_approved", lambda r, p, m: True)
+    monkeypatch.setattr(reg.provider_registry, "get", lambda name: _FakeAdapter(name))
+    monkeypatch.setattr("app.providers.areas.resolve_area",
+                        lambda area: (_FakeAdapter(path[0][0]), path[0][1], path[0][0]))
+    return calls, state
+
+
+def test_narration_failover_drops_unpersisted_prefix(db, monkeypatch):
+    """Provider 1 yields a short prefix then 429s with zero durable chunks:
+    failover drops the prefix; provider 2's text is the only visible output."""
+    from app.dm.adjudication import build_provider_narrator
+    from app.dm.narration import (
+        NarratorRequest,
+        render_deterministic_narration,
+        stream_narration,
+    )
+    from app.dm_streams.service import reconstruct_text
+    from app.providers.contracts import ProviderError
+
+    s, camp_id, thread_id, _ = db
+    turn, attempt = _submit(s, camp_id, thread_id)
+    contract = _contract(LONG_TEXT)
+    projection = contract.model_dump(mode="json")
+    expected = render_deterministic_narration(
+        __import__("app.dm.narration", fromlist=["build_narration_projection"])
+        .build_narration_projection(contract), contract)
+    half = len(expected) // 2
+    calls, state = _provider_narrator_mocks(
+        monkeypatch, path=[("p1", "m"), ("p2", "m")],
+        fail_first=ProviderError("rate limited", kind="http", status_code=429,
+                                 retryable=True),
+    )
+    state["prefix"] = "Hi. "
+    state["pieces"] = [expected[:half], expected[half:]]
+
+    narrate = build_provider_narrator(db=s)
+    result = stream_narration(
+        s, campaign_id=camp_id, thread_id=thread_id, turn_id=str(turn.id),
+        attempt_id=str(attempt.id), contract=contract, narrator=narrate,
+        chunk_size=120, provider="p1/p2", publish_realtime=False,
+    )
+    assert result.completed is True
+    visible = reconstruct_text(s, result.stream_id)
+    assert visible == expected
+    assert "Hi." not in visible
+    assert calls[0] == "p1" and "p2" in calls
+
+
+def test_narration_skipped_primary_stays_recovery(db, monkeypatch):
+    """An unavailable primary cannot promote the alternate to billable primary."""
+    from app.dm.adjudication import build_provider_narrator
+    from app.dm.narration import NarratorRequest
+    from models.reliability import AIRun
+
+    s, _, _, _ = db
+    calls, state = _provider_narrator_mocks(
+        monkeypatch, path=[("p1", "m"), ("p2", "m")])
+    state["pieces"] = ["hello world"]
+
+    def _no_primary(area):
+        raise RuntimeError("META_API_KEY is not set")
+
+    monkeypatch.setattr("app.providers.areas.resolve_area", _no_primary)
+    narrate = build_provider_narrator(db=s)
+    text = "".join(narrate(NarratorRequest(prompt="p", projection={})))
+    assert text == "hello world"
+    assert calls == ["p2"]
+    runs = s.execute(select(AIRun)).scalars().all()
+    assert len(runs) == 1
+    assert runs[0].provider == "p2"
+    assert runs[0].classification == "recovery"
+    assert runs[0].billable is False
+    assert runs[0].status == "succeeded"
+
+
 def test_recover_partial_stream_maps_stale_revision_to_retryable(db):
     from app.dm.recovery import recover_partial_stream
 

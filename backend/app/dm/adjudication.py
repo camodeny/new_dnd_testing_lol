@@ -378,13 +378,20 @@ def build_provider_narrator(
     contract-bound ``NarratorRequest`` and yielding text deltas.
 
     Failover preserves the visible-prefix invariant: provider switching
-    happens ONLY before the first visible token. Once tokens flow, the
-    provider is pinned; later failures propagate to the normal
-    post-visibility handling (fidelity-gated continuation, never silent
-    provider switching mid-stream).
+    happens ONLY before anything is durably player-visible (checked via the
+    request's durability probe, falling back to a no-yield rule without one).
+    On a switch the narrator yields a ``NarratorFailoverMarker`` so the
+    streaming service drops the failed provider's unpersisted prefix — the
+    next provider's text starts clean. Once output is durable, the provider
+    is pinned; later failures propagate to the normal post-visibility
+    handling (fidelity-gated continuation, never silent mid-stream switch).
 
-    Failover attempts are recorded as non-billable recovery AI runs when
-    ``db`` is given (as is narration on an explicit-retry attempt).
+    Candidate lineage follows the policy-path index (not the resolved
+    order): if the primary cannot even be configured, the first alternate
+    is still index 1 — ``recovery``/non-billable, never promoted to
+    billable primary work. Failover attempts are recorded as non-billable
+    recovery AI runs when ``db`` is given (as is narration on an
+    explicit-retry attempt).
     """
     from app.providers import ProviderRequest, stream_chat
     from app.providers import policy as role_policy
@@ -397,55 +404,82 @@ def build_provider_narrator(
                 f"Unapproved model substitution blocked for role {role!r}: "
                 f"{adapter.name}/{model}"
             )
-        candidates = [(adapter, model)]
+        pinned = [(0, adapter, model)]
     else:
-        path = role_policy.execution_path(role)
-        candidates = []
-        first_error: BaseException | None = None
-        for provider_name, candidate_model in path:
-            if not role_policy.is_model_approved(role, provider_name, candidate_model):
-                raise RuntimeError(
-                    f"Unapproved model substitution blocked for role {role!r}: "
-                    f"{provider_name}/{candidate_model}"
-                )
-            try:
-                if adapter is not None or model is not None:
-                    raise RuntimeError(
-                        "Provide both adapter and model, or neither (policy path)"
-                    )
-                if len(candidates) == 0 and provider_name == path[0][0]:
-                    from app.providers.areas import resolve_area
-
-                    area = role_policy.ROLE_AREA.get(role, role)
-                    cand_adapter, cand_model, _ = resolve_area(area)
-                else:
-                    from app.providers.registry import provider_registry
-
-                    cand_adapter = provider_registry.get(provider_name)
-                    cand_adapter.require_config(candidate_model)
-                    cand_model = candidate_model
-                candidates.append((cand_adapter, cand_model))
-            except Exception as exc:
-                if first_error is None:
-                    first_error = exc
-                role_policy.record_failover_attempt(
-                    f"config_unavailable:{provider_name}", provider_name,
-                    candidate_model,
-                )
-                continue
-        if not candidates:
-            raise first_error if first_error is not None else RuntimeError(
-                f"No narration provider available for role {role!r}"
+        if (adapter is not None) != (model is not None):
+            raise RuntimeError(
+                "Provide both adapter and model, or neither (policy path)"
             )
+        pinned = None
+    policy_path = None if pinned is not None else role_policy.execution_path(role)
+
+    def _resolve(path_index: int, provider_name: str, candidate_model: str):
+        """Resolve one candidate, preserving its policy-path index."""
+        if not role_policy.is_model_approved(role, provider_name, candidate_model):
+            raise RuntimeError(
+                f"Unapproved model substitution blocked for role {role!r}: "
+                f"{provider_name}/{candidate_model}"
+            )
+        if path_index == 0:
+            # Primary resolves through the canonical seam so existing
+            # config gates hold.
+            from app.providers.areas import resolve_area
+
+            area = role_policy.ROLE_AREA.get(role, role)
+            cand_adapter, cand_model, _ = resolve_area(area)
+            return cand_adapter, cand_model
+        from app.providers.registry import provider_registry
+
+        cand_adapter = provider_registry.get(provider_name)
+        cand_adapter.require_config(candidate_model)
+        return cand_adapter, candidate_model
 
     def _narrate(narrator_request) -> object:
         prompt = getattr(narrator_request, "prompt", "")
+        probe = getattr(narrator_request, "durable_prefix_fn", None)
+
+        def _durable_visible() -> bool:
+            try:
+                return bool(probe() if callable(probe) else False)
+            except Exception:
+                return False
 
         def _gen():
+            # (path_index, provider_ref, model, pre_resolved): provider_ref
+            # is an adapter when pinned, else a registry name.
+            if pinned is not None:
+                entries = [(0, adapter, model, True)]
+            else:
+                assert policy_path is not None
+                entries = [(i, p, m, False) for i, (p, m) in enumerate(policy_path)]
+            resolved: list[tuple[int, object, str]] = []
+            first_error: BaseException | None = None
+            for path_index, provider_ref, candidate_model, pre_resolved in entries:
+                try:
+                    if pre_resolved:
+                        cand_adapter, cand_model = provider_ref, candidate_model
+                    else:
+                        cand_adapter, cand_model = _resolve(
+                            path_index, provider_ref, candidate_model)
+                except Exception as exc:
+                    if first_error is None:
+                        first_error = exc
+                    role_policy.record_failover_attempt(
+                        f"config_unavailable:{provider_ref}", str(provider_ref),
+                        candidate_model,
+                    )
+                    continue
+                resolved.append((path_index, cand_adapter, cand_model))
+            if not resolved:
+                raise first_error if first_error is not None else RuntimeError(
+                    f"No narration provider available for role {role!r}"
+                )
             failover_reasons: list[str] = []
-            for index, (cand_adapter, cand_model) in enumerate(candidates):
+            for position, (path_index, cand_adapter, cand_model) in enumerate(resolved):
+                # Lineage follows the POLICY-PATH index: a skipped primary
+                # never promotes an alternate to billable primary work.
                 classification = (
-                    "recovery" if (index > 0 or is_retry) else "primary"
+                    "recovery" if (path_index > 0 or is_retry) else "primary"
                 )
                 ai_run = None
                 if db is not None:
@@ -455,7 +489,7 @@ def build_provider_narrator(
                         ai_run = record_ai_run_inline(
                             db, logical_operation="narration_stream",
                             role=role, provider=cand_adapter.name,
-                            model=cand_model, attempt=index + 1,
+                            model=cand_model, attempt=path_index + 1,
                             classification=classification,
                             billable=(classification == "primary"),
                             trace_id=tid,
@@ -474,14 +508,14 @@ def build_provider_narrator(
                 structured_log(
                     logger, logging.INFO, "narration_provider_start",
                     provider=cand_adapter.name, model=cand_model,
-                    trace_id=tid, attempt=index + 1,
+                    trace_id=tid, attempt=path_index + 1,
                     classification=classification,
                 )
-                emitted = False
+                yielded_downstream = False
                 try:
                     for event in stream_chat(cand_adapter, pr):
                         if event.kind == "token" and event.text:
-                            emitted = True
+                            yielded_downstream = True
                             yield event.text
                     if ai_run is not None:
                         try:
@@ -506,10 +540,39 @@ def build_provider_narrator(
                     role_policy.record_failover_attempt(
                         reason, cand_adapter.name, cand_model
                     )
-                    # Pre-first-token retryable failure: next approved
-                    # candidate. After visibility, never switch providers
-                    # mid-stream — propagate for continuation handling.
-                    if not emitted and cls == "retriable" and index < len(candidates) - 1:
+                    # Switching is keyed on DURABLE visibility, not raw token
+                    # emission: a retryable failure with nothing durably
+                    # visible moves to the next approved candidate (the
+                    # marker tells the service to drop the failed
+                    # provider's unpersisted prefix). Once output is
+                    # durable, the provider is pinned — propagate for
+                    # fidelity-gated continuation handling. Without a
+                    # durability probe (direct narrator use), fall back to
+                    # the conservative no-yield rule.
+                    if probe is None:
+                        pre_visible = not yielded_downstream
+                    else:
+                        pre_visible = not _durable_visible()
+                    can_switch = (
+                        cls == "retriable"
+                        and position < len(resolved) - 1
+                        and pre_visible
+                    )
+                    if can_switch:
+                        if db is not None:
+                            role_policy.record_recovery_run(billable=False)
+                        if yielded_downstream:
+                            # The failed provider's prefix reached the
+                            # service but was never durable: tell it to
+                            # drop the prefix so the next provider starts
+                            # clean. With nothing yielded, there is nothing
+                            # to retract (and probe-less consumers never see
+                            # a marker).
+                            from app.dm.narration import NarratorFailoverMarker
+
+                            yield NarratorFailoverMarker(
+                                provider=cand_adapter.name, reason=reason,
+                            )
                         continue
                     raise
             # Unreachable: loop either returns or raises.

@@ -302,12 +302,37 @@ class NarratorRequest:
 
     prompt: str
     projection: dict[str, Any]
+    #: Visibility probe installed by :func:`stream_narration` before invoking
+    #: the narrator: returns the currently durably persisted visible text.
+    #: Failover-capable narrators consult it to key provider switching on
+    #: durable visibility (first player-visible output), not on raw token
+    #: emission. ``None`` outside the streaming service (direct narrator
+    #: use falls back to a no-yield switching rule).
+    durable_prefix_fn: Callable[[], str] | None = None
+
+
+@dataclass
+class NarratorFailoverMarker:
+    """A failover-capable narrator yields this when it switches providers.
+
+    Only ever emitted pre-visibility (the durable probe was empty), so the
+    failed provider's already-yielded prefix was never persisted or
+    delivered. The consumer must drop any unpersisted accumulation and
+    continue with the next provider's deltas — never persist the dropped
+    prefix.
+    """
+
+    provider: str
+    reason: str
 
 
 #: A provider yields narration text deltas (e.g. LLM token batches) as they
 #: are generated. The service persists each delta durably as it arrives, so
 #: time-to-first-visible-chunk tracks first-delta arrival rather than full
-#: generation — the low-TTFT path required by #207.
+#: generation — the low-TTFT path required by #207. Failover-capable
+#: providers may additionally yield :class:`NarratorFailoverMarker` when
+#: switching providers pre-visibility; the service drops the failed
+#: provider's unpersisted prefix on receipt.
 NarratorDeltaStream = Iterable[str]
 
 #: Streaming provider contract. A batch provider may still return a plain
@@ -773,6 +798,10 @@ def stream_narration(
         prompt=build_narrator_prompt(projection),
         projection=projection,
     )
+    # Visibility probe for failover-capable narrators: durable persisted
+    # text. Installed before the narrator is invoked so provider switching
+    # can key on first player-visible output.
+    request.durable_prefix_fn = lambda: "".join(persisted_texts)
 
     # — Durable stream header (pre-chunk, never visible until chunk 0) —
     try:
@@ -915,6 +944,20 @@ def stream_narration(
                 delta = None
             cumulative = ""
             if not exhausted:
+                if isinstance(delta, NarratorFailoverMarker):
+                    # Pre-visibility provider switch: the failed provider's
+                    # prefix was never durable (probe-verified by the
+                    # narrator). Drop the unpersisted accumulation so the
+                    # next provider's text starts clean — never persist the
+                    # dropped prefix.
+                    durable_so_far = "".join(persisted_texts)
+                    full_parts = [durable_so_far] if durable_so_far else []
+                    structured_log(
+                        logger, logging.INFO, "narration_provider_failover",
+                        stream_id=str(stream_id),
+                        provider=delta.provider, reason=delta.reason,
+                    )
+                    continue
                 if not isinstance(delta, str):
                     raise NarratorGenerationError(
                         "Narrator deltas must be str, "
