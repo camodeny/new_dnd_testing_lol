@@ -561,6 +561,97 @@ def test_migration_backfills_legacy_source_bounds():
     assert "a.end_sequence IS NULL" in src
 
 
+def test_unknown_visibility_matches_event_feed_fail_closed(api):
+    """Fail-closed parity: an event with an unrecognized non-public
+    visibility is hidden from both the canonical event feed and the recap
+    for non-actor members."""
+    from app.campaigns.events import commit_campaign_mutation
+
+    client, factory, actor, owner = api
+    camp = _campaign(client)
+    member = _make_member(factory, camp["id"])
+    cid = uuid.UUID(camp["id"])
+    with factory() as db:
+        camp_row = db.get(Campaign, cid)
+        rev = int(camp_row.revision)
+        commit_campaign_mutation(
+            db, cid, rev,
+            event_type="dm.narration",
+            payload={"summary": "public happening at the chapel"},
+            operation_id="seed-pubvis-1", visibility="public",
+        )
+        commit_campaign_mutation(
+            db, cid, rev + 1,
+            event_type="dm.secret",
+            payload={"summary": "zxqv-unrecognized-seclusion beneath the chapel"},
+            operation_id="seed-pubvis-2", visibility="secret",
+        )
+    with factory() as db:
+        rev = int(db.get(Campaign, cid).revision)
+    adv = _open(client, camp["id"], key="op-open-secretvis")
+    _complete(client, camp["id"], adv["id"], rev, "op-complete-secretvis")
+    actor["id"] = member
+    try:
+        feed = client.get(f"/api/campaigns/{camp['id']}/events")
+        assert feed.status_code == 200, feed.text
+        assert "zxqv-unrecognized-seclusion" not in feed.text
+        recap = client.get(f"/api/campaigns/{camp['id']}/adventures/{adv['id']}/recap")
+        assert recap.status_code == 200, recap.text
+        assert "zxqv-unrecognized-seclusion" not in recap.json()["recap_text"]
+        assert "public happening" in recap.json()["recap_text"]
+    finally:
+        actor["id"] = owner
+
+
+def test_open_cursor_excludes_concurrent_pre_insert_event(api, monkeypatch):
+    """A mutation committing between the route's initial campaign read and
+    adventure insertion must not enter the new arc: the default cursor
+    derives from the locked campaign revision inside start_adventure."""
+    import sqlalchemy as sa
+
+    import app.adventures.service as _adventure_service
+    from app.campaigns.events import commit_campaign_mutation
+
+    client, factory, actor, owner = api
+    camp = _campaign(client)
+    cid = uuid.UUID(camp["id"])
+    real_start = _adventure_service.start_adventure
+
+    def _racing_start(db, campaign_id, title, **kw):
+        camp_row = db.get(Campaign, campaign_id)
+        commit_campaign_mutation(
+            db, campaign_id, int(camp_row.revision),
+            event_type="dm.narration",
+            payload={"summary": "racing happening at the gate"},
+            operation_id="seed-race-1", visibility="public",
+        )
+        return real_start(db, campaign_id, title, **kw)
+
+    monkeypatch.setattr(
+        "app.adventures.service.start_adventure", _racing_start
+    )
+    r = client.post(
+        f"/api/campaigns/{cid}/adventures",
+        json={"title": "Race arc", "operation_id": "op-open-race"},
+    )
+    assert r.status_code == 200, r.text
+    adv = r.json()["adventure"]
+    with factory() as db:
+        adv_row = db.get(Adventure, uuid.UUID(adv["id"]))
+        racing_seq = db.execute(
+            sa.select(sa.func.max(CampaignDomainEvent.sequence)).where(
+                CampaignDomainEvent.campaign_id == cid,
+                CampaignDomainEvent.operation_id == "seed-race-1",
+            )
+        ).scalar()
+        assert racing_seq is not None
+        assert int(adv_row.start_sequence) == int(racing_seq) + 1
+    with factory() as db:
+        rev = int(db.get(Campaign, cid).revision)
+    out = _complete(client, camp["id"], adv["id"], rev, "op-complete-race")
+    assert "racing happening" not in (out["summary"]["historical_text"] or "")
+
+
 def test_public_summary_token_shared_with_hidden_evidence_does_not_fail_generation(api):
     """A deliberately published token overlapping hidden evidence must not
     trip the leak detector: generation stays current, while unrelated

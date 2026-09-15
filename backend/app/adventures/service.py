@@ -192,6 +192,7 @@ def start_adventure(
     *,
     commit: bool = True,
     adventure_metadata: dict | None = None,
+    start_sequence: int | None = None,
 ) -> Adventure:
     """Open a new adventure arc. Fails if one is already active.
 
@@ -199,6 +200,11 @@ def start_adventure(
     starts serialize; the partial unique index
     ``uq_adventures_one_active_per_campaign`` is the final backstop and a
     unique violation is mapped to :class:`AdventureAlreadyActiveError`.
+
+    The default source cursor is derived from the LOCKED campaign revision
+    (next event after the current cursor), never from a pre-lock read, so a
+    concurrently committed pre-open mutation cannot leak into the new arc's
+    derived range. An explicit ``start_sequence`` stays inclusive.
     """
     from sqlalchemy.exc import IntegrityError
 
@@ -218,12 +224,24 @@ def start_adventure(
     existing = get_current_adventure(db, campaign_id)
     if existing is not None:
         raise AdventureAlreadyActiveError(campaign_id, existing.id)
+    if start_sequence is None:
+        # Derived under the campaign lock: the event at sequence R already
+        # happened before this open, so the arc starts at R + 1.
+        start_sequence = int(campaign.revision or 0) + 1
+    else:
+        try:
+            start_sequence = int(start_sequence)
+        except (TypeError, ValueError):
+            raise ValueError("start_sequence must be an integer")
+        if start_sequence < 0:
+            raise ValueError("start_sequence must be non-negative")
     adventure = Adventure(
         id=uuid.uuid4(),
         campaign_id=campaign_id,
         title=clean_title,
         status="active",
         adventure_metadata=adventure_metadata,
+        start_sequence=start_sequence,
     )
     db.add(adventure)
     try:
@@ -636,12 +654,21 @@ import uuid as _uuid_lib
 GENERATOR_PROVIDER = "template"
 GENERATOR_MODEL = "adventure-recap-v1"
 
-#: Event visibilities treated as hidden from the player-facing recap.
-HIDDEN_VISIBILITIES = frozenset({"private", "dm_only", "dm_private", "gm_only"})
-
 
 class AdventureError(Exception):
     pass
+
+
+def _is_hidden(ev) -> bool:
+    """Fail-closed mirror of the canonical event-feed visibility rule.
+
+    Only exactly ``"public"`` is globally visible; every other value
+    (including unknown strings, empty, or missing) requires an actor match
+    (see ``_event_visible_to`` and ``list_campaign_events``). No separate
+    hidden-string allowlist is maintained so the two read surfaces cannot
+    drift apart.
+    """
+    return getattr(ev, "visibility", None) != "public"
 
 
 def _utcnow() -> datetime:
@@ -658,10 +685,6 @@ def _event_text(ev) -> str:
         if isinstance(val, str) and val.strip():
             return val.strip()
     return f"{ev.event_type} (seq {ev.sequence})"
-
-
-def _is_hidden(ev) -> bool:
-    return str(getattr(ev, "visibility", "public") or "public").strip().lower() in HIDDEN_VISIBILITIES
 
 
 def _event_visible_to(ev, viewer_id: _uuid_lib.UUID | None) -> bool:

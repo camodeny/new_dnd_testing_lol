@@ -1589,13 +1589,12 @@ def start_adventure_endpoint(
     operation_id = str(payload.get("operation_id") or "").strip() or None
     idempotency_key = require_idempotency_key(request, operation_id)
     # Source-range boundary for derived summaries (issue #263): an explicit
-    # start_sequence stays inclusive; the default is the NEXT event after the
-    # current cursor (the event at sequence R already happened before the
-    # adventure opened).
+    # start_sequence stays inclusive; the default is derived inside
+    # start_adventure from the LOCKED campaign revision (next event after the
+    # current cursor), never from the pre-lock read above.
     raw_start = payload.get("start_sequence")
-    if raw_start is None:
-        start_sequence = int(campaign.revision or 0) + 1
-    else:
+    start_sequence = None
+    if raw_start is not None:
         try:
             start_sequence = int(raw_start)
         except (TypeError, ValueError):
@@ -1606,11 +1605,13 @@ def start_adventure_endpoint(
     def _execute():
         try:
             adventure = start_adventure(
-                db, campaign.id, title, adventure_metadata=metadata, commit=False,
+                db, campaign.id, title, adventure_metadata=metadata,
+                start_sequence=start_sequence, commit=False,
             )
         except AdventureAlreadyActiveError as exc:
             raise HTTPException(status_code=409, detail=str(exc)) from exc
-        adventure.start_sequence = start_sequence
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
         # Committed atomically with the idempotency record by execute_http_idempotent.
         return {"adventure": adventure.to_dict(), "campaign_status": campaign.status}
 
