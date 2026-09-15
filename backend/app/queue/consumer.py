@@ -6,25 +6,12 @@ Delivery-side counterpart to the relay publish path
 rebuilds the :class:`WorkerEnvelope`, resolves the business handler for its
 ``job_type``, and executes it idempotently via ``execute_worker_job``.
 
-DELIBERATELY DEFERRED (documented, not pretended): no business worker is
-registered yet — ``WORKER_HANDLERS`` is empty and no push-consumer trigger
-is registered in ``vercel.json``. Registering a trigger (or a public HTTP
-consumer route, which would be invocable by anyone without queue-signature
-verification) with no handler behind it would silently accept work and then
-fail every delivery until messages expire. Instead:
-
-- published messages remain durable in the Vercel Queues topic for their
-  retention window, deduplicated by ``Vqs-Idempotency-Key`` (outbox/job ID)
-  and idempotent downstream via ``WorkerExecution`` keyed on ``job_id``;
-- the owning feature adds a ``job_type -> handler`` entry to
-  ``WORKER_HANDLERS`` (or replaces ``resolve_worker_handler`` with its own
-  registry) and then registers the push trigger for the topic
-  (``queue/v2beta`` trigger on the consumer function / ``[[tool.vercel
-  .subscribers]]`` entrypoint, per https://vercel.com/docs/queues) with
-  this module's ``consume_queue_delivery`` as the dispatch entrypoint.
-
-Until then ``resolve_worker_handler`` raises ``UnregisteredWorkerType`` so
-a premature consumer wiring fails loudly instead of dropping work.
+Registered business workers (see ``WORKER_HANDLERS``) include
+``dm.turn.execute`` and ``post_turn.process``. Queue push delivery requires
+a subscriber/trigger on the topic; until one is configured, consumption is
+driven by the cron sweeps (``/api/cron/dm-execute``, ``/api/cron/post-turn``,
+``/api/cron/outbox-relay`` in ``vercel.json``). Published messages remain
+durable in the topic for their retention window either way.
 """
 from __future__ import annotations
 
@@ -33,8 +20,9 @@ from typing import Any, Callable
 
 logger = logging.getLogger(__name__)
 
-#: Business handlers keyed by envelope job_type. Empty until the owning
-#: feature registers a real worker (see module docstring).
+#: Business handlers keyed by envelope job_type. Features register their
+#: workers here (e.g. dm.turn.execute, post_turn.process); the push-consumer
+#: trigger itself stays deferred (see module docstring).
 WORKER_HANDLERS: dict[str, Callable[..., Any]] = {}
 
 
@@ -45,9 +33,8 @@ class UnregisteredWorkerType(RuntimeError):
 def resolve_worker_handler(envelope) -> Callable[..., Any]:
     """Return the business handler for ``envelope.job_type``.
 
-    Raises :class:`UnregisteredWorkerType` while no business worker is
-    ready — the queue consumer trigger stays unwired until the owning
-    feature registers one (see module docstring).
+    Raises :class:`UnregisteredWorkerType` for unknown job types so a
+    miswired producer fails loudly instead of dropping work.
     """
     try:
         return WORKER_HANDLERS[envelope.job_type]

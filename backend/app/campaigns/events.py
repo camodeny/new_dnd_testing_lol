@@ -262,6 +262,29 @@ def commit_campaign_mutation(
         db.add(ob)
         db.flush()
 
+    # Best-effort post-turn batch evaluation (issue #216), staged in THIS
+    # transaction via savepoint: the run + outbox rows commit atomically with
+    # the event whether this function owns the commit (commit=True) or the
+    # caller does (commit=False, e.g. the HTTP idempotency outer transaction
+    # in app/deps/idempotency.py). A trigger failure rolls back to the
+    # savepoint and never breaks the authoritative mutation. If the outer
+    # transaction rolls back, the staged trigger rows roll back with it —
+    # and the next committed mutation re-evaluates cumulatively from the
+    # durable checkpoint, so nothing is lost.
+    try:
+        from app.post_turn.service import auto_trigger_enabled, maybe_trigger_post_turn
+
+        if auto_trigger_enabled():
+            with db.begin_nested():
+                maybe_trigger_post_turn(db, campaign_id, operation_id=operation_id, commit=False)
+    except Exception as e:
+        logger.warning(
+            "post-turn auto-trigger skipped campaign_id=%s op=%s error=%s",
+            campaign_id,
+            operation_id or "-",
+            e,
+        )
+
     if commit:
         try:
             db.commit()

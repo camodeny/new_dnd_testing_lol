@@ -76,6 +76,7 @@ def create_app() -> FastAPI:
     from app.rolls.router import router as rolls_router
     from app.rules.router import router as rules_router
     from app.outbox.router import router as outbox_cron_router
+    from app.post_turn.router import router as post_turn_cron_router
 
     app.include_router(health_router)
     app.include_router(auth_router)
@@ -92,5 +93,6 @@ def create_app() -> FastAPI:
     app.include_router(rolls_router)
     app.include_router(rules_router)
     app.include_router(outbox_cron_router)
+    app.include_router(post_turn_cron_router)
 
     return app
