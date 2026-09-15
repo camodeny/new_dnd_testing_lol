@@ -481,55 +481,35 @@ def register_adventure_worker() -> None:
     WORKER_HANDLERS[ADVENTURE_CLOSING_JOB] = handle_adventure_closing
 
 
-def _envelope_for_adventure(adventure: Adventure):
-    """Build the closing-work envelope for an adventure (locator only).
-
-    job_id is the adventure id: one closing job per adventure, so sweeps,
-    queue redelivery, and manual replays converge idempotently.
-    """
-    from app.queue.adapter import new_envelope
-
-    return new_envelope(
-        job_id=adventure.id,
-        job_type=ADVENTURE_CLOSING_JOB,
-        campaign_id=adventure.campaign_id,
-        aggregate_id=adventure.campaign_id,
-        operation_id=adventure.operation_id,
-        idempotency_key=str(adventure.id),
-        payload={
-            "adventure_id": str(adventure.id),
-            "campaign_id": str(adventure.campaign_id),
-            "outcome": adventure.outcome,
-            "operation_id": adventure.operation_id,
-        },
-    )
-
-
 def run_adventure_closing_sweep(db: Session, *, limit: int = 5, max_attempts: int = 5) -> dict:
     """Drive pending adventure closing work through the idempotent worker fence.
 
     Production consumption path for ``adventure.closing`` (mirrors the
-    post-turn sweep): picks up completed adventures whose best-effort
-    closing follow-ups have not succeeded yet — pending, or failed under
-    the attempt budget — and runs each through ``execute_worker_job``.
-    Queue push delivery (when a subscriber is configured) converges on the
-    same adventure rows via job_id. A failed sweep never invalidates the
+    post-turn sweep): consumes the durable outbox rows directly, translating
+    each through ``envelope_for_outbox`` — the exact translation the relay
+    uses — so queue delivery and this sweep converge on one
+    ``WorkerExecution`` per outbox row. A failed sweep never invalidates the
     already-committed narrative completion.
     """
-    from app.worker.executor import execute_worker_job
+    from datetime import datetime as _datetime
+    from datetime import timezone as _timezone
 
+    from sqlalchemy import or_ as _or_
+
+    from app.outbox.service import ack_published, envelope_for_outbox, mark_failed
+    from app.worker.executor import execute_worker_job
+    from models.reliability import Outbox
+
+    now = _datetime.now(_timezone.utc)
     candidates = list(
         db.execute(
-            select(Adventure)
+            select(Outbox)
             .where(
-                Adventure.status == "completed",
-                (Adventure.closing_status == "pending")
-                | (
-                    (Adventure.closing_status == "failed")
-                    & (Adventure.closing_attempts < max_attempts)
-                ),
+                Outbox.event_type == ADVENTURE_CLOSING_JOB,
+                _or_(Outbox.status == "pending", Outbox.status == "failed"),
+                _or_(Outbox.next_attempt_at == None, Outbox.next_attempt_at <= now),  # noqa: E711
             )
-            .order_by(Adventure.completed_at.asc().nulls_last(), Adventure.created_at.asc())
+            .order_by(Outbox.created_at.asc())
             .limit(max(1, limit))
         )
         .scalars()
@@ -537,24 +517,29 @@ def run_adventure_closing_sweep(db: Session, *, limit: int = 5, max_attempts: in
     )
     executed: list[str] = []
     failed: list[dict] = []
-    for adventure in candidates:
+    for row in candidates:
         try:
-            env = _envelope_for_adventure(adventure)
+            env = envelope_for_outbox(row)
             execute_worker_job(
                 db, env, lambda e, _db=db: handle_adventure_closing(e, _db),
                 max_attempts=max_attempts,
             )
-            executed.append(str(adventure.id))
-        except Exception as exc:  # noqa: BLE001 — sweep must survive bad adventures
+            ack_published(db, row.id)
+            executed.append(str(row.id))
+        except Exception as exc:  # noqa: BLE001 — sweep must survive bad rows
             try:
                 db.rollback()
             except Exception:
                 pass
+            try:
+                mark_failed(db, row.id, str(exc)[:500])
+            except Exception:
+                pass
             logger.warning(
-                "adventure closing sweep failed adventure_id=%s error=%s",
-                adventure.id, exc,
+                "adventure closing sweep failed outbox_id=%s error=%s",
+                row.id, exc,
             )
-            failed.append({"adventure_id": str(adventure.id), "error": str(exc)[:300]})
+            failed.append({"outbox_id": str(row.id), "error": str(exc)[:300]})
     logger.info(
         "adventure closing sweep executed=%s failed=%s", len(executed), len(failed)
     )

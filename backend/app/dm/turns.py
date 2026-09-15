@@ -1027,6 +1027,7 @@ def commit_turn(
     base_payload = payload or {"turn_id": str(turn.id), "attempt_id": str(attempt.id), "submission_ids": attempt.submission_ids or []}
     # Include staged effect ids/types in payload for observability
     staged_list = attempt.staged_effects or []
+    adventure_completion_args: dict | None = None
     if staged_list:
         base_payload = dict(base_payload)
         base_payload["staged_effect_ids"] = [e.get("id") for e in staged_list]
@@ -1057,6 +1058,12 @@ def commit_turn(
             base_payload["source_turn_id"] = str(turn.id)
 
     # Wrap mutate to also apply staged effects atomically inside same revision bump
+    # Resolved adventure identity closed by this turn (issue #260): populated
+    # inside the mutation, consumed by the post-mutate payload builder so the
+    # authoritative completion event carries the actual adventure id even when
+    # the effect targeted the implicit current adventure.
+    resolved_adventure: dict[str, str] = {}
+
     def _mutate_with_effects(campaign):
         # Apply caller-provided mutate first
         if mutate is not None:
@@ -1066,6 +1073,26 @@ def commit_turn(
             from app.dm.effects import apply_staged_effects
 
             apply_staged_effects(db, campaign, staged_list, turn, attempt)
+        if adventure_completion_args is not None:
+            try:
+                from models.campaigns import Adventure as _Adventure
+
+                _closed = (
+                    db.execute(
+                        select(_Adventure).where(
+                            _Adventure.campaign_id == turn.campaign_id,
+                            _Adventure.status == "completed",
+                            _Adventure.source_turn_id == turn.id,
+                        )
+                    )
+                    .scalars()
+                    .first()
+                )
+                if _closed is not None:
+                    resolved_adventure["adventure_id"] = str(_closed.id)
+                    resolved_adventure["title"] = _closed.title or ""
+            except Exception as e:
+                logger.warning("dm_turn failed to resolve completed adventure turn_id=%s error=%s", turn.id, e)
         # JIT-promote committed new-entity proposals to durable canonical
         # identity exactly once (issue #209). Runs in the same revision
         # transaction: failed commit leaves no half-created authority.
@@ -1080,6 +1107,18 @@ def commit_turn(
         except ImportError:
             pass
 
+    def _adventure_event_payload() -> dict:
+        """Post-mutate payload: same lifecycle fields, resolved adventure id."""
+        if adventure_completion_args is not None and resolved_adventure.get("adventure_id"):
+            merged = dict(base_payload)
+            merged["adventure_completion"] = {
+                **merged.get("adventure_completion", {}),
+                "adventure_id": resolved_adventure["adventure_id"],
+                "title": resolved_adventure.get("title"),
+            }
+            return merged
+        return base_payload
+
     # Persist commit_operation_id for idempotency
     if not attempt.commit_operation_id:
         attempt.commit_operation_id = duplicate_op
@@ -1091,11 +1130,12 @@ def commit_turn(
             turn.campaign_id,
             expected_revision=int(expected),
             event_type=event_type,
-            payload=base_payload,
+            payload=None if event_type == "adventure.completed" else base_payload,
             operation_id=duplicate_op,
             actor_id=actor_id,
             mutate=_mutate_with_effects,
             commit=False,
+            payload_builder=_adventure_event_payload if event_type == "adventure.completed" else None,
             outbox_event_type="dm.turn_committed",
             outbox_payload={**base_payload, "operation_id": duplicate_op},
             outbox_operation_id=duplicate_op,

@@ -338,6 +338,8 @@ def test_staged_effect_completes_adventure_in_turn_commit(setup):
         db.commit()
         assert event.event_type == "adventure.completed"
         assert event.payload["outcome"] == "retreat"
+        # Implicit-current effect still records the resolved adventure id.
+        assert event.payload["adventure_completion"]["adventure_id"] == str(adv_id)
     with factory() as db:
         adv = db.get(Adventure, adv_id)
         assert adv.status == "completed"
@@ -611,8 +613,9 @@ def test_member_event_feed_hides_dm_reason(api):
 
 def test_closing_consumed_through_production_queue_path(setup, monkeypatch):
     import database
-    from app.queue.adapter import new_envelope
+    from app.outbox.service import envelope_for_outbox
     from app.queue.consumer import consume_queue_delivery
+    from models.reliability import Outbox
 
     factory, camp_id, _owner = setup
     monkeypatch.setattr(database, "SessionLocal", factory)
@@ -621,15 +624,12 @@ def test_closing_consumed_through_production_queue_path(setup, monkeypatch):
     adv, _event = _complete(factory, camp_id, "victory", "op-queue")
     with factory() as db:
         assert db.get(Adventure, adv.id).closing_status == "pending"
-        env = new_envelope(
-            job_id=adv.id,
-            job_type="adventure.closing",
-            campaign_id=camp_id,
-            aggregate_id=camp_id,
-            operation_id="op-queue",
-            payload={"adventure_id": str(adv.id), "campaign_id": str(camp_id)},
-        )
-        result, dup = consume_queue_delivery(db, env.to_dict())
+        # Translate the actual committed outbox row — the exact translation
+        # the relay uses — so queue and sweep share one worker identity.
+        row = db.execute(
+            select(Outbox).where(Outbox.event_type == "adventure.closing")
+        ).scalars().one()
+        result, dup = consume_queue_delivery(db, envelope_for_outbox(row).to_dict())
         assert dup is False and result["ok"] is True
     with factory() as db:
         assert db.get(Adventure, adv.id).closing_status == "succeeded"
@@ -637,16 +637,21 @@ def test_closing_consumed_through_production_queue_path(setup, monkeypatch):
 
 def test_closing_sweep_converges_pending_work(setup):
     from app.adventures.service import run_adventure_closing_sweep
+    from models.reliability import Outbox
 
     factory, camp_id, _owner = setup
     with factory() as db:
         start_adventure(db, camp_id, "Sweep arc")
     adv, _event = _complete(factory, camp_id, "retreat", "op-sweep")
     with factory() as db:
+        row = db.execute(
+            select(Outbox).where(Outbox.event_type == "adventure.closing")
+        ).scalars().one()
         sweep = run_adventure_closing_sweep(db, limit=10)
-        assert sweep["executed"] == [str(adv.id)]
+        assert sweep["executed"] == [str(row.id)]
         assert sweep["failed"] == []
     with factory() as db:
         assert db.get(Adventure, adv.id).closing_status == "succeeded"
+        assert db.get(Outbox, row.id).status == "published"
         # Second sweep finds nothing to do.
         assert run_adventure_closing_sweep(db)["executed"] == []
