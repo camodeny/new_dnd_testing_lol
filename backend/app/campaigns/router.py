@@ -695,6 +695,10 @@ def commit_campaign_mutation_endpoint(
     mutate_fields = payload.get("mutate") if isinstance(payload.get("mutate"), dict) else None
 
     def _mutate(campaign: Campaign):
+        # Archive dormancy (issue #265): even event-only mutations bump the
+        # revision and append to the event stream, so the guard runs
+        # unconditionally on the locked row before any lobby-setting checks.
+        require_playable_campaign(campaign)
         if not mutate_fields:
             return
         if campaign.status != "lobby":
@@ -708,20 +712,23 @@ def commit_campaign_mutation_endpoint(
             campaign.description = mutate_fields["description"]
 
     def _execute():
-        campaign, event = commit_campaign_mutation(
-            db,
-            cid,
-            expected,
-            event_type=event_type,
-            payload=event_payload if isinstance(event_payload, dict) else ({"data": event_payload} if event_payload is not None else None),
-            operation_id=operation_id or idempotency_key,
-            actor_id=profile.id,
-            targets=targets,
-            visibility=visibility,
-            provenance=provenance if isinstance(provenance, dict) else None,
-            mutate=_mutate if mutate_fields else None,
-            commit=False,
-        )
+        try:
+            campaign, event = commit_campaign_mutation(
+                db,
+                cid,
+                expected,
+                event_type=event_type,
+                payload=event_payload if isinstance(event_payload, dict) else ({"data": event_payload} if event_payload is not None else None),
+                operation_id=operation_id or idempotency_key,
+                actor_id=profile.id,
+                targets=targets,
+                visibility=visibility,
+                provenance=provenance if isinstance(provenance, dict) else None,
+                mutate=_mutate,
+                commit=False,
+            )
+        except CampaignArchivedError as exc:
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
         return {"campaign": campaign.to_dict(), "event": event.to_dict()}
 
     try:

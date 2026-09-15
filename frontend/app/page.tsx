@@ -116,6 +116,7 @@ export default function HomePage() {
     try {
       await campaignsApi.delete(campaignToDelete.id)
       setCampaignList((prev) => prev.filter((c) => c.id !== campaignToDelete.id))
+      setArchivedList((prev) => prev.filter((c) => c.id !== campaignToDelete.id))
       setActiveModal(null)
     } catch (err) {
       setDeleteError((err as Error).message || 'Failed to delete campaign.')
@@ -148,6 +149,9 @@ export default function HomePage() {
   if (loadingList) return <Loading />
 
   const hasCampaigns = campaignList.length > 0
+  // Archived tables stay reachable: archiving the last active campaign must
+  // not route to the welcome screen before the Archived/Restore section.
+  const hasAnyCampaigns = hasCampaigns || archivedList.length > 0
 
   const modals = (
     <>
@@ -182,7 +186,7 @@ export default function HomePage() {
     </>
   )
 
-  if (!hasCampaigns) {
+  if (!hasAnyCampaigns) {
     return (
       <>
         <HeroLock />
