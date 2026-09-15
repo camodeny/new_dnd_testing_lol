@@ -291,6 +291,10 @@ def start_streaming(campaign_id: str, turn_id: str, payload: dict, request: Requ
     except AttemptSupersededError as exc:
         raise HTTPException(status_code=409, detail=str(exc)) from exc
     except ValueError as exc:
+        from app.campaigns.service import CampaignArchivedError
+
+        if isinstance(exc, CampaignArchivedError):
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
         raise HTTPException(status_code=422, detail=str(exc)) from exc
 
 

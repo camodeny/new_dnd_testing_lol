@@ -311,28 +311,6 @@ def update_campaign(
         )
 
 
-def _attempt_is_fresh(started_at) -> bool:
-    """True when a running DM claim is recent enough to still be live.
-
-    Stale running claims (crashed worker, lease expired) are recovered by the
-    sweep and must not block dormancy forever; a missing timestamp fails
-    closed and blocks. Timezone-naive stored values are assumed UTC.
-    """
-    import os
-    from datetime import datetime as _dt, timedelta as _td
-
-    if started_at is None:
-        return True
-    try:
-        lease = int(os.getenv("DM_EXECUTE_LEASE_SECONDS", "300") or 300)
-    except (TypeError, ValueError):
-        lease = 300
-    ts = started_at
-    if ts.tzinfo is None:
-        ts = ts.replace(tzinfo=timezone.utc)
-    return ts >= _dt.now(timezone.utc) - _td(seconds=max(60, lease))
-
-
 def _archived_duration_seconds(db: Session, cid: uuid_lib.UUID) -> float | None:
     """Wall-clock seconds since the latest archive event (issue #265).
 
@@ -441,11 +419,13 @@ def transition_campaign_lifecycle(
                 )
         if target == "archived":
             # Issue #265 — never strand visible output mid-stream: archive is
-            # rejected while a DM attempt is irreversibly streaming. Prepared
-            # and pending work simply defers and resumes after restore, so it
-            # never blocks dormancy. This shares serialization with execution:
-            # archive holds the campaign row lock here, and execution cannot
-            # cross its first visibility boundary once archived.
+            # rejected while a DM attempt is running or streaming, or its turn
+            # is streaming. Prepared and pending work simply defers and resumes
+            # after restore, so it never blocks dormancy. Stuck running claims
+            # do not block forever: recover_stuck_attempts resets expired
+            # claims to prepared (only after proving the executor is dead via
+            # the advisory execution lock), which unblocks a later archive.
+            # Dormancy itself never infers executor death from timestamps.
             from models.dm import DmTurn as _DmTurn, DmTurnAttempt as _DmAttempt
 
             _streaming_turn = db.execute(
@@ -454,17 +434,13 @@ def transition_campaign_lifecycle(
                     _DmTurn.status == "streaming",
                 ).limit(1)
             ).scalars().first()
-            _candidates = db.execute(
-                select(_DmAttempt.status, _DmAttempt.started_at).where(
+            _inflight_attempt = db.execute(
+                select(_DmAttempt.id).where(
                     _DmAttempt.campaign_id == locked.id,
                     _DmAttempt.status.in_(("running", "streaming")),
-                ).limit(25)
-            ).all()
-            _inflight = _streaming_turn is not None or any(
-                status == "streaming" or _attempt_is_fresh(started_at)
-                for status, started_at in _candidates
-            )
-            if _inflight:
+                ).limit(1)
+            ).scalars().first()
+            if _inflight_attempt is not None or _streaming_turn is not None:
                 logger.warning(
                     "campaign archive rejected campaign_id=%s actor_id=%s reason=dm_streaming",
                     locked.id, profile.id,

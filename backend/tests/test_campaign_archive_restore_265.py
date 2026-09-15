@@ -439,10 +439,16 @@ def test_dm_execution_defers_while_archived(api):
         assert db.get(DmTurnAttempt, attempt_id).status == "prepared"
 
 
-def test_archive_refused_while_dm_streaming_but_allowed_when_prepared(api):
-    """Archive serializes with visible execution: streaming blocks, prepared defers."""
-    from datetime import datetime, timezone
+def test_archive_refused_while_dm_inflight_and_recovery_unblocks(api):
+    """Archive serializes with visible execution: running/streaming blocks.
 
+    Executor death is never inferred from timestamps: even a stale running
+    claim blocks until recover_stuck_attempts resets it to prepared, which
+    then unblocks archive. Prepared work defers instead of blocking.
+    """
+    from datetime import datetime, timedelta, timezone
+
+    from app.dm.turns import mark_streaming_started, recover_stuck_attempts
     from models.dm import DmTurn, DmTurnAttempt
 
     client, factory, _, owner_id, _, _ = api
@@ -478,11 +484,30 @@ def test_archive_refused_while_dm_streaming_but_allowed_when_prepared(api):
     assert blocked.status_code == 409, blocked.text
     assert _get(client, cid)["status"] == "active"
 
-    # A merely prepared attempt defers instead of blocking dormancy.
+    # Stale claims block too — death requires recovery, not timestamps.
     with factory() as db:
-        db.get(DmTurnAttempt, attempt_id).status = "prepared"
+        db.get(DmTurnAttempt, attempt_id).started_at = datetime.now(timezone.utc) - timedelta(hours=2)
+        db.commit()
+    assert _transition(client, cid, rev, "archived", "archive-stale").status_code == 409
+
+    # Recovery resets the dead claim to prepared, unblocking dormancy.
+    with factory() as db:
+        assert recover_stuck_attempts(db, lease_seconds=0) == 1
         db.commit()
     assert _transition(client, cid, rev, "archived", "archive-1").status_code == 200
+
+    # A worker that claimed before the archive commits cannot cross the
+    # first-visible boundary afterwards: chunk 0 and the dormancy decision
+    # share one commit, so the boundary raises and nothing persists.
+    from app.campaigns.service import CampaignArchivedError
+
+    with factory() as db:
+        db.get(DmTurnAttempt, attempt_id).status = "running"
+        db.commit()
+    with factory() as db:
+        with pytest.raises(CampaignArchivedError):
+            mark_streaming_started(db, turn_id, attempt_id, stream_id=str(uuid.uuid4()), commit=False)
+        db.rollback()
     assert _transition(client, cid, rev + 1, "active", "restore-1").status_code == 200
 
 

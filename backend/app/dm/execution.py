@@ -358,6 +358,14 @@ def _complete_silent(db: Session, *, turn, attempt, contract, provider: str, tra
         attempt.commit_operation_id = duplicate_op
         db.flush()
     execute_start = time.monotonic()
+    from app.campaigns.service import require_playable_campaign
+
+    def _silent_playable_guard(locked) -> None:
+        # Issue #265 — silent completion still advances the table; serialize
+        # the dormancy decision with the same campaign row lock the
+        # revision guard already holds.
+        require_playable_campaign(locked)
+
     campaign_after, event = commit_campaign_mutation(
         db,
         turn.campaign_id,
@@ -365,6 +373,7 @@ def _complete_silent(db: Session, *, turn, attempt, contract, provider: str, tra
         event_type="dm.turn_resolved",
         payload=base_payload,
         operation_id=duplicate_op,
+        mutate=_silent_playable_guard,
         commit=False,
         outbox_event_type="dm.turn_committed",
         outbox_payload={**base_payload, "operation_id": duplicate_op},
@@ -572,6 +581,45 @@ def _execute_owned_attempt(
             error_class=error_class, error=str(exc)[:500], trace_id=tid,
         )
 
+    def _defer_archived(reason: str):
+        """Dormancy deferral — issue #265.
+
+        Archive committed after this worker's last playability check. Reset
+        the claim to prepared (no failure marker — dormancy is not failure)
+        so the post-restore sweep resumes the exact same attempt.
+        """
+        from app.campaigns.service import CampaignArchivedError  # noqa: F401 (re-export guard)
+
+        try:
+            db.rollback()
+        except Exception:
+            pass
+        try:
+            from models.dm import DmTurnAttempt as _AttDeferred
+
+            _cur = db.get(_AttDeferred, attempt.id)
+            if _cur is not None and _cur.status == ATTEMPT_RUNNING:
+                _cur.status = ATTEMPT_PREPARED
+                _cur.started_at = None
+                _cur.last_error = f"CampaignArchived: {reason}"
+                db.add(_cur)
+                db.commit()
+        except Exception:
+            try:
+                db.rollback()
+            except Exception:
+                pass
+        logger.info(
+            "dm_execute deferred attempt_id=%s campaign_id=%s reason=%s",
+            attempt.id, campaign_id, reason,
+        )
+        return None
+
+    def _is_archived_error(exc: BaseException) -> bool:
+        from app.campaigns.service import CampaignArchivedError
+
+        return isinstance(exc, CampaignArchivedError)
+
     try:
         packet = _assemble_production_context(
             db, attempt.id, supplemental_status=supplemental_status
@@ -758,6 +806,8 @@ def _execute_owned_attempt(
                 db, turn=turn, attempt=attempt, contract=contract, trace_id=tid,
             )
         except Exception as exc:
+            if _is_archived_error(exc):
+                return _defer_archived("await_roll")
             db.rollback()
             try:
                 from models.dm import DmTurnAttempt as _Att
@@ -775,6 +825,8 @@ def _execute_owned_attempt(
                 provider=pname or "dm-provider", trace_id=tid,
             )
         except Exception as exc:
+            if _is_archived_error(exc):
+                return _defer_archived("silent")
             db.rollback()
             try:
                 from models.dm import DmTurnAttempt as _Att
@@ -843,6 +895,10 @@ def _execute_owned_attempt(
         )
         raise
     except Exception as exc:
+        if _is_archived_error(exc):
+            # Chunk-0 boundary refused the archived table: the chunk row
+            # rolled back with it, so nothing visible persisted — defer.
+            return _defer_archived("first_visible_boundary")
         db.rollback()
         # Pre-visibility failure: nothing persisted, leave a visible marker
         # so the turn never looks stuck-thinking.
