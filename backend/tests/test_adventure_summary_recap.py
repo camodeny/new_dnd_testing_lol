@@ -561,6 +561,53 @@ def test_migration_backfills_legacy_source_bounds():
     assert "a.end_sequence IS NULL" in src
 
 
+def test_public_summary_token_shared_with_hidden_evidence_does_not_fail_generation(api):
+    """A deliberately published token overlapping hidden evidence must not
+    trip the leak detector: generation stays current, while unrelated
+    hidden-only text stays out of the member recap."""
+    from app.campaigns.events import commit_campaign_mutation
+
+    client, factory, actor, owner = api
+    camp = _campaign(client)
+    member = _make_member(factory, camp["id"])
+    cid = uuid.UUID(camp["id"])
+    with factory() as db:
+        camp_row = db.get(Campaign, cid)
+        rev = int(camp_row.revision)
+        commit_campaign_mutation(
+            db, cid, rev,
+            event_type="dm.narration",
+            payload={"summary": "the party entered the Sunken Chapel"},
+            operation_id="seed-chapel-public", visibility="public",
+        )
+        commit_campaign_mutation(
+            db, cid, rev + 1,
+            event_type="dm.secret",
+            payload={"summary": "moonstone sigil powers the hidden seal"},
+            operation_id="seed-moonstone-hidden", visibility="dm_only",
+        )
+    with factory() as db:
+        rev = int(db.get(Campaign, cid).revision)
+    adv = _open(client, camp["id"], key="op-open-overlap")
+    out = _complete(
+        client, camp["id"], adv["id"], rev, "op-complete-overlap",
+        outcome_reason="The moonstone was recovered.",
+    )
+    summary = out["summary"]
+    assert summary["status"] == "current", summary.get("error")
+    assert summary["leak_failures"] == 0
+    actor["id"] = member
+    try:
+        recap = client.get(f"/api/campaigns/{camp['id']}/adventures/{adv['id']}/recap")
+        assert recap.status_code == 200, recap.text
+        text = recap.json()["recap_text"]
+        assert "moonstone was recovered" in text
+        assert "sigil" not in text
+        assert "hidden seal" not in text
+    finally:
+        actor["id"] = owner
+
+
 def _backfill_sql():
     """Load the migration's exact deploy-time backfill SQL."""
     import importlib.util

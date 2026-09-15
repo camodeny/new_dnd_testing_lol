@@ -671,18 +671,38 @@ def _event_visible_to(ev, viewer_id: _uuid_lib.UUID | None) -> bool:
     return viewer_id is not None and ev.actor_id == viewer_id
 
 
+def _trusted_adventure_tokens(adventure: Adventure) -> set[str]:
+    """Tokens from explicitly member-visible adventure fields.
+
+    Title, outcome, and public_summary are all part of the member-safe
+    projection (``to_public_dict``) and are deliberately published to
+    players, so the leak validator must never treat them as hidden evidence.
+    The DM-private reason and metadata are intentionally excluded.
+    """
+    toks: set[str] = set()
+    for part in (adventure.title, adventure.outcome, adventure.public_summary):
+        if part:
+            toks.update(_WORD_RE.findall(str(part).lower()))
+    return toks
+
+
 def _validate_no_leak(
-    recap_text: str, source_events: list, *, viewer_id: _uuid_lib.UUID | None = None
+    recap_text: str,
+    source_events: list,
+    *,
+    viewer_id: _uuid_lib.UUID | None = None,
+    trusted_tokens: set[str] | frozenset = frozenset(),
 ) -> list[str]:
     """Fail closed: recap must not contain tokens unique to sources hidden
     FROM THIS VIEWER.
 
     Tokens from events the viewer may see (public, or actor-visible to them)
-    are always permitted; only tokens exclusive to hidden-from-viewer sources
-    are forbidden. With ``viewer_id=None`` (the stored public baseline) every
+    plus explicitly trusted member-visible adventure fields are always
+    permitted; only tokens exclusive to hidden-from-viewer sources are
+    forbidden. With ``viewer_id=None`` (the stored public baseline) every
     hidden event counts as forbidden.
     """
-    allowed: set[str] = set()
+    allowed: set[str] = set(trusted_tokens)
     forbidden: set[str] = set()
     for ev in source_events:
         toks = set(_WORD_RE.findall(_event_text(ev).lower()))
@@ -797,7 +817,9 @@ def generate_summary(
         # read time in project_recap().
         visible = [ev for ev in events if _event_visible_to(ev, None)]
         recap = build_recap_text(adventure, visible)
-        leaked = _validate_no_leak(recap, events)
+        leaked = _validate_no_leak(
+            recap, events, trusted_tokens=_trusted_adventure_tokens(adventure)
+        )
         if leaked:
             row.leak_failures = int(row.leak_failures or 0) + 1
             row.validation_failures = int(row.validation_failures or 0) + 1
@@ -888,7 +910,11 @@ def project_recap(
     # Defense in depth: the freshly built text derives solely from
     # viewer-visible sources, so viewer-relative validation must always pass;
     # a failure means a builder bug.
-    leaked = _validate_no_leak(text, events, viewer_id=viewer_id)
+    leaked = _validate_no_leak(
+        text, events,
+        viewer_id=viewer_id,
+        trusted_tokens=_trusted_adventure_tokens(adventure),
+    )
     if leaked:
         row.leak_failures = int(row.leak_failures or 0) + 1
         logger.warning(
