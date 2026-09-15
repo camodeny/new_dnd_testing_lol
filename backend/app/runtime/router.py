@@ -152,7 +152,9 @@ def create_player_submission(
             if coord is not None:
                 turn, attempt = coord
                 result["dm_turn"] = turn.to_dict()
-                result["dm_attempt"] = attempt.to_dict()
+                result["dm_attempt"] = attempt.to_dict(
+                    include_private_staged_effects=campaign.owner_id == profile.id
+                )
         except (StreamBoundaryError, TurnConflictError) as exc:
             logger.info(
                 "player_submission dm_turn coordination deferred campaign_id=%s thread_id=%s reason=%s",

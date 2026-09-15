@@ -285,6 +285,107 @@ def _handle_propose_sheet_update(db: Session, campaign: Campaign, effect: dict[s
     logger.info("effect propose_sheet_update effect_id=%s character_id=%s changes=%s", effect.get("id"), args.get("character_id"), len(args.get("changes") or []))
 
 
+@register("complete_adventure")
+def _handle_complete_adventure(db: Session, campaign: Campaign, effect: dict[str, Any], turn: DmTurn, attempt: DmTurnAttempt):
+    """Close the campaign's adventure arc inside the turn-commit txn (issue #260).
+
+    Runs inside the outer ``commit_campaign_mutation``: a failed turn commit
+    rolls back the adventure close, so failed completions leave the adventure
+    open rather than half-complete. The campaign status is untouched — it
+    stays active and later adventures can be created in the same world.
+
+    Duplicate protection: a retried effect with the same idempotency key
+    against an already-completed adventure is a no-op; a genuinely new
+    completion against an already-closed adventure fails closed.
+    """
+    import uuid as _uuid
+
+    from app.adventures.service import (
+        ADVENTURE_CLOSING_JOB,
+        complete_adventure_inline,
+        find_by_operation,
+        get_current_adventure,
+    )
+    from models.campaigns import Adventure
+
+    args = effect.get("arguments") or {}
+    operation_key = _resolve_effect_key(attempt, effect)
+
+    adventure: Adventure | None = None
+    raw_aid = str(args.get("adventure_id") or "").strip()
+    if raw_aid:
+        try:
+            adventure = db.get(Adventure, _uuid.UUID(raw_aid))
+        except ValueError:
+            raise ValueError(f"Staged effect {effect.get('id')!r} adventure_id must be a UUID")
+        if adventure is None or str(adventure.campaign_id) != str(campaign.id):
+            raise ValueError(f"Staged effect {effect.get('id')!r} adventure not found in this campaign")
+    else:
+        adventure = get_current_adventure(db, campaign.id)
+        if adventure is None:
+            # Idempotent replay: the original commit closed the adventure and
+            # stored this effect's operation key on it.
+            replay = find_by_operation(db, campaign.id, operation_key)
+            if replay is not None and replay.status == "completed":
+                logger.info(
+                    "effect complete_adventure duplicate_replay effect_id=%s adventure_id=%s op=%s",
+                    effect.get("id"), replay.id, operation_key,
+                )
+                return
+            raise ValueError(
+                f"Staged effect {effect.get('id')!r} has no active adventure to complete in campaign {campaign.id}"
+            )
+
+    if adventure.status == "completed":
+        if adventure.operation_id == operation_key:
+            logger.info(
+                "effect complete_adventure duplicate effect_id=%s adventure_id=%s op=%s",
+                effect.get("id"), adventure.id, operation_key,
+            )
+            return
+        raise ValueError(
+            f"Staged effect {effect.get('id')!r} adventure {adventure.id} is already completed "
+            f"(outcome={adventure.outcome})"
+        )
+
+    complete_adventure_inline(
+        db, campaign, adventure,
+        outcome=args.get("outcome"),
+        reason=args.get("reason"),
+        public_summary=args.get("public_summary"),
+        source_turn_id=turn.id,
+        operation_id=operation_key,
+    )
+
+    # Enqueue downstream closing work (recap/rewards) in the same transaction:
+    # best-effort, never invalidates the committed completion.
+    from app.observability.tracing import current_trace_id
+    from models.reliability import Outbox as _Outbox
+
+    db.add(_Outbox(
+        id=_uuid.uuid4(),
+        aggregate_type="campaign",
+        aggregate_id=campaign.id,
+        campaign_id=campaign.id,
+        event_type=ADVENTURE_CLOSING_JOB,
+        operation_id=operation_key,
+        trace_id=current_trace_id(),
+        payload={
+            "adventure_id": str(adventure.id),
+            "campaign_id": str(campaign.id),
+            "outcome": adventure.outcome,
+            "operation_id": operation_key,
+        },
+        status="pending",
+        attempts=0,
+    ))
+    db.flush()
+    logger.info(
+        "effect complete_adventure effect_id=%s adventure_id=%s outcome=%s op=%s",
+        effect.get("id"), adventure.id, adventure.outcome, operation_key,
+    )
+
+
 def _default_effect_key(attempt: DmTurnAttempt, effect: dict[str, Any]) -> str:
     """Bounded collision-resistant default idempotency key for one staged effect.
 

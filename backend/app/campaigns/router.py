@@ -31,6 +31,7 @@ from app.campaigns.service import (
 from app.deps.auth import resolve_profile
 from app.deps.idempotency import execute_http_idempotent, require_idempotency_key
 from database import get_db
+import app.adventures.service  # noqa: F401 — registers the adventure.closing worker
 from models.campaigns import Campaign
 from models.campaigns import CampaignInvite
 from models.campaigns import CampaignMember
@@ -1516,3 +1517,168 @@ def join_campaign(campaign_id: str, payload: dict, request: Request, db: Session
     db.commit()
     logger.info("campaign member joined campaign_id=%s actor_id=%s", cid, profile.id)
     return {"ok": True, "campaign": camp.to_dict()}
+
+
+# ── Adventures (issue #260) ─────────────────────────────────────────────────
+
+_ADVENTURE_OUTCOME_ERROR = (
+    "outcome must be one of victory, failure, retreat, capture, death, tpk, villain_victory"
+)
+
+
+def _adventure_campaign_or_404(db: Session, campaign_id: str) -> Campaign:
+    try:
+        cid = parse_campaign_id(campaign_id)
+    except ValueError:
+        raise HTTPException(status_code=404, detail="Invalid campaign id")
+    campaign = db.get(Campaign, cid)
+    if not campaign:
+        raise HTTPException(status_code=404, detail="Campaign not found")
+    return campaign
+
+
+def _require_adventure_reader(db: Session, campaign: Campaign, profile) -> None:
+    if campaign.owner_id != profile.id and not is_campaign_member(db, campaign.id, profile.id):
+        raise HTTPException(status_code=403, detail="Not a campaign member")
+
+
+def _require_adventure_writer(db: Session, campaign: Campaign, profile) -> None:
+    # Adventure completion is a DM decision surfaced through the campaign
+    # owner; players cannot declare arcs complete.
+    if campaign.owner_id != profile.id:
+        raise HTTPException(status_code=403, detail="Only the campaign owner can manage adventures")
+
+
+@router.get("/api/campaigns/{campaign_id}/adventures")
+def list_adventures_endpoint(campaign_id: str, request: Request, db: Session = Depends(get_db)):
+    from app.adventures.service import get_current_adventure, list_adventures
+
+    profile = resolve_profile(request, db)
+    campaign = _adventure_campaign_or_404(db, campaign_id)
+    _require_adventure_reader(db, campaign, profile)
+    adventures = list_adventures(db, campaign.id)
+    current = get_current_adventure(db, campaign.id)
+    # Only the player-visible summary leaves the table for members; the
+    # DM's reason, metadata, provenance ids, and closing bookkeeping stay
+    # owner-visible (issue #260 security).
+    is_owner = campaign.owner_id == profile.id
+    serialize = (lambda a: a.to_dict()) if is_owner else (lambda a: a.to_public_dict())
+    return {
+        "campaign_id": str(campaign.id),
+        "campaign_status": campaign.status,
+        "current_adventure_id": str(current.id) if current else None,
+        "adventures": [serialize(a) for a in adventures],
+    }
+
+
+@router.post("/api/campaigns/{campaign_id}/adventures")
+def start_adventure_endpoint(
+    campaign_id: str, payload: dict, request: Request, response: Response, db: Session = Depends(get_db)
+):
+    from app.adventures.service import AdventureAlreadyActiveError, start_adventure
+
+    profile = resolve_profile(request, db)
+    campaign = _adventure_campaign_or_404(db, campaign_id)
+    _require_adventure_writer(db, campaign, profile)
+    title = str(payload.get("title") or "").strip()
+    if not title:
+        raise HTTPException(status_code=400, detail="title is required")
+    metadata = payload.get("metadata")
+    if metadata is not None and not isinstance(metadata, dict):
+        raise HTTPException(status_code=400, detail="metadata must be an object")
+    operation_id = str(payload.get("operation_id") or "").strip() or None
+    idempotency_key = require_idempotency_key(request, operation_id)
+
+    def _execute():
+        try:
+            adventure = start_adventure(
+                db, campaign.id, title, adventure_metadata=metadata, commit=False,
+            )
+        except AdventureAlreadyActiveError as exc:
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
+        # Committed atomically with the idempotency record by execute_http_idempotent.
+        return {"adventure": adventure.to_dict(), "campaign_status": campaign.status}
+
+    try:
+        return execute_http_idempotent(
+            db, response, actor_id=profile.id, idempotency_key=idempotency_key,
+            command_type="adventure.start", scope_type="campaign", scope_id=campaign.id,
+            payload=payload, execute=_execute,
+        )
+    except RevisionConflictError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+
+
+@router.post("/api/campaigns/{campaign_id}/adventures/current/complete")
+def complete_adventure_endpoint(
+    campaign_id: str, payload: dict, request: Request, response: Response, db: Session = Depends(get_db)
+):
+    from app.adventures.service import (
+        AdventureAlreadyCompletedError,
+        AdventureNotFoundError,
+        complete_adventure,
+    )
+
+    profile = resolve_profile(request, db)
+    campaign = _adventure_campaign_or_404(db, campaign_id)
+    _require_adventure_writer(db, campaign, profile)
+    expected_revision = _expected_revision(payload)
+    outcome = str(payload.get("outcome") or "").strip().lower()
+    if not outcome:
+        raise HTTPException(status_code=400, detail=_ADVENTURE_OUTCOME_ERROR)
+    operation_id = str(payload.get("operation_id") or "").strip() or None
+    idempotency_key = require_idempotency_key(request, operation_id)
+    raw_aid = str(payload.get("adventure_id") or "").strip() or None
+    adventure_id = None
+    if raw_aid:
+        try:
+            adventure_id = uuid_lib.UUID(raw_aid)
+        except ValueError:
+            raise HTTPException(status_code=400, detail="adventure_id must be a UUID")
+
+    def _execute():
+        try:
+            adventure, event = complete_adventure(
+                db, campaign.id,
+                outcome=outcome,
+                reason=payload.get("reason"),
+                public_summary=payload.get("public_summary"),
+                adventure_id=adventure_id,
+                operation_id=operation_id or idempotency_key,
+                actor_id=profile.id,
+                expected_revision=expected_revision,
+                commit=False,
+            )
+        except AdventureNotFoundError as exc:
+            raise HTTPException(status_code=404, detail=str(exc)) from exc
+        except AdventureAlreadyCompletedError as exc:
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
+        except ValueError as exc:
+            # Includes invalid outcome + revision conflicts surfaced as ValueError.
+            from app.campaigns.events import RevisionConflictError as _RCE
+
+            if isinstance(exc, _RCE):
+                raise HTTPException(
+                    status_code=409, detail=str(exc),
+                    headers={"X-Current-Revision": str(exc.actual_revision)},
+                ) from exc
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+        db.flush()
+        current = db.get(Campaign, campaign.id)
+        return {
+            "adventure": adventure.to_dict(),
+            "event": event.to_dict() if event is not None and hasattr(event, "to_dict") else None,
+            "campaign_status": current.status if current else campaign.status,
+        }
+
+    try:
+        return execute_http_idempotent(
+            db, response, actor_id=profile.id, idempotency_key=idempotency_key,
+            command_type="adventure.complete", scope_type="campaign", scope_id=campaign.id,
+            payload=payload, execute=_execute,
+        )
+    except RevisionConflictError as exc:
+        raise HTTPException(
+            status_code=409, detail=str(exc),
+            headers={"X-Current-Revision": str(exc.actual_revision)},
+        ) from exc
