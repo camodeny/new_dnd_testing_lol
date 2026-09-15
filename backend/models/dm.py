@@ -129,7 +129,7 @@ class DmTurnAttempt(Base):
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now(), nullable=False)
     updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now(), onupdate=func.now(), nullable=False)
 
-    def to_dict(self, *, include_private_roll_evidence: bool = False):
+    def to_dict(self, *, include_private_roll_evidence: bool = False, include_private_staged_effects: bool = False):
         evidence = self.roll_evidence or []
         if not include_private_roll_evidence:
             evidence = []
@@ -140,7 +140,16 @@ class DmTurnAttempt(Base):
                 if isinstance(fulfillment, dict) and fulfillment.get("visibility") == "private":
                     item["fulfillment"] = {key: fulfillment.get(key) for key in ("id", "roll_request_id", "submitted_by", "source", "visibility", "submitted_at")}
                 evidence.append(item)
-        return {"id": str(self.id), "turn_id": str(self.turn_id), "attempt_number": self.attempt_number, "status": self.status, "campaign_id": str(self.campaign_id), "thread_id": self.thread_id, "audience": self.audience, "source_revision": self.source_revision, "input_set_revision": self.input_set_revision, "submission_ids": self.submission_ids or [], "parent_attempt_id": str(self.parent_attempt_id) if self.parent_attempt_id else None, "worker_job_id": str(self.worker_job_id) if self.worker_job_id else None, "invalidation_reason": self.invalidation_reason, "invalidated_at": self.invalidated_at.isoformat() if self.invalidated_at else None, "streaming_started_at": self.streaming_started_at.isoformat() if self.streaming_started_at else None, "last_error": self.last_error, "error_class": self.error_class, "retry_count": self.retry_count or 0, "next_retry_at": self.next_retry_at.isoformat() if self.next_retry_at else None, "assembly_window_start": self.assembly_window_start.isoformat() if self.assembly_window_start else None, "assembly_window_end": self.assembly_window_end.isoformat() if self.assembly_window_end else None, "processing_duration_ms": self.processing_duration_ms, "started_at": self.started_at.isoformat() if self.started_at else None, "completed_at": self.completed_at.isoformat() if self.completed_at else None, "result": self.result, "roll_evidence": evidence, "staged_effects": self.staged_effects or [], "contract_snapshot": self.contract_snapshot, "stream_id": str(self.stream_id) if self.stream_id else None, "commit_operation_id": self.commit_operation_id, "abandoned_at": self.abandoned_at.isoformat() if self.abandoned_at else None, "abandonment_reason": self.abandonment_reason, "created_at": self.created_at.isoformat() if self.created_at else None}
+        staged_effects = self.staged_effects or []
+        contract_snapshot = self.contract_snapshot
+        if not include_private_staged_effects:
+            # Owner-private staged arguments (e.g. adventure completion
+            # rationale, issue #260) never reach members unredacted.
+            from app.adventures.service import redact_private_contract_snapshot, redact_private_effect_arguments
+
+            staged_effects = redact_private_effect_arguments(staged_effects)
+            contract_snapshot = redact_private_contract_snapshot(contract_snapshot)
+        return {"id": str(self.id), "turn_id": str(self.turn_id), "attempt_number": self.attempt_number, "status": self.status, "campaign_id": str(self.campaign_id), "thread_id": self.thread_id, "audience": self.audience, "source_revision": self.source_revision, "input_set_revision": self.input_set_revision, "submission_ids": self.submission_ids or [], "parent_attempt_id": str(self.parent_attempt_id) if self.parent_attempt_id else None, "worker_job_id": str(self.worker_job_id) if self.worker_job_id else None, "invalidation_reason": self.invalidation_reason, "invalidated_at": self.invalidated_at.isoformat() if self.invalidated_at else None, "streaming_started_at": self.streaming_started_at.isoformat() if self.streaming_started_at else None, "last_error": self.last_error, "error_class": self.error_class, "retry_count": self.retry_count or 0, "next_retry_at": self.next_retry_at.isoformat() if self.next_retry_at else None, "assembly_window_start": self.assembly_window_start.isoformat() if self.assembly_window_start else None, "assembly_window_end": self.assembly_window_end.isoformat() if self.assembly_window_end else None, "processing_duration_ms": self.processing_duration_ms, "started_at": self.started_at.isoformat() if self.started_at else None, "completed_at": self.completed_at.isoformat() if self.completed_at else None, "result": self.result, "roll_evidence": evidence, "staged_effects": staged_effects, "contract_snapshot": contract_snapshot, "stream_id": str(self.stream_id) if self.stream_id else None, "commit_operation_id": self.commit_operation_id, "abandoned_at": self.abandoned_at.isoformat() if self.abandoned_at else None, "abandonment_reason": self.abandonment_reason, "created_at": self.created_at.isoformat() if self.created_at else None}
 
 
 class PlayerRollRequest(Base):

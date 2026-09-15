@@ -89,6 +89,45 @@ def validate_outcome(outcome: str) -> str:
     return clean
 
 
+#: Staged-effect argument keys that are DM/owner-private and must never reach
+#: members through serialized projections (issue #260 security). Members see
+#: the outcome + player-visible summary; the completion rationale stays
+#: owner-visible on the adventure record.
+PRIVATE_EFFECT_ARGUMENTS: dict[str, tuple[str, ...]] = {
+    "complete_adventure": ("reason",),
+}
+
+
+def redact_private_effect_arguments(staged_effects: list | None) -> list:
+    """Return a copy of staged effects with owner-private arguments removed."""
+    redacted: list = []
+    for eff in staged_effects or []:
+        if not isinstance(eff, dict):
+            redacted.append(eff)
+            continue
+        private = PRIVATE_EFFECT_ARGUMENTS.get(eff.get("effect_type"))
+        args = eff.get("arguments")
+        if not private or not isinstance(args, dict):
+            redacted.append(eff)
+            continue
+        eff = dict(eff)
+        eff["arguments"] = {k: v for k, v in args.items() if k not in private}
+        redacted.append(eff)
+    return redacted
+
+
+def redact_private_contract_snapshot(snapshot: dict | None) -> dict | None:
+    """Return a copy of a contract snapshot with owner-private arguments removed."""
+    if not isinstance(snapshot, dict):
+        return snapshot
+    staged = snapshot.get("staged_effects")
+    if not isinstance(staged, list):
+        return snapshot
+    snap = dict(snapshot)
+    snap["staged_effects"] = redact_private_effect_arguments(staged)
+    return snap
+
+
 def get_adventure(db: Session, adventure_id: uuid.UUID) -> Adventure | None:
     return db.get(Adventure, adventure_id)
 

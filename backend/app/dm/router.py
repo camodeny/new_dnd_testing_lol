@@ -242,7 +242,7 @@ def get_dm_turn(campaign_id: str, turn_id: str, request: Request, db: Session = 
     ).scalars().all()
     return {
         "turn": turn.to_dict(),
-        "attempts": [a.to_dict(include_private_roll_evidence=campaign.owner_id == profile.id) for a in attempts],
+        "attempts": [a.to_dict(include_private_roll_evidence=campaign.owner_id == profile.id, include_private_staged_effects=campaign.owner_id == profile.id) for a in attempts],
     }
 
 
@@ -287,7 +287,7 @@ def start_streaming(campaign_id: str, turn_id: str, payload: dict, request: Requ
         # Re-verify after mutation that turn still belongs to path campaign
         if str(turn.campaign_id) != str(campaign.id):
             raise HTTPException(status_code=404, detail="Turn not found")
-        return {"turn": turn.to_dict(), "attempt": attempt.to_dict()}
+        return {"turn": turn.to_dict(), "attempt": attempt.to_dict(include_private_staged_effects=True)}
     except AttemptSupersededError as exc:
         raise HTTPException(status_code=409, detail=str(exc)) from exc
     except ValueError as exc:
@@ -365,7 +365,7 @@ def commit_dm_turn_endpoint(campaign_id: str, turn_id: str, payload: dict, reque
         )
         if str(turn.campaign_id) != str(campaign.id):
             raise HTTPException(status_code=404, detail="Turn not found")
-        return {"turn": turn.to_dict(), "attempt": attempt.to_dict(), "event": event.to_dict() if hasattr(event, "to_dict") else None}
+        return {"turn": turn.to_dict(), "attempt": attempt.to_dict(include_private_staged_effects=True), "event": event.to_dict() if hasattr(event, "to_dict") else None}
     except AttemptSupersededError as exc:
         raise HTTPException(status_code=409, detail=str(exc)) from exc
     except StaleRevisionError as exc:
@@ -414,7 +414,7 @@ def abandon_dm_turn_endpoint(campaign_id: str, turn_id: str, payload: dict, requ
         turn, attempt = abandon_visible_attempt(db, tid, aid, reason=reason, actor_id=profile.id)
         if str(turn.campaign_id) != str(campaign.id):
             raise HTTPException(status_code=404, detail="Turn not found")
-        return {"turn": turn.to_dict(), "attempt": attempt.to_dict()}
+        return {"turn": turn.to_dict(), "attempt": attempt.to_dict(include_private_staged_effects=True)}
     except ValueError as exc:
         raise HTTPException(status_code=422, detail=str(exc)) from exc
 

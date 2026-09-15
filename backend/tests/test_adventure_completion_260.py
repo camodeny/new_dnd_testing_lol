@@ -409,6 +409,10 @@ def api(monkeypatch):
         "app.campaigns.router.resolve_profile",
         lambda request, db: db.get(Profile, actor["id"]),
     )
+    monkeypatch.setattr(
+        "app.dm.router.resolve_profile",
+        lambda request, db: db.get(Profile, actor["id"]),
+    )
     app.dependency_overrides[get_db] = override_db
     try:
         yield TestClient(app), factory, actor
@@ -710,3 +714,75 @@ def test_terminal_closing_job_retires_without_starving_newer_work(setup, monkeyp
         poisoned = db.get(Adventure, adv_a.id)
         assert poisoned.status == "completed" and poisoned.outcome == "death"
         assert poisoned.closing_status == "failed"
+
+
+def test_effect_argument_redaction_unit():
+    from app.adventures.service import (
+        redact_private_contract_snapshot,
+        redact_private_effect_arguments,
+    )
+
+    staged = [
+        {"id": "e1", "effect_type": "complete_adventure",
+         "arguments": {"outcome": "victory", "reason": "secret", "public_summary": "yay"}},
+        {"id": "e2", "effect_type": "update_scene",
+         "arguments": {"scene_patch": {}, "reason": "kept"}},
+    ]
+    out = redact_private_effect_arguments(staged)
+    assert "reason" not in out[0]["arguments"]
+    assert out[0]["arguments"]["outcome"] == "victory"
+    assert out[1]["arguments"]["reason"] == "kept"
+    # Input untouched (copy, not mutation).
+    assert staged[0]["arguments"]["reason"] == "secret"
+    snap = redact_private_contract_snapshot({"mode": "respond", "staged_effects": staged})
+    assert "reason" not in snap["staged_effects"][0]["arguments"]
+    assert redact_private_contract_snapshot(None) is None
+
+
+def test_turn_inspection_redacts_completion_reason_for_members(api):
+    import json
+
+    from app.auth.service import TEST_USER_ID
+    from models.campaigns import CampaignMember
+    from models.dm import DmTurn, DmTurnAttempt
+    from models.threads import CampaignThread
+
+    client, factory, actor = api
+    camp = client.post("/api/campaigns", json={"name": "Turn leak"}).json()["campaign"]
+    cid = camp["id"]
+    member_id = uuid.uuid4()
+    turn_id = uuid.uuid4()
+    secret = "DM-only turn rationale: the castellan did it."
+    staged = [{"id": "eff_x", "effect_type": "complete_adventure",
+               "arguments": {"outcome": "capture", "reason": secret,
+                             "public_summary": "Chained in the dark."}}]
+    with factory() as db:
+        db.add(Profile(id=member_id, email="member@example.com"))
+        db.add(CampaignMember(campaign_id=uuid.UUID(cid), user_id=member_id, role="player"))
+        thread_id = db.execute(
+            select(CampaignThread).where(CampaignThread.campaign_id == uuid.UUID(cid))
+        ).scalars().one().id
+        db.add(DmTurn(id=turn_id, campaign_id=uuid.UUID(cid), thread_id=str(thread_id),
+                      audience="campaign", status="streaming", source_revision=0,
+                      input_set_revision=1, submission_ids=[]))
+        db.add(DmTurnAttempt(id=uuid.uuid4(), turn_id=turn_id, attempt_number=1,
+                             status="streaming", campaign_id=uuid.UUID(cid),
+                             thread_id=str(thread_id), audience="campaign",
+                             source_revision=0, input_set_revision=1, submission_ids=[],
+                             staged_effects=staged,
+                             contract_snapshot={"mode": "respond", "staged_effects": staged}))
+        db.commit()
+
+    actor["id"] = member_id
+    body = client.get(f"/api/campaigns/{cid}/dm-turns/{turn_id}").json()
+    assert len(body["attempts"]) == 1
+    mem_args = body["attempts"][0]["staged_effects"][0]["arguments"]
+    assert "reason" not in mem_args
+    assert mem_args["outcome"] == "capture"
+    mem_snap = body["attempts"][0]["contract_snapshot"]["staged_effects"][0]["arguments"]
+    assert "reason" not in mem_snap
+    assert secret not in json.dumps(body)
+
+    actor["id"] = TEST_USER_ID
+    owner_body = client.get(f"/api/campaigns/{cid}/dm-turns/{turn_id}").json()
+    assert owner_body["attempts"][0]["staged_effects"][0]["arguments"]["reason"] == secret
