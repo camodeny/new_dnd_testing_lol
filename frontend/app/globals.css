@@ -1016,6 +1016,51 @@ select.input:focus,
   transform: translateY(-50%);
 }
 
+.campaign-status-badge {
+  display: inline-block;
+  margin-top: 4px;
+  padding: 2px 8px;
+  border-radius: 999px;
+  font-size: 0.7rem;
+  font-weight: 600;
+  letter-spacing: 0.04em;
+  text-transform: uppercase;
+  background: var(--ink-faint-soft, rgba(0, 0, 0, 0.06));
+  color: var(--ink-muted);
+}
+
+.campaign-card-archive-btn,
+.campaign-card-restore-btn {
+  position: absolute;
+  top: 50%;
+  right: 52px;
+  display: grid;
+  width: 40px;
+  height: 40px;
+  padding: 0;
+  place-items: center;
+  border: 0;
+  border-radius: 8px;
+  cursor: pointer;
+  background: transparent;
+  color: var(--ink-faint);
+  transform: translateY(-50%);
+  transition: color var(--transition-smooth), background var(--transition-smooth);
+}
+
+.campaign-card-archive-btn:hover,
+.campaign-card-restore-btn:hover {
+  background: var(--accent-soft, rgba(0, 0, 0, 0.06));
+  color: var(--accent, currentColor);
+  transform: translateY(-50%);
+}
+
+.campaign-card-archive-btn:disabled,
+.campaign-card-restore-btn:disabled {
+  cursor: wait;
+  opacity: 0.5;
+}
+
 .empty-state-v2 {
   display: grid;
   max-width: none;

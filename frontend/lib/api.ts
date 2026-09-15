@@ -84,7 +84,10 @@ export const auth = {
 // ── Campaigns ─────────────────────────────────────────────────────────────
 
 export const campaigns = {
-  list: () => apiFetch<{ campaigns: import('@/types').Campaign[] }>('/campaigns'),
+  list: (includeArchived = false) =>
+    apiFetch<{ campaigns: import('@/types').Campaign[] }>(
+      includeArchived ? '/campaigns?include_archived=true' : '/campaigns',
+    ),
   get: (id: string | number) => apiFetch<{ campaign: import('@/types').Campaign }>(`/campaigns/${id}`),
   create: (payload: Record<string, unknown>) =>
     apiFetch<{ campaign: import('@/types').Campaign }>('/campaigns', {
@@ -118,6 +121,21 @@ export const campaigns = {
       body: JSON.stringify({ expected_revision: expectedRevision, status }),
       headers: { 'Idempotency-Key': idempotencyKey },
     }),
+  // Issue #265 — restore returns the campaign to its pre-archive status, so
+  // discover the target from the latest archive event before transitioning.
+  restoreTarget: async (id: string | number): Promise<string> => {
+    const data = await apiFetch<{ events: { event_type: string; payload?: { from?: string } }[] }>(
+      `/campaigns/${id}/events`,
+    )
+    const archived = [...(data.events ?? [])]
+      .reverse()
+      .find((e) => e.event_type === 'campaign.lifecycle.archived')
+    const from = archived?.payload?.from
+    if (from !== 'lobby' && from !== 'starting' && from !== 'active') {
+      throw new Error('Campaign cannot be restored: pre-archive status unknown.')
+    }
+    return from
+  },
   // Pre-alpha solo bootstrap into the production live-table runtime (#355).
   // Temporary scaffold — deleted/replaced by #245/#246.
   soloBootstrap: (id: string | number, idempotencyKey: string) =>

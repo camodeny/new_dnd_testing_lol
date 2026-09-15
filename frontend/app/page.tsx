@@ -27,8 +27,11 @@ export default function HomePage() {
   const router = useRouter()
 
   const [campaignList, setCampaignList] = useState<Campaign[]>([])
+  const [archivedList, setArchivedList] = useState<Campaign[]>([])
   const [loadingList, setLoadingList] = useState(true)
   const [activeModal, setActiveModal] = useState<ActiveModal>(null)
+  const [actionBusyId, setActionBusyId] = useState<string | null>(null)
+  const [actionError, setActionError] = useState('')
 
   // Join modal
   const [inviteCode, setInviteCode] = useState('')
@@ -50,6 +53,11 @@ export default function HomePage() {
       .then((data) => setCampaignList(data.campaigns ?? []))
       .catch(() => { /* show empty state when backend is unavailable */ })
       .finally(() => setLoadingList(false))
+    // Archived tables are dormant (issue #265) — listed separately for owners.
+    campaignsApi
+      .list(true)
+      .then((data) => setArchivedList((data.campaigns ?? []).filter((c) => c.status === 'archived')))
+      .catch(() => { /* archived section stays hidden when unavailable */ })
   }, [user])
 
   const handleCampaignCreated = (campaign: Campaign) => {
@@ -62,6 +70,43 @@ export default function HomePage() {
     setCampaignToDelete(campaign)
     setDeleteError('')
     setActiveModal('delete')
+  }
+
+  // Issue #265 — owner archive/restore. Archive is dormancy (nothing deleted);
+  // restore reactivates the same persistent table (same ID/world/canon).
+  const handleArchive = async (campaign: Campaign) => {
+    setActionBusyId(campaign.id)
+    setActionError('')
+    try {
+      const data = await campaignsApi.transitionLifecycle(
+        campaign.id, campaign.revision, 'archived', crypto.randomUUID(),
+      )
+      const updated = (data as { campaign: Campaign }).campaign
+      setCampaignList((prev) => prev.filter((c) => c.id !== campaign.id))
+      setArchivedList((prev) => [updated, ...prev.filter((c) => c.id !== campaign.id)])
+    } catch (err) {
+      setActionError((err as Error).message || 'Failed to archive campaign.')
+    } finally {
+      setActionBusyId(null)
+    }
+  }
+
+  const handleRestore = async (campaign: Campaign) => {
+    setActionBusyId(campaign.id)
+    setActionError('')
+    try {
+      const target = await campaignsApi.restoreTarget(campaign.id)
+      const data = await campaignsApi.transitionLifecycle(
+        campaign.id, campaign.revision, target, crypto.randomUUID(),
+      )
+      const updated = (data as { campaign: Campaign }).campaign
+      setArchivedList((prev) => prev.filter((c) => c.id !== campaign.id))
+      setCampaignList((prev) => [updated, ...prev.filter((c) => c.id !== campaign.id)])
+    } catch (err) {
+      setActionError((err as Error).message || 'Failed to restore campaign.')
+    } finally {
+      setActionBusyId(null)
+    }
   }
 
   const handleConfirmDelete = async () => {
@@ -193,6 +238,40 @@ export default function HomePage() {
               <CampaignCard
                 key={campaign.id}
                 campaign={campaign}
+                isOwner={String(user?.id) === String(campaign.owner_id)}
+                onArchive={(e: React.MouseEvent) => { e.preventDefault(); void handleArchive(campaign) }}
+                onRestore={(e: React.MouseEvent) => { e.preventDefault(); void handleRestore(campaign) }}
+                actionBusy={actionBusyId === campaign.id}
+                onDelete={
+                  String(user?.id) === String(campaign.owner_id)
+                    ? (e: React.MouseEvent) => { e.preventDefault(); openDelete(campaign) }
+                    : null
+                }
+              />
+            ))}
+          </div>
+          {actionError && <ErrorMessage message={actionError} />}
+        </>
+      )}
+
+      {/* Archived tables — dormant, restorable to the same table */}
+      {archivedList.length > 0 && (
+        <>
+          <header className="campaigns-header">
+            <div>
+              <span className="section-kicker">ARCHIVED</span>
+              <h2 className="campaigns-title">Rest when you need to</h2>
+            </div>
+          </header>
+          <div className="campaigns-grid">
+            {archivedList.map((campaign) => (
+              <CampaignCard
+                key={campaign.id}
+                campaign={campaign}
+                isOwner={String(user?.id) === String(campaign.owner_id)}
+                onArchive={(e: React.MouseEvent) => { e.preventDefault(); void handleArchive(campaign) }}
+                onRestore={(e: React.MouseEvent) => { e.preventDefault(); void handleRestore(campaign) }}
+                actionBusy={actionBusyId === campaign.id}
                 onDelete={
                   String(user?.id) === String(campaign.owner_id)
                     ? (e: React.MouseEvent) => { e.preventDefault(); openDelete(campaign) }

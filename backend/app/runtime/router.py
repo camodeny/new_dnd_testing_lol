@@ -47,6 +47,14 @@ def create_player_submission(
 ):
     profile = resolve_profile(request, db)
     campaign = authorized_campaign(db, campaign_id, profile.id)
+    if str(campaign.status or "").lower() == "archived":
+        logger.info(
+            "player_submission rejected campaign_id=%s reason=archived", campaign.id
+        )
+        raise HTTPException(
+            status_code=409,
+            detail="Campaign is archived; restore it before continuing play",
+        )
 
     raw_thread = (
         str(payload.get("thread_id", "main"))

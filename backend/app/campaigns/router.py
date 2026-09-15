@@ -1,6 +1,7 @@
 """Campaigns transport — APIRouter. Depends on service layer for domain logic."""
 import logging
 import uuid as uuid_lib
+from datetime import datetime, timezone
 
 from fastapi import APIRouter, Depends, HTTPException, Request, Response
 from sqlalchemy import delete, func, select
@@ -9,6 +10,8 @@ from sqlalchemy.orm import Session
 from app.campaigns.events import (
     RevisionConflictError,
     commit_campaign_mutation,
+    has_domain_event,
+    latest_domain_event,
     list_campaign_events,
 )
 from app.campaigns.service import (
@@ -77,12 +80,20 @@ def _validated_setup(payload: dict, *, creation: bool = False) -> dict:
 
 
 @router.get("/api/campaigns")
-def list_campaigns(request: Request, db: Session = Depends(get_db)):
+def list_campaigns(request: Request, db: Session = Depends(get_db), include_archived: bool = False):
+    """Active campaign surfaces — issue #265.
+
+    Archived campaigns are dormant and hidden by default; authorized
+    review/history access passes ``?include_archived=true``. Detail,
+    snapshot, events, and member reads stay available to members regardless.
+    """
     profile = resolve_profile(request, db)
     member_rows = db.execute(select(CampaignMember.campaign_id).where(CampaignMember.user_id == profile.id)).scalars().all()
     member_ids = set(member_rows)
     rows = db.execute(select(Campaign).order_by(Campaign.updated_at.desc())).scalars().all()
     visible = [c for c in rows if c.owner_id == profile.id or c.id in member_ids]
+    if not include_archived:
+        visible = [c for c in visible if str(c.status or "").lower() != "archived"]
     return {"campaigns": [c.to_dict() for c in visible]}
 
 
@@ -292,6 +303,54 @@ def update_campaign(
         )
 
 
+def _archived_duration_seconds(db: Session, cid: uuid_lib.UUID) -> float | None:
+    """Wall-clock seconds since the latest archive event (issue #265).
+
+    Fictional time is frozen while archived, so this duration only feeds
+    observability — it never advances fictional clocks or NPC plans.
+    """
+    try:
+        event = latest_domain_event(db, cid, "campaign.lifecycle.archived")
+        if event is None or event.created_at is None:
+            return None
+        archived_at = event.created_at
+        if archived_at.tzinfo is None:
+            archived_at = archived_at.replace(tzinfo=timezone.utc)
+        return max(0.0, (datetime.now(timezone.utc) - archived_at).total_seconds())
+    except Exception as exc:
+        logger.warning("campaign archived duration unavailable campaign_id=%s error=%s", cid, exc)
+        return None
+
+
+def _verify_restored_projection(db: Session, cid: uuid_lib.UUID) -> str:
+    """Read-only post-restore projection check — issue #265.
+
+    Verifies the live-table snapshot inputs survived dormancy (shared thread,
+    thread/member presence). Never mutates: a projection failure here is only
+    logged, since the authoritative restored state is already committed and
+    reconnect/snapshot recovers the read model.
+    """
+    try:
+        shared = db.execute(
+            select(CampaignThread).where(
+                CampaignThread.campaign_id == cid,
+                CampaignThread.thread_type == "campaign",
+            )
+        ).scalars().first()
+        threads = db.scalar(
+            select(func.count()).select_from(CampaignThread).where(CampaignThread.campaign_id == cid)
+        ) or 0
+        members = db.scalar(
+            select(func.count()).select_from(CampaignMember).where(CampaignMember.campaign_id == cid)
+        ) or 0
+        if shared is None:
+            return "degraded:shared_thread_missing"
+        return f"ok:threads={threads}:members={members}"
+    except Exception as exc:
+        logger.warning("campaign restore projection verify failed campaign_id=%s error=%s", cid, exc)
+        return "unknown:verify_failed"
+
+
 @router.post("/api/campaigns/{campaign_id}/lifecycle")
 def transition_campaign_lifecycle(
     campaign_id: str,
@@ -312,8 +371,9 @@ def transition_campaign_lifecycle(
         raise HTTPException(status_code=403, detail="Only owner can change campaign lifecycle")
     expected_revision = _expected_revision(payload)
     operation_id = str(payload.get("operation_id") or "").strip() or None
-    idempotency_key = require_idempotency_key(request, operation_id)
     target_raw = payload.get("status")
+    target = str(target_raw or "").strip().lower()
+    idempotency_key = require_idempotency_key(request, operation_id)
 
     def _mutate(locked: Campaign):
         try:
@@ -349,19 +409,57 @@ def transition_campaign_lifecycle(
                         "blockers": eligibility["blockers"],
                     },
                 )
+        if locked.status == "archived":
+            # Issue #265 — restore returns the campaign to its pre-archive
+            # status, so archiving can never bypass start eligibility.
+            # _mutate runs inside the atomic revision-guarded transaction, so
+            # a failed restore leaves the archived state intact.
+            archive_event = latest_domain_event(db, locked.id, "campaign.lifecycle.archived")
+            prior = (archive_event.payload or {}).get("from") if archive_event else None
+            if prior not in ("lobby", "starting", "active"):
+                logger.warning(
+                    "campaign restore rejected campaign_id=%s actor_id=%s reason=unknown_pre_archive_status",
+                    locked.id, profile.id,
+                )
+                raise HTTPException(status_code=409, detail="Campaign cannot be restored: pre-archive status unknown")
+            if target != prior:
+                logger.warning(
+                    "campaign restore rejected campaign_id=%s actor_id=%s to=%s pre_archive=%s",
+                    locked.id, profile.id, target, prior,
+                )
+                raise HTTPException(
+                    status_code=409,
+                    detail=f"Restore returns the campaign to its pre-archive status ({prior})",
+                )
+            # Status-only reactivation: same campaign ID/world/canon — no
+            # reseed, no duplicate clocks/NPCs/threads/characters.
         locked.status = target
 
     def _execute():
         current = db.get(Campaign, cid)
-        target = str(target_raw or "").strip().lower()
+        requested = str(target_raw or "").strip().lower()
+        if current is not None and requested == str(current.status or "").lower():
+            # Issue #265 — idempotent archive/restore convergence: a duplicate
+            # command under a different idempotency key lands on the already
+            # correct lifecycle state without a revision bump or new event.
+            # Same-key replays short-circuit in the idempotency layer above
+            # before reaching here. Restores only converge when the campaign
+            # was actually archived before; anything else falls through to
+            # the strict transition validation (409).
+            if requested == "archived" or has_domain_event(db, cid, "campaign.lifecycle.archived"):
+                logger.info(
+                    "campaign lifecycle duplicate campaign_id=%s actor_id=%s status=%s revision=%s",
+                    cid, profile.id, current.status, current.revision,
+                )
+                return {"campaign": current.to_dict(), "converged": True, "duplicate": True}
         campaign_after, event = commit_campaign_mutation(
             db,
             cid,
             expected_revision,
-            event_type=f"campaign.lifecycle.{target or 'invalid'}",
+            event_type=f"campaign.lifecycle.{requested or 'invalid'}",
             operation_id=operation_id or idempotency_key,
             actor_id=profile.id,
-            payload={"from": current.status if current else None, "to": target},
+            payload={"from": current.status if current else None, "to": requested},
             mutate=_mutate,
             commit=False,
         )
@@ -371,8 +469,9 @@ def transition_campaign_lifecycle(
         )
         return {"campaign": campaign_after.to_dict(), "event": event.to_dict()}
 
+    source_status = campaign.status
     try:
-        return execute_http_idempotent(
+        result = execute_http_idempotent(
             db,
             response,
             actor_id=profile.id,
@@ -384,11 +483,46 @@ def transition_campaign_lifecycle(
             execute=_execute,
         )
     except RevisionConflictError as exc:
+        logger.warning(
+            "campaign lifecycle failed campaign_id=%s actor_id=%s from=%s to=%s reason=revision_conflict",
+            cid, profile.id, source_status, target,
+        )
         raise HTTPException(
             status_code=409,
             detail=str(exc),
             headers={"X-Current-Revision": str(exc.actual_revision)},
         ) from exc
+    except HTTPException as exc:
+        logger.warning(
+            "campaign lifecycle failed campaign_id=%s actor_id=%s from=%s to=%s status=%s",
+            cid, profile.id, source_status, target, exc.status_code,
+        )
+        raise
+    after = result.get("campaign", {}) if isinstance(result, dict) else {}
+    if isinstance(result, dict) and result.get("converged"):
+        logger.info(
+            "campaign lifecycle duplicate campaign_id=%s actor_id=%s status=%s revision=%s",
+            cid, profile.id, after.get("status"), after.get("revision"),
+        )
+        return result
+    if target == "archived":
+        # Dormancy, not deletion: status-only transition, all durable
+        # campaign/world/character/thread state preserved by construction
+        # (_mutate flips status and nothing else).
+        logger.info(
+            "campaign archived campaign_id=%s actor_id=%s from=%s to=%s revision=%s",
+            cid, profile.id, source_status, after.get("status"), after.get("revision"),
+        )
+    elif source_status == "archived":
+        duration_s = _archived_duration_seconds(db, cid)
+        projection = _verify_restored_projection(db, cid)
+        logger.info(
+            "campaign restored campaign_id=%s actor_id=%s from=archived to=%s revision=%s "
+            "duration_archived_s=%s projection_restoration=%s",
+            cid, profile.id, after.get("status"), after.get("revision"),
+            duration_s, projection,
+        )
+    return result
 
 
 @router.post("/api/campaigns/{campaign_id}/solo-bootstrap")

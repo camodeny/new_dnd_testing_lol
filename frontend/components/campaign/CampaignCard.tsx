@@ -33,14 +33,19 @@ function getAvatarColor(str: string): string {
 interface CampaignCardProps {
   campaign: Campaign
   onDelete?: ((e: React.MouseEvent) => void) | null
+  isOwner?: boolean
+  onArchive?: ((e: React.MouseEvent) => void) | null
+  onRestore?: ((e: React.MouseEvent) => void) | null
+  actionBusy?: boolean
 }
 
-export default function CampaignCard({ campaign, onDelete }: CampaignCardProps) {
+export default function CampaignCard({ campaign, onDelete, isOwner, onArchive, onRestore, actionBusy }: CampaignCardProps) {
   const initials = useMemo(() => getInitials(campaign.name), [campaign.name])
   const avatarColor = useMemo(
     () => getAvatarColor(campaign.name + (campaign.random_seed ?? '')),
     [campaign.name, campaign.random_seed],
   )
+  const archived = campaign.status === 'archived'
 
   return (
     <article className="campaign-card-v2">
@@ -59,6 +64,11 @@ export default function CampaignCard({ campaign, onDelete }: CampaignCardProps) 
           </div>
           <div className="campaign-meta">
             <h3 className="campaign-title">{campaign.name}</h3>
+            {archived && (
+              <span className="campaign-status-badge" title="Archived campaigns are dormant — restore to keep playing the same table.">
+                Archived
+              </span>
+            )}
           </div>
         </div>
         {campaign.description && (
@@ -80,6 +90,30 @@ export default function CampaignCard({ campaign, onDelete }: CampaignCardProps) 
           title={`Delete ${campaign.name}`}
         >
           <i className="bi bi-trash" aria-hidden="true" />
+        </button>
+      )}
+      {isOwner && !archived && onArchive && (
+        <button
+          type="button"
+          className="campaign-card-archive-btn"
+          onClick={onArchive}
+          disabled={actionBusy}
+          aria-label={`Archive campaign ${campaign.name}`}
+          title="Archive (dormant — nothing is deleted)"
+        >
+          <i className="bi bi-archive" aria-hidden="true" />
+        </button>
+      )}
+      {isOwner && archived && onRestore && (
+        <button
+          type="button"
+          className="campaign-card-restore-btn"
+          onClick={onRestore}
+          disabled={actionBusy}
+          aria-label={`Restore campaign ${campaign.name}`}
+          title="Restore the same table"
+        >
+          <i className="bi bi-arrow-counterclockwise" aria-hidden="true" />
         </button>
       )}
     </article>

@@ -264,10 +264,13 @@ def test_owner_removal_count_reduction_and_invite_revocation_are_revisioned(api)
         assert db.get(CampaignInvite, cid) is None
 
 
-def test_active_and_archived_transitions_lock_membership_and_invalid_edges(api):
+def test_active_and_archived_transitions_restore_reactivates_same_campaign(api):
+    # Issue #265 — archive is dormancy, not terminal: archived -> active
+    # restores the same campaign (same ID/seed, no reseed, revision + 1).
     client, factory, _, owner_id, _, _ = api
     campaign = _create(client)
     cid = campaign["id"]
+    seed_before = campaign["random_seed"]
     assert _transition(client, cid, 0, "active", "skip-start").status_code == 409
     _ready_lobby(factory, cid, [owner_id])
     assert _transition(client, cid, 0, "starting", "to-starting").status_code == 200
@@ -276,11 +279,17 @@ def test_active_and_archived_transitions_lock_membership_and_invalid_edges(api):
     archived = _transition(client, cid, 2, "archived", "to-archived")
     assert archived.status_code == 200
     assert archived.json()["campaign"]["status"] == "archived"
-    terminal = _transition(client, cid, 3, "active", "unarchive")
-    assert terminal.status_code == 409
+    restored = _transition(client, cid, 3, "active", "restore-active")
+    assert restored.status_code == 200, restored.text
+    body = restored.json()["campaign"]
+    assert body["status"] == "active"
+    assert body["id"] == cid
+    assert body["random_seed"] == seed_before
+    assert body["revision"] == 4
     with factory() as db:
         persisted = db.get(Campaign, uuid.UUID(cid))
-        assert (persisted.status, persisted.revision) == ("archived", 3)
+        assert (persisted.status, persisted.revision) == ("active", 4)
+        assert persisted.random_seed == seed_before
 
 
 def test_required_players_rejects_bool_float_and_out_of_range(api):

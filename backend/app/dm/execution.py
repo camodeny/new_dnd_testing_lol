@@ -193,6 +193,26 @@ def _attach_public_retry_marker(db: Session, attempt_id: uuid.UUID) -> None:
 def execute_dm_attempt(db: Session, attempt_id: uuid.UUID, **kwargs):
     """Only the owner may claim, execute, or fail this attempt."""
     from app.dm.ownership import execution_ownership
+    from models.dm import DmTurnAttempt
+
+    # Issue #265 — dormancy freezes fictional time: a prepared attempt on an
+    # archived campaign is deferred, not executed. It stays prepared so the
+    # post-restore sweep resumes the exact same table; returning None keeps
+    # the sweep's skipped accounting without failing the job.
+    try:
+        attempt = db.get(DmTurnAttempt, attempt_id)
+        if attempt is not None:
+            from models.campaigns import Campaign
+
+            campaign = db.get(Campaign, attempt.campaign_id)
+            if campaign is not None and str(campaign.status or "").lower() == "archived":
+                logger.info(
+                    "dm_execute deferred attempt_id=%s campaign_id=%s reason=archived",
+                    attempt_id, attempt.campaign_id,
+                )
+                return None
+    except Exception as exc:
+        logger.warning("dm_execute archive check failed attempt_id=%s error=%s", attempt_id, exc)
 
     with execution_ownership(db, attempt_id) as acquired:
         if not acquired:

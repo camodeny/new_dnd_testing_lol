@@ -398,3 +398,39 @@ def list_campaign_events(
         .scalars()
         .all()
     )
+
+
+def latest_domain_event(
+    db: Session,
+    campaign_id: uuid.UUID,
+    event_type: str,
+) -> CampaignDomainEvent | None:
+    """Newest domain event of one type (sequence desc) — issue #265.
+
+    Used to derive archive provenance (e.g. duration archived from the
+    latest ``campaign.lifecycle.archived`` event) without new columns.
+    """
+    return db.execute(
+        select(CampaignDomainEvent)
+        .where(
+            CampaignDomainEvent.campaign_id == campaign_id,
+            CampaignDomainEvent.event_type == event_type,
+        )
+        .order_by(CampaignDomainEvent.sequence.desc())
+        .limit(1)
+    ).scalars().first()
+
+
+def has_domain_event(db: Session, campaign_id: uuid.UUID, event_type: str) -> bool:
+    """True when at least one domain event of this type exists."""
+    return (
+        db.execute(
+            select(CampaignDomainEvent.id)
+            .where(
+                CampaignDomainEvent.campaign_id == campaign_id,
+                CampaignDomainEvent.event_type == event_type,
+            )
+            .limit(1)
+        ).scalars().first()
+        is not None
+    )

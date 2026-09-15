@@ -121,6 +121,7 @@ describe('exported API surface', () => {
       'list',
       'quickCreate',
       'randomBrief',
+      'restoreTarget',
       'soloBootstrap',
       'transitionLifecycle',
       'update',
