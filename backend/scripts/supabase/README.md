@@ -57,3 +57,17 @@ HTTPS backend origin and `post_turn_cron_secret` with the backend's
 `CRON_SECRET`. Run `schedule_post_turn.sql` in the SQL editor. Re-running
 updates the named job. Like the DM schedule, this is explicit environment
 setup outside Alembic. To remove: `SELECT cron.unschedule('dnd-post-turn');`.
+
+## Adventure-closing sweep (issue #260)
+
+Same pattern for the authenticated `/api/cron/adventure-closing` endpoint,
+every 5 minutes. The endpoint drives up to 5 completed adventures with
+pending closing work per request through the idempotent worker fence
+(`WorkerExecution` keyed on adventure id), so concurrent or duplicate
+deliveries converge instead of duplicating work. Closing is best-effort:
+failures retry but never invalidate committed completions.
+
+After deploying #260, in Vault create `adventure_closing_base_url` with the
+public HTTPS backend origin and `adventure_closing_cron_secret` with the
+backend's `CRON_SECRET`. Run `schedule_adventure_closing.sql` in the SQL
+editor. To remove: `SELECT cron.unschedule('dnd-adventure-closing');`.
