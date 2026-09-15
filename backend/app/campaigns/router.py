@@ -15,6 +15,7 @@ from app.campaigns.events import (
     list_campaign_events,
 )
 from app.campaigns.service import (
+    CampaignArchivedError,
     character_launch_validity,
     compute_start_eligibility,
     generate_invite_code,
@@ -24,6 +25,7 @@ from app.campaigns.service import (
     normalize_required_players,
     parse_campaign_id,
     random_brief,
+    require_playable_campaign,
     validate_campaign_name,
     validate_content_boundaries,
     validate_difficulty,
@@ -1412,6 +1414,9 @@ def declare_pc_death(
 
     def _execute():
         def _mutate(locked: Campaign):
+            # Archive dormancy (issue #265): frozen canon, checked on the
+            # locked row inside the serialized mutation.
+            require_playable_campaign(locked)
             try:
                 row = _declare(
                     db, locked, char_id,
@@ -1425,23 +1430,26 @@ def declare_pc_death(
             _mutate.result = row
 
         _mutate.result = None  # type: ignore[attr-defined]
-        campaign_after, event = commit_campaign_mutation(
-            db,
-            cid,
-            expected_revision,
-            event_type=f"campaign.pc_{target_status}",
-            operation_id=operation_id or idempotency_key,
-            actor_id=profile.id,
-            targets={"character_id": str(char_id)},
-            payload_builder=lambda: {
-                "character_id": str(char_id),
-                "status": _mutate.result.status,  # type: ignore[attr-defined]
-                "cause": _mutate.result.cause,  # type: ignore[attr-defined]
-                "is_tpk": bool(_mutate.result.is_tpk),  # type: ignore[attr-defined]
-            },
-            mutate=_mutate,
-            commit=False,
-        )
+        try:
+            campaign_after, event = commit_campaign_mutation(
+                db,
+                cid,
+                expected_revision,
+                event_type=f"campaign.pc_{target_status}",
+                operation_id=operation_id or idempotency_key,
+                actor_id=profile.id,
+                targets={"character_id": str(char_id)},
+                payload_builder=lambda: {
+                    "character_id": str(char_id),
+                    "status": _mutate.result.status,  # type: ignore[attr-defined]
+                    "cause": _mutate.result.cause,  # type: ignore[attr-defined]
+                    "is_tpk": bool(_mutate.result.is_tpk),  # type: ignore[attr-defined]
+                },
+                mutate=_mutate,
+                commit=False,
+            )
+        except CampaignArchivedError as exc:
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
         logger.info(
             "pc death declared campaign_id=%s actor_id=%s character_id=%s status=%s revision=%s",
             cid, profile.id, char_id, _mutate.result.status, campaign_after.revision,  # type: ignore[attr-defined]
@@ -1508,6 +1516,9 @@ def activate_pc_replacement(
 
     def _execute():
         def _mutate(locked: Campaign):
+            # Archive dormancy (issue #265): frozen canon, checked on the
+            # locked row inside the serialized mutation.
+            require_playable_campaign(locked)
             try:
                 fresh_member = db.get(CampaignMember, {"campaign_id": cid, "user_id": profile.id})
                 if fresh_member is None:
@@ -1520,22 +1531,25 @@ def activate_pc_replacement(
                 raise HTTPException(status_code=exc.status_code, detail=str(exc)) from exc
 
         _mutate.result = None  # type: ignore[attr-defined]
-        campaign_after, event = commit_campaign_mutation(
-            db,
-            cid,
-            expected_revision,
-            event_type="campaign.pc_replaced",
-            operation_id=operation_id or idempotency_key,
-            actor_id=profile.id,
-            targets_builder=lambda: {
-                "user_id": str(profile.id),
-                "dead_character_id": _mutate.result["dead_character_id"],  # type: ignore[attr-defined]
-                "new_character_id": _mutate.result["new_character_id"],  # type: ignore[attr-defined]
-            },
-            payload_builder=lambda: dict(_mutate.result),  # type: ignore[attr-defined]
-            mutate=_mutate,
-            commit=False,
-        )
+        try:
+            campaign_after, event = commit_campaign_mutation(
+                db,
+                cid,
+                expected_revision,
+                event_type="campaign.pc_replaced",
+                operation_id=operation_id or idempotency_key,
+                actor_id=profile.id,
+                targets_builder=lambda: {
+                    "user_id": str(profile.id),
+                    "dead_character_id": _mutate.result["dead_character_id"],  # type: ignore[attr-defined]
+                    "new_character_id": _mutate.result["new_character_id"],  # type: ignore[attr-defined]
+                },
+                payload_builder=lambda: dict(_mutate.result),  # type: ignore[attr-defined]
+                mutate=_mutate,
+                commit=False,
+            )
+        except CampaignArchivedError as exc:
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
         logger.info(
             "pc replacement activated campaign_id=%s actor_id=%s dead=%s new=%s revision=%s",
             cid, profile.id,
@@ -1593,30 +1607,36 @@ def introduce_pc_replacement(
 
     def _execute():
         def _mutate(locked: Campaign):
+            # Archive dormancy (issue #265): frozen canon, checked on the
+            # locked row inside the serialized mutation.
+            require_playable_campaign(locked)
             try:
                 _mutate.result = _introduce(db, locked, char_id, actor_id=profile.id)  # type: ignore[attr-defined]
             except PcLifecycleError as exc:
                 raise HTTPException(status_code=exc.status_code, detail=str(exc)) from exc
 
         _mutate.result = None  # type: ignore[attr-defined]
-        campaign_after, event = commit_campaign_mutation(
-            db,
-            cid,
-            expected_revision,
-            event_type="campaign.pc_introduced",
-            operation_id=operation_id or idempotency_key,
-            actor_id=profile.id,
-            targets={"character_id": str(char_id)},
-            payload_builder=lambda: {
-                "character_id": str(char_id),
-                "replacement_of_character_id": (
-                    str(_mutate.result.replacement_of_character_id)  # type: ignore[attr-defined]
-                    if _mutate.result.replacement_of_character_id else None  # type: ignore[attr-defined]
-                ),
-            },
-            mutate=_mutate,
-            commit=False,
-        )
+        try:
+            campaign_after, event = commit_campaign_mutation(
+                db,
+                cid,
+                expected_revision,
+                event_type="campaign.pc_introduced",
+                operation_id=operation_id or idempotency_key,
+                actor_id=profile.id,
+                targets={"character_id": str(char_id)},
+                payload_builder=lambda: {
+                    "character_id": str(char_id),
+                    "replacement_of_character_id": (
+                        str(_mutate.result.replacement_of_character_id)  # type: ignore[attr-defined]
+                        if _mutate.result.replacement_of_character_id else None  # type: ignore[attr-defined]
+                    ),
+                },
+                mutate=_mutate,
+                commit=False,
+            )
+        except CampaignArchivedError as exc:
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
         logger.info(
             "pc replacement introduced campaign_id=%s actor_id=%s character_id=%s revision=%s",
             cid, profile.id, char_id, campaign_after.revision,
@@ -1784,6 +1804,8 @@ def start_adventure_endpoint(
             )
         except AdventureAlreadyActiveError as exc:
             raise HTTPException(status_code=409, detail=str(exc)) from exc
+        except CampaignArchivedError as exc:
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
         except ValueError as exc:
             raise HTTPException(status_code=400, detail=str(exc)) from exc
         # Committed atomically with the idempotency record by execute_http_idempotent.
@@ -1852,6 +1874,8 @@ def complete_adventure_endpoint(
                     status_code=409, detail=str(exc),
                     headers={"X-Current-Revision": str(exc.actual_revision)},
                 ) from exc
+            if isinstance(exc, CampaignArchivedError):
+                raise HTTPException(status_code=409, detail=str(exc)) from exc
             raise HTTPException(status_code=400, detail=str(exc)) from exc
         # Shared #263 finalization: bind the authoritative end cursor and
         # derive the summary on this path too (best-effort; the response

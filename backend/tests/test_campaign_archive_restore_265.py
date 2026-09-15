@@ -723,3 +723,112 @@ def test_solo_bootstrap_rejected_while_archived(api):
             )
         )
         assert threads_after == threads_before
+
+
+def test_archived_table_freezes_adventure_and_pc_lifecycle(api):
+    """Issue #265 dormancy covers adventure + PC lifecycle writers.
+
+    start_adventure guards on the locked row; adventure completion and the
+    PC death/replacement/introduction mutations guard inside their locked
+    commit_campaign_mutation callbacks. All surface as HTTP 409 with no
+    state change; restore unfreezes the table.
+    """
+    from models.campaigns import Adventure, CampaignPcLifecycle
+
+    client, factory, _, owner_id, _, _ = api
+    campaign = _drive_to_active(client, factory, owner_id)
+    cid = campaign["id"]
+    rev = campaign["revision"]
+
+    started = client.post(
+        f"/api/campaigns/{cid}/adventures",
+        json={"title": "The Sunken Chapel"},
+        headers={"Idempotency-Key": "adv-start-1"},
+    )
+    assert started.status_code == 200, started.text
+    adventure_id = started.json()["adventure"]["id"]
+
+    with factory() as db:
+        member = db.get(CampaignMember, {"campaign_id": uuid.UUID(cid), "user_id": owner_id})
+        assert member is not None and member.selected_character_id is not None
+        char_id = str(member.selected_character_id)
+        replacement = Character(owner_id=owner_id, name="Second Hero", system="dnd5e")
+        db.add(replacement)
+        db.flush()
+        db.add(Dnd5eCharacterSheet(
+            character_id=replacement.id, owner_id=owner_id, character_name=replacement.name,
+            race="Elf", char_class="Ranger", level=1,
+        ))
+        db.commit()
+        replacement_id = str(replacement.id)
+
+    assert _transition(client, cid, rev, "archived", "archive-1").status_code == 200
+    archived_rev = rev + 1
+
+    def _archived(resp):
+        assert resp.status_code == 409, resp.text
+        assert "archived" in resp.json()["detail"].lower()
+
+    # New adventure cannot open on a dormant table.
+    _archived(client.post(
+        f"/api/campaigns/{cid}/adventures",
+        json={"title": "Sneaky Sequel"},
+        headers={"Idempotency-Key": "adv-start-archived"},
+    ))
+    # The open adventure cannot complete while archived.
+    _archived(client.post(
+        f"/api/campaigns/{cid}/adventures/current/complete",
+        json={"expected_revision": archived_rev, "outcome": "victory"},
+        headers={"Idempotency-Key": "adv-complete-archived"},
+    ))
+    # PC death/retirement cannot advance party canon while archived.
+    _archived(client.post(
+        f"/api/campaigns/{cid}/pc-deaths",
+        json={"expected_revision": archived_rev, "character_id": char_id},
+        headers={"Idempotency-Key": "death-archived"},
+    ))
+    # Replacement activation is frozen (guard fires before any canon write).
+    _archived(client.post(
+        f"/api/campaigns/{cid}/pc-replacements",
+        json={"expected_revision": archived_rev, "character_id": replacement_id},
+        headers={"Idempotency-Key": "replace-archived"},
+    ))
+    # Narrative introduction is frozen too.
+    _archived(client.post(
+        f"/api/campaigns/{cid}/pc-replacements/{replacement_id}/introduce",
+        json={"expected_revision": archived_rev},
+        headers={"Idempotency-Key": "introduce-archived"},
+    ))
+
+    # Nothing advanced: revision, adventure row, lifecycle rows, event feed.
+    assert _get(client, cid)["revision"] == archived_rev
+    with factory() as db:
+        assert db.get(Adventure, uuid.UUID(adventure_id)).status == "active"
+        assert db.scalar(
+            select(func.count()).select_from(Adventure).where(
+                Adventure.campaign_id == uuid.UUID(cid)
+            )
+        ) == 1
+        assert db.scalar(
+            select(func.count()).select_from(CampaignPcLifecycle).where(
+                CampaignPcLifecycle.campaign_id == uuid.UUID(cid)
+            )
+        ) == 0
+        types = db.execute(
+            select(CampaignDomainEvent.event_type)
+            .where(CampaignDomainEvent.campaign_id == uuid.UUID(cid))
+            .order_by(CampaignDomainEvent.sequence.asc())
+        ).scalars().all()
+        assert "adventure.completed" not in types
+        assert not any(t.startswith("campaign.pc") for t in types)
+
+    # Restore unfreezes the table: the pending adventure completes normally.
+    assert _transition(client, cid, archived_rev, "active", "restore-1").status_code == 200
+    completed = client.post(
+        f"/api/campaigns/{cid}/adventures/current/complete",
+        json={"expected_revision": archived_rev + 1, "outcome": "victory"},
+        headers={"Idempotency-Key": "adv-complete-restored"},
+    )
+    assert completed.status_code == 200, completed.text
+    with factory() as db:
+        assert db.get(Adventure, uuid.UUID(adventure_id)).status == "completed"
