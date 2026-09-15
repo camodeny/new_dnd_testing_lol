@@ -1678,8 +1678,19 @@ def complete_adventure_endpoint(
                     headers={"X-Current-Revision": str(exc.actual_revision)},
                 ) from exc
             raise HTTPException(status_code=400, detail=str(exc)) from exc
-        db.flush()
+        # Shared #263 finalization: bind the authoritative end cursor and
+        # derive the summary on this path too (best-effort; the response
+        # shape is unchanged).
+        from app.adventures.service import finalize_adventure_derived as _finalize
+
         current = db.get(Campaign, campaign.id)
+        _finalize(
+            db, adventure,
+            event_sequence=event.sequence if event is not None else None,
+            revision=current.revision if current is not None else None,
+            actor_id=profile.id,
+        )
+        db.flush()
         return {
             "adventure": adventure.to_dict(),
             "event": event.to_dict() if event is not None and hasattr(event, "to_dict") else None,

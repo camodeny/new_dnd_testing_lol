@@ -27,6 +27,7 @@ from sqlalchemy.orm import Session
 from app.adventures.service import (
     AdventureError,
     complete_adventure,
+    finalize_adventure_derived,
     generate_summary,
     mark_stale,
     project_recap,
@@ -177,28 +178,21 @@ def complete_adventure_endpoint(
                     headers={"X-Current-Revision": str(exc.actual_revision)},
                 )
             raise HTTPException(status_code=400, detail=str(exc))
-        # Bind the authoritative source range for derived summaries, then run
-        # best-effort generation (a generator crash can never roll back the
-        # already-flushed authoritative completion).
+        # Bind the authoritative end cursor and derive the summary through the
+        # shared finalizer (same step every completion path runs; best-effort,
+        # never rolls back the authoritative completion).
         fresh_campaign = db.get(Campaign, cid)
-        completed.end_sequence = event.sequence if event is not None else None
-        completed.end_revision = fresh_campaign.revision if fresh_campaign is not None else None
-        try:
-            with db.begin_nested():
-                row = generate_summary(db, completed, actor_id=profile.id, commit=False)
-        except Exception as exc:  # noqa: BLE001 — derived work must not break completion
-            logger.warning(
-                "adventure summary auto-generate deferred adventure_id=%s error=%s",
-                completed.id, exc,
-            )
-            from app.adventures.service import _ensure_summary_placeholder
-
-            row = _ensure_summary_placeholder(db, completed)
+        row = finalize_adventure_derived(
+            db, completed,
+            event_sequence=event.sequence if event is not None else None,
+            revision=fresh_campaign.revision if fresh_campaign is not None else None,
+            actor_id=profile.id,
+        )
         db.flush()
         return {
             "adventure": completed.to_dict(),
             "event": event.to_dict() if event is not None and hasattr(event, "to_dict") else None,
-            "summary": row.to_dict(),
+            "summary": row.to_dict() if row is not None else None,
         }
 
     try:

@@ -671,17 +671,26 @@ def _event_visible_to(ev, viewer_id: _uuid_lib.UUID | None) -> bool:
     return viewer_id is not None and ev.actor_id == viewer_id
 
 
-def _validate_no_leak(recap_text: str, source_events: list) -> list[str]:
-    """Fail closed: recap must not contain tokens unique to hidden sources."""
-    public_tokens: set[str] = set()
-    private_tokens: set[str] = set()
+def _validate_no_leak(
+    recap_text: str, source_events: list, *, viewer_id: _uuid_lib.UUID | None = None
+) -> list[str]:
+    """Fail closed: recap must not contain tokens unique to sources hidden
+    FROM THIS VIEWER.
+
+    Tokens from events the viewer may see (public, or actor-visible to them)
+    are always permitted; only tokens exclusive to hidden-from-viewer sources
+    are forbidden. With ``viewer_id=None`` (the stored public baseline) every
+    hidden event counts as forbidden.
+    """
+    allowed: set[str] = set()
+    forbidden: set[str] = set()
     for ev in source_events:
         toks = set(_WORD_RE.findall(_event_text(ev).lower()))
-        if _is_hidden(ev):
-            private_tokens.update(toks)
+        if _event_visible_to(ev, viewer_id):
+            allowed.update(toks)
         else:
-            public_tokens.update(toks)
-    leaked = sorted(t for t in _WORD_RE.findall(recap_text.lower()) if t in private_tokens - public_tokens)
+            forbidden.update(toks)
+    leaked = sorted(t for t in _WORD_RE.findall(recap_text.lower()) if t in forbidden - allowed)
     return leaked
 
 
@@ -876,9 +885,10 @@ def project_recap(
     events = _source_events(db, adventure)
     visible = [ev for ev in events if _event_visible_to(ev, viewer_id)]
     text = build_recap_text(adventure, visible)
-    # Defense in depth: the freshly built text derives solely from visible
-    # sources, so this must always pass; a failure means a builder bug.
-    leaked = _validate_no_leak(text, events)
+    # Defense in depth: the freshly built text derives solely from
+    # viewer-visible sources, so viewer-relative validation must always pass;
+    # a failure means a builder bug.
+    leaked = _validate_no_leak(text, events, viewer_id=viewer_id)
     if leaked:
         row.leak_failures = int(row.leak_failures or 0) + 1
         logger.warning(
@@ -906,3 +916,60 @@ def project_recap(
         "source_event_to": row.source_event_to,
         "source_revision": row.source_revision,
     }
+
+
+def finalize_adventure_derived(
+    db: Session,
+    adventure: Adventure,
+    *,
+    event_sequence: int | None = None,
+    revision: int | None = None,
+    actor_id: _uuid_lib.UUID | None = None,
+) -> AdventureSummary | None:
+    """Shared #263 post-completion finalization for EVERY completion path.
+
+    Binds the authoritative end cursor (completion event sequence + campaign
+    revision) and creates/generates the derived AdventureSummary. Called by
+    the explicit-target HTTP endpoint, ``/current/complete``, and the staged
+    DM effect so no supported path finishes an adventure without its derived
+    artifacts.
+
+    Best-effort by design: derived-work failures are recorded on the summary
+    row (or logged if even the placeholder cannot persist) and never
+    invalidate the committed completion. Flush-only — safe inside an
+    uncommitted transaction; the caller owns the commit.
+    """
+    from sqlalchemy import func as _func
+
+    from models.campaigns import Campaign as _Campaign
+    from models.campaigns import CampaignDomainEvent as _DomainEvent
+
+    try:
+        if event_sequence is None:
+            event_sequence = db.execute(
+                select(_func.max(_DomainEvent.sequence)).where(
+                    _DomainEvent.campaign_id == adventure.campaign_id
+                )
+            ).scalar()
+        if revision is None:
+            camp = db.get(_Campaign, adventure.campaign_id)
+            revision = camp.revision if camp is not None else None
+        if event_sequence is not None:
+            adventure.end_sequence = int(event_sequence)
+        if revision is not None:
+            adventure.end_revision = int(revision)
+        with db.begin_nested():
+            return generate_summary(db, adventure, actor_id=actor_id, commit=False)
+    except Exception as exc:  # noqa: BLE001 — derived work must not break completion
+        logger.warning(
+            "adventure derived finalization deferred adventure_id=%s error=%s",
+            adventure.id, exc,
+        )
+    try:
+        return _ensure_summary_placeholder(db, adventure)
+    except Exception as exc:  # noqa: BLE001 — placeholder itself is best-effort here
+        logger.warning(
+            "adventure summary placeholder deferred adventure_id=%s error=%s",
+            adventure.id, exc,
+        )
+        return None

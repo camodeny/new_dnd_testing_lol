@@ -10,6 +10,7 @@ from app.adventures.service import (  # noqa: F401
     build_recap_text,
     complete_adventure,
     complete_adventure_inline,
+    finalize_adventure_derived,
     generate_summary,
     get_adventure,
     get_current_adventure,

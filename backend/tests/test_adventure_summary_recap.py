@@ -449,3 +449,89 @@ def test_default_source_range_excludes_pre_open_event(api):
     historical = out["summary"]["historical_text"] or ""
     assert "post-open happening" in historical
     assert "pre-open happening" not in historical
+
+
+def test_current_complete_path_also_produces_summary_and_recap(api):
+    """Every supported completion path finalizes derived artifacts (#263).
+
+    Adventures completed through the canonical /current/complete endpoint
+    (not just the explicit-target endpoint) must bind the end cursor and
+    produce an AdventureSummary so Review Adventure stays available.
+    """
+    client, factory, actor, owner = api
+    camp = _campaign(client)
+    cid = camp["id"]
+    adv = _open(client, cid, key="op-open-current")
+    revision = client.get(f"/api/campaigns/{cid}").json()["campaign"]["revision"]
+    done = client.post(
+        f"/api/campaigns/{cid}/adventures/current/complete",
+        json={
+            "expected_revision": revision,
+            "outcome": "victory",
+            "reason": "DM-only: the seal holds.",
+            "public_summary": "The Sunken Chapel stands quiet.",
+        },
+        headers={"Idempotency-Key": "complete-current"},
+    )
+    assert done.status_code == 200, done.text
+    assert done.json()["adventure"]["status"] == "completed"
+    recap = client.get(f"/api/campaigns/{cid}/adventures/{adv['id']}/recap")
+    assert recap.status_code == 200, recap.text
+    body = recap.json()
+    assert body["is_derived"] is True
+    assert "Sunken Chapel" in body["recap_text"]
+    assert "the seal holds" not in body["recap_text"]
+    durable = client.get(f"/api/campaigns/{cid}/adventures/{adv['id']}/summary")
+    assert durable.status_code == 200, durable.text
+    assert durable.json()["summary"]["status"] == "current"
+
+
+def test_recap_keeps_viewer_authorized_private_tokens(api):
+    """Viewer-relative leak validation: an actor's own private content with
+    unique 4+ character tokens must survive their own projection while
+    staying hidden from other viewers.
+    """
+    from app.campaigns.events import commit_campaign_mutation
+
+    client, factory, actor, owner = api
+    camp = _campaign(client)
+    member_a = _make_member(factory, camp["id"])
+    member_b = _make_member(factory, camp["id"])
+    cid = uuid.UUID(camp["id"])
+    with factory() as db:
+        camp_row = db.get(Campaign, cid)
+        rev = int(camp_row.revision)
+        commit_campaign_mutation(
+            db, cid, rev,
+            event_type="dm.narration",
+            payload={"summary": "the king arrives at dawn"},
+            operation_id="seed-king-public-2", visibility="public",
+        )
+        commit_campaign_mutation(
+            db, cid, rev + 1,
+            event_type="dm.secret",
+            payload={"summary": "moonstone sigil revealed to the king"},
+            operation_id="seed-moonstone-private", visibility="private",
+            actor_id=member_a,
+        )
+    with factory() as db:
+        rev = int(db.get(Campaign, cid).revision)
+    adv = _open(client, camp["id"], key="op-open-moonstone")
+    _complete(client, camp["id"], adv["id"], rev, "op-complete-moonstone")
+    # Viewer B: authorized public text present, private token absent.
+    actor["id"] = member_b
+    try:
+        recap_b = client.get(f"/api/campaigns/{camp['id']}/adventures/{adv['id']}/recap")
+        assert recap_b.status_code == 200, recap_b.text
+        assert "arrives at dawn" in recap_b.json()["recap_text"]
+        assert "moonstone" not in recap_b.json()["recap_text"]
+    finally:
+        actor["id"] = owner
+    # Viewer A (the private actor): their authorized token is NOT stripped.
+    actor["id"] = member_a
+    try:
+        recap_a = client.get(f"/api/campaigns/{camp['id']}/adventures/{adv['id']}/recap")
+        assert recap_a.status_code == 200, recap_a.text
+        assert "moonstone sigil revealed" in recap_a.json()["recap_text"]
+    finally:
+        actor["id"] = owner
