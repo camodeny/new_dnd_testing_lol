@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 import uuid
 
 import pytest
@@ -734,9 +735,50 @@ def test_effect_argument_redaction_unit():
     assert out[1]["arguments"]["reason"] == "kept"
     # Input untouched (copy, not mutation).
     assert staged[0]["arguments"]["reason"] == "secret"
-    snap = redact_private_contract_snapshot({"mode": "respond", "staged_effects": staged})
-    assert "reason" not in snap["staged_effects"][0]["arguments"]
+
+
+def _real_completion_contract(secret: str, nested_secret: str) -> dict:
+    """A real normalized contract dict carrying sentinels in both lanes."""
+    from app.dm.contract import CONTRACT_VERSION, normalize_contract
+
+    return normalize_contract(
+        {
+            "contract_version": CONTRACT_VERSION,
+            "mode": "respond",
+            "reason": secret,
+            "beats": [
+                {
+                    "id": "beat_1",
+                    "type": "narration",
+                    "claims": [
+                        {
+                            "text": "The tomb door grinds shut.",
+                            "claim_kind": "observation",
+                            "origin": "dm_adjudication",
+                            "visibility": "public",
+                        }
+                    ],
+                }
+            ],
+            "open_player_choice": "What do you do?",
+            "staged_effects": [
+                {"id": "eff_x", "effect_type": "complete_adventure",
+                 "arguments": {"outcome": "capture", "reason": nested_secret,
+                               "public_summary": "Chained in the dark."}},
+            ],
+        }
+    ).model_dump(mode="json")
+
+
+def test_contract_snapshot_projection_hides_internal_reason():
+    from app.adventures.service import redact_private_contract_snapshot
+
+    snap = redact_private_contract_snapshot(_real_completion_contract("TOP-SECRET", "NESTED-SECRET"))
+    blob = json.dumps(snap)
+    assert "TOP-SECRET" not in blob
+    assert "NESTED-SECRET" not in blob
     assert redact_private_contract_snapshot(None) is None
+    assert redact_private_contract_snapshot({"not": "a contract"}) is None
 
 
 def test_turn_inspection_redacts_completion_reason_for_members(api):
@@ -752,10 +794,10 @@ def test_turn_inspection_redacts_completion_reason_for_members(api):
     cid = camp["id"]
     member_id = uuid.uuid4()
     turn_id = uuid.uuid4()
-    secret = "DM-only turn rationale: the castellan did it."
-    staged = [{"id": "eff_x", "effect_type": "complete_adventure",
-               "arguments": {"outcome": "capture", "reason": secret,
-                             "public_summary": "Chained in the dark."}}]
+    top_secret = "TOP-SECRET turn rationale: the castellan did it."
+    nested_secret = "NESTED-SECRET effect rationale."
+    snapshot = _real_completion_contract(top_secret, nested_secret)
+    staged = snapshot["staged_effects"]
     with factory() as db:
         db.add(Profile(id=member_id, email="member@example.com"))
         db.add(CampaignMember(campaign_id=uuid.UUID(cid), user_id=member_id, role="player"))
@@ -770,7 +812,7 @@ def test_turn_inspection_redacts_completion_reason_for_members(api):
                              thread_id=str(thread_id), audience="campaign",
                              source_revision=0, input_set_revision=1, submission_ids=[],
                              staged_effects=staged,
-                             contract_snapshot={"mode": "respond", "staged_effects": staged}))
+                             contract_snapshot=snapshot))
         db.commit()
 
     actor["id"] = member_id
@@ -779,10 +821,12 @@ def test_turn_inspection_redacts_completion_reason_for_members(api):
     mem_args = body["attempts"][0]["staged_effects"][0]["arguments"]
     assert "reason" not in mem_args
     assert mem_args["outcome"] == "capture"
-    mem_snap = body["attempts"][0]["contract_snapshot"]["staged_effects"][0]["arguments"]
-    assert "reason" not in mem_snap
-    assert secret not in json.dumps(body)
+    blob = json.dumps(body)
+    assert top_secret not in blob
+    assert nested_secret not in blob
+    assert "castellan" not in blob
 
     actor["id"] = TEST_USER_ID
     owner_body = client.get(f"/api/campaigns/{cid}/dm-turns/{turn_id}").json()
-    assert owner_body["attempts"][0]["staged_effects"][0]["arguments"]["reason"] == secret
+    assert owner_body["attempts"][0]["staged_effects"][0]["arguments"]["reason"] == nested_secret
+    assert top_secret in json.dumps(owner_body)

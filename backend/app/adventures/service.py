@@ -117,15 +117,22 @@ def redact_private_effect_arguments(staged_effects: list | None) -> list:
 
 
 def redact_private_contract_snapshot(snapshot: dict | None) -> dict | None:
-    """Return a copy of a contract snapshot with owner-private arguments removed."""
+    """Project a contract snapshot to its audience-safe public form.
+
+    Uses the contract's own allowlisted ``public_projection`` so internal
+    lanes (top-level ``reason``, staged effects, evidence, provenance,
+    private beat context) never reach members. Unparseable snapshots are
+    omitted entirely (fail closed) rather than leaked partially.
+    """
     if not isinstance(snapshot, dict):
         return snapshot
-    staged = snapshot.get("staged_effects")
-    if not isinstance(staged, list):
-        return snapshot
-    snap = dict(snapshot)
-    snap["staged_effects"] = redact_private_effect_arguments(staged)
-    return snap
+    try:
+        from app.dm.contract import normalize_contract, public_projection
+
+        return public_projection(normalize_contract(snapshot))
+    except Exception:
+        logger.warning("adventure redaction dropped unparseable contract snapshot")
+        return None
 
 
 def get_adventure(db: Session, adventure_id: uuid.UUID) -> Adventure | None:
