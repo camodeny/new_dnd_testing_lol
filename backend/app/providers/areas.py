@@ -36,3 +36,40 @@ def resolve_area(area):
     adapter = provider_registry.get(provider_name)
     adapter.require_config(model)
     return adapter, model, adapter.name
+
+
+def resolve_role(role):
+    """Resolve (adapter, model, provider_name) for an execution role.
+
+    Thin mapping over :func:`resolve_area` — roles (``forward_dm``,
+    ``narration``) are the #208 policy surface; areas remain the pin
+    table. Failover/fallback candidates resolve through
+    ``app.providers.policy`` (same model via alternate providers, or only
+    explicitly approved different models).
+    """
+    from app.providers import policy as _policy
+
+    area = _policy.ROLE_AREA.get(role, role)
+    return resolve_area(area)
+
+
+def resolve_failover_adapters(role):
+    """Resolve same-model / explicitly-approved failover adapters for a role.
+
+    Returns a list of (adapter, model, provider_name); unapproved model
+    substitution is never included. Adapters whose credentials are absent
+    are skipped (fail-clear per provider, not fatal for the chain).
+    """
+    from app.providers import policy as _policy
+    from app.providers.registry import provider_registry
+
+    path = _policy.execution_path(role)[1:]  # skip primary
+    out = []
+    for provider_name, model in path:
+        try:
+            adapter = provider_registry.get(provider_name)
+            adapter.require_config(model)
+        except Exception:
+            continue
+        out.append((adapter, model, adapter.name))
+    return out

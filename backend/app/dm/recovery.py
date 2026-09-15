@@ -1,4 +1,16 @@
-"""Explicit recovery of failed adjudication before any player-visible output."""
+"""Explicit recovery of failed turns — issue #208.
+
+Two operations on the same spine:
+
+- :func:`retry_failed_adjudication` — explicit Retry from the original
+  accepted player intent. Abandons the failed attempt (including partial
+  visible streams), discards staged effects, and starts a fresh logical
+  attempt from current authoritative state. Idempotent.
+- :func:`retry_narration_only` — narration-independent retry that reuses a
+  preserved valid ``contract_snapshot`` without re-adjudication.
+- Partial-stream resume/continuation lives in ``app.dm.narration``
+  (``resume_narration_stream`` / ``continue_partial_stream``).
+"""
 import logging
 import uuid
 
@@ -9,12 +21,80 @@ from models.dm import DmTurn, DmTurnAttempt, DMStream
 logger = logging.getLogger(__name__)
 
 
+def _fresh_attempt_from_old(db, *, campaign, turn, old, reuse_contract: bool = False):
+    """Build the fresh logical attempt; caller owns flush/commit."""
+    from app.dm.turns import _now
+
+    now = _now()
+    # Abandon the failed attempt: staged effects stay on the old row for
+    # audit but are never promoted (commit_operation_id is attempt-scoped,
+    # so the fresh attempt cannot duplicate prior staged effects).
+    old.status = "abandoned"
+    old.abandoned_at = now
+    old.abandonment_reason = "explicit_retry"
+    if old.stream_id:
+        stream = db.get(DMStream, old.stream_id)
+        if stream is not None and stream.status != "abandoned":
+            stream.status = "abandoned"
+            stream.abandoned_at = now
+            stream.abandonment_reason = "explicit_retry"
+    attempt = DmTurnAttempt(
+        id=uuid.uuid4(), turn_id=turn.id, campaign_id=campaign.id,
+        thread_id=turn.thread_id, audience=turn.audience,
+        attempt_number=old.attempt_number + 1, parent_attempt_id=old.id,
+        status="prepared", source_revision=campaign.revision,
+        input_set_revision=turn.input_set_revision,
+        submission_ids=list(old.submission_ids or []),
+        roll_evidence=list(old.roll_evidence or []),
+        assembly_window_start=old.assembly_window_start,
+        assembly_window_end=old.assembly_window_end,
+        # Fresh logical attempt: new idempotency scope, no staged effects
+        # carried over (re-staged on success), no stream attached.
+        staged_effects=[],
+        contract_snapshot=dict(old.contract_snapshot)
+        if (reuse_contract and old.contract_snapshot) else None,
+        commit_operation_id=None,
+        retry_count=0,
+        next_retry_at=None,
+        last_error=None,
+        error_class=None,
+    )
+    # Fresh idempotency scope for the new logical attempt.
+    attempt.commit_operation_id = str(attempt.id)
+    db.add(attempt)
+    db.flush()
+    turn.current_attempt_id = attempt.id
+    turn.status = "pending"
+    turn.source_revision = campaign.revision
+    turn.streaming_attempt_id = None
+    turn.streaming_started_at = None
+    db.flush()
+    logger.info(
+        "dm_retry explicit_retry turn_id=%s old_attempt_id=%s new_attempt_id=%s "
+        "reuse_contract=%s abandoned_partial_stream=%s",
+        turn.id, old.id, attempt.id, reuse_contract,
+        bool(old.stream_id),
+    )
+    return turn, attempt
+
+
 def retry_failed_adjudication(db, campaign_id, turn_id, attempt_id):
     """Create one fresh attempt for the original input; caller owns commit.
 
+    Explicit Retry semantics (#208): abandons the failed attempt, discards
+    staged effects (never promoted — commit is attempt-scoped), and starts
+    a fresh logical attempt from the same original accepted player intent
+    (``submission_ids``/``roll_evidence``) at the current authoritative
+    campaign revision. Recovery AI runs are non-billable (ledger
+    classification), so no double-charge for the discarded work.
+
+    Works for pre-visibility AND partial-stream failures: a persisted
+    partial stream is abandoned (never canonical) rather than blocking
+    retry. Use ``resume_narration_stream``/``continue_partial_stream`` when
+    the goal is to keep the visible prefix instead of starting fresh.
+
     Lock campaign before turn, matching normal coordination. A replay naming
     the old attempt returns its replacement, even with a different command key.
-    Partial-stream continuation remains a separate recovery operation.
     """
     campaign = db.execute(select(Campaign).where(Campaign.id == campaign_id).with_for_update()
                           .execution_options(populate_existing=True)).scalars().one()
@@ -32,37 +112,192 @@ def retry_failed_adjudication(db, campaign_id, turn_id, attempt_id):
         return turn, replacement
     if turn.current_attempt_id != old.id or turn.status != "failed_visible" or old.status != "failed_visible":
         raise ValueError("Only the current failed attempt can be retried")
-    stream = db.get(DMStream, old.stream_id) if old.stream_id else None
-    if old.streaming_started_at or (stream and stream.chunk_count):
-        raise ValueError("A partial narration requires stream recovery")
-    from app.dm.turns import _now
-    now = _now()
-    old.status = "abandoned"
-    old.abandoned_at = now
-    old.abandonment_reason = "explicit_retry"
-    if stream:
-        stream.status = "abandoned"
-        stream.abandoned_at = now
-        stream.abandonment_reason = "explicit_retry"
-    attempt = DmTurnAttempt(
-        id=uuid.uuid4(), turn_id=turn.id, campaign_id=campaign_id,
-        thread_id=turn.thread_id, audience=turn.audience,
-        attempt_number=old.attempt_number + 1, parent_attempt_id=old.id,
-        status="prepared", source_revision=campaign.revision,
-        input_set_revision=turn.input_set_revision,
-        submission_ids=list(old.submission_ids), roll_evidence=list(old.roll_evidence or []),
-        assembly_window_start=old.assembly_window_start,
-        assembly_window_end=old.assembly_window_end,
+    # Explicit Retry abandons even partial visible streams — the old stream
+    # is marked abandoned/non-canonical and the fresh attempt starts clean.
+    return _fresh_attempt_from_old(db, campaign=campaign, turn=turn, old=old)
+
+
+def retry_narration_only(db, campaign_id, turn_id, attempt_id):
+    """Fresh attempt reusing the preserved valid contract (no re-adjudication).
+
+    For narration-only failures where ``contract_snapshot`` survived: the
+    new attempt carries the snapshot forward so the executor can narrate
+    and commit without calling the adjudication model again. Staged effects
+    are still re-staged on success (never copied as committed truth).
+    """
+    campaign = db.execute(select(Campaign).where(Campaign.id == campaign_id).with_for_update()
+                          .execution_options(populate_existing=True)).scalars().one()
+    turn = db.execute(select(DmTurn).where(DmTurn.id == turn_id, DmTurn.campaign_id == campaign_id).with_for_update()
+                      .execution_options(populate_existing=True)).scalars().first()
+    if turn is None:
+        raise ValueError("Turn not found")
+    old = db.get(DmTurnAttempt, attempt_id)
+    if old is None or old.turn_id != turn.id:
+        raise ValueError("Attempt not found")
+    if turn.current_attempt_id != old.id or turn.status != "failed_visible" or old.status != "failed_visible":
+        raise ValueError("Only the current failed attempt can be retried")
+    if not old.contract_snapshot:
+        raise ValueError("No preserved structured result — use full explicit Retry")
+    if int(old.source_revision) != int(campaign.revision):
+        # Authoritative state advanced since the failed adjudication: the
+        # preserved contract was computed against stale state and must not
+        # be narrated/committed under the new revision. Full explicit Retry
+        # re-adjudicates against current state instead.
+        raise ValueError(
+            "Campaign state advanced since the failed attempt — "
+            "use full explicit Retry to re-adjudicate"
+        )
+    return _fresh_attempt_from_old(
+        db, campaign=campaign, turn=turn, old=old, reuse_contract=True
     )
-    db.add(attempt)
-    db.flush()
-    turn.current_attempt_id = attempt.id
-    turn.status = "pending"
-    turn.source_revision = campaign.revision
-    turn.streaming_attempt_id = None
-    turn.streaming_started_at = None
-    db.flush()
-    return turn, attempt
+
+
+def _find_recovery_event(db, turn, attempt):
+    """Resolve the committed domain event for a recovered turn.
+
+    Prefers the attempt's stored result, then the idempotent commit lookup
+    by (campaign, operation_id). Returns None only if neither resolves.
+    """
+    result = dict(attempt.result or {})
+    event_id = result.get("event_id") or result.get("id")
+    if event_id:
+        try:
+            from models.campaigns import CampaignDomainEvent
+
+            event = db.get(CampaignDomainEvent, uuid.UUID(str(event_id)))
+            if event is not None:
+                return event
+        except (ValueError, TypeError):
+            pass
+    try:
+        from models.campaigns import CampaignDomainEvent
+
+        duplicate_op = attempt.commit_operation_id or str(attempt.id)
+        return db.execute(
+            select(CampaignDomainEvent).where(
+                CampaignDomainEvent.campaign_id == turn.campaign_id,
+                CampaignDomainEvent.operation_id == duplicate_op,
+            )
+        ).scalars().first()
+    except Exception:
+        return None
+
+
+def recover_partial_stream(db, campaign_id, turn_id, stream_id, continued_text,
+                           *, actor_id=None, commit: bool = True):
+    """Recover a failed partial stream through the full turn state machine.
+
+    Single orchestration helper for partial-stream recovery (HTTP route +
+    any future trigger): scope-check → fidelity-gated continuation →
+    recovered-streaming transition → ``commit_turn_with_effects`` (staged
+    effects promoted exactly once with the normal idempotency/revision
+    guards). Caller-supplied text ALWAYS goes through the contract fidelity
+    gate; there is no ungated resume path for untrusted input.
+
+    With ``commit=False`` every step is flush-only and the caller owns the
+    single atomic commit — the mode the idempotent HTTP route uses so a
+    crash can never leave half-committed recovery state beside a durable
+    ``in_progress`` command record. Any failure rolls everything back.
+
+    Raises ``LookupError`` when the stream/turn is not found or not scoped
+    to the authorized campaign/turn/attempt (callers map to 404), and
+    ``ValueError`` when the text diverges or the turn cannot recover
+    (callers map to a generic retryable 409).
+    """
+    from app.dm.contract import normalize_contract
+    from app.dm.narration import NarrationError, continue_partial_stream
+    from app.dm.turns import (
+        StaleRevisionError,
+        TurnConflictError,
+        commit_turn_with_effects,
+        mark_recovered_streaming,
+    )
+    from app.dm_streams.service import (
+        DMStreamStateError,
+        get_stream,
+        reopen_failed_stream,
+    )
+
+    campaign = db.execute(select(Campaign).where(Campaign.id == campaign_id).with_for_update()
+                          .execution_options(populate_existing=True)).scalars().one()
+    turn = db.execute(select(DmTurn).where(DmTurn.id == turn_id, DmTurn.campaign_id == campaign_id).with_for_update()
+                      .execution_options(populate_existing=True)).scalars().first()
+    if turn is None:
+        raise LookupError("Turn not found")
+    stream = get_stream(db, stream_id)
+    # Scope the stream to the authorized route context BEFORE any mutation:
+    # a stream from another campaign/turn/attempt can never be continued here.
+    if (
+        stream is None
+        or str(stream.campaign_id) != str(campaign.id)
+        or str(stream.turn_id) != str(turn.id)
+        or str(stream.attempt_id) != str(turn.current_attempt_id)
+    ):
+        raise LookupError("Stream not found")
+    old = db.get(DmTurnAttempt, turn.current_attempt_id)
+    if old is None:
+        raise LookupError("Stream not found")
+    # Duplicate delivery after a completed recovery: return current state
+    # with the ORIGINAL committed domain event (never the stream row —
+    # callers shape event_id from this).
+    if turn.status == "succeeded" and old.status == "succeeded":
+        return turn, old, _find_recovery_event(db, turn, old)
+    if old.status != "failed_visible" or turn.status != "failed_visible":
+        raise ValueError("Only the current failed attempt can recover")
+    if not old.contract_snapshot:
+        raise ValueError("No preserved structured result — use full explicit Retry")
+    if str(old.stream_id) != str(stream.id):
+        raise LookupError("Stream not found")
+
+    contract = normalize_contract(dict(old.contract_snapshot))
+    if stream.status == "completed":
+        # Crash after stream completion but before turn commit: the durable
+        # final text is server-known — accept only an exact match and skip
+        # straight to finalization (no rewrite, no re-gate of new input).
+        if continued_text != (stream.final_text or ""):
+            raise ValueError("Continued narration does not match the completed stream")
+    else:
+        try:
+            reopen_failed_stream(db, stream.id, reason="partial_recovery")
+            narration = continue_partial_stream(
+                db, stream.id, continued_text, contract,
+                # Realtime delivery requires durability first: flush-only
+                # mode defers delivery until after the outer commit.
+                publish_realtime=commit, commit=commit,
+            )
+        except DMStreamStateError as exc:
+            # Abandoned streams cannot recover — explicit Retry instead.
+            raise ValueError(f"Stream cannot recover: {exc}") from exc
+        except NarrationError as exc:
+            # Fidelity or stream failure: generic retryable outcome, details in logs.
+            raise ValueError(f"Continued narration rejected: {exc}") from exc
+    mark_recovered_streaming(db, turn.id, old.id, commit=commit)
+    submission_ids = list(old.submission_ids or [])
+    payload = {
+        "turn_id": str(turn.id),
+        "attempt_id": str(old.id),
+        "submission_ids": submission_ids,
+        "narration_stream_id": str(stream.id),
+        "recovery": "partial_stream_continuation",
+    }
+    try:
+        final_turn, final_attempt, event = commit_turn_with_effects(
+            db, turn.id, old.id,
+            payload=payload,
+            operation_id=old.commit_operation_id or str(old.id),
+            actor_id=actor_id,
+            commit=commit,
+        )
+    except (StaleRevisionError, TurnConflictError) as exc:
+        # Legitimate stale-revision/blocked recovery: generic retryable
+        # outcome (callers map ValueError to 409), never a 500. Details stay
+        # in logs; the atomic commit=False path rolls everything back.
+        raise ValueError(f"Recovery cannot commit: {exc}") from exc
+    logger.info(
+        "dm_retry partial_stream_recovered turn_id=%s attempt_id=%s stream_id=%s event_id=%s",
+        turn.id, old.id, stream.id, getattr(event, "id", None),
+    )
+    return final_turn, final_attempt, event
 
 
 def execute_committed_attempt(attempt_id):

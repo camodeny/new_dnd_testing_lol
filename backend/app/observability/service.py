@@ -121,6 +121,28 @@ def finish_ai_run(session_factory, run_id, *, status: str = "succeeded", first_t
     return _telemetry_write(session_factory, write)
 
 
+def telemetry_factory_for(db: Session):
+    """Derive an independent telemetry session factory from a Session.
+
+    Sessions it creates own short transactions (see :func:`start_ai_run`),
+    so AI-run accounting survives gameplay rollback — failed provider
+    attempts stay in the ledger even when the turn execution rolls back.
+    Returns None when no bind is available (callers skip accounting).
+    """
+    try:
+        bind = db.get_bind()
+    except Exception:
+        return None
+    if bind is None:
+        return None
+    try:
+        from sqlalchemy.orm import sessionmaker
+
+        return sessionmaker(bind=bind, expire_on_commit=False)
+    except Exception:
+        return None
+
+
 def get_trace(db: Session, trace_id: str) -> dict | None:
     record = db.get(OperationTrace, trace_id)
     if record is None:

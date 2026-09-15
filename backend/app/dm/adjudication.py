@@ -199,39 +199,401 @@ def adjudicate_with_provider(
     return contract
 
 
-def build_provider_narrator(*, adapter=None, model: str | None = None, timeout_seconds: float = 90):
-    """Streaming narrator backed by the configured provider.
+def adjudicate_with_failover(
+    packet,
+    *,
+    db=None,
+    role: str = "forward_dm",
+    timeout_seconds: float = 90,
+    trace_id: str | None = None,
+    adapter=None,
+    model: str | None = None,
+    is_retry: bool = False,
+):
+    """Adjudicate through the role policy path with bounded failover.
 
-    Resolves the ``narrator`` call area (pinned in code) when
-    adapter/model are not injected. Returns a ``StreamingNarratorFn`` taking a contract-bound
-    ``NarratorRequest`` and yielding text deltas via ``stream_chat``.
+    Primary first, then same-model alternate providers, then only
+    explicitly approved different-model fallbacks. Every candidate is
+    gated by ``policy.is_model_approved`` — unapproved substitution
+    raises rather than executes. Recovery attempts (failover index > 0,
+    or any call with ``is_retry=True`` for an explicit-Retry attempt) are
+    recorded as non-billable AI runs when ``db`` is given; only a first
+    try's primary call is ``primary``/billable. Runs are finished
+    (succeeded/failed) instead of left running.
+
+    Returns ``(contract, path_info)`` where path_info holds
+    ``provider``/``model``/``attempt_index``/``failover_reasons``.
+    """
+    import time
+
+    from app.providers import ProviderRequest, execute_chat
+    from app.providers import policy as role_policy
+    from app.observability.tracing import structured_log
+
+    tid = trace_id or str(uuid.uuid4())
+    t_start = time.monotonic()
+    policy = role_policy.get_role_policy(role)
+    # Independent telemetry transaction: AI-run rows must survive gameplay
+    # rollback so failed attempts keep their recovery/billing attribution.
+    telemetry = None
+    if db is not None:
+        try:
+            from app.observability.service import telemetry_factory_for
+
+            telemetry = telemetry_factory_for(db)
+        except Exception:
+            telemetry = None
+
+    if adapter is not None and model is not None:
+        # Injected seam (tests): single pinned attempt, no failover chain.
+        if not role_policy.is_model_approved(role, adapter.name, model):
+            raise RuntimeError(
+                f"Unapproved model substitution blocked for role {role!r}: "
+                f"{adapter.name}/{model}"
+            )
+        contract = adjudicate_with_provider(
+            packet, adapter=adapter, model=model,
+            timeout_seconds=timeout_seconds, trace_id=tid,
+        )
+        return contract, {
+            "provider": adapter.name, "model": model,
+            "attempt_index": 0, "failover_reasons": [],
+            "ttft_added_ms": 0.0,
+        }
+
+    path = role_policy.execution_path(role)
+    failover_reasons: list[str] = []
+    last_exc: BaseException | None = None
+    for index, (provider_name, candidate_model) in enumerate(path):
+        if not role_policy.is_model_approved(role, provider_name, candidate_model):
+            # Defense in depth: execution_path should never yield these.
+            raise RuntimeError(
+                f"Unapproved model substitution blocked for role {role!r}: "
+                f"{provider_name}/{candidate_model}"
+            )
+        try:
+            if index == 0:
+                # Primary resolves through the canonical seam so existing
+                # config gates and test hooks on resolve_dm_provider hold.
+                cand_adapter, cand_model, _ = resolve_dm_provider()
+            else:
+                from app.providers.registry import provider_registry
+
+                cand_adapter = provider_registry.get(provider_name)
+                cand_adapter.require_config(candidate_model)
+                cand_model = candidate_model
+        except Exception as exc:
+            last_exc = exc
+            reason = f"config_unavailable:{provider_name}"
+            failover_reasons.append(reason)
+            role_policy.record_failover_attempt(reason, provider_name, candidate_model)
+            continue
+        classification = "recovery" if (index > 0 or is_retry) else "primary"
+        ai_run = None
+        if telemetry is not None:
+            try:
+                from app.observability.service import start_ai_run
+
+                ai_run = start_ai_run(
+                    telemetry, logical_operation="forward_dm_adjudicate",
+                    role=role, provider=cand_adapter.name, model=cand_model,
+                    attempt=index + 1, classification=classification,
+                    billable=(classification == "primary"),
+                    trace_id=tid,
+                )
+                if classification == "recovery":
+                    role_policy.record_recovery_run(billable=False)
+            except Exception:
+                ai_run = None
+        try:
+            from app.dm.contract import contract_json_schema_strict, normalize_contract
+
+            messages = build_forward_dm_messages(packet)
+            request = ProviderRequest(
+                messages=messages, model=cand_model,
+                json_schema=contract_json_schema_strict(),
+                json_schema_name="dm_turn_contract_v1",
+                timeout_seconds=timeout_seconds, temperature=0,
+            )
+            structured_log(
+                logger, logging.INFO, "forward_dm_provider_start",
+                provider=cand_adapter.name, model=cand_model,
+                trace_id=tid, attempt=index + 1, classification=classification,
+            )
+            response = execute_chat(cand_adapter, request)
+            raw = parse_contract_json(response.content)
+            contract = normalize_contract(raw)
+            ttft_added = (time.monotonic() - t_start) * 1000 if index > 0 else 0.0
+            if ai_run is not None and telemetry is not None:
+                try:
+                    from app.observability.service import finish_ai_run
+
+                    finish_ai_run(telemetry, ai_run.id, status="succeeded",
+                                  result_code="contract_ok")
+                except Exception:
+                    pass
+            structured_log(
+                logger, logging.INFO, "forward_dm_provider_contract",
+                provider=cand_adapter.name, model=cand_model,
+                mode=contract.mode, trace_id=tid,
+                failover_reasons=failover_reasons,
+            )
+            return contract, {
+                "provider": cand_adapter.name, "model": cand_model,
+                "attempt_index": index, "failover_reasons": list(failover_reasons),
+                "ttft_added_ms": ttft_added,
+            }
+        except Exception as exc:
+            last_exc = exc
+            if ai_run is not None and telemetry is not None:
+                try:
+                    from app.observability.service import finish_ai_run
+
+                    finish_ai_run(telemetry, ai_run.id, status="failed",
+                                  error_type=type(exc).__name__[:128])
+                except Exception:
+                    pass
+            cls, reason = role_policy.classify_execution_failure(exc)
+            failover_reasons.append(reason)
+            role_policy.record_failover_attempt(
+                reason, cand_adapter.name, cand_model
+            )
+            if cls == "terminal" or index >= len(path) - 1:
+                break
+            continue
+    assert last_exc is not None
+    role_policy.record_exhausted()
+    raise last_exc
+
+
+def build_provider_narrator(
+    *,
+    adapter=None,
+    model: str | None = None,
+    timeout_seconds: float = 90,
+    db=None,
+    trace_id: str | None = None,
+    role: str = "narration",
+    is_retry: bool = False,
+):
+    """Streaming narrator backed by the role-policy provider path.
+
+    Resolves candidates through the ``narration`` role policy: primary
+    first, then same-model alternate providers, then only explicitly
+    approved different-model fallbacks (unapproved substitution raises and
+    is never executed). Returns a ``StreamingNarratorFn`` taking a
+    contract-bound ``NarratorRequest`` and yielding text deltas.
+
+    Failover preserves the visible-prefix invariant: provider switching
+    happens ONLY before anything is durably player-visible (checked via the
+    request's durability probe, falling back to a no-yield rule without one).
+    On a switch the narrator yields a ``NarratorFailoverMarker`` so the
+    streaming service drops the failed provider's unpersisted prefix — the
+    next provider's text starts clean. Once output is durable, the provider
+    is pinned; later failures propagate to the normal post-visibility
+    handling (fidelity-gated continuation, never silent mid-stream switch).
+
+    Candidate lineage follows the policy-path index (not the resolved
+    order): if the primary cannot even be configured, the first alternate
+    is still index 1 — ``recovery``/non-billable, never promoted to
+    billable primary work. Failover attempts are recorded as non-billable
+    recovery AI runs when ``db`` is given (as is narration on an
+    explicit-retry attempt).
     """
     from app.providers import ProviderRequest, stream_chat
-    from app.providers.areas import resolve_area
+    from app.providers import policy as role_policy
+    from app.observability.tracing import structured_log
 
-    if adapter is None or model is None:
-        resolved_adapter, resolved_model, _ = resolve_area("narrator")
-        adapter = adapter or resolved_adapter
-        model = model or resolved_model
+    tid = trace_id or str(uuid.uuid4())
+    # Independent telemetry transaction (see adjudication path): narration
+    # runs survive gameplay rollback.
+    telemetry = None
+    if db is not None:
+        try:
+            from app.observability.service import telemetry_factory_for
+
+            telemetry = telemetry_factory_for(db)
+        except Exception:
+            telemetry = None
+    if adapter is not None and model is not None:
+        if not role_policy.is_model_approved(role, adapter.name, model):
+            raise RuntimeError(
+                f"Unapproved model substitution blocked for role {role!r}: "
+                f"{adapter.name}/{model}"
+            )
+        pinned = [(0, adapter, model)]
+    else:
+        if (adapter is not None) != (model is not None):
+            raise RuntimeError(
+                "Provide both adapter and model, or neither (policy path)"
+            )
+        pinned = None
+    policy_path = None if pinned is not None else role_policy.execution_path(role)
+
+    def _resolve(path_index: int, provider_name: str, candidate_model: str):
+        """Resolve one candidate, preserving its policy-path index."""
+        if not role_policy.is_model_approved(role, provider_name, candidate_model):
+            raise RuntimeError(
+                f"Unapproved model substitution blocked for role {role!r}: "
+                f"{provider_name}/{candidate_model}"
+            )
+        if path_index == 0:
+            # Primary resolves through the canonical seam so existing
+            # config gates hold.
+            from app.providers.areas import resolve_area
+
+            area = role_policy.ROLE_AREA.get(role, role)
+            cand_adapter, cand_model, _ = resolve_area(area)
+            return cand_adapter, cand_model
+        from app.providers.registry import provider_registry
+
+        cand_adapter = provider_registry.get(provider_name)
+        cand_adapter.require_config(candidate_model)
+        return cand_adapter, candidate_model
 
     def _narrate(narrator_request) -> object:
         prompt = getattr(narrator_request, "prompt", "")
-        pr = ProviderRequest(
-            messages=[
-                {"role": "system", "content": prompt},
-                {"role": "user", "content": "Expand the structured turn above into table narration."},
-            ],
-            model=model,
-            timeout_seconds=timeout_seconds,
-            stream=True,
-        )
-        deltas: list[str] = []
+        probe = getattr(narrator_request, "durable_prefix_fn", None)
+
+        def _durable_visible() -> bool:
+            try:
+                return bool(probe() if callable(probe) else False)
+            except Exception:
+                return False
 
         def _gen():
-            for event in stream_chat(adapter, pr):
-                if event.kind == "token" and event.text:
-                    deltas.append(event.text)
-                    yield event.text
+            # (path_index, provider_ref, model, pre_resolved): provider_ref
+            # is an adapter when pinned, else a registry name.
+            if pinned is not None:
+                entries = [(0, adapter, model, True)]
+            else:
+                assert policy_path is not None
+                entries = [(i, p, m, False) for i, (p, m) in enumerate(policy_path)]
+            resolved: list[tuple[int, object, str]] = []
+            first_error: BaseException | None = None
+            for path_index, provider_ref, candidate_model, pre_resolved in entries:
+                try:
+                    if pre_resolved:
+                        cand_adapter, cand_model = provider_ref, candidate_model
+                    else:
+                        cand_adapter, cand_model = _resolve(
+                            path_index, provider_ref, candidate_model)
+                except Exception as exc:
+                    if first_error is None:
+                        first_error = exc
+                    role_policy.record_failover_attempt(
+                        f"config_unavailable:{provider_ref}", str(provider_ref),
+                        candidate_model,
+                    )
+                    continue
+                resolved.append((path_index, cand_adapter, cand_model))
+            if not resolved:
+                raise first_error if first_error is not None else RuntimeError(
+                    f"No narration provider available for role {role!r}"
+                )
+            failover_reasons: list[str] = []
+            for position, (path_index, cand_adapter, cand_model) in enumerate(resolved):
+                # Lineage follows the POLICY-PATH index: a skipped primary
+                # never promotes an alternate to billable primary work.
+                classification = (
+                    "recovery" if (path_index > 0 or is_retry) else "primary"
+                )
+                ai_run = None
+                if telemetry is not None:
+                    try:
+                        from app.observability.service import start_ai_run
+
+                        ai_run = start_ai_run(
+                            telemetry, logical_operation="narration_stream",
+                            role=role, provider=cand_adapter.name,
+                            model=cand_model, attempt=path_index + 1,
+                            classification=classification,
+                            billable=(classification == "primary"),
+                            trace_id=tid,
+                        )
+                    except Exception:
+                        ai_run = None
+                pr = ProviderRequest(
+                    messages=[
+                        {"role": "system", "content": prompt},
+                        {"role": "user", "content": "Expand the structured turn above into table narration."},
+                    ],
+                    model=cand_model,
+                    timeout_seconds=timeout_seconds,
+                    stream=True,
+                )
+                structured_log(
+                    logger, logging.INFO, "narration_provider_start",
+                    provider=cand_adapter.name, model=cand_model,
+                    trace_id=tid, attempt=path_index + 1,
+                    classification=classification,
+                )
+                yielded_downstream = False
+                try:
+                    for event in stream_chat(cand_adapter, pr):
+                        if event.kind == "token" and event.text:
+                            yielded_downstream = True
+                            yield event.text
+                    if ai_run is not None and telemetry is not None:
+                        try:
+                            from app.observability.service import finish_ai_run
+
+                            finish_ai_run(telemetry, ai_run.id, status="succeeded",
+                                          result_code="stream_ok")
+                        except Exception:
+                            pass
+                    return
+                except Exception as exc:
+                    if ai_run is not None and telemetry is not None:
+                        try:
+                            from app.observability.service import finish_ai_run
+
+                            finish_ai_run(telemetry, ai_run.id, status="failed",
+                                          error_type=type(exc).__name__[:128])
+                        except Exception:
+                            pass
+                    cls, reason = role_policy.classify_execution_failure(exc)
+                    failover_reasons.append(reason)
+                    role_policy.record_failover_attempt(
+                        reason, cand_adapter.name, cand_model
+                    )
+                    # Switching is keyed on DURABLE visibility, not raw token
+                    # emission: a retryable failure with nothing durably
+                    # visible moves to the next approved candidate (the
+                    # marker tells the service to drop the failed
+                    # provider's unpersisted prefix). Once output is
+                    # durable, the provider is pinned — propagate for
+                    # fidelity-gated continuation handling. Without a
+                    # durability probe (direct narrator use), fall back to
+                    # the conservative no-yield rule.
+                    if probe is None:
+                        pre_visible = not yielded_downstream
+                    else:
+                        pre_visible = not _durable_visible()
+                    can_switch = (
+                        cls == "retriable"
+                        and position < len(resolved) - 1
+                        and pre_visible
+                    )
+                    if can_switch:
+                        if db is not None:
+                            role_policy.record_recovery_run(billable=False)
+                        if yielded_downstream:
+                            # The failed provider's prefix reached the
+                            # service but was never durable: tell it to
+                            # drop the prefix so the next provider starts
+                            # clean. With nothing yielded, there is nothing
+                            # to retract (and probe-less consumers never see
+                            # a marker).
+                            from app.dm.narration import NarratorFailoverMarker
+
+                            yield NarratorFailoverMarker(
+                                provider=cand_adapter.name, reason=reason,
+                            )
+                        continue
+                    raise
+            # Unreachable: loop either returns or raises.
+            raise RuntimeError("Narration provider path exhausted without result")
 
         # stream_chat is a generator; return the iterable for the delta loop.
         return _gen()

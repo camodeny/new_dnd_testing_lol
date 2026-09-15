@@ -302,12 +302,37 @@ class NarratorRequest:
 
     prompt: str
     projection: dict[str, Any]
+    #: Visibility probe installed by :func:`stream_narration` before invoking
+    #: the narrator: returns the currently durably persisted visible text.
+    #: Failover-capable narrators consult it to key provider switching on
+    #: durable visibility (first player-visible output), not on raw token
+    #: emission. ``None`` outside the streaming service (direct narrator
+    #: use falls back to a no-yield switching rule).
+    durable_prefix_fn: Callable[[], str] | None = None
+
+
+@dataclass
+class NarratorFailoverMarker:
+    """A failover-capable narrator yields this when it switches providers.
+
+    Only ever emitted pre-visibility (the durable probe was empty), so the
+    failed provider's already-yielded prefix was never persisted or
+    delivered. The consumer must drop any unpersisted accumulation and
+    continue with the next provider's deltas — never persist the dropped
+    prefix.
+    """
+
+    provider: str
+    reason: str
 
 
 #: A provider yields narration text deltas (e.g. LLM token batches) as they
 #: are generated. The service persists each delta durably as it arrives, so
 #: time-to-first-visible-chunk tracks first-delta arrival rather than full
-#: generation — the low-TTFT path required by #207.
+#: generation — the low-TTFT path required by #207. Failover-capable
+#: providers may additionally yield :class:`NarratorFailoverMarker` when
+#: switching providers pre-visibility; the service drops the failed
+#: provider's unpersisted prefix on receipt.
 NarratorDeltaStream = Iterable[str]
 
 #: Streaming provider contract. A batch provider may still return a plain
@@ -773,6 +798,10 @@ def stream_narration(
         prompt=build_narrator_prompt(projection),
         projection=projection,
     )
+    # Visibility probe for failover-capable narrators: durable persisted
+    # text. Installed before the narrator is invoked so provider switching
+    # can key on first player-visible output.
+    request.durable_prefix_fn = lambda: "".join(persisted_texts)
 
     # — Durable stream header (pre-chunk, never visible until chunk 0) —
     try:
@@ -915,6 +944,20 @@ def stream_narration(
                 delta = None
             cumulative = ""
             if not exhausted:
+                if isinstance(delta, NarratorFailoverMarker):
+                    # Pre-visibility provider switch: the failed provider's
+                    # prefix was never durable (probe-verified by the
+                    # narrator). Drop the unpersisted accumulation so the
+                    # next provider's text starts clean — never persist the
+                    # dropped prefix.
+                    durable_so_far = "".join(persisted_texts)
+                    full_parts = [durable_so_far] if durable_so_far else []
+                    structured_log(
+                        logger, logging.INFO, "narration_provider_failover",
+                        stream_id=str(stream_id),
+                        provider=delta.provider, reason=delta.reason,
+                    )
+                    continue
                 if not isinstance(delta, str):
                     raise NarratorGenerationError(
                         "Narrator deltas must be str, "
@@ -1263,6 +1306,93 @@ def resume_narration_stream(
     suffix, then materializes the final narration. Idempotent: already
     persisted chunks are re-used, never duplicated.
     """
+    from app.providers import policy as role_policy
+
+    result = _resume_stream_suffix(
+        db, stream_id, full_text,
+        chunk_size=chunk_size, publish_realtime=publish_realtime,
+        completion_reason="narration_resumed",
+    )
+    role_policy.record_partial_resume("direct_resume")
+    return result
+
+
+def continue_partial_stream(
+    db: Session,
+    stream_id: uuid.UUID,
+    continued_text: str,
+    contract: DmTurnContractV1,
+    *,
+    chunk_size: int = 120,
+    publish_realtime: bool = True,
+    extra_secrets: set[str] | None = None,
+    pc_names: dict[str, str] | None = None,
+    commit: bool = True,
+) -> NarrationResult:
+    """Semantically continue a partial visible stream without contradiction.
+
+    Direct resume handles the same-text case. When regeneration diverges,
+    this continues from the persisted visible prefix: ``continued_text``
+    MUST start with the exact persisted visible text (players already saw
+    it — it cannot be rewritten), and the full continuation must pass the
+    authoritative fidelity gate against the validated contract. Only the
+    missing suffix is persisted; no chunk is ever rewritten.
+
+    Raises ``ValueError`` when the prefix diverges (caller must Retry
+    fresh instead) and ``NarrationFidelityError`` /
+    ``NarrationStreamError`` on gate failure.
+    """
+    from app.dm_streams.service import reconstruct_text
+    from app.providers import policy as role_policy
+
+    visible = reconstruct_text(db, stream_id)
+    if not (continued_text or "").startswith(visible):
+        raise ValueError(
+            "Continued narration contradicts the persisted visible prefix — "
+            "cannot continue automatically; use explicit Retry"
+        )
+    check_narration_fidelity_or_raise(
+        continued_text, contract,
+        extra_secrets=extra_secrets, pc_names=pc_names,
+    )
+    result = _resume_stream_suffix(
+        db, stream_id, continued_text,
+        chunk_size=chunk_size,
+        # Realtime delivery requires durability first: when the caller owns
+        # the commit (commit=False), delivery is deferred to after commit.
+        publish_realtime=publish_realtime and commit,
+        commit=commit,
+        completion_reason="narration_continued",
+    )
+    role_policy.record_partial_resume("semantic_continuation")
+    return result
+
+
+def build_continuation_prompt(projection: dict[str, Any], visible_prefix: str) -> str:
+    """Build a regeneration prompt constrained to continue the prefix.
+
+    The persisted prefix is quoted verbatim with an instruction to continue
+    exactly from it without contradicting or restating it differently.
+    """
+    base = build_narrator_prompt(projection)
+    return (
+        base + "\nALREADY VISIBLE (do not rewrite, contradict, or restate):\n"
+        + (visible_prefix or "")[:4000]
+        + "\nContinue exactly from the visible text above."
+    )
+
+
+def _resume_stream_suffix(
+    db: Session,
+    stream_id: uuid.UUID,
+    full_text: str,
+    *,
+    chunk_size: int = 120,
+    publish_realtime: bool = True,
+    commit: bool = True,
+    completion_reason: str = "narration_resumed",
+) -> NarrationResult:
+    """Shared suffix-persist + complete for resume/continuation."""
     from app.dm_streams.service import (
         append_chunk,
         complete_stream,
@@ -1289,7 +1419,10 @@ def resume_narration_stream(
     last = time.monotonic()
     for seq in range(len(existing), len(plan)):
         chunk = append_chunk(db, stream_id, seq, plan[seq])
-        db.commit()
+        if commit:
+            db.commit()
+        else:
+            db.flush()
         db.refresh(stream)
         now = time.monotonic()
         cadence.append((now - last) * 1000)
@@ -1305,8 +1438,11 @@ def resume_narration_stream(
                     "narration resume publish failed stream_id=%s seq=%s error=%s",
                     stream_id, seq, pub_exc,
                 )
-    stream = complete_stream(db, stream_id, completion_reason="narration_resumed")
-    db.commit()
+    stream = complete_stream(db, stream_id, completion_reason=completion_reason)
+    if commit:
+        db.commit()
+    else:
+        db.flush()
     db.refresh(stream)
     if publish_realtime:
         try:

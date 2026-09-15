@@ -319,6 +319,36 @@ def fail_stream(
     return stream
 
 
+def reopen_failed_stream(
+    db: Session,
+    stream_id: uuid.UUID,
+    *,
+    reason: str = "recovery_reopened",
+) -> DMStream:
+    """Reopen a failed partial stream for guarded recovery continuation.
+
+    Only ``failed`` → ``streaming`` is allowed; completed/abandoned streams
+    are never reopened. Partial chunks are retained as the visible prefix.
+    Callers must scope the stream to the authorized turn/attempt and
+    fidelity-gate any continued text before completing.
+    """
+    stream = _get_stream_for_update(db, stream_id)
+    if stream.status == "streaming":
+        return stream
+    if stream.status != "failed":
+        raise DMStreamStateError(
+            f"Cannot reopen stream in status {stream.status}; only failed streams can recover"
+        )
+    stream.status = "streaming"
+    stream.abandonment_reason = reason
+    db.flush()
+    logger.info(
+        "dm_stream reopened stream_id=%s reason=%s chunk_count=%s last_sequence=%s",
+        stream_id, reason, stream.chunk_count, stream.last_sequence,
+    )
+    return stream
+
+
 def list_streams_for_thread(
     db: Session,
     campaign_id: uuid.UUID,

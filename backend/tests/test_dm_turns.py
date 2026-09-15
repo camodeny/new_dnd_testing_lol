@@ -620,6 +620,8 @@ def test_retry_failed_adjudication_keeps_original_input_and_replays_once():
 
 
 def test_retry_rejects_partial_output_and_preserves_roll_evidence():
+    """#208: explicit Retry abandons even partial visible streams and starts
+    fresh from the original accepted intent (staged effects discarded)."""
     from app.dm.recovery import retry_failed_adjudication
     Fac, cid, owner, _, tid = _setup_campaign()
     with Fac() as db:
@@ -629,15 +631,12 @@ def test_retry_rejects_partial_output_and_preserves_roll_evidence():
         turn, old = coordinate_turn(db, cid, tid)
         turn.status = old.status = 'failed_visible'
         old.streaming_started_at = datetime.now(timezone.utc)
+        old.staged_effects = [{"effect_type": "test", "id": "eff_1"}]
         db.commit()
-        with pytest.raises(ValueError, match='partial narration'):
-            retry_failed_adjudication(db, cid, turn.id, old.id)
-        assert old.status == 'failed_visible'
-        old.streaming_started_at = None
-        old.roll_evidence = [{'request_key': 'check', 'fulfillment': {'total': 12}}]
-        db.commit()
+        # Partial visible output no longer blocks explicit Retry — the old
+        # attempt/stream is abandoned and a fresh logical attempt starts.
         _, fresh = retry_failed_adjudication(db, cid, turn.id, old.id)
-        assert fresh.roll_evidence == old.roll_evidence
+        assert fresh.parent_attempt_id == old.id
+        assert fresh.staged_effects == []
+        assert db.get(DmTurnAttempt, old.id).status == 'abandoned'
         db.rollback()
-        assert db.get(DmTurnAttempt, old.id).status == 'failed_visible'
-        assert db.query(DmTurnAttempt).filter_by(turn_id=turn.id).count() == 1

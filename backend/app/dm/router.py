@@ -54,6 +54,132 @@ def retry_adjudication(campaign_id: str, turn_id: str, payload: dict, request: R
     return result
 
 
+@router.post("/api/campaigns/{campaign_id}/dm-turns/{turn_id}/retry-narration")
+def retry_narration(campaign_id: str, turn_id: str, payload: dict, request: Request,
+                    response: Response, background_tasks: BackgroundTasks, db: Session = Depends(get_db)):
+    """Narration-independent retry reusing the preserved structured result."""
+    from app.deps.idempotency import execute_http_idempotent, require_idempotency_key
+    from app.dm.recovery import retry_narration_only, execute_committed_attempt
+    from models.dm import DmTurn
+    profile = resolve_profile(request, db)
+    campaign = authorized_campaign(db, campaign_id, profile.id)
+    require_owner(campaign, profile.id)
+    try:
+        tid, aid = uuid.UUID(turn_id), uuid.UUID(str(payload.get("attempt_id")))
+    except ValueError as exc:
+        raise HTTPException(status_code=422, detail="Valid turn and attempt IDs are required") from exc
+    turn = db.get(DmTurn, tid)
+    if turn is None or turn.campaign_id != campaign.id:
+        raise HTTPException(status_code=404, detail="Turn not found")
+    try:
+        assert_can_read_thread(db, campaign.id, parse_thread_id(turn.thread_id), profile.id)
+    except (ThreadNotFoundError, ThreadAuthorizationError) as exc:
+        raise HTTPException(status_code=404, detail="Turn not found") from exc
+    key = require_idempotency_key(request, payload.get("operation_id"))
+    def execute():
+        try:
+            updated, attempt = retry_narration_only(db, campaign.id, tid, aid)
+        except ValueError as exc:
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
+        return {"turn_id": str(updated.id), "attempt_id": str(attempt.id)}
+    result = execute_http_idempotent(db, response, actor_id=profile.id, idempotency_key=key,
+        command_type="dm_turn.retry_narration", scope_type="dm_turn", scope_id=tid, payload=payload, execute=execute)
+    background_tasks.add_task(execute_committed_attempt, result["attempt_id"])
+    return result
+
+
+@router.post("/api/campaigns/{campaign_id}/dm-turns/{turn_id}/streams/{stream_id}/continue")
+def continue_stream(campaign_id: str, turn_id: str, stream_id: str, payload: dict, request: Request,
+                    response: Response, db: Session = Depends(get_db)):
+    """Recover a failed partial stream through the full turn state machine.
+
+    Body: {"continued_text": "..."}. The stream is scoped to the authorized
+    campaign/turn/current-attempt before any write; the supplied text must
+    preserve the persisted visible prefix and pass the contract fidelity
+    gate; on success the attempt/turn finalize and staged effects promote
+    via the normal commit path. Failures return generic messages without
+    infrastructure details.
+
+    Atomicity: recovery runs flush-only inside the idempotent command, so
+    the command row, stream progress, and turn commit persist in ONE commit.
+    A crash can never leave half-committed recovery state beside a durable
+    ``in_progress`` record — retrying the same key cleanly re-executes.
+    Realtime delivery happens after that commit returns (never before
+    durability), via a best-effort post-commit status publish.
+    """
+    from app.deps.idempotency import execute_http_idempotent, require_idempotency_key
+    from app.dm.recovery import recover_partial_stream
+    from models.dm import DmTurn
+    profile = resolve_profile(request, db)
+    campaign = authorized_campaign(db, campaign_id, profile.id)
+    require_owner(campaign, profile.id)
+    try:
+        tid, sid = uuid.UUID(turn_id), uuid.UUID(stream_id)
+    except ValueError as exc:
+        raise HTTPException(status_code=422, detail="Valid turn and stream IDs are required") from exc
+    turn = db.get(DmTurn, tid)
+    if turn is None or turn.campaign_id != campaign.id:
+        raise HTTPException(status_code=404, detail="Turn not found")
+    try:
+        assert_can_read_thread(db, campaign.id, parse_thread_id(turn.thread_id), profile.id)
+    except (ThreadNotFoundError, ThreadAuthorizationError) as exc:
+        raise HTTPException(status_code=404, detail="Turn not found") from exc
+    continued = str(payload.get("continued_text") or "")
+    if not continued:
+        raise HTTPException(status_code=422, detail="continued_text is required")
+    key = require_idempotency_key(request, payload.get("operation_id"))
+
+    def _shape(final_turn, final_attempt, event) -> dict:
+        event_id = getattr(event, "id", None)
+        if event_id is None:
+            result = dict(final_attempt.result or {})
+            event_id = result.get("event_id") or result.get("id") or ""
+        return {"turn_id": str(final_turn.id), "attempt_id": str(final_attempt.id),
+                "stream_id": str(sid), "event_id": str(event_id)}
+
+    def execute():
+        try:
+            final_turn, final_attempt, event = recover_partial_stream(
+                db, campaign.id, tid, sid, continued, actor_id=profile.id,
+                commit=False,
+            )
+        except LookupError as exc:
+            raise HTTPException(status_code=404, detail="Turn not found") from exc
+        except ValueError as exc:
+            raise HTTPException(status_code=409, detail="The storyteller faltered. You can retry this turn.") from exc
+        return _shape(final_turn, final_attempt, event)
+
+    # Full semantic identity: stream + complete text. Only the digest is
+    # persisted, so nothing is truncated — requests differing anywhere
+    # (even past character 4,000) are distinct commands.
+    result = execute_http_idempotent(
+        db, response, actor_id=profile.id, idempotency_key=key,
+        command_type="dm_turn.recover_partial_stream", scope_type="dm_turn",
+        scope_id=tid, payload={"stream_id": str(sid), "continued_text": continued},
+        execute=execute,
+    )
+    if response.headers.get("X-Idempotent-Replay") != "true":
+        _publish_recovery_status(db, sid)
+    return result
+
+
+def _publish_recovery_status(db: Session, stream_id) -> None:
+    """Best-effort post-commit realtime status for a recovered stream."""
+    import logging as _logging
+
+    _logger = _logging.getLogger(__name__)
+    try:
+        from app.dm_streams.service import get_stream
+        from app.realtime.service import publish_dm_status
+
+        stream = get_stream(db, stream_id)
+        if stream is not None and stream.status == "completed":
+            publish_dm_status(db, stream, visible_text=stream.final_text)
+    except Exception as exc:
+        _logger.warning("recovery realtime publish failed stream_id=%s error=%s",
+                        stream_id, exc)
+
+
 @router.get("/api/campaigns/{campaign_id}/dm-turns")
 def list_dm_turns(campaign_id: str, request: Request, db: Session = Depends(get_db)):
     profile = resolve_profile(request, db)
