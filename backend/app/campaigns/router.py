@@ -1180,6 +1180,294 @@ def revoke_campaign_invite(
         ) from exc
 
 
+@router.get("/api/campaigns/{campaign_id}/party")
+def get_party_roster(campaign_id: str, request: Request, db: Session = Depends(get_db)):
+    """Active roster + preserved fallen-PC canon + pending introductions — issue #266."""
+    from app.campaigns.replacements import party_roster
+
+    profile = resolve_profile(request, db)
+    try:
+        cid = parse_campaign_id(campaign_id)
+    except ValueError:
+        raise HTTPException(status_code=404, detail="Invalid campaign id")
+    camp = db.get(Campaign, cid)
+    if not camp:
+        raise HTTPException(status_code=404, detail="Campaign not found")
+    if camp.owner_id != profile.id and not is_campaign_member(db, cid, profile.id):
+        raise HTTPException(status_code=403, detail="Not a member")
+    return {"party": party_roster(db, camp)}
+
+
+@router.post("/api/campaigns/{campaign_id}/pc-deaths")
+def declare_pc_death(
+    campaign_id: str,
+    payload: dict,
+    request: Request,
+    response: Response,
+    db: Session = Depends(get_db),
+):
+    """Declare a party PC dead/retired — terminal canon state, never deletion (#266)."""
+    from app.campaigns.replacements import PcLifecycleError, declare_pc_death as _declare
+
+    profile = resolve_profile(request, db)
+    try:
+        cid = parse_campaign_id(campaign_id)
+    except ValueError:
+        raise HTTPException(status_code=404, detail="Invalid campaign id")
+    camp = db.get(Campaign, cid)
+    if not camp:
+        raise HTTPException(status_code=404, detail="Campaign not found")
+    if camp.owner_id != profile.id:
+        raise HTTPException(status_code=403, detail="Only the owner can declare PC death")
+    raw_char = payload.get("character_id")
+    if not raw_char:
+        raise HTTPException(status_code=400, detail="character_id is required")
+    try:
+        char_id = uuid_lib.UUID(str(raw_char))
+    except ValueError:
+        raise HTTPException(status_code=404, detail="Character not found")
+    target_status = str(payload.get("status") or "dead").strip().lower()
+    if target_status not in ("dead", "retired"):
+        raise HTTPException(status_code=400, detail="status must be dead or retired")
+    cause = payload.get("cause")
+    is_tpk = bool(payload.get("is_tpk", False))
+    expected_revision = _expected_revision(payload)
+    operation_id = str(payload.get("operation_id") or "").strip() or None
+    idempotency_key = require_idempotency_key(request, operation_id)
+
+    def _execute():
+        def _mutate(locked: Campaign):
+            try:
+                row = _declare(
+                    db, locked, char_id,
+                    status=target_status,
+                    cause=str(cause) if cause is not None else None,
+                    is_tpk=is_tpk,
+                    actor_id=profile.id,
+                )
+            except PcLifecycleError as exc:
+                raise HTTPException(status_code=exc.status_code, detail=str(exc)) from exc
+            _mutate.result = row
+
+        _mutate.result = None  # type: ignore[attr-defined]
+        campaign_after, event = commit_campaign_mutation(
+            db,
+            cid,
+            expected_revision,
+            event_type=f"campaign.pc_{target_status}",
+            operation_id=operation_id or idempotency_key,
+            actor_id=profile.id,
+            targets={"character_id": str(char_id)},
+            payload_builder=lambda: {
+                "character_id": str(char_id),
+                "status": _mutate.result.status,  # type: ignore[attr-defined]
+                "cause": _mutate.result.cause,  # type: ignore[attr-defined]
+                "is_tpk": bool(_mutate.result.is_tpk),  # type: ignore[attr-defined]
+            },
+            mutate=_mutate,
+            commit=False,
+        )
+        logger.info(
+            "pc death declared campaign_id=%s actor_id=%s character_id=%s status=%s revision=%s",
+            cid, profile.id, char_id, _mutate.result.status, campaign_after.revision,  # type: ignore[attr-defined]
+        )
+        return {
+            "ok": True,
+            "campaign": campaign_after.to_dict(),
+            "lifecycle": _mutate.result.to_dict(),  # type: ignore[attr-defined]
+            "event": event.to_dict(),
+        }
+
+    try:
+        return execute_http_idempotent(
+            db, response, actor_id=profile.id, idempotency_key=idempotency_key,
+            command_type="campaign.pc.death",
+            scope_type="campaign", scope_id=cid,
+            payload={**payload, "character_id": str(char_id)},
+            execute=_execute,
+        )
+    except RevisionConflictError as exc:
+        raise HTTPException(
+            status_code=409, detail=str(exc),
+            headers={"X-Current-Revision": str(exc.actual_revision)},
+        ) from exc
+
+
+@router.post("/api/campaigns/{campaign_id}/pc-replacements")
+def activate_pc_replacement(
+    campaign_id: str,
+    payload: dict,
+    request: Request,
+    response: Response,
+    db: Session = Depends(get_db),
+):
+    """Activate a replacement PC for the caller's fallen PC — issue #266."""
+    from app.campaigns.replacements import PcLifecycleError, activate_replacement as _activate
+
+    from models.characters import Character
+
+    profile = resolve_profile(request, db)
+    try:
+        cid = parse_campaign_id(campaign_id)
+    except ValueError:
+        raise HTTPException(status_code=404, detail="Invalid campaign id")
+    camp = db.get(Campaign, cid)
+    if not camp:
+        raise HTTPException(status_code=404, detail="Campaign not found")
+    member = db.get(CampaignMember, {"campaign_id": cid, "user_id": profile.id})
+    if member is None:
+        raise HTTPException(status_code=403, detail="Not a member of this campaign")
+    raw_char = payload.get("character_id")
+    if not raw_char:
+        raise HTTPException(status_code=400, detail="character_id is required")
+    try:
+        char_id = uuid_lib.UUID(str(raw_char))
+    except ValueError:
+        raise HTTPException(status_code=404, detail="Character not found")
+    new_char = db.get(Character, char_id)
+    if new_char is None:
+        raise HTTPException(status_code=404, detail="Character not found")
+    expected_revision = _expected_revision(payload)
+    operation_id = str(payload.get("operation_id") or "").strip() or None
+    idempotency_key = require_idempotency_key(request, operation_id)
+
+    def _execute():
+        def _mutate(locked: Campaign):
+            try:
+                fresh_member = db.get(CampaignMember, {"campaign_id": cid, "user_id": profile.id})
+                if fresh_member is None:
+                    raise HTTPException(status_code=403, detail="Not a member of this campaign")
+                fresh_char = db.get(Character, char_id)
+                if fresh_char is None:
+                    raise HTTPException(status_code=404, detail="Character not found")
+                _mutate.result = _activate(db, locked, fresh_member, fresh_char, actor_id=profile.id)  # type: ignore[attr-defined]
+            except PcLifecycleError as exc:
+                raise HTTPException(status_code=exc.status_code, detail=str(exc)) from exc
+
+        _mutate.result = None  # type: ignore[attr-defined]
+        campaign_after, event = commit_campaign_mutation(
+            db,
+            cid,
+            expected_revision,
+            event_type="campaign.pc_replaced",
+            operation_id=operation_id or idempotency_key,
+            actor_id=profile.id,
+            targets_builder=lambda: {
+                "user_id": str(profile.id),
+                "dead_character_id": _mutate.result["dead_character_id"],  # type: ignore[attr-defined]
+                "new_character_id": _mutate.result["new_character_id"],  # type: ignore[attr-defined]
+            },
+            payload_builder=lambda: dict(_mutate.result),  # type: ignore[attr-defined]
+            mutate=_mutate,
+            commit=False,
+        )
+        logger.info(
+            "pc replacement activated campaign_id=%s actor_id=%s dead=%s new=%s revision=%s",
+            cid, profile.id,
+            _mutate.result["dead_character_id"], _mutate.result["new_character_id"],  # type: ignore[attr-defined]
+            campaign_after.revision,
+        )
+        return {
+            "ok": True,
+            "campaign": campaign_after.to_dict(),
+            "replacement": _mutate.result,  # type: ignore[attr-defined]
+            "event": event.to_dict(),
+        }
+
+    try:
+        return execute_http_idempotent(
+            db, response, actor_id=profile.id, idempotency_key=idempotency_key,
+            command_type="campaign.pc.replacement",
+            scope_type="campaign_member", scope_id=f"{cid}:{profile.id}",
+            payload={**payload, "character_id": str(char_id)},
+            execute=_execute,
+        )
+    except RevisionConflictError as exc:
+        raise HTTPException(
+            status_code=409, detail=str(exc),
+            headers={"X-Current-Revision": str(exc.actual_revision)},
+        ) from exc
+
+
+@router.post("/api/campaigns/{campaign_id}/pc-replacements/{character_id}/introduce")
+def introduce_pc_replacement(
+    campaign_id: str,
+    character_id: str,
+    payload: dict,
+    request: Request,
+    response: Response,
+    db: Session = Depends(get_db),
+):
+    """Mark a replacement PC narratively introduced — normal-play hook (#266)."""
+    from app.campaigns.replacements import PcLifecycleError, mark_replacement_introduced as _introduce
+
+    profile = resolve_profile(request, db)
+    try:
+        cid = parse_campaign_id(campaign_id)
+        char_id = uuid_lib.UUID(str(character_id))
+    except ValueError:
+        raise HTTPException(status_code=404, detail="Invalid campaign or character id")
+    camp = db.get(Campaign, cid)
+    if not camp:
+        raise HTTPException(status_code=404, detail="Campaign not found")
+    if camp.owner_id != profile.id:
+        raise HTTPException(status_code=403, detail="Only the owner can mark introductions")
+    expected_revision = _expected_revision(payload)
+    operation_id = str(payload.get("operation_id") or "").strip() or None
+    idempotency_key = require_idempotency_key(request, operation_id)
+
+    def _execute():
+        def _mutate(locked: Campaign):
+            try:
+                _mutate.result = _introduce(db, locked, char_id, actor_id=profile.id)  # type: ignore[attr-defined]
+            except PcLifecycleError as exc:
+                raise HTTPException(status_code=exc.status_code, detail=str(exc)) from exc
+
+        _mutate.result = None  # type: ignore[attr-defined]
+        campaign_after, event = commit_campaign_mutation(
+            db,
+            cid,
+            expected_revision,
+            event_type="campaign.pc_introduced",
+            operation_id=operation_id or idempotency_key,
+            actor_id=profile.id,
+            targets={"character_id": str(char_id)},
+            payload_builder=lambda: {
+                "character_id": str(char_id),
+                "replacement_of_character_id": (
+                    str(_mutate.result.replacement_of_character_id)  # type: ignore[attr-defined]
+                    if _mutate.result.replacement_of_character_id else None  # type: ignore[attr-defined]
+                ),
+            },
+            mutate=_mutate,
+            commit=False,
+        )
+        logger.info(
+            "pc replacement introduced campaign_id=%s actor_id=%s character_id=%s revision=%s",
+            cid, profile.id, char_id, campaign_after.revision,
+        )
+        return {
+            "ok": True,
+            "campaign": campaign_after.to_dict(),
+            "lifecycle": _mutate.result.to_dict(),  # type: ignore[attr-defined]
+            "event": event.to_dict(),
+        }
+
+    try:
+        return execute_http_idempotent(
+            db, response, actor_id=profile.id, idempotency_key=idempotency_key,
+            command_type="campaign.pc.introduction",
+            scope_type="campaign", scope_id=cid,
+            payload={**payload, "character_id": str(char_id)},
+            execute=_execute,
+        )
+    except RevisionConflictError as exc:
+        raise HTTPException(
+            status_code=409, detail=str(exc),
+            headers={"X-Current-Revision": str(exc.actual_revision)},
+        ) from exc
+
+
 @router.get("/api/invites/lookup")
 def lookup_invite(code: str, request: Request, db: Session = Depends(get_db)):
     resolve_profile(request, db)
