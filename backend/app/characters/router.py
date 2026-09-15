@@ -126,6 +126,17 @@ def update_character(character_id: str, payload: dict, request: Request, db: Ses
             status_code=409,
             detail="Launch character is locked after campaign start; progression only",
         )
+    from app.campaigns.replacements import is_historical_canon as _is_canon
+
+    if _is_canon(db, char.id):
+        logger.warning(
+            "character edit rejected character_id=%s actor_id=%s reason=historical_canon",
+            char.id, profile.id,
+        )
+        raise HTTPException(
+            status_code=409,
+            detail="Fallen PCs are preserved as historical canon and cannot be edited",
+        )
     new_name = payload.get("name") or payload.get("character_name")
     if new_name:
         char.name = new_name
@@ -172,6 +183,17 @@ def delete_character(character_id: str, request: Request, db: Session = Depends(
         raise HTTPException(
             status_code=409,
             detail="Launch character is locked after campaign start; progression only",
+        )
+    from app.campaigns.replacements import is_historical_canon as _is_canon
+
+    if _is_canon(db, char.id):
+        logger.warning(
+            "character delete rejected character_id=%s actor_id=%s reason=historical_canon",
+            char.id, profile.id,
+        )
+        raise HTTPException(
+            status_code=409,
+            detail="Fallen PCs are preserved as historical canon and cannot be deleted",
         )
     from models.campaigns import CampaignMember
 

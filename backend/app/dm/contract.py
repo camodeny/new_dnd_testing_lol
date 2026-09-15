@@ -279,6 +279,7 @@ STAGED_EFFECT_TYPES = (
     "propose_sheet_update",
     "assert_fact",
     "upsert_relation",
+    "complete_adventure",
 )
 
 class RecordWorldEventArgs(StrictModel):
@@ -347,12 +348,25 @@ class ProposeSheetUpdateArgs(StrictModel):
                 raise ValueError("operation must be add|subtract|set")
         return v
 
-StagedEffectArgs = RecordWorldEventArgs | UpdateSceneArgs | RevealFactArgs | ProposeSheetUpdateArgs | AssertFactArgs | UpsertRelationArgs
+class CompleteAdventureArgs(StrictModel):
+    """DM-declared adventure/arc completion — issue #260.
+
+    The outcome is a narrative DM decision, not a checklist: non-victory
+    outcomes (retreat, capture, death/TPK, villain victory) are valid
+    completions. The campaign stays active; this never archives it.
+    """
+    outcome: Literal["victory", "failure", "retreat", "capture", "death", "tpk", "villain_victory"] = Field(description="Completion outcome category")
+    reason: str = Field(min_length=1, max_length=2000, description="Why the adventure is complete")
+    adventure_id: str | None = Field(default=None, max_length=160, description="Explicit adventure id; defaults to the campaign's active adventure")
+    public_summary: str | None = Field(default=None, max_length=2000, description="Player-visible summary")
+    idempotency_key: str | None = Field(default=None, max_length=128)
+
+StagedEffectArgs = RecordWorldEventArgs | UpdateSceneArgs | RevealFactArgs | ProposeSheetUpdateArgs | AssertFactArgs | UpsertRelationArgs | CompleteAdventureArgs
 
 class StagedEffect(StrictModel):
     """One typed, non-generic staged effect.  Must not encode arbitrary SQL."""
     id: str = Field(min_length=1, max_length=48)
-    effect_type: Literal["record_world_event", "update_scene", "reveal_fact", "propose_sheet_update", "assert_fact", "upsert_relation"] = Field(description="Typed effect; no generic SQL capability")
+    effect_type: Literal["record_world_event", "update_scene", "reveal_fact", "propose_sheet_update", "assert_fact", "upsert_relation", "complete_adventure"] = Field(description="Typed effect; no generic SQL capability")
     arguments: dict[str, Any] = Field(description="Effect-specific payload validated by effect_type")
 
     @field_validator("id")
@@ -396,6 +410,8 @@ class StagedEffect(StrictModel):
                 AssertFactArgs.model_validate(args)
             elif t == "upsert_relation":
                 UpsertRelationArgs.model_validate(args)
+            elif t == "complete_adventure":
+                CompleteAdventureArgs.model_validate(args)
         except Exception as e:
             raise ValueError(f"arguments invalid for effect_type={t}: {e}") from e
         # Generic SQL guard: reject any argument that looks like raw SQL / db mutation

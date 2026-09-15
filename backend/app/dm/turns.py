@@ -1027,14 +1027,43 @@ def commit_turn(
     base_payload = payload or {"turn_id": str(turn.id), "attempt_id": str(attempt.id), "submission_ids": attempt.submission_ids or []}
     # Include staged effect ids/types in payload for observability
     staged_list = attempt.staged_effects or []
+    adventure_completion_args: dict | None = None
     if staged_list:
         base_payload = dict(base_payload)
         base_payload["staged_effect_ids"] = [e.get("id") for e in staged_list]
         base_payload["staged_effect_types"] = [e.get("effect_type") for e in staged_list]
         if attempt.stream_id:
             base_payload["stream_id"] = str(attempt.stream_id)
+        # A staged adventure completion promotes the turn commit to the
+        # adventure.completed domain event (issue #260): the turn IS the
+        # authoritative provenance for the DM's completion decision. Only
+        # the default turn event type is promoted — explicit callers keep
+        # their event type.
+        adventure_completion_args = next(
+            (e.get("arguments") or {} for e in staged_list if e.get("effect_type") == "complete_adventure"),
+            None,
+        )
+        if adventure_completion_args is not None and event_type == "dm.turn_resolved":
+            event_type = "adventure.completed"
+            # Player-readable lifecycle data only — the DM's completion
+            # reason stays on the owner-visible adventure row, never in the
+            # public domain-event feed (issue #260 security).
+            base_payload["adventure_completion"] = {
+                "outcome": adventure_completion_args.get("outcome"),
+                "public_summary": adventure_completion_args.get("public_summary"),
+                "adventure_id": adventure_completion_args.get("adventure_id"),
+            }
+            base_payload["outcome"] = adventure_completion_args.get("outcome")
+            base_payload["public_summary"] = adventure_completion_args.get("public_summary")
+            base_payload["source_turn_id"] = str(turn.id)
 
     # Wrap mutate to also apply staged effects atomically inside same revision bump
+    # Resolved adventure identity closed by this turn (issue #260): populated
+    # inside the mutation, consumed by the post-mutate payload builder so the
+    # authoritative completion event carries the actual adventure id even when
+    # the effect targeted the implicit current adventure.
+    resolved_adventure: dict[str, str] = {}
+
     def _mutate_with_effects(campaign):
         # Apply caller-provided mutate first
         if mutate is not None:
@@ -1044,6 +1073,26 @@ def commit_turn(
             from app.dm.effects import apply_staged_effects
 
             apply_staged_effects(db, campaign, staged_list, turn, attempt)
+        if adventure_completion_args is not None:
+            try:
+                from models.campaigns import Adventure as _Adventure
+
+                _closed = (
+                    db.execute(
+                        select(_Adventure).where(
+                            _Adventure.campaign_id == turn.campaign_id,
+                            _Adventure.status == "completed",
+                            _Adventure.source_turn_id == turn.id,
+                        )
+                    )
+                    .scalars()
+                    .first()
+                )
+                if _closed is not None:
+                    resolved_adventure["adventure_id"] = str(_closed.id)
+                    resolved_adventure["title"] = _closed.title or ""
+            except Exception as e:
+                logger.warning("dm_turn failed to resolve completed adventure turn_id=%s error=%s", turn.id, e)
         # JIT-promote committed new-entity proposals to durable canonical
         # identity exactly once (issue #209). Runs in the same revision
         # transaction: failed commit leaves no half-created authority.
@@ -1058,6 +1107,18 @@ def commit_turn(
         except ImportError:
             pass
 
+    def _adventure_event_payload() -> dict:
+        """Post-mutate payload: same lifecycle fields, resolved adventure id."""
+        if adventure_completion_args is not None and resolved_adventure.get("adventure_id"):
+            merged = dict(base_payload)
+            merged["adventure_completion"] = {
+                **merged.get("adventure_completion", {}),
+                "adventure_id": resolved_adventure["adventure_id"],
+                "title": resolved_adventure.get("title"),
+            }
+            return merged
+        return base_payload
+
     # Persist commit_operation_id for idempotency
     if not attempt.commit_operation_id:
         attempt.commit_operation_id = duplicate_op
@@ -1069,11 +1130,12 @@ def commit_turn(
             turn.campaign_id,
             expected_revision=int(expected),
             event_type=event_type,
-            payload=base_payload,
+            payload=None if event_type == "adventure.completed" else base_payload,
             operation_id=duplicate_op,
             actor_id=actor_id,
             mutate=_mutate_with_effects,
             commit=False,
+            payload_builder=_adventure_event_payload if event_type == "adventure.completed" else None,
             outbox_event_type="dm.turn_committed",
             outbox_payload={**base_payload, "operation_id": duplicate_op},
             outbox_operation_id=duplicate_op,
@@ -1107,6 +1169,58 @@ def commit_turn(
 
     now = _now()
     commit_duration_ms = int((time.monotonic() - execute_start) * 1000)
+    # Link the authoritative event back onto the completed adventure for
+    # turn/event provenance (issue #260). Strictly additive bookkeeping —
+    # never breaks the commit.
+    if event_type == "adventure.completed":
+        try:
+            from models.campaigns import Adventure as _Adventure
+
+            _completed_adv = None
+            _explicit_aid = (base_payload.get("adventure_completion") or {}).get("adventure_id")
+            if _explicit_aid:
+                try:
+                    _completed_adv = db.get(_Adventure, uuid.UUID(str(_explicit_aid)))
+                except ValueError:
+                    _completed_adv = None
+            if _completed_adv is None:
+                _completed_adv = (
+                    db.execute(
+                        select(_Adventure).where(
+                            _Adventure.campaign_id == turn.campaign_id,
+                            _Adventure.status == "completed",
+                            _Adventure.source_turn_id == turn.id,
+                        )
+                    )
+                    .scalars()
+                    .first()
+                )
+            if _completed_adv is not None and _completed_adv.source_event_id is None:
+                _completed_adv.source_event_id = event.id
+                db.flush()
+                # Shared #263 finalization, post-commit: the authoritative
+                # completion event and campaign revision exist only now, so
+                # the end cursor binds exactly (event.sequence ==
+                # campaign revision by invariant). Best-effort: derived-work
+                # failures are recorded, never break the turn commit.
+                try:
+                    from app.adventures.service import (
+                        finalize_adventure_derived as _finalize,
+                    )
+
+                    _finalize(
+                        db, _completed_adv,
+                        event_sequence=event.sequence,
+                        revision=campaign_after.revision,
+                    )
+                    db.flush()
+                except Exception as e:
+                    logger.warning(
+                        "dm_turn failed to finalize adventure summary turn_id=%s error=%s",
+                        turn.id, e,
+                    )
+        except Exception as e:
+            logger.warning("dm_turn failed to link adventure event turn_id=%s error=%s", turn.id, e)
     turn.status = TURN_SUCCEEDED
     turn.resolved_at = now
     turn.committed_at = now
