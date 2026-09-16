@@ -2,7 +2,7 @@
 
 ## Work selection and planning
 
-- The linked GitHub Project **DND AI — Development** is the source of truth for cross-issue priority, current sequencing, and work status.
+- The linked GitHub Project [DND AI — Development](https://github.com/users/camodeny/projects/1) is the source of truth for cross-issue priority, current sequencing, and work status.
 - Before choosing a task, inspect the Project's current priority/queue and verify the issue is still open.
 - Native GitHub issue dependencies determine whether work is actually available. Do not start an issue that is blocked by an open dependency merely because it appears high in the queue.
 - Native parent/sub-issue relationships define epic ownership and progress. Epic issue bodies define subsystem intent; individual issue bodies define implementation scope and acceptance criteria.
