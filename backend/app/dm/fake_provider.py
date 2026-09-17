@@ -92,19 +92,41 @@ class FakeDMFixture:
         return rendered
 
 
-def extract_player_input_texts(messages: Any) -> list[str]:
+def extract_player_input_texts(messages: Any, *, role: str = "unknown") -> list[str]:
     """Player-input texts from a provider request's serialized packet.
 
     Reads the ``player_inputs`` lane (``value.segments[].text``) from the
     last user message's canonical packet JSON. Returns [] only for a
     recognized canonical structure that carries no input text (the valid
-    input-free opening) or for messages that never claim packet shape.
+    input-free opening) or, for non-``forward_dm`` roles, for messages
+    that never claim packet shape (those fail loudly later as unmatched
+    roles instead).
 
-    A message that claims packet shape (``{...`` JSON) but cannot be
-    parsed or lacks the canonical ``lanes`` list raises
-    :exc:`FakeProviderUsageError`: such requests must fail loudly at the
-    boundary instead of being silently satisfied by an opening fixture.
+    For ``forward_dm`` requests the provider message must be canonical
+    packet JSON: missing messages, non-text content, or non-JSON content
+    raises :exc:`FakeProviderUsageError` so an unrecognized request can
+    never be silently satisfied by an opening fixture. Likewise, a
+    message that claims packet shape (``{...`` JSON) but cannot be
+    parsed or lacks the canonical ``lanes`` list raises instead of
+    collapsing into the opening match.
     """
+    if role == "forward_dm":
+        if not isinstance(messages, (list, tuple)) or not messages:
+            raise FakeProviderUsageError(
+                "fake-provider forward_dm request has no messages"
+            )
+        last = messages[-1]
+        strict_content = last.get("content") if isinstance(last, dict) else None
+        if not isinstance(strict_content, str):
+            raise FakeProviderUsageError(
+                "fake-provider forward_dm message content is not text "
+                f"(got {type(strict_content).__name__})"
+            )
+        if not strict_content.strip().startswith("{"):
+            raise FakeProviderUsageError(
+                "fake-provider forward_dm request is not canonical packet JSON "
+                f"(content excerpt: {strict_content[:200]!r})"
+            )
     if not isinstance(messages, (list, tuple)) or not messages:
         return []
     content = messages[-1].get("content") if isinstance(messages[-1], dict) else None
@@ -226,7 +248,7 @@ class FakeDMProvider:
 
         role = infer_role(request)
         messages = getattr(request, "messages", None)
-        input_texts = extract_player_input_texts(messages)
+        input_texts = extract_player_input_texts(messages, role=role)
         fixture = self._match(role, input_texts)
         if fixture is None:
             excerpt = " ".join(input_texts)[:300] or "<no player inputs>"

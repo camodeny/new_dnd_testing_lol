@@ -175,6 +175,20 @@ def test_malformed_packet_raises_instead_of_matching_opening():
         )
     with pytest.raises(FakeProviderUsageError, match="lanes list"):
         provider.execute_chat(_adapter(), _request_with_content('{"no_lanes": true}'))
+    # Non-JSON forward-DM content is unrecognized: it must raise through the
+    # full execute_chat path, never return the opening fixture.
+    with pytest.raises(FakeProviderUsageError, match="not canonical packet JSON"):
+        provider.execute_chat(_adapter(), _request_with_content("not json"))
+    with pytest.raises(FakeProviderUsageError, match="no messages"):
+        provider.execute_chat(
+            _adapter(),
+            ProviderRequest(
+                messages=[],
+                model=FAKE_MODEL_NAME,
+                json_schema={"type": "object"},
+                json_schema_name="dm_turn_contract_v1",
+            ),
+        )
     # A recognized canonical structure with zero inputs still matches opening.
     response = provider.execute_chat(_adapter(), _request_with_content('{"lanes": []}'))
     assert "phase0-reply-opening" in response.content
