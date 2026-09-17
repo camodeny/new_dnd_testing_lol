@@ -1,113 +1,209 @@
-# Jev (TypeSafe AI) — Integration Opportunities
+# Jev / bounded decision models — integration direction
 
 Date: 2026-09-17
-Status: Exploration — no code changes yet
-Context: User got early access to Jev, asked where it could plug into this app.
+Status: Background/design context only. GitHub issues and the linked **DND AI — Development** Project are the implementation and priority source of truth.
 
-## 1. What Jev is
+Primary roadmap: #379 with foundational issues #380–#384.
 
-- TypeSafe AI's first "System One Model" (launched Sep 15-16, 2026). Founder: Diogo Almeida (co-invented RLHF / InstructGPT).
-- Not an LLM chatbot: no text generation. Input = unstructured state + typed questions. Output = typed decisions + calibrated probabilities + confidence.
-- Three primitives (can be mixed in one parallel call):
-  - `Choice` — pick from list (up to 255 options) → `choice, probabilities, confidence`
-  - `Score` — score state on a rubric → `score, probabilities, confidence`
-  - `Noul` — is this statement true? → `noul (0-1)`
-- Claims: 70–500ms end-to-end (40–200x faster than frontier LLMs on same decision tasks), $0.042 / MTok input, output tokens free, no type errors / hallucinations by construction.
-- Training: RLCD (Reinforcement Learning for Calibrated Decisions), new architecture + parallel sampler.
-- Best for: classify / route / score / verify / guardrail / boolean checks inside code loops. Worst for: prose, contracts requiring generation, images (structured text state only per current demos).
-- Docs: https://docs.typesafe.ai/introduction.md | Launch post: https://typesafe.ai/blog/introducing-system-one-models-and-jev
+## 1. Architectural conclusion
 
-Key architectural rule from docs: one atomic gut-check per question. If a judgment needs extended reasoning or weighs multiple factors, decompose into separate questions and combine in code.
+Jev should not be treated as a collection of isolated plug-ins around an otherwise unchanged generative-DM pipeline. The stronger opportunity is a provider-neutral **bounded decision runtime** that becomes the semantic control plane for decisions the application can safely constrain.
 
-## 2. Why it matters here
+TypeSafe Jev is the first adapter/reference implementation of that runtime, not the architecture itself.
 
-Our per-turn DM pipeline is LLM-heavy in exactly the places Jev is built for:
+The target shape is:
 
-`context packet → adjudicate (LLM) → validators (heuristics) → evidence loop (LLM x up to 4) → regen loop (LLM x up to 4) → narrate (LLM stream)`
+`authoritative state -> code-enumerated candidates -> bounded semantic decision(s) -> deterministic validation/execution OR OPEN_ENDED_DM -> generative adjudication -> deterministic validation/commit -> narration`
 
-Worst case today is multiplicative: evidence loop (4) × regen loop (4) = up to ~16 LLM calls per turn, each re-sending a growing packet. Validators that gate those retries are currently regex / keyword lists / token-overlap — cheap but brittle.
+The important safety property is not a single confidence threshold. It is that **code defines the possible actions and authority boundaries before the model chooses**.
 
-Jev fits as the **decision shell around the generative core**: keep LLMs for prose + full `DmTurnContractV1` assembly, use Jev for fast/cheap routing, verification, and confidence-gating.
+## 2. Division of responsibility
 
-What Jev explicitly cannot do: generate the turn packet / contract / narration. That requires string generation, which Jev gives up by design.
+### Deterministic/domain code owns
 
-## 3. Plug-in opportunities (ranked)
+- authorization, actor ownership, audience/visibility scope;
+- canonical IDs and source/provenance existence;
+- legal action/candidate enumeration;
+- D&D rule legality, action economy, dice math, HP/resources, geometry;
+- state revisions, stale-candidate detection, idempotency and commit;
+- billing/accounting and provider/transport/config failure taxonomy;
+- the actual side effects performed after a semantic choice.
 
-### P1 — Turn-mode pre-router
-- Where: `backend/app/dm/adjudication.py:22-70` (`FORWARD_DM_SYSTEM` modes), consumed by `execution.py:803,821`, `evidence.py:709`
-- Today: single `execute_chat` with strict JSON schema infers `mode: respond | await_roll | need_evidence | clarify | table_chat | silent | unsupported` as part of full contract generation.
-- Jev shape: `Choice` with 7 options. State = player input + scene summary + history tail. Questions: `mode_choice`.
-- Why: cheapest way to cut a full LLM call when turn is trivially `silent` / `table_chat`, or to short-circuit to roll/clarify paths. Also gives calibrated `confidence` to decide auto-act vs full adjudication.
-- Notes: keep LLM as authority initially; run Jev in shadow/log-only to measure agreement.
+A bounded decision model may not invent or override any of those.
 
-### P2 — Validator upgrades (Agency / Visibility / Epistemic / Canon)
-- Where: `backend/app/dm/validators.py:241-859` (`Agency, Ownership, Entity, Provenance, Epistemic, Visibility, CanonValidator`), plus `narration.py:426-560,608-628` (`validate_narration_fidelity`, `secret_leakage`, `agency_violation`)
-- Today: pydantic + set-membership + regex (`_SPEECH_ATTRIBUTION_RE:361`), keyword lists (`_CONSEQUENCE_VERBS:351`, `_VOLUNTARY_PC_VERBS:356`), antonym pairs, token-overlap. PC-agency branch disabled (`_PC_AGENCY_CHECK_ENABLED=False:375`).
-- Jev shape:
-  - `Noul`: "This beat invents voluntary PC speech/thought/action." / "This claim leaks dm_private truth / hidden DCs / internal IDs." / "This claim contradicts established canon."
-  - `Score`: agency-risk 0-5, secrecy-risk 0-5, canon-conflict 0-5
-  - `Choice`: `claim_kind (observation | world_fact | npc_utterance | player_declaration | roll_instruction | roll_outcome)`, `origin`, `truth_status (truthful | deceptive | mistaken | incomplete | unknown)`
-- Why: these are single gut-check judgments Jev is built for, and current heuristics are the brittleness point that causes expensive regen retries (`validators.py:1177`, max 3 regens).
-- Notes: run parallel — all questions in one call against same state; adding questions barely changes latency per docs.
+### Bounded decision models own semantic choice/judgment
 
-### P3 — Evidence-loop gate (`need_evidence` stop/continue)
-- Where: `backend/app/dm/evidence.py:706,709` (`run_bounded_evidence_loop`, `MAX_EVIDENCE_ROUNDS=3` → up to 4 adjudications/turn)
-- Today: LLM decides `need_evidence` with 1-3 `evidence_requests` + `safe_prelude`; loop re-sends grown packet each round.
-- Jev shape: `Choice: [proceed, need_evidence, clarify]` + `Score: evidence_sufficiency` + `Noul: "Required fact is missing to resolve intent."`
-- Why: model can prolong loop today; a cheap gate with calibrated confidence lets code enforce stopping rules.
+Examples:
 
-### P4 — Regen / failure classifier
-- Where: `backend/app/dm/execution.py:147-165` (`_classify_failure` → `retriable | terminal`), `adjudication.py:356,555`, `execution.py:743,752` (evidence × regen cascade), `validators.py:1177` (`run_with_bounded_regeneration`)
-- Today: exception-type / string-match heuristics.
-- Jev shape: `Choice: [retriable, terminal]` + `Score: repair_likelihood` + `Noul: "Re-running with same packet is likely to succeed."`
-- Why: decides whether to burn another full adjudication. High leverage on cost/latency multiplier.
+- route / supported intent family;
+- mapping freeform prose onto a bounded set of legal commands;
+- choosing among real entity-identity candidates;
+- relevance/reranking among already-authorized retrieval candidates;
+- clock-criteria satisfaction among legal transitions;
+- semantic support / contradiction / narration-agency judgments;
+- bounded NPC action choice when the mechanics layer can enumerate legal actions.
 
-### P5 — Memory / audit judges (map-reduce scoring)
-- Where:
-  - `legacy_system/server/services/dm_memory_repair.py:640` repair-judge loop
-  - `legacy_system/server/services/memory_recovery.py:239`, `openrouter.py:6313` staged memory-writer (1×/post-turn + retries)
-  - `legacy_system/server/services/automation_auditor.py:1468,1470` (up to ~15 LLM calls per audit cycle, 180s timeout)
-  - `legacy_system/server/services/encounter_map_service.py:1396,1402,880,894` (image + vision-LLM QA — note: Jev does NOT do images yet, so map QA stays LLM for now)
-- Today: full LLMs used as judges/scorers in loops.
-- Jev shape: `Score` rubrics (patch-correctness, memory-salience, audit-severity) + `Noul` validity checks, map-reduced in code.
-- Why: docs' canonical Jev workload — turn petabytes into features, verify everything. Auditor loop is the biggest call-count hotspot in repo.
+Independent questions should fan out in one decision request when possible rather than becoming a serial chain of model round trips.
 
-### P6 — Chat / fork routing (high volume, low complexity)
-- Where: `backend/app/characters/chat/service.py:156` (1 stream/message + tool loop), `legacy_system/server/services/clarification_forks.py:267,311` (1 LLM/fork turn, multiplies concurrent load)
-- Today: full chat LLM per message.
-- Jev shape: `Choice: [answer_directly, needs_tools, escalate_to_dm, table_chat]` as pre-router; `Score: ambiguity` to trigger clarification forks only when needed.
-- Why: user-facing TTFT win; cheap filter before expensive path.
+### Generative models remain necessary for
 
-### P7 — Claim-level provenance / truth-status tagging
-- Where: `backend/app/dm/adjudication.py:84-199` (per-claim `claim_kind`, `origin`, `beat.type`, `truth_status`, `visibility`, `effect_type`, `evidence.tool`, `roll.*`)
-- Today: inferred as part of full contract JSON by generative LLM, no confidence attached.
-- Jev shape: parallel `Choice` per claim/beat. Each claim scored independently against same state — matches Jev's "parallel, no context-rot" design.
-- Why: gives calibrated probabilities code can branch/sort/route on; enables thresholding (auto-apply vs review).
+- genuinely open-ended or unusual D&D adjudication;
+- new fictional claims/content that cannot be assembled from authoritative candidate payloads;
+- narration, dialogue, clarification wording, summaries, and other new prose;
+- long-tail mechanics/fiction where the application cannot enumerate a safe complete candidate set.
 
-## 4. Explicit non-fits
+Every bounded surface whose candidate set may be incomplete should expose an explicit escape such as `OPEN_ENDED_DM`, `CLARIFY`, or `DEFER`.
 
-- Full `DmTurnContractV1` assembly (`adjudication.py:202-366`, `normalize_contract`) — requires constrained JSON generation with cross-field rules (≤2 new entities, ≤4 staged effects, roll handles). Jev has no string generation.
-- Narration prose (`adjudication.py:369-599` `build_provider_narrator`, `stream_chat`) — generative by definition.
-- Context packet assembly (`context.py`, `router.py`, `turns.py`) — deterministic; no judgment to replace.
-- Image map QA — Jev demos note structured text state only, not images yet.
-- Anything needing chain-of-thought reasoning over multiple independent factors — must be decomposed first per TypeSafe guidance, not sent as one mega-question.
+## 3. Execution policy: more aggressive than a global 85% rule
 
-## 5. Suggested rollout
+Do not hard-code one confidence threshold for every decision class.
 
-1. Shadow mode: add Jev client + log `Choice/Score/Noul` alongside existing LLM/heuristic decisions for P1+P2. Measure agreement + calibration. No behavior change.
-2. Gate mode: use Jev confidence thresholds to skip/keep expensive paths (e.g., high-confidence `silent/table_chat`, low-risk validator pass). Keep LLM fallback.
-3. Replace mode: only after shadow data shows parity, replace heuristic validators (P2) and failure classifier (P4) outright. Keep bounded regen caps.
-4. Budget enforcement: cap combined evidence × regen budget in `execution.py:743,752` regardless of model — currently multiplicative worst case.
+The runtime should evaluate at least:
 
-## 6. Open questions for spike
+- returned probability/confidence and runner-up margin where available;
+- whether the selected action is reversible;
+- whether deterministic code can fully verify it before mutation;
+- consequence class if it is wrong;
+- calibration measured for that exact decision role / schema / policy version.
 
-- Auth / SDK: API key shape, Python adapter (`system-one-adapter-python` mentioned in launch post), Vercel AI Gateway `typesafe-ai/jev` (`evaluate()` example) vs direct API.
-- Calibration: do returned `confidence` scores actually threshold cleanly on our validators? Needs shadow data.
-- Cardinality limits: docs say up to 255 options; high-cardinality choices use 2-stage scoring — relevant for entity/proposal ranking if we try it.
-- Latency from our infra: published 70–500ms measured from US West Coast laptops; verify from our deploy region.
-- Cost baseline: capture current per-turn LLM $/latency before claiming 100x wins — launch-page 193.6× faster / 444.6× cheaper is on their 4 workflow evals vs GPT-6 Astra / Fable 5.1 average, not necessarily our workload.
+This allows aggressive execution where the action space itself makes mistakes cheap or impossible to commit incorrectly. A cheap/reversible/fully revalidated choice may eventually execute from the top valid candidate with a relatively low or even no fixed probability floor. Canon-sensitive, destructive, or hard-to-reverse choices can require stronger calibrated evidence, extra verification, or escalation.
 
-## 7. Source notes
+#381 owns these policies. #383/#268 measure them. #269 gates approved invite-alpha use while still permitting clearly marked pre-alpha experiments.
 
-- Code refs from `backend/app/dm/{adjudication,validators,narration,execution,evidence,context,router,turns,recovery}.py` and `legacy_system/server/services/{encounter_map_service,dm_memory_repair,automation_auditor,clarification_forks}.py`, inspected 2026-09-17.
-- Jev behavior/pricing from `docs.typesafe.ai` + `typesafe.ai/blog/introducing-system-one-models-and-jev` (early access, Sep 2026).
+## 4. Forward-DM control plane
+
+#382 changes the current assumption that every accepted player intent begins with a full generative `DmTurnContractV1` call.
+
+A decision frame can ask bounded questions such as route, action family, actor, target, roll need, or evidence relevance, but direct execution is allowed only when **all required execution payload** is available from authoritative code/candidates.
+
+A mode label by itself is not enough. For example, choosing `await_roll` does not magically generate a safe roll contract; a direct roll path is valid only when actor/check/ability/skill/advantage/DC policy and required public payload can be assembled from authoritative state/rules without arbitrary invention.
+
+When the bounded path is incomplete, the original player intent reaches the existing full generative adjudicator through `OPEN_ENDED_DM`.
+
+Middle-policy results may be supplied to that adjudicator as an advisory prior rather than as authority.
+
+## 5. Combat is a flagship use case
+
+#233 now defines the intended pattern for freeform combat prose.
+
+For an input such as:
+
+> I rush the wounded goblin and hit him with my longsword.
+
+code should enumerate concrete commands that are actually available from authoritative encounter/rules/VTT state, for example:
+
+- `ATTACK:<pc>:<longsword>:<goblin_a>`
+- `ATTACK:<pc>:<longsword>:<goblin_b>`
+- other supported concrete commands that are currently legal;
+- `CLARIFY`;
+- `OPEN_ENDED_DM`.
+
+The decision model selects. It does not manufacture actor IDs, targets, weapons, positions, action costs, or command JSON.
+
+The selected command is revalidated against the current encounter revision and then executed through the same deterministic services used by structured UI actions.
+
+Creative intent such as swinging from a chandelier while knocking a brazier into an enemy remains open-ended DM work rather than being coerced into the nearest supported command.
+
+#236 extends the same pattern to supported NPC/enemy action selection while explicitly never AI-controlling absent human PCs.
+
+## 6. World, retrieval, and identity
+
+### Entity identity — #214
+
+Resolve exact canonical refs/aliases deterministically first. If identity remains ambiguous, code retrieves a bounded set of real candidate entity IDs and explicit outcomes such as `NEW_ENTITY`, `KEEP_DISTINCT`, or `DEFER`. The decision model chooses only among them. Destructive merges are a higher-risk policy class.
+
+### Retrieval — #212/#213
+
+Authorization/filtering happens before model exposure. Graph/vector search produces bounded authoritative-source references; a decision model may rerank/select from those authorized candidates or return no relevant result. Vector similarity and decision probability are ranking metadata, never evidence authority.
+
+### NPC state — #215
+
+NPC state should be structured enough that relevant goals/knowledge/resources and legal action candidates can feed bounded semantic decisions without creating a dedicated generative LLM agent per NPC.
+
+## 7. Post-turn
+
+The post-turn roadmap now separates generation from decision/judgment:
+
+- **#217 materialization:** generation may propose novel fact/entity/relation content; bounded decisions can classify write categories or verify proposed assertions; deterministic provenance/visibility/identity/idempotency remain final gates.
+- **#218 clocks:** code supplies explicit criteria, evidence, current state, and legal transitions such as `NO_CHANGE`, allowed advance, `COMPLETE`, `DEFER`; the decision model judges semantic criteria satisfaction.
+- **#219 summaries:** summary prose remains generative; claim-level support/secrecy checks can use bounded judgments.
+- **#220 consistency:** exact contradictions are deterministic; paraphrased/implicit conflicts can use `CONSISTENT | CONTRADICTION | UNCERTAIN` semantic judgments.
+
+Do not build new Jev integrations into `legacy_system`; pre-alpha superseded code should be deleted/replaced rather than preserved.
+
+## 8. Validation and secrecy
+
+#384 owns semantic judge infrastructure. Good targets are the residue that is currently brittle under lexical heuristics:
+
+- invented voluntary PC speech/thought/action;
+- unsupported narration additions;
+- paraphrased semantic contradiction;
+- implicit secret/knowledge leakage.
+
+Keep exact/computable checks deterministic: IDs, ownership, provenance/source existence, visibility authorization, hidden literal/DC leakage, typed contract invariants, mechanics legality, etc.
+
+A positive semantic judge can never override a deterministic failure.
+
+Private/secret state is filtered and scoped **before** candidate/model exposure; a decision model is never allowed to see unauthorized records merely so it can rank them.
+
+## 9. Observability, evals, and approval
+
+#383 should retain per decision run:
+
+- decision role and execution mode (`shadow`, `primer`, `direct`);
+- adapter/provider/model/version;
+- question/candidate/schema/policy versions;
+- candidate IDs and full available probability distribution;
+- selected answer, runner-up/margin where available;
+- latency/cost;
+- deterministic revalidation result;
+- downstream correction/repair/validator signals where available.
+
+#268 evaluates each decision role independently: confusion/accuracy, calibration by bucket, direct-execution error rate, unnecessary escalation, failure to choose the escape path, robustness to candidate ordering/noise, and generative calls avoided.
+
+#269 approves exact roles/policies rather than a model globally. A decision model may be approved for retrieval reranking and still be unapproved for direct canon-sensitive identity resolution.
+
+## 10. Explicit non-fits
+
+Do not delegate these to Jev merely because Jev is cheap/fast:
+
+- provider HTTP/config/retryability classification;
+- authorization / RLS / audience scope;
+- rule legality and arithmetic;
+- dice results;
+- action economy and VTT geometry;
+- idempotency / transactional correctness;
+- billing/capacity accounting;
+- arbitrary new prose/fiction;
+- arbitrary unconstrained materialization patches.
+
+## 11. Rollout philosophy
+
+This is pre-alpha and there is one active user, so experimentation can be aggressive without pretending early thresholds are already production-calibrated.
+
+Use a mix of:
+
+- shadow comparison where mistakes would be difficult to observe or repair;
+- experimental active direct execution where code tightly constrains/revalidates the action space;
+- primer/advisory use where a generative model still needs to assemble novel content;
+- explicit open-ended escalation whenever bounded coverage is incomplete.
+
+The goal is not to make Jev the DM. The goal is to stop using a generative model to rediscover semantic choices that the runtime can safely bound, while concentrating generative intelligence on the genuinely open-ended parts of tabletop play.
+
+## 12. Source of truth
+
+Implementation scope and sequencing live in:
+
+- #379–#384 for the decision-control-plane foundation;
+- amended subsystem issues such as #214, #217–#220, #229, #233, #236, #248/#251/#252, #258, #268/#269, #273/#274;
+- the linked GitHub Project **DND AI — Development** for cross-issue priority/readiness.
+
+This document is design/background context and should not be used as a parallel roadmap.
+
+## External background
+
+Jev is a TypeSafe AI bounded decision model designed around typed choices/scores/boolean-style judgments and parallel decision questions rather than arbitrary text generation. Public TypeSafe material and third-party demos should be treated as useful architectural evidence, not as a substitute for calibration on this application's own D&D decision roles.
+
+References:
+- https://docs.typesafe.ai/
+- https://typesafe.ai/blog/introducing-system-one-models-and-jev
