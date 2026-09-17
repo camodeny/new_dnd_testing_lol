@@ -287,10 +287,11 @@ def start_production_play(scn: Scenario, *, operation_key: str) -> dict:
     return body
 
 
-def submit_player_turn(scn: Scenario, text: str, key: str) -> dict:
+def submit_player_turn(scn: Scenario, text: str, key: str, client=None) -> dict:
     """One normal freeform submission through the production submissions API."""
     assert scn.campaign_id is not None
-    r = scn.client.post(
+    http = client or scn.client
+    r = http.post(
         f"/api/campaigns/{scn.campaign_id}/submissions",
         json={"content": text},
         headers={"Idempotency-Key": key},
@@ -391,10 +392,11 @@ def await_committed_reply(scn: Scenario, stage: str, turn_id: str) -> str:
         return text
 
 
-def assert_ordering_invariants(scn: Scenario, stage: str) -> int:
+def assert_ordering_invariants(scn: Scenario, stage: str, client=None) -> int:
     """Campaign revision == domain-event sequence invariant (#188)."""
     assert scn.campaign_id is not None
-    r = scn.client.get(f"/api/campaigns/{scn.campaign_id}/events")
+    http = client or scn.client
+    r = http.get(f"/api/campaigns/{scn.campaign_id}/events")
     scn.check(r.status_code == 200, stage, f"events read failed: {r.text}")
     body = r.json()
     seqs = [e["sequence"] for e in body["events"]]
@@ -425,11 +427,12 @@ def assert_ordering_invariants(scn: Scenario, stage: str) -> int:
 
 
 def assert_single_result_per_submission(
-    scn: Scenario, stage: str, expected_turns: int
+    scn: Scenario, stage: str, expected_turns: int, client=None
 ) -> list:
     """One accepted logical player intent -> one committed gameplay result."""
     assert scn.campaign_id is not None
-    r = scn.client.get(f"/api/campaigns/{scn.campaign_id}/dm-turns")
+    http = client or scn.client
+    r = http.get(f"/api/campaigns/{scn.campaign_id}/dm-turns")
     scn.check(r.status_code == 200, stage, f"dm-turns read failed: {r.text}")
     turns = r.json()["turns"]
     scn.check(
@@ -445,7 +448,7 @@ def assert_single_result_per_submission(
         stage,
         "one submission consumed by multiple turns (duplicate gameplay)",
     )
-    subs = scn.client.get(f"/api/campaigns/{scn.campaign_id}/submissions")
+    subs = http.get(f"/api/campaigns/{scn.campaign_id}/submissions")
     scn.check(subs.status_code == 200, stage, f"submissions read failed: {subs.text}")
     for sub in subs.json()["submissions"]:
         scn.check(
@@ -556,15 +559,20 @@ def test_phase0_solo_dogfood_through_reconnect_and_continued_play(scn):
                 f"stream {stream_id} not reconstructable after reconnect",
             )
 
-    # Play continues after reconnect through the same production path.
+    # Play continues after reconnect through the same production path, driven
+    # by the reconnected client so the test proves a fresh session can play.
     scn.note("post-reconnect")
-    submitted = submit_player_turn(scn, POST_RECONNECT_TURN, "phase0-turn-post")
+    submitted = submit_player_turn(
+        scn, POST_RECONNECT_TURN, "phase0-turn-post", client=reconnected_client
+    )
     outcome = drain_dm_execution(scn, adjudicate, "post-reconnect")
     scn.check(not outcome.get("failed"), "post-reconnect", f"sweep failed: {outcome}")
     await_committed_reply(scn, "post-reconnect", submitted["dm_turn"]["id"])
-    assert_ordering_invariants(scn, "post-reconnect")
-    assert_single_result_per_submission(scn, "post-reconnect", 5)
-    grown = read_snapshot(scn, "post-reconnect")
+    assert_ordering_invariants(scn, "post-reconnect", client=reconnected_client)
+    assert_single_result_per_submission(
+        scn, "post-reconnect", 5, client=reconnected_client
+    )
+    grown = read_snapshot(scn, "post-reconnect", client=reconnected_client)
     scn.check(
         POST_RECONNECT_TURN in [m["raw_content"] for m in grown["history"]["messages"]],
         "post-reconnect",
