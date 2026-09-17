@@ -32,6 +32,8 @@ import os
 from dataclasses import dataclass
 from typing import Any, Callable
 
+from app.providers.contracts import ProviderError
+
 FAKE_PROVIDER_NAME = "fake-dm-test"
 FAKE_MODEL_NAME = "fake-dm-test-model-v1"
 
@@ -39,13 +41,23 @@ FAKE_MODEL_NAME = "fake-dm-test-model-v1"
 FORWARD_DM_SCHEMA_NAME = "dm_turn_contract_v1"
 
 
-class FakeProviderUsageError(RuntimeError):
+class FakeProviderUsageError(ProviderError):
     """An unmatched or misconfigured fake-provider call.
 
     Raised at the provider boundary when no fixture answers the logical
     request, so scenario failures point at the missing fixture/step
     instead of surfacing as downstream validation noise.
+
+    A ``ProviderError`` with terminal kind (not a plain ``RuntimeError``)
+    so the production failover loop classifies it terminal and surfaces
+    it immediately: an unmatched fixture must never dissolve into
+    alternate-provider resolution or provider-config errors.
     """
+
+    def __init__(self, message: str, **kwargs: Any) -> None:
+        kwargs.setdefault("kind", "unsupported_feature")
+        kwargs.setdefault("provider", FAKE_PROVIDER_NAME)
+        super().__init__(message, **kwargs)
 
 
 @dataclass

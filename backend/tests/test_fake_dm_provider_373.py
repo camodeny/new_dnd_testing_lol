@@ -186,3 +186,49 @@ def test_install_refuses_production(monkeypatch):
     monkeypatch.setenv("APP_ENV", "production")
     with pytest.raises(FakeProviderUsageError, match="test-scoped"):
         provider.install(monkeypatch)
+
+
+def test_unmatched_fixture_is_terminal_before_failover(monkeypatch):
+    """A missing fixture surfaces as the fake usage error even with failover.
+
+    With a same-model failover provider configured but unconfigured (no
+    API key), the unmatched fixture must be terminal at the provider
+    boundary: failover must never be attempted and the surfaced error
+    must stay the actionable fixture diagnostic, not a config error.
+    """
+    from app.dm import adjudication as adj
+    from app.providers import policy as role_policy
+    from app.providers import registry as reg
+
+    provider = FakeDMProvider()  # no fixtures: every request is unmatched
+    provider.install(monkeypatch)
+    monkeypatch.setattr(
+        role_policy,
+        "execution_path",
+        lambda role: [
+            (FAKE_PROVIDER_NAME, FAKE_MODEL_NAME),
+            ("openai", FAKE_MODEL_NAME),
+        ],
+    )
+    monkeypatch.setattr(role_policy, "is_model_approved", lambda r, p, m: True)
+    failover_attempted: list[str] = []
+    real_get = reg.provider_registry.get
+
+    def _watch_get(name: str):
+        failover_attempted.append(name)
+        return real_get(name)
+
+    monkeypatch.setattr(reg.provider_registry, "get", _watch_get)
+    packet = {
+        "lanes": [
+            {
+                "name": "player_inputs",
+                "records": [
+                    {"value": {"segments": [{"text": "I befriend the moon."}]}}
+                ],
+            }
+        ]
+    }
+    with pytest.raises(FakeProviderUsageError, match="no fixture"):
+        adj.adjudicate_with_failover(packet, role="forward_dm")
+    assert failover_attempted == []
