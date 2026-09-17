@@ -4,45 +4,97 @@
 
 ## Why this file exists
 
-The issue bodies can be updated through the current GitHub connector, but this connector does not expose GitHub Projects or native parent/sub-issue/dependency mutation APIs. The roadmap pivot is therefore being implemented directly in issue text, while the remaining native relationship / Project metadata work must be done by an agent with GitHub CLI/API/Projects access.
+The issue bodies and repository instructions were updated through ChatGPT's GitHub connector, but the connector available in that session did not expose GitHub Projects or native parent/sub-issue/dependency mutation APIs. The roadmap pivot is therefore already represented in issue text; this file exists only for the remaining native relationship / Project metadata work.
 
-## Architecture being adopted
+Do not turn this file into a permanent roadmap. The linked GitHub Project **DND AI — Development** remains the cross-issue priority/sequencing source of truth, and the issue bodies remain the implementation source of truth.
+
+## Architecture now represented in the issues
 
 The product is moving from a generative-DM-centric semantic orchestration model toward a decision-first control plane:
 
-1. Deterministic code owns authoritative state, permissions, rules, legal candidate enumeration, mutations, idempotency, arithmetic, geometry, and visibility boundaries.
+1. Deterministic/domain code owns authoritative state, permissions, rules, legal candidate enumeration, mutations, idempotency, arithmetic, geometry, visibility, billing/accounting, provenance/source existence, and provider/transport failure taxonomy.
 2. A provider-neutral bounded decision runtime chooses among code-supplied candidates and can score/judge semantic questions. TypeSafe Jev is the first adapter/reference model, not the architecture itself.
-3. The decision model may never invent canonical IDs, legal actions, targets, permissions, or side effects outside the supplied candidate set.
-4. Common, bounded gameplay paths should execute directly when policy permits. Risk/reversibility/verification determine auto-execution policy; there is no single global confidence threshold.
-5. `OPEN_ENDED_DM` / equivalent escape candidates preserve infinite-pathway play. Novel fiction, genuinely open-ended adjudication, and prose generation continue to use generative models.
-6. Full decision distributions, candidate schema/policy/model versions, execution outcome, fallback/escalation, and relevant validation results are observable and replayable.
-7. Deterministic invariants remain deterministic. Decision models handle semantic ambiguity, ranking, classification, routing, and judgment.
+3. A decision model may never invent canonical IDs, legal actions, targets, permissions, or side effects outside the supplied candidate set.
+4. Common bounded gameplay paths may execute directly when the decision-class policy permits. Risk, reversibility, deterministic verification, calibration, and ambiguity/margin determine policy; there is no single global confidence threshold.
+5. `OPEN_ENDED_DM`, `CLARIFY`, `DEFER`, or equivalent escape candidates preserve infinite-pathway play. Novel fiction, genuinely open-ended adjudication, and prose generation continue to use generative models.
+6. Full available decision distributions plus candidate/question/schema/policy/model versions, execution outcome, fallback/escalation, stale-state revalidation, and relevant validation results are observable/replayable.
+7. Decision-first execution changes semantic orchestration, not authority: deterministic invariants still fail closed regardless of AI confidence.
+
+`AGENTS.md` now contains the evergreen implementation guardrails above without embedding roadmap sequencing.
+
+## New epic and foundational issues
+
+- #379 `[EPIC] Decision-first AI control plane & bounded semantic execution`
+- #380 `AI decisions: add provider-neutral bounded decision runtime with Jev adapter`
+- #381 `AI decisions: build candidate enumeration, decision-frame, and execution-policy primitives`
+- #382 `Forward DM: add decision-first semantic router and bounded fast-path executor`
+- #383 `AI decisions: add shadow/active telemetry, calibration, and replay`
+- #384 `AI decisions: add semantic judge layer for ambiguous validation and narration fidelity`
+
+#379 already has the `epic` label and its body lists #380–#384 as children. What remains is the native GitHub relationship metadata.
+
+## Existing issues already amended
+
+The following issue bodies/titles were updated to reflect the decision-first architecture where it materially changes implementation:
+
+- Epics / cross-cutting: #177, #178, #179, #180, #181, #183, #184, #186
+- Forward/provider: #208
+- World/retrieval/NPC: #212, #213, #214, #215
+- Post-turn: #217, #218, #219, #220
+- Rules/combat: #229, #233, #236
+- Private gameplay: #248, #251, #252
+- Usage/provider routing: #257, #258
+- Adventure completion: #261
+- E2E/eval/perf/ops: #267, #268, #269, #273, #274, #275, #374, #375
+
+Closed foundational issues such as #192 and #373 were intentionally not reopened/redefined; #383 extends the existing tracing foundation and #380 adds the decision fake adapter needed for future deterministic E2E coverage.
 
 ## Remaining native GitHub cleanup
 
-After the issue creation/update work in this pivot lands:
+Use an agent/tooling session with GitHub Projects and native issue-relationship mutation support:
 
-- Inspect the newly created `[EPIC] Decision-first AI control plane & bounded semantic execution` issue and its five foundational child issues.
-- Set native GitHub parent/sub-issue relationships so those five issues are children of that epic.
-- Add the new epic and all five children to the linked GitHub Project **DND AI — Development**.
-- Inspect current Project fields/queue before setting priority or status. Do **not** invent priority from issue numbers or this file.
-- Set native dependencies to reflect the issue bodies. At minimum, the decision runtime foundation should precede decision-frame/policy and active forward-DM execution; telemetry/calibration should be available before broad automatic rollout. Preserve any existing dependencies that remain valid.
-- Inspect amended issues (#177, #178, #179, #180, #181, #186, #208, #212, #213, #214, #215, #217, #218, #219, #220, #229, #233, #236, #251, #258, #267, #268, #269, #273, #274, #261) and add native dependencies on the new foundational decision issues only where the amended body explicitly requires them.
-- Do not make all product work globally dependent on the decision epic. Deterministic rules, persistence, geometry, UI, and unrelated infrastructure should remain independently implementable.
-- Update Project sequencing so agents see the new architecture before implementing old generative-DM assumptions. Use current Project context and dependency readiness to decide exact ordering.
-- Verify there are no stale Project descriptions/custom-field notes that still describe the generative forward DM as the universal semantic orchestrator.
-- Delete this handoff file when complete.
+1. **Native parent/sub-issue relationships**
+   - Make #380, #381, #382, #383, and #384 native children of #379.
+   - Do not create duplicate wrapper issues just to simulate the relationship.
+
+2. **Project membership**
+   - Add #379–#384 to **DND AI — Development**.
+   - Inspect the Project's current fields/queue before setting priority/status. Do **not** infer priority from issue numbers, this handoff, or the apparent importance of Jev.
+
+3. **Native dependencies**
+   - Read the issue bodies before editing dependencies; they deliberately distinguish hard dependencies from optional later integrations.
+   - #380 should precede #381.
+   - #381 is required for active decision policy/candidate execution paths such as #382.
+   - #383 should be available early enough to observe/calibrate experimental active paths and before broad invite-alpha direct execution.
+   - #384 depends on #380/#381/#383 and the existing validator/narration foundations.
+   - Add native dependencies from amended issues to #380–#384 only where their bodies describe a true blocking dependency. Do **not** globally block deterministic rules, persistence, VTT geometry, UI, or unrelated infrastructure on the decision epic.
+   - Preserve existing valid dependencies.
+
+4. **Project sequencing**
+   - Use the Project's actual current queue/readiness to position the new work.
+   - Ensure agents inspecting the Project will see the decision-runtime foundation before they implement old assumptions such as `freeform prose -> full generative DM -> command` everywhere.
+   - Do not encode a second priority order in a markdown file.
+
+5. **Stale Project metadata**
+   - Check Project descriptions/notes/custom-field text for statements that imply the generative forward DM is the universal semantic orchestrator.
+   - Update only stale architecture wording; do not rewrite unrelated Project metadata.
 
 ## PR #378
 
-PR #378 (`Add Jev integration opportunities doc`) predates this roadmap rewrite. Update its design note to match the issue architecture rather than treating Jev as a set of isolated plug-ins. In particular:
+PR #378 (`Add Jev integration opportunities doc`) predates this roadmap rewrite and its current exploration note should not become a competing roadmap.
 
-- present bounded decision models as a first-class provider-neutral runtime;
-- keep Jev as the first adapter/reference implementation;
-- describe candidate-space safety and `OPEN_ENDED_DM` escape semantics;
-- treat direct execution as policy/risk-class based rather than one global confidence threshold;
-- keep deterministic runtime facts deterministic;
-- remove legacy-system integration targets;
-- point readers to the new decision-control-plane epic and amended roadmap issues.
+Before merging it, revise the doc so it:
 
-Once the PR accurately reflects the issue architecture, it can remain as background/design context rather than the roadmap source of truth.
+- points to #379–#384 as the implementation architecture;
+- presents bounded decision models as a first-class provider-neutral runtime, with Jev as the first adapter/reference implementation;
+- centers candidate-space safety and explicit `OPEN_ENDED_DM` / clarify / defer escape semantics;
+- describes direct execution as decision-class/risk/calibration policy rather than one global confidence threshold;
+- explains that common paths may be more aggressive when code constrains and revalidates the action space;
+- keeps deterministic runtime facts/permissions/legality/idempotency/billing/provider-failure taxonomy deterministic;
+- removes `legacy_system` as an integration target;
+- covers the roadmap-native integrations now represented in #214, #217–#220, #233, #236, #251/#252, #268/#269, and retrieval #212/#213;
+- treats the issues/Project—not the doc—as the source of implementation scope and priority.
+
+## Completion
+
+After native relationships, Project membership/fields, dependencies, and PR #378's design note are consistent with the issue bodies, delete `docs/jev-roadmap-pivot-handoff.md`.
