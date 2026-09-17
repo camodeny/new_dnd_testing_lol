@@ -14,10 +14,12 @@ Real providers are never registered, replaced, or affected outside an
 installed test. The AI is the only DM; this module contains no gameplay,
 adjudication, or narration logic of its own.
 
-Fixtures are keyed by logical test step/input, not call order: each
-fixture declares the player-input substrings it answers (or that it
-answers the input-free opening), and the fake matches the incoming
-provider request's ``player_inputs`` lane. An unmatched request raises
+Fixtures are keyed by logical test step/input and, where needed,
+authoritative packet state (lane record presence, e.g. roll evidence),
+not call order: each fixture declares the player-input substrings it
+answers (or that it answers the input-free opening) plus optional
+lane-state conditions, and the fake matches the incoming provider
+request's ``player_inputs`` lane and lane record counts. An unmatched request raises
 :exc:`FakeProviderUsageError` identifying the logical request instead of
 inventing output.
 
@@ -62,16 +64,22 @@ class FakeProviderUsageError(ProviderError):
 
 @dataclass
 class FakeDMFixture:
-    """One deterministic response, keyed by logical step/input.
+    """One deterministic response, keyed by logical step/input/state.
 
     ``input_substrings`` must ALL appear in the request's player-input
     texts (case-sensitive). ``match_when_no_inputs`` answers the
-    input-free opening turn. ``contract`` is either a raw contract dict
-    (returned verbatim as the model JSON payload) or a factory taking
-    the extracted request summary and returning one — factories stay
-    deterministic (no randomness, wall-clock, or call counters).
-    ``roles`` scopes which AI role call the fixture may satisfy; later
-    #267 scenarios add roles here without a new fake runtime.
+    input-free opening turn. ``lane_requires_records`` names lanes that
+    must carry at least one record (e.g. ``evidence_results`` once a
+    roll is fulfilled); ``lane_requires_empty`` names lanes that must
+    carry zero records. Together they distinguish same-input requests
+    in different authoritative states — pre-roll vs post-roll resume —
+    deterministically, without call counters. ``contract`` is either a
+    raw contract dict (returned verbatim as the model JSON payload) or
+    a factory taking the extracted request summary and returning one —
+    factories stay deterministic (no randomness, wall-clock, or call
+    counters). ``roles`` scopes which AI role call the fixture may
+    satisfy; later #267 scenarios add roles here without a new fake
+    runtime.
     """
 
     step: str
@@ -79,6 +87,8 @@ class FakeDMFixture:
     input_substrings: tuple[str, ...] = ()
     match_when_no_inputs: bool = False
     roles: tuple[str, ...] = ("forward_dm",)
+    lane_requires_records: tuple[str, ...] = ()
+    lane_requires_empty: tuple[str, ...] = ()
 
     def render(self, summary: dict[str, Any]) -> dict[str, Any]:
         if callable(self.contract):
@@ -92,7 +102,7 @@ class FakeDMFixture:
         return rendered
 
 
-def _extract_forward_dm_inputs(messages: Any) -> list[str]:
+def _extract_forward_dm_inputs(messages: Any) -> tuple[list[str], dict[str, int]]:
     """Strict player-input read for ``forward_dm`` provider requests.
 
     The production ``ForwardDmContextPacket`` carries every named lane
@@ -100,8 +110,13 @@ def _extract_forward_dm_inputs(messages: Any) -> list[str]:
     has the ``record_id`` / ``value.segments[].text`` shape. Any
     deviation raises :exc:`FakeProviderUsageError` so a serialization
     regression can never collapse into an ``opening=True`` fixture
-    match. [] is returned only for a structurally valid lane that
-    genuinely carries no input text.
+    match.
+
+    Returns ``(input_texts, lane_record_counts)``: texts is [] only
+    for a structurally valid lane that genuinely carries no input
+    text, and counts maps each named lane to its record count so
+    fixtures can match on authoritative packet state (pre-roll vs
+    post-roll resume) without call counters.
     """
     if not isinstance(messages, (list, tuple)) or not messages:
         raise FakeProviderUsageError("fake-provider forward_dm request has no messages")
@@ -144,6 +159,13 @@ def _extract_forward_dm_inputs(messages: Any) -> list[str]:
             "fake-provider request must carry exactly one player_inputs lane "
             f"(found {len(player_lanes)})"
         )
+    lane_counts: dict[str, int] = {}
+    for lane in lanes:
+        if isinstance(lane, dict) and isinstance(lane.get("name"), str):
+            lane_records = lane.get("records")
+            lane_counts[lane["name"]] = (
+                len(lane_records) if isinstance(lane_records, list) else 0
+            )
     records = player_lanes[0].get("records")
     if not isinstance(records, list):
         raise FakeProviderUsageError(
@@ -184,7 +206,7 @@ def _extract_forward_dm_inputs(messages: Any) -> list[str]:
                 )
             if segment["text"]:
                 texts.append(segment["text"])
-    return texts
+    return texts, lane_counts
 
 
 def extract_player_input_texts(messages: Any, *, role: str = "unknown") -> list[str]:
@@ -199,7 +221,7 @@ def extract_player_input_texts(messages: Any, *, role: str = "unknown") -> list[
     and fail loudly downstream as unmatched roles instead.
     """
     if role == "forward_dm":
-        return _extract_forward_dm_inputs(messages)
+        return _extract_forward_dm_inputs(messages)[0]
     try:
         if not isinstance(messages, (list, tuple)) or not messages:
             return []
@@ -261,6 +283,8 @@ class FakeDMProvider:
         inputs: tuple[str, ...] = (),
         opening: bool = False,
         roles: tuple[str, ...] = ("forward_dm",),
+        requires_records: tuple[str, ...] = (),
+        requires_empty: tuple[str, ...] = (),
     ) -> FakeDMFixture:
         return self.register(
             FakeDMFixture(
@@ -269,6 +293,8 @@ class FakeDMProvider:
                 input_substrings=tuple(inputs),
                 match_when_no_inputs=opening,
                 roles=roles,
+                lane_requires_records=tuple(requires_records),
+                lane_requires_empty=tuple(requires_empty),
             )
         )
 
@@ -279,10 +305,20 @@ class FakeDMProvider:
     def calls_for_step(self, step: str) -> list[dict[str, Any]]:
         return [call for call in self.calls if call["fixture_step"] == step]
 
-    def _match(self, role: str, input_texts: list[str]) -> FakeDMFixture | None:
+    def _match(
+        self,
+        role: str,
+        input_texts: list[str],
+        lane_counts: dict[str, int] | None = None,
+    ) -> FakeDMFixture | None:
+        counts = lane_counts or {}
         candidates: list[tuple[int, int, FakeDMFixture]] = []
         for order, fixture in enumerate(self._fixtures):
             if role not in fixture.roles:
+                continue
+            if any(counts.get(lane, 0) < 1 for lane in fixture.lane_requires_records):
+                continue
+            if any(counts.get(lane, 0) != 0 for lane in fixture.lane_requires_empty):
                 continue
             if fixture.match_when_no_inputs and not input_texts:
                 candidates.append((0, order, fixture))
@@ -306,13 +342,19 @@ class FakeDMProvider:
 
         role = infer_role(request)
         messages = getattr(request, "messages", None)
-        input_texts = extract_player_input_texts(messages, role=role)
-        fixture = self._match(role, input_texts)
+        if role == "forward_dm":
+            input_texts, lane_counts = _extract_forward_dm_inputs(messages)
+        else:
+            input_texts, lane_counts = (
+                extract_player_input_texts(messages, role=role),
+                {},
+            )
+        fixture = self._match(role, input_texts, lane_counts)
         if fixture is None:
             excerpt = " ".join(input_texts)[:300] or "<no player inputs>"
             raise FakeProviderUsageError(
                 "fake-provider has no fixture for this logical request: "
-                f"role={role} inputs={excerpt!r} "
+                f"role={role} inputs={excerpt!r} lanes={lane_counts} "
                 f"(registered steps: {self.steps or '<none>'})"
             )
         summary = {
@@ -345,21 +387,22 @@ class FakeDMProvider:
             raw={"fake_fixture_step": fixture.step},
         )
 
-    def install(
-        self, monkeypatch: Any, *, roles: tuple[str, ...] = ("forward_dm",)
-    ) -> "FakeDMProvider":
+    def install(self, monkeypatch: Any) -> "FakeDMProvider":
         """Install the fake at the provider boundary for one test.
 
         Patches ``resolve_dm_provider`` (so no API keys are needed) and
         ``app.providers.execute_chat`` (so the production failover path
         consumes fixtures). ``monkeypatch`` scoping keeps this strictly
-        test-local. Refuses production environments outright.
+        test-local. Refuses production environments outright, honoring
+        both the generic ``APP_ENV`` signal and this repository's
+        deployment convention ``VERCEL_ENV=production``.
         """
-        del roles  # roles are recorded per call via infer_role; kept for API growth.
-        if (os.getenv("APP_ENV") or "").strip().lower() == "production":
-            raise FakeProviderUsageError(
-                "fake-provider mode is test-scoped and refused in production"
-            )
+        for env_var in ("APP_ENV", "VERCEL_ENV"):
+            if (os.getenv(env_var) or "").strip().lower() == "production":
+                raise FakeProviderUsageError(
+                    "fake-provider mode is test-scoped and refused in production "
+                    f"({env_var}=production)"
+                )
 
         provider = self
 

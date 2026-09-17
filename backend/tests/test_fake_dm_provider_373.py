@@ -245,6 +245,91 @@ def test_install_refuses_production(monkeypatch):
         provider.install(monkeypatch)
 
 
+def test_install_refuses_vercel_production(monkeypatch):
+    """The repository deploys with VERCEL_ENV, so the guard honors it too."""
+    monkeypatch.delenv("APP_ENV", raising=False)
+    monkeypatch.setenv("VERCEL_ENV", "production")
+    with pytest.raises(FakeProviderUsageError, match="VERCEL_ENV=production"):
+        FakeDMProvider().install(monkeypatch)
+
+
+def _packet_request(
+    input_texts: list[str], evidence_records: list[dict] | None = None
+) -> ProviderRequest:
+    """Canonical-shaped forward-DM request with controllable roll evidence."""
+    lanes: list[dict] = [
+        {
+            "name": "player_inputs",
+            "records": [
+                {
+                    "record_id": "submission:roll-1",
+                    "value": {
+                        "segments": [
+                            {"position": i, "segment_type": "ic", "text": text}
+                            for i, text in enumerate(input_texts)
+                        ]
+                    },
+                }
+            ],
+        },
+        {"name": "evidence_results", "records": list(evidence_records or [])},
+    ]
+    return ProviderRequest(
+        messages=[
+            {"role": "system", "content": "fake system"},
+            {"role": "user", "content": json.dumps({"lanes": lanes})},
+        ],
+        model=FAKE_MODEL_NAME,
+        json_schema={"type": "object"},
+        json_schema_name="dm_turn_contract_v1",
+    )
+
+
+def _roll_evidence_record() -> dict:
+    return {
+        "record_id": "roll_evidence:strength-check",
+        "value": {"request_key": "strength-check", "fulfillment": {"total": 17}},
+    }
+
+
+def test_same_input_matches_by_packet_state_not_call_order():
+    """Pre-roll and post-roll resumes share input but match per state.
+
+    A roll resume keeps the same submission/player input and adds roll
+    evidence to the next attempt. Fixtures discriminate on the
+    authoritative lane state — no call counters — so the same input
+    first returns the roll request and then, with evidence present,
+    the resumed outcome, in either call order.
+    """
+    provider = FakeDMProvider()
+    provider.register_step(
+        "roll-request",
+        {"mode": "request_roll", "marker": "ask-for-roll"},
+        inputs=("I shove the door.",),
+        requires_empty=("evidence_results",),
+    )
+    provider.register_step(
+        "roll-resume",
+        {"mode": "respond", "marker": "door-bursts-open"},
+        inputs=("I shove the door.",),
+        requires_records=("evidence_results",),
+    )
+
+    pre = _packet_request(["I shove the door."])
+    post = _packet_request(["I shove the door."], [_roll_evidence_record()])
+    # Post-roll first: state — not order — selects the fixture.
+    assert json.loads(provider.execute_chat(_adapter(), post).content)["marker"] == (
+        "door-bursts-open"
+    )
+    assert json.loads(provider.execute_chat(_adapter(), pre).content)["marker"] == (
+        "ask-for-roll"
+    )
+    assert [c["fixture_step"] for c in provider.calls] == [
+        "roll-resume",
+        "roll-request",
+    ]
+
+
 def test_unmatched_fixture_is_terminal_before_failover(monkeypatch):
     """A missing fixture surfaces as the fake usage error even with failover.
 
