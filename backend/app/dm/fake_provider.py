@@ -96,23 +96,41 @@ def extract_player_input_texts(messages: Any) -> list[str]:
     """Player-input texts from a provider request's serialized packet.
 
     Reads the ``player_inputs`` lane (``value.segments[].text``) from the
-    last user message's canonical packet JSON. Returns [] for the
-    input-free opening or unparseable payloads — matching then falls back
-    to ``match_when_no_inputs`` fixtures or fails loudly.
+    last user message's canonical packet JSON. Returns [] only for a
+    recognized canonical structure that carries no input text (the valid
+    input-free opening) or for messages that never claim packet shape.
+
+    A message that claims packet shape (``{...`` JSON) but cannot be
+    parsed or lacks the canonical ``lanes`` list raises
+    :exc:`FakeProviderUsageError`: such requests must fail loudly at the
+    boundary instead of being silently satisfied by an opening fixture.
     """
+    if not isinstance(messages, (list, tuple)) or not messages:
+        return []
+    content = messages[-1].get("content") if isinstance(messages[-1], dict) else None
+    if not isinstance(content, str):
+        return []
+    if not content.strip().startswith("{"):
+        return []
     try:
-        if not isinstance(messages, (list, tuple)) or not messages:
-            return []
-        content = (
-            messages[-1].get("content") if isinstance(messages[-1], dict) else None
-        )
-        if not isinstance(content, str) or not content.strip().startswith("{"):
-            return []
         packet = json.loads(content)
+    except json.JSONDecodeError as exc:
+        raise FakeProviderUsageError(
+            "fake-provider could not parse the canonical request packet: "
+            f"{exc} (content excerpt: {content[:200]!r})"
+        ) from exc
+    if not isinstance(packet, dict):
+        raise FakeProviderUsageError(
+            "fake-provider request packet is not a JSON object "
+            f"(got {type(packet).__name__})"
+        )
+    lanes = packet.get("lanes")
+    if not isinstance(lanes, list):
+        raise FakeProviderUsageError(
+            "fake-provider request is missing the canonical lanes list"
+        )
+    try:
         texts: list[str] = []
-        lanes = packet.get("lanes")
-        if not isinstance(lanes, list):
-            return []
         for lane in lanes:
             if not isinstance(lane, dict) or lane.get("name") != "player_inputs":
                 continue
@@ -126,8 +144,10 @@ def extract_player_input_texts(messages: Any) -> list[str]:
                     if text:
                         texts.append(str(text))
         return texts
-    except Exception:
-        return []
+    except Exception as exc:
+        raise FakeProviderUsageError(
+            f"fake-provider could not read player inputs: {exc}"
+        ) from exc
 
 
 def infer_role(request: Any) -> str:

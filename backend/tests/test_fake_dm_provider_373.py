@@ -154,6 +154,32 @@ def test_role_inference_and_input_extraction():
     assert extract_player_input_texts([{"role": "user", "content": "not json"}]) == []
 
 
+def test_malformed_packet_raises_instead_of_matching_opening():
+    """Malformed request shape never collapses into the opening fixture."""
+    provider = build_phase0_provider(freeform_turns=(), post_reconnect_turn="Later.")
+
+    def _request_with_content(content: str) -> ProviderRequest:
+        return ProviderRequest(
+            messages=[
+                {"role": "system", "content": "fake system"},
+                {"role": "user", "content": content},
+            ],
+            model=FAKE_MODEL_NAME,
+            json_schema={"type": "object"},
+            json_schema_name="dm_turn_contract_v1",
+        )
+
+    with pytest.raises(FakeProviderUsageError, match="could not parse"):
+        provider.execute_chat(
+            _adapter(), _request_with_content('{"lanes": [broken json')
+        )
+    with pytest.raises(FakeProviderUsageError, match="lanes list"):
+        provider.execute_chat(_adapter(), _request_with_content('{"no_lanes": true}'))
+    # A recognized canonical structure with zero inputs still matches opening.
+    response = provider.execute_chat(_adapter(), _request_with_content('{"lanes": []}'))
+    assert "phase0-reply-opening" in response.content
+
+
 def test_real_providers_unaffected_outside_test_mode():
     """Installing nothing changes nothing: the real registry has no fake."""
     from app.providers.registry import provider_registry

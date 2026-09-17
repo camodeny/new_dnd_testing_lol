@@ -15,9 +15,9 @@ orchestration path):
 - HTTP live-table snapshot/dm-turns/events projections for reconnect.
 
 Explicit non-goals owned by sibling issues (do NOT absorb them here):
-- #373 provides the deterministic fake-provider mode
-  fake-provider mode. Only external model bytes come from step-keyed fixtures;
-  orchestration, state, and persistence stay production.
+- #373 provides the deterministic fake-provider mode. Only external model
+  bytes come from step-keyed fixtures; orchestration, state, and
+  persistence stay production.
 - #374 owns durable failure-artifact preservation. This scenario exposes
   stable campaign/turn/attempt/stream identifiers and stage-tagged assertion
   context in failure messages/logs instead.
