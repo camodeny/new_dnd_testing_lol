@@ -75,6 +75,7 @@ SNAPSHOT_COMPARE_KEYS = (
     "active_thread_id",
     "history",
     "dm_state",
+    "dm_messages",
     "reconciliation",
 )
 
@@ -544,6 +545,26 @@ def test_phase0_solo_dogfood_through_reconnect_and_continued_play(scn):
     reconnected_client = TestClient(app)
     after = read_snapshot(scn, "reconnect", client=reconnected_client)
     assert_same_authoritative_projection(scn, "reconnect", before, after)
+    # The reconnected snapshot must expose every committed DM reply exactly
+    # once — history only projects player submissions, DM narration lives in
+    # dm_messages keyed by stream id.
+    dm_messages = after.get("dm_messages") or []
+    scn.check(
+        len(dm_messages) == 4,
+        "reconnect",
+        f"expected 4 committed DM replies, found {len(dm_messages)}",
+    )
+    scn.check(
+        len({m["id"] for m in dm_messages}) == 4,
+        "reconnect",
+        "duplicate DM messages after reconnect",
+    )
+    for stream_id in scn.ids["stream_ids"]:
+        scn.check(
+            any(m["id"] == stream_id for m in dm_messages),
+            "reconnect",
+            f"committed DM stream {stream_id} missing from reconnect snapshot",
+        )
     contents = [m["raw_content"] for m in after["history"]["messages"]]
     for text in FREEFORM_TURNS:
         scn.check(
