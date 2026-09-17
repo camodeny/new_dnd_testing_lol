@@ -330,6 +330,78 @@ def test_same_input_matches_by_packet_state_not_call_order():
     ]
 
 
+def _lanes_request(lanes: list[dict]) -> ProviderRequest:
+    return ProviderRequest(
+        messages=[
+            {"role": "system", "content": "fake system"},
+            {"role": "user", "content": json.dumps({"lanes": lanes})},
+        ],
+        model=FAKE_MODEL_NAME,
+        json_schema={"type": "object"},
+        json_schema_name="dm_turn_contract_v1",
+    )
+
+
+def _player_inputs_lane(texts: list[str]) -> dict:
+    return {
+        "name": "player_inputs",
+        "records": [
+            {
+                "record_id": "submission:state-1",
+                "value": {
+                    "segments": [
+                        {"position": i, "segment_type": "ic", "text": text}
+                        for i, text in enumerate(texts)
+                    ]
+                },
+            }
+        ],
+    }
+
+
+def test_missing_or_malformed_state_lane_never_matches_empty():
+    """Absence is not emptiness: a missing/malformed evidence lane raises.
+
+    The pre-roll fixture requires an actually empty evidence lane, so a
+    packet without that lane (or with malformed records) must fail at
+    the boundary instead of satisfying the pre-roll fixture.
+    """
+    provider = FakeDMProvider()
+    provider.register_step(
+        "roll-request",
+        {"mode": "request_roll", "marker": "ask-for-roll"},
+        inputs=("I shove the door.",),
+        requires_empty=("evidence_results",),
+    )
+    player_lane = _player_inputs_lane(["I shove the door."])
+    with pytest.raises(FakeProviderUsageError, match="missing from the request"):
+        provider.execute_chat(_adapter(), _lanes_request([player_lane]))
+    with pytest.raises(FakeProviderUsageError, match="malformed records"):
+        provider.execute_chat(
+            _adapter(),
+            _lanes_request(
+                [player_lane, {"name": "evidence_results", "records": None}]
+            ),
+        )
+    with pytest.raises(FakeProviderUsageError, match="duplicates lane"):
+        provider.execute_chat(
+            _adapter(),
+            _lanes_request(
+                [
+                    player_lane,
+                    {"name": "evidence_results", "records": []},
+                    {"name": "evidence_results", "records": []},
+                ]
+            ),
+        )
+    # Present with zero records still matches the pre-roll fixture.
+    response = provider.execute_chat(
+        _adapter(),
+        _lanes_request([player_lane, {"name": "evidence_results", "records": []}]),
+    )
+    assert json.loads(response.content)["marker"] == "ask-for-roll"
+
+
 def test_unmatched_fixture_is_terminal_before_failover(monkeypatch):
     """A missing fixture surfaces as the fake usage error even with failover.
 

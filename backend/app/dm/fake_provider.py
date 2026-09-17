@@ -102,7 +102,9 @@ class FakeDMFixture:
         return rendered
 
 
-def _extract_forward_dm_inputs(messages: Any) -> tuple[list[str], dict[str, int]]:
+def _extract_forward_dm_inputs(
+    messages: Any, *, require_lanes: tuple[str, ...] = ()
+) -> tuple[list[str], dict[str, int]]:
     """Strict player-input read for ``forward_dm`` provider requests.
 
     The production ``ForwardDmContextPacket`` carries every named lane
@@ -112,11 +114,19 @@ def _extract_forward_dm_inputs(messages: Any) -> tuple[list[str], dict[str, int]
     regression can never collapse into an ``opening=True`` fixture
     match.
 
+    Every parsed lane must be a named object with a ``records`` list;
+    duplicated lane names raise. Lanes named in ``require_lanes``
+    (the lane-state conditions declared by registered fixtures) must
+    additionally be present exactly once, so a missing or malformed
+    state lane can never masquerade as a valid empty one during
+    matching.
+
     Returns ``(input_texts, lane_record_counts)``: texts is [] only
     for a structurally valid lane that genuinely carries no input
     text, and counts maps each named lane to its record count so
     fixtures can match on authoritative packet state (pre-roll vs
-    post-roll resume) without call counters.
+    post-roll resume) without call counters. ``requires_empty`` means
+    present with zero records — never missing.
     """
     if not isinstance(messages, (list, tuple)) or not messages:
         raise FakeProviderUsageError("fake-provider forward_dm request has no messages")
@@ -161,10 +171,28 @@ def _extract_forward_dm_inputs(messages: Any) -> tuple[list[str], dict[str, int]
         )
     lane_counts: dict[str, int] = {}
     for lane in lanes:
-        if isinstance(lane, dict) and isinstance(lane.get("name"), str):
-            lane_records = lane.get("records")
-            lane_counts[lane["name"]] = (
-                len(lane_records) if isinstance(lane_records, list) else 0
+        if not isinstance(lane, dict) or not isinstance(lane.get("name"), str):
+            raise FakeProviderUsageError(
+                "fake-provider request has a malformed lane entry "
+                f"(excerpt: {str(lane)[:200]!r})"
+            )
+        lane_name = lane["name"]
+        if lane_name in lane_counts:
+            raise FakeProviderUsageError(
+                f"fake-provider request duplicates lane {lane_name!r}"
+            )
+        lane_records = lane.get("records")
+        if not isinstance(lane_records, list):
+            raise FakeProviderUsageError(
+                f"fake-provider lane {lane_name!r} has malformed records "
+                f"(got {type(lane_records).__name__})"
+            )
+        lane_counts[lane_name] = len(lane_records)
+    for required in require_lanes:
+        if required not in lane_counts:
+            raise FakeProviderUsageError(
+                f"fake-provider lane {required!r} is required for fixture "
+                "matching but missing from the request"
             )
     records = player_lanes[0].get("records")
     if not isinstance(records, list):
@@ -343,7 +371,19 @@ class FakeDMProvider:
         role = infer_role(request)
         messages = getattr(request, "messages", None)
         if role == "forward_dm":
-            input_texts, lane_counts = _extract_forward_dm_inputs(messages)
+            referenced_lanes = tuple(
+                dict.fromkeys(
+                    lane
+                    for fixture in self._fixtures
+                    for lane in (
+                        *fixture.lane_requires_records,
+                        *fixture.lane_requires_empty,
+                    )
+                )
+            )
+            input_texts, lane_counts = _extract_forward_dm_inputs(
+                messages, require_lanes=referenced_lanes
+            )
         else:
             input_texts, lane_counts = (
                 extract_player_input_texts(messages, role=role),
