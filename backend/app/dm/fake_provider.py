@@ -92,48 +92,31 @@ class FakeDMFixture:
         return rendered
 
 
-def extract_player_input_texts(messages: Any, *, role: str = "unknown") -> list[str]:
-    """Player-input texts from a provider request's serialized packet.
+def _extract_forward_dm_inputs(messages: Any) -> list[str]:
+    """Strict player-input read for ``forward_dm`` provider requests.
 
-    Reads the ``player_inputs`` lane (``value.segments[].text``) from the
-    last user message's canonical packet JSON. Returns [] only for a
-    recognized canonical structure that carries no input text (the valid
-    input-free opening) or, for non-``forward_dm`` roles, for messages
-    that never claim packet shape (those fail loudly later as unmatched
-    roles instead).
-
-    For ``forward_dm`` requests the provider message must be canonical
-    packet JSON: missing messages, non-text content, or non-JSON content
-    raises :exc:`FakeProviderUsageError` so an unrecognized request can
-    never be silently satisfied by an opening fixture. Likewise, a
-    message that claims packet shape (``{...`` JSON) but cannot be
-    parsed or lacks the canonical ``lanes`` list raises instead of
-    collapsing into the opening match.
+    The production ``ForwardDmContextPacket`` carries every named lane
+    exactly once in canonical order, and each ``player_inputs`` record
+    has the ``record_id`` / ``value.segments[].text`` shape. Any
+    deviation raises :exc:`FakeProviderUsageError` so a serialization
+    regression can never collapse into an ``opening=True`` fixture
+    match. [] is returned only for a structurally valid lane that
+    genuinely carries no input text.
     """
-    if role == "forward_dm":
-        if not isinstance(messages, (list, tuple)) or not messages:
-            raise FakeProviderUsageError(
-                "fake-provider forward_dm request has no messages"
-            )
-        last = messages[-1]
-        strict_content = last.get("content") if isinstance(last, dict) else None
-        if not isinstance(strict_content, str):
-            raise FakeProviderUsageError(
-                "fake-provider forward_dm message content is not text "
-                f"(got {type(strict_content).__name__})"
-            )
-        if not strict_content.strip().startswith("{"):
-            raise FakeProviderUsageError(
-                "fake-provider forward_dm request is not canonical packet JSON "
-                f"(content excerpt: {strict_content[:200]!r})"
-            )
     if not isinstance(messages, (list, tuple)) or not messages:
-        return []
-    content = messages[-1].get("content") if isinstance(messages[-1], dict) else None
+        raise FakeProviderUsageError("fake-provider forward_dm request has no messages")
+    last = messages[-1]
+    content = last.get("content") if isinstance(last, dict) else None
     if not isinstance(content, str):
-        return []
+        raise FakeProviderUsageError(
+            "fake-provider forward_dm message content is not text "
+            f"(got {type(content).__name__})"
+        )
     if not content.strip().startswith("{"):
-        return []
+        raise FakeProviderUsageError(
+            "fake-provider forward_dm request is not canonical packet JSON "
+            f"(content excerpt: {content[:200]!r})"
+        )
     try:
         packet = json.loads(content)
     except json.JSONDecodeError as exc:
@@ -151,8 +134,85 @@ def extract_player_input_texts(messages: Any, *, role: str = "unknown") -> list[
         raise FakeProviderUsageError(
             "fake-provider request is missing the canonical lanes list"
         )
+    player_lanes = [
+        lane
+        for lane in lanes
+        if isinstance(lane, dict) and lane.get("name") == "player_inputs"
+    ]
+    if len(player_lanes) != 1:
+        raise FakeProviderUsageError(
+            "fake-provider request must carry exactly one player_inputs lane "
+            f"(found {len(player_lanes)})"
+        )
+    records = player_lanes[0].get("records")
+    if not isinstance(records, list):
+        raise FakeProviderUsageError(
+            "fake-provider player_inputs lane has malformed records "
+            f"(got {type(records).__name__})"
+        )
+    texts: list[str] = []
+    for record in records:
+        if not isinstance(record, dict):
+            raise FakeProviderUsageError(
+                "fake-provider player_inputs record is not an object "
+                f"(got {type(record).__name__})"
+            )
+        record_id = record.get("record_id")
+        if not isinstance(record_id, str) or not record_id:
+            raise FakeProviderUsageError(
+                "fake-provider player_inputs record is missing record_id"
+            )
+        value = record.get("value")
+        if not isinstance(value, dict):
+            raise FakeProviderUsageError(
+                f"fake-provider player_inputs record {record_id!r} "
+                "has a malformed value"
+            )
+        segments = value.get("segments")
+        if not isinstance(segments, list):
+            raise FakeProviderUsageError(
+                f"fake-provider player_inputs record {record_id!r} "
+                "has malformed segments"
+            )
+        for segment in segments:
+            if not isinstance(segment, dict) or not isinstance(
+                segment.get("text"), str
+            ):
+                raise FakeProviderUsageError(
+                    f"fake-provider player_inputs record {record_id!r} "
+                    "has a malformed segment"
+                )
+            if segment["text"]:
+                texts.append(segment["text"])
+    return texts
+
+
+def extract_player_input_texts(messages: Any, *, role: str = "unknown") -> list[str]:
+    """Player-input texts from a provider request's serialized packet.
+
+    ``forward_dm`` requests go through the strict canonical reader:
+    [] is returned only for a structurally valid ``player_inputs``
+    lane that genuinely carries no input text (the valid input-free
+    opening); any shape deviation raises :exc:`FakeProviderUsageError`.
+
+    Other roles keep the lenient read (unparseable content yields [])
+    and fail loudly downstream as unmatched roles instead.
+    """
+    if role == "forward_dm":
+        return _extract_forward_dm_inputs(messages)
     try:
+        if not isinstance(messages, (list, tuple)) or not messages:
+            return []
+        content = (
+            messages[-1].get("content") if isinstance(messages[-1], dict) else None
+        )
+        if not isinstance(content, str) or not content.strip().startswith("{"):
+            return []
+        packet = json.loads(content)
         texts: list[str] = []
+        lanes = packet.get("lanes")
+        if not isinstance(lanes, list):
+            return []
         for lane in lanes:
             if not isinstance(lane, dict) or lane.get("name") != "player_inputs":
                 continue
@@ -166,10 +226,8 @@ def extract_player_input_texts(messages: Any, *, role: str = "unknown") -> list[
                     if text:
                         texts.append(str(text))
         return texts
-    except Exception as exc:
-        raise FakeProviderUsageError(
-            f"fake-provider could not read player inputs: {exc}"
-        ) from exc
+    except Exception:
+        return []
 
 
 def infer_role(request: Any) -> str:

@@ -32,12 +32,13 @@ def _dm_request(input_texts: list[str]) -> ProviderRequest:
             "name": "player_inputs",
             "records": [
                 {
+                    "record_id": "submission:test-inputs",
                     "value": {
                         "segments": [
-                            {"position": i, "segment_type": "ic", "text": text}
-                            for i, text in enumerate(input_texts)
+                            {"position": j, "segment_type": "ic", "text": text}
+                            for j, text in enumerate(input_texts)
                         ]
-                    }
+                    },
                 }
             ],
         }
@@ -175,6 +176,18 @@ def test_malformed_packet_raises_instead_of_matching_opening():
         )
     with pytest.raises(FakeProviderUsageError, match="lanes list"):
         provider.execute_chat(_adapter(), _request_with_content('{"no_lanes": true}'))
+    # An empty lane set is not a canonical opening: exactly one
+    # player_inputs lane is required.
+    with pytest.raises(FakeProviderUsageError, match="exactly one player_inputs lane"):
+        provider.execute_chat(_adapter(), _request_with_content('{"lanes": []}'))
+    # A malformed nested record shape also fails instead of matching opening.
+    with pytest.raises(FakeProviderUsageError, match="missing record_id"):
+        provider.execute_chat(
+            _adapter(),
+            _request_with_content(
+                '{"lanes": [{"name": "player_inputs", "records": [{}]}]}'
+            ),
+        )
     # Non-JSON forward-DM content is unrecognized: it must raise through the
     # full execute_chat path, never return the opening fixture.
     with pytest.raises(FakeProviderUsageError, match="not canonical packet JSON"):
@@ -189,8 +202,12 @@ def test_malformed_packet_raises_instead_of_matching_opening():
                 json_schema_name="dm_turn_contract_v1",
             ),
         )
-    # A recognized canonical structure with zero inputs still matches opening.
-    response = provider.execute_chat(_adapter(), _request_with_content('{"lanes": []}'))
+    # A recognized canonical lane that genuinely carries no input records
+    # still matches opening.
+    response = provider.execute_chat(
+        _adapter(),
+        _request_with_content('{"lanes": [{"name": "player_inputs", "records": []}]}'),
+    )
     assert "phase0-reply-opening" in response.content
 
 
@@ -264,7 +281,18 @@ def test_unmatched_fixture_is_terminal_before_failover(monkeypatch):
             {
                 "name": "player_inputs",
                 "records": [
-                    {"value": {"segments": [{"text": "I befriend the moon."}]}}
+                    {
+                        "record_id": "submission:unmatched",
+                        "value": {
+                            "segments": [
+                                {
+                                    "position": 0,
+                                    "segment_type": "ic",
+                                    "text": "I befriend the moon.",
+                                }
+                            ]
+                        },
+                    }
                 ],
             }
         ]
