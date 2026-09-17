@@ -15,8 +15,8 @@ orchestration path):
 - HTTP live-table snapshot/dm-turns/events projections for reconnect.
 
 Explicit non-goals owned by sibling issues (do NOT absorb them here):
-- #373 replaces the inline deterministic adjudicator below with the shared
-  fake-provider mode. The adjudicator only stands in for the external model;
+- #373 provides the deterministic fake-provider mode
+  fake-provider mode. Only external model bytes come from step-keyed fixtures;
   orchestration, state, and persistence stay production.
 - #374 owns durable failure-artifact preservation. This scenario exposes
   stable campaign/turn/attempt/stream identifiers and stage-tagged assertion
@@ -27,6 +27,12 @@ Explicit non-goals owned by sibling issues (do NOT absorb them here):
 Auth: tests reuse the established per-router ``resolve_profile`` override
 pattern against synthetic profiles. Production Supabase JWT is untouched —
 no mock auth module is introduced.
+
+Model boundary: the scenario runs on #373's deterministic fake-provider
+mode (``app.dm.fake_provider``) installed at the provider boundary. The
+production ``adjudicate_with_failover`` path, contract parsing, validation,
+narration, stream persistence, and commit all run unmodified; only the
+external model bytes come from fixtures keyed by logical step/input.
 """
 
 from __future__ import annotations
@@ -46,7 +52,8 @@ if not hasattr(SQLiteTypeCompiler, "_patched_jsonb"):
     SQLiteTypeCompiler._patched_jsonb = True  # type: ignore
 
 from app.auth.service import TEST_USER_ID  # noqa: E402
-from app.dm.contract import CONTRACT_VERSION, normalize_contract  # noqa: E402
+from app.dm.fake_provider import build_phase0_provider  # noqa: E402
+from app.campaigns.solo_bootstrap import OPENING_OOC_TEXT  # noqa: E402
 from app.dm.execution import run_dm_execute_sweep  # noqa: E402
 from app.dm.turns import list_turns  # noqa: E402
 from app.dm_streams.service import reconstruct_text  # noqa: E402
@@ -80,48 +87,25 @@ SNAPSHOT_COMPARE_KEYS = (
 )
 
 
-# ── deterministic provider stand-in (replaced by #373's fake-provider mode) ──
+# ── deterministic fake-provider mode (#373) ──
 
 
-def make_phase0_adjudicate(state: dict):
-    """Stand in ONLY for the external model call.
+@pytest.fixture
+def phase0_provider(monkeypatch):
+    """#373 fake installed at the provider boundary for one test.
 
-    Returns a valid production ``respond`` contract with a unique per-call
-    marker so each committed reply is attributable. Context assembly,
-    validation, narration, stream persistence, and commit all run the
-    production path inside ``execute_dm_attempt``.
+    Fixtures are keyed by logical step/input with fixed per-step markers
+    (not call order), so repeated runs from clean state are identical.
+    The sweep below runs with ``adjudicate=None`` — the production
+    ``adjudicate_with_failover`` path consumes these fixtures.
     """
-
-    def _adjudicate(packet, feedback=None):
-        state["calls"] += 1
-        n = state["calls"]
-        return normalize_contract(
-            {
-                "contract_version": CONTRACT_VERSION,
-                "mode": "respond",
-                "reason": f"phase0 deterministic reply {n}",
-                "beats": [
-                    {
-                        "id": "beat_1",
-                        "type": "narration",
-                        "claims": [
-                            {
-                                "text": (
-                                    f"Phase0 deterministic DM reply {n}: embers shift in "
-                                    f"the tavern hearth. (phase0-reply-{n})"
-                                ),
-                                "claim_kind": "observation",
-                                "origin": "dm_adjudication",
-                                "visibility": "public",
-                            }
-                        ],
-                    }
-                ],
-                "open_player_choice": "What do you do?",
-            }
-        )
-
-    return _adjudicate
+    provider = build_phase0_provider(
+        freeform_turns=tuple(FREEFORM_TURNS),
+        post_reconnect_turn=POST_RECONNECT_TURN,
+        opening_inputs=(OPENING_OOC_TEXT,),
+    )
+    provider.install(monkeypatch)
+    return provider
 
 
 # ── scenario harness ──────────────────────────────────────────────────────────
@@ -304,8 +288,14 @@ def submit_player_turn(scn: Scenario, text: str, key: str, client=None) -> dict:
     return body
 
 
-def drain_dm_execution(scn: Scenario, adjudicate, stage: str) -> dict:
-    """Run the production execute sweep (cron path) in worker-like sessions."""
+def drain_dm_execution(scn: Scenario, stage: str, adjudicate=None) -> dict:
+    """Run the production execute sweep (cron path) in worker-like sessions.
+
+    ``adjudicate=None`` runs the full production adjudication path
+    (``adjudicate_with_failover`` through the installed #373 fake
+    provider); an explicit callable overrides only the model seam (used
+    by the injected-failure proof).
+    """
     assert scn.campaign_id is not None
     cid = uuid.UUID(scn.campaign_id)
     outcome: dict = {"executed": [], "failed": [], "skipped": []}
@@ -482,10 +472,7 @@ def assert_same_authoritative_projection(
 # ── main scenario ─────────────────────────────────────────────────────────────
 
 
-def test_phase0_solo_dogfood_through_reconnect_and_continued_play(scn):
-    state = {"calls": 0}
-    adjudicate = make_phase0_adjudicate(state)
-
+def test_phase0_solo_dogfood_through_reconnect_and_continued_play(scn, phase0_provider):
     # Setup: synthetic fixtures + authoritative select/ready.
     char_id = make_synthetic_character(scn)
     setup_solo_campaign(scn, char_id)
@@ -497,7 +484,7 @@ def test_phase0_solo_dogfood_through_reconnect_and_continued_play(scn):
 
     # Opening DM turn completes through the production execution path.
     scn.note("opening")
-    outcome = drain_dm_execution(scn, adjudicate, "opening")
+    outcome = drain_dm_execution(scn, "opening")
     scn.check(not outcome.get("failed"), "opening", f"sweep failed: {outcome}")
     opening_text = await_committed_reply(scn, "opening", opening_turn_id)
     assert opening_text
@@ -510,7 +497,7 @@ def test_phase0_solo_dogfood_through_reconnect_and_continued_play(scn):
         scn.note(stage)
         submitted = submit_player_turn(scn, text, f"phase0-turn-{index + 1}")
         turn_id = submitted["dm_turn"]["id"]
-        outcome = drain_dm_execution(scn, adjudicate, stage)
+        outcome = drain_dm_execution(scn, stage)
         scn.check(not outcome.get("failed"), stage, f"sweep failed: {outcome}")
         stream_texts.append(await_committed_reply(scn, stage, turn_id))
         assert_ordering_invariants(scn, stage)
@@ -586,7 +573,7 @@ def test_phase0_solo_dogfood_through_reconnect_and_continued_play(scn):
     submitted = submit_player_turn(
         scn, POST_RECONNECT_TURN, "phase0-turn-post", client=reconnected_client
     )
-    outcome = drain_dm_execution(scn, adjudicate, "post-reconnect")
+    outcome = drain_dm_execution(scn, "post-reconnect")
     scn.check(not outcome.get("failed"), "post-reconnect", f"sweep failed: {outcome}")
     await_committed_reply(scn, "post-reconnect", submitted["dm_turn"]["id"])
     assert_ordering_invariants(scn, "post-reconnect", client=reconnected_client)
@@ -612,6 +599,18 @@ def test_phase0_solo_dogfood_through_reconnect_and_continued_play(scn):
     scn.check(len(diag["turn_ids"]) == 5, "diagnostics", "turn ids incomplete")
     scn.check(len(diag["attempt_ids"]) == 5, "diagnostics", "attempt ids incomplete")
     scn.check(len(diag["stream_ids"]) == 5, "diagnostics", "stream ids incomplete")
+    # #373 observability: every AI role call was satisfied by a named fixture.
+    satisfied = {call["fixture_step"] for call in phase0_provider.calls}
+    scn.check(
+        satisfied == {"opening", "play-1", "play-2", "play-3", "post-reconnect"},
+        "diagnostics",
+        f"fake-provider call attribution incomplete: {sorted(satisfied)}",
+    )
+    scn.check(
+        all(call["role"] == "forward_dm" for call in phase0_provider.calls),
+        "diagnostics",
+        "unexpected AI role served by the fake provider",
+    )
     logger.info("phase0-372 diagnostics=%s", diag)
 
 
@@ -620,17 +619,16 @@ def test_phase0_solo_dogfood_through_reconnect_and_continued_play(scn):
 
 def _run_to_opening_reply(scn: Scenario):
     """Shared prefix for break proofs: setup -> start -> committed opening."""
-    state = {"calls": 0}
     char_id = make_synthetic_character(scn)
     setup_solo_campaign(scn, char_id)
     opening = start_production_play(scn, operation_key="phase0-break-start")
-    outcome = drain_dm_execution(scn, make_phase0_adjudicate(state), "opening")
+    outcome = drain_dm_execution(scn, "opening")
     assert not outcome.get("failed"), outcome
     await_committed_reply(scn, "opening", opening["dm_turn"]["id"])
     return opening
 
 
-def test_break_failing_execution_surfaces_at_dm_reply_assertion(scn):
+def test_break_failing_execution_surfaces_at_dm_reply_assertion(scn, phase0_provider):
     opening = _run_to_opening_reply(scn)
     scn.note("play")
 
@@ -638,7 +636,7 @@ def test_break_failing_execution_surfaces_at_dm_reply_assertion(scn):
         raise RuntimeError("injected provider failure")
 
     submitted = submit_player_turn(scn, "I press on.", "phase0-break-exec")
-    outcome = drain_dm_execution(scn, _boom, "play")
+    outcome = drain_dm_execution(scn, "play", adjudicate=_boom)
     scn.check(
         bool(outcome.get("failed")), "play", "sabotaged sweep unexpectedly succeeded"
     )
@@ -651,7 +649,7 @@ def test_break_failing_execution_surfaces_at_dm_reply_assertion(scn):
     assert opening["dm_turn"]["id"] != submitted["dm_turn"]["id"]
 
 
-def test_break_missing_stream_chunks_fail_durability_assertion(scn):
+def test_break_missing_stream_chunks_fail_durability_assertion(scn, phase0_provider):
     opening = _run_to_opening_reply(scn)
     with scn.factory() as db:
         turn = db.get(DmTurn, uuid.UUID(opening["dm_turn"]["id"]))
@@ -666,7 +664,7 @@ def test_break_missing_stream_chunks_fail_durability_assertion(scn):
         await_committed_reply(scn, "opening", opening["dm_turn"]["id"])
 
 
-def test_break_duplicate_turn_for_one_submission_is_detected(scn):
+def test_break_duplicate_turn_for_one_submission_is_detected(scn, phase0_provider):
     opening = _run_to_opening_reply(scn)
     with scn.factory() as db:
         original = db.get(DmTurn, uuid.UUID(opening["dm_turn"]["id"]))
@@ -688,7 +686,7 @@ def test_break_duplicate_turn_for_one_submission_is_detected(scn):
         assert_single_result_per_submission(scn, "integrity", 2)
 
 
-def test_break_extra_commit_breaks_reconnect_equality(scn):
+def test_break_extra_commit_breaks_reconnect_equality(scn, phase0_provider):
     _run_to_opening_reply(scn)
     scn.note("reconnect")
     before = read_snapshot(scn, "reconnect")
@@ -698,7 +696,7 @@ def test_break_extra_commit_breaks_reconnect_equality(scn):
         assert_same_authoritative_projection(scn, "reconnect", before, after)
 
 
-def test_break_event_gap_breaks_ordering_invariant(scn):
+def test_break_event_gap_breaks_ordering_invariant(scn, phase0_provider):
     _run_to_opening_reply(scn)
     from models.campaigns import CampaignDomainEvent
 
@@ -720,3 +718,35 @@ def test_break_event_gap_breaks_ordering_invariant(scn):
     # Tampering that breaks revision==sequence contiguity must fail here.
     with pytest.raises(AssertionError, match=r"\[372:integrity\]"):
         assert_ordering_invariants(scn, "integrity")
+
+
+def test_break_missing_fixture_fails_at_provider_boundary(scn, phase0_provider):
+    """#373: a removed/mismatched fixture fails loudly at the provider boundary.
+
+    With the ``play-1`` fixture removed, the production sweep must fail
+    with an actionable error naming the logical request — never a silent
+    generic reply or downstream validation noise.
+    """
+    _run_to_opening_reply(scn)
+    scn.note("play")
+    phase0_provider._fixtures = [
+        fixture for fixture in phase0_provider._fixtures if fixture.step != "play-1"
+    ]
+    submitted = submit_player_turn(scn, FREEFORM_TURNS[0], "phase0-turn-1")
+    outcome = drain_dm_execution(scn, "play")
+    scn.check(
+        bool(outcome.get("failed")),
+        "play",
+        "sweep unexpectedly succeeded without a fixture",
+    )
+    error = outcome["failed"][0]["error"]
+    scn.check(
+        "fake-provider has no fixture" in error and "forward_dm" in error,
+        "play",
+        f"provider-boundary error is not actionable: {error!r}",
+    )
+    # The unmatched turn stays uncommitted, never silently narrated.
+    with scn.factory() as db:
+        turn = db.get(DmTurn, uuid.UUID(submitted["dm_turn"]["id"]))
+        assert turn is not None and turn.status != "succeeded"
+    assert not phase0_provider.calls_for_step("play-1")
