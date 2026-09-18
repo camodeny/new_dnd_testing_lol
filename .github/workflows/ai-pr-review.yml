@@ -11,10 +11,11 @@ on:
 permissions:
   contents: read
 
-# There is one persistent browser profile on the Pi, so reviews must be
-# serialized across pull requests.
+# Each self-hosted runner on the Pi owns a persistent ChatGPT browser
+# profile (see the profile step below), so different pull requests can be
+# reviewed in parallel. Pushes to the same PR stay serialized.
 concurrency:
-  group: dnd-ai-chatgpt-browser
+  group: dnd-ai-review-pr-${{ github.event.pull_request.number || github.ref }}
   cancel-in-progress: false
 
 jobs:
@@ -40,6 +41,17 @@ jobs:
       - name: Test reviewer helpers
         working-directory: reviewer-source/.github/ai-review
         run: npm test
+
+      - name: Select this runner's ChatGPT profile
+        # Chromium locks a user-data-dir, so concurrent reviews must each
+        # use their own persistent profile. raspone-ci-2 uses profile-2;
+        # every other runner keeps the original profile.
+        run: |
+          if [ "${{ runner.name }}" = "raspone-ci-2" ]; then
+            echo "CHATGPT_PROFILE_DIR=/home/cpendergrass/.aireview-chatgpt-profile-2" >> "$GITHUB_ENV"
+          else
+            echo "CHATGPT_PROFILE_DIR=/home/cpendergrass/.aireview-chatgpt-profile" >> "$GITHUB_ENV"
+          fi
 
       - name: Ask DND AI to review and submit the PR review
         env:
