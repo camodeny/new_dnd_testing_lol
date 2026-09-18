@@ -1531,7 +1531,15 @@ def send_campaign_invite_email(
         cid = parse_campaign_id(campaign_id)
     except ValueError:
         raise HTTPException(status_code=404, detail="Invalid campaign id")
-    camp = db.get(Campaign, cid)
+    # Serialize with lifecycle transitions and revocation (#242 review): the
+    # campaign row is the same lock create/revoke/accept take, and the
+    # transaction is retained through the send/outcome commit below, so a
+    # concurrent start or revoke cannot slip between the lobby/usability
+    # checks and the send. Provider calls are bounded (~10s timeouts), so
+    # the lock hold is short; SQLite ignores FOR UPDATE in tests.
+    camp = db.execute(
+        select(Campaign).where(Campaign.id == cid).with_for_update()
+    ).scalars().first()
     if not camp:
         raise HTTPException(status_code=404, detail="Campaign not found")
     if camp.owner_id != profile.id:
