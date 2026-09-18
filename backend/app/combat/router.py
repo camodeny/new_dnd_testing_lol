@@ -12,6 +12,7 @@ from app.combat.service import (
     EncounterAuthorizationError,
     EncounterError,
     EncounterNotReadyError,
+    can_view_encounter,
     encounter_view,
     fulfill_human_initiative,
     get_active_encounter,
@@ -47,6 +48,17 @@ def _encounter_or_404(db: Session, campaign_id: uuid.UUID, encounter_id: uuid.UU
 
 def _viewer_view(db: Session, encounter: Encounter, viewer_id: uuid.UUID, is_owner: bool) -> dict:
     return encounter_view(db, encounter, viewer_id, is_owner=is_owner)
+
+
+def _assert_encounter_visible(db: Session, encounter: Encounter, viewer_id: uuid.UUID) -> None:
+    """Thread-scoped encounter read gate (#230 privacy).
+
+    Encounters inherit the source turn's thread; private-thread encounters
+    stay invisible to non-readers. Fail closed as 404, matching the other
+    thread-scoped reads.
+    """
+    if not can_view_encounter(db, encounter, viewer_id):
+        raise HTTPException(status_code=404, detail="Encounter not found")
 
 
 def _publish_post_commit(db: Session, result: dict) -> None:
@@ -133,7 +145,7 @@ def read_active_encounter(campaign_id: str, request: Request, db: Session = Depe
     profile = resolve_profile(request, db)
     campaign = authorized_campaign(db, campaign_id, profile.id)
     encounter = get_active_encounter(db, campaign.id)
-    if encounter is None:
+    if encounter is None or not can_view_encounter(db, encounter, profile.id):
         return {"encounter": None}
     return {"encounter": _viewer_view(db, encounter, profile.id, is_owner=campaign.owner_id == profile.id)}
 
@@ -143,6 +155,7 @@ def read_encounter(campaign_id: str, encounter_id: str, request: Request, db: Se
     profile = resolve_profile(request, db)
     campaign = authorized_campaign(db, campaign_id, profile.id)
     encounter = _encounter_or_404(db, campaign.id, _id(encounter_id, "encounter id"))
+    _assert_encounter_visible(db, encounter, profile.id)
     return {"encounter": _viewer_view(db, encounter, profile.id, is_owner=campaign.owner_id == profile.id)}
 
 
@@ -151,6 +164,7 @@ def read_turn_order(campaign_id: str, encounter_id: str, request: Request, db: S
     profile = resolve_profile(request, db)
     campaign = authorized_campaign(db, campaign_id, profile.id)
     encounter = _encounter_or_404(db, campaign.id, _id(encounter_id, "encounter id"))
+    _assert_encounter_visible(db, encounter, profile.id)
     is_owner = campaign.owner_id == profile.id
     try:
         ordered = get_turn_order(db, encounter.id)
@@ -173,6 +187,7 @@ def fulfill_initiative(campaign_id: str, encounter_id: str, payload: dict, reque
     profile = resolve_profile(request, db)
     campaign = authorized_campaign(db, campaign_id, profile.id)
     encounter = _encounter_or_404(db, campaign.id, _id(encounter_id, "encounter id"))
+    _assert_encounter_visible(db, encounter, profile.id)
     participant_raw = payload.get("participant_id")
     if not participant_raw:
         raise HTTPException(status_code=422, detail="participant_id is required")
@@ -225,6 +240,7 @@ def roll_npc(campaign_id: str, encounter_id: str, payload: dict, request: Reques
     campaign = authorized_campaign(db, campaign_id, profile.id)
     require_owner(campaign, profile.id)
     encounter = _encounter_or_404(db, campaign.id, _id(encounter_id, "encounter id"))
+    _assert_encounter_visible(db, encounter, profile.id)
     participant_raw = payload.get("participant_id")
     if not participant_raw:
         raise HTTPException(status_code=422, detail="participant_id is required")

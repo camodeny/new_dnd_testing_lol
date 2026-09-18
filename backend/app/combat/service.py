@@ -477,6 +477,26 @@ def encounter_view(db: Session, encounter: Encounter, viewer_id: uuid.UUID, *, i
     return payload
 
 
+def can_view_encounter(db: Session, encounter: Encounter, viewer_id: uuid.UUID) -> bool:
+    """Thread-scoped encounter visibility — issue #230 privacy.
+
+    The encounter inherits its source turn's thread; a private-thread
+    encounter is visible only to readers of that thread (the repository's
+    central thread invariant: owner status alone never grants private
+    access). Unparseable/missing threads fail closed.
+    """
+    from app.runtime.threads import can_read_thread, parse_thread_id
+
+    try:
+        thread_id = parse_thread_id(encounter.thread_id)
+    except Exception:
+        return False
+    try:
+        return bool(can_read_thread(db, encounter.campaign_id, thread_id, viewer_id))
+    except Exception:
+        return False
+
+
 def get_snapshot_encounter(db: Session, campaign_id: uuid.UUID, viewer_id: uuid.UUID) -> dict | None:
     """Reconnect-safe encounter projection for the live-table snapshot."""
     campaign = db.get(Campaign, campaign_id)
@@ -486,6 +506,8 @@ def get_snapshot_encounter(db: Session, campaign_id: uuid.UUID, viewer_id: uuid.
         return None
     encounter = get_active_encounter(db, campaign_id)
     if encounter is None:
+        return None
+    if not can_view_encounter(db, encounter, viewer_id):
         return None
     is_owner = str(campaign.owner_id) == str(viewer_id)
     view = encounter_view(db, encounter, viewer_id, is_owner=is_owner)
@@ -512,6 +534,28 @@ def _build_encounter_rows(
     start_source: str,
 ) -> Encounter:
     resolved = _validate_selection(db, campaign.id, participants)
+    # Thread-scoped audience (#230 privacy): a human controller who cannot
+    # read the encounter's source thread would receive an initiative request
+    # they can never see, leaving combat permanently pending. Reject up
+    # front instead of persisting an unfulfillable combatant.
+    from app.runtime.threads import can_read_thread, parse_thread_id
+
+    try:
+        encounter_thread_id = parse_thread_id(turn.thread_id)
+    except Exception as exc:
+        raise EncounterError("source turn has an invalid thread and cannot start combat") from exc
+    for item in resolved:
+        controller = item.get("controller_user_id")
+        if item["kind"] != "pc" or controller is None:
+            continue
+        try:
+            readable = can_read_thread(db, campaign.id, encounter_thread_id, controller)
+        except Exception:
+            readable = False
+        if not readable:
+            raise EncounterError(
+                "selected character's controller cannot read the encounter thread"
+            )
     scene_parts = _validate_scene(db, campaign.id, scene)
     encounter = Encounter(
         id=uuid.uuid4(),

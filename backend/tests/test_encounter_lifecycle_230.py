@@ -23,6 +23,7 @@ from app.combat.service import (  # noqa: E402
     EncounterAuthorizationError,
     EncounterError,
     EncounterNotReadyError,
+    can_view_encounter,
     compute_turn_order,
     encounter_view,
     fulfill_human_initiative,
@@ -980,4 +981,124 @@ def test_http_generic_fulfill_emits_ready_event(monkeypatch):
         assert ready[0]["payload"]["dedupe_key"] == f"{encounter_id}:ready"
     finally:
         set_realtime_publisher(previous)
+        app.dependency_overrides.clear()
+
+
+# ── private-thread audience ───────────────────────────────────────────────
+
+
+def _private_thread_fixture():
+    """Owner-only private thread with its own turn/attempt in this campaign."""
+    from app.runtime.threads import create_private_thread
+
+    fac, ctx = _fixture()
+    with fac() as db:
+        thread = create_private_thread(
+            db, campaign_id=ctx["campaign_id"], created_by=ctx["owner"],
+            member_ids=[ctx["owner"]], title="Side Room",
+        )
+        db.commit()
+        accept_submission(
+            db, campaign_id=ctx["campaign_id"], user_id=ctx["owner"],
+            character_id=ctx["owner_pc"],
+            raw_content="Something moves in the dark!",
+            segments=[{"type": "ic", "text": "Something moves in the dark!"}],
+            thread_id=str(thread.id),
+        )
+        db.commit()
+        turn, attempt = coordinate_turn(db, ctx["campaign_id"], str(thread.id))
+        db.commit()
+        ctx = dict(ctx, private_thread_id=thread.id, private_turn_id=turn.id,
+                   private_attempt_id=attempt.id)
+    return fac, ctx
+
+
+def test_private_thread_encounter_hidden_from_non_members():
+    fac, ctx = _private_thread_fixture()
+    with fac() as db:
+        encounter, _ = start_encounter(
+            db, ctx["campaign_id"], operation_id="op-private-1", expected_revision=0,
+            actor_id=ctx["owner"], source_turn_id=ctx["private_turn_id"],
+            source_attempt_id=ctx["private_attempt_id"],
+            scene={"location_name": "Side Room"},
+            participants=[{"character_id": str(ctx["owner_pc"])}],
+        )
+        assert encounter.thread_id == str(ctx["private_thread_id"])
+        # Thread member sees it; campaign member outside the thread does not.
+        assert can_view_encounter(db, encounter, ctx["owner"]) is True
+        assert can_view_encounter(db, encounter, ctx["player"]) is False
+        assert get_snapshot_encounter(db, ctx["campaign_id"], ctx["player"]) is None
+        visible = get_snapshot_encounter(db, ctx["campaign_id"], ctx["owner"])
+        assert visible is not None and visible["id"] == str(encounter.id)
+
+
+def test_private_thread_rejects_unreadable_controller():
+    fac, ctx = _private_thread_fixture()
+    with fac() as db:
+        # The player controls player_pc but cannot read the private thread:
+        # selecting them must fail fast, not strand an invisible request.
+        with pytest.raises(EncounterError, match="cannot read the encounter thread"):
+            start_encounter(
+                db, ctx["campaign_id"], operation_id="op-private-2", expected_revision=0,
+                actor_id=ctx["owner"], source_turn_id=ctx["private_turn_id"],
+                source_attempt_id=ctx["private_attempt_id"],
+                scene={"location_name": "Side Room"},
+                participants=[{"character_id": str(ctx["player_pc"])}],
+            )
+        db.rollback()
+
+
+def test_http_private_thread_encounter_reads_hidden(monkeypatch):
+    from fastapi.testclient import TestClient
+
+    from database import get_db
+    from main import app
+    from models.profiles import Profile as ProfileModel
+
+    fac, ctx = _private_thread_fixture()
+    with fac() as db:
+        encounter, _ = start_encounter(
+            db, ctx["campaign_id"], operation_id="op-private-http", expected_revision=0,
+            actor_id=ctx["owner"], source_turn_id=ctx["private_turn_id"],
+            source_attempt_id=ctx["private_attempt_id"],
+            scene={"location_name": "Side Room"},
+            participants=[{"character_id": str(ctx["owner_pc"])}],
+        )
+        db.commit()
+        encounter_id = str(encounter.id)
+        campaign_id = str(ctx["campaign_id"])
+        owner_id, player_id = str(ctx["owner"]), str(ctx["player"])
+
+    def override_db():
+        with fac() as db:
+            yield db
+
+    def resolve_test_profile(request, db):
+        return db.get(ProfileModel, uuid.UUID(request.headers["x-test-user"]))
+
+    monkeypatch.setattr("app.combat.router.resolve_profile", resolve_test_profile)
+    app.dependency_overrides[get_db] = override_db
+    try:
+        client = TestClient(app)
+        member_headers = {"x-test-user": owner_id}
+        outsider_headers = {"x-test-user": player_id}
+        active_member = client.get(
+            f"/api/campaigns/{campaign_id}/encounters/active", headers=member_headers)
+        assert active_member.status_code == 200
+        assert active_member.json()["encounter"]["id"] == encounter_id
+        active_outsider = client.get(
+            f"/api/campaigns/{campaign_id}/encounters/active", headers=outsider_headers)
+        assert active_outsider.status_code == 200
+        assert active_outsider.json()["encounter"] is None
+        one_member = client.get(
+            f"/api/campaigns/{campaign_id}/encounters/{encounter_id}", headers=member_headers)
+        assert one_member.status_code == 200
+        one_outsider = client.get(
+            f"/api/campaigns/{campaign_id}/encounters/{encounter_id}", headers=outsider_headers)
+        assert one_outsider.status_code == 404
+        order_outsider = client.get(
+            f"/api/campaigns/{campaign_id}/encounters/{encounter_id}/turn-order",
+            headers=outsider_headers)
+        assert order_outsider.status_code == 404
+    finally:
         app.dependency_overrides.clear()
