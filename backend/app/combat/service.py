@@ -797,6 +797,20 @@ def start_encounter(
 
     require_playable_campaign(campaign)
     turn, attempt = _load_source_turn(db, campaign_id, source_turn_id, source_attempt_id)
+    if start_source == "api" and actor_id is not None:
+        # Thread-scoped writes (#230): the actor must read the source
+        # turn's thread, mirroring the encounter read boundary. Hidden as
+        # not-found so private-thread existence never leaks.
+        from app.runtime.threads import ThreadNotFoundError, can_read_thread, parse_thread_id
+
+        try:
+            thread_ok = can_read_thread(
+                db, campaign_id, parse_thread_id(turn.thread_id), actor_id
+            )
+        except Exception:
+            thread_ok = False
+        if not thread_ok:
+            raise ThreadNotFoundError("Source turn not found")
 
     prior = find_by_operation(db, campaign_id, operation_id)
     if prior is not None:
@@ -852,14 +866,25 @@ def start_encounter(
             outbox_operation_id=operation_id,
         )
     except IntegrityError as exc:
+        # The shared mutation helper rolls back on every error path, and the
+        # unguarded outbox flush rolls back here: the session is unusable
+        # until rolled back, so this rollback is required rather than
+        # optional. It never commits partial state — below either returns a
+        # genuinely committed same-operation replay or raises.
         db.rollback()
-        winner = find_by_operation(db, campaign_id, operation_id) or get_active_encounter(db, campaign_id)
-        if winner is not None:
+        replay = find_by_operation(db, campaign_id, operation_id)
+        if replay is not None:
             logger.info(
                 "encounter concurrent_start_rejected campaign_id=%s op=%s winner=%s",
-                campaign_id, operation_id, winner.id,
+                campaign_id, operation_id, replay.id,
             )
-            return winner, find_created_event(db, winner)
+            return replay, find_created_event(db, replay)
+        # Same-operation replay is impossible, but a *different* encounter
+        # may have won the race: report it as a conflict, never as a replay
+        # of this operation.
+        active = get_active_encounter(db, campaign_id)
+        if active is not None:
+            raise EncounterAlreadyActiveError(campaign_id, active.id) from exc
         raise EncounterError(f"encounter start conflict: {exc}") from exc
 
     encounter = holder["encounter"]

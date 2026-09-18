@@ -24,6 +24,7 @@ from app.combat.service import (
 )
 from app.deps.auth import resolve_profile
 from app.deps.idempotency import execute_http_idempotent, require_idempotency_key
+from app.runtime.threads import ThreadNotFoundError
 from database import get_db
 from models.combat import Encounter
 
@@ -128,6 +129,8 @@ def create_encounter(campaign_id: str, payload: dict, request: Request, response
             raise HTTPException(status_code=409, detail=str(exc)) from exc
         except CampaignArchivedError as exc:
             raise HTTPException(status_code=409, detail=str(exc)) from exc
+        except ThreadNotFoundError as exc:
+            raise HTTPException(status_code=404, detail="Source turn not found") from exc
         except EncounterError as exc:
             raise HTTPException(status_code=422, detail=str(exc)) from exc
 

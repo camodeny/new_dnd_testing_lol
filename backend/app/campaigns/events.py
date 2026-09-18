@@ -395,27 +395,41 @@ def list_campaign_events(
                 CampaignDomainEvent.actor_id == viewer_id,
             )
         )
-    rows = list(
-        db.execute(
-            query
-            .order_by(CampaignDomainEvent.sequence.asc())
-            .limit(limit)
-            .offset(offset)
-        )
-        .scalars()
-        .all()
-    )
+    ordered = query.order_by(CampaignDomainEvent.sequence.asc())
     if viewer_id is None:
-        return rows
-    # Thread-scoped encounter events inherit the source turn's thread; the
-    # generic public/actor rule would leak private-thread combat metadata.
+        return list(
+            db.execute(ordered.limit(limit).offset(offset)).scalars().all()
+        )
+    # Issue #230: thread-scoped encounter lifecycle events inherit the source
+    # turn's thread; the generic public/actor rule would leak private-thread
+    # combat metadata. Filter in Python (thread readability is not SQL), and
+    # fill the member's page from following rows so hidden events never
+    # consume visible pagination. Bounded: pathological all-hidden feeds stop
+    # after a fixed number of batches.
     from app.combat.service import THREAD_SCOPED_EVENT_TYPES, encounter_event_visible_to
 
-    return [
-        ev for ev in rows
-        if ev.event_type not in THREAD_SCOPED_EVENT_TYPES
-        or encounter_event_visible_to(db, ev, viewer_id)
-    ]
+    want = max(0, int(limit or 0))
+    visible: list[CampaignDomainEvent] = []
+    cursor = max(0, int(offset or 0))
+    for _ in range(10):
+        if len(visible) >= want:
+            break
+        batch = list(
+            db.execute(ordered.limit(max(want, 1)).offset(cursor)).scalars().all()
+        )
+        if not batch:
+            break
+        cursor += len(batch)
+        for ev in batch:
+            if ev.event_type not in THREAD_SCOPED_EVENT_TYPES or encounter_event_visible_to(
+                db, ev, viewer_id
+            ):
+                visible.append(ev)
+                if len(visible) >= want:
+                    break
+        if len(batch) < max(want, 1):
+            break
+    return visible[:want]
 
 
 def latest_domain_event(

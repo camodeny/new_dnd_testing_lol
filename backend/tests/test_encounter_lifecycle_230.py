@@ -1354,3 +1354,252 @@ def test_encounter_sweep_retries_failed_execution_after_relay():
             assert started[0]["payload"]["event_id"] == f"encounter:{encounter.id}:started"
     finally:
         set_realtime_publisher(previous)
+
+
+# ── round 12: write gating, private promotion, page fill, conflict ────────
+
+
+def test_api_start_from_unreadable_thread_is_hidden():
+    """Direct start from a thread the actor cannot read fails as not-found."""
+    from app.runtime.threads import ThreadNotFoundError, create_private_thread
+
+    fac, ctx = _fixture()
+    with fac() as db:
+        thread = create_private_thread(
+            db, campaign_id=ctx["campaign_id"], created_by=ctx["player"],
+            member_ids=[ctx["player"]], title="Whispers",
+        )
+        db.commit()
+        accept_submission(
+            db, campaign_id=ctx["campaign_id"], user_id=ctx["player"],
+            character_id=ctx["player_pc"],
+            raw_content="Something moves in the dark!",
+            segments=[{"type": "ic", "text": "Something moves in the dark!"}],
+            thread_id=str(thread.id),
+        )
+        db.commit()
+        turn, attempt = coordinate_turn(db, ctx["campaign_id"], str(thread.id))
+        db.commit()
+        # The owner passes ownership but cannot read this private thread.
+        with pytest.raises(ThreadNotFoundError):
+            start_encounter(
+                db, ctx["campaign_id"], operation_id="op-nope", expected_revision=0,
+                actor_id=ctx["owner"], source_turn_id=turn.id,
+                source_attempt_id=attempt.id,
+                participants=[{"character_id": str(ctx["owner_pc"])}],
+            )
+        db.rollback()
+        assert get_active_encounter(db, ctx["campaign_id"]) is None
+
+
+def test_http_start_from_unreadable_thread_returns_404(monkeypatch):
+    from fastapi.testclient import TestClient
+
+    from database import get_db
+    from main import app
+    from models.profiles import Profile as ProfileModel
+    from app.runtime.threads import create_private_thread
+
+    fac, ctx = _fixture()
+    with fac() as db:
+        thread = create_private_thread(
+            db, campaign_id=ctx["campaign_id"], created_by=ctx["player"],
+            member_ids=[ctx["player"]], title="Whispers",
+        )
+        db.commit()
+        accept_submission(
+            db, campaign_id=ctx["campaign_id"], user_id=ctx["player"],
+            character_id=ctx["player_pc"],
+            raw_content="Something moves in the dark!",
+            segments=[{"type": "ic", "text": "Something moves in the dark!"}],
+            thread_id=str(thread.id),
+        )
+        db.commit()
+        turn, attempt = coordinate_turn(db, ctx["campaign_id"], str(thread.id))
+        db.commit()
+        campaign_id = str(ctx["campaign_id"])
+        owner_id = str(ctx["owner"])
+
+    def override_db():
+        with fac() as db:
+            yield db
+
+    def resolve_test_profile(request, db):
+        return db.get(ProfileModel, uuid.UUID(request.headers["x-test-user"]))
+
+    monkeypatch.setattr("app.combat.router.resolve_profile", resolve_test_profile)
+    app.dependency_overrides[get_db] = override_db
+    try:
+        client = TestClient(app)
+        resp = client.post(
+            f"/api/campaigns/{campaign_id}/encounters",
+            json={
+                "expected_revision": 0,
+                "source_turn_id": str(turn.id),
+                "source_attempt_id": str(attempt.id),
+                "participants": [{"character_id": str(ctx["owner_pc"])}],
+            },
+            headers={"x-test-user": owner_id, "Idempotency-Key": "http-hidden-start"},
+        )
+        assert resp.status_code == 404, resp.text
+    finally:
+        app.dependency_overrides.clear()
+
+
+def test_private_attempt_promotes_start_encounter():
+    """A staged start_encounter commits from a private DM attempt; the
+    encounter stays thread-scoped for non-members."""
+    from datetime import datetime, timezone
+
+    from app.dm.contract import normalize_contract
+    from app.dm.turns import commit_turn_with_effects, mark_streaming_started, stage_validated_attempt
+    from models.dm import DmTurn, DmTurnAttempt, DMStream, DMStreamChunk
+    from app.runtime.threads import create_private_thread
+
+    fac, ctx = _fixture()
+    with fac() as db:
+        thread = create_private_thread(
+            db, campaign_id=ctx["campaign_id"], created_by=ctx["owner"],
+            member_ids=[ctx["owner"]], title="Side Room",
+        )
+        db.commit()
+        accept_submission(
+            db, campaign_id=ctx["campaign_id"], user_id=ctx["owner"],
+            character_id=ctx["owner_pc"],
+            raw_content="Something moves in the dark!",
+            segments=[{"type": "ic", "text": "Something moves in the dark!"}],
+            thread_id=str(thread.id),
+        )
+        db.commit()
+        turn, attempt = coordinate_turn(db, ctx["campaign_id"], str(thread.id))
+        db.commit()
+        attempt.audience = "private"
+        turn.audience = "private"
+        db.commit()
+        contract = normalize_contract({
+            "contract_version": "dm_turn_contract_v1",
+            "mode": "respond",
+            "reason": "combat begins",
+            "beats": [{
+                "id": "beat_1", "type": "narration",
+                "claims": [{"text": "Goblins attack!", "claim_kind": "observation",
+                            "origin": "dm_adjudication"}],
+            }],
+            "staged_effects": [{
+                "id": "start-enc-1", "effect_type": "start_encounter",
+                "arguments": {
+                    "participants": [{"character_id": str(ctx["owner_pc"])}],
+                    "scene": {"location_name": "Side Room"},
+                },
+            }],
+        })
+        stage_validated_attempt(db, attempt.id, contract)
+        stream = DMStream(
+            id=uuid.uuid4(), campaign_id=turn.campaign_id,
+            thread_id=uuid.UUID(str(turn.thread_id)),
+            turn_id=str(turn.id), attempt_id=str(attempt.id),
+            status="streaming", audience=turn.audience,
+        )
+        db.add(stream)
+        db.flush()
+        text = "Goblins burst from the treeline!"
+        db.add(DMStreamChunk(
+            id=uuid.uuid4(), stream_id=stream.id, sequence=0,
+            text=text, byte_length=len(text.encode()),
+        ))
+        stream.first_chunk_at = datetime.now(timezone.utc)
+        stream.chunk_count = 1
+        db.flush()
+        mark_streaming_started(db, turn.id, attempt.id, stream.id)
+        # Previously rejected: public-defaulted effect broadening a private attempt.
+        commit_turn_with_effects(db, turn.id, attempt.id)
+        encounter = get_active_encounter(db, ctx["campaign_id"])
+        assert encounter is not None
+        assert encounter.thread_id == str(thread.id)
+        assert get_snapshot_encounter(db, ctx["campaign_id"], ctx["player"]) is None
+
+
+def test_member_event_page_fills_past_hidden_encounter_events():
+    """Hidden thread-scoped events never consume a member's visible page."""
+    from app.campaigns.events import commit_campaign_mutation
+
+    fac, ctx = _private_thread_fixture()
+    with fac() as db:
+        encounter, _ = start_encounter(
+            db, ctx["campaign_id"], operation_id="op-private-page", expected_revision=0,
+            actor_id=ctx["owner"], source_turn_id=ctx["private_turn_id"],
+            source_attempt_id=ctx["private_attempt_id"],
+            scene={"location_name": "Side Room"},
+            participants=[{"character_id": str(ctx["owner_pc"])}],
+        )
+        owner_p = _pc_participant(db, encounter.id, ctx["owner_pc"])
+        _fulfill(db, encounter.id, owner_p, ctx["owner"], 12)
+        db.commit()
+        campaign = db.get(Campaign, ctx["campaign_id"])
+        commit_campaign_mutation(
+            db, ctx["campaign_id"], expected_revision=int(campaign.revision),
+            event_type="test.public_probe", visibility="public",
+        )
+        full = list_campaign_events(db, ctx["campaign_id"])
+        hidden_idx = next(
+            i for i, e in enumerate(full) if e.event_type == ENCOUNTER_STARTED_EVENT
+        )
+        # Raw offset lands on hidden rows; the member page still fills past them.
+        page = list_campaign_events(
+            db, ctx["campaign_id"], viewer_id=ctx["player"], limit=1, offset=hidden_idx
+        )
+        assert [e.event_type for e in page] == ["test.public_probe"]
+
+
+def test_start_conflict_distinguishes_replay_from_active(monkeypatch):
+    """Same-operation integrity races replay; a different active encounter 409s."""
+    from sqlalchemy.exc import IntegrityError
+
+    import app.campaigns.events as campaign_events
+    import app.combat.service as combat_service
+
+    fac, ctx = _fixture()
+    with fac() as db:
+        encounter, _ = _start(db, ctx, [{"character_id": str(ctx["owner_pc"])}])
+        # Different operation with an active encounter: conflict, never replay.
+        with pytest.raises(EncounterAlreadyActiveError):
+            start_encounter(
+                db, ctx["campaign_id"], operation_id="op-other", expected_revision=0,
+                actor_id=ctx["owner"], source_turn_id=ctx["turn_id"],
+                source_attempt_id=ctx["attempt_id"],
+                participants=[{"character_id": str(ctx["owner_pc"])}],
+            )
+        db.rollback()
+        # Same operation: simulate the race (prior committed between the
+        # pre-checks and the flush) and prove the handler replays it.
+        real_find = combat_service.find_by_operation
+        real_active = combat_service.get_active_encounter
+        state = {"find": 0, "active": 0}
+
+        def _find_once_none(*args, **kwargs):
+            state["find"] += 1
+            if state["find"] == 1:
+                return None
+            return real_find(*args, **kwargs)
+
+        def _active_once_none(*args, **kwargs):
+            state["active"] += 1
+            if state["active"] == 1:
+                return None
+            return real_active(*args, **kwargs)
+
+        def _conflict(*args, **kwargs):
+            raise IntegrityError(
+                "INSERT INTO encounters", {}, Exception("UNIQUE constraint failed")
+            )
+
+        monkeypatch.setattr(combat_service, "find_by_operation", _find_once_none)
+        monkeypatch.setattr(combat_service, "get_active_encounter", _active_once_none)
+        monkeypatch.setattr(campaign_events, "commit_campaign_mutation", _conflict)
+        replay, _ = start_encounter(
+            db, ctx["campaign_id"], operation_id="op-enc-1", expected_revision=0,
+            actor_id=ctx["owner"], source_turn_id=ctx["turn_id"],
+            source_attempt_id=ctx["attempt_id"],
+            participants=[{"character_id": str(ctx["owner_pc"])}],
+        )
+        assert replay.id == encounter.id

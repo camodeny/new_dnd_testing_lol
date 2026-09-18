@@ -73,6 +73,13 @@ def _assert_visibility_not_broadened(effect: dict[str, Any], attempt_audience: s
         raise ValueError(f"Unknown visibility {effective!r} on staged effect {effect.get('id')}")
     if _is_shared_audience(attempt_audience):
         return
+    # Issue #230: start_encounter carries its own thread-scoped audience —
+    # snapshot, direct reads, the campaign event feed, and realtime all
+    # enforce the source thread, and staged NPC mechanics are redacted for
+    # non-owners — so promoting it from a private attempt cannot broaden
+    # disclosure beyond that thread.
+    if effect.get("effect_type") == "start_encounter":
+        return
     # Private attempt: only dm_private is non-broadening
     if effective != "dm_private":
         raise ValueError(
