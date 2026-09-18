@@ -759,13 +759,14 @@ def test_rolls_service_delegates_encounter_fulfillment_and_rejects_cancel():
                          "modifier": owner_p.initiative_modifier,
                          "total": 10 + owner_p.initiative_modifier},
             )
-        req, fulfillment, resumed = fulfill_roll(
+        req, fulfillment, resumed, encounter_ready = fulfill_roll(
             db, request_id=owner_p.roll_request_id, actor_id=ctx["owner"],
             payload={"source": "physical", "raw_rolls": [9],
                      "modifier": owner_p.initiative_modifier,
                      "total": 9 + owner_p.initiative_modifier},
         )
         assert resumed is None  # encounter resumes, never the source DM turn
+        assert encounter_ready == {"encounter_id": str(encounter.id), "ready": True}
         assert fulfillment.source == "physical"
         assert db.get(EncounterParticipant, owner_p.id).roll_source == "human_physical"
         with pytest.raises(RollLifecycleError, match="cannot be cancelled"):
@@ -882,4 +883,101 @@ def test_http_start_and_duplicate_replay(monkeypatch):
         order = client.get(f"/api/campaigns/{campaign_id}/encounters/{encounter_id}/turn-order")
         assert order.status_code == 409
     finally:
+        app.dependency_overrides.clear()
+
+
+def test_http_generic_fulfill_emits_ready_event(monkeypatch):
+    """Issue #230 round 5: the last initiative fulfilled through the generic
+    roll-request API must still publish encounter.initiative_ready post-commit.
+    """
+    from fastapi.testclient import TestClient
+
+    from app.auth.service import TEST_USER_ID
+    from app.realtime.service import (
+        InMemoryRealtimePublisher,
+        get_realtime_publisher,
+        set_realtime_publisher,
+    )
+    from database import get_db
+    from main import app
+    from models.profiles import Profile as ProfileModel
+
+    eng = _engine()
+    fac = sessionmaker(bind=eng, expire_on_commit=False)
+    with fac() as db:
+        db.add(ProfileModel(id=TEST_USER_ID, email="owner@example.com"))
+        db.commit()
+    with fac() as db:
+        ctx = _seed_world(db, second_pc=False, npc=False)
+        owner, campaign_id = ctx["owner"], ctx["campaign_id"]
+        camp = db.get(Campaign, campaign_id)
+        camp.owner_id = TEST_USER_ID
+        for member in db.execute(
+            select(CampaignMember).where(CampaignMember.campaign_id == campaign_id)
+        ).scalars().all():
+            if member.user_id == owner:
+                member.user_id = TEST_USER_ID
+        for char in db.execute(select(Character)).scalars().all():
+            if char.owner_id == owner:
+                char.owner_id = TEST_USER_ID
+        for sheet in db.execute(select(Dnd5eCharacterSheet)).scalars().all():
+            if sheet.owner_id == owner:
+                sheet.owner_id = TEST_USER_ID
+        for req in db.execute(select(PlayerRollRequest)).scalars().all():
+            if req.requested_user_id == owner:
+                req.requested_user_id = TEST_USER_ID
+        db.commit()
+        owner_pc = ctx["owner_pc"]
+        turn_id, attempt_id = ctx["turn_id"], ctx["attempt_id"]
+
+    def override_db():
+        with fac() as db:
+            yield db
+
+    def resolve_test_profile(request, db):
+        return db.get(ProfileModel, TEST_USER_ID)
+
+    monkeypatch.setattr("app.combat.router.resolve_profile", resolve_test_profile)
+    monkeypatch.setattr("app.rolls.router.resolve_profile", resolve_test_profile)
+    app.dependency_overrides[get_db] = override_db
+    previous = get_realtime_publisher()
+    recorder = InMemoryRealtimePublisher()
+    set_realtime_publisher(recorder)
+    try:
+        client = TestClient(app)
+        start = client.post(
+            f"/api/campaigns/{campaign_id}/encounters",
+            json={
+                "expected_revision": 0,
+                "source_turn_id": str(turn_id),
+                "source_attempt_id": str(attempt_id),
+                "participants": [{"character_id": str(owner_pc)}],
+            },
+            headers={"Idempotency-Key": "http-ready-start"},
+        )
+        assert start.status_code == 201, start.text
+        encounter_id = start.json()["encounter"]["id"]
+        with fac() as db:
+            participant = next(
+                p for p in list_participants(db, uuid.UUID(encounter_id))
+                if p.character_id == owner_pc
+            )
+            roll_request_id, modifier = participant.roll_request_id, participant.initiative_modifier
+        fulfill = client.post(
+            f"/api/campaigns/{campaign_id}/roll-requests/{roll_request_id}/fulfill",
+            json={"source": "app", "raw_rolls": [12],
+                  "modifier": modifier, "total": 12 + modifier},
+            headers={"Idempotency-Key": "http-ready-fulfill"},
+        )
+        assert fulfill.status_code == 200, fulfill.text
+        assert fulfill.json()["encounter_ready"] == {
+            "encounter_id": encounter_id, "ready": True,
+        }
+        ready = [p for p in recorder.published if p["event"] == "encounter.initiative_ready"]
+        assert len(ready) == 1
+        assert ready[0]["payload"]["encounter_id"] == encounter_id
+        assert ready[0]["payload"]["event_id"] == f"encounter:{encounter_id}:ready"
+        assert ready[0]["payload"]["dedupe_key"] == f"{encounter_id}:ready"
+    finally:
+        set_realtime_publisher(previous)
         app.dependency_overrides.clear()

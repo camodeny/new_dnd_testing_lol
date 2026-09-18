@@ -205,7 +205,14 @@ def _resume_if_unblocked(db: Session, turn: DmTurn, parent_attempt: DmTurnAttemp
     return next_attempt
 
 
-def fulfill_roll(db: Session, *, request_id: uuid.UUID, actor_id: uuid.UUID, payload: dict) -> tuple[PlayerRollRequest, PlayerRollFulfillment, DmTurnAttempt | None]:
+def fulfill_roll(db: Session, *, request_id: uuid.UUID, actor_id: uuid.UUID, payload: dict) -> tuple[PlayerRollRequest, PlayerRollFulfillment, DmTurnAttempt | None, dict | None]:
+    """Fulfill a roll request; encounter initiative delegates to #230.
+
+    The fourth element is encounter-ready info for the generic fulfill route's
+    post-commit realtime publish: ``{"encounter_id": str, "ready": bool}`` when
+    this request is encounter initiative, else ``None``. ``ready`` is true only
+    when this fulfillment completed the final pending initiative.
+    """
     started = time.monotonic()
     # Canonical lock order for encounter initiative is encounter-first, so
     # linkage is detected before taking any row lock; the encounter service
@@ -223,7 +230,7 @@ def fulfill_roll(db: Session, *, request_id: uuid.UUID, actor_id: uuid.UUID, pay
 
         participant = db.get(EncounterParticipant, linked)
         try:
-            req_row, fulfillment, _, _, _ = fulfill_human_initiative(
+            req_row, fulfillment, _, updated, event = fulfill_human_initiative(
                 db, participant.encounter_id, participant.id, actor_id=actor_id, payload=payload,
                 # Flush-only: the outer idempotent command owns the commit so
                 # the record, mutation, and result commit atomically.
@@ -235,7 +242,10 @@ def fulfill_roll(db: Session, *, request_id: uuid.UUID, actor_id: uuid.UUID, pay
             raise RollLifecycleError(str(exc)) from exc
         logger.info("player_roll encounter_initiative fulfilled request_id=%s encounter_id=%s",
                     req_row.id, participant.encounter_id)
-        return req_row, fulfillment, None
+        return req_row, fulfillment, None, {
+            "encounter_id": str(updated.id),
+            "ready": event is not None,
+        }
     req = db.execute(select(PlayerRollRequest).where(PlayerRollRequest.id == request_id).with_for_update()).scalars().first()
     if req is None:
         raise RollLifecycleError("Roll request not found")
@@ -286,7 +296,7 @@ def fulfill_roll(db: Session, *, request_id: uuid.UUID, actor_id: uuid.UUID, pay
     resumed = _resume_if_unblocked(db, turn, attempt)
     logger.info("player_roll fulfilled request_id=%s turn_id=%s source=%s visibility=%s latency_ms=%.2f resumed=%s",
                 req.id, req.turn_id, source, visibility, (time.monotonic() - started) * 1000, bool(resumed))
-    return req, fulfillment, resumed
+    return req, fulfillment, resumed, None
 
 
 def cancel_or_replace(db: Session, *, request_id: uuid.UUID, replacement: dict | None) -> tuple[PlayerRollRequest, list[PlayerRollRequest], DmTurnAttempt | None]:

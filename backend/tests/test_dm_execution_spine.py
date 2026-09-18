@@ -508,7 +508,7 @@ def test_await_roll_creates_request_and_resumes_on_fulfill(db):
     assert len(rows) == 1
     assert rows[0].status == "pending"
 
-    req, _fulfillment, resumed = fulfill_roll(
+    req, _fulfillment, resumed, _encounter_ready = fulfill_roll(
         s, request_id=rows[0].id, actor_id=owner,
         payload={"source": "app", "visibility": "public",
                  "raw_rolls": [14], "modifier": 2, "total": 16},
