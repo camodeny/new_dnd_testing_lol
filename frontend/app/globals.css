@@ -929,6 +929,11 @@ select.input:focus,
 
 .campaign-card-inner > * { min-width: 0; }
 
+/* Reserve room for the absolute-positioned action buttons (delete spans
+   10–50px from the right edge, archive/restore spans 52–92px). Without
+   this the date at the footer's right edge slides underneath them. */
+.campaign-card-v2.has-actions .campaign-card-inner { padding-right: 100px; }
+
 .campaign-card-header { display: flex; align-items: center; gap: 13px; }
 
 .campaign-avatar {
@@ -1693,7 +1698,20 @@ a.automation-list-item:focus-visible {
   border: 0;
   text-align: left;
   isolation: isolate;
-  background: url('/images/lobby-tall.png') 62% 0% / cover no-repeat;
+  overflow: hidden;
+  border-radius: 10px 0 0 10px;
+  background: url('/images/lobby-tall.png') 62% 100% / cover no-repeat;
+}
+
+/* Parchment scrim — keeps the title/desc legible where they cross the
+   stonework, fading out so the table tableau below stays untouched. */
+.lobby-hero::before {
+  content: "";
+  position: absolute;
+  inset: 0;
+  z-index: -1;
+  background: linear-gradient(to bottom, rgba(238, 226, 199, 0.92) 0%, rgba(238, 226, 199, 0.5) 32%, transparent 58%);
+  pointer-events: none;
 }
 
 .lobby-hero-avatar {
@@ -1753,14 +1771,14 @@ a.automation-list-item:focus-visible {
 .lobby-footer,
 .lobby-card > .llm-manager-card { grid-column: 2; }
 
-.lobby-party-section { margin: 0; padding: 28px 28px 20px; }
+.lobby-party-section { margin: 0; padding: 24px 28px; }
 
 .lobby-section-header {
   display: flex;
   align-items: center;
   justify-content: space-between;
   gap: 18px;
-  margin-bottom: 22px;
+  margin-bottom: 16px;
 }
 
 .lobby-section-label { display: flex; align-items: center; gap: 9px; color: var(--ink-strong); font-size: 0.82rem; font-weight: 700; }
@@ -1770,7 +1788,7 @@ a.automation-list-item:focus-visible {
   display: grid;
   grid-template-columns: repeat(auto-fit, minmax(145px, 1fr));
   gap: 10px;
-  margin-bottom: 18px;
+  margin-bottom: 0;
 }
 
 .lobby-player-slot {
@@ -1788,7 +1806,9 @@ a.automation-list-item:focus-visible {
   transition: border-color var(--transition-smooth), background var(--transition-smooth);
 }
 
-.lobby-slot-filled:hover { border-color: var(--line-strong); background: #fff; }
+.lobby-player-slot.lobby-slot-mine { cursor: pointer; color: inherit; font: inherit; }
+
+.lobby-player-slot.lobby-slot-mine:hover { border-color: var(--line-strong); background: #fff; }
 
 .lobby-slot-circle {
   display: grid;
@@ -1808,10 +1828,9 @@ a.automation-list-item:focus-visible {
 .lobby-slot-empty { border-style: dashed; background: transparent; opacity: 0.72; }
 .lobby-slot-circle-empty { border: 1px dashed var(--line-strong); background: transparent !important; color: var(--ink-faint); }
 
-.lobby-invite-section { margin: 0; padding: 20px 28px; border-top: 1px solid var(--line); }
+.lobby-invite-section { margin: 0; padding: 24px 28px; }
 
 .lobby-invite-card {
-  margin-top: 15px;
   padding: 18px;
   border: 1px solid var(--line);
   border-radius: 9px;
@@ -1849,7 +1868,7 @@ a.automation-list-item:focus-visible {
 .lobby-copy-btn:hover, .lobby-generate-btn:hover { border-color: var(--line-strong); color: var(--ink-strong); }
 .lobby-copy-btn.copied { border-color: var(--moss); background: var(--moss); color: #fff; }
 
-.lobby-footer { display: flex; justify-content: flex-start; padding: 20px 28px 24px; border-top: 1px solid var(--line); }
+.lobby-footer { display: flex; justify-content: flex-end; padding: 24px 28px; }
 
 .lobby-begin-btn {
   display: inline-flex;
@@ -2273,7 +2292,7 @@ a.automation-list-item:focus-visible {
   .lobby-page { display: block; min-height: auto; max-height: none; height: auto; overflow: visible; place-items: initial; padding: clamp(16px, 3vw, 24px); }
   .lobby-container { max-height: none; overflow: visible; }
   .lobby-card { grid-template-columns: 1fr; padding: 24px; max-height: none; overflow: visible; }
-  .lobby-hero { min-height: 410px; grid-row: auto; }
+  .lobby-hero { min-height: 410px; grid-row: auto; border-radius: 10px; }
   .lobby-party-section,
   .lobby-invite-section,
   .lobby-footer { grid-column: 1; }

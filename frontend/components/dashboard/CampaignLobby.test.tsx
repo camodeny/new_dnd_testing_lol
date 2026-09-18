@@ -87,9 +87,16 @@ describe('authoritative lobby synchronization', () => {
     await renderLobby()
     serverRevision = 2
     vi.mocked(campaignMembers.setReadiness).mockRejectedValueOnce(Object.assign(new Error('Revision conflict'), { status: 409 }))
-    await act(async () => button('Mark ready').click())
-    expect(container.textContent).toContain('Revision conflict')
-    await act(async () => button('Mark ready').click())
+    // Readiness lives in the character modal now (Radix portals to document.body).
+    const docButton = (label: string) => {
+      const element = [...document.querySelectorAll('button')].find((b) => b.textContent?.includes(label))
+      if (!element) throw new Error(`Missing button: ${label}`)
+      return element as HTMLButtonElement
+    }
+    await act(async () => { button('(you)').click() })
+    await act(async () => { docButton('Mark ready').click() })
+    expect(document.body.textContent).toContain('Revision conflict')
+    await act(async () => { docButton('Mark ready').click() })
     expect(campaignMembers.setReadiness).toHaveBeenLastCalledWith('campaign', 2, true, expect.any(String))
   })
 
@@ -113,10 +120,14 @@ describe('authoritative lobby synchronization', () => {
       campaign={{ id: 'campaign', name: 'Table', revision: 0 } as Campaign}
       currentUser={{ id: 'friend' } as User} isOwner={false} onBegin={onBegin}
     />))
-    // Outstanding invitee is visible; the bearer link never is.
-    expect(container.textContent).toContain('Sam')
-    expect(container.textContent).toContain('1 outstanding')
-    expect(container.textContent).not.toContain('/invite/')
+    // Outstanding invitee is visible in the invited-players modal; the bearer link never is.
+    // (Icon-only button, so query by aria-label rather than text.)
+    const peopleButton = container.querySelector('button[aria-label="See who\'s been invited"]')
+    if (!peopleButton) throw new Error('Missing button: See who\'s been invited')
+    await act(async () => { (peopleButton as HTMLButtonElement).click() })
+    expect(document.body.textContent).toContain('Sam')
+    expect(document.body.textContent).toContain('invited')
+    expect(document.body.textContent).not.toContain('/invite/')
   })
 
   it('keeps the lobby open when the lifecycle transition fails', async () => {

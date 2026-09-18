@@ -46,9 +46,12 @@ export default function CampaignCard({ campaign, onDelete, isOwner, onArchive, o
     [campaign.name, campaign.random_seed],
   )
   const archived = campaign.status === 'archived'
+  const archiveHandler = isOwner && !archived ? onArchive : null
+  const restoreHandler = isOwner && archived ? onRestore : null
+  const hasActions = Boolean(onDelete || archiveHandler || restoreHandler)
 
   return (
-    <article className="campaign-card-v2">
+    <article className={`campaign-card-v2${hasActions ? ' has-actions' : ''}`}>
       <Link
         href={`/campaigns/${campaign.id}`}
         className="campaign-card-inner campaign-card-link"
@@ -92,11 +95,11 @@ export default function CampaignCard({ campaign, onDelete, isOwner, onArchive, o
           <i className="bi bi-trash" aria-hidden="true" />
         </button>
       )}
-      {isOwner && !archived && onArchive && (
+      {archiveHandler && (
         <button
           type="button"
           className="campaign-card-archive-btn"
-          onClick={onArchive}
+          onClick={archiveHandler}
           disabled={actionBusy}
           aria-label={`Archive campaign ${campaign.name}`}
           title="Archive (dormant — nothing is deleted)"
@@ -104,11 +107,11 @@ export default function CampaignCard({ campaign, onDelete, isOwner, onArchive, o
           <i className="bi bi-archive" aria-hidden="true" />
         </button>
       )}
-      {isOwner && archived && onRestore && (
+      {restoreHandler && (
         <button
           type="button"
           className="campaign-card-restore-btn"
-          onClick={onRestore}
+          onClick={restoreHandler}
           disabled={actionBusy}
           aria-label={`Restore campaign ${campaign.name}`}
           title="Restore the same table"
