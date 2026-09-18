@@ -327,6 +327,12 @@ def test_deterministic_revalidation_guards_execution():
         revalidate_for_execution(frame, "flank", 7, still_legal=lambda c: False)
     assert exc_info.value.kind == "malformed"
 
+    # A truthy non-boolean legality result is malformed, not legal.
+    for bad in ("false", 1, 0, None):
+        with pytest.raises(DecisionError) as exc_info:
+            revalidate_for_execution(frame, "flank", 7, still_legal=lambda c: bad)
+        assert exc_info.value.kind == "malformed"
+
     # Unknown IDs never revalidate, even at the right revision.
     with pytest.raises(DecisionError) as exc_info:
         revalidate_for_execution(

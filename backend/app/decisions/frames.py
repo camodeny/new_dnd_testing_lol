@@ -425,12 +425,22 @@ def revalidate_for_execution(
             f"{current_revision!r}",
             kind="malformed",
         )
-    if still_legal is not None and not still_legal(candidate):
-        raise DecisionError(
-            f"candidate {candidate.id!r} failed deterministic revalidation at "
-            f"revision {current_revision!r}",
-            kind="malformed",
-        )
+    if still_legal is not None:
+        legal = still_legal(candidate)
+        # Truthiness is not legality: a truthy non-boolean such as "false"
+        # must never read as a passed deterministic check.
+        if not isinstance(legal, bool):
+            raise DecisionError(
+                f"legality validator returned non-boolean {legal!r} for "
+                f"candidate {candidate.id!r}",
+                kind="malformed",
+            )
+        if not legal:
+            raise DecisionError(
+                f"candidate {candidate.id!r} failed deterministic revalidation at "
+                f"revision {current_revision!r}",
+                kind="malformed",
+            )
     return candidate
 
 
