@@ -142,20 +142,49 @@ def test_stale_revision_rejected_before_execution():
 
 
 def test_rebuild_after_revision_change_refreshes_frame():
+    from app.decisions.frames import CandidateRecord as _CR
+
     frame = _frame()
+    # Revision 8 removes the archer: the caller re-enumerates fresh and the
+    # stale volley candidate must not survive the rebuild.
     rebuilt = rebuild_frame(
         frame,
         state={"visible": ["goblin"], "turn": "fighter-1"},
         state_revision=8,
+        candidates=(
+            _CR(
+                id="flank",
+                label="Flank the goblin",
+                source="rules:attack",
+                source_ref="state.visible[0]",
+                payload_ref="action:flank@goblin",
+                risk="low",
+                reversible=True,
+            ),
+        ),
     )
     assert rebuilt.state_revision == 8
     assert rebuilt.frame_id != frame.frame_id
     assert is_stale(rebuilt, 8) is False
     assert is_stale(rebuilt, 7) is True
+    assert "volley" not in {c.id for c in rebuilt.candidates}
     # Escapes survive the rebuild; stale frame still rejects the new revision.
     assert OPEN_ENDED_DM_CANDIDATE_ID in {c.id for c in rebuilt.candidates}
     with pytest.raises(DecisionError):
-        revalidate_for_execution(frame, "flank", 8)
+        revalidate_for_execution(
+            frame, "flank", 8, still_legal=lambda c: True
+        )
+
+
+def test_rebuild_requires_fresh_candidates():
+    """Carrying old candidates into a new revision is a TypeError."""
+    frame = _frame()
+    with pytest.raises(TypeError):
+        rebuild_frame(
+            frame,
+            state={"visible": ["goblin"]},
+            state_revision=8,
+        )
 
 
 def test_near_tie_policy_defers_per_decision_class():
@@ -283,6 +312,12 @@ def test_deterministic_revalidation_guards_execution():
     )
     assert record.id == "flank"
 
+    # A non-escape candidate with no legality source fails closed: revision
+    # equality plus old-frame membership is not a revalidation.
+    with pytest.raises(DecisionError) as exc_info:
+        revalidate_for_execution(frame, "flank", 7)
+    assert exc_info.value.kind == "malformed"
+
     # Candidate removed from authoritative state fails revalidation.
     with pytest.raises(DecisionError) as exc_info:
         revalidate_for_execution(frame, "flank", 7, legal_ids={"volley"})
@@ -294,7 +329,9 @@ def test_deterministic_revalidation_guards_execution():
 
     # Unknown IDs never revalidate, even at the right revision.
     with pytest.raises(DecisionError) as exc_info:
-        revalidate_for_execution(frame, "invented", 7)
+        revalidate_for_execution(
+            frame, "invented", 7, legal_ids={"invented"}
+        )
     assert exc_info.value.kind == "malformed"
 
 
@@ -311,3 +348,26 @@ def test_frame_trace_versions_candidate_schema_and_policy():
         CLARIFY_CANDIDATE_ID,
         DEFER_CANDIDATE_ID,
     }
+
+
+def test_verification_outcome_is_required_not_assumed():
+    """Omitting deterministic verification is a TypeError, never a pass."""
+    frame = _frame()
+    with pytest.raises(TypeError):
+        evaluate_execution(frame, "flank", {"flank": 0.9}, 0.95)
+
+
+def test_mapping_coercion_cannot_bless_invalid_metadata():
+    """Raw mapping values validate strictly: "false" is not reversible."""
+    from app.decisions.frames import enumerate_candidates
+
+    with pytest.raises(DecisionError):
+        enumerate_candidates(
+            ({"id": "x", "label": "X", "reversible": "false"}, {"id": "y", "label": "Y"})
+        )
+    with pytest.raises(DecisionError):
+        enumerate_candidates(
+            ({"id": None, "label": "X"}, {"id": "y", "label": "Y"})
+        )
+    with pytest.raises(DecisionError):
+        enumerate_candidates(({"label": "missing-id"}, {"id": "y", "label": "Y"}))

@@ -214,15 +214,16 @@ def evaluate_execution(
     confidence: float | None,
     *,
     policy: DecisionClassPolicy | None = None,
-    verified: bool = True,
+    verified: bool,
 ) -> PolicyVerdict:
     """Produce the execution directive for one calibrated selection.
 
     ``verified`` is the deterministic verification outcome owned by code
-    (legality/authorization/idempotency/geometry/arithmetic checks). A
-    ``False`` value always escalates, regardless of model confidence.
-    Unknown candidate IDs raise malformed — the model selects only supplied
-    candidates.
+    (legality/authorization/idempotency/geometry/arithmetic checks) and has
+    no default — callers must pass it explicitly. A ``False`` value always
+    escalates, regardless of model confidence; omitting it is a TypeError,
+    never an assumed success. Unknown candidate IDs raise malformed — the
+    model selects only supplied candidates.
     """
     active = policy or get_policy(frame.decision_class)
     if active.decision_class != frame.decision_class:

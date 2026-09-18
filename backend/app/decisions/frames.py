@@ -175,18 +175,35 @@ def enumerate_candidates(
             records.append(item)
             continue
         if isinstance(item, Mapping):
-            records.append(
-                CandidateRecord(
-                    id=str(item["id"]),
-                    label=str(item["label"]),
-                    source=str(item.get("source", source)),
-                    source_ref=item.get("source_ref"),
-                    payload_ref=item.get("payload_ref"),
-                    debug_hint=item.get("debug_hint"),
-                    risk=str(item.get("risk", RISK_STANDARD)),
-                    reversible=bool(item.get("reversible", True)),
+            # Raw values pass straight into CandidateRecord validation with
+            # no coercion: bool("false") is True and str(None) is "None",
+            # so coercing here could bless an irreversible candidate as
+            # reversible or an absent ID as the literal "None".
+            try:
+                records.append(
+                    CandidateRecord(
+                        id=item["id"],
+                        label=item["label"],
+                        source=item.get("source", source),
+                        source_ref=item.get("source_ref"),
+                        payload_ref=item.get("payload_ref"),
+                        debug_hint=item.get("debug_hint"),
+                        risk=item.get("risk", RISK_STANDARD),
+                        reversible=item.get("reversible", True),
+                    )
                 )
-            )
+            except KeyError as error:
+                raise DecisionError(
+                    f"candidate mapping is missing required key {error}",
+                    kind="malformed",
+                ) from error
+            except DecisionError:
+                raise
+            except Exception as error:
+                raise DecisionError(
+                    f"candidate mapping is malformed: {error}",
+                    kind="malformed",
+                ) from error
             continue
         if id_fn is None or label_fn is None:
             raise DecisionError(
@@ -342,19 +359,19 @@ def rebuild_frame(
     *,
     state: Any,
     state_revision: str | int,
-    candidates: Iterable[Mapping[str, Any] | CandidateRecord] | None = None,
+    candidates: Iterable[Mapping[str, Any] | CandidateRecord],
     instructions: str | None = None,
 ) -> DecisionFrame:
     """Rebuild a frame after the authoritative revision changed.
 
-    Re-enumeration stays in caller code: pass the fresh candidate set (or
-    ``None`` to re-carry the non-escape candidates) plus the newly authorized
-    state. Returns a new frame with a new ``frame_id``.
+    The fresh candidate set is required: caller code re-enumerates against
+    the newly authorized state and passes the result here. Old domain
+    candidates are never carried into the new revision — carrying them would
+    bless potentially-stale candidates (e.g. targeting entities removed by
+    the new state) as freshly enumerated. Escape candidates are re-appended
+    unless already present. Returns a new frame with a new ``frame_id``.
     """
-    if candidates is None:
-        base = [c for c in frame.candidates if not is_escape_id(c.id)]
-    else:
-        base = list(enumerate_candidates(candidates))
+    base = list(enumerate_candidates(candidates))
     present = {c.id for c in base}
     for escape in escape_candidates():
         if escape.id not in present:
@@ -382,13 +399,26 @@ def revalidate_for_execution(
 
     Checks, in order: the frame revision is current, the ID belongs to the
     frame, the candidate is still legal against current authoritative state
-    (via ``still_legal`` or an explicit ``legal_ids`` set), and — for escape
-    IDs — returns the escape record so the caller defers instead of executing.
+    (via ``still_legal`` or an explicit ``legal_ids`` set — at least one is
+    required for non-escape candidates), and — for escape IDs — returns the
+    escape record so the caller defers instead of executing. Escape/defer
+    candidates are exempt from the legality-source requirement because they
+    are never executed.
     Raises :exc:`DecisionError` with kind ``stale`` on revision drift and
-    kind ``malformed`` on unknown or no-longer-legal candidates.
+    kind ``malformed`` on unknown, no-longer-legal, or validator-less
+    candidates.
     """
     assert_fresh(frame, current_revision)
     candidate = resolve_candidate(frame, selected_id)
+    if is_escape_id(candidate.id):
+        return candidate
+    if still_legal is None and legal_ids is None:
+        raise DecisionError(
+            f"candidate {candidate.id!r} has no authoritative legality source "
+            f"for revalidation at revision {current_revision!r}; pass "
+            "still_legal or legal_ids",
+            kind="malformed",
+        )
     if legal_ids is not None and candidate.id not in set(legal_ids):
         raise DecisionError(
             f"candidate {candidate.id!r} is no longer legal at revision "
