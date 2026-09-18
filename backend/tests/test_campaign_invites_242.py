@@ -264,6 +264,60 @@ def test_lobby_shows_joined_vs_outstanding_invites(api):
 
 # ── Rejection paths ─────────────────────────────────────────────────────────
 
+def test_invite_history_visibility_usability_and_expired_email(api):
+    """Round-3 review: history is owner-only, usability is canonical, email
+    never sends links acceptance would reject."""
+    client, factory, actor, _, member_id, _, _ = api
+    cid = _create(client)["id"]
+    good = _mint(client, cid, recipient_label="open seat")
+    stale = _mint(client, cid, expires_in_hours=1)
+    with factory() as db:
+        row = db.execute(
+            select(CampaignInvite).where(CampaignInvite.code == stale["code"])
+        ).scalars().first()
+        row.expires_at = datetime.now(timezone.utc) - timedelta(seconds=1)
+        db.commit()
+
+    actor["id"] = member_id
+    assert client.post(f"/api/campaigns/{cid}/join", json={"code": good["code"]}).status_code == 200
+
+    # Owner list carries canonical usability for deterministic UI filtering.
+    actor["id"] = TEST_USER_ID
+    listed = client.get(f"/api/campaigns/{cid}/invites")
+    assert listed.status_code == 200
+    by_code = {i["code"]: i for i in listed.json()["invites"]}
+    assert by_code[good["code"]]["usable"] is True
+    assert by_code[stale["code"]]["usable"] is False
+    assert by_code[stale["code"]]["unusable_reason"] == "expired"
+
+    # Expired invites cannot be emailed: 410 with no delivery recorded.
+    email = client.post(
+        f"/api/campaigns/{cid}/invites/{stale['code']}/email",
+        json={"to_email": "friend@example.com"},
+    )
+    assert email.status_code == 410
+    assert "expired" in email.json()["detail"]
+    with factory() as db:
+        row = db.execute(
+            select(CampaignInvite).where(CampaignInvite.code == stale["code"])
+        ).scalars().first()
+        assert row.last_delivery_status is None
+
+    # Revoked/expired history stays owner-only; members see usable rows only.
+    assert _revoke(client, cid, good["code"], 0, "revoke-good").status_code == 200
+    owner_lobby = client.get(f"/api/campaigns/{cid}/lobby")
+    assert {i.get("code") for i in owner_lobby.json()["invites"]} == {good["code"], stale["code"]}
+    assert owner_lobby.json()["outstanding_invites"] == 0
+
+    actor["id"] = member_id
+    member_lobby = client.get(f"/api/campaigns/{cid}/lobby")
+    assert member_lobby.status_code == 200
+    assert member_lobby.json()["invites"] == []
+    assert member_lobby.json()["outstanding_invites"] == 0
+    # Membership itself is untouched — only history visibility changed.
+    assert str(member_id) in {m["user_id"] for m in member_lobby.json()["members"]}
+
+
 def test_revoked_and_expired_invites_cannot_create_membership(api):
     client, factory, actor, _, member_id, outsider_id, _ = api
     cid = _create(client)["id"]

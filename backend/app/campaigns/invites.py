@@ -172,12 +172,17 @@ def public_invite_dict(invite, campaign, *, member_count: int) -> dict:
 
 
 def owner_invite_dict(invite) -> dict:
+    usable, reason = invite_usability(invite)
     return {
         "id": str(invite.id),
         "campaign_id": str(invite.campaign_id),
         "code": invite.code,
         "invite_url_path": f"/invite/{invite.code}",
         "status": invite.status,
+        # Canonical usability so owner UIs filter expiry deterministically
+        # regardless of which endpoint populated the row.
+        "usable": usable,
+        "unusable_reason": reason,
         "intended_email": invite.intended_email,
         "recipient_label": invite.recipient_label,
         "created_by": str(invite.created_by) if invite.created_by else None,

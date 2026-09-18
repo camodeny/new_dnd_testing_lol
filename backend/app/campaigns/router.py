@@ -858,12 +858,13 @@ def get_campaign_lobby(campaign_id: str, request: Request, db: Session = Depends
         "eligibility": eligibility,
         "launch_locked": is_launch_locked(camp.status),
         # Joined vs outstanding invited state — issue #242. Outstanding =
-        # usable active invites; revoked/expired stay visible to the owner
-        # (status-tagged) but never count as outstanding. Member views mask
-        # emails (see lobby_invite_projection).
+        # usable active invites. Revoked/expired history stays owner-only;
+        # members receive only currently usable rows (still without bearer
+        # codes or raw emails — see lobby_invite_projection).
         "invites": [
             lobby_invite_projection(inv, viewer_is_owner=viewer_is_owner)
             for inv in invite_rows
+            if viewer_is_owner or invite_usability(inv)[0]
         ],
         "outstanding_invites": sum(
             1 for inv in invite_rows
@@ -1513,6 +1514,7 @@ def send_campaign_invite_email(
     from app.campaigns.invites import (
         code_fingerprint,
         invite_url,
+        invite_usability,
         normalize_email,
         owner_invite_dict,
         send_invite_email,
@@ -1538,8 +1540,11 @@ def send_campaign_invite_email(
         raise HTTPException(status_code=400, detail=str(exc)) from exc
     if not to_email:
         raise HTTPException(status_code=400, detail="to_email is required")
-    if invite.status != "active":
-        raise HTTPException(status_code=410, detail="Invite is revoked")
+    usable, unusable_reason = invite_usability(invite)
+    if not usable:
+        # Never send a link acceptance will reject — the owner can mint a
+        # fresh invite instead. Delivery state is untouched (nothing sent).
+        raise HTTPException(status_code=410, detail=f"Invite is {unusable_reason}")
     inviter = db.get(Profile, profile.id)
     sent, error = send_invite_email(
         to_email=to_email,
