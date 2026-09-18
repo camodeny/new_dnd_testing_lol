@@ -1,7 +1,7 @@
 """campaign usage/capacity ledger — issue #253 (additive).
 
 Revision ID: 8f3a25300001
-Revises: d3a263a1f263
+Revises: e4f1242a0b77
 
 Additive only: campaign_usage_entries table. Does not touch existing tables.
 """
@@ -13,7 +13,7 @@ import sqlalchemy as sa
 from sqlalchemy.dialects import postgresql
 
 revision: str = "8f3a25300001"
-down_revision: Union[str, Sequence[str], None] = "d3a263a1f263"
+down_revision: Union[str, Sequence[str], None] = "e4f1242a0b77"
 branch_labels: Union[str, Sequence[str], None] = None
 depends_on: Union[str, Sequence[str], None] = None
 
