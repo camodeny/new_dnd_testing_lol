@@ -109,7 +109,16 @@ def start_ai_run(session_factory, *, logical_operation: str, role: str, provider
 
 def finish_ai_run(session_factory, run_id, *, status: str = "succeeded", first_token_at=None,
                   input_tokens=None, output_tokens=None, cost_usd=None, result_code=None,
-                  error_type=None) -> AIRun:
+                  error_type=None, campaign_id=None) -> AIRun:
+    """Finalize an AI run, then fail-soft charge the capacity ledger (#253).
+
+    When a ``campaign_id`` is supplied for a succeeded run, exactly-once
+    spend accounting runs in a second independent telemetry transaction via
+    ``billing.ledger.charge_completed_run``. Accounting failure is logged
+    and swallowed here — it must never rewrite gameplay — and surfaces
+    later through ``reconcile()``. A succeeded primary run with no usable
+    cost is expected-pending (WARNING), not a telemetry failure.
+    """
     def write(db):
         run = db.get(AIRun, run_id)
         if run is None:
@@ -118,7 +127,21 @@ def finish_ai_run(session_factory, run_id, *, status: str = "succeeded", first_t
         run.input_tokens = input_tokens; run.output_tokens = output_tokens; run.cost_usd = cost_usd
         run.result_code = result_code; run.error_type = error_type
         return run
-    return _telemetry_write(session_factory, write)
+    finished = _telemetry_write(session_factory, write)
+    if status == "succeeded" and campaign_id is not None:
+        def charge(db):
+            from app.billing.ledger import charge_completed_run
+
+            return charge_completed_run(db, run_id=finished.id, campaign_id=campaign_id)
+        try:
+            _telemetry_write(session_factory, charge)
+        except Exception as exc:
+            from app.billing.ledger import AmbiguousCostError
+
+            level = logging.WARNING if isinstance(exc, AmbiguousCostError) else logging.ERROR
+            structured_log(logger, level, "ledger_charge_dropped",
+                           error_type=type(exc).__name__, run_id=str(finished.id))
+    return finished
 
 
 def telemetry_factory_for(db: Session):

@@ -421,3 +421,70 @@ def test_contributor_mismatch_and_zero_cost_collision_are_conflicts():
     assert marker.amount_cents == 0
     assert record_ai_spend_for_run(db, campaign_id=camp, ai_run=free).id == marker.id
     db.close()
+
+
+# ── 13. production wiring: finish_ai_run charges exactly once ───────────────
+
+def test_finish_ai_run_charges_primary_run_exactly_once():
+    from app.observability.service import finish_ai_run, start_ai_run
+    factory = _factory()
+    db = factory()
+    camp, _ = _seed(db)
+    db.close()
+    tid = f"trace-{uuid.uuid4().hex[:12]}"
+    run = start_ai_run(factory, logical_operation="forward_dm_adjudicate", role="ai_dm",
+                       provider="test", model="m", classification="primary", billable=True,
+                       trace_id=tid)
+    finish_ai_run(factory, run.id, status="succeeded", cost_usd=1.25, campaign_id=camp)
+    db = factory()
+    entries = db.query(CampaignUsageEntry).filter_by(entry_type="ai_spend").all()
+    assert len(entries) == 1
+    assert entries[0].amount_cents == -125
+    assert str(entries[0].ai_run_id) == str(run.id)
+    assert reconcile(db, camp) == []
+    db.close()
+    # Re-finalization (retry) replays idempotently: still exactly one entry.
+    finish_ai_run(factory, run.id, status="succeeded", cost_usd=1.25, campaign_id=camp)
+    db = factory()
+    assert db.query(CampaignUsageEntry).filter_by(entry_type="ai_spend").count() == 1
+    assert reconcile(db, camp) == []
+    db.close()
+    # Recovery runs finalize observability with no spend entry.
+    recovery = start_ai_run(factory, logical_operation="forward_dm_adjudicate", role="ai_dm",
+                            provider="test", model="m", classification="recovery", billable=False,
+                            trace_id=f"trace-{uuid.uuid4().hex[:12]}")
+    finish_ai_run(factory, recovery.id, status="succeeded", cost_usd=0.50, campaign_id=camp)
+    db = factory()
+    assert db.query(CampaignUsageEntry).filter_by(entry_type="ai_spend").count() == 1
+    db.close()
+
+
+# ── 14. reconcile: None cost is always ambiguous ────────────────────────────
+
+def test_reconcile_flags_none_cost_spend_even_at_zero_amount():
+    factory = _factory()
+    db = factory()
+    camp, _ = _seed(db)
+    run = _run(db, cost_usd=None, campaign_id=camp)  # succeeded primary, no cost
+    db.add(CampaignUsageEntry(campaign_id=camp, entry_type="ai_spend", amount_cents=0,
+                             ai_run_id=run.id, idempotency_key=f"ai_spend:{run.id}"))
+    db.commit()
+    errors = reconcile(db, camp)
+    assert any("ambiguous" in e for e in errors)
+    db.close()
+
+
+# ── 15. canonical pricing: usage + env config → USD ─────────────────────────
+
+def test_cost_usd_for_uses_configured_pricing(monkeypatch):
+    from app.billing import config
+    monkeypatch.setattr(config, "DEFAULT_INPUT_PER_MTOK_USD", 2.0)
+    monkeypatch.setattr(config, "DEFAULT_OUTPUT_PER_MTOK_USD", 8.0)
+    assert config.cost_usd_for("p", "m", {"prompt_tokens": 1_000_000,
+                                         "completion_tokens": 500_000}) == 6.0
+    assert config.tokens_from_usage({"prompt_tokens": 10, "completion_tokens": 5}) == (10, 5)
+    # Unknown usage or unpriced model → None (ambiguous, never zero-guessed).
+    assert config.cost_usd_for("p", "m", {}) is None
+    assert config.cost_usd_for("p", "m", None) is None
+    monkeypatch.setattr(config, "DEFAULT_INPUT_PER_MTOK_USD", None)
+    assert config.cost_usd_for("p", "m", {"prompt_tokens": 100}) is None

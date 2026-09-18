@@ -28,6 +28,9 @@ Deterministic accounting authority (code-owned, never delegated to a model):
 - These functions only ``flush``; the caller owns commit/rollback so an
   accounting failure can never rewrite completed gameplay. Gameplay code
   must treat ledger errors as fail-soft telemetry-style failures.
+- Production charging enters through :func:`charge_completed_run`, called
+  fail-soft from the authoritative AI-run finalization path after the run
+  commits; it reuses the same exactly-once invariants above.
 
 Billing state must never enter DM narrative / rules inputs: this module
 imports only ledger/config/models. ``app/dm/context.py`` has no billing
@@ -36,6 +39,7 @@ lane (covered by test).
 
 from __future__ import annotations
 
+from datetime import datetime, timezone
 from decimal import Decimal, ROUND_HALF_UP
 
 from sqlalchemy import func, select
@@ -329,6 +333,39 @@ def record_ai_spend_for_run(
     )
 
 
+def charge_completed_run(db: Session, *, run_id, campaign_id) -> CampaignUsageEntry | None:
+    """Charge one finalized AI run from the authoritative completion path.
+
+    Flush-only (no commit): call from an independent, fail-soft accounting
+    transaction *after* the run row commits, so accounting failure can never
+    rewrite gameplay. Returns ``None`` for runs that are not chargeable by
+    policy (not succeeded / recovery / non-billable). Raises
+    :class:`AmbiguousCostError` for a chargeable run with no usable cost and
+    :class:`LedgerConflictError` when the trace does not attribute the run
+    to ``campaign_id`` — both surfaced, never silent. Exactly-once per run
+    via the ``ai_run_id`` unique constraint (re-finalization replays).
+    """
+    run = db.get(AIRun, run_id)
+    if run is None:
+        raise AccountingError(f"AI run {run_id} not found")
+    if run.status != "succeeded" or run.classification != "primary" or not run.billable:
+        return None
+    trace = db.get(OperationTrace, run.trace_id) if run.trace_id else None
+    if trace is None:
+        trace = OperationTrace(
+            trace_id=run.trace_id,
+            operation_id=run.operation_id,
+            campaign_id=campaign_id,
+            submitted_at=datetime.now(timezone.utc),
+        )
+        db.add(trace)
+        db.flush()
+    elif trace.campaign_id is None:
+        trace.campaign_id = campaign_id
+        db.flush()
+    return record_ai_spend_for_run(db, campaign_id=campaign_id, ai_run=run)
+
+
 def _campaign_trace_ids(db: Session, campaign_id) -> list[str]:
     rows = db.scalars(select(OperationTrace.trace_id).where(OperationTrace.campaign_id == campaign_id)).all()
     return list(rows)
@@ -449,9 +486,12 @@ def reconcile(db: Session, campaign_id) -> list[str]:
         try:
             expected = usd_to_cents(run.cost_usd)
         except AmbiguousCostError:
-            # Zero-cost marker entries carry amount 0 with ambiguous/None cost.
-            if e.amount_cents != 0:
-                errors.append(f"spend entry {e.id} has ambiguous run cost but nonzero amount")
+            # None is always ambiguous for a persisted spend entry: a genuine
+            # zero-cost run carries cost_usd=0.0, which converts cleanly, so a
+            # zero amount here cannot validate an unknown cost.
+            errors.append(
+                f"spend entry {e.id} references run {run.id} with ambiguous cost"
+            )
             continue
         if abs(e.amount_cents) != expected:
             errors.append(
