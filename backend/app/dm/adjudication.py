@@ -537,20 +537,26 @@ def build_provider_narrator(
                     classification=classification,
                 )
                 yielded_downstream = False
+                stream_usage = None
                 try:
                     for event in stream_chat(cand_adapter, pr):
                         if event.kind == "token" and event.text:
                             yielded_downstream = True
                             yield event.text
+                        elif event.kind == "done" and getattr(event, "usage", None):
+                            stream_usage = event.usage
                     if ai_run is not None and telemetry is not None:
                         try:
+                            from app.billing.config import cost_usd_for, tokens_from_usage
                             from app.observability.service import finish_ai_run
 
-                            # Streaming transport carries no usage payload, so
-                            # cost stays None: the ledger surfaces the run as
-                            # ambiguous via reconcile() rather than guessing.
+                            in_tokens, out_tokens = tokens_from_usage(stream_usage)
                             finish_ai_run(telemetry, ai_run.id, status="succeeded",
-                                          result_code="stream_ok", campaign_id=campaign_id)
+                                          result_code="stream_ok",
+                                          input_tokens=in_tokens, output_tokens=out_tokens,
+                                          cost_usd=cost_usd_for(cand_adapter.name, cand_model,
+                                                                stream_usage),
+                                          campaign_id=campaign_id)
                         except Exception:
                             pass
                     return

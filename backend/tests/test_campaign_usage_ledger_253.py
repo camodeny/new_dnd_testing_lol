@@ -488,3 +488,52 @@ def test_cost_usd_for_uses_configured_pricing(monkeypatch):
     assert config.cost_usd_for("p", "m", None) is None
     monkeypatch.setattr(config, "DEFAULT_INPUT_PER_MTOK_USD", None)
     assert config.cost_usd_for("p", "m", {"prompt_tokens": 100}) is None
+
+
+# ── 16. production narration: streamed usage is charged exactly once ────────
+
+def test_primary_narration_stream_charges_exactly_once(monkeypatch):
+    import app.providers as providers_pkg
+    from app.billing import config as billing_config
+    from app.dm.adjudication import build_provider_narrator
+    from app.dm.narration import NarratorRequest
+    from app.providers import policy as role_policy
+    from app.providers import registry as reg
+    from app.providers.contracts import NormalizedStreamEvent
+
+    monkeypatch.setattr(billing_config, "DEFAULT_INPUT_PER_MTOK_USD", 2.0)
+    monkeypatch.setattr(billing_config, "DEFAULT_OUTPUT_PER_MTOK_USD", 8.0)
+    factory = _factory()
+    db = factory()
+    camp, _ = _seed(db)
+    db.commit()
+
+    class _FakeAdapter:
+        name = "p1"
+
+    def _fake_stream(adapter, request):
+        yield NormalizedStreamEvent(kind="token", text="hello ")
+        yield NormalizedStreamEvent(kind="token", text="world")
+        yield NormalizedStreamEvent(kind="done", usage={"prompt_tokens": 1_000_000,
+                                                       "completion_tokens": 500_000})
+
+    monkeypatch.setattr(providers_pkg, "stream_chat", _fake_stream)
+    monkeypatch.setattr(role_policy, "execution_path", lambda role: [("p1", "m")])
+    monkeypatch.setattr(role_policy, "is_model_approved", lambda r, p, m: True)
+    monkeypatch.setattr(reg.provider_registry, "get", lambda name: _FakeAdapter())
+    monkeypatch.setattr("app.providers.areas.resolve_area",
+                        lambda area: (_FakeAdapter(), "m", "p1"))
+
+    narrate = build_provider_narrator(db=db, campaign_id=camp)
+    assert "".join(narrate(NarratorRequest(prompt="p", projection={}))) == "hello world"
+    entries = db.query(CampaignUsageEntry).filter_by(entry_type="ai_spend").all()
+    assert len(entries) == 1
+    # Actual streamed cost: 2.0 * 1M input + 8.0 * 0.5M output = $6.00.
+    assert entries[0].amount_cents == -600
+    assert reconcile(db, camp) == []
+
+    # Recovery narration finalizes observability with no spend entry.
+    narrate_retry = build_provider_narrator(db=db, campaign_id=camp, is_retry=True)
+    assert "".join(narrate_retry(NarratorRequest(prompt="p", projection={}))) == "hello world"
+    assert db.query(CampaignUsageEntry).filter_by(entry_type="ai_spend").count() == 1
+    db.close()
