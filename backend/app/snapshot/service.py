@@ -413,6 +413,21 @@ def build_live_table_snapshot(
         realtime_resume_token = f"{revision}:{high_water or 0}"
         generated_at = datetime.now(timezone.utc).isoformat()
 
+        # Issue #230 — reconnect-safe encounter projection. Additive: a
+        # projection failure degrades to null rather than failing the whole
+        # snapshot, so combat can never break the live-table read path.
+        encounter_projection = None
+        try:
+            from app.combat.service import get_snapshot_encounter
+
+            encounter_projection = get_snapshot_encounter(db, campaign_id, viewer_id)
+        except Exception as exc:
+            logger.warning(
+                "snapshot encounter projection failed campaign_id=%s viewer_id=%s error=%s",
+                campaign_id, viewer_id, exc,
+            )
+            encounter_projection = None
+
         snapshot: dict[str, Any] = {
             "campaign": campaign.to_dict(),
             "revision": revision,
@@ -442,6 +457,7 @@ def build_live_table_snapshot(
             "dm_state": dm_state,
             "dm_messages": dm_messages,
             "roll_requests": roll_requests,
+            "encounter": encounter_projection,
             "surfaces": {},
             "extensions": {},
             "reconciliation": {

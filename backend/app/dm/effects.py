@@ -36,6 +36,9 @@ _EFFECT_DEFAULT_VISIBILITY: dict[str, str] = {
     "propose_sheet_update": "public",
     "assert_fact": "dm_private",
     "upsert_relation": "dm_private",
+    # Encounter selection references canonical identities only; stat
+    # resolution is server-side, so announcing combat is party-visible.
+    "start_encounter": "public",
 }
 
 def _is_shared_audience(audience: str) -> bool:
@@ -387,6 +390,29 @@ def _handle_complete_adventure(db: Session, campaign: Campaign, effect: dict[str
     logger.info(
         "effect complete_adventure effect_id=%s adventure_id=%s outcome=%s op=%s",
         effect.get("id"), adventure.id, adventure.outcome, operation_key,
+    )
+
+
+@register("start_encounter")
+def _handle_start_encounter(db: Session, campaign: Campaign, effect: dict[str, Any], turn: DmTurn, attempt: DmTurnAttempt):
+    """Start an authoritative encounter inside the turn-commit txn (issue #230).
+
+    Runs inside the outer ``commit_campaign_mutation``: a failed turn commit
+    rolls back the encounter rows, participants, NPC rolls, and pending human
+    initiative requests, so failed starts leave no half-created combat.
+
+    Duplicate protection: a retried effect with the same idempotency key
+    against an already-started encounter is a no-op returning the existing
+    row; a genuinely new start while one is pending/active fails closed.
+    """
+    from app.combat.service import start_encounter_inline
+
+    args = effect.get("arguments") or {}
+    operation_key = _resolve_effect_key(attempt, effect)
+    encounter = start_encounter_inline(db, campaign, turn, attempt, args, operation_key)
+    logger.info(
+        "effect start_encounter effect_id=%s encounter_id=%s participants=%s op=%s",
+        effect.get("id"), encounter.id, encounter.participant_count, operation_key,
     )
 
 

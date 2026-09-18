@@ -18,6 +18,7 @@ from sqlalchemy.orm import Session
 from models.campaigns import Campaign
 from models.campaigns import CampaignMember
 from models.characters import Character
+from models.combat import EncounterParticipant
 from models.dm import DmTurn
 from models.dm import DmTurnAttempt
 from models.dm import PlayerRollFulfillment
@@ -209,6 +210,22 @@ def fulfill_roll(db: Session, *, request_id: uuid.UUID, actor_id: uuid.UUID, pay
     req = db.execute(select(PlayerRollRequest).where(PlayerRollRequest.id == request_id).with_for_update()).scalars().first()
     if req is None:
         raise RollLifecycleError("Roll request not found")
+    # Issue #230 — encounter initiative reuses the durable #204 request /
+    # fulfillment records. Encounter-linked requests resume the encounter,
+    # never the source DM turn (which may already be committed).
+    linked = db.execute(
+        select(EncounterParticipant.id).where(EncounterParticipant.roll_request_id == req.id).limit(1)
+    ).scalars().first()
+    if linked is not None:
+        from app.combat.service import fulfill_human_initiative
+
+        participant = db.get(EncounterParticipant, linked)
+        _, fulfillment, _, _, _ = fulfill_human_initiative(
+            db, participant.encounter_id, participant.id, actor_id=actor_id, payload=payload,
+        )
+        logger.info("player_roll encounter_initiative fulfilled request_id=%s encounter_id=%s",
+                    req.id, participant.encounter_id)
+        return req, fulfillment, None
     from app.campaigns.service import require_playable_campaign
 
     require_playable_campaign(_lock_campaign_row(db, req.campaign_id))
@@ -263,6 +280,13 @@ def cancel_or_replace(db: Session, *, request_id: uuid.UUID, replacement: dict |
     req = db.execute(select(PlayerRollRequest).where(PlayerRollRequest.id == request_id).with_for_update()).scalars().first()
     if req is None:
         raise RollLifecycleError("Roll request not found")
+    # Issue #230 — encounter initiative requests are owned by the encounter
+    # lifecycle; cancelling one would strand its participant in pending.
+    encounter_linked = db.execute(
+        select(EncounterParticipant.id).where(EncounterParticipant.roll_request_id == req.id).limit(1)
+    ).scalars().first()
+    if encounter_linked is not None:
+        raise RollLifecycleError("encounter initiative requests cannot be cancelled; resolve them through the encounter")
     from app.campaigns.service import require_playable_campaign
 
     require_playable_campaign(_lock_campaign_row(db, req.campaign_id))
