@@ -920,9 +920,11 @@ def start_encounter_inline(
 ) -> Encounter:
     """DM structured-effect path: build rows inside the caller's turn-commit txn.
 
-    No commit, no separate domain event — the outer turn commit owns both.
-    The turn's event becomes the start provenance (resolved on read via
-    operation_id). Duplicate effect replays return the existing encounter.
+    No commit here — the outer turn commit owns both. The caller's
+    ``commit_turn`` stages the distinct ``encounter.started`` lifecycle
+    event + outbox hook in the same outer transaction and binds it as the
+    start provenance (resolved on read via operation_id).
+    Duplicate effect replays return the existing encounter.
     """
     prior = find_by_operation(db, campaign.id, operation_key)
     if prior is not None:

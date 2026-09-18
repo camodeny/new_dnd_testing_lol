@@ -1278,11 +1278,15 @@ def test_private_attempt_promotes_start_encounter():
         assert encounter is not None
         assert encounter.thread_id == str(thread.id)
         assert get_snapshot_encounter(db, ctx["campaign_id"], ctx["player"]) is None
-        # Slim scope (issue #230): the DM-effect path persists no distinct
-        # encounter.started domain event — the outer turn commit owns start
-        # provenance (a dedicated lifecycle row is deferred follow-up work).
-        # Thread scoping still holds: the outsider's member feed carries no
-        # encounter lifecycle event for the private-thread combat.
+        # The structured start stages a distinct thread-scoped lifecycle
+        # event in the same outer turn transaction: the thread member sees
+        # it in history, the outsider does not.
+        member_feed = list_campaign_events(db, ctx["campaign_id"], viewer_id=ctx["owner"])
+        member_started = [e for e in member_feed if e.event_type == ENCOUNTER_STARTED_EVENT]
+        assert len(member_started) == 1
+        assert member_started[0].payload["encounter_id"] == str(encounter.id)
+        assert member_started[0].payload["thread_id"] == str(thread.id)
+        assert encounter.created_event_id == member_started[0].id
         outsider_feed = list_campaign_events(db, ctx["campaign_id"], viewer_id=ctx["player"])
         assert all(
             e.event_type != ENCOUNTER_STARTED_EVENT for e in outsider_feed
