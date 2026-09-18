@@ -141,33 +141,9 @@ def _resolve_npc_stats(
     # NPC/monster combat stats are always DM-private per #230 security.
     visibility = "dm_private"
     details = entity.details or {}
-    if override is not None:
-        try:
-            modifier = int(override)
-        except (TypeError, ValueError) as exc:
-            raise EncounterError("npc initiative_modifier override must be an integer") from exc
-        if not -20 <= modifier <= 20:
-            raise EncounterError("npc initiative_modifier override must be between -20 and 20")
-        return modifier, 0, {
-            "source_type": "dm_selection_override",
-            "source_id": str(entity.id),
-            "source_version": entity.updated_at.isoformat() if entity.updated_at else "unknown",
-        }, visibility
-    if details.get("initiative_modifier") is not None:
-        try:
-            modifier = int(details["initiative_modifier"])
-        except (TypeError, ValueError) as exc:
-            raise EncounterError(f"NPC {entity_id} has a malformed initiative_modifier") from exc
-        dex = details.get("dex_modifier")
-        try:
-            dex_mod = int(dex) if dex is not None else 0
-        except (TypeError, ValueError):
-            dex_mod = 0
-        return modifier, dex_mod, {
-            "source_type": "world_entity_details",
-            "source_id": str(entity.id),
-            "source_version": entity.updated_at.isoformat() if entity.updated_at else "unknown",
-        }, visibility
+    # Canonical Dexterity always resolves from entity details: an override
+    # replaces only the total initiative modifier used in arithmetic, never
+    # the Dexterity tiebreak input for deterministic 2024 ordering.
     dex_mod = 0
     if details.get("dex_modifier") is not None:
         try:
@@ -179,6 +155,28 @@ def _resolve_npc_stats(
             dex_mod = (int(details["dexterity"]) - 10) // 2
         except (TypeError, ValueError) as exc:
             raise EncounterError(f"NPC {entity_id} has a malformed dexterity score") from exc
+    if override is not None:
+        try:
+            modifier = int(override)
+        except (TypeError, ValueError) as exc:
+            raise EncounterError("npc initiative_modifier override must be an integer") from exc
+        if not -20 <= modifier <= 20:
+            raise EncounterError("npc initiative_modifier override must be between -20 and 20")
+        return modifier, dex_mod, {
+            "source_type": "dm_selection_override",
+            "source_id": str(entity.id),
+            "source_version": entity.updated_at.isoformat() if entity.updated_at else "unknown",
+        }, visibility
+    if details.get("initiative_modifier") is not None:
+        try:
+            modifier = int(details["initiative_modifier"])
+        except (TypeError, ValueError) as exc:
+            raise EncounterError(f"NPC {entity_id} has a malformed initiative_modifier") from exc
+        return modifier, dex_mod, {
+            "source_type": "world_entity_details",
+            "source_id": str(entity.id),
+            "source_version": entity.updated_at.isoformat() if entity.updated_at else "unknown",
+        }, visibility
     bonus = details.get("initiative_bonus", 0) or 0
     try:
         bonus = int(bonus)
@@ -613,6 +611,9 @@ def _maybe_mark_ready(db: Session, campaign: Campaign, encounter: Encounter, *, 
 
     from app.campaigns.events import commit_campaign_mutation
 
+    # Bounded stable transition key: the start operation_id may legally fill
+    # the 128-char column, so suffixing it would overflow on PostgreSQL.
+    ready_operation_id = f"encounter:{encounter.id}:initiative-ready"
     _, event = commit_campaign_mutation(
         db,
         campaign.id,
@@ -628,7 +629,7 @@ def _maybe_mark_ready(db: Session, campaign: Campaign, encounter: Encounter, *, 
             "roll_sources": dict(encounter.roll_sources or {}),
             "time_to_first_turn_ms": wait_ms,
         },
-        operation_id=f"{encounter.operation_id}:initiative-ready" if encounter.operation_id else None,
+        operation_id=ready_operation_id,
         actor_id=campaign.owner_id,
         outbox_event_type=ENCOUNTER_READY_EVENT,
         outbox_payload={
@@ -638,7 +639,7 @@ def _maybe_mark_ready(db: Session, campaign: Campaign, encounter: Encounter, *, 
             "turn_order_ids": [str(pid) for pid in ordered_ids],
             "active_participant_id": str(ordered_ids[0]),
         },
-        outbox_operation_id=f"{encounter.operation_id}:initiative-ready" if encounter.operation_id else None,
+        outbox_operation_id=ready_operation_id,
         commit=commit,
     )
     structured_log(

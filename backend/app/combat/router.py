@@ -1,4 +1,5 @@
 """HTTP transport for the authoritative encounter lifecycle — issue #230."""
+import logging
 import uuid
 
 from fastapi import APIRouter, Depends, HTTPException, Request, Response
@@ -25,6 +26,8 @@ from app.deps.idempotency import execute_http_idempotent, require_idempotency_ke
 from database import get_db
 from models.combat import Encounter
 
+logger = logging.getLogger(__name__)
+
 router = APIRouter()
 
 
@@ -46,6 +49,30 @@ def _viewer_view(db: Session, encounter: Encounter, viewer_id: uuid.UUID, is_own
     return encounter_view(db, encounter, viewer_id, is_owner=is_owner)
 
 
+def _publish_post_commit(db: Session, result: dict) -> None:
+    """Best-effort realtime delivery after the outer idempotency commit.
+
+    The durable outbox row (enqueued atomically with the mutation) is the
+    guaranteed realtime hook; this direct publish is latency-only and never
+    rolls back authoritative state. Stable event ids make replays idempotent.
+    """
+    try:
+        from app.realtime.service import publish_encounter_ready, publish_encounter_started
+
+        encounter_id = (result.get("encounter") or {}).get("id")
+        if not encounter_id:
+            return
+        encounter = get_encounter(db, uuid.UUID(str(encounter_id)))
+        if encounter is None:
+            return
+        if result.get("event") is not None:
+            publish_encounter_started(db, encounter)
+        if result.get("ready_event") is not None:
+            publish_encounter_ready(db, encounter)
+    except Exception:
+        logger.warning("encounter post-commit publish skipped", exc_info=True)
+
+
 @router.post("/api/campaigns/{campaign_id}/encounters", status_code=201)
 def create_encounter(campaign_id: str, payload: dict, request: Request, response: Response, db: Session = Depends(get_db)):
     profile = resolve_profile(request, db)
@@ -65,6 +92,9 @@ def create_encounter(campaign_id: str, payload: dict, request: Request, response
 
     def execute():
         try:
+            # Flush-only: the outer idempotent command owns the commit so the
+            # record, mutation, and result commit atomically (no crash window
+            # with a stuck in_progress row).
             encounter, event = start_encounter(
                 db,
                 campaign.id,
@@ -76,6 +106,7 @@ def create_encounter(campaign_id: str, payload: dict, request: Request, response
                 scene=payload.get("scene"),
                 participants=payload.get("participants") or [],
                 start_source="api",
+                commit=False,
             )
             return {
                 "encounter": _viewer_view(db, encounter, profile.id, is_owner=True),
@@ -88,11 +119,13 @@ def create_encounter(campaign_id: str, payload: dict, request: Request, response
         except EncounterError as exc:
             raise HTTPException(status_code=422, detail=str(exc)) from exc
 
-    return execute_http_idempotent(
+    result = execute_http_idempotent(
         db, response, actor_id=profile.id, idempotency_key=key,
         command_type="encounter.start", scope_type="campaign", scope_id=campaign.id,
         payload=payload, execute=execute,
     )
+    _publish_post_commit(db, result)
+    return result
 
 
 @router.get("/api/campaigns/{campaign_id}/encounters/active")
@@ -150,6 +183,8 @@ def fulfill_initiative(campaign_id: str, encounter_id: str, payload: dict, reque
         try:
             req, fulfillment, participant, updated, event = fulfill_human_initiative(
                 db, encounter.id, participant_id, actor_id=profile.id, payload=payload,
+                # Flush-only: the outer idempotent command owns the commit.
+                commit=False,
             )
             return {
                 "roll_request": req.to_dict(),
@@ -175,11 +210,13 @@ def fulfill_initiative(campaign_id: str, encounter_id: str, payload: dict, reque
         (p for p in list_participants(db, encounter.id) if p.id == participant_id), None
     )
     scope_id = participant.roll_request_id if participant and participant.roll_request_id else participant_id
-    return execute_http_idempotent(
+    result = execute_http_idempotent(
         db, response, actor_id=profile.id, idempotency_key=key,
         command_type="encounter.initiative_fulfill", scope_type="encounter_participant", scope_id=scope_id,
         payload=payload, execute=execute,
     )
+    _publish_post_commit(db, result)
+    return result
 
 
 @router.post("/api/campaigns/{campaign_id}/encounters/{encounter_id}/initiative/roll-npc")
@@ -198,6 +235,8 @@ def roll_npc(campaign_id: str, encounter_id: str, payload: dict, request: Reques
         try:
             participant, updated, event = roll_npc_initiative(
                 db, encounter.id, participant_id, raw_d20=payload.get("raw_d20"),
+                # Flush-only: the outer idempotent command owns the commit.
+                commit=False,
             )
             return {
                 "participant": participant.to_dict(include_private=True),
@@ -213,8 +252,10 @@ def roll_npc(campaign_id: str, encounter_id: str, payload: dict, request: Reques
                 detail=message,
             ) from exc
 
-    return execute_http_idempotent(
+    result = execute_http_idempotent(
         db, response, actor_id=profile.id, idempotency_key=key,
         command_type="encounter.npc_roll", scope_type="encounter_participant", scope_id=participant_id,
         payload=payload, execute=execute,
     )
+    _publish_post_commit(db, result)
+    return result

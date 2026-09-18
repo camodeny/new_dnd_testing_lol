@@ -361,8 +361,55 @@ def test_incomplete_initiative_stays_pending_without_guessing():
         ).scalars().first() is None
 
 
-# ── idempotency / duplicates ────────────────────────────────────────────────
+def test_ready_operation_key_bounded_for_max_length_start_key():
+    from models.reliability import Outbox
 
+    fac, ctx = _fixture()
+    with fac() as db:
+        encounter, _ = _start(
+            db, ctx, [{"character_id": str(ctx["owner_pc"])}], operation_id="o" * 128,
+        )
+        owner_p = _pc_participant(db, encounter.id, ctx["owner_pc"])
+        _, _, _, encounter, event = _fulfill(db, encounter.id, owner_p, ctx["owner"], 12)
+        assert encounter.status == "active"
+        assert event is not None
+        assert event.operation_id == f"encounter:{encounter.id}:initiative-ready"
+        assert len(event.operation_id) <= 128
+        outbox_keys = {
+            row.operation_id for row in db.execute(
+                select(Outbox).where(Outbox.campaign_id == ctx["campaign_id"])
+            ).scalars().all()
+        }
+        assert f"encounter:{encounter.id}:initiative-ready" in outbox_keys
+        assert all(len(key or "") <= 128 for key in outbox_keys)
+
+
+def test_npc_override_preserves_canonical_dex_tiebreak():
+    fac, ctx = _fixture()
+    with fac() as db:
+        brute = WorldEntity(
+            campaign_id=ctx["campaign_id"], entity_type="monster", name="Ogre Brute",
+            visibility="dm_only", details={"dex_modifier": 3},
+        )
+        db.add(brute)
+        db.commit()
+        # NPC total modifier overridden to +5, but canonical Dex +3 survives
+        # for tiebreaks: 9+5=14 ties the PC's 12+2=14 (Dex +2) → NPC first.
+        encounter, _ = _start(db, ctx, [
+            {"character_id": str(ctx["player_pc"])},
+            {"npc_entity_id": str(brute.id), "initiative_modifier": 5},
+        ])
+        npc_p = next(p for p in list_participants(db, encounter.id) if p.kind == "monster")
+        assert npc_p.initiative_modifier == 5
+        assert npc_p.dex_modifier == 3
+        player_p = _pc_participant(db, encounter.id, ctx["player_pc"])
+        roll_npc_initiative(db, encounter.id, npc_p.id, raw_d20=9)
+        _, _, _, encounter, _ = _fulfill(db, encounter.id, player_p, ctx["player"], 12)
+        order = get_turn_order(db, encounter.id)
+        assert [p.id for p in order] == [npc_p.id, player_p.id]
+
+
+# ── idempotency / duplicates ────────────────────────────────────────────────
 
 def test_duplicate_start_and_duplicate_fulfill_are_idempotent():
     fac, ctx = _fixture()
@@ -565,12 +612,30 @@ def test_contract_rejects_ambiguous_participant_selection():
 
 
 def test_rolls_service_delegates_encounter_fulfillment_and_rejects_cancel():
-    from app.rolls.service import RollLifecycleError, cancel_or_replace, fulfill_roll
+    from app.rolls.service import (
+        RollAuthorizationError,
+        RollLifecycleError,
+        cancel_or_replace,
+        fulfill_roll,
+    )
+    from models.profiles import Profile as ProfileModel
 
     fac, ctx = _fixture()
     with fac() as db:
         encounter, _ = _start(db, ctx, [{"character_id": str(ctx["owner_pc"])}])
         owner_p = _pc_participant(db, encounter.id, ctx["owner_pc"])
+        outsider = uuid.uuid4()
+        db.add(ProfileModel(id=outsider, email="outsider@example.com"))
+        db.commit()
+        # Encounter authorization failures keep the roll API contract: 403
+        # mapping, never a 500 from an untranslated PermissionError.
+        with pytest.raises(RollAuthorizationError):
+            fulfill_roll(
+                db, request_id=owner_p.roll_request_id, actor_id=outsider,
+                payload={"source": "app", "raw_rolls": [10],
+                         "modifier": owner_p.initiative_modifier,
+                         "total": 10 + owner_p.initiative_modifier},
+            )
         req, fulfillment, resumed = fulfill_roll(
             db, request_id=owner_p.roll_request_id, actor_id=ctx["owner"],
             payload={"source": "physical", "raw_rolls": [9],

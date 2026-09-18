@@ -217,12 +217,24 @@ def fulfill_roll(db: Session, *, request_id: uuid.UUID, actor_id: uuid.UUID, pay
         select(EncounterParticipant.id).where(EncounterParticipant.roll_request_id == req.id).limit(1)
     ).scalars().first()
     if linked is not None:
-        from app.combat.service import fulfill_human_initiative
+        from app.combat.service import (
+            EncounterAuthorizationError,
+            EncounterError,
+            fulfill_human_initiative,
+        )
 
         participant = db.get(EncounterParticipant, linked)
-        _, fulfillment, _, _, _ = fulfill_human_initiative(
-            db, participant.encounter_id, participant.id, actor_id=actor_id, payload=payload,
-        )
+        try:
+            _, fulfillment, _, _, _ = fulfill_human_initiative(
+                db, participant.encounter_id, participant.id, actor_id=actor_id, payload=payload,
+                # Flush-only: the outer idempotent command owns the commit so
+                # the record, mutation, and result commit atomically.
+                commit=False,
+            )
+        except EncounterAuthorizationError as exc:
+            raise RollAuthorizationError(str(exc)) from exc
+        except EncounterError as exc:
+            raise RollLifecycleError(str(exc)) from exc
         logger.info("player_roll encounter_initiative fulfilled request_id=%s encounter_id=%s",
                     req.id, participant.encounter_id)
         return req, fulfillment, None
