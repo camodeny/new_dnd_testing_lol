@@ -275,3 +275,25 @@ def roll_npc(campaign_id: str, encounter_id: str, payload: dict, request: Reques
     )
     _publish_post_commit(db, result)
     return result
+
+
+@router.get("/api/cron/encounter-outbox")
+def encounter_outbox_cron_get(request: Request, db: Session = Depends(get_db)):
+    """Drive pending encounter lifecycle outbox work via the worker fence."""
+    from app.outbox.router import _require_cron_secret
+
+    _require_cron_secret(request.headers.get("authorization"))
+    from app.combat.service import run_encounter_outbox_sweep
+
+    result = run_encounter_outbox_sweep(db)
+    logger.info(
+        "encounter outbox cron executed=%s failed=%s",
+        len(result.get("executed", [])),
+        len(result.get("failed", [])),
+    )
+    return {"ok": True, "sweep": result}
+
+
+@router.post("/api/cron/encounter-outbox")
+def encounter_outbox_cron_post(request: Request, db: Session = Depends(get_db)):
+    return encounter_outbox_cron_get(request=request, db=db)

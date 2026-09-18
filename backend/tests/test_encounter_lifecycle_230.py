@@ -1177,3 +1177,85 @@ def test_encounter_outbox_workers_publish_lifecycle():
             assert ready[0]["payload"]["event_id"] == f"encounter:{encounter.id}:ready"
     finally:
         set_realtime_publisher(previous)
+
+
+def test_encounter_outbox_relay_consumer_chain(monkeypatch):
+    """Relay translation → queue consumer → ledger → realtime publish."""
+    import database
+
+    from app.outbox.service import envelope_for_outbox
+    from app.queue.consumer import consume_queue_delivery
+    from app.realtime.service import (
+        InMemoryRealtimePublisher,
+        get_realtime_publisher,
+        set_realtime_publisher,
+    )
+    from models.reliability import Outbox
+
+    fac, ctx = _fixture()
+    # Executor-driven handlers open their own session; bind it to this engine.
+    monkeypatch.setattr(database, "SessionLocal", fac)
+    previous = get_realtime_publisher()
+    recorder = InMemoryRealtimePublisher()
+    set_realtime_publisher(recorder)
+    try:
+        with fac() as db:
+            encounter, _ = _start(db, ctx, [{"character_id": str(ctx["owner_pc"])}])
+            owner_p = _pc_participant(db, encounter.id, ctx["owner_pc"])
+            _fulfill(db, encounter.id, owner_p, ctx["owner"], 12)
+            db.commit()
+            row = db.execute(
+                select(Outbox).where(
+                    Outbox.campaign_id == ctx["campaign_id"],
+                    Outbox.event_type == ENCOUNTER_READY_EVENT,
+                )
+            ).scalars().one()
+            recorder.clear()
+            # The exact translation the relay publishes to the queue.
+            env = envelope_for_outbox(row)
+            result, duplicate = consume_queue_delivery(db, env.to_dict())
+            assert duplicate is False
+            assert result == {"ok": True, "encounter_id": str(encounter.id)}
+            ready = [p for p in recorder.published if p["event"] == "encounter.initiative_ready"]
+            assert len(ready) == 1
+            assert ready[0]["payload"]["event_id"] == f"encounter:{encounter.id}:ready"
+    finally:
+        set_realtime_publisher(previous)
+
+
+def test_encounter_worker_failed_publish_retries():
+    """A failed realtime broadcast fails the worker (retriable), not success."""
+    from app.outbox.service import envelope_for_outbox
+    from app.queue.consumer import WORKER_HANDLERS
+    from app.realtime.service import (
+        InMemoryRealtimePublisher,
+        get_realtime_publisher,
+        set_realtime_publisher,
+    )
+    from app.worker.executor import RetriableError
+    from models.reliability import Outbox
+
+    fac, ctx = _fixture()
+    previous = get_realtime_publisher()
+    recorder = InMemoryRealtimePublisher(fail_next=True)
+    set_realtime_publisher(recorder)
+    try:
+        with fac() as db:
+            encounter, _ = _start(db, ctx, [{"character_id": str(ctx["owner_pc"])}])
+            db.commit()
+            row = db.execute(
+                select(Outbox).where(
+                    Outbox.campaign_id == ctx["campaign_id"],
+                    Outbox.event_type == ENCOUNTER_STARTED_EVENT,
+                )
+            ).scalars().one()
+            env = envelope_for_outbox(row)
+            # Fail only the worker's broadcast (setup already published once).
+            recorder.fail_next = True
+            with pytest.raises(RetriableError):
+                WORKER_HANDLERS[ENCOUNTER_STARTED_EVENT](env, db)
+            # Next attempt (failure consumed) publishes normally.
+            result = WORKER_HANDLERS[ENCOUNTER_STARTED_EVENT](env, db)
+            assert result == {"ok": True, "encounter_id": str(encounter.id)}
+    finally:
+        set_realtime_publisher(previous)

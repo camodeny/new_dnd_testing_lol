@@ -1103,7 +1103,14 @@ def _handle_encounter_envelope(envelope, event_type: str, db: Session | None) ->
     path; this durable outbox path only backstops crashes between commit and
     publish. Stable event ids make redelivery idempotent, and authoritative
     state never rolls back here.
+
+    Retry contract (worker-ledger semantics): a failed realtime publish or
+    an unresolvable encounter raises ``RetriableError`` (bounded by
+    max_attempts, then dead-lettered); malformed identifiers stay
+    ``ValueError`` (terminal poison). Transient database errors propagate
+    and classify retriable — they are never converted into success.
     """
+    from app.worker.executor import RetriableError
     from database import SessionLocal
 
     own_session = False
@@ -1117,10 +1124,7 @@ def _handle_encounter_envelope(envelope, event_type: str, db: Session | None) ->
         encounter = None
         encounter_id = payload.get("encounter_id")
         if encounter_id:
-            try:
-                encounter = get_encounter(db, uuid.UUID(str(encounter_id)))
-            except Exception:
-                encounter = None
+            encounter = get_encounter(db, uuid.UUID(str(encounter_id)))
         if encounter is None:
             # API-path started rows carry the start operation_id (the
             # encounter id is allocated inside the mutation); resolve
@@ -1128,19 +1132,17 @@ def _handle_encounter_envelope(envelope, event_type: str, db: Session | None) ->
             operation_id = payload.get("operation_id") or getattr(envelope, "operation_id", None)
             campaign_ref = payload.get("campaign_id") or getattr(envelope, "campaign_id", None)
             if operation_id and campaign_ref:
-                try:
-                    encounter = find_by_operation(
-                        db, uuid.UUID(str(campaign_ref)), str(operation_id)
-                    )
-                except Exception:
-                    encounter = None
+                encounter = find_by_operation(
+                    db, uuid.UUID(str(campaign_ref)), str(operation_id)
+                )
         if encounter is None:
-            logger.warning("encounter worker unresolved %s payload=%s", event_type, payload)
-            return {"ok": False, "reason": "unknown_encounter"}
+            raise RetriableError(f"{event_type} could not resolve its encounter yet")
         if event_type == ENCOUNTER_STARTED_EVENT:
-            publish_encounter_started(db, encounter)
+            published = publish_encounter_started(db, encounter)
         else:
-            publish_encounter_ready(db, encounter)
+            published = publish_encounter_ready(db, encounter)
+        if not published:
+            raise RetriableError(f"realtime publish failed for {event_type}")
         return {"ok": True, "encounter_id": str(encounter.id)}
     finally:
         if own_session:
@@ -1165,3 +1167,86 @@ def register_encounter_workers() -> None:
 
 
 register_encounter_workers()
+
+
+def run_encounter_outbox_sweep(db: Session, *, limit: int = 5, max_attempts: int = 5) -> dict:
+    """Drive pending encounter lifecycle outbox rows through the worker fence.
+
+    Scheduled-consumer counterpart to the direct post-commit publish
+    (mirrors the adventure-closing sweep): consumes the durable outbox rows
+    directly, translating each through ``envelope_for_outbox`` — the exact
+    translation the relay uses — so relay delivery and this sweep converge
+    on one ``WorkerExecution`` per outbox row. A failed sweep never touches
+    authoritative encounter state; stable realtime event ids keep redelivery
+    idempotent.
+    """
+    from datetime import datetime as _datetime
+    from datetime import timezone as _timezone
+
+    from sqlalchemy import or_ as _or_
+    from sqlalchemy import select as _select
+
+    from app.outbox.service import ack_published, envelope_for_outbox, mark_failed
+    from app.queue.consumer import WORKER_HANDLERS
+    from app.worker.executor import TerminalError, execute_worker_job
+    from models.reliability import Outbox
+
+    now = _datetime.now(_timezone.utc)
+    candidates = list(
+        db.execute(
+            _select(Outbox)
+            .where(
+                Outbox.event_type.in_((ENCOUNTER_STARTED_EVENT, ENCOUNTER_READY_EVENT)),
+                _or_(Outbox.status == "pending", Outbox.status == "failed"),
+                _or_(Outbox.next_attempt_at == None, Outbox.next_attempt_at <= now),  # noqa: E711
+            )
+            .order_by(Outbox.created_at.asc())
+            .limit(max(1, limit))
+        )
+        .scalars()
+        .all()
+    )
+    executed: list[str] = []
+    failed: list[dict] = []
+    for row in candidates:
+        try:
+            env = envelope_for_outbox(row)
+            handler = WORKER_HANDLERS[env.job_type]
+            execute_worker_job(
+                db, env, lambda e, _db=db, _h=handler: _h(e, _db),
+                max_attempts=max_attempts,
+            )
+            ack_published(db, row.id)
+            executed.append(str(row.id))
+        except TerminalError as exc:
+            # The worker ledger durably owns the terminal outcome
+            # (dead_letter): retire the transport row so a poisoned job can
+            # never be reselected or starve newer encounter work.
+            try:
+                db.rollback()
+            except Exception:
+                pass
+            ack_published(db, row.id)
+            logger.warning(
+                "encounter outbox sweep retired terminal outbox_id=%s error=%s",
+                row.id, exc,
+            )
+            failed.append({"outbox_id": str(row.id), "error": str(exc)[:300], "terminal": True})
+        except Exception as exc:  # noqa: BLE001 — sweep must survive bad rows
+            try:
+                db.rollback()
+            except Exception:
+                pass
+            try:
+                mark_failed(db, row.id, str(exc)[:500])
+            except Exception:
+                pass
+            logger.warning(
+                "encounter outbox sweep failed outbox_id=%s error=%s",
+                row.id, exc,
+            )
+            failed.append({"outbox_id": str(row.id), "error": str(exc)[:300]})
+    logger.info(
+        "encounter outbox sweep executed=%s failed=%s", len(executed), len(failed)
+    )
+    return {"executed": executed, "failed": failed}
