@@ -370,24 +370,45 @@ def test_concurrent_supersession_uses_cas():
         assert a3.attempt_number == 2
 
 
+@pytest.mark.postgres
 def test_concurrent_submission_plus_coordination_does_not_rollback_outer(tmp_path):
     """Two genuinely concurrent submission+coordination tx should not lose submissions on unique-constraint race.
 
     Each thread does accept_submission + coordinate_turn(commit=False) inside a single
     outer transaction (simulating execute_http_idempotent's callback). The loser of the
     unique-active race must not roll back its outer submission via a full db.rollback().
+
+    Postgres-only by design: the two coordinations serialize on the campaign
+    SELECT ... FOR UPDATE row lock, which SQLite silently skips. On SQLite the
+    same interleaving runs lock-free and is racy by construction (a stale
+    pre-commit collect can create a second active turn or hit the
+    (turn_id, attempt_number) unique constraint), so this runs against the
+    disposable Postgres and skips without one.
     """
+    import os
     import threading
     import time
 
-    db_file = tmp_path / "concurrent_sub_coord.sqlite"
-    eng = create_engine(f"sqlite:///{db_file}", connect_args={"check_same_thread": False, "timeout": 10})
-    Base.metadata.create_all(bind=eng)
+    if not os.getenv("FAULT_TEST_DATABASE_URL"):
+        pytest.skip("requires disposable Postgres")
+
+    from tests.reliability.test_fault_injection import _safe_engine
+
+    eng = _safe_engine(tmp_path)
     Fac2 = sessionmaker(bind=eng, expire_on_commit=False)
     owner = uuid.uuid4()
     other = uuid.uuid4()
     with Fac2() as db:
+        # Migrated Postgres enforces profiles.id -> auth.users(id) (Supabase
+        # auth mirror); seed the auth rows first like other pg tests do, and
+        # commit profiles before the campaign row that references them.
+        db.execute(
+            text("INSERT INTO auth.users (id) VALUES (:a), (:b) ON CONFLICT (id) DO NOTHING"),
+            {"a": owner, "b": other},
+        )
         db.add_all([Profile(id=owner, email="owner@example.com"), Profile(id=other, email="other@example.com")])
+        db.commit()
+    with Fac2() as db:
         cid = uuid.uuid4()
         db.add(Campaign(id=cid, owner_id=owner, name="RaceCamp", revision=0))
         db.flush()
