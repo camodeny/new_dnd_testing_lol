@@ -64,10 +64,13 @@ export function clearPendingInvite(code?: string): void {
 }
 
 // Where an authenticated landing should continue. Returns the invite path
-// when a valid pending code exists and the app is NOT already on it;
-// clears abandoned/malformed values deliberately so a stale code can never
-// trap the user in a recovery loop. Returns null when there is nothing to
-// recover (or the invite page itself owns the flow from here).
+// when a valid pending code exists and the app is NOT already on it.
+// One-shot (#242 review): producing a target consumes the stored code, so a
+// revoked/expired/full/started/unknown invite can never trap navigation in
+// a recovery loop — the invite page owns the flow from here, and its
+// parkAndLogin() re-persists the code if auth is still missing. Returns
+// null when there is nothing to recover (or the invite page itself owns
+// the flow from here); abandoned/malformed values are cleared deliberately.
 export function recoverPendingInviteTarget(currentPath: string): string | null {
   let raw: string | null = null
   try {
@@ -83,5 +86,8 @@ export function recoverPendingInviteTarget(currentPath: string): string | null {
     return null
   }
   if (currentPath === invitePathFor(raw)) return null
+  try {
+    localStorage.removeItem(PENDING_INVITE_KEY)
+  } catch { /* no-op */ }
   return invitePathFor(raw)
 }

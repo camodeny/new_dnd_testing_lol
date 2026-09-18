@@ -18,6 +18,15 @@ describe('pending-invite recovery (#242)', () => {
     expect(recoverPendingInviteTarget('/')).toBe('/invite/TESTCODE8')
   })
 
+  it('recovery is one-shot: a dead invite never hijacks navigation twice', () => {
+    storePendingInvite('TESTCODE8')
+    expect(recoverPendingInviteTarget('/')).toBe('/invite/TESTCODE8')
+    // Consumed on redirect — a second landing at / stays put instead of
+    // bouncing back to a revoked/expired/full/started/unknown invite.
+    expect(localStorage.getItem(PENDING_INVITE_KEY)).toBeNull()
+    expect(recoverPendingInviteTarget('/')).toBeNull()
+  })
+
   it('is a no-op without a stored code so ordinary logins are untouched', () => {
     expect(recoverPendingInviteTarget('/')).toBeNull()
   })

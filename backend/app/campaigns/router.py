@@ -2031,6 +2031,12 @@ def accept_invite_by_code(payload: dict, request: Request, db: Session = Depends
     ).scalars().first()
     if not camp:
         raise HTTPException(status_code=404, detail="Campaign not found")
+    # Revalidate the invite after acquiring the campaign serialization lock
+    # (#242 review): revocation commits through the same campaign lock, so a
+    # revoke that landed between the code lookup above and this lock must be
+    # observed — otherwise a stale active snapshot could mint membership.
+    # (READ COMMITTED re-read; no invite-row-first lock order introduced.)
+    db.refresh(inv)
     result = _accept_invite(db, camp, inv, profile)
     return {**result, "campaign_id": str(camp.id), "code": inv.code}
 
