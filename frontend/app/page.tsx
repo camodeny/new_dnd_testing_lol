@@ -134,7 +134,9 @@ export default function HomePage() {
     try {
       const data = await campaignMembers.lookupInvite(clean)
       setActiveModal(null)
-      router.push(`/join/${(data as { campaign_id?: string }).campaign_id ?? ''}?code=${encodeURIComponent(clean.toUpperCase())}`)
+      // Canonical shareable flow (#242): the invite page re-verifies,
+      // preserves context across auth, and routes into the lobby.
+      router.push(`/invite/${encodeURIComponent((data as { code?: string }).code ?? clean.toUpperCase())}`)
     } catch (err) {
       setJoinError((err as Error).message || 'Failed to locate campaign. Check your code and try again.')
     } finally {

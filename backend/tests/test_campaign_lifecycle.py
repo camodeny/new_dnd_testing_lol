@@ -211,6 +211,7 @@ def test_owner_removal_count_reduction_and_invite_revocation_are_revisioned(api)
         db.commit()
     invite = client.post(f"/api/campaigns/{cid}/invites")
     assert invite.status_code == 200
+    invite_code = invite.json()["code"]
 
     actor["id"] = member_id
     denied = client.put(
@@ -254,14 +255,18 @@ def test_owner_removal_count_reduction_and_invite_revocation_are_revisioned(api)
 
     revoked = client.request(
         "DELETE",
-        f"/api/campaigns/{cid}/invites",
+        f"/api/campaigns/{cid}/invites/{invite_code}",
         json={"expected_revision": 2},
         headers={"Idempotency-Key": "revoke-invite"},
     )
     assert revoked.status_code == 200
     assert revoked.json()["campaign"]["revision"] == 3
+    assert revoked.json()["invite"]["status"] == "revoked"
     with factory() as db:
-        assert db.get(CampaignInvite, cid) is None
+        row = db.execute(
+            select(CampaignInvite).where(CampaignInvite.code == invite_code)
+        ).scalars().first()
+        assert row is not None and row.status == "revoked"
 
 
 def test_active_and_archived_transitions_restore_reactivates_same_campaign(api):
@@ -374,7 +379,7 @@ def test_non_owner_cannot_change_lifecycle_or_settings(api):
     assert remove_denied.status_code == 403
     revoke_denied = client.request(
         "DELETE",
-        f"/api/campaigns/{cid}/invites",
+        f"/api/campaigns/{cid}/invites/ANYCODE00",
         json={"expected_revision": 0},
         headers={"Idempotency-Key": "non-owner-revoke"},
     )

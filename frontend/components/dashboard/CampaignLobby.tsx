@@ -2,7 +2,7 @@
 
 import { useState, useCallback, useEffect } from 'react'
 import { campaigns as campaignsApi, campaignMembers as membersApi, characters as charactersApi } from '@/lib/api'
-import type { Campaign, CampaignMember, Character, LobbyEligibility, User } from '@/types'
+import type { Campaign, CampaignInvite, CampaignMember, Character, LobbyEligibility, User } from '@/types'
 
 interface CampaignLobbyProps {
   campaign: Campaign
@@ -21,8 +21,14 @@ export default function CampaignLobby({ campaign, currentUser, isOwner, onBegin 
   const [eligibility, setEligibility] = useState<LobbyEligibility | null>(null)
   const [revision, setRevision] = useState<number>(campaign.revision)
   const [launchLocked, setLaunchLocked] = useState(false)
-  const [invite, setInvite] = useState<{ code?: string } | null>(null)
-  const [copied, setCopied] = useState(false)
+  const [invites, setInvites] = useState<CampaignInvite[]>([])
+  const [outstanding, setOutstanding] = useState(0)
+  const [copiedCode, setCopiedCode] = useState<string | null>(null)
+  const [inviteEmail, setInviteEmail] = useState('')
+  const [inviteLabel, setInviteLabel] = useState('')
+  const [inviteBusy, setInviteBusy] = useState(false)
+  const [inviteError, setInviteError] = useState('')
+  const [inviteNotice, setInviteNotice] = useState('')
   const [owned, setOwned] = useState<Character[]>([])
   const [selectedId, setSelectedId] = useState('')
   const [busy, setBusy] = useState(false)
@@ -35,6 +41,14 @@ export default function CampaignLobby({ campaign, currentUser, isOwner, onBegin 
       setEligibility(data.eligibility ?? null)
       setRevision((current) => data.campaign?.revision ?? current)
       setLaunchLocked(Boolean(data.launch_locked))
+      // Joined vs outstanding invited state (#242). Non-owners receive
+      // masked email hints only — never raw addresses.
+      if (Array.isArray((data as { invites?: CampaignInvite[] }).invites)) {
+        setInvites((data as { invites?: CampaignInvite[] }).invites ?? [])
+      }
+      if (typeof (data as { outstanding_invites?: number }).outstanding_invites === 'number') {
+        setOutstanding((data as { outstanding_invites?: number }).outstanding_invites ?? 0)
+      }
     } catch {
       setEligibility(null)
       // Fall back to members-only projection if lobby endpoint is unavailable
@@ -61,24 +75,90 @@ export default function CampaignLobby({ campaign, currentUser, isOwner, onBegin 
   useEffect(() => {
     if (!isOwner) return
     membersApi
-      .getInvite(campaign.id)
-      .then((data) => setInvite(data as { code?: string }))
+      .listInvites(campaign.id)
+      .then((data) => setInvites((data as { invites?: CampaignInvite[] }).invites ?? []))
       .catch(() => {})
   }, [campaign.id, isOwner])
 
-  const handleGenerateCode = useCallback(async () => {
+  const refreshInvites = useCallback(async () => {
+    if (!isOwner) return
     try {
-      const data = await membersApi.createInvite(campaign.id)
-      setInvite(data as { code?: string })
+      const data = await membersApi.listInvites(campaign.id)
+      setInvites((data as { invites?: CampaignInvite[] }).invites ?? [])
     } catch { /* no-op */ }
-  }, [campaign.id])
+  }, [campaign.id, isOwner])
 
-  const handleCopyCode = useCallback(async () => {
-    if (!invite?.code) return
-    await navigator.clipboard.writeText(invite.code).catch(() => {})
-    setCopied(true)
-    setTimeout(() => setCopied(false), 2000)
-  }, [invite?.code])
+  const handleCreateInvite = useCallback(async () => {
+    setInviteBusy(true)
+    setInviteError('')
+    setInviteNotice('')
+    try {
+      await membersApi.createInvite(campaign.id, {
+        intended_email: inviteEmail.trim() || undefined,
+        recipient_label: inviteLabel.trim() || undefined,
+      })
+      setInviteEmail('')
+      setInviteLabel('')
+      await Promise.all([refreshInvites(), refreshLobby()])
+      setInviteNotice('Invite created — share the link below.')
+    } catch (err) {
+      setInviteError((err as Error).message)
+    } finally {
+      setInviteBusy(false)
+    }
+  }, [campaign.id, inviteEmail, inviteLabel, refreshInvites, refreshLobby])
+
+  const handleRevokeInvite = useCallback(async (code: string) => {
+    setInviteBusy(true)
+    setInviteError('')
+    setInviteNotice('')
+    try {
+      await membersApi.revokeInvite(campaign.id, code, revision, newKey())
+      await Promise.all([refreshInvites(), refreshLobby()])
+      setInviteNotice(`Invite ${code} revoked.`)
+    } catch (err) {
+      await refreshLobby()
+      setInviteError((err as Error).message)
+    } finally {
+      setInviteBusy(false)
+    }
+  }, [campaign.id, revision, refreshInvites, refreshLobby])
+
+  const handleSendEmail = useCallback(async (code: string, email?: string | null) => {
+    const target = (email ?? '').trim()
+    if (!target) {
+      setInviteError('That invite has no email address — add one when creating the invite.')
+      return
+    }
+    setInviteBusy(true)
+    setInviteError('')
+    setInviteNotice('')
+    try {
+      const result = await membersApi.sendInviteEmail(campaign.id, code, target) as {
+        ok?: boolean
+        delivery?: { sent?: boolean; error?: string | null }
+      }
+      await Promise.all([refreshInvites(), refreshLobby()])
+      if (result?.delivery?.sent) {
+        setInviteNotice(`Invite email sent to ${target}.`)
+      } else {
+        // Email failure never invalidates the link/code (#242): the invite
+        // stays usable and the owner can copy the link or retry sending.
+        setInviteNotice(`Email not delivered (${result?.delivery?.error ?? 'provider unavailable'}) — the link below still works; retry anytime.`)
+      }
+    } catch (err) {
+      setInviteError((err as Error).message)
+    } finally {
+      setInviteBusy(false)
+    }
+  }, [campaign.id, refreshInvites, refreshLobby])
+
+  const handleCopy = useCallback(async (code: string) => {
+    const url = `${window.location.origin}/invite/${code}`
+    await navigator.clipboard.writeText(url).catch(() => {})
+    setCopiedCode(code)
+    setTimeout(() => setCopiedCode((current) => (current === code ? null : current)), 2000)
+  }, [])
 
   const me = members.find((m) => m.user_id === currentUser?.id) ?? null
   const myCharId = me?.selected_character_id ?? me?.character_id ?? null
@@ -283,44 +363,105 @@ export default function CampaignLobby({ campaign, currentUser, isOwner, onBegin 
             )}
           </section>
 
-          {/* Invite section */}
-          {isOwner && (
-            <section className="lobby-invite-section">
-              <div className="lobby-section-header">
-                <span className="lobby-section-label">
-                  <i className="bi bi-link-45deg" aria-hidden="true" /> Invite players
+          {/* Invite section — issue #242 */}
+          <section className="lobby-invite-section">
+            <div className="lobby-section-header">
+              <span className="lobby-section-label">
+                <i className="bi bi-link-45deg" aria-hidden="true" /> Invite players
+              </span>
+              {outstanding > 0 && (
+                <span style={{ fontSize: '0.72rem', color: 'var(--ink-muted)' }}>
+                  {outstanding} outstanding
                 </span>
-              </div>
-              <div className="lobby-invite-card">
-                <p className="lobby-invite-desc">Share this code with friends. They can join at any time using the &quot;Join with code&quot; button on the campaigns page.</p>
-                <div className="lobby-invite-code-row">
-                  {invite?.code ? (
+              )}
+            </div>
+            <div className="lobby-invite-card">
+              <p className="lobby-invite-desc">Share a link — it survives sign-up: new players land straight in this lobby after creating their account.</p>
+              {invites.filter((inv) => inv.usable !== false && inv.status === 'active').map((inv) => (
+                <div key={inv.code} className="lobby-invite-code-row" style={{ marginBottom: 8 }}>
+                  <div className="lobby-invite-code" title={inv.recipient_label ?? inv.intended_email ?? inv.intended_email_hint ?? inv.code}>
+                    {`${window.location.origin}/invite/${inv.code}`}
+                  </div>
+                  <button
+                    type="button"
+                    className={`lobby-copy-btn${copiedCode === inv.code ? ' copied' : ''}`}
+                    onClick={() => void handleCopy(inv.code)}
+                  >
+                    {copiedCode === inv.code ? <><i className="bi bi-check" aria-hidden="true" /> Copied!</> : <><i className="bi bi-copy" aria-hidden="true" /> Copy link</>}
+                  </button>
+                  {isOwner && (
                     <>
-                      <div className="lobby-invite-code">{invite.code}</div>
+                      {(inv.intended_email || inv.intended_email_hint) && (
+                        <span style={{ alignSelf: 'center', fontSize: '0.72rem', color: 'var(--ink-muted)' }}>
+                          {inv.intended_email ?? inv.intended_email_hint}
+                          {inv.recipient_label && ` · ${inv.recipient_label}`}
+                        </span>
+                      )}
+                      {inv.intended_email && (
+                        <button
+                          type="button"
+                          className="lobby-generate-btn"
+                          disabled={inviteBusy}
+                          onClick={() => void handleSendEmail(inv.code, inv.intended_email)}
+                          title={inv.last_delivery_status === 'sent' ? 'Resend email' : 'Send email'}
+                        >
+                          <i className="bi bi-envelope" aria-hidden="true" /> {inv.last_delivery_status === 'sent' ? 'Resend' : 'Email'}
+                        </button>
+                      )}
                       <button
                         type="button"
-                        className={`lobby-copy-btn${copied ? ' copied' : ''}`}
-                        onClick={handleCopyCode}
+                        className="lobby-generate-btn"
+                        disabled={inviteBusy}
+                        onClick={() => void handleRevokeInvite(inv.code)}
                       >
-                        {copied ? <><i className="bi bi-check" aria-hidden="true" /> Copied!</> : <><i className="bi bi-copy" aria-hidden="true" /> Copy</>}
+                        Revoke
                       </button>
                     </>
-                  ) : (
+                  )}
+                </div>
+              ))}
+              {isOwner && (
+                <>
+                  <div style={{ display: 'flex', gap: 8, flexWrap: 'wrap', marginTop: 8 }}>
+                    <input
+                      type="email"
+                      aria-label="Invitee email (optional)"
+                      placeholder="friend@example.com (optional)"
+                      value={inviteEmail}
+                      onChange={(e) => setInviteEmail(e.target.value)}
+                      disabled={inviteBusy}
+                      style={{ flex: '2 1 200px', padding: '8px 10px', borderRadius: 8 }}
+                    />
+                    <input
+                      type="text"
+                      aria-label="Recipient label (optional)"
+                      placeholder="Name or note (optional)"
+                      value={inviteLabel}
+                      onChange={(e) => setInviteLabel(e.target.value)}
+                      disabled={inviteBusy}
+                      style={{ flex: '1 1 140px', padding: '8px 10px', borderRadius: 8 }}
+                    />
                     <button
                       type="button"
                       className="lobby-generate-btn"
-                      onClick={handleGenerateCode}
+                      onClick={() => void handleCreateInvite()}
+                      disabled={inviteBusy}
                     >
-                      <i className="bi bi-plus-circle" aria-hidden="true" /> Generate invite code
+                      <i className="bi bi-plus-circle" aria-hidden="true" /> New invite link
                     </button>
+                  </div>
+                  {inviteError && <p className="lobby-invite-hint" role="alert">{inviteError}</p>}
+                  {inviteNotice && <p className="lobby-invite-hint" role="status">{inviteNotice}</p>}
+                  {invites.length === 0 && (
+                    <p className="lobby-invite-hint">No invites yet — create one above.</p>
                   )}
-                </div>
-                {invite?.code && (
-                  <p className="lobby-invite-hint">Code never expires. Share it anytime.</p>
-                )}
-              </div>
-            </section>
-          )}
+                </>
+              )}
+              {!isOwner && invites.length === 0 && (
+                <p className="lobby-invite-hint">No outstanding invites.</p>
+              )}
+            </div>
+          </section>
 
           {/* Footer: begin */}
           <footer className="lobby-footer">

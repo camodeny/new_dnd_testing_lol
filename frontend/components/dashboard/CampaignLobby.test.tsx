@@ -8,7 +8,8 @@ import type { Campaign, User } from '@/types'
 
 vi.mock('@/lib/api', () => ({
   campaignMembers: {
-    getLobby: vi.fn(), listMembers: vi.fn(), getInvite: vi.fn(),
+    getLobby: vi.fn(), listMembers: vi.fn(), listInvites: vi.fn(), createInvite: vi.fn(),
+    revokeInvite: vi.fn(), sendInviteEmail: vi.fn(),
     setReadiness: vi.fn(), selectCharacter: vi.fn(),
   },
   campaigns: { transitionLifecycle: vi.fn() },
@@ -37,7 +38,7 @@ beforeEach(() => {
     eligibility: { eligible: remoteReady, blockers: remoteReady ? [] : ['Friend not ready'] },
     launch_locked: false,
   }))
-  vi.mocked(campaignMembers.getInvite).mockResolvedValue({ code: 'invite' })
+  vi.mocked(campaignMembers.listInvites).mockResolvedValue({ invites: [] })
   vi.mocked(characters.list).mockResolvedValue({ characters: [] })
   container = document.createElement('div')
   document.body.appendChild(container)
