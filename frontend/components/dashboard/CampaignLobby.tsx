@@ -29,6 +29,12 @@ export default function CampaignLobby({ campaign, currentUser, isOwner, onBegin 
   const [inviteBusy, setInviteBusy] = useState(false)
   const [inviteError, setInviteError] = useState('')
   const [inviteNotice, setInviteNotice] = useState('')
+  // Render-safe origin for shareable links (#242 review): populated after
+  // mount so server rendering/prerendering never touches `window`.
+  const [origin, setOrigin] = useState('')
+  useEffect(() => {
+    setOrigin(window.location.origin)
+  }, [])
   const [owned, setOwned] = useState<Character[]>([])
   const [selectedId, setSelectedId] = useState('')
   const [busy, setBusy] = useState(false)
@@ -153,12 +159,12 @@ export default function CampaignLobby({ campaign, currentUser, isOwner, onBegin 
     }
   }, [campaign.id, refreshInvites, refreshLobby])
 
-  const handleCopy = useCallback(async (code: string) => {
-    const url = `${window.location.origin}/invite/${code}`
-    await navigator.clipboard.writeText(url).catch(() => {})
+  const handleCopy = useCallback(async (code: string, path?: string | null) => {
+    const text = origin ? `${origin}/invite/${code}` : (path ?? `/invite/${code}`)
+    await navigator.clipboard.writeText(text).catch(() => {})
     setCopiedCode(code)
     setTimeout(() => setCopiedCode((current) => (current === code ? null : current)), 2000)
-  }, [])
+  }, [origin])
 
   const me = members.find((m) => m.user_id === currentUser?.id) ?? null
   const myCharId = me?.selected_character_id ?? me?.character_id ?? null
@@ -377,23 +383,38 @@ export default function CampaignLobby({ campaign, currentUser, isOwner, onBegin 
             </div>
             <div className="lobby-invite-card">
               <p className="lobby-invite-desc">Share a link — it survives sign-up: new players land straight in this lobby after creating their account.</p>
-              {invites.filter((inv) => inv.usable !== false && inv.status === 'active').map((inv) => (
-                <div key={inv.code} className="lobby-invite-code-row" style={{ marginBottom: 8 }}>
-                  <div className="lobby-invite-code" title={inv.recipient_label ?? inv.intended_email ?? inv.intended_email_hint ?? inv.code}>
-                    {`${window.location.origin}/invite/${inv.code}`}
+              {invites.filter((inv) => inv.usable !== false && inv.status === 'active').map((inv) => {
+                const key = inv.id ?? inv.code ?? inv.intended_email_hint ?? 'invite'
+                // Bearer codes/links are owner-only (#242 review): members
+                // see who is outstanding, never the credential itself.
+                if (!isOwner || !inv.code) {
+                  const who = inv.recipient_label ?? inv.intended_email_hint ?? 'Invited player'
+                  return (
+                    <div key={key} className="lobby-invite-code-row" style={{ marginBottom: 8 }}>
+                      <span style={{ alignSelf: 'center', fontSize: '0.78rem', color: 'var(--ink-muted)' }}>
+                        <i className="bi bi-envelope" aria-hidden="true" /> {who} · invited
+                      </span>
+                    </div>
+                  )
+                }
+                const link = origin ? `${origin}/invite/${inv.code}` : (inv.invite_url_path ?? `/invite/${inv.code}`)
+                return (
+                <div key={key} className="lobby-invite-code-row" style={{ marginBottom: 8 }}>
+                  <div className="lobby-invite-code" title={inv.recipient_label ?? inv.intended_email ?? inv.code}>
+                    {link}
                   </div>
                   <button
                     type="button"
                     className={`lobby-copy-btn${copiedCode === inv.code ? ' copied' : ''}`}
-                    onClick={() => void handleCopy(inv.code)}
+                    onClick={() => void handleCopy(inv.code as string, inv.invite_url_path)}
                   >
                     {copiedCode === inv.code ? <><i className="bi bi-check" aria-hidden="true" /> Copied!</> : <><i className="bi bi-copy" aria-hidden="true" /> Copy link</>}
                   </button>
                   {isOwner && (
                     <>
-                      {(inv.intended_email || inv.intended_email_hint) && (
+                      {inv.intended_email && (
                         <span style={{ alignSelf: 'center', fontSize: '0.72rem', color: 'var(--ink-muted)' }}>
-                          {inv.intended_email ?? inv.intended_email_hint}
+                          {inv.intended_email}
                           {inv.recipient_label && ` · ${inv.recipient_label}`}
                         </span>
                       )}
@@ -402,7 +423,7 @@ export default function CampaignLobby({ campaign, currentUser, isOwner, onBegin 
                           type="button"
                           className="lobby-generate-btn"
                           disabled={inviteBusy}
-                          onClick={() => void handleSendEmail(inv.code, inv.intended_email)}
+                          onClick={() => void handleSendEmail(inv.code as string, inv.intended_email)}
                           title={inv.last_delivery_status === 'sent' ? 'Resend email' : 'Send email'}
                         >
                           <i className="bi bi-envelope" aria-hidden="true" /> {inv.last_delivery_status === 'sent' ? 'Resend' : 'Email'}
@@ -412,14 +433,15 @@ export default function CampaignLobby({ campaign, currentUser, isOwner, onBegin 
                         type="button"
                         className="lobby-generate-btn"
                         disabled={inviteBusy}
-                        onClick={() => void handleRevokeInvite(inv.code)}
+                        onClick={() => void handleRevokeInvite(inv.code as string)}
                       >
                         Revoke
                       </button>
                     </>
                   )}
                 </div>
-              ))}
+                )
+              })}
               {isOwner && (
                 <>
                   <div style={{ display: 'flex', gap: 8, flexWrap: 'wrap', marginTop: 8 }}>

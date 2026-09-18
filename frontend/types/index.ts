@@ -90,7 +90,9 @@ export interface LobbyEligibility {
 export interface CampaignInvite {
   id?: string
   campaign_id: string
-  code: string
+  // Bearer credential — present in owner views only; lobby projections for
+  // non-owners omit it (see lobby_invite_projection).
+  code?: string
   invite_url?: string
   invite_url_path?: string
   status: 'active' | 'revoked'

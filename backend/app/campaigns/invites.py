@@ -182,12 +182,15 @@ def owner_invite_dict(invite) -> dict:
 def lobby_invite_projection(invite, *, viewer_is_owner: bool) -> dict:
     """Outstanding-invite entry for the lobby projection.
 
-    Owners see the full record; other members see a masked email hint plus
-    the recipient label so the party can tell who is still outstanding
-    without leaking addresses.
+    Owners see the full record (code + link). Other members see only
+    non-sensitive metadata (recipient label, masked email hint, status,
+    expiry): the raw code is a bearer credential accepted by
+    ``POST /api/invites/accept``, so it never leaves the owner view.
+    ``id`` is safe to expose (accept-by-id does not exist) and gives
+    clients a stable row key.
     """
     base = {
-        "code": invite.code,
+        "id": str(invite.id),
         "status": invite.status,
         "usable": invite_usability(invite)[0],
         "recipient_label": invite.recipient_label,
@@ -196,6 +199,8 @@ def lobby_invite_projection(invite, *, viewer_is_owner: bool) -> dict:
         "created_at": invite.created_at.isoformat() if invite.created_at else None,
     }
     if viewer_is_owner:
+        base["code"] = invite.code
+        base["invite_url_path"] = f"/invite/{invite.code}"
         base["intended_email"] = invite.intended_email
         base["last_delivery_status"] = invite.last_delivery_status
         base["last_delivery_error"] = invite.last_delivery_error

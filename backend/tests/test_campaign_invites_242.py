@@ -247,13 +247,18 @@ def test_lobby_shows_joined_vs_outstanding_invites(api):
     by_code = {i["code"]: i for i in body["invites"]}
     assert by_code[email_invite["code"]]["intended_email"] == "friend@example.com"
 
-    # Members see masked hints, never raw addresses.
+    # Members see masked hints, never raw addresses — and never the bearer
+    # codes themselves (owner-only; codes are accepted by /invites/accept).
     actor["id"] = member_id
     member_lobby = client.get(f"/api/campaigns/{cid}/lobby")
     assert member_lobby.status_code == 200
-    member_view = {i["code"]: i for i in member_lobby.json()["invites"]}
-    assert member_view[email_invite["code"]].get("intended_email") is None
-    assert member_view[email_invite["code"]]["intended_email_hint"].endswith("@example.com")
+    member_invites = member_lobby.json()["invites"]
+    assert all("code" not in i for i in member_invites)
+    member_view = {i["id"]: i for i in member_invites}
+    assert member_view[email_invite["id"]].get("intended_email") is None
+    assert member_view[email_invite["id"]]["intended_email_hint"].endswith("@example.com")
+    assert member_view[email_invite["id"]]["recipient_label"] == "Sam"
+    assert email_invite["code"] not in str(member_lobby.json())
     assert "friend@example.com" not in str(member_lobby.json())
 
 
