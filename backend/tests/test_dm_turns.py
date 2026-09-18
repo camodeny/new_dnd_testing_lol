@@ -3,7 +3,7 @@ import uuid
 from datetime import datetime, timezone, timedelta
 
 import pytest
-from sqlalchemy import create_engine, select
+from sqlalchemy import create_engine, select, text
 from sqlalchemy.orm import sessionmaker
 from sqlalchemy.pool import StaticPool
 from sqlalchemy.dialects.sqlite.base import SQLiteTypeCompiler
@@ -433,6 +433,7 @@ def test_concurrent_submission_plus_coordination_does_not_rollback_outer(tmp_pat
         assert set(active[0].submission_ids) == {str(s.id) for s in subs}
 
 
+@pytest.mark.postgres
 def test_postgres_read_committed_visibility_not_dropped(tmp_path):
     """Postgres READ COMMITTED regression: B must not drop A when collecting before lock.
 
@@ -440,18 +441,38 @@ def test_postgres_read_committed_visibility_not_dropped(tmp_path):
     lock, B accepts {B} and would collect {B} before waiting (old bug). After A
     commits, B acquires lock — with the fix it re-collects after lock and sees
     {A,B}, superseding to {A,B} instead of replacing with {B}.
+
+    Postgres-only by design: the choreography depends on SELECT ... FOR UPDATE
+    row locking, which SQLite silently skips. On SQLite the same interleaving
+    runs lock-free and is racy by construction (concurrent supersedes can
+    collide on (turn_id, attempt_number), or a stale pre-commit collect can
+    win), so this regression runs against the disposable Postgres and skips
+    without one.
     """
+    import os
     import threading
     import time
 
-    db_file = tmp_path / "visibility_race.sqlite"
-    eng = create_engine(f"sqlite:///{db_file}", connect_args={"check_same_thread": False, "timeout": 10})
-    Base.metadata.create_all(bind=eng)
+    if not os.getenv("FAULT_TEST_DATABASE_URL"):
+        pytest.skip("requires disposable Postgres")
+
+    from tests.reliability.test_fault_injection import _safe_engine
+
+    eng = _safe_engine(tmp_path)
     Fac2 = sessionmaker(bind=eng, expire_on_commit=False)
     owner = uuid.uuid4()
     other = uuid.uuid4()
     with Fac2() as db:
+        # Migrated Postgres enforces profiles.id -> auth.users(id) (Supabase
+        # auth mirror); seed the auth rows first like other pg tests do, and
+        # commit profiles before the campaign row that references them.
+        db.execute(
+            text("INSERT INTO auth.users (id) VALUES (:a), (:b) ON CONFLICT (id) DO NOTHING"),
+            {"a": owner, "b": other},
+        )
         db.add_all([Profile(id=owner, email="owner@example.com"), Profile(id=other, email="other@example.com")])
+        db.commit()
+    with Fac2() as db:
         cid = uuid.uuid4()
         db.add(Campaign(id=cid, owner_id=owner, name="VisCamp", revision=0))
         db.flush()
