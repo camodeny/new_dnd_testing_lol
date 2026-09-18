@@ -93,6 +93,10 @@ class NormalizedStreamEvent:
     kind: str  # 'token' | 'tool_call' | 'done'
     text: str = ''
     tool_call: Optional[NormalizedToolCall] = None
+    # Provider-reported usage attached to the terminal 'done' event when the
+    # stream carries it (None when the provider omits it). Billing resolves
+    # canonical cost from this; it is never guessed.
+    usage: Optional[dict] = None
 
 
 class ProviderError(Exception):

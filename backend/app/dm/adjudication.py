@@ -209,6 +209,7 @@ def adjudicate_with_failover(
     adapter=None,
     model: str | None = None,
     is_retry: bool = False,
+    campaign_id=None,
 ):
     """Adjudicate through the role policy path with bounded failover.
 
@@ -326,10 +327,16 @@ def adjudicate_with_failover(
             ttft_added = (time.monotonic() - t_start) * 1000 if index > 0 else 0.0
             if ai_run is not None and telemetry is not None:
                 try:
+                    from app.billing.config import cost_usd_for, tokens_from_usage
                     from app.observability.service import finish_ai_run
 
+                    usage = getattr(response, "usage", None)
+                    in_tokens, out_tokens = tokens_from_usage(usage)
                     finish_ai_run(telemetry, ai_run.id, status="succeeded",
-                                  result_code="contract_ok")
+                                  result_code="contract_ok",
+                                  input_tokens=in_tokens, output_tokens=out_tokens,
+                                  cost_usd=cost_usd_for(cand_adapter.name, cand_model, usage),
+                                  campaign_id=campaign_id)
                 except Exception:
                     pass
             structured_log(
@@ -375,6 +382,7 @@ def build_provider_narrator(
     trace_id: str | None = None,
     role: str = "narration",
     is_retry: bool = False,
+    campaign_id=None,
 ):
     """Streaming narrator backed by the role-policy provider path.
 
@@ -529,17 +537,26 @@ def build_provider_narrator(
                     classification=classification,
                 )
                 yielded_downstream = False
+                stream_usage = None
                 try:
                     for event in stream_chat(cand_adapter, pr):
                         if event.kind == "token" and event.text:
                             yielded_downstream = True
                             yield event.text
+                        elif event.kind == "done" and getattr(event, "usage", None):
+                            stream_usage = event.usage
                     if ai_run is not None and telemetry is not None:
                         try:
+                            from app.billing.config import cost_usd_for, tokens_from_usage
                             from app.observability.service import finish_ai_run
 
+                            in_tokens, out_tokens = tokens_from_usage(stream_usage)
                             finish_ai_run(telemetry, ai_run.id, status="succeeded",
-                                          result_code="stream_ok")
+                                          result_code="stream_ok",
+                                          input_tokens=in_tokens, output_tokens=out_tokens,
+                                          cost_usd=cost_usd_for(cand_adapter.name, cand_model,
+                                                                stream_usage),
+                                          campaign_id=campaign_id)
                         except Exception:
                             pass
                     return

@@ -678,6 +678,7 @@ def _execute_owned_attempt(
                     # first provider call is recovery/non-billable so failed
                     # work is never double-charged.
                     is_retry=_is_recovery_retry,
+                    campaign_id=campaign_id,
                 )
                 path_info.update(info)
                 return contract
@@ -845,6 +846,7 @@ def _execute_owned_attempt(
             narrator = build_provider_narrator(
                 timeout_seconds=timeout_seconds,
                 db=db, trace_id=tid, is_retry=_is_recovery_retry,
+                campaign_id=campaign_id,
             )
         except Exception as exc:
             db.rollback()

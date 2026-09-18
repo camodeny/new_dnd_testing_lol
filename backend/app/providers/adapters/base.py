@@ -152,6 +152,11 @@ class LLMProviderAdapter:
             payload['response_format'] = {'type': 'json_object'}
         if request.stream:
             payload['stream'] = True
+            # Ask OpenAI-compatible providers to append final usage; the
+            # capacity ledger (#253) needs actual token counts for spend.
+            # Providers that do not understand this option ignore it, and
+            # missing usage stays None (ambiguous, never zero-guessed).
+            payload['stream_options'] = {'include_usage': True}
         return payload
 
     # -- response normalization ----------------------------------------
@@ -210,6 +215,7 @@ class LLMProviderAdapter:
 
     def iter_stream_events(self, response) -> Iterable[NormalizedStreamEvent]:
         tool_calls: dict[int, dict] = {}
+        stream_usage: dict | None = None
         for line in response.iter_lines(decode_unicode=True):
             if not line:
                 continue
@@ -223,6 +229,11 @@ class LLMProviderAdapter:
                 choice = (chunk.get('choices') or [{}])[0]
                 delta = choice.get('delta') or {}
                 content = delta.get('content') or ''
+                # Final usage chunk (present when stream_options requests
+                # it): carried through to the terminal event for accounting.
+                usage = chunk.get('usage')
+                if isinstance(usage, dict) and usage:
+                    stream_usage = usage
                 # tool call deltas (chat completions)
                 for tc in delta.get('tool_calls') or []:
                     idx = tc.get('index', 0)
@@ -250,7 +261,7 @@ class LLMProviderAdapter:
                 kind='tool_call',
                 tool_call=NormalizedToolCall(id=tc.get('id'), name=tc.get('name'), arguments=tc.get('arguments') or "", raw=tc),
             )
-        yield NormalizedStreamEvent(kind='done')
+        yield NormalizedStreamEvent(kind='done', usage=stream_usage)
 
     # -- error classification -------------------------------------------
     def classify_error(self, error):
