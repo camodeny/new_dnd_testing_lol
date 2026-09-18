@@ -294,6 +294,10 @@ def _addr_hash(email: str) -> str:
 
 def _post_json(url: str, *, headers: dict, payload: dict) -> tuple[int, str]:
     data = json.dumps(payload).encode()
+    # NOTE: api.resend.com sits behind Cloudflare, which 403s (error 1010)
+    # requests carrying urllib's default `Python-urllib/*` User-Agent. Send
+    # an explicit product UA so delivery works from any runtime.
+    headers = {"User-Agent": "dnd-invites/1.0 (+transactional)", **headers}
     request = urllib.request.Request(url, data=data, headers=headers, method="POST")
     timeout = float(os.environ.get("INVITE_EMAIL_TIMEOUT_SECONDS") or "10")
     try:
