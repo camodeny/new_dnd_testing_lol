@@ -357,6 +357,17 @@ def test_verification_outcome_is_required_not_assumed():
         evaluate_execution(frame, "flank", {"flank": 0.9}, 0.95)
 
 
+def test_non_boolean_verification_cannot_authorize_execution():
+    """A truthy non-boolean like "false" is malformed, not verified."""
+    frame = _frame()
+    for bad in ("false", 1, 0, None, [], object()):
+        with pytest.raises(DecisionError) as exc_info:
+            evaluate_execution(
+                frame, "flank", {"flank": 0.9}, 0.95, verified=bad
+            )
+        assert exc_info.value.kind == "malformed"
+
+
 def test_mapping_coercion_cannot_bless_invalid_metadata():
     """Raw mapping values validate strictly: "false" is not reversible."""
     from app.decisions.frames import enumerate_candidates

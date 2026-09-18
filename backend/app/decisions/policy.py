@@ -249,6 +249,13 @@ def evaluate_execution(
     confidence_value = _checked_unit(confidence, what="confidence")
     margin = alternative_margin(probabilities, candidate.id)
 
+    # Truthiness is not verification: a truthy non-boolean such as "false"
+    # must never read as a passed deterministic check.
+    if not isinstance(verified, bool):
+        raise DecisionError(
+            f"policy input verified {verified!r} is not a boolean",
+            kind="malformed",
+        )
     if not verified:
         return PolicyVerdict(
             directive=ESCALATE,
