@@ -17,6 +17,7 @@ if not hasattr(SQLiteTypeCompiler, "_patched_jsonb"):
 from database import Base  # noqa: E402
 import models  # noqa: E402, F401
 from app.world.epistemics import (  # noqa: E402
+    assert_knowledge_authoritative,
     assert_knowledge_inline,
     grant_visibility_inline,
     has_active_grant,
@@ -30,9 +31,9 @@ from app.world.epistemics import (  # noqa: E402
 )
 from app.world.knowledge import create_fact_authoritative, create_relation_authoritative  # noqa: E402
 from app.world.service import create_entity_authoritative  # noqa: E402
-from models.campaigns import Campaign, CampaignMember  # noqa: E402
+from models.campaigns import Campaign, CampaignDomainEvent, CampaignMember  # noqa: E402
 from models.profiles import Profile  # noqa: E402
-from models.world import WorldKnowledge, WorldVisibilityGrant  # noqa: E402
+from models.world import WorldKnowledge, WorldKnowledgeIdempotency, WorldVisibilityGrant  # noqa: E402
 
 
 def _engine():
@@ -419,3 +420,107 @@ def test_no_access_inferred_from_related_shared_records():
     who = who_knows_target(db, camp, "fact", secret_fact.id, alice)
     assert who["knowers"] == []  # target itself not visible → knowers hidden
     assert who["denied_reasons"] == {"target_not_visible": 1}
+
+
+# ── Hidden subject is never disclosed through projections ───────────────────
+
+def test_hidden_subject_never_disclosed_through_projections():
+    Fac, camp, owner, alice, *_ = _setup()
+    db = Fac()
+    shade, _ = create_entity_authoritative(
+        db, camp.id, 0, entity_type="npc", name="Shade",
+        visibility="dm_only", operation_id="op-shade-211",
+    )
+    fact, _ = create_fact_authoritative(
+        db, camp.id, 1, content="The vault is unguarded at dawn.",
+        epistemic_state="confirmed", visibility="campaign",
+        operation_id="op-vault-truth",
+    )
+    assert_knowledge_inline(
+        db, camp, subject_kind="npc", subject_entity_id=shade.id,
+        target_kind="fact", target_fact_id=fact.id,
+        knowledge_state="knows", acquisition_source="saw_it",
+        visibility="campaign", operation_id="op-k-shade",
+    )
+    # The subject entity itself is hidden from the member viewer even though
+    # both the knowledge row and the target are campaign-visible.
+    assert may_user_receive(db, camp, "entity", shade.id, alice) == {
+        "allowed": False, "reason": "dm_only_requires_authority",
+    }
+    subj_view = what_does_subject_know(db, camp, shade.id, alice)
+    assert subj_view["entries"] == []
+    assert subj_view["total"] == 0
+    assert subj_view["denied_reasons"] == {"subject_not_visible": 1}
+    who = who_knows_target(db, camp, "fact", fact.id, alice)
+    assert who["knowers"] == []
+    assert who["visible"] == 0 and who["total"] == 1 and who["denied"] == 1
+    assert who["denied_reasons"] == {"subject_not_visible": 1}
+    # DM authority still sees the full picture in both directions.
+    assert what_does_subject_know(db, camp, shade.id, owner)["visible"] == 1
+    owner_who = who_knows_target(db, camp, "fact", fact.id, owner)
+    assert [k["subject_entity_id"] for k in owner_who["knowers"]] == [str(shade.id)]
+
+
+# ── Re-assertion retry is idempotent (no revision bump, no second event) ────
+
+def test_reassertion_retry_is_idempotent_without_second_event():
+    Fac, camp, owner, *_ = _setup()
+    db = Fac()
+    _, _, aria, _, _ = _entities(db, camp, 0)
+    fact, _ = create_fact_authoritative(
+        db, camp.id, 5, content="The cellar stair creaks.",
+        epistemic_state="confirmed", visibility="campaign",
+        operation_id="op-cellar-truth",
+    )
+    rev0 = int(db.get(Campaign, camp.id).revision)
+    row_a, ev_a = assert_knowledge_authoritative(
+        db, camp.id, rev0,
+        subject_kind="character", subject_entity_id=aria.id,
+        target_kind="fact", target_fact_id=fact.id,
+        knowledge_state="suspects", acquisition_source="heard_it",
+        visibility="campaign",
+        operation_id="op-k-a", idempotency_key="idem-key-a",
+    )
+    assert ev_a is not None
+    rev1 = int(db.get(Campaign, camp.id).revision)
+    assert rev1 == rev0 + 1
+    # Legitimate re-assertion of the same (subject, target) under a new key.
+    row_b, ev_b = assert_knowledge_authoritative(
+        db, camp.id, rev1,
+        subject_kind="character", subject_entity_id=aria.id,
+        target_kind="fact", target_fact_id=fact.id,
+        knowledge_state="knows", acquisition_source="saw_it",
+        visibility="campaign",
+        operation_id="op-k-b", idempotency_key="idem-key-b",
+    )
+    assert row_b.id == row_a.id and ev_b is not None
+    assert row_b.knowledge_state == "knows"
+    rev2 = int(db.get(Campaign, camp.id).revision)
+    assert rev2 == rev1 + 1
+    # Retry of op-b: same row, no revision bump, no second event.
+    row_r, ev_r = assert_knowledge_authoritative(
+        db, camp.id, rev2,
+        subject_kind="character", subject_entity_id=aria.id,
+        target_kind="fact", target_fact_id=fact.id,
+        knowledge_state="knows", acquisition_source="saw_it",
+        visibility="campaign",
+        operation_id="op-k-b", idempotency_key="idem-key-b",
+    )
+    assert ev_r is None
+    assert row_r.id == row_a.id
+    assert int(db.get(Campaign, camp.id).revision) == rev2
+    events = db.execute(
+        select(CampaignDomainEvent).where(
+            CampaignDomainEvent.campaign_id == camp.id,
+            CampaignDomainEvent.event_type == "world.knowledge_asserted",
+        )
+    ).scalars().all()
+    assert len(events) == 2
+    # Both consumed keys stay durable history pointing at the same live row.
+    keys = db.execute(
+        select(WorldKnowledgeIdempotency).where(
+            WorldKnowledgeIdempotency.campaign_id == camp.id,
+        )
+    ).scalars().all()
+    assert {k.idempotency_key for k in keys} == {"idem-key-a", "idem-key-b"}
+    assert {k.knowledge_id for k in keys} == {row_a.id}

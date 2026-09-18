@@ -20,8 +20,8 @@ Reusable server-side queries (all SQL-expressible, RLS-compatible):
 
 Fail-closed everywhere: missing/ambiguous visibility, unknown records,
 non-membership, and revoked/missing grants all deny with a reason code.
-Access is never inferred from a related shared record — the knowledge row
-and its truth target are authorized independently.
+Access is never inferred from a related shared record — the subject entity,
+the knowledge row, and its truth target are authorized independently.
 
 Observability: acquisition_source on every knowledge row; grant/revoke emit
 domain events + structured logs; denials return reason codes; projections
@@ -53,6 +53,7 @@ from models.world import (
     WorldEntity,
     WorldFact,
     WorldKnowledge,
+    WorldKnowledgeIdempotency,
     WorldRelation,
     WorldVisibilityGrant,
 )
@@ -249,12 +250,55 @@ def _find_knowledge_by_idempotency(
 ) -> WorldKnowledge | None:
     if not key:
         return None
-    return db.execute(
+    direct = db.execute(
         select(WorldKnowledge).where(
             WorldKnowledge.campaign_id == campaign_id,
             WorldKnowledge.idempotency_key == key,
         )
     ).scalars().first()
+    if direct is not None:
+        return direct
+    # Update-path keys live in the durable ledger: the live row only carries
+    # its latest key, so a retry of a superseded update key resolves here and
+    # returns the current row without re-mutating.
+    hist = db.execute(
+        select(WorldKnowledgeIdempotency).where(
+            WorldKnowledgeIdempotency.campaign_id == campaign_id,
+            WorldKnowledgeIdempotency.idempotency_key == key,
+        )
+    ).scalars().first()
+    if hist is None:
+        return None
+    row = db.get(WorldKnowledge, hist.knowledge_id)
+    if row is None or row.campaign_id != campaign_id:
+        return None
+    return row
+
+
+def _record_knowledge_idempotency(
+    db: Session, campaign_id: uuid.UUID, knowledge_id: uuid.UUID,
+    key: str | None, operation_id: str | None = None,
+) -> None:
+    """Remember that key K was consumed by knowledge row R (create or update).
+
+    Check-then-insert matches the existing precheck style; the unique
+    constraint on (campaign_id, idempotency_key) is the final arbiter.
+    """
+    if not key:
+        return
+    exists = db.execute(
+        select(WorldKnowledgeIdempotency.id).where(
+            WorldKnowledgeIdempotency.campaign_id == campaign_id,
+            WorldKnowledgeIdempotency.idempotency_key == key,
+        ).limit(1)
+    ).scalars().first()
+    if exists is not None:
+        return
+    db.add(WorldKnowledgeIdempotency(
+        id=uuid.uuid4(), campaign_id=campaign_id, knowledge_id=knowledge_id,
+        idempotency_key=key, operation_id=operation_id,
+    ))
+    db.flush()
 
 
 def _find_current_knowledge(
@@ -348,6 +392,7 @@ def assert_knowledge_inline(
             current.operation_id = op
         if key and not current.idempotency_key:
             current.idempotency_key = key
+        _record_knowledge_idempotency(db, campaign.id, current.id, key, op)
         db.flush()
         structured_log(
             logger, logging.INFO, "world_knowledge_updated",
@@ -373,6 +418,7 @@ def assert_knowledge_inline(
     )
     db.add(row)
     db.flush()
+    _record_knowledge_idempotency(db, campaign.id, row.id, key, op)
     structured_log(
         logger, logging.INFO, "world_knowledge_asserted",
         campaign_id=str(campaign.id), knowledge_id=str(row.id),
@@ -785,8 +831,8 @@ def what_does_subject_know(
     """Projection: what may viewer U see of subject X's knowledge?
 
     Fictional attribution (X holds stance S toward T) and human disclosure
-    (may U receive the knowledge row? may U receive T?) are checked
-    independently — both must allow, else the entry is counted as denied
+    (may U receive the subject entity? the knowledge row? T?) are checked
+    independently — all must allow, else the entry is counted as denied
     without leaking ids/content.
     """
     try:
@@ -797,6 +843,14 @@ def what_does_subject_know(
             "subject_entity_id": str(subject_entity_id),
             "entries": [], "total": 0, "visible": 0, "denied": 0,
             "denied_reasons": {"record_not_found": 1},
+        }
+    if not may_user_receive(db, campaign, "entity", subject.id, viewer)["allowed"]:
+        # The subject itself is hidden from this viewer: disclose neither its
+        # knowledge rows nor their count.
+        return {
+            "subject_entity_id": str(subject.id),
+            "entries": [], "total": 0, "visible": 0, "denied": 0,
+            "denied_reasons": {"subject_not_visible": 1},
         }
     rows = list_knowledge_for_subject(
         db, campaign.id, subject.id,
@@ -848,8 +902,9 @@ def who_knows_target(
 ) -> dict[str, Any]:
     """Projection: which subjects may viewer U see as holding target T?
 
-    The viewer must independently be allowed the target AND each knowledge
-    row; knower identities behind denied knowledge rows are never listed.
+    The viewer must independently be allowed the target, each knowledge row,
+    AND each knower's subject entity; knower identities behind denied rows or
+    hidden subjects are never listed.
     """
     try:
         kind = validate_knowledge_target_kind(target_kind)
@@ -871,10 +926,13 @@ def who_knows_target(
         db, campaign.id, kind, tid, knowledge_state=knowledge_state, limit=limit,
     )
     knowers: list[dict] = []
-    denied = 0
+    denied_reasons: dict[str, int] = {}
     for row in rows:
         if not may_user_receive(db, campaign, "knowledge", row.id, viewer)["allowed"]:
-            denied += 1
+            denied_reasons["knowledge_not_visible"] = denied_reasons.get("knowledge_not_visible", 0) + 1
+            continue
+        if not may_user_receive(db, campaign, "entity", row.subject_entity_id, viewer)["allowed"]:
+            denied_reasons["subject_not_visible"] = denied_reasons.get("subject_not_visible", 0) + 1
             continue
         knowers.append({
             "knowledge_id": str(row.id),
@@ -883,7 +941,8 @@ def who_knows_target(
             "knowledge_state": row.knowledge_state,
             "acquisition_source": row.acquisition_source,
         })
-    reasons = {"knowledge_not_visible": denied} if denied else {}
+    denied = len(rows) - len(knowers)
+    reasons = dict(denied_reasons)
     return {
         "target_kind": kind, "target_id": str(tid),
         "knowers": knowers, "total": len(rows),
