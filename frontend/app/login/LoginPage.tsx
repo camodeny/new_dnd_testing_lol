@@ -3,6 +3,7 @@
 import { useState, useEffect } from 'react'
 import { useRouter } from 'next/navigation'
 import { supabase, isSupabaseConfigured } from '@/lib/supabase'
+import { inviteContinuation, storePendingInvite } from '@/lib/pendingInvite'
 import type { User } from '@/types'
 import './login.css'
 
@@ -15,23 +16,6 @@ function safeNextPath(raw: string | null): string | null {
   // Only same-origin absolute paths continue — never open-redirect.
   if (!raw.startsWith('/') || raw.startsWith('//')) return null
   return raw
-}
-
-export const PENDING_INVITE_KEY = 'pendingInviteCode'
-
-// Invite continuation derived from the rendered location (#242): AppShell
-// renders LoginPage directly at /invite/:code for signed-out recipients,
-// so there is no ?next= in that path — the pathname itself is the context.
-export function inviteContinuation(): { next: string; code: string } | null {
-  if (typeof window === 'undefined') return null
-  const fromParam = safeNextPath(new URLSearchParams(window.location.search).get('next'))
-  if (fromParam) {
-    const match = /^\/invite\/([A-Za-z0-9_-]{1,20})\/?$/.exec(fromParam)
-    return { next: fromParam, code: (match?.[1] ?? '').toUpperCase() || '' }
-  }
-  const match = /^\/invite\/([A-Za-z0-9_-]{1,20})\/?$/.exec(window.location.pathname)
-  if (!match) return null
-  return { next: `/invite/${match[1].toUpperCase()}`, code: match[1].toUpperCase() }
 }
 
 export default function LoginPage({ onLogin }: LoginPageProps) {
@@ -51,11 +35,7 @@ export default function LoginPage({ onLogin }: LoginPageProps) {
     setInviteNext(continuation?.next ?? null)
     // Persist the pending invite so a later auth-confirmation landing can
     // resume it even if the redirect chain drops the path.
-    if (continuation?.code) {
-      try {
-        localStorage.setItem(PENDING_INVITE_KEY, continuation.code)
-      } catch { /* no-op */ }
-    }
+    if (continuation?.code) storePendingInvite(continuation.code)
     if (authError) {
       setError(authError)
       params.delete('auth_error')

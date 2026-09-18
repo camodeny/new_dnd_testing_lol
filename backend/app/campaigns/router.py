@@ -1344,7 +1344,13 @@ def create_campaign_invite(campaign_id: str, request: Request, db: Session = Dep
         cid = parse_campaign_id(campaign_id)
     except ValueError:
         raise HTTPException(status_code=404, detail="Invalid campaign id")
-    camp = db.get(Campaign, cid)
+    # Serialize with lifecycle transitions (#242 review): the campaign row
+    # is the same lock the acceptance paths take, so a concurrent start
+    # cannot slip between the lobby-only check and the insert below.
+    # (SQLite ignores FOR UPDATE in tests; Postgres serializes writers.)
+    camp = db.execute(
+        select(Campaign).where(Campaign.id == cid).with_for_update()
+    ).scalars().first()
     if not camp:
         raise HTTPException(status_code=404, detail="Campaign not found")
     if camp.owner_id != profile.id:

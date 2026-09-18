@@ -19,7 +19,8 @@ vi.mock('@/lib/supabase', () => ({
   isSupabaseConfigured: () => true,
 }))
 
-import LoginPage, { PENDING_INVITE_KEY } from './LoginPage'
+import LoginPage from './LoginPage'
+import { PENDING_INVITE_KEY } from '@/lib/pendingInvite'
 
 let container: HTMLDivElement
 let root: Root

@@ -4,11 +4,10 @@ import { useState, useEffect, useCallback } from 'react'
 import { useParams, useRouter } from 'next/navigation'
 import Link from 'next/link'
 import { campaignMembers } from '@/lib/api'
+import { clearPendingInvite, storePendingInvite } from '@/lib/pendingInvite'
 import Loading from '@/components/common/Loading'
 import ErrorMessage from '@/components/common/ErrorMessage'
 import type { InviteLookup } from '@/types'
-
-export const PENDING_INVITE_KEY = 'pendingInviteCode'
 
 // Canonical shareable invite URL — issue #242. Preserves invite context
 // across authentication/account creation: unauthenticated recipients are
@@ -26,9 +25,7 @@ export default function InviteAcceptPage() {
   const [error, setError] = useState('')
 
   const parkAndLogin = useCallback(() => {
-    try {
-      localStorage.setItem(PENDING_INVITE_KEY, code)
-    } catch { /* no-op */ }
+    storePendingInvite(code)
     router.replace(`/login?next=${encodeURIComponent(`/invite/${code}`)}`)
   }, [code, router])
 
@@ -64,11 +61,7 @@ export default function InviteAcceptPage() {
     setError('')
     try {
       const result = await campaignMembers.acceptInvite(code)
-      try {
-        if (localStorage.getItem(PENDING_INVITE_KEY) === code) {
-          localStorage.removeItem(PENDING_INVITE_KEY)
-        }
-      } catch { /* no-op */ }
+      clearPendingInvite(code)
       setAccepted(true)
       setTimeout(() => router.push(`/campaigns/${result.campaign_id}`), 1200)
     } catch (err) {
