@@ -133,8 +133,8 @@ def _resolve_npc_stats(
     entity = db.get(WorldEntity, entity_id)
     if entity is None or str(entity.campaign_id) != str(campaign_id):
         raise EncounterError(f"NPC entity {entity_id} not found in this campaign")
-    if (entity.entity_type or "").strip().lower() == "location":
-        raise EncounterError(f"Entity {entity_id} is a location and cannot join combat")
+    if (entity.entity_type or "").strip().lower() not in ("npc", "monster"):
+        raise EncounterError(f"Entity {entity_id} is not an NPC/monster and cannot join combat")
     from models.combat import HIDDEN_ENTITY_VISIBILITIES
 
     visibility = "dm_private" if str(entity.visibility or "") in HIDDEN_ENTITY_VISIBILITIES else "public"
