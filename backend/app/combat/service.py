@@ -1183,22 +1183,36 @@ def run_encounter_outbox_sweep(db: Session, *, limit: int = 5, max_attempts: int
     from datetime import datetime as _datetime
     from datetime import timezone as _timezone
 
+    from sqlalchemy import and_ as _and_
     from sqlalchemy import or_ as _or_
     from sqlalchemy import select as _select
 
     from app.outbox.service import ack_published, envelope_for_outbox, mark_failed
     from app.queue.consumer import WORKER_HANDLERS
-    from app.worker.executor import TerminalError, execute_worker_job
-    from models.reliability import Outbox
+    from app.worker.executor import SUCCEEDED, TerminalError, execute_worker_job
+    from models.reliability import Outbox, WorkerExecution
 
     now = _datetime.now(_timezone.utc)
+    succeeded_ids = _select(WorkerExecution.id).where(WorkerExecution.status == SUCCEEDED)
+    attempted_ids = _select(WorkerExecution.id)
     candidates = list(
         db.execute(
             _select(Outbox)
             .where(
                 Outbox.event_type.in_((ENCOUNTER_STARTED_EVENT, ENCOUNTER_READY_EVENT)),
-                _or_(Outbox.status == "pending", Outbox.status == "failed"),
-                _or_(Outbox.next_attempt_at == None, Outbox.next_attempt_at <= now),  # noqa: E711
+                ~Outbox.id.in_(succeeded_ids),
+                _or_(
+                    _and_(
+                        _or_(Outbox.status == "pending", Outbox.status == "failed"),
+                        _or_(Outbox.next_attempt_at == None, Outbox.next_attempt_at <= now),  # noqa: E711
+                    ),
+                    # Relay pre-emption: the generic relay may publish the
+                    # envelope to the queue (row -> published) with no
+                    # consumer executing it. The worker ledger is the
+                    # convergence point, so sweep published rows that were
+                    # never fenced; ledger duplicates stay no-ops.
+                    _and_(Outbox.status == "published", ~Outbox.id.in_(attempted_ids)),
+                ),
             )
             .order_by(Outbox.created_at.asc())
             .limit(max(1, limit))

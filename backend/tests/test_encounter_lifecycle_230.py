@@ -1259,3 +1259,46 @@ def test_encounter_worker_failed_publish_retries():
             assert result == {"ok": True, "encounter_id": str(encounter.id)}
     finally:
         set_realtime_publisher(previous)
+
+
+def test_encounter_sweep_executes_relay_published_rows_once():
+    """Relay pre-emption: a published-but-never-executed row is still swept,
+    and the ledger prevents a second execution."""
+    from app.combat.service import run_encounter_outbox_sweep
+    from app.realtime.service import (
+        InMemoryRealtimePublisher,
+        get_realtime_publisher,
+        set_realtime_publisher,
+    )
+    from models.reliability import Outbox
+
+    fac, ctx = _fixture()
+    previous = get_realtime_publisher()
+    recorder = InMemoryRealtimePublisher()
+    set_realtime_publisher(recorder)
+    try:
+        with fac() as db:
+            encounter, _ = _start(db, ctx, [{"character_id": str(ctx["owner_pc"])}])
+            db.commit()
+            row = db.execute(
+                select(Outbox).where(
+                    Outbox.campaign_id == ctx["campaign_id"],
+                    Outbox.event_type == ENCOUNTER_STARTED_EVENT,
+                )
+            ).scalars().one()
+            # The generic relay publishes the envelope without executing it.
+            row.status = "published"
+            db.commit()
+            recorder.clear()
+            first = run_encounter_outbox_sweep(db)
+            assert str(row.id) in first["executed"]
+            assert first["failed"] == []
+            started = [p for p in recorder.published if p["event"] == "encounter.started"]
+            assert len(started) == 1
+            assert started[0]["payload"]["event_id"] == f"encounter:{encounter.id}:started"
+            # Second sweep converges: ledger success excludes the row.
+            second = run_encounter_outbox_sweep(db)
+            assert second["executed"] == []
+            assert len(recorder.published) == 1
+    finally:
+        set_realtime_publisher(previous)
