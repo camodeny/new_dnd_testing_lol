@@ -816,6 +816,71 @@ def test_http_start_and_duplicate_replay(monkeypatch):
         app.dependency_overrides.clear()
 
 
+def test_http_start_with_stale_revision_returns_409(monkeypatch):
+    """A stale expected_revision on the encounter-start API maps to the
+    repository's standard 409 + X-Current-Revision response, not a 500."""
+    from fastapi.testclient import TestClient
+
+    from app.auth.service import TEST_USER_ID
+    from app.campaigns.events import commit_campaign_mutation
+    from database import get_db
+    from main import app
+    from models.profiles import Profile as ProfileModel
+
+    eng = _engine()
+    fac = sessionmaker(bind=eng, expire_on_commit=False)
+    with fac() as db:
+        db.add(ProfileModel(id=TEST_USER_ID, email="owner@example.com"))
+        db.commit()
+    with fac() as db:
+        ctx = _seed_world(db, second_pc=False, npc=False)
+        owner, campaign_id = ctx["owner"], ctx["campaign_id"]
+        camp = db.get(Campaign, campaign_id)
+        camp.owner_id = TEST_USER_ID
+        for member in db.execute(
+            select(CampaignMember).where(CampaignMember.campaign_id == campaign_id)
+        ).scalars().all():
+            if member.user_id == owner:
+                member.user_id = TEST_USER_ID
+        for char in db.execute(select(Character)).scalars().all():
+            if char.owner_id == owner:
+                char.owner_id = TEST_USER_ID
+        db.commit()
+        # Bump the campaign past revision 0 so the start below is stale.
+        commit_campaign_mutation(
+            db, campaign_id, expected_revision=0, event_type="test.revision_bump",
+            operation_id="test-bump-1", actor_id=TEST_USER_ID,
+        )
+        owner_pc = ctx["owner_pc"]
+        turn_id, attempt_id = ctx["turn_id"], ctx["attempt_id"]
+
+    def override_db():
+        with fac() as db:
+            yield db
+
+    def resolve_test_profile(request, db):
+        return db.get(ProfileModel, TEST_USER_ID)
+
+    monkeypatch.setattr("app.combat.router.resolve_profile", resolve_test_profile)
+    app.dependency_overrides[get_db] = override_db
+    try:
+        client = TestClient(app)
+        stale = client.post(
+            f"/api/campaigns/{campaign_id}/encounters",
+            json={
+                "expected_revision": 0,
+                "source_turn_id": str(turn_id),
+                "source_attempt_id": str(attempt_id),
+                "participants": [{"character_id": str(owner_pc)}],
+            },
+            headers={"Idempotency-Key": "http-start-stale"},
+        )
+        assert stale.status_code == 409, stale.text
+        assert stale.headers["X-Current-Revision"] == "1"
+    finally:
+        app.dependency_overrides.clear()
+
+
 def test_http_generic_fulfill_emits_ready_event(monkeypatch):
     """Issue #230 round 5: the last initiative fulfilled through the generic
     roll-request API must still publish encounter.initiative_ready post-commit.
