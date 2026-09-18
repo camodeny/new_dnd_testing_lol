@@ -1189,18 +1189,46 @@ def run_encounter_outbox_sweep(db: Session, *, limit: int = 5, max_attempts: int
 
     from app.outbox.service import ack_published, envelope_for_outbox, mark_failed
     from app.queue.consumer import WORKER_HANDLERS
-    from app.worker.executor import SUCCEEDED, TerminalError, execute_worker_job
+    from app.worker.executor import (
+        DEAD_LETTER,
+        FAILED,
+        PENDING,
+        SUCCEEDED,
+        TerminalError,
+        execute_worker_job,
+    )
     from models.reliability import Outbox, WorkerExecution
 
     now = _datetime.now(_timezone.utc)
-    succeeded_ids = _select(WorkerExecution.id).where(WorkerExecution.status == SUCCEEDED)
-    attempted_ids = _select(WorkerExecution.id)
+    # Ledger-complete executions converge the sweep: succeeded and
+    # dead-lettered jobs are never reselected. Everything else is
+    # retryable history, not completion.
+    complete_ids = _select(WorkerExecution.id).where(
+        WorkerExecution.status.in_((SUCCEEDED, DEAD_LETTER))
+    )
+    all_attempted_ids = _select(WorkerExecution.id)
+    # Executions the fence may still claim: never-run ledger aside, these
+    # mirror execute_worker_job's own claim eligibility (pending, or failed
+    # with a due retry). Running/failed-not-due rows stay fenced out here;
+    # the executor remains the final arbiter at claim time.
+    sweepable_exec_ids = _select(WorkerExecution.id).where(
+        _or_(
+            WorkerExecution.status == PENDING,
+            _and_(
+                WorkerExecution.status == FAILED,
+                _or_(
+                    WorkerExecution.next_attempt_at == None,  # noqa: E711
+                    WorkerExecution.next_attempt_at <= now,
+                ),
+            ),
+        )
+    )
     candidates = list(
         db.execute(
             _select(Outbox)
             .where(
                 Outbox.event_type.in_((ENCOUNTER_STARTED_EVENT, ENCOUNTER_READY_EVENT)),
-                ~Outbox.id.in_(succeeded_ids),
+                ~Outbox.id.in_(complete_ids),
                 _or_(
                     _and_(
                         _or_(Outbox.status == "pending", Outbox.status == "failed"),
@@ -1208,10 +1236,16 @@ def run_encounter_outbox_sweep(db: Session, *, limit: int = 5, max_attempts: int
                     ),
                     # Relay pre-emption: the generic relay may publish the
                     # envelope to the queue (row -> published) with no
-                    # consumer executing it. The worker ledger is the
-                    # convergence point, so sweep published rows that were
-                    # never fenced; ledger duplicates stay no-ops.
-                    _and_(Outbox.status == "published", ~Outbox.id.in_(attempted_ids)),
+                    # consumer executing it. Re-sweep published rows unless
+                    # the ledger shows completion or a fenced-out retry
+                    # state; ledger duplicates stay no-ops.
+                    _and_(
+                        Outbox.status == "published",
+                        _or_(
+                            ~Outbox.id.in_(all_attempted_ids),
+                            Outbox.id.in_(sweepable_exec_ids),
+                        ),
+                    ),
                 ),
             )
             .order_by(Outbox.created_at.asc())

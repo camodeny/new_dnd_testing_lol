@@ -1302,3 +1302,55 @@ def test_encounter_sweep_executes_relay_published_rows_once():
             assert len(recorder.published) == 1
     finally:
         set_realtime_publisher(previous)
+
+
+def test_encounter_sweep_retries_failed_execution_after_relay():
+    """Transient worker failure → relay pre-emption → due retry still swept."""
+    from datetime import datetime, timedelta, timezone
+
+    from app.combat.service import run_encounter_outbox_sweep
+    from app.realtime.service import (
+        InMemoryRealtimePublisher,
+        get_realtime_publisher,
+        set_realtime_publisher,
+    )
+    from models.reliability import Outbox, WorkerExecution
+
+    fac, ctx = _fixture()
+    previous = get_realtime_publisher()
+    recorder = InMemoryRealtimePublisher()
+    set_realtime_publisher(recorder)
+    try:
+        with fac() as db:
+            encounter, _ = _start(db, ctx, [{"character_id": str(ctx["owner_pc"])}])
+            db.commit()
+            row = db.execute(
+                select(Outbox).where(
+                    Outbox.campaign_id == ctx["campaign_id"],
+                    Outbox.event_type == ENCOUNTER_STARTED_EVENT,
+                )
+            ).scalars().one()
+            # First sweep fails retriably inside the worker fence.
+            recorder.fail_next = True
+            first = run_encounter_outbox_sweep(db)
+            assert first["executed"] == []
+            assert len(first["failed"]) == 1
+            # Bulk ledger writes bypass the identity map; refresh to read them.
+            db.expire_all()
+            execution = db.get(WorkerExecution, row.id)
+            assert execution is not None and execution.status == "failed"
+            # The generic relay then publishes the envelope without running it.
+            row.status = "published"
+            db.commit()
+            # Make the worker retry due and the broadcast healthy again.
+            execution.next_attempt_at = datetime.now(timezone.utc) - timedelta(minutes=1)
+            db.commit()
+            recorder.clear()
+            recorder.fail_next = False
+            second = run_encounter_outbox_sweep(db)
+            assert str(row.id) in second["executed"]
+            started = [p for p in recorder.published if p["event"] == "encounter.started"]
+            assert len(started) == 1
+            assert started[0]["payload"]["event_id"] == f"encounter:{encounter.id}:started"
+    finally:
+        set_realtime_publisher(previous)
